@@ -9,7 +9,7 @@ use crate::ast::{
 use crate::capabilities::Capabilities;
 use crate::context::Context;
 use crate::error::GenError;
-use crate::functions::{FunctionCategory, AGGREGATE_FUNCTIONS};
+use crate::functions::{AGGREGATE_FUNCTIONS, FunctionCategory};
 use crate::generate::expr::generate_condition;
 use crate::generate::expr::generate_expr;
 use crate::generate::literal::generate_literal;

@@ -250,8 +250,8 @@ expect {
 
 test upsert-array-basic {
     CREATE TABLE ups1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO ups1 VALUES (1, '[1,2,3]');
-    INSERT INTO ups1 VALUES (1, '[4,5,6]') ON CONFLICT(id) DO UPDATE SET vals = excluded.vals;
+    INSERT INTO ups1 VALUES (1, '{1,2,3}');
+    INSERT INTO ups1 VALUES (1, '{4,5,6}') ON CONFLICT(id) DO UPDATE SET vals = excluded.vals;
     SELECT id, vals FROM ups1;
 }
 expect {
@@ -270,8 +270,8 @@ expect {
 
 test upsert-array-do-nothing {
     CREATE TABLE ups3 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO ups3 VALUES (1, '[1,2,3]');
-    INSERT INTO ups3 VALUES (1, '[4,5,6]') ON CONFLICT DO NOTHING;
+    INSERT INTO ups3 VALUES (1, '{1,2,3}');
+    INSERT INTO ups3 VALUES (1, '{4,5,6}') ON CONFLICT DO NOTHING;
     SELECT id, vals FROM ups3;
 }
 expect {
@@ -280,8 +280,8 @@ expect {
 
 test array-in-subquery {
     CREATE TABLE sq1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO sq1 VALUES (1, '[10,20]');
-    INSERT INTO sq1 VALUES (2, '[30,40]');
+    INSERT INTO sq1 VALUES (1, '{10,20}');
+    INSERT INTO sq1 VALUES (2, '{30,40}');
     SELECT vals FROM sq1 WHERE id = (SELECT MAX(id) FROM sq1);
 }
 expect {
@@ -290,8 +290,8 @@ expect {
 
 test array-in-where-comparison {
     CREATE TABLE wh1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO wh1 VALUES (1, '[1,2,3]');
-    INSERT INTO wh1 VALUES (2, '[4,5,6]');
+    INSERT INTO wh1 VALUES (1, '{1,2,3}');
+    INSERT INTO wh1 VALUES (2, '{4,5,6}');
     SELECT id FROM wh1 WHERE vals = ARRAY[1,2,3];
 }
 expect {
@@ -312,9 +312,9 @@ expect {
 
 test array-distinct {
     CREATE TABLE dist1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO dist1 VALUES (1, '[1,2]');
-    INSERT INTO dist1 VALUES (2, '[1,2]');
-    INSERT INTO dist1 VALUES (3, '[3,4]');
+    INSERT INTO dist1 VALUES (1, '{1,2}');
+    INSERT INTO dist1 VALUES (2, '{1,2}');
+    INSERT INTO dist1 VALUES (3, '{3,4}');
     SELECT DISTINCT vals FROM dist1 ORDER BY vals;
 }
 expect {
@@ -341,8 +341,8 @@ expect {
 test array-insert-select {
     CREATE TABLE is1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
     CREATE TABLE is2 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO is1 VALUES (1, '[1,2,3]');
-    INSERT INTO is1 VALUES (2, '[4,5,6]');
+    INSERT INTO is1 VALUES (1, '{1,2,3}');
+    INSERT INTO is1 VALUES (2, '{4,5,6}');
     INSERT INTO is2 SELECT * FROM is1;
     SELECT id, vals FROM is2 ORDER BY id;
 }
@@ -353,7 +353,7 @@ expect {
 
 test array-update-to-null-then-check {
     CREATE TABLE un1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO un1 VALUES (1, '[1,2,3]');
+    INSERT INTO un1 VALUES (1, '{1,2,3}');
     UPDATE un1 SET vals = NULL WHERE id = 1;
     SELECT id, COALESCE(array_length(vals), -1) FROM un1;
 }
@@ -363,7 +363,7 @@ expect {
 
 test array-update-with-function {
     CREATE TABLE uf1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO uf1 VALUES (1, '[1,2,3]');
+    INSERT INTO uf1 VALUES (1, '{1,2,3}');
     UPDATE uf1 SET vals = array_append(vals, 4) WHERE id = 1;
     SELECT id, vals FROM uf1;
 }
@@ -373,8 +373,8 @@ expect {
 
 test array-contains-operator {
     CREATE TABLE co1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO co1 VALUES (1, '[1,2,3,4,5]');
-    INSERT INTO co1 VALUES (2, '[10,20,30]');
+    INSERT INTO co1 VALUES (1, '{1,2,3,4,5}');
+    INSERT INTO co1 VALUES (2, '{10,20,30}');
     SELECT id FROM co1 WHERE vals @> ARRAY[1,3];
 }
 expect {
@@ -383,8 +383,8 @@ expect {
 
 test array-overlap-operator {
     CREATE TABLE oo1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO oo1 VALUES (1, '[1,2,3]');
-    INSERT INTO oo1 VALUES (2, '[4,5,6]');
+    INSERT INTO oo1 VALUES (1, '{1,2,3}');
+    INSERT INTO oo1 VALUES (2, '{4,5,6}');
     SELECT id FROM oo1 WHERE vals && ARRAY[2,5];
 }
 expect {
@@ -392,36 +392,36 @@ expect {
     2
 }
 
-test array-json-parse-nested-strings {
+test array-pg-parse-nested-strings {
     CREATE TABLE jp1 (id INTEGER PRIMARY KEY, vals text[]) STRICT;
-    INSERT INTO jp1 VALUES (1, '["hello \"world\"", "foo\\nbar"]');
+    INSERT INTO jp1 VALUES (1, '{"hello \"world\"", "foo\\nbar"}');
     SELECT vals FROM jp1;
 }
 expect {
     {"hello \"world\"","foo\nbar"}
 }
 
-test array-json-parse-booleans {
+test array-pg-parse-booleans {
     CREATE TABLE jp2 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO jp2 VALUES (1, '[true, false, true]');
+    INSERT INTO jp2 VALUES (1, '{1, 0, 1}');
     SELECT vals FROM jp2;
 }
 expect {
     {1,0,1}
 }
 
-test array-json-parse-mixed-whitespace {
+test array-pg-parse-mixed-whitespace {
     CREATE TABLE jp3 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO jp3 VALUES (1, '[  1 ,  2  , 3  ]');
+    INSERT INTO jp3 VALUES (1, '{  1 ,  2  , 3  }');
     SELECT vals FROM jp3;
 }
 expect {
     {1,2,3}
 }
 
-test array-json-parse-scientific-notation {
+test array-pg-parse-scientific-notation {
     CREATE TABLE jp4 (id INTEGER PRIMARY KEY, vals real[]) STRICT;
-    INSERT INTO jp4 VALUES (1, '[1.5e2, 2.0e-1]');
+    INSERT INTO jp4 VALUES (1, '{1.5e2, 2.0e-1}');
     SELECT vals FROM jp4;
 }
 expect {
@@ -446,7 +446,7 @@ expect error {
 
 test array-invalid-type-mismatch {
     CREATE TABLE ij3 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO ij3 VALUES (1, '["not", "integers"]');
+    INSERT INTO ij3 VALUES (1, '{"not", "integers"}');
 }
 expect error {
     cannot store TEXT value in INTEGER
@@ -454,7 +454,7 @@ expect error {
 
 test array-real-type-accepts-integers {
     CREATE TABLE rt1 (id INTEGER PRIMARY KEY, vals real[]) STRICT;
-    INSERT INTO rt1 VALUES (1, '[1, 2, 3]');
+    INSERT INTO rt1 VALUES (1, '{1, 2, 3}');
     SELECT vals FROM rt1;
 }
 expect {
@@ -463,9 +463,9 @@ expect {
 
 test array-order-by-with-nulls {
     CREATE TABLE obn1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO obn1 VALUES (1, '[1,2,3]');
+    INSERT INTO obn1 VALUES (1, '{1,2,3}');
     INSERT INTO obn1 VALUES (2, NULL);
-    INSERT INTO obn1 VALUES (3, '[1,2]');
+    INSERT INTO obn1 VALUES (3, '{1,2}');
     SELECT id, COALESCE(array_to_string(vals, ','), 'NULL') FROM obn1 ORDER BY vals;
 }
 expect {
@@ -476,10 +476,10 @@ expect {
 
 test array-order-by-limit {
     CREATE TABLE obl1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO obl1 VALUES (1, '[3,2,1]');
-    INSERT INTO obl1 VALUES (2, '[1,2,3]');
-    INSERT INTO obl1 VALUES (3, '[1,2]');
-    INSERT INTO obl1 VALUES (4, '[1,2,4]');
+    INSERT INTO obl1 VALUES (1, '{3,2,1}');
+    INSERT INTO obl1 VALUES (2, '{1,2,3}');
+    INSERT INTO obl1 VALUES (3, '{1,2}');
+    INSERT INTO obl1 VALUES (4, '{1,2,4}');
     SELECT id, vals FROM obl1 ORDER BY vals LIMIT 2;
 }
 expect {
@@ -489,9 +489,9 @@ expect {
 
 test array-count-aggregate {
     CREATE TABLE ca1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO ca1 VALUES (1, '[1,2,3]');
+    INSERT INTO ca1 VALUES (1, '{1,2,3}');
     INSERT INTO ca1 VALUES (2, NULL);
-    INSERT INTO ca1 VALUES (3, '[4,5]');
+    INSERT INTO ca1 VALUES (3, '{4,5}');
     SELECT COUNT(vals), COUNT(*) FROM ca1;
 }
 expect {
@@ -500,7 +500,7 @@ expect {
 
 test array-multiple-array-columns {
     CREATE TABLE mc1 (id INTEGER PRIMARY KEY, a integer[], b text[]) STRICT;
-    INSERT INTO mc1 VALUES (1, '[1,2]', '["x","y"]');
+    INSERT INTO mc1 VALUES (1, '{1,2}', '{"x","y"}');
     SELECT id, a, b FROM mc1;
 }
 expect {
@@ -509,7 +509,7 @@ expect {
 
 test array-subscript-basic {
     CREATE TABLE sb1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO sb1 VALUES (1, '[10,20,30]');
+    INSERT INTO sb1 VALUES (1, '{10,20,30}');
     SELECT vals[1], vals[2], vals[3] FROM sb1;
 }
 expect {
@@ -518,7 +518,7 @@ expect {
 
 test array-subscript-out-of-bounds-is-null {
     CREATE TABLE sb2 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO sb2 VALUES (1, '[10,20,30]');
+    INSERT INTO sb2 VALUES (1, '{10,20,30}');
     SELECT COALESCE(vals[99], -1) FROM sb2;
 }
 expect {
@@ -527,8 +527,8 @@ expect {
 
 test array-subscript-in-where {
     CREATE TABLE sb3 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO sb3 VALUES (1, '[10,20,30]');
-    INSERT INTO sb3 VALUES (2, '[40,50,60]');
+    INSERT INTO sb3 VALUES (1, '{10,20,30}');
+    INSERT INTO sb3 VALUES (2, '{40,50,60}');
     SELECT id FROM sb3 WHERE vals[1] > 30;
 }
 expect {
@@ -538,7 +538,7 @@ expect {
 test array-with-join {
     CREATE TABLE j1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
     CREATE TABLE j2 (id INTEGER PRIMARY KEY, name TEXT) STRICT;
-    INSERT INTO j1 VALUES (1, '[1,2,3]');
+    INSERT INTO j1 VALUES (1, '{1,2,3}');
     INSERT INTO j2 VALUES (1, 'one');
     SELECT j2.name, j1.vals FROM j1 JOIN j2 ON j1.id = j2.id;
 }
@@ -548,7 +548,7 @@ expect {
 
 test array-max-element-type-coercion {
     CREATE TABLE tc1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO tc1 VALUES (1, '[1, 2.0, 3]');
+    INSERT INTO tc1 VALUES (1, '{1, 2.0, 3}');
     SELECT vals FROM tc1;
 }
 expect {
@@ -557,33 +557,33 @@ expect {
 
 test array-leading-comma-rejected {
     CREATE TABLE lc1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO lc1 VALUES (1, '[,1,2]');
+    INSERT INTO lc1 VALUES (1, '{,1,2}');
 }
 expect error {
-    cannot store non-array value in INTEGER column lc1.vals
+    cannot store TEXT value in INTEGER
 }
 
 test array-double-comma-rejected {
     CREATE TABLE dc1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO dc1 VALUES (1, '[1,,2]');
+    INSERT INTO dc1 VALUES (1, '{1,,2}');
 }
 expect error {
-    cannot store non-array value in INTEGER column dc1.vals
+    cannot store TEXT value in INTEGER
 }
 
 test array-nested-array-rejected-for-1d {
     CREATE TABLE na1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO na1 VALUES (1, '[[1,2],[3,4]]');
+    INSERT INTO na1 VALUES (1, '{[1,2],[3,4]}');
 }
 expect error {
-    cannot store non-array value in INTEGER column na1.vals
+    cannot store TEXT value in INTEGER
 }
 
 test array-order-by-multiple-keys {
     CREATE TABLE omk1 (id INTEGER PRIMARY KEY, name TEXT, vals integer[]) STRICT;
-    INSERT INTO omk1 VALUES (1, 'a', '[2,1]');
-    INSERT INTO omk1 VALUES (2, 'b', '[1,2]');
-    INSERT INTO omk1 VALUES (3, 'c', '[1,2]');
+    INSERT INTO omk1 VALUES (1, 'a', '{2,1}');
+    INSERT INTO omk1 VALUES (2, 'b', '{1,2}');
+    INSERT INTO omk1 VALUES (3, 'c', '{1,2}');
     SELECT id, name, vals FROM omk1 ORDER BY vals, name;
 }
 expect {
@@ -602,8 +602,8 @@ expect {
 
 test array-where-with-function {
     CREATE TABLE wf1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO wf1 VALUES (1, '[1,2,3]');
-    INSERT INTO wf1 VALUES (2, '[4,5,6]');
+    INSERT INTO wf1 VALUES (1, '{1,2,3}');
+    INSERT INTO wf1 VALUES (2, '{4,5,6}');
     SELECT id FROM wf1 WHERE array_length(vals) = 3;
 }
 expect {
@@ -613,8 +613,8 @@ expect {
 
 test array-where-contains-function {
     CREATE TABLE wf2 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO wf2 VALUES (1, '[1,2,3]');
-    INSERT INTO wf2 VALUES (2, '[4,5,6]');
+    INSERT INTO wf2 VALUES (1, '{1,2,3}');
+    INSERT INTO wf2 VALUES (2, '{4,5,6}');
     SELECT id FROM wf2 WHERE array_contains(vals, 2) = 1;
 }
 expect {
@@ -623,7 +623,7 @@ expect {
 
 test array-select-star-display {
     CREATE TABLE sd1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO sd1 VALUES (1, '[1,2,3]');
+    INSERT INTO sd1 VALUES (1, '{1,2,3}');
     SELECT * FROM sd1;
 }
 expect {
@@ -635,7 +635,7 @@ test array-left-join-null {
     CREATE TABLE lj2 (id INTEGER PRIMARY KEY, name TEXT) STRICT;
     INSERT INTO lj2 VALUES (1, 'one');
     INSERT INTO lj2 VALUES (2, 'two');
-    INSERT INTO lj1 VALUES (1, '[10,20]');
+    INSERT INTO lj1 VALUES (1, '{10,20}');
     SELECT lj2.name, COALESCE(array_to_string(lj1.vals, ','), 'NONE') FROM lj2 LEFT JOIN lj1 ON lj2.id = lj1.id ORDER BY lj2.id;
 }
 expect {
@@ -645,7 +645,7 @@ expect {
 
 test array-case-when-subscript {
     CREATE TABLE cws1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO cws1 VALUES (1, '[10,20,30]');
+    INSERT INTO cws1 VALUES (1, '{10,20,30}');
     SELECT CASE WHEN vals[1] > 5 THEN 'big' ELSE 'small' END FROM cws1;
 }
 expect {
@@ -654,9 +654,9 @@ expect {
 
 test array-between-comparison {
     CREATE TABLE bc1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO bc1 VALUES (1, '[1,0]');
-    INSERT INTO bc1 VALUES (2, '[1,5]');
-    INSERT INTO bc1 VALUES (3, '[2,0]');
+    INSERT INTO bc1 VALUES (1, '{1,0}');
+    INSERT INTO bc1 VALUES (2, '{1,5}');
+    INSERT INTO bc1 VALUES (3, '{2,0}');
     SELECT id FROM bc1 WHERE vals >= ARRAY[1,0] AND vals <= ARRAY[1,5];
 }
 expect {
@@ -666,7 +666,7 @@ expect {
 
 test array-text-type-empty-strings {
     CREATE TABLE es1 (id INTEGER PRIMARY KEY, vals text[]) STRICT;
-    INSERT INTO es1 VALUES (1, '["", "hello", ""]');
+    INSERT INTO es1 VALUES (1, '{"", "hello", ""}');
     SELECT vals FROM es1;
 }
 expect {
@@ -675,7 +675,7 @@ expect {
 
 test array-real-precision {
     CREATE TABLE rp1 (id INTEGER PRIMARY KEY, vals real[]) STRICT;
-    INSERT INTO rp1 VALUES (1, '[0.1, 0.2, 0.3]');
+    INSERT INTO rp1 VALUES (1, '{0.1, 0.2, 0.3}');
     SELECT vals FROM rp1;
 }
 expect {
@@ -684,7 +684,7 @@ expect {
 
 test array-integer-max-values {
     CREATE TABLE imv1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO imv1 VALUES (1, '[9223372036854775807, -9223372036854775808, 0]');
+    INSERT INTO imv1 VALUES (1, '{9223372036854775807, -9223372036854775808, 0}');
     SELECT vals FROM imv1;
 }
 expect {
@@ -702,9 +702,9 @@ expect {
 
 test array-order-by-real {
     CREATE TABLE obr1 (id INTEGER PRIMARY KEY, vals real[]) STRICT;
-    INSERT INTO obr1 VALUES (1, '[2.5, 1.0]');
-    INSERT INTO obr1 VALUES (2, '[1.5, 2.0]');
-    INSERT INTO obr1 VALUES (3, '[1.5, 1.0]');
+    INSERT INTO obr1 VALUES (1, '{2.5, 1.0}');
+    INSERT INTO obr1 VALUES (2, '{1.5, 2.0}');
+    INSERT INTO obr1 VALUES (3, '{1.5, 1.0}');
     SELECT id, vals FROM obr1 ORDER BY vals;
 }
 expect {
@@ -715,9 +715,9 @@ expect {
 
 test array-min-max-display {
     CREATE TABLE mm1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO mm1 VALUES (1, '[3,2,1]');
-    INSERT INTO mm1 VALUES (2, '[1,2,3]');
-    INSERT INTO mm1 VALUES (3, '[1,2]');
+    INSERT INTO mm1 VALUES (1, '{3,2,1}');
+    INSERT INTO mm1 VALUES (2, '{1,2,3}');
+    INSERT INTO mm1 VALUES (3, '{1,2}');
     SELECT MIN(vals), MAX(vals) FROM mm1;
 }
 expect {
@@ -726,9 +726,9 @@ expect {
 
 test array-min-max-group-by {
     CREATE TABLE mm2 (cat TEXT, vals integer[]) STRICT;
-    INSERT INTO mm2 VALUES ('a', '[3,2]');
-    INSERT INTO mm2 VALUES ('a', '[1,2]');
-    INSERT INTO mm2 VALUES ('b', '[5,6]');
+    INSERT INTO mm2 VALUES ('a', '{3,2}');
+    INSERT INTO mm2 VALUES ('a', '{1,2}');
+    INSERT INTO mm2 VALUES ('b', '{5,6}');
     SELECT cat, MIN(vals), MAX(vals) FROM mm2 GROUP BY cat ORDER BY cat;
 }
 expect {
@@ -745,9 +745,9 @@ expect {
 
 test array-order-by-text-arrays {
     CREATE TABLE obt1 (id INTEGER PRIMARY KEY, vals text[]) STRICT;
-    INSERT INTO obt1 VALUES (1, '["banana"]');
-    INSERT INTO obt1 VALUES (2, '["apple"]');
-    INSERT INTO obt1 VALUES (3, '["cherry"]');
+    INSERT INTO obt1 VALUES (1, '{"banana"}');
+    INSERT INTO obt1 VALUES (2, '{"apple"}');
+    INSERT INTO obt1 VALUES (3, '{"cherry"}');
     SELECT id, vals FROM obt1 ORDER BY vals;
 }
 expect {

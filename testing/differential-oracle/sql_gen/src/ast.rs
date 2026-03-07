@@ -453,9 +453,7 @@ impl Expr {
             // affect the outer query's aggregate/non-aggregate classification.
             Expr::Subquery(_) | Expr::InSubquery(_) | Expr::Exists(_) => false,
             Expr::ArrayLiteral(a) => a.elements.iter().any(|e| e.contains_aggregate()),
-            Expr::ArraySubscript(a) => {
-                a.array.contains_aggregate() || a.index.contains_aggregate()
-            }
+            Expr::ArraySubscript(a) => a.array.contains_aggregate() || a.index.contains_aggregate(),
             Expr::ColumnRef(_) | Expr::Literal(_) => false,
             // Stubs: never instantiated
             Expr::WindowFunction(_) | Expr::Collate(_) | Expr::Raise(_) => false,

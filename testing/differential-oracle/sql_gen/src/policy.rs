@@ -281,7 +281,9 @@ impl Policy {
         self.create_table_config.strict_probability = 1.0;
         self.literal_config.array_min_size = 0;
         self.literal_config.array_max_size = 10;
-        self.function_config = self.function_config.enable_category(FunctionCategory::Array);
+        self.function_config = self
+            .function_config
+            .enable_category(FunctionCategory::Array);
         self
     }
 
@@ -2051,9 +2053,7 @@ impl FunctionConfig {
             function_weights: SCALAR_FUNCTIONS
                 .iter()
                 .map(|f| {
-                    let weight = if !f.is_deterministic
-                        || f.category == FunctionCategory::Array
-                    {
+                    let weight = if !f.is_deterministic || f.category == FunctionCategory::Array {
                         0
                     } else {
                         10

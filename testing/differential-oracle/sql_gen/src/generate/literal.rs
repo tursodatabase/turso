@@ -92,9 +92,7 @@ pub fn generate_array_literal(
     config: &LiteralConfig,
 ) -> Literal {
     let size = ctx.gen_range_inclusive(config.array_min_size, config.array_max_size);
-    let element_type = data_type
-        .array_element_type()
-        .unwrap_or(DataType::Integer);
+    let element_type = data_type.array_element_type().unwrap_or(DataType::Integer);
 
     let mut parts = Vec::with_capacity(size);
     for _ in 0..size {

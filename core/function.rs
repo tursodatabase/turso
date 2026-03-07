@@ -862,7 +862,7 @@ impl ScalarFunc {
             | Self::NumericEq => &[2],
             Self::NumericEncode => &[3],
             // Array construction / element access
-            Self::Array => &[-1],         // variable arity
+            Self::Array => &[-1], // variable arity
             Self::ArrayElement => &[2],
             Self::ArraySetElement => &[3],
             // Array functions

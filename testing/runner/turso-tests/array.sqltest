@@ -3,7 +3,7 @@
 
 test array-basic-insert-json {
     CREATE TABLE t1 (id INTEGER PRIMARY KEY, tags text[]) STRICT;
-    INSERT INTO t1 VALUES (1, '["a","b","c"]');
+    INSERT INTO t1 VALUES (1, '{"a","b","c"}');
     SELECT id, tags FROM t1;
 }
 expect {
@@ -12,7 +12,7 @@ expect {
 
 test array-integer-insert {
     CREATE TABLE t2 (id INTEGER PRIMARY KEY, scores integer[]) STRICT;
-    INSERT INTO t2 VALUES (1, '[10, 20, 30]');
+    INSERT INTO t2 VALUES (1, '{10, 20, 30}');
     SELECT id, scores FROM t2;
 }
 expect {
@@ -21,8 +21,8 @@ expect {
 
 test array-multiple-rows {
     CREATE TABLE t3 (id INTEGER PRIMARY KEY, vals text[]) STRICT;
-    INSERT INTO t3 VALUES (1, '["x","y"]');
-    INSERT INTO t3 VALUES (2, '["a","b","c"]');
+    INSERT INTO t3 VALUES (1, '{"x","y"}');
+    INSERT INTO t3 VALUES (2, '{"a","b","c"}');
     SELECT id, vals FROM t3 ORDER BY id;
 }
 expect {
@@ -32,7 +32,7 @@ expect {
 
 test array-empty {
     CREATE TABLE t4 (id INTEGER PRIMARY KEY, items text[]) STRICT;
-    INSERT INTO t4 VALUES (1, '[]');
+    INSERT INTO t4 VALUES (1, '{}');
     SELECT id, items FROM t4;
 }
 expect {
@@ -50,7 +50,7 @@ expect {
 
 test array-subscript-access {
     CREATE TABLE t6 (id INTEGER PRIMARY KEY, items text[]) STRICT;
-    INSERT INTO t6 VALUES (1, '["first","second","third"]');
+    INSERT INTO t6 VALUES (1, '{"first","second","third"}');
     SELECT items[1], items[2], items[3] FROM t6;
 }
 expect {
@@ -59,9 +59,9 @@ expect {
 
 test array-length {
     CREATE TABLE t7 (id INTEGER PRIMARY KEY, items text[]) STRICT;
-    INSERT INTO t7 VALUES (1, '["a","b","c"]');
-    INSERT INTO t7 VALUES (2, '[]');
-    INSERT INTO t7 VALUES (3, '["x"]');
+    INSERT INTO t7 VALUES (1, '{"a","b","c"}');
+    INSERT INTO t7 VALUES (2, '{}');
+    INSERT INTO t7 VALUES (3, '{"x"}');
     SELECT id, array_length(items) FROM t7 ORDER BY id;
 }
 expect {
@@ -71,55 +71,55 @@ expect {
 }
 
 test array-append {
-    SELECT array_append('["a","b"]', 'c');
+    SELECT array_append('{"a","b"}', 'c');
 }
 expect {
     {a,b,c}
 }
 
 test array-prepend {
-    SELECT array_prepend('z', '["a","b"]');
+    SELECT array_prepend('z', '{"a","b"}');
 }
 expect {
     {z,a,b}
 }
 
 test array-cat {
-    SELECT array_cat('[1,2]', '[3,4]');
+    SELECT array_cat('{1,2}', '{3,4}');
 }
 expect {
     {1,2,3,4}
 }
 
 test array-contains-found {
-    SELECT array_contains('[1,2,3]', 2);
+    SELECT array_contains('{1,2,3}', 2);
 }
 expect {
     1
 }
 
 test array-contains-not-found {
-    SELECT array_contains('[1,2,3]', 5);
+    SELECT array_contains('{1,2,3}', 5);
 }
 expect {
     0
 }
 
 test array-position-found {
-    SELECT array_position('[10,20,30]', 20);
+    SELECT array_position('{10,20,30}', 20);
 }
 expect {
     2
 }
 
 test array-position-not-found {
-    SELECT array_position('[10,20,30]', 99);
+    SELECT array_position('{10,20,30}', 99);
 }
 expect {
 }
 
 test array-remove {
-    SELECT array_remove('[1,2,3,2,1]', 2);
+    SELECT array_remove('{1,2,3,2,1}', 2);
 }
 expect {
     {1,3,1}
@@ -127,7 +127,7 @@ expect {
 
 test array-boolean-elements {
     CREATE TABLE t8 (id INTEGER PRIMARY KEY, flags boolean[]) STRICT;
-    INSERT INTO t8 VALUES (1, '[true, false, true]');
+    INSERT INTO t8 VALUES (1, '{true, false, true}');
     SELECT id, flags FROM t8;
 }
 expect {
@@ -153,7 +153,7 @@ expect {
 
 test array-subscript-out-of-bounds {
     CREATE TABLE t11 (id INTEGER PRIMARY KEY, items text[]) STRICT;
-    INSERT INTO t11 VALUES (1, '["a","b","c"]');
+    INSERT INTO t11 VALUES (1, '{"a","b","c"}');
     SELECT items[100] FROM t11;
 }
 expect {
@@ -161,7 +161,7 @@ expect {
 
 test array-subscript-negative {
     CREATE TABLE t12 (id INTEGER PRIMARY KEY, items text[]) STRICT;
-    INSERT INTO t12 VALUES (1, '["a","b","c"]');
+    INSERT INTO t12 VALUES (1, '{"a","b","c"}');
     SELECT items[-1] FROM t12;
 }
 expect {
@@ -169,8 +169,8 @@ expect {
 
 test array-update {
     CREATE TABLE t13 (id INTEGER PRIMARY KEY, tags text[]) STRICT;
-    INSERT INTO t13 VALUES (1, '["old"]');
-    UPDATE t13 SET tags = '["new","updated"]' WHERE id = 1;
+    INSERT INTO t13 VALUES (1, '{"old"}');
+    UPDATE t13 SET tags = '{"new","updated"}' WHERE id = 1;
     SELECT id, tags FROM t13;
 }
 expect {
@@ -179,7 +179,7 @@ expect {
 
 test array-update-with-literal {
     CREATE TABLE t14 (id INTEGER PRIMARY KEY, tags text[]) STRICT;
-    INSERT INTO t14 VALUES (1, '["old"]');
+    INSERT INTO t14 VALUES (1, '{"old"}');
     UPDATE t14 SET tags = ARRAY['new', 'updated'] WHERE id = 1;
     SELECT id, tags FROM t14;
 }
@@ -189,8 +189,8 @@ expect {
 
 test array-delete-with-subscript {
     CREATE TABLE t15 (id INTEGER PRIMARY KEY, items text[]) STRICT;
-    INSERT INTO t15 VALUES (1, '["keep"]');
-    INSERT INTO t15 VALUES (2, '["remove"]');
+    INSERT INTO t15 VALUES (1, '{"keep"}');
+    INSERT INTO t15 VALUES (2, '{"remove"}');
     DELETE FROM t15 WHERE items[1] = 'remove';
     SELECT id, items FROM t15;
 }
@@ -200,9 +200,9 @@ expect {
 
 test array-where-subscript {
     CREATE TABLE t16 (id INTEGER PRIMARY KEY, items text[]) STRICT;
-    INSERT INTO t16 VALUES (1, '["alpha","beta"]');
-    INSERT INTO t16 VALUES (2, '["gamma","delta"]');
-    INSERT INTO t16 VALUES (3, '["alpha","omega"]');
+    INSERT INTO t16 VALUES (1, '{"alpha","beta"}');
+    INSERT INTO t16 VALUES (2, '{"gamma","delta"}');
+    INSERT INTO t16 VALUES (3, '{"alpha","omega"}');
     SELECT id FROM t16 WHERE items[1] = 'alpha' ORDER BY id;
 }
 expect {
@@ -235,55 +235,55 @@ expect {
 }
 
 test array-contains-null-target {
-    SELECT array_contains('[1,2,3]', NULL);
+    SELECT array_contains('{1,2,3}', NULL);
 }
 expect {
     0
 }
 
 test array-position-null-target {
-    SELECT array_position('[1,2,3]', NULL);
+    SELECT array_position('{1,2,3}', NULL);
 }
 expect {
 }
 
 test array-cat-empty-left {
-    SELECT array_cat('[]', '[1,2]');
+    SELECT array_cat('{}', '{1,2}');
 }
 expect {
     {1,2}
 }
 
 test array-cat-empty-right {
-    SELECT array_cat('[1,2]', '[]');
+    SELECT array_cat('{1,2}', '{}');
 }
 expect {
     {1,2}
 }
 
 test array-cat-both-empty {
-    SELECT array_cat('[]', '[]');
+    SELECT array_cat('{}', '{}');
 }
 expect {
     {}
 }
 
 test array-append-to-empty {
-    SELECT array_append('[]', 'x');
+    SELECT array_append('{}', 'x');
 }
 expect {
     {x}
 }
 
 test array-remove-not-found {
-    SELECT array_remove('[1,2,3]', 99);
+    SELECT array_remove('{1,2,3}', 99);
 }
 expect {
     {1,2,3}
 }
 
 test array-remove-from-empty {
-    SELECT array_remove('[]', 1);
+    SELECT array_remove('{}', 1);
 }
 expect {
     {}
@@ -291,9 +291,9 @@ expect {
 
 test array-order-by-subscript {
     CREATE TABLE t20 (id INTEGER PRIMARY KEY, items integer[]) STRICT;
-    INSERT INTO t20 VALUES (1, '[30]');
-    INSERT INTO t20 VALUES (2, '[10]');
-    INSERT INTO t20 VALUES (3, '[20]');
+    INSERT INTO t20 VALUES (1, '{30}');
+    INSERT INTO t20 VALUES (2, '{10}');
+    INSERT INTO t20 VALUES (3, '{20}');
     SELECT id FROM t20 ORDER BY items[1];
 }
 expect {
@@ -304,7 +304,7 @@ expect {
 
 test array-integer-subscript {
     CREATE TABLE t21 (id INTEGER PRIMARY KEY, scores integer[]) STRICT;
-    INSERT INTO t21 VALUES (1, '[100, 200, 300]');
+    INSERT INTO t21 VALUES (1, '{100, 200, 300}');
     SELECT scores[1], scores[2], scores[3] FROM t21;
 }
 expect {
@@ -313,7 +313,7 @@ expect {
 
 test array-real-type {
     CREATE TABLE t22 (id INTEGER PRIMARY KEY, vals real[]) STRICT;
-    INSERT INTO t22 VALUES (1, '[1.5, 2.5, 3.5]');
+    INSERT INTO t22 VALUES (1, '{1.5, 2.5, 3.5}');
     SELECT id, vals FROM t22;
 }
 expect {
@@ -322,7 +322,7 @@ expect {
 
 test array-multiple-array-columns {
     CREATE TABLE t23 (id INTEGER PRIMARY KEY, names text[], scores integer[]) STRICT;
-    INSERT INTO t23 VALUES (1, '["alice","bob"]', '[90,85]');
+    INSERT INTO t23 VALUES (1, '{"alice","bob"}', '{90,85}');
     SELECT id, names, scores FROM t23;
 }
 expect {
@@ -350,8 +350,8 @@ expect {
 
 test array-boolean-decode-roundtrip {
     CREATE TABLE t24 (id INTEGER PRIMARY KEY, flags boolean[]) STRICT;
-    INSERT INTO t24 VALUES (1, '[true, false]');
-    INSERT INTO t24 VALUES (2, '[false, false, true]');
+    INSERT INTO t24 VALUES (1, '{true, false}');
+    INSERT INTO t24 VALUES (2, '{false, false, true}');
     SELECT id, flags, array_length(flags) FROM t24 ORDER BY id;
 }
 expect {
@@ -369,9 +369,9 @@ expect {
 
 test array-insert-multiple-then-count {
     CREATE TABLE t26 (id INTEGER PRIMARY KEY, tags text[]) STRICT;
-    INSERT INTO t26 VALUES (1, '["a"]');
-    INSERT INTO t26 VALUES (2, '["b","c"]');
-    INSERT INTO t26 VALUES (3, '["d","e","f"]');
+    INSERT INTO t26 VALUES (1, '{"a"}');
+    INSERT INTO t26 VALUES (2, '{"b","c"}');
+    INSERT INTO t26 VALUES (3, '{"d","e","f"}');
     SELECT COUNT(*), SUM(array_length(tags)) FROM t26;
 }
 expect {
@@ -380,7 +380,7 @@ expect {
 
 test array-type-check-string-in-integer-array {
     CREATE TABLE t27 (id INTEGER PRIMARY KEY, scores integer[]) STRICT;
-    INSERT INTO t27 VALUES (1, '["hello"]');
+    INSERT INTO t27 VALUES (1, '{"hello"}');
 }
 expect error {
     cannot store TEXT value in INTEGER
@@ -388,7 +388,7 @@ expect error {
 
 test array-type-check-inexact-float-in-integer-array {
     CREATE TABLE t28 (id INTEGER PRIMARY KEY, scores integer[]) STRICT;
-    INSERT INTO t28 VALUES (1, '[1.5]');
+    INSERT INTO t28 VALUES (1, '{1.5}');
 }
 expect error {
     cannot store REAL value in INTEGER
@@ -396,7 +396,7 @@ expect error {
 
 test array-type-check-exact-float-coerced-to-integer {
     CREATE TABLE t29 (id INTEGER PRIMARY KEY, scores integer[]) STRICT;
-    INSERT INTO t29 VALUES (1, '[1.0, 2.0, 3]');
+    INSERT INTO t29 VALUES (1, '{1.0, 2.0, 3}');
     SELECT scores FROM t29;
 }
 expect {
@@ -405,7 +405,7 @@ expect {
 
 test array-type-check-numbers-coerced-to-text {
     CREATE TABLE t30 (id INTEGER PRIMARY KEY, items text[]) STRICT;
-    INSERT INTO t30 VALUES (1, '[1, 2, 3.14]');
+    INSERT INTO t30 VALUES (1, '{1, 2, 3.14}');
     SELECT items FROM t30;
 }
 expect {
@@ -414,7 +414,7 @@ expect {
 
 test array-type-check-string-in-real-array {
     CREATE TABLE t31 (id INTEGER PRIMARY KEY, vals real[]) STRICT;
-    INSERT INTO t31 VALUES (1, '["not_a_number"]');
+    INSERT INTO t31 VALUES (1, '{"not_a_number"}');
 }
 expect error {
     cannot store TEXT value in REAL
@@ -422,7 +422,7 @@ expect error {
 
 test array-type-check-integer-coerced-to-real {
     CREATE TABLE t32 (id INTEGER PRIMARY KEY, vals real[]) STRICT;
-    INSERT INTO t32 VALUES (1, '[1, 2, 3]');
+    INSERT INTO t32 VALUES (1, '{1, 2, 3}');
     SELECT vals FROM t32;
 }
 expect {
@@ -431,11 +431,11 @@ expect {
 
 test array-type-check-any-accepts-mixed {
     CREATE TABLE t33 (id INTEGER PRIMARY KEY, items ANY[]) STRICT;
-    INSERT INTO t33 VALUES (1, '[1, "hello", 3.14, true, null]');
+    INSERT INTO t33 VALUES (1, '{1, "hello", 3.14, true, null}');
     SELECT items FROM t33;
 }
 expect {
-    {1,hello,3.14,1,NULL}
+    {1,hello,3.14,true,NULL}
 }
 
 test array-type-check-invalid-json {
@@ -456,7 +456,7 @@ expect error {
 
 test array-type-check-null-element-allowed {
     CREATE TABLE t36 (id INTEGER PRIMARY KEY, scores integer[]) STRICT;
-    INSERT INTO t36 VALUES (1, '[1, null, 3]');
+    INSERT INTO t36 VALUES (1, '{1, null, 3}');
     SELECT scores FROM t36;
 }
 expect {
@@ -465,8 +465,8 @@ expect {
 
 test array-type-check-update-validates {
     CREATE TABLE t37 (id INTEGER PRIMARY KEY, scores integer[]) STRICT;
-    INSERT INTO t37 VALUES (1, '[1, 2, 3]');
-    UPDATE t37 SET scores = '["bad"]' WHERE id = 1;
+    INSERT INTO t37 VALUES (1, '{1, 2, 3}');
+    UPDATE t37 SET scores = '{"bad"}' WHERE id = 1;
 }
 expect error {
     cannot store TEXT value in INTEGER
@@ -474,7 +474,7 @@ expect error {
 
 test array-type-check-numeric-string-coerced-to-integer {
     CREATE TABLE t38 (id INTEGER PRIMARY KEY, scores integer[]) STRICT;
-    INSERT INTO t38 VALUES (1, '["42", "100"]');
+    INSERT INTO t38 VALUES (1, '{"42", "100"}');
     SELECT scores FROM t38;
 }
 expect {
@@ -483,7 +483,7 @@ expect {
 
 test array-blob-type {
     CREATE TABLE t_blob_arr (id INTEGER PRIMARY KEY, data BLOB[]) STRICT;
-    INSERT INTO t_blob_arr VALUES (1, '[null]');
+    INSERT INTO t_blob_arr VALUES (1, '{null}');
     SELECT id, data FROM t_blob_arr;
 }
 expect {
@@ -519,7 +519,7 @@ expect {
 
 test array-concat-integer {
     CREATE TABLE t_concat_int (id INTEGER PRIMARY KEY, nums integer[]) STRICT;
-    INSERT INTO t_concat_int VALUES (1, '[10, 20]');
+    INSERT INTO t_concat_int VALUES (1, '{10, 20}');
     SELECT nums || 30 FROM t_concat_int;
 }
 expect {
@@ -602,35 +602,35 @@ expect {
 }
 
 test array-slice-null-start {
-    SELECT array_slice('[1,2,3,4]', NULL, 2);
+    SELECT array_slice('{1,2,3,4}', NULL, 2);
 }
 expect {
     {1,2}
 }
 
 test array-slice-null-end {
-    SELECT array_slice('[1,2,3,4]', 2, NULL);
+    SELECT array_slice('{1,2,3,4}', 2, NULL);
 }
 expect {
     {}
 }
 
 test array-slice-negative-start {
-    SELECT array_slice('[1,2,3,4]', -1, 3);
+    SELECT array_slice('{1,2,3,4}', -1, 3);
 }
 expect {
     {1,2,3}
 }
 
 test array-position-one-based {
-    SELECT array_position('[10,20,30]', 10);
+    SELECT array_position('{10,20,30}', 10);
 }
 expect {
     1
 }
 
 test array-position-one-based-middle {
-    SELECT array_position('[10,20,30]', 30);
+    SELECT array_position('{10,20,30}', 30);
 }
 expect {
     3
@@ -638,7 +638,7 @@ expect {
 
 test array-unicode-escape-input {
     CREATE TABLE t_ue (id INTEGER PRIMARY KEY, tags text[]) STRICT;
-    INSERT INTO t_ue VALUES (1, '["hello\u0020world"]');
+    INSERT INTO t_ue VALUES (1, '{"hello world"}');
     SELECT tags FROM t_ue;
 }
 expect {
@@ -746,28 +746,28 @@ expect {
 # ============================================================
 
 test array-to-string-basic {
-    SELECT array_to_string('[1,2,3]', ',');
+    SELECT array_to_string('{1,2,3}', ',');
 }
 expect {
     1,2,3
 }
 
 test array-to-string-text-array {
-    SELECT array_to_string('["hello","world"]', ' ');
+    SELECT array_to_string('{"hello","world"}', ' ');
 }
 expect {
     hello world
 }
 
 test array-to-string-single-element {
-    SELECT array_to_string('[42]', ',');
+    SELECT array_to_string('{42}', ',');
 }
 expect {
     42
 }
 
 test array-to-string-empty-array {
-    SELECT array_to_string('[]', ',');
+    SELECT array_to_string('{}', ',');
 }
 expect {
 }
@@ -779,27 +779,27 @@ expect {
 }
 
 test array-to-string-null-delimiter {
-    SELECT array_to_string('[1,2,3]', NULL);
+    SELECT array_to_string('{1,2,3}', NULL);
 }
 expect {
 }
 
 test array-to-string-null-elements-skipped {
-    SELECT array_to_string('[1,null,3]', ',');
+    SELECT array_to_string('{1,null,3}', ',');
 }
 expect {
     1,3
 }
 
 test array-to-string-null-replacement {
-    SELECT array_to_string('[1,null,3]', ',', 'N/A');
+    SELECT array_to_string('{1,null,3}', ',', 'N/A');
 }
 expect {
     1,N/A,3
 }
 
 test array-to-string-multi-char-delimiter {
-    SELECT array_to_string('["a","b","c"]', ' - ');
+    SELECT array_to_string('{"a","b","c"}', ' - ');
 }
 expect {
     a - b - c
@@ -915,64 +915,64 @@ expect {
 # ============================================================
 
 test array-overlap-found {
-    SELECT array_overlap('[1,2,3]', '[3,4,5]');
+    SELECT array_overlap('{1,2,3}', '{3,4,5}');
 }
 expect {
     1
 }
 
 test array-overlap-not-found {
-    SELECT array_overlap('[1,2,3]', '[4,5,6]');
+    SELECT array_overlap('{1,2,3}', '{4,5,6}');
 }
 expect {
     0
 }
 
 test array-overlap-empty-left {
-    SELECT array_overlap('[]', '[1,2,3]');
+    SELECT array_overlap('{}', '{1,2,3}');
 }
 expect {
     0
 }
 
 test array-overlap-empty-right {
-    SELECT array_overlap('[1,2,3]', '[]');
+    SELECT array_overlap('{1,2,3}', '{}');
 }
 expect {
     0
 }
 
 test array-overlap-both-empty {
-    SELECT array_overlap('[]', '[]');
+    SELECT array_overlap('{}', '{}');
 }
 expect {
     0
 }
 
 test array-overlap-identical {
-    SELECT array_overlap('[1,2,3]', '[1,2,3]');
+    SELECT array_overlap('{1,2,3}', '{1,2,3}');
 }
 expect {
     1
 }
 
 test array-overlap-text {
-    SELECT array_overlap('["a","b","c"]', '["c","d"]');
+    SELECT array_overlap('{"a","b","c"}', '{"c","d"}');
 }
 expect {
     1
 }
 
 test array-overlap-null-input {
-    SELECT array_overlap(NULL, '[1,2,3]');
+    SELECT array_overlap(NULL, '{1,2,3}');
 }
 expect {
 }
 
 test array-overlap-from-table {
     CREATE TABLE t_ovlp (id INTEGER PRIMARY KEY, a integer[], b integer[]) STRICT;
-    INSERT INTO t_ovlp VALUES (1, '[1,2,3]', '[3,4,5]');
-    INSERT INTO t_ovlp VALUES (2, '[1,2,3]', '[4,5,6]');
+    INSERT INTO t_ovlp VALUES (1, '{1,2,3}', '{3,4,5}');
+    INSERT INTO t_ovlp VALUES (2, '{1,2,3}', '{4,5,6}');
     SELECT id, array_overlap(a, b) FROM t_ovlp ORDER BY id;
 }
 expect {
@@ -985,49 +985,49 @@ expect {
 # ============================================================
 
 test array-contains-all-true {
-    SELECT array_contains_all('[1,2,3,4,5]', '[2,4]');
+    SELECT array_contains_all('{1,2,3,4,5}', '{2,4}');
 }
 expect {
     1
 }
 
 test array-contains-all-false {
-    SELECT array_contains_all('[1,2,3]', '[2,4]');
+    SELECT array_contains_all('{1,2,3}', '{2,4}');
 }
 expect {
     0
 }
 
 test array-contains-all-empty-subset {
-    SELECT array_contains_all('[1,2,3]', '[]');
+    SELECT array_contains_all('{1,2,3}', '{}');
 }
 expect {
     1
 }
 
 test array-contains-all-empty-superset {
-    SELECT array_contains_all('[]', '[1]');
+    SELECT array_contains_all('{}', '{1}');
 }
 expect {
     0
 }
 
 test array-contains-all-identical {
-    SELECT array_contains_all('[1,2,3]', '[1,2,3]');
+    SELECT array_contains_all('{1,2,3}', '{1,2,3}');
 }
 expect {
     1
 }
 
 test array-contains-all-text {
-    SELECT array_contains_all('["a","b","c"]', '["a","c"]');
+    SELECT array_contains_all('{"a","b","c"}', '{"a","c"}');
 }
 expect {
     1
 }
 
 test array-contains-all-null-input {
-    SELECT array_contains_all(NULL, '[1,2]');
+    SELECT array_contains_all(NULL, '{1,2}');
 }
 expect {
 }
@@ -1036,7 +1036,7 @@ test array-contains-all-from-table {
     CREATE TABLE t_ca (id INTEGER PRIMARY KEY, tags text[]) STRICT;
     INSERT INTO t_ca VALUES (1, ARRAY['red','green','blue']);
     INSERT INTO t_ca VALUES (2, ARRAY['red','yellow']);
-    SELECT id FROM t_ca WHERE array_contains_all(tags, '["red","green"]') ORDER BY id;
+    SELECT id FROM t_ca WHERE array_contains_all(tags, '{"red","green"}') ORDER BY id;
 }
 expect {
     1
@@ -1044,7 +1044,7 @@ expect {
 
 test array-negative-index-returns-null {
     CREATE TABLE t_negidx (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO t_negidx VALUES (1, '[10,20,30]');
+    INSERT INTO t_negidx VALUES (1, '{10,20,30}');
     SELECT vals[-1] FROM t_negidx;
 }
 expect {
@@ -1052,7 +1052,7 @@ expect {
 
 test array-oob-index-returns-null {
     CREATE TABLE t_oobidx (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO t_oobidx VALUES (1, '[10,20,30]');
+    INSERT INTO t_oobidx VALUES (1, '{10,20,30}');
     SELECT vals[99] FROM t_oobidx;
 }
 expect {
@@ -1060,7 +1060,7 @@ expect {
 
 test array-set-element-oob-preserves-original {
     CREATE TABLE t_setoob (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO t_setoob VALUES (1, '[10,20,30]');
+    INSERT INTO t_setoob VALUES (1, '{10,20,30}');
     UPDATE t_setoob SET vals[99] = 42 WHERE id = 1;
     SELECT vals FROM t_setoob;
 }
@@ -1095,7 +1095,7 @@ expect {
 
 test array-returning-update {
     CREATE TABLE t_ret2 (id INTEGER PRIMARY KEY, tags text[]) STRICT;
-    INSERT INTO t_ret2 VALUES (1, '["x","y"]');
+    INSERT INTO t_ret2 VALUES (1, '{"x","y"}');
     UPDATE t_ret2 SET tags = ARRAY['a','b'] WHERE id = 1 RETURNING tags;
 }
 expect {
@@ -1110,7 +1110,7 @@ expect {
 
 test array-utf8-roundtrip {
     CREATE TABLE t_utf8 (id INTEGER PRIMARY KEY, vals text[]) STRICT;
-    INSERT INTO t_utf8 VALUES (1, '["café","naïve","über"]');
+    INSERT INTO t_utf8 VALUES (1, '{"café","naïve","über"}');
     SELECT vals FROM t_utf8;
 }
 expect {
@@ -1118,21 +1118,21 @@ expect {
 }
 
 test array-overlaps-alias {
-    SELECT array_overlaps('[1,2,3]', '[3,4,5]');
+    SELECT array_overlaps('{1,2,3}', '{3,4,5}');
 }
 expect {
     1
 }
 
 test array-length-two-args {
-    SELECT array_length('[1,2,3]', 1);
+    SELECT array_length('{1,2,3}', 1);
 }
 expect {
     3
 }
 
 test array-remove-all-duplicates {
-    SELECT array_remove('[1,2,3,2,1]', 2);
+    SELECT array_remove('{1,2,3,2,1}', 2);
 }
 expect {
     {1,3,1}
@@ -1163,7 +1163,7 @@ expect {
 
 test dc1-set-element-negative-index-preserves-array {
     CREATE TABLE t_dc1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO t_dc1 VALUES (1, '[10,20,30]');
+    INSERT INTO t_dc1 VALUES (1, '{10,20,30}');
     UPDATE t_dc1 SET vals[-1] = 99 WHERE id = 1;
     SELECT vals FROM t_dc1;
 }
@@ -1570,14 +1570,14 @@ expect {
 
 # Text literal arrays (JSON text, not ARRAY[] syntax) through operators
 test array-contains-operator-text-literals {
-    SELECT '[1,2,3]' @> '[1,2]';
+    SELECT '{1,2,3}' @> '{1,2}';
 }
 expect {
     1
 }
 
 test array-overlap-operator-text-literals {
-    SELECT '[1,2,3]' && '[4,5,3]';
+    SELECT '{1,2,3}' && '{4,5,3}';
 }
 expect {
     1
@@ -1728,9 +1728,9 @@ expect {
 
 test array-order-by-column-reference {
     CREATE TABLE t_order(id INTEGER PRIMARY KEY, vals integer[]) STRICT;
-    INSERT INTO t_order VALUES (1, '[3,1]');
-    INSERT INTO t_order VALUES (2, '[1,10]');
-    INSERT INTO t_order VALUES (3, '[1,2]');
+    INSERT INTO t_order VALUES (1, '{3,1}');
+    INSERT INTO t_order VALUES (2, '{1,10}');
+    INSERT INTO t_order VALUES (3, '{1,2}');
     SELECT vals FROM t_order ORDER BY vals;
 }
 expect {
