@@ -1899,96 +1899,24 @@ impl Limbo {
         let reader = BufReader::new(file);
 
         let mut query_buffer = String::new();
-        let mut in_single_quote: bool = false; // ''
-        let mut in_double_quote: bool = false; // ""
-        let mut in_block_comment = false; //  /* */
-        let mut in_hash = false; // #
-        let mut in_line_comment = false; // --
+        let mut state = ReadState::default();
 
         for line in reader.lines() {
-            let mut line = line
+            let line = line
                 .map_err(|e| anyhow!("Error: file \"{}\" is not valid UTF-8 text – {}", path, e))?;
-            line.push('\n');
-            let mut iter = line.chars().peekable();
 
-            while let Some(ch) = iter.next() {
-                // Check exit for line comment and hash
-                if (in_line_comment || in_hash) && ch == '\n' {
-                    in_line_comment = false;
-                    in_hash = false;
-                    query_buffer.push(ch);
-                    continue;
-                }
-
-                // Check exit for block comment
-                if in_block_comment && ch == '*' && iter.peek() == Some(&'/') {
-                    query_buffer.push(ch);
-                    query_buffer.push('/');
-                    iter.next();
-                    in_block_comment = false;
-                    continue;
-                }
-
-                // Push into the query buffer if its inside comments
-                if in_line_comment || in_block_comment || in_hash {
-                    query_buffer.push(ch);
-                    continue;
-                }
-
-                // Block comment detection
-                if ch == '/' && iter.peek() == Some(&'*') && !in_single_quote && !in_double_quote {
-                    query_buffer.push('/');
-                    query_buffer.push('*');
-                    iter.next();
-                    in_block_comment = true;
-                    continue;
-                }
-
-                // Hash detection, instead of pushing '#' it pushes '-', '-'
-                // to make it act like line comment
-                if ch == '#' && !in_single_quote && !in_double_quote {
-                    query_buffer.push('-');
-                    query_buffer.push('-');
-                    in_hash = true;
-                    continue;
-                }
-
-                // Line comment detection
-                if ch == '-' && iter.peek() == Some(&'-') && !in_single_quote && !in_double_quote {
-                    query_buffer.push(ch);
-                    query_buffer.push('-');
-                    iter.next();
-                    in_line_comment = true;
-                    continue;
-                }
-
-                // Single quote
-                if ch == '\'' && !in_double_quote {
-                    in_single_quote = !in_single_quote;
-                }
-
-                // Double quote
-                if ch == '"' && !in_single_quote {
-                    in_double_quote = !in_double_quote;
-                }
-
-                query_buffer.push(ch);
-
-                if ch == ';'
-                    && !in_single_quote
-                    && !in_double_quote
-                    && !in_block_comment
-                    && !in_line_comment
-                    && !in_hash
-                {
-                    self.run_query(&query_buffer);
-                    query_buffer.clear();
-                }
+            if !query_buffer.is_empty() {
+                query_buffer.push('\n');
             }
+            query_buffer.push_str(&line);
 
-            // Reset comments
-            in_line_comment = false;
-            in_hash = false;
+            state.process(&line);
+
+            if state.is_complete() {
+                self.run_query(&query_buffer);
+                query_buffer.clear();
+                state = ReadState::default();
+            }
         }
 
         let remaining = query_buffer.trim();
