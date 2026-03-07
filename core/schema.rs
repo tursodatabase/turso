@@ -2540,7 +2540,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     .unwrap_or_default();
                 let declared_type = col_type
                     .as_ref()
-                    .map(|t| ast_type_to_str(t))
+                    .map(ast_type_to_str)
                     .unwrap_or_default();
 
                 let ty_params: Vec<Box<Expr>> = match col_type {
@@ -3251,7 +3251,7 @@ impl TryFrom<&ColumnDefinition> for Column {
         let declared_type = value
             .col_type
             .as_ref()
-            .map(|t| ast_type_to_str(t))
+            .map(ast_type_to_str)
             .unwrap_or_default();
 
         let ty_params: Vec<Box<turso_parser::ast::Expr>> = match &value.col_type {
