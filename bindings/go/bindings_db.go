@@ -169,11 +169,11 @@ var (
 	c_turso_statement_finalize               func(self TursoStatement, error_opt_out **byte) turso_status_code_t
 	c_turso_statement_n_change               func(self TursoStatement) int64
 	c_turso_statement_column_count           func(self TursoStatement) int64
-	c_turso_statement_column_name            func(self TursoStatement, index uintptr) *byte
-	c_turso_statement_column_decltype        func(self TursoStatement, index uintptr) *byte
+	c_turso_statement_column_name            func(self TursoStatement, index uintptr) uintptr
+	c_turso_statement_column_decltype        func(self TursoStatement, index uintptr) uintptr
 	c_turso_statement_row_value_kind         func(self TursoStatement, index uintptr) int32
 	c_turso_statement_row_value_bytes_count  func(self TursoStatement, index uintptr) int64
-	c_turso_statement_row_value_bytes_ptr    func(self TursoStatement, index uintptr) *byte
+	c_turso_statement_row_value_bytes_ptr    func(self TursoStatement, index uintptr) uintptr
 	c_turso_statement_row_value_int          func(self TursoStatement, index uintptr) int64
 	c_turso_statement_row_value_double       func(self TursoStatement, index uintptr) float64
 	c_turso_statement_named_position         func(self TursoStatement, name string) int64
@@ -183,7 +183,7 @@ var (
 	c_turso_statement_bind_positional_double func(self TursoStatement, position uintptr, value float64) turso_status_code_t
 	c_turso_statement_bind_positional_blob   func(self TursoStatement, position uintptr, ptr *byte, len uintptr) turso_status_code_t
 	c_turso_statement_bind_positional_text   func(self TursoStatement, position uintptr, ptr *byte, len uintptr) turso_status_code_t
-	c_turso_str_deinit                       func(self *byte)
+	c_turso_str_deinit                       func(self uintptr)
 	c_turso_database_deinit                  func(self TursoDatabase)
 	c_turso_connection_deinit                func(self TursoConnection)
 	c_turso_statement_deinit                 func(self TursoStatement)
@@ -263,19 +263,23 @@ func statusToError(status TursoStatusCode, msg string) error {
 }
 
 func decodeAndFreeCString(p *byte) string {
-	if p == nil {
+	return decodeAndFreeCStringRaw(uintptr(unsafe.Pointer(p)))
+}
+
+func decodeAndFreeCStringRaw(p uintptr) string {
+	if p == 0 {
 		return ""
 	}
 	// determine length
 	var n uintptr
 	for {
-		b := *(*byte)(unsafe.Pointer(uintptr(unsafe.Pointer(p)) + n))
+		b := *(*byte)(unsafe.Pointer(p + n))
 		if b == 0 {
 			break
 		}
 		n++
 	}
-	s := string(unsafe.Slice(p, n))
+	s := string(unsafe.Slice((*byte)(unsafe.Pointer(p)), n))
 	// free C-allocated string
 	c_turso_str_deinit(p)
 	return s
@@ -551,7 +555,7 @@ func turso_statement_column_count(self TursoStatement) int64 {
 // The underlying C string is freed automatically.
 func turso_statement_column_name(self TursoStatement, index int) string {
 	ptr := c_turso_statement_column_name(self, uintptr(index))
-	return decodeAndFreeCString(ptr)
+	return decodeAndFreeCStringRaw(ptr)
 }
 
 // turso_statement_column_decltype returns the column declared type at the index
@@ -559,10 +563,10 @@ func turso_statement_column_name(self TursoStatement, index int) string {
 // The underlying C string is freed automatically.
 func turso_statement_column_decltype(self TursoStatement, index int) string {
 	ptr := c_turso_statement_column_decltype(self, uintptr(index))
-	if ptr == nil {
+	if ptr == 0 {
 		return ""
 	}
-	return decodeAndFreeCString(ptr)
+	return decodeAndFreeCStringRaw(ptr)
 }
 
 // turso_statement_row_value_kind returns the row value kind at index.
@@ -577,7 +581,7 @@ func turso_statement_row_value_bytes_count(self TursoStatement, index int) int64
 
 // turso_statement_row_value_bytes_ptr returns pointer to start of BLOB/TEXT slice, or nil otherwise.
 func turso_statement_row_value_bytes_ptr(self TursoStatement, index int) uintptr {
-	return uintptr(unsafe.Pointer(c_turso_statement_row_value_bytes_ptr(self, uintptr(index))))
+	return c_turso_statement_row_value_bytes_ptr(self, uintptr(index))
 }
 
 // turso_statement_row_value_int returns INTEGER value at index, or 0 otherwise.
@@ -685,10 +689,10 @@ func turso_statement_row_value_bytes(self TursoStatement, index int) []byte {
 		return nil
 	}
 	ptr := c_turso_statement_row_value_bytes_ptr(self, uintptr(index))
-	if ptr == nil {
+	if ptr == 0 {
 		return nil
 	}
-	src := unsafe.Slice(ptr, n)
+	src := unsafe.Slice((*byte)(unsafe.Pointer(ptr)), n)
 	dst := make([]byte, n)
 	copy(dst, src)
 	return dst
@@ -701,10 +705,10 @@ func turso_statement_row_value_text(self TursoStatement, index int) string {
 		return ""
 	}
 	ptr := c_turso_statement_row_value_bytes_ptr(self, uintptr(index))
-	if ptr == nil {
+	if ptr == 0 {
 		return ""
 	}
-	bs := unsafe.Slice(ptr, n)
+	bs := unsafe.Slice((*byte)(unsafe.Pointer(ptr)), n)
 	// converting []byte to string copies
 	return string(bs)
 }
