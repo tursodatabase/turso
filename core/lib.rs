@@ -1272,6 +1272,7 @@ impl Database {
             closed: AtomicBool::new(false),
             attached_databases: RwLock::new(DatabaseCatalog::new()),
             query_only: AtomicBool::new(false),
+            dml_require_where: AtomicBool::new(false),
             mv_tx: RwLock::new(None),
             attached_mv_txs: RwLock::new(HashMap::default()),
             view_transaction_states: AllViewsTxState::new(),

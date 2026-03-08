@@ -1000,4 +1000,50 @@ mod tests {
 
         conn.execute("UPDATE plucky_maximilienne_680 SET creative_again_681 = 2 WHERE creative_again_681 = 1;").unwrap();
     }
+
+    #[test]
+    fn test_pragma_i_am_a_dummy() -> anyhow::Result<()> {
+        let _ = env_logger::try_init();
+        let tmp_db =
+            TempDatabase::new_with_rusqlite("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);");
+        let conn = tmp_db.connect_limbo();
+
+        // Off by default — DELETE/UPDATE without WHERE allowed
+        conn.execute("INSERT INTO t VALUES (1, 'a')")?;
+        conn.execute("DELETE FROM t")?;
+
+        // Enable via i_am_a_dummy
+        conn.execute("PRAGMA i_am_a_dummy = ON")?;
+        let err = conn.execute("DELETE FROM t").unwrap_err();
+        assert!(
+            err.to_string().contains("DELETE without a WHERE clause"),
+            "{err:?}"
+        );
+        let err = conn.execute("UPDATE t SET val = 'x'").unwrap_err();
+        assert!(
+            err.to_string().contains("UPDATE without a WHERE clause"),
+            "{err:?}"
+        );
+
+        // With WHERE clause still works
+        conn.execute("INSERT INTO t VALUES (2, 'b')")?;
+        conn.execute("DELETE FROM t WHERE id = 2")?;
+        conn.execute("INSERT INTO t VALUES (3, 'c')")?;
+        conn.execute("UPDATE t SET val = 'd' WHERE id = 3")?;
+
+        // Dummy WHERE 1=1 bypasses the check (syntactic only)
+        conn.execute("DELETE FROM t WHERE 1=1")?;
+        conn.execute("UPDATE t SET val = 'e' WHERE 1=1")?;
+
+        // Alias require_where works too
+        conn.execute("PRAGMA i_am_a_dummy = OFF")?;
+        conn.execute("PRAGMA require_where = ON")?;
+        let err = conn.execute("DELETE FROM t").unwrap_err();
+        assert!(
+            err.to_string().contains("DELETE without a WHERE clause"),
+            "{err:?}"
+        );
+
+        Ok(())
+    }
 }

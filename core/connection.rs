@@ -82,6 +82,8 @@ pub struct Connection {
     /// Attached databases
     pub(super) attached_databases: RwLock<DatabaseCatalog>,
     pub(super) query_only: AtomicBool,
+    /// If enabled, the UPDATE/DELETE statements must have a WHERE clause
+    pub(super) dml_require_where: AtomicBool,
     pub(crate) mv_tx: RwLock<Option<(crate::mvcc::database::TxID, TransactionMode)>>,
     /// Per-attached-database MVCC transactions.
     /// Main DB uses `mv_tx` above for zero-cost hot path access.
@@ -1779,6 +1781,14 @@ impl Connection {
     pub fn set_query_only(&self, value: bool) {
         self.query_only.store(value, Ordering::SeqCst);
         self.bump_prepare_context_generation();
+    }
+
+    pub fn get_dml_require_where(&self) -> bool {
+        self.dml_require_where.load(Ordering::SeqCst)
+    }
+
+    pub fn set_dml_require_where(&self, value: bool) {
+        self.dml_require_where.store(value, Ordering::SeqCst);
     }
 
     pub fn get_sync_mode(&self) -> SyncMode {
