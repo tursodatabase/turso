@@ -2473,7 +2473,7 @@ pub fn op_transaction_inner(
                         if !pager.holds_read_lock() {
                             pager.begin_read_tx()?;
                         }
-                        pager.mvcc_refresh_if_db_changed();
+                        pager.mvcc_refresh_if_db_changed()?;
 
                         let current_mv_tx = conn.get_mv_tx_for_db(*db);
                         if current_mv_tx.is_none() {
@@ -2535,7 +2535,7 @@ pub fn op_transaction_inner(
                             state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                         }
                         // MVCC reads must refresh WAL change counters to avoid stale page-cache reads.
-                        pager.mvcc_refresh_if_db_changed();
+                        pager.mvcc_refresh_if_db_changed()?;
                         // In MVCC we don't have write exclusivity, therefore we just need to start a transaction if needed.
                         // Programs can run Transaction twice, first with read flag and then with write flag. So a single txid is enough
                         // for both.
@@ -12213,6 +12213,11 @@ fn op_journal_mode_inner(
 
                 // Setup new mode
                 if matches!(new_mode, journal_mode::JournalMode::Mvcc) {
+                    if program.connection.db.locking_mode.is_shared() {
+                        return Err(LimboError::InternalError(
+                            "cannot enable MVCC in shared locking mode (SharedReads or SharedWrites). MVCC and multi-process WAL coordination are incompatible.".to_string(),
+                        ));
+                    }
                     if program.connection.get_capture_data_changes_info().is_some() {
                         return Err(LimboError::InternalError(
                             "cannot enable MVCC while CDC is active".to_string(),
