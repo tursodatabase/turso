@@ -23,17 +23,17 @@ addr  opcode         p1  p2  p3  p4               p5  comment
    8  Goto            0  10   0                    0
    9  NewRowid        0   2   0                    0  r[2]=rowid
   10  Affinity        3   3   0                    0  r[3..6] = D, D, B
-  11  NotExists       0  16   2                    0
-  12  Copy            2   1   0                    0  r[1]=r[2]
-  13  SeekRowid       0   1  26                    0  if (r[1]!=cursor 0 for table t_defaults.rowid) goto 26
-  14  Delete          0   0   0  t_defaults        0
-  15  Goto            0  16   0                    0
-  16  NotNull         4  18   0                    0  r[4]!=NULL -> goto 18
-  17  Integer        42   4   0                    0  r[4]=42
-  18  HaltIfNull   1299   0   4  t_defaults.val    0
-  19  NotNull         5  21   0                    0  r[5]!=NULL -> goto 21
-  20  String8         0   5   0  unnamed           0  r[5]='unnamed'
-  21  HaltIfNull   1299   0   5  t_defaults.name   0
+  11  NotNull         4  13   0                    0  r[4]!=NULL -> goto 13
+  12  Integer        42   4   0                    0  r[4]=42
+  13  HaltIfNull   1299   0   4  t_defaults.val    0
+  14  NotNull         5  16   0                    0  r[5]!=NULL -> goto 16
+  15  String8         0   5   0  unnamed           0  r[5]='unnamed'
+  16  HaltIfNull   1299   0   5  t_defaults.name   0
+  17  NotExists       0  22   2                    0
+  18  Copy            2   1   0                    0  r[1]=r[2]
+  19  SeekRowid       0   1  26                    0  if (r[1]!=cursor 0 for table t_defaults.rowid) goto 26
+  20  Delete          0   0   0  t_defaults        0
+  21  Goto            0  22   0                    0
   22  MakeRecord      3   3   6                    0  r[6]=mkrec(r[3..5])
   23  Insert          0   6   2  t_defaults        2  intkey=r[2] data=r[6]
   24  Goto            0  25   0                    0

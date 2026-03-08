@@ -29,51 +29,51 @@ addr  opcode         p1  p2  p3  p4             p5  comment
   12  Goto            0  14   0                  0
   13  NewRowid        2   2   0                  0  r[2]=rowid
   14  Affinity        3   4   0                  0  r[3..7] = D, B, B, B
-  15  NotExists       2  26   2                  0
-  16  Copy            2   1   0                  0  r[1]=r[2]
-  17  SeekRowid       2   1  64                  0  if (r[1]!=cursor 2 for table items.rowid) goto 64
-  18  Column          2   2   8                  0  r[8]=items.barcode
-  19  Copy            1   9   0                  0  r[9]=r[1]
-  20  IdxDelete       0   8   2                  1
-  21  Column          2   1  10                  0  r[10]=items.sku
-  22  Copy            1  11   0                  0  r[11]=r[1]
-  23  IdxDelete       1  10   2                  1
-  24  Delete          2   0   0  items           0
-  25  Goto            0  26   0                  0
-  26  Copy            5  12   0                  0  r[12]=r[5]
-  27  Copy            2  13   0                  0  r[13]=r[2]
-  28  Affinity       12   1   0                  0  r[12..13] = B
-  29  NoConflict      0  40  12  1               0  key=r[12..12]
-  30  IdxRowId        0   1   0                  0  r[1]=cursor 0.rowid
-  31  SeekRowid       2   1  64                  0  if (r[1]!=cursor 2 for table items.rowid) goto 64
-  32  Column          2   2  14                  0  r[14]=items.barcode
-  33  Copy            1  15   0                  0  r[15]=r[1]
-  34  IdxDelete       0  14   2                  1
-  35  Column          2   1  16                  0  r[16]=items.sku
-  36  Copy            1  17   0                  0  r[17]=r[1]
-  37  IdxDelete       1  16   2                  1
-  38  Delete          2   0   0  items           0
-  39  Goto            0  40   0                  0
-  40  MakeRecord     12   2  18                  0  r[18]=mkrec(r[12..13]); for sqlite_autoindex_items_2
-  41  IdxInsert       0  18  12                  2  key=r[18]
-  42  Copy            4  19   0                  0  r[19]=r[4]
-  43  Copy            2  20   0                  0  r[20]=r[2]
-  44  Affinity       19   1   0                  0  r[19..20] = B
-  45  NoConflict      1  56  19  1               0  key=r[19..19]
-  46  IdxRowId        1   1   0                  0  r[1]=cursor 1.rowid
-  47  SeekRowid       2   1  64                  0  if (r[1]!=cursor 2 for table items.rowid) goto 64
-  48  Column          2   2  21                  0  r[21]=items.barcode
-  49  Copy            1  22   0                  0  r[22]=r[1]
-  50  IdxDelete       0  21   2                  1
-  51  Column          2   1  23                  0  r[23]=items.sku
-  52  Copy            1  24   0                  0  r[24]=r[1]
-  53  IdxDelete       1  23   2                  1
-  54  Delete          2   0   0  items           0
-  55  Goto            0  56   0                  0
-  56  MakeRecord     19   2  25                  0  r[25]=mkrec(r[19..20]); for sqlite_autoindex_items_1
-  57  IdxInsert       1  25  19                  2  key=r[25]
-  58  HaltIfNull   1299   0   4  items.sku       0
-  59  HaltIfNull   1299   0   5  items.barcode   0
+  15  HaltIfNull   1299   0   4  items.sku       0
+  16  HaltIfNull   1299   0   5  items.barcode   0
+  17  NotExists       2  28   2                  0
+  18  Copy            2   1   0                  0  r[1]=r[2]
+  19  SeekRowid       2   1  64                  0  if (r[1]!=cursor 2 for table items.rowid) goto 64
+  20  Column          2   2   8                  0  r[8]=items.barcode
+  21  Copy            1   9   0                  0  r[9]=r[1]
+  22  IdxDelete       0   8   2                  1
+  23  Column          2   1  10                  0  r[10]=items.sku
+  24  Copy            1  11   0                  0  r[11]=r[1]
+  25  IdxDelete       1  10   2                  1
+  26  Delete          2   0   0  items           0
+  27  Goto            0  28   0                  0
+  28  Copy            5  12   0                  0  r[12]=r[5]
+  29  Copy            2  13   0                  0  r[13]=r[2]
+  30  Affinity       12   1   0                  0  r[12..13] = B
+  31  NoConflict      0  42  12  1               0  key=r[12..12]
+  32  IdxRowId        0   1   0                  0  r[1]=cursor 0.rowid
+  33  SeekRowid       2   1  64                  0  if (r[1]!=cursor 2 for table items.rowid) goto 64
+  34  Column          2   2  14                  0  r[14]=items.barcode
+  35  Copy            1  15   0                  0  r[15]=r[1]
+  36  IdxDelete       0  14   2                  1
+  37  Column          2   1  16                  0  r[16]=items.sku
+  38  Copy            1  17   0                  0  r[17]=r[1]
+  39  IdxDelete       1  16   2                  1
+  40  Delete          2   0   0  items           0
+  41  Goto            0  42   0                  0
+  42  MakeRecord     12   2  18                  0  r[18]=mkrec(r[12..13]); for sqlite_autoindex_items_2
+  43  IdxInsert       0  18  12                  2  key=r[18]
+  44  Copy            4  19   0                  0  r[19]=r[4]
+  45  Copy            2  20   0                  0  r[20]=r[2]
+  46  Affinity       19   1   0                  0  r[19..20] = B
+  47  NoConflict      1  58  19  1               0  key=r[19..19]
+  48  IdxRowId        1   1   0                  0  r[1]=cursor 1.rowid
+  49  SeekRowid       2   1  64                  0  if (r[1]!=cursor 2 for table items.rowid) goto 64
+  50  Column          2   2  21                  0  r[21]=items.barcode
+  51  Copy            1  22   0                  0  r[22]=r[1]
+  52  IdxDelete       0  21   2                  1
+  53  Column          2   1  23                  0  r[23]=items.sku
+  54  Copy            1  24   0                  0  r[24]=r[1]
+  55  IdxDelete       1  23   2                  1
+  56  Delete          2   0   0  items           0
+  57  Goto            0  58   0                  0
+  58  MakeRecord     19   2  25                  0  r[25]=mkrec(r[19..20]); for sqlite_autoindex_items_1
+  59  IdxInsert       1  25  19                  2  key=r[25]
   60  MakeRecord      3   4   7                  0  r[7]=mkrec(r[3..6])
   61  Insert          2   7   2  items           2  intkey=r[2] data=r[7]
   62  Goto            0  63   0                  0

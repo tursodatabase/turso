@@ -29,23 +29,23 @@ addr  opcode         p1  p2  p3  p4             p5  comment
   12  Goto            0  14   0                  0
   13  NewRowid        2   2   0                  0  r[2]=rowid
   14  Affinity        3   4   0                  0  r[3..7] = D, B, B, B
-  15  NotExists       2  18   2                  0
-  16  Copy            2   1   0                  0  r[1]=r[2]
-  17  Goto            0  43   0                  0
-  18  Copy            5   8   0                  0  r[8]=r[5]
-  19  Copy            2   9   0                  0  r[9]=r[2]
-  20  Affinity        8   1   0                  0  r[8..9] = B
-  21  NoConflict      0  24   8  1               0  key=r[8..8]
-  22  Goto            0  44   0                  0
-  23  Halt         2067   0   0  items.barcode   0
-  24  Copy            4  10   0                  0  r[10]=r[4]
-  25  Copy            2  11   0                  0  r[11]=r[2]
-  26  Affinity       10   1   0                  0  r[10..11] = B
-  27  NoConflict      1  30  10  1               0  key=r[10..10]
-  28  Goto            0  44   0                  0
-  29  Halt         2067   0   0  items.sku       0
-  30  IsNull          4  44   0                  0  if (r[4]==NULL) goto 44
-  31  IsNull          5  44   0                  0  if (r[5]==NULL) goto 44
+  15  IsNull          4  44   0                  0  if (r[4]==NULL) goto 44
+  16  IsNull          5  44   0                  0  if (r[5]==NULL) goto 44
+  17  NotExists       2  20   2                  0
+  18  Copy            2   1   0                  0  r[1]=r[2]
+  19  Goto            0  43   0                  0
+  20  Copy            5   8   0                  0  r[8]=r[5]
+  21  Copy            2   9   0                  0  r[9]=r[2]
+  22  Affinity        8   1   0                  0  r[8..9] = B
+  23  NoConflict      0  26   8  1               0  key=r[8..8]
+  24  Goto            0  44   0                  0
+  25  Halt         2067   0   0  items.barcode   0
+  26  Copy            4  10   0                  0  r[10]=r[4]
+  27  Copy            2  11   0                  0  r[11]=r[2]
+  28  Affinity       10   1   0                  0  r[10..11] = B
+  29  NoConflict      1  32  10  1               0  key=r[10..10]
+  30  Goto            0  44   0                  0
+  31  Halt         2067   0   0  items.sku       0
   32  MakeRecord      3   4   7                  0  r[7]=mkrec(r[3..6])
   33  Copy            5  12   0                  0  r[12]=r[5]
   34  Copy            2  13   0                  0  r[13]=r[2]

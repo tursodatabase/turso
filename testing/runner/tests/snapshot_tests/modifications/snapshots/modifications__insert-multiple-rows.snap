@@ -55,12 +55,12 @@ addr  opcode           p1  p2  p3  p4              p5  comment
   33    Goto            0  35   0                   0
   34    NewRowid        1   8   0                   0  r[8]=rowid
   35    Affinity        9   5   0                   0  r[9..14] = D, B, E, D, B
-  36    NotExists       1  38   8                   0
-  37    Halt         1555   0   0  products.id      0
-  38    Copy           13  15   0                   0  r[15]=r[13]
-  39    Copy            8  16   0                   0  r[16]=r[8]
-  40    HaltIfNull   1299   0  10  products.name    0
-  41    HaltIfNull   1299   0  11  products.price   0
+  36    HaltIfNull   1299   0  10  products.name    0
+  37    HaltIfNull   1299   0  11  products.price   0
+  38    NotExists       1  40   8                   0
+  39    Halt         1555   0   0  products.id      0
+  40    Copy           13  15   0                   0  r[15]=r[13]
+  41    Copy            8  16   0                   0  r[16]=r[8]
   42    MakeRecord      9   5  14                   0  r[14]=mkrec(r[9..13])
   43    Copy           13  17   0                   0  r[17]=r[13]
   44    Copy            8  18   0                   0  r[18]=r[8]
