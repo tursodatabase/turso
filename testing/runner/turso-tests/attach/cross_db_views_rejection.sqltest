@@ -54,6 +54,18 @@ expect error {
     view cannot reference table in attached database: aux.products
 }
 
+test cross-db-view-rejected-multiple-attach {
+    CREATE TABLE main_data (id INTEGER, value TEXT);
+    ATTACH ':memory:' AS aux1;
+    ATTACH ':memory:' AS aux2;
+    CREATE TABLE aux1.foo (id INTEGER, label TEXT);
+    CREATE TABLE aux2.bar (id INTEGER, info TEXT);
+    CREATE VIEW cross_view AS SELECT m.value, f.label, b.info FROM main_data m JOIN aux1.foo f ON m.id = f.id JOIN aux2.bar b ON m.id = b.id;
+}
+expect error {
+    view cannot reference table in attached database: aux1.foo
+}
+
 test cross-db-view-rejected-attached-referencing-main {
     CREATE TABLE main_data (id INTEGER, value TEXT);
     ATTACH ':memory:' AS aux;
