@@ -158,6 +158,8 @@ impl OpenLoop {
                                     program.emit_insn(Insn::Yield {
                                         yield_reg: *yield_reg,
                                         end_offset: loop_end,
+                                        subtype_clear_start_reg: 0,
+                                        subtype_clear_count: 0,
                                     });
                                 }
                                 Some(QueryDestination::EphemeralTable { cursor_id, .. }) => {

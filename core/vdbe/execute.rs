@@ -8181,6 +8181,8 @@ pub fn op_yield(
         Yield {
             yield_reg,
             end_offset,
+            subtype_clear_start_reg,
+            subtype_clear_count,
         },
         insn
     );
@@ -8195,6 +8197,23 @@ pub fn op_yield(
             // this is the mechanism that allows jumping back and forth between the coroutine and the caller
             (state.pc, state.registers[*yield_reg]) =
                 (pc, Register::Value(Value::from_i64((state.pc + 1) as i64)));
+
+            // Strip JSON subtypes from co-routine output columns so they do not
+            // survive the subquery boundary, matching SQLite's OP_Copy P5=0x0002.
+            // subtype_clear_count > 0 only for coroutine body yields.
+            #[cfg(feature = "json")]
+            if *subtype_clear_count > 0 {
+                use crate::types::TextSubtype;
+                for reg in &mut state.registers
+                    [*subtype_clear_start_reg..*subtype_clear_start_reg + *subtype_clear_count]
+                {
+                    if let Register::Value(Value::Text(text)) = reg {
+                        if text.subtype == TextSubtype::Json {
+                            text.subtype = TextSubtype::Text;
+                        }
+                    }
+                }
+            }
         }
     } else {
         unreachable!(
