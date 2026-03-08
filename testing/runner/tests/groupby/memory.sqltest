@@ -40,7 +40,18 @@ expect @js {
     Sarah|1|65
 }
 
-# In GROUP BY clauses, column aliases take precedence when resolving identifiers to columns.
+# In GROUP BY, real column names take precedence over aliases.
+@cross-check-integrity
+test group_by_column_over_alias {
+    CREATE TABLE t(x INT, y INT, z INT);
+    INSERT INTO t VALUES (1,10,100),(2,10,200),(3,20,300),(4,20,400);
+    SELECT x as y, SUM(z) FROM t GROUP BY y ORDER BY y;
+}
+expect {
+    1|300
+    3|700
+}
+
 @cross-check-integrity
 test group_by_alias_precedence {
     CREATE TABLE t(x,y);
