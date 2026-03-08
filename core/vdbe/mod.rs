@@ -350,7 +350,7 @@ pub struct ProgramState {
     /// Indicate whether an [Insn::Once] instruction at a given program counter position has already been executed, well, once.
     once: SmallVec<[u32; 4]>,
     pub execution_state: ProgramExecutionState,
-    pub parameters: HashMap<NonZero<usize>, Value>,
+    pub parameters: Vec<Value>,
     commit_state: CommitState,
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
@@ -446,7 +446,7 @@ impl ProgramState {
             ended_coroutine: vec![],
             once: SmallVec::<[u32; 4]>::new(),
             execution_state: ProgramExecutionState::Init,
-            parameters: HashMap::default(),
+            parameters: Vec::new(),
             commit_state: CommitState::Ready,
             #[cfg(feature = "json")]
             json_cache: JsonCacheCell::new(),
@@ -515,7 +515,11 @@ impl ProgramState {
     }
 
     pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) {
-        self.parameters.insert(index, value);
+        let i = index.get() - 1;
+        if i >= self.parameters.len() {
+            self.parameters.resize(i + 1, Value::Null);
+        }
+        self.parameters[i] = value;
     }
 
     pub fn clear_bindings(&mut self) {
@@ -523,7 +527,8 @@ impl ProgramState {
     }
 
     pub fn get_parameter(&self, index: NonZero<usize>) -> Value {
-        self.parameters.get(&index).cloned().unwrap_or(Value::Null)
+        let i = index.get() - 1;
+        self.parameters.get(i).cloned().unwrap_or(Value::Null)
     }
 
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
