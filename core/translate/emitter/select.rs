@@ -227,8 +227,7 @@ pub fn emit_query<'a>(
         &mut plan.non_from_clause_subqueries,
     )?;
 
-    if plan.is_simple_count() {
-        emit_simple_count(program, t_ctx, plan)?;
+    if plan.is_simple_count() && emit_simple_count(program, t_ctx, plan)? {
         // Keep LIMIT's early-exit jump target valid even on the simple_count fast path.
         // init_limit may emit an IfNot to after_main_loop_label (e.g. scalar subquery injects LIMIT 1).
         // Without resolving this label before the early return, bytecode assembly fails

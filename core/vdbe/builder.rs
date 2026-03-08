@@ -1463,6 +1463,11 @@ impl ProgramBuilder {
         self.table_references.contains_table(table)
     }
 
+    /// Returns true if the cursor is a BTreeTable cursor.
+    pub fn cursor_is_btree(&self, cursor_id: CursorID) -> bool {
+        matches!(self.cursor_ref[cursor_id].1, CursorType::BTreeTable(_))
+    }
+
     #[inline]
     pub fn cursor_loop(&mut self, cursor_id: CursorID, f: impl Fn(&mut ProgramBuilder, usize)) {
         let loop_start = self.allocate_label();
