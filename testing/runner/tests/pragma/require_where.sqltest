@@ -1,4 +1,5 @@
 @database :memory:
+@skip-file-if sqlite "require_where is a turso-specific pragma"
 
 test pragma-require-where-alias {
     PRAGMA require_where = ON;
