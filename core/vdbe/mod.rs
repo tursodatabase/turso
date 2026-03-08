@@ -17,6 +17,7 @@
 //!
 //! https://www.sqlite.org/opcode.html
 
+use crate::types::Extendable;
 use crate::{turso_assert, turso_assert_ne, turso_debug_assert, HashSet};
 pub mod affinity;
 pub mod bloom_filter;
@@ -519,7 +520,19 @@ impl ProgramState {
         if i >= self.parameters.len() {
             self.parameters.resize(i + 1, Value::Null);
         }
-        self.parameters[i] = value;
+        let slot = &mut self.parameters[i];
+        match (slot, value) {
+            (Value::Null, Value::Null) => {}
+            (Value::Numeric(Numeric::Integer(existing)), Value::Numeric(Numeric::Integer(new))) => {
+                *existing = new
+            }
+            (Value::Numeric(Numeric::Float(existing)), Value::Numeric(Numeric::Float(new))) => {
+                *existing = new
+            }
+            (Value::Text(existing), Value::Text(new)) => existing.do_extend(&new),
+            (Value::Blob(existing), Value::Blob(new)) => existing.do_extend(&new),
+            (slot, value) => *slot = value,
+        }
     }
 
     pub fn clear_bindings(&mut self) {
