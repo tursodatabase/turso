@@ -102,14 +102,14 @@ async fn lost_updates_scenario(num_workers: usize, rounds: usize) {
 fn shuttle_test_lost_updates() {
     let scheduler = RandomScheduler::new(100);
     let runner = shuttle::Runner::new(scheduler, shuttle_config());
-    runner.run(|| shuttle::future::block_on(lost_updates_scenario(2, 3)));
+    runner.run(|| shuttle::future::block_on(lost_updates_scenario(4, 6)));
 }
 
 #[test]
 fn shuttle_test_lost_updates_slow() {
     let scheduler = RandomScheduler::new(10);
     let runner = shuttle::Runner::new(scheduler, shuttle_config());
-    runner.run(|| shuttle::future::block_on(lost_updates_scenario(4, 20)));
+    runner.run(|| shuttle::future::block_on(lost_updates_scenario(12, 60)));
 }
 
 async fn snapshot_isolation_scenario(num_writers: usize, num_readers: usize, writer_rounds: i64) {
@@ -193,14 +193,14 @@ async fn snapshot_isolation_scenario(num_writers: usize, num_readers: usize, wri
 fn shuttle_test_snapshot_isolation_violation() {
     let scheduler = RandomScheduler::new(100);
     let runner = shuttle::Runner::new(scheduler, shuttle_config());
-    runner.run(|| shuttle::future::block_on(snapshot_isolation_scenario(2, 2, 3)));
+    runner.run(|| shuttle::future::block_on(snapshot_isolation_scenario(4, 4, 6)));
 }
 
 #[test]
 fn shuttle_test_snapshot_isolation_violation_slow() {
     let scheduler = RandomScheduler::new(10);
     let runner = shuttle::Runner::new(scheduler, shuttle_config());
-    runner.run(|| shuttle::future::block_on(snapshot_isolation_scenario(4, 4, 5)));
+    runner.run(|| shuttle::future::block_on(snapshot_isolation_scenario(12, 12, 15)));
 }
 
 async fn ghost_commits_scenario(num_workers: usize, ops_per_worker: i64) {
@@ -255,14 +255,14 @@ async fn ghost_commits_scenario(num_workers: usize, ops_per_worker: i64) {
 fn shuttle_test_ghost_commits() {
     let scheduler = RandomScheduler::new(100);
     let runner = shuttle::Runner::new(scheduler, shuttle_config());
-    runner.run(|| shuttle::future::block_on(ghost_commits_scenario(2, 10)));
+    runner.run(|| shuttle::future::block_on(ghost_commits_scenario(4, 20)));
 }
 
 #[test]
 fn shuttle_test_ghost_commits_slow() {
     let scheduler = RandomScheduler::new(10);
     let runner = shuttle::Runner::new(scheduler, shuttle_config());
-    runner.run(|| shuttle::future::block_on(ghost_commits_scenario(4, 20)));
+    runner.run(|| shuttle::future::block_on(ghost_commits_scenario(12, 60)));
 }
 
 /// Disjoint Writes No False Conflict: N workers each own a distinct row and update it
@@ -318,14 +318,14 @@ async fn disjoint_writes_no_false_conflict_scenario(num_workers: usize, rounds: 
 fn shuttle_test_disjoint_writes_no_false_conflict() {
     let scheduler = RandomScheduler::new(100);
     let runner = shuttle::Runner::new(scheduler, shuttle_config());
-    runner.run(|| shuttle::future::block_on(disjoint_writes_no_false_conflict_scenario(3, 3)));
+    runner.run(|| shuttle::future::block_on(disjoint_writes_no_false_conflict_scenario(6, 6)));
 }
 
 #[test]
 fn shuttle_test_disjoint_writes_no_false_conflict_slow() {
     let scheduler = RandomScheduler::new(10);
     let runner = shuttle::Runner::new(scheduler, shuttle_config());
-    runner.run(|| shuttle::future::block_on(disjoint_writes_no_false_conflict_scenario(4, 5)));
+    runner.run(|| shuttle::future::block_on(disjoint_writes_no_false_conflict_scenario(12, 15)));
 }
 
 /// OTV: Observed Transaction Vanishes
@@ -408,14 +408,14 @@ async fn otv_scenario(num_writers: usize, num_readers: usize, rounds: i64) {
 fn shuttle_test_otv() {
     let scheduler = RandomScheduler::new(100);
     let runner = shuttle::Runner::new(scheduler, shuttle_config());
-    runner.run(|| shuttle::future::block_on(otv_scenario(2, 2, 3)));
+    runner.run(|| shuttle::future::block_on(otv_scenario(4, 4, 6)));
 }
 
 #[test]
 fn shuttle_test_otv_slow() {
     let scheduler = RandomScheduler::new(10);
     let runner = shuttle::Runner::new(scheduler, shuttle_config());
-    runner.run(|| shuttle::future::block_on(otv_scenario(3, 3, 5)));
+    runner.run(|| shuttle::future::block_on(otv_scenario(9, 9, 15)));
 }
 
 /// Rollback Isolation: rolled-back writes must never be visible to concurrent readers.
@@ -478,14 +478,14 @@ async fn rollback_isolation_scenario(num_writers: usize, num_readers: usize, rou
 fn shuttle_test_rollback_isolation() {
     let scheduler = RandomScheduler::new(100);
     let runner = shuttle::Runner::new(scheduler, shuttle_config());
-    runner.run(|| shuttle::future::block_on(rollback_isolation_scenario(2, 2, 3)));
+    runner.run(|| shuttle::future::block_on(rollback_isolation_scenario(4, 4, 6)));
 }
 
 #[test]
 fn shuttle_test_rollback_isolation_slow() {
     let scheduler = RandomScheduler::new(10);
     let runner = shuttle::Runner::new(scheduler, shuttle_config());
-    runner.run(|| shuttle::future::block_on(rollback_isolation_scenario(3, 3, 5)));
+    runner.run(|| shuttle::future::block_on(rollback_isolation_scenario(9, 9, 15)));
 }
 
 /// Phantom Prevention: predicate query results must not change within a snapshot,
@@ -560,12 +560,12 @@ async fn phantom_prevention_scenario(num_writers: usize, num_readers: usize, ops
 fn shuttle_test_phantom_prevention() {
     let scheduler = RandomScheduler::new(100);
     let runner = shuttle::Runner::new(scheduler, shuttle_config());
-    runner.run(|| shuttle::future::block_on(phantom_prevention_scenario(2, 2, 5)));
+    runner.run(|| shuttle::future::block_on(phantom_prevention_scenario(4, 4, 10)));
 }
 
 #[test]
 fn shuttle_test_phantom_prevention_slow() {
     let scheduler = RandomScheduler::new(10);
     let runner = shuttle::Runner::new(scheduler, shuttle_config());
-    runner.run(|| shuttle::future::block_on(phantom_prevention_scenario(3, 3, 8)));
+    runner.run(|| shuttle::future::block_on(phantom_prevention_scenario(9, 9, 24)));
 }
