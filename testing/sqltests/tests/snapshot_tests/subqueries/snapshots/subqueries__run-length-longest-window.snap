@@ -96,4 +96,4 @@ QUERY PLAN
 |  |           `--CORRELATED SCALAR SUBQUERY 1
 |  |              `--SEARCH d2 USING INDEX ephemeral_subquery_t11 (signal_day<?)
 |  `--USE SORTER FOR GROUP BY
-`--USE SORTER FOR ORDER BY
+`--USE TEMP B-TREE FOR ORDER BY

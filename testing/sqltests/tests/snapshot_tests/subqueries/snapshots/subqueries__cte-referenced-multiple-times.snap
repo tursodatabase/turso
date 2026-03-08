@@ -79,16 +79,16 @@ addr  opcode                                       p1   p2   p3  p4            p
   39                        Integer                 0    8    0                 0  r[8]=0
   40                      Return                   16    0    0                 0
   41                      EndCoroutine              4    0    0                 0
-  42                      Null                      0   18    0                 0  r[18]=NULL
-  43                      Integer                   1   19    0                 0  r[19]=1; LIMIT counter
-  44                      IfNot                    19   50    0                 0  if !r[19] goto 50
+  42                      Null                      0   19    0                 0  r[19]=NULL
+  43                      Integer                   1   18    0                 0  r[18]=1; LIMIT counter
+  44                      IfNot                    18   50    0                 0  if !r[18] goto 50
   45                      InitCoroutine             4    0    5                 0
   46                        Yield                   4   50    0                 0
   47                        Copy                    6   20    0                 0  r[20]=r[6]
-  48                        AggStep                 0   20   18  avg            0  accum=r[18] step(r[20])
+  48                        AggStep                 0   20   19  avg            0  accum=r[19] step(r[20])
   49                      Goto                      0   46    0                 0
-  50                      AggFinal                  0   18    0  avg            0  accum=r[18]
-  51                      Copy                     18   17    0                 0  r[17]=r[18]
+  50                      AggFinal                  0   19    0  avg            0  accum=r[19]
+  51                      Copy                     19   17    0                 0  r[17]=r[19]
   52                      Copy                     17    1    0                 0  r[1]=r[17]
   53                    Return                      3    0    1                 0
   54                    Once                      107    0    0                 0  goto 107
@@ -132,16 +132,16 @@ addr  opcode                                       p1   p2   p3  p4            p
   92              Integer                           0   26    0                 0  r[26]=0
   93            Return                             34    0    0                 0
   94            EndCoroutine                       22    0    0                 0
-  95            Null                                0   36    0                 0  r[36]=NULL
-  96            Integer                             1   37    0                 0  r[37]=1; LIMIT counter
-  97            IfNot                              37  103    0                 0  if !r[37] goto 103
+  95            Null                                0   37    0                 0  r[37]=NULL
+  96            Integer                             1   36    0                 0  r[36]=1; LIMIT counter
+  97            IfNot                              36  103    0                 0  if !r[36] goto 103
   98            InitCoroutine                      22    0   58                 0
   99              Yield                            22  103    0                 0
  100              Copy                             24   38    0                 0  r[38]=r[24]
- 101              AggStep                           0   38   36  avg            0  accum=r[36] step(r[38])
+ 101              AggStep                           0   38   37  avg            0  accum=r[37] step(r[38])
  102            Goto                                0   99    0                 0
- 103            AggFinal                            0   36    0  avg            0  accum=r[36]
- 104            Copy                               36   35    0                 0  r[35]=r[36]
+ 103            AggFinal                            0   37    0  avg            0  accum=r[37]
+ 104            Copy                               37   35    0                 0  r[35]=r[37]
  105            Copy                               35    2    0                 0  r[2]=r[35]
  106          Return                               21    0    1                 0
  107          OpenEphemeral                         4    1    0                 0  cursor=4 is_table=true

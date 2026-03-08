@@ -26,17 +26,17 @@ addr  opcode           p1  p2  p3  p4            p5  comment
    2    Rewind          0  22   0                 0  Rewind table customers
    3      BeginSubrtn   4   0   0                 0  r[4]=NULL
    4      Null          0   1   0                 0  r[1]=NULL
-   5      Null          0   6   0                 0  r[6]=NULL
-   6      Integer       1   7   0                 0  r[7]=1; LIMIT counter
-   7      IfNot         7  14   0                 0  if !r[7] goto 14
+   5      Null          0   7   0                 0  r[7]=NULL
+   6      Integer       1   6   0                 0  r[6]=1; LIMIT counter
+   7      IfNot         6  14   0                 0  if !r[6] goto 14
    8      OpenRead      1   9   0  k(2,B)         0  index=idx_orders_customer, root=9, iDb=0
    9      RowId         0   8   0                 0  r[8]=customers.rowid
   10      SeekGE        1  14   8                 0  key=[8..8]
   11        IdxGT       1  14   8                 0  key=[8..8]
-  12        AggStep     0   9   6  count          0  accum=r[6] step(r[9])
+  12        AggStep     0   9   7  count          0  accum=r[7] step(r[9])
   13      Next          1  11   0                 0
-  14      AggFinal      0   6   0  count          0  accum=r[6]
-  15      Copy          6   5   0                 0  r[5]=r[6]
+  14      AggFinal      0   7   0  count          0  accum=r[7]
+  15      Copy          7   5   0                 0  r[5]=r[7]
   16      Copy          5   1   0                 0  r[1]=r[5]
   17    Return          4   0   1                 0
   18    Column          0   1   2                 0  r[2]=customers.name

@@ -45,9 +45,9 @@ addr  opcode               p1  p2  p3  p4      p5  comment
   14      BeginSubrtn      10   0   0           0  r[10]=NULL
   15      Null              0   1   0           0  r[1]=NULL
   16      OpenDup           2   0   0           0  new_cursor=2, original_cursor=0
-  17      Null              0  13   0           0  r[13]=NULL
-  18      Integer           1  14   0           0  r[14]=1; LIMIT counter
-  19      IfNot            14  42   0           0  if !r[14] goto 42
+  17      Null              0  14   0           0  r[14]=NULL
+  18      Integer           1  13   0           0  r[13]=1; LIMIT counter
+  19      IfNot            13  42   0           0  if !r[13] goto 42
   20      Once             28   0   0           0  goto 28
   21      OpenAutoindex     3   0   0           0  cursor=3
   22      Rewind            2  23   0           0  Rewind  ephemeral()
@@ -67,11 +67,11 @@ addr  opcode               p1  p2  p3  p4      p5  comment
   36        Column          3   0  19           0  r[19]=ephemeral(ephemeral_subquery_t7).price
   37        RealAffinity   19   0   0           0
   38        CollSeq         0   0   0  Binary   0  collation=Binary
-  39        AggStep         0  19  13  max      0  accum=r[13] step(r[19])
+  39        AggStep         0  19  14  max      0  accum=r[14] step(r[19])
   40        Goto            0  42   0           0
   41      Prev              3  32   0           0
-  42      AggFinal          0  13   0  max      0  accum=r[13]
-  43      Copy             13  12   0           0  r[12]=r[13]
+  42      AggFinal          0  14   0  max      0  accum=r[14]
+  43      Copy             14  12   0           0  r[12]=r[14]
   44      Copy             12   1   0           0  r[1]=r[12]
   45    Return             10   0   1           0
   46    Copy                1   6   0           0  r[6]=r[1]

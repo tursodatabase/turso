@@ -41,17 +41,17 @@ addr  opcode           p1  p2  p3  p4          p5  comment
   18      Copy          7  13   0               0  r[13]=r[7]
   19      BeginSubrtn  14   0   0               0  r[14]=NULL
   20      Null          0   1   0               0  r[1]=NULL
-  21      Null          0  16   0               0  r[16]=NULL
-  22      Integer       1  17   0               0  r[17]=1; LIMIT counter
-  23      IfNot        17  30   0               0  if !r[17] goto 30
+  21      Null          0  17   0               0  r[17]=NULL
+  22      Integer       1  16   0               0  r[16]=1; LIMIT counter
+  23      IfNot        16  30   0               0  if !r[16] goto 30
   24      OpenRead      2   2   0  k(3,B,B,B)   0  table=t, root=2, iDb=0
   25      Rewind        2  30   0               0  Rewind table t
   26        Column      2   2  19               0  r[19]=t.val
   27        Lt         19  20  29  Binary       0  if r[19]<r[20] goto 29
-  28        AggStep     0  21  16  count        0  accum=r[16] step(r[21])
+  28        AggStep     0  21  17  count        0  accum=r[17] step(r[21])
   29      Next          2  26   0               0
-  30      AggFinal      0  16   0  count        0  accum=r[16]
-  31      Copy         16  15   0               0  r[15]=r[16]
+  30      AggFinal      0  17   0  count        0  accum=r[17]
+  31      Copy         17  15   0               0  r[15]=r[17]
   32      Copy         15   1   0               0  r[1]=r[15]
   33    Return         14   0   1               0
   34    Copy            4  22   0               0  r[22]=r[4]

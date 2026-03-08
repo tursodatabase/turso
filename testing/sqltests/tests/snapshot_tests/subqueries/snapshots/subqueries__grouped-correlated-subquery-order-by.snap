@@ -57,9 +57,9 @@ addr  opcode                    p1  p2  p3  p4              p5  comment
   29        AggFinal             0  10   0  sum              0  accum=r[10]
   30        BeginSubrtn         15   0   0                   0  r[15]=NULL
   31        Null                 0   1   0                   0  r[1]=NULL
-  32        Null                 0  17   0                   0  r[17]=NULL
-  33        Integer              1  18   0                   0  r[18]=1; LIMIT counter
-  34        IfNot               18  47   0                   0  if !r[18] goto 47
+  32        Null                 0  18   0                   0  r[18]=NULL
+  33        Integer              1  17   0                   0  r[17]=1; LIMIT counter
+  34        IfNot               17  47   0                   0  if !r[17] goto 47
   35        OpenRead             3   2   0  k(3,B,B)         0  table=grouped_values, root=2, iDb=0
   36        OpenRead             4   3   0  k(2,B)           0  index=idx_grouped_values_grp, root=3, iDb=0
   37        Copy                 9  19   0                   0  r[19]=r[9]
@@ -70,10 +70,10 @@ addr  opcode                    p1  p2  p3  p4              p5  comment
   42          DeferredSeek       4   3   0                   0
   43          Column             3   1  20                   0  r[20]=grouped_values.val
   44          CollSeq            0   0   0  Binary           0  collation=Binary
-  45          AggStep            0  20  17  max              0  accum=r[17] step(r[20])
+  45          AggStep            0  20  18  max              0  accum=r[18] step(r[20])
   46        Next                 4  41   0                   0
-  47        AggFinal             0  17   0  max              0  accum=r[17]
-  48        Copy                17  16   0                   0  r[16]=r[17]
+  47        AggFinal             0  18   0  max              0  accum=r[18]
+  48        Copy                18  16   0                   0  r[16]=r[18]
   49        Copy                16   1   0                   0  r[1]=r[16]
   50      Return                15   0   1                   0
   51      Copy                   1  21   0                   0  r[21]=r[1]
