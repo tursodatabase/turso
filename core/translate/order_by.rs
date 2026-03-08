@@ -172,7 +172,15 @@ pub fn init_order_by(
         .iter()
         .all(|(e, _)| is_orderby_agg_or_const(&t_ctx.resolver, e, aggregates));
 
-    let use_heap_sort = !has_distinct && !has_group_by && t_ctx.limit_ctx.is_some();
+    // Heap sort uses a BTreeIndex whose comparisons are memcmp-based.
+    // Custom types with OPERATOR '<' need a custom comparator, so fall back
+    // to the full sorter which handles them correctly.
+    let has_custom_type_order = order_by.iter().any(|(expr, _)| {
+        result_column_custom_type_info(expr, referenced_tables, t_ctx.resolver.schema()).is_some()
+    });
+
+    let use_heap_sort =
+        !has_distinct && !has_group_by && !has_custom_type_order && t_ctx.limit_ctx.is_some();
 
     // only emit sequence column if (we have GROUP BY and ORDER BY is not only aggregates or constants) OR (we decided to use heap-sort)
     let has_sequence = (has_group_by && !only_aggs) || use_heap_sort;
