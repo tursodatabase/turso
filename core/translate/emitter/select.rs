@@ -6,7 +6,7 @@ use crate::{
         aggregation::emit_ungrouped_aggregation,
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
-            MaterializedBuildInput, MaterializedBuildInputMode, MaterializedColumnRef,
+            LimitCtx, MaterializedBuildInput, MaterializedBuildInputMode, MaterializedColumnRef,
             OperationMode, ResultSetColumn, TableMask, TranslateCtx,
         },
         group_by::{group_by_agg_phase, group_by_emit_row_phase, init_group_by, GroupByRowSource},
@@ -146,6 +146,12 @@ pub fn emit_query<'a>(
         .group_by
         .as_ref()
         .is_some_and(|gb| !gb.exprs.is_empty());
+
+    // Pre-allocate limit_ctx so init_order_by can activate heap sort (top-K).
+    // init_limit() emits the actual LIMIT instructions later.
+    if t_ctx.limit_ctx.is_none() && plan.limit.is_some() {
+        t_ctx.limit_ctx = Some(LimitCtx::new(program));
+    }
 
     // Initialize cursors and other resources needed for query execution
     if !plan.order_by.is_empty() {
