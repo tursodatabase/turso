@@ -1946,7 +1946,7 @@ mod rename_column_view {
 
             let ctx =
                 ViewRewriteCtx::new(schema, target_table, target_db_name, old_column, new_column);
-            let changed =
+            let sql_changed =
                 rewrite_view_select_for_column_rename(&mut select, &ctx, &[], visiting_views)?;
 
             let view_column_schema = extract_view_columns(&select, schema)?;
@@ -1960,11 +1960,11 @@ mod rename_column_view {
 
             let columns_changed = !columns_equivalent(&original_columns, &final_columns);
 
-            if !changed && !columns_changed {
+            if !sql_changed && !columns_changed {
                 return Ok(None);
             }
 
-            let new_sql = if changed {
+            let new_sql = if sql_changed {
                 let new_stmt = ast::Stmt::CreateView {
                     temporary,
                     if_not_exists,
@@ -3009,15 +3009,22 @@ pub mod tests {
         assert_eq!(normalize_ident("ὈΔΥΣΣΕΎΣ"), "ὀδυσσεύς");
     }
 
-    fn schema_with_table(create_table_sql: &str) -> Schema {
+    fn schema_with_tables(create_table_sqls: &[&str]) -> Schema {
         let mut schema = Schema::new();
-        let table =
-            BTreeTable::from_sql(create_table_sql, 2).expect("test CREATE TABLE should parse");
-        schema
-            .add_btree_table(std::sync::Arc::new(table))
-            .expect("test table should be added to schema");
+        for (index, create_table_sql) in create_table_sqls.iter().enumerate() {
+            let root_page = i64::try_from(index).expect("test table index should fit in i64") + 2;
+            let table = BTreeTable::from_sql(create_table_sql, root_page)
+                .expect("test CREATE TABLE should parse");
+            schema
+                .add_btree_table(std::sync::Arc::new(table))
+                .expect("test table should be added to schema");
+        }
 
         schema
+    }
+
+    fn schema_with_table(create_table_sql: &str) -> Schema {
+        schema_with_tables(&[create_table_sql])
     }
 
     #[test]
@@ -3058,6 +3065,182 @@ pub mod tests {
                 .expect("view should be rewritten");
 
         assert!(!rewritten.sql.contains("t.b"), "{}", rewritten.sql);
+    }
+
+    #[test]
+    fn test_rewrite_view_sql_compound_branch() {
+        let schema = schema_with_table("CREATE TABLE t (a, b)");
+        let view_sql = "CREATE VIEW v AS SELECT b FROM t UNION ALL SELECT b FROM t ORDER BY b";
+
+        let rewritten =
+            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
+                .unwrap()
+                .expect("view should be rewritten");
+
+        assert_eq!(rewritten.sql.matches("SELECT c FROM t").count(), 2);
+        assert!(!rewritten.sql.contains("ORDER BY b"), "{}", rewritten.sql);
+        assert!(rewritten.sql.contains("ORDER BY c"), "{}", rewritten.sql);
+    }
+
+    #[test]
+    fn test_rewrite_view_sql_cte_branch() {
+        let schema = schema_with_table("CREATE TABLE t (a, b)");
+        let view_sql = "CREATE VIEW v AS WITH cte AS (SELECT b FROM t) SELECT b FROM cte";
+
+        let rewritten =
+            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
+                .unwrap()
+                .expect("view should be rewritten");
+
+        assert!(
+            rewritten.sql.contains("WITH cte AS (SELECT c FROM t)"),
+            "{}",
+            rewritten.sql
+        );
+        assert!(
+            rewritten.sql.contains("SELECT c FROM cte"),
+            "{}",
+            rewritten.sql
+        );
+    }
+
+    #[test]
+    fn test_rewrite_view_sql_cte_branch_with_explicit_columns() {
+        let schema = schema_with_table("CREATE TABLE t (a, b)");
+        let view_sql = "CREATE VIEW v AS WITH cte(x) AS (SELECT b FROM t) SELECT x FROM cte";
+
+        let rewritten =
+            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
+                .unwrap()
+                .expect("view should be rewritten");
+
+        assert!(
+            rewritten.sql.contains("WITH cte(x)") || rewritten.sql.contains("WITH cte (x)"),
+            "{}",
+            rewritten.sql
+        );
+        assert!(
+            rewritten.sql.contains("AS (SELECT c FROM t)"),
+            "{}",
+            rewritten.sql
+        );
+        assert!(
+            rewritten.sql.contains("SELECT x FROM cte"),
+            "{}",
+            rewritten.sql
+        );
+    }
+
+    #[test]
+    fn test_rewrite_view_sql_join_on_branch() {
+        let schema = schema_with_tables(&["CREATE TABLE t (a, b)", "CREATE TABLE u (b)"]);
+        let view_sql = "CREATE VIEW v AS SELECT t.a FROM t JOIN u ON t.b = u.b";
+
+        let rewritten =
+            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
+                .unwrap()
+                .expect("view should be rewritten");
+
+        assert!(!rewritten.sql.contains("t.b"), "{}", rewritten.sql);
+        assert!(rewritten.sql.contains("t.c = u.b"), "{}", rewritten.sql);
+    }
+
+    #[test]
+    fn test_rewrite_view_sql_join_using_branch() {
+        let schema = schema_with_tables(&["CREATE TABLE t (a, b)", "CREATE TABLE u (b)"]);
+        let view_sql = "CREATE VIEW v AS SELECT t.a FROM t JOIN u USING (b)";
+
+        let rewritten =
+            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
+                .unwrap()
+                .expect("view should be rewritten");
+
+        assert!(
+            !rewritten.sql.contains("USING (b)") && !rewritten.sql.contains("USING(b)"),
+            "{}",
+            rewritten.sql
+        );
+        assert!(
+            rewritten.sql.contains("USING (c)") || rewritten.sql.contains("USING(c)"),
+            "{}",
+            rewritten.sql
+        );
+    }
+
+    #[test]
+    fn test_rewrite_view_sql_group_by_having_branch() {
+        let schema = schema_with_table("CREATE TABLE t (a, b)");
+        let view_sql = "CREATE VIEW v AS SELECT b FROM t GROUP BY b HAVING b > 0";
+
+        let rewritten =
+            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
+                .unwrap()
+                .expect("view should be rewritten");
+
+        assert!(
+            rewritten
+                .sql
+                .contains("SELECT c FROM t GROUP BY c HAVING c > 0"),
+            "{}",
+            rewritten.sql
+        );
+    }
+
+    #[test]
+    fn test_rewrite_view_sql_window_clause_branch() {
+        let schema = schema_with_table("CREATE TABLE t (a, b)");
+        let view_sql = "CREATE VIEW v AS SELECT sum(a) OVER (PARTITION BY b ORDER BY b) FROM t";
+
+        let rewritten =
+            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
+                .unwrap()
+                .expect("view should be rewritten");
+
+        assert!(
+            !rewritten.sql.contains("PARTITION BY b"),
+            "{}",
+            rewritten.sql
+        );
+        assert!(!rewritten.sql.contains("ORDER BY b"), "{}", rewritten.sql);
+        assert!(
+            rewritten.sql.contains("PARTITION BY c"),
+            "{}",
+            rewritten.sql
+        );
+        assert!(rewritten.sql.contains("ORDER BY c"), "{}", rewritten.sql);
+    }
+
+    #[test]
+    fn test_rewrite_view_sql_limit_offset_branch() {
+        let schema = schema_with_table("CREATE TABLE t (a, b)");
+        let view_sql = "CREATE VIEW v AS SELECT a FROM t LIMIT b OFFSET b";
+
+        let rewritten =
+            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
+                .unwrap()
+                .expect("view should be rewritten");
+
+        assert!(!rewritten.sql.contains("LIMIT b"), "{}", rewritten.sql);
+        assert!(!rewritten.sql.contains("OFFSET b"), "{}", rewritten.sql);
+        assert!(rewritten.sql.contains("LIMIT c"), "{}", rewritten.sql);
+        assert!(rewritten.sql.contains("OFFSET c"), "{}", rewritten.sql);
+    }
+
+    #[test]
+    fn test_rewrite_view_sql_values_branch() {
+        let schema = schema_with_table("CREATE TABLE t (a, b)");
+        let view_sql = "CREATE VIEW v AS VALUES ((SELECT b FROM t LIMIT 1))";
+
+        let rewritten =
+            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
+                .unwrap()
+                .expect("view should be rewritten");
+
+        assert!(
+            rewritten.sql.contains("VALUES ((SELECT c FROM t LIMIT 1))"),
+            "{}",
+            rewritten.sql
+        );
     }
 
     #[test]
