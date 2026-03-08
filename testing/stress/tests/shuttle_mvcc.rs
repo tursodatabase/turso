@@ -7,10 +7,7 @@ use turso_stress::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use turso_stress::sync::Arc;
 
 fn shuttle_config() -> shuttle::Config {
-    let mut config = shuttle::Config::default();
-    config.stack_size *= 10;
-    config.max_steps = shuttle::MaxSteps::FailAfter(10_000_000);
-    config
+    turso_stress::shuttle_config()
 }
 
 async fn setup_mvcc_db(schema: &str) -> (turso::Database, tempfile::TempDir) {
