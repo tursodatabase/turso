@@ -549,25 +549,31 @@ impl SelectPlan {
             return false;
         }
 
-        let count = ast::Expr::FunctionCall {
-            name: ast::Name::exact("count".to_string()),
-            distinctness: None,
-            args: vec![],
-            order_by: vec![],
-            filter_over: ast::FunctionTail {
-                filter_clause: None,
-                over_clause: None,
-            },
-        };
-        let count_star = ast::Expr::FunctionCallStar {
-            name: ast::Name::exact("count".to_string()),
-            filter_over: ast::FunctionTail {
-                filter_clause: None,
-                over_clause: None,
-            },
-        };
         let result_col_expr = &self.result_columns.first().unwrap().expr;
-        if *result_col_expr != count && *result_col_expr != count_star {
+        let is_count = match result_col_expr {
+            ast::Expr::FunctionCall {
+                name,
+                distinctness: None,
+                args,
+                order_by,
+                filter_over,
+            } => {
+                name.as_str().eq_ignore_ascii_case("count")
+                    && args.is_empty()
+                    && order_by.is_empty()
+                    && filter_over.filter_clause.is_none()
+                    && filter_over.over_clause.is_none()
+            }
+            ast::Expr::FunctionCallStar {
+                name, filter_over, ..
+            } => {
+                name.as_str().eq_ignore_ascii_case("count")
+                    && filter_over.filter_clause.is_none()
+                    && filter_over.over_clause.is_none()
+            }
+            _ => false,
+        };
+        if !is_count {
             return false;
         }
         true
