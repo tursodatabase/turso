@@ -547,9 +547,12 @@ impl ProgramState {
         self.cursors.iter_mut().for_each(|c| {
             let _ = c.take();
         });
-        self.registers
-            .iter_mut()
-            .for_each(|r| *r = Register::Value(Value::Null));
+        for r in self.registers.iter_mut() {
+            match r {
+                Register::Value(v) => *v = Value::Null,
+                _ => *r = Register::Value(Value::Null),
+            }
+        }
         self.last_compare = None;
         self.deferred_seeks.iter_mut().for_each(|s| *s = None);
         self.ended_coroutine.clear();
