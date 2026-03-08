@@ -98,31 +98,29 @@ fn encode_seek_keys_for_custom_types(
 /// A seek loop has a real two-phase contract:
 /// 1. Emit and position using the start bound.
 /// 2. Emit the termination bound and anchor `loop_start`.
-///
-/// Those phases stay as private helpers; the public API does not need typestate.
-pub(super) struct SeekEmitter<'prog, 'ctx, 'plan, 'tab, 'seek> {
-    program: &'prog mut ProgramBuilder,
-    tables: &'tab TableReferences,
-    seek_def: &'seek SeekDef,
-    t_ctx: &'ctx mut TranslateCtx<'plan>,
+pub(super) struct SeekEmitter<'a, 'plan> {
+    program: &'a mut ProgramBuilder,
+    tables: &'a TableReferences,
+    seek_def: &'a SeekDef,
+    t_ctx: &'a mut TranslateCtx<'plan>,
     seek_cursor_id: usize,
     start_reg: usize,
     loop_end: BranchOffset,
-    seek_index: Option<&'seek Arc<Index>>,
+    seek_index: Option<&'a Arc<Index>>,
     is_index: bool,
 }
 
-impl<'prog, 'ctx, 'plan, 'tab, 'seek> SeekEmitter<'prog, 'ctx, 'plan, 'tab, 'seek> {
+impl<'a, 'plan> SeekEmitter<'a, 'plan> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
-        program: &'prog mut ProgramBuilder,
-        tables: &'tab TableReferences,
-        seek_def: &'seek SeekDef,
-        t_ctx: &'ctx mut TranslateCtx<'plan>,
+        program: &'a mut ProgramBuilder,
+        tables: &'a TableReferences,
+        seek_def: &'a SeekDef,
+        t_ctx: &'a mut TranslateCtx<'plan>,
         seek_cursor_id: usize,
         start_reg: usize,
         loop_end: BranchOffset,
-        seek_index: Option<&'seek Arc<Index>>,
+        seek_index: Option<&'a Arc<Index>>,
     ) -> Self {
         Self {
             program,

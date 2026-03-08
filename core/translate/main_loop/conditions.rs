@@ -127,30 +127,30 @@ fn emit_conditions(
 ///
 /// Conditions that reference subquery results cannot be emitted until their
 /// correlated subqueries have run, so emission proceeds in three ordered steps.
-pub(super) struct LoopConditionEmitter<'prog, 'ctx, 'sub> {
-    program: &'prog mut ProgramBuilder,
-    t_ctx: &'ctx TranslateCtx<'ctx>,
-    table_references: &'ctx TableReferences,
-    join_order: &'ctx [JoinOrderMember],
-    predicates: &'ctx [WhereTerm],
+pub(super) struct LoopConditionEmitter<'a, 'ctx> {
+    program: &'a mut ProgramBuilder,
+    t_ctx: &'a TranslateCtx<'ctx>,
+    table_references: &'a TableReferences,
+    join_order: &'a [JoinOrderMember],
+    predicates: &'a [WhereTerm],
     join_index: usize,
     condition_fail_target: BranchOffset,
     from_outer_join: bool,
-    subqueries: &'sub mut [NonFromClauseSubquery],
+    subqueries: &'a mut [NonFromClauseSubquery],
 }
 
-impl<'prog, 'ctx, 'sub> LoopConditionEmitter<'prog, 'ctx, 'sub> {
+impl<'a, 'ctx> LoopConditionEmitter<'a, 'ctx> {
     #[allow(clippy::too_many_arguments)]
     pub(super) const fn new(
-        program: &'prog mut ProgramBuilder,
-        t_ctx: &'ctx TranslateCtx<'ctx>,
-        table_references: &'ctx TableReferences,
-        join_order: &'ctx [JoinOrderMember],
-        predicates: &'ctx [WhereTerm],
+        program: &'a mut ProgramBuilder,
+        t_ctx: &'a TranslateCtx<'ctx>,
+        table_references: &'a TableReferences,
+        join_order: &'a [JoinOrderMember],
+        predicates: &'a [WhereTerm],
         join_index: usize,
         condition_fail_target: BranchOffset,
         from_outer_join: bool,
-        subqueries: &'sub mut [NonFromClauseSubquery],
+        subqueries: &'a mut [NonFromClauseSubquery],
     ) -> Self {
         Self {
             program,

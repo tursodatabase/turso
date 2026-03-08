@@ -47,20 +47,20 @@ struct HashBuildConfig {
 ///
 /// Planning decides whether an existing hash build can be reused and, if not,
 /// captures all configuration needed to emit a fresh build deterministically.
-pub(crate) struct HashBuildPlanner<'prog, 'ctx, 'plan, 'tab, 'pred> {
-    program: &'prog mut ProgramBuilder,
-    t_ctx: &'ctx mut TranslateCtx<'plan>,
-    table_references: &'tab TableReferences,
-    non_from_clause_subqueries: &'pred [NonFromClauseSubquery],
-    predicates: &'pred [WhereTerm],
-    hash_join_op: &'pred HashJoinOp,
+pub(crate) struct HashBuildPlanner<'a, 'plan> {
+    program: &'a mut ProgramBuilder,
+    t_ctx: &'a mut TranslateCtx<'plan>,
+    table_references: &'a TableReferences,
+    non_from_clause_subqueries: &'a [NonFromClauseSubquery],
+    predicates: &'a [WhereTerm],
+    hash_join_op: &'a HashJoinOp,
     hash_build_cursor_id: CursorID,
     hash_table_id: usize,
 }
 
 /// A planned hash build whose signature check has already completed.
-pub(super) struct PreparedHashBuild<'prog, 'ctx, 'plan, 'tab, 'pred> {
-    planner: HashBuildPlanner<'prog, 'ctx, 'plan, 'tab, 'pred>,
+pub(super) struct PreparedHashBuild<'a, 'plan> {
+    planner: HashBuildPlanner<'a, 'plan>,
     config: HashBuildConfig,
 }
 
@@ -68,21 +68,21 @@ pub(super) struct PreparedHashBuild<'prog, 'ctx, 'plan, 'tab, 'pred> {
 ///
 /// Reuse means the caller can immediately probe an existing compatible hash
 /// table. Build means the caller must execute the prepared build before probing.
-pub(super) enum HashBuildPlan<'prog, 'ctx, 'plan, 'tab, 'pred> {
+pub(super) enum HashBuildPlan<'a, 'plan> {
     Reuse(HashBuildPayloadInfo),
-    Build(Box<PreparedHashBuild<'prog, 'ctx, 'plan, 'tab, 'pred>>),
+    Build(Box<PreparedHashBuild<'a, 'plan>>),
 }
 
-impl<'prog, 'ctx, 'plan, 'tab, 'pred> HashBuildPlanner<'prog, 'ctx, 'plan, 'tab, 'pred> {
+impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
     #[allow(clippy::too_many_arguments)]
     /// Capture the immutable inputs needed to decide whether to reuse or build.
     pub(super) const fn new(
-        program: &'prog mut ProgramBuilder,
-        t_ctx: &'ctx mut TranslateCtx<'plan>,
-        table_references: &'tab TableReferences,
-        non_from_clause_subqueries: &'pred [NonFromClauseSubquery],
-        predicates: &'pred [WhereTerm],
-        hash_join_op: &'pred HashJoinOp,
+        program: &'a mut ProgramBuilder,
+        t_ctx: &'a mut TranslateCtx<'plan>,
+        table_references: &'a TableReferences,
+        non_from_clause_subqueries: &'a [NonFromClauseSubquery],
+        predicates: &'a [WhereTerm],
+        hash_join_op: &'a HashJoinOp,
         hash_build_cursor_id: CursorID,
         hash_table_id: usize,
     ) -> Self {
@@ -99,7 +99,7 @@ impl<'prog, 'ctx, 'plan, 'tab, 'pred> HashBuildPlanner<'prog, 'ctx, 'plan, 'tab,
     }
 
     /// Decide whether the hash table can be reused or must be rebuilt.
-    pub(super) fn prepare(self) -> Result<HashBuildPlan<'prog, 'ctx, 'plan, 'tab, 'pred>> {
+    pub(super) fn prepare(self) -> Result<HashBuildPlan<'a, 'plan>> {
         let materialized_input = self
             .t_ctx
             .materialized_build_inputs
@@ -246,7 +246,7 @@ impl<'prog, 'ctx, 'plan, 'tab, 'pred> HashBuildPlanner<'prog, 'ctx, 'plan, 'tab,
     }
 }
 
-impl<'prog, 'ctx, 'plan, 'tab, 'pred> PreparedHashBuild<'prog, 'ctx, 'plan, 'tab, 'pred> {
+impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
     /// Emit the fresh hash build after planning has fixed its configuration.
     pub(super) fn emit(self) -> Result<HashBuildPayloadInfo> {
         let Self { planner, config } = self;
@@ -506,36 +506,36 @@ struct ProbeSetupState {
 ///
 /// Setup still runs in three ordered phases, but plain helper methods are enough:
 /// build or reuse the hash table, emit probe instructions, then install `HashCtx`.
-pub(super) struct HashProbeSetupEmitter<'prog, 'ctx, 'plan, 'tab, 'pred> {
-    program: &'prog mut ProgramBuilder,
-    t_ctx: &'ctx mut TranslateCtx<'plan>,
-    table_references: &'tab TableReferences,
-    subqueries: &'pred [NonFromClauseSubquery],
-    predicates: &'pred [WhereTerm],
-    hash_join_op: &'pred HashJoinOp,
-    mode: &'ctx OperationMode,
+pub(super) struct HashProbeSetupEmitter<'a, 'plan> {
+    program: &'a mut ProgramBuilder,
+    t_ctx: &'a mut TranslateCtx<'plan>,
+    table_references: &'a TableReferences,
+    subqueries: &'a [NonFromClauseSubquery],
+    predicates: &'a [WhereTerm],
+    hash_join_op: &'a HashJoinOp,
+    mode: &'a OperationMode,
     probe_cursor_id: CursorID,
     loop_start: BranchOffset,
     loop_end: BranchOffset,
     next: BranchOffset,
-    live_table_ids: &'pred HashSet<TableInternalId>,
+    live_table_ids: &'a HashSet<TableInternalId>,
 }
 
-impl<'prog, 'ctx, 'plan, 'tab, 'pred> HashProbeSetupEmitter<'prog, 'ctx, 'plan, 'tab, 'pred> {
+impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
     #[allow(clippy::too_many_arguments)]
     pub(super) const fn new(
-        program: &'prog mut ProgramBuilder,
-        t_ctx: &'ctx mut TranslateCtx<'plan>,
-        table_references: &'tab TableReferences,
-        subqueries: &'pred [NonFromClauseSubquery],
-        predicates: &'pred [WhereTerm],
-        hash_join_op: &'pred HashJoinOp,
-        mode: &'ctx OperationMode,
+        program: &'a mut ProgramBuilder,
+        t_ctx: &'a mut TranslateCtx<'plan>,
+        table_references: &'a TableReferences,
+        subqueries: &'a [NonFromClauseSubquery],
+        predicates: &'a [WhereTerm],
+        hash_join_op: &'a HashJoinOp,
+        mode: &'a OperationMode,
         probe_cursor_id: CursorID,
         loop_start: BranchOffset,
         loop_end: BranchOffset,
         next: BranchOffset,
-        live_table_ids: &'pred HashSet<TableInternalId>,
+        live_table_ids: &'a HashSet<TableInternalId>,
     ) -> Self {
         Self {
             program,
@@ -826,22 +826,22 @@ pub(super) struct HashProbeCloseOutcome {
 ///
 /// The teardown remains ordered: emit `HashNext`, optionally emit FULL OUTER
 /// unmatched probe rows, then return the probe-row advance state.
-pub(super) struct HashProbeCloseEmitter<'prog, 'ctx, 'plan, 'hash> {
-    program: &'prog mut ProgramBuilder,
-    t_ctx: &'ctx mut TranslateCtx<'plan>,
-    hash_join_op: &'hash HashJoinOp,
+pub(super) struct HashProbeCloseEmitter<'a, 'plan> {
+    program: &'a mut ProgramBuilder,
+    t_ctx: &'a mut TranslateCtx<'plan>,
+    hash_join_op: &'a HashJoinOp,
     hash_ctx: HashCtx,
     select_plan: Option<&'plan SelectPlan>,
     table_index: usize,
 }
 
-impl<'prog, 'ctx, 'plan, 'hash> HashProbeCloseEmitter<'prog, 'ctx, 'plan, 'hash> {
+impl<'a, 'plan> HashProbeCloseEmitter<'a, 'plan> {
     #[allow(clippy::too_many_arguments)]
     /// Capture the mutable close-loop inputs for a single hash probe table.
     pub(super) fn new(
-        program: &'prog mut ProgramBuilder,
-        t_ctx: &'ctx mut TranslateCtx<'plan>,
-        hash_join_op: &'hash HashJoinOp,
+        program: &'a mut ProgramBuilder,
+        t_ctx: &'a mut TranslateCtx<'plan>,
+        hash_join_op: &'a HashJoinOp,
         hash_ctx: HashCtx,
         select_plan: Option<&'plan SelectPlan>,
         table_index: usize,
