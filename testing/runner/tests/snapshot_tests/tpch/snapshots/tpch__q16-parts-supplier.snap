@@ -43,8 +43,8 @@ info:
 QUERY PLAN
 |--LIST SUBQUERY 1
 |  `--SCAN supplier
-|--SCAN part
-|--SEARCH partsupp USING INDEX sqlite_autoindex_partsupp_1 (ps_partkey=?)
+|--SCAN partsupp USING COVERING INDEX sqlite_autoindex_partsupp_1
+|--SEARCH part USING INTEGER PRIMARY KEY (rowid=?)
 |--USE SORTER FOR GROUP BY
 |--USE HASH TABLE FOR count(DISTINCT)
 `--USE SORTER FOR ORDER BY

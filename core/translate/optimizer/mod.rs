@@ -487,12 +487,56 @@ fn transform_match_to_fts_match(where_clause: &mut [WhereTerm]) {
     }
 }
 
+/// Rewrite `col IN (v1, v2, ..., vN)` to `col = v1 OR col = v2 OR ... OR col = vN`
+/// so that the existing MULTI-INDEX OR infrastructure can generate index seeks.
+/// Limited to 200 values — beyond that, the expression tree and N separate index seeks
+/// start to rival a full table scan. The optimizer's cost model decides whether
+/// MULTI-INDEX OR is actually cheaper than a scan for the given table size.
+fn transform_in_list_to_or_chain(where_clause: &mut [WhereTerm]) {
+    use super::expr::{walk_expr_mut, WalkControl};
+
+    const MAX_IN_LIST_REWRITE: usize = 200;
+
+    for term in where_clause.iter_mut() {
+        let _ = walk_expr_mut(&mut term.expr, &mut |e: &mut Expr| -> Result<WalkControl> {
+            match e {
+                Expr::InList { lhs, not, rhs }
+                    if !rhs.is_empty() && rhs.len() <= MAX_IN_LIST_REWRITE =>
+                {
+                    // Build: (lhs = v1) OR (lhs = v2) OR ... OR (lhs = vN)
+                    let mut or_chain: Option<Expr> = None;
+                    for val in rhs.drain(..) {
+                        let eq = Expr::Binary(lhs.clone(), ast::Operator::Equals, val);
+                        or_chain = Some(match or_chain {
+                            None => eq,
+                            Some(prev) => {
+                                Expr::Binary(Box::new(prev), ast::Operator::Or, Box::new(eq))
+                            }
+                        });
+                    }
+                    let or_expr = or_chain.unwrap();
+                    if *not {
+                        *e = Expr::Unary(ast::UnaryOperator::Not, Box::new(or_expr));
+                    } else {
+                        *e = or_expr;
+                    }
+                    Ok(WalkControl::Continue)
+                }
+                _ => Ok(WalkControl::Continue),
+            }
+        });
+    }
+}
+
 /**
  * Make a few passes over the plan to optimize it.
  * TODO: these could probably be done in less passes,
  * but having them separate makes them easier to understand
  */
 pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
+    // Rewrite small IN lists to OR chains before other optimizations
+    transform_in_list_to_or_chain(&mut plan.where_clause);
+
     // Transform MATCH expressions to fts_match() for FTS optimizer recognition
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause);
