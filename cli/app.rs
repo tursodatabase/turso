@@ -529,31 +529,30 @@ impl Limbo {
         let conn = self.conn.clone();
         let runner = conn.query_runner(input.as_bytes());
         let had_error_before = self.had_query_error;
-        for output in runner {
+        let capture_stats = self.opts.stats;
+        let mut last_stmt_metrics = None;
+        for mut output in runner {
             if self
-                .print_query_result(input, output, stats.as_mut())
+                .print_query_result(input, &mut output, stats.as_mut())
                 .is_err()
                 || self.had_query_error != had_error_before
             {
                 self.had_query_error = true;
                 break;
             }
+            // Capture metrics after stepping, before the Statement is dropped
+            if capture_stats {
+                if let Ok(Some(ref stmt)) = output {
+                    last_stmt_metrics = Some(stmt.metrics().clone());
+                }
+            }
         }
 
         self.print_query_performance_stats(start, stats.as_ref());
 
         // Display stats if enabled
-        if self.opts.stats {
-            let stats_output = {
-                let metrics = self.conn.metrics.read();
-                metrics
-                    .last_statement
-                    .as_ref()
-                    .map(|last| format!("\n{last}"))
-            };
-            if let Some(output) = stats_output {
-                let _ = self.writeln(output);
-            }
+        if let Some(ref last) = last_stmt_metrics {
+            let _ = self.writeln(format!("\n{last}"));
         }
     }
 
@@ -828,7 +827,7 @@ impl Limbo {
     fn print_query_result(
         &mut self,
         sql: &str,
-        mut output: Result<Option<Statement>, LimboError>,
+        output: &mut Result<Option<Statement>, LimboError>,
         statistics: Option<&mut QueryStatistics>,
     ) -> anyhow::Result<()> {
         match output {
@@ -856,12 +855,13 @@ impl Limbo {
             }
             Ok(None) => {}
 
-            Err(err) => {
+            Err(ref err) => {
                 match err {
                     LimboError::Busy => {}
                     LimboError::Interrupt => {}
                     _ => {
-                        let report = miette::Error::from(err).with_source_code(sql.to_owned());
+                        let report =
+                            miette::Error::from(err.clone()).with_source_code(sql.to_owned());
                         let _ = self.writeln_fmt(format_args!("{report:?}"));
                     }
                 }
