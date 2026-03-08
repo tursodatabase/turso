@@ -163,3 +163,66 @@ snapshot-eqp order-by-index-with-range {
     WHERE price BETWEEN 10 AND 100
     ORDER BY price;
 }
+
+# =============================================================================
+# Composite index sort elimination edge cases
+# =============================================================================
+
+setup sort_elim {
+    CREATE TABLE articles (
+        id INTEGER PRIMARY KEY,
+        status TEXT NOT NULL,
+        category TEXT NOT NULL,
+        published_at TEXT NOT NULL,
+        title TEXT NOT NULL
+    );
+    -- 3-column composite index for prefix skip tests
+    CREATE INDEX idx_articles_status_cat_pub ON articles(status, category, published_at DESC);
+}
+
+# Equality on prefix, ORDER BY on suffix — sort should be eliminated
+@setup sort_elim
+snapshot-eqp sort-elim-eq-prefix-order-suffix {
+    SELECT * FROM articles
+    WHERE status = 'published'
+    ORDER BY category, published_at DESC;
+}
+
+# Equality on full prefix, ORDER BY on last column — sort eliminated
+@setup sort_elim
+snapshot-eqp sort-elim-two-eq-order-last {
+    SELECT * FROM articles
+    WHERE status = 'published' AND category = 'tech'
+    ORDER BY published_at DESC;
+}
+
+# ORDER BY eq column with DESC — direction irrelevant for constant, sort eliminated
+@setup sort_elim
+snapshot-eqp sort-elim-eq-col-desc-direction {
+    SELECT * FROM articles
+    WHERE status = 'published'
+    ORDER BY status DESC, category, published_at DESC;
+}
+
+# All index columns eq-constrained, ORDER BY on non-index column — needs sorter
+@setup sort_elim
+snapshot-eqp sort-elim-all-eq-order-non-index {
+    SELECT * FROM articles
+    WHERE status = 'published' AND category = 'tech' AND published_at = '2024-01-01'
+    ORDER BY title;
+}
+
+# No equality prefix — ORDER BY on non-leading column needs sorter
+@setup sort_elim
+snapshot-eqp sort-elim-no-eq-order-non-leading {
+    SELECT * FROM articles
+    ORDER BY published_at DESC;
+}
+
+# Range constraint on prefix — cannot skip, sorter needed
+@setup sort_elim
+snapshot-eqp sort-elim-range-prefix-order-suffix {
+    SELECT * FROM articles
+    WHERE status > 'draft'
+    ORDER BY category;
+}
