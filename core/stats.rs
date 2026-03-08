@@ -96,7 +96,7 @@ pub fn gather_sqlite_stat1(
     mv_tx: Option<(u64, TransactionMode)>,
 ) -> Result<AnalyzeStats> {
     let mut stats = AnalyzeStats::default();
-    let mut stmt = conn.prepare(STATS_QUERY)?;
+    let mut stmt = conn.prepare_no_schema_check(STATS_QUERY)?;
     stmt.set_mv_tx(mv_tx);
     load_sqlite_stat1_from_stmt(stmt, schema, &mut stats)?;
     Ok(stats)
@@ -130,7 +130,7 @@ fn load_sqlite_stat1_from_stmt(
     schema: &Schema,
     stats: &mut AnalyzeStats,
 ) -> Result<()> {
-    stmt.run_with_row_callback(|row| {
+    stmt.run_with_row_callback_no_reprepare(|row| {
         let table_name = row.get::<&str>(0)?;
         let idx_value = row.get::<&Value>(1)?;
         let stat_value = row.get::<&Value>(2)?;

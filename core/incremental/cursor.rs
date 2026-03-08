@@ -394,7 +394,9 @@ mod tests {
                 enable_index_method: false,
                 enable_autovacuum: false,
                 enable_attach: false,
+                enable_shared_access: false,
                 unsafe_testing: false,
+                locking_mode: Default::default(),
             },
             None,
         )?;
