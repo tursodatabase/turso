@@ -581,7 +581,7 @@ impl<'prog, 'ctx, 'plan, 'tab, 'pred> HashProbeSetupEmitter<'prog, 'ctx, 'plan, 
             .expect("Hash join build table must be a BTree table");
         let hash_build_cursor_id = self.program.alloc_cursor_id_keyed_if_not_exists(
             CursorKey::hash_build(build_table.internal_id),
-            CursorType::BTreeTable(btree.clone()),
+            CursorType::BTreeTable(btree),
         );
         let payload_info = match HashBuildPlanner::new(
             self.program,
