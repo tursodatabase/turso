@@ -257,6 +257,7 @@ pub fn translate_create_view(
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }
+    ensure_no_cross_db_view_references(select_stmt, database_id, resolver)?;
     let normalized_view_name = normalize_ident(view_name.name.as_str());
 
     // Check for name conflicts with existing schema objects
@@ -343,6 +344,69 @@ fn create_view_to_str(
         return format!("CREATE VIEW {view_name} ({columns_str}) AS {select_stmt}");
     }
     format!("CREATE VIEW {view_name} AS {select_stmt}")
+}
+
+fn ensure_no_cross_db_view_references(
+    select_stmt: &ast::Select,
+    view_database_id: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let view_db_name = resolver
+        .get_database_name_by_index(view_database_id)
+        .unwrap_or_else(|| "main".to_string());
+
+    fn check_qualified_name(name: &ast::QualifiedName, view_db_name: &str) -> Result<()> {
+        if let Some(db_name) = &name.db_name {
+            let referenced_db = crate::util::normalize_ident(db_name.as_str());
+            if referenced_db != view_db_name {
+                crate::bail_parse_error!("cross-database views are not supported");
+            }
+        }
+        Ok(())
+    }
+
+    fn check_table(table: &ast::SelectTable, view_db_name: &str) -> Result<()> {
+        match table {
+            ast::SelectTable::Table(name, _, _) | ast::SelectTable::TableCall(name, _, _) => {
+                check_qualified_name(name, view_db_name)
+            }
+            ast::SelectTable::Select(select, _) => check_select(select, view_db_name),
+            ast::SelectTable::Sub(from, _) => check_from_clause(from, view_db_name),
+        }
+    }
+
+    fn check_from_clause(from: &ast::FromClause, view_db_name: &str) -> Result<()> {
+        check_table(&from.select, view_db_name)?;
+        for join in &from.joins {
+            check_table(&join.table, view_db_name)?;
+        }
+        Ok(())
+    }
+
+    fn check_one_select(one_select: &ast::OneSelect, view_db_name: &str) -> Result<()> {
+        if let ast::OneSelect::Select { from, .. } = one_select {
+            if let Some(from_clause) = from {
+                check_from_clause(from_clause, view_db_name)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn check_select(select: &ast::Select, view_db_name: &str) -> Result<()> {
+        if let Some(with) = &select.with {
+            for cte in &with.ctes {
+                check_select(&cte.select, view_db_name)?;
+            }
+        }
+
+        check_one_select(&select.body.select, view_db_name)?;
+        for compound in &select.body.compounds {
+            check_one_select(&compound.select, view_db_name)?;
+        }
+        Ok(())
+    }
+
+    check_select(select_stmt, &view_db_name)
 }
 
 pub fn translate_drop_view(

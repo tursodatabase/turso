@@ -1,5 +1,32 @@
 use crate::common::TempDatabase;
 
+#[turso_macros::test]
+fn test_reject_cross_db_view_definition(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    let aux_path = tmp_db
+        .path
+        .parent()
+        .unwrap()
+        .join("aux_cross_db_view.db")
+        .to_string_lossy()
+        .to_string();
+
+    conn.execute(format!("ATTACH '{aux_path}' AS aux"))?;
+    conn.execute("CREATE TABLE aux.t1 (x INTEGER)")?;
+
+    let err = conn
+        .execute("CREATE VIEW v AS SELECT x FROM aux.t1")
+        .expect_err("cross-db view should be rejected");
+    assert!(
+        err.to_string()
+            .contains("cross-database views are not supported"),
+        "unexpected error: {err}"
+    );
+
+    Ok(())
+}
+
 #[turso_macros::test(init_sql = "CREATE TABLE t (a, b);")]
 fn test_fail_drop_indexed_column(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
