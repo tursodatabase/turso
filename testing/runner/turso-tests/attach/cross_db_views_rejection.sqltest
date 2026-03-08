@@ -1,0 +1,121 @@
+@database :memory:
+
+test cross-db-view-rejected-join {
+    CREATE TABLE main_table (id INTEGER, value TEXT);
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.other_table (id INTEGER, data TEXT);
+    CREATE VIEW join_view AS SELECT m.value, a.data FROM main_table m JOIN aux.other_table a ON m.id = a.id;
+}
+expect error {
+    view cannot reference table in attached database: aux.other_table
+}
+
+test cross-db-view-rejected-subquery {
+    CREATE TABLE items (id INTEGER, category_id INTEGER);
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.categories (id INTEGER, name TEXT);
+    CREATE VIEW filtered_items AS SELECT * FROM items WHERE category_id IN (SELECT id FROM aux.categories WHERE name = 'electronics');
+}
+expect error {
+    view cannot reference table in attached database: aux.categories
+}
+
+test cross-db-view-rejected-exists {
+    CREATE TABLE logs (id INTEGER, ref_id INTEGER);
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.refs (id INTEGER);
+    CREATE VIEW filtered_logs AS SELECT * FROM logs WHERE EXISTS (SELECT 1 FROM aux.refs WHERE aux.refs.id = logs.ref_id);
+}
+expect error {
+    view cannot reference table in attached database: aux.refs
+}
+
+test cross-db-view-rejected-union {
+    CREATE TABLE main_events (id INTEGER, type TEXT);
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.archive_events (id INTEGER, type TEXT);
+    CREATE VIEW all_events AS SELECT id, type FROM main_events UNION SELECT id, type FROM aux.archive_events;
+}
+expect error {
+    view cannot reference table in attached database: aux.archive_events
+}
+
+test cross-db-view-rejected-with-cte {
+    CREATE TABLE sales (id INTEGER, amount REAL);
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.products (id INTEGER, name TEXT);
+    CREATE VIEW sales_with_names AS 
+        WITH product_names AS (SELECT id, name FROM aux.products)
+        SELECT s.id, s.amount, p.name 
+        FROM sales s 
+        JOIN product_names p ON s.id = p.id;
+}
+expect error {
+    view cannot reference table in attached database: aux.products
+}
+
+test cross-db-view-rejected-attached-referencing-main {
+    CREATE TABLE main_data (id INTEGER, value TEXT);
+    ATTACH ':memory:' AS aux;
+    CREATE VIEW aux.cross_view AS SELECT * FROM main.main_data;
+}
+expect error {
+    view cannot reference table in attached database: main.main_data
+}
+
+test cross-db-materialized-view-rejected {
+    CREATE TABLE inventory (id INTEGER, stock INTEGER);
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.suppliers (id INTEGER, name TEXT);
+    CREATE MATERIALIZED VIEW stock_info AS 
+        SELECT i.id, i.stock, s.name 
+        FROM inventory i 
+        JOIN aux.suppliers s ON i.id = s.id;
+}
+expect error {
+    view cannot reference table in attached database: aux.suppliers
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test same-db-view-works-main {
+    CREATE TABLE users (id INTEGER, name TEXT);
+    CREATE TABLE orders (id INTEGER, user_id INTEGER, total REAL);
+    INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');
+    INSERT INTO orders VALUES (1, 1, 100.0), (2, 2, 200.0);
+    CREATE VIEW user_orders AS SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id;
+    SELECT * FROM user_orders ORDER BY name;
+}
+expect {
+    Alice|100.0
+    Bob|200.0
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test same-db-view-works-main-qualified {
+    CREATE TABLE users (id INTEGER, name TEXT);
+    INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');
+    CREATE VIEW qualified_main_users AS SELECT id, name FROM main.users;
+    SELECT * FROM qualified_main_users ORDER BY id;
+}
+expect {
+    1|Alice
+    2|Bob
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test same-db-view-works-attached {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.products (id INTEGER, name TEXT, price REAL);
+    CREATE TABLE aux.discounts (product_id INTEGER, percent REAL);
+    INSERT INTO aux.products VALUES (1, 'Widget', 10.0), (2, 'Gadget', 20.0);
+    INSERT INTO aux.discounts VALUES (1, 0.1), (2, 0.2);
+    CREATE VIEW aux.discounted_products AS 
+        SELECT p.name, (p.price * (1 - d.percent)) as final_price 
+        FROM aux.products p 
+        JOIN aux.discounts d ON p.id = d.product_id;
+    SELECT * FROM aux.discounted_products ORDER BY name;
+}
+expect {
+    Gadget|16.0
+    Widget|9.0
+}
