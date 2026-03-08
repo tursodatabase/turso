@@ -36,6 +36,15 @@ pub fn translate_create_materialized_view(
     }
 
     let normalized_view_name = normalize_ident(view_name.name.as_str());
+    if RESERVED_TABLE_PREFIXES
+        .iter()
+        .any(|prefix| normalized_view_name.starts_with(prefix))
+    {
+        bail_parse_error!(
+            "Object name reserved for internal use: {}",
+            view_name.name.as_str()
+        );
+    }
 
     // Check if view already exists
     if resolver.with_schema(database_id, |s| {

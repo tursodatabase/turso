@@ -2500,3 +2500,11 @@ expect {
     4|60
 }
 
+test matview-reserved-prefix-sqlite {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1);
+    CREATE MATERIALIZED VIEW sqlite_matview AS SELECT * FROM t;
+}
+expect error {
+    object name reserved for internal use: sqlite_matview
+}
