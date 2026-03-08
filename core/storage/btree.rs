@@ -44,7 +44,8 @@ use crate::{
     numeric::Numeric,
     return_corrupt, return_if_io,
     types::{
-        compare_immutable, AsValueRef, IOResult, ImmutableRecord, SeekKey, SeekOp, Value, ValueRef,
+        compare_immutable_iter, AsValueRef, IOResult, ImmutableRecord, SeekKey, SeekOp, Value,
+        ValueRef,
     },
     LimboError, Result,
 };
@@ -2201,7 +2202,6 @@ impl BTreeCursor {
         let record = bkey
             .get_record()
             .expect("expected record present on insert");
-        let record_values = record.get_values()?;
         if let CursorState::None = &self.state {
             self.state = CursorState::Write(WriteState::Start);
         }
@@ -2245,14 +2245,14 @@ impl BTreeCursor {
                             }
                             BTreeCell::IndexLeafCell(..) | BTreeCell::IndexInteriorCell(..) => {
                                 return_if_io!(self.record());
-                                let cmp = compare_immutable(
-                                    record_values.as_slice(),
+                                let cmp = compare_immutable_iter(
+                                    record.iter()?,
                                     self.get_immutable_record()
                                         .as_ref()
                                         .unwrap()
-                                        .get_values()?.as_slice(),
+                                        .iter()?,
                                         &self.index_info.as_ref().unwrap().key_info,
-                                );
+                                )?;
                                 if cmp == Ordering::Equal {
                                     tracing::debug!("IndexLeafCell: found exact match with cell_idx={cell_idx}, overwriting");
                                     self.set_has_record(true);
@@ -2283,7 +2283,9 @@ impl BTreeCursor {
                     let mut payload = std::mem::take(&mut self.reusable_cell_payload);
                     payload.clear();
                     // Reserve capacity if needed (typical cell is small)
-                    let needed_capacity = record_values.len() + 4;
+                    // child pointer (4) + payload size varint (up to 9) + rowid varint (up to 9)
+                    const MAX_CELL_HEADER: usize = 22;
+                    let needed_capacity = record.get_payload().len() + MAX_CELL_HEADER;
                     if payload.capacity() < needed_capacity {
                         payload.reserve(needed_capacity - payload.capacity());
                     }

@@ -12414,7 +12414,7 @@ pub fn op_vacuum_into(
     match op_vacuum_into_inner(program, state, insn) {
         Ok(InsnFunctionStepResult::Step) => {
             // Instruction complete, reset state
-            state.op_vacuum_into_state = OpVacuumIntoState::default();
+            state.op_vacuum_into_state = None;
             Ok(InsnFunctionStepResult::Step)
         }
         Ok(InsnFunctionStepResult::IO(io)) => {
@@ -12426,7 +12426,7 @@ pub fn op_vacuum_into(
         }
         Err(err) => {
             // Reset state on error
-            state.op_vacuum_into_state = OpVacuumIntoState::default();
+            state.op_vacuum_into_state = None;
             Err(err)
         }
     }
@@ -12439,7 +12439,9 @@ fn op_vacuum_into_inner(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(VacuumInto { dest_path }, insn);
 
-    let vacuum_state = &mut state.op_vacuum_into_state;
+    let vacuum_state = state
+        .op_vacuum_into_state
+        .get_or_insert_with(OpVacuumIntoState::default);
 
     loop {
         let current_sub_state = std::mem::take(&mut vacuum_state.sub_state);

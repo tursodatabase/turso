@@ -17,6 +17,7 @@
 //!
 //! https://www.sqlite.org/opcode.html
 
+use crate::types::Extendable;
 use crate::{turso_assert, turso_assert_ne, turso_debug_assert, HashSet};
 pub mod affinity;
 pub mod bloom_filter;
@@ -348,7 +349,7 @@ pub struct ProgramState {
     /// Indicate whether an [Insn::Once] instruction at a given program counter position has already been executed, well, once.
     once: SmallVec<[u32; 4]>,
     pub execution_state: ProgramExecutionState,
-    pub parameters: HashMap<NonZero<usize>, Value>,
+    pub parameters: Vec<Value>,
     commit_state: CommitState,
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
@@ -371,7 +372,7 @@ pub struct ProgramState {
     op_row_id_state: OpRowIdState,
     op_transaction_state: OpTransactionState,
     op_journal_mode_state: OpJournalModeState,
-    op_vacuum_into_state: OpVacuumIntoState,
+    op_vacuum_into_state: Option<OpVacuumIntoState>,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
@@ -444,7 +445,7 @@ impl ProgramState {
             ended_coroutine: vec![],
             once: SmallVec::<[u32; 4]>::new(),
             execution_state: ProgramExecutionState::Init,
-            parameters: HashMap::default(),
+            parameters: Vec::new(),
             commit_state: CommitState::Ready,
             #[cfg(feature = "json")]
             json_cache: JsonCacheCell::new(),
@@ -475,7 +476,7 @@ impl ProgramState {
             op_row_id_state: OpRowIdState::Start,
             op_transaction_state: OpTransactionState::Start,
             op_journal_mode_state: OpJournalModeState::default(),
-            op_vacuum_into_state: OpVacuumIntoState::default(),
+            op_vacuum_into_state: None,
             view_delta_state: ViewDeltaCommitState::NotStarted,
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
@@ -513,7 +514,23 @@ impl ProgramState {
     }
 
     pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) {
-        self.parameters.insert(index, value);
+        let i = index.get() - 1;
+        if i >= self.parameters.len() {
+            self.parameters.resize(i + 1, Value::Null);
+        }
+        let slot = &mut self.parameters[i];
+        match (slot, value) {
+            (Value::Null, Value::Null) => {}
+            (Value::Numeric(Numeric::Integer(existing)), Value::Numeric(Numeric::Integer(new))) => {
+                *existing = new
+            }
+            (Value::Numeric(Numeric::Float(existing)), Value::Numeric(Numeric::Float(new))) => {
+                *existing = new
+            }
+            (Value::Text(existing), Value::Text(new)) => existing.do_extend(&new),
+            (Value::Blob(existing), Value::Blob(new)) => existing.do_extend(&new),
+            (slot, value) => *slot = value,
+        }
     }
 
     pub fn clear_bindings(&mut self) {
@@ -521,7 +538,8 @@ impl ProgramState {
     }
 
     pub fn get_parameter(&self, index: NonZero<usize>) -> Value {
-        self.parameters.get(&index).cloned().unwrap_or(Value::Null)
+        let i = index.get() - 1;
+        self.parameters.get(i).cloned().unwrap_or(Value::Null)
     }
 
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
@@ -545,9 +563,12 @@ impl ProgramState {
         self.cursors.iter_mut().for_each(|c| {
             let _ = c.take();
         });
-        self.registers
-            .iter_mut()
-            .for_each(|r| *r = Register::Value(Value::Null));
+        for r in self.registers.iter_mut() {
+            match r {
+                Register::Value(v) => *v = Value::Null,
+                _ => *r = Register::Value(Value::Null),
+            }
+        }
         self.last_compare = None;
         self.deferred_seeks.iter_mut().for_each(|s| *s = None);
         self.ended_coroutine.clear();
@@ -583,7 +604,7 @@ impl ProgramState {
         self.op_program_state = OpProgramState::Start;
         self.op_transaction_state = OpTransactionState::Start;
         self.op_journal_mode_state = OpJournalModeState::default();
-        self.op_vacuum_into_state = OpVacuumIntoState::default();
+        self.op_vacuum_into_state = None;
         self.view_delta_state = ViewDeltaCommitState::NotStarted;
         self.auto_txn_cleanup = TxnCleanup::None;
         self.fk_immediate_violations_during_stmt
