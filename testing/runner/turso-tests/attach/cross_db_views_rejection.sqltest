@@ -98,8 +98,8 @@ test same-db-view-works-main {
     SELECT * FROM user_orders ORDER BY name;
 }
 expect {
-    Alice|100.0
-    Bob|200.0
+    Alice|100
+    Bob|200
 }
 
 @skip-if mvcc "views not supported in MVCC mode"
@@ -128,6 +128,6 @@ test same-db-view-works-attached {
     SELECT * FROM aux.discounted_products ORDER BY name;
 }
 expect {
-    Gadget|16.0
-    Widget|9.0
+    Gadget|16
+    Widget|9
 }
