@@ -373,7 +373,7 @@ pub struct ProgramState {
     op_row_id_state: OpRowIdState,
     op_transaction_state: OpTransactionState,
     op_journal_mode_state: OpJournalModeState,
-    op_vacuum_into_state: OpVacuumIntoState,
+    op_vacuum_into_state: Option<OpVacuumIntoState>,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
@@ -477,7 +477,7 @@ impl ProgramState {
             op_row_id_state: OpRowIdState::Start,
             op_transaction_state: OpTransactionState::Start,
             op_journal_mode_state: OpJournalModeState::default(),
-            op_vacuum_into_state: OpVacuumIntoState::default(),
+            op_vacuum_into_state: None,
             view_delta_state: ViewDeltaCommitState::NotStarted,
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
@@ -593,7 +593,7 @@ impl ProgramState {
         self.op_program_state = OpProgramState::Start;
         self.op_transaction_state = OpTransactionState::Start;
         self.op_journal_mode_state = OpJournalModeState::default();
-        self.op_vacuum_into_state = OpVacuumIntoState::default();
+        self.op_vacuum_into_state = None;
         self.view_delta_state = ViewDeltaCommitState::NotStarted;
         self.auto_txn_cleanup = TxnCleanup::None;
         self.fk_immediate_violations_during_stmt
