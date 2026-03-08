@@ -107,6 +107,8 @@ fn emit_toplevel_values(
     program.emit_insn(Insn::Yield {
         yield_reg,
         end_offset: end_label,
+        subtype_clear_start_reg: 0,
+        subtype_clear_count: 0,
     });
 
     let goto_label = program.allocate_label();
@@ -162,6 +164,8 @@ fn emit_values_in_subquery(
         program.emit_insn(Insn::Yield {
             yield_reg,
             end_offset: BranchOffset::Offset(0),
+            subtype_clear_start_reg: start_reg,
+            subtype_clear_count: row_len,
         });
     }
 
@@ -193,6 +197,8 @@ fn emit_values_to_destination(
             program.emit_insn(Insn::Yield {
                 yield_reg: *yield_reg,
                 end_offset: BranchOffset::Offset(0),
+                subtype_clear_start_reg: start_reg,
+                subtype_clear_count: row_len,
             });
         }
         QueryDestination::EphemeralIndex { .. } => {
