@@ -1,0 +1,206 @@
+# Composite index sort elimination — data correctness tests
+# Verifies that rows come out in the correct order when the optimizer
+# eliminates a sort by recognizing that equality-constrained prefix
+# columns of a composite index make the remaining columns already sorted.
+
+@database :memory:
+
+setup schema {
+    CREATE TABLE articles (
+        id INTEGER PRIMARY KEY,
+        status TEXT NOT NULL,
+        category TEXT NOT NULL,
+        published_at TEXT NOT NULL,
+        title TEXT NOT NULL
+    );
+    CREATE INDEX idx_articles_scp ON articles(status, category, published_at DESC);
+
+    -- Insert rows in deliberately non-sorted order so that a missing sort
+    -- would surface as wrong row order.
+    INSERT INTO articles VALUES (1, 'published', 'tech',    '2024-01-15', 'Alpha');
+    INSERT INTO articles VALUES (2, 'published', 'art',     '2024-03-01', 'Beta');
+    INSERT INTO articles VALUES (3, 'published', 'tech',    '2024-06-10', 'Gamma');
+    INSERT INTO articles VALUES (4, 'draft',     'tech',    '2024-02-20', 'Delta');
+    INSERT INTO articles VALUES (5, 'published', 'art',     '2024-01-05', 'Epsilon');
+    INSERT INTO articles VALUES (6, 'published', 'science', '2024-04-12', 'Zeta');
+    INSERT INTO articles VALUES (7, 'draft',     'art',     '2024-05-30', 'Eta');
+    INSERT INTO articles VALUES (8, 'published', 'tech',    '2024-03-22', 'Theta');
+    INSERT INTO articles VALUES (9, 'published', 'science', '2024-07-01', 'Iota');
+    INSERT INTO articles VALUES (10,'published', 'art',     '2024-06-15', 'Kappa');
+}
+
+# Eq on first column, ORDER BY remaining two columns.
+# Index (status, category, published_at DESC) with status='published'
+# should give category ASC, then published_at DESC within each category.
+@setup schema
+test eq-prefix-order-suffix {
+    SELECT id, category, published_at FROM articles
+    WHERE status = 'published'
+    ORDER BY category, published_at DESC;
+}
+expect {
+    10|art|2024-06-15
+    2|art|2024-03-01
+    5|art|2024-01-05
+    9|science|2024-07-01
+    6|science|2024-04-12
+    3|tech|2024-06-10
+    8|tech|2024-03-22
+    1|tech|2024-01-15
+}
+
+# Eq on two prefix columns, ORDER BY last column.
+@setup schema
+test two-eq-order-last {
+    SELECT id, published_at FROM articles
+    WHERE status = 'published' AND category = 'tech'
+    ORDER BY published_at DESC;
+}
+expect {
+    3|2024-06-10
+    8|2024-03-22
+    1|2024-01-15
+}
+
+# Eq on first column, ORDER BY includes the eq column itself (with opposite direction).
+# Since status is constant, its direction is irrelevant.
+@setup schema
+test eq-col-in-order-by-desc {
+    SELECT id, status, category, published_at FROM articles
+    WHERE status = 'published'
+    ORDER BY status DESC, category, published_at DESC;
+}
+expect {
+    10|published|art|2024-06-15
+    2|published|art|2024-03-01
+    5|published|art|2024-01-05
+    9|published|science|2024-07-01
+    6|published|science|2024-04-12
+    3|published|tech|2024-06-10
+    8|published|tech|2024-03-22
+    1|published|tech|2024-01-15
+}
+
+# Eq on first column with LIMIT — verify LIMIT interacts correctly.
+@setup schema
+test eq-prefix-order-suffix-limit {
+    SELECT id, category, published_at FROM articles
+    WHERE status = 'published'
+    ORDER BY category, published_at DESC
+    LIMIT 3;
+}
+expect {
+    10|art|2024-06-15
+    2|art|2024-03-01
+    5|art|2024-01-05
+}
+
+# Eq on first column with LIMIT and OFFSET.
+@setup schema
+test eq-prefix-order-suffix-limit-offset {
+    SELECT id, category, published_at FROM articles
+    WHERE status = 'published'
+    ORDER BY category, published_at DESC
+    LIMIT 2 OFFSET 3;
+}
+expect {
+    9|science|2024-07-01
+    6|science|2024-04-12
+}
+
+# Eq prefix but ORDER BY suffix with WRONG direction (ASC vs index DESC).
+# Index has published_at DESC, so requesting ASC needs a sorter.
+@setup schema
+test eq-prefix-wrong-direction {
+    SELECT id, category, published_at FROM articles
+    WHERE status = 'published'
+    ORDER BY category, published_at ASC;
+}
+expect {
+    5|art|2024-01-05
+    2|art|2024-03-01
+    10|art|2024-06-15
+    6|science|2024-04-12
+    9|science|2024-07-01
+    1|tech|2024-01-15
+    8|tech|2024-03-22
+    3|tech|2024-06-10
+}
+
+# All index columns eq-constrained, ORDER BY on non-index column (title).
+# Sort must NOT be eliminated — a sorter is needed.
+@setup schema
+test all-eq-order-non-index {
+    SELECT id, title FROM articles
+    WHERE status = 'published' AND category = 'tech' AND published_at = '2024-03-22'
+    ORDER BY title;
+}
+expect {
+    8|Theta
+}
+
+# No equality constraint — ORDER BY on non-leading index column needs sort.
+@setup schema
+test no-eq-full-scan-order {
+    SELECT id, published_at FROM articles
+    ORDER BY published_at DESC;
+}
+expect {
+    9|2024-07-01
+    10|2024-06-15
+    3|2024-06-10
+    7|2024-05-30
+    6|2024-04-12
+    8|2024-03-22
+    2|2024-03-01
+    4|2024-02-20
+    1|2024-01-15
+    5|2024-01-05
+}
+
+# Range constraint on prefix — sort should NOT be eliminated.
+@setup schema
+test range-prefix-order-suffix {
+    SELECT id, status, category FROM articles
+    WHERE status >= 'draft' AND status <= 'published'
+    ORDER BY category, id;
+}
+expect {
+    2|published|art
+    5|published|art
+    7|draft|art
+    10|published|art
+    6|published|science
+    9|published|science
+    1|published|tech
+    3|published|tech
+    4|draft|tech
+    8|published|tech
+}
+
+# GROUP BY with eq prefix — the grouping should be correct.
+@setup schema
+test group-by-eq-prefix {
+    SELECT category, COUNT(*), MAX(published_at) FROM articles
+    WHERE status = 'published'
+    GROUP BY category;
+}
+expect {
+    art|3|2024-06-15
+    science|2|2024-07-01
+    tech|3|2024-06-10
+}
+
+# Two-column eq prefix, GROUP BY last column.
+@setup schema
+test group-by-two-eq-prefix {
+    SELECT published_at, COUNT(*) FROM articles
+    WHERE status = 'published' AND category = 'tech'
+    GROUP BY published_at
+    ORDER BY published_at DESC;
+}
+expect {
+    2024-06-10|1
+    2024-03-22|1
+    2024-01-15|1
+}
