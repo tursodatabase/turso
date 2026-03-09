@@ -52,9 +52,9 @@ addr  opcode                  p1  p2  p3  p4                  p5  comment
    1            Once          27   0   0                       0  goto 27
    2            BeginSubrtn    2   0   0                       0  r[2]=NULL
    3            Null           0   1   0                       0  r[1]=NULL
-   4            Null           0   4   0                       0  r[4]=NULL
-   5            Integer        1   5   0                       0  r[5]=1; LIMIT counter
-   6            IfNot          5  22   0                       0  if !r[5] goto 22
+   4            Null           0   5   0                       0  r[5]=NULL
+   5            Integer        1   4   0                       0  r[4]=1; LIMIT counter
+   6            IfNot          4  22   0                       0  if !r[4] goto 22
    7            OpenRead       0   6   0  k(6,B,B,B,B,B)       0  table=partsupp, root=6, iDb=0
    8            OpenRead       1   5   0  k(7,B,B,B,B,B,B,B)   0  table=supplier, root=5, iDb=0
    9            OpenRead       2   2   0  k(4,B,B,B,B)         0  table=nation, root=2, iDb=0
@@ -68,10 +68,10 @@ addr  opcode                  p1  p2  p3  p4                  p5  comment
   17              Column       0   3  12                       0  r[12]=partsupp.ps_supplycost
   18              Column       0   2  13                       0  r[13]=partsupp.ps_availqty
   19              Multiply    12  13  11                       0  r[11]=r[12]*r[13]
-  20              AggStep      0  11   4  sum                  0  accum=r[4] step(r[11])
+  20              AggStep      0  11   5  sum                  0  accum=r[5] step(r[11])
   21            Next           0  11   0                       0
-  22            AggFinal       0   4   0  sum                  0  accum=r[4]
-  23            Copy           4  14   0                       0  r[14]=r[4]
+  22            AggFinal       0   5   0  sum                  0  accum=r[5]
+  23            Copy           5  14   0                       0  r[14]=r[5]
   24            Multiply      14  15   3                       0  r[3]=r[14]*r[15]
   25            Copy           3   1   0                       0  r[1]=r[3]
   26          Return           2   0   1                       0
