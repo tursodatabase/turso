@@ -579,7 +579,15 @@ impl Database {
         }
         let file = io.open_file(path, flags, true)?;
         let db_file = Arc::new(DatabaseFile::new(file));
-        Self::open_with_flags(io, path, db_file, flags, opts, encryption_opts, durable_storage)
+        Self::open_with_flags(
+            io,
+            path,
+            db_file,
+            flags,
+            opts,
+            encryption_opts,
+            durable_storage,
+        )
     }
 
     pub fn open(
