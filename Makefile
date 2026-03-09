@@ -99,7 +99,8 @@ reset-db:
 .PHONY: reset-db
 
 test-fuzz:
-	RUST_LOG=$(RUST_LOG) cargo test -p core_tester --release -- fuzz 
+	RUST_LOG=$(RUST_LOG) cargo test -p core_tester --release -- fuzz
+	RUST_LOG=$(RUST_LOG) cargo run -p differential-fuzzer --bin custom_types_fuzzer -- --seed $(or $(SEED), $$(date +%s)) -n $(or $(N),200) -t $(or $(TABLES),2)
 .PHONY: test-fuzz
 
 test-sqlite3: reset-db
