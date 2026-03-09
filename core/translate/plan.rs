@@ -544,33 +544,16 @@ impl SelectPlan {
         if !matches!(table_ref.table, crate::schema::Table::BTree(..)) {
             return false;
         }
-        let agg = self.aggregates.first().unwrap();
-        if !matches!(agg.func, AggFunc::Count0) {
-            return false;
-        }
-
-        let count = ast::Expr::FunctionCall {
-            name: ast::Name::exact("count".to_string()),
-            distinctness: None,
-            args: vec![],
-            order_by: vec![],
-            filter_over: ast::FunctionTail {
-                filter_clause: None,
-                over_clause: None,
-            },
-        };
-        let count_star = ast::Expr::FunctionCallStar {
-            name: ast::Name::exact("count".to_string()),
-            filter_over: ast::FunctionTail {
-                filter_clause: None,
-                over_clause: None,
-            },
-        };
-        let result_col_expr = &self.result_columns.first().unwrap().expr;
-        if *result_col_expr != count && *result_col_expr != count_star {
-            return false;
-        }
-        true
+        let agg = self
+            .aggregates
+            .first()
+            .expect("we already checked aggregates.len() == 1");
+        let result_expr = &self
+            .result_columns
+            .first()
+            .expect("we already checked result_columns.len() == 1")
+            .expr;
+        matches!(agg.func, AggFunc::Count0) && exprs_are_equivalent(result_expr, &agg.original_expr)
     }
 }
 
