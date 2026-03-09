@@ -1116,7 +1116,15 @@ fn query_pragma(
         PragmaName::QueryOnly => {
             if let Some(value_expr) = value {
                 let is_query_only = match value_expr {
-                    ast::Expr::Literal(Literal::Numeric(i)) => i.parse::<i64>().unwrap() != 0,
+                    ast::Expr::Literal(Literal::Numeric(i)) => i
+                        .parse::<i64>()
+                        .map(|v| v != 0)
+                        .or_else(|_| i.parse::<f64>().map(|v| v != 0.0))
+                        .map_err(|_| {
+                            LimboError::ParseError(format!(
+                                "Invalid numeric value for PRAGMA query_only: {i}"
+                            ))
+                        })?,
                     ast::Expr::Literal(Literal::String(..)) | ast::Expr::Name(..) => {
                         let s = match &value_expr {
                             ast::Expr::Literal(Literal::String(s)) => s.as_bytes(),
