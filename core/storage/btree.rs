@@ -770,6 +770,14 @@ impl BTreeCursor {
         cursor
     }
 
+    /// Resets the cached count state so the next `count()` call re-traverses the
+    /// btree. Must be called after any mutation (insert, delete, clear) that may
+    /// change the number of rows in the tree.
+    fn invalidate_count_cache(&mut self) {
+        self.count_state = CountState::Start;
+        self.count = 0;
+    }
+
     pub fn get_index_rowid_from_record(&self) -> Option<i64> {
         if !self.has_rowid() {
             return None;
@@ -5109,6 +5117,7 @@ impl CursorTrait for BTreeCursor {
     fn insert(&mut self, key: &BTreeKey) -> Result<IOResult<()>> {
         tracing::debug!(valid_state = ?self.valid_state, cursor_state = ?self.state, is_write_in_progress = self.is_write_in_progress());
         return_if_io!(self.insert_into_page(key));
+        self.invalidate_count_cache();
         if key.maybe_rowid().is_some() {
             self.set_has_record(true);
         }
@@ -5130,6 +5139,7 @@ impl CursorTrait for BTreeCursor {
     /// 10. Finish -> Delete operation is done. Return CursorResult(Ok())
     fn delete(&mut self) -> Result<IOResult<()>> {
         if let CursorState::None = &self.state {
+            self.invalidate_count_cache();
             self.state = CursorState::Delete(DeleteState::Start);
         }
 
@@ -5518,6 +5528,7 @@ impl CursorTrait for BTreeCursor {
     /// this method only clears the tree’s contents. The root page remains
     /// allocated and is reset to an empty leaf page.
     fn clear_btree(&mut self) -> Result<IOResult<Option<usize>>> {
+        self.invalidate_count_cache();
         self.destroy_btree_contents(true)
     }
 
@@ -5703,6 +5714,7 @@ impl CursorTrait for BTreeCursor {
 
     fn invalidate_btree_cache(&mut self) {
         self.move_to_right_state.1 = None;
+        self.invalidate_count_cache();
     }
 
     #[inline]
@@ -9969,6 +9981,113 @@ mod tests {
         let key = Value::from_i64(1);
         let exists = run_until_done(|| cursor2.exists(&key), pager.deref())?;
         assert!(exists, "key not found {key}");
+
+        Ok(())
+    }
+
+    /// Regression test: after clear_btree() on one cursor and invalidate_btree_cache()
+    /// on a sibling cursor sharing the same btree (e.g. OpenDup), the count cache must
+    /// be reset. Otherwise count() returns the stale value from before the clear.
+    ///
+    /// This is the mechanism behind stale partition counts in window functions:
+    /// ResetSorter calls clear_btree on the main cursor and invalidate_btree_cache on
+    /// OpenDup cursors. If count_state/count are not reset, the Count instruction on the
+    /// dup cursor returns the previous partition's row count.
+    #[test]
+    pub fn test_clear_btree_resets_count_cache() -> Result<()> {
+        let (pager, root_page, _, _) = empty_btree();
+        let num_columns = 1;
+
+        let mut cursor_main = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
+        let mut cursor_dup = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
+
+        // Insert 5 records (simulating partition 'a' with 5 rows)
+        for rowid in 1..=5 {
+            insert_record(&mut cursor_main, &pager, rowid, Value::from_i64(rowid))?;
+        }
+
+        // Count via the dup cursor -- should be 5 and caches the result
+        let count1 = run_until_done(|| cursor_dup.count(), pager.deref())?;
+        assert_eq!(count1, 5, "first count should be 5");
+
+        // Simulate ResetSorter: clear the btree via the main cursor
+        run_until_done(|| cursor_main.clear_btree(), &pager)?;
+        // Invalidate sibling cursor's cache (as op_reset_sorter does)
+        cursor_dup.invalidate_btree_cache();
+
+        // Insert only 2 records (simulating partition 'b' with 2 rows)
+        for rowid in 1..=2 {
+            insert_record(&mut cursor_main, &pager, rowid, Value::from_i64(rowid + 10))?;
+        }
+
+        // Count via the dup cursor again -- must be 2, not the stale 5
+        let count2 = run_until_done(|| cursor_dup.count(), pager.deref())?;
+        assert_eq!(
+            count2, 2,
+            "count after clear + re-insert should be 2, got stale count if cache was not reset"
+        );
+
+        Ok(())
+    }
+
+    /// Verify that clear_btree() resets its own count cache, not just sibling cursors.
+    #[test]
+    pub fn test_clear_btree_resets_own_count_cache() -> Result<()> {
+        let (pager, root_page, _, _) = empty_btree();
+        let num_columns = 1;
+
+        let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
+
+        // Insert 5 records and count
+        for rowid in 1..=5 {
+            insert_record(&mut cursor, &pager, rowid, Value::from_i64(rowid))?;
+        }
+        let count1 = run_until_done(|| cursor.count(), pager.deref())?;
+        assert_eq!(count1, 5);
+
+        // Clear and re-insert 3 records
+        run_until_done(|| cursor.clear_btree(), &pager)?;
+        for rowid in 1..=3 {
+            insert_record(&mut cursor, &pager, rowid, Value::from_i64(rowid + 10))?;
+        }
+
+        // Count should reflect the new 3 records, not the stale 5
+        let count2 = run_until_done(|| cursor.count(), pager.deref())?;
+        assert_eq!(
+            count2, 3,
+            "count after clear_btree + re-insert should be 3, not stale 5"
+        );
+
+        Ok(())
+    }
+
+    /// Verify that insert() invalidates the count cache so a subsequent count()
+    /// re-traverses the btree instead of returning the stale cached value.
+    #[test]
+    pub fn test_insert_invalidates_count_cache() -> Result<()> {
+        let (pager, root_page, _, _) = empty_btree();
+        let num_columns = 1;
+
+        let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
+
+        // Insert 3 records and count
+        for rowid in 1..=3 {
+            insert_record(&mut cursor, &pager, rowid, Value::from_i64(rowid))?;
+        }
+        let count1 = run_until_done(|| cursor.count(), pager.deref())?;
+        assert_eq!(count1, 3, "initial count should be 3");
+
+        // Insert 2 more records
+        for rowid in 4..=5 {
+            insert_record(&mut cursor, &pager, rowid, Value::from_i64(rowid))?;
+        }
+
+        // Count should reflect all 5 records, not the stale 3
+        let count2 = run_until_done(|| cursor.count(), pager.deref())?;
+        assert_eq!(
+            count2, 5,
+            "count after additional inserts should be 5, not stale 3"
+        );
 
         Ok(())
     }
