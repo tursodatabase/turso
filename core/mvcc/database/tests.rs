@@ -51,8 +51,14 @@ impl MvccTestDbNoConn {
     pub fn new() -> Self {
         let io = Arc::new(MemoryIO::new());
         let opts = DatabaseOpts::new();
-        let db = Database::open_file_with_flags(io, ":memory:", OpenFlags::default(), opts, None)
-            .unwrap();
+        let db = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::default(),
+            opts,
+            None,
+        )
+        .unwrap();
         // Enable MVCC via PRAGMA
         let conn = db.connect().unwrap();
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
@@ -111,8 +117,9 @@ impl MvccTestDbNoConn {
         // Now open again.
         let io = Arc::new(PlatformIO::new().unwrap());
         let path = self.path.as_ref().unwrap();
-        let db = Database::open_file_with_flags(io, path, OpenFlags::default(), self.opts, None)
-            .unwrap();
+        let db =
+            Database::open_file_with_flags(io, path, OpenFlags::default(), self.opts, None)
+                .unwrap();
         self.db.replace(db);
     }
 
@@ -4343,14 +4350,16 @@ fn test_should_checkpoint_after_recovery_uses_recovered_offset() {
     db.restart();
     let _conn = db.connect();
     let mv_store = db.get_mvcc_store();
-    let recovered_offset = mv_store.storage.logical_log.write().offset;
 
+    // We used to assert on the concrete logical-log offset here, but MVCC durable storage
+    // is now abstracted behind a trait object (to allow injecting custom implementations).
+    // Validate behavior instead: after recovery, the recovered offset should be reflected
+    // in should_checkpoint() when the threshold is set very low.
     mv_store.set_checkpoint_threshold(1);
     assert!(
-        recovered_offset > 1,
-        "expected recovered log offset > 1 byte"
+        mv_store.storage.should_checkpoint(),
+        "expected should_checkpoint() to reflect the recovered logical-log offset"
     );
-    assert!(mv_store.storage.should_checkpoint());
 }
 
 /// What this test checks: Checkpoint transitions preserve DB/WAL/log ordering and watermark updates for the tested edge case.

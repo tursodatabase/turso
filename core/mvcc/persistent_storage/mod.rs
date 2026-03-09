@@ -9,6 +9,31 @@ use crate::mvcc::database::LogRecord;
 use crate::mvcc::persistent_storage::logical_log::{LogicalLog, DEFAULT_LOG_CHECKPOINT_THRESHOLD};
 use crate::{Completion, File, Result};
 
+pub trait DurableStorage: Send + Sync + Debug {
+    fn log_tx(&self, m: &LogRecord) -> Result<(Completion, u64)>;
+    fn read_tx_log(&self) -> Result<Vec<LogRecord>>;
+    fn sync(&self, sync_type: FileSyncType) -> Result<Completion>;
+
+    /// Persist the current logical-log header to durable storage.
+    ///
+    /// This is used by MVCC recovery/checkpoint flows. Keeping this in the trait avoids
+    /// reaching into concrete storage internals.
+    fn update_header(&self) -> Result<Completion>;
+
+    fn truncate(&self) -> Result<Completion>;
+    fn get_logical_log_file(&self) -> Arc<dyn File>;
+    fn should_checkpoint(&self) -> bool;
+    fn set_checkpoint_threshold(&self, threshold: i64);
+    fn checkpoint_threshold(&self) -> i64;
+    fn advance_logical_log_offset_after_success(&self, bytes: u64);
+    fn restore_logical_log_state_after_recovery(&self, offset: u64, running_crc: u32);
+
+    /// Set the in-memory log header from a previously-read on-disk header.
+    ///
+    /// Called during recovery to seed the CRC state from the header's salt.
+    fn set_header(&self, header: logical_log::LogHeader);
+}
+
 pub struct Storage {
     pub logical_log: RwLock<LogicalLog>,
     /// Shadowed from LogicalLog::offset for lock-free should_checkpoint() reads.
@@ -38,35 +63,35 @@ impl Storage {
     }
 }
 
-impl Storage {
-    pub fn log_tx(&self, m: &LogRecord) -> Result<(Completion, u64)> {
+impl DurableStorage for Storage {
+    fn log_tx(&self, m: &LogRecord) -> Result<(Completion, u64)> {
         self.logical_log.write().log_tx_deferred_offset(m)
     }
 
-    pub fn read_tx_log(&self) -> Result<Vec<LogRecord>> {
+    fn read_tx_log(&self) -> Result<Vec<LogRecord>> {
         todo!()
     }
 
-    pub fn sync(&self, sync_type: FileSyncType) -> Result<Completion> {
+    fn sync(&self, sync_type: FileSyncType) -> Result<Completion> {
         self.logical_log.write().sync(sync_type)
     }
 
-    pub fn update_header(&self) -> Result<Completion> {
+    fn update_header(&self) -> Result<Completion> {
         self.logical_log.write().update_header()
     }
 
-    pub fn truncate(&self) -> Result<Completion> {
+    fn truncate(&self) -> Result<Completion> {
         let c = self.logical_log.write().truncate()?;
         self.shadow_offset_store(0);
         Ok(c)
     }
 
-    pub fn get_logical_log_file(&self) -> Arc<dyn File> {
+    fn get_logical_log_file(&self) -> Arc<dyn File> {
         self.logical_log.write().file.clone()
     }
 
     /// Lock-free: reads shadowed atomics only.
-    pub fn should_checkpoint(&self) -> bool {
+    fn should_checkpoint(&self) -> bool {
         let threshold = self.checkpoint_threshold.load(Ordering::Relaxed);
         if threshold < 0 {
             return false;
@@ -74,25 +99,29 @@ impl Storage {
         self.log_offset.load(Ordering::Relaxed) >= threshold as u64
     }
 
-    pub fn set_checkpoint_threshold(&self, threshold: i64) {
+    fn set_checkpoint_threshold(&self, threshold: i64) {
         self.checkpoint_threshold
             .store(threshold, Ordering::Relaxed);
     }
 
-    pub fn checkpoint_threshold(&self) -> i64 {
+    fn checkpoint_threshold(&self) -> i64 {
         self.checkpoint_threshold.load(Ordering::Relaxed)
     }
 
-    pub fn advance_logical_log_offset_after_success(&self, bytes: u64) {
+    fn advance_logical_log_offset_after_success(&self, bytes: u64) {
         self.logical_log.write().advance_offset_after_success(bytes);
         self.shadow_offset_advance(bytes);
     }
 
-    pub fn restore_logical_log_state_after_recovery(&self, offset: u64, running_crc: u32) {
+    fn restore_logical_log_state_after_recovery(&self, offset: u64, running_crc: u32) {
         let mut log = self.logical_log.write();
         log.offset = offset;
         log.running_crc = running_crc;
         self.shadow_offset_store(offset);
+    }
+
+    fn set_header(&self, header: logical_log::LogHeader) {
+        self.logical_log.write().set_header(header);
     }
 }
 

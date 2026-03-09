@@ -1,6 +1,5 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
-use crate::mvcc::persistent_storage::Storage;
 use crate::schema::{Schema, Table};
 use crate::state_machine::StateMachine;
 use crate::state_machine::StateTransition;
@@ -1992,7 +1991,12 @@ pub struct MvStore<Clock: LogicalClock> {
     next_rowid: AtomicU64,
     next_table_id: AtomicI64,
     clock: Clock,
-    storage: Storage,
+
+    /// MVCC durable storage (logical log, durability hooks, checkpoint thresholding).
+    ///
+    /// Stored behind a trait object so callers can inject their own implementation
+    /// per database (via `Database::durable_storage`) for testing or custom durability.
+    storage: Arc<dyn crate::mvcc::persistent_storage::DurableStorage>,
 
     /// The transaction ID of a transaction that has acquired an exclusive write lock, if any.
     ///
@@ -2073,7 +2077,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     }
 
     /// Creates a new database.
-    pub fn new(clock: Clock, storage: Storage) -> Self {
+    pub fn new(
+        clock: Clock,
+        storage: Arc<dyn crate::mvcc::persistent_storage::DurableStorage>,
+    ) -> Self {
         Self {
             rows: SkipMap::new(),
             table_id_to_rootpage: SkipMap::from_iter(vec![(SQLITE_SCHEMA_MVCC_TABLE_ID, Some(1))]), // table id 1 / root page 1 is always sqlite_schema.
@@ -4116,7 +4123,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     .io
                     .block(|| wal.truncate_wal(&mut checkpoint_result, pager.get_sync_type()))?;
                 if let HeaderReadResult::Valid(header) = &header_result {
-                    self.storage.logical_log.write().set_header(header.clone());
+                    self.storage.set_header(header.clone());
                 }
             }
             return Ok(());
@@ -4141,7 +4148,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 ))
             }
         };
-        self.storage.logical_log.write().set_header(header);
+        self.storage.set_header(header);
 
         // NOTE: this uses `CheckpointMode::Truncate` to drive WAL backfill only; we still
         // truncate the WAL explicitly below to preserve WAL-last ordering in recovery.
@@ -4223,7 +4230,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         };
 
         if let Some(header) = &header {
-            self.storage.logical_log.write().set_header(header.clone());
+            self.storage.set_header(header.clone());
         }
         let persistent_tx_ts_max = if self.uses_durable_mvcc_metadata(&connection) {
             match self.try_read_persistent_tx_ts_max(&connection)? {

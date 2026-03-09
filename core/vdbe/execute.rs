@@ -12262,6 +12262,7 @@ fn op_journal_mode_inner(
                         pager.io.clone(),
                         &db_path,
                         program.connection.db.open_flags,
+                        program.connection.db.durable_storage.clone(),
                     )?;
                     program.connection.db.mv_store.store(Some(mv_store.clone()));
                     program.connection.demote_to_mvcc_connection();

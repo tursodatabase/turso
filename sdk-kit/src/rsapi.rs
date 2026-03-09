@@ -696,6 +696,7 @@ impl TursoDatabase {
                         OpenFlags::default(),
                         opts,
                         self.config.encryption.clone(),
+                        None,
                     )? {
                         IOResult::Done(db) => {
                             let mut inner_db = self.db.lock().unwrap();
