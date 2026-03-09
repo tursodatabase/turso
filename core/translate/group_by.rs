@@ -3,12 +3,12 @@ use turso_parser::ast::{self, SortOrder};
 use super::{
     emitter::TranslateCtx,
     expr::{translate_condition_expr, translate_expr, ConditionMetadata},
-    order_by::order_by_sorter_insert,
     plan::{Distinctness, GroupBy, SelectPlan},
     result_row::emit_select_result,
 };
 use crate::translate::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
+    order_by::EmitOrderBy,
     plan::Aggregate,
 };
 use crate::translate::{
@@ -84,147 +84,151 @@ pub struct GroupByMetadata {
     pub registers: GroupByRegisters,
 }
 
-/// Initialize resources needed for GROUP BY processing
-pub fn init_group_by<'a>(
-    program: &mut ProgramBuilder,
-    t_ctx: &mut TranslateCtx<'a>,
-    group_by: &'a GroupBy,
-    plan: &SelectPlan,
-    result_columns: &'a [ResultSetColumn],
-    order_by: &'a [(Box<ast::Expr>, ast::SortOrder)],
-) -> Result<()> {
-    collect_non_aggregate_expressions(
-        &mut t_ctx.non_aggregate_expressions,
-        group_by,
-        plan,
-        result_columns,
-        order_by,
-    )?;
+pub struct EmitGroupBy;
+impl EmitGroupBy {
+    /// Initialize resources needed for GROUP BY processing
+    pub fn init<'a>(
+        program: &mut ProgramBuilder,
+        t_ctx: &mut TranslateCtx<'a>,
+        group_by: &'a GroupBy,
+        plan: &SelectPlan,
+        result_columns: &'a [ResultSetColumn],
+        order_by: &'a [(Box<ast::Expr>, ast::SortOrder)],
+    ) -> Result<()> {
+        collect_non_aggregate_expressions(
+            &mut t_ctx.non_aggregate_expressions,
+            group_by,
+            plan,
+            result_columns,
+            order_by,
+        )?;
 
-    let label_subrtn_acc_output = program.allocate_label();
-    let label_group_by_end_without_emitting_row = program.allocate_label();
-    let label_acc_indicator_set_flag_true = program.allocate_label();
-    let label_agg_final = program.allocate_label();
-    let label_group_by_end = program.allocate_label();
-    let label_subrtn_acc_clear = program.allocate_label();
-    let label_sort_loop_start = program.allocate_label();
-    let label_sort_loop_end = program.allocate_label();
-    let label_grouping_agg_step = program.allocate_label();
+        let label_subrtn_acc_output = program.allocate_label();
+        let label_group_by_end_without_emitting_row = program.allocate_label();
+        let label_acc_indicator_set_flag_true = program.allocate_label();
+        let label_agg_final = program.allocate_label();
+        let label_group_by_end = program.allocate_label();
+        let label_subrtn_acc_clear = program.allocate_label();
+        let label_sort_loop_start = program.allocate_label();
+        let label_sort_loop_end = program.allocate_label();
+        let label_grouping_agg_step = program.allocate_label();
 
-    let reg_subrtn_acc_output_return_offset = program.alloc_register();
-    let reg_data_in_acc_flag = program.alloc_register();
-    let reg_abort_flag = program.alloc_register();
-    let reg_group_exprs_cmp = program.alloc_registers(group_by.exprs.len());
+        let reg_subrtn_acc_output_return_offset = program.alloc_register();
+        let reg_data_in_acc_flag = program.alloc_register();
+        let reg_abort_flag = program.alloc_register();
+        let reg_group_exprs_cmp = program.alloc_registers(group_by.exprs.len());
 
-    // The following two blocks of registers should always be allocated contiguously,
-    // because they are cleared in a contiguous block in the GROUP BYs clear accumulator subroutine.
-    // START BLOCK
-    let reg_non_aggregate_exprs_acc =
-        program.alloc_registers(t_ctx.non_aggregate_expressions.len());
-    if !plan.aggregates.is_empty() {
-        // Aggregate registers need to be NULLed at the start because the same registers might be reused on another invocation of a subquery,
-        // and if they are not NULLed, the 2nd invocation of the same subquery will have values left over from the first invocation.
-        t_ctx.reg_agg_start = Some(program.alloc_registers_and_init_w_null(plan.aggregates.len()));
-    }
-    // END BLOCK
-
-    let reg_sorter_key = program.alloc_register();
-    let column_count = plan.agg_args_count() + t_ctx.non_aggregate_expressions.len();
-    let reg_group_by_source_cols_start = program.alloc_registers(column_count);
-
-    let row_source = if let Some(sort_order) = group_by.sort_order.as_ref() {
-        let sort_cursor = program.alloc_cursor_id(CursorType::Sorter);
-        // Should work the same way as Order By
-        /*
-         * Terms of the ORDER BY clause that is part of a SELECT statement may be assigned a collating sequence using the COLLATE operator,
-         * in which case the specified collating function is used for sorting.
-         * Otherwise, if the expression sorted by an ORDER BY clause is a column,
-         * then the collating sequence of the column is used to determine sort order.
-         * If the expression is not a column and has no COLLATE clause, then the BINARY collating sequence is used.
-         */
-        let order_and_collations: Vec<(SortOrder, Option<CollationSeq>)> = group_by
-            .exprs
-            .iter()
-            .zip(sort_order.iter())
-            .map(|(expr, ord)| {
-                let collation = get_collseq_from_expr(expr, &plan.table_references)?;
-                Ok((*ord, collation))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        program.emit_insn(Insn::SorterOpen {
-            cursor_id: sort_cursor,
-            columns: column_count,
-            order_and_collations,
-            comparator_func_names: vec![],
-        });
-        emit_explain!(program, false, "USE SORTER FOR GROUP BY".to_owned());
-        let pseudo_cursor = group_by_create_pseudo_table(program, column_count);
-        GroupByRowSource::Sorter {
-            pseudo_cursor,
-            sort_cursor,
-            reg_sorter_key,
-            sorter_column_count: column_count,
-            start_reg_dest: reg_non_aggregate_exprs_acc,
+        // The following two blocks of registers should always be allocated contiguously,
+        // because they are cleared in a contiguous block in the GROUP BYs clear accumulator subroutine.
+        // START BLOCK
+        let reg_non_aggregate_exprs_acc =
+            program.alloc_registers(t_ctx.non_aggregate_expressions.len());
+        if !plan.aggregates.is_empty() {
+            // Aggregate registers need to be NULLed at the start because the same registers might be reused on another invocation of a subquery,
+            // and if they are not NULLed, the 2nd invocation of the same subquery will have values left over from the first invocation.
+            t_ctx.reg_agg_start =
+                Some(program.alloc_registers_and_init_w_null(plan.aggregates.len()));
         }
-    } else {
-        GroupByRowSource::MainLoop {
-            start_reg_src: reg_group_by_source_cols_start,
-            start_reg_dest: reg_non_aggregate_exprs_acc,
-        }
-    };
+        // END BLOCK
 
-    program.add_comment(program.offset(), "clear group by abort flag");
-    program.emit_insn(Insn::Integer {
-        value: 0,
-        dest: reg_abort_flag,
-    });
+        let reg_sorter_key = program.alloc_register();
+        let column_count = plan.agg_args_count() + t_ctx.non_aggregate_expressions.len();
+        let reg_group_by_source_cols_start = program.alloc_registers(column_count);
 
-    program.add_comment(
-        program.offset(),
-        "initialize group by comparison registers to NULL",
-    );
-    program.emit_insn(Insn::Null {
-        dest: reg_group_exprs_cmp,
-        dest_end: if group_by.exprs.len() > 1 {
-            Some(reg_group_exprs_cmp + group_by.exprs.len() - 1)
+        let row_source = if let Some(sort_order) = group_by.sort_order.as_ref() {
+            let sort_cursor = program.alloc_cursor_id(CursorType::Sorter);
+            // Should work the same way as Order By
+            /*
+             * Terms of the ORDER BY clause that is part of a SELECT statement may be assigned a collating sequence using the COLLATE operator,
+             * in which case the specified collating function is used for sorting.
+             * Otherwise, if the expression sorted by an ORDER BY clause is a column,
+             * then the collating sequence of the column is used to determine sort order.
+             * If the expression is not a column and has no COLLATE clause, then the BINARY collating sequence is used.
+             */
+            let order_and_collations: Vec<(SortOrder, Option<CollationSeq>)> = group_by
+                .exprs
+                .iter()
+                .zip(sort_order.iter())
+                .map(|(expr, ord)| {
+                    let collation = get_collseq_from_expr(expr, &plan.table_references)?;
+                    Ok((*ord, collation))
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            program.emit_insn(Insn::SorterOpen {
+                cursor_id: sort_cursor,
+                columns: column_count,
+                order_and_collations,
+                comparator_func_names: vec![],
+            });
+            emit_explain!(program, false, "USE SORTER FOR GROUP BY".to_owned());
+            let pseudo_cursor = group_by_create_pseudo_table(program, column_count);
+            GroupByRowSource::Sorter {
+                pseudo_cursor,
+                sort_cursor,
+                reg_sorter_key,
+                sorter_column_count: column_count,
+                start_reg_dest: reg_non_aggregate_exprs_acc,
+            }
         } else {
-            None
-        },
-    });
+            GroupByRowSource::MainLoop {
+                start_reg_src: reg_group_by_source_cols_start,
+                start_reg_dest: reg_non_aggregate_exprs_acc,
+            }
+        };
 
-    program.add_comment(program.offset(), "go to clear accumulator subroutine");
+        program.add_comment(program.offset(), "clear group by abort flag");
+        program.emit_insn(Insn::Integer {
+            value: 0,
+            dest: reg_abort_flag,
+        });
 
-    let reg_subrtn_acc_clear_return_offset = program.alloc_register();
-    program.emit_insn(Insn::Gosub {
-        target_pc: label_subrtn_acc_clear,
-        return_reg: reg_subrtn_acc_clear_return_offset,
-    });
+        program.add_comment(
+            program.offset(),
+            "initialize group by comparison registers to NULL",
+        );
+        program.emit_insn(Insn::Null {
+            dest: reg_group_exprs_cmp,
+            dest_end: if group_by.exprs.len() > 1 {
+                Some(reg_group_exprs_cmp + group_by.exprs.len() - 1)
+            } else {
+                None
+            },
+        });
 
-    t_ctx.meta_group_by = Some(GroupByMetadata {
-        row_source,
-        labels: GroupByLabels {
-            label_subrtn_acc_output,
-            label_group_by_end_without_emitting_row,
-            label_acc_indicator_set_flag_true,
-            label_agg_final,
-            label_group_by_end,
-            label_subrtn_acc_clear,
-            label_sort_loop_start,
-            label_sort_loop_end,
-            label_grouping_agg_step,
-        },
-        registers: GroupByRegisters {
-            reg_subrtn_acc_output_return_offset,
-            reg_data_in_acc_flag,
-            reg_abort_flag,
-            reg_non_aggregate_exprs_acc,
-            reg_group_exprs_cmp,
-            reg_subrtn_acc_clear_return_offset,
-            reg_group_by_source_cols_start,
-        },
-    });
-    Ok(())
+        program.add_comment(program.offset(), "go to clear accumulator subroutine");
+
+        let reg_subrtn_acc_clear_return_offset = program.alloc_register();
+        program.emit_insn(Insn::Gosub {
+            target_pc: label_subrtn_acc_clear,
+            return_reg: reg_subrtn_acc_clear_return_offset,
+        });
+
+        t_ctx.meta_group_by = Some(GroupByMetadata {
+            row_source,
+            labels: GroupByLabels {
+                label_subrtn_acc_output,
+                label_group_by_end_without_emitting_row,
+                label_acc_indicator_set_flag_true,
+                label_agg_final,
+                label_group_by_end,
+                label_subrtn_acc_clear,
+                label_sort_loop_start,
+                label_sort_loop_end,
+                label_grouping_agg_step,
+            },
+            registers: GroupByRegisters {
+                reg_subrtn_acc_output_return_offset,
+                reg_data_in_acc_flag,
+                reg_abort_flag,
+                reg_non_aggregate_exprs_acc,
+                reg_group_exprs_cmp,
+                reg_subrtn_acc_clear_return_offset,
+                reg_group_by_source_cols_start,
+            },
+        });
+        Ok(())
+    }
 }
 
 /// Returns whether an ORDER BY expression should be treated as an
@@ -868,7 +872,7 @@ pub fn group_by_emit_row_phase<'a>(
             )?;
         }
         false => {
-            order_by_sorter_insert(program, t_ctx, plan)?;
+            EmitOrderBy::sorter_insert(program, t_ctx, plan)?;
         }
     }
     program.constant_spans_invalidate_after(span_idx);

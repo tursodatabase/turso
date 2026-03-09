@@ -16,7 +16,7 @@ use crate::{
             build_index_affinity_string, emit_guarded_fk_decrement, open_read_index,
             open_read_table, ForeignKeyActions,
         },
-        main_loop::{close_loop, init_loop, open_loop},
+        main_loop::{CloseLoop, InitLoop, OpenLoop},
         plan::{
             DeletePlan, EvalAt, JoinOrderMember, JoinedTable, Operation, ResultSetColumn, Search,
             TableReferences,
@@ -117,12 +117,12 @@ pub fn emit_program_for_delete(
     }
 
     // Initialize cursors and other resources needed for query execution
-    init_loop(
+    InitLoop::emit(
         program,
         &mut t_ctx,
         &plan.table_references,
         &mut [],
-        OperationMode::DELETE,
+        &OperationMode::DELETE,
         &plan.where_clause,
         &join_order,
         &mut plan.non_from_clause_subqueries,
@@ -225,7 +225,7 @@ pub fn emit_program_for_delete(
         // Normal DELETE path without RowSet
 
         // Set up main query execution loop
-        open_loop(
+        OpenLoop::emit(
             program,
             &mut t_ctx,
             &plan.table_references,
@@ -247,7 +247,7 @@ pub fn emit_program_for_delete(
         )?;
 
         // Clean up and close the main execution loop
-        close_loop(
+        CloseLoop::emit(
             program,
             &mut t_ctx,
             &plan.table_references,
