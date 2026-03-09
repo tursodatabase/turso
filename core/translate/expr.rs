@@ -4990,7 +4990,10 @@ pub fn bind_and_rewrite_expr<'a>(
                                     }
                                 }
                                 if !ok {
-                                    crate::bail_parse_error!("Column {} is ambiguous", id.as_str());
+                                    crate::bail_parse_error!(
+                                        "ambiguous column name: {}",
+                                        id.as_str()
+                                    );
                                 }
                             } else {
                                 let col =
@@ -5041,7 +5044,10 @@ pub fn bind_and_rewrite_expr<'a>(
                             });
                             if col_idx.is_some() {
                                 if match_result.is_some() {
-                                    crate::bail_parse_error!("Column {} is ambiguous", id.as_str());
+                                    crate::bail_parse_error!(
+                                        "ambiguous column name: {}",
+                                        id.as_str()
+                                    );
                                 }
                                 let col = outer_ref.table.columns().get(col_idx.unwrap()).unwrap();
                                 match_result = Some((

@@ -1948,7 +1948,7 @@ where
         .any(|s| s.eq_ignore_ascii_case(column_name))
     {
         if fn_check() {
-            crate::bail_parse_error!("ROWID is ambiguous");
+            crate::bail_parse_error!("ambiguous column name: rowid");
         }
 
         return Ok(Some(Expr::RowId {
