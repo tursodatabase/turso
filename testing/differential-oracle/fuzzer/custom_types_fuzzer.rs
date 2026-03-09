@@ -71,7 +71,7 @@ fn main() -> Result<()> {
         io,
         out_dir.join("array_test.db").to_str().unwrap(),
         turso_core::OpenFlags::default(),
-        turso_core::DatabaseOpts::default(),
+        turso_core::DatabaseOpts::default().with_custom_types(true),
         None,
     )?;
     let conn = turso_db.connect()?;
