@@ -508,7 +508,7 @@ fn update_pragma(
             connection.set_sync_type(sync_type);
             Ok(TransactionMode::None)
         }
-        PragmaName::ListTypes => unreachable!("list_types cannot be set"),
+        PragmaName::ListTypes => bail_parse_error!("list_types cannot be set"),
         PragmaName::TempStore => {
             use crate::TempStore;
             // Try to parse as a string first (default, file, memory)
