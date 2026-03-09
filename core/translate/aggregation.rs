@@ -586,6 +586,7 @@ pub fn translate_aggregation_step(
             target_register
         }
         AggFunc::ArrayAgg => {
+            resolver.require_custom_types("Array features")?;
             if num_args != 1 {
                 crate::bail_parse_error!("array_agg bad number of arguments");
             }

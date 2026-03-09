@@ -3001,7 +3001,7 @@ mod tests {
         attached_databases: &'a RwLock<DatabaseCatalog>,
         syms: &'a SymbolTable,
     ) -> Resolver<'a> {
-        Resolver::new(schema, database_schemas, attached_databases, syms)
+        Resolver::new(schema, database_schemas, attached_databases, syms, true)
     }
 
     fn no_tail() -> FunctionTail {

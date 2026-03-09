@@ -865,6 +865,19 @@ pub fn translate_create_table(
     }
     validate(&body, &normalized_tbl_name, resolver)?;
 
+    // Gate array column types behind the experimental custom types flag.
+    if !connection.experimental_custom_types_enabled() {
+        if let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = &body {
+            for col in columns {
+                if col.col_type.as_ref().is_some_and(|t| t.is_array()) {
+                    bail_parse_error!(
+                        "Array column types require --experimental-custom-types flag"
+                    );
+                }
+            }
+        }
+    }
+
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 30,

@@ -1655,6 +1655,7 @@ pub fn translate_expr(
                             unreachable!("this is always ast::Expr::Cast")
                         }
                         ScalarFunc::Array => {
+                            resolver.require_custom_types("Array features")?;
                             let start_reg = program.alloc_registers(args.len());
                             for (i, arg) in args.iter().enumerate() {
                                 translate_expr(
@@ -1673,6 +1674,7 @@ pub fn translate_expr(
                             Ok(target_register)
                         }
                         ScalarFunc::ArrayElement => {
+                            resolver.require_custom_types("Array features")?;
                             let args = expect_arguments_exact!(args, 2, srf);
                             let base_reg = program.alloc_register();
                             translate_expr(
@@ -1698,6 +1700,7 @@ pub fn translate_expr(
                             Ok(target_register)
                         }
                         ScalarFunc::ArraySetElement => {
+                            resolver.require_custom_types("Array features")?;
                             let args = expect_arguments_exact!(args, 3, srf);
                             let array_reg = program.alloc_register();
                             translate_expr(
@@ -2561,8 +2564,15 @@ pub fn translate_expr(
                         | ScalarFunc::NumericMul
                         | ScalarFunc::NumericDiv
                         | ScalarFunc::NumericLt
-                        | ScalarFunc::NumericEq
-                        | ScalarFunc::ArrayLength
+                        | ScalarFunc::NumericEq => translate_function(
+                            program,
+                            args,
+                            referenced_tables,
+                            resolver,
+                            target_register,
+                            func_ctx,
+                        ),
+                        ScalarFunc::ArrayLength
                         | ScalarFunc::ArrayAppend
                         | ScalarFunc::ArrayPrepend
                         | ScalarFunc::ArrayCat
@@ -2573,14 +2583,17 @@ pub fn translate_expr(
                         | ScalarFunc::StringToArray
                         | ScalarFunc::ArrayToString
                         | ScalarFunc::ArrayOverlap
-                        | ScalarFunc::ArrayContainsAll => translate_function(
-                            program,
-                            args,
-                            referenced_tables,
-                            resolver,
-                            target_register,
-                            func_ctx,
-                        ),
+                        | ScalarFunc::ArrayContainsAll => {
+                            resolver.require_custom_types("Array features")?;
+                            translate_function(
+                                program,
+                                args,
+                                referenced_tables,
+                                resolver,
+                                target_register,
+                                func_ctx,
+                            )
+                        }
                     }
                 }
                 Func::Math(math_func) => match math_func.arity() {
@@ -4270,6 +4283,9 @@ fn emit_binary_insn(
             }
         }
         ast::Operator::ArrayContains | ast::Operator::ArrayOverlap => {
+            if let Some(r) = resolver {
+                r.require_custom_types("Array features")?;
+            }
             // Function instructions read contiguous registers start_reg..start_reg+arg_count.
             // When both operands are equivalent the compiler reuses a single shared register,
             // so we must copy it into a contiguous pair.
@@ -4692,6 +4708,9 @@ fn emit_binary_condition_insn(
             eval_result(program, target_register);
         }
         ast::Operator::ArrayContains | ast::Operator::ArrayOverlap => {
+            if let Some(r) = resolver {
+                r.require_custom_types("Array features")?;
+            }
             let start = if lhs == rhs {
                 let regs = program.alloc_registers(2);
                 program.emit_insn(Insn::Copy {

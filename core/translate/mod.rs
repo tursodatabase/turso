@@ -102,6 +102,7 @@ pub fn translate(
         connection.database_schemas(),
         connection.attached_databases(),
         syms,
+        connection.experimental_custom_types_enabled(),
     );
 
     match stmt {
