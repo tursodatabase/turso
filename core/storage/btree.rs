@@ -612,6 +612,11 @@ pub trait CursorTrait: Any + Send + Sync {
     fn seek_end(&mut self) -> Result<IOResult<()>>;
     fn seek_to_last(&mut self, always_seek: bool) -> Result<IOResult<()>>;
 
+    /// Returns true if this cursor operates in MVCC mode.
+    fn is_mvcc(&self) -> bool {
+        false
+    }
+
     // --- start: BTreeCursor specific functions ----
     fn invalidate_record(&mut self);
     fn has_rowid(&self) -> bool;
