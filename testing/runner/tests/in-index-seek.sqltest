@@ -600,3 +600,41 @@ expect {
     1
 }
 
+# Self-referencing IN: col IN (col) must not use InSeek (RHS is not constant)
+setup self_ref {
+    CREATE TABLE tsr (
+        x INTEGER PRIMARY KEY
+    );
+    INSERT INTO tsr VALUES(1);
+    INSERT INTO tsr VALUES(2);
+    INSERT INTO tsr VALUES(3);
+}
+
+@setup self_ref
+test in-self-referencing-rowid {
+    SELECT COUNT(*) FROM tsr WHERE tsr.x IN (tsr.x);
+}
+expect {
+    3
+}
+
+@setup self_ref
+test in-self-referencing-indexed {
+    CREATE TABLE tsr2(id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE INDEX idx_tsr2 ON tsr2(val);
+    INSERT INTO tsr2 VALUES(1, 10), (2, 20), (3, 30);
+    SELECT COUNT(*) FROM tsr2 WHERE tsr2.val IN (tsr2.val);
+}
+expect {
+    3
+}
+
+# Cross-table column reference in IN list (join context)
+@setup join_ctx
+test in-cross-table-column-ref {
+    SELECT tj1.id FROM tj1 JOIN tj2 ON tj1.id = tj2.id WHERE tj1.val IN (tj2.val) ORDER BY tj1.id;
+}
+expect {
+    1
+}
+

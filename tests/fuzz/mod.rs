@@ -4979,6 +4979,19 @@ mod fuzz_tests {
             );
             helpers::execute_on_both(&limbo_conn, &sqlite_conn, &query, &format!("SEED: {seed}"));
         }
+        // Add secondary indexes so IN-list/subquery optimizations are exercised
+        helpers::execute_on_both(
+            &limbo_conn,
+            &sqlite_conn,
+            "CREATE INDEX idx_y ON t(y)",
+            &format!("SEED: {seed}"),
+        );
+        helpers::execute_on_both(
+            &limbo_conn,
+            &sqlite_conn,
+            "CREATE INDEX idx_z ON t(z)",
+            &format!("SEED: {seed}"),
+        );
 
         let mut i = 0;
         let mut primary_key_set = HashSet::with_capacity(100);

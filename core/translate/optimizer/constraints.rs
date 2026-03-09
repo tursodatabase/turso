@@ -915,6 +915,10 @@ pub fn constraints_from_where_clause(
             // Handle IN list: col IN (val1, val2, ...)
             if let ast::Expr::InList { lhs, not, rhs } = &term.expr {
                 let estimated_values = rhs.len() as f64;
+                let mut rhs_mask = TableMask::new();
+                for rhs_expr in rhs.iter() {
+                    rhs_mask |= table_mask_from_expr(rhs_expr, table_references, subqueries)?;
+                }
                 let table_stats = schema
                     .analyze_stats
                     .table_stats(table_reference.table.get_name());
@@ -938,9 +942,9 @@ pub fn constraints_from_where_clause(
                             table_col_pos: Some(*column),
                             expr: None,
                             constraining_expr: None,
-                            lhs_mask: TableMask::new(), // IN list values are constants
+                            lhs_mask: rhs_mask,
                             selectivity,
-                            usable: false, // IN uses a separate seek path (consider_in_list_seek), not the range-seek model
+                            usable: false, // IN uses a separate seek path, not the range-seek model
                             is_rowid,
                         });
                     }
@@ -954,7 +958,7 @@ pub fn constraints_from_where_clause(
                             table_col_pos: rowid_alias_column,
                             expr: None,
                             constraining_expr: None,
-                            lhs_mask: TableMask::new(),
+                            lhs_mask: rhs_mask,
                             selectivity,
                             usable: false,
                             is_rowid: true,
