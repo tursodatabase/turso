@@ -204,6 +204,46 @@ test('on-disk db', async () => {
 //     expect(rows).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }, { x: 4 }, { x: 5 }, { x: 6 }]);
 // })
 
+test('named parameters with $', async () => {
+    const db = await connect(":memory:");
+    await db.exec("CREATE TABLE users(name TEXT, age INTEGER)");
+    await db.exec("INSERT INTO users VALUES ('Alice', 30), ('Bob', 25), ('Carol', 35)");
+    const stmt = db.prepare("SELECT * FROM users WHERE name = $name AND age = $age");
+    const row = await stmt.get({ name: 'Alice', age: 30 });
+    expect(row).toEqual({ name: 'Alice', age: 30 });
+    await db.close();
+})
+
+test('named parameters with :', async () => {
+    const db = await connect(":memory:");
+    await db.exec("CREATE TABLE t(x, y)");
+    await db.exec("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+    const stmt = db.prepare("SELECT * FROM t WHERE x = :x");
+    const rows = await stmt.all({ x: 2 });
+    expect(rows).toEqual([{ x: 2, y: 'b' }]);
+    await db.close();
+})
+
+test('named parameters with @', async () => {
+    const db = await connect(":memory:");
+    await db.exec("CREATE TABLE t(x)");
+    await db.exec("INSERT INTO t VALUES (10), (20), (30)");
+    const stmt = db.prepare("SELECT * FROM t WHERE x = @val");
+    const row = await stmt.get({ val: 20 });
+    expect(row).toEqual({ x: 20 });
+    await db.close();
+})
+
+test('named parameters with mixed prefixes', async () => {
+    const db = await connect(":memory:");
+    await db.exec("CREATE TABLE t(a, b, c)");
+    await db.exec("INSERT INTO t VALUES (1, 2, 3)");
+    const stmt = db.prepare("SELECT * FROM t WHERE a = $a AND b = :b AND c = @c");
+    const row = await stmt.get({ a: 1, b: 2, c: 3 });
+    expect(row).toEqual({ a: 1, b: 2, c: 3 });
+    await db.close();
+})
+
 test('blobs', async () => {
     const db = await connect(":memory:");
     const rows = await db.prepare("SELECT x'1020' as x").all();
