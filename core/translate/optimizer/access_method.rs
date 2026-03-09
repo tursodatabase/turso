@@ -6,7 +6,9 @@ use turso_ext::{ConstraintInfo, ConstraintUsage, ResultCode};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
 use crate::schema::Schema;
-use crate::translate::expr::{as_binary_components, walk_expr, WalkControl};
+use crate::translate::expr::{
+    as_binary_components, expr_references_any_subquery, walk_expr, WalkControl,
+};
 use crate::translate::optimizer::constraints::{
     convert_to_vtab_constraint, BinaryExprSide, Constraint, RangeConstraintRef,
 };
@@ -37,7 +39,7 @@ use super::{
     order::OrderTarget,
 };
 use crate::translate::optimizer::order::ColumnTarget;
-use crate::translate::planner::TableMask;
+use crate::translate::planner::{table_mask_from_expr, TableMask};
 
 #[derive(Debug, Clone)]
 /// Represents a way to access a table.
@@ -140,9 +142,20 @@ pub struct MultiIndexBranchParams {
     pub constraint_refs: Vec<RangeConstraintRef>,
     /// Estimated number of rows from this branch.
     pub estimated_rows: f64,
+    /// Residual filter expressions for compound AND disjuncts.
+    pub residual_exprs: Vec<ast::Expr>,
+    /// Whether residual evaluation needs the scanned table cursor positioned.
+    pub requires_table_cursor: bool,
 }
 
-type MultiIdxBranch = (Option<Arc<Index>>, Constraint, Vec<RangeConstraintRef>, f64);
+struct MultiIdxBranch {
+    index: Option<Arc<Index>>,
+    constraint: Constraint,
+    constraint_refs: Vec<RangeConstraintRef>,
+    estimated_rows: f64,
+    residual_exprs: Vec<ast::Expr>,
+    requires_table_cursor: bool,
+}
 
 /// Computes IndexInfo for a multi-index branch given an optional index and table reference.
 ///
@@ -170,9 +183,10 @@ fn index_info_for_branch(
 
 /// Computes cost and constructs MultiIndexBranchParams for a single branch.
 ///
-/// When `rowid_only` is true (for intersection), the branch only scans the index to collect
-/// rowids into a RowSet, so we treat the index as covering (no table lookup during branch scan).
-/// For union branches, we eventually fetch all rows, so covering status depends on the query.
+/// When `reads_scanned_table` is false, the branch only scans the index to collect
+/// rowids into a RowSet, so we treat the index as covering. If branch-local
+/// residuals read columns from the scanned table, we must cost the branch as
+/// potentially requiring table seeks.
 #[allow(clippy::too_many_arguments)]
 fn compute_branch_cost_and_params(
     index: Option<&Arc<Index>>,
@@ -182,9 +196,10 @@ fn compute_branch_cost_and_params(
     rhs_table: &JoinedTable,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
-    rowid_only: bool,
+    reads_scanned_table: bool,
 ) -> (Cost, MultiIndexBranchParams) {
-    let index_info = index_info_for_branch(index.map(|i| i.as_ref()), rhs_table, rowid_only);
+    let index_info =
+        index_info_for_branch(index.map(|i| i.as_ref()), rhs_table, !reads_scanned_table);
 
     let cost = estimate_cost_for_scan_or_seek(
         index_info,
@@ -201,9 +216,29 @@ fn compute_branch_cost_and_params(
         constraint: constraint.clone(),
         constraint_refs: constraint_refs.to_vec(),
         estimated_rows,
+        residual_exprs: vec![],
+        requires_table_cursor: false,
     };
 
     (cost, branch_params)
+}
+
+fn residual_tables_mask(
+    residual_exprs: &[ast::Expr],
+    table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
+) -> Option<TableMask> {
+    residual_exprs
+        .iter()
+        .try_fold(TableMask::new(), |mut mask, expr| {
+            // Correlated subqueries are translated at a specific loop point and cannot
+            // be safely duplicated across per-branch residual evaluation yet.
+            if expr_references_any_subquery(expr) {
+                return None;
+            }
+            mask |= table_mask_from_expr(expr, table_references, subqueries).ok()?;
+            Some(mask)
+        })
 }
 
 /// Return the best [AccessMethod] for a given join order.
@@ -456,7 +491,7 @@ fn find_best_access_method_for_vtab(
 /// Evaluates multi-index branches and returns AccessMethod if cost-effective.
 #[allow(clippy::too_many_arguments)]
 fn evaluate_multi_index_branches(
-    branches: &[MultiIdxBranch],
+    branches: Vec<MultiIdxBranch>,
     set_op: SetOperation,
     where_term_idx: usize,
     additional_consumed_terms: Vec<usize>,
@@ -470,24 +505,26 @@ fn evaluate_multi_index_branches(
     let mut branch_rows = Vec::with_capacity(branches.len());
     let mut branch_params = Vec::with_capacity(branches.len());
 
-    for (index, constraint, constraint_refs, estimated_rows) in branches {
-        if constraint_refs.is_empty() {
+    for branch in branches {
+        if branch.constraint_refs.is_empty() {
             return None; // Cannot use multi-index if any branch has no index
         }
 
-        let (cost, params_for_branch) = compute_branch_cost_and_params(
-            index.as_ref(),
-            constraint,
-            constraint_refs,
-            *estimated_rows,
+        let (cost, mut params_for_branch) = compute_branch_cost_and_params(
+            branch.index.as_ref(),
+            &branch.constraint,
+            &branch.constraint_refs,
+            branch.estimated_rows,
             rhs_table,
             base_row_count,
             params,
-            true, // rowid_only: branches only collect rowids
+            branch.requires_table_cursor,
         );
+        params_for_branch.residual_exprs = branch.residual_exprs;
+        params_for_branch.requires_table_cursor = branch.requires_table_cursor;
 
         branch_costs.push(cost);
-        branch_rows.push(*estimated_rows);
+        branch_rows.push(branch.estimated_rows);
         branch_params.push(params_for_branch);
     }
 
@@ -569,32 +606,40 @@ pub fn consider_multi_index_union(
             continue;
         }
 
-        // Verify that every disjunct's constraining expression only references
-        // tables already on the LHS. This ensures cross-table disjuncts are only
-        // used when their referenced tables are available in the join context.
-        // Note: `all_indexable` check above guarantees every disjunct has a constraint,
-        // so the `is_some_and` never short-circuits to false on a None constraint.
-        let all_usable = decomposition.disjuncts.iter().all(|d| {
-            d.constraint
-                .as_ref()
-                .is_some_and(|c| lhs_mask.contains_all(&c.lhs_mask))
-        });
-        if !all_usable {
+        // Verify that every disjunct's constraining expression and residual
+        // expressions only reference tables already available in the join context.
+        // The constraint value side must only reference LHS tables.
+        // Residual expressions may reference LHS tables and the table being scanned.
+        let mut allowed_mask = *lhs_mask;
+        let Some(rhs_idx) = table_references
+            .joined_tables()
+            .iter()
+            .position(|t| t.internal_id == rhs_table.internal_id)
+        else {
             continue;
-        }
-
-        // Extract branch info from disjuncts
+        };
+        allowed_mask.add_table(rhs_idx);
+        // Extract branch info from disjuncts, consuming the decomposition
         let branches: Option<Vec<_>> = decomposition
             .disjuncts
-            .iter()
+            .into_iter()
             .map(|d| {
-                d.constraint.as_ref().map(|c| {
-                    (
-                        d.best_index.clone(),
-                        c.clone(),
-                        d.constraint_refs.clone(),
-                        d.estimated_rows,
-                    )
+                let constraint = d.constraint?;
+                if !lhs_mask.contains_all(&constraint.lhs_mask) {
+                    return None;
+                }
+                let residual_mask =
+                    residual_tables_mask(&d.residual_exprs, table_references, subqueries)?;
+                if !allowed_mask.contains_all(&residual_mask) {
+                    return None;
+                }
+                Some(MultiIdxBranch {
+                    index: d.best_index,
+                    constraint,
+                    constraint_refs: d.constraint_refs,
+                    estimated_rows: d.estimated_rows,
+                    residual_exprs: d.residual_exprs,
+                    requires_table_cursor: residual_mask.contains_table(rhs_idx),
                 })
             })
             .collect();
@@ -603,12 +648,8 @@ pub fn consider_multi_index_union(
             continue;
         };
 
-        if branches.len() != decomposition.disjuncts.len() {
-            continue;
-        }
-
         if let Some(access_method) = evaluate_multi_index_branches(
-            &branches,
+            branches,
             SetOperation::Union,
             where_term_idx,
             vec![],
@@ -673,13 +714,13 @@ pub fn consider_multi_index_intersection(
     let branches: Vec<_> = decomposition
         .branches
         .iter()
-        .map(|b| {
-            (
-                b.index.clone(),
-                b.constraint.clone(),
-                b.constraint_refs.clone(),
-                b.estimated_rows,
-            )
+        .map(|b| MultiIdxBranch {
+            index: b.index.clone(),
+            constraint: b.constraint.clone(),
+            constraint_refs: b.constraint_refs.clone(),
+            estimated_rows: b.estimated_rows,
+            residual_exprs: vec![],
+            requires_table_cursor: false,
         })
         .collect::<Vec<MultiIdxBranch>>();
 
@@ -688,7 +729,7 @@ pub fn consider_multi_index_intersection(
         decomposition.term_indices.iter().skip(1).copied().collect();
 
     evaluate_multi_index_branches(
-        &branches,
+        branches,
         SetOperation::Intersection,
         where_term_idx,
         additional_consumed_terms,

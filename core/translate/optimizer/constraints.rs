@@ -3,7 +3,7 @@ use crate::{
     stats::TableStat,
     translate::{
         collate::get_collseq_from_expr,
-        expr::{as_binary_components, comparison_affinity},
+        expr::{as_binary_components, comparison_affinity, unwrap_parens},
         expression_index::normalize_expr_for_index_matching,
         plan::{JoinOrderMember, JoinedTable, NonFromClauseSubquery, TableReferences, WhereTerm},
         planner::{table_mask_from_expr, TableMask},
@@ -1668,6 +1668,11 @@ pub struct OrDisjunct {
     pub constraint_refs: Vec<RangeConstraintRef>,
     /// Estimated number of rows from this disjunct.
     pub estimated_rows: f64,
+    /// Residual filter expressions for compound AND disjuncts.
+    /// When a disjunct is `(a = 1 AND b = 2 AND c = 3)`, one sub-term becomes
+    /// the seek constraint and the rest become residual filters applied within
+    /// the branch loop after positioning on the table row.
+    pub residual_exprs: Vec<ast::Expr>,
 }
 
 /// Flattens nested OR expressions into a list of disjuncts.
@@ -1678,6 +1683,20 @@ pub fn flatten_or_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
         ast::Expr::Binary(lhs, ast::Operator::Or, rhs) => {
             let mut result = flatten_or_expr(lhs);
             result.extend(flatten_or_expr(rhs));
+            result
+        }
+        _ => vec![expr],
+    }
+}
+
+/// Flattens nested AND expressions into a list of conjuncts.
+///
+/// For example, `(a AND b) AND c` becomes `[a, b, c]`.
+fn flatten_and_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
+    match expr {
+        ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
+            let mut result = flatten_and_expr(lhs);
+            result.extend(flatten_and_expr(rhs));
             result
         }
         _ => vec![expr],
@@ -1748,18 +1767,40 @@ pub fn analyze_or_term_for_multi_index(
                     best_index: analyzed.best_index,
                     constraint_refs: analyzed.constraint_refs,
                     estimated_rows: analyzed.estimated_rows,
+                    residual_exprs: vec![],
                 });
             }
             None => {
-                // Not indexable
-                all_indexable = false;
-                analyzed_disjuncts.push(OrDisjunct {
-                    expr: disjunct_expr.clone(),
-                    constraint: None,
-                    best_index: None,
-                    constraint_refs: vec![],
-                    estimated_rows: params.rows_per_table_fallback,
-                });
+                // Not a simple binary comparison. Check if it's a compound AND
+                // like (a = 1 AND b = 2 AND c = 3) where we can pick the best
+                // indexable sub-term as the seek and keep the rest as residuals.
+                if let Some(compound) = analyze_compound_and_disjunct(
+                    disjunct_expr,
+                    where_term_idx,
+                    table_id,
+                    table_reference,
+                    table_name,
+                    indexes,
+                    rowid_alias_column,
+                    available_indexes,
+                    table_references,
+                    subqueries,
+                    schema,
+                    params,
+                ) {
+                    analyzed_disjuncts.push(compound);
+                } else {
+                    // Not indexable
+                    all_indexable = false;
+                    analyzed_disjuncts.push(OrDisjunct {
+                        expr: disjunct_expr.clone(),
+                        constraint: None,
+                        best_index: None,
+                        constraint_refs: vec![],
+                        estimated_rows: params.rows_per_table_fallback,
+                        residual_exprs: vec![],
+                    });
+                }
             }
         }
     }
@@ -1769,6 +1810,89 @@ pub fn analyze_or_term_for_multi_index(
         table_id,
         disjuncts: analyzed_disjuncts,
         all_indexable,
+    })
+}
+
+/// Analyzes a compound AND disjunct within an OR expression for multi-index scan.
+///
+/// When an OR disjunct is itself an AND of multiple conditions (e.g.
+/// `e.fromId = ? AND e.toId = n.id AND e.label = ?`), this function:
+/// 1. Flattens the AND into sub-terms
+/// 2. Finds the best indexable sub-term as the seek constraint
+/// 3. Collects remaining sub-terms as residual filters
+#[allow(clippy::too_many_arguments)]
+fn analyze_compound_and_disjunct(
+    expr: &ast::Expr,
+    where_term_idx: usize,
+    table_id: TableInternalId,
+    table_reference: &JoinedTable,
+    table_name: &str,
+    indexes: Option<&VecDeque<Arc<Index>>>,
+    rowid_alias_column: Option<usize>,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
+    schema: &Schema,
+    params: &CostModelParams,
+) -> Option<OrDisjunct> {
+    // Unwrap parenthesized expressions
+    let Ok(expr) = unwrap_parens(expr) else {
+        return None;
+    };
+    // Only handle AND expressions
+    if !matches!(expr, ast::Expr::Binary(_, ast::Operator::And, _)) {
+        return None;
+    }
+
+    let conjuncts = flatten_and_expr(expr);
+
+    if conjuncts.len() < 2 {
+        return None;
+    }
+
+    // Try to find an indexable sub-term; pick the one with lowest estimated_rows
+    let mut best: Option<(usize, AnalyzedTerm)> = None;
+    for (i, conjunct) in conjuncts.iter().enumerate() {
+        if let Some(analyzed) = analyze_binary_term_for_index(
+            conjunct,
+            where_term_idx,
+            table_id,
+            table_reference,
+            table_name,
+            indexes,
+            rowid_alias_column,
+            available_indexes,
+            table_references,
+            subqueries,
+            schema,
+            params,
+        ) {
+            let dominated = best
+                .as_ref()
+                .is_none_or(|(_, prev)| analyzed.estimated_rows < prev.estimated_rows);
+            if dominated {
+                best = Some((i, analyzed));
+            }
+        }
+    }
+
+    let (best_idx, analyzed) = best?;
+
+    // Collect non-seek sub-terms as residual filter expressions
+    let residual_exprs: Vec<ast::Expr> = conjuncts
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != best_idx)
+        .map(|(_, e)| (*e).clone())
+        .collect();
+
+    Some(OrDisjunct {
+        expr: expr.clone(),
+        constraint: Some(analyzed.constraint),
+        best_index: analyzed.best_index,
+        constraint_refs: analyzed.constraint_refs,
+        estimated_rows: analyzed.estimated_rows,
+        residual_exprs,
     })
 }
 

@@ -3286,6 +3286,10 @@ mod tests {
         Expr::Literal(ast::Literal::Numeric(value.to_string()))
     }
 
+    fn _create_string_literal(value: &str) -> Expr {
+        Expr::Literal(ast::Literal::String(value.to_string()))
+    }
+
     fn _as_btree(
         access_method: &AccessMethod,
     ) -> (
@@ -3301,6 +3305,184 @@ mod tests {
             } => (*iter_dir, index.clone(), constraint_refs),
             _ => panic!("expected BTreeTable access method"),
         }
+    }
+
+    #[test]
+    fn test_multi_index_union_rejects_residuals_on_future_tables() {
+        let link = _create_btree_table(
+            "link",
+            vec![
+                _create_column_of_type("src", Type::Integer),
+                _create_column_of_type("dst", Type::Integer),
+            ],
+        );
+        let item = _create_btree_table(
+            "item",
+            vec![
+                _create_column_of_type("id", Type::Integer),
+                _create_column_of_type("kind", Type::Text),
+            ],
+        );
+        let meta = _create_btree_table(
+            "meta",
+            vec![
+                _create_column_of_type("id", Type::Integer),
+                _create_column_of_type("kind", Type::Text),
+            ],
+        );
+
+        let mut table_id_counter = TableRefIdCounter::new();
+        let joined_tables = vec![
+            _create_table_reference(link, None, table_id_counter.next()),
+            _create_table_reference(
+                item,
+                Some(JoinInfo {
+                    join_type: JoinType::Inner,
+                    using: vec![],
+                }),
+                table_id_counter.next(),
+            ),
+            _create_table_reference(
+                meta,
+                Some(JoinInfo {
+                    join_type: JoinType::Inner,
+                    using: vec![],
+                }),
+                table_id_counter.next(),
+            ),
+        ];
+
+        const LINK: usize = 0;
+        const ITEM: usize = 1;
+        const META: usize = 2;
+
+        let mut available_indexes = HashMap::default();
+        available_indexes.insert(
+            "item".to_string(),
+            VecDeque::from([Arc::new(Index {
+                name: "idx_item_id".to_string(),
+                table_name: "item".to_string(),
+                where_clause: None,
+                columns: vec![IndexColumn {
+                    name: "id".to_string(),
+                    order: SortOrder::Asc,
+                    pos_in_table: 0,
+                    collation: None,
+                    default: None,
+                    expr: None,
+                }],
+                unique: false,
+                ephemeral: false,
+                root_page: 2,
+                has_rowid: true,
+                index_method: None,
+            })]),
+        );
+
+        let lhs_link_src = Expr::Binary(
+            Box::new(_create_column_expr(
+                joined_tables[LINK].internal_id,
+                0,
+                false,
+            )),
+            Operator::Equals,
+            Box::new(_create_numeric_literal("1")),
+        );
+        let lhs_link_dst_item_id = Expr::Binary(
+            Box::new(_create_column_expr(
+                joined_tables[LINK].internal_id,
+                1,
+                false,
+            )),
+            Operator::Equals,
+            Box::new(_create_column_expr(
+                joined_tables[ITEM].internal_id,
+                0,
+                false,
+            )),
+        );
+        let rhs_link_dst = Expr::Binary(
+            Box::new(_create_column_expr(
+                joined_tables[LINK].internal_id,
+                1,
+                false,
+            )),
+            Operator::Equals,
+            Box::new(_create_numeric_literal("1")),
+        );
+        let rhs_link_src_item_id = Expr::Binary(
+            Box::new(_create_column_expr(
+                joined_tables[LINK].internal_id,
+                0,
+                false,
+            )),
+            Operator::Equals,
+            Box::new(_create_column_expr(
+                joined_tables[ITEM].internal_id,
+                0,
+                false,
+            )),
+        );
+        let future_meta_kind = Expr::Binary(
+            Box::new(_create_column_expr(
+                joined_tables[META].internal_id,
+                1,
+                false,
+            )),
+            Operator::Equals,
+            Box::new(_create_string_literal("entity")),
+        );
+
+        let left_disjunct = Expr::Binary(
+            Box::new(Expr::Binary(
+                Box::new(lhs_link_src),
+                Operator::And,
+                Box::new(lhs_link_dst_item_id),
+            )),
+            Operator::And,
+            Box::new(future_meta_kind.clone()),
+        );
+        let right_disjunct = Expr::Binary(
+            Box::new(Expr::Binary(
+                Box::new(rhs_link_dst),
+                Operator::And,
+                Box::new(rhs_link_src_item_id),
+            )),
+            Operator::And,
+            Box::new(future_meta_kind),
+        );
+        let where_clause = vec![WhereTerm {
+            expr: Expr::Binary(
+                Box::new(left_disjunct),
+                Operator::Or,
+                Box::new(right_disjunct),
+            ),
+            from_outer_join: None,
+            consumed: false,
+        }];
+
+        let table_references = TableReferences::new(joined_tables, vec![]);
+        let base_row_count = RowCountEstimate::hardcoded_fallback(&DEFAULT_PARAMS);
+        let lhs_mask = TableMask::from_table_number_iter([LINK].into_iter());
+
+        let access_method = consider_multi_index_union(
+            &table_references.joined_tables()[ITEM],
+            &where_clause,
+            &available_indexes,
+            &table_references,
+            &[],
+            &empty_schema(),
+            1.0,
+            base_row_count,
+            &DEFAULT_PARAMS,
+            Cost(f64::INFINITY),
+            &lhs_mask,
+        );
+
+        assert!(
+            access_method.is_none(),
+            "future-table residuals must not produce a multi-index OR access method"
+        );
     }
 
     #[test]

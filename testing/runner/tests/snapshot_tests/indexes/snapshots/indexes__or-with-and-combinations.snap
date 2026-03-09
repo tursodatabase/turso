@@ -14,4 +14,4 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-`--SCAN events
+`--MULTI-INDEX OR events (idx_events_type, idx_events_type)

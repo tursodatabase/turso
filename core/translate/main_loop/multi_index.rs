@@ -85,6 +85,32 @@ pub(super) fn emit_multi_index_scan_loop(
             });
         }
 
+        if !branch.residual_exprs.is_empty() {
+            if is_index && branch.requires_table_cursor {
+                program.emit_insn(Insn::DeferredSeek {
+                    index_cursor_id: branch_cursor_id,
+                    table_cursor_id,
+                });
+            }
+            for residual_expr in &branch.residual_exprs {
+                let jump_target_when_true = program.allocate_label();
+                let condition_metadata = ConditionMetadata {
+                    jump_if_condition_is_true: false,
+                    jump_target_when_true,
+                    jump_target_when_false: branch_next,
+                    jump_target_when_null: branch_next,
+                };
+                translate_condition_expr(
+                    program,
+                    table_references,
+                    residual_expr,
+                    condition_metadata,
+                    &t_ctx.resolver,
+                )?;
+                program.preassign_label_to_next_insn(jump_target_when_true);
+            }
+        }
+
         if is_intersection {
             if branch_idx == 0 {
                 program.emit_insn(Insn::RowSetAdd {

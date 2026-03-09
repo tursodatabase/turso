@@ -1,22 +1,5 @@
 use super::*;
 
-fn expr_references_subquery_id(expr: &Expr, subquery_id: TableInternalId) -> bool {
-    let mut found = false;
-    let _ = walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
-        if let Expr::SubqueryResult {
-            subquery_id: sid, ..
-        } = e
-        {
-            if *sid == subquery_id {
-                found = true;
-                return Ok(WalkControl::SkipChildren);
-            }
-        }
-        Ok(WalkControl::Continue)
-    });
-    found
-}
-
 fn condition_references_subquery(expr: &Expr, subqueries: &[NonFromClauseSubquery]) -> bool {
     subqueries
         .iter()

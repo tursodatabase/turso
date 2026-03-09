@@ -3,7 +3,7 @@ use crate::translate::optimizer::constraints::ConstraintOperator;
 use crate::turso_assert;
 
 use tracing::{instrument, Level};
-use turso_parser::ast::{self, Expr, ResolveType, SubqueryType, UnaryOperator};
+use turso_parser::ast::{self, Expr, ResolveType, SubqueryType, TableInternalId, UnaryOperator};
 
 use super::emitter::Resolver;
 use super::optimizer::Optimizable;
@@ -5193,6 +5193,35 @@ where
         WalkControl::SkipChildren => return Ok(WalkControl::Continue),
     };
     Ok(WalkControl::Continue)
+}
+
+pub fn expr_references_subquery_id(expr: &ast::Expr, subquery_id: TableInternalId) -> bool {
+    let mut found = false;
+    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        if let ast::Expr::SubqueryResult {
+            subquery_id: sid, ..
+        } = e
+        {
+            if *sid == subquery_id {
+                found = true;
+                return Ok(WalkControl::SkipChildren);
+            }
+        }
+        Ok(WalkControl::Continue)
+    });
+    found
+}
+
+pub fn expr_references_any_subquery(expr: &ast::Expr) -> bool {
+    let mut found = false;
+    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        if matches!(e, ast::Expr::SubqueryResult { .. }) {
+            found = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    });
+    found
 }
 
 fn walk_expr_frame_bound<'a, F>(bound: &'a ast::FrameBound, func: &mut F) -> Result<WalkControl>

@@ -1426,6 +1426,11 @@ pub struct MultiIndexBranch {
     pub seek_def: SeekDef,
     /// Estimated number of rows from this branch
     pub estimated_rows: f64,
+    /// Residual filter expressions for compound AND disjuncts.
+    /// Applied within the branch loop after positioning on the table row.
+    pub residual_exprs: Vec<ast::Expr>,
+    /// Whether residual evaluation needs the scanned table cursor positioned.
+    pub requires_table_cursor: bool,
 }
 
 #[derive(Clone, Debug)]
