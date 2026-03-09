@@ -258,8 +258,8 @@ fn main() -> Result<()> {
             stats.internal_errors,
         );
     }
-
     tracing::info!("Custom types fuzzer completed successfully");
+    std::fs::remove_dir_all(&out_dir)?;
     Ok(())
 }
 
