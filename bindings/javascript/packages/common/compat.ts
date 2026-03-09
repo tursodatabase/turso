@@ -1,4 +1,5 @@
 import { bindParams } from "./bind.js";
+import { BindParams } from "./sql-params.js";
 import { SqliteError } from "./sqlite-error.js";
 import { NativeDatabase, NativeStatement, STEP_IO, STEP_ROW, STEP_DONE } from "./types.js";
 
@@ -66,7 +67,7 @@ class Database {
    *
    * @param {string} sql - The SQL statement string to prepare.
    */
-  prepare(sql) {
+  prepare<S extends string>(sql: S): Statement<S> {
     if (!this.open) {
       throw new TypeError("The database connection is not open");
     }
@@ -75,7 +76,7 @@ class Database {
     }
 
     try {
-      return new Statement(this.db.prepare(sql), this.db);
+      return new Statement<S>(this.db.prepare(sql), this.db);
     } catch (err) {
       throw convertError(err);
     }
@@ -227,7 +228,7 @@ class Database {
 /**
  * Statement represents a prepared SQL statement that can be executed.
  */
-class Statement {
+class Statement<SQL extends string = string> {
   stmt: NativeStatement;
   db: NativeDatabase;
 
@@ -290,7 +291,7 @@ class Statement {
   /**
    * Executes the SQL statement and returns an info object.
    */
-  run(...bindParameters) {
+  run(...bindParameters: BindParams<SQL>) {
     const totalChangesBefore = this.db.totalChanges();
 
     this.stmt.reset();
@@ -321,7 +322,7 @@ class Statement {
    *
    * @param bindParameters - The bind parameters for executing the statement.
    */
-  get(...bindParameters) {
+  get(...bindParameters: BindParams<SQL>) {
     this.stmt.reset();
     bindParams(this.stmt, bindParameters);
     let row = undefined;
@@ -346,7 +347,7 @@ class Statement {
    *
    * @param bindParameters - The bind parameters for executing the statement.
    */
-  *iterate(...bindParameters) {
+  *iterate(...bindParameters: BindParams<SQL>) {
     this.stmt.reset();
     bindParams(this.stmt, bindParameters);
 
@@ -370,7 +371,7 @@ class Statement {
    *
    * @param bindParameters - The bind parameters for executing the statement.
    */
-  all(...bindParameters) {
+  all(...bindParameters: BindParams<SQL>) {
     this.stmt.reset();
     bindParams(this.stmt, bindParameters);
     const rows: any[] = [];
@@ -404,7 +405,7 @@ class Statement {
    * @param bindParameters - The bind parameters for binding the statement.
    * @returns this - Statement with binded parameters
    */
-  bind(...bindParameters) {
+  bind(...bindParameters: BindParams<SQL>) {
     try {
       bindParams(this.stmt, bindParameters);
       return this;

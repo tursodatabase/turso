@@ -1,5 +1,6 @@
 import { AsyncLock } from "./async-lock.js";
 import { bindParams } from "./bind.js";
+import { BindParams } from "./sql-params.js";
 import { SqliteError } from "./sqlite-error.js";
 import { NativeDatabase, NativeStatement, STEP_IO, STEP_ROW, STEP_DONE, DatabaseOpts } from "./types.js";
 
@@ -69,7 +70,7 @@ class Database {
    *
    * @param {string} sql - The SQL statement string to prepare.
    */
-  prepare(sql) {
+  prepare<S extends string>(sql: S): Statement<S> {
     // Only throw if we connected before but now the database is closed
     // Allow implicit connection if not connected yet
     if (this.connected && !this.open) {
@@ -81,9 +82,9 @@ class Database {
 
     try {
       if (this.connected) {
-        return new Statement(maybeValue(this.db.prepare(sql)), this.db, this.execLock, this.ioStep);
+        return new Statement<S>(maybeValue(this.db.prepare(sql)), this.db, this.execLock, this.ioStep);
       } else {
-        return new Statement(maybePromise(() => this.connect().then(() => this.db.prepare(sql))), this.db, this.execLock, this.ioStep)
+        return new Statement<S>(maybePromise(() => this.connect().then(() => this.db.prepare(sql))), this.db, this.execLock, this.ioStep)
       }
     } catch (err) {
       throw convertError(err);
@@ -293,7 +294,7 @@ function maybeValue<T>(value: T): MaybeLazy<T> {
 /**
  * Statement represents a prepared SQL statement that can be executed.
  */
-class Statement {
+class Statement<SQL extends string = string> {
   private stmt: MaybeLazy<NativeStatement>;
   private db: NativeDatabase;
   private execLock: AsyncLock;
@@ -360,7 +361,7 @@ class Statement {
   /**
    * Executes the SQL statement and returns an info object.
    */
-  async run(...bindParameters) {
+  async run(...bindParameters: BindParams<SQL>) {
     let stmt = await this.stmt.resolve();
 
     bindParams(stmt, bindParameters);
@@ -398,7 +399,7 @@ class Statement {
    *
    * @param bindParameters - The bind parameters for executing the statement.
    */
-  async get(...bindParameters) {
+  async get(...bindParameters: BindParams<SQL>) {
     let stmt = await this.stmt.resolve();
 
     bindParams(stmt, bindParameters);
@@ -432,7 +433,7 @@ class Statement {
    *
    * @param bindParameters - The bind parameters for executing the statement.
    */
-  async *iterate(...bindParameters) {
+  async *iterate(...bindParameters: BindParams<SQL>) {
     let stmt = await this.stmt.resolve();
 
     bindParams(stmt, bindParameters);
@@ -463,7 +464,7 @@ class Statement {
    *
    * @param bindParameters - The bind parameters for executing the statement.
    */
-  async all(...bindParameters) {
+  async all(...bindParameters: BindParams<SQL>) {
     let stmt = await this.stmt.resolve();
 
     bindParams(stmt, bindParameters);
@@ -510,7 +511,7 @@ class Statement {
    * @param bindParameters - The bind parameters for binding the statement.
    * @returns this - Statement with binded parameters
    */
-  bind(...bindParameters) {
+  bind(...bindParameters: BindParams<SQL>) {
     try {
       bindParams(this.stmt, bindParameters);
       return this;
