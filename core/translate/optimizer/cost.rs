@@ -68,7 +68,7 @@ fn estimate_scan_cost(base_row_count: f64, num_scans: f64, params: &CostModelPar
 /// * `num_seeks` - Number of B-tree traversals (typically = outer cardinality for joins)
 /// * `rows_per_seek` - Expected rows returned per seek (1 for point lookup, more for range)
 /// * `params` - Cost model parameters
-fn estimate_index_cost(
+pub fn estimate_index_cost(
     base_row_count: f64,
     tree_depth: f64,
     index_info: IndexInfo,

@@ -177,7 +177,9 @@ impl Display for SelectPlan {
                 Operation::Search(search) => {
                     let left_join_suffix = if member.is_outer { " LEFT-JOIN" } else { "" };
                     match search {
-                        Search::RowidEq { .. } | Search::Seek { index: None, .. } => {
+                        Search::RowidEq { .. }
+                        | Search::Seek { index: None, .. }
+                        | Search::InSeek { index: None, .. } => {
                             writeln!(
                                 f,
                                 "{indent}SEARCH {} USING INTEGER PRIMARY KEY (rowid=?){left_join_suffix}",
@@ -192,6 +194,20 @@ impl Display for SelectPlan {
                             writeln!(
                                 f,
                                 "{indent}SEARCH {} USING INDEX {}{constraints}{left_join_suffix}",
+                                reference.identifier, index.name
+                            )?;
+                        }
+                        Search::InSeek {
+                            index: Some(index), ..
+                        } => {
+                            let constraint = if let Some(col) = index.columns.first() {
+                                format!(" ({}=?)", col.name)
+                            } else {
+                                String::new()
+                            };
+                            writeln!(
+                                f,
+                                "{indent}SEARCH {} USING INDEX {}{constraint}{left_join_suffix}",
                                 reference.identifier, index.name
                             )?;
                         }
@@ -282,7 +298,9 @@ impl Display for DeletePlan {
                     }
                 }
                 Operation::Search(search) => match search {
-                    Search::RowidEq { .. } | Search::Seek { index: None, .. } => {
+                    Search::RowidEq { .. }
+                    | Search::Seek { index: None, .. }
+                    | Search::InSeek { index: None, .. } => {
                         writeln!(
                             f,
                             "{}SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
@@ -295,6 +313,20 @@ impl Display for DeletePlan {
                         writeln!(
                             f,
                             "{}SEARCH {} USING INDEX {}",
+                            indent, reference.identifier, index.name
+                        )?;
+                    }
+                    Search::InSeek {
+                        index: Some(index), ..
+                    } => {
+                        let constraint = if let Some(col) = index.columns.first() {
+                            format!(" ({}=?)", col.name)
+                        } else {
+                            String::new()
+                        };
+                        writeln!(
+                            f,
+                            "{}SEARCH {} USING INDEX {}{constraint}",
                             indent, reference.identifier, index.name
                         )?;
                     }
@@ -394,7 +426,9 @@ impl fmt::Display for UpdatePlan {
                     }
                 }
                 Operation::Search(search) => match search {
-                    Search::RowidEq { .. } | Search::Seek { index: None, .. } => {
+                    Search::RowidEq { .. }
+                    | Search::Seek { index: None, .. }
+                    | Search::InSeek { index: None, .. } => {
                         writeln!(
                             f,
                             "{}SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
@@ -407,6 +441,20 @@ impl fmt::Display for UpdatePlan {
                         writeln!(
                             f,
                             "{}SEARCH {} USING INDEX {}",
+                            indent, reference.identifier, index.name
+                        )?;
+                    }
+                    Search::InSeek {
+                        index: Some(index), ..
+                    } => {
+                        let constraint = if let Some(col) = index.columns.first() {
+                            format!(" ({}=?)", col.name)
+                        } else {
+                            String::new()
+                        };
+                        writeln!(
+                            f,
+                            "{}SEARCH {} USING INDEX {}{constraint}",
                             indent, reference.identifier, index.name
                         )?;
                     }

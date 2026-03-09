@@ -20,4 +20,4 @@ info:
 QUERY PLAN
 |--LIST SUBQUERY 1
 |  `--SCAN categories
-`--SCAN products
+`--SEARCH products USING INDEX idx_products_category (category_id=?)

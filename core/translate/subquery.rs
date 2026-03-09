@@ -531,43 +531,45 @@ fn get_subquery_parser<'a>(
                         plan.result_columns.len()
                     );
                 }
-                let in_affinity_str: Arc<String> = Arc::new(
-                    lhs_columns
-                        .enumerate()
-                        .map(|(i, lhs_expr)| {
-                            let lhs_affinity =
-                                get_expr_affinity_info(lhs_expr, Some(referenced_tables), None);
-                            compare_affinity(
-                                &plan.result_columns[i].expr,
-                                lhs_affinity,
-                                Some(&plan.table_references),
-                                None,
-                            )
-                            .aff_mask()
-                        })
-                        .collect(),
-                );
+                // Collect affinity and LHS collation in a single pass over lhs_columns.
+                // "x IN (SELECT y ...)" uses the collation of x
+                // (https://www.sqlite.org/datatype3.html#collation §7.1),
+                // so the ephemeral index must use the LHS collation for correct
+                // NotFound/Found probe comparisons.
+                let mut affinity_chars = String::with_capacity(lhs_column_count);
+                let mut lhs_collations = Vec::with_capacity(lhs_column_count);
+                for (i, lhs_expr) in lhs_columns.enumerate() {
+                    let lhs_affinity =
+                        get_expr_affinity_info(lhs_expr, Some(referenced_tables), None);
+                    affinity_chars.push(
+                        compare_affinity(
+                            &plan.result_columns[i].expr,
+                            lhs_affinity,
+                            Some(&plan.table_references),
+                            None,
+                        )
+                        .aff_mask(),
+                    );
+                    lhs_collations.push(get_collseq_from_expr(lhs_expr, referenced_tables)?);
+                }
+                let in_affinity_str: Arc<String> = Arc::new(affinity_chars);
 
-                let mut columns = plan
+                let columns = plan
                     .result_columns
                     .iter()
                     .enumerate()
-                    .map(|(i, c)| IndexColumn {
-                        name: c.name(&plan.table_references).unwrap_or("").to_string(),
-                        order: SortOrder::Asc,
-                        pos_in_table: i,
-                        collation: None,
-                        default: None,
-                        expr: None,
+                    .map(|(i, c)| {
+                        let rhs_collation = get_collseq_from_expr(&c.expr, &plan.table_references)?;
+                        Ok(IndexColumn {
+                            name: c.name(&plan.table_references).unwrap_or("").to_string(),
+                            order: SortOrder::Asc,
+                            pos_in_table: i,
+                            collation: lhs_collations[i].or(rhs_collation),
+                            default: None,
+                            expr: None,
+                        })
                     })
-                    .collect::<Vec<_>>();
-
-                for (i, column) in columns.iter_mut().enumerate() {
-                    column.collation = get_collseq_from_expr(
-                        &plan.result_columns[i].expr,
-                        &plan.table_references,
-                    )?;
-                }
+                    .collect::<Result<Vec<_>>>()?;
 
                 let ephemeral_index = Arc::new(Index {
                     columns,
@@ -950,7 +952,9 @@ pub fn emit_from_clause_subqueries(
                     }
                 }
                 Operation::Search(search) => match search {
-                    Search::RowidEq { .. } | Search::Seek { index: None, .. } => {
+                    Search::RowidEq { .. }
+                    | Search::Seek { index: None, .. }
+                    | Search::InSeek { index: None, .. } => {
                         format!(
                             "SEARCH {} USING INTEGER PRIMARY KEY (rowid=?){left_join_suffix}",
                             table_reference.identifier
@@ -964,6 +968,19 @@ pub fn emit_from_clause_subqueries(
                             super::display::seek_constraint_annotation(index, seek_def);
                         format!(
                             "SEARCH {} USING INDEX {}{constraints}{left_join_suffix}",
+                            table_reference.identifier, index.name
+                        )
+                    }
+                    Search::InSeek {
+                        index: Some(index), ..
+                    } => {
+                        let constraint = if let Some(col) = index.columns.first() {
+                            format!(" ({}=?)", col.name)
+                        } else {
+                            String::new()
+                        };
+                        format!(
+                            "SEARCH {} USING INDEX {}{constraint}{left_join_suffix}",
                             table_reference.identifier, index.name
                         )
                     }
@@ -1266,6 +1283,9 @@ pub fn emit_from_clause_subquery(
                 non_aggregate_expressions: Vec::new(),
                 cdc_cursor_id: None,
                 meta_window: None,
+                meta_in_seeks: (0..select_plan.joined_tables().len())
+                    .map(|_| None)
+                    .collect(),
                 materialized_build_inputs: HashMap::default(),
                 hash_table_contexts: HashMap::default(),
                 unsafe_testing: t_ctx.unsafe_testing,
@@ -1367,6 +1387,9 @@ fn emit_materialized_cte(
                 non_aggregate_expressions: Vec::new(),
                 cdc_cursor_id: None,
                 meta_window: None,
+                meta_in_seeks: (0..select_plan.joined_tables().len())
+                    .map(|_| None)
+                    .collect(),
                 materialized_build_inputs: HashMap::default(),
                 hash_table_contexts: HashMap::default(),
                 unsafe_testing: t_ctx.unsafe_testing,
@@ -1458,6 +1481,9 @@ fn emit_indexed_materialized_subquery(
                 non_aggregate_expressions: Vec::new(),
                 cdc_cursor_id: None,
                 meta_window: None,
+                meta_in_seeks: (0..select_plan.joined_tables().len())
+                    .map(|_| None)
+                    .collect(),
                 materialized_build_inputs: HashMap::default(),
                 hash_table_contexts: HashMap::default(),
                 unsafe_testing: t_ctx.unsafe_testing,

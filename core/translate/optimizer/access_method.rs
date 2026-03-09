@@ -9,7 +9,7 @@ use crate::schema::Schema;
 use crate::stats::AnalyzeStats;
 use crate::translate::expr::{as_binary_components, walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::{
-    convert_to_vtab_constraint, BinaryExprSide, Constraint, RangeConstraintRef,
+    convert_to_vtab_constraint, BinaryExprSide, Constraint, ConstraintOperator, RangeConstraintRef,
 };
 use crate::translate::optimizer::cost::RowCountEstimate;
 use crate::translate::optimizer::cost_params::CostModelParams;
@@ -18,6 +18,7 @@ use crate::translate::plan::{
     SubqueryState, TableReferences, WhereTerm,
 };
 use crate::util::exprs_are_equivalent;
+use crate::vdbe::affinity::Affinity;
 use crate::vdbe::hash_table::DEFAULT_MEM_BUDGET;
 use crate::{
     schema::{FromClauseSubquery, Index, IndexColumn, Table},
@@ -31,7 +32,7 @@ use super::{
     constraints::{
         usable_constraints_for_join_order, usable_constraints_for_lhs_mask, TableConstraints,
     },
-    cost::{estimate_cost_for_scan_or_seek, Cost, IndexInfo},
+    cost::{estimate_cost_for_scan_or_seek, estimate_index_cost, Cost, IndexInfo},
     multi_index::{
         consider_multi_index_intersection, consider_multi_index_union, MultiIndexBranchParams,
     },
@@ -146,6 +147,12 @@ pub enum AccessMethodParams {
         set_op: SetOperation,
         /// For Intersection: additional WHERE term indices consumed.
         additional_consumed_terms: Vec<usize>,
+    },
+    /// IN-list driven index seek.
+    InSeek {
+        index: Option<Arc<Index>>,
+        affinity: Affinity,
+        where_term_idx: usize,
     },
 }
 
@@ -320,9 +327,205 @@ pub(super) fn choose_best_btree_candidate(
                 cost,
             };
         }
+
+        // Also consider IN-seek on this candidate. For each IN constraint
+        // whose column matches this candidate's first column, compute the
+        // cost of N equality seeks and compare against the current best.
+        {
+            let first_col_pos = candidate
+                .index
+                .as_ref()
+                .and_then(|idx| idx.columns.first().map(|c| c.pos_in_table));
+
+            for constraint in &rhs_constraints.constraints {
+                let ConstraintOperator::In {
+                    not,
+                    estimated_values,
+                } = constraint.operator
+                else {
+                    continue;
+                };
+                // lhs_mask is always empty for current IN constraints (literals
+                // and non-correlated subqueries), but guard against future changes.
+                if not || !constraint.lhs_mask.is_empty() {
+                    continue;
+                }
+
+                // Match: rowid candidate ↔ rowid constraint,
+                //        index candidate ↔ constraint on first column
+                let matches = if candidate.index.is_none() {
+                    constraint.is_rowid
+                } else {
+                    !constraint.is_rowid
+                        && constraint.table_col_pos.is_some()
+                        && constraint.table_col_pos == first_col_pos
+                };
+                if !matches {
+                    continue;
+                }
+
+                let n = estimated_values;
+                let num_seeks = n * input_cardinality;
+                // For unique single-column index or rowid, exactly 1 row per value.
+                // Otherwise estimate rows per value. Without ANALYZE stats,
+                // sel_eq_indexed * base can be very pessimistic (e.g. 0.01 * 1M =
+                // 10K), making IN-seek look as expensive as a full scan. SQLite
+                // avoids this by always preferring indexed IN over a full
+                // scan without stats (where.c:3246).
+                // We use a geometric mean of sel_eq_indexed and 1/base to get a
+                // more moderate per-value estimate that doesn't scale as
+                // aggressively with table size.
+                let rows_per_seek = if index_info.unique && index_info.column_count == 1
+                    || candidate.index.is_none()
+                {
+                    1.0
+                } else {
+                    (base * params.sel_eq_indexed).sqrt().max(1.0)
+                };
+
+                let in_cost = estimate_index_cost(
+                    base,
+                    tree_depth,
+                    index_info,
+                    num_seeks,
+                    rows_per_seek,
+                    params,
+                );
+                if in_cost < best_cost {
+                    let affinity = if let Some(col_pos) = constraint.table_col_pos {
+                        if col_pos < btree.columns.len() {
+                            btree.columns[col_pos].affinity()
+                        } else {
+                            Affinity::Blob
+                        }
+                    } else {
+                        Affinity::Integer
+                    };
+                    best_cost = in_cost;
+                    best_prereq_count = 0; // IN values are constants
+                    best_params = AccessMethodParams::InSeek {
+                        index: candidate.index.clone(),
+                        affinity,
+                        where_term_idx: constraint.where_clause_pos.0,
+                    };
+                }
+            }
+        }
     }
 
     Some(best_choice)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn consider_in_seek_access_method(
+    rhs_table: &JoinedTable,
+    rhs_constraints: &TableConstraints,
+    lhs_mask: &TableMask,
+    input_cardinality: f64,
+    base_row_count: RowCountEstimate,
+    params: &CostModelParams,
+    best_cost: Cost,
+) -> Result<Option<AccessMethod>> {
+    let Table::BTree(btree) = &rhs_table.table else {
+        return Err(LimboError::InternalError(
+            "consider_in_seek_access_method called on non-BTree table".into(),
+        ));
+    };
+
+    let base = *base_row_count;
+    let tree_depth = if base <= 1.0 {
+        1.0
+    } else {
+        (base.ln() / params.rows_per_page.ln()).ceil().max(1.0)
+    };
+    let mut best_in_seek = None;
+    let mut best_in_seek_cost = best_cost;
+
+    for candidate in rhs_constraints.candidates.iter() {
+        let first_col_pos = candidate
+            .index
+            .as_ref()
+            .and_then(|idx| idx.columns.first().map(|c| c.pos_in_table));
+
+        let index_info = match candidate.index.as_ref() {
+            Some(index) => IndexInfo {
+                unique: index.unique,
+                covering: rhs_table.index_is_covering(index),
+                column_count: index.columns.len(),
+            },
+            None => IndexInfo {
+                unique: true,
+                covering: false,
+                column_count: 1,
+            },
+        };
+
+        for constraint in &rhs_constraints.constraints {
+            let ConstraintOperator::In {
+                not,
+                estimated_values,
+            } = constraint.operator
+            else {
+                continue;
+            };
+            if not || !lhs_mask.contains_all(&constraint.lhs_mask) {
+                continue;
+            }
+
+            let matches = if candidate.index.is_none() {
+                constraint.is_rowid
+            } else {
+                !constraint.is_rowid
+                    && constraint.table_col_pos.is_some()
+                    && constraint.table_col_pos == first_col_pos
+            };
+            if !matches {
+                continue;
+            }
+
+            let rows_per_seek = if (index_info.unique && index_info.column_count == 1)
+                || candidate.index.is_none()
+            {
+                1.0
+            } else {
+                (base * params.sel_eq_indexed).sqrt().max(1.0)
+            };
+            let in_cost = estimate_index_cost(
+                base,
+                tree_depth,
+                index_info,
+                estimated_values * input_cardinality,
+                rows_per_seek,
+                params,
+            );
+            if in_cost >= best_in_seek_cost {
+                continue;
+            }
+
+            let affinity = if let Some(col_pos) = constraint.table_col_pos {
+                btree
+                    .columns
+                    .get(col_pos)
+                    .map(|col| col.affinity())
+                    .unwrap_or(Affinity::Blob)
+            } else {
+                Affinity::Integer
+            };
+            best_in_seek_cost = in_cost;
+            best_in_seek = Some(AccessMethod {
+                cost: in_cost,
+                estimated_rows_per_outer_row: (constraint.selectivity * base).max(1.0),
+                post_access_filter: PostAccessFilter::LocalOnly,
+                params: AccessMethodParams::InSeek {
+                    index: candidate.index.clone(),
+                    affinity,
+                    where_term_idx: constraint.where_clause_pos.0,
+                },
+            });
+        }
+    }
+
+    Ok(best_in_seek)
 }
 
 /// Estimate rows produced per outer row for an ordinary btree access path using
@@ -489,6 +692,18 @@ fn find_best_access_method_for_btree(
     };
 
     if rhs_table.btree().is_some_and(|b| b.has_rowid) {
+        if let Some(in_seek_method) = consider_in_seek_access_method(
+            rhs_table,
+            rhs_constraints,
+            &lhs_mask,
+            input_cardinality,
+            base_row_count,
+            params,
+            best_access_method.cost,
+        )? {
+            best_access_method = in_seek_method;
+        }
+
         if let Some(multi_idx_method) = consider_multi_index_union(
             rhs_table,
             where_clause,

@@ -1,0 +1,602 @@
+@database :temp:
+
+# Tests for IN-list index seek optimization.
+# When a column has an index, WHERE col IN (v1,v2,...) should use the index
+# via an ephemeral B-tree rather than a full table scan.
+
+setup schema {
+    CREATE TABLE t (
+        a INTEGER PRIMARY KEY,
+        b TEXT,
+        c INTEGER
+    );
+    CREATE INDEX idx_c ON t(c);
+    INSERT INTO t VALUES(1, 'one', 10);
+    INSERT INTO t VALUES(2, 'two', 20);
+    INSERT INTO t VALUES(3, 'three', 10);
+    INSERT INTO t VALUES(4, 'four', 30);
+    INSERT INTO t VALUES(5, 'five', 20);
+}
+
+# Basic rowid IN seek
+@setup schema
+test rowid-in-basic {
+    SELECT a, b FROM t WHERE a IN (1, 3, 5) ORDER BY a;
+}
+expect {
+    1|one
+    3|three
+    5|five
+}
+
+# Index IN seek on secondary index
+@setup schema
+test index-in-basic {
+    SELECT a, b, c FROM t WHERE c IN (10, 20) ORDER BY a;
+}
+expect {
+    1|one|10
+    2|two|20
+    3|three|10
+    5|five|20
+}
+
+# IN with no matching values
+@setup schema
+test in-no-match {
+    SELECT a FROM t WHERE a IN (99, 100, 101);
+}
+expect {
+}
+
+# IN with single value
+@setup schema
+test in-single-value {
+    SELECT a, b FROM t WHERE a IN (3);
+}
+expect {
+    3|three
+}
+
+# IN with single value on index
+@setup schema
+test in-single-value-index {
+    SELECT a, c FROM t WHERE c IN (30);
+}
+expect {
+    4|30
+}
+
+# IN with NULLs in list - NULLs should be skipped
+@setup schema
+test in-with-nulls {
+    SELECT a, b FROM t WHERE a IN (1, NULL, 3) ORDER BY a;
+}
+expect {
+    1|one
+    3|three
+}
+
+# IN with NULL on index
+@setup schema
+test in-with-nulls-index {
+    SELECT a, c FROM t WHERE c IN (NULL, 10) ORDER BY a;
+}
+expect {
+    1|10
+    3|10
+}
+
+# IN with duplicate values should not produce duplicate rows
+@setup schema
+test in-duplicates {
+    SELECT a, b FROM t WHERE a IN (1, 1, 3, 3, 5) ORDER BY a;
+}
+expect {
+    1|one
+    3|three
+    5|five
+}
+
+# IN with duplicate values on secondary index
+@setup schema
+test in-duplicates-index {
+    SELECT a, c FROM t WHERE c IN (10, 10, 20) ORDER BY a;
+}
+expect {
+    1|10
+    2|20
+    3|10
+    5|20
+}
+
+# NOT IN should still work (no index optimization)
+@setup schema
+test not-in-fallback {
+    SELECT a, b FROM t WHERE a NOT IN (1, 3) ORDER BY a;
+}
+expect {
+    2|two
+    4|four
+    5|five
+}
+
+# IN with ORDER BY on the IN column (secondary index)
+@setup schema
+test in-order-by-indexed-col {
+    SELECT a, c FROM t WHERE c IN (20, 10) ORDER BY c, a;
+}
+expect {
+    1|10
+    3|10
+    2|20
+    5|20
+}
+
+# IN with additional filter
+@setup schema
+test in-with-extra-filter {
+    SELECT a, b, c FROM t WHERE c IN (10, 20) AND b != 'one' ORDER BY a;
+}
+expect {
+    2|two|20
+    3|three|10
+    5|five|20
+}
+
+# IN on rowid combined with another condition
+@setup schema
+test rowid-in-with-filter {
+    SELECT a, b, c FROM t WHERE a IN (1, 2, 3, 4, 5) AND c > 15 ORDER BY a;
+}
+expect {
+    2|two|20
+    4|four|30
+    5|five|20
+}
+
+# IN with expressions (not just literals)
+@setup schema
+test in-with-expressions {
+    SELECT a, b FROM t WHERE a IN (1+0, 2+1, 4+1) ORDER BY a;
+}
+expect {
+    1|one
+    3|three
+    5|five
+}
+
+# Composite index - IN on first column
+setup composite {
+    CREATE TABLE t2 (
+        id INTEGER PRIMARY KEY,
+        x INTEGER,
+        y INTEGER,
+        z TEXT
+    );
+    CREATE INDEX idx_xy ON t2(x, y);
+    INSERT INTO t2 VALUES(1, 10, 100, 'a');
+    INSERT INTO t2 VALUES(2, 10, 200, 'b');
+    INSERT INTO t2 VALUES(3, 20, 100, 'c');
+    INSERT INTO t2 VALUES(4, 20, 200, 'd');
+    INSERT INTO t2 VALUES(5, 30, 300, 'e');
+}
+
+@setup composite
+test in-composite-index-prefix {
+    SELECT id, x, y FROM t2 WHERE x IN (10, 30) ORDER BY id;
+}
+expect {
+    1|10|100
+    2|10|200
+    5|30|300
+}
+
+# Text values in IN list with text index
+setup text_idx {
+    CREATE TABLE t3 (
+        id INTEGER PRIMARY KEY,
+        name TEXT,
+        val INTEGER
+    );
+    CREATE INDEX idx_name ON t3(name);
+    INSERT INTO t3 VALUES(1, 'alice', 10);
+    INSERT INTO t3 VALUES(2, 'bob', 20);
+    INSERT INTO t3 VALUES(3, 'carol', 30);
+    INSERT INTO t3 VALUES(4, 'alice', 40);
+}
+
+@setup text_idx
+test in-text-index {
+    SELECT id, name, val FROM t3 WHERE name IN ('alice', 'carol') ORDER BY id;
+}
+expect {
+    1|alice|10
+    3|carol|30
+    4|alice|40
+}
+
+# Empty table
+setup empty {
+    CREATE TABLE t4 (
+        a INTEGER PRIMARY KEY,
+        b INTEGER
+    );
+    CREATE INDEX idx_b ON t4(b);
+}
+
+@setup empty
+test in-empty-table-rowid {
+    SELECT a FROM t4 WHERE a IN (1, 2, 3);
+}
+expect {
+}
+
+@setup empty
+test in-empty-table-index {
+    SELECT a FROM t4 WHERE b IN (1, 2, 3);
+}
+expect {
+}
+
+# Large IN list
+setup large {
+    CREATE TABLE t5 (
+        id INTEGER PRIMARY KEY,
+        val INTEGER
+    );
+    CREATE INDEX idx_val ON t5(val);
+    INSERT INTO t5 VALUES(1, 1);
+    INSERT INTO t5 VALUES(2, 2);
+    INSERT INTO t5 VALUES(3, 3);
+    INSERT INTO t5 VALUES(4, 4);
+    INSERT INTO t5 VALUES(5, 5);
+    INSERT INTO t5 VALUES(6, 6);
+    INSERT INTO t5 VALUES(7, 7);
+    INSERT INTO t5 VALUES(8, 8);
+    INSERT INTO t5 VALUES(9, 9);
+    INSERT INTO t5 VALUES(10, 10);
+}
+
+@setup large
+test in-many-values {
+    SELECT id FROM t5 WHERE val IN (2, 4, 6, 8, 10) ORDER BY id;
+}
+expect {
+    2
+    4
+    6
+    8
+    10
+}
+
+@setup large
+test rowid-in-many-values {
+    SELECT id FROM t5 WHERE id IN (1, 3, 5, 7, 9) ORDER BY id;
+}
+expect {
+    1
+    3
+    5
+    7
+    9
+}
+
+# NOCASE collation - IN list should respect index collation
+setup nocase {
+    CREATE TABLE t6 (
+        id INTEGER PRIMARY KEY,
+        val TEXT COLLATE NOCASE
+    );
+    CREATE INDEX idx_val_nocase ON t6(val);
+    INSERT INTO t6 VALUES(1, 'hello');
+    INSERT INTO t6 VALUES(2, 'HELLO');
+    INSERT INTO t6 VALUES(3, 'world');
+    INSERT INTO t6 VALUES(4, 'WORLD');
+}
+
+@setup nocase
+test in-nocase-index {
+    SELECT id, val FROM t6 WHERE val IN ('hello', 'world') ORDER BY id;
+}
+expect {
+    1|hello
+    2|HELLO
+    3|world
+    4|WORLD
+}
+
+@setup nocase
+test in-nocase-index-mixed-case-list {
+    SELECT id, val FROM t6 WHERE val IN ('HELLO', 'World') ORDER BY id;
+}
+expect {
+    1|hello
+    2|HELLO
+    3|world
+    4|WORLD
+}
+
+# NOCASE IN subquery - ephemeral must inherit LHS collation
+@setup nocase
+test in-nocase-subquery {
+    CREATE TABLE search_vals(v TEXT);
+    INSERT INTO search_vals VALUES('hello');
+    INSERT INTO search_vals VALUES('world');
+    SELECT id, val FROM t6 WHERE val IN (SELECT v FROM search_vals) ORDER BY id;
+}
+expect {
+    1|hello
+    2|HELLO
+    3|world
+    4|WORLD
+}
+
+# COLLATE BINARY explicit override on NOCASE column
+@setup nocase
+test in-collate-binary-override {
+    SELECT id FROM t6 WHERE val COLLATE BINARY IN ('hello') ORDER BY id;
+}
+expect {
+    1
+}
+
+# NOT IN with NULL - three-valued logic: NOT IN returns empty when NULL is in the list
+setup nulls {
+    CREATE TABLE tn (
+        id INTEGER PRIMARY KEY,
+        val TEXT
+    );
+    INSERT INTO tn VALUES(1, 'a');
+    INSERT INTO tn VALUES(2, NULL);
+    INSERT INTO tn VALUES(3, 'b');
+}
+
+@setup nulls
+test not-in-with-null-in-list {
+    SELECT id FROM tn WHERE val NOT IN ('a', NULL) ORDER BY id;
+}
+expect {
+}
+
+@setup nulls
+test in-with-null-in-list {
+    SELECT id FROM tn WHERE val IN ('a', 'b', NULL) ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+# NOT IN with NULL in subquery result
+@setup nulls
+test not-in-subquery-with-null {
+    CREATE TABLE sn(v TEXT);
+    INSERT INTO sn VALUES('a');
+    INSERT INTO sn VALUES(NULL);
+    INSERT INTO sn VALUES('b');
+    SELECT id FROM tn WHERE val IN (SELECT v FROM sn) ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+@setup nulls
+test not-in-subquery-with-null-notin {
+    CREATE TABLE sn2(v TEXT);
+    INSERT INTO sn2 VALUES('a');
+    INSERT INTO sn2 VALUES(NULL);
+    INSERT INTO sn2 VALUES('b');
+    SELECT id FROM tn WHERE val NOT IN (SELECT v FROM sn2) ORDER BY id;
+}
+expect {
+}
+
+# Type coercion: integer column with string/float IN values
+setup types {
+    CREATE TABLE tt (
+        id INTEGER PRIMARY KEY,
+        val INTEGER
+    );
+    CREATE INDEX idx_tt_val ON tt(val);
+    INSERT INTO tt VALUES(1, 1);
+    INSERT INTO tt VALUES(2, 2);
+    INSERT INTO tt VALUES(3, 3);
+}
+
+@setup types
+test in-integer-col-string-values {
+    SELECT id FROM tt WHERE val IN ('1', '2') ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+@setup types
+test in-integer-col-float-values {
+    SELECT id FROM tt WHERE val IN (1.0, 2.0) ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+# Type coercion in IN subquery
+@setup types
+test in-subquery-type-coercion {
+    CREATE TABLE ts(v TEXT);
+    INSERT INTO ts VALUES('1');
+    INSERT INTO ts VALUES('2');
+    SELECT id FROM tt WHERE val IN (SELECT v FROM ts) ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+# Rowid IN with float/string types
+@setup schema
+test rowid-in-float-values {
+    SELECT b FROM t WHERE a IN (1.0, 2.0) ORDER BY a;
+}
+expect {
+    one
+    two
+}
+
+@setup schema
+test rowid-in-string-values {
+    SELECT b FROM t WHERE a IN ('1', '2') ORDER BY a;
+}
+expect {
+    one
+    two
+}
+
+# Mixed types in typeless column
+setup mixed {
+    CREATE TABLE tm (
+        id INTEGER PRIMARY KEY,
+        val
+    );
+    INSERT INTO tm VALUES(1, 1);
+    INSERT INTO tm VALUES(2, 'hello');
+    INSERT INTO tm VALUES(3, 3.14);
+    INSERT INTO tm VALUES(4, NULL);
+    INSERT INTO tm VALUES(5, X'CAFE');
+}
+
+@setup mixed
+test in-mixed-types {
+    SELECT id FROM tm WHERE val IN (1, 'hello', 3.14) ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+}
+
+@setup mixed
+test in-mixed-types-with-null {
+    SELECT id FROM tm WHERE val IN (1, 'hello', NULL) ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+# IN on non-indexed column
+@setup schema
+test in-non-indexed-column {
+    SELECT a FROM t WHERE b IN ('one', 'three') ORDER BY a;
+}
+expect {
+    1
+    3
+}
+
+# IN subquery with duplicate values in subquery
+@setup text_idx
+test in-subquery-with-duplicates {
+    CREATE TABLE sd(v TEXT);
+    INSERT INTO sd VALUES('alice');
+    INSERT INTO sd VALUES('alice');
+    INSERT INTO sd VALUES('bob');
+    INSERT INTO sd VALUES('bob');
+    SELECT id FROM t3 WHERE name IN (SELECT v FROM sd) ORDER BY id;
+}
+expect {
+    1
+    2
+    4
+}
+
+# IN subquery returning no rows
+@setup text_idx
+test in-subquery-empty {
+    CREATE TABLE se(v TEXT);
+    SELECT id FROM t3 WHERE name IN (SELECT v FROM se) ORDER BY id;
+}
+expect {
+}
+
+# Correlated IN subquery
+setup correlated {
+    CREATE TABLE tc (
+        id INTEGER PRIMARY KEY,
+        val INTEGER
+    );
+    CREATE TABLE sc (
+        id INTEGER,
+        parent_id INTEGER,
+        val INTEGER
+    );
+    INSERT INTO tc VALUES(1, 10);
+    INSERT INTO tc VALUES(2, 20);
+    INSERT INTO tc VALUES(3, 30);
+    INSERT INTO sc VALUES(1, 1, 10);
+    INSERT INTO sc VALUES(2, 1, 20);
+    INSERT INTO sc VALUES(3, 2, 30);
+}
+
+@setup correlated
+test in-correlated-subquery {
+    SELECT tc.id FROM tc WHERE tc.val IN (SELECT sc.val FROM sc WHERE sc.parent_id = tc.id) ORDER BY tc.id;
+}
+expect {
+    1
+}
+
+# IN list in JOIN context
+setup join_ctx {
+    CREATE TABLE tj1 (
+        id INTEGER PRIMARY KEY,
+        val INTEGER
+    );
+    CREATE TABLE tj2 (
+        id INTEGER PRIMARY KEY,
+        val INTEGER
+    );
+    INSERT INTO tj1 VALUES(1, 10);
+    INSERT INTO tj1 VALUES(2, 20);
+    INSERT INTO tj1 VALUES(3, 30);
+    INSERT INTO tj2 VALUES(1, 10);
+    INSERT INTO tj2 VALUES(2, 40);
+}
+
+@setup join_ctx
+test in-list-with-join {
+    SELECT tj1.id FROM tj1 JOIN tj2 ON tj1.id = tj2.id WHERE tj1.val IN (10, 30) ORDER BY tj1.id;
+}
+expect {
+    1
+}
+
+@setup join_ctx
+test in-subquery-with-join {
+    SELECT tj1.id FROM tj1 JOIN tj2 ON tj1.id = tj2.id WHERE tj1.val IN (SELECT val FROM tj2) ORDER BY tj1.id;
+}
+expect {
+    1
+}
+
+# Nested IN subqueries
+setup nested {
+    CREATE TABLE tn1(id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE tn2(id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE tn3(id INTEGER PRIMARY KEY, val INTEGER);
+    INSERT INTO tn1 VALUES(1,1),(2,2),(3,3);
+    INSERT INTO tn2 VALUES(1,1),(2,2);
+    INSERT INTO tn3 VALUES(1,1);
+}
+
+@setup nested
+test in-nested-subqueries {
+    SELECT id FROM tn1 WHERE val IN (SELECT val FROM tn2 WHERE val IN (SELECT val FROM tn3));
+}
+expect {
+    1
+}
+

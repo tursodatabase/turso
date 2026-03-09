@@ -14,7 +14,16 @@ if [ ! -f "$DB" ]; then
     echo "Error: Database file '$DB' not found" >&2
     exit 1
 fi
+if [ ! -f "$MAIN_BIN" ]; then
+    echo "Error: Main binary '$MAIN_BIN' not found" >&2
+    exit 1
+fi
+if [ ! -f "$CURR_BIN" ]; then
+    echo "Error: Current binary '$CURR_BIN' not found" >&2
+    exit 1
+fi
 QUERIES_DIR=perf/tpc-h/queries
+
 
 printf "%-8s %12s %12s %10s\n" "Query" "Main (ms)" "Current (ms)" "Delta"
 printf "%-8s %12s %12s %10s\n" "-----" "---------" "------------" "-----"

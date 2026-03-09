@@ -804,6 +804,10 @@ pub enum NoConstantOptReason {
     /// requires tracking the encode through the hoisting machinery. For now
     /// we simply disable hoisting for these columns.
     CustomTypeEncode,
+    /// IN-list values are inserted into an ephemeral table in a loop.
+    /// Each value reuses the same register, so hoisting would collapse
+    /// all values into the last one.
+    InListEphemeral,
 }
 
 /// Controls how binary expressions are emitted.

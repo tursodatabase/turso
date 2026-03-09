@@ -388,3 +388,35 @@ snapshot-eqp subquery-with-index {
     FROM products
     WHERE id IN (SELECT product_id FROM inventory WHERE warehouse_id = 1);
 }
+
+# =============================================================================
+# 9. IN-List Index Seek - Ephemeral B-tree optimization
+# =============================================================================
+
+# IN on indexed column should use index seek via ephemeral table
+@setup schema
+snapshot-eqp in-list-index-seek {
+    SELECT id, event_type, severity
+    FROM events
+    WHERE event_type IN ('ERROR', 'WARNING');
+}
+
+# IN on primary key should use INTEGER PRIMARY KEY seek
+@setup schema
+snapshot-eqp in-list-rowid-seek {
+    SELECT id, sku, name FROM products WHERE id IN (1, 2, 3);
+}
+
+# IN on non-indexed column should fall back to scan
+@setup schema
+snapshot-eqp in-list-no-index-scan {
+    SELECT id, level, message FROM logs WHERE level IN ('ERROR', 'WARNING');
+}
+
+# IN on first column of composite index
+@setup schema
+snapshot-eqp in-list-composite-prefix {
+    SELECT id, customer_id, order_date
+    FROM orders
+    WHERE customer_id IN (100, 200, 300);
+}

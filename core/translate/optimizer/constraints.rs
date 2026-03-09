@@ -63,8 +63,10 @@ pub struct Constraint {
     /// An estimated selectivity factor (0.0 to 1.0) indicating the fraction of rows
     /// expected to satisfy this constraint. Used for cost and cardinality estimation.
     pub selectivity: f64,
-    /// Whether the constraint is usable for an index seek.
-    /// This is explicitly set to false if the constraint has a different collation than the constrained column.
+    /// Whether the constraint can participate in range-seek index matching
+    /// (the eq/lower_bound/upper_bound model in RangeConstraintRef).
+    /// False for IN constraints (which use a separate multi-value seek path)
+    /// and for collation mismatches.
     pub usable: bool,
     /// Whether this constraint references the implicit rowid (tables without an INTEGER PRIMARY KEY alias).
     /// When true and `table_col_pos` is None, this constraint targets the rowid pseudo-column.
@@ -926,6 +928,7 @@ pub fn constraints_from_where_clause(
                     ast::Expr::Column { table, column, .. }
                         if *table == table_reference.internal_id =>
                     {
+                        let is_rowid = rowid_alias_column == Some(*column);
                         cs.constraints.push(Constraint {
                             where_clause_pos: (i, BinaryExprSide::Rhs),
                             operator: ConstraintOperator::In {
@@ -937,8 +940,8 @@ pub fn constraints_from_where_clause(
                             constraining_expr: None,
                             lhs_mask: TableMask::new(), // IN list values are constants
                             selectivity,
-                            usable: false, // Cannot be used for index seeks (for now- no reason why it couldn't be, but it's not a good idea to index on IN lists)
-                            is_rowid: false,
+                            usable: false, // IN uses a separate seek path (consider_in_list_seek), not the range-seek model
+                            is_rowid,
                         });
                     }
                     ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
@@ -990,6 +993,7 @@ pub fn constraints_from_where_clause(
                         ast::Expr::Column { table, column, .. }
                             if *table == table_reference.internal_id =>
                         {
+                            let is_rowid = rowid_alias_column == Some(*column);
                             cs.constraints.push(Constraint {
                                 where_clause_pos: (i, BinaryExprSide::Rhs),
                                 operator: ConstraintOperator::In {
@@ -1001,8 +1005,8 @@ pub fn constraints_from_where_clause(
                                 constraining_expr: None,
                                 lhs_mask: TableMask::new(), // non-correlated = no dependencies
                                 selectivity,
-                                usable: false, // Cannot be used for index seeks
-                                is_rowid: false,
+                                usable: false, // IN uses a separate seek path (consider_in_list_seek)
+                                is_rowid,
                             });
                         }
                         ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
@@ -1040,7 +1044,7 @@ pub fn constraints_from_where_clause(
 
         // For each constraint we found, add a reference to it for each index that may be able to use it.
         for (i, constraint) in cs.constraints.iter_mut().enumerate() {
-            // Skip constraints already marked unusable (e.g., IN expressions which can't be index seeks)
+            // Skip constraints that don't participate in range-seek matching (IN, collation mismatches)
             if !constraint.usable {
                 continue;
             }

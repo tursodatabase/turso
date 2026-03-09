@@ -3,8 +3,8 @@ use turso_parser::ast::{Expr, SortOrder, TableInternalId};
 use super::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
     emitter::{
-        MaterializedBuildInputMode, MaterializedColumnRef, OperationMode, Resolver, TranslateCtx,
-        UpdateRowSource,
+        InSeekMetadata, MaterializedBuildInputMode, MaterializedColumnRef, OperationMode,
+        Resolver, TranslateCtx, UpdateRowSource,
     },
     expr::{
         expr_references_subquery_id, translate_condition_expr, translate_expr,
@@ -15,15 +15,15 @@ use super::{
     optimizer::{constraints::BinaryExprSide, Optimizable},
     order_by::sorter_insert,
     plan::{
-        Aggregate, DistinctCtx, Distinctness, EvalAt, HashJoinOp, HashJoinType, IterationDirection,
-        JoinOrderMember, JoinedTable, MultiIndexScanOp, NonFromClauseSubquery, Operation,
-        QueryDestination, Scan, Search, SeekDef, SeekKey, SeekKeyComponent, SelectPlan,
-        SetOperation, TableReferences, WhereTerm,
+        Aggregate, DistinctCtx, Distinctness, EvalAt, HashJoinOp, HashJoinType, InSeekSource,
+        IterationDirection, JoinOrderMember, JoinedTable, MultiIndexScanOp, NonFromClauseSubquery,
+        Operation, QueryDestination, Scan, Search, SeekDef, SeekKey, SeekKeyComponent,
+        SelectPlan, SetOperation, TableReferences, WhereTerm,
     },
 };
 use crate::{
     emit_explain,
-    schema::{Index, Table},
+    schema::{Index, IndexColumn, Table},
     translate::{
         collate::{get_collseq_from_expr, resolve_comparison_collseq, CollationSeq},
         emitter::{prepare_cdc_if_necessary, HashCtx},
