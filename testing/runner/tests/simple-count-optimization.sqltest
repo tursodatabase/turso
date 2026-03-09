@@ -1,0 +1,28 @@
+@database :memory:
+
+# Regression tests for the simple count (Count opcode) optimization.
+
+test simple-count {
+    CREATE TABLE t1(x);
+    INSERT INTO t1 VALUES(1),(NULL),(3);
+    SELECT count(*) FROM t1;
+    SELECT count() FROM t1;
+    SELECT COUNT(*) FROM t1;
+    SELECT Count(*) FROM t1;
+    SELECT cOuNt(*) FROM t1;
+    -- count(col) skips NULLs, must NOT use the Count opcode
+    SELECT count(x) FROM t1;
+    -- expressions wrapping count must NOT use the Count opcode
+    SELECT count(*) + 1 FROM t1;
+    SELECT count(*) * 2 FROM t1;
+}
+expect {
+    3
+    3
+    3
+    3
+    3
+    2
+    4
+    6
+}
