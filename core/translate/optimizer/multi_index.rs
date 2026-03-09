@@ -1,0 +1,1183 @@
+//! Multi-index-specific planning for OR-by-union and AND-by-intersection.
+//!
+//! This module owns the parts of planning that are unique to combining several
+//! index probes for the same table. It reuses the generic btree candidate
+//! chooser from `access_method.rs` for each individual branch, then layers the
+//! union/intersection-specific decomposition, costing, and residual handling on
+//! top.
+
+use crate::schema::{Index, Schema};
+use crate::translate::expr::expr_references_any_subquery;
+use crate::translate::optimizer::access_method::{
+    choose_best_btree_candidate, AccessMethod, AccessMethodParams, PostAccessFilter,
+};
+use crate::translate::optimizer::constraints::{
+    analyze_binary_term_for_index, table_constraints_from_exprs, Constraint, RangeConstraintRef,
+};
+use crate::translate::optimizer::cost::{
+    estimate_cost_for_scan_or_seek, estimate_rows_per_seek, Cost, IndexInfo, RowCountEstimate,
+};
+use crate::translate::optimizer::cost_params::CostModelParams;
+use crate::translate::plan::{
+    JoinedTable, NonFromClauseSubquery, SetOperation, TableReferences, WhereTerm,
+};
+use crate::translate::planner::{table_mask_from_expr, TableMask};
+use rustc_hash::FxHashMap as HashMap;
+use std::{collections::VecDeque, sync::Arc};
+use turso_parser::ast;
+
+#[derive(Debug, Clone)]
+/// Parameters for a single branch of a multi-index scan.
+pub struct MultiIndexBranchParams {
+    /// The index to use for this branch, or None for rowid access.
+    pub index: Option<Arc<Index>>,
+    /// Branch-local constraints used to build the seek definition.
+    pub constraints: Vec<Constraint>,
+    /// The constraint references used for this branch.
+    pub constraint_refs: Vec<RangeConstraintRef>,
+    /// Estimated number of rows from this branch.
+    pub estimated_rows: f64,
+    /// Residual filter expressions for compound AND disjuncts.
+    pub residual_exprs: Vec<ast::Expr>,
+    /// Whether residual evaluation needs the scanned table cursor positioned.
+    pub requires_table_cursor: bool,
+}
+
+/// Internal decomposition of an AND clause into intersection branches.
+#[derive(Debug)]
+struct AndClauseDecomposition {
+    term_indices: Vec<usize>,
+    branches: Vec<AndBranch>,
+}
+
+/// One term that can participate in an AND-by-intersection plan.
+#[derive(Debug)]
+struct AndBranch {
+    where_term_idx: usize,
+    constraint: Constraint,
+    index: Option<Arc<Index>>,
+    constraint_refs: Vec<RangeConstraintRef>,
+    estimated_rows: f64,
+}
+
+/// Internal branch representation while evaluating a candidate multi-index plan.
+struct MultiIdxBranch {
+    index: Option<Arc<Index>>,
+    constraints: Vec<Constraint>,
+    constraint_refs: Vec<RangeConstraintRef>,
+    estimated_rows: f64,
+    residual_exprs: Vec<ast::Expr>,
+    requires_table_cursor: bool,
+}
+
+/// Flattens nested OR expressions into a list of disjuncts.
+///
+/// For example, `(a OR b) OR c` becomes `[a, b, c]`.
+fn flatten_or_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
+    match expr {
+        ast::Expr::Binary(lhs, ast::Operator::Or, rhs) => {
+            let mut result = flatten_or_expr(lhs);
+            result.extend(flatten_or_expr(rhs));
+            result
+        }
+        _ => vec![expr],
+    }
+}
+
+/// Flattens nested AND expressions into a list of conjuncts.
+///
+/// For example, `(a AND b) AND c` becomes `[a, b, c]`.
+fn flatten_and_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
+    match expr {
+        ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
+            let mut result = flatten_and_expr(lhs);
+            result.extend(flatten_and_expr(rhs));
+            result
+        }
+        _ => vec![expr],
+    }
+}
+
+/// Estimate the cost of a multi-index union scan (OR-by-union optimization).
+///
+/// The cost model accounts for:
+/// 1. Cost of each branch scan
+/// 2. RowSet insert/test work needed to deduplicate rowids
+/// 3. Table fetches after deduplication
+/// 4. Overlap between branches, approximated from independent selectivities
+fn estimate_multi_index_scan_cost(
+    branch_costs: &[Cost],
+    branch_rows: &[f64],
+    base_row_count: RowCountEstimate,
+    input_cardinality: f64,
+    params: &CostModelParams,
+) -> (Cost, f64) {
+    let base_row_count = *base_row_count;
+    // Total cost of all branch scans.
+    let branch_scan_cost: f64 = branch_costs.iter().map(|c| c.0).sum();
+    // Sum of branch row counts before RowSet deduplication.
+    let total_rows_before_dedup: f64 = branch_rows.iter().sum();
+
+    // Estimate overlap between branches. For independent predicates:
+    //   P(A OR B) = 1 - (1 - P(A)) * (1 - P(B))
+    let mut unique_row_ratio = 1.0f64;
+    for rows in branch_rows.iter() {
+        let branch_selectivity = (*rows / base_row_count).min(1.0);
+        unique_row_ratio *= 1.0 - branch_selectivity;
+    }
+    let estimated_unique_rows = base_row_count * (1.0 - unique_row_ratio);
+
+    // RowSet operations do an insert and membership test per candidate rowid.
+    let rowset_ops_cost = total_rows_before_dedup * params.cpu_cost_per_row * 2.0;
+
+    // Table fetch cost mirrors single-index lookup costing, assuming some
+    // locality benefit from rowid-ordered access after RowSet deduplication.
+    let table_pages = (base_row_count / params.rows_per_page).max(1.0);
+    let selectivity = estimated_unique_rows / base_row_count.max(1.0);
+    let table_fetch_cost = selectivity * table_pages;
+    let total_cost = (branch_scan_cost + rowset_ops_cost + table_fetch_cost) * input_cardinality;
+
+    (Cost(total_cost), estimated_unique_rows)
+}
+
+/// Estimate the cost of a multi-index intersection (AND-by-intersection).
+///
+/// The cost model accounts for:
+/// 1. Cost of each branch scan
+/// 2. RowSet test work while intersecting rowids
+/// 3. Table fetches for the surviving rowids
+/// 4. Final result size as the product of branch selectivities
+fn estimate_multi_index_intersection_cost(
+    branch_costs: &[Cost],
+    branch_rows: &[f64],
+    base_row_count: RowCountEstimate,
+    input_cardinality: f64,
+    params: &CostModelParams,
+) -> (Cost, f64) {
+    let base_row_count = *base_row_count;
+    // Total cost of all branch scans.
+    let branch_scan_cost: f64 = branch_costs.iter().map(|c| c.0).sum();
+
+    // Estimate intersection result as the product of selectivities:
+    //   P(A AND B) = P(A) * P(B)
+    let mut intersection_selectivity = 1.0f64;
+    for rows in branch_rows.iter() {
+        let branch_selectivity = (*rows / base_row_count).min(1.0);
+        intersection_selectivity *= branch_selectivity;
+    }
+    let estimated_intersection_rows = (base_row_count * intersection_selectivity).max(1.0);
+
+    // First branch inserts rowids; later branches test against the RowSet.
+    let first_branch_rows = branch_rows.first().copied().unwrap_or(0.0);
+    let subsequent_branch_rows: f64 = branch_rows.iter().skip(1).sum();
+    let rowset_ops_cost =
+        (first_branch_rows + subsequent_branch_rows) * params.cpu_cost_per_row * 1.5;
+
+    // Table fetch cost mirrors single-index lookup costing, assuming some
+    // locality benefit from rowid-ordered access after intersection.
+    let table_pages = (base_row_count / params.rows_per_page).max(1.0);
+    let selectivity = estimated_intersection_rows / base_row_count.max(1.0);
+    let table_fetch_cost = selectivity * table_pages;
+    let total_cost = (branch_scan_cost + rowset_ops_cost + table_fetch_cost) * input_cardinality;
+
+    (Cost(total_cost), estimated_intersection_rows)
+}
+
+/// Compute [`IndexInfo`] for a multi-index branch.
+///
+/// When `rowid_only` is true, the branch only needs rowids for RowSet
+/// operations, so an index scan can be treated as covering even if later table
+/// columns are not available from the index.
+fn index_info_for_branch(
+    index: Option<&Index>,
+    rhs_table: &JoinedTable,
+    rowid_only: bool,
+) -> Option<IndexInfo> {
+    match index {
+        Some(index) => Some(IndexInfo {
+            unique: index.unique,
+            covering: rowid_only || rhs_table.index_is_covering(index),
+            column_count: index.columns.len(),
+        }),
+        None => Some(IndexInfo {
+            unique: true,
+            covering: true,
+            column_count: 1,
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Compute branch-local cost and persisted planning metadata for one branch of a
+/// multi-index scan.
+///
+/// When `reads_scanned_table` is false, the branch only scans the index to
+/// collect rowids into the RowSet and does not need to price in table lookups.
+fn compute_branch_cost_and_params(
+    index: Option<&Arc<Index>>,
+    constraints: &[Constraint],
+    constraint_refs: &[RangeConstraintRef],
+    rhs_table: &JoinedTable,
+    base_row_count: RowCountEstimate,
+    params: &CostModelParams,
+    reads_scanned_table: bool,
+) -> (Cost, MultiIndexBranchParams) {
+    let index_info =
+        index_info_for_branch(index.map(|i| i.as_ref()), rhs_table, !reads_scanned_table);
+
+    let cost = estimate_cost_for_scan_or_seek(
+        index_info,
+        constraints,
+        constraint_refs,
+        1.0,
+        base_row_count,
+        false,
+        params,
+    );
+
+    let branch_params = MultiIndexBranchParams {
+        index: index.cloned(),
+        constraints: constraints.to_vec(),
+        constraint_refs: constraint_refs.to_vec(),
+        estimated_rows: estimate_rows_per_seek(
+            index_info.expect("multi-index branches always use index-backed cost info"),
+            constraints,
+            constraint_refs,
+            base_row_count,
+        ),
+        residual_exprs: vec![],
+        requires_table_cursor: false,
+    };
+
+    (cost, branch_params)
+}
+
+/// Compute the table-reference mask for residual expressions that remain after
+/// branch seek terms are consumed.
+///
+/// Residuals containing subqueries are rejected here because correlated subquery
+/// translation is loop-position-sensitive and we do not yet duplicate that
+/// machinery safely for each branch.
+fn residual_tables_mask(
+    residual_exprs: &[ast::Expr],
+    table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
+) -> Option<TableMask> {
+    residual_exprs
+        .iter()
+        .try_fold(TableMask::new(), |mut mask, expr| {
+            if expr_references_any_subquery(expr) {
+                return None;
+            }
+            mask |= table_mask_from_expr(expr, table_references, subqueries).ok()?;
+            Some(mask)
+        })
+}
+
+/// Return the branch-local conjuncts that were not consumed by the chosen seek
+/// constraints and therefore must remain as residual filters.
+fn residual_exprs_for_branch(
+    where_clause: &[WhereTerm],
+    constraints: &[Constraint],
+    constraint_refs: &[RangeConstraintRef],
+) -> Vec<ast::Expr> {
+    let mut consumed = vec![false; where_clause.len()];
+    for cref in constraint_refs.iter() {
+        for idx in [
+            cref.eq.as_ref().map(|e| e.constraint_pos),
+            cref.lower_bound,
+            cref.upper_bound,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            consumed[constraints[idx].where_clause_pos.0] = true;
+        }
+    }
+    where_clause
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| !consumed[*idx])
+        .map(|(_, term)| term.expr.clone())
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Evaluate a fully decomposed multi-index plan and return it if it beats the
+/// current best non-multi-index access cost.
+fn evaluate_multi_index_branches(
+    branches: Vec<MultiIdxBranch>,
+    set_op: SetOperation,
+    where_term_idx: usize,
+    additional_consumed_terms: Vec<usize>,
+    rhs_table: &JoinedTable,
+    base_row_count: RowCountEstimate,
+    input_cardinality: f64,
+    params: &CostModelParams,
+    best_cost: Cost,
+) -> Option<AccessMethod> {
+    let mut branch_costs = Vec::with_capacity(branches.len());
+    let mut branch_rows = Vec::with_capacity(branches.len());
+    let mut branch_params = Vec::with_capacity(branches.len());
+
+    for branch in branches {
+        // Multi-index planning only makes sense when every branch can do an
+        // actual keyed lookup rather than degenerating into a scan.
+        if branch.constraint_refs.is_empty() {
+            return None;
+        }
+
+        let (cost, mut params_for_branch) = compute_branch_cost_and_params(
+            branch.index.as_ref(),
+            &branch.constraints,
+            &branch.constraint_refs,
+            rhs_table,
+            base_row_count,
+            params,
+            branch.requires_table_cursor,
+        );
+        params_for_branch.residual_exprs = branch.residual_exprs;
+        params_for_branch.requires_table_cursor = branch.requires_table_cursor;
+
+        branch_costs.push(cost);
+        branch_rows.push(branch.estimated_rows);
+        branch_params.push(params_for_branch);
+    }
+
+    let (multi_index_cost, estimated_rows) = match set_op {
+        SetOperation::Union => estimate_multi_index_scan_cost(
+            &branch_costs,
+            &branch_rows,
+            base_row_count,
+            input_cardinality,
+            params,
+        ),
+        SetOperation::Intersection => estimate_multi_index_intersection_cost(
+            &branch_costs,
+            &branch_rows,
+            base_row_count,
+            input_cardinality,
+            params,
+        ),
+    };
+
+    if multi_index_cost < best_cost {
+        Some(AccessMethod {
+            cost: multi_index_cost,
+            estimated_rows_per_outer_row: estimated_rows,
+            post_access_filter: PostAccessFilter::LocalOnly,
+            params: AccessMethodParams::MultiIndexScan {
+                branches: branch_params,
+                where_term_idx,
+                set_op,
+                additional_consumed_terms,
+            },
+        })
+    } else {
+        None
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Analyze top-level AND terms to determine whether they can be executed as an
+/// AND-by-intersection plan.
+///
+/// Returns `Some(...)` only when:
+/// 1. Multiple terms constrain the same table
+/// 2. Each term is individually indexable
+/// 3. No single composite index already covers multiple terms more directly
+/// 4. At least two distinct indexes participate in the final branch set
+fn analyze_and_terms_for_multi_index(
+    table_reference: &JoinedTable,
+    where_clause: &[WhereTerm],
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
+    schema: &Schema,
+    params: &CostModelParams,
+) -> Option<AndClauseDecomposition> {
+    let table_id = table_reference.internal_id;
+    let table_name = table_reference.table.get_name();
+    let indexes = available_indexes.get(table_name);
+    let rowid_alias_column = table_reference
+        .columns()
+        .iter()
+        .position(|c| c.is_rowid_alias());
+
+    // Collect AND terms that:
+    // 1. Reference this table
+    // 2. Are simple binary comparisons
+    // 3. Can use an index
+    // 4. Are not already consumed
+    // 5. Are local constraints rather than cross-table join conditions
+    let mut candidate_branches: Vec<AndBranch> = Vec::new();
+    let mut columns_used: Vec<Option<usize>> = Vec::new();
+
+    for (where_term_idx, term) in where_clause.iter().enumerate() {
+        if term.consumed {
+            continue;
+        }
+        if matches!(&term.expr, ast::Expr::Binary(_, ast::Operator::Or, _)) {
+            continue;
+        }
+
+        let Some(analyzed) = analyze_binary_term_for_index(
+            &term.expr,
+            where_term_idx,
+            table_id,
+            table_reference,
+            table_name,
+            indexes,
+            rowid_alias_column,
+            available_indexes,
+            table_references,
+            subqueries,
+            schema,
+            params,
+        ) else {
+            continue;
+        };
+
+        if !analyzed.constraint.lhs_mask.is_empty() {
+            continue;
+        }
+
+        columns_used.push(analyzed.constraint.table_col_pos);
+        candidate_branches.push(AndBranch {
+            where_term_idx,
+            constraint: analyzed.constraint,
+            index: analyzed.best_index,
+            constraint_refs: analyzed.constraint_refs,
+            estimated_rows: analyzed.estimated_rows,
+        });
+    }
+
+    if candidate_branches.len() < 2 {
+        return None;
+    }
+
+    // If a composite index already covers multiple constrained columns, prefer
+    // that single lookup path over intersection.
+    if let Some(indexes) = indexes {
+        for index in indexes.iter().filter(|idx| idx.index_method.is_none()) {
+            let mut columns_covered = 0;
+            for (i, col_pos) in columns_used.iter().enumerate() {
+                if let Some(col_pos) = col_pos {
+                    if let Some(idx_pos) = index.column_table_pos_to_index_pos(*col_pos) {
+                        if idx_pos < index.columns.len() {
+                            let earlier_covered =
+                                columns_used[..i].iter().filter_map(|c| *c).any(|c| {
+                                    index
+                                        .column_table_pos_to_index_pos(c)
+                                        .is_some_and(|p| p < idx_pos)
+                                });
+                            if idx_pos == 0 || earlier_covered {
+                                columns_covered += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            if columns_covered >= 2 {
+                return None;
+            }
+        }
+    }
+
+    // Keep only branches that use distinct named indexes. Rowid (`None`) may
+    // still appear more than once because it is not tied to a named index.
+    let mut unique_branches: Vec<AndBranch> = Vec::new();
+    let mut seen_indexes: Vec<Option<String>> = Vec::new();
+    for branch in candidate_branches {
+        let index_name = branch.index.as_ref().map(|idx| idx.name.clone());
+        if index_name.is_some() && seen_indexes.contains(&index_name) {
+            continue;
+        }
+        seen_indexes.push(index_name);
+        unique_branches.push(branch);
+    }
+
+    if unique_branches.len() < 2 {
+        return None;
+    }
+
+    Some(AndClauseDecomposition {
+        term_indices: unique_branches.iter().map(|b| b.where_term_idx).collect(),
+        branches: unique_branches,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Analyze OR clauses for OR-by-union optimization.
+///
+/// Returns a `MultiIndexScan` access method when every disjunct can be planned
+/// as an individual lookup branch and the combined cost beats the current best
+/// non-multi-index alternative.
+pub fn consider_multi_index_union(
+    rhs_table: &JoinedTable,
+    where_clause: &[WhereTerm],
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
+    schema: &Schema,
+    input_cardinality: f64,
+    base_row_count: RowCountEstimate,
+    params: &CostModelParams,
+    best_cost: Cost,
+    lhs_mask: &TableMask,
+) -> Option<AccessMethod> {
+    for (where_term_idx, term) in where_clause.iter().enumerate() {
+        if term.consumed {
+            continue;
+        }
+
+        let ast::Expr::Binary(_, ast::Operator::Or, _) = &term.expr else {
+            continue;
+        };
+
+        let disjuncts = flatten_or_expr(&term.expr);
+        if disjuncts.len() < 2 {
+            continue;
+        }
+
+        let mut allowed_mask = *lhs_mask;
+        let Some(rhs_idx) = table_references
+            .joined_tables()
+            .iter()
+            .position(|t| t.internal_id == rhs_table.internal_id)
+        else {
+            continue;
+        };
+        allowed_mask.add_table(rhs_idx);
+
+        // Each disjunct is replanned with branch-local `TableConstraints`, so
+        // compound conjuncts can reuse the same compound-seek analysis as
+        // ordinary btree access.
+        let branches: Option<Vec<_>> = disjuncts
+            .into_iter()
+            .map(|disjunct_expr| {
+                let Ok(disjunct_expr) = crate::translate::expr::unwrap_parens(disjunct_expr) else {
+                    return None;
+                };
+                let conjuncts = flatten_and_expr(disjunct_expr)
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let (local_where_clause, table_constraints) = table_constraints_from_exprs(
+                    &conjuncts,
+                    rhs_table,
+                    table_references,
+                    available_indexes,
+                    subqueries,
+                    schema,
+                    params,
+                )
+                .ok()?;
+                let chosen = choose_best_btree_candidate(
+                    rhs_table,
+                    &table_constraints,
+                    lhs_mask,
+                    rhs_idx,
+                    None,
+                    1.0,
+                    base_row_count,
+                    params,
+                )?;
+                if chosen.constraint_refs.is_empty() {
+                    return None;
+                }
+                let residual_exprs = residual_exprs_for_branch(
+                    &local_where_clause,
+                    &table_constraints.constraints,
+                    &chosen.constraint_refs,
+                );
+                let residual_mask =
+                    residual_tables_mask(&residual_exprs, table_references, subqueries)?;
+                if !allowed_mask.contains_all(&residual_mask) {
+                    return None;
+                }
+                Some(MultiIdxBranch {
+                    index: chosen.index,
+                    constraints: table_constraints.constraints,
+                    constraint_refs: chosen.constraint_refs,
+                    estimated_rows: chosen.estimated_rows,
+                    residual_exprs,
+                    requires_table_cursor: residual_mask.contains_table(rhs_idx),
+                })
+            })
+            .collect();
+
+        let Some(branches) = branches else {
+            continue;
+        };
+
+        if let Some(access_method) = evaluate_multi_index_branches(
+            branches,
+            SetOperation::Union,
+            where_term_idx,
+            vec![],
+            rhs_table,
+            base_row_count,
+            input_cardinality,
+            params,
+            best_cost,
+        ) {
+            return Some(access_method);
+        }
+    }
+
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Analyze top-level AND terms for AND-by-intersection optimization.
+///
+/// This is more restrictive than OR-by-union because every branch must be a
+/// local term on the current table, and the final plan only survives if it
+/// beats the best ordinary access path.
+pub fn consider_multi_index_intersection(
+    rhs_table: &JoinedTable,
+    where_clause: &[WhereTerm],
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
+    schema: &Schema,
+    input_cardinality: f64,
+    base_row_count: RowCountEstimate,
+    params: &CostModelParams,
+    best_cost: Cost,
+    lhs_mask: &TableMask,
+) -> Option<AccessMethod> {
+    let decomposition = analyze_and_terms_for_multi_index(
+        rhs_table,
+        where_clause,
+        available_indexes,
+        table_references,
+        subqueries,
+        schema,
+        params,
+    )?;
+
+    if decomposition.branches.len() < 2 {
+        return None;
+    }
+
+    let all_usable = decomposition
+        .branches
+        .iter()
+        .all(|b| lhs_mask.contains_all(&b.constraint.lhs_mask));
+    if !all_usable {
+        return None;
+    }
+
+    let branches: Vec<_> = decomposition
+        .branches
+        .iter()
+        .map(|b| MultiIdxBranch {
+            index: b.index.clone(),
+            constraints: vec![b.constraint.clone()],
+            constraint_refs: b.constraint_refs.clone(),
+            estimated_rows: b.estimated_rows,
+            residual_exprs: vec![],
+            requires_table_cursor: false,
+        })
+        .collect();
+
+    let where_term_idx = decomposition.term_indices[0];
+    let additional_consumed_terms: Vec<usize> =
+        decomposition.term_indices.iter().skip(1).copied().collect();
+
+    evaluate_multi_index_branches(
+        branches,
+        SetOperation::Intersection,
+        where_term_idx,
+        additional_consumed_terms,
+        rhs_table,
+        base_row_count,
+        input_cardinality,
+        params,
+        best_cost,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{consider_multi_index_union, MultiIndexBranchParams};
+    use crate::{
+        schema::{BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table, Type},
+        translate::{
+            optimizer::{
+                access_method::AccessMethodParams,
+                cost::{Cost, RowCountEstimate},
+                cost_params::DEFAULT_PARAMS,
+            },
+            plan::{
+                ColumnUsedMask, JoinInfo, JoinType, JoinedTable, Operation, TableReferences,
+                WhereTerm,
+            },
+            planner::TableMask,
+        },
+        vdbe::builder::TableRefIdCounter,
+    };
+    use rustc_hash::FxHashMap as HashMap;
+    use std::{collections::VecDeque, sync::Arc};
+    use turso_parser::ast::{self, Expr, Operator, SortOrder, TableInternalId};
+
+    struct TestColumn {
+        name: String,
+        ty: Type,
+        is_rowid_alias: bool,
+    }
+
+    fn empty_schema() -> Schema {
+        Schema::default()
+    }
+
+    fn create_column(c: &TestColumn) -> Column {
+        Column::new(
+            Some(c.name.clone()),
+            c.ty.to_string(),
+            None,
+            None,
+            c.ty,
+            None,
+            ColDef {
+                primary_key: false,
+                rowid_alias: c.is_rowid_alias,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn create_column_of_type(name: &str, ty: Type) -> Column {
+        create_column(&TestColumn {
+            name: name.to_string(),
+            ty,
+            is_rowid_alias: false,
+        })
+    }
+
+    fn create_btree_table(name: &str, columns: Vec<Column>) -> Arc<BTreeTable> {
+        Arc::new(BTreeTable {
+            root_page: 1,
+            name: name.to_string(),
+            has_autoincrement: false,
+            primary_key_columns: vec![],
+            columns,
+            has_rowid: true,
+            is_strict: false,
+            unique_sets: vec![],
+            foreign_keys: vec![],
+            check_constraints: vec![],
+        })
+    }
+
+    fn create_table_reference(
+        table: Arc<BTreeTable>,
+        join_info: Option<JoinInfo>,
+        internal_id: TableInternalId,
+    ) -> JoinedTable {
+        let name = table.name.clone();
+        let table = Table::BTree(table);
+        JoinedTable {
+            op: Operation::default_scan_for(&table),
+            table,
+            identifier: name,
+            internal_id,
+            join_info,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            database_id: 0,
+        }
+    }
+
+    fn create_column_expr(table: TableInternalId, column: usize, is_rowid_alias: bool) -> Expr {
+        Expr::Column {
+            database: None,
+            table,
+            column,
+            is_rowid_alias,
+        }
+    }
+
+    fn create_numeric_literal(value: &str) -> Expr {
+        Expr::Literal(ast::Literal::Numeric(value.to_string()))
+    }
+
+    fn create_string_literal(value: &str) -> Expr {
+        Expr::Literal(ast::Literal::String(value.to_string()))
+    }
+
+    fn assert_is_multi_index(
+        access_method: &crate::translate::optimizer::access_method::AccessMethod,
+    ) -> &Vec<MultiIndexBranchParams> {
+        let AccessMethodParams::MultiIndexScan { branches, .. } = &access_method.params else {
+            panic!("expected multi-index scan access method");
+        };
+        branches
+    }
+
+    #[test]
+    fn test_multi_index_union_rejects_residuals_on_future_tables() {
+        let link = create_btree_table(
+            "link",
+            vec![
+                create_column_of_type("src", Type::Integer),
+                create_column_of_type("dst", Type::Integer),
+            ],
+        );
+        let item = create_btree_table(
+            "item",
+            vec![
+                create_column_of_type("id", Type::Integer),
+                create_column_of_type("kind", Type::Text),
+            ],
+        );
+        let meta = create_btree_table(
+            "meta",
+            vec![
+                create_column_of_type("id", Type::Integer),
+                create_column_of_type("kind", Type::Text),
+            ],
+        );
+
+        let mut table_id_counter = TableRefIdCounter::new();
+        let joined_tables = vec![
+            create_table_reference(link, None, table_id_counter.next()),
+            create_table_reference(
+                item,
+                Some(JoinInfo {
+                    join_type: JoinType::Inner,
+                    using: vec![],
+                }),
+                table_id_counter.next(),
+            ),
+            create_table_reference(
+                meta,
+                Some(JoinInfo {
+                    join_type: JoinType::Inner,
+                    using: vec![],
+                }),
+                table_id_counter.next(),
+            ),
+        ];
+
+        const LINK: usize = 0;
+        const ITEM: usize = 1;
+        const META: usize = 2;
+
+        let mut available_indexes = HashMap::default();
+        available_indexes.insert(
+            "item".to_string(),
+            VecDeque::from([Arc::new(Index {
+                name: "idx_item_id".to_string(),
+                table_name: "item".to_string(),
+                where_clause: None,
+                columns: vec![IndexColumn {
+                    name: "id".to_string(),
+                    order: SortOrder::Asc,
+                    pos_in_table: 0,
+                    collation: None,
+                    default: None,
+                    expr: None,
+                }],
+                unique: false,
+                ephemeral: false,
+                root_page: 2,
+                has_rowid: true,
+                index_method: None,
+            })]),
+        );
+
+        let lhs_link_src = Expr::Binary(
+            Box::new(create_column_expr(
+                joined_tables[LINK].internal_id,
+                0,
+                false,
+            )),
+            Operator::Equals,
+            Box::new(create_numeric_literal("1")),
+        );
+        let lhs_link_dst_item_id = Expr::Binary(
+            Box::new(create_column_expr(
+                joined_tables[LINK].internal_id,
+                1,
+                false,
+            )),
+            Operator::Equals,
+            Box::new(create_column_expr(
+                joined_tables[ITEM].internal_id,
+                0,
+                false,
+            )),
+        );
+        let rhs_link_dst = Expr::Binary(
+            Box::new(create_column_expr(
+                joined_tables[LINK].internal_id,
+                1,
+                false,
+            )),
+            Operator::Equals,
+            Box::new(create_numeric_literal("1")),
+        );
+        let rhs_link_src_item_id = Expr::Binary(
+            Box::new(create_column_expr(
+                joined_tables[LINK].internal_id,
+                0,
+                false,
+            )),
+            Operator::Equals,
+            Box::new(create_column_expr(
+                joined_tables[ITEM].internal_id,
+                0,
+                false,
+            )),
+        );
+        let future_meta_kind = Expr::Binary(
+            Box::new(create_column_expr(
+                joined_tables[META].internal_id,
+                1,
+                false,
+            )),
+            Operator::Equals,
+            Box::new(create_string_literal("entity")),
+        );
+
+        let left_disjunct = Expr::Binary(
+            Box::new(Expr::Binary(
+                Box::new(lhs_link_src),
+                Operator::And,
+                Box::new(lhs_link_dst_item_id),
+            )),
+            Operator::And,
+            Box::new(future_meta_kind.clone()),
+        );
+        let right_disjunct = Expr::Binary(
+            Box::new(Expr::Binary(
+                Box::new(rhs_link_dst),
+                Operator::And,
+                Box::new(rhs_link_src_item_id),
+            )),
+            Operator::And,
+            Box::new(future_meta_kind),
+        );
+        let where_clause = vec![WhereTerm {
+            expr: Expr::Binary(
+                Box::new(left_disjunct),
+                Operator::Or,
+                Box::new(right_disjunct),
+            ),
+            from_outer_join: None,
+            consumed: false,
+        }];
+
+        let table_references = TableReferences::new(joined_tables, vec![]);
+        let base_row_count = RowCountEstimate::hardcoded_fallback(&DEFAULT_PARAMS);
+        let lhs_mask = TableMask::from_table_number_iter([LINK].into_iter());
+
+        let access_method = consider_multi_index_union(
+            &table_references.joined_tables()[ITEM],
+            &where_clause,
+            &available_indexes,
+            &table_references,
+            &[],
+            &empty_schema(),
+            1.0,
+            base_row_count,
+            &DEFAULT_PARAMS,
+            Cost(f64::INFINITY),
+            &lhs_mask,
+        );
+
+        assert!(
+            access_method.is_none(),
+            "future-table residuals must not produce a multi-index OR access method"
+        );
+    }
+
+    #[test]
+    fn test_multi_index_union_branch_reuses_compound_seek_analysis() {
+        let link = create_btree_table(
+            "link",
+            vec![
+                create_column_of_type("src", Type::Integer),
+                create_column_of_type("dst", Type::Integer),
+            ],
+        );
+        let item = create_btree_table(
+            "item",
+            vec![
+                create_column_of_type("id", Type::Integer),
+                create_column_of_type("kind", Type::Integer),
+            ],
+        );
+
+        let mut table_id_counter = TableRefIdCounter::new();
+        let joined_tables = vec![
+            create_table_reference(link, None, table_id_counter.next()),
+            create_table_reference(
+                item,
+                Some(JoinInfo {
+                    join_type: JoinType::Inner,
+                    using: vec![],
+                }),
+                table_id_counter.next(),
+            ),
+        ];
+
+        const LINK: usize = 0;
+        const ITEM: usize = 1;
+
+        let mut available_indexes = HashMap::default();
+        available_indexes.insert(
+            "item".to_string(),
+            VecDeque::from([Arc::new(Index {
+                name: "idx_item_id_kind".to_string(),
+                table_name: "item".to_string(),
+                where_clause: None,
+                columns: vec![
+                    IndexColumn {
+                        name: "id".to_string(),
+                        order: SortOrder::Asc,
+                        pos_in_table: 0,
+                        collation: None,
+                        default: None,
+                        expr: None,
+                    },
+                    IndexColumn {
+                        name: "kind".to_string(),
+                        order: SortOrder::Asc,
+                        pos_in_table: 1,
+                        collation: None,
+                        default: None,
+                        expr: None,
+                    },
+                ],
+                unique: false,
+                ephemeral: false,
+                root_page: 2,
+                has_rowid: true,
+                index_method: None,
+            })]),
+        );
+
+        let left_disjunct = Expr::Binary(
+            Box::new(Expr::Binary(
+                Box::new(Expr::Binary(
+                    Box::new(create_column_expr(
+                        joined_tables[LINK].internal_id,
+                        0,
+                        false,
+                    )),
+                    Operator::Equals,
+                    Box::new(create_numeric_literal("1")),
+                )),
+                Operator::And,
+                Box::new(Expr::Binary(
+                    Box::new(create_column_expr(
+                        joined_tables[ITEM].internal_id,
+                        0,
+                        false,
+                    )),
+                    Operator::Equals,
+                    Box::new(create_column_expr(
+                        joined_tables[LINK].internal_id,
+                        1,
+                        false,
+                    )),
+                )),
+            )),
+            Operator::And,
+            Box::new(Expr::Binary(
+                Box::new(create_column_expr(
+                    joined_tables[ITEM].internal_id,
+                    1,
+                    false,
+                )),
+                Operator::Equals,
+                Box::new(create_numeric_literal("7")),
+            )),
+        );
+        let right_disjunct = Expr::Binary(
+            Box::new(Expr::Binary(
+                Box::new(Expr::Binary(
+                    Box::new(create_column_expr(
+                        joined_tables[LINK].internal_id,
+                        1,
+                        false,
+                    )),
+                    Operator::Equals,
+                    Box::new(create_numeric_literal("1")),
+                )),
+                Operator::And,
+                Box::new(Expr::Binary(
+                    Box::new(create_column_expr(
+                        joined_tables[ITEM].internal_id,
+                        0,
+                        false,
+                    )),
+                    Operator::Equals,
+                    Box::new(create_column_expr(
+                        joined_tables[LINK].internal_id,
+                        0,
+                        false,
+                    )),
+                )),
+            )),
+            Operator::And,
+            Box::new(Expr::Binary(
+                Box::new(create_column_expr(
+                    joined_tables[ITEM].internal_id,
+                    1,
+                    false,
+                )),
+                Operator::Equals,
+                Box::new(create_numeric_literal("7")),
+            )),
+        );
+
+        let where_clause = vec![WhereTerm {
+            expr: Expr::Binary(
+                Box::new(left_disjunct),
+                Operator::Or,
+                Box::new(right_disjunct),
+            ),
+            from_outer_join: None,
+            consumed: false,
+        }];
+
+        let table_references = TableReferences::new(joined_tables, vec![]);
+        let lhs_mask = TableMask::from_table_number_iter([LINK].into_iter());
+        let base_row_count = RowCountEstimate::hardcoded_fallback(&DEFAULT_PARAMS);
+
+        let access_method = consider_multi_index_union(
+            &table_references.joined_tables()[ITEM],
+            &where_clause,
+            &available_indexes,
+            &table_references,
+            &[],
+            &empty_schema(),
+            1.0,
+            base_row_count,
+            &DEFAULT_PARAMS,
+            Cost(f64::INFINITY),
+            &lhs_mask,
+        )
+        .expect("compound OR branches should produce a multi-index union");
+
+        let branches = assert_is_multi_index(&access_method);
+        assert_eq!(branches.len(), 2);
+        for branch in branches {
+            assert_eq!(
+                branch.index.as_ref().map(|idx| idx.name.as_str()),
+                Some("idx_item_id_kind")
+            );
+            assert_eq!(
+                branch.constraint_refs.len(),
+                2,
+                "branch should use both id and kind in the compound seek"
+            );
+        }
+    }
+}

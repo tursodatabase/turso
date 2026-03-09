@@ -1,8 +1,9 @@
 # Multi-index OR with compound AND disjuncts
 # Tests the case where each OR branch is itself an AND of multiple conditions,
 # e.g. (a = ? AND b = x.id AND c = ?) OR (d = ? AND e = x.id AND f = ?)
-# The optimizer should pick the best indexable sub-term per branch as the seek
-# constraint and apply remaining conditions as residual filters.
+# The optimizer should reuse normal compound-seek analysis per branch, using as
+# much of each branch as the chosen index can support and leaving only the
+# leftover conjuncts as residual filters.
 
 @database :memory:
 
@@ -74,6 +75,19 @@ setup rowid_branch_schema {
     CREATE INDEX idx_t_a ON t(a);
 
     INSERT INTO t VALUES (10, 100), (20, 200), (20, 300);
+}
+
+setup compound_branch_seek_schema {
+    CREATE TABLE link(src INT, dst INT);
+    CREATE TABLE item(id INT, kind INT, name TEXT);
+    CREATE INDEX idx_item_id_kind ON item(id, kind);
+
+    INSERT INTO link VALUES (1, 2), (3, 1), (1, 4), (5, 6);
+    INSERT INTO item VALUES (2, 7, 'a');
+    INSERT INTO item VALUES (2, 8, 'b');
+    INSERT INTO item VALUES (3, 7, 'c');
+    INSERT INTO item VALUES (4, 7, 'd');
+    INSERT INTO item VALUES (6, 7, 'e');
 }
 
 # Basic: find entities connected to a specific node via 'knows' edges (bidirectional)
@@ -215,6 +229,27 @@ expect {
     3|20
 }
 
+# Compound OR branches should reuse full compound seek analysis, not just pick a
+# single indexed conjunct. With only (id, kind) indexed, each branch must seek
+# on both columns to be indexable.
+@setup compound_branch_seek_schema
+test compound-or-compound-branch-seek {
+    SELECT DISTINCT i.id
+    FROM item i
+    JOIN link l
+      ON (
+        (l.src = 1 AND i.id = l.dst AND i.kind = 7)
+        OR
+        (l.dst = 1 AND i.id = l.src AND i.kind = 7)
+      )
+    ORDER BY i.id;
+}
+expect {
+    2
+    3
+    4
+}
+
 # Residuals that reference both the scanned table and an outer table should still
 # use multi-index OR and position the scanned table cursor for evaluation.
 @setup graph_schema
@@ -290,6 +325,19 @@ snapshot-eqp compound-or-rowid-branch-eqp {
     SELECT rowid, a FROM t
     WHERE (rowid = 1 AND rowid > 0)
        OR (a = 20 AND a > 0);
+}
+
+# Snapshot EQP: compound branch seeks should use the composite index in both branches.
+@setup compound_branch_seek_schema
+snapshot-eqp compound-or-compound-branch-seek-eqp {
+    SELECT DISTINCT i.id
+    FROM item i
+    JOIN link l
+      ON (
+        (l.src = 1 AND i.id = l.dst AND i.kind = 7)
+        OR
+        (l.dst = 1 AND i.id = l.src AND i.kind = 7)
+      );
 }
 
 # Snapshot EQP: mixed residuals over outer + scanned tables should still use multi-index OR

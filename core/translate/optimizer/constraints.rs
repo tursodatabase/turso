@@ -3,7 +3,7 @@ use crate::{
     stats::TableStat,
     translate::{
         collate::get_collseq_from_expr,
-        expr::{as_binary_components, comparison_affinity, unwrap_parens},
+        expr::{as_binary_components, comparison_affinity},
         expression_index::normalize_expr_for_index_matching,
         plan::{JoinOrderMember, JoinedTable, NonFromClauseSubquery, TableReferences, WhereTerm},
         planner::{table_mask_from_expr, TableMask},
@@ -216,6 +216,47 @@ pub struct TableConstraints {
     pub constraints: Vec<Constraint>,
     /// Candidates for indexes that may use the constraints to perform a lookup.
     pub candidates: Vec<ConstraintUseCandidate>,
+}
+
+pub fn table_constraints_from_exprs(
+    exprs: &[ast::Expr],
+    table_reference: &JoinedTable,
+    table_references: &TableReferences,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    subqueries: &[NonFromClauseSubquery],
+    schema: &Schema,
+    params: &CostModelParams,
+) -> Result<(Vec<WhereTerm>, TableConstraints)> {
+    let local_where_clause = exprs
+        .iter()
+        .cloned()
+        .map(|expr| WhereTerm {
+            expr,
+            from_outer_join: None,
+            consumed: false,
+        })
+        .collect::<Vec<_>>();
+    let table_constraints = constraints_from_where_clause(
+        &local_where_clause,
+        table_references,
+        available_indexes,
+        subqueries,
+        schema,
+        params,
+    )?
+    .into_iter()
+    .find(|constraints| constraints.table_id == table_reference.internal_id)
+    .expect("constraints_from_where_clause must return constraints for every joined table");
+    let mut table_constraints = table_constraints;
+    for constraint in table_constraints.constraints.iter_mut() {
+        if constraint.constraining_expr.is_some() || constraint.operator.as_ast_operator().is_none()
+        {
+            continue;
+        }
+        constraint.constraining_expr =
+            Some(constraint.get_constraining_expr(&local_where_clause, Some(table_references)));
+    }
+    Ok((local_where_clause, table_constraints))
 }
 
 /// Estimate selectivity for IN expressions given the number of values and table row count.
@@ -1260,61 +1301,38 @@ impl RangeConstraintRef {
 /// Returns a slice of the references to the constraints that are usable.
 /// A constraint is considered usable for a given table if all of the other tables referenced by the constraint
 /// are on the left side in the join order relative to the table.
-pub fn usable_constraints_for_join_order<'a>(
-    constraints: &'a [Constraint],
-    refs: &'a [ConstraintRef],
-    join_order: &[JoinOrderMember],
+pub fn usable_constraints_for_lhs_mask(
+    constraints: &[Constraint],
+    refs: &[ConstraintRef],
+    lhs_mask: &TableMask,
+    table_idx: usize,
 ) -> Vec<RangeConstraintRef> {
     turso_debug_assert!(refs.is_sorted_by_key(|x| x.index_col_pos));
 
-    let table_idx = join_order.last().unwrap().original_idx;
-    let lhs_mask = TableMask::from_table_number_iter(
-        join_order
-            .iter()
-            .take(join_order.len() - 1)
-            .map(|j| j.original_idx),
-    );
     let mut usable: Vec<RangeConstraintRef> = Vec::new();
     let mut current_required_column_pos = 0;
     for cref in refs.iter() {
         let constraint = &constraints[cref.constraint_vec_pos];
         let other_side_refers_to_self = constraint.lhs_mask.contains_table(table_idx);
         if other_side_refers_to_self {
-            // For multi-column indexes, a gap at an earlier column position means later
-            // columns can't be used (B-tree prefix rule). But if this unusable constraint
-            // is at the same column position as one we haven't yet filled, another
-            // constraint on the same column might still be usable — so only break when
-            // the column position would advance past a gap.
-            //
-            // Example: given join order [t, o] and evaluating rowid access for `o`:
-            //   refs = [(col=0, o.id = oi.order_id),  -- unusable, oi not in join order
-            //           (col=0, t.order_id = o.id)]    -- usable
-            // Breaking on the first unusable ref would miss the usable constraint,
-            // causing a full table scan instead of SeekRowid.
             if cref.index_col_pos != current_required_column_pos {
                 break;
             }
             continue;
         }
-        let all_required_tables_are_on_left_side = lhs_mask.contains_all(&constraint.lhs_mask);
-        if !all_required_tables_are_on_left_side {
-            // Same logic as above: skip unusable constraints at the current column
-            // position since a usable one may follow; break only at later positions.
+        if !lhs_mask.contains_all(&constraint.lhs_mask) {
             if cref.index_col_pos != current_required_column_pos {
                 break;
             }
             continue;
         }
         if Some(cref.index_col_pos) == usable.last().map(|x| x.index_col_pos) {
-            // Two constraints on the same index column can be combined into a single range constraint.
             assert_eq!(cref.sort_order, usable.last().unwrap().sort_order);
             assert_eq!(cref.index_col_pos, usable.last().unwrap().index_col_pos);
             assert_eq!(
                 constraints[cref.constraint_vec_pos].table_col_pos,
                 usable.last().unwrap().table_col_pos
             );
-            // if we already have eq constraint - we must not add anything to it
-            // otherwise, we can incorrectly consume filters which will not be used in the access path
             if usable.last().unwrap().eq.is_some() {
                 continue;
             }
@@ -1333,12 +1351,9 @@ pub fn usable_constraints_for_join_order<'a>(
             continue;
         }
         if cref.index_col_pos != current_required_column_pos {
-            // Index columns must be consumed contiguously in the order they appear in the index.
             break;
         }
         if usable.last().is_some_and(|x| x.eq.is_none()) {
-            // Usable index key must have 0-n equalities and then a maximum of 1 range constraint with one or both bounds set.
-            // If we already have a range constraint before this one, we must not add anything to it
             break;
         }
         let operator = constraints[cref.constraint_vec_pos].operator;
@@ -1348,7 +1363,6 @@ pub fn usable_constraints_for_join_order<'a>(
                 .last()
                 .is_some_and(|x| x.table_col_pos == table_col_pos)
         {
-            // If we already have an equality constraint for this column, we can't use it again
             continue;
         }
         let constraint_group = match operator.as_ast_operator() {
@@ -1387,6 +1401,23 @@ pub fn usable_constraints_for_join_order<'a>(
         current_required_column_pos += 1;
     }
     usable
+}
+
+pub fn usable_constraints_for_join_order<'a>(
+    constraints: &'a [Constraint],
+    refs: &'a [ConstraintRef],
+    join_order: &[JoinOrderMember],
+) -> Vec<RangeConstraintRef> {
+    turso_debug_assert!(refs.is_sorted_by_key(|x| x.index_col_pos));
+
+    let table_idx = join_order.last().unwrap().original_idx;
+    let lhs_mask = TableMask::from_table_number_iter(
+        join_order
+            .iter()
+            .take(join_order.len() - 1)
+            .map(|j| j.original_idx),
+    );
+    usable_constraints_for_lhs_mask(constraints, refs, &lhs_mask, table_idx)
 }
 
 fn can_use_partial_index(index: &Index, query_where_clause: &[WhereTerm]) -> bool {
@@ -1488,7 +1519,7 @@ pub struct AnalyzedTerm {
 /// Returns `Some(AnalyzedTerm)` if the expression is a usable indexed constraint,
 /// `None` otherwise.
 #[allow(clippy::too_many_arguments)]
-fn analyze_binary_term_for_index(
+pub(crate) fn analyze_binary_term_for_index(
     expr: &ast::Expr,
     where_term_idx: usize,
     table_id: TableInternalId,
@@ -1636,266 +1667,6 @@ fn analyze_binary_term_for_index(
     })
 }
 
-/// Represents the decomposition of an OR clause for multi-index scan analysis.
-///
-/// For a WHERE clause like `a = 1 OR b = 2`, this structure captures:
-/// - The original WHERE term index
-/// - Each disjunct (a = 1, b = 2) with its indexability info
-#[derive(Debug)]
-#[allow(dead_code)]
-pub struct OrClauseDecomposition {
-    /// Index of the original WHERE term containing the OR expression.
-    pub where_term_idx: usize,
-    /// The table this OR clause applies to.
-    pub table_id: TableInternalId,
-    /// The disjuncts (OR branches) in this clause.
-    pub disjuncts: Vec<OrDisjunct>,
-    /// Whether all disjuncts are indexable (required for multi-index scan).
-    pub all_indexable: bool,
-}
-
-/// A single disjunct (branch) of an OR expression.
-#[derive(Debug)]
-#[allow(dead_code)]
-pub struct OrDisjunct {
-    /// The expression for this disjunct.
-    pub expr: ast::Expr,
-    /// If indexable, the constraint derived from this disjunct.
-    pub constraint: Option<Constraint>,
-    /// The best index for this disjunct, if any.
-    pub best_index: Option<Arc<Index>>,
-    /// Constraint references for this disjunct.
-    pub constraint_refs: Vec<RangeConstraintRef>,
-    /// Estimated number of rows from this disjunct.
-    pub estimated_rows: f64,
-    /// Residual filter expressions for compound AND disjuncts.
-    /// When a disjunct is `(a = 1 AND b = 2 AND c = 3)`, one sub-term becomes
-    /// the seek constraint and the rest become residual filters applied within
-    /// the branch loop after positioning on the table row.
-    pub residual_exprs: Vec<ast::Expr>,
-}
-
-/// Flattens nested OR expressions into a list of disjuncts.
-///
-/// For example, `(a OR b) OR c` becomes `[a, b, c]`.
-pub fn flatten_or_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
-    match expr {
-        ast::Expr::Binary(lhs, ast::Operator::Or, rhs) => {
-            let mut result = flatten_or_expr(lhs);
-            result.extend(flatten_or_expr(rhs));
-            result
-        }
-        _ => vec![expr],
-    }
-}
-
-/// Flattens nested AND expressions into a list of conjuncts.
-///
-/// For example, `(a AND b) AND c` becomes `[a, b, c]`.
-fn flatten_and_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
-    match expr {
-        ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
-            let mut result = flatten_and_expr(lhs);
-            result.extend(flatten_and_expr(rhs));
-            result
-        }
-        _ => vec![expr],
-    }
-}
-
-/// Analyzes an OR expression to determine if it can be optimized with a multi-index scan.
-///
-/// Returns `Some(OrClauseDecomposition)` if the OR term:
-/// 1. Is a simple OR of indexable terms
-/// 2. All terms reference the same table
-/// 3. All terms can use an index
-///
-/// Returns `None` if the OR term cannot be optimized with a multi-index scan.
-#[allow(clippy::too_many_arguments)]
-pub fn analyze_or_term_for_multi_index(
-    where_term_idx: usize,
-    expr: &ast::Expr,
-    table_reference: &JoinedTable,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
-    table_references: &TableReferences,
-    subqueries: &[NonFromClauseSubquery],
-    schema: &Schema,
-    params: &CostModelParams,
-) -> Option<OrClauseDecomposition> {
-    // Only consider OR expressions
-    let ast::Expr::Binary(_, ast::Operator::Or, _) = expr else {
-        return None;
-    };
-
-    let disjuncts = flatten_or_expr(expr);
-
-    // Need at least 2 disjuncts for multi-index scan to be useful
-    if disjuncts.len() < 2 {
-        return None;
-    }
-
-    let table_id = table_reference.internal_id;
-    let table_name = table_reference.table.get_name();
-    let indexes = available_indexes.get(table_name);
-    let rowid_alias_column = table_reference
-        .columns()
-        .iter()
-        .position(|c| c.is_rowid_alias());
-
-    let mut analyzed_disjuncts = Vec::new();
-    let mut all_indexable = true;
-
-    for disjunct_expr in disjuncts {
-        match analyze_binary_term_for_index(
-            disjunct_expr,
-            where_term_idx,
-            table_id,
-            table_reference,
-            table_name,
-            indexes,
-            rowid_alias_column,
-            available_indexes,
-            table_references,
-            subqueries,
-            schema,
-            params,
-        ) {
-            Some(analyzed) => {
-                analyzed_disjuncts.push(OrDisjunct {
-                    expr: disjunct_expr.clone(),
-                    constraint: Some(analyzed.constraint),
-                    best_index: analyzed.best_index,
-                    constraint_refs: analyzed.constraint_refs,
-                    estimated_rows: analyzed.estimated_rows,
-                    residual_exprs: vec![],
-                });
-            }
-            None => {
-                // Not a simple binary comparison. Check if it's a compound AND
-                // like (a = 1 AND b = 2 AND c = 3) where we can pick the best
-                // indexable sub-term as the seek and keep the rest as residuals.
-                if let Some(compound) = analyze_compound_and_disjunct(
-                    disjunct_expr,
-                    where_term_idx,
-                    table_id,
-                    table_reference,
-                    table_name,
-                    indexes,
-                    rowid_alias_column,
-                    available_indexes,
-                    table_references,
-                    subqueries,
-                    schema,
-                    params,
-                ) {
-                    analyzed_disjuncts.push(compound);
-                } else {
-                    // Not indexable
-                    all_indexable = false;
-                    analyzed_disjuncts.push(OrDisjunct {
-                        expr: disjunct_expr.clone(),
-                        constraint: None,
-                        best_index: None,
-                        constraint_refs: vec![],
-                        estimated_rows: params.rows_per_table_fallback,
-                        residual_exprs: vec![],
-                    });
-                }
-            }
-        }
-    }
-
-    Some(OrClauseDecomposition {
-        where_term_idx,
-        table_id,
-        disjuncts: analyzed_disjuncts,
-        all_indexable,
-    })
-}
-
-/// Analyzes a compound AND disjunct within an OR expression for multi-index scan.
-///
-/// When an OR disjunct is itself an AND of multiple conditions (e.g.
-/// `e.fromId = ? AND e.toId = n.id AND e.label = ?`), this function:
-/// 1. Flattens the AND into sub-terms
-/// 2. Finds the best indexable sub-term as the seek constraint
-/// 3. Collects remaining sub-terms as residual filters
-#[allow(clippy::too_many_arguments)]
-fn analyze_compound_and_disjunct(
-    expr: &ast::Expr,
-    where_term_idx: usize,
-    table_id: TableInternalId,
-    table_reference: &JoinedTable,
-    table_name: &str,
-    indexes: Option<&VecDeque<Arc<Index>>>,
-    rowid_alias_column: Option<usize>,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
-    table_references: &TableReferences,
-    subqueries: &[NonFromClauseSubquery],
-    schema: &Schema,
-    params: &CostModelParams,
-) -> Option<OrDisjunct> {
-    // Unwrap parenthesized expressions
-    let Ok(expr) = unwrap_parens(expr) else {
-        return None;
-    };
-    // Only handle AND expressions
-    if !matches!(expr, ast::Expr::Binary(_, ast::Operator::And, _)) {
-        return None;
-    }
-
-    let conjuncts = flatten_and_expr(expr);
-
-    if conjuncts.len() < 2 {
-        return None;
-    }
-
-    // Try to find an indexable sub-term; pick the one with lowest estimated_rows
-    let mut best: Option<(usize, AnalyzedTerm)> = None;
-    for (i, conjunct) in conjuncts.iter().enumerate() {
-        if let Some(analyzed) = analyze_binary_term_for_index(
-            conjunct,
-            where_term_idx,
-            table_id,
-            table_reference,
-            table_name,
-            indexes,
-            rowid_alias_column,
-            available_indexes,
-            table_references,
-            subqueries,
-            schema,
-            params,
-        ) {
-            let dominated = best
-                .as_ref()
-                .is_none_or(|(_, prev)| analyzed.estimated_rows < prev.estimated_rows);
-            if dominated {
-                best = Some((i, analyzed));
-            }
-        }
-    }
-
-    let (best_idx, analyzed) = best?;
-
-    // Collect non-seek sub-terms as residual filter expressions
-    let residual_exprs: Vec<ast::Expr> = conjuncts
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i != best_idx)
-        .map(|(_, e)| (*e).clone())
-        .collect();
-
-    Some(OrDisjunct {
-        expr: expr.clone(),
-        constraint: Some(analyzed.constraint),
-        best_index: analyzed.best_index,
-        constraint_refs: analyzed.constraint_refs,
-        estimated_rows: analyzed.estimated_rows,
-        residual_exprs,
-    })
-}
-
 /// Find the best index for a single constraint.
 fn find_best_index_for_constraint(
     table_col_pos: Option<usize>,
@@ -1995,174 +1766,4 @@ fn find_best_index_for_constraint(
     }
 
     (None, vec![])
-}
-
-/// Represents the decomposition of AND terms for multi-index intersection analysis.
-///
-/// For a WHERE clause like `a = 1 AND b = 2`, this structure captures:
-/// - The WHERE term indices involved
-/// - Each term with its indexability info
-#[derive(Debug)]
-pub struct AndClauseDecomposition {
-    /// The WHERE term indices that can be combined via intersection.
-    pub term_indices: Vec<usize>,
-    /// The branches (one per AND term) for this intersection.
-    pub branches: Vec<AndBranch>,
-}
-
-/// A single branch of an AND intersection, representing one AND term.
-#[derive(Debug)]
-pub struct AndBranch {
-    /// The WHERE term index for this branch.
-    pub where_term_idx: usize,
-    /// The constraint for this branch.
-    pub constraint: Constraint,
-    /// The best index for this branch.
-    pub index: Option<Arc<Index>>,
-    /// Constraint references for this branch.
-    pub constraint_refs: Vec<RangeConstraintRef>,
-    /// Estimated rows from this branch alone.
-    pub estimated_rows: f64,
-}
-
-/// Analyzes WHERE terms to determine if they can be optimized with a multi-index AND intersection.
-///
-/// Returns `Some(AndClauseDecomposition)` if:
-/// 1. Multiple AND terms reference the same table
-/// 2. Each term can use a DIFFERENT index (no composite index covers multiple terms)
-/// 3. The terms are all equality or range constraints
-///
-/// Returns `None` if the AND terms cannot be optimized with multi-index intersection.
-#[allow(clippy::too_many_arguments)]
-pub fn analyze_and_terms_for_multi_index(
-    table_reference: &JoinedTable,
-    where_clause: &[WhereTerm],
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
-    table_references: &TableReferences,
-    subqueries: &[NonFromClauseSubquery],
-    schema: &Schema,
-    params: &CostModelParams,
-) -> Option<AndClauseDecomposition> {
-    let table_id = table_reference.internal_id;
-    let table_name = table_reference.table.get_name();
-    let indexes = available_indexes.get(table_name);
-    let rowid_alias_column = table_reference
-        .columns()
-        .iter()
-        .position(|c| c.is_rowid_alias());
-
-    // Collect AND terms that:
-    // 1. Reference this table
-    // 2. Are simple binary comparisons (equality or range)
-    // 3. Can use an index
-    // 4. Are not already consumed
-    // 5. Are local constraints (not join conditions)
-    let mut candidate_branches: Vec<AndBranch> = Vec::new();
-    let mut columns_used: Vec<Option<usize>> = Vec::new();
-
-    for (where_term_idx, term) in where_clause.iter().enumerate() {
-        // Skip consumed terms
-        if term.consumed {
-            continue;
-        }
-
-        // Skip OR expressions - those are handled separately
-        if matches!(&term.expr, ast::Expr::Binary(_, ast::Operator::Or, _)) {
-            continue;
-        }
-
-        let Some(analyzed) = analyze_binary_term_for_index(
-            &term.expr,
-            where_term_idx,
-            table_id,
-            table_reference,
-            table_name,
-            indexes,
-            rowid_alias_column,
-            available_indexes,
-            table_references,
-            subqueries,
-            schema,
-            params,
-        ) else {
-            continue;
-        };
-
-        // Skip if the constraining expression references other tables (this is a join condition)
-        // Multi-index intersection is only for local constraints, not cross-table conditions
-        if !analyzed.constraint.lhs_mask.is_empty() {
-            continue;
-        }
-
-        columns_used.push(analyzed.constraint.table_col_pos);
-        candidate_branches.push(AndBranch {
-            where_term_idx,
-            constraint: analyzed.constraint,
-            index: analyzed.best_index,
-            constraint_refs: analyzed.constraint_refs,
-            estimated_rows: analyzed.estimated_rows,
-        });
-    }
-
-    // Need at least 2 branches for intersection to be useful
-    if candidate_branches.len() < 2 {
-        return None;
-    }
-
-    // Check if a composite index already covers multiple columns
-    // If so, using a single composite index is likely better than intersection
-    if let Some(indexes) = indexes {
-        for index in indexes.iter().filter(|idx| idx.index_method.is_none()) {
-            let mut columns_covered = 0;
-            for (i, col_pos) in columns_used.iter().enumerate() {
-                if let Some(col_pos) = col_pos {
-                    if let Some(idx_pos) = index.column_table_pos_to_index_pos(*col_pos) {
-                        // Check if this is within the usable prefix (contiguous from start)
-                        if idx_pos < index.columns.len() {
-                            // Check if all previous index columns are also covered
-                            let earlier_covered =
-                                columns_used[..i].iter().filter_map(|c| *c).any(|c| {
-                                    index
-                                        .column_table_pos_to_index_pos(c)
-                                        .is_some_and(|p| p < idx_pos)
-                                });
-                            if idx_pos == 0 || earlier_covered {
-                                columns_covered += 1;
-                            }
-                        }
-                    }
-                }
-            }
-            // If a composite index covers 2+ of our columns, skip intersection
-            if columns_covered >= 2 {
-                return None;
-            }
-        }
-    }
-
-    // Filter to keep only branches with unique indexes
-    // (intersection only helps when we use multiple distinct indexes)
-    let mut unique_branches: Vec<AndBranch> = Vec::new();
-    let mut seen_indexes: Vec<Option<String>> = Vec::new();
-    for branch in candidate_branches {
-        let index_name = branch.index.as_ref().map(|idx| idx.name.clone());
-        // Skip if same named index already used (rowid/None can be used multiple times)
-        if index_name.is_some() && seen_indexes.contains(&index_name) {
-            continue;
-        }
-        seen_indexes.push(index_name);
-        unique_branches.push(branch);
-    }
-
-    // Still need at least 2 branches with unique indexes
-    if unique_branches.len() < 2 {
-        return None;
-    }
-
-    let term_indices: Vec<usize> = unique_branches.iter().map(|b| b.where_term_idx).collect();
-
-    Some(AndClauseDecomposition {
-        term_indices,
-        branches: unique_branches,
-    })
 }

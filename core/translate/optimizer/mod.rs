@@ -60,6 +60,7 @@ pub(crate) mod cost;
 mod cost_params;
 pub(crate) mod join;
 pub(crate) mod lift_common_subexpressions;
+pub(crate) mod multi_index;
 pub(crate) mod order;
 pub(crate) mod unnest;
 
@@ -1910,7 +1911,6 @@ fn optimize_table_access(
                 where_term_idx,
                 set_op,
                 additional_consumed_terms,
-                estimated_rows_per_outer_row: _,
             } => {
                 // Mark the primary WHERE clause term as consumed
                 where_clause[*where_term_idx].consumed = true;
@@ -1926,7 +1926,7 @@ fn optimize_table_access(
                 let mut multi_idx_branches = Vec::with_capacity(branches.len());
                 for branch in std::mem::take(branches) {
                     let seek_def = build_seek_def_from_constraints(
-                        &[branch.constraint],
+                        &branch.constraints,
                         &branch.constraint_refs,
                         IterationDirection::Forwards, // Multi-index always scans forward
                         where_clause,
