@@ -145,10 +145,7 @@ impl<'a> Resolver<'a> {
 
     pub fn require_custom_types(&self, feature: &str) -> crate::Result<()> {
         if !self.enable_custom_types {
-            crate::bail_parse_error!(
-                "{} require --experimental-custom-types flag",
-                feature
-            );
+            crate::bail_parse_error!("{} require --experimental-custom-types flag", feature);
         }
         Ok(())
     }
