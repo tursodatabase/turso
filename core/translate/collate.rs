@@ -54,20 +54,58 @@ impl CollationSeq {
     }
 
     #[inline(always)]
+    pub fn compare_bytes(&self, lhs: &[u8], rhs: &[u8]) -> Ordering {
+        match self {
+            CollationSeq::Unset | CollationSeq::Binary => lhs.cmp(rhs),
+            CollationSeq::NoCase => Self::nocase_cmp_bytes(lhs, rhs),
+            CollationSeq::Rtrim => {
+                let lhs = Self::rtrim_bytes(lhs);
+                let rhs = Self::rtrim_bytes(rhs);
+                lhs.cmp(rhs)
+            }
+        }
+    }
+
+    #[inline(always)]
     fn binary_cmp(lhs: &str, rhs: &str) -> Ordering {
         lhs.cmp(rhs)
     }
 
     #[inline(always)]
     fn nocase_cmp(lhs: &str, rhs: &str) -> Ordering {
-        let nocase_lhs = uncased::UncasedStr::new(lhs);
-        let nocase_rhs = uncased::UncasedStr::new(rhs);
-        nocase_lhs.cmp(nocase_rhs)
+        Self::nocase_cmp_bytes(lhs.as_bytes(), rhs.as_bytes())
     }
 
     #[inline(always)]
     fn rtrim_cmp(lhs: &str, rhs: &str) -> Ordering {
         lhs.trim_end_matches(' ').cmp(rhs.trim_end_matches(' '))
+    }
+
+    #[inline(always)]
+    fn nocase_cmp_bytes(lhs: &[u8], rhs: &[u8]) -> Ordering {
+        let min_len = lhs.len().min(rhs.len());
+        for i in 0..min_len {
+            let left = lhs[i].to_ascii_lowercase();
+            let right = rhs[i].to_ascii_lowercase();
+
+            if left == 0 && right == 0 {
+                return lhs.len().cmp(&rhs.len());
+            }
+
+            if left != right {
+                return left.cmp(&right);
+            }
+        }
+        lhs.len().cmp(&rhs.len())
+    }
+
+    #[inline(always)]
+    fn rtrim_bytes(bytes: &[u8]) -> &[u8] {
+        let end = bytes
+            .iter()
+            .rposition(|&byte| byte != b' ')
+            .map_or(0, |idx| idx + 1);
+        &bytes[..end]
     }
 }
 
@@ -187,6 +225,24 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn test_nocase_embedded_nul_len_tiebreak() {
+        // SQLite NOCASE compares bytes case-insensitively up to NUL, then uses
+        // original byte length as a tie-breaker.
+        assert_eq!(
+            CollationSeq::NoCase.compare_bytes(b"A\0B", b"A\0C"),
+            Ordering::Equal
+        );
+        assert_eq!(
+            CollationSeq::NoCase.compare_bytes(b"A\0B", b"A"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            CollationSeq::NoCase.compare_bytes(b"A\0", b"A\0B"),
+            Ordering::Less
+        );
+    }
 
     #[test]
     fn test_get_collseq_from_expr_single_table_single_column() {

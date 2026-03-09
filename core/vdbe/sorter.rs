@@ -11,7 +11,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 
 use crate::io::TempFile;
-use crate::types::{IOCompletions, ValueIterator};
+use crate::types::{compare_text_refs, IOCompletions, ValueIterator};
 use crate::{
     error::LimboError,
     io::{Buffer, Completion, CompletionGroup, File, IO},
@@ -830,7 +830,7 @@ impl Ord for ArenaSortableRecord {
             } else {
                 match (self_val, other_val) {
                     (ValueRef::Text(left), ValueRef::Text(right)) => {
-                        key_info.collation.compare_strings(&left, &right)
+                        compare_text_refs(left, right, key_info.collation)
                     }
                     _ => self_val.partial_cmp(&other_val).unwrap_or(Ordering::Equal),
                 }
@@ -932,7 +932,7 @@ impl Ord for BoxedSortableRecord {
             } else {
                 match (self_val, other_val) {
                     (ValueRef::Text(left), ValueRef::Text(right)) => {
-                        key_info.collation.compare_strings(&left, &right)
+                        compare_text_refs(left, right, key_info.collation)
                     }
                     _ => self_val.partial_cmp(&other_val).unwrap_or(Ordering::Equal),
                 }

@@ -161,7 +161,7 @@ fn hash_value<H: Hasher>(hasher: &mut H, value: &ValueRef) {
         }
         ValueRef::Text(s) => {
             3u8.hash(hasher);
-            s.as_str().hash(hasher);
+            s.as_bytes().hash(hasher);
         }
         ValueRef::Blob(b) => {
             4u8.hash(hasher);
