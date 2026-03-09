@@ -198,8 +198,8 @@ pub fn estimate_cost_for_scan_or_seek(
         .iter()
         .map(|cref| {
             // for equality constraints, use the selectivity of the equality constraint directly
-            if let Some(eq) = cref.eq {
-                let constraint = &constraints[eq];
+            if let Some(ref eq) = cref.eq {
+                let constraint = &constraints[eq.constraint_pos];
                 return constraint.selectivity;
             }
             // otherwise, multiply the selectivities of the range constraints

@@ -238,20 +238,24 @@ pub fn plan_satisfies_order_target(
                     1
                 }
                 Some(index) => {
-                    // Collect the set of index column positions that have equality
-                    // constraints from the WHERE clause.
+                    // Collect the set of index column positions that have constant
+                    // equality constraints (WHERE, not join-dependent).  Only
+                    // globally constant values can be skipped for ORDER BY: a
+                    // join-condition eq varies per outer row, so duplicate outer
+                    // keys would interleave inner scans and break global ordering.
                     let eq_positions: Vec<usize> = (0..index.columns.len())
                         .take_while(|&pos| {
-                            constraint_refs
-                                .iter()
-                                .any(|c| c.index_col_pos == pos && c.eq.is_some())
+                            constraint_refs.iter().any(|c| {
+                                c.index_col_pos == pos
+                                    && c.eq.as_ref().is_some_and(|eq| eq.is_const)
+                            })
                         })
                         .collect();
 
                     // Walk through the ORDER BY / GROUP BY target columns and
-                    // the index columns together.  An equality-constrained column
-                    // satisfies the target trivially (its value is constant), so
-                    // we can skip it in *both* the target and the index.  For
+                    // the index columns together.  A constant equality-constrained
+                    // column satisfies the target trivially (its value is fixed),
+                    // so we can skip it in *both* the target and the index.  For
                     // non-equality columns the index must provide the right order.
                     let mut col_idx = 0; // consumed target columns
                     let mut idx_pos = 0; // current index column position

@@ -204,3 +204,244 @@ expect {
     2024-03-22|1
     2024-01-15|1
 }
+
+# =============================================================================
+# JOIN tests — verify eq-skip interacts correctly with multi-table ORDER BY
+# =============================================================================
+
+setup join_schema {
+    CREATE TABLE orders (
+        id INTEGER PRIMARY KEY,
+        customer_id INTEGER NOT NULL,
+        order_date TEXT NOT NULL,
+        amount REAL NOT NULL
+    );
+    CREATE INDEX idx_orders_cust_date ON orders(customer_id, order_date DESC);
+
+    CREATE TABLE items (
+        id INTEGER PRIMARY KEY,
+        order_id INTEGER NOT NULL,
+        product TEXT NOT NULL,
+        qty INTEGER NOT NULL
+    );
+    CREATE INDEX idx_items_order ON items(order_id, product);
+
+    INSERT INTO orders VALUES (1, 100, '2024-03-01', 50.0);
+    INSERT INTO orders VALUES (2, 100, '2024-01-15', 30.0);
+    INSERT INTO orders VALUES (3, 100, '2024-06-10', 80.0);
+    INSERT INTO orders VALUES (4, 200, '2024-02-20', 45.0);
+    INSERT INTO orders VALUES (5, 200, '2024-05-05', 60.0);
+
+    INSERT INTO items VALUES (1, 1, 'Widget', 2);
+    INSERT INTO items VALUES (2, 1, 'Gadget', 1);
+    INSERT INTO items VALUES (3, 2, 'Widget', 5);
+    INSERT INTO items VALUES (4, 3, 'Bolt', 10);
+    INSERT INTO items VALUES (5, 3, 'Widget', 3);
+    INSERT INTO items VALUES (6, 4, 'Gadget', 7);
+    INSERT INTO items VALUES (7, 5, 'Bolt', 4);
+}
+
+# eq on outer table, ORDER BY only outer table suffix.
+# customer_id eq-skip should let order_date DESC come from the index.
+# Rows are duplicated by join fanout but order_date ordering must hold.
+@setup join_schema
+test join-eq-skip-order-outer-only {
+    SELECT o.id, o.order_date, i.product
+    FROM orders o JOIN items i ON o.id = i.order_id
+    WHERE o.customer_id = 100
+    ORDER BY o.order_date DESC, i.product;
+}
+expect {
+    3|2024-06-10|Bolt
+    3|2024-06-10|Widget
+    1|2024-03-01|Gadget
+    1|2024-03-01|Widget
+    2|2024-01-15|Widget
+}
+
+# ORDER BY only the inner table — eq-skip on outer should NOT help.
+@setup join_schema
+test join-order-inner-only {
+    SELECT o.id, i.product, i.qty
+    FROM orders o JOIN items i ON o.id = i.order_id
+    WHERE o.customer_id = 100
+    ORDER BY i.product, i.qty;
+}
+expect {
+    3|Bolt|10
+    1|Gadget|1
+    1|Widget|2
+    3|Widget|3
+    2|Widget|5
+}
+
+# LEFT JOIN, ORDER BY right table column.
+@setup join_schema
+test join-left-order-right {
+    SELECT o.id, o.order_date, i.product
+    FROM orders o LEFT JOIN items i ON o.id = i.order_id
+    WHERE o.customer_id = 100
+    ORDER BY i.product, o.id;
+}
+expect {
+    3|2024-06-10|Bolt
+    1|2024-03-01|Gadget
+    1|2024-03-01|Widget
+    2|2024-01-15|Widget
+    3|2024-06-10|Widget
+}
+
+# eq on both joined tables, ORDER BY a column from neither eq set.
+@setup join_schema
+test join-eq-both-tables {
+    SELECT o.id, o.order_date, i.product, i.qty
+    FROM orders o JOIN items i ON o.id = i.order_id
+    WHERE o.customer_id = 100 AND i.product = 'Widget'
+    ORDER BY i.qty;
+}
+expect {
+    1|2024-03-01|Widget|2
+    3|2024-06-10|Widget|3
+    2|2024-01-15|Widget|5
+}
+
+# =============================================================================
+# Two-table join with separate composite indexes and eq-skip on both
+# =============================================================================
+
+setup join_schema2 {
+    CREATE TABLE t1 (
+        id INTEGER PRIMARY KEY,
+        a INTEGER NOT NULL,
+        b INTEGER NOT NULL,
+        c INTEGER NOT NULL
+    );
+    CREATE INDEX idx_t1_ab ON t1(a, b);
+
+    CREATE TABLE t2 (
+        id INTEGER PRIMARY KEY,
+        x INTEGER NOT NULL,
+        y INTEGER NOT NULL,
+        z TEXT NOT NULL
+    );
+    CREATE INDEX idx_t2_xy ON t2(x, y DESC);
+
+    -- t1: a=1 rows with various b values
+    INSERT INTO t1 VALUES (1, 1, 30, 100);
+    INSERT INTO t1 VALUES (2, 1, 10, 200);
+    INSERT INTO t1 VALUES (3, 1, 20, 300);
+    INSERT INTO t1 VALUES (4, 2, 5,  400);
+
+    -- t2: multiple rows per x value, y in non-trivial order
+    INSERT INTO t2 VALUES (10, 30, 9, 'alpha');
+    INSERT INTO t2 VALUES (11, 30, 3, 'beta');
+    INSERT INTO t2 VALUES (12, 10, 7, 'gamma');
+    INSERT INTO t2 VALUES (13, 10, 1, 'delta');
+    INSERT INTO t2 VALUES (14, 20, 5, 'epsilon');
+    INSERT INTO t2 VALUES (15, 20, 2, 'zeta');
+}
+
+# eq-skip on t1.a, ORDER BY t1.b (from index) then t2.y DESC (from t2 index).
+# Both tables contribute to the sort order via their indexes.
+@setup join_schema2
+test join-cross-table-both-indexes {
+    SELECT t1.id, t1.b, t2.y, t2.z
+    FROM t1 JOIN t2 ON t1.b = t2.x
+    WHERE t1.a = 1
+    ORDER BY t1.b, t2.y DESC;
+}
+expect {
+    2|10|7|gamma
+    2|10|1|delta
+    3|20|5|epsilon
+    3|20|2|zeta
+    1|30|9|alpha
+    1|30|3|beta
+}
+
+# Same join but ORDER BY t2.y ASC — wrong direction for t2's DESC index.
+# Must use a sorter to get correct ascending order on y.
+@setup join_schema2
+test join-cross-table-wrong-direction-inner {
+    SELECT t1.id, t1.b, t2.y, t2.z
+    FROM t1 JOIN t2 ON t1.b = t2.x
+    WHERE t1.a = 1
+    ORDER BY t1.b, t2.y ASC;
+}
+expect {
+    2|10|1|delta
+    2|10|7|gamma
+    3|20|2|zeta
+    3|20|5|epsilon
+    1|30|3|beta
+    1|30|9|alpha
+}
+
+# eq-skip on t1.a, but ORDER BY t1.b DESC — wrong direction for t1's ASC index.
+# The eq-skip correctly identifies t1.a as constant, but t1.b is ASC in the index
+# and we want DESC, so a sorter is needed.
+@setup join_schema2
+test join-eq-skip-wrong-direction-outer {
+    SELECT t1.id, t1.b, t2.z
+    FROM t1 JOIN t2 ON t1.b = t2.x
+    WHERE t1.a = 1
+    ORDER BY t1.b DESC, t2.z;
+}
+expect {
+    1|30|alpha
+    1|30|beta
+    3|20|epsilon
+    3|20|zeta
+    2|10|delta
+    2|10|gamma
+}
+
+# Duplicate join key in outer table — the critical cross-table bug case.
+# t1 has two rows with b=10. The inner scan for each produces y DESC
+# independently, but interleaved they break global ORDER BY t1.b, t2.y DESC.
+# Without a sorter the result is (7,1,7,1); correct is (7,7,1,1).
+@setup join_schema2
+test join-duplicate-outer-key {
+    INSERT INTO t1 VALUES (5, 1, 10, 500);
+
+    SELECT t1.id, t1.b, t2.y, t2.z
+    FROM t1 JOIN t2 ON t1.b = t2.x
+    WHERE t1.a = 1
+    ORDER BY t1.b, t2.y DESC;
+}
+expect {
+    2|10|7|gamma
+    5|10|7|gamma
+    2|10|1|delta
+    5|10|1|delta
+    3|20|5|epsilon
+    3|20|2|zeta
+    1|30|9|alpha
+    1|30|3|beta
+}
+
+# Three-way join: eq-skip on t1.a, ORDER BY t1.b, t2.y DESC.
+# Third table (t3) is joined but doesn't participate in ORDER BY.
+@setup join_schema2
+test join-three-way {
+    CREATE TABLE t3 (
+        id INTEGER PRIMARY KEY,
+        ref_id INTEGER NOT NULL,
+        label TEXT NOT NULL
+    );
+    INSERT INTO t3 VALUES (1, 10, 'L1');
+    INSERT INTO t3 VALUES (2, 11, 'L2');
+    INSERT INTO t3 VALUES (3, 12, 'L3');
+
+    SELECT t1.b, t2.y, t3.label
+    FROM t1
+    JOIN t2 ON t1.b = t2.x
+    JOIN t3 ON t2.id = t3.ref_id
+    WHERE t1.a = 1
+    ORDER BY t1.b, t2.y DESC;
+}
+expect {
+    10|7|L3
+    30|9|L1
+    30|3|L2
+}

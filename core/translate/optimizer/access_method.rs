@@ -381,7 +381,14 @@ fn find_best_access_method_for_btree(
         // toId=outer.id, prereq_count=1) touches different pages each time.
         let prereq_count: usize = usable_constraint_refs
             .iter()
-            .flat_map(|ucref| [ucref.eq, ucref.lower_bound, ucref.upper_bound].into_iter())
+            .flat_map(|ucref| {
+                [
+                    ucref.eq.as_ref().map(|e| e.constraint_pos),
+                    ucref.lower_bound,
+                    ucref.upper_bound,
+                ]
+                .into_iter()
+            })
             .flatten()
             .map(|idx| rhs_constraints.constraints[idx].lhs_mask.table_count())
             .sum();

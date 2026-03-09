@@ -1162,7 +1162,6 @@ pub fn constraints_from_where_clause(
     Ok(constraints)
 }
 
-#[derive(Clone, Debug)]
 /// A reference to a [Constraint]s in a [TableConstraints] for single column.
 ///
 /// This is specialized version of [ConstraintRef] which specifically holds range-like constraints:
@@ -1172,6 +1171,18 @@ pub fn constraints_from_where_clause(
 /// - x > 10 AND x < 20 (both lower_bound and upper_bound are set)
 ///
 /// eq, lower_bound and upper_bound holds None or position of the constraint in the [Constraint] array
+
+#[derive(Debug, Clone)]
+pub struct EqConstraintRef {
+    /// Position of the constraint in the [Constraint] array.
+    pub constraint_pos: usize,
+    /// Whether this equality constrains the column to a single value for the
+    /// entire query (true for `col = 5`, false for `t2.x = t1.b` where the
+    /// value changes per outer row in a nested-loop join).
+    pub is_const: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct RangeConstraintRef {
     /// position of the column in the table definition
     pub table_col_pos: Option<usize>,
@@ -1180,7 +1191,7 @@ pub struct RangeConstraintRef {
     /// sort order for the column in the index definition
     pub sort_order: SortOrder,
     /// equality constraint
-    pub eq: Option<usize>,
+    pub eq: Option<EqConstraintRef>,
     /// lower bound constraint (either > or >=)
     pub lower_bound: Option<usize>,
     /// upper bound constraint (either < or <=)
@@ -1228,10 +1239,11 @@ impl RangeConstraintRef {
         where_clause: &[WhereTerm],
         referenced_tables: Option<&TableReferences>,
     ) -> SeekRangeConstraint {
-        if let Some(eq) = self.eq {
+        if let Some(ref eq) = self.eq {
             return SeekRangeConstraint::new_eq(
                 self.sort_order,
-                constraints[eq].get_constraining_expr(where_clause, referenced_tables),
+                constraints[eq.constraint_pos]
+                    .get_constraining_expr(where_clause, referenced_tables),
             );
         }
         SeekRangeConstraint::new_range(
@@ -1344,7 +1356,10 @@ pub fn usable_constraints_for_join_order<'a>(
                 table_col_pos,
                 index_col_pos: cref.index_col_pos,
                 sort_order: cref.sort_order,
-                eq: Some(cref.constraint_vec_pos),
+                eq: Some(EqConstraintRef {
+                    constraint_pos: cref.constraint_vec_pos,
+                    is_const: constraints[cref.constraint_vec_pos].lhs_mask.is_empty(),
+                }),
                 lower_bound: None,
                 upper_bound: None,
             },
@@ -1772,7 +1787,10 @@ fn find_best_index_for_constraint(
             index_col_pos: 0,
             sort_order: SortOrder::Asc,
             eq: if operator.as_ast_operator() == Some(ast::Operator::Equals) {
-                Some(0)
+                Some(EqConstraintRef {
+                    constraint_pos: 0,
+                    is_const: false,
+                })
             } else {
                 None
             },
@@ -1799,7 +1817,10 @@ fn find_best_index_for_constraint(
             index_col_pos: 0,
             sort_order: SortOrder::Asc,
             eq: if operator.as_ast_operator() == Some(ast::Operator::Equals) {
-                Some(0)
+                Some(EqConstraintRef {
+                    constraint_pos: 0,
+                    is_const: false,
+                })
             } else {
                 None
             },
@@ -1827,7 +1848,10 @@ fn find_best_index_for_constraint(
                         index_col_pos: 0,
                         sort_order: index.columns[0].order,
                         eq: if operator.as_ast_operator() == Some(ast::Operator::Equals) {
-                            Some(0)
+                            Some(EqConstraintRef {
+                                constraint_pos: 0,
+                                is_const: false,
+                            })
                         } else {
                             None
                         },

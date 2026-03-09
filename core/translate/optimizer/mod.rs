@@ -1794,9 +1794,10 @@ fn optimize_table_access(
                         {"constraint_refs": format!("{constraint_refs:?}")}
                     );
                     table_references.joined_tables_mut()[table_idx].op =
-                        if let Some(eq) = constraint_refs[0].eq {
+                        if let Some(ref eq) = constraint_refs[0].eq {
                             Operation::Search(Search::RowidEq {
-                                cmp_expr: constraints_per_table[table_idx].constraints[eq]
+                                cmp_expr: constraints_per_table[table_idx].constraints
+                                    [eq.constraint_pos]
                                     .get_constraining_expr(where_clause, Some(table_references))
                                     .1,
                             })
@@ -1846,8 +1847,8 @@ fn optimize_table_access(
                     .expect("should have constraints for this table");
 
                 for cref in constraint_refs.iter() {
-                    if let Some(eq_pos) = cref.eq {
-                        let constraint = &table_constraints.constraints[eq_pos];
+                    if let Some(ref eq) = cref.eq {
+                        let constraint = &table_constraints.constraints[eq.constraint_pos];
                         where_clause[constraint.where_clause_pos.0].consumed = true;
                     }
                 }
@@ -2099,9 +2100,13 @@ fn mark_seek_constraints_consumed(
     defer_cross_table: bool,
 ) {
     for cref in constraint_refs.iter() {
-        for pos in &[cref.eq, cref.lower_bound, cref.upper_bound] {
+        for pos in [
+            cref.eq.as_ref().map(|e| e.constraint_pos),
+            cref.lower_bound,
+            cref.upper_bound,
+        ] {
             let Some(pos) = pos else { continue };
-            let constraint = &constraints[*pos];
+            let constraint = &constraints[pos];
             let where_term = &mut where_clause[constraint.where_clause_pos.0];
             if where_term.consumed {
                 continue;
