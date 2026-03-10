@@ -328,6 +328,43 @@ impl<'a> BindContext<'a> {
     fn aliases(&self) -> &[ResultSetColumn] {
         &self.aliases
     }
+
+    fn bind_select(&mut self, select: &mut ast::Select) -> Result<()> {
+        Ok(())
+    }
+
+    fn bind_cte(&mut self, with: &mut ast::With) -> Result<()> {
+        if with.recursive {
+            crate::bail_parse_error!("Recursive CTEs are not yet supported");
+        }
+
+        // Pass 1: register all CTE names
+        for cte in &with.ctes {
+            let cte_name = normalize_ident(cte.tbl_name.as_str());
+            if self.ctes.contains_key(&cte_name) {
+                crate::bail_parse_error!("duplicate WITH table name: {}", cte.tbl_name.as_str());
+            }
+            let explicit_columns = cte
+                .columns
+                .iter()
+                .map(|c| normalize_ident(c.col_name.as_str()))
+                .collect();
+            self.insert_cte(
+                cte_name,
+                CteEntry {
+                    select: cte.select.clone(),
+                    explicit_columns,
+                    cte_id: None,
+                },
+            );
+        }
+
+        // Pass 2: bind each CTE body
+        for cte in &mut with.ctes {
+            self.bind_select(&mut cte.select)?;
+        }
+        Ok(())
+    }
 }
 
 // ── BoundSelect ──────────────────────────────────────────────────────────
