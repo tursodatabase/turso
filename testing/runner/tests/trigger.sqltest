@@ -319,9 +319,9 @@ test trigger-new-reference-in-values-subquery {
     BEGIN
         INSERT INTO result14_subq_vals VALUES (
             'min=' || (
-                SELECT column1
+                SELECT *
                 FROM (VALUES (NEW.id), (NEW.val))
-                ORDER BY column1
+                ORDER BY 1
                 LIMIT 1
             )
         );
