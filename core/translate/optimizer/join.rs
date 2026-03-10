@@ -3179,10 +3179,6 @@ mod tests {
         Expr::Literal(ast::Literal::Numeric(value.to_string()))
     }
 
-    fn _create_string_literal(value: &str) -> Expr {
-        Expr::Literal(ast::Literal::String(value.to_string()))
-    }
-
     fn _as_btree(
         access_method: &AccessMethod,
     ) -> (

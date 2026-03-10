@@ -227,6 +227,9 @@ fn compute_branch_cost_and_params(
         index_info,
         constraints,
         constraint_refs,
+        // Branch-local costing models one execution of this branch; the outer
+        // join cardinality multiplier is applied by the union/intersection cost
+        // wrapper around the full multi-index plan.
         1.0,
         base_row_count,
         false,
@@ -275,11 +278,11 @@ fn residual_tables_mask(
 /// Return the branch-local conjuncts that were not consumed by the chosen seek
 /// constraints and therefore must remain as residual filters.
 fn residual_exprs_for_branch(
-    where_clause: &[WhereTerm],
+    branch_terms: &[WhereTerm],
     constraints: &[Constraint],
     constraint_refs: &[RangeConstraintRef],
 ) -> Vec<ast::Expr> {
-    let mut consumed = vec![false; where_clause.len()];
+    let mut consumed = vec![false; branch_terms.len()];
     for cref in constraint_refs.iter() {
         for idx in [
             cref.eq.as_ref().map(|e| e.constraint_pos),
@@ -292,7 +295,7 @@ fn residual_exprs_for_branch(
             consumed[constraints[idx].where_clause_pos.0] = true;
         }
     }
-    where_clause
+    branch_terms
         .iter()
         .enumerate()
         .filter(|(idx, _)| !consumed[*idx])
