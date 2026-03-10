@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.1 -- 2026-03-10
+
+### Fixed
+
+* Fix INSERT failing on non-INTEGER PRIMARY KEY when column is omitted (Mikaël Francoeur)
+* core/mvcc: Disable no-op update optimisation (Avinash Sajjanshetty)
+
+### Optimized
+
+* optimizer: some finetuning for statsless heuristics + improve EXPLAIN QUERY PLAN (Jussi Saurio)
+
 ## 0.5.0 -- 2026-03-04
 
 ### Added
