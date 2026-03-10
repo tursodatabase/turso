@@ -1376,7 +1376,7 @@ fn emit_columns_for_table_info(
         program.emit_string8(column.name.clone().unwrap_or_default(), base_reg + 1);
 
         // type
-        program.emit_string8(column.ty_str.clone(), base_reg + 2);
+        program.emit_string8(column.declared_type.clone(), base_reg + 2);
 
         // notnull
         program.emit_bool(column.notnull(), base_reg + 3);
