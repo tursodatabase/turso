@@ -254,6 +254,20 @@ expect {
     [{"name":"hat"},{"name":"cap"},{"name":"shirt"},{"name":"sweater"},{"name":"sweatshirt"},{"name":"shorts"},{"name":"jeans"},{"name":"sneakers"},{"name":"boots"},{"name":"coat"},{"name":"accessories"}]
 }
 
+test json-group-array-empty {
+    SELECT json_group_array(name) FROM products WHERE 1=0;
+}
+expect {
+    []
+}
+
+test json-group-object-empty {
+    SELECT json_group_object('k', name) FROM products WHERE 1=0;
+}
+expect {
+    {}
+}
+
 test select-distinct-agg-functions {
     SELECT sum(distinct age), count(distinct age), avg(distinct age) FROM users;
 }
