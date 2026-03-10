@@ -1,13 +1,62 @@
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap as HashMap;
-use turso_parser::ast::{self, TableInternalId};
+use turso_parser::ast::{self, JoinConstraint, TableInternalId};
 
 use super::emitter::Resolver;
 use super::plan::{JoinInfo, JoinedTable, ResultSetColumn, TableReferences};
 use crate::schema::Table;
 use crate::util::normalize_ident;
 use crate::Result;
+
+// ── IdGenerator ─────────────────────────────────────────────────────────
+
+pub trait IdGenerator {
+    fn next_id(&mut self) -> TableInternalId;
+}
+
+// ── BindTable ───────────────────────────────────────────────────────────
+
+/// Trait for table metadata needed during binding (column name resolution).
+pub trait BindTable {
+    fn column_count(&self) -> usize;
+    fn column_name(&self, idx: usize) -> Option<&str>;
+    fn column_is_rowid_alias(&self, idx: usize) -> bool;
+}
+
+impl BindTable for Table {
+    fn column_count(&self) -> usize {
+        self.columns().len()
+    }
+
+    fn column_name(&self, idx: usize) -> Option<&str> {
+        self.columns().get(idx).and_then(|c| c.name.as_deref())
+    }
+
+    fn column_is_rowid_alias(&self, idx: usize) -> bool {
+        self.columns().get(idx).is_some_and(|c| c.is_rowid_alias())
+    }
+}
+
+/// Lightweight table for CTEs — just column names, no schema object.
+pub struct CteTable {
+    pub name: String,
+    pub columns: Vec<String>,
+}
+
+impl BindTable for CteTable {
+    fn column_count(&self) -> usize {
+        self.columns.len()
+    }
+
+    fn column_name(&self, idx: usize) -> Option<&str> {
+        self.columns.get(idx).map(|s| s.as_str())
+    }
+
+    fn column_is_rowid_alias(&self, _idx: usize) -> bool {
+        false
+    }
+}
 
 // ── BindPhase ────────────────────────────────────────────────────────────
 
@@ -32,21 +81,22 @@ pub enum BindPhase {
 
 /// A table visible within a single query scope.
 ///
-/// Cheap to clone (`Table` is Arc-wrapped).
+/// Cheap to clone (table metadata is Arc-wrapped).
 #[derive(Clone)]
 pub struct ScopeTable {
     /// The name used to refer to this table in the query (original name or alias).
     pub identifier: String,
     /// Opaque ID used in `Expr::Column` to reference this table.
     pub internal_id: TableInternalId,
-    /// Table metadata (columns, types, etc). Clone is an Arc bump.
-    pub table: Table,
+    /// Table metadata for column resolution. Clone is an Arc bump.
+    pub table: Arc<dyn BindTable>,
     /// Join constraint info (USING clause for dedup during unqualified lookup).
     pub join_info: Option<JoinInfo>,
 }
 
 // ── BindScope ────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 /// Snapshot of all tables visible at one query level.
 ///
 /// Analogous to DataFusion's `DFSchema`. Owned, Arc-wrapped for cheap
@@ -61,22 +111,6 @@ pub struct BindScope {
 pub type BindScopeRef = Arc<BindScope>;
 
 impl BindScope {
-    /// Snapshot the current query's joined tables into a scope.
-    pub fn from_joined_tables(joined: &[JoinedTable], right_join_swapped: bool) -> Self {
-        Self {
-            tables: joined
-                .iter()
-                .map(|jt| ScopeTable {
-                    identifier: jt.identifier.clone(),
-                    internal_id: jt.internal_id,
-                    table: jt.table.clone(),
-                    join_info: jt.join_info.clone(),
-                })
-                .collect(),
-            right_join_swapped,
-        }
-    }
-
     /// Find an unqualified column by name across all tables in scope.
     ///
     /// Returns `(table_internal_id, column_index, is_rowid_alias)` or `None`.
@@ -89,9 +123,9 @@ impl BindScope {
         let mut result: Option<(TableInternalId, usize, bool)> = None;
 
         for st in &self.tables {
-            let col_idx = st.table.columns().iter().position(|c| {
-                c.name
-                    .as_ref()
+            let col_idx = (0..st.table.column_count()).position(|i| {
+                st.table
+                    .column_name(i)
                     .is_some_and(|n| n.eq_ignore_ascii_case(&normalized))
             });
 
@@ -106,8 +140,7 @@ impl BindScope {
                         crate::bail_parse_error!("Column {} is ambiguous", name);
                     }
                 } else {
-                    let col = &st.table.columns()[idx];
-                    result = Some((st.internal_id, idx, col.is_rowid_alias()));
+                    result = Some((st.internal_id, idx, st.table.column_is_rowid_alias(idx)));
                 }
             }
         }
@@ -129,9 +162,9 @@ impl BindScope {
         };
 
         let normalized_col = normalize_ident(col_name);
-        let col_idx = st.table.columns().iter().position(|c| {
-            c.name
-                .as_ref()
+        let col_idx = (0..st.table.column_count()).position(|i| {
+            st.table
+                .column_name(i)
                 .is_some_and(|n| n.eq_ignore_ascii_case(&normalized_col))
         });
 
@@ -139,8 +172,11 @@ impl BindScope {
             crate::bail_parse_error!("no such column: {}", col_name);
         };
 
-        let col = &st.table.columns()[idx];
-        Ok(Some((st.internal_id, idx, col.is_rowid_alias())))
+        Ok(Some((
+            st.internal_id,
+            idx,
+            st.table.column_is_rowid_alias(idx),
+        )))
     }
 
     /// Find a table by its identifier (name or alias).
@@ -213,9 +249,12 @@ pub struct CteEntry {
 ///
 /// Does **not** borrow `TableReferences`. Column usage is recorded in
 /// [`BindTracking`] and flushed back after binding completes.
-pub struct BindContext<'a> {
+pub struct BindContext<'a, G: IdGenerator> {
     /// Function and schema resolver.
     pub resolver: &'a Resolver<'a>,
+
+    /// Generates unique table IDs for scope tables.
+    id_gen: &'a mut G,
 
     /// Stack of outer query scopes.
     ///
@@ -241,10 +280,11 @@ pub struct BindContext<'a> {
     pub tracking: BindTracking,
 }
 
-impl<'a> BindContext<'a> {
-    fn new(resolver: &'a Resolver<'a>) -> Self {
+impl<'a, G: IdGenerator> BindContext<'a, G> {
+    fn new(resolver: &'a Resolver<'a>, id_gen: &'a mut G) -> Self {
         Self {
             resolver,
+            id_gen,
             outer_scopes: Vec::new(),
             outer_from_scope: None,
             ctes: HashMap::default(),
