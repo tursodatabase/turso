@@ -566,3 +566,84 @@ fn shuttle_test_phantom_prevention_slow() {
     let runner = shuttle::Runner::new(scheduler, shuttle_config());
     runner.run(|| shuttle::future::block_on(phantom_prevention_scenario(9, 9, 24)));
 }
+
+/// Speculative visibility abort: concurrent UPDATE + ROLLBACK on MVCC-store rows.
+async fn speculative_abort_delete_scenario(num_workers: usize, rounds: i64) {
+    let (db, _dir) = setup_mvcc_db(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER);
+         INSERT INTO t VALUES(1, 0);
+         INSERT INTO t VALUES(2, 0);
+         INSERT INTO t VALUES(3, 0);",
+    )
+    .await;
+
+    let barrier = Arc::new(Barrier::new(num_workers));
+    let mut handles = Vec::new();
+
+    for w in 0..num_workers as i64 {
+        let conn = db.connect().unwrap();
+        let barrier = barrier.clone();
+        let should_rollback = w % 2 == 0;
+        handles.push(turso_stress::future::spawn(async move {
+            barrier.wait();
+            for i in 0..rounds {
+                conn.execute("BEGIN CONCURRENT", ()).await.unwrap();
+
+                // Mix of self-update (SET val=val) and actual changes
+                let result = if i % 3 == 0 {
+                    conn.execute("UPDATE t SET val = val", ()).await
+                } else {
+                    let new_val = w * 1000 + i + 1;
+                    conn.execute(&format!("UPDATE t SET val = {new_val}"), ())
+                        .await
+                };
+
+                match result {
+                    Ok(_) => {
+                        if should_rollback {
+                            // Force abort to create the Preparing → Aborted window
+                            let _ = conn.execute("ROLLBACK", ()).await;
+                        } else {
+                            match conn.execute("COMMIT", ()).await {
+                                Ok(_) => {}
+                                Err(_) => {
+                                    let _ = conn.execute("ROLLBACK", ()).await;
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        let _ = conn.execute("ROLLBACK", ()).await;
+                    }
+                }
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.await.unwrap();
+    }
+
+    // All rows must survive — no corruption
+    let conn = db.connect().unwrap();
+    let count = query_i64(&conn, "SELECT COUNT(*) FROM t").await;
+    assert_eq!(
+        count, 3,
+        "Rows disappeared! Expected 3 rows but found {count}. \
+         Likely hit the speculative visibility abort bug in MvccLazyCursor::delete()."
+    );
+}
+
+#[test]
+fn shuttle_test_speculative_abort_delete() {
+    let scheduler = RandomScheduler::new(100);
+    let runner = shuttle::Runner::new(scheduler, shuttle_config());
+    runner.run(|| shuttle::future::block_on(speculative_abort_delete_scenario(6, 6)));
+}
+
+#[test]
+fn shuttle_test_speculative_abort_delete_slow() {
+    let scheduler = RandomScheduler::new(10);
+    let runner = shuttle::Runner::new(scheduler, shuttle_config());
+    runner.run(|| shuttle::future::block_on(speculative_abort_delete_scenario(30, 60)));
+}
