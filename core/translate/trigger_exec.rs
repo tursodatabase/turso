@@ -1,8 +1,12 @@
 use crate::schema::{BTreeTable, Trigger};
 use crate::sync::Arc;
-use crate::translate::emitter::Resolver;
-use crate::translate::expr::translate_expr;
-use crate::translate::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
+use crate::translate::expr::WalkControl;
+use crate::translate::{
+    emitter::Resolver,
+    expr::{self, translate_expr, walk_expr_mut},
+    planner::ROWID_STRS,
+    translate_inner, ProgramBuilder, ProgramBuilderOpts,
+};
 use crate::util::normalize_ident;
 use crate::vdbe::insn::Insn;
 use crate::vdbe::BranchOffset;
@@ -151,13 +155,9 @@ fn rewrite_trigger_expr_for_subprogram(
     expr: &mut ast::Expr,
     ctx: &TriggerSubprogramContext,
 ) -> Result<()> {
-    use crate::translate::expr::walk_expr_mut;
-
-    walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<
-        crate::translate::expr::WalkControl,
-    > {
+    walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
         rewrite_trigger_expr_single_for_subprogram(e, ctx)?;
-        Ok(crate::translate::expr::WalkControl::Continue)
+        Ok(WalkControl::Continue)
     })?;
     Ok(())
 }
@@ -356,10 +356,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                         }
                     }
                     // Handle NEW.rowid
-                    if crate::translate::planner::ROWID_STRS
-                        .iter()
-                        .any(|s| s.eq_ignore_ascii_case(&col))
-                    {
+                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
                         *e = Expr::Variable(format!(
                             "{}",
                             ctx.get_new_rowid_param()
@@ -400,10 +397,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                         }
                     }
                     // Handle OLD.rowid
-                    if crate::translate::planner::ROWID_STRS
-                        .iter()
-                        .any(|s| s.eq_ignore_ascii_case(&col))
-                    {
+                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
                         *e = Expr::Variable(format!(
                             "{}",
                             ctx.get_old_rowid_param()
@@ -722,7 +716,7 @@ fn decode_trigger_registers(
     let decoded_new = if ctx.new_encoded {
         if let Some(new_regs) = &ctx.new_registers {
             let rowid_reg = *new_regs.last().expect("NEW registers must include rowid");
-            Some(crate::translate::expr::emit_trigger_decode_registers(
+            Some(expr::emit_trigger_decode_registers(
                 program,
                 resolver,
                 columns,
@@ -739,7 +733,7 @@ fn decode_trigger_registers(
 
     let decoded_old = if let Some(old_regs) = &ctx.old_registers {
         let rowid_reg = *old_regs.last().expect("OLD registers must include rowid");
-        Some(crate::translate::expr::emit_trigger_decode_registers(
+        Some(expr::emit_trigger_decode_registers(
             program,
             resolver,
             columns,
@@ -766,13 +760,9 @@ fn rewrite_trigger_expr_for_when_clause(
     table: &BTreeTable,
     ctx: &TriggerContext,
 ) -> Result<()> {
-    use crate::translate::expr::walk_expr_mut;
-
-    walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<
-        crate::translate::expr::WalkControl,
-    > {
+    walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
         rewrite_trigger_expr_single_for_when_clause(e, table, ctx, false)?;
-        Ok(crate::translate::expr::WalkControl::Continue)
+        Ok(WalkControl::Continue)
     })?;
     Ok(())
 }
@@ -966,14 +956,13 @@ fn rewrite_expression_tree<F>(expr: &mut ast::Expr, rewrite_expr: &mut F) -> Res
 where
     F: FnMut(&mut ast::Expr) -> Result<()>,
 {
-    use crate::translate::expr::walk_expr_mut;
-
-    walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<
-        crate::translate::expr::WalkControl,
-    > {
-        rewrite_expr(e)?;
-        Ok(crate::translate::expr::WalkControl::Continue)
-    })?;
+    walk_expr_mut(
+        expr,
+        &mut |e: &mut ast::Expr| -> Result<expr::WalkControl> {
+            rewrite_expr(e)?;
+            Ok(WalkControl::Continue)
+        },
+    )?;
 
     Ok(())
 }
@@ -990,9 +979,7 @@ fn rewrite_trigger_expr_single_for_when_clause(
         Expr::Id(name) if !allow_non_trigger_qualified => {
             let ident = normalize_ident(name.as_str());
             if table.get_column(&ident).is_some()
-                || crate::translate::planner::ROWID_STRS
-                    .iter()
-                    .any(|s| s.eq_ignore_ascii_case(&ident))
+                || ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&ident))
             {
                 crate::bail_parse_error!("no such column: {}", ident);
             }
@@ -1027,10 +1014,7 @@ fn rewrite_trigger_expr_single_for_when_clause(
                         }
                     }
                     // Handle NEW.rowid
-                    if crate::translate::planner::ROWID_STRS
-                        .iter()
-                        .any(|s| s.eq_ignore_ascii_case(&col))
-                    {
+                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
                         *expr = Expr::Register(
                             *ctx.new_registers
                                 .as_ref()
@@ -1058,10 +1042,7 @@ fn rewrite_trigger_expr_single_for_when_clause(
                         }
                     }
                     // Handle OLD.rowid
-                    if crate::translate::planner::ROWID_STRS
-                        .iter()
-                        .any(|s| s.eq_ignore_ascii_case(&col))
-                    {
+                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
                         *expr = Expr::Register(
                             *ctx.old_registers
                                 .as_ref()
