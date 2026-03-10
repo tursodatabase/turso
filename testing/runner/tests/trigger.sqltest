@@ -183,6 +183,228 @@ expect {
     old=hello new=world
 }
 
+# NEW reference inside subquery in trigger body
+@cross-check-integrity
+test trigger-new-reference-in-subquery {
+    CREATE TABLE test14_subq (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE lookup14_subq (id INTEGER PRIMARY KEY, multiplier INT);
+    CREATE TABLE result14_subq (msg TEXT);
+    INSERT INTO lookup14_subq VALUES (1, 10);
+    CREATE TRIGGER t14_subq AFTER INSERT ON test14_subq
+    BEGIN
+        INSERT INTO result14_subq VALUES (
+            'mult=' || (SELECT multiplier FROM lookup14_subq WHERE id = NEW.id)
+        );
+    END;
+
+    INSERT INTO test14_subq VALUES (1, 42);
+    SELECT * FROM test14_subq;
+    SELECT * FROM result14_subq;
+}
+expect {
+    1|42
+    mult=10
+}
+
+# NEW reference in subquery ORDER BY / LIMIT inside trigger body
+@cross-check-integrity
+test trigger-new-reference-in-subquery-orderby-limit {
+    CREATE TABLE test14_subq_ord (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE lookup14_subq_ord (id INTEGER PRIMARY KEY, multiplier INT);
+    CREATE TABLE result14_subq_ord (msg TEXT);
+    INSERT INTO lookup14_subq_ord VALUES (1, 10);
+    INSERT INTO lookup14_subq_ord VALUES (2, 20);
+    CREATE TRIGGER t14_subq_ord AFTER INSERT ON test14_subq_ord
+    BEGIN
+        INSERT INTO result14_subq_ord VALUES (
+            'pick=' || (
+                SELECT multiplier
+                FROM lookup14_subq_ord
+                ORDER BY ABS(id - NEW.id), NEW.val
+                LIMIT 1
+            )
+        );
+    END;
+
+    INSERT INTO test14_subq_ord VALUES (2, 7);
+    SELECT * FROM result14_subq_ord;
+}
+expect {
+    pick=20
+}
+
+# NEW reference in subquery LIMIT/OFFSET inside trigger body
+@cross-check-integrity
+test trigger-new-reference-in-subquery-offset {
+    CREATE TABLE test14_subq_off (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE lookup14_subq_off (id INTEGER PRIMARY KEY, multiplier INT);
+    CREATE TABLE result14_subq_off (msg TEXT);
+    INSERT INTO lookup14_subq_off VALUES (1, 10);
+    INSERT INTO lookup14_subq_off VALUES (2, 20);
+    INSERT INTO lookup14_subq_off VALUES (3, 30);
+    CREATE TRIGGER t14_subq_off AFTER INSERT ON test14_subq_off
+    BEGIN
+        INSERT INTO result14_subq_off VALUES (
+            'pick=' || (
+                SELECT multiplier
+                FROM lookup14_subq_off
+                ORDER BY id
+                LIMIT 1
+                OFFSET NEW.id - 1
+            )
+        );
+    END;
+
+    INSERT INTO test14_subq_off VALUES (2, 7);
+    SELECT * FROM result14_subq_off;
+}
+expect {
+    pick=20
+}
+
+# NEW reference in subquery WITH clause (CTE) inside trigger body
+@cross-check-integrity
+test trigger-new-reference-in-subquery-cte {
+    CREATE TABLE test14_subq_cte (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE result14_subq_cte (msg TEXT);
+    CREATE TRIGGER t14_subq_cte AFTER INSERT ON test14_subq_cte
+    BEGIN
+        INSERT INTO result14_subq_cte VALUES (
+            'cte=' || (
+                WITH c(x) AS (SELECT NEW.id)
+                SELECT x FROM c
+            )
+        );
+    END;
+
+    INSERT INTO test14_subq_cte VALUES (4, 0);
+    SELECT * FROM result14_subq_cte;
+}
+expect {
+    cte=4
+}
+
+# NEW reference in subquery JOIN ON clause inside trigger body
+@cross-check-integrity
+test trigger-new-reference-in-subquery-join-on {
+    CREATE TABLE test14_subq_join (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE result14_subq_join (msg TEXT);
+    CREATE TRIGGER t14_subq_join AFTER INSERT ON test14_subq_join
+    BEGIN
+        INSERT INTO result14_subq_join VALUES (
+            'join=' || (
+                SELECT b.k
+                FROM (SELECT 1 AS k) a
+                JOIN (SELECT NEW.id AS k) b
+                  ON a.k <= b.k
+                ORDER BY b.k DESC
+                LIMIT 1
+            )
+        );
+    END;
+
+    INSERT INTO test14_subq_join VALUES (2, 0);
+    SELECT * FROM result14_subq_join;
+}
+expect {
+    join=2
+}
+
+# NEW reference in VALUES-based subquery inside trigger body
+@cross-check-integrity
+test trigger-new-reference-in-values-subquery {
+    CREATE TABLE test14_subq_vals (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE result14_subq_vals (msg TEXT);
+    CREATE TRIGGER t14_subq_vals AFTER INSERT ON test14_subq_vals
+    BEGIN
+        INSERT INTO result14_subq_vals VALUES (
+            'min=' || (
+                SELECT *
+                FROM (VALUES (NEW.id), (NEW.val))
+                ORDER BY 1
+                LIMIT 1
+            )
+        );
+    END;
+
+    INSERT INTO test14_subq_vals VALUES (2, 10);
+    SELECT * FROM result14_subq_vals;
+}
+expect {
+    min=2
+}
+
+# NEW reference in compound subquery (UNION ALL) inside trigger body
+@cross-check-integrity
+test trigger-new-reference-in-subquery-compound {
+    CREATE TABLE test14_subq_cmp (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE result14_subq_cmp (msg TEXT);
+    CREATE TRIGGER t14_subq_cmp AFTER INSERT ON test14_subq_cmp
+    BEGIN
+        INSERT INTO result14_subq_cmp VALUES (
+            'id=' || (
+                SELECT v
+                FROM (SELECT -1 AS v UNION ALL SELECT NEW.id AS v)
+                ORDER BY v DESC
+                LIMIT 1
+            )
+        );
+    END;
+
+    INSERT INTO test14_subq_cmp VALUES (5, 1);
+    SELECT * FROM result14_subq_cmp;
+}
+expect {
+    id=5
+}
+
+# NEW reference in FROM subquery inside trigger body
+@cross-check-integrity
+test trigger-new-reference-in-from-subquery {
+    CREATE TABLE test14_subq_from (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE result14_subq_from (msg TEXT);
+    CREATE TRIGGER t14_subq_from AFTER INSERT ON test14_subq_from
+    BEGIN
+        INSERT INTO result14_subq_from VALUES (
+            'x=' || (
+                SELECT x
+                FROM (SELECT NEW.id AS x)
+            )
+        );
+    END;
+
+    INSERT INTO test14_subq_from VALUES (8, 99);
+    SELECT * FROM result14_subq_from;
+}
+expect {
+    x=8
+}
+
+# OLD/NEW references in nested subquery in UPDATE trigger body
+@cross-check-integrity
+test trigger-old-new-reference-in-subquery {
+    CREATE TABLE test14_subq_upd (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE result14_subq_upd (msg TEXT);
+    INSERT INTO test14_subq_upd VALUES (1, 10);
+    CREATE TRIGGER t14_subq_upd AFTER UPDATE ON test14_subq_upd
+    BEGIN
+        INSERT INTO result14_subq_upd VALUES (
+            'min=' || (
+                SELECT x
+                FROM (SELECT OLD.val AS x UNION ALL SELECT NEW.val AS x)
+                ORDER BY x
+                LIMIT 1
+            )
+        );
+    END;
+
+    UPDATE test14_subq_upd SET val = 30 WHERE id = 1;
+    SELECT * FROM result14_subq_upd;
+}
+expect {
+    min=10
+}
+
 # Trigger with UPDATE OF clause
 @cross-check-integrity
 test trigger-update-of {
