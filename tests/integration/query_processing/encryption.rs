@@ -1068,3 +1068,220 @@ fn test_vacuum_into_unencrypts(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Open an encrypted database, then enable MVCC on it, insert data, and verify
+/// the MVCC log is encrypted and recovery works with the correct key.
+#[turso_macros::test]
+fn test_encrypted_db_then_enable_mvcc(_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir
+        .path()
+        .join(format!("test-enc-mvcc-{}.db", rng().next_u32()));
+    let db_path_str = db_path.to_str().unwrap();
+
+    let hex_key = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+    let io = Arc::new(PlatformIO::new()?);
+    let opts = DatabaseOpts::new().with_encryption(true);
+    let enc_opts = Some(EncryptionOpts {
+        cipher: "aes256gcm".to_string(),
+        hexkey: hex_key.to_string(),
+    });
+
+    // Phase 1: Create encrypted DB, enable MVCC, insert data
+    {
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path_str,
+            OpenFlags::Create,
+            opts,
+            enc_opts.clone(),
+        )?;
+        let key = EncryptionKey::from_hex_string(hex_key)?;
+        let conn = db.connect_with_encryption(Some(key))?;
+        conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+        conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")?;
+        conn.execute("INSERT INTO test (value) VALUES ('hello encrypted mvcc')")?;
+        // Flush but do NOT checkpoint — data lives only in the MVCC log
+        for c in conn.cacheflush()? {
+            io.wait_for_completion(c)?;
+        }
+    }
+
+    // Verify the MVCC log file is encrypted (plaintext must not appear)
+    {
+        let log_path = db_path.with_extension("db-log");
+        let log_bytes = std::fs::read(&log_path)?;
+        assert!(
+            log_bytes.len() > 56,
+            "MVCC log should contain data beyond the header"
+        );
+        let plaintext = b"hello encrypted mvcc";
+        assert!(
+            !log_bytes.windows(plaintext.len()).any(|w| w == plaintext),
+            "MVCC log must not contain plaintext when encryption is enabled"
+        );
+    }
+
+    // Phase 2: Reopen with correct key — MVCC recovery should replay the encrypted log
+    {
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path_str,
+            OpenFlags::default(),
+            opts,
+            enc_opts.clone(),
+        )?;
+        let key = EncryptionKey::from_hex_string(hex_key)?;
+        let conn = db.connect_with_encryption(Some(key))?;
+
+        let rows = conn.query("SELECT value FROM test")?;
+        let mut found = false;
+        if let Some(mut rows) = rows {
+            loop {
+                match rows.step()? {
+                    turso_core::StepResult::Row => {
+                        let row = rows.row().unwrap();
+                        assert_eq!(row.get::<String>(0).unwrap(), "hello encrypted mvcc");
+                        found = true;
+                    }
+                    turso_core::StepResult::Done => break,
+                    turso_core::StepResult::Interrupt => break,
+                    turso_core::StepResult::Busy | turso_core::StepResult::IO => continue,
+                }
+            }
+        }
+        assert!(found, "Should recover inserted row from encrypted MVCC log");
+    }
+
+    Ok(())
+}
+
+/// Create an encrypted database with existing data, then switch to MVCC mode.
+/// Verifies that pre-existing rows survive the journal mode switch and that
+/// new MVCC writes produce an encrypted log.
+#[turso_macros::test]
+fn test_encrypted_db_with_data_then_enable_mvcc(_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir
+        .path()
+        .join(format!("test-enc-data-mvcc-{}.db", rng().next_u32()));
+    let db_path_str = db_path.to_str().unwrap();
+
+    let hex_key = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+    let io = Arc::new(PlatformIO::new()?);
+    let opts = DatabaseOpts::new().with_encryption(true);
+    let enc_opts = Some(EncryptionOpts {
+        cipher: "aes256gcm".to_string(),
+        hexkey: hex_key.to_string(),
+    });
+
+    // Phase 1: Create encrypted DB in WAL mode, insert data
+    {
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path_str,
+            OpenFlags::Create,
+            opts,
+            enc_opts.clone(),
+        )?;
+        let key = EncryptionKey::from_hex_string(hex_key)?;
+        let conn = db.connect_with_encryption(Some(key))?;
+        conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")?;
+        conn.execute("INSERT INTO test (value) VALUES ('before mvcc')")?;
+        for c in conn.cacheflush()? {
+            io.wait_for_completion(c)?;
+        }
+    }
+
+    // Phase 2: Reopen, switch to MVCC, insert more data
+    {
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path_str,
+            OpenFlags::default(),
+            opts,
+            enc_opts.clone(),
+        )?;
+        let key = EncryptionKey::from_hex_string(hex_key)?;
+        let conn = db.connect_with_encryption(Some(key))?;
+
+        // Pre-existing row should be readable
+        let rows = conn.query("SELECT value FROM test")?;
+        let mut count = 0;
+        if let Some(mut rows) = rows {
+            loop {
+                match rows.step()? {
+                    turso_core::StepResult::Row => {
+                        let row = rows.row().unwrap();
+                        assert_eq!(row.get::<String>(0).unwrap(), "before mvcc");
+                        count += 1;
+                    }
+                    turso_core::StepResult::Done => break,
+                    turso_core::StepResult::Interrupt => break,
+                    turso_core::StepResult::Busy | turso_core::StepResult::IO => continue,
+                }
+            }
+        }
+        assert_eq!(count, 1, "pre-existing row must be readable");
+
+        // Switch to MVCC
+        conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+        conn.execute("INSERT INTO test (value) VALUES ('after mvcc')")?;
+        for c in conn.cacheflush()? {
+            io.wait_for_completion(c)?;
+        }
+    }
+
+    // Verify the MVCC log is encrypted
+    {
+        let log_path = db_path.with_extension("db-log");
+        let log_bytes = std::fs::read(&log_path)?;
+        assert!(
+            log_bytes.len() > 56,
+            "MVCC log should contain data beyond the header"
+        );
+        for plaintext in [b"before mvcc" as &[u8], b"after mvcc"] {
+            assert!(
+                !log_bytes.windows(plaintext.len()).any(|w| w == plaintext),
+                "MVCC log must not contain plaintext '{}' when encryption is enabled",
+                std::str::from_utf8(plaintext).unwrap()
+            );
+        }
+    }
+
+    // Phase 3: Reopen — MVCC recovery should replay, both rows visible
+    {
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path_str,
+            OpenFlags::default(),
+            opts,
+            enc_opts.clone(),
+        )?;
+        let key = EncryptionKey::from_hex_string(hex_key)?;
+        let conn = db.connect_with_encryption(Some(key))?;
+
+        let rows = conn.query("SELECT value FROM test ORDER BY id")?;
+        let mut values = Vec::new();
+        if let Some(mut rows) = rows {
+            loop {
+                match rows.step()? {
+                    turso_core::StepResult::Row => {
+                        let row = rows.row().unwrap();
+                        values.push(row.get::<String>(0).unwrap());
+                    }
+                    turso_core::StepResult::Done => break,
+                    turso_core::StepResult::Interrupt => break,
+                    turso_core::StepResult::Busy | turso_core::StepResult::IO => continue,
+                }
+            }
+        }
+        assert_eq!(values, vec!["before mvcc", "after mvcc"]);
+    }
+
+    Ok(())
+}
