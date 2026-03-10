@@ -272,6 +272,11 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static> {
     btree_advance_state: Option<AdvanceBtreeState>,
     /// Dual-cursor peek state for proper iteration
     dual_peek: DualCursorPeek,
+    /// One-shot flag that prevents the next `insert()` from bumping the MVCC
+    /// rowid allocator. SQLite implements `UPDATE ... SET rowid = <new>` as
+    /// DELETE + INSERT; without this flag the re-insert would feed the
+    /// user-chosen rowid into the monotonic allocator, advancing it as though
+    /// a fresh auto-generated rowid was consumed.
     suppress_rowid_allocator_update_once: bool,
 }
 

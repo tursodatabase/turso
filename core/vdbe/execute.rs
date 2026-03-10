@@ -8968,9 +8968,17 @@ pub enum OpNewRowidState {
     Start,
     SeekingToLast {
         mvcc_already_initialized: bool,
+        /// The AUTOINCREMENT floor: `max(sqlite_sequence.seq, table_max_rowid)`,
+        /// read from `prev_largest_reg` at `Start`. Threaded through each state
+        /// so `bump_rowid_floor()` can be called wherever the allocator is
+        /// initialized or consulted, ensuring the allocator never hands out a
+        /// rowid at or below the sequence high-water mark — even when the B-tree
+        /// has not yet been checkpointed with the latest MVCC writes.
+        /// Zero means no floor (non-AUTOINCREMENT path).
         requested_prev_largest: i64,
     },
     ReadingMaxRowid {
+        /// See `SeekingToLast::requested_prev_largest`.
         requested_prev_largest: i64,
     },
     GeneratingRandom {
