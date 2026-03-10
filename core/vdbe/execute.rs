@@ -3275,9 +3275,8 @@ pub fn op_transaction_inner(
                 state.op_transaction_state = OpTransactionState::BeginStatement;
             }
             OpTransactionState::BeginStatement => {
-                if *db == crate::MAIN_DB_ID
-                    && program.needs_stmt_subtransactions.load(Ordering::Relaxed)
-                {
+                let needs_stmt_journal = program.needs_stmt_subtransactions.load(Ordering::Relaxed);
+                if *db == crate::MAIN_DB_ID && needs_stmt_journal {
                     let write = matches!(tx_mode, TransactionMode::Write);
                     let res = state.begin_statement(&program.connection, &pager, write)?;
                     if let IOResult::IO(io) = res {
@@ -3285,7 +3284,7 @@ pub fn op_transaction_inner(
                     }
                 } else if crate::is_attached_db(*db)
                     && matches!(tx_mode, TransactionMode::Write)
-                    && program.needs_stmt_subtransactions.load(Ordering::Relaxed)
+                    && needs_stmt_journal
                 {
                     if let Some(mv_store) = program.connection.mv_store_for_db(*db) {
                         // Attached MVCC DB: open an MvStore savepoint.
@@ -3307,6 +3306,16 @@ pub fn op_transaction_inner(
                     }
                 }
 
+                if *db == crate::MAIN_DB_ID
+                    && matches!(tx_mode, TransactionMode::Write)
+                    && !program.connection.auto_commit.load(Ordering::SeqCst)
+                {
+                    program
+                        .connection
+                        .n_active_writes
+                        .fetch_add(1, Ordering::SeqCst);
+                    state.is_active_write = true;
+                }
                 state.pc += 1;
                 state.op_transaction_state = OpTransactionState::Start;
                 return Ok(InsnFunctionStepResult::Step);
@@ -3375,8 +3384,7 @@ pub fn op_auto_commit(
     let is_commit_req = !had_autocommit && requested_autocommit && !requested_rollback;
     let is_rollback_req = !had_autocommit && requested_autocommit && requested_rollback;
 
-    let another_stmt_using_subjournal = !state.uses_subjournal && pager.subjournal_in_use();
-    if is_txn_end_eq && another_stmt_using_subjournal {
+    if is_txn_end_eq && conn.n_active_writes.load(Ordering::SeqCst) > 0 {
         return Err(LimboError::Busy);
     }
 

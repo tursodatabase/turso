@@ -397,6 +397,10 @@ pub struct ProgramState {
     distinct_key_values: Vec<Value>,
     hash_tables: HashMap<usize, HashTable>,
     uses_subjournal: bool,
+    /// Whether this statement is an active write inside an explicit transaction.
+    pub(crate) is_active_write: bool,
+    /// Whether begin_statement was called (savepoint + FK bookkeeping active).
+    has_stmt_transaction: bool,
     /// Attached pagers that have open savepoints for statement rollback.
     attached_savepoint_pagers: Vec<Arc<Pager>>,
     pub n_change: AtomicI64,
@@ -486,6 +490,8 @@ impl ProgramState {
             bloom_filters: HashMap::default(),
             hash_tables: HashMap::default(),
             uses_subjournal: false,
+            is_active_write: false,
+            has_stmt_transaction: false,
             attached_savepoint_pagers: Vec::new(),
             n_change: AtomicI64::new(0),
             explain_state: RwLock::new(ExplainState::default()),
@@ -618,6 +624,8 @@ impl ProgramState {
         self.op_hash_build_state = None;
         self.op_hash_probe_state = None;
         self.uses_subjournal = false;
+        self.is_active_write = false;
+        self.has_stmt_transaction = false;
         self.distinct_key_values.clear();
         self.attached_savepoint_pagers.clear();
         self.n_change.store(0, Ordering::SeqCst);
@@ -636,16 +644,22 @@ impl ProgramState {
 
     /// Begin a statement subtransaction.
     ///
-    /// Creates a savepoint on the main DB's MvStore (or pager for WAL mode).
+    /// Creates a savepoint on the main DB's MvStore (or pager for WAL mode),
+    /// and snapshots FK violation counters for potential statement rollback.
     /// Attached DB savepoints are opened per-DB in `op_transaction_inner`
     /// when each DB's Transaction opcode is executed.
+    ///
+    /// Pager/MVCC savepoints are only opened for write statements inside an
+    /// explicit transaction. In autocommit mode, a statement abort is a
+    /// transaction abort, so savepoints are unnecessary.
     pub fn begin_statement(
         &mut self,
         connection: &Connection,
         pager: &Arc<Pager>,
         write: bool,
     ) -> Result<IOResult<()>> {
-        if write {
+        let in_explicit_txn = !connection.auto_commit.load(Ordering::SeqCst);
+        if write && in_explicit_txn {
             // Check if MVCC is active - if so, use MVCC savepoints instead of pager savepoints
             if let Some(mv_store) = connection.mv_store().as_ref() {
                 if let Some(tx_id) = connection.get_mv_tx_id() {
@@ -665,6 +679,8 @@ impl ProgramState {
             }
         }
 
+        self.has_stmt_transaction = true;
+
         // Store the deferred foreign key violations counter at the start of the statement.
         // This is used to ensure that if an interactive transaction had deferred FK violations and a statement subtransaction rolls back,
         // the deferred FK violations are not lost.
@@ -679,76 +695,100 @@ impl ProgramState {
     }
 
     /// End a statement subtransaction.
+    ///
+    /// Mirrors SQLite's vdbeCloseStatement (vdbeaux.c:3203-3248). Pager/MVCC
+    /// savepoint management and FK violation counter restoration are independent
+    /// concerns: pager savepoints may be skipped (e.g. autocommit optimization)
+    /// while FK bookkeeping still needs cleanup.
     pub fn end_statement(
         &mut self,
         connection: &Connection,
         pager: &Arc<Pager>,
         end_statement: EndStatement,
     ) -> Result<()> {
+        if self.is_active_write {
+            connection.n_active_writes.fetch_sub(1, Ordering::SeqCst);
+            self.is_active_write = false;
+        }
+        // If begin_statement was never called, no savepoint/FK cleanup needed.
+        if !self.has_stmt_transaction {
+            return Ok(());
+        }
+        self.has_stmt_transaction = false;
+
         // Drain attached pagers upfront so we can clean them up regardless of path.
         let attached_pagers: Vec<Arc<Pager>> = self.attached_savepoint_pagers.drain(..).collect();
-        let result = 'outer: {
-            match end_statement {
-                EndStatement::ReleaseSavepoint => {
-                    if let Some(mv_store) = connection.mv_store().as_ref() {
-                        if let Some(tx_id) = connection.get_mv_tx_id() {
-                            mv_store.release_savepoint(tx_id);
-                        }
-                        // Release savepoints on attached MVCC databases.
-                        connection.for_each_attached_mv_tx(|db_id, tx_id| {
-                            if let Some(attached_mv) = connection.mv_store_for_db(db_id) {
-                                attached_mv.release_savepoint(tx_id);
-                            }
-                        });
-                        Ok(()) // MVCC mode: no pager savepoint to release
-                    } else {
-                        pager.release_savepoint()?;
-                        for p in &attached_pagers {
-                            p.release_savepoint()?;
-                        }
-                        Ok(())
+        let result = match end_statement {
+            EndStatement::ReleaseSavepoint => {
+                if let Some(mv_store) = connection.mv_store().as_ref() {
+                    if let Some(tx_id) = connection.get_mv_tx_id() {
+                        mv_store.release_savepoint(tx_id);
                     }
-                }
-                EndStatement::RollbackSavepoint => {
-                    if let Some(mv_store) = connection.mv_store().as_ref() {
-                        if let Some(tx_id) = connection.get_mv_tx_id() {
-                            // Returns false if no savepoint was active - don't reset FK counters
-                            if !mv_store.rollback_first_savepoint(tx_id)? {
-                                break 'outer Ok(());
-                            }
+                    connection.for_each_attached_mv_tx(|db_id, tx_id| {
+                        if let Some(attached_mv) = connection.mv_store_for_db(db_id) {
+                            attached_mv.release_savepoint(tx_id);
                         }
-                        // Rollback savepoints on attached MVCC databases.
-                        let mut attached_err = None;
-                        connection.for_each_attached_mv_tx(|db_id, tx_id| {
-                            if let Some(attached_mv) = connection.mv_store_for_db(db_id) {
-                                if let Err(e) = attached_mv.rollback_first_savepoint(tx_id) {
-                                    attached_err = Some(e);
+                    });
+                    Ok(())
+                } else if self.uses_subjournal {
+                    pager.release_savepoint()?;
+                    for p in &attached_pagers {
+                        p.release_savepoint()?;
+                    }
+                    Ok(())
+                } else {
+                    Ok(())
+                }
+            }
+            EndStatement::RollbackSavepoint => {
+                // Rollback pager/MVCC savepoint if one was opened.
+                let pager_err = if let Some(mv_store) = connection.mv_store().as_ref() {
+                    let mut err = None;
+                    if let Some(tx_id) = connection.get_mv_tx_id() {
+                        if let Err(e) = mv_store.rollback_first_savepoint(tx_id) {
+                            err = Some(e);
+                        }
+                    }
+                    connection.for_each_attached_mv_tx(|db_id, tx_id| {
+                        if let Some(attached_mv) = connection.mv_store_for_db(db_id) {
+                            if let Err(e) = attached_mv.rollback_first_savepoint(tx_id) {
+                                if err.is_none() {
+                                    err = Some(e);
                                 }
                             }
-                        });
-                        if let Some(e) = attached_err {
-                            break 'outer Err(e);
                         }
-                    } else {
-                        match pager.rollback_to_newest_savepoint() {
-                            // We sometimes call end_statement() on errors without explicitly knowing whether a stmt transaction
-                            // caused the error or not. If it didn't, don't reset any FK violation counters.
-                            Ok(false) => break 'outer Ok(()),
-                            Err(err) => break 'outer Err(err),
-                            _ => {}
+                    });
+                    err
+                } else if self.uses_subjournal {
+                    match pager.rollback_to_newest_savepoint() {
+                        Ok(_) => {
+                            let mut err = None;
+                            for p in &attached_pagers {
+                                if let Err(e) = p.rollback_to_newest_savepoint() {
+                                    err = Some(e);
+                                    break;
+                                }
+                            }
+                            err
                         }
-                        for p in &attached_pagers {
-                            p.rollback_to_newest_savepoint()?;
-                        }
+                        Err(e) => Some(e),
                     }
-                    // Reset the deferred foreign key violations counter to the value it had at the start of the statement.
-                    // This is used to ensure that if an interactive transaction had deferred FK violations, they are not lost.
-                    connection.fk_deferred_violations.store(
-                        self.fk_deferred_violations_when_stmt_started
-                            .load(Ordering::Acquire),
-                        Ordering::SeqCst,
-                    );
-                    Ok(())
+                } else {
+                    None
+                };
+
+                // Always restore FK violation counters on statement rollback,
+                // regardless of whether a pager savepoint was opened.
+                // Mirrors SQLite's vdbeCloseStatement (vdbeaux.c:3243-3246).
+                connection.fk_deferred_violations.store(
+                    self.fk_deferred_violations_when_stmt_started
+                        .load(Ordering::Acquire),
+                    Ordering::SeqCst,
+                );
+
+                match pager_err {
+                    Some(e) => Err(e),
+                    None => Ok(()),
                 }
             }
         };
@@ -886,9 +926,9 @@ pub struct PreparedProgram {
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: TableReferences,
     pub sql: String,
-    /// In SQLite, whether statement subtransactions will be used for executing a program (`usesStmtJournal`)
-    /// is determined by the parser flags "mayAbort" and "isMultiWrite". Essentially this means that the individual
-    /// statement may need to be aborted due to a constraint conflict, etc. instead of the entire transaction.
+    /// Whether the statement needs to be wrapped in a statement subtransaction
+    /// when run as part of an interactive (non-autocommit) transaction.
+    /// See [crate::vdbe::builder::ProgramBuilder::is_multi_write] and [crate::vdbe::builder::ProgramBuilder::may_abort] for more details.
     pub needs_stmt_subtransactions: Arc<AtomicBool>,
     /// If this Program is a trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,

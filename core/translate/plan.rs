@@ -1479,6 +1479,38 @@ impl Operation {
             Operation::MultiIndexScan(_) => None,
         }
     }
+
+    /// Returns true if this operation is guaranteed to access at most one row.
+    /// Used to determine whether UPDATE/DELETE is single-write.
+    ///
+    /// Conservative: returns false when unsure (e.g. table scans, range seeks,
+    /// non-unique index seeks).
+    pub fn affects_max_1_row(&self) -> bool {
+        match self {
+            // RowidEq is always a single-row point lookup.
+            Operation::Search(Search::RowidEq { .. }) => true,
+            // Seek on a unique index with all columns equality-constrained.
+            Operation::Search(Search::Seek { index, seek_def }) => {
+                let Some(idx) = index else {
+                    // Seek on rowid (no index): check if the seek is an equality
+                    // point lookup. This happens when prefix has one eq constraint
+                    // and no range component.
+                    return seek_def.prefix.len() == 1
+                        && seek_def.prefix[0].eq.is_some()
+                        && matches!(seek_def.start.last_component, SeekKeyComponent::None);
+                };
+                if !idx.unique {
+                    return false;
+                }
+                // All index columns must have equality constraints.
+                let num_index_cols = idx.columns.len();
+                let num_eq_prefix = seek_def.prefix.iter().filter(|c| c.eq.is_some()).count();
+                num_eq_prefix == num_index_cols
+            }
+            // Table scans, hash joins, multi-index scans, etc. are not single-row.
+            _ => false,
+        }
+    }
 }
 
 impl JoinedTable {
