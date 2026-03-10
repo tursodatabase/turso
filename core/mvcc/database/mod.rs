@@ -2217,7 +2217,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 None => {
                     let log_size = self.get_logical_log_file().size()?;
                     let pager = bootstrap_conn.pager.load().clone();
-                    if !pager.is_encryption_enabled() {
+                    // Skip metadata-table bootstrap when encryption is opted-in
+                    // but not yet configured (e.g. key will be set later via PRAGMA).
+                    // Writing unencrypted pages now would make them unreadable once
+                    // encryption is activated. When encryption context IS already
+                    // set (e.g. opened via URI with key), bootstrap proceeds normally.
+                    if !pager.is_encryption_enabled() || pager.is_encryption_ctx_set() {
                         if bootstrap_conn.db.is_readonly() {
                             return Err(LimboError::Corrupt(
                                 "Missing MVCC metadata table in read-only mode".to_string(),
@@ -2239,7 +2244,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             bootstrap_conn.db.io.wait_for_completion(c)?;
                         }
                         if log_size <= LOG_HDR_SIZE as u64 {
-                            let pager = bootstrap_conn.pager.load().clone();
                             let c = self.storage.update_header()?;
                             pager.io.wait_for_completion(c)?;
                             if bootstrap_conn.get_sync_mode() != SyncMode::Off {
@@ -4076,6 +4080,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     fn logical_log_header_crc_valid(&self, pager: &Arc<Pager>) -> Result<bool> {
         let file = self.get_logical_log_file();
+        // Header is never encrypted; no need to clone EncryptionContext here.
         let mut reader = StreamingLogicalLogReader::new(file, None);
         match reader.try_read_header(&pager.io)? {
             HeaderReadResult::Valid(_) => Ok(true),
@@ -4102,6 +4107,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         let wal_max_frame = wal.get_max_frame_in_wal();
         let file = self.get_logical_log_file();
+        // This method only reads the header (never encrypted); skip cloning EncryptionContext.
         let mut reader = StreamingLogicalLogReader::new(file, None);
         let header_result = reader.try_read_header(&pager.io)?;
 
@@ -4205,7 +4211,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn maybe_recover_logical_log(&self, connection: Arc<Connection>) -> Result<bool> {
         let pager = connection.pager.load().clone();
         let file = self.get_logical_log_file();
-        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
+        let enc_ctx = self.storage.encryption_ctx();
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), enc_ctx);
         let preserved_table_valued_functions =
             Self::capture_table_valued_functions(&connection.schema.read());
 
@@ -4225,7 +4232,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let persistent_tx_ts_max = if self.uses_durable_mvcc_metadata(&connection) {
             match self.try_read_persistent_tx_ts_max(&connection)? {
                 Some(ts) => ts,
-                None if pager.is_encryption_enabled() => 0,
+                // Metadata table was not created when encryption is opted-in
+                // but not yet configured (keys set later via PRAGMA).
+                None if pager.is_encryption_enabled() && !pager.is_encryption_ctx_set() => 0,
                 None if header.is_none() => 0,
                 None => {
                     return Err(LimboError::Corrupt(

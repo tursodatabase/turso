@@ -12,7 +12,7 @@ use crate::storage::sqlite3_ondisk::{
 };
 use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::RwLock;
-use crate::{Buffer, Completion, DatabaseOpts, OpenFlags};
+use crate::{Buffer, Completion, DatabaseOpts, EncryptionKey, OpenFlags};
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
 use rand::{Rng, SeedableRng};
@@ -22,6 +22,7 @@ pub(crate) struct MvccTestDbNoConn {
     pub(crate) db: Option<Arc<Database>>,
     path: Option<String>,
     opts: DatabaseOpts,
+    enc_opts: Option<crate::EncryptionOpts>,
     // Stored mainly to not drop the temp dir before the test is done.
     _temp_dir: Option<tempfile::TempDir>,
 }
@@ -61,6 +62,7 @@ impl MvccTestDbNoConn {
             db: Some(db),
             path: None,
             opts,
+            enc_opts: None,
             _temp_dir: None,
         }
     }
@@ -95,25 +97,68 @@ impl MvccTestDbNoConn {
             db: Some(db),
             path: Some(path.to_str().unwrap().to_string()),
             opts,
+            enc_opts: None,
+            _temp_dir: Some(temp_dir),
+        }
+    }
+
+    /// Opens a file-backed encrypted database with the given hex key.
+    pub fn new_encrypted(hex_key: &str) -> Self {
+        let opts = DatabaseOpts::new().with_encryption(true);
+        let enc_opts = crate::EncryptionOpts {
+            cipher: "aes256gcm".to_string(),
+            hexkey: hex_key.to_string(),
+        };
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir
+            .path()
+            .join(format!("test_{}", rand::random::<u64>()));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            path.as_os_str().to_str().unwrap(),
+            OpenFlags::default(),
+            opts,
+            Some(enc_opts.clone()),
+        )
+        .unwrap();
+        let encryption_key = EncryptionKey::from_hex_string(hex_key).unwrap();
+        let conn = db.connect_with_encryption(Some(encryption_key)).unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.close().unwrap();
+        Self {
+            db: Some(db),
+            path: Some(path.to_str().unwrap().to_string()),
+            opts,
+            enc_opts: Some(enc_opts),
             _temp_dir: Some(temp_dir),
         }
     }
 
     /// Restarts the database, make sure there is no connection to the database open before calling this!
     pub fn restart(&mut self) {
-        // First let's clear any entries in database manager in order to force restart.
-        // If not, we will load the same database instance again.
+        self.restart_result().unwrap();
+    }
+
+    /// Like `restart`, but returns the error instead of panicking.
+    /// Useful for testing wrong-key scenarios.
+    pub fn restart_result(&mut self) -> crate::Result<()> {
         {
             let mut manager = DATABASE_MANAGER.lock();
             manager.clear();
         }
-
-        // Now open again.
         let io = Arc::new(PlatformIO::new().unwrap());
         let path = self.path.as_ref().unwrap();
-        let db = Database::open_file_with_flags(io, path, OpenFlags::default(), self.opts, None)
-            .unwrap();
+        let db = Database::open_file_with_flags(
+            io,
+            path,
+            OpenFlags::default(),
+            self.opts,
+            self.enc_opts.clone(),
+        )?;
         self.db.replace(db);
+        Ok(())
     }
 
     /// Asumes there is a database open
@@ -122,7 +167,11 @@ impl MvccTestDbNoConn {
     }
 
     pub fn connect(&self) -> Arc<Connection> {
-        self.get_db().connect().unwrap()
+        let enc_key = self
+            .enc_opts
+            .as_ref()
+            .map(|e| EncryptionKey::from_hex_string(&e.hexkey).unwrap());
+        self.get_db().connect_with_encryption(enc_key).unwrap()
     }
 
     pub fn get_mvcc_store(&self) -> Arc<MvStore<MvccClock>> {
@@ -7392,5 +7441,112 @@ fn test_autoincrement_no_reuse_after_delete_and_restart() {
          but new rowid after delete+restart is {new_rowid}. \
          sqlite_sequence had {seq_count} duplicate rows; \
          init_autoincrement picked the stale one (seq=1 instead of seq=2)."
+    );
+}
+
+/// Encrypted MVCC: write rows, restart with same key, verify recovery replays them.
+/// Then swap to a wrong key and verify that restart fails.
+#[test]
+fn test_mvcc_encrypted_log_recovery_and_wrong_key() {
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
+
+    // --- Write phase (identical to test_restart, just on an encrypted DB) ---
+    {
+        let conn = db.connect();
+        let mvcc_store = db.get_mvcc_store();
+        let max_root_page = get_rows(
+            &conn,
+            "SELECT COALESCE(MAX(rootpage), 0) FROM sqlite_schema WHERE rootpage > 0",
+        )[0][0]
+            .as_int()
+            .unwrap();
+        let next_schema_rowid = get_rows(
+            &conn,
+            "SELECT COALESCE(MAX(rowid), 0) + 1 FROM sqlite_schema",
+        )[0][0]
+            .as_int()
+            .unwrap();
+        let synthetic_root = -(max_root_page + 100);
+        let synthetic_table_id = MVTableId::new(synthetic_root);
+        let tx_id = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
+        let data = ImmutableRecord::from_values(
+            &[
+                Value::Text(Text::new("table")),
+                Value::Text(Text::new("test")),
+                Value::Text(Text::new("test")),
+                Value::from_i64(synthetic_root),
+                Value::Text(Text::new(
+                    "CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)",
+                )),
+            ],
+            5,
+        );
+        mvcc_store
+            .insert(
+                tx_id,
+                Row::new_table_row(
+                    RowID::new((-1).into(), RowKey::Int(next_schema_rowid)),
+                    data.as_blob().to_vec(),
+                    5,
+                ),
+            )
+            .unwrap();
+        let row = generate_simple_string_row(synthetic_table_id, 1, "encrypted_value");
+        mvcc_store.insert(tx_id, row).unwrap();
+        commit_tx(mvcc_store, &conn, tx_id).unwrap();
+        // Do NOT checkpoint — row lives only in the encrypted logical log.
+        conn.close().unwrap();
+    }
+
+    // --- Verify the raw log file is encrypted (no plaintext leakage) ---
+    {
+        let log_path = std::path::PathBuf::from(db.path.as_ref().unwrap()).with_extension("db-log");
+        let log_bytes = std::fs::read(&log_path).expect("MVCC log file should exist");
+        assert!(
+            log_bytes.len() > 56,
+            "MVCC log should contain data beyond the header"
+        );
+        let plaintext = b"encrypted_value";
+        assert!(
+            !log_bytes.windows(plaintext.len()).any(|w| w == plaintext),
+            "MVCC log must not contain plaintext data when encryption is enabled"
+        );
+    }
+
+    // --- Restart with correct key: recovery should replay the encrypted log ---
+    db.restart();
+    {
+        let conn = db.connect();
+        let mvcc_store = db.get_mvcc_store();
+        let max_root_page = get_rows(
+            &conn,
+            "SELECT COALESCE(MAX(rootpage), 0) FROM sqlite_schema WHERE rootpage > 0",
+        )[0][0]
+            .as_int()
+            .unwrap();
+        let synthetic_table_id = MVTableId::new(-(max_root_page + 100));
+        let tx_id = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
+        let row = mvcc_store
+            .read(tx_id, &RowID::new(synthetic_table_id, RowKey::Int(1)))
+            .unwrap()
+            .unwrap();
+        let record = get_record_value(&row);
+        match record.get_value(0).unwrap() {
+            ValueRef::Text(text) => assert_eq!(text.as_str(), "encrypted_value"),
+            other => panic!("Expected Text, got {other:?}"),
+        }
+        conn.close().unwrap();
+    }
+
+    // --- Restart with wrong key: should fail ---
+    let wrong_key = "ff0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    db.enc_opts = Some(crate::EncryptionOpts {
+        cipher: "aes256gcm".to_string(),
+        hexkey: wrong_key.to_string(),
+    });
+    assert!(
+        db.restart_result().is_err(),
+        "Expected error when reopening encrypted MVCC DB with wrong key"
     );
 }

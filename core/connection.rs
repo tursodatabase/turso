@@ -1556,13 +1556,13 @@ impl Connection {
         // A fresh :memory: DB defaults to WAL, so when main is MVCC we need to
         // create an MvStore for the attached DB so it runs in the same mode.
         if is_memory_db && self.mvcc_enabled() && !db.mvcc_enabled() {
-            // todo(v): pass required encryption ctx to enable encryption with mvcc
+            let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
             let mv_store = journal_mode::open_mv_store(
                 db.io.clone(),
                 &db.path,
                 db.open_flags,
                 db.durable_storage.clone(),
-                None,
+                enc_ctx,
             )?;
             db.mv_store.store(Some(mv_store.clone()));
             let bootstrap_conn = db._connect(true, Some(pager.clone()), encryption_key)?;

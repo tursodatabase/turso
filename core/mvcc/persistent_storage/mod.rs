@@ -121,6 +121,10 @@ impl DurableStorage for Storage {
         self.logical_log.write().file.clone()
     }
 
+    pub fn encryption_ctx(&self) -> Option<EncryptionContext> {
+        self.logical_log.read().encryption_ctx.clone()
+    }
+
     /// Lock-free: reads shadowed atomics only.
     fn should_checkpoint(&self) -> bool {
         let threshold = self.checkpoint_threshold.load(Ordering::Relaxed);
