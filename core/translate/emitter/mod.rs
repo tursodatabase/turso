@@ -101,6 +101,19 @@ pub struct Resolver<'a> {
     /// than redirecting column reads at codegen time.
     pub register_affinities: HashMap<usize, Affinity>,
     pub enable_custom_types: bool,
+    /// When set, we are compiling a trigger subprogram for this database.
+    /// All table references must resolve to this same database; cross-database
+    /// references are forbidden (matching SQLite's behavior).
+    pub(crate) trigger_context: Option<TriggerDatabaseContext>,
+}
+
+/// Context for restricting table resolution during trigger subprogram compilation.
+#[derive(Debug, Clone)]
+pub(crate) struct TriggerDatabaseContext {
+    /// The database ID the trigger belongs to.
+    database_id: usize,
+    /// The trigger name (for error messages).
+    trigger_name: String,
 }
 
 impl<'a> Resolver<'a> {
@@ -123,6 +136,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
             enable_custom_types,
+            trigger_context: None,
         }
     }
 
@@ -140,6 +154,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
             enable_custom_types: self.enable_custom_types,
+            trigger_context: self.trigger_context.clone(),
         }
     }
 
@@ -148,6 +163,14 @@ impl<'a> Resolver<'a> {
             crate::bail_parse_error!("{} require --experimental-custom-types flag", feature);
         }
         Ok(())
+    }
+
+    /// Set trigger database context to restrict table resolution to the trigger's database.
+    pub(crate) fn set_trigger_context(&mut self, database_id: usize, trigger_name: String) {
+        self.trigger_context = Some(TriggerDatabaseContext {
+            database_id,
+            trigger_name,
+        });
     }
 
     pub fn resolve_function(&self, func_name: &str, arg_count: usize) -> Option<Func> {
@@ -211,7 +234,7 @@ impl<'a> Resolver<'a> {
         use crate::util::normalize_ident;
 
         // Check if this is a qualified name (database.table) or unqualified
-        if let Some(db_name) = &qualified_name.db_name {
+        let resolved_id = if let Some(db_name) = &qualified_name.db_name {
             let db_name_normalized = normalize_ident(db_name.as_str());
             let name_bytes = db_name_normalized.as_bytes();
             match_ignore_ascii_case!(match name_bytes {
@@ -231,9 +254,34 @@ impl<'a> Resolver<'a> {
                 }
             })
         } else {
-            // Unqualified table name - use main database
-            Ok(0)
+            // Unqualified table name — when compiling a trigger subprogram,
+            // resolve to the trigger's database (matching SQLite behavior).
+            // Otherwise default to main.
+            if let Some(ref ctx) = self.trigger_context {
+                Ok(ctx.database_id)
+            } else {
+                Ok(0)
+            }
+        }?;
+
+        // Triggers can only reference tables in their own database.
+        // This only fires for explicitly qualified names (e.g. "aux.table")
+        // since unqualified names already resolve to the trigger's database above.
+        if let Some(ref ctx) = self.trigger_context {
+            if resolved_id != ctx.database_id {
+                let db_name = qualified_name
+                    .db_name
+                    .as_ref()
+                    .map(|n| n.as_str())
+                    .unwrap_or("main");
+                return Err(LimboError::ParseError(format!(
+                    "trigger {} cannot reference objects in database {}",
+                    ctx.trigger_name, db_name
+                )));
+            }
         }
+
+        Ok(resolved_id)
     }
 
     // Get an attached database by alias name

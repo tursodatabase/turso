@@ -226,6 +226,8 @@ pub fn translate_inner(
                 tbl_name,
                 program,
                 sql,
+                &commands,
+                when_clause.as_deref(),
             )?
         }
         ast::Stmt::CreateView {
