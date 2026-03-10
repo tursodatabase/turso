@@ -100,6 +100,7 @@ pub struct Resolver<'a> {
     /// mechanism, but operates as a side-channel since limbo rewrites the AST rather
     /// than redirecting column reads at codegen time.
     pub register_affinities: HashMap<usize, Affinity>,
+    pub enable_custom_types: bool,
 }
 
 impl<'a> Resolver<'a> {
@@ -111,6 +112,7 @@ impl<'a> Resolver<'a> {
         database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
         attached_databases: &'a RwLock<DatabaseCatalog>,
         symbol_table: &'a SymbolTable,
+        enable_custom_types: bool,
     ) -> Self {
         Self {
             schema,
@@ -120,6 +122,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
+            enable_custom_types,
         }
     }
 
@@ -136,7 +139,15 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
+            enable_custom_types: self.enable_custom_types,
         }
+    }
+
+    pub fn require_custom_types(&self, feature: &str) -> crate::Result<()> {
+        if !self.enable_custom_types {
+            crate::bail_parse_error!("{} require --experimental-custom-types flag", feature);
+        }
+        Ok(())
     }
 
     pub fn resolve_function(&self, func_name: &str, arg_count: usize) -> Option<Func> {

@@ -1285,6 +1285,7 @@ fn emit_update_insns<'a>(
                 &btree_table.columns,
                 start,
                 Some(&set_col_indices),
+                table_name,
             )?;
 
             // Post-encode TypeCheck: validate encoded values match storage type.

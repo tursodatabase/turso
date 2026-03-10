@@ -773,6 +773,16 @@ fn validate(body: &ast::CreateTableBody, table_name: &str, resolver: &Resolver) 
                     _ => false,
                 });
 
+                // Array columns require STRICT tables because the encode/decode
+                // pipeline is only emitted for STRICT tables.
+                if col_type.is_array() && !is_strict {
+                    bail_parse_error!(
+                        "array type columns require STRICT tables: {}.{}",
+                        table_name,
+                        c.col_name
+                    );
+                }
+
                 if !is_builtin && is_strict {
                     // On non-STRICT tables any type name is allowed and is
                     // treated as a plain affinity hint (no encode/decode).
@@ -854,6 +864,19 @@ pub fn translate_create_table(
         bail_parse_error!("TEMPORARY table not supported yet");
     }
     validate(&body, &normalized_tbl_name, resolver)?;
+
+    // Gate array column types behind the experimental custom types flag.
+    if !connection.experimental_custom_types_enabled() {
+        if let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = &body {
+            for col in columns {
+                if col.col_type.as_ref().is_some_and(|t| t.is_array()) {
+                    bail_parse_error!(
+                        "Array column types require --experimental-custom-types flag"
+                    );
+                }
+            }
+        }
+    }
 
     let opts = ProgramBuilderOpts {
         num_cursors: 1,

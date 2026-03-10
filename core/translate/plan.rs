@@ -627,7 +627,7 @@ pub struct UpdatePlan {
     pub table_references: TableReferences,
     /// Conflict resolution strategy (e.g., OR IGNORE, OR REPLACE)
     pub or_conflict: Option<ResolveType>,
-    // (colum index, new value) pairs
+    // (column index, new value) pairs
     pub set_clauses: Vec<(usize, Box<ast::Expr>)>,
     pub where_clause: Vec<WhereTerm>,
     pub order_by: Vec<(Box<ast::Expr>, SortOrder)>,
@@ -1522,6 +1522,12 @@ impl JoinedTable {
             .collect::<Vec<_>>();
 
         for (i, column) in columns.iter_mut().enumerate() {
+            if super::expr::expr_is_array(
+                &plan.result_columns[i].expr,
+                Some(&plan.table_references),
+            ) {
+                column.set_array_dimensions(1);
+            }
             column.set_collation(get_collseq_from_expr(
                 &plan.result_columns[i].expr,
                 &plan.table_references,
@@ -1611,6 +1617,9 @@ impl JoinedTable {
             .collect::<Vec<_>>();
 
         for (i, column) in columns.iter_mut().enumerate() {
+            if super::expr::expr_is_array(&result_columns[i].expr, Some(table_references)) {
+                column.set_array_dimensions(1);
+            }
             column.set_collation(get_collseq_from_expr(
                 &result_columns[i].expr,
                 table_references,

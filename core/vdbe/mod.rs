@@ -20,6 +20,7 @@
 use crate::types::Extendable;
 use crate::{turso_assert, turso_assert_ne, turso_debug_assert, HashSet};
 pub mod affinity;
+pub mod array;
 pub mod bloom_filter;
 pub mod builder;
 pub mod execute;

@@ -420,6 +420,17 @@ impl SchemaIntrospector {
     fn parse_type(type_str: &str) -> DataType {
         // SQLite type affinity rules (simplified)
         let upper = type_str.to_uppercase();
+        // Check for array types first (e.g., "INTEGER[]", "TEXT[]", "REAL[]")
+        if upper.ends_with("[]") {
+            let base = upper.trim_end_matches("[]").trim();
+            return if base.contains("INT") {
+                DataType::IntegerArray
+            } else if base.contains("REAL") || base.contains("FLOA") || base.contains("DOUB") {
+                DataType::RealArray
+            } else {
+                DataType::TextArray
+            };
+        }
         if upper.contains("INT") {
             DataType::Integer
         } else if upper.contains("REAL")

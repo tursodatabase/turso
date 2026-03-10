@@ -2311,6 +2311,9 @@ impl Optimizable for ast::Expr {
             Expr::Unary(_, expr) => expr.is_nonnull(tables),
             Expr::Variable(..) => false,
             Expr::Register(..) => false, // Register values can be null
+            Expr::Array { .. } | Expr::Subscript { .. } => {
+                unreachable!("Array and Subscript are desugared into function calls by the parser")
+            }
         }
     }
     /// Returns true if the expression is a constant i.e. does not depend on columns and can be evaluated only once during the execution
@@ -2388,6 +2391,9 @@ impl Optimizable for ast::Expr {
             Expr::Unary(_, expr) => expr.is_constant(resolver),
             Expr::Variable(_) => true,
             Expr::Register(_) => false,
+            Expr::Array { .. } | Expr::Subscript { .. } => {
+                unreachable!("Array and Subscript are desugared into function calls by the parser")
+            }
         }
     }
     /// Returns true if the expression is a constant expression that, when evaluated as a condition, is always true or false
@@ -2995,7 +3001,7 @@ mod tests {
         attached_databases: &'a RwLock<DatabaseCatalog>,
         syms: &'a SymbolTable,
     ) -> Resolver<'a> {
-        Resolver::new(schema, database_schemas, attached_databases, syms)
+        Resolver::new(schema, database_schemas, attached_databases, syms, true)
     }
 
     fn no_tail() -> FunctionTail {

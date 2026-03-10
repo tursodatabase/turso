@@ -14,6 +14,10 @@ path = "main.rs"
 name = "printf_fuzzer"
 path = "printf_fuzzer.rs"
 
+[[bin]]
+name = "custom_types_fuzzer"
+path = "custom_types_fuzzer.rs"
+
 [lib]
 path = "lib.rs"
 

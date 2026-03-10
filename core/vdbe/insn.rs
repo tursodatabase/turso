@@ -32,6 +32,7 @@ impl CmpInsFlags {
     const NULL_EQ: usize = 0x80;
     const JUMP_IF_NULL: usize = 0x10;
     const AFFINITY_MASK: usize = 0x47;
+    const ARRAY_CMP: usize = 0x100;
 
     fn has(&self, flag: usize) -> bool {
         (self.0 & flag) != 0
@@ -64,6 +65,15 @@ impl CmpInsFlags {
     pub fn get_affinity(&self) -> Affinity {
         let aff_code = (self.0 & Self::AFFINITY_MASK) as u8;
         Affinity::from_char_code(aff_code)
+    }
+
+    pub fn array_cmp(mut self) -> Self {
+        self.0 |= Self::ARRAY_CMP;
+        self
+    }
+
+    pub fn has_array_cmp(&self) -> bool {
+        self.has(Self::ARRAY_CMP)
     }
 }
 
@@ -528,6 +538,96 @@ pub enum Insn {
         /// When P3 is non-zero, no type checking occurs for static generated columns.
         check_generated: bool, // P3
         table_reference: Arc<BTreeTable>, // P4
+    },
+
+    /// Parse a JSON text array into a native record-format BLOB, validating
+    /// and coercing each element against the declared type using STRICT
+    /// type-checking logic (apply_affinity_char + value_type check).
+    /// Input: reg = JSON text like '[1,2,3]'. Output: reg = record-format BLOB.
+    /// Raises SQLITE_CONSTRAINT on type mismatch.
+    ArrayEncode {
+        reg: usize,
+        element_affinity: Affinity,
+        element_type: Arc<str>,
+        table_name: Arc<str>,
+        col_name: Arc<str>,
+    },
+
+    /// Convert a native record-format BLOB back to JSON text for display.
+    /// Input: reg = record-format BLOB. Output: reg = JSON text '[1,2,3]'.
+    ArrayDecode {
+        reg: usize,
+    },
+
+    /// Access element at index from a record-format array BLOB.
+    /// If array is NULL or index out of bounds, dest = NULL.
+    ArrayElement {
+        array_reg: usize,
+        index_reg: usize,
+        dest: usize,
+    },
+
+    /// Get the number of elements in a record-format array BLOB.
+    /// If input is NULL, dest = 0.
+    ArrayLength {
+        reg: usize,
+        dest: usize,
+    },
+
+    /// Create an array from contiguous registers (static count).
+    /// Reads `count` values from start_reg..start_reg+count,
+    /// serializes via ImmutableRecord, stores Value::Blob in dest.
+    MakeArray {
+        start_reg: usize,
+        count: usize,
+        dest: usize,
+    },
+
+    /// Create an array from contiguous registers (dynamic count).
+    /// Like MakeArray but count is read from count_reg at runtime.
+    MakeArrayDynamic {
+        start_reg: usize,
+        count_reg: usize,
+        dest: usize,
+    },
+
+    /// Copy a register value to a dynamically-computed destination.
+    /// dest = registers[base + registers[offset_reg]]
+    /// registers[base + registers[offset_reg]] = registers[src]
+    RegCopyOffset {
+        src: usize,
+        base: usize,
+        offset_reg: usize,
+    },
+
+    /// Concatenate/append/prepend arrays. PostgreSQL-compatible semantics:
+    /// - blob || blob → array_cat
+    /// - blob || scalar → array_append
+    /// - scalar || blob → array_prepend
+    ///
+    /// Falls back to string Concat for non-array operands.
+    ArrayConcat {
+        lhs: usize,
+        rhs: usize,
+        dest: usize,
+    },
+
+    /// Set element at index in a record-format array BLOB.
+    /// Extracts all elements, replaces element at index, rebuilds blob.
+    ArraySetElement {
+        array_reg: usize,
+        index_reg: usize,
+        value_reg: usize,
+        dest: usize,
+    },
+
+    /// Extract a subslice of elements from a record-format array BLOB.
+    /// Creates a new array blob from elements[start..end].
+    ArraySlice {
+        array_reg: usize,
+        start_reg: usize,
+        end_reg: usize,
+        dest: usize,
     },
 
     // Make a record and write it to destination register.
@@ -1586,6 +1686,16 @@ impl InsnVariants {
             InsnVariants::Last => execute::op_last,
             InsnVariants::Column => execute::op_column,
             InsnVariants::TypeCheck => execute::op_type_check,
+            InsnVariants::ArrayEncode => execute::op_array_encode,
+            InsnVariants::ArrayDecode => execute::op_array_decode,
+            InsnVariants::ArrayElement => execute::op_array_element,
+            InsnVariants::ArrayLength => execute::op_array_length,
+            InsnVariants::MakeArray => execute::op_make_array,
+            InsnVariants::MakeArrayDynamic => execute::op_make_array_dynamic,
+            InsnVariants::RegCopyOffset => execute::op_reg_copy_offset,
+            InsnVariants::ArrayConcat => execute::op_array_concat,
+            InsnVariants::ArraySetElement => execute::op_array_set_element,
+            InsnVariants::ArraySlice => execute::op_array_slice,
             InsnVariants::MakeRecord => execute::op_make_record,
             InsnVariants::ResultRow => execute::op_result_row,
             InsnVariants::Next => execute::op_next,

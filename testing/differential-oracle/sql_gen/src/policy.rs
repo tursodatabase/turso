@@ -268,6 +268,25 @@ impl Policy {
         self
     }
 
+    /// Enable array type support with reasonable defaults.
+    /// Forces STRICT tables (arrays require STRICT).
+    pub fn with_array_support(mut self) -> Self {
+        self.expr_weights.array_literal = 10;
+        self.expr_weights.array_subscript = 8;
+        self.binop_weights.array_contains = 5;
+        self.binop_weights.contained_by = 5;
+        self.binop_weights.array_overlap = 5;
+        self.expr_config.binop_category_weights.array = 15;
+        self.create_table_config.array_column_probability = 0.4;
+        self.create_table_config.strict_probability = 1.0;
+        self.literal_config.array_min_size = 0;
+        self.literal_config.array_max_size = 10;
+        self.function_config = self
+            .function_config
+            .enable_category(FunctionCategory::Array);
+        self
+    }
+
     // =========================================================================
     // Selection methods
     // =========================================================================
@@ -530,6 +549,9 @@ pub struct ExprWeights {
     pub in_subquery: u32,
     pub is_null: u32,
     pub exists: u32,
+    // Array expressions (default 0 — only enabled for array fuzzer)
+    pub array_literal: u32,
+    pub array_subscript: u32,
     // Stubs (not yet implemented, weight 0)
     pub window_function: u32,
     pub collate: u32,
@@ -552,6 +574,9 @@ impl Default for ExprWeights {
             in_subquery: 5,
             is_null: 1,
             exists: 5,
+            // Array
+            array_literal: 0,
+            array_subscript: 0,
             // Stubs
             window_function: 0,
             collate: 0,
@@ -579,6 +604,9 @@ impl ExprWeights {
             ExprKind::IsNull => self.is_null,
             ExprKind::Exists => self.exists,
             ExprKind::Parenthesized => 0, // Never generated directly
+            // Array
+            ExprKind::ArrayLiteral => self.array_literal,
+            ExprKind::ArraySubscript => self.array_subscript,
             // Stubs
             ExprKind::WindowFunction => self.window_function,
             ExprKind::Collate => self.collate,
@@ -611,6 +639,8 @@ impl ExprWeights {
             in_subquery: 8,
             is_null: 1,
             exists: 8,
+            array_literal: 0,
+            array_subscript: 0,
             window_function: 0,
             collate: 0,
             raise: 0,
@@ -633,6 +663,8 @@ impl ExprWeights {
             in_subquery: 0,
             is_null: 0,
             exists: 0,
+            array_literal: 0,
+            array_subscript: 0,
             window_function: 0,
             collate: 0,
             raise: 0,
@@ -676,6 +708,11 @@ pub struct BinOpWeights {
     pub concat: u32,
     pub like: u32,
     pub glob: u32,
+
+    // Array (default 0 — only enabled for array fuzzer)
+    pub array_contains: u32,
+    pub contained_by: u32,
+    pub array_overlap: u32,
 }
 
 impl Default for BinOpWeights {
@@ -706,6 +743,10 @@ impl Default for BinOpWeights {
             concat: 5,
             like: 8,
             glob: 3,
+            // Array
+            array_contains: 0,
+            contained_by: 0,
+            array_overlap: 0,
         }
     }
 }
@@ -734,6 +775,9 @@ impl BinOpWeights {
             concat: 0,
             like: 0,
             glob: 0,
+            array_contains: 0,
+            contained_by: 0,
+            array_overlap: 0,
         }
     }
 
@@ -812,6 +856,12 @@ pub struct LiteralConfig {
 
     /// Weights for literal types.
     pub type_weights: LiteralTypeWeights,
+
+    /// Minimum array size for array literal generation.
+    pub array_min_size: usize,
+
+    /// Maximum array size for array literal generation.
+    pub array_max_size: usize,
 }
 
 impl Default for LiteralConfig {
@@ -828,6 +878,8 @@ impl Default for LiteralConfig {
             blob_max_size: 100,
             string_charset: StringCharset::Alphanumeric,
             type_weights: LiteralTypeWeights::default(),
+            array_min_size: 0,
+            array_max_size: 10,
         }
     }
 }
@@ -1507,6 +1559,10 @@ pub struct CreateTableConfig {
 
     /// Probability of CREATE TABLE ... AS SELECT.
     pub as_select_probability: f64,
+
+    /// Probability of an array column type (INTEGER[], REAL[], TEXT[]).
+    /// Default 0.0 — only enabled for array fuzzer.
+    pub array_column_probability: f64,
 }
 
 impl Default for CreateTableConfig {
@@ -1525,6 +1581,7 @@ impl Default for CreateTableConfig {
             autoincrement_probability: 0.0,
             generated_column_probability: 0.0,
             as_select_probability: 0.0,
+            array_column_probability: 0.0,
         }
     }
 }
@@ -1874,6 +1931,7 @@ pub struct BinOpCategoryWeights {
     pub comparison: u32,
     pub logical: u32,
     pub arithmetic: u32,
+    pub array: u32,
 }
 
 impl Default for BinOpCategoryWeights {
@@ -1882,6 +1940,7 @@ impl Default for BinOpCategoryWeights {
             comparison: 40,
             logical: 30,
             arithmetic: 30,
+            array: 0,
         }
     }
 }
@@ -1893,6 +1952,7 @@ impl BinOpCategoryWeights {
             comparison: 100,
             logical: 0,
             arithmetic: 0,
+            array: 0,
         }
     }
 }
@@ -1928,7 +1988,18 @@ pub struct FunctionConfig {
 impl Default for FunctionConfig {
     fn default() -> Self {
         Self {
-            function_weights: SCALAR_FUNCTIONS.iter().map(|f| (f, 10)).collect(),
+            function_weights: SCALAR_FUNCTIONS
+                .iter()
+                .map(|f| {
+                    // Array functions are disabled by default (Turso-only, not in SQLite)
+                    let weight = if f.category == FunctionCategory::Array {
+                        0
+                    } else {
+                        10
+                    };
+                    (f, weight)
+                })
+                .collect(),
             deterministic_only: false,
             category_weights: FunctionCategoryWeights::default(),
         }
@@ -1975,12 +2046,18 @@ impl FunctionConfig {
     }
 
     /// Create a config with only deterministic functions.
+    ///
+    /// Array functions are excluded by default (Turso-only, not in SQLite).
     pub fn deterministic() -> Self {
         Self {
             function_weights: SCALAR_FUNCTIONS
                 .iter()
                 .map(|f| {
-                    let weight = if f.is_deterministic { 10 } else { 0 };
+                    let weight = if !f.is_deterministic || f.category == FunctionCategory::Array {
+                        0
+                    } else {
+                        10
+                    };
                     (f, weight)
                 })
                 .collect(),
@@ -1994,6 +2071,16 @@ impl FunctionConfig {
         for (f, w) in &mut self.function_weights {
             if names.contains(&f.name) {
                 *w = 0;
+            }
+        }
+        self
+    }
+
+    /// Enable all functions in a category (sets their weight to 10).
+    pub fn enable_category(mut self, category: FunctionCategory) -> Self {
+        for (f, w) in &mut self.function_weights {
+            if f.category == category {
+                *w = 10;
             }
         }
         self

@@ -8,10 +8,15 @@ use crate::{
     Result,
 };
 
+use turso_parser::ast;
+
 use super::{
     emitter::{LimitCtx, Resolver},
-    expr::{translate_expr, translate_expr_no_constant_opt, NoConstantOptReason},
-    plan::{Distinctness, QueryDestination, SelectPlan},
+    expr::{
+        emit_array_decode, expr_is_array, translate_expr, translate_expr_no_constant_opt,
+        NoConstantOptReason,
+    },
+    plan::{Distinctness, QueryDestination, ResultSetColumn, SelectPlan, TableReferences},
 };
 
 /// Emits the bytecode for:
@@ -97,6 +102,19 @@ pub fn emit_select_result(
                 )?;
             }
         }
+    }
+
+    // Emit ArrayDecode for result columns that produce array blobs.
+    // Array values are stored as record-format blobs internally; decode
+    // them to JSON text for user-facing display.
+    if !skip_column_eval {
+        emit_array_decode_for_results(
+            program,
+            &plan.result_columns,
+            &plan.table_references,
+            start_reg,
+            resolver,
+        )?;
     }
 
     // Handle SELECT DISTINCT deduplication
@@ -373,4 +391,49 @@ pub fn emit_offset(program: &mut ProgramBuilder, jump_to: BranchOffset, reg_offs
         target_pc: jump_to,
         decrement_by: 1,
     });
+}
+
+/// Emit ArrayDecode for result columns that produce array record blobs.
+/// Array values are stored as record-format blobs internally; this converts
+/// them to JSON text for user-facing display, just before ResultRow.
+pub(crate) fn emit_array_decode_for_results(
+    program: &mut ProgramBuilder,
+    result_columns: &[ResultSetColumn],
+    table_references: &TableReferences,
+    start_reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    for (i, rc) in result_columns.iter().enumerate() {
+        // Check if this is a column reference to an array column
+        let array_col = if let ast::Expr::Column { table, column, .. } = &rc.expr {
+            table_references
+                .find_table_by_internal_id(*table)
+                .map(|(_, t)| t)
+                .and_then(|t| t.get_column_at(*column))
+                .filter(|col| col.is_array())
+        } else {
+            None
+        };
+
+        // Check if this expression produces an array (function call, || operator, etc.)
+        let is_array_expr = array_col.is_none() && expr_is_array(&rc.expr, Some(table_references));
+
+        if array_col.is_some() || is_array_expr {
+            let reg = start_reg + i;
+            let skip = program.allocate_label();
+            program.emit_insn(Insn::IsNull {
+                reg,
+                target_pc: skip,
+            });
+
+            if let Some(col) = array_col {
+                emit_array_decode(program, reg, col, resolver)?;
+            } else {
+                program.emit_insn(Insn::ArrayDecode { reg });
+            }
+
+            program.preassign_label_to_next_insn(skip);
+        }
+    }
+    Ok(())
 }
