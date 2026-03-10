@@ -13,7 +13,7 @@ use super::{
 };
 use crate::translate::{
     emitter::Resolver,
-    expr::{unwrap_parens, BindingBehavior, WalkControl},
+    expr::{expr_vector_size, unwrap_parens, BindingBehavior, WalkControl},
     plan::{NonFromClauseSubquery, SubqueryState},
 };
 use crate::{
@@ -357,6 +357,7 @@ fn link_with_window(
     if distinctness.is_distinct() {
         crate::bail_parse_error!("DISTINCT is not supported for window functions");
     }
+    expr_vector_size(expr)?;
     if let Some(windows) = windows {
         let window = resolve_window(windows, over_clause)?;
         window.functions.push(WindowFunction {

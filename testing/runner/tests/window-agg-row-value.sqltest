@@ -1,0 +1,17 @@
+@database :memory:
+
+test window-agg-case-else-row-value {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES(0);
+    SELECT COUNT(*) FROM t ORDER BY SUM(CASE WHEN a THEN 1 ELSE (1, 1) END) OVER();
+}
+expect error {
+}
+
+test window-agg-case-then-row-value {
+    CREATE TABLE t2(a);
+    INSERT INTO t2 VALUES(1);
+    SELECT COUNT(*) FROM t2 ORDER BY SUM(CASE WHEN a THEN (1, 1) ELSE 1 END) OVER();
+}
+expect error {
+}
