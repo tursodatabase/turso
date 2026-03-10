@@ -121,7 +121,8 @@ fn test_mvcc_create_table_on_attached_db(tmp_db: TempDatabase) -> anyhow::Result
     Ok(())
 }
 
-/// Injecting a custom MVCC durable storage implementation via DatabaseOpts should work.
+/// Injecting a custom MVCC durable storage implementation via
+/// `Database::open_file_with_flags_and_durable_storage` should work.
 /// We validate that MVCC commits route through the injected storage by recording `log_tx` calls.
 ///
 /// Note: this uses the real on-disk DurableStorage under the hood and simply wraps it.
