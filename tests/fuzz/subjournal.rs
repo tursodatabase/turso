@@ -196,7 +196,10 @@ mod subjournal_tests {
                         format!("({id}, {x}, '{y}')")
                     })
                     .collect();
-                format!("INSERT OR IGNORE INTO t_bare(id, x, y) VALUES {}", rows.join(", "))
+                format!(
+                    "INSERT OR IGNORE INTO t_bare(id, x, y) VALUES {}",
+                    rows.join(", ")
+                )
             }
             // INSERT OR REPLACE on bare table (multi_write=true via replace, may_abort=false
             // since no NOT NULL/CHECK — replace_can_abort is false)
@@ -215,11 +218,17 @@ mod subjournal_tests {
             // Multi-row UPDATE (multi_write=true, may_abort=false → NO subjournal)
             4 => {
                 let x = rng.random_range(1..=100);
-                format!("UPDATE t_bare SET x = {x} WHERE id > {}", rng.random_range(1..=100))
+                format!(
+                    "UPDATE t_bare SET x = {x} WHERE id > {}",
+                    rng.random_range(1..=100)
+                )
             }
             // Single-row DELETE by PK (multi_write=false, may_abort=false → NO subjournal)
             5 => {
-                format!("DELETE FROM t_bare WHERE id = {}", rng.random_range(1..=200))
+                format!(
+                    "DELETE FROM t_bare WHERE id = {}",
+                    rng.random_range(1..=200)
+                )
             }
             // Multi-row DELETE (multi_write=true, may_abort=false → NO subjournal)
             6 => {
@@ -261,7 +270,10 @@ mod subjournal_tests {
                         format!("({id}, {val}, '{tag}')")
                     })
                     .collect();
-                format!("INSERT OR IGNORE INTO t_trig(id, val, tag) VALUES {}", rows.join(", "))
+                format!(
+                    "INSERT OR IGNORE INTO t_trig(id, val, tag) VALUES {}",
+                    rows.join(", ")
+                )
             }
             // UPDATE (multi_write=true due to trigger, may_abort=true)
             3 => {
@@ -272,14 +284,20 @@ mod subjournal_tests {
             // UPDATE multiple rows
             4 => {
                 let new_val = rng.random_range(1..=50);
-                format!("UPDATE t_trig SET val = {new_val} WHERE id > {}", rng.random_range(1..=50))
+                format!(
+                    "UPDATE t_trig SET val = {new_val} WHERE id > {}",
+                    rng.random_range(1..=50)
+                )
             }
             // DELETE (multi_write=true due to trigger, may_abort=true)
             5 => {
                 if rng.random_bool(0.2) {
                     "DELETE FROM t_trig".to_string()
                 } else {
-                    format!("DELETE FROM t_trig WHERE id = {}", rng.random_range(1..=100))
+                    format!(
+                        "DELETE FROM t_trig WHERE id = {}",
+                        rng.random_range(1..=100)
+                    )
                 }
             }
             _ => unreachable!(),
@@ -318,7 +336,10 @@ mod subjournal_tests {
             }
             // DELETE
             4 => {
-                format!("DELETE FROM t_pidx WHERE id = {}", rng.random_range(1..=150))
+                format!(
+                    "DELETE FROM t_pidx WHERE id = {}",
+                    rng.random_range(1..=150)
+                )
             }
             _ => unreachable!(),
         }
