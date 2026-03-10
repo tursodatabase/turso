@@ -90,6 +90,8 @@ pub fn translate_create_trigger(
     tbl_name: QualifiedName,
     program: &mut ProgramBuilder,
     sql: String,
+    commands: &[ast::TriggerCmd],
+    when_clause: Option<&ast::Expr>,
 ) -> Result<()> {
     let database_id = resolver.resolve_database_id(&trigger_name)?;
     if crate::is_attached_db(database_id) {
@@ -99,6 +101,15 @@ pub fn translate_create_trigger(
     program.begin_write_operation();
     let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
     let normalized_table_name = normalize_ident(tbl_name.name.as_str());
+
+    // Validate that trigger body does not reference other databases.
+    validate_trigger_no_cross_db_refs(
+        resolver,
+        database_id,
+        &normalized_trigger_name,
+        commands,
+        when_clause,
+    )?;
 
     if crate::schema::is_system_table(&normalized_table_name) {
         bail_parse_error!("cannot create trigger on system table");
@@ -179,6 +190,242 @@ pub fn translate_create_trigger(
         where_clause: Some(format!("name = '{normalized_trigger_name}'")),
     });
 
+    Ok(())
+}
+
+/// Validate that no table or expression reference in a trigger body points to a
+/// database other than the trigger's own database. SQLite forbids this with:
+///   "trigger X cannot reference objects in database Y"
+fn validate_trigger_no_cross_db_refs(
+    resolver: &Resolver,
+    trigger_db_id: usize,
+    trigger_name: &str,
+    commands: &[ast::TriggerCmd],
+    when_clause: Option<&ast::Expr>,
+) -> Result<()> {
+    let ctx = CrossDbCheckCtx {
+        resolver,
+        trigger_db_id,
+        trigger_name,
+    };
+
+    if let Some(when) = when_clause {
+        ctx.check_expr(when)?;
+    }
+
+    for cmd in commands {
+        match cmd {
+            ast::TriggerCmd::Insert { select, .. } => {
+                ctx.check_select(select)?;
+            }
+            ast::TriggerCmd::Update {
+                sets,
+                from,
+                where_clause,
+                ..
+            } => {
+                for set in sets {
+                    ctx.check_expr(&set.expr)?;
+                }
+                if let Some(from) = from {
+                    ctx.check_from_clause(from)?;
+                }
+                if let Some(wc) = where_clause {
+                    ctx.check_expr(wc)?;
+                }
+            }
+            ast::TriggerCmd::Delete { where_clause, .. } => {
+                if let Some(wc) = where_clause {
+                    ctx.check_expr(wc)?;
+                }
+            }
+            ast::TriggerCmd::Select(select) => {
+                ctx.check_select(select)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+struct CrossDbCheckCtx<'a> {
+    resolver: &'a Resolver<'a>,
+    trigger_db_id: usize,
+    trigger_name: &'a str,
+}
+
+impl CrossDbCheckCtx<'_> {
+    fn check_qname(&self, qn: &QualifiedName) -> Result<()> {
+        if let Some(ref db_name) = qn.db_name {
+            let resolved = self.resolver.resolve_database_id(qn)?;
+            if resolved != self.trigger_db_id {
+                bail_parse_error!(
+                    "trigger {} cannot reference objects in database {}",
+                    self.trigger_name,
+                    db_name
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Check an expression tree for cross-database references.
+    /// Handles DoublyQualified expressions and descends into subqueries
+    /// that walk_expr skips.
+    fn check_expr(&self, expr: &ast::Expr) -> Result<()> {
+        use crate::translate::expr::WalkControl;
+        crate::translate::expr::walk_expr(expr, &mut |e| -> Result<WalkControl> {
+            match e {
+                ast::Expr::DoublyQualified(db, ns, _) => {
+                    let ns_normalized = normalize_ident(ns.as_str());
+                    // NEW and OLD are pseudo-tables, not real database references
+                    if !ns_normalized.eq_ignore_ascii_case("new")
+                        && !ns_normalized.eq_ignore_ascii_case("old")
+                    {
+                        let qn = QualifiedName {
+                            db_name: Some(ast::Name::exact(normalize_ident(db.as_str()))),
+                            name: ast::Name::exact(ns_normalized),
+                            alias: None,
+                        };
+                        self.check_qname(&qn)?;
+                    }
+                }
+                // walk_expr doesn't descend into subqueries, so handle them here
+                ast::Expr::Exists(select) | ast::Expr::Subquery(select) => {
+                    self.check_select(select)?;
+                }
+                ast::Expr::InSelect { rhs, .. } => {
+                    self.check_select(rhs)?;
+                }
+                _ => {}
+            }
+            Ok(WalkControl::Continue)
+        })?;
+        Ok(())
+    }
+
+    fn check_select(&self, select: &ast::Select) -> Result<()> {
+        check_select_table_refs(select, &|qn| self.check_qname(qn), &|e| self.check_expr(e))
+    }
+
+    fn check_from_clause(&self, from: &ast::FromClause) -> Result<()> {
+        check_from_clause_refs(from, &|qn| self.check_qname(qn), &|e| self.check_expr(e))
+    }
+}
+
+fn check_select_table_refs(
+    select: &ast::Select,
+    check_qname: &dyn Fn(&QualifiedName) -> Result<()>,
+    check_expr: &dyn Fn(&ast::Expr) -> Result<()>,
+) -> Result<()> {
+    // Check CTEs
+    if let Some(with) = &select.with {
+        for cte in &with.ctes {
+            check_select_table_refs(&cte.select, check_qname, check_expr)?;
+        }
+    }
+
+    check_one_select_refs(&select.body.select, check_qname, check_expr)?;
+
+    for compound in &select.body.compounds {
+        check_one_select_refs(&compound.select, check_qname, check_expr)?;
+    }
+
+    // Check ORDER BY / LIMIT / OFFSET expressions
+    for col in &select.order_by {
+        check_expr(&col.expr)?;
+    }
+    if let Some(limit) = &select.limit {
+        check_expr(&limit.expr)?;
+        if let Some(offset) = &limit.offset {
+            check_expr(offset)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn check_one_select_refs(
+    one_select: &ast::OneSelect,
+    check_qname: &dyn Fn(&QualifiedName) -> Result<()>,
+    check_expr: &dyn Fn(&ast::Expr) -> Result<()>,
+) -> Result<()> {
+    match one_select {
+        ast::OneSelect::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            ..
+        } => {
+            for col in columns {
+                if let ast::ResultColumn::Expr(expr, _) = col {
+                    check_expr(expr)?;
+                }
+            }
+            if let Some(from) = from {
+                check_from_clause_refs(from, check_qname, check_expr)?;
+            }
+            if let Some(wc) = where_clause {
+                check_expr(wc)?;
+            }
+            if let Some(gb) = group_by {
+                for expr in &gb.exprs {
+                    check_expr(expr)?;
+                }
+                if let Some(having) = &gb.having {
+                    check_expr(having)?;
+                }
+            }
+        }
+        ast::OneSelect::Values(rows) => {
+            for row in rows {
+                for expr in row {
+                    check_expr(expr)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_from_clause_refs(
+    from: &ast::FromClause,
+    check_qname: &dyn Fn(&QualifiedName) -> Result<()>,
+    check_expr: &dyn Fn(&ast::Expr) -> Result<()>,
+) -> Result<()> {
+    check_select_table_ref(&from.select, check_qname, check_expr)?;
+    for join in &from.joins {
+        check_select_table_ref(&join.table, check_qname, check_expr)?;
+        if let Some(ast::JoinConstraint::On(expr)) = &join.constraint {
+            check_expr(expr)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_select_table_ref(
+    table: &ast::SelectTable,
+    check_qname: &dyn Fn(&QualifiedName) -> Result<()>,
+    check_expr: &dyn Fn(&ast::Expr) -> Result<()>,
+) -> Result<()> {
+    match table {
+        ast::SelectTable::Table(qname, ..) => {
+            check_qname(qname)?;
+        }
+        ast::SelectTable::TableCall(qname, args, _) => {
+            check_qname(qname)?;
+            for arg in args {
+                check_expr(arg)?;
+            }
+        }
+        ast::SelectTable::Select(select, _) => {
+            check_select_table_refs(select, check_qname, check_expr)?;
+        }
+        ast::SelectTable::Sub(from, _) => {
+            check_from_clause_refs(from, check_qname, check_expr)?;
+        }
+    }
     Ok(())
 }
 

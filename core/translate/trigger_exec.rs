@@ -496,17 +496,26 @@ fn execute_trigger_commands(
     if let Some(override_conflict) = ctx.override_conflict {
         subprogram_builder.set_trigger_conflict_override(override_conflict);
     }
-    for command in trigger.commands.iter() {
-        let stmt = trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?;
-        subprogram_builder.prologue();
-        translate_inner(
-            stmt,
-            resolver,
-            &mut subprogram_builder,
-            connection,
-            "trigger subprogram",
-        )?;
-    }
+    // Restrict table resolution to the trigger's database during subprogram compilation.
+    let prev_trigger_context = resolver.trigger_context.clone();
+    resolver.set_trigger_context(database_id, trigger.name.clone());
+    let compile_result = (|| -> Result<()> {
+        for command in trigger.commands.iter() {
+            let stmt = trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?;
+            subprogram_builder.prologue();
+            translate_inner(
+                stmt,
+                resolver,
+                &mut subprogram_builder,
+                connection,
+                "trigger subprogram",
+            )?;
+        }
+        Ok(())
+    })();
+    // Restore previous trigger context (supports nested triggers).
+    resolver.trigger_context = prev_trigger_context;
+    compile_result?;
     subprogram_builder.epilogue(resolver.schema());
     let built_subprogram =
         subprogram_builder.build(connection.clone(), true, "trigger subprogram")?;
