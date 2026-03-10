@@ -575,6 +575,13 @@ impl Database {
         // Check the registry before opening the file to avoid acquiring a file
         // lock that would conflict with an already-open Database in this process.
         if let Some(db) = Self::lookup_in_registry(path, &encryption_opts)? {
+            if durable_storage.is_some() && db.durable_storage.is_none() {
+                return Err(LimboError::InvalidArgument(
+                    "database already open without custom durable storage; \
+                     close the existing instance before reopening with a custom DurableStorage"
+                        .to_string(),
+                ));
+            }
             return Ok(db);
         }
         let file = io.open_file(path, flags, true)?;

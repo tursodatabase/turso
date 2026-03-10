@@ -11,7 +11,6 @@ use crate::{Completion, File, Result};
 
 pub trait DurableStorage: Send + Sync + Debug {
     fn log_tx(&self, m: &LogRecord) -> Result<(Completion, u64)>;
-    fn read_tx_log(&self) -> Result<Vec<LogRecord>>;
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion>;
 
     /// Persist the current logical-log header to durable storage.
@@ -66,10 +65,6 @@ impl Storage {
 impl DurableStorage for Storage {
     fn log_tx(&self, m: &LogRecord) -> Result<(Completion, u64)> {
         self.logical_log.write().log_tx_deferred_offset(m)
-    }
-
-    fn read_tx_log(&self) -> Result<Vec<LogRecord>> {
-        todo!()
     }
 
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion> {

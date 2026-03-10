@@ -3859,18 +3859,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         before - versions.len()
     }
 
-    pub fn recover(&self) -> Result<()> {
-        let tx_log = self.storage.read_tx_log()?;
-        for record in tx_log {
-            tracing::debug!("recover() -> tx_timestamp={}", record.tx_timestamp);
-            for version in record.row_versions {
-                self.insert_version(version.row.id.clone(), version);
-            }
-            self.clock.reset(record.tx_timestamp);
-        }
-        Ok(())
-    }
-
     // Extracts the begin timestamp from a transaction
     #[inline]
     fn resolve_begin_timestamp(&self, ts_or_id: &Option<TxTimestampOrID>) -> u64 {

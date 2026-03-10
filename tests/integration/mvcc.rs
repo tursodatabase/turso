@@ -21,7 +21,8 @@ fn create_mvcc_db(io: &Arc<dyn turso_core::io::IO + Send>, path: &Path) -> anyho
 }
 
 /// A minimal DurableStorage wrapper that delegates to the built-in implementation,
-/// but records that it was used. This validates per-database injection via DatabaseOpts.
+/// but records that it was used. This validates per-database injection via
+/// `Database::open_file_with_flags_and_durable_storage`.
 #[derive(Debug)]
 struct RecordingDurableStorage {
     inner: Arc<dyn turso_core::mvcc::persistent_storage::DurableStorage>,
@@ -49,10 +50,6 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
         self.used_log_tx
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.inner.log_tx(m)
-    }
-
-    fn read_tx_log(&self) -> turso_core::Result<Vec<turso_core::mvcc::database::LogRecord>> {
-        self.inner.read_tx_log()
     }
 
     fn sync(
