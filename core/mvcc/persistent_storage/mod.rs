@@ -22,6 +22,8 @@ pub trait DurableStorage: Send + Sync + Debug {
     fn truncate(&self) -> Result<Completion>;
     fn get_logical_log_file(&self) -> Arc<dyn File>;
     fn should_checkpoint(&self) -> bool;
+    /// Set the checkpoint threshold in bytes of logical-log data written.
+    /// A negative value disables automatic checkpointing.
     fn set_checkpoint_threshold(&self, threshold: i64);
     fn checkpoint_threshold(&self) -> i64;
     fn advance_logical_log_offset_after_success(&self, bytes: u64);

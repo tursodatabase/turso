@@ -1992,7 +1992,7 @@ pub struct MvStore<Clock: LogicalClock> {
     next_table_id: AtomicI64,
     clock: Clock,
 
-    /// MVCC durable storage (logical log, durability hooks, checkpoint thresholding).
+    /// MVCC durable storage (logical log writes, checkpoint thresholding, recovery state).
     ///
     /// Stored behind a trait object so callers can inject their own implementation
     /// per database (via `Database::durable_storage`) for testing or custom durability.
