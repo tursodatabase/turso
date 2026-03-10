@@ -180,22 +180,18 @@ fn quote_string_literal(s: &str) -> String {
 #[derive(Debug, Clone)]
 pub struct TypeDef {
     pub name: String,
-    pub params: Vec<turso_parser::ast::TypeParam>,
+    pub params: Vec<ast::TypeParam>,
     pub base: String,
-    pub encode: Option<Box<turso_parser::ast::Expr>>,
-    pub decode: Option<Box<turso_parser::ast::Expr>>,
+    pub encode: Option<Box<ast::Expr>>,
+    pub decode: Option<Box<ast::Expr>>,
     pub operators: Vec<TypeOperator>,
-    pub default: Option<Box<turso_parser::ast::Expr>>,
+    pub default: Option<Box<ast::Expr>>,
     pub is_builtin: bool,
 }
 
 impl TypeDef {
     /// Construct a TypeDef from a parsed CREATE TYPE statement.
-    pub fn from_create_type(
-        type_name: &str,
-        body: &turso_parser::ast::CreateTypeBody,
-        is_builtin: bool,
-    ) -> Self {
+    pub fn from_create_type(type_name: &str, body: &ast::CreateTypeBody, is_builtin: bool) -> Self {
         Self {
             name: type_name.to_string(),
             params: body.params.clone(),
