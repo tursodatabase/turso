@@ -1674,3 +1674,16 @@ test trigger-raise-fail-delete {
 expect error {
     delete fail
 }
+
+# Bare column reference in trigger WHEN clause should error
+# SQLite rejects bare column names in WHEN clauses; they must be
+# qualified with NEW or OLD.
+@cross-check-integrity
+test trigger-when-bare-column-error {
+    CREATE TABLE t_bare_when (a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TRIGGER trg_bare_when AFTER INSERT ON t_bare_when FOR EACH ROW WHEN a BEGIN SELECT 1; END;
+    INSERT INTO t_bare_when (a, b) VALUES (1, 'hello');
+}
+expect error {
+    no such column: a
+}
