@@ -2473,7 +2473,7 @@ pub fn op_transaction_inner(
                         if !pager.holds_read_lock() {
                             pager.begin_read_tx()?;
                         }
-                        pager.mvcc_refresh_if_db_changed();
+                        pager.mvcc_refresh_if_db_changed()?;
 
                         let current_mv_tx = conn.get_mv_tx_for_db(*db);
                         if current_mv_tx.is_none() {
@@ -2535,7 +2535,7 @@ pub fn op_transaction_inner(
                             state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                         }
                         // MVCC reads must refresh WAL change counters to avoid stale page-cache reads.
-                        pager.mvcc_refresh_if_db_changed();
+                        pager.mvcc_refresh_if_db_changed()?;
                         // In MVCC we don't have write exclusivity, therefore we just need to start a transaction if needed.
                         // Programs can run Transaction twice, first with read flag and then with write flag. So a single txid is enough
                         // for both.
@@ -3050,31 +3050,37 @@ pub fn op_savepoint(
             // After rolling back pages, the in-memory schema cache may be stale
             // if DDL was executed within the savepoint. Invalidate the pager's
             // cached schema cookie and check if a schema reparse is needed.
-            pager.set_schema_cookie(None);
-            let in_memory_version = conn.schema.read().schema_version;
-            let pager_ref = conn.pager.load().clone();
-            match pager_ref
-                .io
-                .block(|| pager.with_header(|h| h.schema_cookie.get()))
-            {
-                Ok(on_disk_cookie) if in_memory_version != on_disk_cookie => {
-                    // Schema was modified during the savepoint. Try to reparse
-                    // from the restored database pages. If that fails (e.g. the
-                    // database was empty at the savepoint), use an empty schema.
-                    if conn.reparse_schema().is_err() {
+            //
+            // In MVCC mode, schema is tracked through MvStore which already
+            // handled the rollback above, so skip the pager-based check
+            // (page 1's schema_cookie may not reflect MVCC state).
+            if mv_store.is_none() {
+                pager.set_schema_cookie(None);
+                let in_memory_version = conn.schema.read().schema_version;
+                let pager_ref = conn.pager.load().clone();
+                match pager_ref
+                    .io
+                    .block(|| pager.with_header(|h| h.schema_cookie.get()))
+                {
+                    Ok(on_disk_cookie) if in_memory_version != on_disk_cookie => {
+                        // Schema was modified during the savepoint. Try to reparse
+                        // from the restored database pages. If that fails (e.g. the
+                        // database was empty at the savepoint), use an empty schema.
+                        if conn.reparse_schema().is_err() {
+                            conn.with_schema_mut(|schema| {
+                                *schema = Schema::new();
+                            });
+                        }
+                    }
+                    Err(_) => {
+                        // Header page is not readable (database empty after rollback).
+                        // Reset to an empty schema.
                         conn.with_schema_mut(|schema| {
                             *schema = Schema::new();
                         });
                     }
+                    _ => {} // Schema unchanged, nothing to do.
                 }
-                Err(_) => {
-                    // Header page is not readable (database empty after rollback).
-                    // Reset to an empty schema.
-                    conn.with_schema_mut(|schema| {
-                        *schema = Schema::new();
-                    });
-                }
-                _ => {} // Schema unchanged, nothing to do.
             }
 
             state.pc += 1;
@@ -9749,11 +9755,19 @@ pub fn op_set_cookie(
                     if *db == crate::MAIN_DB_ID {
                         match program.connection.get_tx_state() {
                             TransactionState::Write { .. } => {
-                                program.connection.set_tx_state(TransactionState::Write { schema_did_change: true });
-                            },
-                            TransactionState::Read => unreachable!("invalid transaction state for SetCookie: TransactionState::Read, should be write"),
-                            TransactionState::None => unreachable!("invalid transaction state for SetCookie: TransactionState::None, should be write"),
-                            TransactionState::PendingUpgrade { .. } => unreachable!("invalid transaction state for SetCookie: TransactionState::PendingUpgrade, should be write"),
+                                program.connection.set_tx_state(TransactionState::Write {
+                                    schema_did_change: true,
+                                });
+                            }
+                            TransactionState::Read => unreachable!(
+                                "invalid transaction state for SetCookie: TransactionState::Read, should be write"
+                            ),
+                            TransactionState::None => unreachable!(
+                                "invalid transaction state for SetCookie: TransactionState::None, should be write"
+                            ),
+                            TransactionState::PendingUpgrade { .. } => unreachable!(
+                                "invalid transaction state for SetCookie: TransactionState::PendingUpgrade, should be write"
+                            ),
                         }
                     }
                     program.connection.with_database_schema_mut(*db, |schema| {
@@ -12263,6 +12277,11 @@ fn op_journal_mode_inner(
 
                 // Setup new mode
                 if matches!(new_mode, journal_mode::JournalMode::Mvcc) {
+                    if program.connection.db.locking_mode.is_shared() {
+                        return Err(LimboError::InternalError(
+                            "cannot enable MVCC in shared locking mode (SharedReads or SharedWrites). MVCC and multi-process WAL coordination are incompatible.".to_string(),
+                        ));
+                    }
                     if program.connection.get_capture_data_changes_info().is_some() {
                         return Err(LimboError::InternalError(
                             "cannot enable MVCC while CDC is active".to_string(),

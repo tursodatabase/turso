@@ -42,6 +42,10 @@ mod shuttle_adapter {
             self.0.try_lock().ok().map(MutexGuard)
         }
 
+        pub fn get_mut(&mut self) -> &mut T {
+            self.0.get_mut().unwrap()
+        }
+
         /// Lock the mutex through an Arc, returning an owned guard that can be stored
         pub fn lock_arc(self: &Arc<Self>) -> ArcMutexGuard<T>
         where

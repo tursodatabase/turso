@@ -163,6 +163,50 @@ pub const fn is_attached_db(database_id: usize) -> bool {
 }
 
 /// Configuration for database features
+/// Controls how the database file is locked for multi-process access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LockingMode {
+    /// Single-process exclusive access (default). No TSHM, no flock overhead.
+    #[default]
+    Exclusive,
+    /// Multiple processes can read, but only one process writes.
+    /// The write lock (flock) is acquired once and held permanently.
+    SharedReads,
+    /// Full multi-process read/write access.
+    /// Write lock (flock) is acquired and released per transaction.
+    SharedWrites,
+}
+
+impl LockingMode {
+    pub fn is_shared(self) -> bool {
+        matches!(self, LockingMode::SharedReads | LockingMode::SharedWrites)
+    }
+}
+
+impl std::fmt::Display for LockingMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LockingMode::Exclusive => write!(f, "exclusive"),
+            LockingMode::SharedReads => write!(f, "shared_reads"),
+            LockingMode::SharedWrites => write!(f, "shared_writes"),
+        }
+    }
+}
+
+impl std::str::FromStr for LockingMode {
+    type Err = LimboError;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "exclusive" => Ok(LockingMode::Exclusive),
+            "shared_reads" => Ok(LockingMode::SharedReads),
+            "shared_writes" | "normal" => Ok(LockingMode::SharedWrites),
+            _ => Err(LimboError::InternalError(format!(
+                "invalid locking_mode: '{s}'. Expected: exclusive, shared_reads, shared_writes, or normal"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DatabaseOpts {
     pub enable_views: bool,
@@ -171,8 +215,10 @@ pub struct DatabaseOpts {
     pub enable_index_method: bool,
     pub enable_autovacuum: bool,
     pub enable_attach: bool,
+    pub enable_shared_access: bool,
     pub unsafe_testing: bool,
     enable_load_extension: bool,
+    pub locking_mode: LockingMode,
 }
 
 impl DatabaseOpts {
@@ -216,8 +262,18 @@ impl DatabaseOpts {
         self
     }
 
+    pub fn with_shared_access(mut self, enable: bool) -> Self {
+        self.enable_shared_access = enable;
+        self
+    }
+
     pub fn with_unsafe_testing(mut self, enable: bool) -> Self {
         self.unsafe_testing = enable;
+        self
+    }
+
+    pub fn with_locking_mode(mut self, mode: LockingMode) -> Self {
+        self.locking_mode = mode;
         self
     }
 }
@@ -376,6 +432,19 @@ pub struct Database {
 
     // Encryption
     encryption_cipher_mode: AtomicCipherMode,
+
+    // Multi-process coordination (64-bit Unix only)
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    pub(crate) tshm: Option<Arc<storage::tshm::Tshm>>,
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    pub(crate) wal_index: Option<Arc<storage::wal_index::WalIndex>>,
+
+    pub(crate) locking_mode: LockingMode,
+
+    /// Sentinel `-shm` file with fcntl byte-range locks that prevent
+    /// SQLite from operating on the same database in WAL mode.
+    #[cfg(unix)]
+    shm_sentinel: Option<storage::shm_sentinel::ShmSentinel>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -496,6 +565,16 @@ impl Database {
             encryption_cipher_mode: AtomicCipherMode::new(
                 encryption_cipher_mode.unwrap_or(CipherMode::None),
             ),
+
+            #[cfg(all(unix, target_pointer_width = "64"))]
+            tshm: None,
+            #[cfg(all(unix, target_pointer_width = "64"))]
+            wal_index: None,
+
+            locking_mode: opts.locking_mode,
+
+            #[cfg(unix)]
+            shm_sentinel: None,
         };
 
         db.register_global_builtin_extensions()
@@ -556,6 +635,12 @@ impl Database {
         // lock that would conflict with an already-open Database in this process.
         if let Some(db) = Self::lookup_in_registry(path, &encryption_opts)? {
             return Ok(db);
+        }
+        // In shared locking modes, use a shared fcntl lock on the DB file.
+        // Write exclusion is handled by flock on the TSHM file instead.
+        let mut flags = flags;
+        if opts.locking_mode.is_shared() {
+            flags |= OpenFlags::SharedLock;
         }
         let file = io.open_file(path, flags, true)?;
         let db_file = Arc::new(DatabaseFile::new(file));
@@ -669,6 +754,17 @@ impl Database {
                     return Err(LimboError::InvalidArgument(
                         "Database is encrypted but no encryption options provided".to_string(),
                     ));
+                }
+
+                // Validate that the requested locking mode matches the existing instance.
+                // A mismatch silently ignoring the caller's intent could cause subtle bugs.
+                if opts.locking_mode != LockingMode::Exclusive
+                    && opts.locking_mode != db.locking_mode
+                {
+                    return Err(LimboError::InvalidArgument(format!(
+                        "Database already open with locking_mode={:?}, cannot reopen with {:?}",
+                        db.locking_mode, opts.locking_mode
+                    )));
                 }
 
                 // Found in registry, no need to hold lock
@@ -917,7 +1013,7 @@ impl Database {
                             .expect("conn must be initialized in Init phase");
                         // Sync the connection's schema from the database so it
                         // can query __turso_internal_types.
-                        conn.maybe_update_schema();
+                        let _ = conn.maybe_update_schema();
                         let load_result: Result<()> = (|| {
                             let type_sqls = conn.query_stored_type_definitions()?;
                             if !type_sqls.is_empty() {
@@ -1188,12 +1284,76 @@ impl Database {
         let shared_wal = WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, flags)?;
 
         let last_checksum_and_max_frame = shared_wal.read().last_checksum_and_max_frame();
-        let wal = Arc::new(WalFile::new(
-            self.io.clone(),
+
+        // Create and lock the SQLite -shm sentinel file to prevent SQLite
+        // from operating on the same database. Skipped for read-only opens:
+        // concurrent read-only access from both Turso and SQLite is safe
+        // (no writes = no corruption risk).
+        #[cfg(unix)]
+        if !self.path.starts_with(":memory:") && !self.open_flags.contains(OpenFlags::ReadOnly) {
+            let shm_path = format!("{}-shm", self.path);
+            self.shm_sentinel = Some(storage::shm_sentinel::ShmSentinel::open(&shm_path)?);
+        }
+
+        // Shared locking modes require the experimental flag.
+        if self.locking_mode.is_shared() && !self.opts.enable_shared_access {
+            return Err(LimboError::InvalidArgument(
+                "shared locking modes (shared_reads, shared_writes) require \
+                 --experimental-shared-access flag"
+                    .to_string(),
+            ));
+        }
+
+        // MVCC and shared locking modes are incompatible.
+        if open_mv_store && self.locking_mode.is_shared() {
+            return Err(LimboError::InternalError(
+                "cannot open MVCC database in shared locking mode (SharedReads or SharedWrites). MVCC and multi-process WAL coordination are incompatible.".to_string(),
+            ));
+        }
+
+        // Initialize multi-process coordination on supported platforms.
+        // Only open TSHM when in a shared locking mode (not exclusive).
+        #[cfg(all(unix, target_pointer_width = "64"))]
+        if self.locking_mode.is_shared() && !self.path.starts_with(":memory:") {
+            let tshm_path = format!("{}-tshm", self.path);
+            let tshm = Arc::new(storage::tshm::Tshm::open(&tshm_path)?);
+
+            // Store our locking mode in TSHM slot 1 for mode discovery.
+            // If another process already set a different mode, fail.
+            let mode_val = storage::tshm::Tshm::locking_mode_to_value(self.locking_mode);
+            if let Err(existing) = tshm.try_set_locking_mode(mode_val) {
+                let existing_name = storage::tshm::Tshm::locking_mode_from_value(existing)
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| format!("unknown({existing})"));
+                return Err(LimboError::LockingError(format!(
+                    "Database is open in {existing_name} mode by another process, \
+                     cannot use {mode}",
+                    mode = self.locking_mode,
+                )));
+            }
+
+            // In SharedReads mode, try to acquire the write lock permanently.
+            // If another process already holds it, that's fine — we just
+            // can't write. Writes will fail with Busy at begin_write_tx time.
+            if self.locking_mode == LockingMode::SharedReads {
+                let _ = tshm.write_lock();
+            }
+
+            self.tshm = Some(tshm);
+        }
+
+        // Open the shared WAL index (embedded in the tshm file after the coordination page).
+        #[cfg(all(unix, target_pointer_width = "64"))]
+        if let Some(tshm) = &self.tshm {
+            let wal_index = Arc::new(storage::wal_index::WalIndex::open(tshm.fd())?);
+            self.wal_index = Some(wal_index);
+        }
+
+        let wal = self.make_wal(
             Arc::clone(&shared_wal),
             last_checksum_and_max_frame,
             pager.buffer_pool.clone(),
-        ));
+        );
 
         self.shared_wal = shared_wal;
         pager.set_wal(wal);
@@ -1387,6 +1547,33 @@ impl Database {
         }
     }
 
+    /// Build a WAL instance, wrapping in MultiProcessWal on supported platforms.
+    fn make_wal(
+        &self,
+        shared_wal: Arc<RwLock<WalFileShared>>,
+        last_checksum_and_max_frame: ((u32, u32), u64),
+        buffer_pool: Arc<BufferPool>,
+    ) -> Arc<dyn Wal> {
+        let wal_file = WalFile::new(
+            self.io.clone(),
+            shared_wal,
+            last_checksum_and_max_frame,
+            buffer_pool,
+        );
+
+        #[cfg(all(unix, target_pointer_width = "64"))]
+        if let Some(tshm) = &self.tshm {
+            return Arc::new(storage::multi_process_wal::MultiProcessWal::new(
+                wal_file,
+                Arc::clone(tshm),
+                self.locking_mode,
+                self.wal_index.clone(),
+            ));
+        }
+
+        Arc::new(wal_file)
+    }
+
     fn init_pager(&self, requested_page_size: Option<usize>) -> Result<Pager> {
         let cipher = self.encryption_cipher_mode.get();
         let reserved_bytes = self.maybe_get_reserved_space_bytes()?.or_else(|| {
@@ -1416,12 +1603,11 @@ impl Database {
         }
 
         let pager_wal: Option<Arc<dyn Wal>> = if shared_wal.enabled.load(Ordering::SeqCst) {
-            Some(Arc::new(WalFile::new(
-                self.io.clone(),
+            Some(self.make_wal(
                 self.shared_wal.clone(),
                 shared_wal.last_checksum_and_max_frame(),
                 buffer_pool.clone(),
-            )))
+            ))
         } else {
             None
         };

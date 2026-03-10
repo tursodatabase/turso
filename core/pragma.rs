@@ -59,6 +59,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NeedSchema | PragmaFlags::Result0 | PragmaFlags::SchemaReq,
             &["journal_mode"],
         ),
+        LockingMode => Pragma::new(
+            PragmaFlags::Result0 | PragmaFlags::NoColumns1,
+            &["locking_mode"],
+        ),
         LegacyFileFormat => {
             unreachable!("pragma_for() called with LegacyFileFormat, which is unsupported")
         }
