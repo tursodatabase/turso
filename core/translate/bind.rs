@@ -1,10 +1,10 @@
-use std::sync::Arc;
+use crate::sync::Arc;
 
 use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, JoinConstraint, TableInternalId};
 
 use super::emitter::Resolver;
-use super::plan::{JoinInfo, JoinedTable, ResultSetColumn, TableReferences};
+use super::plan::{JoinInfo, ResultSetColumn, TableReferences};
 use crate::schema::Table;
 use crate::util::normalize_ident;
 use crate::Result;
@@ -22,6 +22,49 @@ pub trait BindTable {
     fn column_count(&self) -> usize;
     fn column_name(&self, idx: usize) -> Option<&str>;
     fn column_is_rowid_alias(&self, idx: usize) -> bool;
+}
+
+impl dyn BindTable {
+    /// Create a column iterator for any `dyn BindTable`.
+    pub fn columns(&self) -> BindColumnIter<'_, Self> {
+        BindColumnIter {
+            table: self,
+            idx: 0,
+        }
+    }
+}
+
+pub struct BindColumnIter<'a, T: BindTable + ?Sized> {
+    table: &'a T,
+    idx: usize,
+}
+
+pub struct BindColumnRef<'a> {
+    pub idx: usize,
+    pub name: &'a str,
+    pub is_rowid_alias: bool,
+}
+
+impl<'a, T: BindTable + ?Sized> Iterator for BindColumnIter<'a, T> {
+    type Item = BindColumnRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.idx >= self.table.column_count() {
+            return None;
+        }
+        let i = self.idx;
+        self.idx += 1;
+        Some(BindColumnRef {
+            idx: i,
+            name: self.table.column_name(i).unwrap(),
+            is_rowid_alias: self.table.column_is_rowid_alias(i),
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.table.column_count() - self.idx;
+        (remaining, Some(remaining))
+    }
 }
 
 impl BindTable for Table {
@@ -111,6 +154,13 @@ pub struct BindScope {
 pub type BindScopeRef = Arc<BindScope>;
 
 impl BindScope {
+    pub fn empty() -> Self {
+        Self {
+            tables: Vec::new(),
+            right_join_swapped: false,
+        }
+    }
+
     /// Find an unqualified column by name across all tables in scope.
     ///
     /// Returns `(table_internal_id, column_index, is_rowid_alias)` or `None`.
@@ -123,11 +173,10 @@ impl BindScope {
         let mut result: Option<(TableInternalId, usize, bool)> = None;
 
         for st in &self.tables {
-            let col_idx = (0..st.table.column_count()).position(|i| {
-                st.table
-                    .column_name(i)
-                    .is_some_and(|n| n.eq_ignore_ascii_case(&normalized))
-            });
+            let col_idx = st
+                .table
+                .columns()
+                .position(|col| col.name.eq_ignore_ascii_case(&normalized));
 
             if let Some(idx) = col_idx {
                 if result.is_some() {
@@ -162,11 +211,10 @@ impl BindScope {
         };
 
         let normalized_col = normalize_ident(col_name);
-        let col_idx = (0..st.table.column_count()).position(|i| {
-            st.table
-                .column_name(i)
-                .is_some_and(|n| n.eq_ignore_ascii_case(&normalized_col))
-        });
+        let col_idx = st
+            .table
+            .columns()
+            .position(|col| col.name.eq_ignore_ascii_case(&normalized_col));
 
         let Some(idx) = col_idx else {
             crate::bail_parse_error!("no such column: {}", col_name);
@@ -238,6 +286,10 @@ pub struct CteEntry {
     pub explicit_columns: Vec<String>,
     /// CTE ID for materialization tracking.
     pub cte_id: Option<usize>,
+    /// Result column names, populated after binding the CTE body.
+    /// If explicit_columns is non-empty, equals explicit_columns.
+    /// Otherwise, extracted from the SELECT result columns.
+    pub resolved_columns: Vec<String>,
 }
 
 // ── BindContext ───────────────────────────────────────────────────────────
@@ -369,8 +421,11 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         &self.aliases
     }
 
-    fn bind_select(&mut self, select: &mut ast::Select) -> Result<()> {
-        Ok(())
+    /// Bind a SELECT statement, resolving all name references in-place.
+    /// Returns the result column names of the SELECT.
+    fn bind_select(&mut self, select: &mut ast::Select) -> Result<Vec<String>> {
+        // TODO: bind CTEs, FROM, SELECT list, WHERE, GROUP BY, HAVING, ORDER BY
+        Ok(vec![])
     }
 
     fn bind_cte(&mut self, with: &mut ast::With) -> Result<()> {
@@ -384,7 +439,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             if self.ctes.contains_key(&cte_name) {
                 crate::bail_parse_error!("duplicate WITH table name: {}", cte.tbl_name.as_str());
             }
-            let explicit_columns = cte
+            let explicit_columns: Vec<String> = cte
                 .columns
                 .iter()
                 .map(|c| normalize_ident(c.col_name.as_str()))
@@ -395,15 +450,209 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     select: cte.select.clone(),
                     explicit_columns,
                     cte_id: None,
+                    resolved_columns: vec![],
                 },
             );
         }
 
-        // Pass 2: bind each CTE body
+        // Pass 2: bind each CTE body and populate resolved columns
         for cte in &mut with.ctes {
-            self.bind_select(&mut cte.select)?;
+            let cte_name = normalize_ident(cte.tbl_name.as_str());
+            let result_columns = self.bind_select(&mut cte.select)?;
+
+            let entry = self.ctes.get_mut(&cte_name).unwrap();
+            if entry.explicit_columns.is_empty() {
+                entry.resolved_columns = result_columns;
+            } else {
+                entry.resolved_columns = entry.explicit_columns.clone();
+            }
         }
         Ok(())
+    }
+
+    fn resolve_select_table(&mut self, table: &mut ast::SelectTable) -> Result<ScopeTable> {
+        match table {
+            // Named table: CTE lookup first, then schema lookup
+            ast::SelectTable::Table(name, alias, _indexed) => {
+                let table_name = normalize_ident(name.name.as_str());
+                // 1. Determine identifier (alias or table name)
+                let identifier = alias
+                    .as_ref()
+                    .map(|a| match a {
+                        ast::As::As(id) | ast::As::Elided(id) => normalize_ident(id.as_str()),
+                    })
+                    .unwrap_or_else(|| table_name.clone());
+
+                // 2. Check self.ctes for a CTE match
+                if let Some(cte) = self.ctes.get(&table_name) {
+                    //    - resolved_columns was populated by bind_cte pass 2
+                    //    - Build Arc<CteTable> as the BindTable
+                    let cte_table = Arc::new(CteTable {
+                        name: table_name,
+                        columns: cte.resolved_columns.clone(),
+                    });
+                    // 4. Generate internal_id via self.id_gen.next_id()
+                    return Ok(ScopeTable {
+                        identifier,
+                        internal_id: self.id_gen.next_id(),
+                        table: cte_table,
+                        join_info: None,
+                    });
+                }
+
+                // 3. Otherwise, schema lookup via resolver
+                //    - Build Arc<Table> as the BindTable (Table already implements BindTable)
+                let schema_table =
+                    self.resolver
+                        .schema()
+                        .get_table(&table_name)
+                        .ok_or_else(|| {
+                            crate::LimboError::ParseError(format!("no such table: {}", table_name))
+                        })?;
+
+                // 4. Generate internal_id via self.id_gen.next_id()
+                Ok(ScopeTable {
+                    identifier,
+                    internal_id: self.id_gen.next_id(),
+                    table: schema_table,
+                    join_info: None,
+                })
+            }
+            // Inline subquery in FROM: SELECT ... FROM (SELECT ...)
+            ast::SelectTable::Select(subselect, alias) => {
+                // 1. Alias is required by SQLite for FROM subqueries
+                let identifier = alias
+                    .as_ref()
+                    .map(|a| match a {
+                        ast::As::As(id) | ast::As::Elided(id) => normalize_ident(id.as_str()),
+                    })
+                    .unwrap_or_else(|| String::from("subquery"));
+
+                // FROM subqueries don't correlate with the query being built.
+                // The outer_scopes stack already contains any enclosing query scopes.
+                let result_columns = self.bind_select(subselect)?;
+
+                // 5-6. Build Arc<CteTable> with the result column names
+                let subquery_table = Arc::new(CteTable {
+                    name: identifier.clone(),
+                    columns: result_columns,
+                });
+
+                // 7. Generate internal_id
+                Ok(ScopeTable {
+                    identifier,
+                    internal_id: self.id_gen.next_id(),
+                    table: subquery_table,
+                    join_info: None,
+                })
+            }
+            // Virtual table function call: SELECT ... FROM table_func(args)
+            ast::SelectTable::TableCall(name, args, alias) => {
+                let table_name = normalize_ident(name.name.as_str());
+                // 1. Look up the virtual table via resolver
+                let schema_table =
+                    self.resolver
+                        .schema()
+                        .get_table(&table_name)
+                        .ok_or_else(|| {
+                            crate::LimboError::ParseError(format!("no such table: {}", table_name))
+                        })?;
+
+                let identifier = alias
+                    .as_ref()
+                    .map(|a| match a {
+                        ast::As::As(id) | ast::As::Elided(id) => normalize_ident(id.as_str()),
+                    })
+                    .unwrap_or_else(|| table_name.clone());
+
+                // 2. Bind argument expressions (typically literals, no FROM scope yet)
+                let empty_scope = BindScope::empty();
+                for arg in args.iter_mut() {
+                    self.bind_expr(arg, &empty_scope)?;
+                }
+
+                // 3. Build ScopeTable from the virtual table's columns
+                Ok(ScopeTable {
+                    identifier,
+                    internal_id: self.id_gen.next_id(),
+                    table: schema_table,
+                    join_info: None,
+                })
+            }
+            // Parenthesized FROM subclause: SELECT ... FROM (t1 JOIN t2 ON ...)
+            ast::SelectTable::Sub(from_clause, alias) => {
+                // 1. Recursively bind_from(from_clause)
+                let inner_scope = self.bind_from(from_clause)?;
+
+                // 2-3. Collect all column names from inner scope tables
+                let all_columns: Vec<String> = inner_scope
+                    .tables
+                    .iter()
+                    .flat_map(|table| table.table.columns())
+                    .map(|col| col.name.to_string())
+                    .collect();
+
+                let identifier = alias
+                    .as_ref()
+                    .map(|a| match a {
+                        ast::As::As(id) | ast::As::Elided(id) => normalize_ident(id.as_str()),
+                    })
+                    .unwrap_or_else(|| String::from("subquery"));
+
+                // If alias is present, wrap all columns under that alias
+                // If no alias, flatten tables into parent scope
+                let sub_table = Arc::new(CteTable {
+                    name: identifier.clone(),
+                    columns: all_columns,
+                });
+
+                Ok(ScopeTable {
+                    identifier,
+                    internal_id: self.id_gen.next_id(),
+                    table: sub_table,
+                    join_info: None,
+                })
+            }
+        }
+    }
+
+    /// Bind an expression, resolving column references against the given scope.
+    fn bind_expr(&mut self, _expr: &mut ast::Expr, _scope: &BindScope) -> Result<()> {
+        // TODO: walk the expression tree and resolve Expr::Id, Expr::Qualified, etc.
+        Ok(())
+    }
+
+    fn bind_from(&mut self, from: &mut ast::FromClause) -> Result<BindScope> {
+        let mut tables: Vec<ScopeTable> = Vec::new();
+
+        tables.push(self.resolve_select_table(&mut from.select)?);
+        for join in &mut from.joins {
+            tables.push(self.resolve_select_table(&mut join.table)?);
+        }
+
+        let scope = BindScope {
+            tables,
+            right_join_swapped: false,
+        };
+
+        // Bind ON expressions against the complete scope
+        for join in &mut from.joins {
+            match &mut join.constraint {
+                Some(JoinConstraint::On(expr)) => {
+                    self.bind_expr(expr, &scope)?;
+                }
+                Some(JoinConstraint::Using(columns)) => {
+                    for col_name in columns {
+                        if scope.find_column_unqualified(col_name.as_str())?.is_none() {
+                            crate::bail_parse_error!("cannot join using column {} - column not present in both sides of the join", col_name);
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+
+        Ok(scope)
     }
 }
 
