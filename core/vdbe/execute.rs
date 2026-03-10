@@ -7633,8 +7633,19 @@ pub fn op_insert(
                 // has the exact same record payload. This check is isolated in its own
                 // sub-state so that cursor.rowid()/record() IO yields never interleave
                 // with a partially-completed cursor.insert().
+                //
+                // In MVCC mode this check must be skipped: after Delete, cursor.record()
+                // cannot reliably return the pre-delete payload (btree-resident rows
+                // still appear physically intact, MVCC-store rows become invisible).
+                // The noop check is fundamentally incompatible with the MVCC
+                // Delete+Insert update pattern.
                 state.op_insert_state.is_noop_update = false;
-                if flag.has(InsertFlags::SKIP_LAST_ROWID)
+                let is_mvcc = {
+                    let cursor_ref = get_cursor!(state, *cursor_id);
+                    cursor_ref.as_btree_mut().is_mvcc()
+                };
+                if !is_mvcc
+                    && flag.has(InsertFlags::SKIP_LAST_ROWID)
                     && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE)
                 {
                     let key = match &state.registers[*key_reg].get_value() {
