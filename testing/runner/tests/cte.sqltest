@@ -350,7 +350,7 @@ expect {
 # =============================================================================
 
 # Direct CTE column reference in SET clause is invalid SQL (issue #5224).
-# SQLite rejects with "no such column: c.v", we reject with "no such table: c".
+# SQLite rejects with "no such column: c.v", we match with "no such column: c.v".
 @cross-check-integrity
 test cte-update-direct-ref-keyed {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b);
@@ -1021,6 +1021,17 @@ test cte-duplicate-name {
 }
 expect error {
     duplicate WITH table name
+}
+
+@cross-check-integrity
+test cte-unreferenced-qualified-column-orderby-exists {
+    CREATE TABLE t(a);
+    WITH cte AS (SELECT 1 y)
+    SELECT cte.y FROM t
+    ORDER BY EXISTS (SELECT 1);
+}
+expect error {
+    no such column: cte\.y
 }
 
 @cross-check-integrity

@@ -5424,6 +5424,25 @@ pub fn bind_and_rewrite_expr<'a>(
                     let matching_tbl = referenced_tables
                         .find_table_and_internal_id_by_identifier(&normalized_table_name);
                     if matching_tbl.is_none() {
+                        // CTEs preplanned for subquery FROM visibility are kept as
+                        // definition-only outer refs. They are not valid column sources
+                        // unless explicitly referenced in this scope's FROM clause.
+                        // Restrict this branch to actual CTE definition refs so other
+                        // definition-only uses (if added later) still report "no such table".
+                        if referenced_tables
+                            .find_outer_query_ref_by_identifier(&normalized_table_name)
+                            .is_some_and(|outer_ref| {
+                                outer_ref.cte_definition_only
+                                    && (outer_ref.cte_id.is_some()
+                                        || outer_ref.cte_select.is_some())
+                            })
+                        {
+                            crate::bail_parse_error!(
+                                "no such column: {}.{}",
+                                tbl.as_str(),
+                                id.as_str()
+                            );
+                        }
                         crate::bail_parse_error!("no such table: {}", normalized_table_name);
                     }
                     let (tbl_id, tbl) = matching_tbl.unwrap();
