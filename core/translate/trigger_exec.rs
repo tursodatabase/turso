@@ -920,6 +920,19 @@ fn rewrite_trigger_expr_for_when_clause(
 
     walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
         match e {
+            // Bare column references are not valid in trigger WHEN clauses.
+            // Per SQLite docs, columns must be qualified with NEW or OLD.
+            Expr::Id(name) => {
+                let ident = normalize_ident(name.as_str());
+                if table.get_column(&ident).is_some()
+                    || crate::translate::planner::ROWID_STRS
+                        .iter()
+                        .any(|s| s.eq_ignore_ascii_case(&ident))
+                {
+                    crate::bail_parse_error!("no such column: {}", ident);
+                }
+                Ok(WalkControl::Continue)
+            }
             Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
                 let ns = normalize_ident(ns.as_str());
                 let col = normalize_ident(col.as_str());
