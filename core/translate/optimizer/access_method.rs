@@ -22,6 +22,7 @@ use crate::vdbe::hash_table::DEFAULT_MEM_BUDGET;
 use crate::{
     schema::{FromClauseSubquery, Index, IndexColumn, Table},
     translate::plan::{IndexMethodQuery, IterationDirection, JoinOrderMember, JoinedTable},
+    turso_assert,
     vtab::VirtualTable,
     LimboError, Result,
 };
@@ -30,7 +31,7 @@ use super::{
     constraints::{
         usable_constraints_for_join_order, usable_constraints_for_lhs_mask, TableConstraints,
     },
-    cost::{estimate_cost_for_scan_or_seek, estimate_rows_per_seek, Cost, IndexInfo},
+    cost::{estimate_cost_for_scan_or_seek, Cost, IndexInfo},
     multi_index::{
         consider_multi_index_intersection, consider_multi_index_union, MultiIndexBranchParams,
     },
@@ -155,7 +156,6 @@ pub(super) struct ChosenBtreeCandidate {
     pub(super) index: Option<Arc<Index>>,
     pub(super) constraint_refs: Vec<RangeConstraintRef>,
     pub(super) cost: Cost,
-    pub(super) estimated_rows: f64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -185,7 +185,6 @@ pub(super) fn choose_best_btree_candidate(
         index: None,
         constraint_refs: vec![],
         cost: best_cost,
-        estimated_rows: *base_row_count,
     };
     let mut best_prereq_count = usize::MAX;
     let table_no = rhs_table.internal_id;
@@ -319,12 +318,6 @@ pub(super) fn choose_best_btree_candidate(
                 index: candidate.index.clone(),
                 constraint_refs: usable_constraint_refs.clone(),
                 cost,
-                estimated_rows: estimate_rows_per_seek(
-                    index_info,
-                    &rhs_constraints.constraints,
-                    &usable_constraint_refs,
-                    base_row_count,
-                ),
             };
         }
     }
@@ -341,9 +334,10 @@ fn estimate_btree_rows_per_outer_row(
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
 ) -> f64 {
-    if constraint_refs.is_empty() {
-        return rhs_table.btree().map(|_| 0.0).unwrap_or(0.0);
-    }
+    turso_assert!(
+        !constraint_refs.is_empty(),
+        "btree row-estimate helper expects a lookup, not a full scan"
+    );
 
     if index.is_none() {
         return params.fanout_index_seek_unique;

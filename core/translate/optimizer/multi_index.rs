@@ -57,7 +57,6 @@ struct AndBranch {
     constraint: Constraint,
     index: Option<Arc<Index>>,
     constraint_refs: Vec<RangeConstraintRef>,
-    estimated_rows: f64,
 }
 
 /// Internal branch representation while evaluating a candidate multi-index plan.
@@ -65,7 +64,6 @@ struct MultiIdxBranch {
     index: Option<Arc<Index>>,
     constraints: Vec<Constraint>,
     constraint_refs: Vec<RangeConstraintRef>,
-    estimated_rows: f64,
     residual_exprs: Vec<ast::Expr>,
     requires_table_cursor: bool,
 }
@@ -340,7 +338,7 @@ fn evaluate_multi_index_branches(
         params_for_branch.requires_table_cursor = branch.requires_table_cursor;
 
         branch_costs.push(cost);
-        branch_rows.push(branch.estimated_rows);
+        branch_rows.push(params_for_branch.estimated_rows);
         branch_params.push(params_for_branch);
     }
 
@@ -426,7 +424,6 @@ fn analyze_and_terms_for_multi_index(
             where_term_idx,
             table_id,
             table_reference,
-            table_name,
             indexes,
             rowid_alias_column,
             available_indexes,
@@ -448,7 +445,6 @@ fn analyze_and_terms_for_multi_index(
             constraint: analyzed.constraint,
             index: analyzed.best_index,
             constraint_refs: analyzed.constraint_refs,
-            estimated_rows: analyzed.estimated_rows,
         });
     }
 
@@ -600,7 +596,6 @@ pub fn consider_multi_index_union(
                     index: chosen.index,
                     constraints: table_constraints.constraints,
                     constraint_refs: chosen.constraint_refs,
-                    estimated_rows: chosen.estimated_rows,
                     residual_exprs,
                     requires_table_cursor: residual_mask.contains_table(rhs_idx),
                 })
@@ -677,7 +672,6 @@ pub fn consider_multi_index_intersection(
             index: b.index.clone(),
             constraints: vec![b.constraint.clone()],
             constraint_refs: b.constraint_refs.clone(),
-            estimated_rows: b.estimated_rows,
             residual_exprs: vec![],
             requires_table_cursor: false,
         })

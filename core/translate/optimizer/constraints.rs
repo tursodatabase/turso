@@ -1301,6 +1301,15 @@ impl RangeConstraintRef {
 /// Returns a slice of the references to the constraints that are usable.
 /// A constraint is considered usable for a given table if all of the other tables referenced by the constraint
 /// are on the left side in the join order relative to the table.
+///
+/// This enforces the normal B-tree prefix rules:
+/// - usable index columns must form a contiguous prefix starting at column 0
+/// - once a prefix column has no usable constraint, later columns cannot be used
+/// - once a prefix column uses a range constraint, later columns cannot be used
+///
+/// Multiple constraints on the same index column are merged into a single
+/// [RangeConstraintRef]. Equality wins over range constraints; otherwise we keep
+/// at most one lower bound and one upper bound for that column.
 pub fn usable_constraints_for_lhs_mask(
     constraints: &[Constraint],
     refs: &[ConstraintRef],
@@ -1315,18 +1324,25 @@ pub fn usable_constraints_for_lhs_mask(
         let constraint = &constraints[cref.constraint_vec_pos];
         let other_side_refers_to_self = constraint.lhs_mask.contains_table(table_idx);
         if other_side_refers_to_self {
+            // Self-referential constraints cannot seed a lookup, but if they are
+            // on a later index column they also terminate the usable prefix.
             if cref.index_col_pos != current_required_column_pos {
                 break;
             }
             continue;
         }
         if !lhs_mask.contains_all(&constraint.lhs_mask) {
+            // Join-dependent constraints are only usable when every referenced
+            // outer table is already on the left side of the join order. As
+            // above, a missing earlier prefix column terminates the prefix.
             if cref.index_col_pos != current_required_column_pos {
                 break;
             }
             continue;
         }
         if Some(cref.index_col_pos) == usable.last().map(|x| x.index_col_pos) {
+            // Merge multiple usable constraints for the same index column into a
+            // single equality-or-range group.
             assert_eq!(cref.sort_order, usable.last().unwrap().sort_order);
             assert_eq!(cref.index_col_pos, usable.last().unwrap().index_col_pos);
             assert_eq!(
@@ -1334,6 +1350,8 @@ pub fn usable_constraints_for_lhs_mask(
                 usable.last().unwrap().table_col_pos
             );
             if usable.last().unwrap().eq.is_some() {
+                // An equality already fixes this column exactly, so extra
+                // constraints on the same column do not change the seek shape.
                 continue;
             }
             match constraints[cref.constraint_vec_pos]
@@ -1351,9 +1369,13 @@ pub fn usable_constraints_for_lhs_mask(
             continue;
         }
         if cref.index_col_pos != current_required_column_pos {
+            // We found a gap in the usable prefix, so later index columns are
+            // not usable for the lookup.
             break;
         }
         if usable.last().is_some_and(|x| x.eq.is_none()) {
+            // The previous prefix column is already a range, so no later column
+            // can participate in the seek key.
             break;
         }
         let operator = constraints[cref.constraint_vec_pos].operator;
@@ -1363,6 +1385,8 @@ pub fn usable_constraints_for_lhs_mask(
                 .last()
                 .is_some_and(|x| x.table_col_pos == table_col_pos)
         {
+            // Duplicate equalities on the same column do not expand the usable
+            // prefix or change the seek shape.
             continue;
         }
         let constraint_group = match operator.as_ast_operator() {
@@ -1509,8 +1533,6 @@ pub struct AnalyzedTerm {
     pub best_index: Option<Arc<Index>>,
     /// Constraint references for this term.
     pub constraint_refs: Vec<RangeConstraintRef>,
-    /// Estimated number of rows from this term.
-    pub estimated_rows: f64,
 }
 
 /// Analyzes a single binary expression to determine if it can use an index.
@@ -1524,7 +1546,6 @@ pub(crate) fn analyze_binary_term_for_index(
     where_term_idx: usize,
     table_id: TableInternalId,
     table_reference: &JoinedTable,
-    table_name: &str,
     indexes: Option<&VecDeque<Arc<Index>>>,
     rowid_alias_column: Option<usize>,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
@@ -1653,17 +1674,10 @@ pub(crate) fn analyze_binary_term_for_index(
         is_rowid,
     };
 
-    let row_count = schema
-        .analyze_stats
-        .table_stats(table_name)
-        .and_then(|s| s.row_count)
-        .unwrap_or(params.rows_per_table_fallback as u64) as f64;
-
     Some(AnalyzedTerm {
         constraint,
         best_index,
         constraint_refs,
-        estimated_rows: row_count * selectivity,
     })
 }
 
