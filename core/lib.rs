@@ -362,6 +362,12 @@ pub struct Database {
     // Shared structures of a Database are the parts that are common to multiple threads that might
     // create DB connections.
     _shared_page_cache: Arc<RwLock<PageCache>>,
+
+    /// Optional per-database MVCC durable storage override.
+    ///
+    /// When set, MVCC will use this implementation for logical-log durability
+    /// (commit, sync, checkpoint thresholds, etc.) instead of the built-in storage.
+    durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
     shared_wal: Arc<RwLock<WalFileShared>>,
     init_lock: Arc<Mutex<()>>,
     open_flags: OpenFlags,
@@ -496,6 +502,8 @@ impl Database {
             encryption_cipher_mode: AtomicCipherMode::new(
                 encryption_cipher_mode.unwrap_or(CipherMode::None),
             ),
+
+            durable_storage: None,
         };
 
         db.register_global_builtin_extensions()
@@ -552,14 +560,41 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
     ) -> Result<Arc<Database>> {
+        Self::open_file_with_flags_and_durable_storage(io, path, flags, opts, encryption_opts, None)
+    }
+
+    #[cfg(feature = "fs")]
+    pub fn open_file_with_flags_and_durable_storage(
+        io: Arc<dyn IO>,
+        path: &str,
+        flags: OpenFlags,
+        opts: DatabaseOpts,
+        encryption_opts: Option<EncryptionOpts>,
+        durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
+    ) -> Result<Arc<Database>> {
         // Check the registry before opening the file to avoid acquiring a file
         // lock that would conflict with an already-open Database in this process.
         if let Some(db) = Self::lookup_in_registry(path, &encryption_opts)? {
+            if durable_storage.is_some() && db.durable_storage.is_none() {
+                return Err(LimboError::InvalidArgument(
+                    "database already open without custom durable storage; \
+                     close the existing instance before reopening with a custom DurableStorage"
+                        .to_string(),
+                ));
+            }
             return Ok(db);
         }
         let file = io.open_file(path, flags, true)?;
         let db_file = Arc::new(DatabaseFile::new(file));
-        Self::open_with_flags(io, path, db_file, flags, opts, encryption_opts)
+        Self::open_with_flags(
+            io,
+            path,
+            db_file,
+            flags,
+            opts,
+            encryption_opts,
+            durable_storage,
+        )
     }
 
     pub fn open(
@@ -574,9 +609,11 @@ impl Database {
             OpenFlags::default(),
             DatabaseOpts::new(),
             None,
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn open_with_flags(
         io: Arc<dyn IO>,
         path: &str,
@@ -584,6 +621,7 @@ impl Database {
         flags: OpenFlags,
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
+        durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
     ) -> Result<Arc<Database>> {
         let mut state = OpenDbAsyncState::new();
         loop {
@@ -595,6 +633,7 @@ impl Database {
                 flags,
                 opts,
                 encryption_opts.clone(),
+                durable_storage.clone(),
             )? {
                 IOResult::Done(db) => return Ok(db),
                 IOResult::IO(io_completion) => {
@@ -611,6 +650,7 @@ impl Database {
     /// Uses the database registry to ensure single Database instance per file within a process.
     /// Caller must drive the IO loop and pass state between calls.
     /// The registry lock is held for the entire duration to prevent concurrent opens.
+    #[allow(clippy::too_many_arguments)]
     pub fn open_with_flags_async(
         state: &mut OpenDbAsyncState,
         io: Arc<dyn IO>,
@@ -619,6 +659,7 @@ impl Database {
         flags: OpenFlags,
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
+        durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
     ) -> Result<IOResult<Arc<Database>>> {
         let result = Self::open_with_flags_async_internal(
             state,
@@ -628,6 +669,7 @@ impl Database {
             flags,
             opts,
             encryption_opts,
+            durable_storage,
         );
         if result.is_err() {
             // registry_guard is set by the open_with_flags_async_internal - so we release it in case of error
@@ -636,6 +678,7 @@ impl Database {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open_with_flags_async_internal(
         state: &mut OpenDbAsyncState,
         io: Arc<dyn IO>,
@@ -644,6 +687,7 @@ impl Database {
         flags: OpenFlags,
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
+        durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
     ) -> Result<IOResult<Arc<Database>>> {
         // turso-sync-engine creates 2 databases with different names in the same IO if MemoryIO is used
         // in this case we need to bypass registry (as this is MemoryIO DB) but also preserve original distinction in names (e.g. :memory:-draft and :memory:-synced)
@@ -690,6 +734,7 @@ impl Database {
             flags,
             opts,
             encryption_opts,
+            durable_storage,
         )?;
 
         if let IOResult::Done(ref db) = result {
@@ -726,6 +771,7 @@ impl Database {
                 flags,
                 opts,
                 encryption_opts.clone(),
+                None,
             )? {
                 IOResult::Done(db) => return Ok(db),
                 IOResult::IO(io_completion) => {
@@ -748,6 +794,7 @@ impl Database {
         flags: OpenFlags,
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
+        durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
     ) -> Result<IOResult<Arc<Database>>> {
         let result = Self::open_with_flags_bypass_registry_async_internal(
             state,
@@ -758,6 +805,7 @@ impl Database {
             flags,
             opts,
             encryption_opts,
+            durable_storage,
         );
         if result.is_err() {
             // schema_guard is set by the open_with_flags_bypass_registry_async_internal - so we release it in case of error
@@ -777,6 +825,7 @@ impl Database {
         flags: OpenFlags,
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
+        durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
     ) -> Result<IOResult<Arc<Database>>> {
         loop {
             tracing::debug!(
@@ -806,6 +855,7 @@ impl Database {
                         db_file.clone(),
                         encryption_opts.clone(),
                     )?;
+                    db.durable_storage.clone_from(&durable_storage);
 
                     let pager = db.header_validation(encryption_key.as_ref())?;
 
@@ -1205,8 +1255,12 @@ impl Database {
         pager.set_schema_cookie(None);
 
         if open_mv_store {
-            let mv_store =
-                journal_mode::open_mv_store(self.io.clone(), &self.path, self.open_flags)?;
+            let mv_store = journal_mode::open_mv_store(
+                self.io.clone(),
+                &self.path,
+                self.open_flags,
+                self.durable_storage.clone(),
+            )?;
             self.mv_store.store(Some(mv_store));
         }
 

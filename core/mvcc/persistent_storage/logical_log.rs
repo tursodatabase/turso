@@ -143,7 +143,7 @@ const TX_MIN_FRAME_SIZE: usize = TX_HEADER_SIZE + TX_TRAILER_SIZE; // 32
 
 /// Log's Header, the first 56 bytes of any logical log file.
 #[derive(Clone, Debug)]
-pub(crate) struct LogHeader {
+pub struct LogHeader {
     version: u8,
     flags: u8,
     hdr_len: u16,

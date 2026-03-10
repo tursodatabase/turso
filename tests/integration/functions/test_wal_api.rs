@@ -871,6 +871,7 @@ fn test_db_share_same_file() {
         turso_core::OpenFlags::Create,
         turso_core::DatabaseOpts::new(),
         None,
+        None,
     )
     .unwrap();
     let conn1 = db1.connect().unwrap();

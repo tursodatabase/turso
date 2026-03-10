@@ -66,15 +66,22 @@ pub fn open_mv_store(
     io: Arc<dyn IO>,
     db_path: impl AsRef<std::path::Path>,
     flags: OpenFlags,
+    durable_storage: Option<Arc<dyn mvcc::persistent_storage::DurableStorage>>,
 ) -> Result<Arc<MvStore>> {
-    let db_path = db_path.as_ref();
-    let log_path = db_path.with_extension("db-log");
-    let string_path = log_path
-        .as_os_str()
-        .to_str()
-        .expect("path should be valid string");
-    let file = io.open_file(string_path, flags, false)?;
-    let storage = mvcc::persistent_storage::Storage::new(file, io);
+    let storage: Arc<dyn mvcc::persistent_storage::DurableStorage> =
+        if let Some(storage) = durable_storage {
+            storage
+        } else {
+            let db_path = db_path.as_ref();
+            let log_path = db_path.with_extension("db-log");
+            let string_path = log_path
+                .as_os_str()
+                .to_str()
+                .expect("path should be valid string");
+            let file = io.open_file(string_path, flags, false)?;
+            Arc::new(mvcc::persistent_storage::Storage::new(file, io))
+        };
+
     let mv_store = MvStore::new(mvcc::MvccClock::new(), storage);
     let mv_store = Arc::new(mv_store);
     Ok(mv_store)
