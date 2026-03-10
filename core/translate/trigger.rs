@@ -270,26 +270,14 @@ impl CrossDbCheckCtx<'_> {
     }
 
     /// Check an expression tree for cross-database references.
-    /// Handles DoublyQualified expressions and descends into subqueries
-    /// that walk_expr skips.
+    /// Descends into subqueries that walk_expr skips.
+    /// Note: DoublyQualified expressions (e.g. aux.table.column) are NOT checked
+    /// here — they are column references, not table references. SQLite allows them
+    /// at CREATE TRIGGER time and only rejects them at runtime as "no such column".
     fn check_expr(&self, expr: &ast::Expr) -> Result<()> {
         use crate::translate::expr::WalkControl;
         crate::translate::expr::walk_expr(expr, &mut |e| -> Result<WalkControl> {
             match e {
-                ast::Expr::DoublyQualified(db, ns, _) => {
-                    let ns_normalized = normalize_ident(ns.as_str());
-                    // NEW and OLD are pseudo-tables, not real database references
-                    if !ns_normalized.eq_ignore_ascii_case("new")
-                        && !ns_normalized.eq_ignore_ascii_case("old")
-                    {
-                        let qn = QualifiedName {
-                            db_name: Some(ast::Name::exact(normalize_ident(db.as_str()))),
-                            name: ast::Name::exact(ns_normalized),
-                            alias: None,
-                        };
-                        self.check_qname(&qn)?;
-                    }
-                }
                 // walk_expr doesn't descend into subqueries, so handle them here
                 ast::Expr::Exists(select) | ast::Expr::Subquery(select) => {
                     self.check_select(select)?;
