@@ -25,7 +25,7 @@ use crate::translate::emitter::Resolver;
 use crate::translate::plan::{DeletePlan, DmlSafetyReason, UpdatePlan};
 use crate::translate::trigger_exec::has_relevant_triggers_type_only;
 use crate::vdbe::builder::ProgramBuilder;
-use crate::{HashSet, Result};
+use crate::{sync::Arc, Connection, HashSet, Result};
 use turso_parser::ast::TriggerEvent;
 
 /// Check whether a table has any FK relationships (child or parent side).
@@ -87,8 +87,7 @@ pub(crate) fn set_insert_stmt_journal_flags(program: &mut ProgramBuilder, ctx: &
     {
         program.set_multi_write(false);
     }
-
-    let may_abort = compute_may_abort(
+    program.set_may_abort(compute_may_abort(
         ctx.has_triggers,
         ctx.has_fks,
         ctx.has_abort_resolution,
@@ -96,10 +95,7 @@ pub(crate) fn set_insert_stmt_journal_flags(program: &mut ProgramBuilder, ctx: &
         ctx.notnull_col_exists,
         ctx.has_check,
         ctx.has_unique,
-    );
-    if !may_abort {
-        program.set_may_abort(false);
-    }
+    ));
 }
 
 /// Set multi_write / may_abort for UPDATE statements.
@@ -168,7 +164,7 @@ pub(crate) fn set_update_stmt_journal_flags(
     let has_unique =
         !btree_table.unique_sets.is_empty() || plan.indexes_to_update.iter().any(|idx| idx.unique);
 
-    let may_abort = compute_may_abort(
+    program.set_may_abort(compute_may_abort(
         has_triggers,
         has_fks,
         has_abort_resolution,
@@ -176,10 +172,7 @@ pub(crate) fn set_update_stmt_journal_flags(
         has_notnull_cols,
         has_check,
         has_unique,
-    );
-    if !may_abort {
-        program.set_may_abort(false);
-    }
+    ));
     Ok(())
 }
 
@@ -188,7 +181,7 @@ pub(crate) fn set_delete_stmt_journal_flags(
     program: &mut ProgramBuilder,
     plan: &DeletePlan,
     resolver: &Resolver,
-    connection: &crate::sync::Arc<crate::Connection>,
+    connection: &Arc<Connection>,
     database_id: usize,
 ) -> Result<()> {
     let Some(target_table) = plan.table_references.joined_tables().first() else {
