@@ -405,6 +405,14 @@ def _test_series(limbo: TestTursoShell):
         lambda res: res == "10\n8\n6\n4\n2",
     )
     limbo.run_test_fn(
+        "SELECT * FROM generate_series(-1, 2);",
+        lambda res: res == "-1\n0\n1\n2"
+    )
+    limbo.run_test_fn(
+        "SELECT * FROM generate_series(-3, -1);",
+        lambda res: res == "-3\n-2\n-1"
+    )
+    limbo.run_test_fn(
         "SELECT * FROM generate_series(b.start, b.stop) b;",
         lambda res: "Invalid Argument" in res or 'first argument to "generate_series()" missing or unusable' in res,
         "self-reference in generate_series arguments",
