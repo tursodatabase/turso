@@ -2434,6 +2434,9 @@ impl Pager {
             panic!("DB should not be initialized and should not do any IO");
         };
         self.page_size.store(size.get(), Ordering::SeqCst);
+        // Clear dirty pages since this is pre-initialization setup, not a real write transaction.
+        // with_header_mut marks page 1 dirty as a side effect, but no transaction is active.
+        self.dirty_pages.write().clear();
         Ok(())
     }
 
