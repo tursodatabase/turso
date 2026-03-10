@@ -174,18 +174,20 @@ expect error {
     trigger trg_join_cross cannot reference objects in database aux
 }
 
-# Cross-db reference via DoublyQualified expression (aux.table.column)
-test trigger-cross-db-doubly-qualified-expr {
+# DoublyQualified expressions (aux.table.column) are column references, not table
+# references. SQLite allows CREATE TRIGGER but rejects at runtime as "no such column".
+test trigger-doubly-qualified-expr-runtime-error {
     ATTACH ':memory:' AS aux;
     CREATE TABLE t_dq (id INTEGER PRIMARY KEY, val INT);
     CREATE TABLE aux.ref_t (id INTEGER PRIMARY KEY, v INT);
-    CREATE TRIGGER trg_dq_cross AFTER INSERT ON t_dq
+    CREATE TRIGGER trg_dq AFTER INSERT ON t_dq
     BEGIN
         INSERT INTO t_dq VALUES (NEW.id + 100, aux.ref_t.v);
     END;
+    INSERT INTO t_dq VALUES (1, 42);
 }
 expect error {
-    trigger trg_dq_cross cannot reference objects in database aux
+    no such column
 }
 
 # Cross-db in IN (SELECT) expression inside trigger
@@ -202,19 +204,20 @@ expect error {
     trigger trg_in_cross cannot reference objects in database aux
 }
 
-# Cross-db reference in WHEN clause via doubly-qualified expression
-test trigger-cross-db-when-doubly-qualified {
+# DoublyQualified in WHEN clause — SQLite allows CREATE, rejects at runtime.
+test trigger-doubly-qualified-when-runtime-error {
     ATTACH ':memory:' AS aux;
     CREATE TABLE t_wdq (id INTEGER PRIMARY KEY, val INT);
     CREATE TABLE aux.flag (id INTEGER PRIMARY KEY, on_off INT);
-    CREATE TRIGGER trg_wdq_cross AFTER INSERT ON t_wdq
+    CREATE TRIGGER trg_wdq AFTER INSERT ON t_wdq
     WHEN aux.flag.on_off = 1
     BEGIN
         SELECT 1;
     END;
+    INSERT INTO t_wdq VALUES (1, 42);
 }
 expect error {
-    trigger trg_wdq_cross cannot reference objects in database aux
+    no such column
 }
 
 # Second attached db: trigger on aux1 cannot reference aux2
