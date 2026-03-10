@@ -755,3 +755,1166 @@ expect {
     1|{banana}
     3|{cherry}
 }
+
+test negative-zero-float-display {
+    CREATE TABLE nz1 (id INTEGER PRIMARY KEY, vals real[]) STRICT;
+    INSERT INTO nz1 VALUES (1, '{-0.0}');
+    SELECT vals FROM nz1;
+}
+expect {
+    {0.0}
+}
+
+test negative-zero-integer-display {
+    CREATE TABLE nz2 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO nz2 VALUES (1, '{-0}');
+    SELECT vals FROM nz2;
+}
+expect {
+    {0}
+}
+
+test negative-zero-float-equality {
+    CREATE TABLE nz3 (id INTEGER PRIMARY KEY, vals real[]) STRICT;
+    INSERT INTO nz3 VALUES (1, '{0.0}');
+    INSERT INTO nz3 VALUES (2, '{-0.0}');
+    SELECT COUNT(DISTINCT vals) FROM nz3;
+}
+expect {
+    2
+}
+
+test negative-zero-in-mixed-array {
+    CREATE TABLE nz4 (id INTEGER PRIMARY KEY, vals real[]) STRICT;
+    INSERT INTO nz4 VALUES (1, '{1.0, -0.0, 2.0}');
+    SELECT vals FROM nz4;
+}
+expect {
+    {1.0,0.0,2.0}
+}
+
+test negative-zero-round-trip {
+    CREATE TABLE nz5 (id INTEGER PRIMARY KEY, vals real[]) STRICT;
+    INSERT INTO nz5 VALUES (1, '{-0.0, 0.0}');
+    INSERT INTO nz5 SELECT id + 1, vals FROM nz5;
+    SELECT id, vals FROM nz5 ORDER BY id;
+}
+expect {
+    1|{0.0,0.0}
+    2|{0.0,0.0}
+}
+
+test negative-zero-remove {
+    CREATE TABLE nz6 (id INTEGER PRIMARY KEY, vals real[]) STRICT;
+    INSERT INTO nz6 VALUES (1, '{-0.0, 1.0, 0.0}');
+    SELECT array_to_string(array_remove(vals, 0.0), ',') FROM nz6;
+}
+expect {
+    1.0
+}
+
+test negative-zero-contains {
+    CREATE TABLE nz7 (id INTEGER PRIMARY KEY, vals real[]) STRICT;
+    INSERT INTO nz7 VALUES (1, '{-0.0, 1.0}');
+    SELECT array_contains(vals, 0.0) FROM nz7;
+}
+expect {
+    1
+}
+
+test negative-zero-position {
+    CREATE TABLE nz8 (id INTEGER PRIMARY KEY, vals real[]) STRICT;
+    INSERT INTO nz8 VALUES (1, '{1.0, -0.0, 2.0}');
+    SELECT array_position(vals, 0.0) FROM nz8;
+}
+expect {
+    2
+}
+
+test bare-minus-rejected {
+    CREATE TABLE bm1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO bm1 VALUES (1, '{-}');
+}
+expect error {
+    cannot store TEXT value in INTEGER
+}
+
+test leading-plus-accepted {
+    CREATE TABLE lp1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO lp1 VALUES (1, '{+1}');
+    SELECT vals FROM lp1;
+}
+expect {
+    {1}
+}
+
+test unclosed-bracket-rejected {
+    CREATE TABLE ub1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO ub1 VALUES (1, char(123) || '1,2,3');
+}
+expect error {
+    cannot store non-array value in INTEGER column ub1.vals
+}
+
+test incomplete-scientific-rejected {
+    CREATE TABLE is1 (id INTEGER PRIMARY KEY, vals real[]) STRICT;
+    INSERT INTO is1 VALUES (1, '{1e}');
+}
+expect error {
+    cannot store TEXT value in REAL
+}
+
+test incomplete-scientific-plus-rejected {
+    CREATE TABLE is2 (id INTEGER PRIMARY KEY, vals real[]) STRICT;
+    INSERT INTO is2 VALUES (1, '{1e+}');
+}
+expect error {
+    cannot store TEXT value in REAL
+}
+
+test double-minus-rejected {
+    CREATE TABLE dm1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO dm1 VALUES (1, '{--1}');
+}
+expect error {
+    cannot store TEXT value in INTEGER
+}
+
+test pg-escape-newline {
+    CREATE TABLE en1 (id INTEGER PRIMARY KEY, vals text[]) STRICT;
+    INSERT INTO en1 VALUES (1, '{"hello\nworld"}');
+    SELECT array_length(vals), length(vals[1]) FROM en1;
+}
+expect {
+    1|11
+}
+
+test pg-escape-tab {
+    CREATE TABLE et1 (id INTEGER PRIMARY KEY, vals text[]) STRICT;
+    INSERT INTO et1 VALUES (1, '{"hello\tworld"}');
+    SELECT array_length(vals), length(vals[1]) FROM et1;
+}
+expect {
+    1|11
+}
+
+test pg-literal-emoji {
+    CREATE TABLE sp1 (id INTEGER PRIMARY KEY, vals text[]) STRICT;
+    INSERT INTO sp1 VALUES (1, '{"😀"}');
+    SELECT vals FROM sp1;
+}
+expect {
+    {😀}
+}
+
+test union-all-with-arrays {
+    CREATE TABLE ua1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO ua1 VALUES (1, '{1,2,3}');
+    INSERT INTO ua1 VALUES (2, '{4,5,6}');
+    SELECT vals FROM ua1 WHERE id = 1 UNION ALL SELECT vals FROM ua1 WHERE id = 2;
+}
+expect {
+    {1,2,3}
+    {4,5,6}
+}
+
+test union-dedup-with-arrays {
+    CREATE TABLE ud1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO ud1 VALUES (1, '{1,2,3}');
+    INSERT INTO ud1 VALUES (2, '{4,5,6}');
+    INSERT INTO ud1 VALUES (3, '{1,2,3}');
+    SELECT COUNT(*) FROM (SELECT DISTINCT vals FROM ud1);
+}
+expect {
+    2
+}
+
+test intersect-with-arrays {
+    CREATE TABLE it1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO it1 VALUES (1, '{1,2,3}');
+    INSERT INTO it1 VALUES (2, '{4,5,6}');
+    SELECT vals FROM it1 INTERSECT SELECT vals FROM it1 WHERE id = 1;
+}
+expect {
+    {1,2,3}
+}
+
+test except-with-arrays {
+    CREATE TABLE et1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO et1 VALUES (1, '{1,2,3}');
+    INSERT INTO et1 VALUES (2, '{4,5,6}');
+    SELECT vals FROM et1 EXCEPT SELECT vals FROM et1 WHERE id = 1;
+}
+expect {
+    {4,5,6}
+}
+
+test cte-with-arrays {
+    CREATE TABLE cte1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO cte1 VALUES (1, '{1,2,3}');
+    INSERT INTO cte1 VALUES (2, '{4,5,6}');
+    WITH arr_cte AS (SELECT id, vals FROM cte1) SELECT id, vals FROM arr_cte ORDER BY id;
+}
+expect {
+    1|{1,2,3}
+    2|{4,5,6}
+}
+
+test returning-insert-array {
+    CREATE TABLE ri1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO ri1 VALUES (1, '{1,2,3}') RETURNING id, vals;
+}
+expect {
+    1|{1,2,3}
+}
+
+test returning-update-array {
+    CREATE TABLE ru1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO ru1 VALUES (1, '{1,2,3}');
+    UPDATE ru1 SET vals = '{4,5,6}' WHERE id = 1 RETURNING vals;
+}
+expect {
+    {4,5,6}
+}
+
+test returning-delete-array {
+    CREATE TABLE rd1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO rd1 VALUES (1, '{1,2,3}');
+    DELETE FROM rd1 WHERE id = 1 RETURNING vals;
+}
+expect {
+    {1,2,3}
+}
+
+test insert-or-replace-array {
+    CREATE TABLE ior1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO ior1 VALUES (1, '{1,2,3}');
+    INSERT OR REPLACE INTO ior1 VALUES (1, '{4,5,6}');
+    SELECT * FROM ior1;
+}
+expect {
+    1|{4,5,6}
+}
+
+test between-with-arrays {
+    CREATE TABLE bw1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO bw1 VALUES (1, '{1,0}');
+    INSERT INTO bw1 VALUES (2, '{1,5}');
+    INSERT INTO bw1 VALUES (3, '{2,0}');
+    SELECT id FROM bw1 WHERE vals BETWEEN ARRAY[1,0] AND ARRAY[1,5] ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+test in-clause-with-arrays {
+    CREATE TABLE ic1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO ic1 VALUES (1, '{1,2,3}');
+    INSERT INTO ic1 VALUES (2, '{4,5,6}');
+    INSERT INTO ic1 VALUES (3, '{7,8,9}');
+    SELECT id FROM ic1 WHERE vals IN (ARRAY[1,2,3], ARRAY[7,8,9]) ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+test concat-operator-display {
+    CREATE TABLE co1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO co1 VALUES (1, ARRAY[1,2]);
+    SELECT vals || ARRAY[3,4] FROM co1;
+}
+expect {
+    {1,2,3,4}
+}
+
+test delete-where-array {
+    CREATE TABLE dw1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO dw1 VALUES (1, '{1,2,3}');
+    INSERT INTO dw1 VALUES (2, '{4,5,6}');
+    DELETE FROM dw1 WHERE vals = ARRAY[1,2,3];
+    SELECT * FROM dw1;
+}
+expect {
+    2|{4,5,6}
+}
+
+test update-array-reject-non-array {
+    CREATE TABLE ur1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO ur1 VALUES (1, '{1,2,3}');
+    UPDATE ur1 SET vals = 42 WHERE id = 1;
+}
+expect error {
+    cannot store non-array value in INTEGER column ur1.vals
+}
+
+test mixed-type-order-by {
+    CREATE TABLE mto1 (id INTEGER PRIMARY KEY, vals any[]) STRICT;
+    INSERT INTO mto1 VALUES (1, ARRAY[1, 'hello']);
+    INSERT INTO mto1 VALUES (2, ARRAY[1, 2]);
+    INSERT INTO mto1 VALUES (3, ARRAY[NULL, 1]);
+    SELECT id, vals FROM mto1 ORDER BY vals;
+}
+expect {
+    3|{NULL,1}
+    2|{1,2}
+    1|{1,hello}
+}
+
+test order-by-null-elements {
+    CREATE TABLE one1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO one1 VALUES (1, ARRAY[1,2,3]);
+    INSERT INTO one1 VALUES (2, ARRAY[1,NULL,3]);
+    INSERT INTO one1 VALUES (3, ARRAY[1,2]);
+    SELECT id, vals FROM one1 ORDER BY vals;
+}
+expect {
+    2|{1,NULL,3}
+    3|{1,2}
+    1|{1,2,3}
+}
+
+test order-by-empty-and-null-arrays {
+    CREATE TABLE oena1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO oena1 VALUES (1, ARRAY[NULL]);
+    INSERT INTO oena1 VALUES (2, ARRAY[0]);
+    INSERT INTO oena1 VALUES (3, ARRAY[]);
+    INSERT INTO oena1 VALUES (4, ARRAY[NULL, NULL]);
+    SELECT id, vals FROM oena1 ORDER BY vals;
+}
+expect {
+    3|{}
+    1|{NULL}
+    4|{NULL,NULL}
+    2|{0}
+}
+
+test chained-array-functions {
+    CREATE TABLE caf1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO caf1 VALUES (1, '{1,2,3}');
+    SELECT array_to_string(array_append(array_prepend(0, vals), 4), ',') FROM caf1;
+}
+expect {
+    0,1,2,3,4
+}
+
+test chained-array-remove {
+    CREATE TABLE car1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO car1 VALUES (1, '{1,2,3}');
+    SELECT array_to_string(array_remove(array_remove(vals, 1), 3), ',') FROM car1;
+}
+expect {
+    2
+}
+
+test array-position-used-as-subscript {
+    CREATE TABLE aps1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO aps1 VALUES (1, '{10,20,30}');
+    SELECT vals[array_position(vals, 20)] FROM aps1;
+}
+expect {
+    20
+}
+
+test negative-subscript-returns-null {
+    CREATE TABLE nsr1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO nsr1 VALUES (1, '{10,20,30}');
+    SELECT COALESCE(vals[-1], -1) FROM nsr1;
+}
+expect {
+    -1
+}
+
+test whitespace-only-brackets-empty-array {
+    CREATE TABLE wsb1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO wsb1 VALUES (1, '{ }');
+    SELECT vals, array_length(vals) FROM wsb1;
+}
+expect {
+    {}|0
+}
+
+test array-contains-all-empty-subset {
+    CREATE TABLE ace1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO ace1 VALUES (1, '{1,2,3}');
+    SELECT array_contains_all(vals, ARRAY[]) FROM ace1;
+}
+expect {
+    1
+}
+
+test array-to-string-null-delimiter {
+    SELECT COALESCE(array_to_string(ARRAY[1, 2, 3], NULL), 'NULL_RESULT');
+}
+expect {
+    NULL_RESULT
+}
+
+test array-to-string-empty-array {
+    SELECT array_to_string(ARRAY[], ',');
+}
+expect {
+}
+
+test string-to-array-consecutive-delimiters {
+    SELECT array_to_string(string_to_array('a,,b', ','), '|');
+}
+expect {
+    a||b
+}
+
+test float-array-precision-round-trip {
+    CREATE TABLE fpr1 (id INTEGER PRIMARY KEY, vals real[]) STRICT;
+    INSERT INTO fpr1 VALUES (1, '{0.1, 0.2, 0.3}');
+    INSERT INTO fpr1 SELECT id + 1, vals FROM fpr1;
+    SELECT id, vals FROM fpr1 ORDER BY id;
+}
+expect {
+    1|{0.1,0.2,0.3}
+    2|{0.1,0.2,0.3}
+}
+
+test f64-max-value-accepted {
+    CREATE TABLE fmv1 (id INTEGER PRIMARY KEY, vals real[]) STRICT;
+    INSERT INTO fmv1 VALUES (1, '{1.7976931348623157e+308}');
+    SELECT array_length(vals) FROM fmv1;
+}
+expect {
+    1
+}
+
+test array-agg-on-non-array {
+    CREATE TABLE aan1 (cat TEXT, val INTEGER) STRICT;
+    INSERT INTO aan1 VALUES ('a', 1);
+    INSERT INTO aan1 VALUES ('a', 2);
+    SELECT array_agg(val) FROM aan1;
+}
+expect {
+    {1,2}
+}
+
+test array-float-in-integer-column-rejected {
+    CREATE TABLE fir1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO fir1 VALUES (1, ARRAY[1, 2.5, 3]);
+}
+expect error {
+    cannot store REAL value in INTEGER
+}
+
+test leading-zeros-accepted-lenient {
+    CREATE TABLE lz1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO lz1 VALUES (1, '{007}');
+    SELECT vals FROM lz1;
+}
+expect {
+    {7}
+}
+
+test trailing-dot-accepted-lenient {
+    CREATE TABLE td1 (id INTEGER PRIMARY KEY, vals real[]) STRICT;
+    INSERT INTO td1 VALUES (1, '{1.}');
+    SELECT vals FROM td1;
+}
+expect {
+    {1.0}
+}
+
+test array-typeof-is-blob {
+    CREATE TABLE at1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO at1 VALUES (1, '{1,2,3}');
+    SELECT TYPEOF(vals) FROM at1;
+}
+expect {
+    blob
+}
+
+test having-with-count-on-array-table {
+    CREATE TABLE hc1 (cat TEXT, vals integer[]) STRICT;
+    INSERT INTO hc1 VALUES ('a', '{1,2}');
+    INSERT INTO hc1 VALUES ('a', '{3,4}');
+    INSERT INTO hc1 VALUES ('b', '{5,6}');
+    SELECT cat, COUNT(*) FROM hc1 GROUP BY cat HAVING COUNT(*) > 1;
+}
+expect {
+    a|2
+}
+
+test array-overlap-empty {
+    SELECT array_overlap(ARRAY[], ARRAY[1,2,3]);
+}
+expect {
+    0
+}
+
+test array-overlap-both-empty {
+    SELECT array_overlap(ARRAY[], ARRAY[]);
+}
+expect {
+    0
+}
+
+test nested-array-in-json-rejected {
+    CREATE TABLE nar1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO nar1 VALUES (1, '{[1,2],[3,4]}');
+}
+expect error {
+    cannot store TEXT value in INTEGER
+}
+
+test json-object-rejected {
+    CREATE TABLE jor1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO jor1 VALUES (1, '{"key": 1}');
+}
+expect error {
+    cannot store non-array value in INTEGER column jor1.vals
+}
+
+test plain-text-rejected {
+    CREATE TABLE ptr1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO ptr1 VALUES (1, 'hello');
+}
+expect error {
+    cannot store non-array value in INTEGER column ptr1.vals
+}
+
+test text-array-with-escapes-round-trip {
+    CREATE TABLE ter1 (id INTEGER PRIMARY KEY, vals text[]) STRICT;
+    INSERT INTO ter1 VALUES (1, '{"hello\\nworld", "tab\\there", "quote\\"test"}');
+    INSERT INTO ter1 SELECT id + 1, vals FROM ter1;
+    SELECT id, vals FROM ter1 ORDER BY id;
+}
+expect {
+    1|{"hello\nworld","tab\there","quote\"test"}
+    2|{"hello\nworld","tab\there","quote\"test"}
+}
+
+test text-array-empty-strings {
+    CREATE TABLE tes1 (id INTEGER PRIMARY KEY, vals text[]) STRICT;
+    INSERT INTO tes1 VALUES (1, '{"", "", ""}');
+    SELECT vals, array_length(vals) FROM tes1;
+}
+expect {
+    {"","",""}|3
+}
+
+test array-slice-negative-start-defaults-to-zero {
+    CREATE TABLE asn1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO asn1 VALUES (1, '{10,20,30}');
+    SELECT array_to_string(array_slice(vals, -1, 2), ',') FROM asn1;
+}
+expect {
+    10,20
+}
+
+test array-slice-start-greater-than-end {
+    CREATE TABLE asg1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO asg1 VALUES (1, '{10,20,30}');
+    SELECT array_length(array_slice(vals, 3, 1)) FROM asg1;
+}
+expect {
+    0
+}
+
+
+test subscript-set-first-element {
+    CREATE TABLE sse1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO sse1 VALUES (1, '{10,20,30}');
+    UPDATE sse1 SET vals[1] = 99 WHERE id = 1;
+    SELECT vals FROM sse1;
+}
+expect {
+    {99,20,30}
+}
+
+test subscript-set-last-element {
+    CREATE TABLE sse2 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO sse2 VALUES (1, '{10,20,30}');
+    UPDATE sse2 SET vals[3] = 99 WHERE id = 1;
+    SELECT vals FROM sse2;
+}
+expect {
+    {10,20,99}
+}
+
+test subscript-set-out-of-bounds {
+    CREATE TABLE sse3 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO sse3 VALUES (1, '{10,20,30}');
+    UPDATE sse3 SET vals[100] = 99 WHERE id = 1;
+    SELECT vals FROM sse3;
+}
+expect {
+    {10,20,30}
+}
+
+test subscript-zero-returns-null {
+    CREATE TABLE sz1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO sz1 VALUES (1, '{10,20,30}');
+    SELECT COALESCE(vals[0], -1) FROM sz1;
+}
+expect {
+    -1
+}
+
+
+test contains-all-null-lhs {
+    SELECT COALESCE(ARRAY[1,2,3] @> NULL, -1);
+}
+expect {
+    -1
+}
+
+test contains-all-null-rhs {
+    SELECT COALESCE(NULL @> ARRAY[1,2,3], -1);
+}
+expect {
+    -1
+}
+
+test overlap-null-lhs {
+    SELECT COALESCE(NULL && ARRAY[1,2,3], -1);
+}
+expect {
+    -1
+}
+
+test overlap-null-rhs {
+    SELECT COALESCE(ARRAY[1,2,3] && NULL, -1);
+}
+expect {
+    -1
+}
+
+
+test self-concat {
+    CREATE TABLE sc1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO sc1 VALUES (1, '{1,2}');
+    SELECT array_cat(vals, vals) FROM sc1;
+}
+expect {
+    {1,2,1,2}
+}
+
+test self-overlap {
+    CREATE TABLE so1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO so1 VALUES (1, '{1,2,3}');
+    SELECT vals && vals FROM so1;
+}
+expect {
+    1
+}
+
+test self-contains-all {
+    CREATE TABLE sca1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO sca1 VALUES (1, '{1,2,3}');
+    SELECT vals @> vals FROM sca1;
+}
+expect {
+    1
+}
+
+
+test concat-empty-lhs {
+    SELECT ARRAY[] || ARRAY[1,2,3];
+}
+expect {
+    {1,2,3}
+}
+
+test concat-empty-rhs {
+    SELECT ARRAY[1,2,3] || ARRAY[];
+}
+expect {
+    {1,2,3}
+}
+
+test concat-both-empty {
+    SELECT ARRAY[] || ARRAY[];
+}
+expect {
+    {}
+}
+
+test concat-null-lhs-pg-compat {
+    SELECT COALESCE(NULL || ARRAY[1,2], ARRAY[-1]);
+}
+expect {
+    {1,2}
+}
+
+test concat-null-rhs-pg-compat {
+    SELECT COALESCE(ARRAY[1,2] || NULL, ARRAY[-1]);
+}
+expect {
+    {1,2}
+}
+
+
+test contains-all-duplicates-in-subset {
+    SELECT ARRAY[1,2,3] @> ARRAY[1,1,1];
+}
+expect {
+    1
+}
+
+test contains-all-superset-with-dupes {
+    SELECT ARRAY[1,1,2,2,3,3] @> ARRAY[1,2,3];
+}
+expect {
+    1
+}
+
+test contains-all-missing-element {
+    SELECT ARRAY[1,2,3] @> ARRAY[1,2,4];
+}
+expect {
+    0
+}
+
+
+test text-array-with-commas {
+    CREATE TABLE tc1 (id INTEGER PRIMARY KEY, vals text[]) STRICT;
+    INSERT INTO tc1 VALUES (1, '{"a,b", "c,d"}');
+    SELECT vals[1], vals[2] FROM tc1;
+}
+expect {
+    a,b|c,d
+}
+
+test text-array-with-parens-brackets {
+    CREATE TABLE tb1 (id INTEGER PRIMARY KEY, vals text[]) STRICT;
+    INSERT INTO tb1 VALUES (1, '{"a(b)", "c[d]"}');
+    SELECT vals[1], vals[2] FROM tb1;
+}
+expect {
+    a(b)|c[d]
+}
+
+test text-array-with-pipe-char {
+    CREATE TABLE tbs1 (id INTEGER PRIMARY KEY, vals text[]) STRICT;
+    INSERT INTO tbs1 VALUES (1, '{"a|b", "c~d"}');
+    SELECT vals[1] FROM tbs1;
+}
+expect {
+    a|b
+}
+
+test text-array-with-null-string {
+    CREATE TABLE tns1 (id INTEGER PRIMARY KEY, vals text[]) STRICT;
+    INSERT INTO tns1 VALUES (1, '{"NULL", NULL, "null"}');
+    SELECT array_length(vals), vals[1], COALESCE(vals[2], 'WAS_NULL'), vals[3] FROM tns1;
+}
+expect {
+    3|NULL|WAS_NULL|null
+}
+
+test text-array-quoted-numbers {
+    CREATE TABLE tqn1 (id INTEGER PRIMARY KEY, vals text[]) STRICT;
+    INSERT INTO tqn1 VALUES (1, '{"123", "45.6"}');
+    SELECT vals[1], TYPEOF(vals[1]) FROM tqn1;
+}
+expect {
+    123|text
+}
+
+
+test array-agg-single-null {
+    CREATE TABLE aas1 (val INTEGER) STRICT;
+    INSERT INTO aas1 VALUES (NULL);
+    SELECT array_agg(val) FROM aas1;
+}
+expect {
+    {NULL}
+}
+
+test array-agg-all-nulls {
+    CREATE TABLE aan2 (val INTEGER) STRICT;
+    INSERT INTO aan2 VALUES (NULL);
+    INSERT INTO aan2 VALUES (NULL);
+    SELECT array_agg(val) FROM aan2;
+}
+expect {
+    {NULL,NULL}
+}
+
+test array-agg-mixed-nulls {
+    CREATE TABLE aam1 (val INTEGER) STRICT;
+    INSERT INTO aam1 VALUES (1);
+    INSERT INTO aam1 VALUES (NULL);
+    INSERT INTO aam1 VALUES (3);
+    SELECT array_agg(val) FROM aam1;
+}
+expect {
+    {1,NULL,3}
+}
+
+test array-agg-preserves-order {
+    CREATE TABLE aao1 (id INTEGER PRIMARY KEY, val INTEGER) STRICT;
+    INSERT INTO aao1 VALUES (1, 30);
+    INSERT INTO aao1 VALUES (2, 10);
+    INSERT INTO aao1 VALUES (3, 20);
+    SELECT array_agg(val) FROM aao1;
+}
+expect {
+    {30,10,20}
+}
+
+test array-agg-with-order-by {
+    CREATE TABLE aaw1 (id INTEGER PRIMARY KEY, val INTEGER) STRICT;
+    INSERT INTO aaw1 VALUES (1, 30);
+    INSERT INTO aaw1 VALUES (2, 10);
+    INSERT INTO aaw1 VALUES (3, 20);
+    SELECT array_agg(val) FROM (SELECT val FROM aaw1 ORDER BY val);
+}
+expect {
+    {10,20,30}
+}
+
+
+test insert-select-with-append {
+    CREATE TABLE isa1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    CREATE TABLE isa2 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO isa1 VALUES (1, '{1,2}');
+    INSERT INTO isa2 SELECT id, array_append(vals, 3) FROM isa1;
+    SELECT vals FROM isa2;
+}
+expect {
+    {1,2,3}
+}
+
+test insert-select-with-concat {
+    CREATE TABLE isc1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    CREATE TABLE isc2 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO isc1 VALUES (1, '{1,2}');
+    INSERT INTO isc2 SELECT id, vals || ARRAY[3,4] FROM isc1;
+    SELECT vals FROM isc2;
+}
+expect {
+    {1,2,3,4}
+}
+
+
+test correlated-subquery-array-length {
+    CREATE TABLE csq1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO csq1 VALUES (1, '{1,2,3}');
+    INSERT INTO csq1 VALUES (2, '{4,5}');
+    INSERT INTO csq1 VALUES (3, '{6,7,8,9}');
+    SELECT id FROM csq1 WHERE array_length(vals) = (SELECT MAX(array_length(vals)) FROM csq1);
+}
+expect {
+    3
+}
+
+test correlated-subquery-contains {
+    CREATE TABLE csq2 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    CREATE TABLE csq3 (id INTEGER PRIMARY KEY, target INTEGER) STRICT;
+    INSERT INTO csq2 VALUES (1, '{10,20,30}');
+    INSERT INTO csq2 VALUES (2, '{40,50,60}');
+    INSERT INTO csq3 VALUES (1, 20);
+    SELECT csq2.id FROM csq2 WHERE array_contains(csq2.vals, (SELECT target FROM csq3 WHERE csq3.id = 1)) = 1;
+}
+expect {
+    1
+}
+
+
+test large-array-100-elements {
+    CREATE TABLE la1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO la1 VALUES (1, '{1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100}');
+    SELECT array_length(vals), vals[1], vals[50], vals[100] FROM la1;
+}
+expect {
+    100|1|50|100
+}
+
+test large-array-slice {
+    CREATE TABLE la2 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO la2 VALUES (1, '{1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50}');
+    SELECT array_length(array_slice(vals, 25, 30)) FROM la2;
+}
+expect {
+    6
+}
+
+
+test multi-array-column-update {
+    CREATE TABLE mac1 (id INTEGER PRIMARY KEY, a integer[], b text[]) STRICT;
+    INSERT INTO mac1 VALUES (1, '{1,2}', '{"x","y"}');
+    UPDATE mac1 SET a = array_append(a, 3), b = array_append(b, 'z') WHERE id = 1;
+    SELECT a, b FROM mac1;
+}
+expect {
+    {1,2,3}|{x,y,z}
+}
+
+test multi-array-column-returning {
+    CREATE TABLE mac2 (id INTEGER PRIMARY KEY, a integer[], b text[]) STRICT;
+    INSERT INTO mac2 VALUES (1, '{1}', '{"a"}') RETURNING a, b;
+}
+expect {
+    {1}|{a}
+}
+
+
+test array-remove-from-empty {
+    SELECT array_length(array_remove(ARRAY[], 1));
+}
+expect {
+    0
+}
+
+test array-remove-null-from-array {
+    SELECT array_to_string(array_remove(ARRAY[1, NULL, 3], NULL), ',');
+}
+expect {
+    1,3
+}
+
+test array-remove-preserves-duplicates {
+    SELECT array_to_string(array_remove(ARRAY[1,2,1,3,1], 1), ',');
+}
+expect {
+    2,3
+}
+
+
+test string-to-array-null-delimiter-splits-chars {
+    SELECT array_to_string(string_to_array('abc', NULL), ',');
+}
+expect {
+    a,b,c
+}
+
+test string-to-array-multichar-delimiter {
+    SELECT array_to_string(string_to_array('a::b::c', '::'), ',');
+}
+expect {
+    a,b,c
+}
+
+test string-to-array-delimiter-at-boundaries {
+    SELECT array_to_string(string_to_array(',a,b,', ','), '|');
+}
+expect {
+    |a|b|
+}
+
+
+test array-eq-different-lengths-not-equal {
+    SELECT ARRAY[1,2] = ARRAY[1,2,3];
+}
+expect {
+    0
+}
+
+test array-lt-prefix-shorter {
+    SELECT ARRAY[1,2] < ARRAY[1,2,0];
+}
+expect {
+    1
+}
+
+test array-gt-first-element-wins {
+    SELECT ARRAY[2] > ARRAY[1,999,999];
+}
+expect {
+    1
+}
+
+test array-eq-empty-arrays {
+    SELECT ARRAY[] = ARRAY[];
+}
+expect {
+    1
+}
+
+test array-neq-empty-vs-nonempty {
+    SELECT ARRAY[] != ARRAY[1];
+}
+expect {
+    1
+}
+
+
+test returning-update-with-append {
+    CREATE TABLE rua1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO rua1 VALUES (1, '{1,2}');
+    UPDATE rua1 SET vals = array_append(vals, 3) WHERE id = 1 RETURNING vals;
+}
+expect {
+    {1,2,3}
+}
+
+test returning-insert-array-literal {
+    CREATE TABLE ril1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO ril1 VALUES (1, ARRAY[10,20,30]) RETURNING array_length(vals);
+}
+expect {
+    3
+}
+
+
+test array-insert-rollback {
+    CREATE TABLE air1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO air1 VALUES (1, '{1,2,3}');
+    BEGIN;
+    UPDATE air1 SET vals = '{4,5,6}' WHERE id = 1;
+    ROLLBACK;
+    SELECT vals FROM air1;
+}
+expect {
+    {1,2,3}
+}
+
+test array-delete-rollback {
+    CREATE TABLE adr1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO adr1 VALUES (1, '{1,2,3}');
+    BEGIN;
+    DELETE FROM adr1 WHERE id = 1;
+    ROLLBACK;
+    SELECT vals FROM adr1;
+}
+expect {
+    {1,2,3}
+}
+
+
+test distinct-order-by-desc-arrays {
+    CREATE TABLE dod1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO dod1 VALUES (1, '{1,2}');
+    INSERT INTO dod1 VALUES (2, '{3,4}');
+    INSERT INTO dod1 VALUES (3, '{1,2}');
+    SELECT DISTINCT vals FROM dod1 ORDER BY vals DESC;
+}
+expect {
+    {3,4}
+    {1,2}
+}
+
+
+test append-to-null-array {
+    SELECT COALESCE(array_length(array_append(NULL, 1)), -1);
+}
+expect {
+    1
+}
+
+test prepend-to-null-array {
+    SELECT COALESCE(array_length(array_prepend(1, NULL)), -1);
+}
+expect {
+    1
+}
+
+
+test deeply-chained-operations {
+    SELECT array_to_string(
+        array_remove(
+            array_append(
+                array_prepend(0,
+                    array_cat(ARRAY[1,2], ARRAY[3,4])
+                ),
+                5
+            ),
+            3
+        ),
+        ','
+    );
+}
+expect {
+    0,1,2,4,5
+}
+
+
+test case-array-vs-null {
+    CREATE TABLE can1 (id INTEGER PRIMARY KEY, flag INTEGER, vals integer[]) STRICT;
+    INSERT INTO can1 VALUES (1, 1, '{1,2,3}');
+    INSERT INTO can1 VALUES (2, 0, '{4,5,6}');
+    SELECT id, CASE WHEN flag = 1 THEN vals ELSE NULL END FROM can1 ORDER BY id;
+}
+expect {
+    1|{1,2,3}
+    2|
+}
+
+
+test array-position-returns-first {
+    SELECT array_position(ARRAY[1,2,1,2,1], 1);
+}
+expect {
+    1
+}
+
+test array-position-second-element {
+    SELECT array_position(ARRAY[1,2,1,2,1], 2);
+}
+expect {
+    2
+}
+
+
+test true-false-as-text-in-integer-rejected {
+    CREATE TABLE tf1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO tf1 VALUES (1, '{true}');
+}
+expect error {
+    cannot store TEXT value in INTEGER
+}
+
+
+test empty-string-element-round-trip {
+    CREATE TABLE esr1 (id INTEGER PRIMARY KEY, vals text[]) STRICT;
+    INSERT INTO esr1 VALUES (1, '{"", "a", ""}');
+    SELECT vals[1], length(vals[1]), vals[2], vals[3], length(vals[3]) FROM esr1;
+}
+expect {
+    |0|a||0
+}
+
+
+test array-contains-int-in-real-array {
+    CREATE TABLE acir1 (id INTEGER PRIMARY KEY, vals real[]) STRICT;
+    INSERT INTO acir1 VALUES (1, '{1.0, 2.0, 3.0}');
+    SELECT array_contains(vals, 2) FROM acir1;
+}
+expect {
+    1
+}
+
+
+test order-by-array-limit-offset {
+    CREATE TABLE oalo1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO oalo1 VALUES (1, '{5}');
+    INSERT INTO oalo1 VALUES (2, '{2}');
+    INSERT INTO oalo1 VALUES (3, '{4}');
+    INSERT INTO oalo1 VALUES (4, '{1}');
+    INSERT INTO oalo1 VALUES (5, '{3}');
+    SELECT id, vals FROM oalo1 ORDER BY vals LIMIT 2 OFFSET 1;
+}
+expect {
+    2|{2}
+    5|{3}
+}
+
+
+test aliased-array-expr {
+    CREATE TABLE aae1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO aae1 VALUES (1, '{1,2,3}');
+    SELECT array_length(vals) AS len, vals[1] AS first_elem FROM aae1;
+}
+expect {
+    3|1
+}
+
+
+test group-by-array-column {
+    CREATE TABLE gba1 (vals integer[], cnt INTEGER) STRICT;
+    INSERT INTO gba1 VALUES ('{1,2}', 1);
+    INSERT INTO gba1 VALUES ('{1,2}', 2);
+    INSERT INTO gba1 VALUES ('{3,4}', 3);
+    SELECT vals, SUM(cnt) FROM gba1 GROUP BY vals ORDER BY vals;
+}
+expect {
+    {1,2}|3
+    {3,4}|3
+}
