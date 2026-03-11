@@ -811,6 +811,63 @@ expect {
     1
 }
 
+setup left_join_in {
+    CREATE TABLE lj1 (
+        id INTEGER PRIMARY KEY
+    );
+    CREATE TABLE lj2 (
+        id INTEGER PRIMARY KEY,
+        val INTEGER
+    );
+    CREATE INDEX idx_lj2_val ON lj2(val);
+    INSERT INTO lj1 VALUES(1);
+    INSERT INTO lj1 VALUES(2);
+}
+
+@setup left_join_in
+test in-list-left-join-on-match {
+    INSERT INTO lj2 VALUES(10, 1);
+    INSERT INTO lj2 VALUES(11, 2);
+    SELECT lj1.id, IFNULL(lj2.id, -1), IFNULL(lj2.val, -1)
+    FROM lj1
+    LEFT JOIN lj2 ON lj2.val IN (1)
+    ORDER BY lj1.id, lj2.id;
+}
+expect {
+    1|10|1
+    2|10|1
+}
+
+@setup left_join_in
+test in-list-left-join-on-no-match {
+    INSERT INTO lj2 VALUES(10, 2);
+    INSERT INTO lj2 VALUES(11, 3);
+    SELECT lj1.id, IFNULL(lj2.id, -1), IFNULL(lj2.val, -1)
+    FROM lj1
+    LEFT JOIN lj2 ON lj2.val IN (1)
+    ORDER BY lj1.id, lj2.id;
+}
+expect {
+    1|-1|-1
+    2|-1|-1
+}
+
+@setup left_join_in
+test in-subquery-left-join-on-match {
+    CREATE TABLE lj_search(v INTEGER);
+    INSERT INTO lj2 VALUES(10, 1);
+    INSERT INTO lj2 VALUES(11, 2);
+    INSERT INTO lj_search VALUES(1);
+    SELECT lj1.id, IFNULL(lj2.id, -1), IFNULL(lj2.val, -1)
+    FROM lj1
+    LEFT JOIN lj2 ON lj2.val IN (SELECT v FROM lj_search)
+    ORDER BY lj1.id, lj2.id;
+}
+expect {
+    1|10|1
+    2|10|1
+}
+
 # Nested IN subqueries
 setup nested {
     CREATE TABLE tn1(id INTEGER PRIMARY KEY, val INTEGER);
