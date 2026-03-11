@@ -175,14 +175,15 @@ test window-in-subquery {
     FROM users u
     )
     WHERE zmax > 20
+    ORDER BY zmax, first_name
     LIMIT 5;
 }
 expect {
-    Britney|51
-    Kaci|51
-    Selena|51
-    Isaac|68
-    Odessa|76
+    Aditya|21
+    Ali|21
+    Anjali|21
+    Arielle|21
+    Aurelia|21
 }
 
 test window-nested-in-expression {
@@ -764,4 +765,3 @@ expect {
     7
     7
 }
-
