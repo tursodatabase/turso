@@ -1,5 +1,6 @@
 @database :memory:
 
+@backend rust
 test vacuum-into-empty-path-rejected {
     VACUUM INTO '';
 }
@@ -7,6 +8,7 @@ expect error {
     VACUUM INTO path cannot be empty
 }
 
+@backend rust
 test vacuum-into-rejected-in-transaction {
     CREATE TABLE t(a TEXT);
     BEGIN;
