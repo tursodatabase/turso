@@ -421,11 +421,201 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         &self.aliases
     }
 
+    /// Run `f` with a fresh per-query state (phase, aliases).
+    /// Saves and restores on exit, so recursive calls (CTEs, subqueries) don't clobber.
+    fn with_scope<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let saved_aliases = std::mem::take(&mut self.aliases);
+
+        let result = f(self);
+
+        self.aliases = saved_aliases;
+
+        result
+    }
+
+    /// Run `f` with a temporary phase, restoring the previous phase on exit.
+    fn with_phase<T>(
+        &mut self,
+        phase: BindPhase,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let saved = self.phase;
+        self.phase = phase;
+        let result = f(self);
+        self.phase = saved;
+        result
+    }
+
+    /// Extract result column names from a SELECT list before binding.
+    ///
+    /// These names are used for:
+    /// - CTE column resolution (when referenced in FROM)
+    /// - FROM subquery column resolution
+    ///
+    /// The name is determined by:
+    /// - Explicit alias (`SELECT expr AS foo` → "foo")
+    /// - Bare column reference (`SELECT x` → "x", `SELECT t.x` → "x")
+    /// - Star expansion (`SELECT *` → all column names from scope)
+    /// - Complex expressions without alias are unreferenceable by name,
+    ///   so we use an empty string placeholder.
+    fn select_result_column_names(
+        columns: &[ast::ResultColumn],
+        scope: &BindScope,
+    ) -> Result<Vec<String>> {
+        let mut names = Vec::with_capacity(columns.len());
+        for col in columns {
+            match col {
+                ast::ResultColumn::Expr(expr, alias) => {
+                    // Explicit alias takes priority
+                    if let Some(a) = alias {
+                        let name = match a {
+                            ast::As::As(id) | ast::As::Elided(id) => normalize_ident(id.as_str()),
+                        };
+                        names.push(name);
+                        continue;
+                    }
+                    // Bare or qualified column reference — extract the column part
+                    let name = match expr.as_ref() {
+                        ast::Expr::Id(id) => normalize_ident(id.as_str()),
+                        ast::Expr::Qualified(_, id) => normalize_ident(id.as_str()),
+                        ast::Expr::DoublyQualified(_, _, id) => normalize_ident(id.as_str()),
+                        // Complex expressions (count(*), x+1, etc.) without an alias
+                        // can't be referenced by name from outer queries.
+                        _ => String::new(),
+                    };
+                    names.push(name);
+                }
+                ast::ResultColumn::Star => {
+                    // Expand * into all column names from all tables in scope
+                    for st in &scope.tables {
+                        for col in st.table.columns() {
+                            names.push(col.name.to_string());
+                        }
+                    }
+                }
+                ast::ResultColumn::TableStar(table_name) => {
+                    // Expand table.* into that table's column names
+                    let Some(st) = scope.find_table_by_identifier(table_name.as_str()) else {
+                        crate::bail_parse_error!("no such table: {}", table_name);
+                    };
+                    for col in st.table.columns() {
+                        names.push(col.name.to_string());
+                    }
+                }
+            }
+        }
+        Ok(names)
+    }
+
     /// Bind a SELECT statement, resolving all name references in-place.
     /// Returns the result column names of the SELECT.
     fn bind_select(&mut self, select: &mut ast::Select) -> Result<Vec<String>> {
-        // TODO: bind CTEs, FROM, SELECT list, WHERE, GROUP BY, HAVING, ORDER BY
-        Ok(vec![])
+        // 1. Bind CTEs from WITH clause
+        if let Some(with) = &mut select.with {
+            self.bind_cte(with)?;
+        }
+
+        // 2. Bind the main OneSelect
+        let result_columns = self.bind_one_select(&mut select.body.select)?;
+
+        // 3. Bind compound selects (UNION, INTERSECT, EXCEPT)
+        for compound in &mut select.body.compounds {
+            self.bind_one_select(&mut compound.select)?;
+        }
+
+        // 4. Bind ORDER BY (AliasFirst phase — aliases take priority)
+        // ORDER BY lives on the outer Select, not on OneSelect.
+        // It needs the FROM scope from the main select, but we don't
+        // have it here anymore. For now we bind against an empty scope.
+        // TODO: pass the main select's scope through
+        let empty = BindScope::empty();
+        self.with_phase(BindPhase::AliasFirst, |ctx| {
+            for sort_col in &mut select.order_by {
+                ctx.bind_expr(&mut sort_col.expr, &empty)?;
+            }
+            Ok(())
+        })?;
+
+        Ok(result_columns)
+    }
+
+    /// Bind a single SELECT (not compound). Returns result column names.
+    fn bind_one_select(&mut self, one: &mut ast::OneSelect) -> Result<Vec<String>> {
+        self.with_scope(|ctx| {
+            match one {
+                ast::OneSelect::Select {
+                    columns,
+                    from,
+                    where_clause,
+                    group_by,
+                    ..
+                } => {
+                    // 1. Bind FROM → build scope
+                    let scope = match from {
+                        Some(from) => ctx.bind_from(from)?,
+                        None => BindScope::empty(),
+                    };
+
+                    // 2. Extract result column names before binding expressions
+                    //    (binding rewrites Expr::Id into Expr::Column, losing the name)
+                    let result_names = Self::select_result_column_names(columns, &scope)?;
+
+                    // 3. Bind SELECT expressions (NoAliases phase)
+                    ctx.with_phase(BindPhase::NoAliases, |ctx| {
+                        ctx.bind_select_list(columns, &scope)
+                    })?;
+
+                    // 4. Bind WHERE (TableFirst phase — table columns first, aliases as fallback)
+                    if let Some(where_expr) = where_clause {
+                        ctx.with_phase(BindPhase::TableFirst, |ctx| {
+                            ctx.bind_expr(where_expr, &scope)
+                        })?;
+                    }
+
+                    // 5. Bind GROUP BY and HAVING (AliasFirst phase)
+                    if let Some(group_by) = group_by {
+                        ctx.with_phase(BindPhase::AliasFirst, |ctx| {
+                            ctx.bind_group_by(group_by, &scope)
+                        })?;
+                    }
+
+                    Ok(result_names)
+                }
+                ast::OneSelect::Values(_) => {
+                    // VALUES clauses have no column references to bind
+                    Ok(vec![])
+                }
+            }
+        })
+    }
+
+    /// Bind expressions in the SELECT list.
+    fn bind_select_list(
+        &mut self,
+        columns: &mut [ast::ResultColumn],
+        scope: &BindScope,
+    ) -> Result<()> {
+        for col in columns.iter_mut() {
+            match col {
+                ast::ResultColumn::Expr(expr, _) => {
+                    self.bind_expr(expr, scope)?;
+                }
+                // Star and TableStar don't contain expressions to bind
+                ast::ResultColumn::Star | ast::ResultColumn::TableStar(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Bind GROUP BY expressions and HAVING clause.
+    fn bind_group_by(&mut self, group_by: &mut ast::GroupBy, scope: &BindScope) -> Result<()> {
+        for expr in &mut group_by.exprs {
+            self.bind_expr(expr, scope)?;
+        }
+        if let Some(having) = &mut group_by.having {
+            self.bind_expr(having, scope)?;
+        }
+        Ok(())
     }
 
     fn bind_cte(&mut self, with: &mut ast::With) -> Result<()> {
