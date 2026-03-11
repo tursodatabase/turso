@@ -179,6 +179,7 @@ fn try_unnest_exists(plan: &mut SelectPlan, subquery_idx: usize) -> bool {
             table.join_info = Some(JoinInfo {
                 join_type,
                 using: vec![],
+                no_reorder: false,
             });
         }
         plan.table_references.add_joined_table(table);
