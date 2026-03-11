@@ -8433,13 +8433,14 @@ pub fn op_insert(
                 {
                     state.op_insert_state.sub_state = OpInsertSubState::UpdateLastRowid;
                 } else {
-                    let schema = program.connection.schema.read();
-                    let dependent_views = schema.get_dependent_materialized_views(table_name);
-                    if !dependent_views.is_empty() {
-                        state.op_insert_state.sub_state = OpInsertSubState::ApplyViewChange;
-                    } else {
-                        break;
-                    }
+                    // Schema table writes (sqlite_master, sqlite_sequence, ephemeral)
+                    // must not produce view deltas. The p4 table_name on these inserts
+                    // refers to the *target* table (for the update hook), not the table
+                    // actually being written to. Tracking deltas here would feed the
+                    // sqlite_master record into the DBSP circuit as if it were data
+                    // from the named table, corrupting the materialized view.
+                    state.op_insert_state.old_record = None;
+                    break;
                 }
             }
             OpInsertSubState::UpdateLastRowid => {
