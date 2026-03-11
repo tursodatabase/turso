@@ -357,3 +357,16 @@ expect {
     3
 }
 
+test json_group_array_extract_repro {
+    SELECT JSON_GROUP_ARRAY(JSON_EXTRACT('{"name":"Alice"}', '$.name'));
+}
+expect {
+    ["Alice"]
+}
+
+test json_group_array_arrow_operator_repro {
+    SELECT JSON_GROUP_ARRAY('{"name":"Alice"}' ->> '$.name');
+}
+expect {
+    ["Alice"]
+}

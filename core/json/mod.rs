@@ -597,7 +597,7 @@ pub fn json_string_to_db_type(
             if matches!(flag, OutputVariant::ElementType) {
                 json_string.remove(json_string.len() - 1);
                 json_string.remove(0);
-                Ok(Value::Text(Text::json(json_string)))
+                Ok(Value::Text(Text::new(json_string)))
             } else {
                 Ok(Value::Text(Text::new(json_string)))
             }
