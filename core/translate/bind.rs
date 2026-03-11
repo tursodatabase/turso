@@ -1296,6 +1296,85 @@ mod tests {
         f(&mut ctx)
     }
 
+    fn select_expr(select: &ast::Select, idx: usize) -> &ast::Expr {
+        match &select.body.select {
+            ast::OneSelect::Select { columns, .. } => match &columns[idx] {
+                ast::ResultColumn::Expr(expr, _) => expr,
+                other => panic!("expected expression result column, got {other:?}"),
+            },
+            other => panic!("expected SELECT core, got {other:?}"),
+        }
+    }
+
+    fn where_expr(select: &ast::Select) -> &ast::Expr {
+        match &select.body.select {
+            ast::OneSelect::Select { where_clause, .. } => where_clause
+                .as_deref()
+                .expect("expected WHERE clause on bound select"),
+            other => panic!("expected SELECT core, got {other:?}"),
+        }
+    }
+
+    fn group_by_expr(select: &ast::Select, idx: usize) -> &ast::Expr {
+        match &select.body.select {
+            ast::OneSelect::Select { group_by, .. } => {
+                &group_by.as_ref().expect("expected GROUP BY clause").exprs[idx]
+            }
+            other => panic!("expected SELECT core, got {other:?}"),
+        }
+    }
+
+    fn having_expr(select: &ast::Select) -> &ast::Expr {
+        match &select.body.select {
+            ast::OneSelect::Select { group_by, .. } => group_by
+                .as_ref()
+                .and_then(|group_by| group_by.having.as_deref())
+                .expect("expected HAVING clause"),
+            other => panic!("expected SELECT core, got {other:?}"),
+        }
+    }
+
+    fn order_by_expr(select: &ast::Select, idx: usize) -> &ast::Expr {
+        &select.order_by[idx].expr
+    }
+
+    fn exists_subquery(select: &ast::Select) -> &ast::Select {
+        match where_expr(select) {
+            ast::Expr::Exists(subquery) => subquery,
+            other => panic!("expected EXISTS subquery in WHERE, got {other:?}"),
+        }
+    }
+
+    fn subquery_expr(expr: &ast::Expr) -> &ast::Select {
+        match expr {
+            ast::Expr::Subquery(select) => select,
+            other => panic!("expected subquery expression, got {other:?}"),
+        }
+    }
+
+    fn assert_column_expr(expr: &ast::Expr, table: usize, column: usize) {
+        assert_eq!(
+            expr,
+            &ast::Expr::Column {
+                database: None,
+                table: TableInternalId::from(table),
+                column,
+                is_rowid_alias: false,
+            }
+        );
+    }
+
+    fn bind_select_error(
+        ctx: &mut BindContext<'_, TestIdGenerator>,
+        sql: &str,
+    ) -> crate::LimboError {
+        let mut select = parse_select(sql);
+        match ctx.bind_select(&mut select) {
+            Ok(_) => panic!("expected bind failure for SQL: {sql}"),
+            Err(err) => err,
+        }
+    }
+
     #[test]
     fn bind_select_returns_main_scope_and_tracking() {
         with_bind_context(&["CREATE TABLE t(a, b)"], |ctx| {
@@ -1363,6 +1442,472 @@ mod tests {
 
             let cte = ctx.get_cte("cte").expect("cte should exist");
             assert_eq!(cte.resolved_columns, vec!["col_x", "col_y"]);
+        });
+    }
+
+    #[test]
+    fn select_list_uses_no_aliases_phase() {
+        with_bind_context(&["CREATE TABLE t(x, a)"], |ctx| {
+            let mut select = parse_select("SELECT a AS x, x FROM t");
+            let bound = ctx.bind_select(&mut select).unwrap();
+
+            assert_column_expr(select_expr(&select, 0), 0, 1);
+            assert_column_expr(select_expr(&select, 1), 0, 0);
+            assert_eq!(bound.result_columns[0].name, "x");
+            assert_eq!(bound.result_columns[1].name, "x");
+        });
+    }
+
+    #[test]
+    fn where_clause_prefers_table_column_over_alias() {
+        with_bind_context(&["CREATE TABLE t(a, b)"], |ctx| {
+            let mut select = parse_select("SELECT a AS b FROM t WHERE b = 1");
+            ctx.bind_select(&mut select).unwrap();
+
+            let ast::Expr::Binary(lhs, ast::Operator::Equals, rhs) = where_expr(&select) else {
+                panic!("expected bound WHERE binary expression");
+            };
+            assert_column_expr(lhs, 0, 1);
+            assert_eq!(
+                rhs.as_ref(),
+                &ast::Expr::Literal(ast::Literal::Numeric("1".into()))
+            );
+        });
+    }
+
+    #[test]
+    fn where_clause_falls_back_to_alias_when_no_table_column_matches() {
+        with_bind_context(&["CREATE TABLE t(a)"], |ctx| {
+            let mut select = parse_select("SELECT a + 1 AS x FROM t WHERE x = 3");
+            ctx.bind_select(&mut select).unwrap();
+
+            let ast::Expr::Binary(lhs, ast::Operator::Equals, rhs) = where_expr(&select) else {
+                panic!("expected bound WHERE binary expression");
+            };
+            assert_eq!(
+                lhs.as_ref(),
+                &ast::Expr::Binary(
+                    ast::Expr::Column {
+                        database: None,
+                        table: TableInternalId::from(0usize),
+                        column: 0,
+                        is_rowid_alias: false,
+                    }
+                    .into_boxed(),
+                    ast::Operator::Add,
+                    ast::Expr::Literal(ast::Literal::Numeric("1".into())).into_boxed(),
+                )
+            );
+            assert_eq!(
+                rhs.as_ref(),
+                &ast::Expr::Literal(ast::Literal::Numeric("3".into()))
+            );
+        });
+    }
+
+    #[test]
+    fn group_by_prefers_alias_expression_over_table_column() {
+        with_bind_context(&["CREATE TABLE t(a, b)"], |ctx| {
+            let mut select = parse_select("SELECT a + 1 AS b FROM t GROUP BY b");
+            ctx.bind_select(&mut select).unwrap();
+
+            assert_eq!(
+                group_by_expr(&select, 0),
+                &ast::Expr::Binary(
+                    ast::Expr::Column {
+                        database: None,
+                        table: TableInternalId::from(0usize),
+                        column: 0,
+                        is_rowid_alias: false,
+                    }
+                    .into_boxed(),
+                    ast::Operator::Add,
+                    ast::Expr::Literal(ast::Literal::Numeric("1".into())).into_boxed(),
+                )
+            );
+        });
+    }
+
+    #[test]
+    fn having_prefers_alias_expression_over_table_column() {
+        with_bind_context(&["CREATE TABLE t(a, b, c)"], |ctx| {
+            let mut select = parse_select("SELECT a + 1 AS b FROM t GROUP BY c HAVING b > 10");
+            ctx.bind_select(&mut select).unwrap();
+
+            let ast::Expr::Binary(lhs, ast::Operator::Greater, rhs) = having_expr(&select) else {
+                panic!("expected bound HAVING binary expression");
+            };
+            assert_eq!(
+                lhs.as_ref(),
+                &ast::Expr::Binary(
+                    ast::Expr::Column {
+                        database: None,
+                        table: TableInternalId::from(0usize),
+                        column: 0,
+                        is_rowid_alias: false,
+                    }
+                    .into_boxed(),
+                    ast::Operator::Add,
+                    ast::Expr::Literal(ast::Literal::Numeric("1".into())).into_boxed(),
+                )
+            );
+            assert_eq!(
+                rhs.as_ref(),
+                &ast::Expr::Literal(ast::Literal::Numeric("10".into()))
+            );
+        });
+    }
+
+    #[test]
+    fn order_by_prefers_alias_expression_over_table_column() {
+        with_bind_context(&["CREATE TABLE t(a, b)"], |ctx| {
+            let mut select = parse_select("SELECT a + 1 AS b FROM t ORDER BY b");
+            ctx.bind_select(&mut select).unwrap();
+
+            assert_eq!(
+                order_by_expr(&select, 0),
+                &ast::Expr::Binary(
+                    ast::Expr::Column {
+                        database: None,
+                        table: TableInternalId::from(0usize),
+                        column: 0,
+                        is_rowid_alias: false,
+                    }
+                    .into_boxed(),
+                    ast::Operator::Add,
+                    ast::Expr::Literal(ast::Literal::Numeric("1".into())).into_boxed(),
+                )
+            );
+        });
+    }
+
+    #[test]
+    fn order_by_falls_back_to_main_scope_column_when_alias_is_missing() {
+        with_bind_context(&["CREATE TABLE t(a, b)"], |ctx| {
+            let mut select = parse_select("SELECT a AS renamed FROM t ORDER BY b");
+            let bound = ctx.bind_select(&mut select).unwrap();
+
+            assert_column_expr(order_by_expr(&select, 0), 0, 1);
+            assert_eq!(bound.tracking.columns_used.len(), 2);
+            assert!(bound
+                .tracking
+                .columns_used
+                .contains(&(TableInternalId::from(0usize), 0)));
+            assert!(bound
+                .tracking
+                .columns_used
+                .contains(&(TableInternalId::from(0usize), 1)));
+        });
+    }
+
+    #[test]
+    fn correlated_grouped_subquery_binds_inner_aliases_and_outer_references() {
+        with_bind_context(&["CREATE TABLE t(a)", "CREATE TABLE u(b, c)"], |ctx| {
+            let mut select = parse_select(
+                "SELECT t.a \
+                 FROM t \
+                 WHERE EXISTS (\
+                    SELECT u.c + 2 AS a \
+                    FROM u \
+                    WHERE u.b = t.a \
+                    GROUP BY a \
+                    HAVING a > t.a \
+                    ORDER BY a\
+                 )",
+            );
+            let bound = ctx.bind_select(&mut select).unwrap();
+            let subquery = exists_subquery(&select);
+
+            assert_eq!(
+                bound.tracking.columns_used,
+                vec![(TableInternalId::from(0usize), 0)]
+            );
+            assert!(bound.tracking.outer_refs_used.is_empty());
+
+            assert_eq!(
+                select_expr(subquery, 0),
+                &ast::Expr::Binary(
+                    ast::Expr::Column {
+                        database: None,
+                        table: TableInternalId::from(1usize),
+                        column: 1,
+                        is_rowid_alias: false,
+                    }
+                    .into_boxed(),
+                    ast::Operator::Add,
+                    ast::Expr::Literal(ast::Literal::Numeric("2".into())).into_boxed(),
+                )
+            );
+
+            let ast::Expr::Binary(lhs, ast::Operator::Equals, rhs) = where_expr(subquery) else {
+                panic!("expected bound inner WHERE binary expression");
+            };
+            assert_column_expr(lhs, 1, 0);
+            assert_column_expr(rhs, 0, 0);
+
+            assert_eq!(group_by_expr(subquery, 0), select_expr(subquery, 0));
+
+            let ast::Expr::Binary(lhs, ast::Operator::Greater, rhs) = having_expr(subquery) else {
+                panic!("expected bound inner HAVING binary expression");
+            };
+            assert_eq!(lhs.as_ref(), select_expr(subquery, 0));
+            assert_column_expr(rhs, 0, 0);
+
+            assert_eq!(order_by_expr(subquery, 0), select_expr(subquery, 0));
+        });
+    }
+
+    #[test]
+    fn derived_table_columns_flow_into_outer_alias_binding() {
+        with_bind_context(&["CREATE TABLE t(a)"], |ctx| {
+            let mut select = parse_select(
+                "SELECT sq.x AS y \
+                 FROM (SELECT t.a + 1 AS x FROM t) AS sq \
+                 WHERE y > 2 \
+                 ORDER BY y",
+            );
+            let bound = ctx.bind_select(&mut select).unwrap();
+
+            assert_eq!(bound.main_scope.tables.len(), 1);
+            assert_eq!(bound.main_scope.tables[0].identifier, "sq");
+
+            let ast::Expr::Binary(lhs, ast::Operator::Greater, rhs) = where_expr(&select) else {
+                panic!("expected bound outer WHERE binary expression");
+            };
+            assert_eq!(
+                lhs.as_ref(),
+                &ast::Expr::Column {
+                    database: None,
+                    table: TableInternalId::from(1usize),
+                    column: 0,
+                    is_rowid_alias: false,
+                }
+            );
+            assert_eq!(
+                rhs.as_ref(),
+                &ast::Expr::Literal(ast::Literal::Numeric("2".into()))
+            );
+
+            assert_eq!(
+                order_by_expr(&select, 0),
+                &ast::Expr::Column {
+                    database: None,
+                    table: TableInternalId::from(1usize),
+                    column: 0,
+                    is_rowid_alias: false,
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn cte_query_combines_cte_scope_group_by_having_and_order_by() {
+        with_bind_context(&["CREATE TABLE t(a, b)"], |ctx| {
+            let mut select = parse_select(
+                "WITH cte AS (SELECT a, b FROM t) \
+                 SELECT a + 1 AS b \
+                 FROM cte \
+                 GROUP BY b \
+                 HAVING b > 2 \
+                 ORDER BY b",
+            );
+            let bound = ctx.bind_select(&mut select).unwrap();
+
+            assert_eq!(bound.main_scope.tables.len(), 1);
+            assert_eq!(bound.main_scope.tables[0].identifier, "cte");
+            assert!(matches!(
+                bound.main_scope.tables[0].source,
+                ScopeTableSource::Cte { .. }
+            ));
+
+            let alias_expr = ast::Expr::Binary(
+                ast::Expr::Column {
+                    database: None,
+                    table: TableInternalId::from(1usize),
+                    column: 0,
+                    is_rowid_alias: false,
+                }
+                .into_boxed(),
+                ast::Operator::Add,
+                ast::Expr::Literal(ast::Literal::Numeric("1".into())).into_boxed(),
+            );
+
+            assert_eq!(select_expr(&select, 0), &alias_expr);
+            assert_eq!(group_by_expr(&select, 0), &alias_expr);
+
+            let ast::Expr::Binary(lhs, ast::Operator::Greater, rhs) = having_expr(&select) else {
+                panic!("expected bound HAVING binary expression");
+            };
+            assert_eq!(lhs.as_ref(), &alias_expr);
+            assert_eq!(
+                rhs.as_ref(),
+                &ast::Expr::Literal(ast::Literal::Numeric("2".into()))
+            );
+
+            assert_eq!(order_by_expr(&select, 0), &alias_expr);
+        });
+    }
+
+    #[test]
+    fn table_alias_hides_base_name_and_qualified_alias_resolves() {
+        with_bind_context(&["CREATE TABLE t(x)"], |ctx| {
+            let mut good = parse_select("SELECT u.x FROM t AS u");
+            ctx.bind_select(&mut good).unwrap();
+            assert_column_expr(select_expr(&good, 0), 0, 0);
+
+            let err = bind_select_error(ctx, "SELECT t.x FROM t AS u").to_string();
+            assert!(
+                err.contains("no such column: t.x"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn correlated_subquery_group_by_does_not_capture_outer_column_without_inner_match() {
+        with_bind_context(&["CREATE TABLE t1(a, b)", "CREATE TABLE t2(x, y)"], |ctx| {
+            let err =
+                bind_select_error(ctx, "SELECT a FROM t1 WHERE EXISTS (SELECT x FROM t2 GROUP BY a)")
+                    .to_string();
+            assert!(err.contains("no such column: a"), "unexpected error: {err}");
+        });
+    }
+
+    #[test]
+    fn correlated_subquery_group_by_prefers_inner_column_when_present() {
+        with_bind_context(&["CREATE TABLE t1(a, b)", "CREATE TABLE t3(a, x)"], |ctx| {
+            let mut select =
+                parse_select("SELECT a FROM t1 WHERE EXISTS (SELECT x FROM t3 GROUP BY a)");
+            ctx.bind_select(&mut select).unwrap();
+
+            let subquery = exists_subquery(&select);
+            assert_column_expr(group_by_expr(subquery, 0), 1, 0);
+        });
+    }
+
+    #[test]
+    fn duplicate_aliases_are_allowed_in_order_by() {
+        with_bind_context(&["CREATE TABLE t(x, y)"], |ctx| {
+            let mut select = parse_select("SELECT x AS a, y AS a FROM t ORDER BY a");
+            ctx.bind_select(&mut select).unwrap();
+
+            assert_column_expr(order_by_expr(&select, 0), 0, 0);
+        });
+    }
+
+    #[test]
+    fn sqlite_compat_where_and_order_by_precedence_cases() {
+        with_bind_context(&["CREATE TABLE t(a, b)"], |ctx| {
+            let mut where_select = parse_select("SELECT -a AS b, a, t.b FROM t WHERE b > 15");
+            ctx.bind_select(&mut where_select).unwrap();
+            let ast::Expr::Binary(lhs, ast::Operator::Greater, rhs) = where_expr(&where_select)
+            else {
+                panic!("expected bound WHERE binary expression");
+            };
+            assert_column_expr(lhs, 0, 1);
+            assert_eq!(
+                rhs.as_ref(),
+                &ast::Expr::Literal(ast::Literal::Numeric("15".into()))
+            );
+
+            let mut order_select = parse_select("SELECT -a AS b, a, t.b FROM t ORDER BY b");
+            ctx.bind_select(&mut order_select).unwrap();
+            assert_eq!(
+                order_by_expr(&order_select, 0),
+                &ast::Expr::Unary(
+                    ast::UnaryOperator::Negative,
+                    ast::Expr::Column {
+                        database: None,
+                        table: TableInternalId::from(1usize),
+                        column: 0,
+                        is_rowid_alias: false,
+                    }
+                    .into_boxed(),
+                )
+            );
+        });
+    }
+
+    #[test]
+    fn sqlite_compat_group_by_prefers_source_column_over_alias() {
+        with_bind_context(&["CREATE TABLE t(a, b)"], |ctx| {
+            let mut select = parse_select("SELECT -a AS b, COUNT(*) FROM t GROUP BY b ORDER BY 1");
+            ctx.bind_select(&mut select).unwrap();
+
+            assert_column_expr(group_by_expr(&select, 0), 0, 1);
+        });
+    }
+
+    #[test]
+    fn order_by_subquery_can_see_select_alias_and_prefer_source_column() {
+        with_bind_context(&["CREATE TABLE t(a, b)"], |ctx| {
+            let mut alias_visible = parse_select("SELECT a, -a AS x FROM t ORDER BY (SELECT x)");
+            ctx.bind_select(&mut alias_visible).unwrap();
+            let order_subquery = subquery_expr(order_by_expr(&alias_visible, 0));
+            assert_eq!(
+                select_expr(order_subquery, 0),
+                &ast::Expr::Unary(
+                    ast::UnaryOperator::Negative,
+                    ast::Expr::Column {
+                        database: None,
+                        table: TableInternalId::from(0usize),
+                        column: 0,
+                        is_rowid_alias: false,
+                    }
+                    .into_boxed(),
+                )
+            );
+
+            let mut source_preferred =
+                parse_select("SELECT -a AS b, a, t.b FROM t ORDER BY (SELECT b)");
+            ctx.bind_select(&mut source_preferred).unwrap();
+            let order_subquery = subquery_expr(order_by_expr(&source_preferred, 0));
+            assert_column_expr(select_expr(order_subquery, 0), 0, 1);
+        });
+    }
+
+    #[test]
+    fn subqueries_in_having_and_where_can_see_outer_aliases() {
+        with_bind_context(&["CREATE TABLE t(a, b)"], |ctx| {
+            let mut having_select = parse_select(
+                "SELECT a % 2 AS g, SUM(b) AS s FROM t GROUP BY g HAVING (SELECT s) > 15 ORDER BY g",
+            );
+            ctx.bind_select(&mut having_select).unwrap();
+            let ast::Expr::Binary(lhs, ast::Operator::Greater, rhs) = having_expr(&having_select)
+            else {
+                panic!("expected bound HAVING binary expression");
+            };
+            let having_subquery = subquery_expr(lhs);
+            assert_eq!(
+                select_expr(having_subquery, 0),
+                select_expr(&having_select, 1)
+            );
+            assert_eq!(
+                rhs.as_ref(),
+                &ast::Expr::Literal(ast::Literal::Numeric("15".into()))
+            );
+
+            let mut nested_where = parse_select(
+                "SELECT -a AS x, a \
+                 FROM t \
+                 WHERE EXISTS (SELECT 1 WHERE EXISTS (SELECT x WHERE x < 0))",
+            );
+            ctx.bind_select(&mut nested_where).unwrap();
+            let first_exists = exists_subquery(&nested_where);
+            let second_exists = exists_subquery(first_exists);
+            assert_eq!(
+                select_expr(second_exists, 0),
+                &ast::Expr::Unary(
+                    ast::UnaryOperator::Negative,
+                    ast::Expr::Column {
+                        database: None,
+                        table: TableInternalId::from(0usize),
+                        column: 0,
+                        is_rowid_alias: false,
+                    }
+                    .into_boxed(),
+                )
+            );
         });
     }
 }
