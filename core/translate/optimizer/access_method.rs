@@ -327,7 +327,6 @@ pub(super) fn choose_best_btree_candidate(
                 cost,
             };
         }
-
     }
 
     Some(best_choice)
