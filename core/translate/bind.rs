@@ -104,6 +104,26 @@ impl BindTable for CteTable {
     }
 }
 
+#[derive(Clone)]
+pub struct DerivedTable {
+    pub name: String,
+    pub columns: Vec<String>,
+}
+
+impl BindTable for DerivedTable {
+    fn column_count(&self) -> usize {
+        self.columns.len()
+    }
+
+    fn column_name(&self, idx: usize) -> Option<&str> {
+        self.columns.get(idx).map(|s| s.as_str())
+    }
+
+    fn column_is_rowid_alias(&self, _idx: usize) -> bool {
+        false
+    }
+}
+
 // ── BindPhase ────────────────────────────────────────────────────────────
 
 /// Controls alias visibility per SQL clause.
@@ -134,10 +154,27 @@ pub struct ScopeTable {
     pub identifier: String,
     /// Opaque ID used in `Expr::Column` to reference this table.
     pub internal_id: TableInternalId,
+    /// Planner-facing source data for producing `TableReferences`.
+    pub source: ScopeTableSource,
     /// Table metadata for column resolution. Clone is an Arc bump.
     pub table: Arc<dyn BindTable>,
     /// Join constraint info (USING clause for dedup during unqualified lookup).
     pub join_info: Option<JoinInfo>,
+}
+
+#[derive(Clone)]
+pub enum ScopeTableSource {
+    Table(Arc<Table>),
+    Cte {
+        name: String,
+        columns: Vec<String>,
+        cte_id: Option<usize>,
+        select: ast::Select,
+    },
+    Derived {
+        name: String,
+        columns: Vec<String>,
+    },
 }
 
 // ── BindScope ────────────────────────────────────────────────────────────
@@ -248,6 +285,44 @@ pub struct BoundColumn {
     pub name: String,
     /// The original expression (before binding), cloned into alias references.
     pub expr: ast::Expr,
+}
+
+pub struct BoundSelect {
+    pub result_columns: Vec<BoundColumn>,
+    pub main_scope: BindScope,
+    pub tracking: BindTracking,
+}
+
+impl BoundSelect {
+    pub fn into_table_references(self) -> Result<TableReferences> {
+        let joined_tables = self
+            .main_scope
+            .tables
+            .into_iter()
+            .map(|scope_table| match scope_table.source {
+                ScopeTableSource::Table(table) => Ok(super::plan::JoinedTable {
+                    op: super::plan::Operation::default_scan_for(&table),
+                    column_use_counts: vec![0; table.columns().len()],
+                    table: (*table).clone(),
+                    identifier: scope_table.identifier,
+                    internal_id: scope_table.internal_id,
+                    join_info: scope_table.join_info,
+                    col_used_mask: Default::default(),
+                    expression_index_usages: Vec::new(),
+                    database_id: 0,
+                }),
+                ScopeTableSource::Cte { name, .. } | ScopeTableSource::Derived { name, .. } => {
+                    Err(crate::LimboError::InternalError(format!(
+                        "derived bind source {name} cannot yet be converted into planner table references"
+                    )))
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut table_references = TableReferences::new(joined_tables, Vec::new());
+        self.tracking.flush(&mut table_references);
+        Ok(table_references)
+    }
 }
 
 // ── BindTracking ─────────────────────────────────────────────────────────
@@ -462,6 +537,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         let saved_aliases = std::mem::take(&mut self.aliases);
         let saved_phase = self.phase;
         let saved_outer_from_scope = self.outer_from_scope.clone();
+        let saved_tracking = std::mem::take(&mut self.tracking);
 
         let result = f(self);
 
@@ -469,6 +545,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         self.aliases = saved_aliases;
         self.phase = saved_phase;
         self.outer_from_scope = saved_outer_from_scope;
+        self.tracking = saved_tracking;
 
         result
     }
@@ -564,8 +641,8 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
     }
 
     /// Bind a SELECT statement, resolving all name references in-place.
-    /// Returns the bound result columns of the SELECT.
-    fn bind_select(&mut self, select: &mut ast::Select) -> Result<Vec<BoundColumn>> {
+    /// Returns the bound query result needed by planning.
+    fn bind_select(&mut self, select: &mut ast::Select) -> Result<BoundSelect> {
         self.with_query(|ctx| {
             // 1. Bind CTEs from WITH clause
             if let Some(with) = &mut select.with {
@@ -590,7 +667,11 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 Ok(())
             })?;
 
-            Ok(result_columns)
+            Ok(BoundSelect {
+                result_columns,
+                main_scope,
+                tracking: std::mem::take(&mut ctx.tracking),
+            })
         })
     }
 
@@ -713,7 +794,11 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
             let entry = self.ctes.get_mut(&cte_name).unwrap();
             if entry.explicit_columns.is_empty() {
-                entry.resolved_columns = bound_columns.into_iter().map(|bc| bc.name).collect();
+                entry.resolved_columns = bound_columns
+                    .result_columns
+                    .into_iter()
+                    .map(|bc| bc.name)
+                    .collect();
             } else {
                 entry.resolved_columns = entry.explicit_columns.clone();
             }
@@ -739,13 +824,19 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     //    - resolved_columns was populated by bind_cte pass 2
                     //    - Build Arc<CteTable> as the BindTable
                     let cte_table = Arc::new(CteTable {
-                        name: table_name,
+                        name: table_name.clone(),
                         columns: cte.resolved_columns.clone(),
                     });
                     // 4. Generate internal_id via self.id_gen.next_id()
                     return Ok(ScopeTable {
                         identifier,
                         internal_id: self.id_gen.next_id(),
+                        source: ScopeTableSource::Cte {
+                            name: table_name,
+                            columns: cte.resolved_columns.clone(),
+                            cte_id: cte.cte_id,
+                            select: cte.select.clone(),
+                        },
                         table: cte_table,
                         join_info: None,
                     });
@@ -765,6 +856,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 Ok(ScopeTable {
                     identifier,
                     internal_id: self.id_gen.next_id(),
+                    source: ScopeTableSource::Table(schema_table.clone()),
                     table: schema_table,
                     join_info: None,
                 })
@@ -782,18 +874,27 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
                 // FROM subqueries don't correlate with the query being built.
                 // The outer_scopes stack already contains any enclosing query scopes.
-                let bound_columns = self.bind_select(subselect)?;
+                let bound_select = self.bind_select(subselect)?;
 
                 // Build CteTable with the result column names
-                let subquery_table = Arc::new(CteTable {
+                let subquery_columns: Vec<String> = bound_select
+                    .result_columns
+                    .into_iter()
+                    .map(|bc| bc.name)
+                    .collect();
+                let subquery_table = Arc::new(DerivedTable {
                     name: identifier.clone(),
-                    columns: bound_columns.into_iter().map(|bc| bc.name).collect(),
+                    columns: subquery_columns.clone(),
                 });
 
                 // 7. Generate internal_id
                 Ok(ScopeTable {
                     identifier,
                     internal_id: self.id_gen.next_id(),
+                    source: ScopeTableSource::Derived {
+                        name: subquery_table.name.clone(),
+                        columns: subquery_columns,
+                    },
                     table: subquery_table,
                     join_info: None,
                 })
@@ -827,6 +928,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 Ok(ScopeTable {
                     identifier,
                     internal_id: self.id_gen.next_id(),
+                    source: ScopeTableSource::Table(schema_table.clone()),
                     table: schema_table,
                     join_info: None,
                 })
@@ -853,7 +955,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
                 // If alias is present, wrap all columns under that alias
                 // If no alias, flatten tables into parent scope
-                let sub_table = Arc::new(CteTable {
+                let sub_table = Arc::new(DerivedTable {
                     name: identifier.clone(),
                     columns: all_columns,
                 });
@@ -861,6 +963,10 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 Ok(ScopeTable {
                     identifier,
                     internal_id: self.id_gen.next_id(),
+                    source: ScopeTableSource::Derived {
+                        name: sub_table.name.clone(),
+                        columns: sub_table.columns.clone(),
+                    },
                     table: sub_table,
                     join_info: None,
                 })
@@ -1126,5 +1232,137 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         }
 
         Ok(scope)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{BTreeTable, Schema};
+    use crate::{DatabaseCatalog, RwLock, SymbolTable};
+    use turso_parser::ast::{Cmd, Stmt};
+    use turso_parser::parser::Parser;
+
+    #[derive(Default)]
+    struct TestIdGenerator {
+        next: usize,
+    }
+
+    impl IdGenerator for TestIdGenerator {
+        fn next_id(&mut self) -> TableInternalId {
+            let id = self.next;
+            self.next += 1;
+            id.into()
+        }
+    }
+
+    fn parse_select(sql: &str) -> ast::Select {
+        let mut parser = Parser::new(sql.as_bytes());
+        let cmd = parser
+            .next_cmd()
+            .expect("SQL should parse")
+            .expect("SQL should contain a statement");
+        match cmd {
+            Cmd::Stmt(Stmt::Select(select)) => select,
+            other => panic!("expected SELECT statement, got {other:?}"),
+        }
+    }
+
+    fn with_bind_context<T>(
+        table_ddls: &[&str],
+        f: impl FnOnce(&mut BindContext<'_, TestIdGenerator>) -> T,
+    ) -> T {
+        let mut schema = Schema::new();
+        for (idx, ddl) in table_ddls.iter().enumerate() {
+            schema
+                .add_btree_table(Arc::new(
+                    BTreeTable::from_sql(ddl, (idx + 2) as i64).expect("table DDL should parse"),
+                ))
+                .expect("table should be added to schema");
+        }
+
+        let database_schemas = RwLock::new(HashMap::default());
+        let attached_databases = RwLock::new(DatabaseCatalog::new());
+        let symbol_table = SymbolTable::new();
+        let resolver = Resolver::new(
+            &schema,
+            &database_schemas,
+            &attached_databases,
+            &symbol_table,
+            false,
+        );
+        let mut id_gen = TestIdGenerator::default();
+        let mut ctx = BindContext::new(&resolver, &mut id_gen);
+        f(&mut ctx)
+    }
+
+    #[test]
+    fn bind_select_returns_main_scope_and_tracking() {
+        with_bind_context(&["CREATE TABLE t(a, b)"], |ctx| {
+            let mut select = parse_select("SELECT b FROM t WHERE a = 1 ORDER BY b");
+            let bound = ctx.bind_select(&mut select).unwrap();
+
+            assert_eq!(bound.main_scope.tables.len(), 1);
+            assert_eq!(bound.main_scope.tables[0].identifier, "t");
+            assert_eq!(
+                bound.main_scope.tables[0].internal_id,
+                TableInternalId::from(0usize)
+            );
+            assert_eq!(bound.tracking.columns_used.len(), 2);
+            assert!(bound
+                .tracking
+                .columns_used
+                .contains(&(TableInternalId::from(0usize), 0)));
+            assert!(bound
+                .tracking
+                .columns_used
+                .contains(&(TableInternalId::from(0usize), 1)));
+        });
+    }
+
+    #[test]
+    fn bind_select_keeps_subquery_tracking_out_of_outer_tracking() {
+        with_bind_context(&["CREATE TABLE t(a)", "CREATE TABLE u(b)"], |ctx| {
+            let mut select =
+                parse_select("SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.b = a)");
+            let bound = ctx.bind_select(&mut select).unwrap();
+
+            assert_eq!(
+                bound.tracking.columns_used,
+                vec![(TableInternalId::from(0usize), 0)]
+            );
+            assert!(bound.tracking.outer_refs_used.is_empty());
+        });
+    }
+
+    #[test]
+    fn bound_select_into_table_references_populates_joined_tables() {
+        with_bind_context(&["CREATE TABLE t(a, b)"], |ctx| {
+            let mut select = parse_select("SELECT b FROM t WHERE a = 1");
+            let bound = ctx.bind_select(&mut select).unwrap();
+            let table_references = bound.into_table_references().unwrap();
+
+            assert_eq!(table_references.joined_tables().len(), 1);
+            let table = &table_references.joined_tables()[0];
+            assert_eq!(table.identifier, "t");
+            assert_eq!(table.internal_id, TableInternalId::from(0usize));
+            assert_eq!(table.table.get_name(), "t");
+            assert!(table.col_used_mask.get(0));
+            assert!(table.col_used_mask.get(1));
+            assert!(table_references.outer_query_refs().is_empty());
+        });
+    }
+
+    #[test]
+    fn bind_cte_uses_bound_select_result_columns() {
+        with_bind_context(&["CREATE TABLE t(x, y)"], |ctx| {
+            let mut select =
+                parse_select("WITH cte(col_x, col_y) AS (SELECT x, y FROM t) SELECT * FROM cte");
+            let with = select.with.as_mut().expect("expected WITH clause");
+            ctx.bind_cte(with).unwrap();
+
+            let cte = ctx.get_cte("cte").expect("cte should exist");
+            assert_eq!(cte.resolved_columns, vec!["col_x", "col_y"]);
+        });
     }
 }
