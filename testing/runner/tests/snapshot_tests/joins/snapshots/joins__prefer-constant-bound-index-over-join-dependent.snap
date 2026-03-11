@@ -1,0 +1,16 @@
+---
+source: joins.sqltest
+expression: SELECT t1.id FROM t1 LEFT JOIN t2 ON t1.id = t2.a AND t2.b = 'x' WHERE t2.a IS NULL;
+info:
+  statement_type: SELECT
+  tables:
+  - t1
+  - t1.id
+  - t2
+  setup_blocks:
+  - prereq_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN t1 USING COVERING INDEX sqlite_autoindex_t1_1
+`--SEARCH t2 USING INDEX idx_t2_b (b=?) LEFT-JOIN

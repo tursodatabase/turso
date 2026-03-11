@@ -113,6 +113,7 @@ The MVCC implementation is experimental and has the following limitations:
 * Indexes cannot be created and databases with indexes cannot be used.
 * All the data is eagerly loaded from disk to memory on first access so using big databases may take a long time to start, and will consume a lot of memory
 * Only `PRAGMA wal_checkpoint(TRUNCATE)` is supported and it blocks both readers and writers
+* `AUTOINCREMENT` is not supported. Tables with `AUTOINCREMENT` cannot be created or inserted into while MVCC is enabled.
 * Many features may not work, work incorrectly, and/or cause a panic.
 * Queries may return incorrect results
 * If a database is written to using MVCC and then opened again without MVCC, the changes are not visible unless first checkpointed
@@ -588,7 +589,7 @@ Turso supports switching between different journal modes at runtime using the `P
 | Mode | Description |
 |------|-------------|
 | `wal` | Write-Ahead Logging mode. The default mode for new databases. Provides good concurrency for readers and writers. |
-| `experimental_mvcc` | Multi-Version Concurrency Control mode. Enables concurrent transactions with snapshot isolation. **Note:** the feature is not production ready so do not use it for critical data right now. |
+| `mvcc` | Multi-Version Concurrency Control mode. Enables concurrent transactions with snapshot isolation. **Note:** the feature is not production ready so do not use it for critical data right now. |
 
 > **Note:** Legacy SQLite journal modes (`delete`, `truncate`, `persist`, `memory`, `off`) are recognized but not currently supported. Attempting to switch to these modes will return an error.
 
@@ -609,7 +610,7 @@ PRAGMA journal_mode = wal;
 **Switch to MVCC mode:**
 
 ```sql
-PRAGMA journal_mode = experimental_mvcc;
+PRAGMA journal_mode = mvcc;
 ```
 
 ### Example
@@ -621,11 +622,11 @@ turso> PRAGMA journal_mode;
 ├──────────────┤
 │ wal          │
 └──────────────┘
-turso> PRAGMA journal_mode = experimental_mvcc;
+turso> PRAGMA journal_mode = mvcc;
 ┌───────────────────┐
 │ journal_mode      │
 ├───────────────────┤
-│ experimental_mvcc │
+│ mvcc │
 └───────────────────┘
 ```
 

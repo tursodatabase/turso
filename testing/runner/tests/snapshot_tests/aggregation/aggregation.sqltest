@@ -219,3 +219,38 @@ snapshot distinct-count-with-join {
     ORDER BY
         unique_customers DESC;
 }
+
+# Simple count optimization: count(*) and count() should use the Count opcode
+# instead of a full table scan with AggStep.
+
+setup simple_table {
+    CREATE TABLE t1(x);
+}
+
+@setup simple_table
+snapshot simple-count-star {
+    SELECT count(*) FROM t1;
+}
+
+@setup simple_table
+snapshot simple-count-no-args {
+    SELECT count() FROM t1;
+}
+
+# count(col) must NOT use the Count opcode because it skips NULLs
+@setup simple_table
+snapshot count-column {
+    SELECT count(x) FROM t1;
+}
+
+# Mixed case must also use the Count opcode
+@setup simple_table
+snapshot simple-count-mixed-case {
+    SELECT CoUnT(*) FROM t1;
+}
+
+# Expression wrapping count must NOT use the Count opcode
+@setup simple_table
+snapshot count-star-plus-expr {
+    SELECT count(*) + 1 FROM t1;
+}

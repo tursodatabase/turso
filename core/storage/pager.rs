@@ -1628,7 +1628,15 @@ impl Pager {
             let Some(cur_savepoint) = savepoints.last() else {
                 return Ok(());
             };
-            if cur_savepoint.has_dirty_page(page.get().id as u32) {
+            // Skip subjournaling for pages that didn't exist when the savepoint was opened.
+            // New pages (allocated during this statement) can be "rolled back" by simply
+            // truncating back to the original db_size. This matches SQLite's subjRequiresPage()
+            // which checks: p->nOrig >= pgno.
+            let page_id_u32 = page.get().id as u32;
+            if page_id_u32 > cur_savepoint.db_size.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            if cur_savepoint.has_dirty_page(page_id_u32) {
                 return Ok(());
             }
             cur_savepoint.write_offset.load(Ordering::SeqCst)
@@ -2434,6 +2442,9 @@ impl Pager {
             panic!("DB should not be initialized and should not do any IO");
         };
         self.page_size.store(size.get(), Ordering::SeqCst);
+        // Clear dirty pages since this is pre-initialization setup, not a real write transaction.
+        // with_header_mut marks page 1 dirty as a side effect, but no transaction is active.
+        self.dirty_pages.write().clear();
         Ok(())
     }
 

@@ -200,6 +200,7 @@ fn update_pragma(
         PragmaName::CacheSpill => {
             let enabled = parse_pragma_enabled(&value);
             connection.get_pager().set_spill_enabled(enabled);
+            connection.bump_prepare_context_generation();
             Ok(TransactionMode::None)
         }
         PragmaName::Encoding => {
@@ -210,6 +211,7 @@ fn update_pragma(
             // For JournalMode, when setting a value, we use the opcode
             let mode_str = match value {
                 Expr::Name(name) => name.as_str().to_string(),
+                Expr::Literal(Literal::Keyword(ref kw)) => kw.clone(),
                 _ => parse_string(&value)?,
             };
 
@@ -486,6 +488,11 @@ fn update_pragma(
             connection.set_foreign_keys_enabled(enabled);
             Ok(TransactionMode::None)
         }
+        PragmaName::IAmADummy | PragmaName::RequireWhere => {
+            let enabled = parse_pragma_enabled(&value);
+            connection.set_dml_require_where(enabled);
+            Ok(TransactionMode::None)
+        }
         PragmaName::IgnoreCheckConstraints => {
             let enabled = parse_pragma_enabled(&value);
             connection.set_check_constraints_ignored(enabled);
@@ -502,7 +509,7 @@ fn update_pragma(
             connection.set_sync_type(sync_type);
             Ok(TransactionMode::None)
         }
-        PragmaName::ListTypes => unreachable!("list_types cannot be set"),
+        PragmaName::ListTypes => bail_parse_error!("list_types cannot be set"),
         PragmaName::TempStore => {
             use crate::TempStore;
             // Try to parse as a string first (default, file, memory)
@@ -1110,7 +1117,15 @@ fn query_pragma(
         PragmaName::QueryOnly => {
             if let Some(value_expr) = value {
                 let is_query_only = match value_expr {
-                    ast::Expr::Literal(Literal::Numeric(i)) => i.parse::<i64>().unwrap() != 0,
+                    ast::Expr::Literal(Literal::Numeric(i)) => i
+                        .parse::<i64>()
+                        .map(|v| v != 0)
+                        .or_else(|_| i.parse::<f64>().map(|v| v != 0.0))
+                        .map_err(|_| {
+                            LimboError::ParseError(format!(
+                                "Invalid numeric value for PRAGMA query_only: {i}"
+                            ))
+                        })?,
                     ast::Expr::Literal(Literal::String(..)) | ast::Expr::Name(..) => {
                         let s = match &value_expr {
                             ast::Expr::Literal(Literal::String(s)) => s.as_bytes(),
@@ -1198,6 +1213,14 @@ fn query_pragma(
         PragmaName::ForeignKeys => {
             let enabled = connection.foreign_keys_enabled();
             let register = program.alloc_register();
+            program.emit_int(enabled as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::IAmADummy | PragmaName::RequireWhere => {
+            let register = program.alloc_register();
+            let enabled = connection.get_dml_require_where();
             program.emit_int(enabled as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());

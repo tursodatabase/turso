@@ -695,8 +695,7 @@ fn bench_limbo(
     {
         let conn = db.connect().unwrap();
         if mvcc {
-            conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
-                .unwrap();
+            conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         }
         conn.execute("CREATE TABLE test (x)").unwrap();
         conn.close().unwrap();
@@ -781,9 +780,7 @@ fn bench_limbo_mvcc(
     let mut connecitons = Vec::new();
     let conn0 = db.connect().unwrap();
     if mvcc {
-        conn0
-            .execute("PRAGMA journal_mode = 'experimental_mvcc'")
-            .unwrap();
+        conn0.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     }
     conn0.execute("CREATE TABLE test (x)").unwrap();
 

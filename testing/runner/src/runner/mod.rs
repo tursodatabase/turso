@@ -1135,7 +1135,6 @@ async fn run_cross_check_integrity(binary: &Path, db_path: &Path) -> Result<(), 
     if is_turso {
         cmd.arg("-q");
         cmd.arg("-m").arg("list");
-        cmd.arg("--experimental-triggers");
     }
 
     cmd.arg("PRAGMA integrity_check;");

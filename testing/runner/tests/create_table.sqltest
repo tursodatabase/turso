@@ -22,6 +22,7 @@ expect {
 }
 
 # https://github.com/tursodatabase/turso/issues/3187
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
 @cross-check-integrity
 test create_table_unique_constraint_and_autoinc_backticks {
     CREATE TABLE `databases` (`id` integer PRIMARY KEY AUTOINCREMENT,`created_at` datetime,`updated_at` datetime,`deleted_at` datetime,`hostname` text NOT NULL,`namespace` text,`address` text,`primary_address` text,`local` numeric,`allowed_ips` text, CONSTRAINT `uni_databases_hostname` UNIQUE (`hostname`));

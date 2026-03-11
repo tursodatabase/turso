@@ -34,6 +34,7 @@ pub(crate) mod result_row;
 pub(crate) mod rollback;
 pub(crate) mod schema;
 pub(crate) mod select;
+pub(crate) mod stmt_journal;
 pub(crate) mod subquery;
 pub(crate) mod transaction;
 pub(crate) mod trigger;
@@ -102,6 +103,7 @@ pub fn translate(
         connection.database_schemas(),
         connection.attached_databases(),
         syms,
+        connection.experimental_custom_types_enabled(),
     );
 
     match stmt {
@@ -225,7 +227,8 @@ pub fn translate_inner(
                 tbl_name,
                 program,
                 sql,
-                connection.clone(),
+                &commands,
+                when_clause.as_deref(),
             )?
         }
         ast::Stmt::CreateView {
@@ -261,6 +264,11 @@ pub fn translate_inner(
             if !order_by.is_empty() {
                 bail_parse_error!("ORDER BY clause is not supported in DELETE");
             }
+            if where_clause.is_none() && connection.get_dml_require_where() {
+                bail_parse_error!(
+                    "DELETE without a WHERE clause is not allowed when require_where is enabled"
+                );
+            }
             translate_delete(
                 &tbl_name,
                 resolver,
@@ -286,13 +294,7 @@ pub fn translate_inner(
         ast::Stmt::DropTrigger {
             if_exists,
             trigger_name,
-        } => trigger::translate_drop_trigger(
-            connection,
-            resolver,
-            &trigger_name,
-            if_exists,
-            program,
-        )?,
+        } => trigger::translate_drop_trigger(resolver, &trigger_name, if_exists, program)?,
         ast::Stmt::DropView {
             if_exists,
             view_name,
@@ -338,7 +340,14 @@ pub fn translate_inner(
                 connection,
             )?;
         }
-        ast::Stmt::Update(update) => translate_update(update, resolver, program, connection)?,
+        ast::Stmt::Update(update) => {
+            if update.where_clause.is_none() && connection.get_dml_require_where() {
+                bail_parse_error!(
+                    "UPDATE without a WHERE clause is not allowed when require_where is enabled"
+                );
+            }
+            translate_update(update, resolver, program, connection)?
+        }
         ast::Stmt::Vacuum { name, into } => {
             vacuum::translate_vacuum(program, name.as_ref(), into.as_deref())?
         }
@@ -379,6 +388,7 @@ pub fn translate_inner(
 mod tests {
     use super::*;
     use crate::io::MemoryIO;
+    use crate::schema::{BTreeTable, Table, SQLITE_SEQUENCE_TABLE_NAME};
     use crate::Database;
 
     /// Verify that REGEXP produces the correct error when no regexp function is registered.
@@ -413,5 +423,83 @@ mod tests {
             err.contains("no such function: regexp"),
             "expected 'no such function: regexp', got: {err}"
         );
+    }
+
+    #[test]
+    fn test_insert_autoincrement_with_malformed_sqlite_sequence_is_corrupt() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:").unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+            .unwrap();
+
+        let mut schema = db.schema.lock().as_ref().clone();
+        let seq_root_page = schema
+            .get_btree_table(SQLITE_SEQUENCE_TABLE_NAME)
+            .expect("sqlite_sequence should exist after creating AUTOINCREMENT table")
+            .root_page;
+        let malformed_seq =
+            BTreeTable::from_sql("CREATE TABLE sqlite_sequence(name)", seq_root_page)
+                .expect("malformed sqlite_sequence SQL should parse");
+        schema.tables.insert(
+            SQLITE_SEQUENCE_TABLE_NAME.to_string(),
+            Arc::new(Table::BTree(Arc::new(malformed_seq))),
+        );
+
+        let pager = conn.pager.load().clone();
+        let syms = SymbolTable::new();
+
+        let mut parser = turso_parser::parser::Parser::new(b"INSERT INTO t(v) VALUES('x')");
+        let cmd = parser.next().unwrap().unwrap();
+        let stmt = match cmd {
+            ast::Cmd::Stmt(s) => s,
+            _ => panic!("expected statement"),
+        };
+
+        let err = translate(&schema, stmt, pager, conn, &syms, QueryMode::Normal, "")
+            .expect_err("translation should fail with malformed sqlite_sequence");
+        match err {
+            crate::LimboError::Corrupt(msg) => {
+                assert!(
+                    msg.contains("sqlite_sequence"),
+                    "expected sqlite_sequence corruption error, got: {msg}"
+                );
+            }
+            other => panic!("expected LimboError::Corrupt, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_insert_autoincrement_with_missing_sqlite_sequence_is_corrupt() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:").unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+            .unwrap();
+
+        let mut schema = db.schema.lock().as_ref().clone();
+        schema.tables.remove(SQLITE_SEQUENCE_TABLE_NAME);
+
+        let pager = conn.pager.load().clone();
+        let syms = SymbolTable::new();
+
+        let mut parser = turso_parser::parser::Parser::new(b"INSERT INTO t(v) VALUES('x')");
+        let cmd = parser.next().unwrap().unwrap();
+        let stmt = match cmd {
+            ast::Cmd::Stmt(s) => s,
+            _ => panic!("expected statement"),
+        };
+
+        let err = translate(&schema, stmt, pager, conn, &syms, QueryMode::Normal, "")
+            .expect_err("translation should fail with missing sqlite_sequence");
+        match err {
+            crate::LimboError::Corrupt(msg) => {
+                assert!(
+                    msg.contains("missing sqlite_sequence"),
+                    "expected missing sqlite_sequence error, got: {msg}"
+                );
+            }
+            other => panic!("expected LimboError::Corrupt, got: {other}"),
+        }
     }
 }

@@ -97,6 +97,8 @@ pub enum LimboError {
     PlanningError(String),
     #[error("Checkpoint failed: {0}")]
     CheckpointFailed(String),
+    #[error("Unsupported text encoding: {0}. Only UTF-8 is supported.")]
+    UnsupportedEncoding(String),
 }
 
 #[cfg(target_family = "unix")]

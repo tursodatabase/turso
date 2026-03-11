@@ -25,4 +25,4 @@ info:
 ---
 QUERY PLAN
 |--SCAN customers AS c
-`--SEARCH o USING INDEX idx_orders_customer_id
+`--SEARCH o USING INDEX idx_orders_customer_id (customer_id=?)

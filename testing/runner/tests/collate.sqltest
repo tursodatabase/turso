@@ -425,6 +425,22 @@ expect {
 }
 
 @cross-check-integrity
+test collate_group_by_explicit_override_binary_index {
+    CREATE TABLE t(a TEXT, b INT);
+    CREATE INDEX i_a ON t(a);
+    INSERT INTO t VALUES
+      ('a',1),('A',2),('b',3),('B',4),('a',5);
+    SELECT sum(b)
+    FROM t
+    GROUP BY a COLLATE NOCASE
+    ORDER BY 1;
+}
+expect {
+    7
+    8
+}
+
+@cross-check-integrity
 test collate_group_by_mixed_columns {
     CREATE TABLE t(a TEXT COLLATE NOCASE, b TEXT COLLATE RTRIM);
     INSERT INTO t VALUES ('A', 'x'), ('a', 'x '), ('B', 'y'), ('b', 'y  ');

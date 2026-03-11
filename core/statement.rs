@@ -128,6 +128,11 @@ impl Statement {
         self.state.execution_state
     }
 
+    /// Current statement-level metrics (rows read, VM steps, etc.).
+    pub fn metrics(&self) -> &vdbe::metrics::StatementMetrics {
+        &self.state.metrics
+    }
+
     pub fn mv_store(&self) -> impl Deref<Target = Option<Arc<MvStore>>> {
         self.program.connection.mv_store()
     }
@@ -160,9 +165,9 @@ impl Statement {
         }
 
         const MAX_SCHEMA_RETRY: usize = 50;
-        let mut res =
-            self.program
-                .step(&mut self.state, self.pager.clone(), self.query_mode, waker);
+        let mut res = self
+            .program
+            .step(&mut self.state, &self.pager, self.query_mode, waker);
         for attempt in 0..MAX_SCHEMA_RETRY {
             // Only reprepare if we still need to update schema
             if !matches!(res, Err(LimboError::SchemaUpdated)) {
@@ -172,20 +177,22 @@ impl Statement {
             self.reprepare()?;
             res = self
                 .program
-                .step(&mut self.state, self.pager.clone(), self.query_mode, waker);
+                .step(&mut self.state, &self.pager, self.query_mode, waker);
         }
 
         // Aggregate metrics when statement completes
         if matches!(res, Ok(StepResult::Done)) {
-            let mut conn_metrics = self.program.connection.metrics.write();
-            conn_metrics.record_statement(self.state.metrics.clone());
+            self.program
+                .connection
+                .metrics
+                .write()
+                .record_statement(&self.state.metrics);
             self.busy = false;
             self.busy_handler_state = None; // Reset busy state on completion
-            drop(conn_metrics);
 
             // After ANALYZE completes, refresh in-memory stats so planners can use them.
-            let sql = self.program.sql.trim_start();
-            if sql.to_ascii_uppercase().starts_with("ANALYZE") {
+            let sql = self.program.sql.trim_start().as_bytes();
+            if sql.len() >= 7 && sql[..7].eq_ignore_ascii_case(b"ANALYZE") {
                 refresh_analyze_stats(&self.program.connection);
             }
         } else {
@@ -228,10 +235,12 @@ impl Statement {
         res
     }
 
+    #[inline]
     pub fn step(&mut self) -> Result<StepResult> {
         self._step(None)
     }
 
+    #[inline]
     pub fn step_with_waker(&mut self, waker: &Waker) -> Result<StepResult> {
         self._step(Some(waker))
     }
@@ -673,6 +682,16 @@ impl Statement {
                     "Abort failed during statement reset",
                 );
             }
+        }
+        // Safety net: if end_statement wasn't reached (e.g. statement dropped
+        // mid-execution), ensure n_active_writes is decremented before reset
+        // clears the flag.
+        if self.state.is_active_write {
+            self.program
+                .connection
+                .n_active_writes
+                .fetch_sub(1, Ordering::SeqCst);
+            self.state.is_active_write = false;
         }
         self.state.reset(max_registers, max_cursors);
         self.state.n_change.store(0, Ordering::SeqCst);

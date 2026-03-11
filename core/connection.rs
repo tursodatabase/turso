@@ -49,30 +49,9 @@ pub(crate) enum TransactionState {
 
 /// Database connection handle.
 ///
-/// # Compile-Affecting Fields
-///
-/// The following fields affect SQL statement compilation and are tracked by `PrepareContext`
-/// in `vdbe/mod.rs`. If you add a new field that affects how statements are compiled or
-/// executed, you MUST also update `PrepareContext::from_connection()` to include it
-/// in core/vdbe/mod.rs.
-/// Failure to do so will cause stale cached statements to be used incorrectly.
-///
-/// Currently tracked fields:
-/// - `db` (via database pointer identity)
-/// - `fk_pragma` (foreign_keys)
-/// - `query_only`
-/// - `capture_data_changes`
-/// - `syms` / `syms_generation` (registered functions, virtual tables, etc.)
-/// - `attached_databases` (via fingerprint)
-/// - `busy_handler` (timeout affects retry behavior)
-/// - `cache_size`
-/// - `page_size`
-/// - `sync_mode`
-/// - `data_sync_retry`
-/// - `encryption_key` (whether set)
-/// - `encryption_cipher_mode`
-/// - Pager's `spill_enabled` setting
-/// - MVCC checkpoint threshold (when MVCC enabled)
+/// If you add a setting that affects SQL compilation or execution, call
+/// `bump_prepare_context_generation()` in its setter so cached prepared
+/// statements know they need to be reprepared.
 pub struct Connection {
     pub(crate) db: Arc<Database>,
     pub(crate) pager: ArcSwap<Pager>,
@@ -87,7 +66,6 @@ pub struct Connection {
     pub(crate) last_change: AtomicI64,
     pub(crate) total_changes: AtomicI64,
     pub(crate) syms: parking_lot::RwLock<SymbolTable>,
-    pub(crate) syms_generation: AtomicU64,
     pub(super) _shared_cache: bool,
     pub(super) cache_size: AtomicI32,
     /// page size used for an uninitialized database or the next vacuum command.
@@ -104,6 +82,8 @@ pub struct Connection {
     /// Attached databases
     pub(super) attached_databases: RwLock<DatabaseCatalog>,
     pub(super) query_only: AtomicBool,
+    /// If enabled, the UPDATE/DELETE statements must have a WHERE clause
+    pub(super) dml_require_where: AtomicBool,
     pub(crate) mv_tx: RwLock<Option<(crate::mvcc::database::TxID, TransactionMode)>>,
     /// Per-attached-database MVCC transactions.
     /// Main DB uses `mv_tx` above for zero-cost hot path access.
@@ -140,17 +120,19 @@ pub struct Connection {
     /// Whether pragma foreign_keys=ON for this connection
     pub(super) fk_pragma: AtomicBool,
     pub(crate) fk_deferred_violations: AtomicIsize,
+    /// Number of active write statements on this connection.
+    pub(crate) n_active_writes: AtomicI32,
     /// Whether pragma ignore_check_constraints=ON for this connection
     pub(super) check_constraints_pragma: AtomicBool,
     /// Track when each virtual table instance is currently in transaction.
     pub(crate) vtab_txn_states: RwLock<HashSet<u64>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct AttachedDatabasesFingerprint {
-    pub(crate) count: usize,
-    pub(crate) hash1: u64,
-    pub(crate) hash2: u64,
+    /// Generation counter bumped whenever any setting that affects PrepareContext
+    /// changes. Allows prepared statements to cheaply detect when they need to be
+    /// reprepared (single u64 comparison instead of rebuilding the full context).
+    /// IMPORTANT: this is a bit of a regression landmine because the generation
+    /// MUST be incremented whenever any setting that affects PrepareContext changes,
+    /// and this is not currently centralized; each setter bumps the generation individually.
+    pub(crate) prepare_context_generation: AtomicU64,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -211,6 +193,20 @@ impl Drop for Connection {
 }
 
 impl Connection {
+    /// Bump the prepare context generation counter. Must be called whenever any
+    /// connection setting that is tracked in `PrepareContext` changes, so that
+    /// prepared statements know they need to be reprepared.
+    #[inline]
+    pub(crate) fn bump_prepare_context_generation(&self) {
+        self.prepare_context_generation
+            .fetch_add(1, Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) fn prepare_context_generation(&self) -> u64 {
+        self.prepare_context_generation.load(Ordering::Acquire)
+    }
+
     /// check if connection executes nested program (so it must not do any "finalization" work as parent program will handle it)
     pub fn is_nested_stmt(&self) -> bool {
         self.nestedness.load(Ordering::SeqCst) > 0
@@ -467,14 +463,7 @@ impl Connection {
             self.get_mv_tx()
         };
         // TODO: This function below is synchronous, make it async
-        parse_schema_rows(
-            stmt,
-            &mut fresh,
-            &self.syms.read(),
-            mv_tx,
-            existing_views,
-            self.experimental_triggers_enabled(),
-        )?;
+        parse_schema_rows(stmt, &mut fresh, &self.syms.read(), mv_tx, existing_views)?;
 
         // Load custom types from __turso_internal_types if the table exists
         // and custom types are enabled. Type loading errors are non-fatal: we log
@@ -760,6 +749,7 @@ impl Connection {
 
     pub fn set_foreign_keys_enabled(&self, enable: bool) {
         self.fk_pragma.store(enable, Ordering::Release);
+        self.bump_prepare_context_generation();
     }
 
     pub fn foreign_keys_enabled(&self) -> bool {
@@ -1153,6 +1143,7 @@ impl Connection {
     }
     pub fn set_cache_size(&self, size: i32) {
         self.cache_size.store(size, Ordering::SeqCst);
+        self.bump_prepare_context_generation();
     }
 
     pub fn get_capture_data_changes_info(
@@ -1162,6 +1153,7 @@ impl Connection {
     }
     pub fn set_capture_data_changes_info(&self, opts: Option<CaptureDataChangesInfo>) {
         *self.capture_data_changes.write() = opts;
+        self.bump_prepare_context_generation();
     }
     pub fn get_cdc_transaction_id(&self) -> i64 {
         self.cdc_transaction_id.load(Ordering::SeqCst)
@@ -1222,6 +1214,7 @@ impl Connection {
 
         self.page_size.store(size.get_raw(), Ordering::SeqCst);
         self.pager.load().set_initial_page_size(size)?;
+        self.bump_prepare_context_generation();
 
         Ok(())
     }
@@ -1282,7 +1275,6 @@ impl Connection {
         } // Statement dropped here, before schema write lock
 
         let syms = self.syms.read();
-        let enable_triggers = self.experimental_triggers_enabled();
         self.with_schema_mut(|schema| -> Result<()> {
             // Incremental re-parse after extension loading. The schema already has
             // tables/indices/views from initial parse. We only need to pick up
@@ -1307,7 +1299,6 @@ impl Connection {
                     &mut dbsp_state_roots,
                     &mut dbsp_state_index_roots,
                     &mut materialized_view_info,
-                    enable_triggers,
                 ) {
                     Ok(()) => {}
                     Err(LimboError::ParseError(msg)) if msg.contains("already exists") => {}
@@ -1375,10 +1366,6 @@ impl Connection {
 
     pub fn experimental_custom_types_enabled(&self) -> bool {
         self.db.experimental_custom_types_enabled()
-    }
-
-    pub fn experimental_triggers_enabled(&self) -> bool {
-        self.db.experimental_triggers_enabled()
     }
 
     pub fn experimental_attach_enabled(&self) -> bool {
@@ -1569,7 +1556,12 @@ impl Connection {
         // A fresh :memory: DB defaults to WAL, so when main is MVCC we need to
         // create an MvStore for the attached DB so it runs in the same mode.
         if is_memory_db && self.mvcc_enabled() && !db.mvcc_enabled() {
-            let mv_store = journal_mode::open_mv_store(db.io.clone(), &db.path, db.open_flags)?;
+            let mv_store = journal_mode::open_mv_store(
+                db.io.clone(),
+                &db.path,
+                db.open_flags,
+                db.durable_storage.clone(),
+            )?;
             db.mv_store.store(Some(mv_store.clone()));
             let bootstrap_conn = db._connect(true, Some(pager.clone()), encryption_key)?;
             mv_store.bootstrap(bootstrap_conn)?;
@@ -1598,6 +1590,7 @@ impl Connection {
             }
         }
         self.attached_databases.write().insert(alias, (db, pager));
+        self.bump_prepare_context_generation();
 
         Ok(())
     }
@@ -1656,6 +1649,7 @@ impl Connection {
         // Invalidate the cached schema for this database index so that a future
         // ATTACH reusing the same index won't see stale schema entries.
         self.database_schemas.write().remove(&database_id);
+        self.bump_prepare_context_generation();
 
         Ok(())
     }
@@ -1757,58 +1751,6 @@ impl Connection {
         }
     }
 
-    pub(crate) fn attached_databases_fingerprint(&self) -> AttachedDatabasesFingerprint {
-        const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-        fn hash_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
-            for &byte in bytes {
-                hash ^= byte as u64;
-                hash = hash.wrapping_mul(FNV_PRIME);
-            }
-            hash
-        }
-
-        fn hash_u64(hash: u64, value: u64) -> u64 {
-            hash_bytes(hash, &value.to_le_bytes())
-        }
-
-        fn hash_entry(index: usize, alias: &str, db_ptr: usize) -> u64 {
-            let mut hash = FNV_OFFSET_BASIS;
-            hash = hash_u64(hash, index as u64);
-            hash = hash_bytes(hash, alias.as_bytes());
-            hash_u64(hash, db_ptr as u64)
-        }
-
-        let attached = self.attached_databases.read();
-        if attached.name_to_index.is_empty() {
-            return AttachedDatabasesFingerprint {
-                count: 0,
-                hash1: 0,
-                hash2: 0,
-            };
-        }
-
-        let mut hash1 = 0u64;
-        let mut hash2 = 0u64;
-        for (alias, &index) in attached.name_to_index.iter() {
-            let db_ptr = attached
-                .index_to_data
-                .get(&index)
-                .map(|(db, _pager)| Arc::as_ptr(db) as usize)
-                .unwrap_or(0);
-            let entry_hash = hash_entry(index, alias.as_str(), db_ptr);
-            hash1 = hash1.wrapping_add(entry_hash);
-            hash2 ^= entry_hash.rotate_left(17);
-        }
-
-        AttachedDatabasesFingerprint {
-            count: attached.name_to_index.len(),
-            hash1,
-            hash2,
-        }
-    }
-
     /// List all databases (main + attached) with their sequence numbers, names, and file paths
     /// Returns a vector of tuples: (seq_number, name, file_path)
     pub fn list_all_databases(&self) -> Vec<(usize, String, String)> {
@@ -1845,6 +1787,15 @@ impl Connection {
 
     pub fn set_query_only(&self, value: bool) {
         self.query_only.store(value, Ordering::SeqCst);
+        self.bump_prepare_context_generation();
+    }
+
+    pub fn get_dml_require_where(&self) -> bool {
+        self.dml_require_where.load(Ordering::SeqCst)
+    }
+
+    pub fn set_dml_require_where(&self, value: bool) {
+        self.dml_require_where.store(value, Ordering::SeqCst);
     }
 
     pub fn get_sync_mode(&self) -> SyncMode {
@@ -1853,6 +1804,7 @@ impl Connection {
 
     pub fn set_sync_mode(&self, mode: SyncMode) {
         self.sync_mode.set(mode);
+        self.bump_prepare_context_generation();
     }
 
     pub fn get_temp_store(&self) -> crate::TempStore {
@@ -1871,6 +1823,7 @@ impl Connection {
     pub fn set_data_sync_retry(&self, value: bool) {
         self.data_sync_retry
             .store(value, crate::sync::atomic::Ordering::SeqCst);
+        self.bump_prepare_context_generation();
     }
 
     /// Get the sync type setting.
@@ -1905,10 +1858,6 @@ impl Connection {
             .collect()
     }
 
-    pub(crate) fn syms_generation(&self) -> u64 {
-        self.syms_generation.load(Ordering::SeqCst)
-    }
-
     pub(crate) fn database_ptr(&self) -> usize {
         Arc::as_ptr(&self.db) as usize
     }
@@ -1916,12 +1865,14 @@ impl Connection {
     pub fn set_encryption_key(&self, key: EncryptionKey) -> Result<()> {
         tracing::trace!("setting encryption key for connection");
         *self.encryption_key.write() = Some(key);
+        self.bump_prepare_context_generation();
         self.set_encryption_context()
     }
 
     pub fn set_encryption_cipher(&self, cipher_mode: CipherMode) -> Result<()> {
         tracing::trace!("setting encryption cipher for connection");
         self.encryption_cipher_mode.set(cipher_mode);
+        self.bump_prepare_context_generation();
         self.set_encryption_context()
     }
 
@@ -1971,6 +1922,7 @@ impl Connection {
             Some(callback) => BusyHandler::Custom { callback },
             None => BusyHandler::None,
         };
+        self.bump_prepare_context_generation();
     }
 
     /// Sets maximum total accumulated timeout. If the duration is Zero, we unset the busy handler.
@@ -1980,6 +1932,7 @@ impl Connection {
         } else {
             BusyHandler::Timeout(duration)
         };
+        self.bump_prepare_context_generation();
     }
 
     /// Get the busy timeout duration.
@@ -2150,6 +2103,7 @@ impl Connection {
         match self.db.get_mv_store().as_ref() {
             Some(mv_store) => {
                 mv_store.set_checkpoint_threshold(threshold);
+                self.bump_prepare_context_generation();
                 Ok(())
             }
             None => Err(LimboError::InternalError("MVCC not enabled".into())),

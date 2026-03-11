@@ -222,7 +222,7 @@ impl TempDatabaseBuilder {
         // Enable MVCC via turso connection if requested
         if self.enable_mvcc {
             let conn = db.connect().unwrap();
-            conn.pragma_update("journal_mode", "'experimental_mvcc'")
+            conn.pragma_update("journal_mode", "'mvcc'")
                 .expect("enable mvcc");
         }
 
@@ -256,7 +256,7 @@ impl TempDatabase {
     pub fn new_with_mvcc(db_name: &str) -> Self {
         let db = Self::new(db_name);
         let conn = db.connect_limbo();
-        conn.pragma_update("journal_mode", "'experimental_mvcc'")
+        conn.pragma_update("journal_mode", "'mvcc'")
             .expect("enable mvcc");
         db
     }
@@ -999,5 +999,51 @@ mod tests {
         conn.execute("CREATE TRIGGER trigger_plucky_maximilienne_680_1169180867 BEFORE UPDATE ON plucky_maximilienne_680 BEGIN UPDATE shimmering_l_361 SET determined_g_421 = 'diligent_marmol', lovely_thorn_424 = X'6361707469766174696E675F7072616461', adaptable_ray_441 = 'energetic_tee', rousing_woodbine_414 = 'stupendous_gethin', perfect_greenhead_419 = X'6272696C6C69616E745F6461727474', ample_igualada_381 = X'7368696E696E675F6E616F756D6F76', knowledgeable_bacca_371 = 8795766455619870255, productive_kumper_465 = X'666162756C6F75735F6261636B', spellbinding_pouget_410 = -2080320213985020508, mirthful_castoriadis_442 = -5622911538.309956, open_minded_tcherkesoff_395 = X'70657273697374656E745F6B657272', imaginative_wright_464 = X'70726F647563746976655F7061736F', amiable_bluestein_373 = X'617765736F6D655F626F7A6F6B69', zestful_escalante_455 = -3488495773897908929, proficient_hoyt_392 = 2109777389586581121, gregarious_shantz_444 = X'676F7267656F75735F68616E636F78', knowledgeable_giollamoir_456 = 1807255432535784487, fortuitous_walia_422 = 5716860416.539839, giving_hapgood_388 = -7945368599.58225, sincere_pointblank_463 = 'blithesome_moon', excellent_burgos_405 = 'fantastic_grey', glistening_dent_447 = -8720078206077868004, excellent_lesoleil_445 = -8308316719.976472, imaginative_barrio_399 = 2586704785.5247574, gorgeous_jacquier_432 = X'696E6372656469626C655F657272616E646F6E6561', nice_gouldhawke_418 = -9218489973071029860, stunning_baverel_415 = 'elegant_macsimoin', gorgeous_perkins_401 = 1858284188.5782166, patient_cascade_411 = 5434496617634431287, glimmering_leighton_393 = X'70617373696F6E6174655F636F6F7264696E61646F73', blithesome_turgenev_369 = 539105039.8303547, lovely_kinna_390 = X'67656E65726F75735F706F696E74626C616E6B', propitious_driscoll_402 = 6110709419.661383 WHERE (shimmering_l_361.flexible_cairns_435 != -2665602268.6225224); UPDATE super_vernet_712 SET responsible_shilton_716 = X'6D617276656C6F75735F6172636865676F6E6F73' WHERE (TRUE); INSERT INTO sensible_samudzi_342 VALUES ('frank_olympics', 'splendid_academy', 6786370686344360623, -8674635739.474007, -4807591805.499456, 2818384407.6066933, 'insightful_fiorina', -4425841829162377840), ('productive_duch', 'ravishing_asher', 957231539187121006, -9936535798.322428, 3542340933.6666107, 6847954059.14608, 'loving_seminatore', 3269958273313428337); END;").unwrap();
 
         conn.execute("UPDATE plucky_maximilienne_680 SET creative_again_681 = 2 WHERE creative_again_681 = 1;").unwrap();
+    }
+
+    #[test]
+    fn test_pragma_i_am_a_dummy() -> anyhow::Result<()> {
+        let _ = env_logger::try_init();
+        let tmp_db =
+            TempDatabase::new_with_rusqlite("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);");
+        let conn = tmp_db.connect_limbo();
+
+        // Off by default — DELETE/UPDATE without WHERE allowed
+        conn.execute("INSERT INTO t VALUES (1, 'a')")?;
+        conn.execute("DELETE FROM t")?;
+
+        // Enable via i_am_a_dummy
+        conn.execute("PRAGMA i_am_a_dummy = ON")?;
+        let err = conn.execute("DELETE FROM t").unwrap_err();
+        assert!(
+            err.to_string().contains("DELETE without a WHERE clause"),
+            "{err:?}"
+        );
+        let err = conn.execute("UPDATE t SET val = 'x'").unwrap_err();
+        assert!(
+            err.to_string().contains("UPDATE without a WHERE clause"),
+            "{err:?}"
+        );
+
+        // With WHERE clause still works
+        conn.execute("INSERT INTO t VALUES (2, 'b')")?;
+        conn.execute("DELETE FROM t WHERE id = 2")?;
+        conn.execute("INSERT INTO t VALUES (3, 'c')")?;
+        conn.execute("UPDATE t SET val = 'd' WHERE id = 3")?;
+
+        // Dummy WHERE 1=1 bypasses the check (syntactic only)
+        conn.execute("DELETE FROM t WHERE 1=1")?;
+        conn.execute("UPDATE t SET val = 'e' WHERE 1=1")?;
+
+        // Alias require_where works too
+        conn.execute("PRAGMA i_am_a_dummy = OFF")?;
+        conn.execute("PRAGMA require_where = ON")?;
+        let err = conn.execute("DELETE FROM t").unwrap_err();
+        assert!(
+            err.to_string().contains("DELETE without a WHERE clause"),
+            "{err:?}"
+        );
+
+        Ok(())
     }
 }

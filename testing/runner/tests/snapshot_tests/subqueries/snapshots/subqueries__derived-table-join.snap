@@ -24,7 +24,7 @@ info:
 ---
 QUERY PLAN
 |--SCAN customers AS c
-`--SEARCH order_stats USING INDEX ephemeral_subquery_t3
+`--SEARCH order_stats USING INDEX ephemeral_subquery_t3 (customer_id=?)
    `--SCAN orders USING INDEX idx_orders_customer
 
 BYTECODE

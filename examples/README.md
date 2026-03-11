@@ -6,3 +6,4 @@
 - [`database-wasm-vite`](./javascript/database-wasm-vite/) — Browser (WASM), local database in the browser
 - [`sync-node`](./javascript/sync-node/) — Node.js with bidirectional sync to [Turso Cloud](https://turso.tech/)
 - [`sync-wasm-vite`](./javascript/sync-wasm-vite/) — Browser (WASM) with bidirectional sync to [Turso Cloud](https://turso.tech/)
+- [`concurrent-writes`](./javascript/concurrent-writes/) — MVCC: 16 concurrent writers using `BEGIN CONCURRENT`

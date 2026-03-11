@@ -127,7 +127,7 @@ BEGIN CONCURRENT [TRANSACTION];
 BEGIN CONCURRENT requires MVCC mode. Enable it by setting the journal mode before opening any transactions:
 
 ```sql
-PRAGMA journal_mode = experimental_mvcc;
+PRAGMA journal_mode = mvcc;
 ```
 
 ### How It Works
@@ -145,13 +145,13 @@ This provides **snapshot isolation**: each transaction sees a consistent view of
 
 ```sql
 -- Connection 1
-PRAGMA journal_mode = experimental_mvcc;
+PRAGMA journal_mode = mvcc;
 BEGIN CONCURRENT;
 UPDATE accounts SET balance = balance - 100 WHERE id = 1;
 COMMIT;
 
 -- Connection 2 (running simultaneously)
-PRAGMA journal_mode = experimental_mvcc;
+PRAGMA journal_mode = mvcc;
 BEGIN CONCURRENT;
 UPDATE accounts SET balance = balance + 50 WHERE id = 2;
 COMMIT;

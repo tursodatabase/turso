@@ -18,5 +18,6 @@ info:
 ---
 QUERY PLAN
 |--LIST SUBQUERY 1
-|  `--SCAN employees USING COVERING INDEX idx_employees_manager
+|  |--SCAN employees USING COVERING INDEX idx_employees_manager
+|  `--USE HASH TABLE FOR DISTINCT
 `--SCAN employees

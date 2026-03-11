@@ -225,7 +225,6 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
                     "encryption" => core_opts.with_encryption(true),
                     "index_method" => core_opts.with_index_method(true),
                     "autovacuum" => core_opts.with_autovacuum(true),
-                    "triggers" => core_opts.with_triggers(true),
                     "attach" => core_opts.with_attach(true),
                     _ => core_opts,
                 };

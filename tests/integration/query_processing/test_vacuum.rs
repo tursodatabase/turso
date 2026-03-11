@@ -356,7 +356,7 @@ fn test_vacuum_into_with_triggers(tmp_db: TempDatabase) {
     conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))
         .unwrap();
 
-    let dest_opts = turso_core::DatabaseOpts::new().with_triggers(true);
+    let dest_opts = turso_core::DatabaseOpts::new();
     let dest_db = TempDatabase::new_with_existent_with_opts(&dest_path, dest_opts);
     let dest_conn = dest_db.connect_limbo();
 
@@ -575,7 +575,8 @@ fn test_vacuum_into_empty_edge_cases(tmp_db: TempDatabase) -> anyhow::Result<()>
 }
 
 /// Test VACUUM INTO preserves AUTOINCREMENT counters (sqlite_sequence)
-#[turso_macros::test(mvcc)]
+/// FIXME: enable for mvcc when autoincrement is fixed
+#[turso_macros::test]
 fn test_vacuum_into_preserves_autoincrement(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
@@ -1366,15 +1367,15 @@ fn test_vacuum_into_with_partial_indexes(tmp_db: TempDatabase) -> anyhow::Result
 }
 
 /// Test VACUUM INTO preserves MVCC journal mode from source database.
-/// If source has experimental_mvcc enabled, destination should too.
+/// If source has mvcc enabled, destination should too.
 #[turso_macros::test]
 fn test_vacuum_into_preserves_mvcc(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
-    conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")?;
+    conn.execute("PRAGMA journal_mode = 'mvcc'")?;
     let source_mode: Vec<(String,)> = conn.exec_rows("PRAGMA journal_mode");
     assert_eq!(
         source_mode,
-        vec![("experimental_mvcc".to_string(),)],
+        vec![("mvcc".to_string(),)],
         "Source should have MVCC enabled"
     );
 
@@ -1393,7 +1394,7 @@ fn test_vacuum_into_preserves_mvcc(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let dest_mode: Vec<(String,)> = dest_conn.exec_rows("PRAGMA journal_mode");
     assert_eq!(
         dest_mode,
-        vec![("experimental_mvcc".to_string(),)],
+        vec![("mvcc".to_string(),)],
         "Destination should have MVCC enabled (inherited from source)"
     );
 

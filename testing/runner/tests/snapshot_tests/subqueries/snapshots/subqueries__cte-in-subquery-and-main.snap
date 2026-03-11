@@ -27,7 +27,7 @@ QUERY PLAN
 |  |--SCAN products USING INDEX idx_products_category
 |  `--SCAN category_avg
 |--SCAN products AS p
-`--SEARCH ca USING INDEX ephemeral_subquery_t5
+`--SEARCH ca USING INDEX ephemeral_subquery_t5 (category_id=?)
 
 BYTECODE
 addr  opcode                    p1  p2  p3  p4              p5  comment

@@ -558,21 +558,42 @@ test.skip("Timeout option", async (t) => {
   fs.unlinkSync(path);
 });
 
-test.skip("Concurrent writes over same connection", async (t) => {
+test.serial("Concurrent reads over same connection", async (t) => {
   const db = t.context.db;
-  await db.exec(`
-    DROP TABLE IF EXISTS users;
-    CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)
-  `);
-  const stmt = await db.prepare("INSERT INTO users(name, email) VALUES (:name, :email)");
+
+  // Fire multiple reads concurrently on the same connection.
+  // Each gets its own prepared statement to avoid sharing cursor state.
+  // The connection should serialize them internally, not corrupt or error.
+  const stmts = [];
+  for (let i = 0; i < 10; i++) {
+    stmts.push(await db.prepare("SELECT * FROM users ORDER BY id"));
+  }
+  const promises = stmts.map(stmt => stmt.all());
+  const results = await Promise.all(promises);
+  for (const rows of results) {
+    t.is(rows.length, 2);
+    t.is(rows[0].name, "Alice");
+    t.is(rows[1].name, "Bob");
+  }
+});
+
+test.serial("Concurrent writes over same connection", async (t) => {
+  const db = t.context.db;
+
+  // Fire multiple writes concurrently on the same connection.
+  // The connection should serialize them internally, not corrupt or error.
   const promises = [];
-  for (let i = 0; i < 1000; i++) {
-    promises.push(stmt.run({ name: "Alice", email: "alice@example.org" }));
+  for (let i = 0; i < 20; i++) {
+    promises.push(
+      db.exec(`INSERT INTO users (name, email) VALUES ('User${i}', 'user${i}@example.org')`)
+    );
   }
   await Promise.all(promises);
-  const stmt2 = await db.prepare("SELECT * FROM users ORDER BY name");
-  const rows = await stmt2.all();
-  t.is(rows.length, 1000);
+
+  const stmt = await db.prepare("SELECT count(*) as cnt FROM users");
+  const rows = await stmt.raw().all();
+  // 2 from beforeEach + 20 concurrent inserts
+  t.is(rows[0][0], 22);
 });
 
 const connect = async (path, options = {}) => {

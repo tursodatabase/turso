@@ -1,11 +1,14 @@
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
-    schema::{self, BTreeTable, ColDef, Column, Index, IndexColumn, ResolvedFkRef, Table},
+    schema::{
+        self, BTreeTable, ColDef, Column, Index, IndexColumn, ResolvedFkRef, Table,
+        SQLITE_SEQUENCE_TABLE_NAME,
+    },
     sync::Arc,
     translate::{
         emitter::{
-            emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
-            emit_cdc_patch_record, emit_check_constraints, emit_fk_child_decrement_on_delete,
+            delete::emit_fk_child_decrement_on_delete, emit_cdc_autocommit_commit,
+            emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, emit_check_constraints,
             prepare_cdc_if_necessary, OperationMode, Resolver,
         },
         expr::{
@@ -44,6 +47,7 @@ use crate::{
     CaptureDataChangesExt, Connection, LimboError, Result, VirtualTable,
 };
 use std::num::NonZeroUsize;
+use turso_macros::turso_assert;
 use turso_parser::ast::{
     self, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, TriggerEvent,
     TriggerTime, Upsert, UpsertDo, With,
@@ -85,6 +89,11 @@ fn validate(
     }
     if table.btree().is_some_and(|t| !t.has_rowid) {
         crate::bail_parse_error!("INSERT into WITHOUT ROWID table is not supported");
+    }
+    if table.btree().is_some_and(|t| t.has_autoincrement) && conn.mvcc_enabled() {
+        crate::bail_parse_error!(
+            "AUTOINCREMENT is not supported in MVCC mode (journal_mode=experimental_mvcc)"
+        );
     }
 
     Ok(())
@@ -455,7 +464,8 @@ pub fn translate_insert(
         .collect()
     });
 
-    if !relevant_before_triggers.is_empty() {
+    let has_before_triggers = !relevant_before_triggers.is_empty();
+    if has_before_triggers {
         // Build NEW registers: for rowid alias columns, use the rowid register; otherwise use column register
         let new_registers: Vec<usize> = insertion
             .col_mappings
@@ -554,7 +564,7 @@ pub fn translate_insert(
         });
 
         // Encode values for columns with custom types.
-        emit_custom_type_encode(program, resolver, &insertion)?;
+        emit_custom_type_encode(program, resolver, &insertion, &ctx.table.name)?;
 
         // Post-encode TypeCheck: validate that encode produced the correct
         // storage type (BASE).
@@ -598,6 +608,15 @@ pub fn translate_insert(
             table_name_reg,
         }) = ctx.autoincrement_meta
         {
+            turso_assert!(ctx.table.has_autoincrement);
+            // Existing sqlite_sequence row: update only when explicit key advances seq.
+            let missing_row_label = program.allocate_label();
+            let explicit_done_label = program.allocate_label();
+            program.emit_insn(Insn::IsNull {
+                reg: r_seq_rowid,
+                target_pc: missing_row_label,
+            });
+
             let skip_seq_update_label = program.allocate_label();
             program.emit_insn(Insn::Le {
                 lhs: insertion.key_register(),
@@ -616,8 +635,34 @@ pub fn translate_insert(
                 table_name_reg,
                 insertion.key_register(),
             )?;
-
+            program.emit_insn(Insn::Goto {
+                target_pc: explicit_done_label,
+            });
             program.preassign_label_to_next_insn(skip_seq_update_label);
+
+            // Missing sqlite_sequence row: materialize it once with max(existing_seq, explicit_key).
+            // For first explicit negative insert this yields seq=0, matching SQLite.
+            program.preassign_label_to_next_insn(missing_row_label);
+            let seq_to_write_reg = program.alloc_register();
+            program.emit_insn(Insn::Copy {
+                src_reg: r_seq,
+                dst_reg: seq_to_write_reg,
+                extra_amount: 0,
+            });
+            program.emit_insn(Insn::MemMax {
+                dest_reg: seq_to_write_reg,
+                src_reg: insertion.key_register(),
+            });
+            emit_update_sqlite_sequence(
+                program,
+                resolver,
+                ctx.database_id,
+                seq_cursor_id,
+                r_seq_rowid,
+                table_name_reg,
+                seq_to_write_reg,
+            )?;
+            program.preassign_label_to_next_insn(explicit_done_label);
         }
     }
 
@@ -746,7 +791,8 @@ pub fn translate_insert(
         )
         .collect()
     });
-    if !relevant_after_triggers.is_empty() {
+    let has_after_triggers = !relevant_after_triggers.is_empty();
+    if has_after_triggers {
         // Build raw NEW registers for AFTER triggers. Values are encoded at this point;
         // fire_trigger will decode them via decode_trigger_registers.
         let key_reg = insertion.key_register();
@@ -902,7 +948,25 @@ pub fn translate_insert(
 
     emit_epilogue(program, resolver, &ctx, inserting_multiple_rows)?;
 
-    program.set_needs_stmt_subtransactions(true);
+    super::stmt_journal::set_insert_stmt_journal_flags(
+        program,
+        &super::stmt_journal::InsertJournalCtx {
+            inserting_multiple_rows,
+            has_triggers: has_before_triggers || has_after_triggers,
+            has_fks,
+            is_replace: matches!(ctx.on_conflict, ResolveType::Replace),
+            has_upsert,
+            has_autoincrement: btree_table.has_autoincrement,
+            has_abort_resolution: matches!(ctx.on_conflict, ResolveType::Abort),
+            notnull_col_exists: insertion
+                .col_mappings
+                .iter()
+                .any(|m| m.column.notnull() && !m.column.is_rowid_alias()),
+            has_check: !ctx.table.check_constraints.is_empty(),
+            has_unique: !constraints.constraints_to_check.is_empty(),
+        },
+    );
+
     program.result_columns = result_columns;
     program.table_references.extend(table_references);
     Ok(())
@@ -1233,16 +1297,44 @@ fn resolve_upserts(
     Ok(())
 }
 
+fn get_valid_sqlite_sequence_table(
+    resolver: &Resolver,
+    database_id: usize,
+) -> Result<Arc<BTreeTable>> {
+    let Some(seq_table) = resolver.with_schema(database_id, |s| {
+        s.get_btree_table(SQLITE_SEQUENCE_TABLE_NAME)
+    }) else {
+        crate::bail_corrupt_error!("missing sqlite_sequence table");
+    };
+
+    if !seq_table.has_rowid {
+        crate::bail_corrupt_error!("malformed sqlite_sequence: table must have rowid");
+    }
+
+    if seq_table.columns.len() != 2 {
+        crate::bail_corrupt_error!(
+            "malformed sqlite_sequence: expected 2 columns, got {}",
+            seq_table.columns.len()
+        );
+    }
+
+    let col0_name = seq_table.columns[0].name.as_deref();
+    let col1_name = seq_table.columns[1].name.as_deref();
+    if !matches!(col0_name, Some(name) if name.eq_ignore_ascii_case("name"))
+        || !matches!(col1_name, Some(name) if name.eq_ignore_ascii_case("seq"))
+    {
+        crate::bail_corrupt_error!("malformed sqlite_sequence: expected columns (name, seq)");
+    }
+
+    Ok(seq_table)
+}
+
 fn init_autoincrement(
     program: &mut ProgramBuilder,
     ctx: &mut InsertEmitCtx,
     resolver: &Resolver,
 ) -> Result<()> {
-    let seq_table = resolver
-        .with_schema(ctx.database_id, |s| s.get_btree_table("sqlite_sequence"))
-        .ok_or_else(|| {
-            crate::error::LimboError::InternalError("sqlite_sequence table not found".to_string())
-        })?;
+    let seq_table = get_valid_sqlite_sequence_table(resolver, ctx.database_id)?;
     let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: seq_cursor_id,
@@ -2235,7 +2327,7 @@ fn translate_column(
             });
         }
     } else {
-        let nullable = !column.notnull() && !column.primary_key();
+        let nullable = !column.notnull() && !column.is_rowid_alias();
         if !nullable {
             crate::bail_parse_error!(
                 "column {} is not nullable",
@@ -2668,11 +2760,7 @@ fn ensure_sequence_initialized(
     table: &schema::BTreeTable,
     database_id: usize,
 ) -> Result<()> {
-    let seq_table = resolver
-        .with_schema(database_id, |s| s.get_btree_table("sqlite_sequence"))
-        .ok_or_else(|| {
-            crate::error::LimboError::InternalError("sqlite_sequence table not found".to_string())
-        })?;
+    let seq_table = get_valid_sqlite_sequence_table(resolver, database_id)?;
 
     let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
 
@@ -2760,7 +2848,7 @@ fn ensure_sequence_initialized(
         key_reg: new_rowid_reg,
         record_reg,
         flag: InsertFlags::new(),
-        table_name: "sqlite_sequence".to_string(),
+        table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
     });
 
     program.preassign_label_to_next_insn(entry_exists_label);
@@ -3033,9 +3121,7 @@ fn emit_update_sqlite_sequence(
         extra_amount: 0,
     });
 
-    let seq_table = resolver
-        .with_schema(database_id, |s| s.get_btree_table("sqlite_sequence"))
-        .unwrap();
+    let seq_table = get_valid_sqlite_sequence_table(resolver, database_id)?;
     let affinity_str = seq_table
         .columns
         .iter()
@@ -3066,7 +3152,7 @@ fn emit_update_sqlite_sequence(
         key_reg: r_seq_rowid,
         record_reg,
         flag: InsertFlags::new(),
-        table_name: "sqlite_sequence".to_string(),
+        table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
     });
     program.emit_insn(Insn::Goto {
         target_pc: end_update_label,
@@ -3078,7 +3164,7 @@ fn emit_update_sqlite_sequence(
         key_reg: r_seq_rowid,
         record_reg,
         flag: InsertFlags(turso_parser::ast::ResolveType::Replace.bit_value() as u8),
-        table_name: "sqlite_sequence".to_string(),
+        table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
     });
 
     program.preassign_label_to_next_insn(end_update_label);
@@ -3645,6 +3731,7 @@ fn emit_custom_type_encode(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     insertion: &Insertion,
+    table_name: &str,
 ) -> Result<()> {
     let columns: Vec<_> = insertion
         .col_mappings
@@ -3657,5 +3744,6 @@ fn emit_custom_type_encode(
         &columns,
         insertion.first_col_register(),
         None, // INSERT: encode all columns
+        table_name,
     )
 }

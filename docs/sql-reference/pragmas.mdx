@@ -222,7 +222,7 @@ Turso supports WAL (Write-Ahead Logging) mode. Rollback journal modes (DELETE, T
 **Turso Extension**: Turso supports an experimental MVCC journal mode for concurrent writes:
 
 ```sql
-PRAGMA journal_mode = experimental_mvcc;
+PRAGMA journal_mode = mvcc;
 ```
 
 When MVCC mode is active, you can use `BEGIN CONCURRENT` for optimistic concurrent write transactions. See [Transactions](/docs/sql-reference/statements/transactions#begin-concurrent) for details.

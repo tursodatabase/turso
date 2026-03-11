@@ -1,4 +1,5 @@
 @database :memory:
+@skip-file-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
 
 # Test: Create an AUTOINCREMENT table and verify sqlite_sequence is also created.
 @cross-check-integrity
@@ -259,7 +260,6 @@ expect {
 }
 
 # refer https://github.com/tursodatabase/turso/pull/2983#issuecomment-3322404270 was discovered while adding autoincr to fuzz tests
-@skip-if mvcc "not supported in MVCC mode"
 @cross-check-integrity
 test autoinc-conflict-on-nothing {
     CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, k TEXT);
@@ -301,4 +301,13 @@ test autoinc-fail-on-non-integer-pk-mixed-case-string-name {
     CREATE TABLE t("Id" TEXT, PRIMARY KEY('ID' AUTOINCREMENT));
 }
 expect error {
+}
+
+# regression test for https://github.com/tursodatabase/turso/issues/5703
+test autoinc-expicit-negative-rowid-initializes-seq-table {
+	CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT);
+	INSERT OR IGNORE INTO t(id,payload) VALUES (-42, 'tx_explicit_0');
+	SELECT name, seq FROM sqlite_sequence WHERE name='t';
+} expect {
+	t|0
 }

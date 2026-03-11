@@ -589,6 +589,7 @@ pub fn emit_upsert(
                 &bt.columns,
                 new_start,
                 None,
+                &bt.name,
             )?;
 
             // Post-encode TypeCheck: validate encoded values match storage type.
@@ -1423,6 +1424,8 @@ fn rewrite_expr_to_registers(
                         if ns.eq_ignore_ascii_case(tn) {
                             if let Some(r) = col_reg_from_row_image(&c) {
                                 *expr = Expr::Register(r);
+                            } else {
+                                bail_parse_error!("no such column: {}.{}", ns, c);
                             }
                             return Ok(WalkControl::Continue);
                         }

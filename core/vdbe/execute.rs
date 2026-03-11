@@ -2,9 +2,9 @@ use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::AlterTableFunc;
 use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
 use crate::mvcc::database::CheckpointStateMachine;
-use crate::mvcc::LocalClock;
+use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
-use crate::schema::{Table, SQLITE_SEQUENCE_TABLE_NAME};
+use crate::schema::{Schema, Table, SQLITE_SEQUENCE_TABLE_NAME};
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
     integrity_check, CursorTrait, IntegrityCheckError, IntegrityCheckState, PageCategory,
@@ -18,13 +18,13 @@ use crate::translate::collate::CollationSeq;
 use crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME;
 use crate::types::{
     compare_immutable, compare_records_generic, AsValueRef, Extendable, IOCompletions, IOResult,
-    ImmutableRecord, IndexInfo, SeekResult, Text,
+    ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
 };
 use crate::util::{
     escape_sql_string_literal, normalize_ident, rename_identifiers, rewrite_check_expr_table_refs,
     rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
     rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
-    trim_ascii_whitespace,
+    rewrite_view_sql_for_column_rename, trim_ascii_whitespace, RewrittenView,
 };
 use crate::vdbe::affinity::{
     apply_numeric_affinity, try_for_float, Affinity, NumericParseResult, ParsedNumber,
@@ -63,6 +63,7 @@ use crate::{
     IOExt, MvCursor, QueryMode,
 };
 use crate::{CdcVersion, Statement};
+use branches::{mark_unlikely, unlikely};
 use either::Either;
 use smallvec::SmallVec;
 use std::any::Any;
@@ -92,6 +93,13 @@ use crate::{
 use crate::{connection::Row, info, turso_assert, OpenFlags, TransactionState, ValueRef};
 
 use super::{
+    array::{
+        array_values_from_blob, compare_arrays, compute_array_length, exec_array_append,
+        exec_array_cat, exec_array_contains, exec_array_contains_all, exec_array_overlap,
+        exec_array_position, exec_array_prepend, exec_array_remove, exec_array_slice,
+        exec_array_to_string, exec_string_to_array, make_array_from_registers, parse_text_array,
+        serialize_array_from_blob, values_to_record_blob,
+    },
     insn::{Cookie, RegisterOrLiteral},
     CommitState,
 };
@@ -139,14 +147,17 @@ macro_rules! return_if_io {
         match $expr {
             Ok(IOResult::Done(v)) => v,
             Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
-            Err(err) => return Err(err),
+            Err(err) => {
+                mark_unlikely();
+                return Err(err);
+            }
         }
     };
 }
 
 macro_rules! check_arg_count {
     ($actual:expr, $expected:expr) => {
-        if $actual != $expected {
+        if unlikely($actual != $expected) {
             return Err(LimboError::InternalError(format!(
                 "expected {} argument(s), got {}",
                 $expected, $actual
@@ -242,6 +253,37 @@ fn make_sort_comparator(func_name: &str) -> Option<crate::vdbe::sorter::SortComp
                 }
             },
         )),
+        "array_lt" => Some(std::sync::Arc::new(
+            |a: &ValueRef, b: &ValueRef| -> Ordering {
+                match (a, b) {
+                    (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
+                    (ValueRef::Null, _) => Ordering::Less,
+                    (_, ValueRef::Null) => Ordering::Greater,
+                    (ValueRef::Blob(a_blob), ValueRef::Blob(b_blob)) => {
+                        crate::vdbe::array::compare_arrays(a_blob, b_blob)
+                            .unwrap_or(Ordering::Equal)
+                    }
+                    (ValueRef::Text(a_text), ValueRef::Text(b_text)) => {
+                        let a_vals = crate::vdbe::array::parse_text_array(a_text);
+                        let b_vals = crate::vdbe::array::parse_text_array(b_text);
+                        match (a_vals, b_vals) {
+                            (Some(av), Some(bv)) => {
+                                let a_blob = crate::vdbe::array::values_to_record_blob(&av);
+                                let b_blob = crate::vdbe::array::values_to_record_blob(&bv);
+                                if let (Value::Blob(ab), Value::Blob(bb)) = (&a_blob, &b_blob) {
+                                    crate::vdbe::array::compare_arrays(ab, bb)
+                                        .unwrap_or(Ordering::Equal)
+                                } else {
+                                    Ordering::Equal
+                                }
+                            }
+                            _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+                        }
+                    }
+                    _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+                }
+            },
+        )),
         _ => None,
     }
 }
@@ -288,7 +330,7 @@ pub fn op_init(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Init { target_pc }, insn);
-    if !target_pc.is_offset() {
+    if unlikely(!target_pc.is_offset()) {
         crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
     }
     state.pc = target_pc.as_offset_int();
@@ -475,7 +517,7 @@ pub fn op_checkpoint(
     }
     // Re-fetch mv_store from connection to get the latest value.
     // This is necessary because the mv_store may have been set by a preceding JournalMode instruction
-    // (e.g., when switching from WAL to MVCC mode via `PRAGMA journal_mode = "experimental_mvcc"`).
+    // (e.g., when switching from WAL to MVCC mode via `PRAGMA journal_mode = "mvcc"`).
     let mv_store = program.connection.mv_store_for_db(*database);
     if let Some(mv_store) = mv_store.as_ref() {
         if !matches!(checkpoint_mode, CheckpointMode::Truncate { .. }) {
@@ -540,7 +582,7 @@ pub fn op_checkpoint(
         }
         Ok(IOResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
         Err(err) => {
-            tracing::error!("PRAGMA wal_checkpoint failed: {err:?}");
+            tracing::debug!("PRAGMA wal_checkpoint failed: {err:?}");
             pager.clear_checkpoint_state();
             state.registers[*dest] = Register::Value(Value::from_i64(1));
             state.pc += 1;
@@ -571,7 +613,10 @@ pub fn op_null(
                 state.rowsets.remove(dest);
             }
         }
-        _ => unreachable!("unexpected Insn {:?}", insn),
+        _ => {
+            mark_unlikely();
+            unreachable!("unexpected Insn {:?}", insn)
+        }
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -608,7 +653,7 @@ pub fn op_compare(
     let start_reg_b = *start_reg_b;
     let count = *count;
 
-    if start_reg_a + count > start_reg_b {
+    if unlikely(start_reg_a + count > start_reg_b) {
         return Err(LimboError::InternalError(
             "Compare registers overlap".to_string(),
         ));
@@ -645,7 +690,7 @@ pub fn op_jump(
     assert!(target_pc_eq.is_offset());
     assert!(target_pc_gt.is_offset());
     let cmp = state.last_compare.take();
-    if cmp.is_none() {
+    if unlikely(cmp.is_none()) {
         return Err(LimboError::InternalError(
             "Jump without compare".to_string(),
         ));
@@ -714,6 +759,7 @@ pub fn op_if_pos(
             state.pc += 1;
         }
         _ => {
+            mark_unlikely();
             return Err(LimboError::InternalError(
                 "IfPos: the value in the register is not an integer".into(),
             ));
@@ -878,6 +924,28 @@ pub fn op_comparison(
             state.pc += 1;
         }
         return Ok(InsnFunctionStepResult::Step);
+    }
+
+    // Element-wise array comparison when ARRAY_CMP flag is set
+    if flags.has_array_cmp() {
+        if let (Value::Blob(lb), Value::Blob(rb)) = (lhs_value, rhs_value) {
+            if let Ok(ord) = compare_arrays(lb, rb) {
+                let should_jump = match op {
+                    ComparisonOp::Eq => ord.is_eq(),
+                    ComparisonOp::Ne => !ord.is_eq(),
+                    ComparisonOp::Lt => ord.is_lt(),
+                    ComparisonOp::Le => ord.is_le(),
+                    ComparisonOp::Gt => ord.is_gt(),
+                    ComparisonOp::Ge => ord.is_ge(),
+                };
+                if should_jump {
+                    state.pc = target_pc.as_offset_int();
+                } else {
+                    state.pc += 1;
+                }
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
     }
 
     let (new_lhs, new_rhs) = (affinity.convert(lhs_value), affinity.convert(rhs_value));
@@ -1170,6 +1238,7 @@ pub fn op_vcreate(
                 .map(|v| v.map(|v| v.to_ffi()))
                 .collect::<Result<_, _>>()?
         } else {
+            mark_unlikely();
             return Err(LimboError::InternalError(
                 "VCreate: args_reg is not a record".to_string(),
             ));
@@ -1294,7 +1363,7 @@ pub fn op_vupdate(
         return Err(LimboError::ReadOnly);
     }
 
-    if *arg_count < 2 {
+    if unlikely(*arg_count < 2) {
         return Err(LimboError::InternalError(
             "VUpdate: arg_count must be at least 2 (rowid and insert_rowid)".to_string(),
         ));
@@ -1304,6 +1373,7 @@ pub fn op_vupdate(
         if let Some(value) = state.registers.get(*start_reg + i) {
             argv.push(value.get_value().clone());
         } else {
+            mark_unlikely();
             return Err(LimboError::InternalError(format!(
                 "VUpdate: register out of bounds at {}",
                 *start_reg + i
@@ -1336,6 +1406,7 @@ pub fn op_vupdate(
         }
         Err(e) => {
             // virtual table update failed
+            mark_unlikely();
             return Err(LimboError::ExtensionError(format!(
                 "Virtual table update failed: {e}"
             )));
@@ -1382,6 +1453,7 @@ pub fn op_vdestroy(
     let conn = program.connection.clone();
     {
         let Some(vtab) = conn.syms.write().vtabs.remove(table_name) else {
+            mark_unlikely();
             return Err(crate::LimboError::InternalError(
                 "Could not find Virtual Table to Destroy".to_string(),
             ));
@@ -1847,6 +1919,492 @@ pub fn op_type_check(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Parse an array input (JSON text or record blob), validate/coerce each element
+/// against the declared element type using STRICT type-checking logic, then
+/// serialize to a native record-format BLOB for storage.
+pub fn op_array_encode(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        ArrayEncode {
+            reg,
+            element_affinity,
+            element_type,
+            table_name,
+            col_name,
+        },
+        insn
+    );
+
+    let val = state.registers[*reg].get_value();
+    if matches!(val, Value::Null) {
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
+    // Fast path: blob input with ANY type — validate it is a well-formed record
+    // before accepting. This avoids the redundant extract→reserialize when MakeArray
+    // output feeds directly into ArrayEncode with ANY affinity, but rejects raw blobs
+    // (e.g. zeroblob, X'DEADBEEF') that would crash on read.
+    if let Value::Blob(b) = val {
+        if element_type.eq_ignore_ascii_case("ANY") {
+            // Validate blob is a well-formed record using streaming iterator
+            // (no Vec<Value> allocation). Rejects empty blobs and invalid records.
+            let valid = !b.is_empty()
+                && ValueIterator::new(b)
+                    .map(|iter| iter.into_iter().all(|r| r.is_ok()))
+                    .unwrap_or(false);
+            if !valid {
+                bail_constraint_error!(
+                    "cannot store non-array value in {} column {}.{} ({})",
+                    element_type,
+                    table_name,
+                    col_name,
+                    SQLITE_CONSTRAINT
+                );
+            }
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
+
+    // Extract elements from either blob (MakeArray) or text (JSON literal)
+    let raw_elements = match val {
+        Value::Blob(b) => array_values_from_blob(b).ok(),
+        Value::Text(text) => parse_text_array(text.as_str()),
+        _ => None,
+    };
+    let Some(raw_elements) = raw_elements else {
+        bail_constraint_error!(
+            "cannot store non-array value in {} column {}.{} ({})",
+            element_type,
+            table_name,
+            col_name,
+            SQLITE_CONSTRAINT
+        );
+    };
+
+    const MAX_ARRAY_ELEMENTS: usize = 100_000;
+    if raw_elements.len() > MAX_ARRAY_ELEMENTS {
+        bail_constraint_error!(
+            "array exceeds maximum element count ({MAX_ARRAY_ELEMENTS}) for column {table_name}.{col_name} ({SQLITE_CONSTRAINT})"
+        );
+    }
+
+    let mut coerced_elements: Vec<Value> = Vec::with_capacity(raw_elements.len());
+    for elem in raw_elements {
+        // NULL elements are allowed — same as STRICT allows NULL in columns
+        if matches!(elem, Value::Null) {
+            coerced_elements.push(elem);
+            continue;
+        }
+
+        // Apply affinity coercion — same as STRICT's TypeCheck
+        let mut reg_tmp = Register::Value(elem);
+        apply_affinity_char(&mut reg_tmp, *element_affinity);
+        let coerced = reg_tmp.get_value().clone();
+
+        // Check value type matches the declared element type — same as STRICT's TypeCheck
+        let value_type = coerced.value_type();
+        let ty_bytes = element_type.as_bytes();
+        let type_ok = turso_macros::match_ignore_ascii_case!(match ty_bytes {
+            b"ANY" => true,
+            b"INTEGER" | b"INT" => value_type == ValueType::Integer,
+            b"REAL" => value_type == ValueType::Float,
+            b"TEXT" => value_type == ValueType::Text,
+            b"BLOB" => value_type == ValueType::Blob,
+            _ => true, // custom types validated by their own encode
+        });
+
+        if !type_ok {
+            bail_constraint_error!(
+                "cannot store {} value in {} ({})",
+                value_type,
+                element_type,
+                SQLITE_CONSTRAINT
+            );
+        }
+
+        coerced_elements.push(coerced);
+    }
+
+    // Serialize coerced elements as a native record-format BLOB
+    let record = ImmutableRecord::from_values(&coerced_elements, coerced_elements.len());
+    state.registers[*reg] = Register::Value(Value::Blob(record.into_payload()));
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Convert a native record-format array BLOB to PG text representation for display.
+pub fn op_array_decode(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(ArrayDecode { reg }, insn);
+
+    let val = state.registers[*reg].get_value();
+    if matches!(val, Value::Null) {
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
+    let text = match val {
+        Value::Blob(b) if b.is_empty() => "{}".to_string(),
+        Value::Blob(b) => serialize_array_from_blob(b)?,
+        _ => {
+            // Not a blob — leave as-is (might be text from a function result)
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    };
+    state.registers[*reg] = Register::Value(Value::build_text(text));
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Access element at index from a record-format array BLOB.
+pub fn op_array_element(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        ArrayElement {
+            array_reg,
+            index_reg,
+            dest,
+        },
+        insn
+    );
+
+    let arr_val = state.registers[*array_reg].get_value();
+    if matches!(arr_val, Value::Null) {
+        state.registers[*dest] = Register::Value(Value::Null);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
+    let idx = match state.registers[*index_reg].get_value() {
+        Value::Numeric(Numeric::Integer(i)) if *i >= 1 => (*i - 1) as usize,
+        _ => {
+            // Non-positive, non-integer, or NULL index → NULL result (PG convention: 1-based)
+            state.registers[*dest] = Register::Value(Value::Null);
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    };
+
+    let result = match arr_val {
+        Value::Blob(blob) => match ValueIterator::new(blob) {
+            Ok(mut iter) => iter
+                .nth(idx)
+                .and_then(|r| r.ok())
+                .map(|vref| {
+                    // The blob may not be a real record — text fields could
+                    // contain invalid UTF-8 (from_utf8_unchecked in the
+                    // record decoder). Validate and demote to blob if needed.
+                    if let ValueRef::Text(t) = &vref {
+                        if t.value.as_bytes().iter().any(|&b| b > 0x7F)
+                            && std::str::from_utf8(t.value.as_bytes()).is_err()
+                        {
+                            return Value::Blob(t.value.as_bytes().to_vec());
+                        }
+                    }
+                    vref.to_owned()
+                })
+                .unwrap_or(Value::Null),
+            Err(_) => Value::Null,
+        },
+        _ => Value::Null,
+    };
+
+    state.registers[*dest] = Register::Value(result);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Get the number of elements in a record-format array BLOB.
+pub fn op_array_length(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(ArrayLength { reg, dest }, insn);
+
+    let val = state.registers[*reg].get_value();
+    let result = match compute_array_length(val) {
+        Some(count) => Value::from_i64(count),
+        None => Value::Null,
+    };
+    state.registers[*dest] = Register::Value(result);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Create an array from contiguous registers as a record-format BLOB.
+pub fn op_make_array(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        MakeArray {
+            start_reg,
+            count,
+            dest
+        },
+        insn
+    );
+
+    let end = start_reg
+        .checked_add(*count)
+        .ok_or_else(|| LimboError::InternalError("MakeArray: register range overflow".into()))?;
+    if end > state.registers.len() {
+        return Err(LimboError::InternalError(format!(
+            "MakeArray: register range {}..{} exceeds register file size {}",
+            start_reg,
+            end,
+            state.registers.len()
+        )));
+    }
+    state.registers[*dest] = Register::Value(make_array_from_registers(
+        &state.registers,
+        *start_reg,
+        *count,
+    ));
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Create an array from contiguous registers with dynamic count.
+pub fn op_make_array_dynamic(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        MakeArrayDynamic {
+            start_reg,
+            count_reg,
+            dest
+        },
+        insn
+    );
+
+    let count = match state.registers[*count_reg].get_value() {
+        Value::Numeric(Numeric::Integer(n)) if *n >= 0 => *n as usize,
+        _ => 0,
+    };
+
+    let end = start_reg.checked_add(count).ok_or_else(|| {
+        LimboError::InternalError("MakeArrayDynamic: register range overflow".into())
+    })?;
+    if end > state.registers.len() {
+        return Err(LimboError::InternalError(format!(
+            "MakeArrayDynamic: register range {}..{} exceeds register file size {}",
+            start_reg,
+            end,
+            state.registers.len()
+        )));
+    }
+
+    state.registers[*dest] = Register::Value(make_array_from_registers(
+        &state.registers,
+        *start_reg,
+        count,
+    ));
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Copy a register value to a dynamically-computed destination register.
+pub fn op_reg_copy_offset(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        RegCopyOffset {
+            src,
+            base,
+            offset_reg
+        },
+        insn
+    );
+
+    let offset = match state.registers[*offset_reg].get_value() {
+        Value::Numeric(Numeric::Integer(n)) if *n >= 0 => *n as usize,
+        _ => 0,
+    };
+    let dest = *base + offset;
+    if dest >= state.registers.len() {
+        return Err(LimboError::InternalError(format!(
+            "RegCopyOffset: destination register {} out of bounds (max {})",
+            dest,
+            state.registers.len()
+        )));
+    }
+    state.registers[dest] = state.registers[*src].clone();
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Concatenate/append/prepend arrays. Runtime dispatch based on operand types.
+pub fn op_array_concat(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(ArrayConcat { lhs, rhs, dest }, insn);
+
+    // Check NULL before cloning to avoid unnecessary allocation
+    let lhs_ref = state.registers[*lhs].get_value();
+    let rhs_ref = state.registers[*rhs].get_value();
+
+    // PG-compatible NULL handling for arrays:
+    // array || NULL = array, NULL || array = array, NULL || NULL = NULL
+    if matches!(lhs_ref, Value::Null) && matches!(rhs_ref, Value::Null) {
+        state.registers[*dest] = Register::Value(Value::Null);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+    if matches!(lhs_ref, Value::Null) {
+        state.registers[*dest] = Register::Value(rhs_ref.clone());
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+    if matches!(rhs_ref, Value::Null) {
+        state.registers[*dest] = Register::Value(lhs_ref.clone());
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
+    let result = match (lhs_ref, rhs_ref) {
+        (Value::Blob(lb), Value::Blob(rb)) => {
+            let mut elems_a = array_values_from_blob(lb)?;
+            let elems_b = array_values_from_blob(rb)?;
+            elems_a.extend(elems_b);
+            values_to_record_blob(&elems_a)
+        }
+        (Value::Blob(lb), _) => {
+            let mut elems = array_values_from_blob(lb)?;
+            elems.push(rhs_ref.clone());
+            values_to_record_blob(&elems)
+        }
+        (_, Value::Blob(rb)) => {
+            let mut elems = array_values_from_blob(rb)?;
+            elems.insert(0, lhs_ref.clone());
+            values_to_record_blob(&elems)
+        }
+        _ => {
+            // Neither is an array blob — fall back to string concat
+            Value::build_text(format!("{lhs_ref}{rhs_ref}"))
+        }
+    };
+
+    state.registers[*dest] = Register::Value(result);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Set element at index in a record-format array BLOB.
+pub fn op_array_set_element(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        ArraySetElement {
+            array_reg,
+            index_reg,
+            value_reg,
+            dest,
+        },
+        insn
+    );
+
+    let arr_val = state.registers[*array_reg].get_value();
+    if matches!(arr_val, Value::Null) {
+        state.registers[*dest] = Register::Value(Value::Null);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
+    let idx = match state.registers[*index_reg].get_value() {
+        Value::Numeric(Numeric::Integer(i)) if *i >= 1 => (*i - 1) as usize,
+        _ => {
+            // Invalid index (non-positive, non-integer): preserve original array (PG: 1-based)
+            state.registers[*dest] = Register::Value(arr_val.clone());
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    };
+
+    let new_val = state.registers[*value_reg].get_value().clone();
+
+    let Value::Blob(blob) = arr_val else {
+        return Err(LimboError::InternalError(
+            "ArraySetElement: expected blob array".into(),
+        ));
+    };
+    let mut elements = array_values_from_blob(blob)?;
+    if idx >= elements.len() {
+        // Out-of-bounds: preserve original array unchanged
+        state.registers[*dest] = Register::Value(Value::Blob(blob.clone()));
+    } else {
+        elements[idx] = new_val;
+        state.registers[*dest] = Register::Value(values_to_record_blob(&elements));
+    }
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Extract a subslice of elements from a record-format array BLOB.
+pub fn op_array_slice(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        ArraySlice {
+            array_reg,
+            start_reg,
+            end_reg,
+            dest,
+        },
+        insn
+    );
+
+    let arr_val = state.registers[*array_reg].get_value().clone();
+    let start_val = state.registers[*start_reg].get_value().clone();
+    let end_val = state.registers[*end_reg].get_value().clone();
+
+    let result = exec_array_slice(&arr_val, &start_val, &end_val);
+    state.registers[*dest] = Register::Value(result);
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_make_record(
     _program: &Program,
     state: &mut ProgramState,
@@ -1869,7 +2427,7 @@ pub fn op_make_record(
     let dest_reg = *dest_reg as usize;
 
     if let Some(affinity_str) = affinity_str {
-        if affinity_str.len() != count {
+        if unlikely(affinity_str.len() != count) {
             return Err(LimboError::InternalError(format!(
                 "MakeRecord: the length of affinity string ({}) does not match the count ({})",
                 affinity_str.len(),
@@ -2473,6 +3031,7 @@ pub fn op_transaction_inner(
                             if conn_has_executed_begin_deferred
                                 && *tx_mode == TransactionMode::Concurrent
                             {
+                                mark_unlikely();
                                 return Err(LimboError::TxError(
                                     "Cannot start CONCURRENT transaction after BEGIN DEFERRED"
                                         .to_string(),
@@ -2534,6 +3093,7 @@ pub fn op_transaction_inner(
                         if conn_has_executed_begin_deferred
                             && *tx_mode == TransactionMode::Concurrent
                         {
+                            mark_unlikely();
                             return Err(LimboError::TxError(
                                 "Cannot start CONCURRENT transaction after BEGIN DEFERRED"
                                     .to_string(),
@@ -2583,6 +3143,7 @@ pub fn op_transaction_inner(
                     }
                 } else {
                     if matches!(tx_mode, TransactionMode::Concurrent) {
+                        mark_unlikely();
                         return Err(LimboError::TxError(
                             "Concurrent transaction mode is only supported when MVCC is enabled"
                                 .to_string(),
@@ -2714,9 +3275,8 @@ pub fn op_transaction_inner(
                 state.op_transaction_state = OpTransactionState::BeginStatement;
             }
             OpTransactionState::BeginStatement => {
-                if *db == crate::MAIN_DB_ID
-                    && program.needs_stmt_subtransactions.load(Ordering::Relaxed)
-                {
+                let needs_stmt_journal = program.needs_stmt_subtransactions.load(Ordering::Relaxed);
+                if *db == crate::MAIN_DB_ID && needs_stmt_journal {
                     let write = matches!(tx_mode, TransactionMode::Write);
                     let res = state.begin_statement(&program.connection, &pager, write)?;
                     if let IOResult::IO(io) = res {
@@ -2724,7 +3284,7 @@ pub fn op_transaction_inner(
                     }
                 } else if crate::is_attached_db(*db)
                     && matches!(tx_mode, TransactionMode::Write)
-                    && program.needs_stmt_subtransactions.load(Ordering::Relaxed)
+                    && needs_stmt_journal
                 {
                     if let Some(mv_store) = program.connection.mv_store_for_db(*db) {
                         // Attached MVCC DB: open an MvStore savepoint.
@@ -2746,6 +3306,16 @@ pub fn op_transaction_inner(
                     }
                 }
 
+                if *db == crate::MAIN_DB_ID
+                    && matches!(tx_mode, TransactionMode::Write)
+                    && !program.connection.auto_commit.load(Ordering::SeqCst)
+                {
+                    program
+                        .connection
+                        .n_active_writes
+                        .fetch_add(1, Ordering::SeqCst);
+                    state.is_active_write = true;
+                }
                 state.pc += 1;
                 state.op_transaction_state = OpTransactionState::Start;
                 return Ok(InsnFunctionStepResult::Step);
@@ -2814,8 +3384,7 @@ pub fn op_auto_commit(
     let is_commit_req = !had_autocommit && requested_autocommit && !requested_rollback;
     let is_rollback_req = !had_autocommit && requested_autocommit && requested_rollback;
 
-    let another_stmt_using_subjournal = !state.uses_subjournal && pager.subjournal_in_use();
-    if is_txn_end_eq && another_stmt_using_subjournal {
+    if is_txn_end_eq && conn.n_active_writes.load(Ordering::SeqCst) > 0 {
         return Err(LimboError::Busy);
     }
 
@@ -2990,6 +3559,7 @@ pub fn op_savepoint(
             }
             match release_result {
                 SavepointResult::NotFound => {
+                    mark_unlikely();
                     return Err(LimboError::TxError(format!("no such savepoint: {name}")));
                 }
                 SavepointResult::Release => {
@@ -3025,10 +3595,41 @@ pub fn op_savepoint(
             };
 
             let Some(deferred_fk_snapshot) = deferred_fk_snapshot else {
+                mark_unlikely();
                 return Err(LimboError::TxError(format!("no such savepoint: {name}")));
             };
             conn.fk_deferred_violations
                 .store(deferred_fk_snapshot, Ordering::SeqCst);
+
+            // After rolling back pages, the in-memory schema cache may be stale
+            // if DDL was executed within the savepoint. Invalidate the pager's
+            // cached schema cookie and check if a schema reparse is needed.
+            pager.set_schema_cookie(None);
+            let in_memory_version = conn.schema.read().schema_version;
+            let pager_ref = conn.pager.load().clone();
+            match pager_ref
+                .io
+                .block(|| pager.with_header(|h| h.schema_cookie.get()))
+            {
+                Ok(on_disk_cookie) if in_memory_version != on_disk_cookie => {
+                    // Schema was modified during the savepoint. Try to reparse
+                    // from the restored database pages. If that fails (e.g. the
+                    // database was empty at the savepoint), use an empty schema.
+                    if conn.reparse_schema().is_err() {
+                        conn.with_schema_mut(|schema| {
+                            *schema = Schema::new();
+                        });
+                    }
+                }
+                Err(_) => {
+                    // Header page is not readable (database empty after rollback).
+                    // Reset to an empty schema.
+                    conn.with_schema_mut(|schema| {
+                        *schema = Schema::new();
+                    });
+                }
+                _ => {} // Schema unchanged, nothing to do.
+            }
 
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
@@ -3102,7 +3703,7 @@ pub fn op_return(
             .unwrap_or_else(|_| panic!("Return register is negative: {pc}"));
         state.pc = pc;
     } else {
-        if !*can_fallthrough {
+        if unlikely(!*can_fallthrough) {
             return Err(LimboError::InternalError(
                 "Return register is not an integer".to_string(),
             ));
@@ -3324,6 +3925,7 @@ pub fn op_row_data(
         let record_option = return_if_io!(cursor.record());
 
         let record = record_option.ok_or_else(|| {
+            mark_unlikely();
             LimboError::InternalError("RowData: cursor has no record".to_string())
         })?;
 
@@ -3458,6 +4060,7 @@ pub fn op_row_id(
                         state.registers[*dest] = Register::Value(Value::Null);
                     }
                 } else {
+                    mark_unlikely();
                     return Err(LimboError::InternalError(
                         "RowId: cursor is not a table, virtual, or materialized view cursor"
                             .to_string(),
@@ -4311,6 +4914,7 @@ pub fn op_decr_jump_zero(
             bail_constraint_error!("datatype mismatch");
         }
         Register::Aggregate(_) => {
+            mark_unlikely();
             return Err(LimboError::InternalError(
                 "DecrJumpZero: unexpected aggregate register".into(),
             ));
@@ -4385,10 +4989,16 @@ fn init_agg_payload(func: &AggFunc, payload: &mut Vec<Value>) -> Result<()> {
             payload.push(Value::Null);
         }
         AggFunc::External(_) => {
+            mark_unlikely();
             // External aggregates use ExternalAggState, not flat payload
             return Err(LimboError::InternalError(
                 "External aggregate not supported in init_agg_payload".to_string(),
             ));
+        }
+        AggFunc::ArrayAgg => {
+            // payload[0] = element count (Integer), remaining slots = accumulated values.
+            // We serialize to a record blob only in finalize, avoiding O(n²) re-serialization.
+            payload.push(Value::from_i64(0));
         }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
@@ -4440,6 +5050,7 @@ fn update_agg_payload(
             if !matches!(arg, Value::Null) {
                 // invariant as per init_agg_payload: payload[0] is always an integer
                 let Value::Numeric(Numeric::Integer(i)) = &mut payload[0] else {
+                    mark_unlikely();
                     return Err(LimboError::InternalError(
                         "Count: payload is not an integer".to_string(),
                     ));
@@ -4450,6 +5061,7 @@ fn update_agg_payload(
         AggFunc::Count0 => {
             // invariant as per init_agg_payload: payload[0] is always an integer
             let Value::Numeric(Numeric::Integer(i)) = &mut payload[0] else {
+                mark_unlikely();
                 return Err(LimboError::InternalError(
                     "Count0: payload is not an integer".to_string(),
                 ));
@@ -4462,12 +5074,14 @@ fn update_agg_payload(
             }
             // invariant as per init_agg_payload: payload[0] is Float (sum), payload[1] is Float (r_err), payload[2] is Integer (count)
             let [sum_val, r_err_val, count_val, ..] = payload else {
+                mark_unlikely();
                 return Err(LimboError::InternalError(
                     "Avg: payload too short".to_string(),
                 ));
             };
             let r_err = r_err_val.as_float();
             let Value::Numeric(Numeric::Integer(count)) = count_val else {
+                mark_unlikely();
                 return Err(LimboError::InternalError(
                     "Avg: payload[2] is not an integer".to_string(),
                 ));
@@ -4513,11 +5127,13 @@ fn update_agg_payload(
             };
             let r_err_f = r_err_val.as_float();
             let Value::Numeric(Numeric::Integer(approx_i)) = approx_val else {
+                mark_unlikely();
                 return Err(LimboError::InternalError(
                     "Sum/Total: payload[2] is not an integer".to_string(),
                 ));
             };
             let Value::Numeric(Numeric::Integer(ovrfl_i)) = ovrfl_val else {
+                mark_unlikely();
                 return Err(LimboError::InternalError(
                     "Sum/Total: payload[3] is not an integer".to_string(),
                 ));
@@ -4543,6 +5159,7 @@ fn update_agg_payload(
                                 sum_state.ovrfl = true;
                                 apply_kbn_step_int(acc, i, &mut sum_state);
                             } else {
+                                mark_unlikely();
                                 return Err(LimboError::IntegerOverflow);
                             }
                         }
@@ -4622,6 +5239,7 @@ fn update_agg_payload(
             }
         }
         AggFunc::External(_) => {
+            mark_unlikely();
             return Err(LimboError::InternalError(
                 "External aggregate not supported in update_agg_payload".to_string(),
             ));
@@ -4630,6 +5248,7 @@ fn update_agg_payload(
         AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
             // arg = key, maybe_arg2 = value
             let Some(value) = maybe_arg2 else {
+                mark_unlikely();
                 return Err(LimboError::InternalError(
                     "JsonGroupObject/JsonbGroupObject: no value provided".to_string(),
                 ));
@@ -4637,6 +5256,7 @@ fn update_agg_payload(
             let mut key_vec = convert_dbtype_to_raw_jsonb(&arg)?;
             let mut val_vec = convert_dbtype_to_raw_jsonb(&value)?;
             let Value::Blob(vec) = &mut payload[0] else {
+                mark_unlikely();
                 return Err(LimboError::InternalError(
                     "JsonGroupObject: payload[0] is not a blob".to_string(),
                 ));
@@ -4648,11 +5268,19 @@ fn update_agg_payload(
             vec.append(&mut key_vec);
             vec.append(&mut val_vec);
         }
+        AggFunc::ArrayAgg => {
+            // ArrayAgg accumulation is handled directly in the AggStep caller
+            // via payload_vec_mut() to grow the Vec (O(1) per row).
+            return Err(LimboError::InternalError(
+                "ArrayAgg should be handled directly in op_agg_step, not update_agg_payload".into(),
+            ));
+        }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
             // arg = value
             let mut data = convert_dbtype_to_raw_jsonb(&arg)?;
             let Value::Blob(vec) = &mut payload[0] else {
+                mark_unlikely();
                 return Err(LimboError::InternalError(
                     "JsonGroupArray: payload[0] is not a blob".to_string(),
                 ));
@@ -4729,7 +5357,24 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
         }
         AggFunc::Min | AggFunc::Max => payload[0].clone(),
         AggFunc::GroupConcat | AggFunc::StringAgg => payload[0].clone(),
+        AggFunc::ArrayAgg => {
+            // payload[0] = count, payload[1..] = accumulated values.
+            // Serialize to a record blob only once at finalization.
+            let count = payload[0].as_int().unwrap_or(0) as usize;
+            if count == 0 {
+                Value::Null
+            } else if 1 + count > payload.len() {
+                return Err(LimboError::InternalError(format!(
+                    "ArrayAgg: count ({count}) exceeds payload length ({})",
+                    payload.len() - 1
+                )));
+            } else {
+                let elements = &payload[1..1 + count];
+                Value::Blob(ImmutableRecord::from_values(elements, count).into_payload())
+            }
+        }
         AggFunc::External(_) => {
+            mark_unlikely();
             // External aggregates are finalized via AggContext::compute_external()
             return Err(LimboError::InternalError(
                 "finalize_agg_payload called for External aggregate".to_string(),
@@ -4838,28 +5483,46 @@ pub fn op_agg_step(
         }
         _ => {
             let arg = state.registers[*col].get_value().clone();
-            // Only a subset of aggregate functions take two arguments
-            let maybe_arg2 = match func {
-                AggFunc::GroupConcat | AggFunc::StringAgg => {
-                    Some(state.registers[*delimiter].get_value().clone())
-                }
-                #[cfg(feature = "json")]
-                AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
-                    Some(state.registers[*delimiter].get_value().clone())
-                }
-                _ => None,
-            };
-            let collation = state.current_collation.unwrap_or(CollationSeq::Binary);
 
-            // Now get mutable borrow on payload
-            let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
-                panic!(
-                    "Unexpected value {:?} in AggStep at register {}",
-                    state.registers[*acc_reg], *acc_reg
-                );
-            };
-            let payload = agg.payload_mut();
-            update_agg_payload(func, arg, maybe_arg2, payload, collation, &comparator)?;
+            if matches!(func, AggFunc::ArrayAgg) {
+                // ArrayAgg grows the payload Vec directly (O(1) per row).
+                let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
+                    panic!(
+                        "Unexpected value {:?} in AggStep at register {}",
+                        state.registers[*acc_reg], *acc_reg
+                    );
+                };
+                let payload = agg.payload_vec_mut();
+                let count = payload[0]
+                    .as_int()
+                    .expect("array_agg count must be an integer")
+                    as usize;
+                payload[0] = Value::from_i64((count + 1) as i64);
+                payload.push(arg);
+            } else {
+                // Only a subset of aggregate functions take two arguments
+                let maybe_arg2 = match func {
+                    AggFunc::GroupConcat | AggFunc::StringAgg => {
+                        Some(state.registers[*delimiter].get_value().clone())
+                    }
+                    #[cfg(feature = "json")]
+                    AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
+                        Some(state.registers[*delimiter].get_value().clone())
+                    }
+                    _ => None,
+                };
+                let collation = state.current_collation.unwrap_or(CollationSeq::Binary);
+
+                // Now get mutable borrow on payload
+                let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
+                    panic!(
+                        "Unexpected value {:?} in AggStep at register {}",
+                        state.registers[*acc_reg], *acc_reg
+                    );
+                };
+                let payload = agg.payload_mut();
+                update_agg_payload(func, arg, maybe_arg2, payload, collation, &comparator)?;
+            }
         }
     };
 
@@ -5117,6 +5780,7 @@ pub fn op_sorter_compare(
 
     let previous_sorter_values = {
         let Register::Record(record) = &state.registers[*sorted_record_reg] else {
+            mark_unlikely();
             return Err(LimboError::InternalError(
                 "Sorted record must be a record".to_string(),
             ));
@@ -5134,6 +5798,7 @@ pub fn op_sorter_compare(
 
     let cursor = cursor.as_sorter_mut();
     let Some(current_sorter_record) = cursor.record() else {
+        mark_unlikely();
         return Err(LimboError::InternalError(
             "Sorter must have a record".to_string(),
         ));
@@ -5179,6 +5844,7 @@ pub fn op_rowset_add(
     let rowid = match value {
         Value::Numeric(Numeric::Integer(i)) => *i,
         _ => {
+            mark_unlikely();
             return Err(LimboError::InternalError(
                 "RowSetAdd: P2 must be an integer".to_string(),
             ));
@@ -5267,6 +5933,7 @@ pub fn op_rowset_test(
     let rowid = match value {
         Value::Numeric(Numeric::Integer(i)) => *i,
         _ => {
+            mark_unlikely();
             return Err(LimboError::InternalError(
                 "RowSetTest: P3 must be an integer".to_string(),
             ));
@@ -5589,6 +6256,9 @@ pub fn op_function(
             }
         },
         crate::function::Func::Scalar(scalar_func) => match scalar_func {
+            ScalarFunc::Array | ScalarFunc::ArrayElement | ScalarFunc::ArraySetElement => {
+                unreachable!("desugared to dedicated instructions, not Function")
+            }
             ScalarFunc::Cast => {
                 assert_eq!(arg_count, 2);
                 assert!(*start_reg + 1 < state.registers.len());
@@ -5628,6 +6298,7 @@ pub fn op_function(
             }
             ScalarFunc::Glob => {
                 if arg_count != 2 {
+                    mark_unlikely();
                     return Err(LimboError::ParseError(
                         "wrong number of arguments to function GLOB()".to_string(),
                     ));
@@ -6531,6 +7202,96 @@ pub fn op_function(
                     }
                 };
                 state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::ArrayAppend => {
+                check_arg_count!(arg_count, 2);
+                let arr_val = state.registers[*start_reg].get_value().clone();
+                let elem_val = state.registers[*start_reg + 1].get_value().clone();
+                state.registers[*dest] = Register::Value(exec_array_append(&arr_val, &elem_val));
+            }
+            ScalarFunc::ArrayPrepend => {
+                check_arg_count!(arg_count, 2);
+                let elem_val = state.registers[*start_reg].get_value().clone();
+                let arr_val = state.registers[*start_reg + 1].get_value().clone();
+                state.registers[*dest] = Register::Value(exec_array_prepend(&arr_val, &elem_val));
+            }
+            ScalarFunc::ArrayCat => {
+                check_arg_count!(arg_count, 2);
+                let a_val = state.registers[*start_reg].get_value().clone();
+                let b_val = state.registers[*start_reg + 1].get_value().clone();
+                state.registers[*dest] = Register::Value(exec_array_cat(&a_val, &b_val));
+            }
+            ScalarFunc::ArrayRemove => {
+                check_arg_count!(arg_count, 2);
+                let arr_val = state.registers[*start_reg].get_value().clone();
+                let target = state.registers[*start_reg + 1].get_value().clone();
+                state.registers[*dest] = Register::Value(exec_array_remove(&arr_val, &target));
+            }
+            ScalarFunc::ArrayContains => {
+                check_arg_count!(arg_count, 2);
+                let arr_val = state.registers[*start_reg].get_value().clone();
+                let target = state.registers[*start_reg + 1].get_value().clone();
+                state.registers[*dest] = Register::Value(exec_array_contains(&arr_val, &target));
+            }
+            ScalarFunc::ArrayPosition => {
+                check_arg_count!(arg_count, 2);
+                let arr_val = state.registers[*start_reg].get_value().clone();
+                let target = state.registers[*start_reg + 1].get_value().clone();
+                state.registers[*dest] = Register::Value(exec_array_position(&arr_val, &target));
+            }
+            ScalarFunc::ArrayLength => {
+                // Accept 1 or 2 args; dimension arg (PG compat) ignored for 1D arrays
+                let arr_val = state.registers[*start_reg].get_value();
+                let result = match compute_array_length(arr_val) {
+                    Some(count) => Value::from_i64(count),
+                    None => Value::Null,
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::ArraySlice => {
+                check_arg_count!(arg_count, 3);
+                let arr_val = state.registers[*start_reg].get_value().clone();
+                let start_idx = state.registers[*start_reg + 1].get_value().clone();
+                let end_idx = state.registers[*start_reg + 2].get_value().clone();
+                let result = exec_array_slice(&arr_val, &start_idx, &end_idx);
+                state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::StringToArray => {
+                let text = state.registers[*start_reg].get_value().clone();
+                let delimiter = state.registers[*start_reg + 1].get_value().clone();
+                let null_str = if arg_count >= 3 {
+                    Some(state.registers[*start_reg + 2].get_value().clone())
+                } else {
+                    None
+                };
+                state.registers[*dest] =
+                    Register::Value(exec_string_to_array(&text, &delimiter, null_str.as_ref()));
+            }
+            ScalarFunc::ArrayToString => {
+                let arr_val = state.registers[*start_reg].get_value().clone();
+                let delimiter = state.registers[*start_reg + 1].get_value().clone();
+                let null_str = if arg_count >= 3 {
+                    Some(state.registers[*start_reg + 2].get_value().clone())
+                } else {
+                    None
+                };
+                state.registers[*dest] = Register::Value(exec_array_to_string(
+                    &arr_val,
+                    &delimiter,
+                    null_str.as_ref(),
+                ));
+            }
+            ScalarFunc::ArrayOverlap => {
+                check_arg_count!(arg_count, 2);
+                let a_val = state.registers[*start_reg].get_value().clone();
+                let b_val = state.registers[*start_reg + 1].get_value().clone();
+                state.registers[*dest] = Register::Value(exec_array_overlap(&a_val, &b_val));
+            }
+            ScalarFunc::ArrayContainsAll => {
+                check_arg_count!(arg_count, 2);
+                let a_val = state.registers[*start_reg].get_value().clone();
+                let b_val = state.registers[*start_reg + 1].get_value().clone();
+                state.registers[*dest] = Register::Value(exec_array_contains_all(&a_val, &b_val));
             }
         },
         crate::function::Func::Vector(vector_func) => {
@@ -7447,6 +8208,9 @@ pub fn op_yield(
 pub struct OpInsertState {
     pub sub_state: OpInsertSubState,
     pub old_record: Option<(i64, Vec<Value>)>,
+    /// Set by the NoopCheck sub-state to indicate the row already has the exact
+    /// same payload, so the physical write can be skipped.
+    pub is_noop_update: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -7464,6 +8228,10 @@ pub enum OpInsertSubState {
     /// Capture the old record at the current cursor position for IVM.
     /// The cursor must already be positioned (by a prior seek or by NotExists/NewRowid).
     CaptureRecord,
+    /// Check whether the update is a no-op (existing record matches new record).
+    /// Must complete before Insert so that cursor.rowid()/record() are never
+    /// interleaved with a partially-completed cursor.insert().
+    NoopCheck,
     /// Insert the row into the table.
     Insert,
     /// Updating last_insert_rowid may return IO, so we need a separate state for it so that we don't
@@ -7511,7 +8279,7 @@ pub fn op_insert(
                 } else if needs_capture {
                     state.op_insert_state.sub_state = OpInsertSubState::CaptureRecord;
                 } else {
-                    state.op_insert_state.sub_state = OpInsertSubState::Insert;
+                    state.op_insert_state.sub_state = OpInsertSubState::NoopCheck;
                 }
                 continue;
             }
@@ -7541,7 +8309,7 @@ pub fn op_insert(
                 if needs_capture {
                     state.op_insert_state.sub_state = OpInsertSubState::CaptureRecord;
                 } else {
-                    state.op_insert_state.sub_state = OpInsertSubState::Insert;
+                    state.op_insert_state.sub_state = OpInsertSubState::NoopCheck;
                 }
                 continue;
             }
@@ -7578,33 +8346,81 @@ pub fn op_insert(
                     None
                 };
                 state.op_insert_state.old_record = old_record;
+                state.op_insert_state.sub_state = OpInsertSubState::NoopCheck;
+                continue;
+            }
+            // TODO: add some InsertFlags that allows us to skip this check when we know for
+            // certain that the update is not a no-op to avoid the branch.
+            OpInsertSubState::NoopCheck => {
+                // UPDATE fast path: skip the physical write if the target row already
+                // has the exact same record payload. This check is isolated in its own
+                // sub-state so that cursor.rowid()/record() IO yields never interleave
+                // with a partially-completed cursor.insert().
+                //
+                // In MVCC mode this check must be skipped: after Delete, cursor.record()
+                // cannot reliably return the pre-delete payload (btree-resident rows
+                // still appear physically intact, MVCC-store rows become invisible).
+                // The noop check is fundamentally incompatible with the MVCC
+                // Delete+Insert update pattern.
+                state.op_insert_state.is_noop_update = false;
+                let is_mvcc = {
+                    let cursor_ref = get_cursor!(state, *cursor_id);
+                    cursor_ref.as_btree_mut().is_mvcc()
+                };
+                if !is_mvcc
+                    && flag.has(InsertFlags::SKIP_LAST_ROWID)
+                    && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE)
+                {
+                    let key = match &state.registers[*key_reg].get_value() {
+                        Value::Numeric(Numeric::Integer(i)) => *i,
+                        _ => unreachable!("expected integer key"),
+                    };
+                    let cursor = get_cursor!(state, *cursor_id);
+                    let cursor = cursor.as_btree_mut();
+                    let existing_key = return_if_io!(cursor.rowid());
+                    if existing_key == Some(key) {
+                        let record = match &state.registers[*record_reg] {
+                            Register::Record(r) => std::borrow::Cow::Borrowed(r),
+                            Register::Value(value) => {
+                                let values = [value];
+                                let record = ImmutableRecord::from_values(values, values.len());
+                                std::borrow::Cow::Owned(record)
+                            }
+                            Register::Aggregate(..) => {
+                                unreachable!("Cannot insert an aggregate value.")
+                            }
+                        };
+                        let existing_record = return_if_io!(cursor.record());
+                        if existing_record.is_some_and(|r| r == record.as_ref()) {
+                            state.op_insert_state.is_noop_update = true;
+                        }
+                    }
+                }
                 state.op_insert_state.sub_state = OpInsertSubState::Insert;
                 continue;
             }
             OpInsertSubState::Insert => {
-                let key = match &state.registers[*key_reg].get_value() {
-                    Value::Numeric(Numeric::Integer(i)) => *i,
-                    _ => unreachable!("expected integer key"),
-                };
-                let record = match &state.registers[*record_reg] {
-                    Register::Record(r) => std::borrow::Cow::Borrowed(r),
-                    Register::Value(value) => {
-                        let values = [value];
-                        let record = ImmutableRecord::from_values(values, values.len());
-                        std::borrow::Cow::Owned(record)
-                    }
-                    Register::Aggregate(..) => unreachable!("Cannot insert an aggregate value."),
-                };
-
-                {
+                if !state.op_insert_state.is_noop_update {
+                    let key = match &state.registers[*key_reg].get_value() {
+                        Value::Numeric(Numeric::Integer(i)) => *i,
+                        _ => unreachable!("expected integer key"),
+                    };
+                    let record = match &state.registers[*record_reg] {
+                        Register::Record(r) => std::borrow::Cow::Borrowed(r),
+                        Register::Value(value) => {
+                            let values = [value];
+                            let record = ImmutableRecord::from_values(values, values.len());
+                            std::borrow::Cow::Owned(record)
+                        }
+                        Register::Aggregate(..) => {
+                            unreachable!("Cannot insert an aggregate value.")
+                        }
+                    };
                     let cursor = get_cursor!(state, *cursor_id);
                     let cursor = cursor.as_btree_mut();
-
                     return_if_io!(cursor.insert(&BTreeKey::new_table_rowid(key, Some(&record))));
+                    state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);
                 }
-                // Increment metrics for row write
-                state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);
-
                 // Only update last_insert_rowid for regular table inserts, not schema modifications
                 let root_page = {
                     let cursor = state.get_cursor(*cursor_id);
@@ -7711,6 +8527,7 @@ pub fn op_insert(
     }
 
     state.op_insert_state.sub_state = OpInsertSubState::MaybeCaptureRecord;
+    state.op_insert_state.is_noop_update = false;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -9240,7 +10057,6 @@ pub fn op_parse_schema(
     let previous_auto_commit = conn.auto_commit.load(Ordering::SeqCst);
     conn.auto_commit.store(false, Ordering::SeqCst);
 
-    let enable_triggers = conn.experimental_triggers_enabled();
     // For attached databases, qualify the sqlite_schema table with the database name
     let schema_table = if crate::is_attached_db(*db) {
         let db_name = conn
@@ -9306,7 +10122,6 @@ pub fn op_parse_schema(
         // correctly without setting mv_tx.
         program.connection.get_mv_tx(),
         existing_views,
-        enable_triggers,
     );
 
     // Store the modified schema back
@@ -10795,6 +11610,33 @@ pub fn op_alter_column(
     let new_column = crate::schema::Column::try_from(definition.as_ref())?;
     let new_name = definition.col_name.as_str().to_owned();
 
+    let view_rewrites = if *rename {
+        let target_db_name = conn.get_database_name_by_index(*db).ok_or_else(|| {
+            LimboError::InternalError(format!("unknown database id {} during ALTER TABLE", *db))
+        })?;
+        conn.with_schema(
+            *db,
+            |schema| -> crate::Result<Vec<(String, RewrittenView)>> {
+                let mut rewrites = Vec::new();
+                for (view_name, view) in schema.views.iter() {
+                    if let Some(rewritten) = rewrite_view_sql_for_column_rename(
+                        &view.sql,
+                        schema,
+                        table_name.as_str(),
+                        &target_db_name,
+                        &old_column_name,
+                        &new_name,
+                    )? {
+                        rewrites.push((view_name.clone(), rewritten));
+                    }
+                }
+                Ok(rewrites)
+            },
+        )?
+    } else {
+        Vec::new()
+    };
+
     conn.with_database_schema_mut(*db, |schema| {
         let table_arc = schema
             .tables
@@ -10909,6 +11751,19 @@ pub fn op_alter_column(
     });
 
     if *rename {
+        let rewrites = view_rewrites;
+        conn.with_database_schema_mut(*db, move |schema| -> crate::Result<()> {
+            for (view_name, rewritten) in rewrites {
+                if let Some(view_arc) = schema.views.get_mut(&view_name) {
+                    let view = Arc::make_mut(view_arc);
+                    view.sql = rewritten.sql;
+                    view.select_stmt = rewritten.select_stmt;
+                    view.columns = rewritten.columns;
+                }
+            }
+            Ok(())
+        })?;
+
         conn.with_schema(*db, |schema| -> crate::Result<()> {
             let table = schema
                 .tables
@@ -10919,7 +11774,6 @@ pub fn op_alter_column(
                 .expect("column being ALTERed should be in schema");
             for (view_name, view) in schema.views.iter() {
                 let view_select_sql = format!("SELECT * FROM {view_name}");
-                // FIXME: this should rewrite the view to reference the new column name
                 let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
                     LimboError::ParseError(format!(
                         "cannot rename column \"{}\": referenced in VIEW {view_name}: {}. {e}",
@@ -11922,7 +12776,7 @@ pub struct OpJournalModeState {
     /// The new journal mode we're changing to
     pub new_mode: Option<journal_mode::JournalMode>,
     /// Checkpoint state machine for MVCC mode
-    pub checkpoint_sm: Option<StateMachine<CheckpointStateMachine<LocalClock>>>,
+    pub checkpoint_sm: Option<StateMachine<CheckpointStateMachine<MvccClock>>>,
     /// Page reference for writing header
     pub page_ref: Option<PageRef>,
 }
@@ -11987,18 +12841,17 @@ fn op_journal_mode_inner(
                     return Ok(InsnFunctionStepResult::Step);
                 };
 
-                // Parse the new mode
-                let new_mode =
-                    journal_mode::JournalMode::from_str(mode_str.as_str()).map_err(|_| {
-                        LimboError::ParseError(format!("Unknown journal mode: {mode_str}"))
-                    })?;
-
-                // Validate the new mode
-                if !new_mode.supported() {
-                    return Err(LimboError::ParseError(format!(
-                        "Journal Mode `{new_mode}` is not supported"
-                    )));
-                }
+                // Parse the new mode. If unknown or unsupported, silently return
+                // current mode (matches SQLite behavior).
+                let new_mode = match journal_mode::JournalMode::from_str(mode_str.as_str()) {
+                    Ok(mode) if mode.supported() => mode,
+                    _ => {
+                        let ret: &'static str = prev_mode.into();
+                        state.registers[*dest] = Register::Value(Value::build_text(ret));
+                        state.pc += 1;
+                        return Ok(InsnFunctionStepResult::Step);
+                    }
+                };
 
                 // If same mode, just return
                 if prev_mode == new_mode {
@@ -12103,7 +12956,7 @@ fn op_journal_mode_inner(
                 pager.clear_page_cache(true);
 
                 // Setup new mode
-                if matches!(new_mode, journal_mode::JournalMode::ExperimentalMvcc) {
+                if matches!(new_mode, journal_mode::JournalMode::Mvcc) {
                     if program.connection.get_capture_data_changes_info().is_some() {
                         return Err(LimboError::InternalError(
                             "cannot enable MVCC while CDC is active".to_string(),
@@ -12114,6 +12967,7 @@ fn op_journal_mode_inner(
                         pager.io.clone(),
                         &db_path,
                         program.connection.db.open_flags,
+                        program.connection.db.durable_storage.clone(),
                     )?;
                     program.connection.db.mv_store.store(Some(mv_store.clone()));
                     program.connection.demote_to_mvcc_connection();
@@ -12335,7 +13189,7 @@ pub fn op_vacuum_into(
     match op_vacuum_into_inner(program, state, insn) {
         Ok(InsnFunctionStepResult::Step) => {
             // Instruction complete, reset state
-            state.op_vacuum_into_state = OpVacuumIntoState::default();
+            state.op_vacuum_into_state = None;
             Ok(InsnFunctionStepResult::Step)
         }
         Ok(InsnFunctionStepResult::IO(io)) => {
@@ -12347,7 +13201,7 @@ pub fn op_vacuum_into(
         }
         Err(err) => {
             // Reset state on error
-            state.op_vacuum_into_state = OpVacuumIntoState::default();
+            state.op_vacuum_into_state = None;
             Err(err)
         }
     }
@@ -12360,7 +13214,9 @@ fn op_vacuum_into_inner(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(VacuumInto { dest_path }, insn);
 
-    let vacuum_state = &mut state.op_vacuum_into_state;
+    let vacuum_state = state
+        .op_vacuum_into_state
+        .get_or_insert_with(OpVacuumIntoState::default);
 
     loop {
         let current_sub_state = std::mem::take(&mut vacuum_state.sub_state);
@@ -12389,7 +13245,6 @@ fn op_vacuum_into_inner(
                 let source_db = &program.connection.db;
                 let dest_opts = crate::DatabaseOpts::new()
                     .with_views(source_db.experimental_views_enabled())
-                    .with_triggers(source_db.experimental_triggers_enabled())
                     .with_index_method(source_db.experimental_index_method_enabled());
 
                 program.connection.execute("BEGIN")?;
@@ -12433,7 +13288,7 @@ fn op_vacuum_into_inner(
                 // Enable MVCC on destination if source has it enabled
                 // Must be done before any schema operations to ensure the log file is created
                 if program.connection.db.mvcc_enabled() {
-                    dest_conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")?;
+                    dest_conn.execute("PRAGMA journal_mode = 'mvcc'")?;
                 }
 
                 // Performance optimizations for destination database:
@@ -12448,7 +13303,7 @@ fn op_vacuum_into_inner(
                 dest_conn.execute("BEGIN")?;
 
                 // Exclude the MVCC metadata table from the vacuum destination — it is an
-                // internal artifact of experimental_mvcc mode and must not appear in a
+                // internal artifact of mvcc mode and must not appear in a
                 // standalone SQLite file produced by VACUUM INTO.
                 let schema_sql = format!(
                     "SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE sql IS NOT NULL AND name <> '{}' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'index' THEN 2 WHEN 'trigger' THEN 3 WHEN 'view' THEN 4 ELSE 5 END",
@@ -13386,5 +14241,81 @@ mod tests {
         ];
         let result = finalize_agg_payload(&AggFunc::Avg, &payload).unwrap();
         assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn test_array_agg_accumulates_correctly() {
+        // Verify that array_agg produces correct results when accumulating
+        // multiple values. Uses the direct payload approach (O(1) per row).
+        let mut payload = Vec::new();
+        init_agg_payload(&AggFunc::ArrayAgg, &mut payload).unwrap();
+
+        // Simulate how AggStep accumulates values directly into the payload Vec.
+        for i in 0..100 {
+            let count = payload[0].as_int().unwrap_or(0) as usize;
+            payload[0] = Value::from_i64((count + 1) as i64);
+            payload.push(Value::from_i64(i));
+        }
+
+        let result = finalize_agg_payload(&AggFunc::ArrayAgg, &payload).unwrap();
+        let blob = match &result {
+            Value::Blob(b) => b,
+            _ => panic!("Expected Blob, got {result:?}"),
+        };
+        let elements = array_values_from_blob(blob).unwrap();
+        assert_eq!(elements.len(), 100);
+        for (i, elem) in elements.iter().enumerate() {
+            assert_eq!(*elem, Value::from_i64(i as i64));
+        }
+    }
+
+    #[test]
+    fn test_array_agg_zero_rows_produces_valid_result() {
+        // array_agg with zero rows should return NULL, matching PostgreSQL.
+        // The result must not be an invalid empty blob that crashes on decode.
+        let mut payload = Vec::new();
+        init_agg_payload(&AggFunc::ArrayAgg, &mut payload).unwrap();
+        // No values accumulated — count stays 0.
+        let result = finalize_agg_payload(&AggFunc::ArrayAgg, &payload).unwrap();
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn test_array_agg_finalize_bounds_check() {
+        // If payload[0] count is larger than the actual payload length,
+        // finalize should return an error rather than panicking.
+        let payload = vec![Value::from_i64(999)]; // claims 999 elements but has none
+        let result = finalize_agg_payload(&AggFunc::ArrayAgg, &payload);
+        assert!(
+            result.is_err(),
+            "Should error on count exceeding payload length"
+        );
+    }
+
+    #[test]
+    fn test_negate_blob_subscript_invalid_utf8_no_panic() {
+        // Negating a blob subscript that extracts a "text" value containing
+        // invalid UTF-8 bytes must not panic. The record decoder uses
+        // from_utf8_unchecked, so ArrayElement must validate extracted text.
+        //
+        // Reproduces fuzzer bug at seed 27035.
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            conn.execute("SELECT -X'18530E218A8D2D8D8F7456733370E68357745AFE13FC1B94751B77FCB00D0CAD971017936278BFF49BB4C8BD47F874ECA5226D3A433B7DFCD18661673598CED1FDB30A795F6F25'[2]")
+        }));
+        assert!(
+            result.is_ok(),
+            "Negating a blob subscript with invalid UTF-8 text should not panic"
+        );
     }
 }

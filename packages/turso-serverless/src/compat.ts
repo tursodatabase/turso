@@ -1,4 +1,5 @@
 import { Session, type SessionConfig } from './session.js';
+import { AsyncLock } from './async-lock.js';
 import { DatabaseError } from './error.js';
 
 /**
@@ -140,6 +141,7 @@ export interface Client {
 
 class LibSQLClient implements Client {
   private session: Session;
+  private execLock: AsyncLock = new AsyncLock();
   private _closed = false;
   private _defaultSafeIntegers = false;
 
@@ -246,13 +248,14 @@ class LibSQLClient implements Client {
   async execute(stmt: InStatement): Promise<ResultSet>;
   async execute(sql: string, args?: InArgs): Promise<ResultSet>;
   async execute(stmtOrSql: InStatement | string, args?: InArgs): Promise<ResultSet> {
+    await this.execLock.acquire();
     try {
       if (this._closed) {
         throw new LibsqlError("Client is closed", "CLIENT_CLOSED");
       }
 
       let normalizedStmt: { sql: string; args: any[] };
-      
+
       if (typeof stmtOrSql === 'string') {
         const normalizedArgs = args ? (Array.isArray(args) ? args : Object.values(args)) : [];
         normalizedStmt = { sql: stmtOrSql, args: normalizedArgs };
@@ -267,10 +270,13 @@ class LibSQLClient implements Client {
         throw error;
       }
       throw mapDatabaseError(error, "EXECUTE_ERROR");
+    } finally {
+      this.execLock.release();
     }
   }
 
   async batch(stmts: Array<InStatement>, mode?: TransactionMode): Promise<Array<ResultSet>> {
+    await this.execLock.acquire();
     try {
       if (this._closed) {
         throw new LibsqlError("Client is closed", "CLIENT_CLOSED");
@@ -282,7 +288,7 @@ class LibSQLClient implements Client {
       });
 
       const result = await this.session.batch(sqlStatements);
-      
+
       // Return array of result sets (simplified - actual implementation would be more complex)
       return [this.convertResult(result)];
     } catch (error: any) {
@@ -290,6 +296,8 @@ class LibSQLClient implements Client {
         throw error;
       }
       throw mapDatabaseError(error, "BATCH_ERROR");
+    } finally {
+      this.execLock.release();
     }
   }
 
@@ -303,17 +311,20 @@ class LibSQLClient implements Client {
   }
 
   async executeMultiple(sql: string): Promise<void> {
+    await this.execLock.acquire();
     try {
       if (this._closed) {
         throw new LibsqlError("Client is closed", "CLIENT_CLOSED");
       }
-      
+
       await this.session.sequence(sql);
     } catch (error: any) {
       if (error instanceof LibsqlError) {
         throw error;
       }
       throw mapDatabaseError(error, "EXECUTE_MULTIPLE_ERROR");
+    } finally {
+      this.execLock.release();
     }
   }
 

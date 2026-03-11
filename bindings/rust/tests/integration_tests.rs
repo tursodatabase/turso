@@ -1506,25 +1506,19 @@ async fn test_lost_updates() {
 
 /// Helper: create MVCC-enabled file-backed database with given schema
 async fn setup_mvcc_db(schema: &str) -> (turso::Database, tempfile::TempDir) {
-    setup_mvcc_db_with_options(schema, false).await
+    setup_mvcc_db_with_options(schema).await
 }
 
 /// Helper: create MVCC-enabled file-backed database with options
-async fn setup_mvcc_db_with_options(
-    schema: &str,
-    triggers: bool,
-) -> (turso::Database, tempfile::TempDir) {
+async fn setup_mvcc_db_with_options(schema: &str) -> (turso::Database, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let mut builder = Builder::new_local(db_path.to_str().unwrap());
-    if triggers {
-        builder = builder.experimental_triggers(true);
-    }
+    let builder = Builder::new_local(db_path.to_str().unwrap());
     let db = builder.build().await.unwrap();
     let conn = db.connect().unwrap();
     // PRAGMA journal_mode returns a row, so use query() to consume it
     let mut rows = conn
-        .query("PRAGMA journal_mode = 'experimental_mvcc'", ())
+        .query("PRAGMA journal_mode = 'mvcc'", ())
         .await
         .unwrap();
     while let Ok(Some(_)) = rows.next().await {}
@@ -1753,4 +1747,39 @@ async fn test_ghost_commits() {
             total_successes - actual_rows,
         );
     }
+}
+
+/// AUTOINCREMENT is not supported in MVCC mode. Verify that CREATE TABLE
+/// with AUTOINCREMENT fails with a clear error message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_autoincrement_blocked_in_mvcc() {
+    let (db, _dir) = setup_mvcc_db("").await;
+    let conn = db.connect().unwrap();
+
+    // CREATE TABLE with AUTOINCREMENT should fail
+    let result = conn
+        .execute(
+            "CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)",
+            (),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "CREATE TABLE with AUTOINCREMENT should fail in MVCC mode"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("AUTOINCREMENT is not supported in MVCC mode"),
+        "unexpected error: {err}"
+    );
+
+    // Regular tables without AUTOINCREMENT should still work
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)", ())
+        .await
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'hello')", ())
+        .await
+        .unwrap();
+    let count = query_i64(&conn, "SELECT COUNT(*) FROM t").await;
+    assert_eq!(count, 1);
 }

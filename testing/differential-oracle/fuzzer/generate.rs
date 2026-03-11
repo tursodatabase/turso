@@ -55,8 +55,6 @@ impl SqlGenBackend {
         let ctx = sql_gen::Context::new_with_seed(seed);
         let mut policy = Policy::default()
             .with_stmt_weights(sql_gen::StmtWeights {
-                create_trigger: 0,
-                drop_trigger: 0,
                 ..sql_gen::StmtWeights::default()
             })
             .with_function_config(
@@ -84,8 +82,12 @@ impl SqlGenerator for SqlGenBackend {
             .map_err(|e| anyhow::anyhow!("Failed to generate statement: {e}"))?;
         let sql = stmt.to_string();
         let is_ddl = StmtKind::from(&stmt).is_ddl();
-        let has_unordered_limit = stmt.has_unordered_limit();
-        let unordered_limit_reason = stmt.unordered_limit_reason().map(str::to_string);
+        let has_unordered_limit =
+            stmt.has_unordered_limit() || stmt.non_unique_order_by_reason(schema).is_some();
+        let unordered_limit_reason = stmt
+            .unordered_limit_reason()
+            .or_else(|| stmt.non_unique_order_by_reason(schema))
+            .map(str::to_string);
         Ok(GeneratedStatement {
             sql,
             is_ddl,
@@ -161,6 +163,10 @@ fn to_prop_schema(schema: &sql_gen::Schema) -> sql_gen_prop::Schema {
                     sql_gen::DataType::Text => sql_gen_prop::DataType::Text,
                     sql_gen::DataType::Blob => sql_gen_prop::DataType::Blob,
                     sql_gen::DataType::Null => sql_gen_prop::DataType::Null,
+                    // Array types have no prop equivalent — map to Blob
+                    sql_gen::DataType::IntegerArray
+                    | sql_gen::DataType::RealArray
+                    | sql_gen::DataType::TextArray => sql_gen_prop::DataType::Blob,
                 };
                 let mut col = sql_gen_prop::ColumnDef::new(c.name.clone(), dt);
                 if !c.nullable {

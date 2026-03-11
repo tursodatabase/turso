@@ -656,7 +656,6 @@ impl TursoDatabase {
                                 "strict" => opts, // strict is always enabled, kept for backwards compatibility
                                 "custom_types" => opts.with_custom_types(true),
                                 "autovacuum" => opts.with_autovacuum(true),
-                                "triggers" => opts.with_triggers(true),
                                 "encryption" => opts.with_encryption(true),
                                 "attach" => opts.with_attach(true),
                                 _ => opts,
@@ -697,6 +696,7 @@ impl TursoDatabase {
                         OpenFlags::default(),
                         opts,
                         self.config.encryption.clone(),
+                        None,
                     )? {
                         IOResult::Done(db) => {
                             let mut inner_db = self.db.lock().unwrap();
@@ -996,12 +996,14 @@ impl TursoStatement {
     /// method returns [TursoStatusCode::Done] if execution is finished
     /// method returns [TursoStatusCode::Row] if execution generated a row
     /// method returns [TursoStatusCode::Io] if async_io was set and execution needs IO in order to make progress
+    #[inline]
     pub fn step(&mut self, waker: Option<&Waker>) -> Result<TursoStatusCode, TursoError> {
         let guard = self.concurrent_guard.clone();
         let _guard = guard.try_use()?;
         self.step_no_guard(waker)
     }
 
+    #[inline]
     fn step_no_guard(&mut self, waker: Option<&Waker>) -> Result<TursoStatusCode, TursoError> {
         let async_io = self.async_io;
         loop {
@@ -1060,6 +1062,7 @@ impl TursoStatement {
     }
     /// get row value reference currently pointed by the statement
     /// note, that this row will no longer be valid after execution of methods like [Self::step]/[Self::execute]/[Self::finalize]/[Self::reset]
+    #[inline]
     pub fn row_value(&self, index: usize) -> Result<turso_core::ValueRef, TursoError> {
         let Some(row) = self.statement.row() else {
             return Err(TursoError::Misuse("statement holds no row".to_string()));

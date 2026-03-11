@@ -1692,7 +1692,7 @@ fn test_update_pk_on_attached_table_with_unique_index(tmp_db: TempDatabase) -> a
         .path
         .parent()
         .unwrap()
-        .join("aux.db")
+        .join("aux_update.db")
         .to_string_lossy()
         .to_string();
     conn.execute(format!("ATTACH '{aux_path}' AS aux1"))?;
@@ -1709,6 +1709,39 @@ fn test_update_pk_on_attached_table_with_unique_index(tmp_db: TempDatabase) -> a
     );
 
     Ok(())
+}
+
+/// Regression test: UPDATE t SET v=v in MVCC mode should not delete rows.
+/// When UPDATE sets a column to its own value (a no-op update), the row count
+/// should remain unchanged. Previously this caused count(*) to return 0.
+/// The bug reproduces when MVCC is enabled *after* table creation and inserts.
+#[test]
+pub fn test_mvcc_update_set_self_does_not_delete_rows() {
+    let _ = env_logger::try_init();
+    let db_path = tempfile::NamedTempFile::new().unwrap();
+    let (_file, db_path) = db_path.keep().unwrap();
+    let tmp_db = TempDatabase::builder().with_db_path(&db_path).build();
+    let conn = tmp_db.connect_limbo();
+
+    // Create table and insert data BEFORE enabling MVCC
+    conn.execute("CREATE TABLE t(v)").unwrap();
+    conn.execute("INSERT INTO t VALUES('hello')").unwrap();
+
+    // Switch to MVCC journal mode after data exists
+    conn.pragma_update("journal_mode", "'mvcc'")
+        .expect("enable mvcc");
+
+    // Self-update: SET v=v should be a no-op
+    conn.execute("UPDATE t SET v=v").unwrap();
+
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, 1, "UPDATE t SET v=v should not delete the row");
+
+    // Also verify the actual data is intact
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT v FROM t");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "hello");
 }
 
 /// Regression test: when a statement writes to the main DB and reads from an

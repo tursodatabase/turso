@@ -9,7 +9,7 @@ use crate::{
     translate::{
         collate::get_collseq_from_expr,
         compound_select::emit_program_for_compound_select,
-        emitter::emit_program_for_select,
+        emitter::select::{emit_program_for_select, emit_query},
         expr::{
             compare_affinity, get_expr_affinity_info, unwrap_parens, walk_expr_mut, WalkControl,
         },
@@ -20,17 +20,19 @@ use crate::{
         },
         select::prepare_select_plan,
     },
+    types::Value,
+    util::parse_signed_number,
     vdbe::{
         affinity,
         builder::{CursorType, MaterializedCteInfo, ProgramBuilder},
         insn::Insn,
         CursorID,
     },
-    Connection, QueryMode, Result,
+    Connection, Numeric, Result,
 };
 
 use super::{
-    emitter::{emit_query, Resolver, TranslateCtx},
+    emitter::{Resolver, TranslateCtx},
     main_loop::LoopLabels,
     plan::{Aggregate, Operation, QueryDestination, Scan, Search, SelectPlan},
     planner::resolve_window_and_aggregate_functions,
@@ -440,11 +442,23 @@ fn get_subquery_parser<'a>(
                     result_reg_start: reg_start,
                     num_regs: reg_count,
                 };
-                // RowValue subqueries are satisfied after at most 1 row has been returned,
-                // as they are used in comparisons with a scalar or a tuple of scalars like (x,y) = (SELECT ...) or x = (SELECT ...).
-                plan.limit = Some(Box::new(ast::Expr::Literal(ast::Literal::Numeric(
-                    "1".to_string(),
-                ))));
+
+                // Only inject LIMIT 1 if there's no existing limit, or the existing limit is > 1,
+                // If LIMIT 0, subquery should return no rows (NULL).
+                let limit = match &plan.limit {
+                    Some(expr) => match parse_signed_number(expr) {
+                        Ok(Value::Numeric(Numeric::Integer(v))) => !(0..=1).contains(&v),
+                        _ => true,
+                    },
+                    None => true,
+                };
+                if limit {
+                    // RowValue subqueries are satisfied after at most 1 row has been returned,
+                    // as they are used in comparisons with a scalar or a tuple of scalars like (x,y) = (SELECT ...) or x = (SELECT ...).
+                    plan.limit = Some(Box::new(ast::Expr::Literal(ast::Literal::Numeric(
+                        "1".to_string(),
+                    ))));
+                }
 
                 let ast::Expr::SubqueryResult {
                     subquery_id,
@@ -888,8 +902,20 @@ pub fn emit_from_clause_subqueries(
         }
     }
 
+    // Build lookup from table index to is_outer for LEFT-JOIN annotations
+    let outer_table_set: HashSet<usize> = join_order
+        .iter()
+        .filter(|m| m.is_outer)
+        .map(|m| m.original_idx)
+        .collect();
+
     for table_index in visit_order {
         let table_reference = &mut tables.joined_tables_mut()[table_index];
+        let left_join_suffix = if outer_table_set.contains(&table_index) {
+            " LEFT-JOIN"
+        } else {
+            ""
+        };
         emit_explain!(
             program,
             true,
@@ -926,15 +952,18 @@ pub fn emit_from_clause_subqueries(
                 Operation::Search(search) => match search {
                     Search::RowidEq { .. } | Search::Seek { index: None, .. } => {
                         format!(
-                            "SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
+                            "SEARCH {} USING INTEGER PRIMARY KEY (rowid=?){left_join_suffix}",
                             table_reference.identifier
                         )
                     }
                     Search::Seek {
-                        index: Some(index), ..
+                        index: Some(index),
+                        seek_def,
                     } => {
+                        let constraints =
+                            super::display::seek_constraint_annotation(index, seek_def);
                         format!(
-                            "SEARCH {} USING INDEX {}",
+                            "SEARCH {} USING INDEX {}{constraints}{left_join_suffix}",
                             table_reference.identifier, index.name
                         )
                     }

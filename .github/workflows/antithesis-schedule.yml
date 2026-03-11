@@ -1,0 +1,14 @@
+name: Antithesis nightly
+
+on:
+  schedule:
+    - cron: "0 0 * * 0-5" # Sun-Fri: 4 hour run
+    - cron: "0 0 * * 6"   # Saturday: 24 hour run
+
+jobs:
+  test:
+    uses: ./.github/workflows/antithesis.yml
+    with:
+      duration: ${{ github.event.schedule == '0 0 * * 6' && 1440 || 240 }}
+      test_name: ${{ github.event.schedule == '0 0 * * 6' && 'weekend run' || 'scheduled run' }}
+    secrets: inherit

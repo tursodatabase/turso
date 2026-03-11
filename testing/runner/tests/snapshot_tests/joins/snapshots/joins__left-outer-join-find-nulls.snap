@@ -22,7 +22,7 @@ info:
 ---
 QUERY PLAN
 |--SCAN customers AS c
-`--SEARCH o USING INDEX idx_orders_customer_id
+`--SEARCH o USING INDEX idx_orders_customer_id (customer_id=?) LEFT-JOIN
 
 BYTECODE
 addr  opcode         p1  p2  p3  p4              p5  comment

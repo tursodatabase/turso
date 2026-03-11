@@ -509,6 +509,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 OpenFlags::Create,
                 turso_core::DatabaseOpts::new(),
                 None,
+                None,
             )? {
                 turso_core::IOResult::Done(db) => break db,
                 turso_core::IOResult::IO(io_completion) => {
@@ -537,6 +538,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     self.db_file.clone(),
                     OpenFlags::Create,
                     turso_core::DatabaseOpts::new(),
+                    None,
                     None,
                 )? {
                     turso_core::IOResult::Done(db) => break db,

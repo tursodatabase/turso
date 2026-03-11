@@ -48,5 +48,5 @@ QUERY PLAN
 |  |--SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)
 |  |--SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)
 |  |--SEARCH orders USING INTEGER PRIMARY KEY (rowid=?)
-|  `--SEARCH partsupp USING INDEX sqlite_autoindex_partsupp_1
+|  `--SEARCH partsupp USING INDEX sqlite_autoindex_partsupp_1 (ps_partkey=? AND ps_suppkey=?)
 `--USE SORTER FOR GROUP BY

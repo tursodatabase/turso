@@ -37,7 +37,7 @@ fn open_two_conns(io: Arc<MemorySimIO>, path: &str) -> Result<(Arc<Connection>, 
 }
 
 fn enable_mvcc(conn: &Arc<Connection>) -> Result<()> {
-    conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")?;
+    conn.execute("PRAGMA journal_mode = 'mvcc'")?;
     Ok(())
 }
 

@@ -27,6 +27,9 @@ pub fn generate_literal_with_config(
         DataType::Text => generate_text(ctx, config),
         DataType::Blob => generate_blob(ctx, config),
         DataType::Null => Literal::Null,
+        DataType::IntegerArray | DataType::RealArray | DataType::TextArray => {
+            generate_array_literal(ctx, data_type, config)
+        }
     }
 }
 
@@ -82,6 +85,53 @@ pub fn generate_blob(ctx: &mut Context, config: &LiteralConfig) -> Literal {
     Literal::Blob(bytes)
 }
 
+/// Generate an array literal as a PG-style text string (e.g. '{1, 2, 3}').
+pub fn generate_array_literal(
+    ctx: &mut Context,
+    data_type: DataType,
+    config: &LiteralConfig,
+) -> Literal {
+    let size = ctx.gen_range_inclusive(config.array_min_size, config.array_max_size);
+    let element_type = data_type.array_element_type().unwrap_or(DataType::Integer);
+
+    let mut parts = Vec::with_capacity(size);
+    for _ in 0..size {
+        match element_type {
+            DataType::Integer => {
+                let v = ctx.gen_i64_range(config.int_min, config.int_max);
+                parts.push(v.to_string());
+            }
+            DataType::Real => {
+                let v = ctx.gen_f64_range(config.real_min, config.real_max);
+                parts.push(format!("{v}"));
+            }
+            DataType::Text => {
+                let len = ctx.gen_range_inclusive(config.string_min_len, config.string_max_len);
+                let s = generate_string_alphanumeric(ctx, len);
+                // Quote text elements in PG array format
+                parts.push(format!("\"{s}\""));
+            }
+            _ => {
+                let v = ctx.gen_i64_range(config.int_min, config.int_max);
+                parts.push(v.to_string());
+            }
+        }
+    }
+
+    Literal::Text(format!("{{{}}}", parts.join(",")))
+}
+
+/// Generate a simple alphanumeric string.
+fn generate_string_alphanumeric(ctx: &mut Context, len: usize) -> String {
+    let chars: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    (0..len)
+        .map(|_| {
+            let idx = ctx.gen_range(chars.len());
+            chars[idx] as char
+        })
+        .collect()
+}
+
 /// Generate a literal suitable for comparison with a column.
 pub fn generate_comparable_literal(
     ctx: &mut Context,
@@ -94,6 +144,9 @@ pub fn generate_comparable_literal(
         DataType::Text => generate_text(ctx, config),
         DataType::Blob => generate_blob(ctx, config),
         DataType::Null => Literal::Null,
+        DataType::IntegerArray | DataType::RealArray | DataType::TextArray => {
+            generate_array_literal(ctx, data_type, config)
+        }
     }
 }
 

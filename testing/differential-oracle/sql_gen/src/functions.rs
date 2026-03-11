@@ -25,6 +25,8 @@ pub enum FunctionCategory {
     Blob,
     /// Aggregate functions (COUNT, SUM, AVG, etc.)
     Aggregate,
+    /// Array functions (array_length, array_append, etc.)
+    Array,
     /// Miscellaneous functions
     Other,
 }
@@ -326,6 +328,48 @@ pub static SCALAR_FUNCTIONS: &[FunctionDef] = &[
     FunctionDef::new("UNLIKELY")
         .args(&[ANY])
         .category(FunctionCategory::Other),
+    // =========================================================================
+    // Array functions
+    // =========================================================================
+    FunctionDef::new("ARRAY_LENGTH")
+        .args(&[ANY])
+        .returns(DataType::Integer)
+        .category(FunctionCategory::Array),
+    FunctionDef::new("ARRAY_APPEND")
+        .args(&[ANY, ANY])
+        .category(FunctionCategory::Array),
+    FunctionDef::new("ARRAY_PREPEND")
+        .args(&[ANY, ANY])
+        .category(FunctionCategory::Array),
+    FunctionDef::new("ARRAY_CAT")
+        .args(&[ANY, ANY])
+        .category(FunctionCategory::Array),
+    FunctionDef::new("ARRAY_CONTAINS")
+        .args(&[ANY, ANY])
+        .returns(DataType::Integer)
+        .category(FunctionCategory::Array),
+    FunctionDef::new("ARRAY_POSITION")
+        .args(&[ANY, ANY])
+        .returns(DataType::Integer)
+        .category(FunctionCategory::Array),
+    FunctionDef::new("ARRAY_REMOVE")
+        .args(&[ANY, ANY])
+        .category(FunctionCategory::Array),
+    FunctionDef::new("ARRAY_TO_STRING")
+        .args(&[ANY, TEXT])
+        .returns(DataType::Text)
+        .category(FunctionCategory::Array),
+    FunctionDef::new("ARRAY_SLICE")
+        .args(&[ANY, INT, INT])
+        .category(FunctionCategory::Array),
+    FunctionDef::new("STRING_TO_ARRAY")
+        .args(&[TEXT, TEXT])
+        .arity(2, 3)
+        .category(FunctionCategory::Array),
+    FunctionDef::new("ARRAY_CONTAINS_ALL")
+        .args(&[ANY, ANY])
+        .returns(DataType::Integer)
+        .category(FunctionCategory::Array),
 ];
 
 /// All built-in aggregate functions.
@@ -354,6 +398,10 @@ pub static AGGREGATE_FUNCTIONS: &[FunctionDef] = &[
         .arity(1, 2)
         .returns(DataType::Text)
         .category(FunctionCategory::Aggregate)
+        .aggregate(),
+    FunctionDef::new("ARRAY_AGG")
+        .args(&[ANY])
+        .category(FunctionCategory::Array)
         .aggregate(),
 ];
 

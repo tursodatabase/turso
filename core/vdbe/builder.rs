@@ -153,10 +153,16 @@ pub struct ProgramBuilder {
     /// Current parent explain address, if any.
     current_parent_explain_idx: Option<usize>,
     pub(crate) reg_result_cols_start: Option<usize>,
-    /// Whether the program needs to use statement subtransactions,
-    /// i.e. the individual statement may need to be aborted due to a constraint conflict, etc.
-    /// instead of the entire transaction.
-    needs_stmt_subtransactions: bool,
+    /// Mirrors SQLite's isMultiWrite: true if the statement may modify/insert multiple rows.
+    /// If a non-autocommit transaction can modify multiple rows, statement subjournaling is always
+    /// required for proper cleanup on abort. If only one row can be modified, then journaling is not
+    /// necessary because on abort there is nothing to clean up.
+    /// Defaults to true for safety; specific translate paths (e.g., single-row INSERT) set false.
+    is_multi_write: bool,
+    /// Mirrors SQLite's mayAbort: true if the statement may throw an ABORT exception.
+    /// This flag is used in combination with is_multi_write to determine if statement subjournaling is required.
+    /// Defaults to true for safety; specific translate paths (e.g., INSERT with no constraints) set false.
+    may_abort: bool,
     /// If this ProgramBuilder is building trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
     /// Whether this is a subprogram (trigger or FK action). Subprograms skip Transaction instructions.
@@ -347,7 +353,7 @@ pub struct ProgramBuilderOpts {
 #[macro_export]
 macro_rules! emit_explain {
     ($builder:expr, $push:expr, $detail:expr) => {
-        if let QueryMode::ExplainQueryPlan = $builder.get_query_mode() {
+        if let $crate::QueryMode::ExplainQueryPlan = $builder.get_query_mode() {
             $builder.emit_explain($push, $detail);
         }
     };
@@ -420,7 +426,8 @@ impl ProgramBuilder {
             query_mode,
             current_parent_explain_idx: None,
             reg_result_cols_start: None,
-            needs_stmt_subtransactions: false,
+            is_multi_write: true,
+            may_abort: true,
             trigger,
             is_subprogram,
             resolve_type: ResolveType::Abort,
@@ -581,8 +588,15 @@ impl ProgramBuilder {
         self.subquery_result_regs.get(&internal_id).copied()
     }
 
-    pub fn set_needs_stmt_subtransactions(&mut self, needs_stmt_subtransactions: bool) {
-        self.needs_stmt_subtransactions = needs_stmt_subtransactions;
+    /// Mark that this statement may modify/insert multiple rows (mirrors SQLite's sqlite3MultiWrite).
+    /// When false, statement journals are skipped since single-write statements are atomic.
+    pub fn set_multi_write(&mut self, is_multi_write: bool) {
+        self.is_multi_write = is_multi_write;
+    }
+
+    /// Mark that this statement may throw an ABORT exception (mirrors SQLite's sqlite3MayAbort).
+    pub fn set_may_abort(&mut self, may_abort: bool) {
+        self.may_abort = may_abort;
     }
 
     pub fn capture_data_changes_info(&self) -> &Option<CaptureDataChangesInfo> {
@@ -1463,6 +1477,11 @@ impl ProgramBuilder {
         self.table_references.contains_table(table)
     }
 
+    /// Returns true if the cursor is a BTreeTable cursor.
+    pub fn cursor_is_btree(&self, cursor_id: CursorID) -> bool {
+        matches!(self.cursor_ref[cursor_id].1, CursorType::BTreeTable(_))
+    }
+
     #[inline]
     pub fn cursor_loop(&mut self, cursor_id: CursorID, f: impl Fn(&mut ProgramBuilder, usize)) {
         let loop_start = self.allocate_label();
@@ -1589,11 +1608,14 @@ impl ProgramBuilder {
 
         self.parameters.list.dedup();
 
-        // before, we required stmt subtransaction only if !self.table_references.is_empty()
-        // this is wrong in case of CREATE UNIQUE INDEX statements - as they can fail with CONSTRAINT error and we need to properly behave in this case
-        if matches!(self.txn_mode, TransactionMode::Write) {
-            self.needs_stmt_subtransactions = true;
-        }
+        // Mirrors SQLite's: usesStmtJournal = isMultiWrite && mayAbort
+        // Statement journals are only needed when a statement writes multiple rows AND could
+        // abort midway (e.g. constraint violation). Single-row writes are atomic and don't
+        // need statement-level rollback. Both flags default to true; specific translate paths
+        // (e.g., single-row INSERT) set is_multi_write=false to opt out.
+        let needs_stmt_subtransactions = matches!(self.txn_mode, TransactionMode::Write)
+            && self.is_multi_write
+            && self.may_abort;
 
         let contains_trigger_subprograms = self
             .insns
@@ -1611,7 +1633,7 @@ impl ProgramBuilder {
             table_references: self.table_references,
             sql: sql.to_string(),
             needs_stmt_subtransactions: crate::Arc::new(crate::AtomicBool::new(
-                self.needs_stmt_subtransactions,
+                needs_stmt_subtransactions,
             )),
             trigger: self.trigger.take(),
             is_subprogram: self.is_subprogram,

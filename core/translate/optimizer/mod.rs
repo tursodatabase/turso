@@ -536,7 +536,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
 
     if let Some((best_join_order, output_rows)) = best_join_order {
         plan.join_order = best_join_order;
-        let mut est = output_rows as f64;
+        let mut est = output_rows;
         // Clamp to LIMIT when it's a literal non-negative number.
         // Negative LIMIT means "no limit" in SQLite, so we skip those.
         if let Some(limit_expr) = &plan.limit {
@@ -1284,7 +1284,7 @@ fn optimize_table_access(
     subqueries: &[NonFromClauseSubquery],
     limit: &mut Option<Box<Expr>>,
     offset: &mut Option<Box<Expr>>,
-) -> Result<Option<(Vec<JoinOrderMember>, usize)>> {
+) -> Result<Option<(Vec<JoinOrderMember>, f64)>> {
     // When optimizer_params feature is enabled, use lazily-loaded params (cached process-wide).
     // Otherwise, use the compile-time static for zero overhead.
     #[cfg(feature = "optimizer_params")]
@@ -1474,8 +1474,7 @@ fn optimize_table_access(
         let best_unordered_plan_cost = best_plan.cost;
         let best_ordered_plan_cost = best_ordered_plan.cost;
         const SORT_COST_PER_ROW_MULTIPLIER: f64 = 0.001;
-        let sorting_penalty =
-            Cost(best_plan.output_cardinality as f64 * SORT_COST_PER_ROW_MULTIPLIER);
+        let sorting_penalty = Cost(best_plan.output_cardinality * SORT_COST_PER_ROW_MULTIPLIER);
         if best_unordered_plan_cost + sorting_penalty > best_ordered_plan_cost {
             best_ordered_plan
         } else {
@@ -2156,8 +2155,8 @@ fn eliminate_constant_conditions(
     Ok(ConstantConditionEliminationResult::Continue)
 }
 
-/// Check if the order by collation matches the index columns collations.
-/// Only remove the index if sort was eliminated.
+/// Check if the order target collation matches index column collations.
+/// Only remove the index when sort elimination selected this plan.
 fn maybe_remove_index_candidate(
     index: &mut Option<Arc<Index>>,
     table_reference: &JoinedTable,
@@ -2188,12 +2187,9 @@ fn maybe_remove_index_candidate(
             };
 
             if let Some(idx_col) = matching_idx_col {
-                let idx_collation = idx_col.collation;
-
-                // If ORDER BY collation doesn't match index collation, this index can't satisfy the ordering
-                if idx_collation.is_some_and(|idx_collation| col_order.collation != idx_collation)
-                    && sort_eliminated
-                {
+                // Index columns without explicit COLLATE use BINARY.
+                // Treat them as BINARY for ordering compatibility checks.
+                if col_order.collation != idx_col.collation.unwrap_or_default() {
                     *index = None;
                     return;
                 }
@@ -2315,6 +2311,9 @@ impl Optimizable for ast::Expr {
             Expr::Unary(_, expr) => expr.is_nonnull(tables),
             Expr::Variable(..) => false,
             Expr::Register(..) => false, // Register values can be null
+            Expr::Array { .. } | Expr::Subscript { .. } => {
+                unreachable!("Array and Subscript are desugared into function calls by the parser")
+            }
         }
     }
     /// Returns true if the expression is a constant i.e. does not depend on columns and can be evaluated only once during the execution
@@ -2392,6 +2391,9 @@ impl Optimizable for ast::Expr {
             Expr::Unary(_, expr) => expr.is_constant(resolver),
             Expr::Variable(_) => true,
             Expr::Register(_) => false,
+            Expr::Array { .. } | Expr::Subscript { .. } => {
+                unreachable!("Array and Subscript are desugared into function calls by the parser")
+            }
         }
     }
     /// Returns true if the expression is a constant expression that, when evaluated as a condition, is always true or false
@@ -2999,7 +3001,7 @@ mod tests {
         attached_databases: &'a RwLock<DatabaseCatalog>,
         syms: &'a SymbolTable,
     ) -> Resolver<'a> {
-        Resolver::new(schema, database_schemas, attached_databases, syms)
+        Resolver::new(schema, database_schemas, attached_databases, syms, true)
     }
 
     fn no_tail() -> FunctionTail {

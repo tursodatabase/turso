@@ -20,7 +20,7 @@ info:
 ---
 QUERY PLAN
 |--SCAN customers AS c
-`--SEARCH o USING INDEX idx_orders_customer
+`--SEARCH o USING INDEX idx_orders_customer (customer_id=?)
 
 BYTECODE
 addr  opcode             p1  p2  p3  p4            p5  comment

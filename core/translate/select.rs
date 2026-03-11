@@ -1065,6 +1065,9 @@ fn expr_contains_subquery(expr: &Expr) -> bool {
                     stack.push(expr);
                 }
             }
+            Expr::Array { .. } | Expr::Subscript { .. } => {
+                unreachable!("Array and Subscript are desugared into function calls by the parser")
+            }
             Expr::Column { .. }
             | Expr::DoublyQualified(_, _, _)
             | Expr::Id(_)
@@ -1187,7 +1190,7 @@ pub fn emit_simple_count(
     program: &mut ProgramBuilder,
     _t_ctx: &mut TranslateCtx,
     plan: &SelectPlan,
-) -> Result<()> {
+) -> Result<bool> {
     let cursors = plan
         .joined_tables()
         .first()
@@ -1197,9 +1200,15 @@ pub fn emit_simple_count(
     let cursor_id = {
         match cursors {
             (_, Some(cursor_id)) | (Some(cursor_id), None) => cursor_id,
-            _ => panic!("cursor for table should have been opened"),
+            _ => return Ok(false),
         }
     };
+
+    // Count opcode only works on BTree cursors. Materialized view trigger
+    // queries may have pseudo cursors — fall back to normal aggregation.
+    if !program.cursor_is_btree(cursor_id) {
+        return Ok(false);
+    }
 
     // TODO: I think this allocation can be avoided if we are smart with the `TranslateCtx`
     let target_reg = program.alloc_register();
@@ -1218,7 +1227,7 @@ pub fn emit_simple_count(
         extra_amount: 0,
     });
     program.emit_result_row(output_reg, 1);
-    Ok(())
+    Ok(true)
 }
 
 fn process_having_clause(

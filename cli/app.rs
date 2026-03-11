@@ -88,8 +88,6 @@ pub struct Opts {
     pub experimental_index_method: bool,
     #[clap(long, help = "Enable experimental autovacuum feature")]
     pub experimental_autovacuum: bool,
-    #[clap(long, help = "Enable experimental triggers feature")]
-    pub experimental_triggers: bool,
     #[clap(long, help = "Enable experimental attach feature")]
     pub experimental_attach: bool,
     #[clap(
@@ -219,7 +217,6 @@ impl Limbo {
             .with_encryption(opts.experimental_encryption)
             .with_index_method(opts.experimental_index_method)
             .with_autovacuum(opts.experimental_autovacuum)
-            .with_triggers(opts.experimental_triggers)
             .with_attach(opts.experimental_attach)
             .with_unsafe_testing(opts.unsafe_testing);
 
@@ -532,31 +529,30 @@ impl Limbo {
         let conn = self.conn.clone();
         let runner = conn.query_runner(input.as_bytes());
         let had_error_before = self.had_query_error;
-        for output in runner {
+        let capture_stats = self.opts.stats;
+        let mut last_stmt_metrics = None;
+        for mut output in runner {
             if self
-                .print_query_result(input, output, stats.as_mut())
+                .print_query_result(input, &mut output, stats.as_mut())
                 .is_err()
                 || self.had_query_error != had_error_before
             {
                 self.had_query_error = true;
                 break;
             }
+            // Capture metrics after stepping, before the Statement is dropped
+            if capture_stats {
+                if let Ok(Some(ref stmt)) = output {
+                    last_stmt_metrics = Some(stmt.metrics().clone());
+                }
+            }
         }
 
         self.print_query_performance_stats(start, stats.as_ref());
 
         // Display stats if enabled
-        if self.opts.stats {
-            let stats_output = {
-                let metrics = self.conn.metrics.read();
-                metrics
-                    .last_statement
-                    .as_ref()
-                    .map(|last| format!("\n{last}"))
-            };
-            if let Some(output) = stats_output {
-                let _ = self.writeln(output);
-            }
+        if let Some(ref last) = last_stmt_metrics {
+            let _ = self.writeln(format!("\n{last}"));
         }
     }
 
@@ -831,7 +827,7 @@ impl Limbo {
     fn print_query_result(
         &mut self,
         sql: &str,
-        mut output: Result<Option<Statement>, LimboError>,
+        output: &mut Result<Option<Statement>, LimboError>,
         statistics: Option<&mut QueryStatistics>,
     ) -> anyhow::Result<()> {
         match output {
@@ -859,12 +855,13 @@ impl Limbo {
             }
             Ok(None) => {}
 
-            Err(err) => {
+            Err(ref err) => {
                 match err {
                     LimboError::Busy => {}
                     LimboError::Interrupt => {}
                     _ => {
-                        let report = miette::Error::from(err).with_source_code(sql.to_owned());
+                        let report =
+                            miette::Error::from(err.clone()).with_source_code(sql.to_owned());
                         let _ = self.writeln_fmt(format_args!("{report:?}"));
                     }
                 }
@@ -1902,96 +1899,24 @@ impl Limbo {
         let reader = BufReader::new(file);
 
         let mut query_buffer = String::new();
-        let mut in_single_quote: bool = false; // ''
-        let mut in_double_quote: bool = false; // ""
-        let mut in_block_comment = false; //  /* */
-        let mut in_hash = false; // #
-        let mut in_line_comment = false; // --
+        let mut state = ReadState::default();
 
         for line in reader.lines() {
-            let mut line = line
+            let line = line
                 .map_err(|e| anyhow!("Error: file \"{}\" is not valid UTF-8 text – {}", path, e))?;
-            line.push('\n');
-            let mut iter = line.chars().peekable();
 
-            while let Some(ch) = iter.next() {
-                // Check exit for line comment and hash
-                if (in_line_comment || in_hash) && ch == '\n' {
-                    in_line_comment = false;
-                    in_hash = false;
-                    query_buffer.push(ch);
-                    continue;
-                }
-
-                // Check exit for block comment
-                if in_block_comment && ch == '*' && iter.peek() == Some(&'/') {
-                    query_buffer.push(ch);
-                    query_buffer.push('/');
-                    iter.next();
-                    in_block_comment = false;
-                    continue;
-                }
-
-                // Push into the query buffer if its inside comments
-                if in_line_comment || in_block_comment || in_hash {
-                    query_buffer.push(ch);
-                    continue;
-                }
-
-                // Block comment detection
-                if ch == '/' && iter.peek() == Some(&'*') && !in_single_quote && !in_double_quote {
-                    query_buffer.push('/');
-                    query_buffer.push('*');
-                    iter.next();
-                    in_block_comment = true;
-                    continue;
-                }
-
-                // Hash detection, instead of pushing '#' it pushes '-', '-'
-                // to make it act like line comment
-                if ch == '#' && !in_single_quote && !in_double_quote {
-                    query_buffer.push('-');
-                    query_buffer.push('-');
-                    in_hash = true;
-                    continue;
-                }
-
-                // Line comment detection
-                if ch == '-' && iter.peek() == Some(&'-') && !in_single_quote && !in_double_quote {
-                    query_buffer.push(ch);
-                    query_buffer.push('-');
-                    iter.next();
-                    in_line_comment = true;
-                    continue;
-                }
-
-                // Single quote
-                if ch == '\'' && !in_double_quote {
-                    in_single_quote = !in_single_quote;
-                }
-
-                // Double quote
-                if ch == '"' && !in_single_quote {
-                    in_double_quote = !in_double_quote;
-                }
-
-                query_buffer.push(ch);
-
-                if ch == ';'
-                    && !in_single_quote
-                    && !in_double_quote
-                    && !in_block_comment
-                    && !in_line_comment
-                    && !in_hash
-                {
-                    self.run_query(&query_buffer);
-                    query_buffer.clear();
-                }
+            if !query_buffer.is_empty() {
+                query_buffer.push('\n');
             }
+            query_buffer.push_str(&line);
 
-            // Reset comments
-            in_line_comment = false;
-            in_hash = false;
+            state.process(&line);
+
+            if state.is_complete() {
+                self.run_query(&query_buffer);
+                query_buffer.clear();
+                state = ReadState::default();
+            }
         }
 
         let remaining = query_buffer.trim();

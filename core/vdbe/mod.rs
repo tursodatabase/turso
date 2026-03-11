@@ -17,8 +17,10 @@
 //!
 //! https://www.sqlite.org/opcode.html
 
+use crate::types::Extendable;
 use crate::{turso_assert, turso_assert_ne, turso_debug_assert, HashSet};
 pub mod affinity;
+pub mod array;
 pub mod bloom_filter;
 pub mod builder;
 pub mod execute;
@@ -35,7 +37,7 @@ pub use crate::translate::collate::CollationSeq;
 use crate::{
     error::LimboError,
     function::{AggFunc, FuncCtx},
-    mvcc::{database::CommitStateMachine, LocalClock},
+    mvcc::{database::CommitStateMachine, MvccClock},
     numeric::Numeric,
     return_if_io,
     schema::Trigger,
@@ -52,21 +54,19 @@ use crate::{
         hash_table::HashTable,
         metrics::StatementMetrics,
     },
-    CipherMode, ValueRef,
+    ValueRef,
 };
 use smallvec::SmallVec;
 
+#[cfg(feature = "json")]
+use crate::json::JsonCacheCell;
+use crate::sync::RwLock;
 use crate::{
     storage::pager::Pager,
     translate::plan::ResultSetColumn,
     types::{AggContext, Cursor, ImmutableRecord, Value},
     vdbe::{builder::CursorType, insn::Insn},
 };
-
-use crate::connection::AttachedDatabasesFingerprint;
-#[cfg(feature = "json")]
-use crate::json::JsonCacheCell;
-use crate::sync::RwLock;
 use crate::{
     AtomicBool, CaptureDataChangesInfo, Connection, MvStore, Result, SyncMode, TransactionState,
 };
@@ -215,11 +215,11 @@ enum CommitState {
     /// Committing attached database pagers after main pager commit is done.
     CommittingAttached,
     CommittingMvcc {
-        state_machine: StateMachine<CommitStateMachine<LocalClock>>,
+        state_machine: StateMachine<CommitStateMachine<MvccClock>>,
     },
     /// Committing MVCC transactions on attached databases after main MVCC commit is done.
     CommittingAttachedMvcc {
-        state_machine: StateMachine<CommitStateMachine<LocalClock>>,
+        state_machine: StateMachine<CommitStateMachine<MvccClock>>,
         db_id: usize,
         mv_store: Arc<MvStore>,
     },
@@ -350,7 +350,7 @@ pub struct ProgramState {
     /// Indicate whether an [Insn::Once] instruction at a given program counter position has already been executed, well, once.
     once: SmallVec<[u32; 4]>,
     pub execution_state: ProgramExecutionState,
-    pub parameters: HashMap<NonZero<usize>, Value>,
+    pub parameters: Vec<Value>,
     commit_state: CommitState,
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
@@ -373,7 +373,7 @@ pub struct ProgramState {
     op_row_id_state: OpRowIdState,
     op_transaction_state: OpTransactionState,
     op_journal_mode_state: OpJournalModeState,
-    op_vacuum_into_state: OpVacuumIntoState,
+    op_vacuum_into_state: Option<OpVacuumIntoState>,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
@@ -397,6 +397,10 @@ pub struct ProgramState {
     distinct_key_values: Vec<Value>,
     hash_tables: HashMap<usize, HashTable>,
     uses_subjournal: bool,
+    /// Whether this statement is an active write inside an explicit transaction.
+    pub(crate) is_active_write: bool,
+    /// Whether begin_statement was called (savepoint + FK bookkeeping active).
+    has_stmt_transaction: bool,
     /// Attached pagers that have open savepoints for statement rollback.
     attached_savepoint_pagers: Vec<Arc<Pager>>,
     pub n_change: AtomicI64,
@@ -446,7 +450,7 @@ impl ProgramState {
             ended_coroutine: vec![],
             once: SmallVec::<[u32; 4]>::new(),
             execution_state: ProgramExecutionState::Init,
-            parameters: HashMap::default(),
+            parameters: Vec::new(),
             commit_state: CommitState::Ready,
             #[cfg(feature = "json")]
             json_cache: JsonCacheCell::new(),
@@ -465,6 +469,7 @@ impl ProgramState {
             op_insert_state: OpInsertState {
                 sub_state: OpInsertSubState::MaybeCaptureRecord,
                 old_record: None,
+                is_noop_update: false,
             },
             op_no_conflict_state: OpNoConflictState::Start,
             op_hash_build_state: None,
@@ -476,7 +481,7 @@ impl ProgramState {
             op_row_id_state: OpRowIdState::Start,
             op_transaction_state: OpTransactionState::Start,
             op_journal_mode_state: OpJournalModeState::default(),
-            op_vacuum_into_state: OpVacuumIntoState::default(),
+            op_vacuum_into_state: None,
             view_delta_state: ViewDeltaCommitState::NotStarted,
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
@@ -485,6 +490,8 @@ impl ProgramState {
             bloom_filters: HashMap::default(),
             hash_tables: HashMap::default(),
             uses_subjournal: false,
+            is_active_write: false,
+            has_stmt_transaction: false,
             attached_savepoint_pagers: Vec::new(),
             n_change: AtomicI64::new(0),
             explain_state: RwLock::new(ExplainState::default()),
@@ -514,7 +521,23 @@ impl ProgramState {
     }
 
     pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) {
-        self.parameters.insert(index, value);
+        let i = index.get() - 1;
+        if i >= self.parameters.len() {
+            self.parameters.resize(i + 1, Value::Null);
+        }
+        let slot = &mut self.parameters[i];
+        match (slot, value) {
+            (Value::Null, Value::Null) => {}
+            (Value::Numeric(Numeric::Integer(existing)), Value::Numeric(Numeric::Integer(new))) => {
+                *existing = new
+            }
+            (Value::Numeric(Numeric::Float(existing)), Value::Numeric(Numeric::Float(new))) => {
+                *existing = new
+            }
+            (Value::Text(existing), Value::Text(new)) => existing.do_extend(&new),
+            (Value::Blob(existing), Value::Blob(new)) => existing.do_extend(&new),
+            (slot, value) => *slot = value,
+        }
     }
 
     pub fn clear_bindings(&mut self) {
@@ -522,7 +545,8 @@ impl ProgramState {
     }
 
     pub fn get_parameter(&self, index: NonZero<usize>) -> Value {
-        self.parameters.get(&index).cloned().unwrap_or(Value::Null)
+        let i = index.get() - 1;
+        self.parameters.get(i).cloned().unwrap_or(Value::Null)
     }
 
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
@@ -546,9 +570,12 @@ impl ProgramState {
         self.cursors.iter_mut().for_each(|c| {
             let _ = c.take();
         });
-        self.registers
-            .iter_mut()
-            .for_each(|r| *r = Register::Value(Value::Null));
+        for r in self.registers.iter_mut() {
+            match r {
+                Register::Value(v) => *v = Value::Null,
+                _ => *r = Register::Value(Value::Null),
+            }
+        }
         self.last_compare = None;
         self.deferred_seeks.iter_mut().for_each(|s| *s = None);
         self.ended_coroutine.clear();
@@ -572,6 +599,7 @@ impl ProgramState {
         self.op_insert_state = OpInsertState {
             sub_state: OpInsertSubState::MaybeCaptureRecord,
             old_record: None,
+            is_noop_update: false,
         };
         self.op_no_conflict_state = OpNoConflictState::Start;
         self.seek_state = OpSeekState::Start;
@@ -583,7 +611,7 @@ impl ProgramState {
         self.op_program_state = OpProgramState::Start;
         self.op_transaction_state = OpTransactionState::Start;
         self.op_journal_mode_state = OpJournalModeState::default();
-        self.op_vacuum_into_state = OpVacuumIntoState::default();
+        self.op_vacuum_into_state = None;
         self.view_delta_state = ViewDeltaCommitState::NotStarted;
         self.auto_txn_cleanup = TxnCleanup::None;
         self.fk_immediate_violations_during_stmt
@@ -596,6 +624,8 @@ impl ProgramState {
         self.op_hash_build_state = None;
         self.op_hash_probe_state = None;
         self.uses_subjournal = false;
+        self.is_active_write = false;
+        self.has_stmt_transaction = false;
         self.distinct_key_values.clear();
         self.attached_savepoint_pagers.clear();
         self.n_change.store(0, Ordering::SeqCst);
@@ -614,16 +644,22 @@ impl ProgramState {
 
     /// Begin a statement subtransaction.
     ///
-    /// Creates a savepoint on the main DB's MvStore (or pager for WAL mode).
+    /// Creates a savepoint on the main DB's MvStore (or pager for WAL mode),
+    /// and snapshots FK violation counters for potential statement rollback.
     /// Attached DB savepoints are opened per-DB in `op_transaction_inner`
     /// when each DB's Transaction opcode is executed.
+    ///
+    /// Pager/MVCC savepoints are only opened for write statements inside an
+    /// explicit transaction. In autocommit mode, a statement abort is a
+    /// transaction abort, so savepoints are unnecessary.
     pub fn begin_statement(
         &mut self,
         connection: &Connection,
         pager: &Arc<Pager>,
         write: bool,
     ) -> Result<IOResult<()>> {
-        if write {
+        let in_explicit_txn = !connection.auto_commit.load(Ordering::SeqCst);
+        if write && in_explicit_txn {
             // Check if MVCC is active - if so, use MVCC savepoints instead of pager savepoints
             if let Some(mv_store) = connection.mv_store().as_ref() {
                 if let Some(tx_id) = connection.get_mv_tx_id() {
@@ -643,6 +679,8 @@ impl ProgramState {
             }
         }
 
+        self.has_stmt_transaction = true;
+
         // Store the deferred foreign key violations counter at the start of the statement.
         // This is used to ensure that if an interactive transaction had deferred FK violations and a statement subtransaction rolls back,
         // the deferred FK violations are not lost.
@@ -657,76 +695,100 @@ impl ProgramState {
     }
 
     /// End a statement subtransaction.
+    ///
+    /// Mirrors SQLite's vdbeCloseStatement (vdbeaux.c:3203-3248). Pager/MVCC
+    /// savepoint management and FK violation counter restoration are independent
+    /// concerns: pager savepoints may be skipped (e.g. autocommit optimization)
+    /// while FK bookkeeping still needs cleanup.
     pub fn end_statement(
         &mut self,
         connection: &Connection,
         pager: &Arc<Pager>,
         end_statement: EndStatement,
     ) -> Result<()> {
+        if self.is_active_write {
+            connection.n_active_writes.fetch_sub(1, Ordering::SeqCst);
+            self.is_active_write = false;
+        }
+        // If begin_statement was never called, no savepoint/FK cleanup needed.
+        if !self.has_stmt_transaction {
+            return Ok(());
+        }
+        self.has_stmt_transaction = false;
+
         // Drain attached pagers upfront so we can clean them up regardless of path.
         let attached_pagers: Vec<Arc<Pager>> = self.attached_savepoint_pagers.drain(..).collect();
-        let result = 'outer: {
-            match end_statement {
-                EndStatement::ReleaseSavepoint => {
-                    if let Some(mv_store) = connection.mv_store().as_ref() {
-                        if let Some(tx_id) = connection.get_mv_tx_id() {
-                            mv_store.release_savepoint(tx_id);
-                        }
-                        // Release savepoints on attached MVCC databases.
-                        connection.for_each_attached_mv_tx(|db_id, tx_id| {
-                            if let Some(attached_mv) = connection.mv_store_for_db(db_id) {
-                                attached_mv.release_savepoint(tx_id);
-                            }
-                        });
-                        Ok(()) // MVCC mode: no pager savepoint to release
-                    } else {
-                        pager.release_savepoint()?;
-                        for p in &attached_pagers {
-                            p.release_savepoint()?;
-                        }
-                        Ok(())
+        let result = match end_statement {
+            EndStatement::ReleaseSavepoint => {
+                if let Some(mv_store) = connection.mv_store().as_ref() {
+                    if let Some(tx_id) = connection.get_mv_tx_id() {
+                        mv_store.release_savepoint(tx_id);
                     }
-                }
-                EndStatement::RollbackSavepoint => {
-                    if let Some(mv_store) = connection.mv_store().as_ref() {
-                        if let Some(tx_id) = connection.get_mv_tx_id() {
-                            // Returns false if no savepoint was active - don't reset FK counters
-                            if !mv_store.rollback_first_savepoint(tx_id)? {
-                                break 'outer Ok(());
-                            }
+                    connection.for_each_attached_mv_tx(|db_id, tx_id| {
+                        if let Some(attached_mv) = connection.mv_store_for_db(db_id) {
+                            attached_mv.release_savepoint(tx_id);
                         }
-                        // Rollback savepoints on attached MVCC databases.
-                        let mut attached_err = None;
-                        connection.for_each_attached_mv_tx(|db_id, tx_id| {
-                            if let Some(attached_mv) = connection.mv_store_for_db(db_id) {
-                                if let Err(e) = attached_mv.rollback_first_savepoint(tx_id) {
-                                    attached_err = Some(e);
+                    });
+                    Ok(())
+                } else if self.uses_subjournal {
+                    pager.release_savepoint()?;
+                    for p in &attached_pagers {
+                        p.release_savepoint()?;
+                    }
+                    Ok(())
+                } else {
+                    Ok(())
+                }
+            }
+            EndStatement::RollbackSavepoint => {
+                // Rollback pager/MVCC savepoint if one was opened.
+                let pager_err = if let Some(mv_store) = connection.mv_store().as_ref() {
+                    let mut err = None;
+                    if let Some(tx_id) = connection.get_mv_tx_id() {
+                        if let Err(e) = mv_store.rollback_first_savepoint(tx_id) {
+                            err = Some(e);
+                        }
+                    }
+                    connection.for_each_attached_mv_tx(|db_id, tx_id| {
+                        if let Some(attached_mv) = connection.mv_store_for_db(db_id) {
+                            if let Err(e) = attached_mv.rollback_first_savepoint(tx_id) {
+                                if err.is_none() {
+                                    err = Some(e);
                                 }
                             }
-                        });
-                        if let Some(e) = attached_err {
-                            break 'outer Err(e);
                         }
-                    } else {
-                        match pager.rollback_to_newest_savepoint() {
-                            // We sometimes call end_statement() on errors without explicitly knowing whether a stmt transaction
-                            // caused the error or not. If it didn't, don't reset any FK violation counters.
-                            Ok(false) => break 'outer Ok(()),
-                            Err(err) => break 'outer Err(err),
-                            _ => {}
+                    });
+                    err
+                } else if self.uses_subjournal {
+                    match pager.rollback_to_newest_savepoint() {
+                        Ok(_) => {
+                            let mut err = None;
+                            for p in &attached_pagers {
+                                if let Err(e) = p.rollback_to_newest_savepoint() {
+                                    err = Some(e);
+                                    break;
+                                }
+                            }
+                            err
                         }
-                        for p in &attached_pagers {
-                            p.rollback_to_newest_savepoint()?;
-                        }
+                        Err(e) => Some(e),
                     }
-                    // Reset the deferred foreign key violations counter to the value it had at the start of the statement.
-                    // This is used to ensure that if an interactive transaction had deferred FK violations, they are not lost.
-                    connection.fk_deferred_violations.store(
-                        self.fk_deferred_violations_when_stmt_started
-                            .load(Ordering::Acquire),
-                        Ordering::SeqCst,
-                    );
-                    Ok(())
+                } else {
+                    None
+                };
+
+                // Always restore FK violation counters on statement rollback,
+                // regardless of whether a pager savepoint was opened.
+                // Mirrors SQLite's vdbeCloseStatement (vdbeaux.c:3243-3246).
+                connection.fk_deferred_violations.store(
+                    self.fk_deferred_violations_when_stmt_started
+                        .load(Ordering::Acquire),
+                    Ordering::SeqCst,
+                );
+
+                match pager_err {
+                    Some(e) => Err(e),
+                    None => Ok(()),
                 }
             }
         };
@@ -864,9 +926,9 @@ pub struct PreparedProgram {
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: TableReferences,
     pub sql: String,
-    /// In SQLite, whether statement subtransactions will be used for executing a program (`usesStmtJournal`)
-    /// is determined by the parser flags "mayAbort" and "isMultiWrite". Essentially this means that the individual
-    /// statement may need to be aborted due to a constraint conflict, etc. instead of the entire transaction.
+    /// Whether the statement needs to be wrapped in a statement subtransaction
+    /// when run as part of an interactive (non-autocommit) transaction.
+    /// See [crate::vdbe::builder::ProgramBuilder::is_multi_write] and [crate::vdbe::builder::ProgramBuilder::may_abort] for more details.
     pub needs_stmt_subtransactions: Arc<AtomicBool>,
     /// If this Program is a trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
@@ -897,61 +959,32 @@ pub struct Program {
 /// # Adding New Fields
 ///
 /// If you add a new setting to `Connection` that affects statement compilation or execution,
-/// you MUST add a corresponding field here and update `from_connection()`. See the doc
-/// comment on `Connection` in `connection.rs` for the authoritative list of tracked fields.
-///
-/// Fields that affect compilation include (but are not limited to):
-/// - PRAGMA settings that change query semantics (foreign_keys, query_only, etc.)
-/// - Registered functions/virtual tables (tracked via syms_generation)
-/// - Attached databases (tracked via fingerprint)
-/// - Storage settings (page_size, cache_size, encryption, sync_mode, etc.)
+/// When adding a new connection setting that affects query compilation, you MUST call
+/// `bump_prepare_context_generation()` in its setter so that prepared statements know
+/// they need to be reprepared.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrepareContext {
+    /// Identity check: the prepared statement must belong to the same database.
     database_ptr: usize,
-    foreign_keys: bool,
-    query_only: bool,
-    capture_data_changes: Option<CaptureDataChangesInfo>,
-    syms_generation: u64,
-    attached_databases_fingerprint: AttachedDatabasesFingerprint,
-    busy_timeout_ms: u64,
-    cache_size: i32,
-    spill_enabled: bool,
-    page_size: u32,
-    sync_mode: SyncMode,
-    data_sync_retry: bool,
-    encryption_key_set: bool,
-    encryption_cipher: CipherMode,
-    mvcc_checkpoint_threshold: Option<i64>,
+    /// Generation counter snapshot taken at prepare time. Compared against the
+    /// connection's current generation to detect setting changes (pragmas,
+    /// attach/detach, extension registration, etc.) without rebuilding the full
+    /// context on every step.
+    generation: u64,
 }
 
 impl PrepareContext {
     pub fn from_connection(connection: &Connection) -> Self {
-        let pager = connection.get_pager();
         Self {
             database_ptr: connection.database_ptr(),
-            foreign_keys: connection.foreign_keys_enabled(),
-            query_only: connection.get_query_only(),
-            capture_data_changes: connection.get_capture_data_changes_info().clone(),
-            syms_generation: connection.syms_generation(),
-            attached_databases_fingerprint: connection.attached_databases_fingerprint(),
-            busy_timeout_ms: connection.get_busy_timeout().as_millis() as u64,
-            cache_size: connection.get_cache_size(),
-            spill_enabled: pager.get_spill_enabled(),
-            page_size: connection.get_page_size().get(),
-            sync_mode: connection.get_sync_mode(),
-            data_sync_retry: connection.get_data_sync_retry(),
-            encryption_key_set: connection.encryption_key.read().is_some(),
-            encryption_cipher: connection.encryption_cipher_mode.get(),
-            mvcc_checkpoint_threshold: connection
-                .db
-                .mvcc_enabled()
-                .then(|| connection.mvcc_checkpoint_threshold())
-                .and_then(|res| res.ok()),
+            generation: connection.prepare_context_generation(),
         }
     }
 
+    #[inline]
     pub fn matches_connection(&self, connection: &Connection) -> bool {
-        self == &Self::from_connection(connection)
+        self.database_ptr == connection.database_ptr()
+            && self.generation == connection.prepare_context_generation()
     }
 }
 
@@ -989,7 +1022,7 @@ impl Program {
     pub fn step(
         &self,
         state: &mut ProgramState,
-        pager: Arc<Pager>,
+        pager: &Arc<Pager>,
         query_mode: QueryMode,
         waker: Option<&Waker>,
     ) -> Result<StepResult> {
@@ -1014,7 +1047,7 @@ impl Program {
         result
     }
 
-    fn explain_step(&self, state: &mut ProgramState, pager: Arc<Pager>) -> Result<StepResult> {
+    fn explain_step(&self, state: &mut ProgramState, pager: &Arc<Pager>) -> Result<StepResult> {
         turso_debug_assert!(state.column_count() == EXPLAIN_COLUMNS.len());
         if self.connection.is_closed() {
             let tx_state = self.connection.get_tx_state();
@@ -1112,7 +1145,7 @@ impl Program {
     fn explain_query_plan_step(
         &self,
         state: &mut ProgramState,
-        pager: Arc<Pager>,
+        pager: &Arc<Pager>,
     ) -> Result<StepResult> {
         turso_debug_assert!(state.column_count() == EXPLAIN_QUERY_PLAN_COLUMNS.len());
         loop {
@@ -1159,7 +1192,7 @@ impl Program {
     fn normal_step(
         &self,
         state: &mut ProgramState,
-        pager: Arc<Pager>,
+        pager: &Arc<Pager>,
         waker: Option<&Waker>,
     ) -> Result<StepResult> {
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
@@ -1173,7 +1206,7 @@ impl Program {
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
             if matches!(state.execution_state, ProgramExecutionState::Interrupting) {
-                self.abort(&pager, None, state)?;
+                self.abort(pager, None, state)?;
                 return Ok(StepResult::Interrupt);
             }
 
@@ -1191,7 +1224,7 @@ impl Program {
                         // the write itself succeeded.
                         let checkpoint_err = LimboError::CheckpointFailed(err.to_string());
                         tracing::error!("Checkpoint failed: {checkpoint_err}");
-                        if let Err(abort_err) = self.abort(&pager, Some(&checkpoint_err), state) {
+                        if let Err(abort_err) = self.abort(pager, Some(&checkpoint_err), state) {
                             tracing::error!(
                                 "Abort also failed during checkpoint error handling: {abort_err}"
                             );
@@ -1199,7 +1232,7 @@ impl Program {
                         return Err(checkpoint_err);
                     }
                     let err = err.into();
-                    if let Err(abort_err) = self.abort(&pager, Some(&err), state) {
+                    if let Err(abort_err) = self.abort(pager, Some(&err), state) {
                         tracing::error!("Abort failed during error handling: {abort_err}");
                     }
                     return Err(err);
@@ -1216,7 +1249,7 @@ impl Program {
             // Always increment VM steps for every loop iteration
             state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
 
-            match insn_function(self, state, insn, &pager) {
+            match insn_function(self, state, insn, pager) {
                 Ok(InsnFunctionStepResult::Step) => {
                     // Instruction completed, moving to next
                     state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
@@ -1265,7 +1298,7 @@ impl Program {
                     return Ok(StepResult::Busy);
                 }
                 Err(err) => {
-                    if let Err(abort_err) = self.abort(&pager, Some(&err), state) {
+                    if let Err(abort_err) = self.abort(pager, Some(&err), state) {
                         tracing::error!("Abort failed during error handling: {abort_err}");
                     }
                     return Err(err);
@@ -1756,7 +1789,7 @@ impl Program {
     #[instrument(skip(self, commit_state, mv_store), level = Level::DEBUG)]
     fn step_end_mvcc_txn(
         &self,
-        commit_state: &mut StateMachine<CommitStateMachine<LocalClock>>,
+        commit_state: &mut StateMachine<CommitStateMachine<MvccClock>>,
         mv_store: &Arc<MvStore>,
     ) -> Result<IOResult<()>> {
         commit_state.step(mv_store)

@@ -2,7 +2,7 @@ use rustc_hash::FxHashSet as HashSet;
 
 use super::*;
 use crate::io::PlatformIO;
-use crate::mvcc::clock::LocalClock;
+use crate::mvcc::clock::MvccClock;
 use crate::mvcc::cursor::MvccCursorType;
 use crate::mvcc::persistent_storage::logical_log::LOG_HDR_SIZE;
 use crate::state_machine::{StateTransition, TransitionResult};
@@ -26,7 +26,7 @@ pub(crate) struct MvccTestDbNoConn {
     _temp_dir: Option<tempfile::TempDir>,
 }
 pub(crate) struct MvccTestDb {
-    pub(crate) mvcc_store: Arc<MvStore<LocalClock>>,
+    pub(crate) mvcc_store: Arc<MvStore<MvccClock>>,
     pub(crate) db: Arc<Database>,
     pub(crate) conn: Arc<Connection>,
 }
@@ -37,8 +37,7 @@ impl MvccTestDb {
         let db = Database::open_file(io, ":memory:").unwrap();
         let conn = db.connect().unwrap();
         // Enable MVCC via PRAGMA
-        conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
-            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         let mvcc_store = db.get_mv_store().clone().unwrap();
         Self {
             mvcc_store,
@@ -56,8 +55,7 @@ impl MvccTestDbNoConn {
             .unwrap();
         // Enable MVCC via PRAGMA
         let conn = db.connect().unwrap();
-        conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
-            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         conn.close().unwrap();
         Self {
             db: Some(db),
@@ -91,8 +89,7 @@ impl MvccTestDbNoConn {
         .unwrap();
         // Enable MVCC via PRAGMA
         let conn = db.connect().unwrap();
-        conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
-            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         conn.close().unwrap();
         Self {
             db: Some(db),
@@ -128,7 +125,7 @@ impl MvccTestDbNoConn {
         self.get_db().connect().unwrap()
     }
 
-    pub fn get_mvcc_store(&self) -> Arc<MvStore<LocalClock>> {
+    pub fn get_mvcc_store(&self) -> Arc<MvStore<MvccClock>> {
         self.get_db().get_mv_store().clone().unwrap()
     }
 }
@@ -147,7 +144,7 @@ pub(crate) fn generate_simple_string_record(data: &str) -> ImmutableRecord {
 }
 
 fn advance_checkpoint_until_wal_has_commit_frame(
-    mvcc_store: Arc<MvStore<LocalClock>>,
+    mvcc_store: Arc<MvStore<MvccClock>>,
     conn: &Arc<Connection>,
 ) {
     let pager = conn.pager.load().clone();
@@ -759,8 +756,7 @@ fn test_recovery_checkpoint_then_more_writes() {
 /// Why this matters: Trigger definitions are stored without btrees and should not break recovery.
 #[test]
 fn test_restart_with_trigger_rootpage_zero() {
-    let mut db =
-        MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_triggers(true));
+    let mut db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new());
     {
         let conn = db.connect();
         conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, a TEXT)")
@@ -907,8 +903,7 @@ fn test_bootstrap_repairs_torn_short_log_before_metadata_init() {
         let io = Arc::new(PlatformIO::new().unwrap());
         let db = Database::open_file(io, &db_path_str).unwrap();
         let conn = db.connect().unwrap();
-        conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
-            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         conn.close().unwrap();
     }
 
@@ -2594,7 +2589,7 @@ fn setup_lazy_db(initial_keys: &[i64]) -> (MvccTestDb, u64, MVTableId, i64) {
 }
 
 pub(crate) fn commit_tx(
-    mv_store: Arc<MvStore<LocalClock>>,
+    mv_store: Arc<MvStore<MvccClock>>,
     conn: &Arc<Connection>,
     tx_id: u64,
 ) -> Result<()> {
@@ -3351,14 +3346,15 @@ fn test_commit_dep_threaded_abort_cascades() {
     // Simulate mid-commit: transition writer to Preparing.
     // end_ts comes from the global clock so the reader's begin_ts will be >=
     // end_ts, satisfying the speculative read condition (Hekaton Table 1).
-    let end_ts = mvcc_store.clock.get_timestamp();
-    mvcc_store
-        .txs
-        .get(&writer_tx_id)
-        .unwrap()
-        .value()
-        .state
-        .store(TransactionState::Preparing(end_ts));
+    let _end_ts = mvcc_store.get_commit_timestamp(|ts| {
+        mvcc_store
+            .txs
+            .get(&writer_tx_id)
+            .unwrap()
+            .value()
+            .state
+            .store(TransactionState::Preparing(ts));
+    });
 
     // Reader signals after speculative read so main thread can abort writer.
     let (signal_tx, signal_rx) = std::sync::mpsc::channel();
@@ -3460,14 +3456,15 @@ fn test_commit_dep_threaded_multiple_dependents_abort() {
         .unwrap();
     let writer_tx_id = writer_conn.get_mv_tx_id().unwrap();
 
-    let end_ts = mvcc_store.clock.get_timestamp();
-    mvcc_store
-        .txs
-        .get(&writer_tx_id)
-        .unwrap()
-        .value()
-        .state
-        .store(TransactionState::Preparing(end_ts));
+    let _end_ts = mvcc_store.get_commit_timestamp(|ts| {
+        mvcc_store
+            .txs
+            .get(&writer_tx_id)
+            .unwrap()
+            .value()
+            .state
+            .store(TransactionState::Preparing(ts));
+    });
 
     let num_readers = 4;
     // Barrier: all readers + main thread synchronize after speculative reads
@@ -3551,14 +3548,15 @@ fn test_commit_dep_threaded_commit_resolves() {
         .unwrap();
     let writer_tx_id = writer_conn.get_mv_tx_id().unwrap();
 
-    let end_ts = mvcc_store.clock.get_timestamp();
-    mvcc_store
-        .txs
-        .get(&writer_tx_id)
-        .unwrap()
-        .value()
-        .state
-        .store(TransactionState::Preparing(end_ts));
+    let end_ts = mvcc_store.get_commit_timestamp(|ts| {
+        mvcc_store
+            .txs
+            .get(&writer_tx_id)
+            .unwrap()
+            .value()
+            .state
+            .store(TransactionState::Preparing(ts));
+    });
 
     let (signal_tx, signal_rx) = std::sync::mpsc::channel();
 
@@ -3667,14 +3665,15 @@ fn test_commit_dep_threaded_readonly_abort_cascades() {
         .unwrap();
     let writer_tx_id = writer_conn.get_mv_tx_id().unwrap();
 
-    let end_ts = mvcc_store.clock.get_timestamp();
-    mvcc_store
-        .txs
-        .get(&writer_tx_id)
-        .unwrap()
-        .value()
-        .state
-        .store(TransactionState::Preparing(end_ts));
+    let _end_ts = mvcc_store.get_commit_timestamp(|ts| {
+        mvcc_store
+            .txs
+            .get(&writer_tx_id)
+            .unwrap()
+            .value()
+            .state
+            .store(TransactionState::Preparing(ts));
+    });
 
     let (signal_tx, signal_rx) = std::sync::mpsc::channel();
 
@@ -3809,14 +3808,15 @@ fn test_commit_dep_readonly_does_not_advance_timestamp() {
         .unwrap();
     let writer_tx_id = writer_conn.get_mv_tx_id().unwrap();
 
-    let end_ts = mvcc_store.clock.get_timestamp();
-    mvcc_store
-        .txs
-        .get(&writer_tx_id)
-        .unwrap()
-        .value()
-        .state
-        .store(TransactionState::Preparing(end_ts));
+    let end_ts = mvcc_store.get_commit_timestamp(|ts| {
+        mvcc_store
+            .txs
+            .get(&writer_tx_id)
+            .unwrap()
+            .value()
+            .state
+            .store(TransactionState::Preparing(ts));
+    });
 
     let (signal_tx, signal_rx) = std::sync::mpsc::channel();
 
@@ -3906,14 +3906,15 @@ fn test_commit_dep_readonly_does_not_cause_spurious_busy() {
         .unwrap();
     let writer_tx_id = writer_conn.get_mv_tx_id().unwrap();
 
-    let end_ts = mvcc_store.clock.get_timestamp();
-    mvcc_store
-        .txs
-        .get(&writer_tx_id)
-        .unwrap()
-        .value()
-        .state
-        .store(TransactionState::Preparing(end_ts));
+    let end_ts = mvcc_store.get_commit_timestamp(|ts| {
+        mvcc_store
+            .txs
+            .get(&writer_tx_id)
+            .unwrap()
+            .value()
+            .state
+            .store(TransactionState::Preparing(ts));
+    });
 
     // Start a non-CONCURRENT tx that will try to get exclusive lock later.
     // Its begin_ts is assigned now, before the read-only tx commits.
@@ -4281,39 +4282,6 @@ fn test_concurrent_writes() {
     conn.close().unwrap();
 }
 
-fn generate_batched_insert(num_inserts: usize) -> String {
-    let mut inserts = String::from("INSERT INTO test (x) VALUES ");
-    for i in 0..num_inserts {
-        inserts.push_str(&format!("({i})"));
-        if i < num_inserts - 1 {
-            inserts.push(',');
-        }
-    }
-    inserts.push(';');
-    inserts
-}
-/// What this test checks: The implementation maintains the intended invariant for this scenario.
-/// Why this matters: The invariant protects correctness across commit, replay, and query execution paths.
-#[test]
-#[ignore]
-fn test_batch_writes() {
-    let mut start = 0;
-    let mut end = 5000;
-    while start < end {
-        let i = ((end - start) / 2) + start;
-        let db = MvccTestDbNoConn::new_with_random_db();
-        let conn = db.connect();
-        conn.execute("CREATE TABLE test (x)").unwrap();
-        let inserts = generate_batched_insert(i);
-        if conn.execute(inserts.clone()).is_err() {
-            end = i;
-        } else {
-            start = i + 1;
-        }
-    }
-    println!("start: {start} end: {end}");
-}
-
 /// What this test checks: The implementation maintains the intended invariant for this scenario.
 /// Why this matters: The invariant protects correctness across commit, replay, and query execution paths.
 #[test]
@@ -4375,14 +4343,16 @@ fn test_should_checkpoint_after_recovery_uses_recovered_offset() {
     db.restart();
     let _conn = db.connect();
     let mv_store = db.get_mvcc_store();
-    let recovered_offset = mv_store.storage.logical_log.write().offset;
 
+    // We used to assert on the concrete logical-log offset here, but MVCC durable storage
+    // is now abstracted behind a trait object (to allow injecting custom implementations).
+    // Validate behavior instead: after recovery, the recovered offset should be reflected
+    // in should_checkpoint() when the threshold is set very low.
     mv_store.set_checkpoint_threshold(1);
     assert!(
-        recovered_offset > 1,
-        "expected recovered log offset > 1 byte"
+        mv_store.storage.should_checkpoint(),
+        "expected should_checkpoint() to reflect the recovered logical-log offset"
     );
-    assert!(mv_store.storage.should_checkpoint());
 }
 
 /// What this test checks: Checkpoint transitions preserve DB/WAL/log ordering and watermark updates for the tested edge case.
@@ -4870,9 +4840,9 @@ fn test_cursor_with_btree_and_mvcc_delete_after_checkpoint() {
     assert_eq!(rows.len(), 0);
 }
 
-/// What this test checks: Core MVCC read/write semantics hold for this operation sequence.
-/// Why this matters: These are foundational invariants; regressions here invalidate higher-level SQL behavior.
+/// Core MVCC read/write semantics for AUTOINCREMENT with rowid update.
 #[test]
+#[ignore = "AUTOINCREMENT not yet supported in MVCC mode"]
 fn test_skips_updated_rowid() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
@@ -5121,7 +5091,7 @@ fn txid(v: u64) -> Option<TxTimestampOrID> {
 /// invisible to every transaction and must be removed unconditionally by Rule 1.
 fn test_gc_rule1_aborted_garbage_removed() {
     let mut versions = vec![make_rv(None, None)];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, u64::MAX, 0);
+    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, u64::MAX, 0);
     assert_eq!(dropped, 1);
     assert!(versions.is_empty());
 }
@@ -5136,7 +5106,7 @@ fn test_gc_rule1_aborted_among_live_versions() {
         make_rv(None, None),   // aborted
         make_rv(ts(3), ts(5)), // superseded
     ];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 2, 0);
+    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, 2, 0);
     // Only aborted removed; superseded has e=5 > lwm=2 so retained
     assert_eq!(dropped, 1);
     assert_eq!(versions.len(), 2);
@@ -5157,7 +5127,7 @@ fn test_gc_rule2_superseded_below_lwm_with_current() {
         make_rv(ts(3), ts(5)), // superseded, e=5 <= lwm=10
         make_rv(ts(5), None),  // current
     ];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 10, 0);
+    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, 10, 0);
     assert_eq!(dropped, 1);
     assert_eq!(versions.len(), 1);
     assert!(versions[0].end.is_none()); // only current remains
@@ -5171,7 +5141,7 @@ fn test_gc_rule2_superseded_below_lwm_with_current() {
 fn test_gc_rule2_superseded_above_lwm_retained() {
     // Superseded version (end=Timestamp(15)) above LWM=10 — must be retained.
     let mut versions = vec![make_rv(ts(3), ts(15)), make_rv(ts(15), None)];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 10, 0);
+    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, 10, 0);
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 2);
 }
@@ -5188,7 +5158,7 @@ fn test_gc_rule2_tombstone_guard_uncheckpointed() {
     let mut versions = vec![
         make_rv(ts(3), ts(5)), // tombstone (sole version, no current)
     ];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 10, 2);
+    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, 10, 2);
     // e=5 > ckpt_max=2, no current → tombstone guard retains it
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 1);
@@ -5202,7 +5172,7 @@ fn test_gc_rule2_tombstone_guard_uncheckpointed() {
 fn test_gc_rule2_tombstone_guard_checkpointed() {
     // Tombstone with e <= ckpt_max — deletion is checkpointed, safe to remove.
     let mut versions = vec![make_rv(ts(3), ts(5))];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 10, 5);
+    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, 10, 5);
     // e=5 <= ckpt_max=5, e=5 <= lwm=10 → removable
     assert_eq!(dropped, 1);
     assert!(versions.is_empty());
@@ -5217,7 +5187,7 @@ fn test_gc_rule2_tombstone_guard_checkpointed() {
 fn test_gc_rule3_checkpointed_sole_survivor_removed() {
     // Single current version with b <= ckpt_max and b < lwm.
     let mut versions = vec![make_rv(ts(5), None)];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 10, 5);
+    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, 10, 5);
     assert_eq!(dropped, 1);
     assert!(versions.is_empty());
 }
@@ -5230,7 +5200,7 @@ fn test_gc_rule3_checkpointed_sole_survivor_removed() {
 fn test_gc_rule3_not_checkpointed_retained() {
     // Single current version with b > ckpt_max — B-tree doesn't have it yet.
     let mut versions = vec![make_rv(ts(5), None)];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 10, 3);
+    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, 10, 3);
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 1);
 }
@@ -5243,7 +5213,7 @@ fn test_gc_rule3_not_checkpointed_retained() {
 fn test_gc_rule3_visible_to_active_tx_retained() {
     // Single current version with b >= lwm — some active tx might need it.
     let mut versions = vec![make_rv(ts(5), None)];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 5, 10);
+    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, 5, 10);
     // b=5 is NOT < lwm=5 (strict <), so retained
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 1);
@@ -5255,7 +5225,7 @@ fn test_gc_rule3_visible_to_active_tx_retained() {
 /// A current version cannot be removed before checkpoint has persisted it.
 fn test_gc_rule3_current_retained_before_first_checkpoint() {
     let mut versions = vec![make_rv(ts(1), None)];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 10, 0);
+    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, 10, 0);
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 1);
 }
@@ -5266,7 +5236,7 @@ fn test_gc_rule3_current_retained_before_first_checkpoint() {
 /// Once checkpoint has persisted a sole current version, it becomes GC-eligible.
 fn test_gc_rule3_current_collected_after_checkpoint() {
     let mut versions = vec![make_rv(ts(1), None)];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 10, 5);
+    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, 10, 5);
     assert_eq!(dropped, 1);
     assert_eq!(versions.len(), 0);
 }
@@ -5283,7 +5253,7 @@ fn test_gc_rule3_not_sole_survivor() {
     // Both b <= ckpt_max and b < lwm, but there are 2 versions.
     // Rule 2 removes the superseded one (has_current=true), then rule 3 fires
     // on the remaining sole survivor.
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 10, 5);
+    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, 10, 5);
     assert_eq!(dropped, 2);
     assert!(versions.is_empty());
 }
@@ -5296,7 +5266,7 @@ fn test_gc_rule3_not_sole_survivor() {
 fn test_gc_txid_refs_retained() {
     // Versions with TxID (uncommitted) references are never collected.
     let mut versions = vec![make_rv(txid(99), None)];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, u64::MAX, u64::MAX);
+    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, u64::MAX, u64::MAX);
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 1);
 }
@@ -5309,7 +5279,7 @@ fn test_gc_txid_refs_retained() {
 fn test_gc_txid_end_retained() {
     // end=TxID means the deletion is uncommitted; rule 2 only matches Timestamp.
     let mut versions = vec![make_rv(ts(3), txid(50))];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, u64::MAX, u64::MAX);
+    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, u64::MAX, u64::MAX);
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 1);
 }
@@ -5328,7 +5298,7 @@ fn test_gc_rule2_pending_insert_does_not_disable_tombstone_guard() {
         make_rv(ts(3), ts(5)), // tombstone: deletion at e=5, not checkpointed (ckpt_max=2)
         make_rv(txid(99), None), // pending insert (uncommitted)
     ];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 10, 2);
+    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, 10, 2);
     // Tombstone must be retained: e=5 > ckpt_max=2, and pending insert doesn't count.
     // Only nothing changes (pending insert is not aborted garbage either).
     assert_eq!(dropped, 0);
@@ -5348,7 +5318,7 @@ fn test_gc_rule2_committed_current_disables_tombstone_guard() {
         make_rv(ts(3), ts(5)), // superseded, e=5 <= lwm=10
         make_rv(ts(5), None),  // committed current
     ];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 10, 2);
+    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, 10, 2);
     // Superseded removed (has_current=true for committed version), current remains.
     assert_eq!(dropped, 1);
     assert_eq!(versions.len(), 1);
@@ -5367,12 +5337,12 @@ fn test_gc_rule2_btree_tombstone_lifecycle() {
     // Represents a row deleted in MVCC that existed in B-tree before MVCC.
     // Before checkpoint (ckpt_max < e): tombstone must be retained.
     let mut versions = vec![make_rv(None, ts(5))];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, u64::MAX, 3);
+    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, u64::MAX, 3);
     assert_eq!(dropped, 0, "tombstone retained: e=5 > ckpt_max=3");
     assert_eq!(versions.len(), 1);
 
     // After checkpoint (ckpt_max >= e): tombstone is collected.
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, u64::MAX, 5);
+    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, u64::MAX, 5);
     assert_eq!(dropped, 1, "tombstone collected: e=5 <= ckpt_max=5");
     assert_eq!(versions.len(), 0);
 }
@@ -5391,7 +5361,7 @@ fn test_gc_rule3_not_firing_with_unremovable_superseded() {
         make_rv(ts(3), ts(15)), // e=15 > lwm=10 — retained
         make_rv(ts(15), None),  // current
     ];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 10, 20);
+    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, 10, 20);
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 2);
 }
@@ -5402,7 +5372,7 @@ fn test_gc_rule3_not_firing_with_unremovable_superseded() {
 /// GC on an empty version chain is a no-op. Verifies no panics or off-by-one errors.
 fn test_gc_noop_on_empty() {
     let mut versions: Vec<RowVersion> = vec![];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 10, 5);
+    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, 10, 5);
     assert_eq!(dropped, 0);
 }
 
@@ -5421,7 +5391,7 @@ fn test_gc_combined_rules() {
         make_rv(ts(3), ts(5)), // superseded, e=5 <= lwm=10 → rule 2
         make_rv(ts(5), None),  // current, b=5 <= ckpt_max=5, b < lwm=10 → rule 3
     ];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 10, 5);
+    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, 10, 5);
     assert_eq!(dropped, 4);
     assert!(versions.is_empty());
 }
@@ -5725,7 +5695,7 @@ impl Arbitrary for ArbitraryVersionChain {
 fn prop_gc_never_increases_version_count(chain: ArbitraryVersionChain) -> bool {
     let before = chain.versions.len();
     let mut versions = chain.versions;
-    MvStore::<LocalClock>::gc_version_chain(&mut versions, chain.lwm, chain.ckpt_max);
+    MvStore::<MvccClock>::gc_version_chain(&mut versions, chain.lwm, chain.ckpt_max);
     versions.len() <= before
 }
 
@@ -5736,9 +5706,9 @@ fn prop_gc_never_increases_version_count(chain: ArbitraryVersionChain) -> bool {
 #[quickcheck]
 fn prop_gc_is_idempotent(chain: ArbitraryVersionChain) -> bool {
     let mut v1 = chain.versions.clone();
-    MvStore::<LocalClock>::gc_version_chain(&mut v1, chain.lwm, chain.ckpt_max);
+    MvStore::<MvccClock>::gc_version_chain(&mut v1, chain.lwm, chain.ckpt_max);
     let snapshot = v1.clone();
-    MvStore::<LocalClock>::gc_version_chain(&mut v1, chain.lwm, chain.ckpt_max);
+    MvStore::<MvccClock>::gc_version_chain(&mut v1, chain.lwm, chain.ckpt_max);
     // Compare content, not just length — a swap bug would pass a length-only check.
     v1.len() == snapshot.len()
         && v1
@@ -5753,7 +5723,7 @@ fn prop_gc_is_idempotent(chain: ArbitraryVersionChain) -> bool {
 #[quickcheck]
 fn prop_gc_removes_all_aborted_garbage(chain: ArbitraryVersionChain) -> bool {
     let mut versions = chain.versions;
-    MvStore::<LocalClock>::gc_version_chain(&mut versions, chain.lwm, chain.ckpt_max);
+    MvStore::<MvccClock>::gc_version_chain(&mut versions, chain.lwm, chain.ckpt_max);
     versions
         .iter()
         .all(|rv| !matches!((&rv.begin, &rv.end), (None, None)))
@@ -5770,7 +5740,7 @@ fn prop_gc_retains_txid_begins(chain: ArbitraryVersionChain) -> bool {
         .filter(|rv| matches!(&rv.begin, Some(TxTimestampOrID::TxID(_))) && rv.end.is_none())
         .count();
     let mut versions = chain.versions;
-    MvStore::<LocalClock>::gc_version_chain(&mut versions, chain.lwm, chain.ckpt_max);
+    MvStore::<MvccClock>::gc_version_chain(&mut versions, chain.lwm, chain.ckpt_max);
     let txid_begins_after: usize = versions
         .iter()
         .filter(|rv| matches!(&rv.begin, Some(TxTimestampOrID::TxID(_))) && rv.end.is_none())
@@ -5791,7 +5761,7 @@ fn prop_gc_retains_txid_ends(chain: ArbitraryVersionChain) -> bool {
         |rv: &&RowVersion| matches!(&rv.end, Some(TxTimestampOrID::TxID(_))) && rv.begin.is_some();
     let txid_ends_before: usize = chain.versions.iter().filter(filter).count();
     let mut versions = chain.versions;
-    MvStore::<LocalClock>::gc_version_chain(&mut versions, chain.lwm, chain.ckpt_max);
+    MvStore::<MvccClock>::gc_version_chain(&mut versions, chain.lwm, chain.ckpt_max);
     let txid_ends_after: usize = versions.iter().filter(filter).count();
     txid_ends_after == txid_ends_before
 }
@@ -5812,7 +5782,7 @@ fn prop_gc_current_versions_protected_before_checkpoint(chain: ArbitraryVersionC
         })
         .count();
     let mut versions = chain.versions;
-    MvStore::<LocalClock>::gc_version_chain(&mut versions, chain.lwm, 0);
+    MvStore::<MvccClock>::gc_version_chain(&mut versions, chain.lwm, 0);
     let current_after: usize = versions
         .iter()
         .filter(|rv| {
@@ -5836,7 +5806,7 @@ fn prop_gc_tombstone_guard_preserves_btree_safety(chain: ArbitraryVersionChain) 
     // least one has e > ckpt_max, GC must not empty the chain — removing all
     // versions would let the dual cursor fall through to a stale B-tree row.
     let mut versions = chain.versions.clone();
-    MvStore::<LocalClock>::gc_version_chain(&mut versions, chain.lwm, chain.ckpt_max);
+    MvStore::<MvccClock>::gc_version_chain(&mut versions, chain.lwm, chain.ckpt_max);
 
     // Check: if pre-GC chain had no committed current version AND had a
     // superseded version with e > ckpt_max, post-GC chain must not be empty.
@@ -5873,7 +5843,7 @@ fn prop_gc_no_orphaned_superseded_versions(chain: ArbitraryVersionChain) -> bool
     // - e > lwm (Rule 2 didn't fire — still visible to some reader)
     // - e > ckpt_max (tombstone guard — deletion not yet in B-tree)
     let mut versions = chain.versions;
-    MvStore::<LocalClock>::gc_version_chain(&mut versions, chain.lwm, chain.ckpt_max);
+    MvStore::<MvccClock>::gc_version_chain(&mut versions, chain.lwm, chain.ckpt_max);
 
     let has_committed_current = versions
         .iter()
@@ -6329,8 +6299,7 @@ fn test_checkpoint_root_page_mismatch_with_index() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
-    conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
-        .unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
 
     // Create MULTIPLE tables to consume enough page numbers
     // so that test_table's allocated pages diverge from abs(negative_id)
@@ -6735,8 +6704,7 @@ fn test_alter_table_rename_with_index_panics_on_restart() {
     db.restart();
     {
         let conn = db.connect();
-        conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
-            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         conn.execute("ALTER TABLE old_name RENAME TO new_name")
             .unwrap();
         conn.close().unwrap();
@@ -6745,8 +6713,7 @@ fn test_alter_table_rename_with_index_panics_on_restart() {
     db.restart();
     {
         let conn = db.connect();
-        conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
-            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         let rows = get_rows(&conn, "SELECT * FROM new_name");
         assert_eq!(rows.len(), 1);
     }
@@ -6772,8 +6739,7 @@ fn test_alter_table_rename_with_unique_constraint_panics_on_restart() {
     db.restart();
     {
         let conn = db.connect();
-        conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
-            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         conn.execute("ALTER TABLE old_name RENAME TO new_name")
             .unwrap();
         conn.close().unwrap();
@@ -6782,8 +6748,7 @@ fn test_alter_table_rename_with_unique_constraint_panics_on_restart() {
     db.restart();
     {
         let conn = db.connect();
-        conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
-            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         let rows = get_rows(&conn, "SELECT * FROM new_name");
         assert_eq!(rows.len(), 1);
     }
@@ -7122,5 +7087,310 @@ fn test_double_delete_btree_resident_row_with_unique_index() {
         &rows[0][0].to_string(),
         "ok",
         "Index corruption after concurrent double-delete of B-tree-resident row"
+    );
+}
+
+/// AUTOINCREMENT is not supported in MVCC mode due to sqlite_sequence
+/// corruption with concurrent transactions. Verify that CREATE TABLE
+/// with AUTOINCREMENT and INSERT into AUTOINCREMENT tables are blocked.
+#[test]
+fn test_autoincrement_blocked_in_mvcc() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    // CREATE TABLE with AUTOINCREMENT should fail in MVCC mode
+    let result = conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)");
+    assert!(
+        result.is_err(),
+        "CREATE TABLE with AUTOINCREMENT should fail in MVCC mode"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("AUTOINCREMENT is not supported in MVCC mode"),
+        "unexpected error: {err}"
+    );
+
+    // Regular tables without AUTOINCREMENT should still work
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
+    let rows = get_rows(&conn, "SELECT * FROM t");
+    assert_eq!(rows.len(), 1);
+}
+
+/// If a table with AUTOINCREMENT was created before MVCC was enabled,
+/// INSERT into that table should still be blocked in MVCC mode.
+#[test]
+fn test_autoincrement_insert_blocked_for_preexisting_table() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir
+        .path()
+        .join(format!("test_{}", rand::random::<u64>()));
+    let path_str = path.to_str().unwrap();
+    let io = Arc::new(PlatformIO::new().unwrap());
+
+    // Phase 1: Open in WAL mode, create AUTOINCREMENT table
+    {
+        let db = crate::Database::open_file_with_flags(
+            io.clone(),
+            path_str,
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t(b) VALUES ('before_mvcc')")
+            .unwrap();
+        conn.close().unwrap();
+    }
+
+    // Clear the database manager to force a fresh open
+    {
+        let mut manager = crate::DATABASE_MANAGER.lock();
+        manager.clear();
+    }
+
+    // Phase 2: Reopen in MVCC mode — INSERT should be blocked
+    {
+        let db = crate::Database::open_file_with_flags(
+            io,
+            path_str,
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
+            .unwrap();
+
+        let result = conn.execute("INSERT INTO t(b) VALUES ('in_mvcc')");
+        assert!(
+            result.is_err(),
+            "INSERT into AUTOINCREMENT table should fail in MVCC mode"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("AUTOINCREMENT is not supported in MVCC mode"),
+            "unexpected error: {err}"
+        );
+    }
+}
+
+/// Two concurrent MVCC transactions inserting into an AUTOINCREMENT table must
+/// both succeed. Before the fix, the second transaction would fail with a
+/// WriteWriteConflict on the sqlite_sequence metadata table.
+#[test]
+#[ignore = "AUTOINCREMENT not yet supported in MVCC mode"]
+fn test_concurrent_autoincrement_inserts() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn1 = db.connect();
+
+    conn1
+        .execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)")
+        .unwrap();
+
+    // Tx1: begin and insert
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1
+        .execute("INSERT INTO t(b) VALUES ('from_tx1')")
+        .unwrap();
+
+    // Tx2: begin and insert (while tx1 is still open)
+    let conn2 = db.connect();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2
+        .execute("INSERT INTO t(b) VALUES ('from_tx2')")
+        .unwrap();
+
+    // Both commits must succeed
+    conn1.execute("COMMIT").unwrap();
+    conn2.execute("COMMIT").unwrap();
+
+    // Verify both rows are present with distinct, increasing rowids
+    let rows = get_rows(&conn1, "SELECT a, b FROM t ORDER BY a");
+    assert_eq!(rows.len(), 2, "both inserts should be visible");
+    let rowid1 = rows[0][0].as_int().unwrap();
+    let rowid2 = rows[1][0].as_int().unwrap();
+    assert!(rowid1 < rowid2, "rowids must be strictly increasing");
+    assert_eq!(rows[0][1].to_string(), "from_tx1");
+    assert_eq!(rows[1][1].to_string(), "from_tx2");
+}
+
+/// After concurrent autoincrement inserts and a checkpoint, sqlite_sequence
+/// must reflect the true maximum rowid.
+#[test]
+#[ignore = "AUTOINCREMENT not yet supported in MVCC mode"]
+fn test_autoincrement_sqlite_sequence_after_checkpoint() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn1 = db.connect();
+
+    conn1
+        .execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)")
+        .unwrap();
+
+    // Insert several rows from separate transactions
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1.execute("INSERT INTO t(b) VALUES ('row1')").unwrap();
+    conn1.execute("COMMIT").unwrap();
+
+    let conn2 = db.connect();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2.execute("INSERT INTO t(b) VALUES ('row2')").unwrap();
+    conn2.execute("COMMIT").unwrap();
+
+    // Force a checkpoint to flush autoincrement entries
+    conn1.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    // After checkpoint, sqlite_sequence should have the correct max (2)
+    let rows = get_rows(&conn1, "SELECT seq FROM sqlite_sequence WHERE name = 't'");
+    assert_eq!(rows.len(), 1, "sqlite_sequence should have entry for 't'");
+    let seq = rows[0][0].as_int().unwrap();
+    assert_eq!(seq, 2, "sqlite_sequence should reflect the max rowid");
+
+    // A subsequent insert should get rowid 3
+    conn1.execute("INSERT INTO t(b) VALUES ('row3')").unwrap();
+    let rows = get_rows(&conn1, "SELECT MAX(a) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 3);
+}
+
+/// Three concurrent transactions all inserting into the same AUTOINCREMENT table
+/// must all succeed and produce unique, increasing rowids.
+#[test]
+#[ignore = "AUTOINCREMENT not yet supported in MVCC mode"]
+fn test_three_concurrent_autoincrement_inserts() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)")
+        .unwrap();
+
+    let conn1 = db.connect();
+    let conn2 = db.connect();
+    let conn3 = db.connect();
+
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1.execute("INSERT INTO t(b) VALUES ('tx1')").unwrap();
+
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2.execute("INSERT INTO t(b) VALUES ('tx2')").unwrap();
+
+    conn3.execute("BEGIN CONCURRENT").unwrap();
+    conn3.execute("INSERT INTO t(b) VALUES ('tx3')").unwrap();
+
+    conn1.execute("COMMIT").unwrap();
+    conn2.execute("COMMIT").unwrap();
+    conn3.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&conn, "SELECT a FROM t ORDER BY a");
+    assert_eq!(rows.len(), 3, "all three inserts should be visible");
+    let ids: Vec<i64> = rows.iter().map(|r| r[0].as_int().unwrap()).collect();
+    assert!(
+        ids[0] < ids[1] && ids[1] < ids[2],
+        "rowids must be strictly increasing: {ids:?}"
+    );
+}
+
+/// Deterministic reproduction of the sqlite_sequence pollution bug.
+///
+/// Two concurrent transactions insert into an AUTOINCREMENT table.
+/// Tx1 gets data rowid 1, tx2 gets data rowid 2. Tx1 commits first,
+/// so its sqlite_sequence row (name='t', seq=1) gets sqlite_sequence
+/// rowid 1. Tx2 commits second, so its sqlite_sequence row (name='t',
+/// seq=2) gets sqlite_sequence rowid 2.
+///
+/// After DELETE + checkpoint + restart, the table is empty (btree max = 0).
+/// init_autoincrement scans sqlite_sequence by rowid order, finds the FIRST
+/// match at sqlite_sequence rowid 1 with seq=1, and uses that.
+/// New rowid = max(1, 0) + 1 = 2, which REUSES the previously-used rowid 2.
+///
+/// This violates AUTOINCREMENT's contract that rowids must never decrease.
+#[test]
+#[ignore = "AUTOINCREMENT not yet supported in MVCC mode"]
+fn test_autoincrement_no_reuse_after_delete_and_restart() {
+    let _ = tracing_subscriber::fmt().try_init();
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let conn1 = db.connect();
+
+    conn1
+        .execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)")
+        .unwrap();
+
+    // Two concurrent transactions: tx1 commits first, tx2 commits second.
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1
+        .execute("INSERT INTO t(b) VALUES ('from_tx1')")
+        .unwrap();
+
+    let conn2 = db.connect();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2
+        .execute("INSERT INTO t(b) VALUES ('from_tx2')")
+        .unwrap();
+
+    // Commit tx1 first: its sqlite_sequence row gets the lower rowid
+    conn1.execute("COMMIT").unwrap();
+    conn2.execute("COMMIT").unwrap();
+
+    // Verify: data rowids are 1 and 2
+    let rows = get_rows(&conn1, "SELECT a FROM t ORDER BY a");
+    assert_eq!(rows.len(), 2);
+    let max_data_rowid = rows[1][0].as_int().unwrap();
+    assert_eq!(max_data_rowid, 2);
+
+    // sqlite_sequence should have duplicate rows (the bug):
+    // rowid=1: name=t, seq=1  (from tx1, committed first)
+    // rowid=2: name=t, seq=2  (from tx2, committed second)
+    let seq_rows = get_rows(
+        &conn1,
+        "SELECT rowid, seq FROM sqlite_sequence WHERE name = 't' ORDER BY rowid",
+    );
+    // If there's only 1 row with the correct max, the fix is applied.
+    // If there are 2 rows, the bug is present and init_autoincrement will
+    // pick the wrong one after restart.
+    let seq_count = seq_rows.len();
+
+    // Delete all data rows so btree max becomes 0 after restart
+    conn1.execute("DELETE FROM t").unwrap();
+
+    // Checkpoint to flush everything to disk
+    conn1.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    // Drop connections and restart
+    drop(conn1);
+    drop(conn2);
+    db.restart();
+
+    let conn = db.connect();
+
+    // Verify table is empty
+    let rows = get_rows(&conn, "SELECT COUNT(*) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 0);
+
+    // Insert after restart. The new rowid MUST be > max_data_rowid (2).
+    conn.execute("INSERT INTO t(b) VALUES ('after_restart')")
+        .unwrap();
+    let rows = get_rows(&conn, "SELECT a FROM t");
+    let new_rowid = rows[0][0].as_int().unwrap();
+
+    if seq_count > 1 {
+        // Bug present: sqlite_sequence has duplicate rows.
+        // init_autoincrement picked the first match (seq=1), so new rowid = 2,
+        // which reuses a previously-issued rowid.
+        eprintln!(
+            "sqlite_sequence had {seq_count} rows for 't'. \
+             After restart, new rowid = {new_rowid} (previous max was {max_data_rowid})"
+        );
+    }
+
+    assert!(
+        new_rowid > max_data_rowid,
+        "AUTOINCREMENT rowid reuse! Previous max was {max_data_rowid}, \
+         but new rowid after delete+restart is {new_rowid}. \
+         sqlite_sequence had {seq_count} duplicate rows; \
+         init_autoincrement picked the stale one (seq=1 instead of seq=2)."
     );
 }

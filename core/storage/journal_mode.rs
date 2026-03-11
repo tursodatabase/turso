@@ -23,7 +23,8 @@ pub enum JournalMode {
     Persist,
     Memory,
     Wal,
-    ExperimentalMvcc,
+    #[strum(to_string = "mvcc", serialize = "experimental_mvcc")]
+    Mvcc,
     Off,
 }
 
@@ -31,7 +32,7 @@ impl JournalMode {
     /// Modes that are supported
     #[inline]
     pub fn supported(&self) -> bool {
-        matches!(self, JournalMode::Wal | JournalMode::ExperimentalMvcc)
+        matches!(self, JournalMode::Wal | JournalMode::Mvcc)
     }
 
     /// As the header file version
@@ -39,7 +40,7 @@ impl JournalMode {
     pub fn as_version(&self) -> Option<Version> {
         match self {
             JournalMode::Wal => Some(Version::Wal),
-            JournalMode::ExperimentalMvcc => Some(Version::Mvcc),
+            JournalMode::Mvcc => Some(Version::Mvcc),
             _ => None,
         }
     }
@@ -50,7 +51,7 @@ impl From<Version> for JournalMode {
         match value {
             Version::Legacy => Self::Delete,
             Version::Wal => Self::Wal,
-            Version::Mvcc => Self::ExperimentalMvcc,
+            Version::Mvcc => Self::Mvcc,
         }
     }
 }
@@ -65,16 +66,23 @@ pub fn open_mv_store(
     io: Arc<dyn IO>,
     db_path: impl AsRef<std::path::Path>,
     flags: OpenFlags,
+    durable_storage: Option<Arc<dyn mvcc::persistent_storage::DurableStorage>>,
 ) -> Result<Arc<MvStore>> {
-    let db_path = db_path.as_ref();
-    let log_path = db_path.with_extension("db-log");
-    let string_path = log_path
-        .as_os_str()
-        .to_str()
-        .expect("path should be valid string");
-    let file = io.open_file(string_path, flags, false)?;
-    let storage = mvcc::persistent_storage::Storage::new(file, io);
-    let mv_store = MvStore::new(mvcc::LocalClock::new(), storage);
+    let storage: Arc<dyn mvcc::persistent_storage::DurableStorage> =
+        if let Some(storage) = durable_storage {
+            storage
+        } else {
+            let db_path = db_path.as_ref();
+            let log_path = db_path.with_extension("db-log");
+            let string_path = log_path
+                .as_os_str()
+                .to_str()
+                .expect("path should be valid string");
+            let file = io.open_file(string_path, flags, false)?;
+            Arc::new(mvcc::persistent_storage::Storage::new(file, io))
+        };
+
+    let mv_store = MvStore::new(mvcc::MvccClock::new(), storage);
     let mv_store = Arc::new(mv_store);
     Ok(mv_store)
 }

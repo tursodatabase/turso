@@ -157,8 +157,8 @@ pub struct SimulatorCLI {
     pub min_tick: Option<u64>,
     #[clap(long, help = "Maximum tick time in microseconds for simulated time")]
     pub max_tick: Option<u64>,
-    #[clap(long, help = "Enable experimental MVCC feature")]
-    pub experimental_mvcc: Option<bool>,
+    #[clap(long, help = "Enable MVCC feature")]
+    pub mvcc: Option<bool>,
     #[clap(
         long,
         help = "Keep all database and plan files",

@@ -25,6 +25,8 @@
 //! When `test()` is called with a different batch number than the current `i_batch`, all
 //! values in the fresh list are consolidated into the consolidated set.
 
+use branches::mark_unlikely;
+
 use crate::turso_assert;
 use std::collections::BTreeSet;
 
@@ -106,6 +108,7 @@ impl RowSet {
             };
         }
         let RowSetMode::Test { set, batch_number } = &mut self.mode else {
+            mark_unlikely();
             unreachable!()
         };
 
@@ -145,6 +148,7 @@ impl RowSet {
             self.mode = RowSetMode::Smallest { sorted_vec: v };
         }
         let RowSetMode::Smallest { sorted_vec } = &mut self.mode else {
+            mark_unlikely();
             unreachable!()
         };
 

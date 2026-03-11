@@ -544,33 +544,16 @@ impl SelectPlan {
         if !matches!(table_ref.table, crate::schema::Table::BTree(..)) {
             return false;
         }
-        let agg = self.aggregates.first().unwrap();
-        if !matches!(agg.func, AggFunc::Count0) {
-            return false;
-        }
-
-        let count = ast::Expr::FunctionCall {
-            name: ast::Name::exact("count".to_string()),
-            distinctness: None,
-            args: vec![],
-            order_by: vec![],
-            filter_over: ast::FunctionTail {
-                filter_clause: None,
-                over_clause: None,
-            },
-        };
-        let count_star = ast::Expr::FunctionCallStar {
-            name: ast::Name::exact("count".to_string()),
-            filter_over: ast::FunctionTail {
-                filter_clause: None,
-                over_clause: None,
-            },
-        };
-        let result_col_expr = &self.result_columns.first().unwrap().expr;
-        if *result_col_expr != count && *result_col_expr != count_star {
-            return false;
-        }
-        true
+        let agg = self
+            .aggregates
+            .first()
+            .expect("we already checked aggregates.len() == 1");
+        let result_expr = &self
+            .result_columns
+            .first()
+            .expect("we already checked result_columns.len() == 1")
+            .expr;
+        matches!(agg.func, AggFunc::Count0) && exprs_are_equivalent(result_expr, &agg.original_expr)
     }
 }
 
@@ -644,7 +627,7 @@ pub struct UpdatePlan {
     pub table_references: TableReferences,
     /// Conflict resolution strategy (e.g., OR IGNORE, OR REPLACE)
     pub or_conflict: Option<ResolveType>,
-    // (colum index, new value) pairs
+    // (column index, new value) pairs
     pub set_clauses: Vec<(usize, Box<ast::Expr>)>,
     pub where_clause: Vec<WhereTerm>,
     pub order_by: Vec<(Box<ast::Expr>, SortOrder)>,
@@ -1496,6 +1479,38 @@ impl Operation {
             Operation::MultiIndexScan(_) => None,
         }
     }
+
+    /// Returns true if this operation is guaranteed to access at most one row.
+    /// Used to determine whether UPDATE/DELETE is single-write.
+    ///
+    /// Conservative: returns false when unsure (e.g. table scans, range seeks,
+    /// non-unique index seeks).
+    pub fn affects_max_1_row(&self) -> bool {
+        match self {
+            // RowidEq is always a single-row point lookup.
+            Operation::Search(Search::RowidEq { .. }) => true,
+            // Seek on a unique index with all columns equality-constrained.
+            Operation::Search(Search::Seek { index, seek_def }) => {
+                let Some(idx) = index else {
+                    // Seek on rowid (no index): check if the seek is an equality
+                    // point lookup. This happens when prefix has one eq constraint
+                    // and no range component.
+                    return seek_def.prefix.len() == 1
+                        && seek_def.prefix[0].eq.is_some()
+                        && matches!(seek_def.start.last_component, SeekKeyComponent::None);
+                };
+                if !idx.unique {
+                    return false;
+                }
+                // All index columns must have equality constraints.
+                let num_index_cols = idx.columns.len();
+                let num_eq_prefix = seek_def.prefix.iter().filter(|c| c.eq.is_some()).count();
+                num_eq_prefix == num_index_cols
+            }
+            // Table scans, hash joins, multi-index scans, etc. are not single-row.
+            _ => false,
+        }
+    }
 }
 
 impl JoinedTable {
@@ -1539,6 +1554,12 @@ impl JoinedTable {
             .collect::<Vec<_>>();
 
         for (i, column) in columns.iter_mut().enumerate() {
+            if super::expr::expr_is_array(
+                &plan.result_columns[i].expr,
+                Some(&plan.table_references),
+            ) {
+                column.set_array_dimensions(1);
+            }
             column.set_collation(get_collseq_from_expr(
                 &plan.result_columns[i].expr,
                 &plan.table_references,
@@ -1628,6 +1649,9 @@ impl JoinedTable {
             .collect::<Vec<_>>();
 
         for (i, column) in columns.iter_mut().enumerate() {
+            if super::expr::expr_is_array(&result_columns[i].expr, Some(table_references)) {
+                column.set_array_dimensions(1);
+            }
             column.set_collation(get_collseq_from_expr(
                 &result_columns[i].expr,
                 table_references,

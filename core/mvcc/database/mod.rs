@@ -1,6 +1,5 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
-use crate::mvcc::persistent_storage::Storage;
 use crate::schema::{Schema, Table};
 use crate::state_machine::StateMachine;
 use crate::state_machine::StateTransition;
@@ -1204,7 +1203,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
         tracing::trace!("step(state={:?})", self.state);
         match &self.state {
             CommitState::Initial => {
-                let end_ts = mvcc_store.get_timestamp();
                 // NOTICE: the first shadowed tx keeps the entry alive in the map
                 // for the duration of this whole function, which is important for correctness!
                 let tx = mvcc_store
@@ -1230,11 +1228,25 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     return Err(LimboError::SchemaConflict);
                 }
 
-                turso_assert!(
-                    end_ts > tx.begin_ts,
-                    "end_ts must be strictly greater than begin_ts"
-                );
-                tx.state.store(TransactionState::Preparing(end_ts));
+                // Atomically generate end_ts and publish Preparing(end_ts) while the
+                // clock lock is held. This closes the TOCTOU window
+                // Consider the example:
+                //
+                // tx1 (Active): get_ts for end - 10
+                // tx2 (Active): got begin_ts - 11
+                // tx2 (Active): does queries but does not see changes by tx1
+                // tx1 (Preparing): now stores `end_ts(10)`
+                // tx2 (Active): queries again, but now it can see changes by tx1
+                //
+                // hence we want to guard the timestamp generation by a mutex, only allow next
+                // ts to generate when the previous one is used / discarded
+                let end_ts = mvcc_store.get_commit_timestamp(|ts| {
+                    turso_assert!(
+                        ts > tx.begin_ts,
+                        "end_ts must be strictly greater than begin_ts"
+                    );
+                    tx.state.store(TransactionState::Preparing(ts));
+                });
                 tracing::trace!("prepare_tx(tx_id={}, end_ts={})", self.tx_id, end_ts);
                 /* In order to implement serializability, we need the following steps:
                 **
@@ -1979,7 +1991,12 @@ pub struct MvStore<Clock: LogicalClock> {
     next_rowid: AtomicU64,
     next_table_id: AtomicI64,
     clock: Clock,
-    storage: Storage,
+
+    /// MVCC durable storage (logical log writes, checkpoint thresholding, recovery state).
+    ///
+    /// Stored behind a trait object so callers can inject their own implementation
+    /// per database (via `Database::durable_storage`) for testing or custom durability.
+    storage: Arc<dyn crate::mvcc::persistent_storage::DurableStorage>,
 
     /// The transaction ID of a transaction that has acquired an exclusive write lock, if any.
     ///
@@ -2060,7 +2077,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     }
 
     /// Creates a new database.
-    pub fn new(clock: Clock, storage: Storage) -> Self {
+    pub fn new(
+        clock: Clock,
+        storage: Arc<dyn crate::mvcc::persistent_storage::DurableStorage>,
+    ) -> Self {
         Self {
             rows: SkipMap::new(),
             table_id_to_rootpage: SkipMap::from_iter(vec![(SQLITE_SCHEMA_MVCC_TABLE_ID, Some(1))]), // table id 1 / root page 1 is always sqlite_schema.
@@ -3037,7 +3057,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 .value()
                 .begin_ts
         } else {
-            self.get_timestamp()
+            self.get_begin_timestamp()
         };
 
         let already_exclusive = self.is_exclusive_tx(&tx_id);
@@ -3106,7 +3126,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             return Err(LimboError::Busy);
         }
         let tx_id = self.get_tx_id();
-        let begin_ts = self.get_timestamp();
+        let begin_ts = self.get_begin_timestamp();
 
         // Set txn's header to the global header
         let header = self.get_new_transaction_database_header(&pager);
@@ -3661,9 +3681,16 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.version_id_counter.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// Gets current timestamp
-    pub fn get_timestamp(&self) -> u64 {
-        self.clock.get_timestamp()
+    /// Generate a begin timestamp. No side-effect needed alongside generation.
+    pub fn get_begin_timestamp(&self) -> u64 {
+        self.clock.get_timestamp(crate::mvcc::clock::no_op)
+    }
+
+    /// Generate a commit timestamp and call `f` with it while the clock
+    /// lock is held, atomically publishing the timestamp before release.
+    /// See [`MvccClock`] for the full explanation.
+    pub fn get_commit_timestamp<F: FnOnce(u64)>(&self, f: F) -> u64 {
+        self.clock.get_timestamp(f)
     }
 
     /// Compute the low-water mark: the minimum begin_ts of all active or
@@ -3832,21 +3859,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         before - versions.len()
     }
 
-    pub fn recover(&self) -> Result<()> {
-        let tx_log = self.storage.read_tx_log()?;
-        for record in tx_log {
-            tracing::debug!("recover() -> tx_timestamp={}", record.tx_timestamp);
-            for version in record.row_versions {
-                self.insert_version(version.row.id.clone(), version);
-            }
-            self.clock.reset(record.tx_timestamp);
-        }
-        Ok(())
-    }
-
     // Extracts the begin timestamp from a transaction
     #[inline]
-    fn get_begin_timestamp(&self, ts_or_id: &Option<TxTimestampOrID>) -> u64 {
+    fn resolve_begin_timestamp(&self, ts_or_id: &Option<TxTimestampOrID>) -> u64 {
         match ts_or_id {
             Some(TxTimestampOrID::Timestamp(ts)) => *ts,
             Some(TxTimestampOrID::TxID(tx_id)) => {
@@ -3915,8 +3930,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // which performs a binary search for the insertion point.
         let mut position = 0_usize;
         for (i, v) in versions.iter().enumerate().rev() {
-            let existing_begin = self.get_begin_timestamp(&v.begin);
-            let new_begin = self.get_begin_timestamp(&row_version.begin);
+            let existing_begin = self.resolve_begin_timestamp(&v.begin);
+            let new_begin = self.resolve_begin_timestamp(&row_version.begin);
             if existing_begin <= new_begin {
                 // Recovery can replay multiple operations for the same row from one transaction
                 // (e.g. insert then delete), which share the same begin timestamp.
@@ -4096,7 +4111,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     .io
                     .block(|| wal.truncate_wal(&mut checkpoint_result, pager.get_sync_type()))?;
                 if let HeaderReadResult::Valid(header) = &header_result {
-                    self.storage.logical_log.write().set_header(header.clone());
+                    self.storage.set_header(header.clone());
                 }
             }
             return Ok(());
@@ -4121,7 +4136,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 ))
             }
         };
-        self.storage.logical_log.write().set_header(header);
+        self.storage.set_header(header);
 
         // NOTE: this uses `CheckpointMode::Truncate` to drive WAL backfill only; we still
         // truncate the WAL explicitly below to preserve WAL-last ordering in recovery.
@@ -4203,7 +4218,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         };
 
         if let Some(header) = &header {
-            self.storage.logical_log.write().set_header(header.clone());
+            self.storage.set_header(header.clone());
         }
         let persistent_tx_ts_max = if self.uses_durable_mvcc_metadata(&connection) {
             match self.try_read_persistent_tx_ts_max(&connection)? {
@@ -4326,7 +4341,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         &mut dbsp_state_roots,
                         &mut dbsp_state_index_roots,
                         &mut materialized_view_info,
-                        connection.experimental_triggers_enabled(),
                     )?;
                 }
                 fresh.populate_indices(

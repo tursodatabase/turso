@@ -170,7 +170,6 @@ pub struct DatabaseOpts {
     pub enable_encryption: bool,
     pub enable_index_method: bool,
     pub enable_autovacuum: bool,
-    pub enable_triggers: bool,
     pub enable_attach: bool,
     pub unsafe_testing: bool,
     enable_load_extension: bool,
@@ -209,11 +208,6 @@ impl DatabaseOpts {
 
     pub fn with_autovacuum(mut self, enable: bool) -> Self {
         self.enable_autovacuum = enable;
-        self
-    }
-
-    pub fn with_triggers(mut self, enable: bool) -> Self {
-        self.enable_triggers = enable;
         self
     }
 
@@ -262,9 +256,9 @@ pub enum TempStore {
     Memory = 2,
 }
 
-pub(crate) type MvStore = mvcc::MvStore<mvcc::LocalClock>;
+pub(crate) type MvStore = mvcc::MvStore<mvcc::MvccClock>;
 
-pub(crate) type MvCursor = mvcc::cursor::MvccLazyCursor<mvcc::LocalClock>;
+pub(crate) type MvCursor = mvcc::cursor::MvccLazyCursor<mvcc::MvccClock>;
 
 /// Creates a read completion for database header reads that checks for short reads.
 /// The header is always on page 1, so this function hardcodes that page index.
@@ -368,6 +362,12 @@ pub struct Database {
     // Shared structures of a Database are the parts that are common to multiple threads that might
     // create DB connections.
     _shared_page_cache: Arc<RwLock<PageCache>>,
+
+    /// Optional per-database MVCC durable storage override.
+    ///
+    /// When set, MVCC will use this implementation for logical-log durability
+    /// (commit, sync, checkpoint thresholds, etc.) instead of the built-in storage.
+    durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
     shared_wal: Arc<RwLock<WalFileShared>>,
     init_lock: Arc<Mutex<()>>,
     open_flags: OpenFlags,
@@ -502,6 +502,8 @@ impl Database {
             encryption_cipher_mode: AtomicCipherMode::new(
                 encryption_cipher_mode.unwrap_or(CipherMode::None),
             ),
+
+            durable_storage: None,
         };
 
         db.register_global_builtin_extensions()
@@ -558,14 +560,41 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
     ) -> Result<Arc<Database>> {
+        Self::open_file_with_flags_and_durable_storage(io, path, flags, opts, encryption_opts, None)
+    }
+
+    #[cfg(feature = "fs")]
+    pub fn open_file_with_flags_and_durable_storage(
+        io: Arc<dyn IO>,
+        path: &str,
+        flags: OpenFlags,
+        opts: DatabaseOpts,
+        encryption_opts: Option<EncryptionOpts>,
+        durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
+    ) -> Result<Arc<Database>> {
         // Check the registry before opening the file to avoid acquiring a file
         // lock that would conflict with an already-open Database in this process.
         if let Some(db) = Self::lookup_in_registry(path, &encryption_opts)? {
+            if durable_storage.is_some() && db.durable_storage.is_none() {
+                return Err(LimboError::InvalidArgument(
+                    "database already open without custom durable storage; \
+                     close the existing instance before reopening with a custom DurableStorage"
+                        .to_string(),
+                ));
+            }
             return Ok(db);
         }
         let file = io.open_file(path, flags, true)?;
         let db_file = Arc::new(DatabaseFile::new(file));
-        Self::open_with_flags(io, path, db_file, flags, opts, encryption_opts)
+        Self::open_with_flags(
+            io,
+            path,
+            db_file,
+            flags,
+            opts,
+            encryption_opts,
+            durable_storage,
+        )
     }
 
     pub fn open(
@@ -580,9 +609,11 @@ impl Database {
             OpenFlags::default(),
             DatabaseOpts::new(),
             None,
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn open_with_flags(
         io: Arc<dyn IO>,
         path: &str,
@@ -590,6 +621,7 @@ impl Database {
         flags: OpenFlags,
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
+        durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
     ) -> Result<Arc<Database>> {
         let mut state = OpenDbAsyncState::new();
         loop {
@@ -601,6 +633,7 @@ impl Database {
                 flags,
                 opts,
                 encryption_opts.clone(),
+                durable_storage.clone(),
             )? {
                 IOResult::Done(db) => return Ok(db),
                 IOResult::IO(io_completion) => {
@@ -617,6 +650,7 @@ impl Database {
     /// Uses the database registry to ensure single Database instance per file within a process.
     /// Caller must drive the IO loop and pass state between calls.
     /// The registry lock is held for the entire duration to prevent concurrent opens.
+    #[allow(clippy::too_many_arguments)]
     pub fn open_with_flags_async(
         state: &mut OpenDbAsyncState,
         io: Arc<dyn IO>,
@@ -625,6 +659,7 @@ impl Database {
         flags: OpenFlags,
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
+        durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
     ) -> Result<IOResult<Arc<Database>>> {
         let result = Self::open_with_flags_async_internal(
             state,
@@ -634,6 +669,7 @@ impl Database {
             flags,
             opts,
             encryption_opts,
+            durable_storage,
         );
         if result.is_err() {
             // registry_guard is set by the open_with_flags_async_internal - so we release it in case of error
@@ -642,6 +678,7 @@ impl Database {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open_with_flags_async_internal(
         state: &mut OpenDbAsyncState,
         io: Arc<dyn IO>,
@@ -650,6 +687,7 @@ impl Database {
         flags: OpenFlags,
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
+        durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
     ) -> Result<IOResult<Arc<Database>>> {
         // turso-sync-engine creates 2 databases with different names in the same IO if MemoryIO is used
         // in this case we need to bypass registry (as this is MemoryIO DB) but also preserve original distinction in names (e.g. :memory:-draft and :memory:-synced)
@@ -696,6 +734,7 @@ impl Database {
             flags,
             opts,
             encryption_opts,
+            durable_storage,
         )?;
 
         if let IOResult::Done(ref db) = result {
@@ -732,6 +771,7 @@ impl Database {
                 flags,
                 opts,
                 encryption_opts.clone(),
+                None,
             )? {
                 IOResult::Done(db) => return Ok(db),
                 IOResult::IO(io_completion) => {
@@ -754,6 +794,7 @@ impl Database {
         flags: OpenFlags,
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
+        durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
     ) -> Result<IOResult<Arc<Database>>> {
         let result = Self::open_with_flags_bypass_registry_async_internal(
             state,
@@ -764,6 +805,7 @@ impl Database {
             flags,
             opts,
             encryption_opts,
+            durable_storage,
         );
         if result.is_err() {
             // schema_guard is set by the open_with_flags_bypass_registry_async_internal - so we release it in case of error
@@ -783,6 +825,7 @@ impl Database {
         flags: OpenFlags,
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
+        durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
     ) -> Result<IOResult<Arc<Database>>> {
         loop {
             tracing::debug!(
@@ -812,6 +855,7 @@ impl Database {
                         db_file.clone(),
                         encryption_opts.clone(),
                     )?;
+                    db.durable_storage.clone_from(&durable_storage);
 
                     let pager = db.header_validation(encryption_key.as_ref())?;
 
@@ -867,10 +911,6 @@ impl Database {
                 }
 
                 OpenDbAsyncPhase::LoadingSchema => {
-                    let db = state
-                        .db
-                        .as_ref()
-                        .expect("db must be initialized in Init phase");
                     let pager = state
                         .pager
                         .as_ref()
@@ -880,7 +920,6 @@ impl Database {
                         .as_ref()
                         .expect("conn must be initialized in Init phase");
                     let syms = conn.syms.read();
-                    let enable_triggers = db.opts.enable_triggers;
 
                     let guard = state
                         .schema_guard
@@ -898,7 +937,6 @@ impl Database {
                         None,
                         pager,
                         &syms,
-                        enable_triggers,
                     );
 
                     match result {
@@ -1058,6 +1096,13 @@ impl Database {
 
         let header: HeaderRefMut = self.io.block(|| HeaderRefMut::from_pager(&pager))?;
         let header_mut = header.borrow_mut();
+
+        if !header_mut.text_encoding.is_utf8() {
+            return Err(LimboError::UnsupportedEncoding(
+                header_mut.text_encoding.to_string(),
+            ));
+        }
+
         let (read_version, write_version) = { (header_mut.read_version, header_mut.write_version) };
 
         if encryption_key.is_none() && header_mut.magic != SQLITE_HEADER {
@@ -1210,8 +1255,12 @@ impl Database {
         pager.set_schema_cookie(None);
 
         if open_mv_store {
-            let mv_store =
-                journal_mode::open_mv_store(self.io.clone(), &self.path, self.open_flags)?;
+            let mv_store = journal_mode::open_mv_store(
+                self.io.clone(),
+                &self.path,
+                self.open_flags,
+                self.durable_storage.clone(),
+            )?;
             self.mv_store.store(Some(mv_store));
         }
 
@@ -1268,7 +1317,6 @@ impl Database {
             last_change: AtomicI64::new(0),
             total_changes: AtomicI64::new(0),
             syms: parking_lot::RwLock::new(SymbolTable::new()),
-            syms_generation: AtomicU64::new(0),
             _shared_cache: false,
             cache_size: AtomicI32::new(default_cache_size),
             page_size: AtomicU16::new(page_size.get_raw()),
@@ -1278,6 +1326,7 @@ impl Database {
             closed: AtomicBool::new(false),
             attached_databases: RwLock::new(DatabaseCatalog::new()),
             query_only: AtomicBool::new(false),
+            dml_require_where: AtomicBool::new(false),
             mv_tx: RwLock::new(None),
             attached_mv_txs: RwLock::new(HashMap::default()),
             view_transaction_states: AllViewsTxState::new(),
@@ -1294,8 +1343,10 @@ impl Database {
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
+            n_active_writes: AtomicI32::new(0),
             check_constraints_pragma: AtomicBool::new(false),
             vtab_txn_states: RwLock::new(HashSet::default()),
+            prepare_context_generation: AtomicU64::new(0),
         });
         self.n_connections
             .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
@@ -1559,10 +1610,6 @@ impl Database {
 
     pub fn experimental_custom_types_enabled(&self) -> bool {
         self.opts.enable_custom_types
-    }
-
-    pub fn experimental_triggers_enabled(&self) -> bool {
-        self.opts.enable_triggers
     }
 
     pub fn experimental_attach_enabled(&self) -> bool {

@@ -393,7 +393,6 @@ mod tests {
                 enable_encryption: false,
                 enable_index_method: false,
                 enable_autovacuum: false,
-                enable_triggers: false,
                 enable_attach: false,
                 unsafe_testing: false,
             },

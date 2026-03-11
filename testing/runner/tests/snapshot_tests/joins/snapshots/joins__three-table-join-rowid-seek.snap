@@ -25,6 +25,6 @@ info:
 QUERY PLAN
 |--SCAN orders AS o USING COVERING INDEX idx_orders_customer_id
 |--SEARCH c USING INTEGER PRIMARY KEY (rowid=?)
-|--SEARCH oi USING INDEX idx_order_items_order_id
+|--SEARCH oi USING INDEX idx_order_items_order_id (order_id=?)
 |--USE SORTER FOR GROUP BY
 `--USE HASH TABLE FOR count(DISTINCT)

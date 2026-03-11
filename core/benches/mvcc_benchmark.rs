@@ -12,7 +12,7 @@ use codspeed_criterion_compat::{
     async_executor::FuturesExecutor, criterion_group, criterion_main, Criterion, Throughput,
 };
 
-use turso_core::mvcc::clock::LocalClock;
+use turso_core::mvcc::clock::MvccClock;
 use turso_core::mvcc::database::{MvStore, Row, RowID, RowKey};
 use turso_core::types::{IOResult, ImmutableRecord, Text};
 use turso_core::{Connection, Database, MemoryIO, Value};
@@ -20,7 +20,7 @@ use turso_core::{Connection, Database, MemoryIO, Value};
 struct BenchDb {
     _db: Arc<Database>,
     conn: Arc<Connection>,
-    mvcc_store: Arc<MvStore<LocalClock>>,
+    mvcc_store: Arc<MvStore<MvccClock>>,
 }
 
 fn bench_db() -> BenchDb {
@@ -28,8 +28,7 @@ fn bench_db() -> BenchDb {
     let db = Database::open_file(io, ":memory:").unwrap();
     let conn = db.connect().unwrap();
     // Enable MVCC via PRAGMA
-    conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
-        .unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     let mvcc_store = db.get_mv_store().clone().unwrap();
     BenchDb {
         _db: db,

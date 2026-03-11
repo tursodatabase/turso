@@ -55,7 +55,11 @@ impl SqlBackend for RustBackend {
     }
 
     fn capabilities(&self) -> HashSet<Capability> {
-        HashSet::from_iter([Capability::Trigger, Capability::MaterializedViews])
+        HashSet::from_iter([
+            Capability::Trigger,
+            Capability::MaterializedViews,
+            Capability::CustomTypes,
+        ])
     }
 
     fn supports_snapshots(&self) -> bool {
@@ -92,10 +96,10 @@ impl SqlBackend for RustBackend {
 
         // Create the database using the Turso builder
         let db = Builder::new_local(&db_path)
-            .experimental_triggers(true)
             .experimental_attach(true)
             .experimental_index_method(true)
             .experimental_materialized_views(true)
+            .experimental_custom_types(true)
             .build()
             .await
             .map_err(|e| BackendError::CreateDatabase(e.to_string()))?;
@@ -108,7 +112,7 @@ impl SqlBackend for RustBackend {
         // Prepend MVCC pragma if enabled (skip for readonly databases; the generated readonly DBs are already in MVCC mode).
         if self.mvcc && !config.readonly {
             let mut rows = conn
-                .query("PRAGMA journal_mode = 'experimental_mvcc'", ())
+                .query("PRAGMA journal_mode = 'mvcc'", ())
                 .await
                 .map_err(|e| {
                     BackendError::CreateDatabase(format!("failed to enable MVCC mode: {e}"))

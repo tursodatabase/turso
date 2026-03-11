@@ -17,7 +17,7 @@ info:
 ---
 QUERY PLAN
 |--SCAN customers AS c
-`--SEARCH p USING INDEX ephemeral_purchases_t2
+`--SEARCH p USING INDEX ephemeral_purchases_t2 (customer_id=?)
 
 BYTECODE
 addr  opcode            p1  p2  p3  p4          p5  comment

@@ -270,6 +270,7 @@ fn find_best_access_method_for_btree(
         index: None,
         constraint_refs: vec![],
     };
+    let mut best_prereq_count: usize = usize::MAX; // full scan has no prereq preference
     let rowid_column_idx = rhs_table.columns().iter().position(|c| c.is_rowid_alias());
 
     // Estimate cost for each candidate index (including the rowid index) and replace best_access_method if the cost is lower.
@@ -372,8 +373,25 @@ fn find_best_access_method_for_btree(
             is_index_ordered,
             params,
         );
-        if cost < best_cost + order_satisfiability_bonus {
+        // Prerequisite tiebreaker (mirrors SQLite's whereLoopFindLesser).
+        // Compute the number of outer tables this access method depends on.
+        // When costs are equal, prefer fewer prerequisites: a constant-bound
+        // seek (e.g., label='alias', prereq_count=0) accesses the same index
+        // entries every iteration, while a join-dependent seek (e.g.,
+        // toId=outer.id, prereq_count=1) touches different pages each time.
+        let prereq_count: usize = usable_constraint_refs
+            .iter()
+            .flat_map(|ucref| [ucref.eq, ucref.lower_bound, ucref.upper_bound].into_iter())
+            .flatten()
+            .map(|idx| rhs_constraints.constraints[idx].lhs_mask.table_count())
+            .sum();
+        let adjusted_best = best_cost + order_satisfiability_bonus;
+        let costs_equal = (cost.0 - adjusted_best.0).abs() < 1e-9;
+        let cost_beats_best =
+            cost < adjusted_best || (costs_equal && prereq_count < best_prereq_count);
+        if cost_beats_best {
             best_cost = cost;
+            best_prereq_count = prereq_count;
             best_params = AccessMethodParams::BTreeTable {
                 iter_dir,
                 index: candidate.index.clone(),

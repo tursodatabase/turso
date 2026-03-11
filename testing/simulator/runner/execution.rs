@@ -248,7 +248,7 @@ pub fn execute_interaction_turso(
 
             stack.push(results);
             // TODO: skip integrity check with mvcc
-            if !env.profile.experimental_mvcc && env.rng.random_ratio(1, 10) {
+            if !env.profile.mvcc && env.rng.random_ratio(1, 10) {
                 let SimConnection::LimboConnection(conn) = &mut env.connections[connection_index]
                 else {
                     unreachable!()
@@ -310,7 +310,7 @@ pub fn execute_interaction_turso(
             // Reset fault injection
             env.io.inject_fault(false);
             // TODO: skip integrity check with mvcc
-            if !env.profile.experimental_mvcc && env.rng.random_ratio(1, 10) {
+            if !env.profile.mvcc && env.rng.random_ratio(1, 10) {
                 limbo_integrity_check(&conn)?;
             }
         }

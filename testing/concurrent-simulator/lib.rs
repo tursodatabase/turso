@@ -32,7 +32,7 @@ use crate::{
     workloads::{Workload, WorkloadContext},
 };
 pub use io::{IOFaultConfig, SimulatorIO};
-pub use operations::{FiberState, OpContext, OpResult, Operation};
+pub use operations::{FiberState, OpContext, OpResult, Operation, TxMode};
 
 /// A bounded container for sampling values with reservoir sampling.
 #[derive(Debug, Clone)]
@@ -495,7 +495,7 @@ impl Whopper {
 
         // Enable MVCC if requested
         if opts.enable_mvcc {
-            bootstrap_conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")?;
+            bootstrap_conn.execute("PRAGMA journal_mode = 'mvcc'")?;
         }
 
         let schema = create_initial_schema(&mut rng);
@@ -678,8 +678,14 @@ impl Whopper {
             let _enter = span.enter();
             debug!("result={step_result:?}, rows.len()={}", rows.len());
 
-            if matches!(completed_op, Operation::Begin { .. }) && step_result.is_ok() {
-                ctx.fiber.state = FiberState::InTx;
+            if let Operation::Begin { mode } = completed_op {
+                if step_result.is_ok() {
+                    ctx.fiber.state = if mode == TxMode::Concurrent {
+                        FiberState::InConcurrentTx
+                    } else {
+                        FiberState::InTx
+                    };
+                }
             }
 
             let txn_id = ctx.fiber.txn_id;
@@ -726,9 +732,7 @@ impl Whopper {
                     | turso_core::LimboError::BusySnapshot
                     | turso_core::LimboError::WriteWriteConflict
                     | turso_core::LimboError::InvalidArgument(..) => {
-                        if matches!(ctx.fiber.state, FiberState::InTx)
-                            && !ctx.fiber.connection.get_auto_commit()
-                        {
+                        if ctx.fiber.state.is_in_tx() && !ctx.fiber.connection.get_auto_commit() {
                             ctx.fiber.current_op = Some(Operation::Rollback);
                         } else {
                             ctx.fiber.txn_id = None;

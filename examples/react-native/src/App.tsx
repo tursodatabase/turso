@@ -7,6 +7,7 @@ type TestResult = {
   name: string;
   passed: boolean;
   error?: string;
+  metric?: string; // e.g. "1234 q/s" for benchmark rows
 };
 
 // Environment variables injected at build time via babel-plugin-transform-inline-environment-variables
@@ -23,6 +24,101 @@ const TURSO_ENCRYPTION_CIPHER = (process.env.TURSO_ENCRYPTION_CIPHER || 'aes256g
 const SYNC_ENABLED = !!(TURSO_DATABASE_URL && TURSO_AUTH_TOKEN);
 // Check if encryption tests should run (requires sync + encryption key)
 const ENCRYPTION_ENABLED = !!(SYNC_ENABLED && TURSO_ENCRYPTION_KEY);
+
+// ============================================================
+// CONCURRENT READ DEBUG HARNESS
+// Diagnoses where time goes in concurrent read workloads.
+// ============================================================
+
+type BenchResult = { label: string; ms: number; qps: number };
+
+async function benchConcurrentReads(
+  dbPath: string,
+  push: (r: TestResult) => void,
+): Promise<void> {
+  const Q = 500; // queries per test
+
+  // --- Setup: populate a shared DB file with 1000 rows ---
+  const setupDb = await connect({ path: dbPath });
+  await setupDb.exec(
+    'CREATE TABLE IF NOT EXISTS bench (id INTEGER PRIMARY KEY, data TEXT)',
+  );
+  // Batch insert for speed
+  await setupDb.exec('BEGIN');
+  for (let i = 0; i < 1000; i++) {
+    await setupDb.run(
+      'INSERT OR IGNORE INTO bench (id, data) VALUES (?, ?)',
+      i,
+      `row-${i}-${'x'.repeat(100)}`,
+    );
+  }
+  await setupDb.exec('COMMIT');
+  setupDb.close();
+
+  const bench = async (
+    label: string,
+    fn: () => Promise<void>,
+  ): Promise<BenchResult> => {
+    // Warm-up run (ignore timing)
+    try { await fn(); } catch (_) {}
+    const start = performance.now();
+    await fn();
+    const ms = performance.now() - start;
+    const qps = Q / (ms / 1000);
+    push({
+      name: label,
+      passed: true,
+      metric: `${ms.toFixed(0)} ms  |  ${qps.toFixed(0)} q/s`,
+    });
+    return { label, ms, qps };
+  };
+
+  // Row counts to test
+  for (const limit of [1, 100, 1000]) {
+    const sql = `SELECT * FROM bench LIMIT ${limit}`;
+    push({ name: `--- ${limit} row(s) per query, ${Q} queries ---`, passed: true });
+
+    // 1) Sequential reads, 1 connection
+    const db1 = await connect({ path: dbPath });
+    await bench(`  seq / 1 conn / ${limit}r`, async () => {
+      for (let i = 0; i < Q; i++) await db1.all(sql);
+    });
+
+    // 2) Promise.all on 1 connection (AsyncLock serialized)
+    await bench(`  Promise.all / 1 conn / ${limit}r`, async () => {
+      const p = [];
+      for (let i = 0; i < Q; i++) p.push(db1.all(sql));
+      await Promise.all(p);
+    });
+    db1.close();
+
+    // 3) Multi-connection: 2, 4, 8 connections, Promise.all
+    for (const C of [2, 4, 8]) {
+      const dbs: Database[] = [];
+      for (let c = 0; c < C; c++) dbs.push(await connect({ path: dbPath }));
+
+      await bench(`  Promise.all / ${C} conn / ${limit}r`, async () => {
+        const p = [];
+        for (let i = 0; i < Q; i++) p.push(dbs[i % C]!.all(sql));
+        await Promise.all(p);
+      });
+
+      for (const d of dbs) d.close();
+    }
+
+    // 4) Prepared statement reuse: prepare once, loop step/reset
+    //    This bypasses prepareSingle overhead on each call.
+    const db2 = await connect({ path: dbPath });
+    const stmt = db2.prepare(sql);
+    await bench(`  prepared stmt reuse / 1 conn / ${limit}r`, async () => {
+      for (let i = 0; i < Q; i++) {
+        await stmt.all();
+      }
+    });
+    await stmt.finalize();
+    db2.close();
+  }
+}
 
 export default function App() {
   const [openTime, setOpenTime] = useState(0);
@@ -263,6 +359,26 @@ export default function App() {
     }
 
     // ========================================
+    // CONCURRENT READ DEBUG HARNESS
+    // ========================================
+    testResults.push({ name: '--- Concurrent Read Benchmark ---', passed: true });
+    setResults([...testResults]);
+
+    try {
+      const benchDbPath = `bench-${Date.now()}.db`;
+      await benchConcurrentReads(benchDbPath, (r) => {
+        testResults.push(r);
+        setResults([...testResults]); // live update UI
+      });
+    } catch (e) {
+      testResults.push({
+        name: 'Concurrent read benchmark',
+        passed: false,
+        error: String(e),
+      });
+    }
+
+    // ========================================
     // SYNC API TESTS (requires env vars, skipped if encryption is enabled)
     // ========================================
     if (SYNC_ENABLED && !ENCRYPTION_ENABLED) {
@@ -446,6 +562,7 @@ export default function App() {
               </Text>
               <View style={styles.resultTextContainer}>
                 <Text style={styles.resultName}>{result.name}</Text>
+                {result.metric && <Text style={styles.resultMetric}>{result.metric}</Text>}
                 {result.error && <Text style={styles.resultError}>{result.error}</Text>}
               </View>
             </View>
@@ -525,6 +642,12 @@ const styles = StyleSheet.create({
   resultName: {
     color: '#eee',
     fontSize: 16,
+  },
+  resultMetric: {
+    color: '#4cc9f0',
+    fontSize: 13,
+    fontFamily: 'monospace',
+    marginTop: 2,
   },
   resultError: {
     color: '#f87171',

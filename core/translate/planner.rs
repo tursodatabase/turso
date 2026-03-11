@@ -13,7 +13,7 @@ use super::{
 };
 use crate::translate::{
     emitter::Resolver,
-    expr::{unwrap_parens, BindingBehavior, WalkControl},
+    expr::{expr_vector_size, unwrap_parens, BindingBehavior, WalkControl},
     plan::{NonFromClauseSubquery, SubqueryState},
 };
 use crate::{
@@ -357,6 +357,7 @@ fn link_with_window(
     if distinctness.is_distinct() {
         crate::bail_parse_error!("DISTINCT is not supported for window functions");
     }
+    expr_vector_size(expr)?;
     if let Some(windows) = windows {
         let window = resolve_window(windows, over_clause)?;
         window.functions.push(WindowFunction {
@@ -1273,7 +1274,10 @@ pub fn parse_from(
                     cte_select: Some(cte_def.select.clone()),
                     cte_explicit_columns: cte_def.explicit_columns.clone(),
                     cte_id: Some(cte_def.cte_id),
-                    cte_definition_only: false,
+                    // Preplanned CTE refs are for subquery FROM lookup only. They are not
+                    // visible as column sources unless the CTE is explicitly referenced in
+                    // this scope's FROM/JOIN clause.
+                    cte_definition_only: true,
                     rowid_referenced: false,
                 });
             }

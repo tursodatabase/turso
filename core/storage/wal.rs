@@ -4,6 +4,7 @@ use crate::io::FileSyncType;
 use crate::sync::Mutex;
 use crate::sync::OnceLock;
 use crate::{turso_assert, turso_assert_greater_than, turso_debug_assert};
+use branches::mark_unlikely;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::array;
 use std::borrow::Cow;
@@ -1378,14 +1379,14 @@ impl Wal for WalFile {
         let shared_file = self.shared.clone();
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
-                tracing::error!(err = ?res.unwrap_err());
+                tracing::debug!(err = ?res.unwrap_err());
                 page.clear_locked();
                 page.clear_wal_tag();
                 return None; // IO error already captured in completion
             };
             let buf_len = buf.len();
             if bytes_read != buf_len as i32 {
-                tracing::error!(
+                tracing::debug!(
                     "WAL short read at offset {offset}, page {page_idx}, frame_id={frame_id}: expected {buf_len} bytes, got {bytes_read}"
                 );
                 page.clear_locked();
@@ -1451,7 +1452,7 @@ impl Wal for WalFile {
             };
             let buf_len = buf.len();
             if bytes_read != buf_len as i32 {
-                tracing::error!(
+                tracing::debug!(
                     "short read on WAL frame {frame_id} at offset {offset}: expected {buf_len} bytes, got {bytes_read}"
                 );
                 return Some(CompletionError::ShortReadWalFrame {
@@ -1484,7 +1485,7 @@ impl Wal for WalFile {
                         frame_ref[WAL_FRAME_HEADER_SIZE..].copy_from_slice(&decrypted_data);
                     }
                     Err(_) => {
-                        tracing::error!("Failed to decrypt page data for frame_id={frame_id}");
+                        tracing::debug!("Failed to decrypt page data for frame_id={frame_id}");
                     }
                 }
             }
@@ -1551,7 +1552,7 @@ impl Wal for WalFile {
                     };
                     let buf_len = buf.len();
                     if bytes_read != buf_len as i32 {
-                        tracing::error!(
+                        tracing::debug!(
                             "short read on WAL frame validation at offset {offset}, page_id={page_id}: expected {buf_len} bytes, got {bytes_read}"
                         );
                         return Some(CompletionError::ShortReadWalFrame {
@@ -1640,7 +1641,7 @@ impl Wal for WalFile {
         mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>> {
         self.checkpoint_inner(pager, mode).inspect_err(|e| {
-            tracing::error!("Wal Checkpoint failed: {e}");
+            tracing::debug!("Wal Checkpoint failed: {e}");
             let _ = self.checkpoint_guard.write().take();
             self.ongoing_checkpoint.write().state = CheckpointState::Start;
         })
@@ -1970,11 +1971,10 @@ impl Wal for WalFile {
                 shared.enabled.load(Ordering::Relaxed),
                 "WAL must be enabled"
             );
-            shared
-                .file
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| LimboError::InternalError("WAL file not open".into()))
+            shared.file.as_ref().cloned().ok_or_else(|| {
+                mark_unlikely();
+                LimboError::InternalError("WAL file not open".into())
+            })
         })
     }
 
@@ -2384,6 +2384,7 @@ impl WalFile {
                         tracing::trace!("Drained reads into batch");
                     }
                     if let Some(e) = ongoing_chkpt.first_write_error() {
+                        mark_unlikely();
                         // cancel everything still in-flight to avoid leaks
                         let to_cancel: Vec<Completion> = ongoing_chkpt
                             .inflight_reads
@@ -2469,6 +2470,7 @@ impl WalFile {
                         ongoing_chkpt.state = CheckpointState::DetermineResult;
                     } else {
                         // This should be impossible now so we treat it as logic error.
+                        mark_unlikely();
                         return Err(LimboError::InternalError(
                             "checkpoint stuck: no inflight completions but not complete".into(),
                         ));
@@ -2769,7 +2771,8 @@ impl WalFile {
             shared.read_locks[idx].unlock();
         }
         if let Some(e) = e {
-            tracing::error!(
+            mark_unlikely();
+            tracing::debug!(
                 "Failed to restart WAL header: {:?}, releasing read locks",
                 e
             );

@@ -9,6 +9,7 @@ pub mod orderby_collation;
 pub mod raise;
 pub mod rowid_alias;
 pub mod savepoint;
+pub mod subjournal;
 pub mod subquery;
 pub mod test_join_optimizer;
 
@@ -53,10 +54,7 @@ mod fuzz_tests {
     }
 
     // INTEGER PRIMARY KEY is a rowid alias, so an index is not created
-    #[turso_macros::test(
-        mvcc,
-        init_sql = "CREATE TABLE t (x INTEGER PRIMARY KEY autoincrement)"
-    )]
+    #[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (x INTEGER PRIMARY KEY)")]
     pub fn rowid_seek_fuzz(db: TempDatabase) {
         let _ = tracing_subscriber::fmt::try_init();
         let sqlite_path = db.path.parent().unwrap().join("sqlite.db");

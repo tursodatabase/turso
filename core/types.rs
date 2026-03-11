@@ -709,11 +709,20 @@ impl AggContext {
         }
     }
 
-    /// Get a mutable reference to the builtin payload
+    /// Get a mutable reference to the builtin payload as a slice
     pub fn payload_mut(&mut self) -> &mut [Value] {
         match self {
             Self::Builtin(payload) => payload,
             Self::External(_) => panic!("payload_mut() called on External aggregate"),
+        }
+    }
+
+    /// Get a mutable reference to the builtin payload Vec (for aggregates that
+    /// grow the payload, e.g. array_agg).
+    pub fn payload_vec_mut(&mut self) -> &mut Vec<Value> {
+        match self {
+            Self::Builtin(payload) => payload,
+            Self::External(_) => panic!("payload_vec_mut() called on External aggregate"),
         }
     }
 
@@ -1433,7 +1442,10 @@ impl<'a> ValueIterator<'a> {
         let (header_size, header_varint_len) = read_varint(payload)?;
         let header_size = header_size as usize;
 
-        if header_size > payload.len() || header_varint_len > payload.len() {
+        if header_size > payload.len()
+            || header_varint_len > payload.len()
+            || header_varint_len > header_size
+        {
             return Err(LimboError::Corrupt(
                 "Payload too small for indicated header size".into(),
             ));
@@ -1680,6 +1692,7 @@ impl<'a> ValueRef<'a> {
         }
     }
 
+    #[inline]
     pub fn to_owned(&self) -> Value {
         match self {
             ValueRef::Null => Value::Null,
@@ -2374,56 +2387,56 @@ impl SerialType {
     const CONST_INT0: Self = Self(8);
     const CONST_INT1: Self = Self(9);
 
-    pub fn null() -> Self {
+    pub const fn null() -> Self {
         Self::NULL
     }
 
-    pub fn i8() -> Self {
+    pub const fn i8() -> Self {
         Self::I8
     }
 
-    pub fn i16() -> Self {
+    pub const fn i16() -> Self {
         Self::I16
     }
 
-    pub fn i24() -> Self {
+    pub const fn i24() -> Self {
         Self::I24
     }
 
-    pub fn i32() -> Self {
+    pub const fn i32() -> Self {
         Self::I32
     }
 
-    pub fn i48() -> Self {
+    pub const fn i48() -> Self {
         Self::I48
     }
 
-    pub fn i64() -> Self {
+    pub const fn i64() -> Self {
         Self::I64
     }
 
-    pub fn f64() -> Self {
+    pub const fn f64() -> Self {
         Self::F64
     }
 
-    pub fn const_int0() -> Self {
+    pub const fn const_int0() -> Self {
         Self::CONST_INT0
     }
 
-    pub fn const_int1() -> Self {
+    pub const fn const_int1() -> Self {
         Self::CONST_INT1
     }
 
-    pub fn blob(size: u64) -> Self {
+    pub const fn blob(size: u64) -> Self {
         Self(12 + size * 2)
     }
 
-    pub fn text(size: u64) -> Self {
+    pub const fn text(size: u64) -> Self {
         Self(13 + size * 2)
     }
 
     #[inline(always)]
-    pub fn kind(&self) -> SerialTypeKind {
+    pub const fn kind(&self) -> SerialTypeKind {
         match self.0 {
             0 => SerialTypeKind::Null,
             1 => SerialTypeKind::I8,
@@ -2438,13 +2451,19 @@ impl SerialType {
             n if n >= 12 => match n % 2 {
                 0 => SerialTypeKind::Blob,
                 1 => SerialTypeKind::Text,
-                _ => unreachable!(),
+                _ => {
+                    mark_unlikely();
+                    unreachable!();
+                }
             },
-            _ => unreachable!(),
+            _ => {
+                mark_unlikely();
+                unreachable!();
+            }
         }
     }
 
-    pub fn size(&self) -> usize {
+    pub const fn size(&self) -> usize {
         match self.kind() {
             SerialTypeKind::Null => 0,
             SerialTypeKind::I8 => 1,
@@ -2475,11 +2494,17 @@ pub fn get_serial_type_size(serial: u64) -> Result<usize> {
         n if n >= 12 => match n % 2 {
             0 => Ok(((n - 12) / 2) as usize), // Blob
             1 => Ok(((n - 13) / 2) as usize), // Text
-            _ => unreachable!(),
+            _ => {
+                mark_unlikely();
+                unreachable!();
+            }
         },
-        _ => Err(LimboError::Corrupt(format!(
-            "Invalid serial type: {serial}"
-        ))),
+        _ => {
+            mark_unlikely();
+            Err(LimboError::Corrupt(format!(
+                "Invalid serial type: {serial}"
+            )))
+        }
     }
 }
 
@@ -2588,7 +2613,10 @@ impl Record {
                         SerialTypeKind::I32 => buf.extend_from_slice(&(*i as i32).to_be_bytes()),
                         SerialTypeKind::I48 => buf.extend_from_slice(&i.to_be_bytes()[2..]), // remove 2 most significant bytes
                         SerialTypeKind::I64 => buf.extend_from_slice(&i.to_be_bytes()),
-                        _ => unreachable!(),
+                        _ => {
+                            mark_unlikely();
+                            unreachable!();
+                        }
                     }
                 }
                 Value::Numeric(Numeric::Float(f)) => {
@@ -2652,28 +2680,40 @@ impl Cursor {
     pub fn as_btree_mut(&mut self) -> &mut dyn CursorTrait {
         match self {
             Self::BTree(cursor) => cursor.as_mut(),
-            _ => panic!("Cursor is not a btree"),
+            _ => {
+                mark_unlikely();
+                panic!("Cursor is not a btree cursor");
+            }
         }
     }
 
     pub fn as_pseudo_mut(&mut self) -> &mut PseudoCursor {
         match self {
             Self::Pseudo(cursor) => cursor,
-            _ => panic!("Cursor is not a pseudo cursor"),
+            _ => {
+                mark_unlikely();
+                panic!("Cursor is not a pseudo cursor");
+            }
         }
     }
 
     pub fn as_sorter_mut(&mut self) -> &mut Sorter {
         match self {
             Self::Sorter(cursor) => cursor,
-            _ => panic!("Cursor is not a sorter cursor"),
+            _ => {
+                mark_unlikely();
+                panic!("Cursor is not a sorter cursor")
+            }
         }
     }
 
     pub fn as_virtual_mut(&mut self) -> &mut VirtualTableCursor {
         match self {
             Self::Virtual(cursor) => cursor,
-            _ => panic!("Cursor is not a virtual cursor"),
+            _ => {
+                mark_unlikely();
+                panic!("Cursor is not a virtual cursor")
+            }
         }
     }
 
@@ -2682,14 +2722,20 @@ impl Cursor {
     ) -> &mut crate::incremental::cursor::MaterializedViewCursor {
         match self {
             Self::MaterializedView(cursor) => cursor,
-            _ => panic!("Cursor is not a materialized view cursor"),
+            _ => {
+                mark_unlikely();
+                panic!("Cursor is not a materialized view cursor");
+            }
         }
     }
 
     pub fn as_index_method_mut(&mut self) -> &mut dyn IndexMethodCursor {
         match self {
             Self::IndexMethod(cursor) => cursor.as_mut(),
-            _ => panic!("Cursor is not an IndexMethod cursor"),
+            _ => {
+                mark_unlikely();
+                panic!("Cursor is not an IndexMethod cursor");
+            }
         }
     }
 
@@ -2697,7 +2743,10 @@ impl Cursor {
         match self {
             Self::BTree(cursor) => cursor.set_null_flag(flag),
             Self::Virtual(cursor) => cursor.set_null_flag(flag),
-            _ => panic!("set_null_flag on unexpected cursor type"),
+            _ => {
+                mark_unlikely();
+                panic!("set_null_flag on unexpected cursor type");
+            }
         }
     }
 }
@@ -2820,7 +2869,10 @@ macro_rules! return_if_io {
         match $expr {
             Ok(IOResult::Done(v)) => v,
             Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
-            Err(err) => return Err(err),
+            Err(err) => {
+                branches::mark_unlikely();
+                return Err(err);
+            }
         }
     };
 }

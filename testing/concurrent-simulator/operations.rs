@@ -13,6 +13,37 @@ const MAX_SAMPLE_KEYS_PER_TABLE: usize = 1000;
 pub enum FiberState {
     Idle,
     InTx,
+    InConcurrentTx,
+}
+
+impl FiberState {
+    pub fn is_in_tx(self) -> bool {
+        matches!(self, FiberState::InTx | FiberState::InConcurrentTx)
+    }
+}
+
+/// Transaction begin mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxMode {
+    Default,
+    Deferred,
+    Immediate,
+    Concurrent,
+}
+
+impl TxMode {
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            TxMode::Default => "BEGIN",
+            TxMode::Deferred => "BEGIN DEFERRED",
+            TxMode::Immediate => "BEGIN IMMEDIATE",
+            TxMode::Concurrent => "BEGIN CONCURRENT",
+        }
+    }
+
+    pub fn is_deferred(self) -> bool {
+        matches!(self, TxMode::Default | TxMode::Deferred)
+    }
 }
 
 /// An operation that can be executed on the database.
@@ -20,7 +51,7 @@ pub enum FiberState {
 #[derive(Debug, Clone)]
 pub enum Operation {
     /// Begin a transaction
-    Begin { mode: String },
+    Begin { mode: TxMode },
     /// Commit current transaction
     Commit,
     /// Rollback current transaction
@@ -87,7 +118,7 @@ impl Operation {
     /// Get the SQL string for this operation
     pub fn sql(&self) -> String {
         match self {
-            Operation::Begin { mode } => mode.clone(),
+            Operation::Begin { mode } => mode.as_sql().to_string(),
             Operation::Commit => "COMMIT".to_string(),
             Operation::Rollback => "ROLLBACK".to_string(),
             Operation::IntegrityCheck => "PRAGMA integrity_check".to_string(),

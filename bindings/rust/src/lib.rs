@@ -137,7 +137,6 @@ pub type EncryptionOpts = turso_sdk_kit::rsapi::EncryptionOpts;
 pub struct Builder {
     path: String,
     enable_encryption: bool,
-    enable_triggers: bool,
     enable_attach: bool,
     enable_custom_types: bool,
     enable_index_method: bool,
@@ -152,7 +151,6 @@ impl Builder {
         Self {
             path: path.to_string(),
             enable_encryption: false,
-            enable_triggers: false,
             enable_attach: false,
             enable_custom_types: false,
             enable_index_method: false,
@@ -172,8 +170,8 @@ impl Builder {
         self
     }
 
-    pub fn experimental_triggers(mut self, triggers_enabled: bool) -> Self {
-        self.enable_triggers = triggers_enabled;
+    /// Kept for backwards compatibility. Triggers are now always enabled.
+    pub fn experimental_triggers(self, _triggers_enabled: bool) -> Self {
         self
     }
 
@@ -210,9 +208,6 @@ impl Builder {
         let mut features = Vec::new();
         if self.enable_encryption {
             features.push("encryption");
-        }
-        if self.enable_triggers {
-            features.push("triggers");
         }
         if self.enable_attach {
             features.push("attach");
@@ -458,10 +453,8 @@ impl Statement {
                 .column_name(i)
                 .expect("column index must be within valid range")
                 .into_owned();
-            cols.push(Column {
-                name,
-                decl_type: None, // TODO
-            });
+            let decl_type = stmt.column_decltype(i);
+            cols.push(Column { name, decl_type });
         }
 
         cols

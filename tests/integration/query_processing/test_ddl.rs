@@ -1,4 +1,4 @@
-use crate::common::TempDatabase;
+use crate::common::{ExecRows, TempDatabase};
 
 #[turso_macros::test(init_sql = "CREATE TABLE t (a, b);")]
 fn test_fail_drop_indexed_column(tmp_db: TempDatabase) -> anyhow::Result<()> {
@@ -88,17 +88,21 @@ fn test_fail_drop_view_column(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
-// FIXME: this should rewrite the view to reference the new column name
 #[turso_macros::test(init_sql = "CREATE TABLE t (a, b);")]
-fn test_fail_rename_view_column(tmp_db: TempDatabase) -> anyhow::Result<()> {
+fn test_rename_view_column(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let conn = tmp_db.connect_limbo();
 
     conn.execute("CREATE VIEW v AS SELECT a, b FROM t")?;
-    let res = conn.execute("ALTER TABLE t RENAME a TO c");
-    assert!(
-        res.is_err(),
-        "Expected error when renaming column referenced by view"
+    conn.execute("INSERT INTO t VALUES (1, 2)")?;
+    conn.execute("ALTER TABLE t RENAME a TO c")?;
+    let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT * FROM v");
+    assert_eq!(rows, vec![(1, 2)]);
+    let sql: Vec<(String,)> =
+        conn.exec_rows("SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'v'");
+    assert_eq!(
+        sql,
+        vec![("CREATE VIEW v AS SELECT c, b FROM t".to_string(),)]
     );
     Ok(())
 }

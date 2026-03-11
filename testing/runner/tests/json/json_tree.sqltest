@@ -1,0 +1,31 @@
+@database :memory:
+
+# Regression: json_tree filter() does not clear traversal_states on re-entry.
+# In a correlated subquery the VDBE reuses the same cursor for every outer row.
+# If EXISTS stops iteration early, stale TraversalState entries remain on the
+# stack with innermost_container_cursor values that point into the old (now
+# replaced) path string.  When the next outer row exhausts its own iteration
+# and pops into those stale states, read(stale_cursor) slices past the end of
+# the new path string -> panic (SIGABRT).
+#
+# Row 1 has nested JSON so json_tree recurses, pushing states whose
+# innermost_container_cursor captures the longer path "$.a" (len 3).
+# EXISTS matches key='b' early, leaving those states behind.
+# Row 2 is a large flat object whose jsonb bytes happen to look like valid
+# key-value pairs at the stale byte offsets, so the stale iterator returns
+# Some instead of None.  The path has already been popped to "" (len 0) at
+# that point, push_object_key grows it to ".e" (len 2), and read(3) panics.
+
+test json-tree-correlated-subquery-stale-cursor {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, data TEXT);
+    INSERT INTO t VALUES(1, '{"a":{"b":1,"c":2,"d":3},"x":4}');
+    INSERT INTO t VALUES(2, '{"a":"b","c":"d","e":"f","g":"h","i":"j","k":"l"}');
+    SELECT id FROM t
+    WHERE EXISTS (
+        SELECT 1 FROM json_tree(t.data) WHERE json_tree.key = 'b'
+    )
+    ORDER BY id;
+}
+expect {
+    1
+}

@@ -601,9 +601,7 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
         // Enable MVCC if requested
         if opts.mvcc_enabled {
             let conn = db.connect().unwrap();
-            conn.pragma_update("journal_mode", "'experimental_mvcc'")
-                .await
-                .unwrap();
+            conn.pragma_update("journal_mode", "'mvcc'").await.unwrap();
         }
 
         // SHARED shadow database for all connections

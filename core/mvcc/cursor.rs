@@ -1657,6 +1657,11 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     fn get_skip_advance(&self) -> bool {
         todo!()
     }
+
+    /// Returns true if this cursor operates in MVCC mode.
+    fn is_mvcc(&self) -> bool {
+        true
+    }
 }
 
 impl<Clock: LogicalClock> Debug for MvccLazyCursor<Clock> {

@@ -16,9 +16,9 @@ info:
 QUERY PLAN
 `--COMPOUND QUERY
    |--LEFT-MOST SUBQUERY
-   |  `--SEARCH current_employees USING INDEX idx_current_dept
+   |  `--SEARCH current_employees USING INDEX idx_current_dept (department=?)
    `--UNION ALL
-      `--SEARCH former_employees USING INDEX idx_former_dept
+      `--SEARCH former_employees USING INDEX idx_former_dept (department=?)
 
 BYTECODE
 addr  opcode          p1  p2  p3  p4              p5  comment

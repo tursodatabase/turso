@@ -146,6 +146,12 @@ jsi::Value TursoStatementHostObject::get(jsi::Runtime &rt, const jsi::PropNameID
                 return this->parametersCount(rt);
             });
     }
+    if (propName == "getAllRows") {
+        return jsi::Function::createFromHostFunction(rt, name, 0,
+            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return this->getAllRows(rt);
+            });
+    }
 
     return jsi::Value::undefined();
 }
@@ -177,6 +183,7 @@ std::vector<jsi::PropNameID> TursoStatementHostObject::getPropertyNames(jsi::Run
     props.emplace_back(jsi::PropNameID::forAscii(rt, "rowValueDouble"));
     props.emplace_back(jsi::PropNameID::forAscii(rt, "namedPosition"));
     props.emplace_back(jsi::PropNameID::forAscii(rt, "parametersCount"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "getAllRows"));
     return props;
 }
 
@@ -417,6 +424,114 @@ jsi::Value TursoStatementHostObject::namedPosition(jsi::Runtime &rt, const jsi::
 jsi::Value TursoStatementHostObject::parametersCount(jsi::Runtime &rt) {
     int64_t count = turso_statement_parameters_count(stmt_);
     return jsi::Value(static_cast<double>(count));
+}
+
+jsi::Value TursoStatementHostObject::getAllRows(jsi::Runtime &rt) {
+    int64_t colCount = turso_statement_column_count(stmt_);
+    if (colCount < 0) {
+        // defensive fallback to 0 to not allocate a vector with a negative size
+        colCount = 0;
+    }
+
+    // Cache column names upfront (one allocation per query, not per row)
+    std::vector<std::string> colNames(colCount);
+    for (int64_t i = 0; i < colCount; ++i) {
+        const char* name = turso_statement_column_name(stmt_, static_cast<size_t>(i));
+        if (name) {
+            colNames[i] = std::string(name);
+            turso_str_deinit(name);
+        }
+    }
+
+    // Collect rows into a vector first, then build the jsi::Array at the end
+    // (jsi::Array needs a size upfront)
+    std::vector<jsi::Object> rowObjects;
+
+    while (true) {
+        const char* error = nullptr;
+        turso_status_code_t status = turso_statement_step(stmt_, &error);
+
+        if (status == TURSO_DONE) {
+            break;
+        }
+
+        if (status == TURSO_IO) {
+            // Return partial results so JS can handle IO and fall back
+            jsi::Array rows(rt, rowObjects.size());
+            for (size_t i = 0; i < rowObjects.size(); ++i) {
+                rows.setValueAtIndex(rt, i, std::move(rowObjects[i]));
+            }
+            jsi::Object result(rt);
+            result.setProperty(rt, "status", jsi::Value(static_cast<int>(TURSO_IO)));
+            result.setProperty(rt, "rows", std::move(rows));
+            return result;
+        }
+
+        if (status != TURSO_ROW) {
+            throwError(rt, error);
+        }
+
+        // Read all columns for this row
+        jsi::Object row(rt);
+        for (int64_t i = 0; i < colCount; ++i) {
+            size_t idx = static_cast<size_t>(i);
+            turso_type_t kind = turso_statement_row_value_kind(stmt_, idx);
+
+            switch (kind) {
+                case TURSO_TYPE_INTEGER: {
+                    int64_t val = turso_statement_row_value_int(stmt_, idx);
+                    row.setProperty(rt, colNames[i].c_str(), jsi::Value(static_cast<double>(val)));
+                    break;
+                }
+                case TURSO_TYPE_REAL: {
+                    double val = turso_statement_row_value_double(stmt_, idx);
+                    row.setProperty(rt, colNames[i].c_str(), jsi::Value(val));
+                    break;
+                }
+                case TURSO_TYPE_TEXT: {
+                    const char* ptr = turso_statement_row_value_bytes_ptr(stmt_, idx);
+                    int64_t len = turso_statement_row_value_bytes_count(stmt_, idx);
+                    if (ptr && len >= 0) {
+                        row.setProperty(rt, colNames[i].c_str(),
+                            jsi::String::createFromUtf8(rt, reinterpret_cast<const uint8_t*>(ptr), static_cast<size_t>(len)));
+                    } else {
+                        row.setProperty(rt, colNames[i].c_str(), jsi::String::createFromUtf8(rt, ""));
+                    }
+                    break;
+                }
+                case TURSO_TYPE_BLOB: {
+                    const char* ptr = turso_statement_row_value_bytes_ptr(stmt_, idx);
+                    int64_t len = turso_statement_row_value_bytes_count(stmt_, idx);
+                    size_t blobLen = (len > 0) ? static_cast<size_t>(len) : 0;
+                    jsi::Function arrayBufferCtor = rt.global().getPropertyAsFunction(rt, "ArrayBuffer");
+                    jsi::Object arrayBuffer = arrayBufferCtor.callAsConstructor(rt, static_cast<int>(blobLen)).asObject(rt);
+                    if (ptr && blobLen > 0) {
+                        jsi::ArrayBuffer buf = arrayBuffer.getArrayBuffer(rt);
+                        memcpy(buf.data(rt), ptr, blobLen);
+                    }
+                    row.setProperty(rt, colNames[i].c_str(), std::move(arrayBuffer));
+                    break;
+                }
+                case TURSO_TYPE_NULL:
+                default:
+                    row.setProperty(rt, colNames[i].c_str(), jsi::Value::null());
+                    break;
+            }
+        }
+
+        rowObjects.push_back(std::move(row));
+    }
+
+    // Build final array
+    jsi::Array rows(rt, rowObjects.size());
+    for (size_t i = 0; i < rowObjects.size(); ++i) {
+        rows.setValueAtIndex(rt, i, std::move(rowObjects[i]));
+    }
+
+    jsi::Object result(rt);
+    result.setProperty(rt, "status", jsi::Value(static_cast<int>(TURSO_DONE)));
+    result.setProperty(rt, "rows", std::move(rows));
+    return result;
 }
 
 } // namespace turso

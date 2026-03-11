@@ -23,6 +23,10 @@ TURSO_LIB := $(ROOT_DIR)/target/debug
 SRC       := $(ROOT_DIR)/bindings/tcl/turso_tcl.c
 INCLUDE   := $(ROOT_DIR)/sqlite3/include
 
+# Default target — local build (no Docker required).
+.PHONY: all
+all: build
+
 # ---- Docker -----------------------------------------------------------------
 
 DOCKER_IMAGE ?= rust:bookworm

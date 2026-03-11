@@ -188,7 +188,7 @@ impl<'a, R: rand::Rng> PlanGenerator<'a, R> {
                         env.opts.max_interactions,
                         &env.profile.query,
                         stats,
-                        env.profile.experimental_mvcc,
+                        env.profile.mvcc,
                         &conn_ctx,
                     );
 
@@ -359,7 +359,7 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats, usize)> for Interactions {
             env.opts.max_interactions,
             &env.profile.query,
             stats,
-            env.profile.experimental_mvcc,
+            env.profile.mvcc,
             conn_ctx,
         );
 

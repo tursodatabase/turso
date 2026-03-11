@@ -323,7 +323,7 @@ CREATE TABLE bad (
 ```
 
 <Info>
-**Turso Extension**: STRICT tables also support custom types defined with [CREATE TYPE](/docs/sql-reference/statements/create-type). Custom types extend the type system with user-defined encoding, decoding, validation, and operator overloading. See [Data Types](/docs/sql-reference/data-types#custom-types) for details.
+**Turso Extension**: STRICT tables also support custom types defined with [CREATE TYPE](/docs/sql-reference/statements/create-type) and [array types](/docs/sql-reference/data-types#array-types). Custom types extend the type system with user-defined encoding, decoding, validation, and operator overloading. Array columns are declared by appending `[]` to a base type.
 </Info>
 
 ```sql
@@ -331,7 +331,8 @@ CREATE TABLE events (
     id uuid PRIMARY KEY,
     name varchar(100) NOT NULL,
     event_date date,
-    is_active boolean DEFAULT 1
+    is_active boolean DEFAULT 1,
+    tags TEXT[]
 ) STRICT;
 ```
 

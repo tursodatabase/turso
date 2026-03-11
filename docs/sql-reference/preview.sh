@@ -12,7 +12,7 @@ fi
 
 # Clean and create src directory for mdbook
 rm -rf src
-mkdir -p src/statements src/functions
+mkdir -p src/statements src/functions src/cli
 
 # Convert .mdx files to .md:
 #  - Strip YAML frontmatter
@@ -23,7 +23,7 @@ convert() {
   # Determine depth: files in subdirs need ../ prefix for top-level pages
   local depth=""
   case "$in" in
-    statements/*|functions/*) depth="../" ;;
+    statements/*|functions/*|cli/*) depth="../" ;;
   esac
   sed -E \
     -e 's/^<Info>$/> **Note**/g' \
@@ -44,10 +44,21 @@ done
 for f in functions/*.mdx; do
   convert "$f" "src/${f%.mdx}.md"
 done
+for f in cli/*.mdx; do
+  convert "$f" "src/${f%.mdx}.md"
+done
 
 # Generate SUMMARY.md
 cat > src/SUMMARY.md << 'EOF'
 # Summary
+
+# CLI
+
+- [Getting Started](cli/getting-started.md)
+- [Command-Line Options](cli/command-line-options.md)
+- [Shell Commands](cli/shell-commands.md)
+
+# SQL Language
 
 - [Data Types](data-types.md)
 - [Expressions](expressions.md)
@@ -87,6 +98,7 @@ cat > src/SUMMARY.md << 'EOF'
 - [Math](functions/math.md)
 - [JSON](functions/json.md)
 - [Window](functions/window.md)
+- [Array](functions/array.md)
 - [Vector](functions/vector.md)
 - [Full-Text Search](functions/fts.md)
 

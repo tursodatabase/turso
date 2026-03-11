@@ -15,5 +15,5 @@ info:
 ---
 QUERY PLAN
 |--LIST SUBQUERY 1
-|  `--SEARCH inventory USING INDEX idx_inventory_covering
+|  `--SEARCH inventory USING INDEX idx_inventory_covering (warehouse_id=?)
 `--SCAN products

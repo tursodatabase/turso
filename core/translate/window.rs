@@ -4,7 +4,7 @@ use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSourc
 use crate::translate::collate::{get_collseq_from_expr, CollationSeq};
 use crate::translate::emitter::{Resolver, TranslateCtx};
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
-use crate::translate::order_by::order_by_sorter_insert;
+use crate::translate::order_by::EmitOrderBy;
 use crate::translate::plan::{
     Aggregate, Distinctness, JoinOrderMember, JoinedTable, QueryDestination, ResultSetColumn,
     SelectPlan, TableReferences, Window,
@@ -480,126 +480,180 @@ pub struct WindowCursors {
     pub buffer_write: CursorID,
 }
 
-pub fn init_window<'a>(
-    program: &mut ProgramBuilder,
-    t_ctx: &mut TranslateCtx<'a>,
-    window: &'a Window,
-    plan: &SelectPlan,
-    result_columns: &'a [ResultSetColumn],
-    order_by: &'a [(Box<Expr>, SortOrder)],
-) -> crate::Result<()> {
-    let joined_tables = &plan.joined_tables();
-    turso_assert_eq!(joined_tables.len(), 1, "expected only one joined table");
+pub struct EmitWindow;
+impl EmitWindow {
+    pub fn init<'a>(
+        program: &mut ProgramBuilder,
+        t_ctx: &mut TranslateCtx<'a>,
+        window: &'a Window,
+        plan: &SelectPlan,
+        result_columns: &'a [ResultSetColumn],
+        order_by: &'a [(Box<Expr>, SortOrder)],
+    ) -> crate::Result<()> {
+        let joined_tables = &plan.joined_tables();
+        turso_assert_eq!(joined_tables.len(), 1, "expected only one joined table");
 
-    let src_table = &joined_tables[0];
-    let reg_src_columns_start =
-        if let Table::FromClauseSubquery(from_clause_subquery) = &src_table.table {
-            from_clause_subquery
-                .result_columns_start_reg
-                .expect("Subquery result_columns_start_reg must be set")
-        } else {
-            panic!(
-                "expected source table to be a FromClauseSubquery, but got: {:?}",
-                src_table.table
-            );
-        };
-
-    let src_columns = src_table.columns().to_vec();
-    let src_column_count = src_columns.len();
-    let window_name = window.name.clone().expect("window name is missing");
-    let partition_by_len = window
-        .deduplicated_partition_by_len
-        .unwrap_or(window.partition_by.len());
-    let order_by_len = window.order_by.len();
-    let window_function_count = window.functions.len();
-
-    // An ephemeral table used to buffer rows for the current frame
-    let buffer_table = Arc::new(BTreeTable {
-        root_page: 0,
-        // TODO: Generating the name this way may cause collisions with real tables in the
-        //  attached database. Other ephemeral tables are created similarly, so it’s left
-        //  as-is for now. Ideally, there should be a way to mark tables as ephemeral so
-        //  they can be handled differently from regular tables.
-        name: format!("buffer_table_{window_name}"),
-        has_rowid: true,
-        primary_key_columns: vec![],
-        columns: src_columns,
-        is_strict: false,
-        unique_sets: vec![],
-        has_autoincrement: false,
-        foreign_keys: vec![],
-        check_constraints: vec![],
-    });
-    let cursor_buffer_read = program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone()));
-    let cursor_buffer_write = program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone()));
-    program.emit_insn(Insn::OpenEphemeral {
-        cursor_id: cursor_buffer_read,
-        is_table: true,
-    });
-    program.emit_insn(Insn::OpenDup {
-        original_cursor_id: cursor_buffer_read,
-        new_cursor_id: cursor_buffer_write,
-    });
-
-    // Window function processing is similar to aggregation processing in how results are mapped
-    // to registers. Each function expression is stored in `expr_to_reg_cache` along with its
-    // result register. Later, when bytecode generation encounters the expression, the value is
-    // copied from the result register instead of generating code to evaluate the expression.
-    let reg_acc_start = program.alloc_registers(window_function_count);
-    let reg_acc_result_start = program.alloc_registers(window_function_count);
-    for (i, func) in window.functions.iter().enumerate() {
-        t_ctx.resolver.expr_to_reg_cache.push((
-            std::borrow::Cow::Borrowed(&func.original_expr),
-            reg_acc_result_start + i,
-            false,
-        ));
-    }
-
-    // The same approach applies to expressions referencing the subquery (columns).
-    // Instead of reading directly from the subquery, we redirect them to the corresponding
-    // result registers. This is necessary because rows are buffered in an ephemeral table and
-    // returned according to the rules of the window definition.
-    let expressions_referencing_subquery =
-        collect_expressions_referencing_subquery(result_columns, order_by, &src_table.internal_id)?;
-    let reg_col_start = program.alloc_registers(expressions_referencing_subquery.len());
-    for (i, (expr, _)) in expressions_referencing_subquery.iter().enumerate() {
-        t_ctx.resolver.expr_to_reg_cache.push((
-            std::borrow::Cow::Borrowed(expr),
-            reg_col_start + i,
-            false,
-        ));
-    }
-
-    t_ctx.meta_window = Some(WindowMetadata {
-        labels: WindowLabels {
-            flush_buffer: program.allocate_label(),
-            window_processing_end: program.allocate_label(),
-        },
-        registers: WindowRegisters {
-            rowid: program.alloc_registers_and_init_w_null(1),
-            partition_start: if partition_by_len > 0 {
-                Some(program.alloc_registers_and_init_w_null(partition_by_len))
+        let src_table = &joined_tables[0];
+        let reg_src_columns_start =
+            if let Table::FromClauseSubquery(from_clause_subquery) = &src_table.table {
+                from_clause_subquery
+                    .result_columns_start_reg
+                    .expect("Subquery result_columns_start_reg must be set")
             } else {
-                None
-            },
-            acc_start: reg_acc_start,
-            acc_result_start: reg_acc_result_start,
-            flush_buffer_return_offset: program.alloc_register(),
-            src_columns_start: reg_src_columns_start,
-            result_columns_start: reg_col_start,
-            prev_order_by_columns_start: alloc_optional_registers(program, order_by_len),
-            new_order_by_columns_start: alloc_optional_registers(program, order_by_len),
-        },
-        cursors: WindowCursors {
-            buffer_read: cursor_buffer_read,
-            buffer_write: cursor_buffer_write,
-        },
-        src_column_count,
-        expressions_referencing_subquery,
-        buffer_table_name: buffer_table.name.clone(),
-    });
+                panic!(
+                    "expected source table to be a FromClauseSubquery, but got: {:?}",
+                    src_table.table
+                );
+            };
 
-    Ok(())
+        let src_columns = src_table.columns().to_vec();
+        let src_column_count = src_columns.len();
+        let window_name = window.name.clone().expect("window name is missing");
+        let partition_by_len = window
+            .deduplicated_partition_by_len
+            .unwrap_or(window.partition_by.len());
+        let order_by_len = window.order_by.len();
+        let window_function_count = window.functions.len();
+
+        // An ephemeral table used to buffer rows for the current frame
+        let buffer_table = Arc::new(BTreeTable {
+            root_page: 0,
+            // TODO: Generating the name this way may cause collisions with real tables in the
+            //  attached database. Other ephemeral tables are created similarly, so it’s left
+            //  as-is for now. Ideally, there should be a way to mark tables as ephemeral so
+            //  they can be handled differently from regular tables.
+            name: format!("buffer_table_{window_name}"),
+            has_rowid: true,
+            primary_key_columns: vec![],
+            columns: src_columns,
+            is_strict: false,
+            unique_sets: vec![],
+            has_autoincrement: false,
+            foreign_keys: vec![],
+            check_constraints: vec![],
+        });
+        let cursor_buffer_read =
+            program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone()));
+        let cursor_buffer_write =
+            program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone()));
+        program.emit_insn(Insn::OpenEphemeral {
+            cursor_id: cursor_buffer_read,
+            is_table: true,
+        });
+        program.emit_insn(Insn::OpenDup {
+            original_cursor_id: cursor_buffer_read,
+            new_cursor_id: cursor_buffer_write,
+        });
+
+        // Window function processing is similar to aggregation processing in how results are mapped
+        // to registers. Each function expression is stored in `expr_to_reg_cache` along with its
+        // result register. Later, when bytecode generation encounters the expression, the value is
+        // copied from the result register instead of generating code to evaluate the expression.
+        let reg_acc_start = program.alloc_registers(window_function_count);
+        let reg_acc_result_start = program.alloc_registers(window_function_count);
+        for (i, func) in window.functions.iter().enumerate() {
+            t_ctx.resolver.expr_to_reg_cache.push((
+                std::borrow::Cow::Borrowed(&func.original_expr),
+                reg_acc_result_start + i,
+                false,
+            ));
+        }
+
+        // The same approach applies to expressions referencing the subquery (columns).
+        // Instead of reading directly from the subquery, we redirect them to the corresponding
+        // result registers. This is necessary because rows are buffered in an ephemeral table and
+        // returned according to the rules of the window definition.
+        let expressions_referencing_subquery = collect_expressions_referencing_subquery(
+            result_columns,
+            order_by,
+            &src_table.internal_id,
+        )?;
+        let reg_col_start = program.alloc_registers(expressions_referencing_subquery.len());
+        for (i, (expr, _)) in expressions_referencing_subquery.iter().enumerate() {
+            t_ctx.resolver.expr_to_reg_cache.push((
+                std::borrow::Cow::Borrowed(expr),
+                reg_col_start + i,
+                false,
+            ));
+        }
+
+        t_ctx.meta_window = Some(WindowMetadata {
+            labels: WindowLabels {
+                flush_buffer: program.allocate_label(),
+                window_processing_end: program.allocate_label(),
+            },
+            registers: WindowRegisters {
+                rowid: program.alloc_registers_and_init_w_null(1),
+                partition_start: if partition_by_len > 0 {
+                    Some(program.alloc_registers_and_init_w_null(partition_by_len))
+                } else {
+                    None
+                },
+                acc_start: reg_acc_start,
+                acc_result_start: reg_acc_result_start,
+                flush_buffer_return_offset: program.alloc_register(),
+                src_columns_start: reg_src_columns_start,
+                result_columns_start: reg_col_start,
+                prev_order_by_columns_start: alloc_optional_registers(program, order_by_len),
+                new_order_by_columns_start: alloc_optional_registers(program, order_by_len),
+            },
+            cursors: WindowCursors {
+                buffer_read: cursor_buffer_read,
+                buffer_write: cursor_buffer_write,
+            },
+            src_column_count,
+            expressions_referencing_subquery,
+            buffer_table_name: buffer_table.name.clone(),
+        });
+
+        Ok(())
+    }
+    /// Emits bytecode to process a single row of the window’s input (always a subquery).
+    ///
+    /// Note:
+    /// The **buffer table** mentioned below is an ephemeral B-tree that temporarily
+    /// stores rows for the current window frame.
+    ///
+    /// High-level overview:
+    /// - Each row from the subquery is read, and its ORDER BY columns are loaded into
+    ///   dedicated registers for comparison and partitioning purposes.
+    /// - If the row starts a new partition (based on PARTITION BY columns), the buffer
+    ///   and accumulators are flushed or reset as needed.
+    /// - Rows are compared against the previous row to determine if they are "peers"
+    ///   (i.e., have the same ORDER BY values). Non-peer rows may trigger flushing
+    ///   of intermediate results.
+    /// - The row is then inserted into the window’s buffer table.
+    /// - Aggregate steps for any window functions are executed.
+    pub fn emit_window_loop_source(
+        program: &mut ProgramBuilder,
+        t_ctx: &mut TranslateCtx,
+        plan: &SelectPlan,
+    ) -> crate::Result<()> {
+        let WindowMetadata {
+            labels,
+            registers,
+            cursors,
+            src_column_count: input_column_count,
+            buffer_table_name,
+            ..
+        } = t_ctx.meta_window.as_ref().expect("missing window metadata");
+        let window = plan.window.as_ref().expect("missing window");
+
+        emit_load_order_by_columns(program, window, registers);
+        emit_flush_buffer_if_new_partition(program, labels, registers, window, plan)?;
+        emit_reset_state_if_new_partition(program, registers, window);
+        emit_flush_buffer_if_not_peer(program, labels, registers, window, plan)?;
+        emit_insert_row_into_buffer(
+            program,
+            registers,
+            cursors,
+            input_column_count,
+            buffer_table_name,
+        );
+        emit_aggregation_step(program, window, &t_ctx.resolver, plan, registers)?;
+
+        Ok(())
+    }
 }
 
 fn alloc_optional_registers(program: &mut ProgramBuilder, count: usize) -> Option<usize> {
@@ -653,53 +707,6 @@ fn collect_expressions_referencing_subquery<'a>(
     }
 
     Ok(expressions_referencing_subquery)
-}
-
-/// Emits bytecode to process a single row of the window’s input (always a subquery).
-///
-/// Note:
-/// The **buffer table** mentioned below is an ephemeral B-tree that temporarily
-/// stores rows for the current window frame.
-///
-/// High-level overview:
-/// - Each row from the subquery is read, and its ORDER BY columns are loaded into
-///   dedicated registers for comparison and partitioning purposes.
-/// - If the row starts a new partition (based on PARTITION BY columns), the buffer
-///   and accumulators are flushed or reset as needed.
-/// - Rows are compared against the previous row to determine if they are "peers"
-///   (i.e., have the same ORDER BY values). Non-peer rows may trigger flushing
-///   of intermediate results.
-/// - The row is then inserted into the window’s buffer table.
-/// - Aggregate steps for any window functions are executed.
-pub fn emit_window_loop_source(
-    program: &mut ProgramBuilder,
-    t_ctx: &mut TranslateCtx,
-    plan: &SelectPlan,
-) -> crate::Result<()> {
-    let WindowMetadata {
-        labels,
-        registers,
-        cursors,
-        src_column_count: input_column_count,
-        buffer_table_name,
-        ..
-    } = t_ctx.meta_window.as_ref().expect("missing window metadata");
-    let window = plan.window.as_ref().expect("missing window");
-
-    emit_load_order_by_columns(program, window, registers);
-    emit_flush_buffer_if_new_partition(program, labels, registers, window, plan)?;
-    emit_reset_state_if_new_partition(program, registers, window);
-    emit_flush_buffer_if_not_peer(program, labels, registers, window, plan)?;
-    emit_insert_row_into_buffer(
-        program,
-        registers,
-        cursors,
-        input_column_count,
-        buffer_table_name,
-    );
-    emit_aggregation_step(program, window, &t_ctx.resolver, plan, registers)?;
-
-    Ok(())
 }
 
 fn emit_flush_buffer_if_new_partition(
@@ -1078,7 +1085,7 @@ fn emit_return_buffered_rows(
             )?;
         }
         false => {
-            order_by_sorter_insert(program, t_ctx, plan)?;
+            EmitOrderBy::sorter_insert(program, t_ctx, plan)?;
         }
     }
 

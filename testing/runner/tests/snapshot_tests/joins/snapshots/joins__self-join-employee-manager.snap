@@ -20,7 +20,7 @@ info:
 ---
 QUERY PLAN
 |--SCAN employees AS e
-`--SEARCH m USING INTEGER PRIMARY KEY (rowid=?)
+`--SEARCH m USING INTEGER PRIMARY KEY (rowid=?) LEFT-JOIN
 
 BYTECODE
 addr  opcode       p1  p2  p3  p4              p5  comment

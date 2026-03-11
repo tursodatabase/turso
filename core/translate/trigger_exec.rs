@@ -1,8 +1,12 @@
 use crate::schema::{BTreeTable, Trigger};
 use crate::sync::Arc;
-use crate::translate::emitter::Resolver;
-use crate::translate::expr::translate_expr;
-use crate::translate::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
+use crate::translate::expr::WalkControl;
+use crate::translate::{
+    emitter::Resolver,
+    expr::{self, translate_expr, walk_expr_mut},
+    planner::ROWID_STRS,
+    translate_inner, ProgramBuilder, ProgramBuilderOpts,
+};
 use crate::util::normalize_ident;
 use crate::vdbe::insn::Insn;
 use crate::vdbe::BranchOffset;
@@ -149,104 +153,11 @@ impl TriggerSubprogramContext {
 /// Rewrite NEW and OLD references in trigger expressions to use Variable instructions (parameters)
 fn rewrite_trigger_expr_for_subprogram(
     expr: &mut ast::Expr,
-    table: &BTreeTable,
     ctx: &TriggerSubprogramContext,
 ) -> Result<()> {
-    use crate::translate::expr::walk_expr_mut;
-    use crate::translate::expr::WalkControl;
-
     walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
-        match e {
-            Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
-                let ns = normalize_ident(ns.as_str());
-                let col = normalize_ident(col.as_str());
-
-                // Handle NEW.column references
-                if ns.eq_ignore_ascii_case("new") {
-                    if let Some(new_params) = &ctx.new_param_map {
-                        // Check if this is a rowid alias column first
-                        if let Some((idx, col_def)) = table.get_column(&col) {
-                            if col_def.is_rowid_alias() {
-                                // Rowid alias columns map to the rowid parameter, not the column register
-                                *e = Expr::Variable(format!(
-                                    "{}",
-                                    ctx.get_new_rowid_param()
-                                        .expect("NEW parameters must be provided")
-                                ));
-                                return Ok(WalkControl::Continue);
-                            }
-                            if idx < new_params.len() {
-                                *e = Expr::Variable(format!(
-                                    "{}",
-                                    ctx.get_new_param(idx)
-                                        .expect("NEW parameters must be provided")
-                                        .get()
-                                ));
-                                return Ok(WalkControl::Continue);
-                            } else {
-                                crate::bail_parse_error!("no such column in NEW: {}", col);
-                            }
-                        }
-                        // Handle NEW.rowid
-                        if crate::translate::planner::ROWID_STRS
-                            .iter()
-                            .any(|s| s.eq_ignore_ascii_case(&col))
-                        {
-                            *e = Expr::Variable(format!(
-                                "{}",
-                                ctx.get_new_rowid_param()
-                                    .expect("NEW parameters must be provided")
-                            ));
-                            return Ok(WalkControl::Continue);
-                        }
-                        bail_parse_error!("no such column in NEW: {}", col);
-                    } else {
-                        bail_parse_error!(
-                            "NEW references are only valid in INSERT and UPDATE triggers"
-                        );
-                    }
-                }
-
-                // Handle OLD.column references
-                if ns.eq_ignore_ascii_case("old") {
-                    if let Some(old_params) = &ctx.old_param_map {
-                        if let Some((idx, _)) = table.get_column(&col) {
-                            if idx < old_params.len() {
-                                *e = Expr::Variable(format!(
-                                    "{}",
-                                    ctx.get_old_param(idx)
-                                        .expect("OLD parameters must be provided")
-                                        .get()
-                                ));
-                                return Ok(WalkControl::Continue);
-                            } else {
-                                crate::bail_parse_error!("no such column in OLD: {}", col);
-                            }
-                        }
-                        // Handle OLD.rowid
-                        if crate::translate::planner::ROWID_STRS
-                            .iter()
-                            .any(|s| s.eq_ignore_ascii_case(&col))
-                        {
-                            *e = Expr::Variable(format!(
-                                "{}",
-                                ctx.get_old_rowid_param()
-                                    .expect("OLD parameters must be provided")
-                            ));
-                            return Ok(WalkControl::Continue);
-                        }
-                        bail_parse_error!("no such column in OLD: {}", col);
-                    } else {
-                        bail_parse_error!(
-                            "OLD references are only valid in UPDATE and DELETE triggers"
-                        );
-                    }
-                }
-
-                Ok(WalkControl::Continue)
-            }
-            _ => Ok(WalkControl::Continue),
-        }
+        rewrite_trigger_expr_single_for_subprogram(e, ctx)?;
+        Ok(WalkControl::Continue)
     })?;
     Ok(())
 }
@@ -264,15 +175,15 @@ fn rewrite_upsert_exprs_for_subprogram(
         } = u.do_clause
         {
             for set in sets.iter_mut() {
-                rewrite_trigger_expr_for_subprogram(&mut set.expr, &ctx.table, ctx)?;
+                rewrite_trigger_expr_for_subprogram(&mut set.expr, ctx)?;
             }
             if let Some(ref mut wc) = where_clause {
-                rewrite_trigger_expr_for_subprogram(wc, &ctx.table, ctx)?;
+                rewrite_trigger_expr_for_subprogram(wc, ctx)?;
             }
         }
         if let Some(ref mut idx) = u.index {
             if let Some(ref mut wc) = idx.where_clause {
-                rewrite_trigger_expr_for_subprogram(wc, &ctx.table, ctx)?;
+                rewrite_trigger_expr_for_subprogram(wc, ctx)?;
             }
         }
         current = u.next.as_mut();
@@ -331,20 +242,12 @@ fn trigger_cmd_to_stmt_for_subprogram(
             // Rewrite NEW/OLD references in SET clauses and WHERE clause
             let mut sets_clone = sets.clone();
             for set in &mut sets_clone {
-                rewrite_trigger_expr_for_subprogram(
-                    &mut set.expr,
-                    &subprogram_ctx.table,
-                    subprogram_ctx,
-                )?;
+                rewrite_trigger_expr_for_subprogram(&mut set.expr, subprogram_ctx)?;
             }
 
             let mut where_clause_clone = where_clause.clone();
             if let Some(ref mut where_expr) = where_clause_clone {
-                rewrite_trigger_expr_for_subprogram(
-                    where_expr,
-                    &subprogram_ctx.table,
-                    subprogram_ctx,
-                )?;
+                rewrite_trigger_expr_for_subprogram(where_expr, subprogram_ctx)?;
             }
 
             // If override_conflict is set (e.g., in UPSERT DO UPDATE context),
@@ -374,11 +277,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
             // Rewrite NEW/OLD references in WHERE clause
             let mut where_clause_clone = where_clause.clone();
             if let Some(ref mut where_expr) = where_clause_clone {
-                rewrite_trigger_expr_for_subprogram(
-                    where_expr,
-                    &subprogram_ctx.table,
-                    subprogram_ctx,
-                )?;
+                rewrite_trigger_expr_for_subprogram(where_expr, subprogram_ctx)?;
             }
 
             Ok(ast::Stmt::Delete {
@@ -409,65 +308,9 @@ fn rewrite_expressions_in_select_for_subprogram(
     select: &mut ast::Select,
     ctx: &TriggerSubprogramContext,
 ) -> Result<()> {
-    use crate::translate::expr::walk_expr_mut;
-
-    // Rewrite expressions in the SELECT body
-    match &mut select.body.select {
-        ast::OneSelect::Select {
-            columns,
-            where_clause,
-            group_by,
-            ..
-        } => {
-            // Rewrite in columns
-            for col in columns {
-                if let ast::ResultColumn::Expr(ref mut expr, _) = col {
-                    walk_expr_mut(expr, &mut |e: &mut ast::Expr| {
-                        rewrite_trigger_expr_single_for_subprogram(e, ctx)?;
-                        Ok(crate::translate::expr::WalkControl::Continue)
-                    })?;
-                }
-            }
-
-            // Rewrite in WHERE clause
-            if let Some(ref mut where_expr) = where_clause {
-                walk_expr_mut(where_expr, &mut |e: &mut ast::Expr| {
-                    rewrite_trigger_expr_single_for_subprogram(e, ctx)?;
-                    Ok(crate::translate::expr::WalkControl::Continue)
-                })?;
-            }
-
-            // Rewrite in GROUP BY expressions and HAVING clause
-            if let Some(ref mut group_by) = group_by {
-                for expr in &mut group_by.exprs {
-                    walk_expr_mut(expr, &mut |e: &mut ast::Expr| {
-                        rewrite_trigger_expr_single_for_subprogram(e, ctx)?;
-                        Ok(crate::translate::expr::WalkControl::Continue)
-                    })?;
-                }
-
-                // Rewrite in HAVING clause
-                if let Some(ref mut having_expr) = group_by.having {
-                    walk_expr_mut(having_expr, &mut |e: &mut ast::Expr| {
-                        rewrite_trigger_expr_single_for_subprogram(e, ctx)?;
-                        Ok(crate::translate::expr::WalkControl::Continue)
-                    })?;
-                }
-            }
-        }
-        ast::OneSelect::Values(values) => {
-            for row in values {
-                for expr in row {
-                    walk_expr_mut(expr, &mut |e: &mut ast::Expr| {
-                        rewrite_trigger_expr_single_for_subprogram(e, ctx)?;
-                        Ok(crate::translate::expr::WalkControl::Continue)
-                    })?;
-                }
-            }
-        }
-    }
-
-    Ok(())
+    rewrite_select_expressions(select, &mut |e: &mut ast::Expr| {
+        rewrite_trigger_expr_single_for_subprogram(e, ctx)
+    })
 }
 
 /// Rewrite a single NEW/OLD reference for subprogram (called from walk_expr_mut)
@@ -476,6 +319,14 @@ fn rewrite_trigger_expr_single_for_subprogram(
     ctx: &TriggerSubprogramContext,
 ) -> Result<()> {
     match e {
+        Expr::Exists(select) | Expr::Subquery(select) => {
+            rewrite_expressions_in_select_for_subprogram(select, ctx)?;
+            return Ok(());
+        }
+        Expr::InSelect { rhs, .. } => {
+            rewrite_expressions_in_select_for_subprogram(rhs, ctx)?;
+            return Ok(());
+        }
         Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
             let ns = normalize_ident(ns.as_str());
             let col = normalize_ident(col.as_str());
@@ -505,10 +356,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                         }
                     }
                     // Handle NEW.rowid
-                    if crate::translate::planner::ROWID_STRS
-                        .iter()
-                        .any(|s| s.eq_ignore_ascii_case(&col))
-                    {
+                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
                         *e = Expr::Variable(format!(
                             "{}",
                             ctx.get_new_rowid_param()
@@ -549,10 +397,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                         }
                     }
                     // Handle OLD.rowid
-                    if crate::translate::planner::ROWID_STRS
-                        .iter()
-                        .any(|s| s.eq_ignore_ascii_case(&col))
-                    {
+                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
                         *e = Expr::Variable(format!(
                             "{}",
                             ctx.get_old_rowid_param()
@@ -651,17 +496,26 @@ fn execute_trigger_commands(
     if let Some(override_conflict) = ctx.override_conflict {
         subprogram_builder.set_trigger_conflict_override(override_conflict);
     }
-    for command in trigger.commands.iter() {
-        let stmt = trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?;
-        subprogram_builder.prologue();
-        translate_inner(
-            stmt,
-            resolver,
-            &mut subprogram_builder,
-            connection,
-            "trigger subprogram",
-        )?;
-    }
+    // Restrict table resolution to the trigger's database during subprogram compilation.
+    let prev_trigger_context = resolver.trigger_context.clone();
+    resolver.set_trigger_context(database_id, trigger.name.clone());
+    let compile_result = (|| -> Result<()> {
+        for command in trigger.commands.iter() {
+            let stmt = trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?;
+            subprogram_builder.prologue();
+            translate_inner(
+                stmt,
+                resolver,
+                &mut subprogram_builder,
+                connection,
+                "trigger subprogram",
+            )?;
+        }
+        Ok(())
+    })();
+    // Restore previous trigger context (supports nested triggers).
+    resolver.trigger_context = prev_trigger_context;
+    compile_result?;
     subprogram_builder.epilogue(resolver.schema());
     let built_subprogram =
         subprogram_builder.build(connection.clone(), true, "trigger subprogram")?;
@@ -871,7 +725,7 @@ fn decode_trigger_registers(
     let decoded_new = if ctx.new_encoded {
         if let Some(new_regs) = &ctx.new_registers {
             let rowid_reg = *new_regs.last().expect("NEW registers must include rowid");
-            Some(crate::translate::expr::emit_trigger_decode_registers(
+            Some(expr::emit_trigger_decode_registers(
                 program,
                 resolver,
                 columns,
@@ -888,7 +742,7 @@ fn decode_trigger_registers(
 
     let decoded_old = if let Some(old_regs) = &ctx.old_registers {
         let rowid_reg = *old_regs.last().expect("OLD registers must include rowid");
-        Some(crate::translate::expr::emit_trigger_decode_registers(
+        Some(expr::emit_trigger_decode_registers(
             program,
             resolver,
             columns,
@@ -915,88 +769,312 @@ fn rewrite_trigger_expr_for_when_clause(
     table: &BTreeTable,
     ctx: &TriggerContext,
 ) -> Result<()> {
-    use crate::translate::expr::walk_expr_mut;
-    use crate::translate::expr::WalkControl;
-
     walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
-        match e {
-            Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
-                let ns = normalize_ident(ns.as_str());
-                let col = normalize_ident(col.as_str());
-
-                // Handle NEW.column references
-                if ns.eq_ignore_ascii_case("new") {
-                    if let Some(new_regs) = &ctx.new_registers {
-                        if let Some((idx, col_def)) = table.get_column(&col) {
-                            if col_def.is_rowid_alias() {
-                                // Rowid alias columns map to the rowid register (last element)
-                                *e = Expr::Register(
-                                    *new_regs.last().expect("NEW registers must be provided"),
-                                );
-                                return Ok(WalkControl::Continue);
-                            }
-                            if idx < new_regs.len() {
-                                *e = Expr::Register(new_regs[idx]);
-                                return Ok(WalkControl::Continue);
-                            }
-                        }
-                        // Handle NEW.rowid
-                        if crate::translate::planner::ROWID_STRS
-                            .iter()
-                            .any(|s| s.eq_ignore_ascii_case(&col))
-                        {
-                            *e = Expr::Register(
-                                *ctx.new_registers
-                                    .as_ref()
-                                    .expect("NEW registers must be provided")
-                                    .last()
-                                    .expect("NEW registers must be provided"),
-                            );
-                            return Ok(WalkControl::Continue);
-                        }
-                        bail_parse_error!("no such column in NEW: {}", col);
-                    } else {
-                        bail_parse_error!(
-                            "NEW references are only valid in INSERT and UPDATE triggers"
-                        );
-                    }
-                }
-
-                // Handle OLD.column references
-                if ns.eq_ignore_ascii_case("old") {
-                    if let Some(old_regs) = &ctx.old_registers {
-                        if let Some((idx, _)) = table.get_column(&col) {
-                            if idx < old_regs.len() {
-                                *e = Expr::Register(old_regs[idx]);
-                                return Ok(WalkControl::Continue);
-                            }
-                        }
-                        // Handle OLD.rowid
-                        if crate::translate::planner::ROWID_STRS
-                            .iter()
-                            .any(|s| s.eq_ignore_ascii_case(&col))
-                        {
-                            *e = Expr::Register(
-                                *ctx.old_registers
-                                    .as_ref()
-                                    .expect("OLD registers must be provided")
-                                    .last()
-                                    .expect("OLD registers must be provided"),
-                            );
-                            return Ok(WalkControl::Continue);
-                        }
-                        bail_parse_error!("no such column in OLD: {}", col);
-                    } else {
-                        bail_parse_error!(
-                            "OLD references are only valid in UPDATE and DELETE triggers"
-                        );
-                    }
-                }
-
-                crate::bail_parse_error!("no such column: {ns}.{col}");
-            }
-            _ => Ok(WalkControl::Continue),
-        }
+        rewrite_trigger_expr_single_for_when_clause(e, table, ctx, false)?;
+        Ok(WalkControl::Continue)
     })?;
+    Ok(())
+}
+
+/// Rewrite NEW/OLD references in all expressions within a SELECT statement for trigger WHEN clauses.
+fn rewrite_expressions_in_select_for_when_clause(
+    select: &mut ast::Select,
+    table: &BTreeTable,
+    ctx: &TriggerContext,
+) -> Result<()> {
+    rewrite_select_expressions(select, &mut |e: &mut ast::Expr| {
+        rewrite_trigger_expr_single_for_when_clause(e, table, ctx, true)
+    })
+}
+
+/// Rewrite all expressions in a SELECT tree, including CTEs, compounds, ORDER BY,
+/// LIMIT/OFFSET, FROM/JOIN subqueries, and window clauses.
+fn rewrite_select_expressions<F>(select: &mut ast::Select, rewrite_expr: &mut F) -> Result<()>
+where
+    F: FnMut(&mut ast::Expr) -> Result<()>,
+{
+    // Rewrite WITH clause (CTEs)
+    if let Some(with_clause) = &mut select.with {
+        for cte in &mut with_clause.ctes {
+            rewrite_select_expressions(&mut cte.select, rewrite_expr)?;
+        }
+    }
+
+    rewrite_one_select_expressions(&mut select.body.select, rewrite_expr)?;
+
+    // Rewrite compound SELECT arms (UNION/EXCEPT/INTERSECT)
+    for compound in &mut select.body.compounds {
+        rewrite_one_select_expressions(&mut compound.select, rewrite_expr)?;
+    }
+
+    // Rewrite top-level ORDER BY
+    for sorted_col in &mut select.order_by {
+        rewrite_expression_tree(&mut sorted_col.expr, rewrite_expr)?;
+    }
+
+    // Rewrite top-level LIMIT/OFFSET
+    if let Some(limit) = &mut select.limit {
+        rewrite_expression_tree(&mut limit.expr, rewrite_expr)?;
+        if let Some(offset) = &mut limit.offset {
+            rewrite_expression_tree(offset, rewrite_expr)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn rewrite_one_select_expressions<F>(
+    one_select: &mut ast::OneSelect,
+    rewrite_expr: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut ast::Expr) -> Result<()>,
+{
+    match one_select {
+        ast::OneSelect::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            window_clause,
+            ..
+        } => {
+            for col in columns {
+                if let ast::ResultColumn::Expr(expr, _) = col {
+                    rewrite_expression_tree(expr, rewrite_expr)?;
+                }
+            }
+
+            if let Some(from_clause) = from {
+                rewrite_from_clause_expressions(from_clause, rewrite_expr)?;
+            }
+
+            if let Some(where_expr) = where_clause {
+                rewrite_expression_tree(where_expr, rewrite_expr)?;
+            }
+
+            if let Some(group_by) = group_by {
+                for expr in &mut group_by.exprs {
+                    rewrite_expression_tree(expr, rewrite_expr)?;
+                }
+                if let Some(having_expr) = &mut group_by.having {
+                    rewrite_expression_tree(having_expr, rewrite_expr)?;
+                }
+            }
+
+            for window_def in window_clause {
+                rewrite_window_expressions(&mut window_def.window, rewrite_expr)?;
+            }
+        }
+        ast::OneSelect::Values(values) => {
+            for row in values {
+                for expr in row {
+                    rewrite_expression_tree(expr, rewrite_expr)?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn rewrite_from_clause_expressions<F>(
+    from_clause: &mut ast::FromClause,
+    rewrite_expr: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut ast::Expr) -> Result<()>,
+{
+    rewrite_select_table_expressions(&mut from_clause.select, rewrite_expr)?;
+
+    for join in &mut from_clause.joins {
+        rewrite_select_table_expressions(&mut join.table, rewrite_expr)?;
+        if let Some(ast::JoinConstraint::On(expr)) = &mut join.constraint {
+            rewrite_expression_tree(expr, rewrite_expr)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn rewrite_select_table_expressions<F>(
+    select_table: &mut ast::SelectTable,
+    rewrite_expr: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut ast::Expr) -> Result<()>,
+{
+    match select_table {
+        ast::SelectTable::Table(..) => {}
+        ast::SelectTable::TableCall(_, args, _) => {
+            for arg in args {
+                rewrite_expression_tree(arg, rewrite_expr)?;
+            }
+        }
+        ast::SelectTable::Select(select, _) => {
+            rewrite_select_expressions(select, rewrite_expr)?;
+        }
+        ast::SelectTable::Sub(from_clause, _) => {
+            rewrite_from_clause_expressions(from_clause, rewrite_expr)?;
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_window_expressions<F>(window: &mut ast::Window, rewrite_expr: &mut F) -> Result<()>
+where
+    F: FnMut(&mut ast::Expr) -> Result<()>,
+{
+    for expr in &mut window.partition_by {
+        rewrite_expression_tree(expr, rewrite_expr)?;
+    }
+
+    for sorted_col in &mut window.order_by {
+        rewrite_expression_tree(&mut sorted_col.expr, rewrite_expr)?;
+    }
+
+    if let Some(frame_clause) = &mut window.frame_clause {
+        rewrite_frame_bound_expressions(&mut frame_clause.start, rewrite_expr)?;
+        if let Some(end) = &mut frame_clause.end {
+            rewrite_frame_bound_expressions(end, rewrite_expr)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn rewrite_frame_bound_expressions<F>(
+    frame_bound: &mut ast::FrameBound,
+    rewrite_expr: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut ast::Expr) -> Result<()>,
+{
+    match frame_bound {
+        ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr) => {
+            rewrite_expression_tree(expr, rewrite_expr)?;
+        }
+        ast::FrameBound::CurrentRow
+        | ast::FrameBound::UnboundedFollowing
+        | ast::FrameBound::UnboundedPreceding => {}
+    }
+    Ok(())
+}
+
+fn rewrite_expression_tree<F>(expr: &mut ast::Expr, rewrite_expr: &mut F) -> Result<()>
+where
+    F: FnMut(&mut ast::Expr) -> Result<()>,
+{
+    walk_expr_mut(
+        expr,
+        &mut |e: &mut ast::Expr| -> Result<expr::WalkControl> {
+            rewrite_expr(e)?;
+            Ok(WalkControl::Continue)
+        },
+    )?;
+
+    Ok(())
+}
+
+fn rewrite_trigger_expr_single_for_when_clause(
+    expr: &mut ast::Expr,
+    table: &BTreeTable,
+    ctx: &TriggerContext,
+    allow_non_trigger_qualified: bool,
+) -> Result<()> {
+    match expr {
+        // Bare column references are not valid in trigger WHEN clauses.
+        // Per SQLite docs, columns must be qualified with NEW or OLD.
+        Expr::Id(name) if !allow_non_trigger_qualified => {
+            let ident = normalize_ident(name.as_str());
+            if table.get_column(&ident).is_some()
+                || ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&ident))
+            {
+                crate::bail_parse_error!("no such column: {}", ident);
+            }
+            return Ok(());
+        }
+        Expr::Exists(select) | Expr::Subquery(select) => {
+            rewrite_expressions_in_select_for_when_clause(select, table, ctx)?;
+            return Ok(());
+        }
+        Expr::InSelect { rhs, .. } => {
+            rewrite_expressions_in_select_for_when_clause(rhs, table, ctx)?;
+            return Ok(());
+        }
+        Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
+            let ns = normalize_ident(ns.as_str());
+            let col = normalize_ident(col.as_str());
+
+            // Handle NEW.column references
+            if ns.eq_ignore_ascii_case("new") {
+                if let Some(new_regs) = &ctx.new_registers {
+                    if let Some((idx, col_def)) = table.get_column(&col) {
+                        if col_def.is_rowid_alias() {
+                            // Rowid alias columns map to the rowid register (last element)
+                            *expr = Expr::Register(
+                                *new_regs.last().expect("NEW registers must be provided"),
+                            );
+                            return Ok(());
+                        }
+                        if idx < new_regs.len() {
+                            *expr = Expr::Register(new_regs[idx]);
+                            return Ok(());
+                        }
+                    }
+                    // Handle NEW.rowid
+                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
+                        *expr = Expr::Register(
+                            *ctx.new_registers
+                                .as_ref()
+                                .expect("NEW registers must be provided")
+                                .last()
+                                .expect("NEW registers must be provided"),
+                        );
+                        return Ok(());
+                    }
+                    bail_parse_error!("no such column in NEW: {}", col);
+                } else {
+                    bail_parse_error!(
+                        "NEW references are only valid in INSERT and UPDATE triggers"
+                    );
+                }
+            }
+
+            // Handle OLD.column references
+            if ns.eq_ignore_ascii_case("old") {
+                if let Some(old_regs) = &ctx.old_registers {
+                    if let Some((idx, _)) = table.get_column(&col) {
+                        if idx < old_regs.len() {
+                            *expr = Expr::Register(old_regs[idx]);
+                            return Ok(());
+                        }
+                    }
+                    // Handle OLD.rowid
+                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
+                        *expr = Expr::Register(
+                            *ctx.old_registers
+                                .as_ref()
+                                .expect("OLD registers must be provided")
+                                .last()
+                                .expect("OLD registers must be provided"),
+                        );
+                        return Ok(());
+                    }
+                    bail_parse_error!("no such column in OLD: {}", col);
+                } else {
+                    bail_parse_error!(
+                        "OLD references are only valid in UPDATE and DELETE triggers"
+                    );
+                }
+            }
+
+            if !allow_non_trigger_qualified {
+                bail_parse_error!("no such column: {ns}.{col}");
+            }
+        }
+        _ => {}
+    }
+
     Ok(())
 }
