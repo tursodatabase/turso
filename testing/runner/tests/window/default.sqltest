@@ -411,6 +411,13 @@ expect error {
     no such function
 }
 
+test window-function-without-over {
+    SELECT row_number() FROM products;
+}
+expect error {
+    misuse of window function
+}
+
 test window-scalar-function-star {
     SELECT
     lower(*) OVER (PARTITION BY price)
@@ -765,3 +772,55 @@ expect {
     7
 }
 
+test window-row-number-order-by {
+    WITH t(v) AS (
+        VALUES (3), (1), (2)
+    )
+    SELECT v, row_number() OVER (ORDER BY v)
+    FROM t
+    ORDER BY v;
+}
+expect {
+    1|1
+    2|2
+    3|3
+}
+
+test window-row-number-no-order-by {
+    WITH t(v) AS (
+        VALUES (3), (1), (2)
+    )
+    SELECT v, row_number() OVER ()
+    FROM t
+    ORDER BY 2;
+}
+expect {
+    3|1
+    1|2
+    2|3
+}
+
+test window-row-number-with-peers {
+    WITH t(p, o, val) AS (
+        VALUES
+            ('x', 1, 'a'),
+            ('x', 1, 'b'),
+            ('x', 2, 'c'),
+            ('y', 1, 'd'),
+            ('y', 1, 'e')
+    )
+    SELECT
+        p,
+        o,
+        row_number(*) OVER (PARTITION BY p ORDER BY o),
+        count(*) OVER (PARTITION BY p ORDER BY o)
+    FROM t
+    ORDER BY p, 3;
+}
+expect {
+    x|1|1|2
+    x|1|2|2
+    x|2|3|3
+    y|1|1|2
+    y|1|2|2
+}

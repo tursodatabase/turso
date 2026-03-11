@@ -187,17 +187,14 @@ expect error {
 }
 
 @skip-if mvcc "ATTACH is not supported in MVCC mode"
-@skip-if sqlite "sqlite views cannot reference attached databases"
 test alter-table-rename-column-view-attached-db-qualified {
     ATTACH ':memory:' AS aux;
     CREATE TABLE t (a, b);
     CREATE TABLE aux.t (a, b);
     CREATE VIEW v AS SELECT a, b FROM aux.t;
-    ALTER TABLE t RENAME COLUMN b TO c;
-    SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'v';
 }
-expect {
-    CREATE VIEW v AS SELECT a, b FROM aux.t
+expect error {
+    view .*cannot reference.*database.*aux
 }
 
 # https://github.com/tursodatabase/turso/issues/5246
