@@ -206,6 +206,41 @@ expect {
 }
 
 # =============================================================================
+# Collation-sensitive eq-prefix skip
+# =============================================================================
+
+setup collation_eq_prefix_schema {
+    CREATE TABLE collated_values (
+        a TEXT COLLATE NOCASE NOT NULL,
+        b TEXT COLLATE RTRIM NOT NULL,
+        c TEXT COLLATE BINARY NOT NULL,
+        UNIQUE(a, b, c)
+    );
+
+    INSERT INTO collated_values VALUES ('a', 'aa', '1');
+    INSERT INTO collated_values VALUES ('A', 'zz', '1');
+    INSERT INTO collated_values VALUES ('a', 'mm', '2');
+    INSERT INTO collated_values VALUES ('A', 'yy', '2');
+}
+
+# a = 'a' is evaluated with NOCASE and therefore matches both 'a' and 'A'.
+# ORDER BY a COLLATE BINARY must still distinguish those values, so the
+# optimizer must not skip the leading ORDER BY term as "constant".
+@setup collation_eq_prefix_schema
+test eq-prefix-collation-mismatch-is-not-constant {
+    SELECT a, b, c
+    FROM collated_values
+    WHERE a = 'a'
+    ORDER BY a COLLATE BINARY ASC, b COLLATE RTRIM ASC, c ASC, rowid ASC;
+}
+expect {
+    A|yy|2
+    A|zz|1
+    a|aa|1
+    a|mm|2
+}
+
+# =============================================================================
 # JOIN tests — verify eq-skip interacts correctly with multi-table ORDER BY
 # =============================================================================
 

@@ -297,6 +297,17 @@ pub fn plan_satisfies_order_target(
                             let same_col =
                                 target_matches_index_column(target_col, idx_col, table_ref);
                             if same_col {
+                                // An equality constraint only makes the ORDER BY term
+                                // "constant" if it compares values the same way that
+                                // ORDER BY does. For example, `a = 'x'` under NOCASE
+                                // does not make `ORDER BY a COLLATE BINARY` constant:
+                                // both 'x' and 'X' can match the filter but still sort
+                                // differently under BINARY.
+                                let same_collation =
+                                    target_col.collation == idx_col.collation.unwrap_or_default();
+                                if !same_collation {
+                                    break;
+                                }
                                 col_idx += 1; // target satisfied by constant
                             }
                             idx_pos += 1; // advance index regardless
