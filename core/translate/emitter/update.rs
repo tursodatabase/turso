@@ -924,13 +924,23 @@ fn emit_update_insns<'a>(
                 .chain(std::iter::once(new_rowid_reg))
                 .collect();
 
-            // If the program has a trigger_conflict_override, propagate it to the trigger context.
+            // Propagate conflict resolution to trigger context:
+            // 1. UPSERT DO UPDATE override takes precedence
+            // 2. Outer UPDATE's explicit ON CONFLICT overrides trigger body
+            // 3. Otherwise, use trigger's own conflict resolution
             let trigger_ctx = if let Some(override_conflict) = program.trigger_conflict_override {
                 TriggerContext::new_with_override_conflict(
                     btree_table,
                     Some(new_registers),
                     Some(old_registers.clone()), // Clone for AFTER trigger
                     override_conflict,
+                )
+            } else if !matches!(or_conflict, ResolveType::Abort) {
+                TriggerContext::new_with_override_conflict(
+                    btree_table,
+                    Some(new_registers),
+                    Some(old_registers.clone()),
+                    or_conflict,
                 )
             } else {
                 TriggerContext::new(
@@ -2093,7 +2103,7 @@ fn emit_update_insns<'a>(
                 // Use preserved OLD registers from BEFORE trigger
                 let old_registers_after = preserved_old_registers;
 
-                // If the program has a trigger_conflict_override, propagate it to the trigger context.
+                // Propagate conflict resolution to AFTER trigger context (same logic as BEFORE)
                 let trigger_ctx_after =
                     if let Some(override_conflict) = program.trigger_conflict_override {
                         TriggerContext::new_after_with_override_conflict(
@@ -2101,6 +2111,13 @@ fn emit_update_insns<'a>(
                             Some(new_registers_after),
                             old_registers_after, // OLD values preserved from BEFORE trigger
                             override_conflict,
+                        )
+                    } else if !matches!(or_conflict, ResolveType::Abort) {
+                        TriggerContext::new_after_with_override_conflict(
+                            btree_table,
+                            Some(new_registers_after),
+                            old_registers_after,
+                            or_conflict,
                         )
                     } else {
                         TriggerContext::new_after(
