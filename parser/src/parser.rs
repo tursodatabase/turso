@@ -4042,7 +4042,9 @@ impl<'a> Parser<'a> {
         let select = self.parse_select()?;
         let (upsert, returning) = self.parse_upsert()?;
         if !returning.is_empty() {
-            return Err(Error::Custom("cannot use RETURNING in a trigger".to_owned()));
+            return Err(Error::Custom(
+                "cannot use RETURNING in a trigger".to_owned(),
+            ));
         }
         Ok(TriggerCmd::Insert {
             or_conflict: resolve_type,
@@ -4063,7 +4065,9 @@ impl<'a> Parser<'a> {
         let from = self.parse_from_clause_opt()?;
         let where_clause = self.parse_where()?;
         if matches!(self.peek()?, Some(tok) if tok.token_type == TK_RETURNING) {
-            return Err(Error::Custom("cannot use RETURNING in a trigger".to_owned()));
+            return Err(Error::Custom(
+                "cannot use RETURNING in a trigger".to_owned(),
+            ));
         }
         Ok(TriggerCmd::Update {
             or_conflict,
@@ -4080,7 +4084,9 @@ impl<'a> Parser<'a> {
         let tbl_name = self.parse_nm()?;
         let where_clause = self.parse_where()?;
         if matches!(self.peek()?, Some(tok) if tok.token_type == TK_RETURNING) {
-            return Err(Error::Custom("cannot use RETURNING in a trigger".to_owned()));
+            return Err(Error::Custom(
+                "cannot use RETURNING in a trigger".to_owned(),
+            ));
         }
         Ok(TriggerCmd::Delete {
             tbl_name,
