@@ -4,7 +4,7 @@ use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, JoinConstraint, TableInternalId};
 
 use super::emitter::Resolver;
-use super::expr::{walk_expr_mut, WalkControl};
+use super::expr::{walk_expr, walk_expr_mut, WalkControl};
 use super::optimizer::TakeOwnership;
 use super::plan::{JoinInfo, TableReferences};
 use super::planner::parse_row_id;
@@ -293,6 +293,12 @@ pub struct BoundSelect {
     pub tracking: BindTracking,
 }
 
+#[derive(Clone)]
+struct OuterQueryFrame {
+    scope: BindScopeRef,
+    aliases: Vec<BoundColumn>,
+}
+
 impl BoundSelect {
     pub fn into_table_references(self) -> Result<TableReferences> {
         let joined_tables = self
@@ -400,12 +406,8 @@ pub struct BindContext<'a, G: IdGenerator> {
     /// Generates unique table IDs for scope tables.
     id_gen: &'a mut G,
 
-    /// Stack of outer query scopes.
-    ///
-    /// When entering a subquery, the parent scope is pushed here.
-    /// `outer_scopes_iter()` returns them innermost-first (reversed),
-    /// matching column lookup precedence.
-    outer_scopes: Vec<BindScopeRef>,
+    /// Stack of outer query scopes plus visible aliases.
+    outer_query_frames: Vec<OuterQueryFrame>,
 
     /// Outer FROM schema for LATERAL join support.
     outer_from_scope: Option<BindScopeRef>,
@@ -429,7 +431,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         Self {
             resolver,
             id_gen,
-            outer_scopes: Vec::new(),
+            outer_query_frames: Vec::new(),
             outer_from_scope: None,
             ctes: HashMap::default(),
             aliases: Vec::new(),
@@ -441,24 +443,32 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
     // ── Outer scope stack (mirrors DataFusion PlannerContext) ─────────
 
     /// Push a scope onto the outer-scope stack (entering a subquery).
-    fn append_outer_query_scope(&mut self, scope: BindScopeRef) {
-        self.outer_scopes.push(scope);
+    fn append_outer_query_scope(&mut self, scope: BindScopeRef, aliases: Vec<BoundColumn>) {
+        self.outer_query_frames
+            .push(OuterQueryFrame { scope, aliases });
     }
 
     /// Pop the most recent outer scope (exiting a subquery).
-    fn pop_outer_query_scope(&mut self) -> Option<BindScopeRef> {
-        self.outer_scopes.pop()
+    fn pop_outer_query_scope(&mut self) -> Option<OuterQueryFrame> {
+        self.outer_query_frames.pop()
     }
 
     /// Iterate outer scopes innermost-first (reversed storage order).
     /// Matches column lookup precedence: nearest enclosing query first.
     fn outer_scopes_iter(&self) -> impl Iterator<Item = &BindScopeRef> {
-        self.outer_scopes.iter().rev()
+        self.outer_query_frames
+            .iter()
+            .rev()
+            .map(|frame| &frame.scope)
+    }
+
+    fn outer_query_frames_iter(&self) -> impl Iterator<Item = &OuterQueryFrame> {
+        self.outer_query_frames.iter().rev()
     }
 
     /// The immediately enclosing query's scope (if any).
     fn latest_outer_scope(&self) -> Option<&BindScopeRef> {
-        self.outer_scopes.last()
+        self.outer_query_frames.last().map(|frame| &frame.scope)
     }
 
     // ── Outer FROM (LATERAL support) ─────────────────────────────────
@@ -714,9 +724,9 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         })?;
                     }
 
-                    // 5. Bind GROUP BY and HAVING (AliasFirst phase)
+                    // 5. Bind GROUP BY and HAVING (table columns win in GROUP BY)
                     if let Some(group_by) = group_by {
-                        ctx.with_phase(BindPhase::AliasFirst, |ctx| {
+                        ctx.with_phase(BindPhase::TableFirst, |ctx| {
                             ctx.bind_group_by(group_by, &scope)
                         })?;
                     }
@@ -751,11 +761,17 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
     /// Bind GROUP BY expressions and HAVING clause.
     fn bind_group_by(&mut self, group_by: &mut ast::GroupBy, scope: &BindScope) -> Result<()> {
-        for expr in &mut group_by.exprs {
-            self.bind_expr(expr, scope)?;
-        }
+        let saved_outer_query_frames = std::mem::take(&mut self.outer_query_frames);
+        let group_result: Result<()> = (|| {
+            for expr in &mut group_by.exprs {
+                self.bind_expr(expr, scope)?;
+            }
+            Ok(())
+        })();
+        self.outer_query_frames = saved_outer_query_frames;
+        group_result?;
         if let Some(having) = &mut group_by.having {
-            self.bind_expr(having, scope)?;
+            self.with_phase(BindPhase::AliasFirst, |ctx| ctx.bind_expr(having, scope))?;
         }
         Ok(())
     }
@@ -982,6 +998,28 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             .map(|alias| alias.expr.clone())
     }
 
+    fn resolve_outer_alias(&mut self, name: &str) -> Option<ast::Expr> {
+        let normalized = normalize_ident(name);
+        let resolved = self.outer_query_frames_iter().find_map(|frame| {
+            frame
+                .aliases
+                .iter()
+                .find(|alias| alias.name.eq_ignore_ascii_case(&normalized))
+                .map(|alias| alias.expr.clone())
+        })?;
+        self.record_outer_refs_in_expr(&resolved);
+        Some(resolved)
+    }
+
+    fn record_outer_refs_in_expr(&mut self, expr: &ast::Expr) {
+        let _ = walk_expr(expr, &mut |expr| {
+            if let ast::Expr::Column { table, column, .. } = expr {
+                self.tracking.record_outer_ref(*table, *column);
+            }
+            Ok(WalkControl::Continue)
+        });
+    }
+
     fn resolve_unqualified_column(
         &mut self,
         name: &str,
@@ -1077,12 +1115,14 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     BindPhase::NoAliases => self.resolve_unqualified_column(id.as_str(), scope)?,
                     BindPhase::TableFirst => self
                         .resolve_unqualified_column(id.as_str(), scope)?
-                        .or_else(|| self.resolve_alias(id.as_str())),
+                        .or_else(|| self.resolve_alias(id.as_str()))
+                        .or_else(|| self.resolve_outer_alias(id.as_str())),
                     BindPhase::AliasFirst => {
                         if let Some(alias) = self.resolve_alias(id.as_str()) {
                             Some(alias)
                         } else {
                             self.resolve_unqualified_column(id.as_str(), scope)?
+                                .or_else(|| self.resolve_outer_alias(id.as_str()))
                         }
                     }
                 };
@@ -1149,7 +1189,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
     }
 
     fn bind_subquery_expr(&mut self, select: &mut ast::Select, scope: &BindScope) -> Result<()> {
-        self.append_outer_query_scope(Arc::new(scope.clone()));
+        self.append_outer_query_scope(Arc::new(scope.clone()), self.aliases.clone());
         let result = self.bind_select(select);
         self.pop_outer_query_scope();
         result.map(|_| ())
@@ -1506,25 +1546,12 @@ mod tests {
     }
 
     #[test]
-    fn group_by_prefers_alias_expression_over_table_column() {
+    fn group_by_prefers_source_column_over_alias_expression() {
         with_bind_context(&["CREATE TABLE t(a, b)"], |ctx| {
             let mut select = parse_select("SELECT a + 1 AS b FROM t GROUP BY b");
             ctx.bind_select(&mut select).unwrap();
 
-            assert_eq!(
-                group_by_expr(&select, 0),
-                &ast::Expr::Binary(
-                    ast::Expr::Column {
-                        database: None,
-                        table: TableInternalId::from(0usize),
-                        column: 0,
-                        is_rowid_alias: false,
-                    }
-                    .into_boxed(),
-                    ast::Operator::Add,
-                    ast::Expr::Literal(ast::Literal::Numeric("1".into())).into_boxed(),
-                )
-            );
+            assert_column_expr(group_by_expr(&select, 0), 0, 1);
         });
     }
 
@@ -1733,7 +1760,7 @@ mod tests {
             );
 
             assert_eq!(select_expr(&select, 0), &alias_expr);
-            assert_eq!(group_by_expr(&select, 0), &alias_expr);
+            assert_column_expr(group_by_expr(&select, 0), 1, 1);
 
             let ast::Expr::Binary(lhs, ast::Operator::Greater, rhs) = having_expr(&select) else {
                 panic!("expected bound HAVING binary expression");
@@ -1766,9 +1793,11 @@ mod tests {
     #[test]
     fn correlated_subquery_group_by_does_not_capture_outer_column_without_inner_match() {
         with_bind_context(&["CREATE TABLE t1(a, b)", "CREATE TABLE t2(x, y)"], |ctx| {
-            let err =
-                bind_select_error(ctx, "SELECT a FROM t1 WHERE EXISTS (SELECT x FROM t2 GROUP BY a)")
-                    .to_string();
+            let err = bind_select_error(
+                ctx,
+                "SELECT a FROM t1 WHERE EXISTS (SELECT x FROM t2 GROUP BY a)",
+            )
+            .to_string();
             assert!(err.contains("no such column: a"), "unexpected error: {err}");
         });
     }
@@ -1862,7 +1891,7 @@ mod tests {
                 parse_select("SELECT -a AS b, a, t.b FROM t ORDER BY (SELECT b)");
             ctx.bind_select(&mut source_preferred).unwrap();
             let order_subquery = subquery_expr(order_by_expr(&source_preferred, 0));
-            assert_column_expr(select_expr(order_subquery, 0), 0, 1);
+            assert_eq!(select_expr(order_subquery, 0), select_expr(&source_preferred, 2));
         });
     }
 
@@ -1895,19 +1924,7 @@ mod tests {
             ctx.bind_select(&mut nested_where).unwrap();
             let first_exists = exists_subquery(&nested_where);
             let second_exists = exists_subquery(first_exists);
-            assert_eq!(
-                select_expr(second_exists, 0),
-                &ast::Expr::Unary(
-                    ast::UnaryOperator::Negative,
-                    ast::Expr::Column {
-                        database: None,
-                        table: TableInternalId::from(0usize),
-                        column: 0,
-                        is_rowid_alias: false,
-                    }
-                    .into_boxed(),
-                )
-            );
+            assert_eq!(select_expr(second_exists, 0), select_expr(&nested_where, 0));
         });
     }
 }
