@@ -1593,7 +1593,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@tursodatabase/database-common@npm:^0.5.0-pre.20, @tursodatabase/database-common@workspace:packages/common":
+"@tursodatabase/database-common@npm:^0.6.0-pre.1, @tursodatabase/database-common@workspace:packages/common":
   version: 0.0.0-use.local
   resolution: "@tursodatabase/database-common@workspace:packages/common"
   dependencies:
@@ -1602,7 +1602,7 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@tursodatabase/database-wasm-common@npm:^0.5.0-pre.20, @tursodatabase/database-wasm-common@workspace:packages/wasm-common":
+"@tursodatabase/database-wasm-common@npm:^0.6.0-pre.1, @tursodatabase/database-wasm-common@workspace:packages/wasm-common":
   version: 0.0.0-use.local
   resolution: "@tursodatabase/database-wasm-common@workspace:packages/wasm-common"
   dependencies:
@@ -1616,8 +1616,8 @@ __metadata:
   resolution: "@tursodatabase/database-wasm@workspace:packages/wasm"
   dependencies:
     "@napi-rs/cli": "npm:^3.1.5"
-    "@tursodatabase/database-common": "npm:^0.5.0-pre.20"
-    "@tursodatabase/database-wasm-common": "npm:^0.5.0-pre.20"
+    "@tursodatabase/database-common": "npm:^0.6.0-pre.1"
+    "@tursodatabase/database-wasm-common": "npm:^0.6.0-pre.1"
     "@vitest/browser": "npm:^3.2.4"
     playwright: "npm:^1.55.0"
     typescript: "npm:^5.9.2"
@@ -1631,7 +1631,7 @@ __metadata:
   resolution: "@tursodatabase/database@workspace:packages/native"
   dependencies:
     "@napi-rs/cli": "npm:^3.1.5"
-    "@tursodatabase/database-common": "npm:^0.5.0-pre.20"
+    "@tursodatabase/database-common": "npm:^0.6.0-pre.1"
     "@types/node": "npm:^24.3.1"
     better-sqlite3: "npm:^12.2.0"
     drizzle-kit: "npm:^0.31.4"
@@ -1648,11 +1648,11 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@tursodatabase/sync-common@npm:^0.5.0-pre.20, @tursodatabase/sync-common@workspace:sync/packages/common":
+"@tursodatabase/sync-common@npm:^0.6.0-pre.1, @tursodatabase/sync-common@workspace:sync/packages/common":
   version: 0.0.0-use.local
   resolution: "@tursodatabase/sync-common@workspace:sync/packages/common"
   dependencies:
-    "@tursodatabase/database-common": "npm:^0.5.0-pre.20"
+    "@tursodatabase/database-common": "npm:^0.6.0-pre.1"
     "@tursodatabase/serverless": "npm:^0.2.2"
     typescript: "npm:^5.9.2"
   languageName: unknown
@@ -1663,9 +1663,9 @@ __metadata:
   resolution: "@tursodatabase/sync-wasm@workspace:sync/packages/wasm"
   dependencies:
     "@napi-rs/cli": "npm:^3.1.5"
-    "@tursodatabase/database-common": "npm:^0.5.0-pre.20"
-    "@tursodatabase/database-wasm-common": "npm:^0.5.0-pre.20"
-    "@tursodatabase/sync-common": "npm:^0.5.0-pre.20"
+    "@tursodatabase/database-common": "npm:^0.6.0-pre.1"
+    "@tursodatabase/database-wasm-common": "npm:^0.6.0-pre.1"
+    "@tursodatabase/sync-common": "npm:^0.6.0-pre.1"
     "@vitest/browser": "npm:^3.2.4"
     playwright: "npm:^1.57.0"
     typescript: "npm:^5.9.2"
@@ -1679,8 +1679,8 @@ __metadata:
   resolution: "@tursodatabase/sync@workspace:sync/packages/native"
   dependencies:
     "@napi-rs/cli": "npm:^3.1.5"
-    "@tursodatabase/database-common": "npm:^0.5.0-pre.20"
-    "@tursodatabase/sync-common": "npm:^0.5.0-pre.20"
+    "@tursodatabase/database-common": "npm:^0.6.0-pre.1"
+    "@tursodatabase/sync-common": "npm:^0.6.0-pre.1"
     "@types/node": "npm:^24.3.1"
     typescript: "npm:^5.9.2"
     vitest: "npm:^3.2.4"
@@ -3556,15 +3556,15 @@ __metadata:
   linkType: hard
 
 "tar@npm:^7.5.4":
-  version: 7.5.9
-  resolution: "tar@npm:7.5.9"
+  version: 7.5.11
+  resolution: "tar@npm:7.5.11"
   dependencies:
     "@isaacs/fs-minipass": "npm:^4.0.0"
     chownr: "npm:^3.0.0"
     minipass: "npm:^7.1.2"
     minizlib: "npm:^3.1.0"
     yallist: "npm:^5.0.0"
-  checksum: 10c0/e870beb1b2477135ca2abe86b2d18f7b35d0a4e3a37bbc523d3b8f7adca268dfab543f26528a431d569897f8c53a7cac745cdfbc4411c2f89aeeacc652b81b0a
+  checksum: 10c0/b6bb420550ef50ef23356018155e956cd83282c97b6128d8d5cfe5740c57582d806a244b2ef0bf686a74ce526babe8b8b9061527623e935e850008d86d838929
   languageName: node
   linkType: hard
 
