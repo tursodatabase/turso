@@ -334,10 +334,15 @@ impl OpenLoop {
                             let is_rowid = index.is_none();
                             let ephemeral_cursor_id = match source {
                                 InSeekSource::LiteralList { values, affinity } => {
+                                    // Literal RHS values are materialized once into a unique
+                                    // ephemeral index. The main loop then iterates that cursor
+                                    // and performs one equality seek per materialized key.
                                     let label_once_end = program.allocate_label();
                                     program.emit_insn(Insn::Once {
                                         target_pc_when_reentered: label_once_end,
                                     });
+                                    // Match the target index's first-key collation so the
+                                    // ephemeral RHS uses the same comparison semantics.
                                     let collation = index
                                         .as_ref()
                                         .and_then(|idx| idx.columns.first())
@@ -410,6 +415,10 @@ impl OpenLoop {
                             let outer_loop_start = program.allocate_label();
                             program.preassign_label_to_next_insn(outer_loop_start);
                             let seek_reg = program.alloc_register();
+                            // The emitted loop is:
+                            //   for each RHS key in the ephemeral cursor
+                            //     seek table/index to that key
+                            //     scan all matching rows for that key
                             program.emit_insn(Insn::Column {
                                 cursor_id: ephemeral_cursor_id,
                                 column: 0,
@@ -456,6 +465,9 @@ impl OpenLoop {
                                 }
                             }
 
+                            // `close_loop` uses this metadata to stitch together the outer
+                            // ephemeral-value loop and the inner scan over matches for the
+                            // current value.
                             t_ctx.meta_in_seeks[joined_table_index] = Some(InSeekMetadata {
                                 ephemeral_cursor_id,
                                 outer_loop_start,

@@ -189,13 +189,20 @@ impl CloseLoop {
                             let outer_loop_start = meta.outer_loop_start;
                             let next_val_label = meta.next_val_label;
 
-                            if index.is_some() {
+                            let can_have_multiple_matches = index.is_some();
+                            if can_have_multiple_matches {
+                                // Rowid InSeek uses SeekRowid, so one RHS key can produce at
+                                // most one row. Index-backed InSeek can hit duplicates, so
+                                // keep scanning the current key's match range before advancing
+                                // the ephemeral cursor to the next IN value.
                                 program.emit_insn(Insn::Next {
                                     cursor_id: iteration_cursor_id,
                                     pc_if_next: loop_labels.loop_start,
                                 });
                             }
 
+                            // Once the current key is exhausted (or a seek found nothing),
+                            // advance the outer ephemeral cursor and restart the equality seek.
                             program.resolve_label(next_val_label, program.offset());
                             program.emit_insn(Insn::Next {
                                 cursor_id: ephemeral_cursor_id,

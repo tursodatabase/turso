@@ -333,6 +333,16 @@ pub(super) fn choose_best_btree_candidate(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Evaluate whether an `IN (...)` predicate should replace the ordinary btree
+/// access path with repeated equality seeks.
+///
+/// This is intentionally separate from `choose_best_btree_candidate()`: the
+/// generic btree chooser reasons about a single continuous scan/seek over one
+/// candidate, while `InSeek` emits a two-level loop that materializes the RHS
+/// into an ephemeral cursor and performs one equality seek per RHS value.
+/// Because of that execution shape, only rowid or the first column of an index
+/// can drive `InSeek`, and the comparison collation must match the chosen
+/// index's first-key collation.
 fn consider_in_seek_access_method(
     rhs_table: &JoinedTable,
     rhs_constraints: &TableConstraints,
@@ -399,6 +409,9 @@ fn consider_in_seek_access_method(
                 continue;
             }
 
+            // `open_loop` copies the chosen index collation onto the ephemeral
+            // IN cursor. Reject mismatches here so a BINARY `IN` comparison
+            // cannot silently become `NOCASE`/`RTRIM` just because the index is.
             if let (Some(index), Some(col_pos)) = (&candidate.index, constraint.table_col_pos) {
                 let constrained_column = &rhs_table.table.columns()[col_pos];
                 let table_collation = constrained_column.collation();
