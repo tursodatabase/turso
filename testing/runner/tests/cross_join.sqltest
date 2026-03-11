@@ -1,0 +1,539 @@
+@database :memory:
+
+
+test cross-join-basic-2x2 {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (10), (20);
+    SELECT t1.a, t2.b FROM t1 CROSS JOIN t2 ORDER BY t1.a, t2.b;
+}
+expect {
+    1|10
+    1|20
+    2|10
+    2|20
+}
+
+test cross-join-left-empty {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t2 VALUES (10), (20);
+    SELECT t1.a, t2.b FROM t1 CROSS JOIN t2 ORDER BY t1.a, t2.b;
+}
+expect {
+}
+
+test cross-join-right-empty {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (2);
+    SELECT t1.a, t2.b FROM t1 CROSS JOIN t2 ORDER BY t1.a, t2.b;
+}
+expect {
+}
+
+test cross-join-both-empty {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    SELECT t1.a, t2.b FROM t1 CROSS JOIN t2 ORDER BY t1.a, t2.b;
+}
+expect {
+}
+
+test cross-join-single-left-row {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (7);
+    INSERT INTO t2 VALUES (10), (20), (30);
+    SELECT t1.a, t2.b FROM t1 CROSS JOIN t2 ORDER BY t2.b;
+}
+expect {
+    7|10
+    7|20
+    7|30
+}
+
+test cross-join-single-right-row {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (99);
+    SELECT t1.a, t2.b FROM t1 CROSS JOIN t2 ORDER BY t1.a;
+}
+expect {
+    1|99
+    2|99
+    3|99
+}
+
+test cross-join-count-star {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (10), (20);
+    SELECT count(*) FROM t1 CROSS JOIN t2;
+}
+expect {
+    6
+}
+
+test cross-join-null-values {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (NULL);
+    INSERT INTO t2 VALUES (10), (NULL);
+    SELECT t1.a, t2.b FROM t1 CROSS JOIN t2
+    ORDER BY t1.a IS NOT NULL, t1.a, t2.b IS NOT NULL, t2.b;
+}
+expect {
+    |
+    |10
+    1|
+    1|10
+}
+
+test cross-join-text-values {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES ('a'), ('b');
+    INSERT INTO t2 VALUES ('x'), ('y');
+    SELECT t1.a, t2.b, t1.a || t2.b FROM t1 CROSS JOIN t2 ORDER BY t1.a, t2.b;
+}
+expect {
+    a|x|ax
+    a|y|ay
+    b|x|bx
+    b|y|by
+}
+
+test cross-join-mixed-types {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES ('10'), ('abc');
+    SELECT t1.a, t2.b, t1.a + t2.b FROM t1 CROSS JOIN t2 ORDER BY t1.a, t2.b;
+}
+expect {
+    1|10|11
+    1|abc|1
+    2|10|12
+    2|abc|2
+}
+
+test cross-join-expressions {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (2), (3);
+    INSERT INTO t2 VALUES (4), (5);
+    SELECT t1.a, t2.b, t1.a * t2.b, t1.a + t2.b
+    FROM t1 CROSS JOIN t2
+    ORDER BY t1.a, t2.b;
+}
+expect {
+    2|4|8|6
+    2|5|10|7
+    3|4|12|7
+    3|5|15|8
+}
+
+test cross-join-with-aliases {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (5), (6);
+    INSERT INTO t2 VALUES (7), (8);
+    SELECT l.a, r.b, l.a - r.b
+    FROM t1 AS l CROSS JOIN t2 AS r
+    ORDER BY l.a, r.b;
+}
+expect {
+    5|7|-2
+    5|8|-3
+    6|7|-1
+    6|8|-2
+}
+
+test cross-join-where-filter {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (10), (20), (30);
+    SELECT t1.a, t2.b
+    FROM t1 CROSS JOIN t2
+    WHERE t1.a + t2.b = 22 OR t1.a + t2.b = 33
+    ORDER BY t1.a, t2.b;
+}
+expect {
+    2|20
+    3|30
+}
+
+test cross-join-where-false {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (10), (20);
+    SELECT t1.a, t2.b
+    FROM t1 CROSS JOIN t2
+    WHERE 0
+    ORDER BY t1.a, t2.b;
+}
+expect {
+}
+
+test cross-join-where-null-predicate {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (NULL);
+    INSERT INTO t2 VALUES (10), (NULL);
+    SELECT t1.a, t2.b
+    FROM t1 CROSS JOIN t2
+    WHERE t1.a IS NULL OR t2.b IS NULL
+    ORDER BY t1.a IS NOT NULL, t1.a, t2.b IS NOT NULL, t2.b;
+}
+expect {
+    |
+    |10
+    1|
+}
+
+test cross-join-order-by-desc-limit {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (10), (20);
+    SELECT t1.a, t2.b
+    FROM t1 CROSS JOIN t2
+    ORDER BY t1.a DESC, t2.b DESC
+    LIMIT 3;
+}
+expect {
+    3|20
+    3|10
+    2|20
+}
+
+test cross-join-limit-offset {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (10), (20);
+    SELECT t1.a, t2.b
+    FROM t1 CROSS JOIN t2
+    ORDER BY t1.a, t2.b
+    LIMIT 2 OFFSET 2;
+}
+expect {
+    2|10
+    2|20
+}
+
+test cross-join-distinct-left-column {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (2), (2);
+    INSERT INTO t2 VALUES (10), (20);
+    SELECT DISTINCT t1.a FROM t1 CROSS JOIN t2 ORDER BY t1.a;
+}
+expect {
+    1
+    2
+}
+
+test cross-join-distinct-pairs {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (1);
+    INSERT INTO t2 VALUES (10), (10), (20);
+    SELECT DISTINCT t1.a, t2.b FROM t1 CROSS JOIN t2 ORDER BY t1.a, t2.b;
+}
+expect {
+    1|10
+    1|20
+}
+
+test cross-join-group-by-left {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (10), (20);
+    SELECT t1.a, count(*), sum(t2.b)
+    FROM t1 CROSS JOIN t2
+    GROUP BY t1.a
+    ORDER BY t1.a;
+}
+expect {
+    1|2|30
+    2|2|30
+    3|2|30
+}
+
+test cross-join-group-by-right {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (10), (20), (30);
+    SELECT t2.b, count(*), sum(t1.a)
+    FROM t1 CROSS JOIN t2
+    GROUP BY t2.b
+    ORDER BY t2.b;
+}
+expect {
+    10|2|3
+    20|2|3
+    30|2|3
+}
+
+test cross-join-having {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (10), (20);
+    SELECT t1.a, count(*)
+    FROM t1 CROSS JOIN t2
+    GROUP BY t1.a
+    HAVING count(*) = 2
+    ORDER BY t1.a;
+}
+expect {
+    1|2
+    2|2
+    3|2
+}
+
+test cross-join-aggregate-sum {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (10), (20), (30);
+    SELECT sum(t1.a), sum(t2.b), sum(t1.a + t2.b) FROM t1 CROSS JOIN t2;
+}
+expect {
+    9|120|129
+}
+
+test cross-join-count-column-vs-count-star {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (NULL);
+    INSERT INTO t2 VALUES (10), (20);
+    SELECT count(*), count(t1.a), count(t2.b) FROM t1 CROSS JOIN t2;
+}
+expect {
+    4|2|4
+}
+
+test cross-join-self-join {
+    CREATE TABLE t1(a);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    SELECT l.a, r.a
+    FROM t1 AS l CROSS JOIN t1 AS r
+    WHERE l.a < r.a
+    ORDER BY l.a, r.a;
+}
+expect {
+    1|2
+    1|3
+    2|3
+}
+
+test cross-join-self-join-diagonal {
+    CREATE TABLE t1(a);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    SELECT l.a, r.a
+    FROM t1 AS l CROSS JOIN t1 AS r
+    WHERE l.a = r.a
+    ORDER BY l.a;
+}
+expect {
+    1|1
+    2|2
+    3|3
+}
+
+test cross-join-three-tables {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE TABLE t3(c);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (10), (20);
+    INSERT INTO t3 VALUES (100), (200);
+    SELECT t1.a, t2.b, t3.c
+    FROM t1 CROSS JOIN t2 CROSS JOIN t3
+    ORDER BY t1.a, t2.b, t3.c;
+}
+expect {
+    1|10|100
+    1|10|200
+    1|20|100
+    1|20|200
+    2|10|100
+    2|10|200
+    2|20|100
+    2|20|200
+}
+
+test cross-join-three-tables-count {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE TABLE t3(c);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (10), (20), (30);
+    INSERT INTO t3 VALUES (100), (200);
+    SELECT count(*) FROM t1 CROSS JOIN t2 CROSS JOIN t3;
+}
+expect {
+    12
+}
+
+test cross-join-subquery-right {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (10), (20), (30);
+    SELECT t1.a, q.b
+    FROM t1 CROSS JOIN (
+        SELECT b FROM t2 WHERE b >= 20
+    ) AS q
+    ORDER BY t1.a, q.b;
+}
+expect {
+    1|20
+    1|30
+    2|20
+    2|30
+}
+
+test cross-join-subquery-both-sides {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (10), (20), (30);
+    SELECT x.a, y.b
+    FROM (
+        SELECT a FROM t1 WHERE a <> 2
+    ) AS x
+    CROSS JOIN (
+        SELECT b FROM t2 WHERE b <> 20
+    ) AS y
+    ORDER BY x.a, y.b;
+}
+expect {
+    1|10
+    1|30
+    3|10
+    3|30
+}
+
+test cross-join-derived-left-constant {
+    CREATE TABLE t1(b);
+    INSERT INTO t1 VALUES (10), (20);
+    SELECT x.a, t1.b
+    FROM (SELECT 5 AS a) AS x
+    CROSS JOIN t1
+    ORDER BY t1.b;
+}
+expect {
+    5|10
+    5|20
+}
+
+test cross-join-derived-right-constant {
+    CREATE TABLE t1(a);
+    INSERT INTO t1 VALUES (1), (2);
+    SELECT t1.a, y.b
+    FROM t1
+    CROSS JOIN (SELECT 9 AS b) AS y
+    ORDER BY t1.a;
+}
+expect {
+    1|9
+    2|9
+}
+
+test cross-join-comma-equivalence {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (10), (20);
+    SELECT t1.a, t2.b FROM t1, t2 ORDER BY t1.a, t2.b;
+}
+expect {
+    1|10
+    1|20
+    2|10
+    2|20
+}
+
+test cross-join-where-like-inner-join {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y'), (3, 'z');
+    INSERT INTO t2 VALUES (2, 'p'), (3, 'q'), (4, 'r');
+    SELECT t1.a, t1.b, t2.c, t2.d
+    FROM t1 CROSS JOIN t2
+    WHERE t1.a = t2.c
+    ORDER BY t1.a;
+}
+expect {
+    2|y|2|p
+    3|z|3|q
+}
+
+test cross-join-order-by-expression {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (3);
+    INSERT INTO t2 VALUES (2), (4);
+    SELECT t1.a, t2.b, t1.a + t2.b
+    FROM t1 CROSS JOIN t2
+    ORDER BY t1.a + t2.b, t1.a, t2.b;
+}
+expect {
+    1|2|3
+    1|4|5
+    3|2|5
+    3|4|7
+}
+
+test cross-join-duplicate-rows-preserved {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (1);
+    INSERT INTO t2 VALUES (2), (2);
+    SELECT t1.a, t2.b
+    FROM t1 CROSS JOIN t2
+    ORDER BY t1.a, t2.b;
+}
+expect {
+    1|2
+    1|2
+    1|2
+    1|2
+}
+
+test cross-join-select-constants {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (10), (20);
+    SELECT 42, 'k' FROM t1 CROSS JOIN t2 ORDER BY t1.a, t2.b;
+}
+expect {
+    42|k
+    42|k
+    42|k
+    42|k
+}
+
+test cross-join-null-safe-aggregates {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (NULL), (NULL);
+    INSERT INTO t2 VALUES (1), (2);
+    SELECT count(*), count(t1.a), sum(t1.a), sum(t2.b)
+    FROM t1 CROSS JOIN t2;
+}
+expect {
+    4|0||6
+}
