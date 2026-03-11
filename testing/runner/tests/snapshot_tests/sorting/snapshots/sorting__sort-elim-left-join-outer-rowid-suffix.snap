@@ -1,0 +1,22 @@
+---
+source: sorting.sqltest
+expression: |-
+  SELECT o.customer_id, o.id
+      FROM lhs_orders o
+      LEFT JOIN rhs_items i
+          ON i.order_id = o.id
+         AND i.product = 'x'
+      WHERE o.customer_id = 300
+      ORDER BY o.customer_id, o.id;
+info:
+  statement_type: SELECT
+  tables:
+  - lhs_orders
+  - rhs_items
+  setup_blocks:
+  - outer_left_order
+  database: ':memory:'
+---
+QUERY PLAN
+|--SEARCH o USING INDEX idx_lhs_customer (customer_id=?)
+`--SEARCH i USING INDEX idx_rhs_product_qty (product=?) LEFT-JOIN

@@ -1,0 +1,17 @@
+---
+source: sorting.sqltest
+expression: |-
+  SELECT * FROM articles
+      WHERE status = 'published' AND category = 'tech' AND published_at = '2024-01-01'
+      ORDER BY title;
+info:
+  statement_type: SELECT
+  tables:
+  - articles
+  setup_blocks:
+  - sort_elim
+  database: ':memory:'
+---
+QUERY PLAN
+|--SEARCH articles USING INDEX idx_articles_status_cat_pub (status=? AND category=? AND published_at=?)
+`--USE SORTER FOR ORDER BY

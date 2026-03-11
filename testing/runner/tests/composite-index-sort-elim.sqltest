@@ -1,0 +1,662 @@
+# Composite index sort elimination — data correctness tests
+# Verifies that rows come out in the correct order when the optimizer
+# eliminates a sort by recognizing that equality-constrained prefix
+# columns of a composite index make the remaining columns already sorted.
+
+@database :memory:
+
+setup schema {
+    CREATE TABLE articles (
+        id INTEGER PRIMARY KEY,
+        status TEXT NOT NULL,
+        category TEXT NOT NULL,
+        published_at TEXT NOT NULL,
+        title TEXT NOT NULL
+    );
+    CREATE INDEX idx_articles_scp ON articles(status, category, published_at DESC);
+
+    -- Insert rows in deliberately non-sorted order so that a missing sort
+    -- would surface as wrong row order.
+    INSERT INTO articles VALUES (1, 'published', 'tech',    '2024-01-15', 'Alpha');
+    INSERT INTO articles VALUES (2, 'published', 'art',     '2024-03-01', 'Beta');
+    INSERT INTO articles VALUES (3, 'published', 'tech',    '2024-06-10', 'Gamma');
+    INSERT INTO articles VALUES (4, 'draft',     'tech',    '2024-02-20', 'Delta');
+    INSERT INTO articles VALUES (5, 'published', 'art',     '2024-01-05', 'Epsilon');
+    INSERT INTO articles VALUES (6, 'published', 'science', '2024-04-12', 'Zeta');
+    INSERT INTO articles VALUES (7, 'draft',     'art',     '2024-05-30', 'Eta');
+    INSERT INTO articles VALUES (8, 'published', 'tech',    '2024-03-22', 'Theta');
+    INSERT INTO articles VALUES (9, 'published', 'science', '2024-07-01', 'Iota');
+    INSERT INTO articles VALUES (10,'published', 'art',     '2024-06-15', 'Kappa');
+}
+
+# Eq on first column, ORDER BY remaining two columns.
+# Index (status, category, published_at DESC) with status='published'
+# should give category ASC, then published_at DESC within each category.
+@setup schema
+test eq-prefix-order-suffix {
+    SELECT id, category, published_at FROM articles
+    WHERE status = 'published'
+    ORDER BY category, published_at DESC;
+}
+expect {
+    10|art|2024-06-15
+    2|art|2024-03-01
+    5|art|2024-01-05
+    9|science|2024-07-01
+    6|science|2024-04-12
+    3|tech|2024-06-10
+    8|tech|2024-03-22
+    1|tech|2024-01-15
+}
+
+# Eq on two prefix columns, ORDER BY last column.
+@setup schema
+test two-eq-order-last {
+    SELECT id, published_at FROM articles
+    WHERE status = 'published' AND category = 'tech'
+    ORDER BY published_at DESC;
+}
+expect {
+    3|2024-06-10
+    8|2024-03-22
+    1|2024-01-15
+}
+
+# Eq on first column, ORDER BY includes the eq column itself (with opposite direction).
+# Since status is constant, its direction is irrelevant.
+@setup schema
+test eq-col-in-order-by-desc {
+    SELECT id, status, category, published_at FROM articles
+    WHERE status = 'published'
+    ORDER BY status DESC, category, published_at DESC;
+}
+expect {
+    10|published|art|2024-06-15
+    2|published|art|2024-03-01
+    5|published|art|2024-01-05
+    9|published|science|2024-07-01
+    6|published|science|2024-04-12
+    3|published|tech|2024-06-10
+    8|published|tech|2024-03-22
+    1|published|tech|2024-01-15
+}
+
+# Eq on first column with LIMIT — verify LIMIT interacts correctly.
+@setup schema
+test eq-prefix-order-suffix-limit {
+    SELECT id, category, published_at FROM articles
+    WHERE status = 'published'
+    ORDER BY category, published_at DESC
+    LIMIT 3;
+}
+expect {
+    10|art|2024-06-15
+    2|art|2024-03-01
+    5|art|2024-01-05
+}
+
+# Eq on first column with LIMIT and OFFSET.
+@setup schema
+test eq-prefix-order-suffix-limit-offset {
+    SELECT id, category, published_at FROM articles
+    WHERE status = 'published'
+    ORDER BY category, published_at DESC
+    LIMIT 2 OFFSET 3;
+}
+expect {
+    9|science|2024-07-01
+    6|science|2024-04-12
+}
+
+# Eq prefix but ORDER BY suffix with WRONG direction (ASC vs index DESC).
+# Index has published_at DESC, so requesting ASC needs a sorter.
+@setup schema
+test eq-prefix-wrong-direction {
+    SELECT id, category, published_at FROM articles
+    WHERE status = 'published'
+    ORDER BY category, published_at ASC;
+}
+expect {
+    5|art|2024-01-05
+    2|art|2024-03-01
+    10|art|2024-06-15
+    6|science|2024-04-12
+    9|science|2024-07-01
+    1|tech|2024-01-15
+    8|tech|2024-03-22
+    3|tech|2024-06-10
+}
+
+# All index columns eq-constrained, ORDER BY on non-index column (title).
+# Sort must NOT be eliminated — a sorter is needed.
+@setup schema
+test all-eq-order-non-index {
+    SELECT id, title FROM articles
+    WHERE status = 'published' AND category = 'tech' AND published_at = '2024-03-22'
+    ORDER BY title;
+}
+expect {
+    8|Theta
+}
+
+# No equality constraint — ORDER BY on non-leading index column needs sort.
+@setup schema
+test no-eq-full-scan-order {
+    SELECT id, published_at FROM articles
+    ORDER BY published_at DESC;
+}
+expect {
+    9|2024-07-01
+    10|2024-06-15
+    3|2024-06-10
+    7|2024-05-30
+    6|2024-04-12
+    8|2024-03-22
+    2|2024-03-01
+    4|2024-02-20
+    1|2024-01-15
+    5|2024-01-05
+}
+
+# Range constraint on prefix — sort should NOT be eliminated.
+@setup schema
+test range-prefix-order-suffix {
+    SELECT id, status, category FROM articles
+    WHERE status >= 'draft' AND status <= 'published'
+    ORDER BY category, id;
+}
+expect {
+    2|published|art
+    5|published|art
+    7|draft|art
+    10|published|art
+    6|published|science
+    9|published|science
+    1|published|tech
+    3|published|tech
+    4|draft|tech
+    8|published|tech
+}
+
+# GROUP BY with eq prefix — the grouping should be correct.
+@setup schema
+test group-by-eq-prefix {
+    SELECT category, COUNT(*), MAX(published_at) FROM articles
+    WHERE status = 'published'
+    GROUP BY category;
+}
+expect {
+    art|3|2024-06-15
+    science|2|2024-07-01
+    tech|3|2024-06-10
+}
+
+# Two-column eq prefix, GROUP BY last column.
+@setup schema
+test group-by-two-eq-prefix {
+    SELECT published_at, COUNT(*) FROM articles
+    WHERE status = 'published' AND category = 'tech'
+    GROUP BY published_at
+    ORDER BY published_at DESC;
+}
+expect {
+    2024-06-10|1
+    2024-03-22|1
+    2024-01-15|1
+}
+
+# =============================================================================
+# Collation-sensitive eq-prefix skip
+# =============================================================================
+
+setup collation_eq_prefix_schema {
+    CREATE TABLE collated_values (
+        a TEXT COLLATE NOCASE NOT NULL,
+        b TEXT COLLATE RTRIM NOT NULL,
+        c TEXT COLLATE BINARY NOT NULL,
+        UNIQUE(a, b, c)
+    );
+
+    INSERT INTO collated_values VALUES ('a', 'aa', '1');
+    INSERT INTO collated_values VALUES ('A', 'zz', '1');
+    INSERT INTO collated_values VALUES ('a', 'mm', '2');
+    INSERT INTO collated_values VALUES ('A', 'yy', '2');
+}
+
+# a = 'a' is evaluated with NOCASE and therefore matches both 'a' and 'A'.
+# ORDER BY a COLLATE BINARY must still distinguish those values, so the
+# optimizer must not skip the leading ORDER BY term as "constant".
+@setup collation_eq_prefix_schema
+test eq-prefix-collation-mismatch-is-not-constant {
+    SELECT a, b, c
+    FROM collated_values
+    WHERE a = 'a'
+    ORDER BY a COLLATE BINARY ASC, b COLLATE RTRIM ASC, c ASC, rowid ASC;
+}
+expect {
+    A|yy|2
+    A|zz|1
+    a|aa|1
+    a|mm|2
+}
+
+# =============================================================================
+# JOIN tests — verify eq-skip interacts correctly with multi-table ORDER BY
+# =============================================================================
+
+setup join_schema {
+    CREATE TABLE orders (
+        id INTEGER PRIMARY KEY,
+        customer_id INTEGER NOT NULL,
+        order_date TEXT NOT NULL,
+        amount REAL NOT NULL
+    );
+    CREATE INDEX idx_orders_cust_date ON orders(customer_id, order_date DESC);
+
+    CREATE TABLE items (
+        id INTEGER PRIMARY KEY,
+        order_id INTEGER NOT NULL,
+        product TEXT NOT NULL,
+        qty INTEGER NOT NULL
+    );
+    CREATE INDEX idx_items_order ON items(order_id, product);
+
+    INSERT INTO orders VALUES (1, 100, '2024-03-01', 50.0);
+    INSERT INTO orders VALUES (2, 100, '2024-01-15', 30.0);
+    INSERT INTO orders VALUES (3, 100, '2024-06-10', 80.0);
+    INSERT INTO orders VALUES (4, 200, '2024-02-20', 45.0);
+    INSERT INTO orders VALUES (5, 200, '2024-05-05', 60.0);
+
+    INSERT INTO items VALUES (1, 1, 'Widget', 2);
+    INSERT INTO items VALUES (2, 1, 'Gadget', 1);
+    INSERT INTO items VALUES (3, 2, 'Widget', 5);
+    INSERT INTO items VALUES (4, 3, 'Bolt', 10);
+    INSERT INTO items VALUES (5, 3, 'Widget', 3);
+    INSERT INTO items VALUES (6, 4, 'Gadget', 7);
+    INSERT INTO items VALUES (7, 5, 'Bolt', 4);
+}
+
+# eq on outer table, ORDER BY only outer table suffix.
+# customer_id eq-skip should let order_date DESC come from the index.
+# Rows are duplicated by join fanout but order_date ordering must hold.
+@setup join_schema
+test join-eq-skip-order-outer-only {
+    SELECT o.id, o.order_date, i.product
+    FROM orders o JOIN items i ON o.id = i.order_id
+    WHERE o.customer_id = 100
+    ORDER BY o.order_date DESC, i.product;
+}
+expect {
+    3|2024-06-10|Bolt
+    3|2024-06-10|Widget
+    1|2024-03-01|Gadget
+    1|2024-03-01|Widget
+    2|2024-01-15|Widget
+}
+
+# ORDER BY only the inner table — eq-skip on outer should NOT help.
+@setup join_schema
+test join-order-inner-only {
+    SELECT o.id, i.product, i.qty
+    FROM orders o JOIN items i ON o.id = i.order_id
+    WHERE o.customer_id = 100
+    ORDER BY i.product, i.qty;
+}
+expect {
+    3|Bolt|10
+    1|Gadget|1
+    1|Widget|2
+    3|Widget|3
+    2|Widget|5
+}
+
+# LEFT JOIN, ORDER BY right table column.
+@setup join_schema
+test join-left-order-right {
+    SELECT o.id, o.order_date, i.product
+    FROM orders o LEFT JOIN items i ON o.id = i.order_id
+    WHERE o.customer_id = 100
+    ORDER BY i.product, o.id;
+}
+expect {
+    3|2024-06-10|Bolt
+    1|2024-03-01|Gadget
+    1|2024-03-01|Widget
+    2|2024-01-15|Widget
+    3|2024-06-10|Widget
+}
+
+# eq on both joined tables, ORDER BY a column from neither eq set.
+@setup join_schema
+test join-eq-both-tables {
+    SELECT o.id, o.order_date, i.product, i.qty
+    FROM orders o JOIN items i ON o.id = i.order_id
+    WHERE o.customer_id = 100 AND i.product = 'Widget'
+    ORDER BY i.qty;
+}
+expect {
+    1|2024-03-01|Widget|2
+    3|2024-06-10|Widget|3
+    2|2024-01-15|Widget|5
+}
+
+setup join_outer_const_schema {
+    CREATE TABLE lhs_orders (
+        id INTEGER PRIMARY KEY,
+        customer_id INTEGER NOT NULL
+    );
+    CREATE INDEX idx_lhs_customer ON lhs_orders(customer_id);
+
+    CREATE TABLE rhs_items (
+        id INTEGER PRIMARY KEY,
+        order_id INTEGER NOT NULL,
+        product TEXT NOT NULL,
+        qty INTEGER NOT NULL
+    );
+    CREATE INDEX idx_rhs_product_qty ON rhs_items(product, qty);
+
+    INSERT INTO lhs_orders VALUES (6, 300);
+    INSERT INTO lhs_orders VALUES (7, 300);
+
+    INSERT INTO rhs_items VALUES (8, 6, 'x', 2);
+    INSERT INTO rhs_items VALUES (9, 6, 'x', 1);
+    INSERT INTO rhs_items VALUES (10, 6, 'y', 9);
+}
+
+# LEFT JOIN ON-clause constants are not query-global constants:
+# unmatched rows still produce NULLs on the right-hand side.
+# Skipping the constant prefix would incorrectly emit matched rows before
+# the NULL-extended row for the same outer ordering key.
+@setup join_outer_const_schema
+test join-left-on-constant-is-not-global-order {
+    SELECT o.customer_id, o.id, i.product, i.qty
+    FROM lhs_orders o
+    LEFT JOIN rhs_items i
+        ON i.order_id = o.id
+       AND i.product = 'x'
+    WHERE o.customer_id = 300
+    ORDER BY o.customer_id, i.product, i.qty;
+}
+expect {
+    300|7||
+    300|6|x|1
+    300|6|x|2
+}
+
+# Ordering by only outer-table columns must still work across a LEFT JOIN.
+@setup join_outer_const_schema
+test join-left-order-outer-only {
+    SELECT o.customer_id, o.id, i.product, i.qty
+    FROM lhs_orders o
+    LEFT JOIN rhs_items i
+        ON i.order_id = o.id
+       AND i.product = 'x'
+    WHERE o.customer_id = 300
+    ORDER BY o.customer_id, o.id, i.qty;
+}
+expect {
+    300|6|x|1
+    300|6|x|2
+    300|7||
+}
+
+# The rowid appended to a rowid-table index should preserve ORDER BY ties
+# on the non-nullable side of a LEFT JOIN.
+@setup join_outer_const_schema
+test join-left-order-outer-rowid-suffix {
+    SELECT o.customer_id, o.id
+    FROM lhs_orders o
+    LEFT JOIN rhs_items i
+        ON i.order_id = o.id
+       AND i.product = 'x'
+    WHERE o.customer_id = 300
+    ORDER BY o.customer_id, o.id;
+}
+expect {
+    300|6
+    300|6
+    300|7
+}
+
+setup expr_sort_elim {
+    CREATE TABLE expr_articles (
+        id INTEGER PRIMARY KEY,
+        status TEXT NOT NULL,
+        title TEXT NOT NULL,
+        score INTEGER NOT NULL
+    );
+    CREATE INDEX idx_expr_articles ON expr_articles(status, lower(title), score DESC);
+
+    INSERT INTO expr_articles VALUES (1, 'active',   'Beta',  7);
+    INSERT INTO expr_articles VALUES (2, 'active',   'alpha', 3);
+    INSERT INTO expr_articles VALUES (3, 'active',   'ALPHA', 9);
+    INSERT INTO expr_articles VALUES (4, 'active',   'gamma', 1);
+    INSERT INTO expr_articles VALUES (5, 'inactive', 'alpha', 8);
+    INSERT INTO expr_articles VALUES (6, 'active',   'beta',  2);
+}
+
+# Eq prefix on a composite expression index, ORDER BY the indexed expression and suffix.
+@setup expr_sort_elim
+test expr-index-eq-prefix-order-suffix {
+    SELECT id, lower(title), score
+    FROM expr_articles
+    WHERE status = 'active'
+    ORDER BY lower(title), score DESC;
+}
+expect {
+    3|alpha|9
+    2|alpha|3
+    1|beta|7
+    6|beta|2
+    4|gamma|1
+}
+
+# Equality on the expression-index prefix should allow ordering by the trailing column.
+@setup expr_sort_elim
+test expr-index-two-eq-order-last {
+    SELECT id, score
+    FROM expr_articles
+    WHERE status = 'active' AND lower(title) = 'alpha'
+    ORDER BY score DESC;
+}
+expect {
+    3|9
+    2|3
+}
+
+# GROUP BY should also work with the same expression-index prefix skip.
+@setup expr_sort_elim
+test expr-index-group-by-eq-prefix {
+    SELECT lower(title), COUNT(*), MAX(score)
+    FROM expr_articles
+    WHERE status = 'active'
+    GROUP BY lower(title)
+    ORDER BY lower(title);
+}
+expect {
+    alpha|2|9
+    beta|2|7
+    gamma|1|1
+}
+
+setup expr_outer_join_sort_elim {
+    CREATE TABLE lhs_groups (
+        id INTEGER PRIMARY KEY,
+        grp INTEGER NOT NULL
+    );
+
+    CREATE TABLE rhs_names (
+        id INTEGER PRIMARY KEY,
+        lhs_id INTEGER NOT NULL,
+        tag TEXT NOT NULL,
+        name TEXT NOT NULL,
+        score INTEGER NOT NULL
+    );
+    CREATE INDEX idx_rhs_names ON rhs_names(tag, lower(name), score DESC);
+
+    INSERT INTO lhs_groups VALUES (1, 1);
+    INSERT INTO lhs_groups VALUES (2, 1);
+
+    INSERT INTO rhs_names VALUES (1, 1, 'keep', 'Alice', 9);
+    INSERT INTO rhs_names VALUES (2, 1, 'keep', 'alice', 3);
+    INSERT INTO rhs_names VALUES (3, 1, 'skip', 'Bob', 8);
+}
+
+# Expression-index ordering on the RHS of a LEFT JOIN is not globally valid:
+# NULL-extended rows still need to sort ahead of the matched expression values.
+@setup expr_outer_join_sort_elim
+test join-left-expr-index-is-not-global-order {
+    SELECT l.id, lower(r.name), r.score
+    FROM lhs_groups l
+    LEFT JOIN rhs_names r
+        ON r.lhs_id = l.id
+       AND r.tag = 'keep'
+    WHERE l.grp = 1
+    ORDER BY lower(r.name), r.score DESC;
+}
+expect {
+    2||
+    1|alice|9
+    1|alice|3
+}
+
+# =============================================================================
+# Two-table join with separate composite indexes and eq-skip on both
+# =============================================================================
+
+setup join_schema2 {
+    CREATE TABLE t1 (
+        id INTEGER PRIMARY KEY,
+        a INTEGER NOT NULL,
+        b INTEGER NOT NULL,
+        c INTEGER NOT NULL
+    );
+    CREATE INDEX idx_t1_ab ON t1(a, b);
+
+    CREATE TABLE t2 (
+        id INTEGER PRIMARY KEY,
+        x INTEGER NOT NULL,
+        y INTEGER NOT NULL,
+        z TEXT NOT NULL
+    );
+    CREATE INDEX idx_t2_xy ON t2(x, y DESC);
+
+    -- t1: a=1 rows with various b values
+    INSERT INTO t1 VALUES (1, 1, 30, 100);
+    INSERT INTO t1 VALUES (2, 1, 10, 200);
+    INSERT INTO t1 VALUES (3, 1, 20, 300);
+    INSERT INTO t1 VALUES (4, 2, 5,  400);
+
+    -- t2: multiple rows per x value, y in non-trivial order
+    INSERT INTO t2 VALUES (10, 30, 9, 'alpha');
+    INSERT INTO t2 VALUES (11, 30, 3, 'beta');
+    INSERT INTO t2 VALUES (12, 10, 7, 'gamma');
+    INSERT INTO t2 VALUES (13, 10, 1, 'delta');
+    INSERT INTO t2 VALUES (14, 20, 5, 'epsilon');
+    INSERT INTO t2 VALUES (15, 20, 2, 'zeta');
+}
+
+# eq-skip on t1.a, ORDER BY t1.b (from index) then t2.y DESC (from t2 index).
+# Both tables contribute to the sort order via their indexes.
+@setup join_schema2
+test join-cross-table-both-indexes {
+    SELECT t1.id, t1.b, t2.y, t2.z
+    FROM t1 JOIN t2 ON t1.b = t2.x
+    WHERE t1.a = 1
+    ORDER BY t1.b, t2.y DESC;
+}
+expect {
+    2|10|7|gamma
+    2|10|1|delta
+    3|20|5|epsilon
+    3|20|2|zeta
+    1|30|9|alpha
+    1|30|3|beta
+}
+
+# Same join but ORDER BY t2.y ASC — wrong direction for t2's DESC index.
+# Must use a sorter to get correct ascending order on y.
+@setup join_schema2
+test join-cross-table-wrong-direction-inner {
+    SELECT t1.id, t1.b, t2.y, t2.z
+    FROM t1 JOIN t2 ON t1.b = t2.x
+    WHERE t1.a = 1
+    ORDER BY t1.b, t2.y ASC;
+}
+expect {
+    2|10|1|delta
+    2|10|7|gamma
+    3|20|2|zeta
+    3|20|5|epsilon
+    1|30|3|beta
+    1|30|9|alpha
+}
+
+# eq-skip on t1.a, but ORDER BY t1.b DESC — wrong direction for t1's ASC index.
+# The eq-skip correctly identifies t1.a as constant, but t1.b is ASC in the index
+# and we want DESC, so a sorter is needed.
+@setup join_schema2
+test join-eq-skip-wrong-direction-outer {
+    SELECT t1.id, t1.b, t2.z
+    FROM t1 JOIN t2 ON t1.b = t2.x
+    WHERE t1.a = 1
+    ORDER BY t1.b DESC, t2.z;
+}
+expect {
+    1|30|alpha
+    1|30|beta
+    3|20|epsilon
+    3|20|zeta
+    2|10|delta
+    2|10|gamma
+}
+
+# Duplicate join key in outer table — the critical cross-table bug case.
+# t1 has two rows with b=10. The inner scan for each produces y DESC
+# independently, but interleaved they break global ORDER BY t1.b, t2.y DESC.
+# Without a sorter the result is (7,1,7,1); correct is (7,7,1,1).
+@setup join_schema2
+test join-duplicate-outer-key {
+    INSERT INTO t1 VALUES (5, 1, 10, 500);
+
+    SELECT t1.id, t1.b, t2.y, t2.z
+    FROM t1 JOIN t2 ON t1.b = t2.x
+    WHERE t1.a = 1
+    ORDER BY t1.b, t2.y DESC;
+}
+expect {
+    2|10|7|gamma
+    5|10|7|gamma
+    2|10|1|delta
+    5|10|1|delta
+    3|20|5|epsilon
+    3|20|2|zeta
+    1|30|9|alpha
+    1|30|3|beta
+}
+
+# Three-way join: eq-skip on t1.a, ORDER BY t1.b, t2.y DESC.
+# Third table (t3) is joined but doesn't participate in ORDER BY.
+@setup join_schema2
+test join-three-way {
+    CREATE TABLE t3 (
+        id INTEGER PRIMARY KEY,
+        ref_id INTEGER NOT NULL,
+        label TEXT NOT NULL
+    );
+    INSERT INTO t3 VALUES (1, 10, 'L1');
+    INSERT INTO t3 VALUES (2, 11, 'L2');
+    INSERT INTO t3 VALUES (3, 12, 'L3');
+
+    SELECT t1.b, t2.y, t3.label
+    FROM t1
+    JOIN t2 ON t1.b = t2.x
+    JOIN t3 ON t2.id = t3.ref_id
+    WHERE t1.a = 1
+    ORDER BY t1.b, t2.y DESC;
+}
+expect {
+    10|7|L3
+    30|9|L1
+    30|3|L2
+}
