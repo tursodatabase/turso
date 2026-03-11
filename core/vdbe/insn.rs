@@ -662,6 +662,9 @@ pub enum Insn {
         description: String,
         /// Override the program's resolve_type for error handling (used by RAISE).
         on_error: Option<ResolveType>,
+        /// If set, read the error description from this register instead of
+        /// the static `description` field (used by RAISE with expression messages).
+        description_reg: Option<usize>,
     },
 
     /// Halt the program if P3 is null.

@@ -492,6 +492,7 @@ pub fn translate_create_index(
                 err_code: SQLITE_CONSTRAINT_UNIQUE,
                 description: format_unique_violation_desc(tbl_name.as_str(), &idx),
                 on_error: None,
+                description_reg: None,
             });
             program.preassign_label_to_next_insn(label_after_sorter_compare);
         } else {

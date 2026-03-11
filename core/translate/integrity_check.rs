@@ -73,6 +73,7 @@ fn emit_integrity_result_row(
     program.emit_insn(Insn::Halt {
         err_code: 0,
         on_error: None,
+        description_reg: None,
         description: String::new(),
     });
     program.preassign_label_to_next_insn(continue_label);

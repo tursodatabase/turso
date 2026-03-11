@@ -1897,6 +1897,67 @@ expect error {
     delete fail
 }
 
+# RAISE(ABORT, expr) with concatenation expression (issue #5875)
+test trigger-raise-expr-concat {
+    CREATE TABLE raise_expr_t1 (a INTEGER);
+    CREATE TRIGGER raise_expr_tr1 BEFORE INSERT ON raise_expr_t1 WHEN NEW.a < 0 BEGIN
+        SELECT RAISE(ABORT, 'bad: ' || NEW.a);
+    END;
+    INSERT INTO raise_expr_t1 VALUES(-5);
+}
+expect error {
+    bad: -5
+}
+
+# RAISE(ABORT, expr) with concatenation - allowed value passes
+test trigger-raise-expr-concat-pass {
+    CREATE TABLE raise_expr_t1b (a INTEGER);
+    CREATE TRIGGER raise_expr_tr1b BEFORE INSERT ON raise_expr_t1b WHEN NEW.a < 0 BEGIN
+        SELECT RAISE(ABORT, 'bad: ' || NEW.a);
+    END;
+    INSERT INTO raise_expr_t1b VALUES(5);
+    SELECT * FROM raise_expr_t1b;
+}
+expect {
+    5
+}
+
+# RAISE(FAIL, expr) with expression error message
+test trigger-raise-fail-expr {
+    CREATE TABLE raise_expr_t2 (a INTEGER);
+    CREATE TRIGGER raise_expr_tr2 BEFORE INSERT ON raise_expr_t2 WHEN NEW.a < 0 BEGIN
+        SELECT RAISE(FAIL, 'invalid value: ' || NEW.a);
+    END;
+    INSERT INTO raise_expr_t2 VALUES(-10);
+}
+expect error {
+    invalid value: -10
+}
+
+# RAISE(ROLLBACK, expr) with expression error message
+test trigger-raise-rollback-expr {
+    CREATE TABLE raise_expr_t3 (a INTEGER);
+    CREATE TRIGGER raise_expr_tr3 BEFORE INSERT ON raise_expr_t3 WHEN NEW.a < 0 BEGIN
+        SELECT RAISE(ROLLBACK, 'rollback: ' || NEW.a);
+    END;
+    INSERT INTO raise_expr_t3 VALUES(-1);
+}
+expect error {
+    rollback: -1
+}
+
+# RAISE with expression using CASE
+test trigger-raise-expr-case {
+    CREATE TABLE raise_expr_t4 (a INTEGER);
+    CREATE TRIGGER raise_expr_tr4 BEFORE INSERT ON raise_expr_t4 WHEN NEW.a < 0 BEGIN
+        SELECT RAISE(ABORT, CASE WHEN NEW.a < -10 THEN 'very bad' ELSE 'bad' END);
+    END;
+    INSERT INTO raise_expr_t4 VALUES(-5);
+}
+expect error {
+    bad
+}
+
 # Bare column reference in trigger WHEN clause should error
 # SQLite rejects bare column names in WHEN clauses; they must be
 # qualified with NEW or OLD.

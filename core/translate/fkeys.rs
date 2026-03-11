@@ -240,6 +240,7 @@ pub fn emit_fk_restrict_halt(program: &mut ProgramBuilder) -> Result<()> {
         err_code: SQLITE_CONSTRAINT_FOREIGNKEY,
         description: "FOREIGN KEY constraint failed".to_string(),
         on_error: None,
+        description_reg: None,
     });
     Ok(())
 }

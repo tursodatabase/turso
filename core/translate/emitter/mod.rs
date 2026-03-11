@@ -1410,6 +1410,7 @@ fn emit_check_constraint_bytecode(
                     err_code: SQLITE_CONSTRAINT_CHECK,
                     description: constraint_name.to_string(),
                     on_error: None,
+                    description_reg: None,
                 });
             }
         }

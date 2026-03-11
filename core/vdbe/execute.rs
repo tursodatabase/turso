@@ -2855,10 +2855,18 @@ pub fn op_halt(
             err_code,
             description,
             on_error,
+            description_reg,
         },
         insn
     );
-    halt(program, state, pager, *err_code, description, *on_error)
+    // If description_reg is set, read the error message from that register at runtime
+    // (used by RAISE with expression-based error messages).
+    let desc = if let Some(reg) = description_reg {
+        state.registers[*reg].get_value().to_string()
+    } else {
+        description.to_string()
+    };
+    halt(program, state, pager, *err_code, &desc, *on_error)
 }
 
 pub fn op_halt_if_null(

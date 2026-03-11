@@ -800,6 +800,7 @@ pub fn insn_to_row(
                 err_code,
                 description,
                 on_error,
+                description_reg,
             } => {
                 let p2 = match on_error {
                     Some(ResolveType::Rollback) => 1,
@@ -809,11 +810,12 @@ pub fn insn_to_row(
                     Some(ResolveType::Replace) => 5,
                     None => 0,
                 };
+                let p3 = description_reg.unwrap_or(0) as i64;
                 (
                     "Halt",
                     *err_code as i64,
                     p2,
-                    0,
+                    p3,
                     Value::build_text(description.clone()),
                     0,
                     "".to_string(),

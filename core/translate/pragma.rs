@@ -376,6 +376,7 @@ fn update_pragma(
                 err_code: 0,
                 description: "Early halt because auto vacuum mode is not enabled".to_string(),
                 on_error: None,
+                description_reg: None,
             });
             program.resolve_label(set_cookie_label, program.offset());
             program.emit_insn(Insn::SetCookie {
