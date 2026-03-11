@@ -4,7 +4,10 @@ use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, JoinConstraint, TableInternalId};
 
 use super::emitter::Resolver;
+use super::expr::{walk_expr_mut, WalkControl};
+use super::optimizer::TakeOwnership;
 use super::plan::{JoinInfo, TableReferences};
+use super::planner::parse_row_id;
 use crate::schema::Table;
 use crate::util::normalize_ident;
 use crate::Result;
@@ -292,6 +295,7 @@ impl BindTracking {
 // ── CteEntry ─────────────────────────────────────────────────────────────
 
 /// A CTE definition stored in the binding context.
+#[derive(Clone)]
 pub struct CteEntry {
     /// The raw AST for re-planning on each reference.
     pub select: ast::Select,
@@ -434,14 +438,37 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         &self.aliases
     }
 
-    /// Run `f` with a fresh per-query state (phase, aliases).
-    /// Saves and restores on exit, so recursive calls (CTEs, subqueries) don't clobber.
+    /// Run `f` with a fresh per-select-core state (phase, aliases).
+    /// Saves and restores on exit so individual SELECT cores in the same
+    /// compound query do not clobber each other.
     fn with_scope<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         let saved_aliases = std::mem::take(&mut self.aliases);
+        let saved_phase = self.phase;
 
         let result = f(self);
 
         self.aliases = saved_aliases;
+        self.phase = saved_phase;
+
+        result
+    }
+
+    /// Run `f` with a fresh query state, restoring CTE/alias/phase state on exit.
+    ///
+    /// This mirrors DataFusion's per-query PlannerContext cloning semantics:
+    /// subqueries inherit outer CTEs, but their own WITH items remain private.
+    fn with_query<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let saved_ctes = self.ctes.clone();
+        let saved_aliases = std::mem::take(&mut self.aliases);
+        let saved_phase = self.phase;
+        let saved_outer_from_scope = self.outer_from_scope.clone();
+
+        let result = f(self);
+
+        self.ctes = saved_ctes;
+        self.aliases = saved_aliases;
+        self.phase = saved_phase;
+        self.outer_from_scope = saved_outer_from_scope;
 
         result
     }
@@ -539,37 +566,39 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
     /// Bind a SELECT statement, resolving all name references in-place.
     /// Returns the bound result columns of the SELECT.
     fn bind_select(&mut self, select: &mut ast::Select) -> Result<Vec<BoundColumn>> {
-        // 1. Bind CTEs from WITH clause
-        if let Some(with) = &mut select.with {
-            self.bind_cte(with)?;
-        }
-
-        // 2. Bind the main OneSelect
-        let result_columns = self.bind_one_select(&mut select.body.select)?;
-
-        // 3. Bind compound selects (UNION, INTERSECT, EXCEPT)
-        for compound in &mut select.body.compounds {
-            self.bind_one_select(&mut compound.select)?;
-        }
-
-        // 4. Bind ORDER BY (AliasFirst phase — aliases take priority)
-        // ORDER BY lives on the outer Select, not on OneSelect.
-        // It needs the FROM scope from the main select, but we don't
-        // have it here anymore. For now we bind against an empty scope.
-        // TODO: pass the main select's scope through
-        let empty = BindScope::empty();
-        self.with_phase(BindPhase::AliasFirst, |ctx| {
-            for sort_col in &mut select.order_by {
-                ctx.bind_expr(&mut sort_col.expr, &empty)?;
+        self.with_query(|ctx| {
+            // 1. Bind CTEs from WITH clause
+            if let Some(with) = &mut select.with {
+                ctx.bind_cte(with)?;
             }
-            Ok(())
-        })?;
 
-        Ok(result_columns)
+            // 2. Bind the main OneSelect. Its aliases and FROM scope are the ones
+            // visible to the query-level ORDER BY.
+            let (result_columns, main_scope) = ctx.bind_one_select(&mut select.body.select)?;
+
+            // 3. Bind compound selects (UNION, INTERSECT, EXCEPT)
+            for compound in &mut select.body.compounds {
+                ctx.bind_one_select(&mut compound.select)?;
+            }
+
+            // 4. Bind ORDER BY (AliasFirst phase — aliases take priority)
+            ctx.set_aliases(result_columns.clone());
+            ctx.with_phase(BindPhase::AliasFirst, |ctx| {
+                for sort_col in &mut select.order_by {
+                    ctx.bind_expr(&mut sort_col.expr, &main_scope)?;
+                }
+                Ok(())
+            })?;
+
+            Ok(result_columns)
+        })
     }
 
     /// Bind a single SELECT (not compound). Returns bound result columns.
-    fn bind_one_select(&mut self, one: &mut ast::OneSelect) -> Result<Vec<BoundColumn>> {
+    fn bind_one_select(
+        &mut self,
+        one: &mut ast::OneSelect,
+    ) -> Result<(Vec<BoundColumn>, BindScope)> {
         self.with_scope(|ctx| {
             match one {
                 ast::OneSelect::Select {
@@ -611,11 +640,11 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         })?;
                     }
 
-                    Ok(bound_columns)
+                    Ok((bound_columns, scope))
                 }
                 ast::OneSelect::Values(_) => {
                     // VALUES clauses have no column references to bind
-                    Ok(Vec::new())
+                    Ok((Vec::new(), BindScope::empty()))
                 }
             }
         })
@@ -839,9 +868,230 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         }
     }
 
+    fn resolve_alias(&self, name: &str) -> Option<ast::Expr> {
+        let normalized = normalize_ident(name);
+        self.aliases()
+            .iter()
+            .find(|alias| alias.name.eq_ignore_ascii_case(&normalized))
+            .map(|alias| alias.expr.clone())
+    }
+
+    fn resolve_unqualified_column(
+        &mut self,
+        name: &str,
+        scope: &BindScope,
+    ) -> Result<Option<ast::Expr>> {
+        if let Some((table_id, col_idx, is_rowid_alias)) = scope.find_column_unqualified(name)? {
+            self.tracking.record_column(table_id, col_idx);
+            return Ok(Some(ast::Expr::Column {
+                database: None,
+                table: table_id,
+                column: col_idx,
+                is_rowid_alias,
+            }));
+        }
+
+        for st in &scope.tables {
+            if let Some(row_id_expr) =
+                parse_row_id(name, st.internal_id, || scope.tables.len() != 1)?
+            {
+                self.tracking.record_rowid(st.internal_id);
+                return Ok(Some(row_id_expr));
+            }
+        }
+
+        let outer_match = {
+            let mut result = None;
+            for outer_scope in self.outer_scopes_iter() {
+                if let Some(found) = outer_scope.find_column_unqualified(name)? {
+                    result = Some(found);
+                    break;
+                }
+            }
+            result
+        };
+        if let Some((table_id, col_idx, is_rowid_alias)) = outer_match {
+            self.tracking.record_outer_ref(table_id, col_idx);
+            return Ok(Some(ast::Expr::Column {
+                database: None,
+                table: table_id,
+                column: col_idx,
+                is_rowid_alias,
+            }));
+        }
+
+        Ok(None)
+    }
+
+    fn resolve_qualified_column(
+        &mut self,
+        table_name: &str,
+        col_name: &str,
+        scope: &BindScope,
+    ) -> Result<Option<ast::Expr>> {
+        if let Some((table_id, col_idx, is_rowid_alias)) =
+            scope.find_column_qualified(table_name, col_name)?
+        {
+            self.tracking.record_column(table_id, col_idx);
+            return Ok(Some(ast::Expr::Column {
+                database: None,
+                table: table_id,
+                column: col_idx,
+                is_rowid_alias,
+            }));
+        }
+
+        let outer_match = {
+            let mut result = None;
+            for outer_scope in self.outer_scopes_iter() {
+                if let Some(found) = outer_scope.find_column_qualified(table_name, col_name)? {
+                    result = Some(found);
+                    break;
+                }
+            }
+            result
+        };
+        if let Some((table_id, col_idx, is_rowid_alias)) = outer_match {
+            self.tracking.record_outer_ref(table_id, col_idx);
+            return Ok(Some(ast::Expr::Column {
+                database: None,
+                table: table_id,
+                column: col_idx,
+                is_rowid_alias,
+            }));
+        }
+
+        Ok(None)
+    }
+
+    fn bind_identifier(&mut self, expr: &mut ast::Expr, scope: &BindScope) -> Result<()> {
+        match expr {
+            ast::Expr::Id(id) => {
+                let resolved = match self.phase() {
+                    BindPhase::NoAliases => self.resolve_unqualified_column(id.as_str(), scope)?,
+                    BindPhase::TableFirst => self
+                        .resolve_unqualified_column(id.as_str(), scope)?
+                        .or_else(|| self.resolve_alias(id.as_str())),
+                    BindPhase::AliasFirst => {
+                        if let Some(alias) = self.resolve_alias(id.as_str()) {
+                            Some(alias)
+                        } else {
+                            self.resolve_unqualified_column(id.as_str(), scope)?
+                        }
+                    }
+                };
+
+                if let Some(resolved) = resolved {
+                    *expr = resolved;
+                    return Ok(());
+                }
+
+                if id.quoted_with('"') {
+                    *expr = ast::Expr::Literal(ast::Literal::String(id.as_literal()));
+                } else {
+                    crate::bail_parse_error!("no such column: {}", id.as_str());
+                }
+            }
+            ast::Expr::Qualified(tbl, col) => {
+                if let Some(resolved) =
+                    self.resolve_qualified_column(tbl.as_str(), col.as_str(), scope)?
+                {
+                    *expr = resolved;
+                } else {
+                    crate::bail_parse_error!("no such column: {}.{}", tbl.as_str(), col.as_str());
+                }
+            }
+            ast::Expr::DoublyQualified(db_name, tbl_name, col_name) => {
+                let database_id = self.resolver.resolve_database_id(&ast::QualifiedName {
+                    db_name: Some(db_name.clone()),
+                    name: tbl_name.clone(),
+                    alias: None,
+                })?;
+
+                let Some(resolved) =
+                    self.resolve_qualified_column(tbl_name.as_str(), col_name.as_str(), scope)?
+                else {
+                    crate::bail_parse_error!(
+                        "no such column: {}.{}.{}",
+                        db_name.as_str(),
+                        tbl_name.as_str(),
+                        col_name.as_str()
+                    );
+                };
+
+                match resolved {
+                    ast::Expr::Column {
+                        table,
+                        column,
+                        is_rowid_alias,
+                        ..
+                    } => {
+                        *expr = ast::Expr::Column {
+                            database: Some(database_id),
+                            table,
+                            column,
+                            is_rowid_alias,
+                        };
+                    }
+                    other => *expr = other,
+                }
+            }
+            _ => unreachable!("bind_identifier only handles identifier nodes"),
+        }
+
+        Ok(())
+    }
+
+    fn bind_subquery_expr(&mut self, select: &mut ast::Select, scope: &BindScope) -> Result<()> {
+        self.append_outer_query_scope(Arc::new(scope.clone()));
+        let result = self.bind_select(select);
+        self.pop_outer_query_scope();
+        result.map(|_| ())
+    }
+
     /// Bind an expression, resolving column references against the given scope.
-    fn bind_expr(&mut self, _expr: &mut ast::Expr, _scope: &BindScope) -> Result<()> {
-        // TODO: walk the expression tree and resolve Expr::Id, Expr::Qualified, etc.
+    fn bind_expr(&mut self, expr: &mut ast::Expr, scope: &BindScope) -> Result<()> {
+        walk_expr_mut(expr, &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
+            match expr {
+                ast::Expr::Between {
+                    lhs,
+                    not,
+                    start,
+                    end,
+                } => {
+                    let (lower_op, upper_op) = if *not {
+                        (ast::Operator::Greater, ast::Operator::Greater)
+                    } else {
+                        (ast::Operator::LessEquals, ast::Operator::LessEquals)
+                    };
+                    let start = start.take_ownership();
+                    let lhs_v = lhs.take_ownership();
+                    let end = end.take_ownership();
+                    let lower =
+                        ast::Expr::Binary(Box::new(start), lower_op, Box::new(lhs_v.clone()));
+                    let upper = ast::Expr::Binary(Box::new(lhs_v), upper_op, Box::new(end));
+                    *expr = if *not {
+                        ast::Expr::Binary(Box::new(lower), ast::Operator::Or, Box::new(upper))
+                    } else {
+                        ast::Expr::Binary(Box::new(lower), ast::Operator::And, Box::new(upper))
+                    };
+                }
+                ast::Expr::Id(_)
+                | ast::Expr::Qualified(_, _)
+                | ast::Expr::DoublyQualified(_, _, _) => {
+                    self.bind_identifier(expr, scope)?;
+                }
+                ast::Expr::Exists(select) | ast::Expr::Subquery(select) => {
+                    self.bind_subquery_expr(select, scope)?;
+                    return Ok(WalkControl::SkipChildren);
+                }
+                ast::Expr::InSelect { rhs, .. } => {
+                    self.bind_subquery_expr(rhs, scope)?;
+                }
+                _ => {}
+            }
+            Ok(WalkControl::Continue)
+        })?;
         Ok(())
     }
 
