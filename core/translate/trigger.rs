@@ -186,7 +186,9 @@ pub fn translate_create_trigger(
     // Parse schema to load the new trigger
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
-        where_clause: Some(format!("name = '{normalized_trigger_name}'")),
+        where_clause: Some(format!(
+            "name = '{normalized_trigger_name}' AND type = 'trigger'"
+        )),
     });
 
     Ok(())

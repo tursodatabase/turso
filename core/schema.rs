@@ -721,7 +721,9 @@ impl Schema {
     }
 
     pub fn add_trigger(&mut self, trigger: Trigger, table_name: &str) -> Result<()> {
-        self.check_object_name_conflict(&trigger.name)?;
+        // Triggers have their own namespace in SQLite, so we don't check for
+        // conflicts with tables/views/indexes. Duplicate trigger names are
+        // checked separately in translate_create_trigger.
         let table_name = normalize_ident(table_name);
 
         // See [Schema::add_index] for why we push to the front of the deque.
