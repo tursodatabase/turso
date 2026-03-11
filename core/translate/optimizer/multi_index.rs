@@ -148,6 +148,9 @@ fn get_table_local_constraints_for_branch(
     .find(|constraints| constraints.table_id == table_reference.internal_id)
     .expect("constraints_from_where_clause must return constraints for every joined table");
     let mut table_constraints = table_constraints;
+    // Branch-local constraints originate from synthetic `WhereTerm`s, so copy
+    // out their constraining expressions while those temporary terms still
+    // exist.
     for constraint in table_constraints.constraints.iter_mut() {
         if constraint.constraining_expr.is_some() || constraint.operator.as_ast_operator().is_none()
         {
@@ -345,6 +348,9 @@ fn residual_exprs_for_branch(
     constraints: &[Constraint],
     constraint_refs: &[RangeConstraintRef],
 ) -> Vec<ast::Expr> {
+    // These residuals stop being planner-managed `WhereTerm`s here. Downstream
+    // they are evaluated directly inside the branch loop, so metadata like
+    // `from_outer_join` no longer participates in scheduling or ownership.
     let mut consumed = vec![false; branch_terms.len()];
     for cref in constraint_refs.iter() {
         for idx in [
@@ -789,6 +795,10 @@ pub fn consider_multi_index_union(
                 if chosen.constraint_refs.is_empty() {
                     return None;
                 }
+                // Residuals are kept as raw expressions because the multi-index
+                // executor runs them directly inside the branch loop rather
+                // than feeding them back through normal `WhereTerm`
+                // evaluation/scheduling.
                 let residual_exprs = residual_exprs_for_branch(
                     &synthetic_where_terms,
                     &table_constraints.constraints,

@@ -92,6 +92,11 @@ pub(super) fn emit_multi_index_scan_loop(
                     table_cursor_id,
                 });
             }
+            // Branch residuals are emitted as raw expressions here, after the
+            // branch seek has positioned the RHS cursor. They do not go back
+            // through global `WhereTerm` scheduling, which is why synthetic
+            // branch terms can be flattened down to `ast::Expr`s during
+            // planning.
             for residual_expr in &branch.residual_exprs {
                 let jump_target_when_true = program.allocate_label();
                 let condition_metadata = ConditionMetadata {
