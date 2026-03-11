@@ -60,6 +60,7 @@ pub(crate) mod cost;
 mod cost_params;
 pub(crate) mod join;
 pub(crate) mod lift_common_subexpressions;
+pub(crate) mod multi_index;
 pub(crate) mod order;
 pub(crate) mod unnest;
 
@@ -1910,7 +1911,6 @@ fn optimize_table_access(
                 where_term_idx,
                 set_op,
                 additional_consumed_terms,
-                estimated_rows_per_outer_row: _,
             } => {
                 // Mark the primary WHERE clause term as consumed
                 where_clause[*where_term_idx].consumed = true;
@@ -1919,31 +1919,34 @@ fn optimize_table_access(
                     where_clause[*term_idx].consumed = true;
                 }
 
+                let w_idx = *where_term_idx;
+                let s_op = *set_op;
+                let add_consumed = std::mem::take(additional_consumed_terms);
                 // Build the MultiIndexScanOp from the branch parameters
-                let mut multi_idx_branches: Vec<MultiIndexBranch> = Vec::new();
-                for branch in branches.iter() {
-                    // Build seek_def from constraint_refs using the branch's own constraint
-                    // (not constraints_per_table, since the branch constraint was created separately)
+                let mut multi_idx_branches = Vec::with_capacity(branches.len());
+                for branch in std::mem::take(branches) {
                     let seek_def = build_seek_def_from_constraints(
-                        &[branch.constraint.clone()],
+                        &branch.constraints,
                         &branch.constraint_refs,
                         IterationDirection::Forwards, // Multi-index always scans forward
                         where_clause,
                         Some(table_references),
                     )?;
                     multi_idx_branches.push(MultiIndexBranch {
-                        index: branch.index.clone(),
+                        index: branch.index,
                         seek_def,
                         estimated_rows: branch.estimated_rows,
+                        residual_exprs: branch.residual_exprs,
+                        requires_table_cursor: branch.requires_table_cursor,
                     });
                 }
 
                 table_references.joined_tables_mut()[table_idx].op =
                     Operation::MultiIndexScan(MultiIndexScanOp {
                         branches: multi_idx_branches,
-                        where_term_idx: *where_term_idx,
-                        set_op: *set_op,
-                        additional_consumed_terms: additional_consumed_terms.clone(),
+                        where_term_idx: w_idx,
+                        set_op: s_op,
+                        additional_consumed_terms: add_consumed,
                     });
             }
         }

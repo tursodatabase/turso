@@ -1,0 +1,25 @@
+---
+source: multi_index_or_compound.sqltest
+expression: |-
+  SELECT DISTINCT i.id
+      FROM item i
+      JOIN link l
+        ON (
+          (l.src = 'n1' AND l.dst = i.id AND l.label = 'knows')
+          OR
+          (l.dst = 'n1' AND l.src = i.id AND l.label = 'knows')
+        )
+      WHERE i.type = 'entity';
+info:
+  statement_type: SELECT
+  tables:
+  - item
+  - link
+  setup_blocks:
+  - graph_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SEARCH l USING INDEX idx_link_label (label=?)
+|--MULTI-INDEX OR i (sqlite_autoindex_item_1, sqlite_autoindex_item_1)
+`--USE HASH TABLE FOR DISTINCT

@@ -1,0 +1,19 @@
+---
+source: multi_index_or_compound.sqltest
+expression: |-
+  SELECT b FROM t
+      WHERE (a = 1 AND EXISTS(SELECT 1 FROM u WHERE u.x = t.b))
+         OR (a = 2 AND EXISTS(SELECT 1 FROM u WHERE u.x = t.b));
+info:
+  statement_type: SELECT
+  tables:
+  - t
+  - u
+  setup_blocks:
+  - correlated_subquery_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN t
+|--SCAN u
+`--SCAN u

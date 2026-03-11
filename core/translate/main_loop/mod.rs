@@ -7,8 +7,9 @@ use super::{
         UpdateRowSource,
     },
     expr::{
-        translate_condition_expr, translate_expr, translate_expr_no_constant_opt, walk_expr,
-        ConditionMetadata, NoConstantOptReason, WalkControl,
+        expr_references_subquery_id, translate_condition_expr, translate_expr,
+        translate_expr_no_constant_opt, walk_expr, ConditionMetadata, NoConstantOptReason,
+        WalkControl,
     },
     group_by::{group_by_agg_phase, GroupByMetadata, GroupByRowSource},
     optimizer::{constraints::BinaryExprSide, Optimizable},

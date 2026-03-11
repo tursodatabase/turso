@@ -120,6 +120,17 @@ fn estimate_index_cost(
     Cost((io_cost + cpu_cost - params.index_bonus).max(0.001))
 }
 
+fn is_unique_point_lookup(
+    index_info: IndexInfo,
+    usable_constraint_refs: &[RangeConstraintRef],
+) -> bool {
+    let eq_count = usable_constraint_refs
+        .iter()
+        .take_while(|cref| cref.eq.is_some())
+        .count();
+    index_info.unique && eq_count >= index_info.column_count
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RowCountEstimate {
     HardcodedFallback(f64),
@@ -142,6 +153,36 @@ impl std::ops::Deref for RowCountEstimate {
             RowCountEstimate::AnalyzeStats(val) => val,
         }
     }
+}
+
+pub(crate) fn estimate_rows_per_seek(
+    index_info: IndexInfo,
+    constraints: &[Constraint],
+    usable_constraint_refs: &[RangeConstraintRef],
+    base_row_count: RowCountEstimate,
+) -> f64 {
+    if is_unique_point_lookup(index_info, usable_constraint_refs) {
+        return 1.0;
+    }
+
+    let selectivity_multiplier: f64 = usable_constraint_refs
+        .iter()
+        .map(|cref| {
+            if let Some(ref eq) = cref.eq {
+                return constraints[eq.constraint_pos].selectivity;
+            }
+            let mut selectivity = 1.0;
+            if let Some(lower_bound) = cref.lower_bound {
+                selectivity *= constraints[lower_bound].selectivity;
+            }
+            if let Some(upper_bound) = cref.upper_bound {
+                selectivity *= constraints[upper_bound].selectivity;
+            }
+            selectivity
+        })
+        .product();
+
+    (selectivity_multiplier * *base_row_count).max(1.0)
 }
 
 /// Estimate the cost of a scan or seek operation.
@@ -169,19 +210,7 @@ pub fn estimate_cost_for_scan_or_seek(
         return estimate_scan_cost(base_row_count, input_cardinality, params);
     };
 
-    // Check if this is a unique index with full equality constraints on all columns.
-    // If so, it's guaranteed to return at most 1 row per lookup.
-    let is_unique_point_lookup = index_info.unique && {
-        // Count how many leading index columns have equality constraints
-        let eq_count = usable_constraint_refs
-            .iter()
-            .take_while(|cref| cref.eq.is_some())
-            .count();
-        // A unique point lookup requires equality on all index columns
-        eq_count >= index_info.column_count
-    };
-
-    if is_unique_point_lookup {
+    if is_unique_point_lookup(index_info, usable_constraint_refs) {
         // Unique point lookup: 1 seek per input row, 1 row returned per seek
         return estimate_index_cost(
             base_row_count,
@@ -193,29 +222,12 @@ pub fn estimate_cost_for_scan_or_seek(
         );
     }
 
-    // Calculate selectivity to estimate rows returned per seek
-    let selectivity_multiplier: f64 = usable_constraint_refs
-        .iter()
-        .map(|cref| {
-            // for equality constraints, use the selectivity of the equality constraint directly
-            if let Some(ref eq) = cref.eq {
-                let constraint = &constraints[eq.constraint_pos];
-                return constraint.selectivity;
-            }
-            // otherwise, multiply the selectivities of the range constraints
-            let mut selectivity = 1.0;
-            if let Some(lower_bound) = cref.lower_bound {
-                selectivity *= constraints[lower_bound].selectivity;
-            }
-            if let Some(upper_bound) = cref.upper_bound {
-                selectivity *= constraints[upper_bound].selectivity;
-            }
-            selectivity
-        })
-        .product();
-
-    // rows_per_seek: how many rows we expect to get from each index seek
-    let rows_per_seek = (selectivity_multiplier * base_row_count).max(1.0);
+    let rows_per_seek = estimate_rows_per_seek(
+        index_info,
+        constraints,
+        usable_constraint_refs,
+        RowCountEstimate::AnalyzeStats(base_row_count),
+    );
 
     let base_cost = estimate_index_cost(
         base_row_count,
@@ -236,124 +248,4 @@ pub fn estimate_cost_for_scan_or_seek(
     } else {
         base_cost
     }
-}
-
-/// Estimate the cost of a multi-index scan (OR-by-union optimization).
-///
-/// The cost model accounts for:
-/// 1. Cost of each index branch scan
-/// 2. Deduplication overhead using RowSet
-/// 3. Table row fetches after deduplication
-/// 4. Potential overlap between branches (rows appearing in multiple disjuncts)
-///
-/// # Arguments
-/// * `branch_costs` - Cost of scanning each individual index branch
-/// * `branch_rows` - Estimated rows from each branch before deduplication
-/// * `base_row_count` - Total rows in the table
-/// * `input_cardinality` - Number of times the multi-index scan is executed (from outer join)
-/// * `params` - Cost model parameters
-pub fn estimate_multi_index_scan_cost(
-    branch_costs: &[Cost],
-    branch_rows: &[f64],
-    base_row_count: RowCountEstimate,
-    input_cardinality: f64,
-    params: &CostModelParams,
-) -> (Cost, f64) {
-    let base_row_count = *base_row_count;
-
-    // Total cost of all branch scans
-    let branch_scan_cost: f64 = branch_costs.iter().map(|c| c.0).sum();
-
-    // Estimate total rows before deduplication (sum of all branch estimates)
-    let total_rows_before_dedup: f64 = branch_rows.iter().sum();
-
-    // Estimate overlap between branches (rough approximation)
-    // For independent branches, P(A OR B) = P(A) + P(B) - P(A AND B)
-    // We approximate P(A AND B) = P(A) * P(B) for independence
-    let mut unique_row_ratio = 1.0f64;
-    for rows in branch_rows.iter() {
-        let branch_selectivity = (*rows / base_row_count).min(1.0);
-        unique_row_ratio *= 1.0 - branch_selectivity;
-    }
-    let estimated_unique_rows = base_row_count * (1.0 - unique_row_ratio);
-
-    // Deduplication cost: adding and checking rowids in the RowSet
-    // RowSet operations are O(log n) for balanced tree implementation
-    let rowset_ops_cost = total_rows_before_dedup * params.cpu_cost_per_row * 2.0; // add + test
-
-    // Table fetch cost: use same formula as single-index table lookup for consistency
-    // This models the expected number of pages to fetch, assuming some locality benefit
-    // from sorted rowid access after RowSet deduplication
-    let table_pages = (base_row_count / params.rows_per_page).max(1.0);
-    let selectivity = estimated_unique_rows / base_row_count.max(1.0);
-    let table_fetch_cost = selectivity * table_pages;
-
-    // Total cost
-    let total_cost = (branch_scan_cost + rowset_ops_cost + table_fetch_cost) * input_cardinality;
-
-    (Cost(total_cost), estimated_unique_rows)
-}
-
-/// Estimate the cost of a multi-index intersection (AND-by-intersection optimization).
-///
-/// The cost model accounts for:
-/// 1. Cost of each index branch scan
-/// 2. Intersection overhead using RowSet test operations
-/// 3. Table row fetches for intersection result
-/// 4. Final row estimate is the product of selectivities (assuming independence)
-///
-/// Intersection works differently from union:
-/// - First branch populates the RowSet
-/// - Subsequent branches test against and reduce the set
-/// - Final result is only rowids that appear in ALL branches
-///
-/// # Arguments
-/// * `branch_costs` - Cost of scanning each individual index branch
-/// * `branch_rows` - Estimated rows from each branch
-/// * `base_row_count` - Total rows in the table
-/// * `input_cardinality` - Number of times the multi-index scan is executed (from outer join)
-/// * `params` - Cost model parameters
-///
-/// # Returns
-/// A tuple of (Cost, estimated_result_rows)
-pub fn estimate_multi_index_intersection_cost(
-    branch_costs: &[Cost],
-    branch_rows: &[f64],
-    base_row_count: RowCountEstimate,
-    input_cardinality: f64,
-    params: &CostModelParams,
-) -> (Cost, f64) {
-    let base_row_count = *base_row_count;
-
-    // Total cost of all branch scans
-    let branch_scan_cost: f64 = branch_costs.iter().map(|c| c.0).sum();
-
-    // Estimate intersection result (product of selectivities, assuming independence)
-    // P(A AND B) = P(A) * P(B) for independent predicates
-    let mut intersection_selectivity = 1.0f64;
-    for rows in branch_rows.iter() {
-        let branch_selectivity = (*rows / base_row_count).min(1.0);
-        intersection_selectivity *= branch_selectivity;
-    }
-    let estimated_intersection_rows = (base_row_count * intersection_selectivity).max(1.0);
-
-    // Intersection cost: first branch adds, subsequent branches test
-    // First branch: rows[0] inserts
-    // Subsequent branches: rows[i] tests
-    let first_branch_rows = branch_rows.first().copied().unwrap_or(0.0);
-    let subsequent_branch_rows: f64 = branch_rows.iter().skip(1).sum();
-    let rowset_ops_cost =
-        (first_branch_rows + subsequent_branch_rows) * params.cpu_cost_per_row * 1.5; // add is cheaper than test+add
-
-    // Table fetch cost: use same formula as single-index table lookup for consistency
-    // This models the expected number of pages to fetch, assuming some locality benefit
-    // from sorted rowid access after RowSet intersection
-    let table_pages = (base_row_count / params.rows_per_page).max(1.0);
-    let selectivity = estimated_intersection_rows / base_row_count.max(1.0);
-    let table_fetch_cost = selectivity * table_pages;
-
-    // Total cost
-    let total_cost = (branch_scan_cost + rowset_ops_cost + table_fetch_cost) * input_cardinality;
-
-    (Cost(total_cost), estimated_intersection_rows)
 }

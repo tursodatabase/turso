@@ -22,8 +22,8 @@ use crate::{
         expr::{walk_expr, WalkControl},
         optimizer::{
             access_method::{
-                consider_multi_index_intersection, consider_multi_index_union,
                 estimate_hash_join_cost, try_hash_join_access_method, AccessMethodParams,
+                PostAccessFilter,
             },
             cost::{Cost, RowCountEstimate},
             order::plan_satisfies_order_target,
@@ -112,6 +112,12 @@ pub fn join_lhs_and_rhs<'a>(
         rhs_constraints,
         join_order,
         maybe_order_target,
+        where_clause,
+        available_indexes,
+        table_references,
+        subqueries,
+        schema,
+        analyze_stats,
         input_cardinality,
         rhs_base_rows,
         params,
@@ -151,48 +157,10 @@ pub fn join_lhs_and_rhs<'a>(
     // If we have a previous table, consider hash join as an alternative
     let mut best_access_method = method;
 
-    // Reuse for multi-index scans, hash cost and output cardinality computation
+    // Reuse for hash cost and output cardinality computation
     let lhs_mask = lhs.map_or_else(TableMask::new, |l| {
         TableMask::from_table_number_iter(l.table_numbers())
     });
-
-    // Consider multi-index scans (OR-by-union and AND-by-intersection) for BTree tables with rowids.
-    // Cross-table disjuncts are validated against lhs_mask in the respective consider_ functions.
-    if rhs_table_reference.btree().is_some_and(|b| b.has_rowid) {
-        // Try OR-by-union
-        if let Some(multi_idx_method) = consider_multi_index_union(
-            rhs_table_reference,
-            where_clause,
-            available_indexes,
-            table_references,
-            subqueries,
-            schema,
-            input_cardinality,
-            rhs_base_rows,
-            params,
-            best_access_method.cost,
-            &lhs_mask,
-        ) {
-            best_access_method = multi_idx_method;
-        }
-
-        // Try AND-by-intersection
-        if let Some(multi_idx_and_method) = consider_multi_index_intersection(
-            rhs_table_reference,
-            where_clause,
-            available_indexes,
-            table_references,
-            subqueries,
-            schema,
-            input_cardinality,
-            rhs_base_rows,
-            params,
-            best_access_method.cost,
-            &lhs_mask,
-        ) {
-            best_access_method = multi_idx_and_method;
-        }
-    }
 
     // Self-constraints are conditions comparing columns within the same table
     // (e.g., t.col1 < t.col2). Include them in selectivity since they filter rows.
@@ -461,7 +429,7 @@ pub fn join_lhs_and_rhs<'a>(
             };
 
             // If this build table was already a probe in a prior hash join, scanning it again
-            // for a hash build would ignore the prior join filters. We currently disallow
+            // for a hash build would ignore the prior join filters. The planner disallows
             // probe-to-build chaining, even with materialization.
             let build_table_is_prior_probe = lhs.data.iter().any(|(_, am_idx)| {
                 let arena = &access_methods_arena;
@@ -711,7 +679,6 @@ pub fn join_lhs_and_rhs<'a>(
 
     // Check if there's an index method candidate for this table (e.g., FTS)
     // and compare its cost against the current best access method.
-    let mut index_method_estimated_rows: Option<u64> = None;
     if let Some(candidate) = index_method_candidates
         .iter()
         .find(|c| c.table_idx == rhs_table_number)
@@ -729,13 +696,13 @@ pub fn join_lhs_and_rhs<'a>(
             if fts_cost < best_access_method.cost {
                 best_access_method = AccessMethod {
                     cost: fts_cost,
+                    estimated_rows_per_outer_row: cost_estimate.estimated_rows as f64,
+                    post_access_filter: PostAccessFilter::None,
                     params: AccessMethodParams::IndexMethod {
                         query: candidate.to_query(),
                         where_covered: candidate.where_covered,
                     },
                 };
-                // Track index_method estimated_rows for output cardinality
-                index_method_estimated_rows = Some(cost_estimate.estimated_rows);
             }
         }
     }
@@ -769,100 +736,26 @@ pub fn join_lhs_and_rhs<'a>(
     // OUTPUT CARDINALITY CALCULATION
     // ============================================================================
     //
-    // Formula: output_rows = input_rows × rows_per_lookup × filter_selectivity
+    // Formula: output_rows = input_rows × rows_from_access_path × remaining_filter_selectivity.
     //
-    // ACCESS METHOD TYPES:
+    // Each access method provides its own per-outer-row row estimate for:
+    // - full BTree scans and full index scans
+    // - rowid seeks
+    // - ordinary secondary-index seeks
+    // - multi-index OR/AND scans
+    // - index-method access such as FTS
     //
-    // FULL SCAN (no constraints):
-    //   Cartesian product filtered by all constraints.
-    //   output = input × rhs_table_size × all_selectivities
+    // Join planning only applies the remaining filter class that the chosen
+    // access path did not already account for.
     //
-    // ROWID SEEK (no index, has constraints):
-    //   Primary key lookup returns 0 or 1 row.
-    //   output = input × 1 × local_filter_selectivity
-    //   (local_filter excludes equi-join selectivity since the seek handles that)
-    //
-    // INDEX SEEK (has index and constraints):
-    //   Secondary index lookup. Rows per lookup = "fanout".
-    //   output = input × fanout × local_filter_selectivity
-    //
-    // FANOUT ESTIMATION:
-    //   Fanout = expected rows per index lookup.
-    //   - With ANALYZE stats: use avg_rows_per_distinct_prefix[matched_cols - 1]
-    //   - Without stats: cost_params.fanout_index_seek_per_unmatched_column^(unmatched_columns) heuristic
-    //     Example: 3-column index, match 1 column → 4^2 = 16 rows per lookup
-    //   - Full key match: cost_params.fanout_index_seek_unique (unique index) or cost_params.fanout_index_seek_non_unique (non-unique)
-    //
-    let output_cardinality = if let Some(estimated_rows) = index_method_estimated_rows {
-        // Special index methods (e.g., FTS) provide their own row estimate
-        input_cardinality * estimated_rows as f64
-    } else if let AccessMethodParams::BTreeTable {
-        index,
-        constraint_refs,
-        ..
-    } = &best_access_method.params
-    {
-        if constraint_refs.is_empty() {
-            // FULL SCAN: cartesian product filtered by all constraints
-            input_cardinality * *rhs_base_rows * output_cardinality_multiplier
-        } else if index.is_none() {
-            // ROWID SEEK: exactly 1 row per lookup (primary key is unique)
-            // Only apply local filters, not equi-join selectivity (that's the seek)
-            input_cardinality * local_filter_multiplier * params.fanout_index_seek_unique
-        } else {
-            // INDEX SEEK: fanout depends on matched columns
-            let index = index.as_ref().unwrap();
-            let matched_cols = constraint_refs.len();
-            let total_cols = index.columns.len();
-            let unmatched = total_cols.saturating_sub(matched_cols);
-
-            // Try to get actual fanout from ANALYZE statistics (sqlite_stat1).
-            // Stats give us avg_rows_per_distinct_prefix[i] = avg rows sharing
-            // the same values in first i+1 columns.
-            let table_name = rhs_table_reference.table.get_name();
-            let stats_fanout = analyze_stats
-                .table_stats(table_name)
-                .and_then(|ts| ts.index_stats.get(&index.name))
-                .and_then(|is| {
-                    // matched_cols=1 means we use prefix of length 1, which is index 0
-                    if matched_cols > 0 && matched_cols <= is.avg_rows_per_distinct_prefix.len() {
-                        Some(is.avg_rows_per_distinct_prefix[matched_cols - 1] as f64)
-                    } else {
-                        None
-                    }
-                });
-
-            let fanout = if let Some(f) = stats_fanout {
-                // Use actual statistics from ANALYZE
-                f
-            } else if matched_cols >= total_cols {
-                // Full key match: very few rows per lookup
-                if index.unique {
-                    params.fanout_index_seek_unique // Unique index + full key = exactly 1 row
-                } else {
-                    params.fanout_index_seek_non_unique // Non-unique but full key = probably few duplicates
-                }
-            } else {
-                // Partial key match: use 4^unmatched heuristic
-                // Example: 2-column index, match 1 → 4^1 = 4 rows per lookup
-                params
-                    .fanout_index_seek_per_unmatched_column
-                    .powi(unmatched as i32)
-            };
-
-            // Final: input_rows × fanout × local_filters
-            input_cardinality * fanout * local_filter_multiplier
-        }
-    } else if let AccessMethodParams::MultiIndexScan {
-        estimated_rows_per_outer_row,
-        ..
-    } = &best_access_method.params
-    {
-        input_cardinality * estimated_rows_per_outer_row * local_filter_multiplier
-    } else {
-        // HashJoin, VirtualTable, Subquery: use full selectivity formula
-        input_cardinality * *rhs_base_rows * output_cardinality_multiplier
+    let post_access_filter_multiplier = match best_access_method.post_access_filter {
+        PostAccessFilter::AllConstraints => output_cardinality_multiplier,
+        PostAccessFilter::LocalOnly => local_filter_multiplier,
+        PostAccessFilter::None => 1.0,
     };
+    let output_cardinality = input_cardinality
+        * best_access_method.estimated_rows_per_outer_row
+        * post_access_filter_multiplier;
 
     access_methods_arena.push(best_access_method);
 
@@ -1234,7 +1127,7 @@ pub fn compute_best_join_order<'a>(
                 lhs_keys.sort_unstable();
                 for lhs_key in lhs_keys {
                     let lhs = &lhs_variants[&lhs_key];
-                    // Build a JoinOrder out of the table bitmask we are now considering.
+                    // Build a JoinOrder out of the table bitmask under consideration.
                     for table_no in lhs.table_numbers() {
                         join_order.push(JoinOrderMember {
                             table_id: joined_tables[table_no].internal_id,

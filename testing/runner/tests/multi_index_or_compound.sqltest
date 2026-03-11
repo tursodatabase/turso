@@ -1,0 +1,354 @@
+# Multi-index OR with compound AND disjuncts
+# Tests the case where each OR branch is itself an AND of multiple conditions,
+# e.g. (a = ? AND b = x.id AND c = ?) OR (d = ? AND e = x.id AND f = ?)
+# The optimizer should reuse normal compound-seek analysis per branch, using as
+# much of each branch as the chosen index can support and leaving only the
+# leftover conjuncts as residual filters.
+
+@database :memory:
+
+setup graph_schema {
+    CREATE TABLE item (
+        id VARCHAR(36) PRIMARY KEY NOT NULL,
+        label VARCHAR NOT NULL DEFAULT '',
+        type VARCHAR DEFAULT 'item'
+    );
+    CREATE TABLE link (
+        id VARCHAR(36) PRIMARY KEY NOT NULL,
+        src VARCHAR(36) NOT NULL DEFAULT '',
+        dst VARCHAR(36) NOT NULL DEFAULT '',
+        label VARCHAR NOT NULL DEFAULT ''
+    );
+    CREATE INDEX idx_link_label ON link(label);
+    CREATE INDEX idx_link_src ON link(src);
+    CREATE INDEX idx_link_dst ON link(dst);
+
+    INSERT INTO item VALUES ('n1', 'Alice', 'entity');
+    INSERT INTO item VALUES ('n2', 'Bob', 'entity');
+    INSERT INTO item VALUES ('n3', 'Carol', 'entity');
+    INSERT INTO item VALUES ('n4', 'Dave', 'other');
+
+    -- links: n1 --knows--> n2, n2 --knows--> n3, n1 --likes--> n3, n4 --knows--> n1
+    INSERT INTO link VALUES ('e1', 'n1', 'n2', 'knows');
+    INSERT INTO link VALUES ('e2', 'n2', 'n3', 'knows');
+    INSERT INTO link VALUES ('e3', 'n1', 'n3', 'likes');
+    INSERT INTO link VALUES ('e4', 'n4', 'n1', 'knows');
+}
+
+setup benchmark_shape_schema {
+    CREATE TABLE node (
+        id VARCHAR(36) PRIMARY KEY NOT NULL,
+        type VARCHAR NOT NULL DEFAULT 'node'
+    );
+    CREATE TABLE edge (
+        id VARCHAR(36) PRIMARY KEY NOT NULL,
+        fromId VARCHAR(36) NOT NULL DEFAULT '',
+        toId VARCHAR(36) NOT NULL DEFAULT '',
+        label VARCHAR NOT NULL DEFAULT ''
+    );
+    CREATE INDEX idx_edge_label ON edge(label);
+    CREATE INDEX idx_edge_fromId ON edge(fromId);
+    CREATE INDEX idx_edge_toId ON edge(toId);
+
+    INSERT INTO node VALUES ('n1', 'entity');
+    INSERT INTO node VALUES ('n2', 'entity');
+    INSERT INTO node VALUES ('n3', 'entity');
+    INSERT INTO node VALUES ('n4', 'other');
+
+    INSERT INTO edge VALUES ('e1', 'n1', 'n2', 'knows');
+    INSERT INTO edge VALUES ('e2', 'n2', 'n3', 'knows');
+    INSERT INTO edge VALUES ('e3', 'n1', 'n3', 'likes');
+    INSERT INTO edge VALUES ('e4', 'n4', 'n1', 'knows');
+}
+
+setup correlated_subquery_schema {
+    CREATE TABLE t(a INT, b INT);
+    CREATE TABLE u(x INT);
+    CREATE INDEX idx_t_a ON t(a);
+
+    INSERT INTO t VALUES (1, 10), (1, 20), (2, 10), (3, 30);
+    INSERT INTO u VALUES (10);
+}
+
+setup rowid_branch_schema {
+    CREATE TABLE t(a INT, b INT);
+    CREATE INDEX idx_t_a ON t(a);
+
+    INSERT INTO t VALUES (10, 100), (20, 200), (20, 300);
+}
+
+setup compound_branch_seek_schema {
+    CREATE TABLE link(src INT, dst INT);
+    CREATE TABLE item(id INT, kind INT, name TEXT);
+    CREATE INDEX idx_item_id_kind ON item(id, kind);
+
+    INSERT INTO link VALUES (1, 2), (3, 1), (1, 4), (5, 6);
+    INSERT INTO item VALUES (2, 7, 'a');
+    INSERT INTO item VALUES (2, 8, 'b');
+    INSERT INTO item VALUES (3, 7, 'c');
+    INSERT INTO item VALUES (4, 7, 'd');
+    INSERT INTO item VALUES (6, 7, 'e');
+}
+
+# Basic: find entities connected to a specific node via 'knows' edges (bidirectional)
+@setup graph_schema
+test compound-or-basic {
+    SELECT DISTINCT i.id
+    FROM item i
+    JOIN link l
+      ON (
+        (l.src = 'n1' AND l.dst = i.id AND l.label = 'knows')
+        OR
+        (l.dst = 'n1' AND l.src = i.id AND l.label = 'knows')
+      )
+    WHERE i.type = 'entity'
+    ORDER BY i.id;
+}
+expect {
+    n2
+}
+
+# Bidirectional: n2 connects to n1 (via e1 dst) and n3 (via e2 src)
+@setup graph_schema
+test compound-or-node2 {
+    SELECT DISTINCT i.id
+    FROM item i
+    JOIN link l
+      ON (
+        (l.src = 'n2' AND l.dst = i.id AND l.label = 'knows')
+        OR
+        (l.dst = 'n2' AND l.src = i.id AND l.label = 'knows')
+      )
+    WHERE i.type = 'entity'
+    ORDER BY i.id;
+}
+expect {
+    n1
+    n3
+}
+
+# Include non-entity filter: n4 is 'other' type, should be excluded
+@setup graph_schema
+test compound-or-type-filter {
+    SELECT DISTINCT i.id
+    FROM item i
+    JOIN link l
+      ON (
+        (l.src = 'n1' AND l.dst = i.id AND l.label = 'knows')
+        OR
+        (l.dst = 'n1' AND l.src = i.id AND l.label = 'knows')
+      )
+    ORDER BY i.id;
+}
+expect {
+    n2
+    n4
+}
+
+# No matches: node n3 has no 'knows' edges where n3 is src or dst
+# (n3 is only a dst in e2 and e3, but e3 is 'likes' not 'knows')
+@setup graph_schema
+test compound-or-no-match {
+    SELECT DISTINCT i.id
+    FROM item i
+    JOIN link l
+      ON (
+        (l.src = 'n3' AND l.dst = i.id AND l.label = 'knows')
+        OR
+        (l.dst = 'n3' AND l.src = i.id AND l.label = 'knows')
+      )
+    WHERE i.type = 'entity'
+    ORDER BY i.id;
+}
+expect {
+    n2
+}
+
+# All entities with any 'knows' connection (no specific node filter)
+@setup graph_schema
+test compound-or-all-entities {
+    SELECT DISTINCT i.id
+    FROM item i
+    JOIN link l
+      ON (
+        (l.src = i.id AND l.label = 'knows')
+        OR
+        (l.dst = i.id AND l.label = 'knows')
+      )
+    WHERE i.type = 'entity'
+    ORDER BY i.id;
+}
+expect {
+    n1
+    n2
+    n3
+}
+
+# Benchmark shape: the join pattern from the larger kin database should use multi-index OR
+@setup benchmark_shape_schema
+test compound-or-benchmark-shape {
+    SELECT DISTINCT n.id
+    FROM node n
+    JOIN edge e
+      ON (
+        (e.fromId = 'n1' AND e.toId = n.id AND e.label = 'knows')
+        OR
+        (e.toId = 'n1' AND e.fromId = n.id AND e.label = 'knows')
+      )
+    WHERE n.type = 'entity'
+    ORDER BY n.id;
+}
+expect {
+    n2
+}
+
+# Correlated residual subqueries should still return correct results
+@setup correlated_subquery_schema
+test compound-or-correlated-subquery {
+    SELECT b FROM t
+    WHERE (a = 1 AND EXISTS(SELECT 1 FROM u WHERE u.x = t.b))
+       OR (a = 2 AND EXISTS(SELECT 1 FROM u WHERE u.x = t.b))
+    ORDER BY b, a;
+}
+expect {
+    10
+    10
+}
+
+# Rowid branches may participate in the same multi-index OR as indexed branches
+@setup rowid_branch_schema
+test compound-or-rowid-branch {
+    SELECT rowid, a FROM t
+    WHERE (rowid = 1 AND rowid > 0)
+       OR (a = 20 AND a > 0)
+    ORDER BY rowid;
+}
+expect {
+    1|10
+    2|20
+    3|20
+}
+
+# Compound OR branches should reuse full compound seek analysis, not just pick a
+# single indexed conjunct. With only (id, kind) indexed, each branch must seek
+# on both columns to be indexable.
+@setup compound_branch_seek_schema
+test compound-or-compound-branch-seek {
+    SELECT DISTINCT i.id
+    FROM item i
+    JOIN link l
+      ON (
+        (l.src = 1 AND i.id = l.dst AND i.kind = 7)
+        OR
+        (l.dst = 1 AND i.id = l.src AND i.kind = 7)
+      )
+    ORDER BY i.id;
+}
+expect {
+    2
+    3
+    4
+}
+
+# Residuals that reference both the scanned table and an outer table should still
+# use multi-index OR and position the scanned table cursor for evaluation.
+@setup graph_schema
+test compound-or-mixed-residual {
+    SELECT DISTINCT i.id
+    FROM item i
+    JOIN link l
+      ON (
+        (l.src = 'n1' AND l.dst = i.id AND ((i.type = 'entity' AND l.label = 'knows') OR l.id = 'e4'))
+        OR
+        (l.dst = 'n1' AND l.src = i.id AND ((i.type = 'entity' AND l.label = 'knows') OR l.id = 'e4'))
+      )
+    ORDER BY i.id;
+}
+expect {
+    n2
+    n4
+}
+
+# Snapshot EQP: verify multi-index OR is used
+@setup graph_schema
+snapshot-eqp compound-or-eqp {
+    SELECT DISTINCT i.id
+    FROM item i
+    JOIN link l
+      ON (
+        (l.src = 'n1' AND l.dst = i.id AND l.label = 'knows')
+        OR
+        (l.dst = 'n1' AND l.src = i.id AND l.label = 'knows')
+      )
+    WHERE i.type = 'entity';
+}
+
+# Snapshot EQP: variant without parameters in the seek position
+@setup graph_schema
+snapshot-eqp compound-or-cross-table-eqp {
+    SELECT DISTINCT i.id
+    FROM item i
+    JOIN link l
+      ON (
+        (l.src = i.id AND l.label = 'knows')
+        OR
+        (l.dst = i.id AND l.label = 'knows')
+      )
+    WHERE i.type = 'entity';
+}
+
+# Snapshot EQP: benchmark-shaped join should also use multi-index OR
+@setup benchmark_shape_schema
+snapshot-eqp compound-or-benchmark-shape-eqp {
+    SELECT DISTINCT n.id
+    FROM node n
+    JOIN edge e
+      ON (
+        (e.fromId = 'n1' AND e.toId = n.id AND e.label = 'knows')
+        OR
+        (e.toId = 'n1' AND e.fromId = n.id AND e.label = 'knows')
+      )
+    WHERE n.type = 'entity';
+}
+
+# Snapshot EQP: correlated subquery residuals should fall back to a regular scan
+@setup correlated_subquery_schema
+snapshot-eqp compound-or-correlated-subquery-eqp {
+    SELECT b FROM t
+    WHERE (a = 1 AND EXISTS(SELECT 1 FROM u WHERE u.x = t.b))
+       OR (a = 2 AND EXISTS(SELECT 1 FROM u WHERE u.x = t.b));
+}
+
+# Snapshot EQP: rowid branch plus indexed branch still uses multi-index OR
+@setup rowid_branch_schema
+snapshot-eqp compound-or-rowid-branch-eqp {
+    SELECT rowid, a FROM t
+    WHERE (rowid = 1 AND rowid > 0)
+       OR (a = 20 AND a > 0);
+}
+
+# Snapshot EQP: compound branch seeks should use the composite index in both branches.
+@setup compound_branch_seek_schema
+snapshot-eqp compound-or-compound-branch-seek-eqp {
+    SELECT DISTINCT i.id
+    FROM item i
+    JOIN link l
+      ON (
+        (l.src = 1 AND i.id = l.dst AND i.kind = 7)
+        OR
+        (l.dst = 1 AND i.id = l.src AND i.kind = 7)
+      );
+}
+
+# Snapshot EQP: mixed residuals over outer + scanned tables should still use multi-index OR
+@setup graph_schema
+snapshot-eqp compound-or-mixed-residual-eqp {
+    SELECT DISTINCT i.id
+    FROM item i
+    JOIN link l
+      ON (
+        (l.src = 'n1' AND l.dst = i.id AND ((i.type = 'entity' AND l.label = 'knows') OR l.id = 'e4'))
+        OR
+        (l.dst = 'n1' AND l.src = i.id AND ((i.type = 'entity' AND l.label = 'knows') OR l.id = 'e4'))
+      );
+}

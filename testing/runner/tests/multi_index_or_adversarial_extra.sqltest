@@ -41,6 +41,131 @@ expect {
     5|5|50
 }
 
+setup outer_join_compound_or {
+    CREATE TABLE node (id INTEGER PRIMARY KEY, label TEXT);
+    CREATE TABLE edge (id INTEGER PRIMARY KEY, src INT, dst INT, kind TEXT, weight INT);
+    CREATE INDEX edge_src ON edge(src);
+    CREATE INDEX edge_dst ON edge(dst);
+    INSERT INTO node VALUES (1,'A'),(2,'B'),(3,'C'),(4,'D'),(5,'E');
+    INSERT INTO edge VALUES
+        (1,1,2,'out',10),
+        (2,2,1,'in',15),
+        (3,3,1,'out',25),
+        (4,4,2,'out',35),
+        (5,5,4,'in',40),
+        (6,NULL,3,'out',50),
+        (7,2,NULL,'out',60);
+}
+
+@setup outer_join_compound_or
+test left-join-compound-or-branch-residuals {
+    SELECT n.id, e.id, e.kind, e.weight
+    FROM node n
+    LEFT JOIN edge e
+      ON (e.src = n.id AND e.kind = 'out')
+      OR (e.dst = n.id AND e.weight >= 35)
+    ORDER BY n.id, e.id;
+}
+expect {
+    1|1|out|10
+    2|4|out|35
+    2|7|out|60
+    3|3|out|25
+    3|6|out|50
+    4|4|out|35
+    4|5|in|40
+    5|||
+}
+
+@setup outer_join_compound_or
+test left-join-compound-or-null-extended-antijoin {
+    SELECT n.id
+    FROM node n
+    LEFT JOIN edge e
+      ON (e.src = n.id AND e.kind = 'out')
+      OR (e.dst = n.id AND e.weight >= 35)
+    WHERE e.id IS NULL
+    ORDER BY n.id;
+}
+expect {
+    5
+}
+
+setup outer_join_correlated_residuals {
+    CREATE TABLE node (id INTEGER PRIMARY KEY, label TEXT);
+    CREATE TABLE edge (id INTEGER PRIMARY KEY, src INT, dst INT);
+    CREATE INDEX edge_src ON edge(src);
+    CREATE INDEX edge_dst ON edge(dst);
+    CREATE TABLE edge_flag (edge_id INT, keep_node INT, branch TEXT);
+
+    INSERT INTO node VALUES (1,'A'),(2,'B'),(3,'C'),(4,'D'),(5,'E');
+    INSERT INTO edge VALUES
+        (1,1,2),
+        (2,2,3),
+        (3,4,2),
+        (4,3,4);
+    INSERT INTO edge_flag VALUES
+        (1,1,'src'),
+        (2,3,'dst'),
+        (3,2,'dst'),
+        (3,4,'src');
+}
+
+@setup outer_join_correlated_residuals
+test left-join-compound-or-correlated-residuals {
+    SELECT n.id, e.id
+    FROM node n
+    LEFT JOIN edge e
+      ON (e.src = n.id AND EXISTS (
+            SELECT 1
+            FROM edge_flag f
+            WHERE f.edge_id = e.id
+              AND f.keep_node = n.id
+              AND f.branch = 'src'
+         ))
+      OR (e.dst = n.id AND EXISTS (
+            SELECT 1
+            FROM edge_flag f
+            WHERE f.edge_id = e.id
+              AND f.keep_node = n.id
+              AND f.branch = 'dst'
+         ))
+    ORDER BY n.id, e.id;
+}
+expect {
+    1|1
+    2|3
+    3|2
+    4|3
+    5|
+}
+
+@setup outer_join_correlated_residuals
+test left-join-compound-or-correlated-residuals-antijoin {
+    SELECT n.id
+    FROM node n
+    LEFT JOIN edge e
+      ON (e.src = n.id AND EXISTS (
+            SELECT 1
+            FROM edge_flag f
+            WHERE f.edge_id = e.id
+              AND f.keep_node = n.id
+              AND f.branch = 'src'
+         ))
+      OR (e.dst = n.id AND EXISTS (
+            SELECT 1
+            FROM edge_flag f
+            WHERE f.edge_id = e.id
+              AND f.keep_node = n.id
+              AND f.branch = 'dst'
+         ))
+    WHERE e.id IS NULL
+    ORDER BY n.id;
+}
+expect {
+    5
+}
+
 # Mixed AND/OR in ON clause: (t2.x = t1.a OR t2.y = t1.a) AND t1.id < t2.id
 setup mixed_and_or {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, a INT, b INT);

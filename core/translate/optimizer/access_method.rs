@@ -6,6 +6,7 @@ use turso_ext::{ConstraintInfo, ConstraintUsage, ResultCode};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
 use crate::schema::Schema;
+use crate::stats::AnalyzeStats;
 use crate::translate::expr::{as_binary_components, walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::{
     convert_to_vtab_constraint, BinaryExprSide, Constraint, RangeConstraintRef,
@@ -21,18 +22,18 @@ use crate::vdbe::hash_table::DEFAULT_MEM_BUDGET;
 use crate::{
     schema::{FromClauseSubquery, Index, IndexColumn, Table},
     translate::plan::{IndexMethodQuery, IterationDirection, JoinOrderMember, JoinedTable},
+    turso_assert,
     vtab::VirtualTable,
     LimboError, Result,
 };
 
 use super::{
     constraints::{
-        analyze_and_terms_for_multi_index, analyze_or_term_for_multi_index,
-        usable_constraints_for_join_order, TableConstraints,
+        usable_constraints_for_join_order, usable_constraints_for_lhs_mask, TableConstraints,
     },
-    cost::{
-        estimate_cost_for_scan_or_seek, estimate_multi_index_intersection_cost,
-        estimate_multi_index_scan_cost, Cost, IndexInfo,
+    cost::{estimate_cost_for_scan_or_seek, Cost, IndexInfo},
+    multi_index::{
+        consider_multi_index_intersection, consider_multi_index_union, MultiIndexBranchParams,
     },
     order::OrderTarget,
 };
@@ -43,10 +44,31 @@ use crate::translate::planner::TableMask;
 /// Represents a way to access a table.
 pub struct AccessMethod {
     /// The estimated number of page fetches.
-    /// We are ignoring CPU cost for now.
+    /// CPU costs are folded into the same scalar cost model.
     pub cost: Cost,
+    /// Estimated rows produced per outer row before applying remaining filters.
+    pub estimated_rows_per_outer_row: f64,
+    /// Which remaining filter multiplier join cardinality estimation should apply.
+    pub post_access_filter: PostAccessFilter,
     /// Table-type specific access method details.
     pub params: AccessMethodParams,
+}
+
+/// Describes which remaining WHERE-term selectivity join planning must still
+/// apply after choosing an access path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostAccessFilter {
+    /// Full scans and virtual-table scans still need join planning to apply all
+    /// relevant WHERE-term selectivity, because the access path itself did not
+    /// consume any specific seek predicates.
+    AllConstraints,
+    /// Rowid seeks, ordinary index seeks, and `MultiIndexScan` branches already
+    /// account for the lookup predicates that drive the access path, so join
+    /// planning should only apply remaining local/self residual filters.
+    LocalOnly,
+    /// Index-method access paths such as FTS return their own output estimate, so
+    /// join planning should not apply any extra filter multiplier here.
+    None,
 }
 
 /// Table‑specific details of how an [`AccessMethod`] operates.
@@ -124,138 +146,31 @@ pub enum AccessMethodParams {
         set_op: SetOperation,
         /// For Intersection: additional WHERE term indices consumed.
         additional_consumed_terms: Vec<usize>,
-        /// Estimated unique rows per outer row from the multi-index scan.
-        estimated_rows_per_outer_row: f64,
     },
 }
 
-/// Parameters for a single branch of a multi-index scan.
-#[derive(Debug, Clone)]
-pub struct MultiIndexBranchParams {
-    /// The index to use for this branch, or None for rowid access.
-    pub index: Option<Arc<Index>>,
-    /// The constraint for this branch (needed for building seek_def).
-    pub constraint: Constraint,
-    /// The constraint references used for this branch.
-    pub constraint_refs: Vec<RangeConstraintRef>,
-    /// Estimated number of rows from this branch.
-    pub estimated_rows: f64,
+/// Result of generic btree candidate selection before it is wrapped into a full
+/// [`AccessMethod`].
+pub(super) struct ChosenBtreeCandidate {
+    pub(super) iter_dir: IterationDirection,
+    pub(super) index: Option<Arc<Index>>,
+    pub(super) constraint_refs: Vec<RangeConstraintRef>,
+    pub(super) cost: Cost,
 }
 
-type MultiIdxBranch = (Option<Arc<Index>>, Constraint, Vec<RangeConstraintRef>, f64);
-
-/// Computes IndexInfo for a multi-index branch given an optional index and table reference.
-///
-/// When `rowid_only` is true (for intersection branches), the index is treated as covering
-/// because we only need to extract rowids during the branch scan, not fetch table data.
-fn index_info_for_branch(
-    index: Option<&Index>,
-    rhs_table: &JoinedTable,
-    rowid_only: bool,
-) -> Option<IndexInfo> {
-    match index {
-        Some(index) => Some(IndexInfo {
-            unique: index.unique,
-            // For intersection branches, we only collect rowids, so treat as covering
-            covering: rowid_only || rhs_table.index_is_covering(index),
-            column_count: index.columns.len(),
-        }),
-        None => Some(IndexInfo {
-            unique: true,
-            covering: true,
-            column_count: 1,
-        }),
-    }
-}
-
-/// Computes cost and constructs MultiIndexBranchParams for a single branch.
-///
-/// When `rowid_only` is true (for intersection), the branch only scans the index to collect
-/// rowids into a RowSet, so we treat the index as covering (no table lookup during branch scan).
-/// For union branches, we eventually fetch all rows, so covering status depends on the query.
 #[allow(clippy::too_many_arguments)]
-fn compute_branch_cost_and_params(
-    index: Option<&Arc<Index>>,
-    constraint: &Constraint,
-    constraint_refs: &[RangeConstraintRef],
-    estimated_rows: f64,
-    rhs_table: &JoinedTable,
-    base_row_count: RowCountEstimate,
-    params: &CostModelParams,
-    rowid_only: bool,
-) -> (Cost, MultiIndexBranchParams) {
-    let index_info = index_info_for_branch(index.map(|i| i.as_ref()), rhs_table, rowid_only);
-
-    let cost = estimate_cost_for_scan_or_seek(
-        index_info,
-        &[constraint.clone()],
-        constraint_refs,
-        1.0, // Single pass for each branch
-        base_row_count,
-        false,
-        params,
-    );
-
-    let branch_params = MultiIndexBranchParams {
-        index: index.cloned(),
-        constraint: constraint.clone(),
-        constraint_refs: constraint_refs.to_vec(),
-        estimated_rows,
-    };
-
-    (cost, branch_params)
-}
-
-/// Return the best [AccessMethod] for a given join order.
-pub fn find_best_access_method_for_join_order(
+/// Choose the best ordinary btree lookup candidate for one table under the
+/// current join-order prefix.
+pub(super) fn choose_best_btree_candidate(
     rhs_table: &JoinedTable,
     rhs_constraints: &TableConstraints,
-    join_order: &[JoinOrderMember],
+    lhs_mask: &TableMask,
+    rhs_table_idx: usize,
     maybe_order_target: Option<&OrderTarget>,
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
-) -> Result<Option<AccessMethod>> {
-    match &rhs_table.table {
-        Table::BTree(_) => find_best_access_method_for_btree(
-            rhs_table,
-            rhs_constraints,
-            join_order,
-            maybe_order_target,
-            input_cardinality,
-            base_row_count,
-            params,
-        ),
-        Table::Virtual(vtab) => find_best_access_method_for_vtab(
-            vtab,
-            &rhs_constraints.constraints,
-            join_order,
-            input_cardinality,
-            base_row_count,
-            params,
-        ),
-        Table::FromClauseSubquery(subquery) => find_best_access_method_for_subquery(
-            rhs_table,
-            subquery,
-            rhs_constraints,
-            join_order,
-            input_cardinality,
-            base_row_count,
-            params,
-        ),
-    }
-}
-
-fn find_best_access_method_for_btree(
-    rhs_table: &JoinedTable,
-    rhs_constraints: &TableConstraints,
-    join_order: &[JoinOrderMember],
-    maybe_order_target: Option<&OrderTarget>,
-    input_cardinality: f64,
-    base_row_count: RowCountEstimate,
-    params: &CostModelParams,
-) -> Result<Option<AccessMethod>> {
-    let table_no = join_order.last().unwrap().table_id;
+) -> Option<ChosenBtreeCandidate> {
     let mut best_cost = estimate_cost_for_scan_or_seek(
         None,
         &[],
@@ -265,20 +180,24 @@ fn find_best_access_method_for_btree(
         false,
         params,
     );
-    let mut best_params = AccessMethodParams::BTreeTable {
+    let mut best_choice = ChosenBtreeCandidate {
         iter_dir: IterationDirection::Forwards,
         index: None,
         constraint_refs: vec![],
+        cost: best_cost,
     };
-    let mut best_prereq_count: usize = usize::MAX; // full scan has no prereq preference
+    let mut best_prereq_count = usize::MAX;
+    let table_no = rhs_table.internal_id;
     let rowid_column_idx = rhs_table.columns().iter().position(|c| c.is_rowid_alias());
 
-    // Estimate cost for each candidate index (including the rowid index) and replace best_access_method if the cost is lower.
+    // Estimate cost for each candidate index (including the rowid index) and
+    // keep the best candidate.
     for candidate in rhs_constraints.candidates.iter() {
-        let usable_constraint_refs = usable_constraints_for_join_order(
+        let usable_constraint_refs = usable_constraints_for_lhs_mask(
             &rhs_constraints.constraints,
             &candidate.refs,
-            join_order,
+            lhs_mask,
+            rhs_table_idx,
         );
 
         let index_info = match candidate.index.as_ref() {
@@ -288,8 +207,7 @@ fn find_best_access_method_for_btree(
                 column_count: index.columns.len(),
             },
             None => IndexInfo {
-                unique: true, // rowids are always unique
-                // Only treat rowid as covering when there are usable constraints/rowid seek
+                unique: true,
                 covering: !usable_constraint_refs.is_empty(),
                 column_count: 1,
             },
@@ -298,29 +216,31 @@ fn find_best_access_method_for_btree(
         let (iter_dir, is_index_ordered, order_satisfiability_bonus) = if let Some(order_target) =
             maybe_order_target
         {
-            // If the index delivers rows in the same direction (or the exact reverse direction) as the order target, then it
-            // satisfies the order target.
+            // If the index delivers rows in the same direction, or the exact
+            // reverse direction, as the order target, then it satisfies the
+            // ORDER BY and we can credit the access path with the saved sort.
             let mut all_same_direction = true;
             let mut all_opposite_direction = true;
             for i in 0..order_target.0.len().min(index_info.column_count) {
                 let target = &order_target.0[i];
                 let correct_table = target.table_id == table_no;
                 let correct_column = match (&target.target, &candidate.index) {
-                    // Regular column target on normal index, simply check column number
-                    // against index column's pos_in_table
+                    // Regular column target on a normal index: compare the table
+                    // column position against the indexed column.
                     (ColumnTarget::Column(col_no), Some(index)) => {
                         index.columns[i].expr.is_none() && index.columns[i].pos_in_table == *col_no
                     }
-                    // Expression column target on expression index, check expr equivalence
+                    // Expression target on an expression index: compare the
+                    // normalized expressions for equivalence.
                     (ColumnTarget::Expr(expr), Some(index)) => index.columns[i]
                         .expr
                         .as_ref()
                         .is_some_and(|e| exprs_are_equivalent(e, unsafe { &**expr })),
-                    // Normal column target on rowid index, check if column is rowid
+                    // Normal column target on the rowid access path.
                     (ColumnTarget::Column(col_no), None) => {
                         rowid_column_idx.is_some_and(|idx| idx == *col_no)
                     }
-                    // Rowid target on rowid index
+                    // Explicit rowid target on the rowid access path.
                     (ColumnTarget::RowId, None) => true,
                     _ => false,
                 };
@@ -329,11 +249,9 @@ fn find_best_access_method_for_btree(
                     all_opposite_direction = false;
                     break;
                 }
-                let correct_order = {
-                    match &candidate.index {
-                        Some(index) => target.order == index.columns[i].order,
-                        None => target.order == SortOrder::Asc,
-                    }
+                let correct_order = match &candidate.index {
+                    Some(index) => target.order == index.columns[i].order,
+                    None => target.order == SortOrder::Asc,
                 };
                 if correct_order {
                     all_opposite_direction = false;
@@ -374,11 +292,9 @@ fn find_best_access_method_for_btree(
             params,
         );
         // Prerequisite tiebreaker (mirrors SQLite's whereLoopFindLesser).
-        // Compute the number of outer tables this access method depends on.
-        // When costs are equal, prefer fewer prerequisites: a constant-bound
-        // seek (e.g., label='alias', prereq_count=0) accesses the same index
-        // entries every iteration, while a join-dependent seek (e.g.,
-        // toId=outer.id, prereq_count=1) touches different pages each time.
+        // When costs are equal, prefer fewer outer-table prerequisites: a
+        // constant-bound seek touches the same key range each iteration, while a
+        // join-dependent seek may bounce around the index.
         let prereq_count: usize = usable_constraint_refs
             .iter()
             .flat_map(|ucref| {
@@ -394,23 +310,219 @@ fn find_best_access_method_for_btree(
             .sum();
         let adjusted_best = best_cost + order_satisfiability_bonus;
         let costs_equal = (cost.0 - adjusted_best.0).abs() < 1e-9;
-        let cost_beats_best =
-            cost < adjusted_best || (costs_equal && prereq_count < best_prereq_count);
-        if cost_beats_best {
+        if cost < adjusted_best || (costs_equal && prereq_count < best_prereq_count) {
             best_cost = cost;
             best_prereq_count = prereq_count;
-            best_params = AccessMethodParams::BTreeTable {
+            best_choice = ChosenBtreeCandidate {
                 iter_dir,
                 index: candidate.index.clone(),
-                constraint_refs: usable_constraint_refs,
+                constraint_refs: usable_constraint_refs.clone(),
+                cost,
             };
         }
     }
 
-    Ok(Some(AccessMethod {
-        cost: best_cost,
-        params: best_params,
-    }))
+    Some(best_choice)
+}
+
+/// Estimate rows produced per outer row for an ordinary btree access path using
+/// the join-order heuristic that the planner expects for btree lookups.
+fn estimate_btree_rows_per_outer_row(
+    rhs_table: &JoinedTable,
+    index: Option<&Arc<Index>>,
+    constraint_refs: &[RangeConstraintRef],
+    analyze_stats: &AnalyzeStats,
+    params: &CostModelParams,
+) -> f64 {
+    turso_assert!(
+        !constraint_refs.is_empty(),
+        "btree row-estimate helper expects a lookup, not a full scan"
+    );
+
+    if index.is_none() {
+        return params.fanout_index_seek_unique;
+    }
+
+    let index = index.expect("checked above");
+    let matched_cols = constraint_refs.len();
+    let total_cols = index.columns.len();
+    let unmatched = total_cols.saturating_sub(matched_cols);
+    let table_name = rhs_table.table.get_name();
+    if let Some(fanout) = analyze_stats
+        .table_stats(table_name)
+        .and_then(|ts| ts.index_stats.get(&index.name))
+        .and_then(|stats| {
+            if matched_cols > 0 && matched_cols <= stats.avg_rows_per_distinct_prefix.len() {
+                Some(stats.avg_rows_per_distinct_prefix[matched_cols - 1] as f64)
+            } else {
+                None
+            }
+        })
+    {
+        return fanout;
+    }
+
+    if matched_cols >= total_cols {
+        if index.unique {
+            params.fanout_index_seek_unique
+        } else {
+            params.fanout_index_seek_non_unique
+        }
+    } else {
+        params
+            .fanout_index_seek_per_unmatched_column
+            .powi(unmatched as i32)
+    }
+}
+
+/// Return the best [AccessMethod] for a given join order.
+#[allow(clippy::too_many_arguments)]
+pub fn find_best_access_method_for_join_order(
+    rhs_table: &JoinedTable,
+    rhs_constraints: &TableConstraints,
+    join_order: &[JoinOrderMember],
+    maybe_order_target: Option<&OrderTarget>,
+    where_clause: &[WhereTerm],
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
+    schema: &Schema,
+    analyze_stats: &AnalyzeStats,
+    input_cardinality: f64,
+    base_row_count: RowCountEstimate,
+    params: &CostModelParams,
+) -> Result<Option<AccessMethod>> {
+    match &rhs_table.table {
+        Table::BTree(_) => find_best_access_method_for_btree(
+            rhs_table,
+            rhs_constraints,
+            join_order,
+            maybe_order_target,
+            where_clause,
+            available_indexes,
+            table_references,
+            subqueries,
+            schema,
+            analyze_stats,
+            input_cardinality,
+            base_row_count,
+            params,
+        ),
+        Table::Virtual(vtab) => find_best_access_method_for_vtab(
+            vtab,
+            &rhs_constraints.constraints,
+            join_order,
+            input_cardinality,
+            base_row_count,
+            params,
+        ),
+        Table::FromClauseSubquery(subquery) => find_best_access_method_for_subquery(
+            rhs_table,
+            subquery,
+            rhs_constraints,
+            join_order,
+            input_cardinality,
+            base_row_count,
+            params,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn find_best_access_method_for_btree(
+    rhs_table: &JoinedTable,
+    rhs_constraints: &TableConstraints,
+    join_order: &[JoinOrderMember],
+    maybe_order_target: Option<&OrderTarget>,
+    where_clause: &[WhereTerm],
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
+    schema: &Schema,
+    analyze_stats: &AnalyzeStats,
+    input_cardinality: f64,
+    base_row_count: RowCountEstimate,
+    params: &CostModelParams,
+) -> Result<Option<AccessMethod>> {
+    let rhs_table_idx = join_order.last().unwrap().original_idx;
+    let lhs_mask = TableMask::from_table_number_iter(
+        join_order
+            .iter()
+            .take(join_order.len() - 1)
+            .map(|member| member.original_idx),
+    );
+    let best = choose_best_btree_candidate(
+        rhs_table,
+        rhs_constraints,
+        &lhs_mask,
+        rhs_table_idx,
+        maybe_order_target,
+        input_cardinality,
+        base_row_count,
+        params,
+    )
+    .expect("btree candidate selection must always consider the rowid candidate");
+
+    let mut best_access_method = AccessMethod {
+        cost: best.cost,
+        estimated_rows_per_outer_row: if best.constraint_refs.is_empty() {
+            *base_row_count
+        } else {
+            estimate_btree_rows_per_outer_row(
+                rhs_table,
+                best.index.as_ref(),
+                &best.constraint_refs,
+                analyze_stats,
+                params,
+            )
+        },
+        post_access_filter: if best.constraint_refs.is_empty() {
+            PostAccessFilter::AllConstraints
+        } else {
+            PostAccessFilter::LocalOnly
+        },
+        params: AccessMethodParams::BTreeTable {
+            iter_dir: best.iter_dir,
+            index: best.index,
+            constraint_refs: best.constraint_refs,
+        },
+    };
+
+    if rhs_table.btree().is_some_and(|b| b.has_rowid) {
+        if let Some(multi_idx_method) = consider_multi_index_union(
+            rhs_table,
+            where_clause,
+            available_indexes,
+            table_references,
+            subqueries,
+            schema,
+            input_cardinality,
+            base_row_count,
+            params,
+            best_access_method.cost,
+            &lhs_mask,
+        ) {
+            best_access_method = multi_idx_method;
+        }
+
+        if let Some(multi_idx_and_method) = consider_multi_index_intersection(
+            rhs_table,
+            where_clause,
+            available_indexes,
+            table_references,
+            subqueries,
+            schema,
+            input_cardinality,
+            base_row_count,
+            params,
+            best_access_method.cost,
+            &lhs_mask,
+        ) {
+            best_access_method = multi_idx_and_method;
+        }
+    }
+
+    Ok(Some(best_access_method))
 }
 
 fn find_best_access_method_for_vtab(
@@ -440,6 +552,8 @@ fn find_best_access_method_for_vtab(
                     false,
                     params,
                 ),
+                estimated_rows_per_outer_row: *base_row_count,
+                post_access_filter: PostAccessFilter::AllConstraints,
                 params: AccessMethodParams::VirtualTable {
                     idx_num: index_info.idx_num,
                     idx_str: index_info.idx_str,
@@ -451,253 +565,6 @@ fn find_best_access_method_for_vtab(
         Err(ResultCode::ConstraintViolation) => Ok(None),
         Err(e) => Err(LimboError::from(e)),
     }
-}
-
-/// Evaluates multi-index branches and returns AccessMethod if cost-effective.
-#[allow(clippy::too_many_arguments)]
-fn evaluate_multi_index_branches(
-    branches: &[MultiIdxBranch],
-    set_op: SetOperation,
-    where_term_idx: usize,
-    additional_consumed_terms: Vec<usize>,
-    rhs_table: &JoinedTable,
-    base_row_count: RowCountEstimate,
-    input_cardinality: f64,
-    params: &CostModelParams,
-    best_cost: Cost,
-) -> Option<AccessMethod> {
-    let mut branch_costs = Vec::with_capacity(branches.len());
-    let mut branch_rows = Vec::with_capacity(branches.len());
-    let mut branch_params = Vec::with_capacity(branches.len());
-
-    for (index, constraint, constraint_refs, estimated_rows) in branches {
-        if constraint_refs.is_empty() {
-            return None; // Cannot use multi-index if any branch has no index
-        }
-
-        let (cost, params_for_branch) = compute_branch_cost_and_params(
-            index.as_ref(),
-            constraint,
-            constraint_refs,
-            *estimated_rows,
-            rhs_table,
-            base_row_count,
-            params,
-            true, // rowid_only: branches only collect rowids
-        );
-
-        branch_costs.push(cost);
-        branch_rows.push(*estimated_rows);
-        branch_params.push(params_for_branch);
-    }
-
-    let (multi_index_cost, estimated_rows) = match set_op {
-        SetOperation::Union => estimate_multi_index_scan_cost(
-            &branch_costs,
-            &branch_rows,
-            base_row_count,
-            input_cardinality,
-            params,
-        ),
-        SetOperation::Intersection => estimate_multi_index_intersection_cost(
-            &branch_costs,
-            &branch_rows,
-            base_row_count,
-            input_cardinality,
-            params,
-        ),
-    };
-
-    if multi_index_cost < best_cost {
-        Some(AccessMethod {
-            cost: multi_index_cost,
-            params: AccessMethodParams::MultiIndexScan {
-                branches: branch_params,
-                where_term_idx,
-                set_op,
-                additional_consumed_terms,
-                estimated_rows_per_outer_row: estimated_rows,
-            },
-        })
-    } else {
-        None
-    }
-}
-
-/// Analyze OR clauses for multi-index union optimization.
-///
-/// Returns an `AccessMethod` using `MultiIndexScan` with `SetOperation::Union` if:
-/// 1. An OR term has all disjuncts indexable on different indexes
-/// 2. The estimated cost is lower than the provided best_cost
-#[allow(clippy::too_many_arguments)]
-pub fn consider_multi_index_union(
-    rhs_table: &JoinedTable,
-    where_clause: &[WhereTerm],
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
-    table_references: &TableReferences,
-    subqueries: &[NonFromClauseSubquery],
-    schema: &Schema,
-    input_cardinality: f64,
-    base_row_count: RowCountEstimate,
-    params: &CostModelParams,
-    best_cost: Cost,
-    lhs_mask: &TableMask,
-) -> Option<AccessMethod> {
-    for (where_term_idx, term) in where_clause.iter().enumerate() {
-        if term.consumed {
-            continue;
-        }
-
-        let ast::Expr::Binary(_, ast::Operator::Or, _) = &term.expr else {
-            continue;
-        };
-
-        let Some(decomposition) = analyze_or_term_for_multi_index(
-            where_term_idx,
-            &term.expr,
-            rhs_table,
-            available_indexes,
-            table_references,
-            subqueries,
-            schema,
-            params,
-        ) else {
-            continue;
-        };
-
-        if !decomposition.all_indexable {
-            continue;
-        }
-
-        // Verify that every disjunct's constraining expression only references
-        // tables already on the LHS. This ensures cross-table disjuncts are only
-        // used when their referenced tables are available in the join context.
-        // Note: `all_indexable` check above guarantees every disjunct has a constraint,
-        // so the `is_some_and` never short-circuits to false on a None constraint.
-        let all_usable = decomposition.disjuncts.iter().all(|d| {
-            d.constraint
-                .as_ref()
-                .is_some_and(|c| lhs_mask.contains_all(&c.lhs_mask))
-        });
-        if !all_usable {
-            continue;
-        }
-
-        // Extract branch info from disjuncts
-        let branches: Option<Vec<_>> = decomposition
-            .disjuncts
-            .iter()
-            .map(|d| {
-                d.constraint.as_ref().map(|c| {
-                    (
-                        d.best_index.clone(),
-                        c.clone(),
-                        d.constraint_refs.clone(),
-                        d.estimated_rows,
-                    )
-                })
-            })
-            .collect();
-
-        let Some(branches) = branches else {
-            continue;
-        };
-
-        if branches.len() != decomposition.disjuncts.len() {
-            continue;
-        }
-
-        if let Some(access_method) = evaluate_multi_index_branches(
-            &branches,
-            SetOperation::Union,
-            where_term_idx,
-            vec![],
-            rhs_table,
-            base_row_count,
-            input_cardinality,
-            params,
-            best_cost,
-        ) {
-            return Some(access_method);
-        }
-    }
-
-    None
-}
-
-/// Analyze AND terms for multi-index intersection optimization.
-///
-/// Returns an `AccessMethod` using `MultiIndexScan` with `SetOperation::Intersection` if:
-/// 1. Multiple AND terms reference different indexed columns
-/// 2. The estimated cost is lower than the provided best_cost
-#[allow(clippy::too_many_arguments)]
-pub fn consider_multi_index_intersection(
-    rhs_table: &JoinedTable,
-    where_clause: &[WhereTerm],
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
-    table_references: &TableReferences,
-    subqueries: &[NonFromClauseSubquery],
-    schema: &Schema,
-    input_cardinality: f64,
-    base_row_count: RowCountEstimate,
-    params: &CostModelParams,
-    best_cost: Cost,
-    lhs_mask: &TableMask,
-) -> Option<AccessMethod> {
-    let decomposition = analyze_and_terms_for_multi_index(
-        rhs_table,
-        where_clause,
-        available_indexes,
-        table_references,
-        subqueries,
-        schema,
-        params,
-    )?;
-
-    if decomposition.branches.len() < 2 {
-        return None;
-    }
-
-    // Verify all branches only reference tables already on the LHS.
-    // Although analyze_and_terms_for_multi_index currently filters out cross-table
-    // constraints (lhs_mask.is_empty()), this explicit check provides defense-in-depth.
-    let all_usable = decomposition
-        .branches
-        .iter()
-        .all(|b| lhs_mask.contains_all(&b.constraint.lhs_mask));
-    if !all_usable {
-        return None;
-    }
-
-    // Extract branch info
-    let branches: Vec<_> = decomposition
-        .branches
-        .iter()
-        .map(|b| {
-            (
-                b.index.clone(),
-                b.constraint.clone(),
-                b.constraint_refs.clone(),
-                b.estimated_rows,
-            )
-        })
-        .collect::<Vec<MultiIdxBranch>>();
-
-    let where_term_idx = decomposition.term_indices[0];
-    let additional_consumed_terms: Vec<usize> =
-        decomposition.term_indices.iter().skip(1).copied().collect();
-
-    evaluate_multi_index_branches(
-        &branches,
-        SetOperation::Intersection,
-        where_term_idx,
-        additional_consumed_terms,
-        rhs_table,
-        base_row_count,
-        input_cardinality,
-        params,
-        best_cost,
-    )
 }
 
 /// Collect all table IDs referenced in an expression.
@@ -898,7 +765,7 @@ pub fn try_hash_join_access_method(
         return None;
     }
 
-    //skip hash join for now on USING/NATURAL joins
+    // Skip hash join on USING/NATURAL joins.
     if build_table
         .join_info
         .as_ref()
@@ -1037,6 +904,8 @@ pub fn try_hash_join_access_method(
     );
     Some(AccessMethod {
         cost,
+        estimated_rows_per_outer_row: probe_cardinality,
+        post_access_filter: PostAccessFilter::AllConstraints,
         params: AccessMethodParams::HashJoin {
             build_table_idx,
             probe_table_idx,
@@ -1088,6 +957,8 @@ fn find_best_access_method_for_subquery(
                 false,
                 params,
             ),
+            estimated_rows_per_outer_row: *base_row_count,
+            post_access_filter: PostAccessFilter::AllConstraints,
             params: AccessMethodParams::Subquery,
         }));
     }
@@ -1107,6 +978,8 @@ fn find_best_access_method_for_subquery(
                 false,
                 params,
             ),
+            estimated_rows_per_outer_row: *base_row_count,
+            post_access_filter: PostAccessFilter::AllConstraints,
             params: AccessMethodParams::Subquery,
         }));
     }
@@ -1138,6 +1011,8 @@ fn find_best_access_method_for_subquery(
                 false,
                 params,
             ),
+            estimated_rows_per_outer_row: *base_row_count,
+            post_access_filter: PostAccessFilter::AllConstraints,
             params: AccessMethodParams::Subquery,
         }));
     }
@@ -1188,6 +1063,8 @@ fn find_best_access_method_for_subquery(
                 false,
                 params,
             ),
+            estimated_rows_per_outer_row: *base_row_count,
+            post_access_filter: PostAccessFilter::AllConstraints,
             params: AccessMethodParams::Subquery,
         }));
     }
@@ -1229,6 +1106,8 @@ fn find_best_access_method_for_subquery(
                 false,
                 params,
             ),
+            estimated_rows_per_outer_row: *base_row_count,
+            post_access_filter: PostAccessFilter::AllConstraints,
             params: AccessMethodParams::Subquery,
         }));
     }
@@ -1272,6 +1151,8 @@ fn find_best_access_method_for_subquery(
 
     Ok(Some(AccessMethod {
         cost: total_cost,
+        estimated_rows_per_outer_row: *base_row_count,
+        post_access_filter: PostAccessFilter::AllConstraints,
         params: AccessMethodParams::MaterializedSubquery {
             index: ephemeral_index,
             constraint_refs: usable_constraint_refs,
