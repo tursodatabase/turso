@@ -358,17 +358,16 @@ snapshot-eqp self-join-same-department {
 # 6. Cross join - cartesian product
 # =============================================================================
 
-# TODO: Uncomment when CROSS JOIN is supported
-# @setup schema
-# snapshot cross-join-explicit {
-#     SELECT
-#         c.name AS customer_name,
-#         p.name AS product_name,
-#         p.price
-#     FROM
-#         customers c
-#     CROSS JOIN products p;
-# }
+@setup schema
+snapshot cross-join-explicit {
+    SELECT
+        c.name AS customer_name,
+        p.name AS product_name,
+        p.price
+    FROM
+        customers c
+    CROSS JOIN products p;
+}
 
 @setup schema
 snapshot-eqp cross-join-implicit {
@@ -381,32 +380,30 @@ snapshot-eqp cross-join-implicit {
         products p;
 }
 
-# TODO: Uncomment when CROSS JOIN is supported
-# @setup schema
-# snapshot cross-join-with-filter {
-#     SELECT
-#         c.name AS customer_name,
-#         p.name AS product_name,
-#         p.price
-#     FROM
-#         customers c
-#     CROSS JOIN products p
-#     WHERE
-#         c.city = 'Boston'
-#         AND p.category = 'Books';
-# }
+@setup schema
+snapshot cross-join-with-filter {
+    SELECT
+        c.name AS customer_name,
+        p.name AS product_name,
+        p.price
+    FROM
+        customers c
+    CROSS JOIN products p
+    WHERE
+        c.city = 'Boston'
+        AND p.category = 'Books';
+}
 
-# TODO: Uncomment when CROSS JOIN is supported
-# @setup schema
-# snapshot cross-join-limited {
-#     SELECT
-#         c.name AS customer_name,
-#         p.name AS product_name
-#     FROM
-#         customers c
-#     CROSS JOIN products p
-#     LIMIT 10;
-# }
+@setup schema
+snapshot cross-join-limited {
+    SELECT
+        c.name AS customer_name,
+        p.name AS product_name
+    FROM
+        customers c
+    CROSS JOIN products p
+    LIMIT 10;
+}
 
 # =============================================================================
 # 7. Join with index on FK - index-assisted join
