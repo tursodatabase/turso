@@ -3029,8 +3029,47 @@ mod fuzz_tests {
                     _ => unreachable!(),
                 };
 
+                // Optionally generate a WHEN clause, sometimes with subqueries
+                let when_clause = if rng.random_bool(0.4) {
+                    let ref_prefix = if has_new { "NEW" } else { "OLD" };
+                    let ref_col = rng.random_range(0..num_cols);
+                    match rng.random_range(0..4) {
+                        0 => {
+                            // Simple comparison WHEN clause
+                            let threshold = rng.random_range(0..1000);
+                            format!(" WHEN {ref_prefix}.c{ref_col} > {threshold}")
+                        }
+                        1 => {
+                            // IN (SELECT ...) subquery WHEN clause
+                            let select_col = rng.random_range(0..num_cols);
+                            let threshold = rng.random_range(0..1000);
+                            format!(
+                                " WHEN {ref_prefix}.c{ref_col} IN (SELECT c{select_col} FROM t WHERE c{select_col} < {threshold})"
+                            )
+                        }
+                        2 => {
+                            // NOT IN (SELECT ...) subquery WHEN clause
+                            let select_col = rng.random_range(0..num_cols);
+                            let threshold = rng.random_range(0..1000);
+                            format!(
+                                " WHEN {ref_prefix}.c{ref_col} NOT IN (SELECT c{select_col} FROM t WHERE c{select_col} > {threshold})"
+                            )
+                        }
+                        3 => {
+                            // EXISTS subquery WHEN clause
+                            let select_col = rng.random_range(0..num_cols);
+                            format!(
+                                " WHEN EXISTS (SELECT 1 FROM t WHERE c{select_col} = {ref_prefix}.c{ref_col})"
+                            )
+                        }
+                        _ => unreachable!(),
+                    }
+                } else {
+                    String::new()
+                };
+
                 let create_trigger = format!(
-                    "CREATE TRIGGER test_trigger {trigger_time} {trigger_event} ON t BEGIN {trigger_action}; END;",
+                    "CREATE TRIGGER test_trigger {trigger_time} {trigger_event} ON t{when_clause} BEGIN {trigger_action}; END;",
                 );
 
                 sqlite_conn.execute(&create_trigger, params![]).unwrap();
