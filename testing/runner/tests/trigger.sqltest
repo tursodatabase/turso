@@ -1942,3 +1942,69 @@ test trigger-update-pk-change-bug {
 expect {
     1|100
 }
+
+# regression test for https://github.com/tursodatabase/turso/issues/5844
+# BEFORE UPDATE WHEN clause should see new rowid via NEW.id
+@cross-check-integrity
+test trigger-before-update-when-new-rowid {
+    CREATE TABLE t211 (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO t211 VALUES(1, 'hello');
+    CREATE TRIGGER tr211 BEFORE UPDATE ON t211 WHEN NEW.id = 5
+        BEGIN SELECT RAISE(ABORT, 'blocked'); END;
+    UPDATE t211 SET id = 5 WHERE id = 1;
+}
+expect error {
+    blocked
+}
+
+# BEFORE UPDATE trigger on multiple rows changing rowid
+@cross-check-integrity
+test trigger-before-update-multi-row-rowid-change {
+    CREATE TABLE t212 (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t212 VALUES(1, 'a');
+    INSERT INTO t212 VALUES(2, 'b');
+    INSERT INTO t212 VALUES(3, 'c');
+    CREATE TABLE log212 (old_id INTEGER, new_id INTEGER);
+    CREATE TRIGGER tr212 BEFORE UPDATE ON t212 BEGIN
+        INSERT INTO log212 VALUES(OLD.id, NEW.id);
+    END;
+    UPDATE t212 SET id = id + 10 WHERE id >= 2;
+    SELECT * FROM log212 ORDER BY old_id;
+}
+expect {
+    2|12
+    3|13
+}
+
+# BEFORE UPDATE trigger when rowid is NOT changing (only non-pk columns updated)
+@cross-check-integrity
+test trigger-before-update-rowid-unchanged {
+    CREATE TABLE t213 (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t213 VALUES(1, 'x');
+    CREATE TABLE log213 (old_id INTEGER, new_id INTEGER);
+    CREATE TRIGGER tr213 BEFORE UPDATE ON t213 BEGIN
+        INSERT INTO log213 VALUES(OLD.id, NEW.id);
+    END;
+    UPDATE t213 SET val = 'y' WHERE id = 1;
+    SELECT * FROM log213;
+}
+expect {
+    1|1
+}
+
+# BEFORE UPDATE WHEN clause comparing OLD.id <> NEW.id fires only when rowid changes
+@cross-check-integrity
+test trigger-before-update-when-old-ne-new-rowid {
+    CREATE TABLE t214 (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t214 VALUES(10, 'test');
+    CREATE TABLE log214 (msg TEXT);
+    CREATE TRIGGER tr214 BEFORE UPDATE ON t214 WHEN OLD.id <> NEW.id BEGIN
+        INSERT INTO log214 VALUES('changed');
+    END;
+    UPDATE t214 SET id = 20 WHERE id = 10;
+    UPDATE t214 SET val = 'no-change' WHERE id = 20;
+    SELECT * FROM log214;
+}
+expect {
+    changed
+}
