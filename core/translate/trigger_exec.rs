@@ -1,7 +1,9 @@
 use crate::schema::{BTreeTable, Trigger};
 use crate::sync::Arc;
 use crate::translate::expr::WalkControl;
-use crate::translate::subquery::{emit_non_from_clause_subquery, plan_subqueries_from_trigger_when_clause};
+use crate::translate::subquery::{
+    emit_non_from_clause_subquery, plan_subqueries_from_trigger_when_clause,
+};
 use crate::translate::{
     emitter::Resolver,
     expr::{self, rewrite_between_expr, translate_expr, walk_expr_mut},
