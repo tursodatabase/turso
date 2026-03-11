@@ -9,7 +9,8 @@
 use crate::schema::{Index, Schema};
 use crate::translate::expr::expr_references_any_subquery;
 use crate::translate::optimizer::access_method::{
-    choose_best_btree_candidate, AccessMethod, AccessMethodParams, PostAccessFilter,
+    choose_best_btree_candidate, choose_best_in_seek_candidate, AccessMethod, AccessMethodParams,
+    BranchReadMode, ChosenInSeekCandidate, PostAccessFilter,
 };
 use crate::translate::optimizer::constraints::{
     analyze_binary_term_for_index, constraints_from_where_clause, Constraint, RangeConstraintRef,
@@ -20,28 +21,37 @@ use crate::translate::optimizer::cost::{
 };
 use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::plan::{
-    JoinedTable, NonFromClauseSubquery, SetOperation, TableReferences, WhereTerm,
+    InSeekSource, JoinedTable, NonFromClauseSubquery, SetOperation, TableReferences, WhereTerm,
 };
 use crate::translate::planner::{table_mask_from_expr, TableMask};
 use rustc_hash::FxHashMap as HashMap;
 use std::{collections::VecDeque, sync::Arc};
-use turso_parser::ast;
+use turso_parser::ast::{self, TableInternalId};
 
 #[derive(Debug, Clone)]
 /// Parameters for a single branch of a multi-index scan.
 pub struct MultiIndexBranchParams {
     /// The index to use for this branch, or None for rowid access.
     pub index: Option<Arc<Index>>,
-    /// Branch-local constraints used to build the seek definition.
-    pub constraints: Vec<Constraint>,
-    /// The constraint references used for this branch.
-    pub constraint_refs: Vec<RangeConstraintRef>,
+    /// How this branch probes the table/index.
+    pub access: MultiIndexBranchAccessParams,
     /// Estimated number of rows from this branch.
     pub estimated_rows: f64,
     /// Residual filter expressions for compound AND disjuncts.
     pub residual_exprs: Vec<ast::Expr>,
     /// Whether residual evaluation needs the scanned table cursor positioned.
     pub requires_table_cursor: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum MultiIndexBranchAccessParams {
+    Seek {
+        constraints: Vec<Constraint>,
+        constraint_refs: Vec<RangeConstraintRef>,
+    },
+    InSeek {
+        source: InSeekSource,
+    },
 }
 
 /// Internal decomposition of an AND clause into intersection branches.
@@ -63,10 +73,22 @@ struct AndBranch {
 /// Internal branch representation while evaluating a candidate multi-index plan.
 struct MultiIdxBranch {
     index: Option<Arc<Index>>,
-    constraints: Vec<Constraint>,
-    constraint_refs: Vec<RangeConstraintRef>,
+    access: MultiIdxBranchAccess,
+    cost: Cost,
+    estimated_rows: f64,
     residual_exprs: Vec<ast::Expr>,
     requires_table_cursor: bool,
+}
+
+enum MultiIdxBranchAccess {
+    Seek {
+        constraints: Vec<Constraint>,
+        constraint_refs: Vec<RangeConstraintRef>,
+    },
+    InSeek {
+        source: InSeekSource,
+        constraint_idx: usize,
+    },
 }
 
 /// Flattens nested OR expressions into a list of disjuncts.
@@ -113,6 +135,7 @@ fn flatten_and_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
 /// terms.
 fn get_table_local_constraints_for_branch(
     exprs: &[ast::Expr],
+    from_outer_join: Option<TableInternalId>,
     table_reference: &JoinedTable,
     table_references: &TableReferences,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
@@ -125,14 +148,7 @@ fn get_table_local_constraints_for_branch(
         .cloned()
         .map(|expr| WhereTerm {
             expr,
-            // WARNING: these synthetic planner terms intentionally drop
-            // `from_outer_join`. That is not a correctness hole for current
-            // call sites because they only extract constraints for the active
-            // RHS table, where `Some(rhs_table)` and `None` behave the same.
-            // This remains a fragile abstraction boundary and should be fixed
-            // by giving branch-local planning a direct constraint extraction
-            // path instead of fabricating `WhereTerm`s.
-            from_outer_join: None,
+            from_outer_join,
             consumed: false,
         })
         .collect::<Vec<_>>();
@@ -249,18 +265,18 @@ fn estimate_multi_index_intersection_cost(
 
 /// Compute [`IndexInfo`] for a multi-index branch.
 ///
-/// When `rowid_only` is true, the branch only needs rowids for RowSet
-/// operations, so an index scan can be treated as covering even if later table
-/// columns are not available from the index.
+/// RowSet-building branches only need rowids from the scan, so an index can be
+/// treated as covering even if it does not contain all later table columns.
 fn index_info_for_branch(
     index: Option<&Index>,
     rhs_table: &JoinedTable,
-    rowid_only: bool,
+    read_mode: BranchReadMode,
 ) -> Option<IndexInfo> {
     match index {
         Some(index) => Some(IndexInfo {
             unique: index.unique,
-            covering: rowid_only || rhs_table.index_is_covering(index),
+            covering: matches!(read_mode, BranchReadMode::RowIdOnly)
+                || rhs_table.index_is_covering(index),
             column_count: index.columns.len(),
         }),
         None => Some(IndexInfo {
@@ -271,52 +287,117 @@ fn index_info_for_branch(
     }
 }
 
+fn in_seek_source_from_expr(
+    expr: &ast::Expr,
+    chosen: &ChosenInSeekCandidate,
+) -> Option<InSeekSource> {
+    match expr {
+        ast::Expr::InList { rhs, .. } => Some(InSeekSource::LiteralList {
+            values: rhs.iter().map(|e| *e.clone()).collect(),
+            affinity: chosen.affinity,
+        }),
+        ast::Expr::SubqueryResult {
+            query_type: ast::SubqueryType::In { cursor_id, .. },
+            ..
+        } => Some(InSeekSource::Subquery {
+            cursor_id: *cursor_id,
+        }),
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-/// Compute branch-local cost and persisted planning metadata for one branch of a
-/// multi-index scan.
-///
-/// When `reads_scanned_table` is false, the branch only scans the index to
-/// collect rowids into the RowSet and does not need to price in table lookups.
-fn compute_branch_cost_and_params(
-    index: Option<&Arc<Index>>,
-    constraints: &[Constraint],
-    constraint_refs: &[RangeConstraintRef],
+fn choose_multi_index_branch_access(
     rhs_table: &JoinedTable,
+    table_constraints: &TableConstraints,
+    branch_terms: &[WhereTerm],
+    lhs_mask: &TableMask,
+    rhs_idx: usize,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
-    reads_scanned_table: bool,
-) -> (Cost, MultiIndexBranchParams) {
-    let index_info =
-        index_info_for_branch(index.map(|i| i.as_ref()), rhs_table, !reads_scanned_table);
-
-    let cost = estimate_cost_for_scan_or_seek(
-        index_info,
-        constraints,
-        constraint_refs,
-        // Branch-local costing models one execution of this branch; the outer
-        // join cardinality multiplier is applied by the union/intersection cost
-        // wrapper around the full multi-index plan.
+) -> crate::Result<Option<MultiIdxBranch>> {
+    let chosen_seek = choose_best_btree_candidate(
+        rhs_table,
+        table_constraints,
+        lhs_mask,
+        rhs_idx,
+        None,
         1.0,
         base_row_count,
-        false,
         params,
     );
 
-    let branch_params = MultiIndexBranchParams {
-        index: index.cloned(),
-        constraints: constraints.to_vec(),
-        constraint_refs: constraint_refs.to_vec(),
-        estimated_rows: estimate_rows_per_seek(
-            index_info.expect("multi-index branches always use index-backed cost info"),
-            constraints,
-            constraint_refs,
-            base_row_count,
-        ),
-        residual_exprs: vec![],
-        requires_table_cursor: false,
-    };
+    let mut best_branch = chosen_seek
+        .as_ref()
+        .filter(|chosen| !chosen.constraint_refs.is_empty())
+        .map(|chosen| {
+            let index_info = index_info_for_branch(
+                chosen.index.as_deref(),
+                rhs_table,
+                BranchReadMode::RowIdOnly,
+            )
+            .expect("multi-index branches always have costable access");
+            let branch_cost = estimate_cost_for_scan_or_seek(
+                Some(index_info),
+                &table_constraints.constraints,
+                &chosen.constraint_refs,
+                1.0,
+                base_row_count,
+                false,
+                params,
+            );
+            MultiIdxBranch {
+                index: chosen.index.clone(),
+                access: MultiIdxBranchAccess::Seek {
+                    constraints: table_constraints.constraints.clone(),
+                    constraint_refs: chosen.constraint_refs.clone(),
+                },
+                cost: branch_cost,
+                estimated_rows: estimate_rows_per_seek(
+                    index_info,
+                    &table_constraints.constraints,
+                    &chosen.constraint_refs,
+                    base_row_count,
+                ),
+                residual_exprs: vec![],
+                requires_table_cursor: false,
+            }
+        });
 
-    (cost, branch_params)
+    let in_seek_threshold = best_branch
+        .as_ref()
+        .map(|branch| branch.cost)
+        .unwrap_or(Cost(f64::INFINITY));
+    if let Some(chosen_in_seek) = choose_best_in_seek_candidate(
+        rhs_table,
+        table_constraints,
+        lhs_mask,
+        1.0,
+        base_row_count,
+        params,
+        in_seek_threshold,
+        BranchReadMode::RowIdOnly,
+    )? {
+        let Some(source) = in_seek_source_from_expr(
+            &branch_terms[chosen_in_seek.constraint_idx].expr,
+            &chosen_in_seek,
+        ) else {
+            return Ok(None);
+        };
+        best_branch = Some(MultiIdxBranch {
+            index: chosen_in_seek.index,
+            access: MultiIdxBranchAccess::InSeek {
+                source,
+                constraint_idx: chosen_in_seek.constraint_idx,
+            },
+            cost: chosen_in_seek.cost,
+            estimated_rows: chosen_in_seek.estimated_rows_per_outer_row,
+            residual_exprs: vec![],
+            requires_table_cursor: false,
+        });
+    }
+
+    Ok(best_branch)
 }
 
 /// Compute the table-reference mask for residual expressions that remain after
@@ -345,24 +426,31 @@ fn residual_tables_mask(
 /// constraints and therefore must remain as residual filters.
 fn residual_exprs_for_branch(
     branch_terms: &[WhereTerm],
-    constraints: &[Constraint],
-    constraint_refs: &[RangeConstraintRef],
+    access: &MultiIdxBranchAccess,
 ) -> Vec<ast::Expr> {
     // These residuals stop being planner-managed `WhereTerm`s here. Downstream
     // they are evaluated directly inside the branch loop, so metadata like
     // `from_outer_join` no longer participates in scheduling or ownership.
     let mut consumed = vec![false; branch_terms.len()];
-    for cref in constraint_refs.iter() {
-        for idx in [
-            cref.eq.as_ref().map(|e| e.constraint_pos),
-            cref.lower_bound,
-            cref.upper_bound,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            consumed[constraints[idx].where_clause_pos.0] = true;
+    match access {
+        MultiIdxBranchAccess::Seek {
+            constraints,
+            constraint_refs,
+        } => {
+            for cref in constraint_refs.iter() {
+                for idx in [
+                    cref.eq.as_ref().map(|e| e.constraint_pos),
+                    cref.lower_bound,
+                    cref.upper_bound,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    consumed[constraints[idx].where_clause_pos.0] = true;
+                }
+            }
         }
+        MultiIdxBranchAccess::InSeek { constraint_idx, .. } => consumed[*constraint_idx] = true,
     }
     branch_terms
         .iter()
@@ -447,6 +535,7 @@ fn estimate_residual_expr_selectivity(
         _ => {
             let Ok((_, table_constraints)) = get_table_local_constraints_for_branch(
                 &[expr.clone()],
+                None,
                 rhs_table,
                 table_references,
                 available_indexes,
@@ -522,21 +611,24 @@ fn evaluate_multi_index_branches(
     let mut branch_params = Vec::with_capacity(branches.len());
 
     for branch in branches {
-        // Multi-index planning only makes sense when every branch can do an
-        // actual keyed lookup rather than degenerating into a scan.
-        if branch.constraint_refs.is_empty() {
-            return None;
-        }
-
-        let (cost, mut params_for_branch) = compute_branch_cost_and_params(
-            branch.index.as_ref(),
-            &branch.constraints,
-            &branch.constraint_refs,
-            rhs_table,
-            base_row_count,
-            params,
-            branch.requires_table_cursor,
-        );
+        let mut params_for_branch = MultiIndexBranchParams {
+            index: branch.index.clone(),
+            access: match branch.access {
+                MultiIdxBranchAccess::Seek {
+                    constraints,
+                    constraint_refs,
+                } => MultiIndexBranchAccessParams::Seek {
+                    constraints,
+                    constraint_refs,
+                },
+                MultiIdxBranchAccess::InSeek { source, .. } => {
+                    MultiIndexBranchAccessParams::InSeek { source }
+                }
+            },
+            estimated_rows: branch.estimated_rows,
+            residual_exprs: vec![],
+            requires_table_cursor: false,
+        };
         params_for_branch.residual_exprs = branch.residual_exprs;
         params_for_branch.requires_table_cursor = branch.requires_table_cursor;
         params_for_branch.estimated_rows *= estimate_residual_selectivity(
@@ -549,7 +641,7 @@ fn evaluate_multi_index_branches(
             params,
         );
 
-        branch_costs.push(cost);
+        branch_costs.push(branch.cost);
         branch_rows.push(params_for_branch.estimated_rows);
         branch_params.push(params_for_branch);
     }
@@ -774,6 +866,7 @@ pub fn consider_multi_index_union(
                 let (synthetic_where_terms, table_constraints) =
                     get_table_local_constraints_for_branch(
                         &conjuncts,
+                        term.from_outer_join,
                         rhs_table,
                         table_references,
                         available_indexes,
@@ -782,40 +875,30 @@ pub fn consider_multi_index_union(
                         params,
                     )
                     .ok()?;
-                let chosen = choose_best_btree_candidate(
+                let mut chosen = choose_multi_index_branch_access(
                     rhs_table,
                     &table_constraints,
+                    &synthetic_where_terms,
                     lhs_mask,
                     rhs_idx,
-                    None,
-                    1.0,
                     base_row_count,
                     params,
-                )?;
-                if chosen.constraint_refs.is_empty() {
-                    return None;
-                }
+                )
+                .ok()??;
                 // Residuals are kept as raw expressions because the multi-index
                 // executor runs them directly inside the branch loop rather
                 // than feeding them back through normal `WhereTerm`
                 // evaluation/scheduling.
-                let residual_exprs = residual_exprs_for_branch(
-                    &synthetic_where_terms,
-                    &table_constraints.constraints,
-                    &chosen.constraint_refs,
-                );
+                let residual_exprs =
+                    residual_exprs_for_branch(&synthetic_where_terms, &chosen.access);
                 let residual_mask =
                     residual_tables_mask(&residual_exprs, table_references, subqueries)?;
                 if !allowed_mask.contains_all(&residual_mask) {
                     return None;
                 }
-                Some(MultiIdxBranch {
-                    index: chosen.index,
-                    constraints: table_constraints.constraints,
-                    constraint_refs: chosen.constraint_refs,
-                    residual_exprs,
-                    requires_table_cursor: residual_mask.contains_table(rhs_idx),
-                })
+                chosen.residual_exprs = residual_exprs;
+                chosen.requires_table_cursor = residual_mask.contains_table(rhs_idx);
+                Some(chosen)
             })
             .collect();
 
@@ -889,12 +972,35 @@ pub fn consider_multi_index_intersection(
     let branches: Vec<_> = decomposition
         .branches
         .iter()
-        .map(|b| MultiIdxBranch {
-            index: b.index.clone(),
-            constraints: vec![b.constraint.clone()],
-            constraint_refs: b.constraint_refs.clone(),
-            residual_exprs: vec![],
-            requires_table_cursor: false,
+        .map(|b| {
+            let constraints = vec![b.constraint.clone()];
+            let index_info =
+                index_info_for_branch(b.index.as_deref(), rhs_table, BranchReadMode::RowIdOnly)
+                    .expect("intersection branches always have costable access");
+            MultiIdxBranch {
+                index: b.index.clone(),
+                access: MultiIdxBranchAccess::Seek {
+                    constraints: constraints.clone(),
+                    constraint_refs: b.constraint_refs.clone(),
+                },
+                cost: estimate_cost_for_scan_or_seek(
+                    Some(index_info),
+                    &constraints,
+                    &b.constraint_refs,
+                    1.0,
+                    base_row_count,
+                    false,
+                    params,
+                ),
+                estimated_rows: estimate_rows_per_seek(
+                    index_info,
+                    &constraints,
+                    &b.constraint_refs,
+                    base_row_count,
+                ),
+                residual_exprs: vec![],
+                requires_table_cursor: false,
+            }
         })
         .collect();
 
@@ -1489,8 +1595,14 @@ mod tests {
                 branch.index.as_ref().map(|idx| idx.name.as_str()),
                 Some("idx_item_id_kind")
             );
+            let super::MultiIndexBranchAccessParams::Seek {
+                constraint_refs, ..
+            } = &branch.access
+            else {
+                panic!("compound OR test should choose ordinary seek branches");
+            };
             assert_eq!(
-                branch.constraint_refs.len(),
+                constraint_refs.len(),
                 2,
                 "branch should use both id and kind in the compound seek"
             );

@@ -1422,8 +1422,8 @@ pub struct MultiIndexScanOp {
 pub struct MultiIndexBranch {
     /// The index to use for this branch, or None for rowid access
     pub index: Option<Arc<Index>>,
-    /// The seek definition for this branch
-    pub seek_def: SeekDef,
+    /// How this branch probes the table/index.
+    pub access: MultiIndexBranchAccess,
     /// Estimated number of rows from this branch
     pub estimated_rows: f64,
     /// Residual filter expressions for compound AND disjuncts.
@@ -1431,6 +1431,15 @@ pub struct MultiIndexBranch {
     pub residual_exprs: Vec<ast::Expr>,
     /// Whether residual evaluation needs the scanned table cursor positioned.
     pub requires_table_cursor: bool,
+}
+
+/// Access shape for a single multi-index branch.
+#[derive(Debug, Clone)]
+pub enum MultiIndexBranchAccess {
+    /// Ordinary seek/range scan on either the rowid btree or a secondary index.
+    Seek { seek_def: SeekDef },
+    /// Repeated equality seeks driven by an IN-list or IN-subquery RHS.
+    InSeek { source: InSeekSource },
 }
 
 #[derive(Clone, Debug)]

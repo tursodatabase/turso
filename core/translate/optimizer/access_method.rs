@@ -165,6 +165,29 @@ pub(super) struct ChosenBtreeCandidate {
     pub(super) cost: Cost,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct ChosenInSeekCandidate {
+    pub(super) index: Option<Arc<Index>>,
+    pub(super) affinity: Affinity,
+    pub(super) constraint_idx: usize,
+    pub(super) cost: Cost,
+    pub(super) estimated_rows_per_outer_row: f64,
+}
+
+/// Describes what a caller needs to read from a branch-local scan.
+///
+/// Ordinary table access needs the scanned rows themselves, but multi-index
+/// branches only harvest rowids into a RowSet and fetch full rows later.
+/// Making this explicit avoids threading "mystery bool" flags through the cost
+/// model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BranchReadMode {
+    /// Cost the branch as if it only needs rowids from the scan.
+    RowIdOnly,
+    /// Cost the branch as a normal table/index access that may need full row data.
+    FullRow,
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Choose the best ordinary btree lookup candidate for one table under the
 /// current join-order prefix.
@@ -343,7 +366,7 @@ pub(super) fn choose_best_btree_candidate(
 /// Because of that execution shape, only rowid or the first column of an index
 /// can drive `InSeek`, and the comparison collation must match the chosen
 /// index's first-key collation.
-fn consider_in_seek_access_method(
+pub(super) fn choose_best_in_seek_candidate(
     rhs_table: &JoinedTable,
     rhs_constraints: &TableConstraints,
     lhs_mask: &TableMask,
@@ -351,7 +374,8 @@ fn consider_in_seek_access_method(
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
     best_cost: Cost,
-) -> Result<Option<AccessMethod>> {
+    read_mode: BranchReadMode,
+) -> Result<Option<ChosenInSeekCandidate>> {
     let Table::BTree(btree) = &rhs_table.table else {
         return Err(LimboError::InternalError(
             "consider_in_seek_access_method called on non-BTree table".into(),
@@ -376,7 +400,8 @@ fn consider_in_seek_access_method(
         let index_info = match candidate.index.as_ref() {
             Some(index) => IndexInfo {
                 unique: index.unique,
-                covering: rhs_table.index_is_covering(index),
+                covering: matches!(read_mode, BranchReadMode::RowIdOnly)
+                    || rhs_table.index_is_covering(index),
                 column_count: index.columns.len(),
             },
             None => IndexInfo {
@@ -450,20 +475,48 @@ fn consider_in_seek_access_method(
                 Affinity::Integer
             };
             best_in_seek_cost = in_cost;
-            best_in_seek = Some(AccessMethod {
+            best_in_seek = Some(ChosenInSeekCandidate {
+                index: candidate.index.clone(),
+                affinity,
+                constraint_idx: constraint.where_clause_pos.0,
                 cost: in_cost,
                 estimated_rows_per_outer_row: (constraint.selectivity * base).max(1.0),
-                post_access_filter: PostAccessFilter::LocalOnly,
-                params: AccessMethodParams::InSeek {
-                    index: candidate.index.clone(),
-                    affinity,
-                    where_term_idx: constraint.where_clause_pos.0,
-                },
             });
         }
     }
 
     Ok(best_in_seek)
+}
+
+fn consider_in_seek_access_method(
+    rhs_table: &JoinedTable,
+    rhs_constraints: &TableConstraints,
+    lhs_mask: &TableMask,
+    input_cardinality: f64,
+    base_row_count: RowCountEstimate,
+    params: &CostModelParams,
+    best_cost: Cost,
+) -> Result<Option<AccessMethod>> {
+    Ok(choose_best_in_seek_candidate(
+        rhs_table,
+        rhs_constraints,
+        lhs_mask,
+        input_cardinality,
+        base_row_count,
+        params,
+        best_cost,
+        BranchReadMode::FullRow,
+    )?
+    .map(|chosen| AccessMethod {
+        cost: chosen.cost,
+        estimated_rows_per_outer_row: chosen.estimated_rows_per_outer_row,
+        post_access_filter: PostAccessFilter::LocalOnly,
+        params: AccessMethodParams::InSeek {
+            index: chosen.index,
+            affinity: chosen.affinity,
+            where_term_idx: chosen.constraint_idx,
+        },
+    }))
 }
 
 /// Estimate rows produced per outer row for an ordinary btree access path using

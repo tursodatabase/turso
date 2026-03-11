@@ -1,4 +1,5 @@
 use crate::translate::expression_index::expression_index_column_usage;
+use crate::translate::plan::MultiIndexBranchAccess;
 use crate::{
     function::Deterministic,
     index_method::IndexMethodCostEstimate,
@@ -10,6 +11,7 @@ use crate::{
             access_method::AccessMethodParams,
             constraints::{RangeConstraintRef, SeekRangeConstraint, TableConstraints},
             cost::RowCountEstimate,
+            multi_index::MultiIndexBranchAccessParams,
             order::{ColumnTarget, OrderTarget},
         },
         plan::{
@@ -1925,16 +1927,26 @@ fn optimize_table_access(
                 // Build the MultiIndexScanOp from the branch parameters
                 let mut multi_idx_branches = Vec::with_capacity(branches.len());
                 for branch in std::mem::take(branches) {
-                    let seek_def = build_seek_def_from_constraints(
-                        &branch.constraints,
-                        &branch.constraint_refs,
-                        IterationDirection::Forwards, // Multi-index always scans forward
-                        where_clause,
-                        Some(table_references),
-                    )?;
+                    let access = match branch.access {
+                        MultiIndexBranchAccessParams::Seek {
+                            constraints,
+                            constraint_refs,
+                        } => MultiIndexBranchAccess::Seek {
+                            seek_def: build_seek_def_from_constraints(
+                                &constraints,
+                                &constraint_refs,
+                                IterationDirection::Forwards, // Multi-index always scans forward
+                                where_clause,
+                                Some(table_references),
+                            )?,
+                        },
+                        MultiIndexBranchAccessParams::InSeek { source } => {
+                            MultiIndexBranchAccess::InSeek { source }
+                        }
+                    };
                     multi_idx_branches.push(MultiIndexBranch {
                         index: branch.index,
-                        seek_def,
+                        access,
                         estimated_rows: branch.estimated_rows,
                         residual_exprs: branch.residual_exprs,
                         requires_table_cursor: branch.requires_table_cursor,
