@@ -166,7 +166,7 @@ pub struct InsertEmitCtx<'a> {
     /// then scanned back and yielded to the caller after all DML is complete.
     pub returning_buffer: Option<ReturningBufferCtx>,
     /// Original table name spelling
-    pub original_table_name: String,
+    pub original_table_name: &'a str,
 }
 
 impl<'a> InsertEmitCtx<'a> {
@@ -181,7 +181,7 @@ impl<'a> InsertEmitCtx<'a> {
         temp_table_ctx: Option<TempTableCtx>,
         database_id: usize,
         _connection: &Arc<crate::Connection>,
-        original_table_name: String,
+        original_table_name: &'a str,
     ) -> Result<Self> {
         // allocate cursor id's for each btree index cursor we'll need to populate the indexes
         let indices: Vec<_> = resolver.with_schema(database_id, |s| {
@@ -384,7 +384,7 @@ pub fn translate_insert(
         None,
         database_id,
         connection,
-        tbl_name.name.as_str().to_string(),
+        tbl_name.name.as_str(),
     )?;
 
     // Open an ephemeral table for buffering RETURNING results.
@@ -1327,7 +1327,7 @@ fn init_autoincrement(
         db: ctx.database_id,
     });
 
-    let table_name_reg = program.emit_string8_new_reg(ctx.original_table_name.clone());
+    let table_name_reg = program.emit_string8_new_reg(ctx.original_table_name.into());
     let r_seq = program.alloc_register();
     let r_seq_rowid = program.alloc_register();
 
