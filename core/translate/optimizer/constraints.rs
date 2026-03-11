@@ -218,47 +218,6 @@ pub struct TableConstraints {
     pub candidates: Vec<ConstraintUseCandidate>,
 }
 
-pub fn table_constraints_from_exprs(
-    exprs: &[ast::Expr],
-    table_reference: &JoinedTable,
-    table_references: &TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
-    subqueries: &[NonFromClauseSubquery],
-    schema: &Schema,
-    params: &CostModelParams,
-) -> Result<(Vec<WhereTerm>, TableConstraints)> {
-    let local_where_clause = exprs
-        .iter()
-        .cloned()
-        .map(|expr| WhereTerm {
-            expr,
-            from_outer_join: None,
-            consumed: false,
-        })
-        .collect::<Vec<_>>();
-    let table_constraints = constraints_from_where_clause(
-        &local_where_clause,
-        table_references,
-        available_indexes,
-        subqueries,
-        schema,
-        params,
-    )?
-    .into_iter()
-    .find(|constraints| constraints.table_id == table_reference.internal_id)
-    .expect("constraints_from_where_clause must return constraints for every joined table");
-    let mut table_constraints = table_constraints;
-    for constraint in table_constraints.constraints.iter_mut() {
-        if constraint.constraining_expr.is_some() || constraint.operator.as_ast_operator().is_none()
-        {
-            continue;
-        }
-        constraint.constraining_expr =
-            Some(constraint.get_constraining_expr(&local_where_clause, Some(table_references)));
-    }
-    Ok((local_where_clause, table_constraints))
-}
-
 /// Estimate selectivity for IN expressions given the number of values and table row count.
 fn estimate_in_selectivity(in_list_len: f64, row_count: f64, not: bool) -> f64 {
     if not {

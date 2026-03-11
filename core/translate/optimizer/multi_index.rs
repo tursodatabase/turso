@@ -12,7 +12,8 @@ use crate::translate::optimizer::access_method::{
     choose_best_btree_candidate, AccessMethod, AccessMethodParams, PostAccessFilter,
 };
 use crate::translate::optimizer::constraints::{
-    analyze_binary_term_for_index, table_constraints_from_exprs, Constraint, RangeConstraintRef,
+    analyze_binary_term_for_index, constraints_from_where_clause, Constraint, RangeConstraintRef,
+    TableConstraints,
 };
 use crate::translate::optimizer::cost::{
     estimate_cost_for_scan_or_seek, estimate_rows_per_seek, Cost, IndexInfo, RowCountEstimate,
@@ -94,6 +95,68 @@ fn flatten_and_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
         }
         _ => vec![expr],
     }
+}
+
+/// Build temporary `WhereTerm`s from branch-local expressions and extract the
+/// constraints for exactly one target table.
+///
+/// This is narrower than `constraints_from_where_clause()`:
+/// - `exprs` are synthetic planner inputs, not the query's real top-level
+///   `WHERE` terms.
+/// - The returned `WhereTerm`s are only suitable for branch-local planning
+///   and constraint bookkeeping for `table_reference`; they must not be reused
+///   for global predicate consumption or join rewrites.
+///
+/// FIXME: stop synthesizing `WhereTerm`s here just to reuse
+/// `constraints_from_where_clause()`. Branch-local planning should have a
+/// direct constraint-extraction path that does not fabricate top-level planner
+/// terms.
+fn get_table_local_constraints_for_branch(
+    exprs: &[ast::Expr],
+    table_reference: &JoinedTable,
+    table_references: &TableReferences,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    subqueries: &[NonFromClauseSubquery],
+    schema: &Schema,
+    params: &CostModelParams,
+) -> crate::Result<(Vec<WhereTerm>, TableConstraints)> {
+    let synthetic_where_terms = exprs
+        .iter()
+        .cloned()
+        .map(|expr| WhereTerm {
+            expr,
+            // WARNING: these synthetic planner terms intentionally drop
+            // `from_outer_join`. That is not a correctness hole for current
+            // call sites because they only extract constraints for the active
+            // RHS table, where `Some(rhs_table)` and `None` behave the same.
+            // This remains a fragile abstraction boundary and should be fixed
+            // by giving branch-local planning a direct constraint extraction
+            // path instead of fabricating `WhereTerm`s.
+            from_outer_join: None,
+            consumed: false,
+        })
+        .collect::<Vec<_>>();
+    let table_constraints = constraints_from_where_clause(
+        &synthetic_where_terms,
+        table_references,
+        available_indexes,
+        subqueries,
+        schema,
+        params,
+    )?
+    .into_iter()
+    .find(|constraints| constraints.table_id == table_reference.internal_id)
+    .expect("constraints_from_where_clause must return constraints for every joined table");
+    let mut table_constraints = table_constraints;
+    for constraint in table_constraints.constraints.iter_mut() {
+        if constraint.constraining_expr.is_some() || constraint.operator.as_ast_operator().is_none()
+        {
+            continue;
+        }
+        constraint.constraining_expr =
+            Some(constraint.get_constraining_expr(&synthetic_where_terms, Some(table_references)));
+    }
+    Ok((synthetic_where_terms, table_constraints))
 }
 
 /// Estimate the cost of a multi-index union scan (OR-by-union optimization).
@@ -376,7 +439,7 @@ fn estimate_residual_expr_selectivity(
             )
         }
         _ => {
-            let Ok((_, table_constraints)) = table_constraints_from_exprs(
+            let Ok((_, table_constraints)) = get_table_local_constraints_for_branch(
                 &[expr.clone()],
                 rhs_table,
                 table_references,
@@ -702,16 +765,17 @@ pub fn consider_multi_index_union(
                     .into_iter()
                     .cloned()
                     .collect::<Vec<_>>();
-                let (local_where_clause, table_constraints) = table_constraints_from_exprs(
-                    &conjuncts,
-                    rhs_table,
-                    table_references,
-                    available_indexes,
-                    subqueries,
-                    schema,
-                    params,
-                )
-                .ok()?;
+                let (synthetic_where_terms, table_constraints) =
+                    get_table_local_constraints_for_branch(
+                        &conjuncts,
+                        rhs_table,
+                        table_references,
+                        available_indexes,
+                        subqueries,
+                        schema,
+                        params,
+                    )
+                    .ok()?;
                 let chosen = choose_best_btree_candidate(
                     rhs_table,
                     &table_constraints,
@@ -726,7 +790,7 @@ pub fn consider_multi_index_union(
                     return None;
                 }
                 let residual_exprs = residual_exprs_for_branch(
-                    &local_where_clause,
+                    &synthetic_where_terms,
                     &table_constraints.constraints,
                     &chosen.constraint_refs,
                 );
