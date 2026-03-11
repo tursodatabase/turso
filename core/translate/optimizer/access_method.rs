@@ -9,7 +9,7 @@ use crate::schema::Schema;
 use crate::stats::AnalyzeStats;
 use crate::translate::expr::{as_binary_components, walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::{
-    convert_to_vtab_constraint, BinaryExprSide, Constraint, RangeConstraintRef,
+    convert_to_vtab_constraint, BinaryExprSide, Constraint, ConstraintOperator, RangeConstraintRef,
 };
 use crate::translate::optimizer::cost::RowCountEstimate;
 use crate::translate::optimizer::cost_params::CostModelParams;
@@ -18,6 +18,7 @@ use crate::translate::plan::{
     SubqueryState, TableReferences, WhereTerm,
 };
 use crate::util::exprs_are_equivalent;
+use crate::vdbe::affinity::Affinity;
 use crate::vdbe::hash_table::DEFAULT_MEM_BUDGET;
 use crate::{
     schema::{FromClauseSubquery, Index, IndexColumn, Table},
@@ -31,7 +32,7 @@ use super::{
     constraints::{
         usable_constraints_for_join_order, usable_constraints_for_lhs_mask, TableConstraints,
     },
-    cost::{estimate_cost_for_scan_or_seek, Cost, IndexInfo},
+    cost::{estimate_cost_for_scan_or_seek, estimate_index_cost, Cost, IndexInfo},
     multi_index::{
         consider_multi_index_intersection, consider_multi_index_union, MultiIndexBranchParams,
     },
@@ -147,6 +148,12 @@ pub enum AccessMethodParams {
         /// For Intersection: additional WHERE term indices consumed.
         additional_consumed_terms: Vec<usize>,
     },
+    /// IN-list driven index seek.
+    InSeek {
+        index: Option<Arc<Index>>,
+        affinity: Affinity,
+        where_term_idx: usize,
+    },
 }
 
 /// Result of generic btree candidate selection before it is wrapped into a full
@@ -156,6 +163,29 @@ pub(super) struct ChosenBtreeCandidate {
     pub(super) index: Option<Arc<Index>>,
     pub(super) constraint_refs: Vec<RangeConstraintRef>,
     pub(super) cost: Cost,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ChosenInSeekCandidate {
+    pub(super) index: Option<Arc<Index>>,
+    pub(super) affinity: Affinity,
+    pub(super) constraint_idx: usize,
+    pub(super) cost: Cost,
+    pub(super) estimated_rows_per_outer_row: f64,
+}
+
+/// Describes what a caller needs to read from a branch-local scan.
+///
+/// Ordinary table access needs the scanned rows themselves, but multi-index
+/// branches only harvest rowids into a RowSet and fetch full rows later.
+/// Making this explicit avoids threading "mystery bool" flags through the cost
+/// model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BranchReadMode {
+    /// Cost the branch as if it only needs rowids from the scan.
+    RowIdOnly,
+    /// Cost the branch as a normal table/index access that may need full row data.
+    FullRow,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -325,6 +355,170 @@ pub(super) fn choose_best_btree_candidate(
     Some(best_choice)
 }
 
+#[allow(clippy::too_many_arguments)]
+/// Evaluate whether an `IN (...)` predicate should replace the ordinary btree
+/// access path with repeated equality seeks.
+///
+/// This is intentionally separate from `choose_best_btree_candidate()`: the
+/// generic btree chooser reasons about a single continuous scan/seek over one
+/// candidate, while `InSeek` emits a two-level loop that materializes the RHS
+/// into an ephemeral cursor and performs one equality seek per RHS value.
+/// Because of that execution shape, only rowid or the first column of an index
+/// can drive `InSeek`, and the comparison collation must match the chosen
+/// index's first-key collation.
+pub(super) fn choose_best_in_seek_candidate(
+    rhs_table: &JoinedTable,
+    rhs_constraints: &TableConstraints,
+    lhs_mask: &TableMask,
+    input_cardinality: f64,
+    base_row_count: RowCountEstimate,
+    params: &CostModelParams,
+    best_cost: Cost,
+    read_mode: BranchReadMode,
+) -> Result<Option<ChosenInSeekCandidate>> {
+    let Table::BTree(btree) = &rhs_table.table else {
+        return Err(LimboError::InternalError(
+            "consider_in_seek_access_method called on non-BTree table".into(),
+        ));
+    };
+
+    let base = *base_row_count;
+    let tree_depth = if base <= 1.0 {
+        1.0
+    } else {
+        (base.ln() / params.rows_per_page.ln()).ceil().max(1.0)
+    };
+    let mut best_in_seek = None;
+    let mut best_in_seek_cost = best_cost;
+
+    for candidate in rhs_constraints.candidates.iter() {
+        let first_col_pos = candidate
+            .index
+            .as_ref()
+            .and_then(|idx| idx.columns.first().map(|c| c.pos_in_table));
+
+        let index_info = match candidate.index.as_ref() {
+            Some(index) => IndexInfo {
+                unique: index.unique,
+                covering: matches!(read_mode, BranchReadMode::RowIdOnly)
+                    || rhs_table.index_is_covering(index),
+                column_count: index.columns.len(),
+            },
+            None => IndexInfo {
+                unique: true,
+                covering: false,
+                column_count: 1,
+            },
+        };
+
+        for constraint in &rhs_constraints.constraints {
+            let ConstraintOperator::In {
+                not,
+                estimated_values,
+            } = constraint.operator
+            else {
+                continue;
+            };
+            if not || !lhs_mask.contains_all(&constraint.lhs_mask) {
+                continue;
+            }
+
+            let matches = if candidate.index.is_none() {
+                constraint.is_rowid
+            } else {
+                !constraint.is_rowid
+                    && constraint.table_col_pos.is_some()
+                    && constraint.table_col_pos == first_col_pos
+            };
+            if !matches {
+                continue;
+            }
+
+            // `open_loop` copies the chosen index collation onto the ephemeral
+            // IN cursor. Reject mismatches here so a BINARY `IN` comparison
+            // cannot silently become `NOCASE`/`RTRIM` just because the index is.
+            if let (Some(index), Some(col_pos)) = (&candidate.index, constraint.table_col_pos) {
+                let constrained_column = &rhs_table.table.columns()[col_pos];
+                let table_collation = constrained_column.collation();
+                let index_collation = index.columns[0].collation.unwrap_or_default();
+                if table_collation != index_collation {
+                    continue;
+                }
+            }
+
+            let rows_per_seek = if (index_info.unique && index_info.column_count == 1)
+                || candidate.index.is_none()
+            {
+                1.0
+            } else {
+                (base * params.sel_eq_indexed).sqrt().max(1.0)
+            };
+            let in_cost = estimate_index_cost(
+                base,
+                tree_depth,
+                index_info,
+                estimated_values * input_cardinality,
+                rows_per_seek,
+                params,
+            );
+            if in_cost >= best_in_seek_cost {
+                continue;
+            }
+
+            let affinity = if let Some(col_pos) = constraint.table_col_pos {
+                btree
+                    .columns
+                    .get(col_pos)
+                    .map(|col| col.affinity())
+                    .unwrap_or(Affinity::Blob)
+            } else {
+                Affinity::Integer
+            };
+            best_in_seek_cost = in_cost;
+            best_in_seek = Some(ChosenInSeekCandidate {
+                index: candidate.index.clone(),
+                affinity,
+                constraint_idx: constraint.where_clause_pos.0,
+                cost: in_cost,
+                estimated_rows_per_outer_row: (constraint.selectivity * base).max(1.0),
+            });
+        }
+    }
+
+    Ok(best_in_seek)
+}
+
+fn consider_in_seek_access_method(
+    rhs_table: &JoinedTable,
+    rhs_constraints: &TableConstraints,
+    lhs_mask: &TableMask,
+    input_cardinality: f64,
+    base_row_count: RowCountEstimate,
+    params: &CostModelParams,
+    best_cost: Cost,
+) -> Result<Option<AccessMethod>> {
+    Ok(choose_best_in_seek_candidate(
+        rhs_table,
+        rhs_constraints,
+        lhs_mask,
+        input_cardinality,
+        base_row_count,
+        params,
+        best_cost,
+        BranchReadMode::FullRow,
+    )?
+    .map(|chosen| AccessMethod {
+        cost: chosen.cost,
+        estimated_rows_per_outer_row: chosen.estimated_rows_per_outer_row,
+        post_access_filter: PostAccessFilter::LocalOnly,
+        params: AccessMethodParams::InSeek {
+            index: chosen.index,
+            affinity: chosen.affinity,
+            where_term_idx: chosen.constraint_idx,
+        },
+    }))
+}
+
 /// Estimate rows produced per outer row for an ordinary btree access path using
 /// the join-order heuristic that the planner expects for btree lookups.
 fn estimate_btree_rows_per_outer_row(
@@ -489,6 +683,18 @@ fn find_best_access_method_for_btree(
     };
 
     if rhs_table.btree().is_some_and(|b| b.has_rowid) {
+        if let Some(in_seek_method) = consider_in_seek_access_method(
+            rhs_table,
+            rhs_constraints,
+            &lhs_mask,
+            input_cardinality,
+            base_row_count,
+            params,
+            best_access_method.cost,
+        )? {
+            best_access_method = in_seek_method;
+        }
+
         if let Some(multi_idx_method) = consider_multi_index_union(
             rhs_table,
             where_clause,

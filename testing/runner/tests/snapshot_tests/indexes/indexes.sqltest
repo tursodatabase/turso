@@ -104,6 +104,61 @@ snapshot-eqp simple-index-with-filter {
     SELECT id, name, price FROM products WHERE sku = 'ABC123' AND stock_qty > 0;
 }
 
+setup collated-index-mismatch {
+    CREATE TABLE collated_values (
+        id INTEGER PRIMARY KEY,
+        val TEXT
+    );
+
+    CREATE INDEX idx_collated_values_nocase ON collated_values(val COLLATE NOCASE);
+}
+
+# BINARY IN cannot use a NOCASE-only index without changing semantics
+@setup collated-index-mismatch
+snapshot-eqp in-list-collation-mismatch {
+    SELECT id FROM collated_values WHERE val IN ('hello');
+}
+
+# Explicit NOCASE makes the comparison compatible with the NOCASE index
+@setup collated-index-mismatch
+snapshot-eqp in-list-collation-match-explicit-nocase {
+    SELECT id FROM collated_values WHERE val COLLATE NOCASE IN ('hello');
+}
+
+setup collated-subquery-mismatch {
+    CREATE TABLE collated_values_subquery (
+        id INTEGER PRIMARY KEY,
+        val TEXT
+    );
+    CREATE INDEX idx_collated_values_subquery_nocase
+        ON collated_values_subquery(val COLLATE NOCASE);
+
+    CREATE TABLE rhs_values(v TEXT);
+}
+
+# Subquery RHS should also avoid NOCASE seek when the comparison is BINARY
+@setup collated-subquery-mismatch
+snapshot-eqp in-subquery-collation-mismatch {
+    SELECT id FROM collated_values_subquery WHERE val IN (SELECT v FROM rhs_values);
+}
+
+setup collated-composite-mismatch {
+    CREATE TABLE collated_values_composite (
+        id INTEGER PRIMARY KEY,
+        val TEXT,
+        other INTEGER
+    );
+
+    CREATE INDEX idx_collated_values_composite_nocase
+        ON collated_values_composite(val COLLATE NOCASE, other);
+}
+
+# Composite indexes should respect the first-key collation too
+@setup collated-composite-mismatch
+snapshot-eqp in-composite-collation-mismatch {
+    SELECT id FROM collated_values_composite WHERE val IN ('hello');
+}
+
 # =============================================================================
 # 2. Composite Index - Multi-column index with partial and full usage
 # =============================================================================
@@ -281,6 +336,42 @@ snapshot-eqp or-with-and-combinations {
        OR (event_type = 'WARNING' AND severity > 7);
 }
 
+setup in-or-indexed {
+    CREATE TABLE in_or_values (
+        id INTEGER PRIMARY KEY,
+        a INTEGER,
+        b INTEGER,
+        c INTEGER
+    );
+    CREATE INDEX idx_in_or_values_a ON in_or_values(a);
+    CREATE INDEX idx_in_or_values_b ON in_or_values(b);
+
+    CREATE TABLE in_or_rhs_a(v INTEGER);
+    CREATE TABLE in_or_rhs_b(v INTEGER);
+
+    CREATE TABLE in_or_tags(
+        id INTEGER PRIMARY KEY,
+        c INTEGER
+    );
+}
+
+@setup in-or-indexed
+snapshot-eqp in-subquery-or-in-subquery-indexed {
+    SELECT id
+    FROM in_or_values
+    WHERE a IN (SELECT v FROM in_or_rhs_a)
+       OR b IN (SELECT v FROM in_or_rhs_b);
+}
+
+@setup in-or-indexed
+snapshot-eqp in-subquery-or-in-list-left-join {
+    SELECT in_or_values.id, in_or_tags.id
+    FROM in_or_values
+    LEFT JOIN in_or_tags
+      ON in_or_values.c = in_or_tags.c
+     AND (a IN (SELECT v FROM in_or_rhs_a) OR b IN (200, 500));
+}
+
 # =============================================================================
 # 6. No Index (Full Scan) - For comparison
 # =============================================================================
@@ -387,4 +478,36 @@ snapshot-eqp subquery-with-index {
     SELECT id, sku, name
     FROM products
     WHERE id IN (SELECT product_id FROM inventory WHERE warehouse_id = 1);
+}
+
+# =============================================================================
+# 9. IN-List Index Seek - Ephemeral B-tree optimization
+# =============================================================================
+
+# IN on indexed column should use index seek via ephemeral table
+@setup schema
+snapshot-eqp in-list-index-seek {
+    SELECT id, event_type, severity
+    FROM events
+    WHERE event_type IN ('ERROR', 'WARNING');
+}
+
+# IN on primary key should use INTEGER PRIMARY KEY seek
+@setup schema
+snapshot-eqp in-list-rowid-seek {
+    SELECT id, sku, name FROM products WHERE id IN (1, 2, 3);
+}
+
+# IN on non-indexed column should fall back to scan
+@setup schema
+snapshot-eqp in-list-no-index-scan {
+    SELECT id, level, message FROM logs WHERE level IN ('ERROR', 'WARNING');
+}
+
+# IN on first column of composite index
+@setup schema
+snapshot-eqp in-list-composite-prefix {
+    SELECT id, customer_id, order_date
+    FROM orders
+    WHERE customer_id IN (100, 200, 300);
 }

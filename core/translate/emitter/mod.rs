@@ -462,7 +462,17 @@ pub struct TranslateCtx<'a> {
     /// Cursor id for cdc table (if capture_data_changes PRAGMA is set and query can modify the data)
     pub cdc_cursor_id: Option<usize>,
     pub meta_window: Option<WindowMetadata<'a>>,
+    /// Metadata stored during `open_loop` for `Search::InSeek`, consumed by `close_loop`.
+    pub meta_in_seeks: Vec<Option<InSeekMetadata>>,
     pub unsafe_testing: bool,
+}
+
+/// Metadata for the two-level loop emitted by `Search::InSeek`.
+#[derive(Debug)]
+pub struct InSeekMetadata {
+    pub ephemeral_cursor_id: CursorID,
+    pub outer_loop_start: BranchOffset,
+    pub next_val_label: BranchOffset,
 }
 
 impl<'a> TranslateCtx<'a> {
@@ -491,6 +501,7 @@ impl<'a> TranslateCtx<'a> {
             non_aggregate_expressions: Vec::new(),
             cdc_cursor_id: None,
             meta_window: None,
+            meta_in_seeks: (0..table_count).map(|_| None).collect(),
             unsafe_testing,
         }
     }

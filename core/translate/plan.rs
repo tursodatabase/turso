@@ -1422,8 +1422,8 @@ pub struct MultiIndexScanOp {
 pub struct MultiIndexBranch {
     /// The index to use for this branch, or None for rowid access
     pub index: Option<Arc<Index>>,
-    /// The seek definition for this branch
-    pub seek_def: SeekDef,
+    /// How this branch probes the table/index.
+    pub access: MultiIndexBranchAccess,
     /// Estimated number of rows from this branch
     pub estimated_rows: f64,
     /// Residual filter expressions for compound AND disjuncts.
@@ -1431,6 +1431,16 @@ pub struct MultiIndexBranch {
     pub residual_exprs: Vec<ast::Expr>,
     /// Whether residual evaluation needs the scanned table cursor positioned.
     pub requires_table_cursor: bool,
+}
+
+/// Access shape for a single multi-index branch.
+#[derive(Debug, Clone)]
+#[expect(clippy::large_enum_variant)]
+pub enum MultiIndexBranchAccess {
+    /// Ordinary seek/range scan on either the rowid btree or a secondary index.
+    Seek { seek_def: SeekDef },
+    /// Repeated equality seeks driven by an IN-list or IN-subquery RHS.
+    InSeek { source: InSeekSource },
 }
 
 #[derive(Clone, Debug)]
@@ -1475,7 +1485,8 @@ impl Operation {
     pub fn index(&self) -> Option<&Arc<Index>> {
         match self {
             Operation::Scan(Scan::BTreeTable { index, .. }) => index.as_ref(),
-            Operation::Search(Search::Seek { index, .. }) => index.as_ref(),
+            Operation::Search(Search::Seek { index, .. })
+            | Operation::Search(Search::InSeek { index, .. }) => index.as_ref(),
             Operation::IndexMethodQuery(IndexMethodQuery { index, .. }) => Some(index),
             Operation::Scan(_) => None,
             Operation::Search(Search::RowidEq { .. }) => None,
@@ -2115,6 +2126,25 @@ pub enum Search {
         index: Option<Arc<Index>>,
         seek_def: SeekDef,
     },
+    /// An IN-driven index seek. Iterates an ephemeral B-tree of IN values and
+    /// for each value seeks into the real index (or table, if seek by rowid).
+    InSeek {
+        index: Option<Arc<Index>>,
+        source: InSeekSource,
+    },
+}
+
+/// Where IN-seek values come from.
+#[derive(Clone, Debug)]
+pub enum InSeekSource {
+    /// Literal values to materialize into a new ephemeral index at open_loop time.
+    LiteralList {
+        values: Vec<ast::Expr>,
+        affinity: Affinity,
+    },
+    /// Subquery already materialized by emit_non_from_clause_subquery;
+    /// open_loop reuses the existing ephemeral cursor.
+    Subquery { cursor_id: CursorID },
 }
 
 #[allow(clippy::large_enum_variant)]

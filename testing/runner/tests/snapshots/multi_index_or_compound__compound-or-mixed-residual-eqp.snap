@@ -19,6 +19,6 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN link AS l
-|--MULTI-INDEX OR i (sqlite_autoindex_item_1, sqlite_autoindex_item_1)
+|--SCAN item AS i
+|--MULTI-INDEX OR l (idx_link_dst, idx_link_src)
 `--USE HASH TABLE FOR DISTINCT

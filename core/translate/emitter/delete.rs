@@ -435,10 +435,15 @@ fn emit_delete_insns<'a>(
     let cursor_id = match unsafe { &(*table_reference).op } {
         Operation::Scan { .. } => program.resolve_cursor_id(&CursorKey::table(internal_id)),
         Operation::Search(search) => match search {
-            Search::RowidEq { .. } | Search::Seek { index: None, .. } => {
+            Search::RowidEq { .. }
+            | Search::Seek { index: None, .. }
+            | Search::InSeek { index: None, .. } => {
                 program.resolve_cursor_id(&CursorKey::table(internal_id))
             }
             Search::Seek {
+                index: Some(index), ..
+            }
+            | Search::InSeek {
                 index: Some(index), ..
             } => program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone())),
         },

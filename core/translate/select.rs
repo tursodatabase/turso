@@ -1,7 +1,7 @@
 use super::emitter::{emit_program, TranslateCtx};
 use super::plan::{
-    select_star, Distinctness, JoinOrderMember, Operation, OuterQueryReference, QueryDestination,
-    Search, TableReferences, WhereTerm, Window,
+    select_star, Distinctness, InSeekSource, JoinOrderMember, Operation, OuterQueryReference,
+    QueryDestination, Search, TableReferences, WhereTerm, Window,
 };
 use crate::schema::Table;
 use crate::sync::Arc;
@@ -877,6 +877,12 @@ fn count_required_cursors_for_simple_select(plan: &SelectPlan) -> usize {
             Operation::Search(search) => match search {
                 Search::RowidEq { .. } => 1,
                 Search::Seek { index, .. } => 1 + index.is_some() as usize,
+                Search::InSeek { index, source } => match source {
+                    // table cursor + new ephemeral cursor + optional index cursor
+                    InSeekSource::LiteralList { .. } => 2 + index.is_some() as usize,
+                    // table cursor + optional index cursor (ephemeral already counted)
+                    InSeekSource::Subquery { .. } => 1 + index.is_some() as usize,
+                },
             }
             Operation::IndexMethodQuery(_) => 1,
             Operation::HashJoin(_) => 2,

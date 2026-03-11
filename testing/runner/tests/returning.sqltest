@@ -800,6 +800,33 @@ expect {
     2|mordor
 }
 
+@cross-check-integrity
+test update-returning-correlated-in-selfread {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, grp INTEGER, val INTEGER, note TEXT);
+    INSERT INTO t VALUES (1, 1, 10, 'a');
+    INSERT INTO t VALUES (2, 1, 20, 'b');
+    INSERT INTO t VALUES (3, 2, 30, 'c');
+    INSERT INTO t VALUES (4, 2, 40, 'd');
+    INSERT INTO t VALUES (5, 3, NULL, 'e');
+    UPDATE t
+    SET note = note || '+'
+    WHERE val IN (
+        SELECT t2.val FROM t AS t2 WHERE t2.grp = t.grp AND t2.val <= 30
+    )
+    RETURNING id, note;
+    SELECT id, note FROM t ORDER BY id;
+}
+expect {
+    1|a+
+    2|b+
+    3|c+
+    1|a+
+    2|b+
+    3|c+
+    4|d
+    5|e
+}
+
 # ============================================================================
 # DELETE RETURNING tests
 # ============================================================================
@@ -1073,6 +1100,32 @@ test delete-returning-where-in {
 expect {
     1|1
     3|3
+}
+
+@cross-check-integrity
+test delete-returning-correlated-in-selfread {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, grp INTEGER, val INTEGER, note TEXT);
+    INSERT INTO t VALUES (1, 1, 10, 'a');
+    INSERT INTO t VALUES (2, 1, 20, 'b');
+    INSERT INTO t VALUES (3, 2, 30, 'c');
+    INSERT INTO t VALUES (4, 2, 40, 'd');
+    INSERT INTO t VALUES (5, 3, NULL, 'e');
+    DELETE FROM t
+    WHERE id IN (
+        SELECT t2.id
+        FROM t AS t2
+        WHERE t2.grp = t.grp
+          AND t2.val = (SELECT MIN(t3.val) FROM t AS t3 WHERE t3.grp = t2.grp)
+    )
+    RETURNING id, note;
+    SELECT id, note FROM t ORDER BY id;
+}
+expect {
+    1|a
+    3|c
+    2|b
+    4|d
+    5|e
 }
 
 # Complex WHERE clauses with BETWEEN
@@ -2229,4 +2282,3 @@ test insert-returning-single-column-subquery {
 expect {
     42
 }
-

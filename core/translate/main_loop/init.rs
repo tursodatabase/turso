@@ -317,10 +317,16 @@ impl InitLoop {
                         }
                     }
 
-                    if let Search::Seek {
-                        index: Some(index), ..
-                    } = search
-                    {
+                    let search_index = match search {
+                        Search::Seek {
+                            index: Some(index), ..
+                        }
+                        | Search::InSeek {
+                            index: Some(index), ..
+                        } => Some(index),
+                        _ => None,
+                    };
+                    if let Some(index) = search_index {
                         // Ephemeral index cursor are opened ad-hoc when needed.
                         if !index.ephemeral {
                             match mode {

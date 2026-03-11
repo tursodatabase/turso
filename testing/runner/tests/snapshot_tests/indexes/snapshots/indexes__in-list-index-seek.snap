@@ -3,7 +3,7 @@ source: indexes.sqltest
 expression: |-
   SELECT id, event_type, severity
       FROM events
-      WHERE event_type IN ('ERROR', 'WARNING', 'CRITICAL');
+      WHERE event_type IN ('ERROR', 'WARNING');
 info:
   statement_type: SELECT
   tables:

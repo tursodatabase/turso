@@ -53,7 +53,7 @@ QUERY PLAN
 |--CORRELATED LIST SUBQUERY 1
 |  |--LIST SUBQUERY 2
 |  |  `--SCAN part
-|  |--SCAN partsupp
+|  |--SEARCH partsupp USING INDEX sqlite_autoindex_partsupp_1 (ps_partkey=?)
 |  `--CORRELATED SCALAR SUBQUERY 3
 |     `--SCAN lineitem
 |--SCAN supplier

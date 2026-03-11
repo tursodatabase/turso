@@ -1,0 +1,24 @@
+---
+source: indexes.sqltest
+expression: |-
+  SELECT in_or_values.id, in_or_tags.id
+      FROM in_or_values
+      LEFT JOIN in_or_tags
+        ON in_or_values.c = in_or_tags.c
+       AND (a IN (SELECT v FROM in_or_rhs_a) OR b IN (200, 500));
+info:
+  statement_type: SELECT
+  tables:
+  - in_or_rhs_a
+  - in_or_tags
+  - in_or_values
+  - in_or_values.c
+  setup_blocks:
+  - in-or-indexed
+  database: ':memory:'
+---
+QUERY PLAN
+|--LIST SUBQUERY 1
+|  `--SCAN in_or_rhs_a
+|--HASH JOIN in_or_tags
+`--SCAN in_or_values

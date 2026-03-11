@@ -78,3 +78,57 @@ test in-null-column-or {
 expect {
     1
 }
+
+setup in_or_indexed {
+    CREATE TABLE t (
+        id INTEGER PRIMARY KEY,
+        a INTEGER,
+        b INTEGER,
+        c INTEGER
+    );
+    CREATE INDEX idx_t_a ON t(a);
+    CREATE INDEX idx_t_b ON t(b);
+    INSERT INTO t VALUES
+        (1, 10, 100, 1),
+        (2, 20, 200, 1),
+        (3, 30, 300, 2),
+        (4, 40, 400, 2),
+        (5, NULL, 500, 3),
+        (6, 60, NULL, 3);
+    CREATE TABLE sa(v INTEGER);
+    CREATE TABLE sb(v INTEGER);
+    INSERT INTO sa VALUES (10), (30), (NULL);
+    INSERT INTO sb VALUES (200), (500), (NULL);
+}
+
+@setup in_or_indexed
+test in-subquery-or-in-subquery-indexed {
+    SELECT id
+    FROM t
+    WHERE a IN (SELECT v FROM sa) OR b IN (SELECT v FROM sb)
+    ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    5
+}
+
+@setup in_or_indexed
+test in-subquery-or-in-list-left-join {
+    CREATE TABLE u(id INTEGER PRIMARY KEY, tag INTEGER);
+    INSERT INTO u VALUES (1, 1), (2, 2), (3, 3);
+    SELECT t.id, coalesce(u.id, -1)
+    FROM t
+    LEFT JOIN u ON t.c = u.tag AND (a IN (SELECT v FROM sa) OR b IN (200, 500))
+    ORDER BY 1, 2;
+}
+expect {
+    1|1
+    2|1
+    3|2
+    4|-1
+    5|3
+    6|-1
+}

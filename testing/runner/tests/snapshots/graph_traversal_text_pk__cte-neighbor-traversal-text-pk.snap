@@ -27,6 +27,6 @@ info:
 ---
 QUERY PLAN
 |--SCAN seed_articles AS s
-|  `--SCAN article AS a USING COVERING INDEX sqlite_autoindex_article_1
+|  `--SEARCH a USING INDEX sqlite_autoindex_article_1 (id=?)
 |--MULTI-INDEX OR l (idx_link_source, idx_link_target)
 `--MULTI-INDEX OR a (sqlite_autoindex_article_1, sqlite_autoindex_article_1)

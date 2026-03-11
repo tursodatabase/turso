@@ -1,4 +1,5 @@
 use crate::translate::expression_index::expression_index_column_usage;
+use crate::translate::plan::MultiIndexBranchAccess;
 use crate::{
     function::Deterministic,
     index_method::IndexMethodCostEstimate,
@@ -10,6 +11,7 @@ use crate::{
             access_method::AccessMethodParams,
             constraints::{RangeConstraintRef, SeekRangeConstraint, TableConstraints},
             cost::RowCountEstimate,
+            multi_index::MultiIndexBranchAccessParams,
             order::{ColumnTarget, OrderTarget},
         },
         plan::{
@@ -42,14 +44,14 @@ use order::{compute_order_target, plan_satisfies_order_target, EliminatesSortBy}
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
-use turso_parser::ast::{self, Expr, SortOrder, TriggerEvent};
+use turso_parser::ast::{self, Expr, SortOrder, SubqueryType, TriggerEvent};
 
 use super::{
     emitter::Resolver,
     plan::{
-        DeletePlan, GroupBy, IterationDirection, JoinOrderMember, JoinType, JoinedTable,
-        MultiIndexBranch, MultiIndexScanOp, Operation, Plan, Search, SeekDef, SeekKey, SelectPlan,
-        TableReferences, UpdatePlan, WhereTerm,
+        DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinOrderMember, JoinType,
+        JoinedTable, MultiIndexBranch, MultiIndexScanOp, Operation, Plan, Search, SeekDef, SeekKey,
+        SelectPlan, TableReferences, UpdatePlan, WhereTerm,
     },
     planner::TableMask,
 };
@@ -1925,16 +1927,26 @@ fn optimize_table_access(
                 // Build the MultiIndexScanOp from the branch parameters
                 let mut multi_idx_branches = Vec::with_capacity(branches.len());
                 for branch in std::mem::take(branches) {
-                    let seek_def = build_seek_def_from_constraints(
-                        &branch.constraints,
-                        &branch.constraint_refs,
-                        IterationDirection::Forwards, // Multi-index always scans forward
-                        where_clause,
-                        Some(table_references),
-                    )?;
+                    let access = match branch.access {
+                        MultiIndexBranchAccessParams::Seek {
+                            constraints,
+                            constraint_refs,
+                        } => MultiIndexBranchAccess::Seek {
+                            seek_def: build_seek_def_from_constraints(
+                                &constraints,
+                                &constraint_refs,
+                                IterationDirection::Forwards, // Multi-index always scans forward
+                                where_clause,
+                                Some(table_references),
+                            )?,
+                        },
+                        MultiIndexBranchAccessParams::InSeek { source } => {
+                            MultiIndexBranchAccess::InSeek { source }
+                        }
+                    };
                     multi_idx_branches.push(MultiIndexBranch {
                         index: branch.index,
-                        seek_def,
+                        access,
                         estimated_rows: branch.estimated_rows,
                         residual_exprs: branch.residual_exprs,
                         requires_table_cursor: branch.requires_table_cursor,
@@ -1947,6 +1959,39 @@ fn optimize_table_access(
                         where_term_idx: w_idx,
                         set_op: s_op,
                         additional_consumed_terms: add_consumed,
+                    });
+            }
+            AccessMethodParams::InSeek {
+                index,
+                affinity,
+                where_term_idx,
+            } => {
+                let source = match &where_clause[*where_term_idx].expr {
+                    Expr::InList { rhs, .. } => {
+                        let in_values: Vec<ast::Expr> = rhs.iter().map(|e| *e.clone()).collect();
+                        InSeekSource::LiteralList {
+                            values: in_values,
+                            affinity: *affinity,
+                        }
+                    }
+                    Expr::SubqueryResult {
+                        query_type: SubqueryType::In { cursor_id, .. },
+                        ..
+                    } => InSeekSource::Subquery {
+                        cursor_id: *cursor_id,
+                    },
+                    _ => {
+                        return Err(crate::LimboError::InternalError(
+                            "InSeek where term is not an InList or SubqueryResult expression"
+                                .into(),
+                        ));
+                    }
+                };
+                where_clause[*where_term_idx].consumed = true;
+                table_references.joined_tables_mut()[table_idx].op =
+                    Operation::Search(Search::InSeek {
+                        index: index.clone(),
+                        source,
                     });
             }
         }

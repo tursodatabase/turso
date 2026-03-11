@@ -330,6 +330,86 @@ impl OpenLoop {
                                 }
                             }
                         }
+                        Search::InSeek { index, source } => {
+                            let is_rowid = index.is_none();
+                            let ephemeral_cursor_id = open_in_seek_source_cursor(
+                                program,
+                                table_references,
+                                &t_ctx.resolver,
+                                index.as_ref(),
+                                source,
+                            )?;
+
+                            program.emit_insn(Insn::NullRow {
+                                cursor_id: ephemeral_cursor_id,
+                            });
+                            program.emit_insn(Insn::Rewind {
+                                cursor_id: ephemeral_cursor_id,
+                                pc_if_empty: loop_end,
+                            });
+
+                            let outer_loop_start = program.allocate_label();
+                            program.preassign_label_to_next_insn(outer_loop_start);
+                            let seek_reg = program.alloc_register();
+                            // The emitted loop is:
+                            //   for each RHS key in the ephemeral cursor
+                            //     seek table/index to that key
+                            //     scan all matching rows for that key
+                            program.emit_insn(Insn::Column {
+                                cursor_id: ephemeral_cursor_id,
+                                column: 0,
+                                dest: seek_reg,
+                                default: None,
+                            });
+
+                            let next_val_label = program.allocate_label();
+                            program.emit_insn(Insn::IsNull {
+                                reg: seek_reg,
+                                target_pc: next_val_label,
+                            });
+
+                            if is_rowid {
+                                program.emit_insn(Insn::SeekRowid {
+                                    cursor_id: table_cursor_id
+                                        .expect("InSeek rowid requires table cursor"),
+                                    src_reg: seek_reg,
+                                    target_pc: next_val_label,
+                                });
+                            } else {
+                                let idx_cursor = index_cursor_id
+                                    .expect("InSeek with index requires index cursor");
+                                program.emit_insn(Insn::SeekGE {
+                                    cursor_id: idx_cursor,
+                                    start_reg: seek_reg,
+                                    num_regs: 1,
+                                    target_pc: next_val_label,
+                                    is_index: true,
+                                    eq_only: false,
+                                });
+                                program.preassign_label_to_next_insn(loop_start);
+                                program.emit_insn(Insn::IdxGT {
+                                    cursor_id: idx_cursor,
+                                    start_reg: seek_reg,
+                                    num_regs: 1,
+                                    target_pc: next_val_label,
+                                });
+                                if let Some(table_cursor_id) = table_cursor_id {
+                                    program.emit_insn(Insn::DeferredSeek {
+                                        index_cursor_id: idx_cursor,
+                                        table_cursor_id,
+                                    });
+                                }
+                            }
+
+                            // `close_loop` uses this metadata to stitch together the outer
+                            // ephemeral-value loop and the inner scan over matches for the
+                            // current value.
+                            t_ctx.meta_in_seeks[joined_table_index] = Some(InSeekMetadata {
+                                ephemeral_cursor_id,
+                                outer_loop_start,
+                                next_val_label,
+                            });
+                        }
                     }
                 }
                 Operation::IndexMethodQuery(query) => {

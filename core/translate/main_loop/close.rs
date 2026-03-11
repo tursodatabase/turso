@@ -166,21 +166,47 @@ impl CloseLoop {
                             })
                         };
                     // Rowid equality point lookups are handled with a SeekRowid instruction which does not loop, so there is no need to emit a Next instruction.
-                    if !matches!(search, Search::RowidEq { .. }) {
-                        let iter_dir = match search {
-                            Search::Seek { seek_def, .. } => seek_def.iter_dir,
-                            Search::RowidEq { .. } => unreachable!(),
-                        };
+                    match search {
+                        Search::RowidEq { .. } => {}
+                        Search::Seek { seek_def, .. } => {
+                            if seek_def.iter_dir == IterationDirection::Backwards {
+                                program.emit_insn(Insn::Prev {
+                                    cursor_id: iteration_cursor_id,
+                                    pc_if_prev: loop_labels.loop_start,
+                                });
+                            } else {
+                                program.emit_insn(Insn::Next {
+                                    cursor_id: iteration_cursor_id,
+                                    pc_if_next: loop_labels.loop_start,
+                                });
+                            }
+                        }
+                        Search::InSeek { index, .. } => {
+                            let meta = t_ctx.meta_in_seeks[table_index]
+                                .as_ref()
+                                .expect("InSeek must have metadata");
+                            let ephemeral_cursor_id = meta.ephemeral_cursor_id;
+                            let outer_loop_start = meta.outer_loop_start;
+                            let next_val_label = meta.next_val_label;
 
-                        if iter_dir == IterationDirection::Backwards {
-                            program.emit_insn(Insn::Prev {
-                                cursor_id: iteration_cursor_id,
-                                pc_if_prev: loop_labels.loop_start,
-                            });
-                        } else {
+                            let can_have_multiple_matches = index.is_some();
+                            if can_have_multiple_matches {
+                                // Rowid InSeek uses SeekRowid, so one RHS key can produce at
+                                // most one row. Index-backed InSeek can hit duplicates, so
+                                // keep scanning the current key's match range before advancing
+                                // the ephemeral cursor to the next IN value.
+                                program.emit_insn(Insn::Next {
+                                    cursor_id: iteration_cursor_id,
+                                    pc_if_next: loop_labels.loop_start,
+                                });
+                            }
+
+                            // Once the current key is exhausted (or a seek found nothing),
+                            // advance the outer ephemeral cursor and restart the equality seek.
+                            program.resolve_label(next_val_label, program.offset());
                             program.emit_insn(Insn::Next {
-                                cursor_id: iteration_cursor_id,
-                                pc_if_next: loop_labels.loop_start,
+                                cursor_id: ephemeral_cursor_id,
+                                pc_if_next: outer_loop_start,
                             });
                         }
                     }

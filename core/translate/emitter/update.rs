@@ -673,8 +673,13 @@ fn emit_update_insns<'a>(
         ),
         Operation::Scan(_) => (None, target_table.virtual_table().is_some()),
         Operation::Search(search) => match search {
-            &Search::RowidEq { .. } | Search::Seek { index: None, .. } => (None, false),
+            &Search::RowidEq { .. }
+            | Search::Seek { index: None, .. }
+            | Search::InSeek { index: None, .. } => (None, false),
             Search::Seek {
+                index: Some(index), ..
+            }
+            | Search::InSeek {
                 index: Some(index), ..
             } => (
                 Some((
