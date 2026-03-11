@@ -15,8 +15,8 @@ use crate::{
         plan::{ColumnUsedMask, OuterQueryReference, TableReferences},
     },
     util::{
-        check_expr_references_column, normalize_ident, parse_numeric_literal,
-        rewrite_view_sql_for_column_rename,escape_sql_string_literal
+        check_expr_references_column, escape_sql_string_literal, normalize_ident,
+        parse_numeric_literal, rewrite_view_sql_for_column_rename,
     },
     vdbe::{
         affinity::Affinity,
