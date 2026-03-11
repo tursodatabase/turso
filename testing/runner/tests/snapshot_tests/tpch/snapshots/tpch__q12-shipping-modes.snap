@@ -53,28 +53,28 @@ addr  opcode                  p1  p2  p3  p4                                    
    6          OpenRead         2   9   0  k(9,B,B,B,B,B,B,B,B,B)                  0  table=orders, root=9, iDb=0
    7          OpenRead         3  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
    8          Rewind           3  58   0                                          0  Rewind table lineitem
-   9            Column         3  14  16                                          0  r[16]=lineitem.l_shipmode
+   9            Column         3  14  16                                          0  r[16]=lineitem.L_SHIPMODE
   10            Eq            16  17  12  Binary                                  0  if r[16]==r[17] goto 12
   11            Ne            16  18  57  Binary                                  0  if r[16]!=r[18] goto 57
-  12            Column         3  11  20                                          0  r[20]=lineitem.l_commitdate
-  13            Column         3  12  21                                          0  r[21]=lineitem.l_receiptdate
+  12            Column         3  11  20                                          0  r[20]=lineitem.L_COMMITDATE
+  13            Column         3  12  21                                          0  r[21]=lineitem.L_RECEIPTDATE
   14            Ge            20  21  57  Binary                                  0  if r[20]>=r[21] goto 57
-  15            Column         3  10  23                                          0  r[23]=lineitem.l_shipdate
-  16            Column         3  11  24                                          0  r[24]=lineitem.l_commitdate
+  15            Column         3  10  23                                          0  r[23]=lineitem.L_SHIPDATE
+  16            Column         3  11  24                                          0  r[24]=lineitem.L_COMMITDATE
   17            Ge            23  24  57  Binary                                  0  if r[23]>=r[24] goto 57
-  18            Column         3  12  26                                          0  r[26]=lineitem.l_receiptdate
+  18            Column         3  12  26                                          0  r[26]=lineitem.L_RECEIPTDATE
   19            Lt            26  27  57  Binary                                  0  if r[26]<r[27] goto 57
-  20            Column         3  12  29                                          0  r[29]=lineitem.l_receiptdate
+  20            Column         3  12  29                                          0  r[29]=lineitem.L_RECEIPTDATE
   21            Ge            29  30  57  Binary                                  0  if r[29]>=r[30] goto 57
-  22            Column         3   0  31                                          0  r[31]=lineitem.l_orderkey
+  22            Column         3   0  31                                          0  r[31]=lineitem.L_ORDERKEY
   23            SeekRowid      2  31  57                                          0  if (r[31]!=cursor 2 for table orders.rowid) goto 57
-  24            Column         3  14  12                                          0  r[12]=lineitem.l_shipmode
-  25            Column         2   5  35                                          0  r[35]=orders.o_orderpriority
+  24            Column         3  14  12                                          0  r[12]=lineitem.L_SHIPMODE
+  25            Column         2   5  35                                          0  r[35]=orders.O_ORDERPRIORITY
   26            String8        0  36   0  1-URGENT                                0  r[36]='1-URGENT'
   27            Integer        1  33   0                                          0  r[33]=1
   28            Eq            35  36  30  Binary                                  0  if r[35]==r[36] goto 30
   29            ZeroOrNull    35  33  36                                          0  ((r[35]=NULL)|(r[36]=NULL)) ? r[33]=NULL : r[33]=0
-  30            Column         2   5  37                                          0  r[37]=orders.o_orderpriority
+  30            Column         2   5  37                                          0  r[37]=orders.O_ORDERPRIORITY
   31            String8        0  38   0  2-HIGH                                  0  r[38]='2-HIGH'
   32            Integer        1  34   0                                          0  r[34]=1
   33            Eq            37  38  35  Binary                                  0  if r[37]==r[38] goto 35
@@ -84,12 +84,12 @@ addr  opcode                  p1  p2  p3  p4                                    
   37            Integer        1  13   0                                          0  r[13]=1
   38            Goto           0  40   0                                          0
   39            Integer        0  13   0                                          0  r[13]=0
-  40            Column         2   5  42                                          0  r[42]=orders.o_orderpriority
+  40            Column         2   5  42                                          0  r[42]=orders.O_ORDERPRIORITY
   41            String8        0  43   0  1-URGENT                                0  r[43]='1-URGENT'
   42            Integer        1  40   0                                          0  r[40]=1
   43            Ne            42  43  45  Binary                                  0  if r[42]!=r[43] goto 45
   44            ZeroOrNull    42  40  43                                          0  ((r[42]=NULL)|(r[43]=NULL)) ? r[40]=NULL : r[40]=0
-  45            Column         2   5  44                                          0  r[44]=orders.o_orderpriority
+  45            Column         2   5  44                                          0  r[44]=orders.O_ORDERPRIORITY
   46            String8        0  45   0  2-HIGH                                  0  r[45]='2-HIGH'
   47            Integer        1  41   0                                          0  r[41]=1
   48            Ne            44  45  50  Binary                                  0  if r[44]!=r[45] goto 50

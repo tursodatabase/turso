@@ -48,18 +48,18 @@ addr  opcode                    p1  p2  p3  p4                                  
    7          OpenRead           3  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
    8          OpenRead           4  11   0  k(3,B,B)                                0  index=sqlite_autoindex_lineitem_1, root=11, iDb=0
    9          Rewind             2  28   0                                          0  Rewind table orders
-  10            Column           2   4  14                                          0  r[14]=orders.o_orderdate
+  10            Column           2   4  14                                          0  r[14]=orders.O_ORDERDATE
   11            Lt              14  15  27  Binary                                  0  if r[14]<r[15] goto 27
-  12            Column           2   4  17                                          0  r[17]=orders.o_orderdate
+  12            Column           2   4  17                                          0  r[17]=orders.O_ORDERDATE
   13            Ge              17  18  27  Binary                                  0  if r[17]>=r[18] goto 27
   14            RowId            2  19   0                                          0  r[19]=orders.rowid
   15            SeekGE           4  26  19                                          0  key=[19..19]
   16              IdxGT          4  26  19                                          0  key=[19..19]
   17              DeferredSeek   4   3   0                                          0
-  18              Column         3  11  21                                          0  r[21]=lineitem.l_commitdate
-  19              Column         3  12  22                                          0  r[22]=lineitem.l_receiptdate
+  18              Column         3  11  21                                          0  r[21]=lineitem.L_COMMITDATE
+  19              Column         3  12  22                                          0  r[22]=lineitem.L_RECEIPTDATE
   20              Ge            21  22  25  Binary                                  0  if r[21]>=r[22] goto 25
-  21              Column         2   5  11                                          0  r[11]=orders.o_orderpriority
+  21              Column         2   5  11                                          0  r[11]=orders.O_ORDERPRIORITY
   22              MakeRecord    11   1  10                                          0  r[10]=mkrec(r[11..11])
   23              SorterInsert   0  10   0  0                                       0  key=r[10]
   24              Goto           0  27   0                                          0  ; semi-join: early out after first match

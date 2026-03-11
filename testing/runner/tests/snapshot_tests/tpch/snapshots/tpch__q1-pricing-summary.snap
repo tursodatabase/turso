@@ -44,26 +44,26 @@ addr  opcode                  p1  p2  p3  p4                                    
    5          Gosub           36  88   0                                          0  ; go to clear accumulator subroutine
    6          OpenRead         2  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
    7          Rewind           2  31   0                                          0  Rewind table lineitem
-   8            Column         2  10  38                                          0  r[38]=lineitem.l_shipdate
+   8            Column         2  10  38                                          0  r[38]=lineitem.L_SHIPDATE
    9            Gt            38  39  30  Binary                                  0  if r[38]>r[39] goto 30
-  10            Column         2   8  27                                          0  r[27]=lineitem.l_returnflag
-  11            Column         2   9  28                                          0  r[28]=lineitem.l_linestatus
-  12            Column         2   4  29                                          0  r[29]=lineitem.l_quantity
-  13            Column         2   5  30                                          0  r[30]=lineitem.l_extendedprice
-  14            Column         2   5  40                                          0  r[40]=lineitem.l_extendedprice
-  15            Column         2   6  43                                          0  r[43]=lineitem.l_discount
+  10            Column         2   8  27                                          0  r[27]=lineitem.L_RETURNFLAG
+  11            Column         2   9  28                                          0  r[28]=lineitem.L_LINESTATUS
+  12            Column         2   4  29                                          0  r[29]=lineitem.L_QUANTITY
+  13            Column         2   5  30                                          0  r[30]=lineitem.L_EXTENDEDPRICE
+  14            Column         2   5  40                                          0  r[40]=lineitem.L_EXTENDEDPRICE
+  15            Column         2   6  43                                          0  r[43]=lineitem.L_DISCOUNT
   16            Subtract      42  43  41                                          0  r[41]=r[42]-r[43]
   17            Multiply      40  41  31                                          0  r[31]=r[40]*r[41]
-  18            Column         2   5  46                                          0  r[46]=lineitem.l_extendedprice
-  19            Column         2   6  49                                          0  r[49]=lineitem.l_discount
+  18            Column         2   5  46                                          0  r[46]=lineitem.L_EXTENDEDPRICE
+  19            Column         2   6  49                                          0  r[49]=lineitem.L_DISCOUNT
   20            Subtract      48  49  47                                          0  r[47]=r[48]-r[49]
   21            Multiply      46  47  44                                          0  r[44]=r[46]*r[47]
-  22            Column         2   7  51                                          0  r[51]=lineitem.l_tax
+  22            Column         2   7  51                                          0  r[51]=lineitem.L_TAX
   23            Add           50  51  45                                          0  r[45]=r[50]+r[51]
   24            Multiply      44  45  32                                          0  r[32]=r[44]*r[45]
-  25            Column         2   4  33                                          0  r[33]=lineitem.l_quantity
-  26            Column         2   5  34                                          0  r[34]=lineitem.l_extendedprice
-  27            Column         2   6  35                                          0  r[35]=lineitem.l_discount
+  25            Column         2   4  33                                          0  r[33]=lineitem.L_QUANTITY
+  26            Column         2   5  34                                          0  r[34]=lineitem.L_EXTENDEDPRICE
+  27            Column         2   6  35                                          0  r[35]=lineitem.L_DISCOUNT
   28            MakeRecord    27   9  26                                          0  r[26]=mkrec(r[27..35])
   29            SorterInsert   0  26   0  0                                       0  key=r[26]
   30          Next             2   8   0                                          0
