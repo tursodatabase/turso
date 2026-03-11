@@ -2391,17 +2391,43 @@ fn rewrite_expr_for_column_rename(
 
     let mut expr = expr.clone();
     walk_expr_mut(&mut expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
-        rewrite_expr_column_ref_with_context(
-            e,
-            trigger_table,
-            trigger_table_name,
-            old_col_norm,
-            new_col_norm,
-            is_renaming_trigger_table,
-            context_table_info
-                .as_ref()
-                .map(|(t, n, r)| (t.as_ref(), n, *r)),
-        )?;
+        match e {
+            ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
+                // Subqueries don't inherit the context table scope
+                rewrite_select_for_column_rename(
+                    select,
+                    trigger_table,
+                    trigger_table_name,
+                    target_table_name,
+                    old_col_norm,
+                    new_col_norm,
+                )?;
+            }
+            ast::Expr::InSelect { rhs, .. } => {
+                rewrite_select_for_column_rename(
+                    rhs,
+                    trigger_table,
+                    trigger_table_name,
+                    target_table_name,
+                    old_col_norm,
+                    new_col_norm,
+                )?;
+                // lhs will be walked by walk_expr_mut
+            }
+            _ => {
+                rewrite_expr_column_ref_with_context(
+                    e,
+                    trigger_table,
+                    trigger_table_name,
+                    old_col_norm,
+                    new_col_norm,
+                    is_renaming_trigger_table,
+                    context_table_info
+                        .as_ref()
+                        .map(|(t, n, r)| (t.as_ref(), n, *r)),
+                )?;
+            }
+        }
         Ok(WalkControl::Continue)
     })?;
 
@@ -2413,15 +2439,13 @@ fn rewrite_expr_for_column_rename(
 fn rewrite_trigger_cmd_for_column_rename(
     cmd: ast::TriggerCmd,
     trigger_table: &BTreeTable,
-    target_table: &BTreeTable,
+    _target_table: &BTreeTable,
     trigger_table_name: &str,
     target_table_name: &str,
     old_col_norm: &str,
     new_col_norm: &str,
     resolver: &Resolver,
 ) -> Result<ast::TriggerCmd> {
-    use crate::translate::expr::walk_expr_mut;
-
     match cmd {
         ast::TriggerCmd::Update {
             or_conflict,
@@ -2448,19 +2472,13 @@ fn rewrite_trigger_cmd_for_column_rename(
 
             // Rewrite SET expressions
             for set in &mut sets {
-                walk_expr_mut(
+                walk_expr_for_column_rename(
                     &mut set.expr,
-                    &mut |e: &mut ast::Expr| -> Result<WalkControl> {
-                        rewrite_expr_column_ref(
-                            e,
-                            trigger_table,
-                            trigger_table_name,
-                            target_table_name,
-                            old_col_norm,
-                            new_col_norm,
-                        )?;
-                        Ok(WalkControl::Continue)
-                    },
+                    trigger_table,
+                    trigger_table_name,
+                    target_table_name,
+                    old_col_norm,
+                    new_col_norm,
                 )?;
             }
 
@@ -2509,10 +2527,10 @@ fn rewrite_trigger_cmd_for_column_rename(
                 }
             }
             // Rewrite SELECT expressions
-            let new_select = rewrite_select_for_column_rename(
-                select,
+            let mut select = select;
+            rewrite_select_for_column_rename(
+                &mut select,
                 trigger_table,
-                target_table,
                 trigger_table_name,
                 target_table_name,
                 old_col_norm,
@@ -2522,7 +2540,7 @@ fn rewrite_trigger_cmd_for_column_rename(
                 or_conflict,
                 tbl_name,
                 col_names,
-                select: new_select,
+                select,
                 upsert,
                 returning,
             })
@@ -2555,56 +2573,86 @@ fn rewrite_trigger_cmd_for_column_rename(
                 where_clause: new_where,
             })
         }
-        ast::TriggerCmd::Select(select) => {
-            let new_select = rewrite_select_for_column_rename(
-                select,
+        ast::TriggerCmd::Select(mut select) => {
+            rewrite_select_for_column_rename(
+                &mut select,
                 trigger_table,
-                target_table,
                 trigger_table_name,
                 target_table_name,
                 old_col_norm,
                 new_col_norm,
             )?;
-            Ok(ast::TriggerCmd::Select(new_select))
+            Ok(ast::TriggerCmd::Select(select))
         }
     }
 }
 
-/// Rewrite a SELECT statement to replace column references
-fn rewrite_select_for_column_rename(
-    select: ast::Select,
+/// Walk an expression tree for column renaming, handling subqueries that walk_expr_mut skips.
+/// This is the central expression walker for trigger column rename rewrites.
+fn walk_expr_for_column_rename(
+    expr: &mut ast::Expr,
     trigger_table: &BTreeTable,
-    _target_table: &BTreeTable,
     trigger_table_name: &str,
     target_table_name: &str,
     old_col_norm: &str,
     new_col_norm: &str,
-) -> Result<ast::Select> {
+) -> Result<()> {
     use crate::translate::expr::walk_expr_mut;
 
-    let mut rewrite_cb = |e: &mut ast::Expr| -> Result<WalkControl> {
-        rewrite_expr_column_ref(
-            e,
-            trigger_table,
-            trigger_table_name,
-            target_table_name,
-            old_col_norm,
-            new_col_norm,
-        )?;
+    walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
+        match e {
+            ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
+                rewrite_select_for_column_rename(
+                    select,
+                    trigger_table,
+                    trigger_table_name,
+                    target_table_name,
+                    old_col_norm,
+                    new_col_norm,
+                )?;
+            }
+            ast::Expr::InSelect { rhs, .. } => {
+                rewrite_select_for_column_rename(
+                    rhs,
+                    trigger_table,
+                    trigger_table_name,
+                    target_table_name,
+                    old_col_norm,
+                    new_col_norm,
+                )?;
+                // lhs will be walked by walk_expr_mut
+            }
+            _ => {
+                rewrite_expr_column_ref(
+                    e,
+                    trigger_table,
+                    trigger_table_name,
+                    target_table_name,
+                    old_col_norm,
+                    new_col_norm,
+                )?;
+            }
+        }
         Ok(WalkControl::Continue)
-    };
+    })?;
+    Ok(())
+}
 
-    let mut select = select;
-
+/// Rewrite a SELECT statement in-place to replace column references.
+fn rewrite_select_for_column_rename(
+    select: &mut ast::Select,
+    trigger_table: &BTreeTable,
+    trigger_table_name: &str,
+    target_table_name: &str,
+    old_col_norm: &str,
+    new_col_norm: &str,
+) -> Result<()> {
     // Rewrite WITH clause (CTEs)
-    // Note: We clone here because Select doesn't implement Default, so we can't use mem::take.
-    // The clone is necessary to move ownership to rewrite_select_for_column_rename.
     if let Some(ref mut with_clause) = select.with {
         for cte in &mut with_clause.ctes {
-            cte.select = rewrite_select_for_column_rename(
-                cte.select.clone(),
+            rewrite_select_for_column_rename(
+                &mut cte.select,
                 trigger_table,
-                _target_table,
                 trigger_table_name,
                 target_table_name,
                 old_col_norm,
@@ -2637,18 +2685,39 @@ fn rewrite_select_for_column_rename(
 
     // Rewrite ORDER BY
     for sorted_col in &mut select.order_by {
-        walk_expr_mut(&mut sorted_col.expr, &mut rewrite_cb)?;
+        walk_expr_for_column_rename(
+            &mut sorted_col.expr,
+            trigger_table,
+            trigger_table_name,
+            target_table_name,
+            old_col_norm,
+            new_col_norm,
+        )?;
     }
 
     // Rewrite LIMIT
     if let Some(ref mut limit) = select.limit {
-        walk_expr_mut(&mut limit.expr, &mut rewrite_cb)?;
+        walk_expr_for_column_rename(
+            &mut limit.expr,
+            trigger_table,
+            trigger_table_name,
+            target_table_name,
+            old_col_norm,
+            new_col_norm,
+        )?;
         if let Some(ref mut offset) = limit.offset {
-            walk_expr_mut(offset, &mut rewrite_cb)?;
+            walk_expr_for_column_rename(
+                offset,
+                trigger_table,
+                trigger_table_name,
+                target_table_name,
+                old_col_norm,
+                new_col_norm,
+            )?;
         }
     }
 
-    Ok(select)
+    Ok(())
 }
 
 /// Rewrite a OneSelect to replace column references
@@ -2660,20 +2729,6 @@ fn rewrite_one_select_for_column_rename(
     old_col_norm: &str,
     new_col_norm: &str,
 ) -> Result<()> {
-    use crate::translate::expr::walk_expr_mut;
-
-    let mut rewrite_cb = |e: &mut ast::Expr| -> Result<WalkControl> {
-        rewrite_expr_column_ref(
-            e,
-            trigger_table,
-            trigger_table_name,
-            target_table_name,
-            old_col_norm,
-            new_col_norm,
-        )?;
-        Ok(WalkControl::Continue)
-    };
-
     match one_select {
         ast::OneSelect::Select {
             columns,
@@ -2686,7 +2741,14 @@ fn rewrite_one_select_for_column_rename(
             // Rewrite columns
             for col in columns {
                 if let ast::ResultColumn::Expr(expr, _) = col {
-                    walk_expr_mut(expr, &mut rewrite_cb)?;
+                    walk_expr_for_column_rename(
+                        expr,
+                        trigger_table,
+                        trigger_table_name,
+                        target_table_name,
+                        old_col_norm,
+                        new_col_norm,
+                    )?;
                 }
             }
 
@@ -2704,16 +2766,37 @@ fn rewrite_one_select_for_column_rename(
 
             // Rewrite WHERE clause
             if let Some(ref mut where_expr) = where_clause {
-                walk_expr_mut(where_expr, &mut rewrite_cb)?;
+                walk_expr_for_column_rename(
+                    where_expr,
+                    trigger_table,
+                    trigger_table_name,
+                    target_table_name,
+                    old_col_norm,
+                    new_col_norm,
+                )?;
             }
 
             // Rewrite GROUP BY and HAVING
             if let Some(ref mut group_by) = group_by {
                 for expr in &mut group_by.exprs {
-                    walk_expr_mut(expr, &mut rewrite_cb)?;
+                    walk_expr_for_column_rename(
+                        expr,
+                        trigger_table,
+                        trigger_table_name,
+                        target_table_name,
+                        old_col_norm,
+                        new_col_norm,
+                    )?;
                 }
                 if let Some(ref mut having_expr) = group_by.having {
-                    walk_expr_mut(having_expr, &mut rewrite_cb)?;
+                    walk_expr_for_column_rename(
+                        having_expr,
+                        trigger_table,
+                        trigger_table_name,
+                        target_table_name,
+                        old_col_norm,
+                        new_col_norm,
+                    )?;
                 }
             }
 
@@ -2732,7 +2815,14 @@ fn rewrite_one_select_for_column_rename(
         ast::OneSelect::Values(values) => {
             for row in values {
                 for expr in row {
-                    walk_expr_mut(expr, &mut rewrite_cb)?;
+                    walk_expr_for_column_rename(
+                        expr,
+                        trigger_table,
+                        trigger_table_name,
+                        target_table_name,
+                        old_col_norm,
+                        new_col_norm,
+                    )?;
                 }
             }
         }
@@ -2749,20 +2839,6 @@ fn rewrite_from_clause_for_column_rename(
     old_col_norm: &str,
     new_col_norm: &str,
 ) -> Result<()> {
-    use crate::translate::expr::walk_expr_mut;
-
-    let mut rewrite_cb = |e: &mut ast::Expr| -> Result<WalkControl> {
-        rewrite_expr_column_ref(
-            e,
-            trigger_table,
-            trigger_table_name,
-            target_table_name,
-            old_col_norm,
-            new_col_norm,
-        )?;
-        Ok(WalkControl::Continue)
-    };
-
     // Rewrite main table (could be a subquery)
     rewrite_select_table_for_column_rename(
         &mut from_clause.select,
@@ -2786,7 +2862,14 @@ fn rewrite_from_clause_for_column_rename(
         if let Some(ref mut constraint) = join.constraint {
             match constraint {
                 ast::JoinConstraint::On(expr) => {
-                    walk_expr_mut(expr, &mut rewrite_cb)?;
+                    walk_expr_for_column_rename(
+                        expr,
+                        trigger_table,
+                        trigger_table_name,
+                        target_table_name,
+                        old_col_norm,
+                        new_col_norm,
+                    )?;
                 }
                 ast::JoinConstraint::Using(_) => {
                     // USING clause contains column names, not expressions
@@ -2806,28 +2889,11 @@ fn rewrite_select_table_for_column_rename(
     old_col_norm: &str,
     new_col_norm: &str,
 ) -> Result<()> {
-    use crate::translate::expr::walk_expr_mut;
-
-    let mut rewrite_cb = |e: &mut ast::Expr| -> Result<WalkControl> {
-        rewrite_expr_column_ref(
-            e,
-            trigger_table,
-            trigger_table_name,
-            target_table_name,
-            old_col_norm,
-            new_col_norm,
-        )?;
-        Ok(WalkControl::Continue)
-    };
-
     match select_table {
         ast::SelectTable::Select(select, _) => {
-            // Note: We clone here because Select doesn't implement Default, so we can't use mem::take.
-            // The clone is necessary to move ownership to rewrite_select_for_column_rename.
-            *select = rewrite_select_for_column_rename(
-                select.clone(),
+            rewrite_select_for_column_rename(
+                select,
                 trigger_table,
-                trigger_table, // target_table not needed for subqueries
                 trigger_table_name,
                 target_table_name,
                 old_col_norm,
@@ -2846,7 +2912,14 @@ fn rewrite_select_table_for_column_rename(
         }
         ast::SelectTable::TableCall(_, args, _) => {
             for arg in args {
-                walk_expr_mut(arg, &mut rewrite_cb)?;
+                walk_expr_for_column_rename(
+                    arg,
+                    trigger_table,
+                    trigger_table_name,
+                    target_table_name,
+                    old_col_norm,
+                    new_col_norm,
+                )?;
             }
         }
         ast::SelectTable::Table(_, _, _) => {
@@ -2865,32 +2938,30 @@ fn rewrite_window_for_column_rename(
     old_col_norm: &str,
     new_col_norm: &str,
 ) -> Result<()> {
-    use crate::translate::expr::walk_expr_mut;
-
-    let mut rewrite_cb = |e: &mut ast::Expr| -> Result<WalkControl> {
-        rewrite_expr_column_ref(
-            e,
+    // Rewrite PARTITION BY expressions
+    for expr in &mut window.partition_by {
+        walk_expr_for_column_rename(
+            expr,
             trigger_table,
             trigger_table_name,
             target_table_name,
             old_col_norm,
             new_col_norm,
         )?;
-        Ok(WalkControl::Continue)
-    };
-
-    // Rewrite PARTITION BY expressions
-    for expr in &mut window.partition_by {
-        walk_expr_mut(expr, &mut rewrite_cb)?;
     }
 
     // Rewrite ORDER BY expressions
     for sorted_col in &mut window.order_by {
-        walk_expr_mut(&mut sorted_col.expr, &mut rewrite_cb)?;
+        walk_expr_for_column_rename(
+            &mut sorted_col.expr,
+            trigger_table,
+            trigger_table_name,
+            target_table_name,
+            old_col_norm,
+            new_col_norm,
+        )?;
     }
 
-    // TODO: FrameClause can also contain expressions, but they're more complex
-    // For now, we'll skip them as they're less common in triggers
     Ok(())
 }
 
