@@ -5569,6 +5569,27 @@ pub fn op_agg_final(
                 AggFunc::Count | AggFunc::Count0 => {
                     state.registers[dest_reg] = Register::Value(Value::from_i64(0));
                 }
+                #[cfg(feature = "json")]
+                AggFunc::JsonGroupArray => {
+                    state.registers[dest_reg] =
+                        Register::Value(Value::Text(Text::json("[]".to_string())));
+                }
+                #[cfg(feature = "json")]
+                AggFunc::JsonbGroupArray => {
+                    state.registers[dest_reg] = Register::Value(Value::Blob(
+                        json::jsonb::Jsonb::make_empty_array(1).data(),
+                    ));
+                }
+                #[cfg(feature = "json")]
+                AggFunc::JsonGroupObject => {
+                    state.registers[dest_reg] =
+                        Register::Value(Value::Text(Text::json("{}".to_string())));
+                }
+                #[cfg(feature = "json")]
+                AggFunc::JsonbGroupObject => {
+                    state.registers[dest_reg] =
+                        Register::Value(Value::Blob(json::jsonb::Jsonb::make_empty_obj(1).data()));
+                }
                 _ => {}
             }
         }
