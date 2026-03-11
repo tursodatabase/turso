@@ -28,29 +28,29 @@ addr  opcode         p1  p2  p3  p4                p5  comment
   11  Goto            0  13   0                     0
   12  NewRowid        1   2   0                     0  r[2]=rowid
   13  Affinity        3   4   0                     0  r[3..7] = D, B, B, B
-  14  NotExists       1  22   2                     0
-  15  Copy            2   1   0                     0  r[1]=r[2]
-  16  SeekRowid       1   1  41                     0  if (r[1]!=cursor 1 for table users.rowid) goto 41
-  17  Column          1   1   8                     0  r[8]=users.email
-  18  Copy            1   9   0                     0  r[9]=r[1]
-  19  IdxDelete       0   8   2                     1
-  20  Delete          1   0   0  users              0
-  21  Goto            0  22   0                     0
-  22  Copy            4  10   0                     0  r[10]=r[4]
-  23  Copy            2  11   0                     0  r[11]=r[2]
-  24  Affinity       10   1   0                     0  r[10..11] = B
-  25  NoConflict      0  33  10  1                  0  key=r[10..10]
-  26  IdxRowId        0   1   0                     0  r[1]=cursor 0.rowid
-  27  SeekRowid       1   1  41                     0  if (r[1]!=cursor 1 for table users.rowid) goto 41
-  28  Column          1   1  12                     0  r[12]=users.email
-  29  Copy            1  13   0                     0  r[13]=r[1]
-  30  IdxDelete       0  12   2                     1
-  31  Delete          1   0   0  users              0
-  32  Goto            0  33   0                     0
-  33  MakeRecord     10   2  14                     0  r[14]=mkrec(r[10..11]); for sqlite_autoindex_users_1
-  34  IdxInsert       0  14  10                     2  key=r[14]
-  35  HaltIfNull   1299   0   4  users.email        0
-  36  HaltIfNull   1299   0   5  users.name         0
+  14  HaltIfNull   1299   0   4  users.email        0
+  15  HaltIfNull   1299   0   5  users.name         0
+  16  NotExists       1  24   2                     0
+  17  Copy            2   1   0                     0  r[1]=r[2]
+  18  SeekRowid       1   1  41                     0  if (r[1]!=cursor 1 for table users.rowid) goto 41
+  19  Column          1   1   8                     0  r[8]=users.email
+  20  Copy            1   9   0                     0  r[9]=r[1]
+  21  IdxDelete       0   8   2                     1
+  22  Delete          1   0   0  users              0
+  23  Goto            0  24   0                     0
+  24  Copy            4  10   0                     0  r[10]=r[4]
+  25  Copy            2  11   0                     0  r[11]=r[2]
+  26  Affinity       10   1   0                     0  r[10..11] = B
+  27  NoConflict      0  35  10  1                  0  key=r[10..10]
+  28  IdxRowId        0   1   0                     0  r[1]=cursor 0.rowid
+  29  SeekRowid       1   1  41                     0  if (r[1]!=cursor 1 for table users.rowid) goto 41
+  30  Column          1   1  12                     0  r[12]=users.email
+  31  Copy            1  13   0                     0  r[13]=r[1]
+  32  IdxDelete       0  12   2                     1
+  33  Delete          1   0   0  users              0
+  34  Goto            0  35   0                     0
+  35  MakeRecord     10   2  14                     0  r[14]=mkrec(r[10..11]); for sqlite_autoindex_users_1
+  36  IdxInsert       0  14  10                     2  key=r[14]
   37  MakeRecord      3   4   7                     0  r[7]=mkrec(r[3..6])
   38  Insert          1   7   2  users              2  intkey=r[2] data=r[7]
   39  Goto            0  40   0                     0

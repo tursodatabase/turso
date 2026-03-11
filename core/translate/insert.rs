@@ -713,6 +713,11 @@ pub fn translate_insert(
         connection,
         table_references: &mut table_references,
     };
+    // NOT NULL default substitution must happen before index key registers are
+    // copied in preflight constraint checks. Otherwise the index entry gets NULL
+    // while the table row gets the default value, causing integrity_check failures.
+    emit_notnulls(program, &ctx, &insertion, resolver)?;
+
     emit_preflight_constraint_checks(
         program,
         &mut ctx,
@@ -721,8 +726,6 @@ pub fn translate_insert(
         &constraints,
         &mut preflight_ctx,
     )?;
-
-    emit_notnulls(program, &ctx, &insertion, resolver)?;
 
     // Create and insert the record
     let affinity_str = insertion

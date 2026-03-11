@@ -29,20 +29,20 @@ addr  opcode         p1  p2  p3  p4             p5  comment
   12  Goto            0  14   0                  0
   13  NewRowid        2   2   0                  0  r[2]=rowid
   14  Affinity        3   4   0                  0  r[3..7] = D, B, B, B
-  15  NotExists       2  17   2                  0
-  16  Halt         1555   0   0  items.id        0
-  17  Copy            5   8   0                  0  r[8]=r[5]
-  18  Copy            2   9   0                  0  r[9]=r[2]
-  19  Affinity        8   1   0                  0  r[8..9] = B
-  20  NoConflict      0  22   8  1               0  key=r[8..8]
-  21  Halt         2067   0   0  items.barcode   0
-  22  Copy            4  10   0                  0  r[10]=r[4]
-  23  Copy            2  11   0                  0  r[11]=r[2]
-  24  Affinity       10   1   0                  0  r[10..11] = B
-  25  NoConflict      1  27  10  1               0  key=r[10..10]
-  26  Halt         2067   0   0  items.sku       0
-  27  HaltIfNull   1299   0   4  items.sku       0
-  28  HaltIfNull   1299   0   5  items.barcode   0
+  15  HaltIfNull   1299   0   4  items.sku       0
+  16  HaltIfNull   1299   0   5  items.barcode   0
+  17  NotExists       2  19   2                  0
+  18  Halt         1555   0   0  items.id        0
+  19  Copy            5   8   0                  0  r[8]=r[5]
+  20  Copy            2   9   0                  0  r[9]=r[2]
+  21  Affinity        8   1   0                  0  r[8..9] = B
+  22  NoConflict      0  24   8  1               0  key=r[8..8]
+  23  Halt         2067   0   0  items.barcode   0
+  24  Copy            4  10   0                  0  r[10]=r[4]
+  25  Copy            2  11   0                  0  r[11]=r[2]
+  26  Affinity       10   1   0                  0  r[10..11] = B
+  27  NoConflict      1  29  10  1               0  key=r[10..10]
+  28  Halt         2067   0   0  items.sku       0
   29  MakeRecord      3   4   7                  0  r[7]=mkrec(r[3..6])
   30  Copy            5  12   0                  0  r[12]=r[5]
   31  Copy            2  13   0                  0  r[13]=r[2]

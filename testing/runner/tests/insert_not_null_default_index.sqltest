@@ -1,0 +1,79 @@
+@database :memory:
+
+# Regression test: INSERT OR REPLACE with a NOT NULL DEFAULT column and a
+# secondary UNIQUE index. When a column expression evaluates to NULL at
+# runtime (e.g. expr + NULL), the NOT NULL default substitution must happen
+# BEFORE index key registers are copied, otherwise the index entry gets NULL
+# while the table row gets the default value → integrity_check fails.
+
+setup schema {
+    CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER, c INTEGER NOT NULL DEFAULT 0, d INTEGER CHECK (d > 0));
+    CREATE UNIQUE INDEX idx ON t (b DESC, c, d DESC);
+}
+
+@setup schema
+@cross-check-integrity
+test insert-or-replace-null-expr-not-null-default {
+    INSERT OR REPLACE INTO t (a, b, c, d) VALUES (1, NULL, 1892229699219097912 + -NULL, 100);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+@setup schema
+@cross-check-integrity
+test insert-or-replace-null-expr-select-back {
+    INSERT OR REPLACE INTO t (a, b, c, d) VALUES (1, NULL, 1892229699219097912 + -NULL, 100);
+    SELECT a, b, c, d FROM t;
+}
+expect {
+    1||0|100
+}
+
+@setup schema
+@cross-check-integrity
+test insert-or-replace-null-expr-not-null-default-text {
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, x TEXT NOT NULL DEFAULT 'fallback', y INTEGER);
+    CREATE UNIQUE INDEX idx2 ON t2 (x, y);
+    INSERT OR REPLACE INTO t2 (id, x, y) VALUES (1, NULL || NULL, 42);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+@setup schema
+@cross-check-integrity
+test insert-or-replace-null-expr-not-null-default-text-select {
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, x TEXT NOT NULL DEFAULT 'fallback', y INTEGER);
+    CREATE UNIQUE INDEX idx2 ON t2 (x, y);
+    INSERT OR REPLACE INTO t2 (id, x, y) VALUES (1, NULL || NULL, 42);
+    SELECT id, x, y FROM t2;
+}
+expect {
+    1|fallback|42
+}
+
+@setup schema
+@cross-check-integrity
+test insert-not-null-default-middle-column-index {
+    INSERT OR REPLACE INTO t (a, b, c, d) VALUES (1, 5, NULL, 10);
+    INSERT OR REPLACE INTO t (a, b, c, d) VALUES (2, 6, 0 * NULL, 20);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+@setup schema
+@cross-check-integrity
+test insert-not-null-default-middle-column-select {
+    INSERT OR REPLACE INTO t (a, b, c, d) VALUES (1, 5, NULL, 10);
+    INSERT OR REPLACE INTO t (a, b, c, d) VALUES (2, 6, 0 * NULL, 20);
+    SELECT a, b, c, d FROM t ORDER BY a;
+}
+expect {
+    1|5|0|10
+    2|6|0|20
+}
