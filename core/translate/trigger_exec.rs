@@ -3,7 +3,7 @@ use crate::sync::Arc;
 use crate::translate::expr::WalkControl;
 use crate::translate::{
     emitter::Resolver,
-    expr::{self, translate_expr, walk_expr_mut},
+    expr::{self, rewrite_between_expr, translate_expr, walk_expr_mut},
     planner::ROWID_STRS,
     translate_inner, ProgramBuilder, ProgramBuilderOpts,
 };
@@ -651,6 +651,9 @@ pub fn fire_trigger(
 
     // Evaluate WHEN clause if present
     if let Some(mut when_expr) = trigger.when_clause.clone() {
+        // Rewrite BETWEEN expressions to AND/OR form before translation,
+        // since translate_expr expects this rewrite to have already happened.
+        rewrite_between_expr(&mut when_expr);
         // Rewrite NEW/OLD references in WHEN clause to use registers
         rewrite_trigger_expr_for_when_clause(&mut when_expr, &ctx.table, ctx)?;
 
