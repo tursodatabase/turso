@@ -268,6 +268,28 @@ pub fn plan_subqueries_from_returning(
     Ok(())
 }
 
+/// Plan subqueries in a trigger WHEN clause expression.
+/// The WHEN clause has no FROM clause, so there are no outer query references.
+/// NEW/OLD references should already be rewritten to Expr::Register before calling this.
+pub fn plan_subqueries_from_trigger_when_clause(
+    program: &mut ProgramBuilder,
+    non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
+    expr: &mut ast::Expr,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let mut table_references = TableReferences::new(vec![], vec![]);
+    plan_subqueries_with_outer_query_access(
+        program,
+        non_from_clause_subqueries,
+        &mut table_references,
+        resolver,
+        std::iter::once(expr),
+        connection,
+        SubqueryPosition::Where,
+    )
+}
+
 /// Compute query plans for subqueries in the WHERE clause and HAVING clause (both of which have access to the outer query scope)
 fn plan_subqueries_with_outer_query_access<'a>(
     program: &mut ProgramBuilder,
