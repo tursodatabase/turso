@@ -13,7 +13,7 @@ use crate::vdbe::BranchOffset;
 use crate::HashSet;
 use crate::{bail_parse_error, QueryMode, Result};
 use std::num::NonZero;
-use turso_parser::ast::{self, Expr, TriggerEvent, TriggerTime};
+use turso_parser::ast::{self, Expr, Name, TriggerEvent, TriggerTime};
 
 /// Context for trigger execution
 #[derive(Debug)]
@@ -979,6 +979,17 @@ where
     Ok(())
 }
 
+/// Wrap a register reference with an explicit COLLATE node if the column has
+/// a non-default collation. This ensures that comparisons in trigger WHEN
+/// clauses inherit the column's collation sequence.
+fn wrap_register_with_collation(reg: usize, col: &crate::schema::Column) -> Expr {
+    let register_expr = Expr::Register(reg);
+    match col.collation_opt() {
+        Some(coll) => Expr::Collate(Box::new(register_expr), Name::exact(coll.to_string())),
+        None => register_expr,
+    }
+}
+
 fn rewrite_trigger_expr_single_for_when_clause(
     expr: &mut ast::Expr,
     table: &BTreeTable,
@@ -1021,7 +1032,7 @@ fn rewrite_trigger_expr_single_for_when_clause(
                             return Ok(());
                         }
                         if idx < new_regs.len() {
-                            *expr = Expr::Register(new_regs[idx]);
+                            *expr = wrap_register_with_collation(new_regs[idx], col_def);
                             return Ok(());
                         }
                     }
@@ -1047,9 +1058,9 @@ fn rewrite_trigger_expr_single_for_when_clause(
             // Handle OLD.column references
             if ns.eq_ignore_ascii_case("old") {
                 if let Some(old_regs) = &ctx.old_registers {
-                    if let Some((idx, _)) = table.get_column(&col) {
+                    if let Some((idx, col_def)) = table.get_column(&col) {
                         if idx < old_regs.len() {
-                            *expr = Expr::Register(old_regs[idx]);
+                            *expr = wrap_register_with_collation(old_regs[idx], col_def);
                             return Ok(());
                         }
                     }

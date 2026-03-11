@@ -1,0 +1,105 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE t(name TEXT COLLATE NOCASE);
+    CREATE TABLE log(msg);
+}
+
+# Basic: WHEN clause with NEW.col should inherit COLLATE NOCASE
+@setup schema
+test trigger-when-collate-nocase-basic {
+    CREATE TRIGGER tr AFTER INSERT ON t WHEN NEW.name = 'hello' BEGIN
+        INSERT INTO log VALUES('matched:' || NEW.name);
+    END;
+    INSERT INTO t VALUES('HELLO');
+    INSERT INTO t VALUES('hello');
+    INSERT INTO t VALUES('HeLLo');
+    SELECT * FROM log ORDER BY msg;
+}
+expect {
+    matched:HELLO
+    matched:HeLLo
+    matched:hello
+}
+
+# Non-matching case: value that doesn't match even case-insensitively
+@setup schema
+test trigger-when-collate-nocase-no-match {
+    CREATE TRIGGER tr AFTER INSERT ON t WHEN NEW.name = 'hello' BEGIN
+        INSERT INTO log VALUES('matched:' || NEW.name);
+    END;
+    INSERT INTO t VALUES('world');
+    INSERT INTO t VALUES('WORLD');
+    SELECT COUNT(*) FROM log;
+}
+expect {
+    0
+}
+
+# WHEN clause with != operator should also respect collation
+@setup schema
+test trigger-when-collate-nocase-not-equals {
+    CREATE TRIGGER tr AFTER INSERT ON t WHEN NEW.name != 'hello' BEGIN
+        INSERT INTO log VALUES('fired:' || NEW.name);
+    END;
+    INSERT INTO t VALUES('HELLO');
+    INSERT INTO t VALUES('world');
+    SELECT * FROM log ORDER BY msg;
+}
+expect {
+    fired:world
+}
+
+# WHEN clause with comparison operators (<, >) should respect collation
+@setup schema
+test trigger-when-collate-nocase-comparison {
+    CREATE TRIGGER tr AFTER INSERT ON t WHEN NEW.name < 'C' BEGIN
+        INSERT INTO log VALUES('lt:' || NEW.name);
+    END;
+    INSERT INTO t VALUES('a');
+    INSERT INTO t VALUES('B');
+    INSERT INTO t VALUES('d');
+    SELECT * FROM log ORDER BY msg;
+}
+expect {
+    lt:B
+    lt:a
+}
+
+# UPDATE trigger with OLD.col should also inherit collation
+setup update_schema {
+    CREATE TABLE t(name TEXT COLLATE NOCASE);
+    CREATE TABLE log(msg);
+    INSERT INTO t VALUES('hello');
+}
+
+@setup update_schema
+test trigger-when-collate-nocase-old-ref {
+    CREATE TRIGGER tr AFTER UPDATE ON t WHEN OLD.name = 'hello' BEGIN
+        INSERT INTO log VALUES('updated from:' || OLD.name || ' to:' || NEW.name);
+    END;
+    UPDATE t SET name = 'world' WHERE name = 'hello';
+    SELECT * FROM log;
+}
+expect {
+    updated from:hello to:world
+}
+
+# Column without COLLATE should use default (binary) comparison
+setup binary_schema {
+    CREATE TABLE t(name TEXT);
+    CREATE TABLE log(msg);
+}
+
+@setup binary_schema
+test trigger-when-collate-binary-default {
+    CREATE TRIGGER tr AFTER INSERT ON t WHEN NEW.name = 'hello' BEGIN
+        INSERT INTO log VALUES('matched:' || NEW.name);
+    END;
+    INSERT INTO t VALUES('HELLO');
+    INSERT INTO t VALUES('hello');
+    SELECT * FROM log ORDER BY msg;
+}
+expect {
+    matched:hello
+}
