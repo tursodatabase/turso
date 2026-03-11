@@ -1,0 +1,23 @@
+---
+source: indexes.sqltest
+expression: |-
+  SELECT id
+      FROM in_or_values
+      WHERE a IN (SELECT v FROM in_or_rhs_a)
+         OR b IN (SELECT v FROM in_or_rhs_b);
+info:
+  statement_type: SELECT
+  tables:
+  - in_or_rhs_a
+  - in_or_rhs_b
+  - in_or_values
+  setup_blocks:
+  - in-or-indexed
+  database: ':memory:'
+---
+QUERY PLAN
+|--LIST SUBQUERY 1
+|  `--SCAN in_or_rhs_a
+|--LIST SUBQUERY 2
+|  `--SCAN in_or_rhs_b
+`--SCAN in_or_values

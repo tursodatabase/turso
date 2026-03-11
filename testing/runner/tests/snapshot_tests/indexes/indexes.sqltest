@@ -336,6 +336,42 @@ snapshot-eqp or-with-and-combinations {
        OR (event_type = 'WARNING' AND severity > 7);
 }
 
+setup in-or-indexed {
+    CREATE TABLE in_or_values (
+        id INTEGER PRIMARY KEY,
+        a INTEGER,
+        b INTEGER,
+        c INTEGER
+    );
+    CREATE INDEX idx_in_or_values_a ON in_or_values(a);
+    CREATE INDEX idx_in_or_values_b ON in_or_values(b);
+
+    CREATE TABLE in_or_rhs_a(v INTEGER);
+    CREATE TABLE in_or_rhs_b(v INTEGER);
+
+    CREATE TABLE in_or_tags(
+        id INTEGER PRIMARY KEY,
+        c INTEGER
+    );
+}
+
+@setup in-or-indexed
+snapshot-eqp in-subquery-or-in-subquery-indexed {
+    SELECT id
+    FROM in_or_values
+    WHERE a IN (SELECT v FROM in_or_rhs_a)
+       OR b IN (SELECT v FROM in_or_rhs_b);
+}
+
+@setup in-or-indexed
+snapshot-eqp in-subquery-or-in-list-left-join {
+    SELECT in_or_values.id, in_or_tags.id
+    FROM in_or_values
+    LEFT JOIN in_or_tags
+      ON in_or_values.c = in_or_tags.c
+     AND (a IN (SELECT v FROM in_or_rhs_a) OR b IN (200, 500));
+}
+
 # =============================================================================
 # 6. No Index (Full Scan) - For comparison
 # =============================================================================
