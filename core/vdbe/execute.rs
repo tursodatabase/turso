@@ -2723,6 +2723,17 @@ pub fn halt(
     }
 
     if program.is_trigger_subprogram() {
+        // Trigger subprograms track their own n_change. Add it to total_changes
+        // so that total_changes() counts rows modified by triggers, matching SQLite
+        // behavior. We don't update last_change here — that only reflects the
+        // outermost statement's direct changes.
+        let trigger_changes = state.n_change.load(Ordering::SeqCst);
+        if trigger_changes > 0 {
+            program
+                .connection
+                .total_changes
+                .fetch_add(trigger_changes, Ordering::SeqCst);
+        }
         return Ok(InsnFunctionStepResult::Done);
     }
 

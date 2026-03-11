@@ -1,0 +1,107 @@
+@database :memory:
+
+setup single_insert {
+    CREATE TABLE t(a);
+    CREATE TABLE log(msg);
+    CREATE TRIGGER tr_insert AFTER INSERT ON t BEGIN
+        INSERT INTO log VALUES('inserted');
+    END;
+}
+
+@setup single_insert
+
+test total-changes-single-insert-with-trigger {
+    -- 1 direct insert + 1 trigger insert = 2
+    INSERT INTO t VALUES(1);
+    SELECT total_changes();
+}
+expect {
+    2
+}
+
+setup multi_insert {
+    CREATE TABLE t1(a);
+    CREATE TABLE log1(msg);
+    CREATE TRIGGER tr_insert1 AFTER INSERT ON t1 BEGIN
+        INSERT INTO log1 VALUES('inserted');
+    END;
+}
+
+@setup multi_insert
+
+test total-changes-multiple-inserts-with-trigger {
+    -- 3 direct inserts + 3 trigger inserts = 6
+    INSERT INTO t1 VALUES(1);
+    INSERT INTO t1 VALUES(2);
+    INSERT INTO t1 VALUES(3);
+    SELECT total_changes();
+}
+expect {
+    6
+}
+
+setup multi_trigger {
+    CREATE TABLE t2(a);
+    CREATE TABLE audit1(msg);
+    CREATE TABLE audit2(msg);
+    CREATE TRIGGER tr_audit1 AFTER INSERT ON t2 BEGIN
+        INSERT INTO audit1 VALUES('a1');
+    END;
+    CREATE TRIGGER tr_audit2 AFTER INSERT ON t2 BEGIN
+        INSERT INTO audit2 VALUES('a2');
+    END;
+}
+
+@setup multi_trigger
+
+test total-changes-multiple-triggers-per-row {
+    -- 1 direct insert + 2 trigger inserts = 3
+    INSERT INTO t2 VALUES(1);
+    SELECT total_changes();
+}
+expect {
+    3
+}
+
+setup update_trigger {
+    CREATE TABLE t3(a, b);
+    CREATE TABLE update_log(msg);
+    CREATE TRIGGER tr_update AFTER UPDATE ON t3 BEGIN
+        INSERT INTO update_log VALUES('updated');
+    END;
+}
+
+@setup update_trigger
+
+test total-changes-update-trigger {
+    -- 2 inserts + 2 updates + 2 trigger inserts = 6
+    INSERT INTO t3 VALUES(1, 'x');
+    INSERT INTO t3 VALUES(2, 'y');
+    UPDATE t3 SET b = 'z';
+    SELECT total_changes();
+}
+expect {
+    6
+}
+
+setup delete_trigger {
+    CREATE TABLE t4(a);
+    CREATE TABLE delete_log(msg);
+    CREATE TRIGGER tr_delete AFTER DELETE ON t4 BEGIN
+        INSERT INTO delete_log VALUES('deleted');
+    END;
+}
+
+@setup delete_trigger
+
+test total-changes-delete-trigger {
+    -- 3 inserts + 3 deletes + 3 trigger inserts = 9
+    INSERT INTO t4 VALUES(1);
+    INSERT INTO t4 VALUES(2);
+    INSERT INTO t4 VALUES(3);
+    DELETE FROM t4;
+    SELECT total_changes();
+}
+expect {
+    9
+}
