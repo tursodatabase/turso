@@ -1071,6 +1071,7 @@ mod tests {
                 Some(JoinInfo {
                     join_type: JoinType::Inner,
                     using: vec![],
+                    no_reorder: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -1079,6 +1080,7 @@ mod tests {
                 Some(JoinInfo {
                     join_type: JoinType::Inner,
                     using: vec![],
+                    no_reorder: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -1337,6 +1339,7 @@ mod tests {
                 Some(JoinInfo {
                     join_type: JoinType::Inner,
                     using: vec![],
+                    no_reorder: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -1522,6 +1525,7 @@ mod tests {
                 Some(JoinInfo {
                     join_type: JoinType::Inner,
                     using: vec![],
+                    no_reorder: false,
                 }),
                 table_id_counter.next(),
             ),
