@@ -910,10 +910,13 @@ fn emit_update_insns<'a>(
         if has_before_triggers {
             let old_registers =
                 old_registers.expect("old_registers allocated when has_before_triggers");
-            // NEW row values are already in 'start' registers
+            // NEW row values are already in 'start' registers.
+            // If the rowid is being updated (INTEGER PRIMARY KEY in SET clause),
+            // use the new rowid register; otherwise use the current rowid (beg).
+            let new_rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
             let new_registers = (0..col_len)
                 .map(|i| start + i)
-                .chain(std::iter::once(beg))
+                .chain(std::iter::once(new_rowid_reg))
                 .collect();
 
             // If the program has a trigger_conflict_override, propagate it to the trigger context.

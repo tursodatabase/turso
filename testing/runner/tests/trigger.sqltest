@@ -1909,3 +1909,36 @@ test trigger-when-bare-column-error {
 expect error {
     no such column: a
 }
+
+# regression test for https://github.com/tursodatabase/turso/issues/5858
+@cross-check-integrity
+test trigger-when-between-bug {
+    CREATE TABLE t202 (a INTEGER);
+    CREATE TABLE log202 (val INTEGER);
+    CREATE TRIGGER tr202 AFTER INSERT ON t202
+    WHEN NEW.a BETWEEN 1 AND 10 BEGIN
+        INSERT INTO log202 VALUES (NEW.a);
+    END;
+    INSERT INTO t202 VALUES (5);
+    INSERT INTO t202 VALUES (50);
+    SELECT * FROM log202;
+}
+expect {
+    5
+}
+
+# regression test for https://github.com/tursodatabase/turso/issues/5859
+@cross-check-integrity
+test trigger-update-pk-change-bug {
+    CREATE TABLE t210 (a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE log210 (old_a INTEGER, new_a INTEGER);
+    INSERT INTO t210 VALUES (1, 'hello');
+    CREATE TRIGGER tr210 BEFORE UPDATE ON t210 BEGIN
+        INSERT INTO log210 VALUES (OLD.a, NEW.a);
+    END;
+    UPDATE t210 SET a = 100 WHERE a = 1;
+    SELECT * FROM log210;
+}
+expect {
+    1|100
+}
