@@ -3870,6 +3870,11 @@ impl<'a> Parser<'a> {
         let col_names = self.parse_nm_list_opt()?;
         let select = self.parse_select()?;
         let (upsert, returning) = self.parse_upsert()?;
+        if !returning.is_empty() {
+            return Err(Error::Custom(
+                "cannot use RETURNING in a trigger".to_owned(),
+            ));
+        }
         Ok(TriggerCmd::Insert {
             or_conflict: resolve_type,
             tbl_name,
@@ -3888,6 +3893,11 @@ impl<'a> Parser<'a> {
         let sets = self.parse_set_list()?;
         let from = self.parse_from_clause_opt()?;
         let where_clause = self.parse_where()?;
+        if matches!(self.peek()?, Some(tok) if tok.token_type == TK_RETURNING) {
+            return Err(Error::Custom(
+                "cannot use RETURNING in a trigger".to_owned(),
+            ));
+        }
         Ok(TriggerCmd::Update {
             or_conflict,
             tbl_name,
@@ -3902,6 +3912,11 @@ impl<'a> Parser<'a> {
         eat_expect!(self, TK_FROM);
         let tbl_name = self.parse_nm()?;
         let where_clause = self.parse_where()?;
+        if matches!(self.peek()?, Some(tok) if tok.token_type == TK_RETURNING) {
+            return Err(Error::Custom(
+                "cannot use RETURNING in a trigger".to_owned(),
+            ));
+        }
         Ok(TriggerCmd::Delete {
             tbl_name,
             where_clause,
@@ -4443,6 +4458,11 @@ mod tests {
             "INSERT INTO my_table(bar) DEFAULT VALUES",
             "INSERT INTO my_table(bar, baz, barr) VALUES (1, 1)",
             "UPDATE foo SET bar = 1 ORDER BY bar",
+            "CREATE TRIGGER foo INSERT ON bar BEGIN INSERT INTO foo VALUES (1, 2) RETURNING bar, baz; END",
+            "CREATE TRIGGER foo INSERT ON bar BEGIN INSERT INTO foo VALUES (1, 2) ON CONFLICT (bar, baz) WHERE 1 DO NOTHING RETURNING bar, baz; END",
+            "CREATE TRIGGER foo INSERT ON bar BEGIN INSERT INTO foo VALUES (1, 2) ON CONFLICT DO UPDATE SET (bar, baz) = 1 WHERE 1 RETURNING bar, baz; END",
+            "CREATE TRIGGER foo INSERT ON bar BEGIN DELETE FROM foo RETURNING *; END",
+            "CREATE TRIGGER foo INSERT ON bar BEGIN UPDATE foo SET bar = 1 RETURNING *; END",
         ];
 
         for tc in testcases {
@@ -10995,198 +11015,6 @@ mod tests {
                             },
                             upsert: None,
                             returning: vec![],
-                        },
-                    ],
-                })],
-            ),
-            (
-                b"CREATE TRIGGER foo INSERT ON bar BEGIN INSERT INTO foo VALUES (1, 2) RETURNING bar, baz; END".as_slice(),
-                vec![Cmd::Stmt(Stmt::CreateTrigger {
-                    temporary: false,
-                    if_not_exists: false,
-                    trigger_name: QualifiedName {
-                        db_name: None,
-                        name: Name::exact("foo".to_owned()),
-                        alias: None,
-                    },
-                    time: None,
-                    event: TriggerEvent::Insert,
-                    tbl_name: QualifiedName {
-                        db_name: None,
-                        name: Name::exact("bar".to_owned()),
-                        alias: None,
-                    },
-                    for_each_row: false,
-                    when_clause: None,
-                    commands: vec![
-                        TriggerCmd::Insert {
-                            or_conflict: None,
-                            tbl_name: Name::exact("foo".to_owned()),
-                            col_names: vec![],
-                            select: Select {
-                                with: None,
-                                body: SelectBody {
-                                    select: OneSelect::Values(vec![
-                                        vec![
-                                            Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                                            Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
-                                        ],
-                                    ]),
-                                    compounds: vec![],
-                                },
-                                order_by: vec![],
-                                limit: None,
-                            },
-                            upsert: None,
-                            returning: vec![
-                                ResultColumn::Expr(
-                                    Box::new(Expr::Id(Name::exact("bar".to_owned()))),
-                                    None,
-                                ),
-                                ResultColumn::Expr(
-                                    Box::new(Expr::Id(Name::exact("baz".to_owned()))),
-                                    None,
-                                ),
-                            ],
-                        },
-                    ],
-                })],
-            ),
-            (
-                b"CREATE TRIGGER foo INSERT ON bar BEGIN INSERT INTO foo VALUES (1, 2) ON CONFLICT (bar, baz) WHERE 1 DO NOTHING RETURNING bar, baz; END".as_slice(),
-                vec![Cmd::Stmt(Stmt::CreateTrigger {
-                    temporary: false,
-                    if_not_exists: false,
-                    trigger_name: QualifiedName {
-                        db_name: None,
-                        name: Name::exact("foo".to_owned()),
-                        alias: None,
-                    },
-                    time: None,
-                    event: TriggerEvent::Insert,
-                    tbl_name: QualifiedName {
-                        db_name: None,
-                        name: Name::exact("bar".to_owned()),
-                        alias: None,
-                    },
-                    for_each_row: false,
-                    when_clause: None,
-                    commands: vec![
-                        TriggerCmd::Insert {
-                            or_conflict: None,
-                            tbl_name: Name::exact("foo".to_owned()),
-                            col_names: vec![],
-                            select: Select {
-                                with: None,
-                                body: SelectBody {
-                                    select: OneSelect::Values(vec![
-                                        vec![
-                                            Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                                            Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
-                                        ],
-                                    ]),
-                                    compounds: vec![],
-                                },
-                                order_by: vec![],
-                                limit: None,
-                            },
-                            upsert: Some(Box::new(Upsert {
-                                index: Some(UpsertIndex {
-                                    targets: vec![
-                                        SortedColumn {
-                                            expr: Box::new(Expr::Id(Name::exact("bar".to_owned()))),
-                                            order: None,
-                                            nulls: None
-                                        },
-                                        SortedColumn {
-                                            expr: Box::new(Expr::Id(Name::exact("baz".to_owned()))),
-                                            order: None,
-                                            nulls: None
-                                        },
-                                    ],
-                                    where_clause: Some(Box::new(Expr::Literal(Literal::Numeric("1".to_owned())))),
-                                }),
-                                do_clause: UpsertDo::Nothing,
-                                next: None
-                            })),
-                            returning: vec![
-                                ResultColumn::Expr(
-                                    Box::new(Expr::Id(Name::exact("bar".to_owned()))),
-                                    None,
-                                ),
-                                ResultColumn::Expr(
-                                    Box::new(Expr::Id(Name::exact("baz".to_owned()))),
-                                    None,
-                                ),
-                            ],
-                        },
-                    ],
-                })],
-            ),
-            (
-                b"CREATE TRIGGER foo INSERT ON bar BEGIN INSERT INTO foo VALUES (1, 2) ON CONFLICT DO UPDATE SET (bar, baz) = 1 WHERE 1 RETURNING bar, baz; END".as_slice(),
-                vec![Cmd::Stmt(Stmt::CreateTrigger {
-                    temporary: false,
-                    if_not_exists: false,
-                    trigger_name: QualifiedName {
-                        db_name: None,
-                        name: Name::exact("foo".to_owned()),
-                        alias: None,
-                    },
-                    time: None,
-                    event: TriggerEvent::Insert,
-                    tbl_name: QualifiedName {
-                        db_name: None,
-                        name: Name::exact("bar".to_owned()),
-                        alias: None,
-                    },
-                    for_each_row: false,
-                    when_clause: None,
-                    commands: vec![
-                        TriggerCmd::Insert {
-                            or_conflict: None,
-                            tbl_name: Name::exact("foo".to_owned()),
-                            col_names: vec![],
-                            select: Select {
-                                with: None,
-                                body: SelectBody {
-                                    select: OneSelect::Values(vec![
-                                        vec![
-                                            Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                                            Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
-                                        ],
-                                    ]),
-                                    compounds: vec![],
-                                },
-                                order_by: vec![],
-                                limit: None,
-                            },
-                            upsert: Some(Box::new(Upsert {
-                                index: None,
-                                do_clause: UpsertDo::Set {
-                                    sets: vec![
-                                        Set {
-                                            col_names: vec![
-                                                Name::exact("bar".to_owned()),
-                                                Name::exact("baz".to_owned()),
-                                            ],
-                                            expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                                        }
-                                    ],
-                                    where_clause: Some(Box::new(Expr::Literal(Literal::Numeric("1".to_owned())))),
-                                },
-                                next: None
-                            })),
-                            returning: vec![
-                                ResultColumn::Expr(
-                                    Box::new(Expr::Id(Name::exact("bar".to_owned()))),
-                                    None,
-                                ),
-                                ResultColumn::Expr(
-                                    Box::new(Expr::Id(Name::exact("baz".to_owned()))),
-                                    None,
-                                ),
-                            ],
                         },
                     ],
                 })],

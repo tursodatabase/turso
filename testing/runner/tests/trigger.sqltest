@@ -1909,3 +1909,37 @@ test trigger-when-bare-column-error {
 expect error {
     no such column: a
 }
+
+# RETURNING is not allowed in trigger bodies (SQLite compatibility)
+test trigger-returning-insert-rejected {
+    CREATE TABLE tret(a);
+    CREATE TABLE other_ret(b);
+    CREATE TRIGGER tr_ret AFTER INSERT ON tret BEGIN
+        INSERT INTO other_ret VALUES(NEW.a * 10) RETURNING *;
+    END;
+}
+expect error {
+    RETURNING
+}
+
+test trigger-returning-update-rejected {
+    CREATE TABLE tret2(a);
+    CREATE TABLE other_ret2(b);
+    CREATE TRIGGER tr_ret2 AFTER INSERT ON tret2 BEGIN
+        UPDATE other_ret2 SET b = 1 RETURNING *;
+    END;
+}
+expect error {
+    RETURNING
+}
+
+test trigger-returning-delete-rejected {
+    CREATE TABLE tret3(a);
+    CREATE TABLE other_ret3(b);
+    CREATE TRIGGER tr_ret3 AFTER INSERT ON tret3 BEGIN
+        DELETE FROM other_ret3 RETURNING *;
+    END;
+}
+expect error {
+    RETURNING
+}
