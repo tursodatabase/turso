@@ -104,6 +104,61 @@ snapshot-eqp simple-index-with-filter {
     SELECT id, name, price FROM products WHERE sku = 'ABC123' AND stock_qty > 0;
 }
 
+setup collated-index-mismatch {
+    CREATE TABLE collated_values (
+        id INTEGER PRIMARY KEY,
+        val TEXT
+    );
+
+    CREATE INDEX idx_collated_values_nocase ON collated_values(val COLLATE NOCASE);
+}
+
+# BINARY IN cannot use a NOCASE-only index without changing semantics
+@setup collated-index-mismatch
+snapshot-eqp in-list-collation-mismatch {
+    SELECT id FROM collated_values WHERE val IN ('hello');
+}
+
+# Explicit NOCASE makes the comparison compatible with the NOCASE index
+@setup collated-index-mismatch
+snapshot-eqp in-list-collation-match-explicit-nocase {
+    SELECT id FROM collated_values WHERE val COLLATE NOCASE IN ('hello');
+}
+
+setup collated-subquery-mismatch {
+    CREATE TABLE collated_values_subquery (
+        id INTEGER PRIMARY KEY,
+        val TEXT
+    );
+    CREATE INDEX idx_collated_values_subquery_nocase
+        ON collated_values_subquery(val COLLATE NOCASE);
+
+    CREATE TABLE rhs_values(v TEXT);
+}
+
+# Subquery RHS should also avoid NOCASE seek when the comparison is BINARY
+@setup collated-subquery-mismatch
+snapshot-eqp in-subquery-collation-mismatch {
+    SELECT id FROM collated_values_subquery WHERE val IN (SELECT v FROM rhs_values);
+}
+
+setup collated-composite-mismatch {
+    CREATE TABLE collated_values_composite (
+        id INTEGER PRIMARY KEY,
+        val TEXT,
+        other INTEGER
+    );
+
+    CREATE INDEX idx_collated_values_composite_nocase
+        ON collated_values_composite(val COLLATE NOCASE, other);
+}
+
+# Composite indexes should respect the first-key collation too
+@setup collated-composite-mismatch
+snapshot-eqp in-composite-collation-mismatch {
+    SELECT id FROM collated_values_composite WHERE val IN ('hello');
+}
+
 # =============================================================================
 # 2. Composite Index - Multi-column index with partial and full usage
 # =============================================================================

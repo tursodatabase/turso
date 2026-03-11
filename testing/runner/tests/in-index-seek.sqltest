@@ -341,6 +341,90 @@ expect {
     1
 }
 
+# BINARY IN must not use a NOCASE index, or it will match extra rows
+setup nocase_mismatch {
+    CREATE TABLE t7 (
+        id INTEGER PRIMARY KEY,
+        val TEXT
+    );
+    CREATE INDEX idx_val_nocase_only ON t7(val COLLATE NOCASE);
+    INSERT INTO t7 VALUES(1, 'hello');
+    INSERT INTO t7 VALUES(2, 'HELLO');
+}
+
+@setup nocase_mismatch
+test in-index-collation-mismatch-falls-back {
+    SELECT id FROM t7 WHERE val IN ('hello') ORDER BY id;
+}
+expect {
+    1
+}
+
+@setup nocase_mismatch
+test in-index-collation-match-explicit-nocase {
+    SELECT id FROM t7 WHERE val COLLATE NOCASE IN ('hello') ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+@setup nocase_mismatch
+test in-subquery-collation-mismatch-falls-back {
+    CREATE TABLE search_vals2(v TEXT);
+    INSERT INTO search_vals2 VALUES('hello');
+    SELECT id FROM t7 WHERE val IN (SELECT v FROM search_vals2) ORDER BY id;
+}
+expect {
+    1
+}
+
+setup rtrim_mismatch {
+    CREATE TABLE t8 (
+        id INTEGER PRIMARY KEY,
+        val TEXT
+    );
+    CREATE INDEX idx_val_rtrim_only ON t8(val COLLATE RTRIM);
+    INSERT INTO t8 VALUES(1, 'hello');
+    INSERT INTO t8 VALUES(2, 'hello   ');
+}
+
+@setup rtrim_mismatch
+test in-index-collation-mismatch-rtrim-falls-back {
+    SELECT id FROM t8 WHERE val IN ('hello') ORDER BY id;
+}
+expect {
+    1
+}
+
+@setup rtrim_mismatch
+test in-index-collation-match-explicit-rtrim {
+    SELECT id FROM t8 WHERE val COLLATE RTRIM IN ('hello') ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+setup composite_nocase_mismatch {
+    CREATE TABLE t9 (
+        id INTEGER PRIMARY KEY,
+        val TEXT,
+        other INTEGER
+    );
+    CREATE INDEX idx_val_other_nocase ON t9(val COLLATE NOCASE, other);
+    INSERT INTO t9 VALUES(1, 'hello', 1);
+    INSERT INTO t9 VALUES(2, 'HELLO', 2);
+}
+
+@setup composite_nocase_mismatch
+test in-composite-index-collation-mismatch-falls-back {
+    SELECT id FROM t9 WHERE val IN ('hello') ORDER BY id;
+}
+expect {
+    1
+}
+
 # NOT IN with NULL - three-valued logic: NOT IN returns empty when NULL is in the list
 setup nulls {
     CREATE TABLE tn (
@@ -637,4 +721,3 @@ test in-cross-table-column-ref {
 expect {
     1
 }
-

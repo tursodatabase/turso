@@ -1,0 +1,16 @@
+---
+source: indexes.sqltest
+expression: SELECT id FROM collated_values_subquery WHERE val IN (SELECT v FROM rhs_values);
+info:
+  statement_type: SELECT
+  tables:
+  - collated_values_subquery
+  - rhs_values
+  setup_blocks:
+  - collated-subquery-mismatch
+  database: ':memory:'
+---
+QUERY PLAN
+|--LIST SUBQUERY 1
+|  `--SCAN rhs_values
+`--SCAN collated_values_subquery USING COVERING INDEX idx_collated_values_subquery_nocase

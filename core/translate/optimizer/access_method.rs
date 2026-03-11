@@ -364,6 +364,15 @@ pub(super) fn choose_best_btree_candidate(
                     continue;
                 }
 
+                if let (Some(index), Some(col_pos)) = (&candidate.index, constraint.table_col_pos) {
+                    let constrained_column = &rhs_table.table.columns()[col_pos];
+                    let table_collation = constrained_column.collation();
+                    let index_collation = index.columns[0].collation.unwrap_or_default();
+                    if table_collation != index_collation {
+                        continue;
+                    }
+                }
+
                 let n = estimated_values;
                 let num_seeks = n * input_cardinality;
                 // For unique single-column index or rowid, exactly 1 row per value.

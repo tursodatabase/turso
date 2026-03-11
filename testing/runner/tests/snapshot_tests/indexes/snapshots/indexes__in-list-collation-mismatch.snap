@@ -1,0 +1,13 @@
+---
+source: indexes.sqltest
+expression: SELECT id FROM collated_values WHERE val IN ('hello');
+info:
+  statement_type: SELECT
+  tables:
+  - collated_values
+  setup_blocks:
+  - collated-index-mismatch
+  database: ':memory:'
+---
+QUERY PLAN
+`--SCAN collated_values USING COVERING INDEX idx_collated_values_nocase
