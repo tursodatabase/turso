@@ -328,98 +328,6 @@ pub(super) fn choose_best_btree_candidate(
             };
         }
 
-        // Also consider IN-seek on this candidate. For each IN constraint
-        // whose column matches this candidate's first column, compute the
-        // cost of N equality seeks and compare against the current best.
-        {
-            let first_col_pos = candidate
-                .index
-                .as_ref()
-                .and_then(|idx| idx.columns.first().map(|c| c.pos_in_table));
-
-            for constraint in &rhs_constraints.constraints {
-                let ConstraintOperator::In {
-                    not,
-                    estimated_values,
-                } = constraint.operator
-                else {
-                    continue;
-                };
-                // lhs_mask is always empty for current IN constraints (literals
-                // and non-correlated subqueries), but guard against future changes.
-                if not || !constraint.lhs_mask.is_empty() {
-                    continue;
-                }
-
-                // Match: rowid candidate ↔ rowid constraint,
-                //        index candidate ↔ constraint on first column
-                let matches = if candidate.index.is_none() {
-                    constraint.is_rowid
-                } else {
-                    !constraint.is_rowid
-                        && constraint.table_col_pos.is_some()
-                        && constraint.table_col_pos == first_col_pos
-                };
-                if !matches {
-                    continue;
-                }
-
-                if let (Some(index), Some(col_pos)) = (&candidate.index, constraint.table_col_pos) {
-                    let constrained_column = &rhs_table.table.columns()[col_pos];
-                    let table_collation = constrained_column.collation();
-                    let index_collation = index.columns[0].collation.unwrap_or_default();
-                    if table_collation != index_collation {
-                        continue;
-                    }
-                }
-
-                let n = estimated_values;
-                let num_seeks = n * input_cardinality;
-                // For unique single-column index or rowid, exactly 1 row per value.
-                // Otherwise estimate rows per value. Without ANALYZE stats,
-                // sel_eq_indexed * base can be very pessimistic (e.g. 0.01 * 1M =
-                // 10K), making IN-seek look as expensive as a full scan. SQLite
-                // avoids this by always preferring indexed IN over a full
-                // scan without stats (where.c:3246).
-                // We use a geometric mean of sel_eq_indexed and 1/base to get a
-                // more moderate per-value estimate that doesn't scale as
-                // aggressively with table size.
-                let rows_per_seek = if index_info.unique && index_info.column_count == 1
-                    || candidate.index.is_none()
-                {
-                    1.0
-                } else {
-                    (base * params.sel_eq_indexed).sqrt().max(1.0)
-                };
-
-                let in_cost = estimate_index_cost(
-                    base,
-                    tree_depth,
-                    index_info,
-                    num_seeks,
-                    rows_per_seek,
-                    params,
-                );
-                if in_cost < best_cost {
-                    let affinity = if let Some(col_pos) = constraint.table_col_pos {
-                        if col_pos < btree.columns.len() {
-                            btree.columns[col_pos].affinity()
-                        } else {
-                            Affinity::Blob
-                        }
-                    } else {
-                        Affinity::Integer
-                    };
-                    best_cost = in_cost;
-                    best_prereq_count = 0; // IN values are constants
-                    best_params = AccessMethodParams::InSeek {
-                        index: candidate.index.clone(),
-                        affinity,
-                        where_term_idx: constraint.where_clause_pos.0,
-                    };
-                }
-            }
-        }
     }
 
     Some(best_choice)
@@ -490,6 +398,15 @@ fn consider_in_seek_access_method(
             };
             if !matches {
                 continue;
+            }
+
+            if let (Some(index), Some(col_pos)) = (&candidate.index, constraint.table_col_pos) {
+                let constrained_column = &rhs_table.table.columns()[col_pos];
+                let table_collation = constrained_column.collation();
+                let index_collation = index.columns[0].collation.unwrap_or_default();
+                if table_collation != index_collation {
+                    continue;
+                }
             }
 
             let rows_per_seek = if (index_info.unique && index_info.column_count == 1)
