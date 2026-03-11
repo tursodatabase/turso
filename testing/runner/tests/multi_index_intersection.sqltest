@@ -21,6 +21,11 @@ expect {
     3|10|100|3000|30000
 }
 
+@setup multi_index_schema
+snapshot-eqp multi-index-and-2-way-eqp {
+    SELECT id FROM t WHERE a = 10 AND b = 100;
+}
+
 # 3-way multi-index intersection (AND with 3 indexed columns)
 # Regression test for #5285: panic on 3+ way MULTI-INDEX AND
 @setup multi_index_schema
@@ -58,6 +63,19 @@ setup correlated_schema {
     CREATE INDEX idx_grp ON t(grp);
     INSERT INTO t VALUES (1, 10, 'A'), (2, 20, 'A'), (3, 30, 'B'),
                          (4, 40, 'B'), (5, 50, 'C'), (6, 60, 'C');
+}
+
+setup composite_preference_schema {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, payload TEXT);
+    CREATE INDEX idx_a ON t(a);
+    CREATE INDEX idx_b ON t(b);
+    CREATE INDEX idx_ab ON t(a, b);
+
+    INSERT INTO t VALUES
+        (1, 10, 100, 'x'),
+        (2, 10, 100, 'y'),
+        (3, 10, 200, 'z'),
+        (4, 20, 100, 'w');
 }
 
 # EXISTS with MULTI-INDEX AND in correlated subquery
@@ -105,4 +123,18 @@ expect {
     4|30
     5|
     6|
+}
+
+@setup composite_preference_schema
+test composite-index-preferred-over-intersection {
+    SELECT id, payload FROM t WHERE a = 10 AND b = 100 ORDER BY id;
+}
+expect {
+    1|x
+    2|y
+}
+
+@setup composite_preference_schema
+snapshot-eqp composite-index-preferred-over-intersection-eqp {
+    SELECT id FROM t WHERE a = 10 AND b = 100;
 }

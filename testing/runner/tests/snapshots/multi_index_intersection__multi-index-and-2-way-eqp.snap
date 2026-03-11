@@ -1,0 +1,13 @@
+---
+source: multi_index_intersection.sqltest
+expression: SELECT id FROM t WHERE a = 10 AND b = 100;
+info:
+  statement_type: SELECT
+  tables:
+  - t
+  setup_blocks:
+  - multi_index_schema
+  database: ':memory:'
+---
+QUERY PLAN
+`--MULTI-INDEX AND t (idx_a, idx_b)
