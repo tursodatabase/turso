@@ -11,6 +11,7 @@ use crate::translate::{
     translate_inner, ProgramBuilder, ProgramBuilderOpts,
 };
 use crate::util::normalize_ident;
+use crate::vdbe::affinity::Affinity;
 use crate::vdbe::insn::Insn;
 use crate::vdbe::BranchOffset;
 use crate::HashSet;
@@ -659,7 +660,12 @@ pub fn fire_trigger(
     // - OLD registers always come from cursor reads → always encoded → always decode
     // - NEW registers are only encoded for AFTER triggers (post-encode) → decode when new_encoded
     let decoded_ctx = decode_trigger_registers(program, resolver, ctx)?;
-    let ctx = &decoded_ctx;
+    // Apply column affinity to copies of NEW values so that both WHEN clauses
+    // and trigger bodies see affinity-applied values (e.g., integer 42 becomes
+    // real 42.0 for REAL columns). SQLite applies affinity before trigger
+    // evaluation via OP_Affinity + OP_Copy before OP_Program.
+    let affinity_ctx = apply_new_column_affinity(program, &decoded_ctx)?;
+    let ctx = &affinity_ctx;
 
     // Evaluate WHEN clause if present
     if let Some(mut when_expr) = trigger.when_clause.clone() {
@@ -790,6 +796,62 @@ fn decode_trigger_registers(
         old_registers: decoded_old,
         override_conflict: ctx.override_conflict,
         new_encoded: false, // decoded now
+    })
+}
+
+/// Apply column affinity to copies of NEW registers for non-strict tables.
+/// This ensures both WHEN clauses and trigger bodies see affinity-applied values
+/// (e.g., integer 42 becomes real 42.0 for REAL columns), matching SQLite's behavior.
+fn apply_new_column_affinity(
+    program: &mut ProgramBuilder,
+    ctx: &TriggerContext,
+) -> Result<TriggerContext> {
+    let new_registers = if let Some(new_regs) = &ctx.new_registers {
+        let num_cols = ctx.table.columns.len();
+        if !ctx.table.is_strict && num_cols > 0 {
+            let affinities: String = ctx
+                .table
+                .columns
+                .iter()
+                .map(|c| c.affinity().aff_mask())
+                .collect();
+            if affinities.chars().any(|c| c != Affinity::Blob.aff_mask()) {
+                let temp_start = program.alloc_registers(num_cols);
+                for (i, &reg) in new_regs.iter().take(num_cols).enumerate() {
+                    program.emit_insn(Insn::Copy {
+                        src_reg: reg,
+                        dst_reg: temp_start + i,
+                        extra_amount: 0,
+                    });
+                }
+                if let Ok(count) = std::num::NonZeroUsize::try_from(num_cols) {
+                    program.emit_insn(Insn::Affinity {
+                        start_reg: temp_start,
+                        count,
+                        affinities,
+                    });
+                }
+                let mut regs: Vec<usize> = (temp_start..temp_start + num_cols).collect();
+                // Preserve the rowid register (always last in the NEW registers list)
+                if new_regs.len() > num_cols {
+                    regs.push(*new_regs.last().unwrap());
+                }
+                Some(regs)
+            } else {
+                Some(new_regs.clone())
+            }
+        } else {
+            Some(new_regs.clone())
+        }
+    } else {
+        None
+    };
+    Ok(TriggerContext {
+        table: ctx.table.clone(),
+        new_registers,
+        old_registers: ctx.old_registers.clone(),
+        override_conflict: ctx.override_conflict,
+        new_encoded: ctx.new_encoded,
     })
 }
 

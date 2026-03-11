@@ -1,0 +1,140 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE t(a REAL);
+    CREATE TABLE log(msg);
+    CREATE TRIGGER tr BEFORE INSERT ON t BEGIN
+        INSERT INTO log VALUES(typeof(NEW.a));
+    END;
+}
+
+@setup schema
+test basic-integer-to-real-affinity {
+    INSERT INTO t VALUES(42);
+    SELECT * FROM log;
+}
+expect {
+    real
+}
+
+setup multi-col-schema {
+    CREATE TABLE t2(a REAL, b TEXT, c INTEGER, d NUMERIC);
+    CREATE TABLE log2(type_a, type_b, type_c, type_d, val_a, val_b, val_c, val_d);
+    CREATE TRIGGER tr2 BEFORE INSERT ON t2 BEGIN
+        INSERT INTO log2 VALUES(typeof(NEW.a), typeof(NEW.b), typeof(NEW.c), typeof(NEW.d),
+                                NEW.a, NEW.b, NEW.c, NEW.d);
+    END;
+}
+
+@setup multi-col-schema
+test multi-column-affinity {
+    INSERT INTO t2 VALUES(42, 123, '456', '789.0');
+    SELECT type_a, type_b, type_c, type_d FROM log2;
+}
+expect {
+    real|text|integer|integer
+}
+
+@setup multi-col-schema
+test multi-column-values {
+    INSERT INTO t2 VALUES(42, 123, '456', '789.0');
+    SELECT val_a, val_b, val_c, val_d FROM log2;
+}
+expect {
+    42.0|123|456|789
+}
+
+setup null-schema {
+    CREATE TABLE t3(a REAL);
+    CREATE TABLE log3(msg);
+    CREATE TRIGGER tr3 BEFORE INSERT ON t3 BEGIN
+        INSERT INTO log3 VALUES(typeof(NEW.a));
+    END;
+}
+
+@setup null-schema
+test null-value {
+    INSERT INTO t3 VALUES(NULL);
+    SELECT * FROM log3;
+}
+expect {
+    null
+}
+
+setup real-schema {
+    CREATE TABLE t4(a REAL);
+    CREATE TABLE log4(val, typ);
+    CREATE TRIGGER tr4 BEFORE INSERT ON t4 BEGIN
+        INSERT INTO log4 VALUES(NEW.a, typeof(NEW.a));
+    END;
+}
+
+@setup real-schema
+test zero-value {
+    INSERT INTO t4 VALUES(0);
+    SELECT val, typ FROM log4;
+}
+expect {
+    0.0|real
+}
+
+@setup real-schema
+test negative-integer {
+    INSERT INTO t4 VALUES(-7);
+    SELECT val, typ FROM log4;
+}
+expect {
+    -7.0|real
+}
+
+setup when-clause-schema {
+    CREATE TABLE t6(a REAL);
+    CREATE TABLE log6(msg);
+    CREATE TRIGGER tr6 BEFORE INSERT ON t6 WHEN typeof(NEW.a) = 'real' BEGIN
+        INSERT INTO log6 VALUES(typeof(NEW.a));
+    END;
+}
+
+@setup when-clause-schema
+test when-clause-sees-affinity {
+    INSERT INTO t6 VALUES(42);
+    SELECT * FROM log6;
+}
+expect {
+    real
+}
+
+setup update-schema {
+    CREATE TABLE t7(a REAL);
+    CREATE TABLE log7(msg);
+    INSERT INTO t7 VALUES(1.0);
+    CREATE TRIGGER tr7 BEFORE UPDATE ON t7 BEGIN
+        INSERT INTO log7 VALUES(typeof(NEW.a));
+    END;
+}
+
+@setup update-schema
+test before-update-affinity {
+    UPDATE t7 SET a = 42 WHERE rowid = 1;
+    SELECT * FROM log7;
+}
+expect {
+    real
+}
+
+setup after-schema {
+    CREATE TABLE t5(a REAL);
+    CREATE TABLE log5(msg);
+    CREATE TRIGGER tr5 AFTER INSERT ON t5 BEGIN
+        INSERT INTO log5 VALUES(typeof(NEW.a));
+    END;
+}
+
+@setup after-schema
+test after-trigger-affinity {
+    INSERT INTO t5 VALUES(42);
+    SELECT * FROM log5;
+}
+expect {
+    real
+}
