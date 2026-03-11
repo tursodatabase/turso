@@ -410,6 +410,7 @@ pub(super) struct AutoIndexResult {
 /// Open an ephemeral index cursor and build an automatic index on a table.
 /// This is used as a last-resort to avoid a nested full table scan
 /// Returns the cursor id of the ephemeral index cursor.
+#[expect(clippy::too_many_arguments)]
 pub(super) fn emit_autoindex(
     program: &mut ProgramBuilder,
     index: &Arc<Index>,
