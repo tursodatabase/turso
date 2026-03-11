@@ -996,6 +996,7 @@ pub fn emit_upsert(
                     err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                     description,
                     on_error: None,
+                    description_reg: None,
                 });
                 program.preassign_label_to_next_insn(ok);
             }
@@ -1062,6 +1063,7 @@ pub fn emit_upsert(
                     .unwrap_or("rowid")
             ),
             on_error: None,
+            description_reg: None,
         });
         program.preassign_label_to_next_insn(ok);
 

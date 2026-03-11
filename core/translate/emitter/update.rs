@@ -1194,6 +1194,7 @@ fn emit_update_insns<'a>(
                         err_code: SQLITE_CONSTRAINT_UNIQUE,
                         description: column_names,
                         on_error: None,
+                        description_reg: None,
                     });
                 }
                 _ => unreachable!(
@@ -1253,6 +1254,7 @@ fn emit_update_insns<'a>(
                         err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                         description,
                         on_error: None,
+                        description_reg: None,
                     });
                 }
                 _ => unreachable!(
@@ -1820,6 +1822,7 @@ fn emit_update_insns<'a>(
                         err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                         description: column_names,
                         on_error: None,
+                        description_reg: None,
                     });
                 }
             }
@@ -1941,6 +1944,7 @@ fn emit_update_insns<'a>(
                         err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                         description,
                         on_error: None,
+                        description_reg: None,
                     });
                 }
             }

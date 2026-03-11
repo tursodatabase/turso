@@ -3389,6 +3389,7 @@ pub fn translate_expr(
                         err_code: 0,
                         description: String::new(),
                         on_error: Some(ResolveType::Ignore),
+                        description_reg: None,
                     });
                 }
                 ResolveType::Fail | ResolveType::Abort | ResolveType::Rollback => {
@@ -3397,29 +3398,37 @@ pub fn translate_expr(
                             "RAISE() may only be used within a trigger-program"
                         );
                     }
-                    let msg = match msg_expr {
+                    let err_code = if in_trigger {
+                        SQLITE_CONSTRAINT_TRIGGER
+                    } else {
+                        SQLITE_ERROR
+                    };
+                    match msg_expr {
                         Some(e) => match e.as_ref() {
-                            ast::Expr::Literal(ast::Literal::String(s)) => sanitize_string(s),
+                            ast::Expr::Literal(ast::Literal::String(s)) => {
+                                program.emit_insn(Insn::Halt {
+                                    err_code,
+                                    description: sanitize_string(s),
+                                    on_error: Some(*resolve_type),
+                                    description_reg: None,
+                                });
+                            }
                             _ => {
-                                crate::bail_parse_error!(
-                                    "RAISE error message must be a string literal"
-                                );
+                                // Expression-based error message: evaluate at runtime
+                                let reg = program.alloc_register();
+                                translate_expr(program, referenced_tables, e, reg, resolver)?;
+                                program.emit_insn(Insn::Halt {
+                                    err_code,
+                                    description: String::new(),
+                                    on_error: Some(*resolve_type),
+                                    description_reg: Some(reg),
+                                });
                             }
                         },
                         None => {
                             crate::bail_parse_error!("RAISE requires an error message");
                         }
                     };
-                    let err_code = if in_trigger {
-                        SQLITE_CONSTRAINT_TRIGGER
-                    } else {
-                        SQLITE_ERROR
-                    };
-                    program.emit_insn(Insn::Halt {
-                        err_code,
-                        description: msg,
-                        on_error: Some(*resolve_type),
-                    });
                 }
                 ResolveType::Replace => {
                     crate::bail_parse_error!("REPLACE is not valid for RAISE");
@@ -7142,6 +7151,7 @@ fn emit_array_element_loop(
             "array exceeds maximum element count for custom type transform ({MAX_ARRAY_LOOP_ELEMENTS})"
         ),
         on_error: None,
+        description_reg: None,
     });
     program.preassign_label_to_next_insn(ok_label);
     // reg_idx is the 1-based array index for ArrayElement (PG convention)

@@ -814,6 +814,7 @@ impl ProgramBuilder {
                 String::new()
             },
             on_error: None,
+            description_reg: None,
         });
     }
 
@@ -826,6 +827,7 @@ impl ProgramBuilder {
             err_code,
             description,
             on_error: None,
+            description_reg: None,
         });
     }
 
@@ -1419,6 +1421,7 @@ impl ProgramBuilder {
                 err_code: 0,
                 description: description.to_string(),
                 on_error: None,
+                description_reg: None,
             });
             return;
         }

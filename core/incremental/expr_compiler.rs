@@ -351,6 +351,7 @@ impl CompiledExpression {
             err_code: 0,
             description: String::new(),
             on_error: None,
+            description_reg: None,
         });
 
         // Build the program from the compiled expression bytecode

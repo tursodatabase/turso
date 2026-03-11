@@ -1227,6 +1227,7 @@ fn emit_rowid_generation(
             err_code: crate::error::SQLITE_FULL,
             description: "database or disk is full".to_string(),
             on_error: None,
+            description_reg: None,
         });
 
         program.preassign_label_to_next_insn(no_overflow_label);
@@ -2411,6 +2412,7 @@ fn emit_pk_uniqueness_check(
             err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
             description,
             on_error: None,
+            description_reg: None,
         });
     }
     program.preassign_label_to_next_insn(make_record_label);
@@ -2574,6 +2576,7 @@ fn emit_unique_index_check(
             err_code: SQLITE_CONSTRAINT_UNIQUE,
             description: format_unique_violation_desc(ctx.table.name.as_str(), index),
             on_error: None,
+            description_reg: None,
         });
 
         // continue preflight with next constraint
@@ -2607,6 +2610,7 @@ fn emit_unique_index_check(
                 err_code: SQLITE_CONSTRAINT_UNIQUE,
                 description: format_unique_violation_desc(ctx.table.name.as_str(), index),
                 on_error: None,
+                description_reg: None,
             });
         }
         program.preassign_label_to_next_insn(ok);
