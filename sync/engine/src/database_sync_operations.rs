@@ -924,7 +924,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
         use_implicit_rowid: false,
     };
 
-    let generator = DatabaseReplayGenerator::new(source_conn, replay_opts);
+    let mut generator = DatabaseReplayGenerator::new(source_conn, replay_opts);
 
     let iterate_opts = DatabaseChangesIteratorOpts {
         first_change_id: last_change_id.map(|x| x + 1),
@@ -981,8 +981,14 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
         }
     }
 
+    generator.seed_schema_from_changes(&local_changes);
+
     let mut transformed = if opts.use_transform {
-        Some(apply_transformation(ctx, &local_changes, &generator).await?)
+        let result = apply_transformation(ctx, &local_changes, &mut generator).await?;
+        // Re-seed the schema cache for the main loop since apply_transformation
+        // evolved it through DDL changes.
+        generator.seed_schema_from_changes(&local_changes);
+        Some(result)
     } else {
         None
     };
@@ -1030,58 +1036,63 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
             }
             DatabaseTapeOperation::RowChange(change) => {
                 let replay_info = generator.replay_info(ctx.coro, &change).await?;
-                match change.change {
-                    DatabaseTapeRowChangeType::Delete { before } => {
-                        let values = generator.replay_values(
-                            &replay_info,
-                            replay_info.change_type,
-                            change.id,
-                            before,
-                            None,
-                        );
-                        sql_over_http_requests
-                            .push(step(replay_info.query.clone(), convert_to_args(values)))
-                    }
-                    DatabaseTapeRowChangeType::Insert { after } => {
-                        let values = generator.replay_values(
-                            &replay_info,
-                            replay_info.change_type,
-                            change.id,
+                if replay_info.is_ddl_replay {
+                    sql_over_http_requests.push(step(replay_info.query.clone(), Vec::new()));
+                    generator.notify_ddl_applied(&change);
+                } else {
+                    match change.change {
+                        DatabaseTapeRowChangeType::Delete { before } => {
+                            let values = generator.replay_values(
+                                &replay_info,
+                                replay_info.change_type,
+                                change.id,
+                                before,
+                                None,
+                            );
+                            sql_over_http_requests
+                                .push(step(replay_info.query.clone(), convert_to_args(values)))
+                        }
+                        DatabaseTapeRowChangeType::Insert { after } => {
+                            let values = generator.replay_values(
+                                &replay_info,
+                                replay_info.change_type,
+                                change.id,
+                                after,
+                                None,
+                            );
+                            sql_over_http_requests
+                                .push(step(replay_info.query.clone(), convert_to_args(values)));
+                        }
+                        DatabaseTapeRowChangeType::Update {
                             after,
-                            None,
-                        );
-                        sql_over_http_requests
-                            .push(step(replay_info.query.clone(), convert_to_args(values)));
-                    }
-                    DatabaseTapeRowChangeType::Update {
-                        after,
-                        updates: Some(updates),
-                        ..
-                    } => {
-                        let values = generator.replay_values(
-                            &replay_info,
-                            replay_info.change_type,
-                            change.id,
+                            updates: Some(updates),
+                            ..
+                        } => {
+                            let values = generator.replay_values(
+                                &replay_info,
+                                replay_info.change_type,
+                                change.id,
+                                after,
+                                Some(updates),
+                            );
+                            sql_over_http_requests
+                                .push(step(replay_info.query.clone(), convert_to_args(values)));
+                        }
+                        DatabaseTapeRowChangeType::Update {
                             after,
-                            Some(updates),
-                        );
-                        sql_over_http_requests
-                            .push(step(replay_info.query.clone(), convert_to_args(values)));
-                    }
-                    DatabaseTapeRowChangeType::Update {
-                        after,
-                        updates: None,
-                        ..
-                    } => {
-                        let values = generator.replay_values(
-                            &replay_info,
-                            replay_info.change_type,
-                            change.id,
-                            after,
-                            None,
-                        );
-                        sql_over_http_requests
-                            .push(step(replay_info.query.clone(), convert_to_args(values)));
+                            updates: None,
+                            ..
+                        } => {
+                            let values = generator.replay_values(
+                                &replay_info,
+                                replay_info.change_type,
+                                change.id,
+                                after,
+                                None,
+                            );
+                            sql_over_http_requests
+                                .push(step(replay_info.query.clone(), convert_to_args(values)));
+                        }
                     }
                 }
             }
@@ -1130,11 +1141,14 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
 pub async fn apply_transformation<IO: SyncEngineIo, Ctx>(
     ctx: &SyncOperationCtx<'_, IO, Ctx>,
     changes: &Vec<DatabaseTapeRowChange>,
-    generator: &DatabaseReplayGenerator,
+    generator: &mut DatabaseReplayGenerator,
 ) -> Result<Vec<DatabaseRowTransformResult>> {
     let mut mutations = Vec::new();
     for change in changes {
         let replay_info = generator.replay_info(ctx.coro, change).await?;
+        if replay_info.is_ddl_replay {
+            generator.notify_ddl_applied(change);
+        }
         mutations.push(generator.create_mutation(&replay_info, change)?);
     }
     let completion = ctx.io.transform(mutations)?;

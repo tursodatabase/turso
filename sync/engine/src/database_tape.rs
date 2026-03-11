@@ -226,7 +226,7 @@ impl DatabaseTape {
             cached_insert_stmt: HashMap::new(),
             cached_update_stmt: HashMap::new(),
             in_txn: true,
-            generator: DatabaseReplayGenerator { conn, opts },
+            generator: DatabaseReplayGenerator::new(conn, opts),
         })
     }
 }
