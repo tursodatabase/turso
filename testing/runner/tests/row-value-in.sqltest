@@ -77,3 +77,66 @@ expect {
     1|10|x
     3|30|w
 }
+
+setup row_value_subquery_schema {
+    CREATE TABLE t(a INT, b INT, g INT, c TEXT);
+    CREATE TABLE s(x INT, y INT, g INT);
+    INSERT INTO t VALUES
+        (1, 10, 1, 'm1'),
+        (1, 20, 1, 'm2'),
+        (2, 20, 2, 'm3'),
+        (NULL, 20, 2, 'm4'),
+        (3, NULL, 3, 'm5'),
+        (NULL, NULL, 3, 'm6');
+    INSERT INTO s VALUES
+        (1, 10, 1),
+        (1, 10, 1),
+        (1, NULL, 1),
+        (2, 20, 2),
+        (NULL, 20, 2),
+        (3, NULL, 3),
+        (NULL, NULL, 3);
+}
+
+@setup row_value_subquery_schema
+test row-value-correlated-subquery-in {
+    SELECT c
+    FROM t
+    WHERE (a, b) IN (SELECT x, y FROM s WHERE s.g = t.g)
+    ORDER BY c;
+}
+expect {
+    m1
+    m3
+}
+
+@setup row_value_subquery_schema
+test row-value-correlated-subquery-not-in {
+    SELECT c
+    FROM t
+    WHERE (a, b) NOT IN (SELECT x, y FROM s WHERE s.g = t.g)
+    ORDER BY c;
+}
+expect {
+}
+
+@setup row_value_subquery_schema
+test row-value-left-join-correlated-subquery-in {
+    CREATE TABLE u(id INT, a INT, b INT);
+    INSERT INTO u VALUES (1, 1, 10), (2, 2, 20), (3, 9, 9);
+    SELECT t.c, coalesce(u.id, -1)
+    FROM t
+    LEFT JOIN u
+      ON (t.a, t.b) IN (SELECT x, y FROM s WHERE s.g = t.g)
+     AND t.a = u.a
+     AND t.b = u.b
+    ORDER BY t.c, u.id;
+}
+expect {
+    m1|1
+    m2|-1
+    m3|2
+    m4|-1
+    m5|-1
+    m6|-1
+}

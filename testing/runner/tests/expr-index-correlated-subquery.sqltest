@@ -147,3 +147,29 @@ expect {
     70
     110
 }
+
+test expr-index-correlated-in-subquery-duplicates-and-filter {
+    CREATE TABLE t(name TEXT, grp INT, keep INT);
+    CREATE INDEX idx ON t(lower(name));
+    INSERT INTO t VALUES('Alice', 1, 1);
+    INSERT INTO t VALUES('ALICE', 1, 0);
+    INSERT INTO t VALUES('Bob', 2, 1);
+    INSERT INTO t VALUES('Carol', 2, 1);
+    INSERT INTO t VALUES(NULL, 1, 1);
+    CREATE TABLE rhs(v TEXT, grp INT, keep INT);
+    INSERT INTO rhs VALUES('alice', 1, 1);
+    INSERT INTO rhs VALUES('alice', 1, 1);
+    INSERT INTO rhs VALUES('bob', 2, 0);
+    INSERT INTO rhs VALUES('carol', 2, 1);
+    INSERT INTO rhs VALUES(NULL, 1, 1);
+    SELECT rowid
+    FROM t
+    WHERE lower(name) IN (
+        SELECT v FROM rhs WHERE rhs.grp = t.grp AND rhs.keep = t.keep
+    )
+    ORDER BY rowid;
+}
+expect {
+    1
+    4
+}
