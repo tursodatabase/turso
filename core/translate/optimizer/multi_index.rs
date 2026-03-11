@@ -1230,9 +1230,10 @@ mod tests {
             "expected one rowid branch"
         );
         assert!(
-            branches.iter().any(
-                |branch| branch.index.as_ref().map(|idx| idx.name.as_str()) == Some("idx_item_a")
-            ),
+            branches
+                .iter()
+                .any(|branch| branch.index.as_ref().map(|idx| idx.name.as_str())
+                    == Some("idx_item_a")),
             "expected one secondary-index branch"
         );
     }
@@ -1483,27 +1484,15 @@ mod tests {
         let make_branch = |literal_col, join_col, item_kind: Option<&str>| {
             let branch = Expr::Binary(
                 Box::new(Expr::Binary(
-                    Box::new(create_column_expr(
-                        link_id,
-                        literal_col,
-                        false,
-                    )),
+                    Box::new(create_column_expr(link_id, literal_col, false)),
                     Operator::Equals,
                     Box::new(create_numeric_literal("1")),
                 )),
                 Operator::And,
                 Box::new(Expr::Binary(
-                    Box::new(create_column_expr(
-                        item_id,
-                        0,
-                        false,
-                    )),
+                    Box::new(create_column_expr(item_id, 0, false)),
                     Operator::Equals,
-                    Box::new(create_column_expr(
-                        link_id,
-                        join_col,
-                        false,
-                    )),
+                    Box::new(create_column_expr(link_id, join_col, false)),
                 )),
             );
 
@@ -1512,11 +1501,7 @@ mod tests {
                     Box::new(branch),
                     Operator::And,
                     Box::new(Expr::Binary(
-                        Box::new(create_column_expr(
-                            item_id,
-                            1,
-                            false,
-                        )),
+                        Box::new(create_column_expr(item_id, 1, false)),
                         Operator::Equals,
                         Box::new(create_numeric_literal(kind)),
                     )),
@@ -1572,7 +1557,8 @@ mod tests {
         .expect("residual-filtered OR branches should still produce a multi-index union");
 
         assert!(
-            with_residual.estimated_rows_per_outer_row < without_residual.estimated_rows_per_outer_row,
+            with_residual.estimated_rows_per_outer_row
+                < without_residual.estimated_rows_per_outer_row,
             "branch-local residual filters must reduce the multi-index row estimate"
         );
     }
