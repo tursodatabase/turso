@@ -1049,3 +1049,167 @@ expect {
     1
     ok
 }
+# --- Trigger rewriting for ALTER TABLE RENAME ---
+
+# Verify trigger fires correctly after table rename
+@cross-check-integrity
+test alter-table-rename-trigger-fires-after-rename {
+    CREATE TABLE t1 (a, b);
+    CREATE TABLE log (x, y);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN
+        INSERT INTO log VALUES (new.a, new.b);
+    END;
+    ALTER TABLE t1 RENAME TO t2;
+    INSERT INTO t2 VALUES (1, 2);
+    SELECT * FROM log;
+}
+expect {
+    1|2
+}
+
+# Verify trigger body UPDATE command targets renamed table
+@cross-check-integrity
+test alter-table-rename-trigger-body-update {
+    CREATE TABLE t1 (a, b);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN
+        UPDATE t1 SET b = 99 WHERE a = new.a;
+    END;
+    ALTER TABLE t1 RENAME TO t2;
+    INSERT INTO t2 VALUES (1, 0);
+    SELECT * FROM t2;
+}
+expect {
+    1|99
+}
+
+# Verify trigger body DELETE command targets renamed table
+@cross-check-integrity
+test alter-table-rename-trigger-body-delete {
+    CREATE TABLE t1 (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE t2 (id, x);
+    INSERT INTO t2 VALUES (1, 'keep');
+    INSERT INTO t2 VALUES (2, 'remove');
+    CREATE TRIGGER trig1 AFTER UPDATE ON t1 BEGIN
+        DELETE FROM t2 WHERE id = old.a;
+    END;
+    INSERT INTO t1 VALUES (2, 'hello');
+    ALTER TABLE t2 RENAME TO t3;
+    UPDATE t1 SET b = 'world' WHERE a = 2;
+    SELECT * FROM t3;
+}
+expect {
+    1|keep
+}
+
+# Verify trigger body INSERT into a different renamed table
+@cross-check-integrity
+test alter-table-rename-trigger-body-insert-other-table {
+    CREATE TABLE t1 (a, b);
+    CREATE TABLE log (a, b);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN
+        INSERT INTO log VALUES (new.a, new.b);
+    END;
+    ALTER TABLE log RENAME TO log2;
+    INSERT INTO t1 VALUES (10, 20);
+    SELECT * FROM log2;
+}
+expect {
+    10|20
+}
+
+# Verify trigger schema entry tbl_name is updated
+@cross-check-integrity
+test alter-table-rename-trigger-schema-tbl-name {
+    CREATE TABLE t1 (a);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN
+        SELECT 1;
+    END;
+    ALTER TABLE t1 RENAME TO t2;
+    SELECT tbl_name FROM sqlite_schema WHERE type = 'trigger';
+}
+expect {
+    t2
+}
+
+# --- Trigger rewriting for ALTER TABLE RENAME COLUMN ---
+
+# Verify trigger fires after column rename (NEW refs updated)
+@cross-check-integrity
+test alter-table-rename-column-trigger-fires {
+    CREATE TABLE t1 (a, b);
+    CREATE TABLE log (x, y);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN
+        INSERT INTO log VALUES (new.a, new.b);
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO c;
+    INSERT INTO t1 VALUES (10, 20);
+    SELECT * FROM log;
+}
+expect {
+    10|20
+}
+
+# Verify UPDATE OF column list is rewritten
+@cross-check-integrity
+test alter-table-rename-column-trigger-update-of {
+    CREATE TABLE t1 (a, b, c);
+    INSERT INTO t1 VALUES (1, 2, 3);
+    CREATE TABLE log (x);
+    CREATE TRIGGER trig1 AFTER UPDATE OF b ON t1 BEGIN
+        INSERT INTO log VALUES (new.b);
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO d;
+    UPDATE t1 SET d = 42 WHERE a = 1;
+    SELECT * FROM log;
+}
+expect {
+    42
+}
+
+# Verify trigger body UPDATE SET column names and WHERE refs updated
+@cross-check-integrity
+test alter-table-rename-column-trigger-body-update-refs {
+    CREATE TABLE t1 (a INTEGER PRIMARY KEY, b);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN
+        UPDATE t1 SET b = new.b + 1 WHERE a = new.a;
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO c;
+    INSERT INTO t1 VALUES (1, 100);
+    SELECT a, c FROM t1;
+}
+expect {
+    1|101
+}
+
+# Verify WHEN clause column refs are rewritten
+@cross-check-integrity
+test alter-table-rename-column-trigger-when-clause {
+    CREATE TABLE t1 (a, b);
+    CREATE TABLE log (x);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 WHEN new.b > 0 BEGIN
+        INSERT INTO log VALUES (new.b);
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO c;
+    INSERT INTO t1 VALUES (1, -5);
+    INSERT INTO t1 VALUES (2, 10);
+    SELECT * FROM log;
+}
+expect {
+    10
+}
+
+# Verify INSERT column list in trigger body is NOT rewritten for different table
+@cross-check-integrity
+test alter-table-rename-column-trigger-insert-other-table {
+    CREATE TABLE t1 (a, b);
+    CREATE TABLE log (a, b);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN
+        INSERT INTO log (a, b) VALUES (new.a, new.b);
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO c;
+    INSERT INTO t1 VALUES (1, 2);
+    SELECT * FROM log;
+}
+expect {
+    1|2
+}
