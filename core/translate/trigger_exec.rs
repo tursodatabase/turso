@@ -680,6 +680,8 @@ pub fn fire_trigger(
             connection,
         )?;
         // Emit the planned subqueries so their results are available when we evaluate the WHEN expression.
+        // Always treat these as correlated (no `Once` caching) because the WHEN clause is evaluated
+        // per-row, and trigger bodies may modify the tables referenced by the subquery between evaluations.
         for subquery in &mut subqueries {
             let plan = subquery.consume_plan(crate::translate::plan::EvalAt::BeforeLoop);
             emit_non_from_clause_subquery(
@@ -687,7 +689,7 @@ pub fn fire_trigger(
                 resolver,
                 *plan,
                 &subquery.query_type,
-                subquery.correlated,
+                true, // always re-evaluate: trigger WHEN is checked per-row
             )?;
         }
 
