@@ -383,6 +383,20 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
         let mut m = TableMask::new();
         m.add_table(build_table_idx);
         m.add_table(probe_table_idx);
+        // When there's a gosub wrapping inner tables, we must also allow
+        // conditions that reference outer tables (those appearing before the
+        // hash join probe in the join order), since their cursors are valid
+        // at the unmatched-scan point.
+        if has_gosub {
+            let probe_pos = plan
+                .join_order
+                .iter()
+                .position(|j| j.original_idx == probe_table_idx)
+                .expect("probe table must be in join order");
+            for join in &plan.join_order[..probe_pos] {
+                m.add_table(join.original_idx);
+            }
+        }
         m
     };
     for cond in plan

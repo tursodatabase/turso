@@ -613,3 +613,24 @@ expect {
     2|2|-1
     3|3|3
 }
+
+# Regression: hash outer join unmatched scan must apply WHERE predicates
+# that reference outer tables (issue #5797).
+@cross-check-integrity
+test left-hash-join-unmatched-where-references-outer-table {
+    CREATE TABLE t0(x INT);
+    CREATE TABLE t1(x INT, a INT);
+    CREATE TABLE t2(a INT);
+    INSERT INTO t0 VALUES (0),(10);
+    INSERT INTO t1 VALUES (1,20),(0,10);
+    INSERT INTO t2 VALUES (10);
+    SELECT t0.x, t1.x, t2.a
+    FROM t0
+    JOIN t1 ON 1=1
+    LEFT JOIN t2 ON t1.a=t2.a
+    WHERE t0.x IN (t1.x, t1.x+1)
+    ORDER BY 1,2,3;
+}
+expect {
+    0|0|10
+}
