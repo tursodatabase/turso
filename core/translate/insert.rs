@@ -1,7 +1,7 @@
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{
-        self, BTreeTable, ColDef, Column, Index, IndexColumn, ResolvedFkRef, Table,
+        self, BTreeTable, ColDef, Column, Index, IndexColumn, ResolvedFkRef, Table, View,
         SQLITE_SEQUENCE_TABLE_NAME,
     },
     sync::Arc,
@@ -272,7 +272,24 @@ pub fn translate_insert(
     let table_name = &tbl_name.name;
     let table = match resolver.with_schema(database_id, |s| s.get_table(table_name.as_str())) {
         Some(table) => table,
-        None => crate::bail_parse_error!("no such table: {}", table_name),
+        None => {
+            // Check if target is a view — views can be written to via INSTEAD OF triggers
+            let view = resolver.with_schema(database_id, |s| {
+                s.get_view(&normalize_ident(table_name.as_str()))
+            });
+            if let Some(view) = view {
+                return translate_instead_of_insert(
+                    resolver,
+                    program,
+                    connection,
+                    &view,
+                    columns,
+                    body,
+                    database_id,
+                );
+            }
+            crate::bail_parse_error!("no such table: {}", table_name);
+        }
     };
     if program.trigger.is_some() && table.virtual_table().is_some() {
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name.name.as_str());
@@ -3753,4 +3770,191 @@ fn emit_custom_type_encode(
         None, // INSERT: encode all columns
         table_name,
     )
+}
+
+/// Create a pseudo BTreeTable from a View's columns for use in trigger contexts.
+/// Views don't have real btree tables, but INSTEAD OF triggers need a table
+/// reference to resolve NEW/OLD column references.
+fn btree_table_from_view(view: &View) -> Arc<BTreeTable> {
+    Arc::new(BTreeTable {
+        root_page: 0,
+        name: view.name.clone(),
+        primary_key_columns: Vec::new(),
+        columns: view.columns.clone(),
+        has_rowid: true,
+        is_strict: false,
+        has_autoincrement: false,
+        unique_sets: Vec::new(),
+        foreign_keys: Vec::new(),
+        check_constraints: Vec::new(),
+    })
+}
+
+/// Translate INSERT into a view by firing INSTEAD OF triggers.
+/// SQLite requires an INSTEAD OF INSERT trigger to exist on the view;
+/// without one, INSERT on a view is an error.
+#[allow(clippy::too_many_arguments)]
+fn translate_instead_of_insert(
+    resolver: &mut Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+    view: &Arc<View>,
+    columns: Vec<ast::Name>,
+    mut body: InsertBody,
+    database_id: usize,
+) -> Result<()> {
+    let pseudo_table = btree_table_from_view(view);
+
+    // Look up INSTEAD OF INSERT triggers
+    let instead_of_triggers: Vec<_> = resolver.with_schema(database_id, |s| {
+        s.get_triggers_for_table(&view.name)
+            .filter(|t| t.time == TriggerTime::InsteadOf && matches!(t.event, TriggerEvent::Insert))
+            .cloned()
+            .collect()
+    });
+
+    if instead_of_triggers.is_empty() {
+        crate::bail_parse_error!("cannot modify {} because it is a view", view.name);
+    }
+
+    // Evaluate the VALUES
+    let mut values: Vec<Box<Expr>> = vec![];
+    let mut inserting_multiple_rows = false;
+    match &mut body {
+        InsertBody::DefaultValues => {
+            values = view
+                .columns
+                .iter()
+                .map(|c| {
+                    c.default
+                        .clone()
+                        .unwrap_or_else(|| Box::new(ast::Expr::Literal(ast::Literal::Null)))
+                })
+                .collect();
+        }
+        InsertBody::Select(select, _) => {
+            if select.body.compounds.is_empty() {
+                match &mut select.body.select {
+                    OneSelect::Values(values_expr) if values_expr.len() == 1 => {
+                        for expr in values_expr.iter_mut().flat_map(|v| v.iter_mut()) {
+                            match expr.as_mut() {
+                                Expr::Id(name) => {
+                                    if name.quoted_with('"') {
+                                        *expr =
+                                            Expr::Literal(ast::Literal::String(name.as_literal()))
+                                                .into();
+                                    } else {
+                                        crate::bail_parse_error!("no such column: {name}");
+                                    }
+                                }
+                                Expr::Qualified(first_name, second_name) => {
+                                    crate::bail_parse_error!(
+                                        "no such column: {first_name}.{second_name}"
+                                    );
+                                }
+                                _ => {}
+                            }
+                            bind_and_rewrite_expr(
+                                expr,
+                                None,
+                                None,
+                                resolver,
+                                BindingBehavior::ResultColumnsNotAllowed,
+                            )?;
+                        }
+                        values = values_expr.pop().unwrap_or_default();
+                    }
+                    _ => inserting_multiple_rows = true,
+                }
+            } else {
+                inserting_multiple_rows = true;
+            }
+        }
+    }
+
+    if inserting_multiple_rows {
+        crate::bail_parse_error!(
+            "multi-row INSERT into views with INSTEAD OF triggers is not yet supported"
+        );
+    }
+
+    // Map column names to positions
+    let num_cols = view.columns.len();
+    let mut col_values: Vec<Box<Expr>> = (0..num_cols)
+        .map(|_| Box::new(Expr::Literal(ast::Literal::Null)))
+        .collect();
+
+    if columns.is_empty() {
+        // No column list — values map 1:1 to view columns
+        if values.len() != num_cols {
+            crate::bail_parse_error!(
+                "table {} has {} columns but {} values were supplied",
+                view.name,
+                num_cols,
+                values.len()
+            );
+        }
+        for (i, val) in values.into_iter().enumerate() {
+            col_values[i] = val;
+        }
+    } else {
+        // Map named columns to positions
+        for (i, col_name) in columns.iter().enumerate() {
+            let normalized = normalize_ident(col_name.as_str());
+            let pos = view
+                .columns
+                .iter()
+                .position(|c| {
+                    c.name
+                        .as_ref()
+                        .is_some_and(|n| normalize_ident(n) == normalized)
+                })
+                .ok_or_else(|| {
+                    LimboError::ParseError(format!(
+                        "table {} has no column named {}",
+                        view.name,
+                        col_name.as_str()
+                    ))
+                })?;
+            if i < values.len() {
+                col_values[pos].clone_from(&values[i]);
+            }
+        }
+    }
+
+    // Emit value expressions into registers
+    let base_reg = program.alloc_registers(num_cols + 1); // +1 for pseudo rowid
+    for (i, val) in col_values.iter().enumerate() {
+        translate_expr(program, None, val, base_reg + i, resolver)?;
+    }
+    // Set pseudo rowid to NULL (views don't have real rowids)
+    program.emit_insn(Insn::Null {
+        dest: base_reg + num_cols,
+        dest_end: None,
+    });
+
+    // Build NEW registers: columns + rowid
+    let new_registers: Vec<usize> = (0..=num_cols).map(|i| base_reg + i).collect();
+
+    let trigger_ctx = TriggerContext::new(
+        pseudo_table,
+        Some(new_registers),
+        None, // No OLD for INSERT
+    );
+
+    let ignore_label = program.allocate_label();
+    for trigger in instead_of_triggers {
+        fire_trigger(
+            program,
+            resolver,
+            trigger,
+            &trigger_ctx,
+            connection,
+            database_id,
+            ignore_label,
+        )?;
+    }
+    program.preassign_label_to_next_insn(ignore_label);
+
+    Ok(())
 }

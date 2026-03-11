@@ -146,7 +146,17 @@ pub fn prepare_delete_plan(
     let schema = resolver.schema();
     let table = match resolver.with_schema(database_id, |s| s.get_table(&tbl_name)) {
         Some(table) => table,
-        None => crate::bail_parse_error!("no such table: {}", tbl_name),
+        None => {
+            let is_view = resolver
+                .with_schema(database_id, |s| {
+                    s.get_view(&crate::util::normalize_ident(&tbl_name))
+                })
+                .is_some();
+            if is_view {
+                crate::bail_parse_error!("cannot modify {} because it is a view", tbl_name);
+            }
+            crate::bail_parse_error!("no such table: {}", tbl_name);
+        }
     };
     if program.trigger.is_some() && table.virtual_table().is_some() {
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name);

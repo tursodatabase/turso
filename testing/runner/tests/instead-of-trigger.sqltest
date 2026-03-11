@@ -1,0 +1,185 @@
+@database :memory:
+@requires-file trigger "instead of trigger tests require trigger support"
+
+# Basic INSTEAD OF INSERT trigger on a view
+@cross-check-integrity
+test instead-of-insert-basic {
+    CREATE TABLE t1(a, b);
+    CREATE VIEW v1 AS SELECT a, b FROM t1;
+    CREATE TRIGGER tr1 INSTEAD OF INSERT ON v1 BEGIN
+        INSERT INTO t1 VALUES(NEW.a, NEW.b);
+    END;
+    INSERT INTO v1 VALUES(1, 2);
+    SELECT * FROM t1;
+}
+expect {
+    1|2
+}
+
+# INSTEAD OF INSERT with named columns
+@cross-check-integrity
+test instead-of-insert-named-columns {
+    CREATE TABLE t2(a, b, c);
+    CREATE VIEW v2 AS SELECT a, b, c FROM t2;
+    CREATE TRIGGER tr2 INSTEAD OF INSERT ON v2 BEGIN
+        INSERT INTO t2 VALUES(NEW.a, NEW.b, NEW.c);
+    END;
+    INSERT INTO v2(c, a) VALUES('hello', 42);
+    SELECT * FROM t2;
+}
+expect {
+    42||hello
+}
+
+# INSTEAD OF INSERT with multiple inserts
+@cross-check-integrity
+test instead-of-insert-multiple-rows {
+    CREATE TABLE t3(x INTEGER, y TEXT);
+    CREATE VIEW v3 AS SELECT x, y FROM t3;
+    CREATE TRIGGER tr3 INSTEAD OF INSERT ON v3 BEGIN
+        INSERT INTO t3 VALUES(NEW.x, NEW.y);
+    END;
+    INSERT INTO v3 VALUES(1, 'first');
+    INSERT INTO v3 VALUES(2, 'second');
+    INSERT INTO v3 VALUES(3, 'third');
+    SELECT * FROM t3 ORDER BY x;
+}
+expect {
+    1|first
+    2|second
+    3|third
+}
+
+# INSTEAD OF INSERT with NULL values
+@cross-check-integrity
+test instead-of-insert-null {
+    CREATE TABLE t4(a, b);
+    CREATE VIEW v4 AS SELECT a, b FROM t4;
+    CREATE TRIGGER tr4 INSTEAD OF INSERT ON v4 BEGIN
+        INSERT INTO t4 VALUES(NEW.a, NEW.b);
+    END;
+    INSERT INTO v4 VALUES(NULL, NULL);
+    INSERT INTO v4 VALUES(1, NULL);
+    INSERT INTO v4 VALUES(NULL, 'text');
+    SELECT * FROM t4 ORDER BY rowid;
+}
+expect {
+    |
+    1|
+    |text
+}
+
+# INSERT on view WITHOUT INSTEAD OF trigger should fail
+test instead-of-insert-no-trigger {
+    CREATE TABLE t5(a, b);
+    CREATE VIEW v5 AS SELECT a, b FROM t5;
+    INSERT INTO v5 VALUES(1, 2);
+}
+expect error {
+    cannot modify v5 because it is a view
+}
+
+# INSTEAD OF INSERT with WHEN clause
+@cross-check-integrity
+test instead-of-insert-when {
+    CREATE TABLE t6(a INTEGER, b TEXT);
+    CREATE VIEW v6 AS SELECT a, b FROM t6;
+    CREATE TRIGGER tr6 INSTEAD OF INSERT ON v6 WHEN NEW.a > 0 BEGIN
+        INSERT INTO t6 VALUES(NEW.a, NEW.b);
+    END;
+    INSERT INTO v6 VALUES(-1, 'negative');
+    INSERT INTO v6 VALUES(0, 'zero');
+    INSERT INTO v6 VALUES(1, 'positive');
+    SELECT * FROM t6;
+}
+expect {
+    1|positive
+}
+
+# Cannot create BEFORE trigger on a view
+test cannot-create-before-on-view {
+    CREATE TABLE t7(a);
+    CREATE VIEW v7 AS SELECT a FROM t7;
+    CREATE TRIGGER tr7 BEFORE INSERT ON v7 BEGIN SELECT 1; END;
+}
+expect error {
+    cannot create BEFORE trigger on view: v7
+}
+
+# Cannot create AFTER trigger on a view
+test cannot-create-after-on-view {
+    CREATE TABLE t7b(a);
+    CREATE VIEW v7b AS SELECT a FROM t7b;
+    CREATE TRIGGER tr7b AFTER INSERT ON v7b BEGIN SELECT 1; END;
+}
+expect error {
+    cannot create AFTER trigger on view: v7b
+}
+
+# Cannot create INSTEAD OF trigger on a table
+test cannot-create-instead-of-on-table {
+    CREATE TABLE t8(a);
+    CREATE TRIGGER tr8 INSTEAD OF INSERT ON t8 BEGIN SELECT 1; END;
+}
+expect error {
+    cannot create INSTEAD OF trigger on table: t8
+}
+
+# Trigger modifies different table than the view source
+@cross-check-integrity
+test instead-of-insert-different-target {
+    CREATE TABLE src(a, b);
+    CREATE TABLE log(msg TEXT);
+    CREATE VIEW v9 AS SELECT a, b FROM src;
+    CREATE TRIGGER tr9 INSTEAD OF INSERT ON v9 BEGIN
+        INSERT INTO log VALUES('inserted ' || NEW.a);
+    END;
+    INSERT INTO v9 VALUES(42, 'test');
+    SELECT * FROM src;
+    SELECT * FROM log;
+}
+expect {
+    inserted 42
+}
+
+# INSTEAD OF INSERT with expression values
+@cross-check-integrity
+test instead-of-insert-expressions {
+    CREATE TABLE t10(a, b);
+    CREATE VIEW v10 AS SELECT a, b FROM t10;
+    CREATE TRIGGER tr10 INSTEAD OF INSERT ON v10 BEGIN
+        INSERT INTO t10 VALUES(NEW.a, NEW.b);
+    END;
+    INSERT INTO v10 VALUES(1 + 2, 'hello' || ' world');
+    SELECT * FROM t10;
+}
+expect {
+    3|hello world
+}
+
+# DROP TRIGGER on view then INSERT should fail
+@cross-check-integrity
+test instead-of-drop-then-insert-fails {
+    CREATE TABLE t11(a, b);
+    CREATE VIEW v11 AS SELECT a, b FROM t11;
+    CREATE TRIGGER tr11 INSTEAD OF INSERT ON v11 BEGIN
+        INSERT INTO t11 VALUES(NEW.a, NEW.b);
+    END;
+    INSERT INTO v11 VALUES(1, 2);
+    DROP TRIGGER tr11;
+    INSERT INTO v11 VALUES(3, 4);
+}
+expect error {
+    cannot modify v11 because it is a view
+}
+
+# Verify trigger appears in sqlite_schema
+test instead-of-trigger-in-schema {
+    CREATE TABLE t12(a);
+    CREATE VIEW v12 AS SELECT a FROM t12;
+    CREATE TRIGGER tr12 INSTEAD OF INSERT ON v12 BEGIN SELECT 1; END;
+    SELECT type, name, tbl_name FROM sqlite_schema WHERE name='tr12';
+}
+expect {
+    trigger|tr12|v12
+}

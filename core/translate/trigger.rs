@@ -125,20 +125,42 @@ pub fn translate_create_trigger(
         bail_parse_error!("Trigger {} already exists", normalized_trigger_name);
     }
 
-    // Verify the table exists
-    let table = resolver.with_schema(database_id, |s| s.get_table(&normalized_table_name));
-    let Some(table) = table else {
-        bail_parse_error!("no such table: {}", normalized_table_name);
-    };
-    if table.virtual_table().is_some() {
-        bail_parse_error!("cannot create triggers on virtual tables");
-    }
-
-    if time
+    let is_instead_of = time
         .as_ref()
-        .is_some_and(|t| *t == ast::TriggerTime::InsteadOf)
-    {
-        bail_parse_error!("INSTEAD OF triggers are not supported yet");
+        .is_some_and(|t| *t == ast::TriggerTime::InsteadOf);
+
+    if is_instead_of {
+        // INSTEAD OF triggers work only on views
+        let view = resolver.with_schema(database_id, |s| s.get_view(&normalized_table_name));
+        if view.is_none() {
+            bail_parse_error!(
+                "cannot create INSTEAD OF trigger on table: {}",
+                normalized_table_name
+            );
+        }
+    } else {
+        // BEFORE and AFTER triggers work only on ordinary tables
+        let table = resolver.with_schema(database_id, |s| s.get_table(&normalized_table_name));
+        let Some(table) = table else {
+            // Check if it's a view to give a better error message
+            let is_view = resolver
+                .with_schema(database_id, |s| s.get_view(&normalized_table_name))
+                .is_some();
+            if is_view {
+                bail_parse_error!(
+                    "cannot create {} trigger on view: {}",
+                    match time {
+                        Some(ast::TriggerTime::After) => "AFTER",
+                        _ => "BEFORE",
+                    },
+                    normalized_table_name
+                );
+            }
+            bail_parse_error!("no such table: {}", normalized_table_name);
+        };
+        if table.virtual_table().is_some() {
+            bail_parse_error!("cannot create triggers on virtual tables");
+        }
     }
 
     if temporary {

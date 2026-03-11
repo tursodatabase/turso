@@ -224,7 +224,17 @@ pub fn prepare_update_plan(
     let table_name = &body.tbl_name.name;
     let table = match resolver.with_schema(database_id, |s| s.get_table(table_name.as_str())) {
         Some(table) => table,
-        None => bail_parse_error!("Parse error: no such table: {}", table_name),
+        None => {
+            let is_view = resolver
+                .with_schema(database_id, |s| {
+                    s.get_view(&crate::util::normalize_ident(table_name.as_str()))
+                })
+                .is_some();
+            if is_view {
+                bail_parse_error!("cannot modify {} because it is a view", table_name);
+            }
+            bail_parse_error!("Parse error: no such table: {}", table_name);
+        }
     };
     if program.trigger.is_some() && table.virtual_table().is_some() {
         bail_parse_error!(
