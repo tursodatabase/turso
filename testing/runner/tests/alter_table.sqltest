@@ -11,6 +11,29 @@ expect {
 }
 
 @cross-check-integrity
+test alter-table-rename-autoindex-updated {
+    CREATE TABLE new_cas (id integer, database_id integer UNIQUE, cluster_id integer UNIQUE, PRIMARY KEY (id));
+    ALTER TABLE new_cas RENAME TO cas;
+    SELECT name FROM sqlite_schema WHERE type = 'index' ORDER BY name;
+}
+expect {
+    sqlite_autoindex_cas_1
+    sqlite_autoindex_cas_2
+}
+
+@cross-check-integrity
+test alter-table-rename-then-recreate-with-autoindex {
+    CREATE TABLE new_t (a integer, b integer UNIQUE, PRIMARY KEY (a));
+    ALTER TABLE new_t RENAME TO t;
+    CREATE TABLE IF NOT EXISTS new_t (a integer, b integer UNIQUE, PRIMARY KEY (a));
+    SELECT name, tbl_name FROM sqlite_schema WHERE type = 'index' ORDER BY name;
+}
+expect {
+    sqlite_autoindex_new_t_1|new_t
+    sqlite_autoindex_t_1|t
+}
+
+@cross-check-integrity
 test alter-table-rename-column {
     CREATE TABLE t (a INTEGER);
     CREATE INDEX i ON t (a);

@@ -11363,9 +11363,14 @@ pub fn op_rename_table(
 
     conn.with_database_schema_mut(*db, |schema| -> crate::Result<()> {
         if let Some(mut indexes) = schema.indexes.remove(&normalized_from) {
+            let autoindex_prefix = format!("sqlite_autoindex_{normalized_from}_");
             indexes.iter_mut().for_each(|index| {
                 let index = Arc::make_mut(index);
                 normalized_to.clone_into(&mut index.table_name);
+                // Rename autoindexes to match the new table name
+                if let Some(suffix) = index.name.strip_prefix(&autoindex_prefix) {
+                    index.name = format!("sqlite_autoindex_{normalized_to}_{suffix}");
+                }
             });
 
             schema.indexes.insert(normalized_to.to_owned(), indexes);
