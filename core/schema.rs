@@ -1901,19 +1901,22 @@ impl Table {
 
     /// Returns the column position and column for a given column name.
     pub fn get_column_by_name(&self, name: &str) -> Option<(usize, &Column)> {
-        let name = normalize_ident(name);
         match self {
-            Self::BTree(table) => table.get_column(name.as_str()),
-            Self::Virtual(table) => table
-                .columns
-                .iter()
-                .enumerate()
-                .find(|(_, col)| col.name.as_ref() == Some(&name)),
+            Self::BTree(table) => table.get_column(name),
+            Self::Virtual(table) => table.columns.iter().enumerate().find(|(_, col)| {
+                col.name
+                    .as_ref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
+            }),
             Self::FromClauseSubquery(from_clause_subquery) => from_clause_subquery
                 .columns
                 .iter()
                 .enumerate()
-                .find(|(_, col)| col.name.as_ref() == Some(&name)),
+                .find(|(_, col)| {
+                    col.name
+                        .as_ref()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(name))
+                }),
         }
     }
 
@@ -2096,12 +2099,12 @@ impl BTreeTable {
     /// E.g. if table is CREATE TABLE t (a, b, c)
     /// then get_column("b") returns (1, &Column { .. })
     pub fn get_column(&self, name: &str) -> Option<(usize, &Column)> {
-        let name = normalize_ident(name);
-
-        self.columns
-            .iter()
-            .enumerate()
-            .find(|(_, column)| column.name.as_ref() == Some(&name))
+        self.columns.iter().enumerate().find(|(_, column)| {
+            column
+                .name
+                .as_ref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        })
     }
 
     pub fn from_sql(sql: &str, root_page: i64) -> Result<BTreeTable> {
@@ -2706,13 +2709,13 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     }
                 } else if primary_key_columns
                     .iter()
-                    .any(|(col_name, _)| col_name == &name)
+                    .any(|(col_name, _)| col_name.eq_ignore_ascii_case(&name))
                 {
                     primary_key = true;
                 }
 
                 let mut col = Column::new(
-                    Some(normalize_ident(&name)),
+                    Some(name),
                     ty_str,
                     default,
                     None,
@@ -2781,7 +2784,12 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
             let unique_set_w_only_rowid_alias = unique_sets.iter().position(|us| {
                 us.is_primary_key
                     && us.columns.len() == 1
-                    && &us.columns.first().unwrap().0 == col.name.as_ref().unwrap()
+                    && us
+                        .columns
+                        .first()
+                        .unwrap()
+                        .0
+                        .eq_ignore_ascii_case(col.name.as_ref().unwrap())
             });
             if let Some(u) = unique_set_w_only_rowid_alias {
                 unique_sets.remove(u);
@@ -2816,7 +2824,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             .columns
                             .iter()
                             .zip(unique_sets[j].columns.iter())
-                            .all(|((a_name, _), (b_name, _))| a_name == b_name)
+                            .all(|((a_name, _), (b_name, _))| a_name.eq_ignore_ascii_case(b_name))
                     {
                         unique_sets.remove(j);
                     } else {
@@ -3253,7 +3261,7 @@ impl TryFrom<&ColumnDefinition> for Column {
         let hidden = ty_str.contains("HIDDEN");
 
         let mut col = Column::new(
-            Some(normalize_ident(name)),
+            Some(name.to_string()),
             ty_str,
             default,
             generated,
@@ -3569,11 +3577,11 @@ impl Index {
 
         let tbl_norm = self.table_name.as_str();
         let has_col = |name: &str| {
-            let n = normalize_ident(name);
-            table
-                .columns()
-                .iter()
-                .any(|c| c.name.as_ref().is_some_and(|cn| *cn == n))
+            table.columns().iter().any(|c| {
+                c.name
+                    .as_ref()
+                    .is_some_and(|cn| cn.eq_ignore_ascii_case(name))
+            })
         };
         let is_tbl = |ns: &str| normalize_ident(ns) == tbl_norm;
         let is_deterministic_fn = |name: &str, argc: usize| {

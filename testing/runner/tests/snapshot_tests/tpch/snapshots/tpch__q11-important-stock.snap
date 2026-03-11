@@ -59,14 +59,14 @@ addr  opcode                  p1  p2  p3  p4                  p5  comment
    8            OpenRead       1   5   0  k(7,B,B,B,B,B,B,B)   0  table=supplier, root=5, iDb=0
    9            OpenRead       2   2   0  k(4,B,B,B,B)         0  table=nation, root=2, iDb=0
   10            Rewind         0  22   0                       0  Rewind table partsupp
-  11              Column       0   1   6                       0  r[6]=partsupp.ps_suppkey
+  11              Column       0   1   6                       0  r[6]=partsupp.PS_SUPPKEY
   12              SeekRowid    1   6  21                       0  if (r[6]!=cursor 1 for table supplier.rowid) goto 21
-  13              Column       1   3   7                       0  r[7]=supplier.s_nationkey
+  13              Column       1   3   7                       0  r[7]=supplier.S_NATIONKEY
   14              SeekRowid    2   7  21                       0  if (r[7]!=cursor 2 for table nation.rowid) goto 21
-  15              Column       2   1   9                       0  r[9]=nation.n_name
+  15              Column       2   1   9                       0  r[9]=nation.N_NAME
   16              Ne           9  10  21  Binary               0  if r[9]!=r[10] goto 21
-  17              Column       0   3  12                       0  r[12]=partsupp.ps_supplycost
-  18              Column       0   2  13                       0  r[13]=partsupp.ps_availqty
+  17              Column       0   3  12                       0  r[12]=partsupp.PS_SUPPLYCOST
+  18              Column       0   2  13                       0  r[13]=partsupp.PS_AVAILQTY
   19              Multiply    12  13  11                       0  r[11]=r[12]*r[13]
   20              AggStep      0  11   4  sum                  0  accum=r[4] step(r[11])
   21            Next           0  11   0                       0
@@ -86,16 +86,16 @@ addr  opcode                  p1  p2  p3  p4                  p5  comment
   35          OpenRead         7   2   0  k(4,B,B,B,B)         0  table=nation, root=2, iDb=0
   36          Rewind           5  61   0                       0  Rewind index sqlite_autoindex_partsupp_1
   37            DeferredSeek   5   4   0                       0
-  38            Column         4   1  31                       0  r[31]=partsupp.ps_suppkey
+  38            Column         4   1  31                       0  r[31]=partsupp.PS_SUPPKEY
   39            SeekRowid      6  31  60                       0  if (r[31]!=cursor 6 for table supplier.rowid) goto 60
-  40            Column         6   3  32                       0  r[32]=supplier.s_nationkey
+  40            Column         6   3  32                       0  r[32]=supplier.S_NATIONKEY
   41            SeekRowid      7  32  60                       0  if (r[32]!=cursor 7 for table nation.rowid) goto 60
-  42            Column         7   1  34                       0  r[34]=nation.n_name
+  42            Column         7   1  34                       0  r[34]=nation.N_NAME
   43            Ne            34  35  60  Binary               0  if r[34]!=r[35] goto 60
-  44            Column         4   0  27                       0  r[27]=partsupp.ps_partkey
+  44            Column         4   0  27                       0  r[27]=partsupp.PS_PARTKEY
   45            Copy           1  28   0                       0  r[28]=r[1]
-  46            Column         4   3  36                       0  r[36]=partsupp.ps_supplycost
-  47            Column         4   2  37                       0  r[37]=partsupp.ps_availqty
+  46            Column         4   3  36                       0  r[36]=partsupp.PS_SUPPLYCOST
+  47            Column         4   2  37                       0  r[37]=partsupp.PS_AVAILQTY
   48            Multiply      36  37  29                       0  r[29]=r[36]*r[37]
   49            Compare       22  27   1  k(1, Binary)         0  r[22..22]==r[27..27]
   50            Jump          51  55  51                       0  ; start new group if comparison is not equal
@@ -105,7 +105,7 @@ addr  opcode                  p1  p2  p3  p4                  p5  comment
   54            Gosub         30  76   0                       0  ; goto clear accumulator subroutine
   55            AggStep        0  29  25  sum                  0  accum=r[25] step(r[29])
   56            If            20  59   0                       0  if r[20] goto 59; don't emit group columns if continuing existing group
-  57            Column         4   0  23                       0  r[23]=partsupp.ps_partkey
+  57            Column         4   0  23                       0  r[23]=partsupp.PS_PARTKEY
   58            Copy           1  24   0                       0  r[24]=r[1]
   59            Integer        1  20   0                       0  r[20]=1; indicate data in accumulator
   60          Next             5  37   0                       0

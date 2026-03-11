@@ -566,9 +566,12 @@ fn emit_update_column_values<'a>(
         } else {
             // Column is not being updated, read it from the table
             let column_idx_in_index = index.as_ref().and_then(|(idx, _)| {
-                idx.columns
-                    .iter()
-                    .position(|c| Some(&c.name) == table_column.name.as_ref())
+                idx.columns.iter().position(|c| {
+                    table_column
+                        .name
+                        .as_ref()
+                        .is_some_and(|tc_name| c.name.eq_ignore_ascii_case(tc_name))
+                })
             });
 
             // don't emit null for pkey of virtual tables. they require first two args
