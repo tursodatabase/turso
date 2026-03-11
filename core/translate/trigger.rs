@@ -116,8 +116,7 @@ pub fn translate_create_trigger(
 
     // Check if trigger already exists
     if resolver.with_schema(database_id, |s| {
-        s.get_trigger_for_table(&normalized_table_name, &normalized_trigger_name)
-            .is_some()
+        s.get_trigger(&normalized_trigger_name).is_some()
     }) {
         if if_not_exists {
             return Ok(());
