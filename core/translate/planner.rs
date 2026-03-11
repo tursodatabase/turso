@@ -1694,11 +1694,10 @@ fn parse_join(
         connection,
     )?;
 
+    let is_cross = matches!(join_operator, ast::JoinOperator::TypedJoin(Some(jt)) if jt.contains(JoinType::CROSS));
+
     let (outer, natural, full_outer) = match join_operator {
         ast::JoinOperator::TypedJoin(Some(join_type)) => {
-            if join_type.contains(JoinType::CROSS) {
-                crate::bail_parse_error!("CROSS JOIN is not supported");
-            }
             let is_right = join_type.contains(JoinType::RIGHT);
             let is_left = join_type.contains(JoinType::LEFT);
             let is_outer = join_type.contains(JoinType::OUTER);
@@ -1914,6 +1913,7 @@ fn parse_join(
     rightmost_table.join_info = Some(JoinInfo {
         join_type: plan_join_type,
         using,
+        no_reorder: is_cross,
     });
 
     Ok(())

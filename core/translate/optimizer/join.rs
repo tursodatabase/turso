@@ -1048,7 +1048,7 @@ pub fn compute_best_join_order<'a>(
             .filter(|t| {
                 t.join_info
                     .as_ref()
-                    .is_some_and(|j| j.is_outer() || j.is_semi_or_anti())
+                    .is_some_and(|j| j.is_ordering_constrained())
             })
             .count();
         if ordering_constrained_count == 0 {
@@ -1064,7 +1064,7 @@ pub fn compute_best_join_order<'a>(
                     if joined_table
                         .join_info
                         .as_ref()
-                        .is_some_and(|j| j.is_outer() || j.is_semi_or_anti())
+                        .is_some_and(|j| j.is_ordering_constrained())
                     {
                         // bitwise OR the masks
                         if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&i) {
@@ -1331,7 +1331,7 @@ pub fn compute_greedy_join_order<'a>(
         .filter(|(_, t)| {
             t.join_info
                 .as_ref()
-                .is_some_and(|ji| ji.is_outer() || ji.is_semi_or_anti())
+                .is_some_and(|ji| ji.is_ordering_constrained())
         })
         .map(|(j, _)| {
             let mut required = TableMask::new();
@@ -2020,6 +2020,7 @@ mod tests {
                 Some(JoinInfo {
                     join_type: JoinType::Inner,
                     using: vec![],
+                    no_reorder: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -2145,6 +2146,7 @@ mod tests {
                 Some(JoinInfo {
                     join_type: JoinType::Inner,
                     using: vec![],
+                    no_reorder: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -2153,6 +2155,7 @@ mod tests {
                 Some(JoinInfo {
                     join_type: JoinType::Inner,
                     using: vec![],
+                    no_reorder: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -2355,6 +2358,7 @@ mod tests {
                 Some(JoinInfo {
                     join_type: JoinType::Inner,
                     using: vec![],
+                    no_reorder: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -2363,6 +2367,7 @@ mod tests {
                 Some(JoinInfo {
                     join_type: JoinType::Inner,
                     using: vec![],
+                    no_reorder: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -2478,6 +2483,7 @@ mod tests {
                     Some(JoinInfo {
                         join_type: JoinType::Inner,
                         using: vec![],
+                        no_reorder: false,
                     }),
                     table_id_counter.next(),
                 )
@@ -2487,6 +2493,7 @@ mod tests {
                 Some(JoinInfo {
                     join_type: JoinType::Inner,
                     using: vec![],
+                    no_reorder: false,
                 }),
                 table_id_counter.next(),
             ));
@@ -3218,6 +3225,7 @@ mod tests {
                 Some(JoinInfo {
                     join_type: JoinType::Inner,
                     using: vec![],
+                    no_reorder: false,
                 }),
                 table_id_counter.next(),
             ),

@@ -731,6 +731,9 @@ pub struct JoinInfo {
     pub join_type: JoinType,
     /// The USING clause for the join, if any. NATURAL JOIN is transformed into USING (col1, col2, ...).
     pub using: Vec<ast::Name>,
+    /// When true, the optimizer must not reorder this table relative to its
+    /// neighbors. Set for CROSS JOIN to match SQLite semantics.
+    pub no_reorder: bool,
 }
 
 impl JoinInfo {
@@ -757,6 +760,11 @@ impl JoinInfo {
     /// Whether this is a semi-join or anti-join (EXISTS/NOT EXISTS).
     pub fn is_semi_or_anti(&self) -> bool {
         matches!(self.join_type, JoinType::Semi | JoinType::Anti)
+    }
+
+    /// Whether the optimizer must preserve this table's position in the join order.
+    pub fn is_ordering_constrained(&self) -> bool {
+        self.is_outer() || self.is_semi_or_anti() || self.no_reorder
     }
 }
 
