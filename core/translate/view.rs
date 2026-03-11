@@ -49,6 +49,10 @@ pub fn translate_create_materialized_view(
     // Validate the view can be created and extract its columns
     // This validation happens before updating sqlite_master to prevent
     // storing invalid view definitions
+
+    // Check for cross-database table references first
+    crate::util::validate_select_for_views(select_stmt, view_name.db_name.as_ref())?;
+
     use crate::incremental::view::IncrementalView;
     use crate::schema::BTreeTable;
     let view_column_schema = resolver.with_schema(database_id, |s| {
@@ -285,7 +289,7 @@ pub fn translate_create_view(
         )));
     }
 
-    crate::util::validate_select_for_unsupported_features(select_stmt)?;
+    crate::util::validate_select_for_views(select_stmt, view_name.db_name.as_ref())?;
 
     // Reconstruct the SQL string
     let sql = create_view_to_str(&view_name.name.as_ident(), columns, select_stmt);
