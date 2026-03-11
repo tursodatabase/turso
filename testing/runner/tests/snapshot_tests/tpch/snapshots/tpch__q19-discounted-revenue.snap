@@ -55,56 +55,56 @@ addr  opcode       p1  p2  p3  p4                                     p5  commen
    2  OpenRead      0  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
    3  OpenRead      1   4   0  k(9,B,B,B,B,B,B,B,B,B)                  0  table=part, root=4, iDb=0
    4  Rewind        0  59   0                                          0  Rewind table lineitem
-   5    Column      0  14   3                                          0  r[3]=lineitem.l_shipmode
+   5    Column      0  14   3                                          0  r[3]=lineitem.L_SHIPMODE
    6    Eq          3   4   8  Binary                                  0  if r[3]==r[4] goto 8
    7    Ne          3   5  58  Binary                                  0  if r[3]!=r[5] goto 58
-   8    Column      0  13   7                                          0  r[7]=lineitem.l_shipinstruct
+   8    Column      0  13   7                                          0  r[7]=lineitem.L_SHIPINSTRUCT
    9    Ne          7   8  58  Binary                                  0  if r[7]!=r[8] goto 58
-  10    Column      0   1   9                                          0  r[9]=lineitem.l_partkey
+  10    Column      0   1   9                                          0  r[9]=lineitem.L_PARTKEY
   11    SeekRowid   1   9  58                                          0  if (r[9]!=cursor 1 for table part.rowid) goto 58
-  12    Column      1   3  11                                          0  r[11]=part.p_brand
+  12    Column      1   3  11                                          0  r[11]=part.P_BRAND
   13    Ne         11  12  25  Binary                                  0  if r[11]!=r[12] goto 25
-  14    Column      1   6  13                                          0  r[13]=part.p_container
+  14    Column      1   6  13                                          0  r[13]=part.P_CONTAINER
   15    Eq         13  14  19  Binary                                  0  if r[13]==r[14] goto 19
   16    Eq         13  15  19  Binary                                  0  if r[13]==r[15] goto 19
   17    Eq         13  16  19  Binary                                  0  if r[13]==r[16] goto 19
   18    Ne         13  17  25  Binary                                  0  if r[13]!=r[17] goto 25
-  19    Column      0   4  19                                          0  r[19]=lineitem.l_quantity
+  19    Column      0   4  19                                          0  r[19]=lineitem.L_QUANTITY
   20    Lt         19  20  25  Binary                                  0  if r[19]<r[20] goto 25
-  21    Column      0   4  22                                          0  r[22]=lineitem.l_quantity
+  21    Column      0   4  22                                          0  r[22]=lineitem.L_QUANTITY
   22    Gt         22  23  25  Binary                                  0  if r[22]>r[23] goto 25
-  23    Column      1   5  27                                          0  r[27]=part.p_size
+  23    Column      1   5  27                                          0  r[27]=part.P_SIZE
   24    Le         27  28  51  Binary                                  0  if r[27]<=r[28] goto 51
-  25    Column      1   3  30                                          0  r[30]=part.p_brand
+  25    Column      1   3  30                                          0  r[30]=part.P_BRAND
   26    Ne         30  31  38  Binary                                  0  if r[30]!=r[31] goto 38
-  27    Column      1   6  32                                          0  r[32]=part.p_container
+  27    Column      1   6  32                                          0  r[32]=part.P_CONTAINER
   28    Eq         32  33  32  Binary                                  0  if r[32]==r[33] goto 32
   29    Eq         32  34  32  Binary                                  0  if r[32]==r[34] goto 32
   30    Eq         32  35  32  Binary                                  0  if r[32]==r[35] goto 32
   31    Ne         32  36  38  Binary                                  0  if r[32]!=r[36] goto 38
-  32    Column      0   4  38                                          0  r[38]=lineitem.l_quantity
+  32    Column      0   4  38                                          0  r[38]=lineitem.L_QUANTITY
   33    Lt         38  39  38  Binary                                  0  if r[38]<r[39] goto 38
-  34    Column      0   4  41                                          0  r[41]=lineitem.l_quantity
+  34    Column      0   4  41                                          0  r[41]=lineitem.L_QUANTITY
   35    Gt         41  42  38  Binary                                  0  if r[41]>r[42] goto 38
-  36    Column      1   5  45                                          0  r[45]=part.p_size
+  36    Column      1   5  45                                          0  r[45]=part.P_SIZE
   37    Le         45  46  51  Binary                                  0  if r[45]<=r[46] goto 51
-  38    Column      1   3  48                                          0  r[48]=part.p_brand
+  38    Column      1   3  48                                          0  r[48]=part.P_BRAND
   39    Ne         48  49  58  Binary                                  0  if r[48]!=r[49] goto 58
-  40    Column      1   6  50                                          0  r[50]=part.p_container
+  40    Column      1   6  50                                          0  r[50]=part.P_CONTAINER
   41    Eq         50  51  45  Binary                                  0  if r[50]==r[51] goto 45
   42    Eq         50  52  45  Binary                                  0  if r[50]==r[52] goto 45
   43    Eq         50  53  45  Binary                                  0  if r[50]==r[53] goto 45
   44    Ne         50  54  58  Binary                                  0  if r[50]!=r[54] goto 58
-  45    Column      0   4  56                                          0  r[56]=lineitem.l_quantity
+  45    Column      0   4  56                                          0  r[56]=lineitem.L_QUANTITY
   46    Lt         56  57  58  Binary                                  0  if r[56]<r[57] goto 58
-  47    Column      0   4  59                                          0  r[59]=lineitem.l_quantity
+  47    Column      0   4  59                                          0  r[59]=lineitem.L_QUANTITY
   48    Gt         59  60  58  Binary                                  0  if r[59]>r[60] goto 58
-  49    Column      1   5  64                                          0  r[64]=part.p_size
+  49    Column      1   5  64                                          0  r[64]=part.P_SIZE
   50    Gt         64  65  58  Binary                                  0  if r[64]>r[65] goto 58
-  51    Column      1   5  68                                          0  r[68]=part.p_size
+  51    Column      1   5  68                                          0  r[68]=part.P_SIZE
   52    Gt         67  68  58  Binary                                  0  if r[67]>r[68] goto 58
-  53    Column      0   5  70                                          0  r[70]=lineitem.l_extendedprice
-  54    Column      0   6  73                                          0  r[73]=lineitem.l_discount
+  53    Column      0   5  70                                          0  r[70]=lineitem.L_EXTENDEDPRICE
+  54    Column      0   6  73                                          0  r[73]=lineitem.L_DISCOUNT
   55    Subtract   72  73  71                                          0  r[71]=r[72]-r[73]
   56    Multiply   70  71  69                                          0  r[69]=r[70]*r[71]
   57    AggStep     0  69   2  sum                                     0  accum=r[2] step(r[69])

@@ -33,27 +33,27 @@ addr  opcode       p1  p2  p3  p4                                     p5  commen
    2  OpenRead      0  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
    3  OpenRead      1   4   0  k(9,B,B,B,B,B,B,B,B,B)                  0  table=part, root=4, iDb=0
    4  Rewind        0  30   0                                          0  Rewind table lineitem
-   5    Column      0  10   5                                          0  r[5]=lineitem.l_shipdate
+   5    Column      0  10   5                                          0  r[5]=lineitem.L_SHIPDATE
    6    Lt          5   6  29  Binary                                  0  if r[5]<r[6] goto 29
-   7    Column      0  10   8                                          0  r[8]=lineitem.l_shipdate
+   7    Column      0  10   8                                          0  r[8]=lineitem.L_SHIPDATE
    8    Ge          8   9  29  Binary                                  0  if r[8]>=r[9] goto 29
-   9    Column      0   1  10                                          0  r[10]=lineitem.l_partkey
+   9    Column      0   1  10                                          0  r[10]=lineitem.L_PARTKEY
   10    SeekRowid   1  10  29                                          0  if (r[10]!=cursor 1 for table part.rowid) goto 29
-  11    Column      1   4  14                                          0  r[14]=part.p_type
+  11    Column      1   4  14                                          0  r[14]=part.P_TYPE
   12    String8     0  13   0  PROMO%                                  0  r[13]='PROMO%'
   13    Function    1  13  12  like(2)                                 0  r[12]=func(r[13..14])
   14    IfNot      12  21   1                                          0  if !r[12] goto 21
-  15    Column      0   5  15                                          0  r[15]=lineitem.l_extendedprice
+  15    Column      0   5  15                                          0  r[15]=lineitem.L_EXTENDEDPRICE
   16    Integer     1  17   0                                          0  r[17]=1
-  17    Column      0   6  18                                          0  r[18]=lineitem.l_discount
+  17    Column      0   6  18                                          0  r[18]=lineitem.L_DISCOUNT
   18    Subtract   17  18  16                                          0  r[16]=r[17]-r[18]
   19    Multiply   15  16  11                                          0  r[11]=r[15]*r[16]
   20    Goto        0  22   0                                          0
   21    Integer     0  11   0                                          0  r[11]=0
   22    Cast       11   0   0                                          0  affinity(r[11]=Numeric)
   23    AggStep     0  11   2  sum                                     0  accum=r[2] step(r[11])
-  24    Column      0   5  20                                          0  r[20]=lineitem.l_extendedprice
-  25    Column      0   6  23                                          0  r[23]=lineitem.l_discount
+  24    Column      0   5  20                                          0  r[20]=lineitem.L_EXTENDEDPRICE
+  25    Column      0   6  23                                          0  r[23]=lineitem.L_DISCOUNT
   26    Subtract   22  23  21                                          0  r[21]=r[22]-r[23]
   27    Multiply   20  21  19                                          0  r[19]=r[20]*r[21]
   28    AggStep     0  19   3  sum                                     0  accum=r[3] step(r[19])

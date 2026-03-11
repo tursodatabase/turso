@@ -52,5 +52,5 @@ QUERY PLAN
 |  |--SCALAR SUBQUERY 1
 |  |  `--SCAN customer
 |  |--SCAN customer
-|  `--SEARCH orders USING INDEX ephemeral_orders_t5 (o_custkey=?)
+|  `--SEARCH orders USING INDEX ephemeral_orders_t5 (O_CUSTKEY=?)
 `--USE SORTER FOR GROUP BY
