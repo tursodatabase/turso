@@ -211,6 +211,24 @@ expect {
 }
 
 @cross-check-integrity
+test left-join-indexed-equality-no-match-nulls-right-side {
+    CREATE TABLE l(id INTEGER PRIMARY KEY);
+    CREATE TABLE r(id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE INDEX r_val ON r(val);
+    INSERT INTO l VALUES (1), (2);
+    INSERT INTO r VALUES (10, 3), (11, 4);
+
+    SELECT l.id, IFNULL(r.id, -1), IFNULL(r.val, -1)
+    FROM l
+    LEFT JOIN r ON r.val = l.id
+    ORDER BY l.id;
+}
+expect {
+    1|-1|-1
+    2|-1|-1
+}
+
+@cross-check-integrity
 test three-way-left-chain-null {
     create table t(a, b);
     create table u(a, b);

@@ -320,6 +320,9 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
 
     /// Returns the current row as an immutable record.
     pub fn current_row(&mut self) -> Result<IOResult<Option<&crate::types::ImmutableRecord>>> {
+        if self.get_null_flag() {
+            return Ok(IOResult::Done(None));
+        }
         let current_pos = &self.current_pos;
         tracing::trace!("current_row({:?})", current_pos);
         match current_pos {
@@ -1027,6 +1030,9 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn rowid(&mut self) -> Result<IOResult<Option<i64>>> {
+        if self.get_null_flag() {
+            return Ok(IOResult::Done(None));
+        }
         let rowid = match self.get_current_pos() {
             CursorPosition::Loaded {
                 row_id,
