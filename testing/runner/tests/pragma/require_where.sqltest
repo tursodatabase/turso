@@ -35,7 +35,7 @@ test pragma-require-where-delete-without-where {
     DELETE FROM nonexistent_table
 }
 expect error {
-    DELETE without a WHERE clause is not allowed when require_where is enabled
+    DELETE without a WHERE clause is not allowed when require_where \(or i_am_a_dummy\) is enabled
 }
 
 test pragma-require-where-update-without-where {
@@ -43,5 +43,5 @@ test pragma-require-where-update-without-where {
     UPDATE nonexistent_table SET val = 'x'
 }
 expect error {
-    UPDATE without a WHERE clause is not allowed when require_where is enabled
+    UPDATE without a WHERE clause is not allowed when require_where \(or i_am_a_dummy\) is enabled
 }

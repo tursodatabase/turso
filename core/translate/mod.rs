@@ -266,7 +266,7 @@ pub fn translate_inner(
             }
             if where_clause.is_none() && connection.get_dml_require_where() {
                 bail_parse_error!(
-                    "DELETE without a WHERE clause is not allowed when require_where is enabled"
+                    "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
                 );
             }
             translate_delete(
@@ -343,7 +343,7 @@ pub fn translate_inner(
         ast::Stmt::Update(update) => {
             if update.where_clause.is_none() && connection.get_dml_require_where() {
                 bail_parse_error!(
-                    "UPDATE without a WHERE clause is not allowed when require_where is enabled"
+                    "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
                 );
             }
             translate_update(update, resolver, program, connection)?
