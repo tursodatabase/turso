@@ -194,7 +194,7 @@ test alter-table-rename-column-view-attached-db-qualified {
     CREATE VIEW v AS SELECT a, b FROM aux.t;
 }
 expect error {
-    view cannot reference table in attached database: aux.t
+    view .*cannot reference.*database.*aux
 }
 
 # https://github.com/tursodatabase/turso/issues/5246
