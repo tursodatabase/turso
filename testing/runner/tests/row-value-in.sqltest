@@ -140,3 +140,24 @@ expect {
     m5|-1
     m6|-1
 }
+
+@setup row_value_subquery_schema
+test row-value-left-join-correlated-subquery-not-in {
+    CREATE TABLE u(id INT, a INT, b INT);
+    INSERT INTO u VALUES (1, 1, 10), (2, 2, 20), (3, 9, 9);
+    SELECT t.c, coalesce(u.id, -1)
+    FROM t
+    LEFT JOIN u
+      ON (t.a, t.b) NOT IN (SELECT x, y FROM s WHERE s.g = t.g)
+     AND t.a = u.a
+     AND t.b = u.b
+    ORDER BY t.c, u.id;
+}
+expect {
+    m1|-1
+    m2|-1
+    m3|-1
+    m4|-1
+    m5|-1
+    m6|-1
+}

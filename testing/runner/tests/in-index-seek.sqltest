@@ -811,6 +811,75 @@ expect {
     1
 }
 
+setup multi_join_in_ctx {
+    CREATE TABLE mj1 (
+        id INTEGER PRIMARY KEY,
+        a INTEGER,
+        b INTEGER
+    );
+    CREATE TABLE mj2 (
+        id INTEGER PRIMARY KEY,
+        a INTEGER,
+        c INTEGER
+    );
+    CREATE TABLE mj3 (
+        id INTEGER PRIMARY KEY,
+        b INTEGER,
+        c INTEGER
+    );
+    CREATE TABLE ms1(v INTEGER);
+    CREATE TABLE ms2(v INTEGER);
+    CREATE INDEX idx_mj1_a ON mj1(a);
+    CREATE INDEX idx_mj2_a ON mj2(a);
+    CREATE INDEX idx_mj2_c ON mj2(c);
+    INSERT INTO mj1 VALUES (1, 10, 100);
+    INSERT INTO mj1 VALUES (2, 20, 200);
+    INSERT INTO mj1 VALUES (3, 30, 300);
+    INSERT INTO mj1 VALUES (4, NULL, 400);
+    INSERT INTO mj2 VALUES (1, 10, 1);
+    INSERT INTO mj2 VALUES (2, 20, 2);
+    INSERT INTO mj2 VALUES (3, 40, 3);
+    INSERT INTO mj3 VALUES (1, 100, 1);
+    INSERT INTO mj3 VALUES (2, 200, 9);
+    INSERT INTO mj3 VALUES (3, 300, 3);
+    INSERT INTO mj3 VALUES (4, 400, 4);
+    INSERT INTO ms1 VALUES (10);
+    INSERT INTO ms1 VALUES (30);
+    INSERT INTO ms1 VALUES (NULL);
+    INSERT INTO ms2 VALUES (1);
+    INSERT INTO ms2 VALUES (3);
+    INSERT INTO ms2 VALUES (NULL);
+}
+
+@setup multi_join_in_ctx
+test multi-join-two-independent-in-subqueries {
+    SELECT mj1.id, mj2.id, mj3.id
+    FROM mj1
+    JOIN mj2 ON mj1.a = mj2.a
+    JOIN mj3 ON mj1.b = mj3.b AND mj2.c = mj3.c
+    WHERE mj1.a IN (SELECT v FROM ms1)
+      AND mj2.c IN (SELECT v FROM ms2)
+    ORDER BY 1, 2, 3;
+}
+expect {
+    1|1|1
+}
+
+@setup multi_join_in_ctx
+test multi-left-join-two-independent-in-subqueries {
+    SELECT mj1.id, IFNULL(mj2.id, -1), IFNULL(mj3.id, -1)
+    FROM mj1
+    LEFT JOIN mj2 ON mj1.a = mj2.a AND mj1.a IN (SELECT v FROM ms1)
+    LEFT JOIN mj3 ON mj1.b = mj3.b AND mj2.c IN (SELECT v FROM ms2) AND mj2.c = mj3.c
+    ORDER BY 1, 2, 3;
+}
+expect {
+    1|1|1
+    2|-1|-1
+    3|-1|-1
+    4|-1|-1
+}
+
 setup left_join_in {
     CREATE TABLE lj1 (
         id INTEGER PRIMARY KEY
