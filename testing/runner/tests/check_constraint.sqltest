@@ -982,6 +982,26 @@ expect {
 }
 
 @cross-check-integrity
+test check_constraint_alter_add_column_existing_column_violation {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES(-1);
+    ALTER TABLE t ADD COLUMN b INT CHECK (a > 0);
+}
+expect error {
+}
+
+@cross-check-integrity
+test check_constraint_alter_add_column_existing_column_satisfied {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN b INT CHECK (a > 0);
+    SELECT a, b FROM t;
+}
+expect {
+    1|
+}
+
+@cross-check-integrity
 test check_constraint_alter_add_column_with_data_enforced {
     CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT);
     INSERT INTO products VALUES (1, 'Widget A');
