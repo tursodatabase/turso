@@ -220,7 +220,9 @@ impl Limbo {
             .with_attach(opts.experimental_attach)
             .with_unsafe_testing(opts.unsafe_testing);
 
-        let (io, conn) = if db_file.contains([':', '?', '&', '#']) {
+        let db_file = normalize_db_path(db_file);
+
+        let (io, conn) = if db_file.starts_with("file:") {
             Connection::from_uri(&db_file, db_opts)?
         } else {
             let flags = if opts.readonly {
@@ -2103,4 +2105,106 @@ fn fetch_single_i64(rows: &mut turso_core::Statement) -> anyhow::Result<i64> {
         Ok(())
     })?;
     result.ok_or_else(|| anyhow!("query did not return a row"))
+}
+
+/// Normalize `path?key=val` to `file:path?key=val` so query parameters
+/// are parsed as URI options (e.g. `?locking=shared_reads`) instead of
+/// being treated as part of the filename.
+///
+/// Only the *last* `?` that introduces a valid `key=value` query string is
+/// treated as the query separator. Earlier `?` characters are
+/// percent-encoded (`%3F`) so they remain part of the filename.
+/// A trailing `?` with no `key=value` pair is left alone (it is just part
+/// of the filename).
+fn normalize_db_path(db_file: String) -> String {
+    if db_file.starts_with("file:") {
+        return db_file;
+    }
+
+    // Walk from the right to find the last '?' whose suffix looks like
+    // query parameters (contains at least one '=').
+    if let Some(pos) = db_file.rfind('?') {
+        let query = &db_file[pos + 1..];
+        if query.contains('=') {
+            let path = &db_file[..pos];
+            // Percent-encode any '?' inside the path portion so the URI
+            // parser does not mistake them for the query separator.
+            let encoded_path = path.replace('?', "%3F");
+            return format!("file:{encoded_path}?{query}");
+        }
+    }
+
+    db_file
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_db_path_adds_file_prefix_for_query_params() {
+        assert_eq!(
+            normalize_db_path("test.db?locking=shared_reads".into()),
+            "file:test.db?locking=shared_reads"
+        );
+    }
+
+    #[test]
+    fn test_normalize_db_path_preserves_existing_file_prefix() {
+        assert_eq!(
+            normalize_db_path("file:test.db?mode=ro".into()),
+            "file:test.db?mode=ro"
+        );
+    }
+
+    #[test]
+    fn test_normalize_db_path_preserves_file_triple_slash() {
+        assert_eq!(
+            normalize_db_path("file:///tmp/test.db?mode=ro".into()),
+            "file:///tmp/test.db?mode=ro"
+        );
+    }
+
+    #[test]
+    fn test_normalize_db_path_plain_path_unchanged() {
+        assert_eq!(normalize_db_path("test.db".into()), "test.db");
+    }
+
+    #[test]
+    fn test_normalize_db_path_memory_unchanged() {
+        assert_eq!(normalize_db_path(":memory:".into()), ":memory:");
+    }
+
+    #[test]
+    fn test_normalize_db_path_multiple_query_params() {
+        assert_eq!(
+            normalize_db_path("test.db?locking=shared_reads&cache=shared".into()),
+            "file:test.db?locking=shared_reads&cache=shared"
+        );
+    }
+
+    #[test]
+    fn test_normalize_db_path_absolute_path_with_query() {
+        assert_eq!(
+            normalize_db_path("/tmp/my.db?mode=ro".into()),
+            "file:/tmp/my.db?mode=ro"
+        );
+    }
+
+    #[test]
+    fn test_normalize_db_path_question_mark_in_filename_no_query() {
+        // '?' is legitimately part of the filename, no key=value follows
+        assert_eq!(normalize_db_path("what?.db".into()), "what?.db");
+    }
+
+    #[test]
+    fn test_normalize_db_path_filename_contains_question_mark_with_query() {
+        // File is literally "foo.bar?mode=ro", opened with ?mode=ro query.
+        // The '?' in the filename must be percent-encoded so the URI parser
+        // treats only the last ?mode=ro as the query string.
+        assert_eq!(
+            normalize_db_path("foo.bar?mode=ro?mode=ro".into()),
+            "file:foo.bar%3Fmode=ro?mode=ro"
+        );
+    }
 }
