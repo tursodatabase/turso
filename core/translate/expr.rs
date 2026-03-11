@@ -512,7 +512,8 @@ pub fn translate_condition_expr(
             translate_expr(program, Some(referenced_tables), lhs, lhs_reg, resolver)?;
             translate_expr(program, Some(referenced_tables), start, start_reg, resolver)?;
             translate_expr(program, Some(referenced_tables), end, end_reg, resolver)?;
-            let flags = CmpInsFlags::default();
+            let affinity = comparison_affinity(lhs, start, Some(referenced_tables), Some(resolver));
+            let flags = CmpInsFlags::default().with_affinity(affinity);
             let collation = program.curr_collation();
             if *not {
                 // NOT BETWEEN: (start > lhs) OR (lhs > end)
@@ -1264,7 +1265,8 @@ pub fn translate_expr(
             translate_expr(program, referenced_tables, start, start_reg, resolver)?;
             translate_expr(program, referenced_tables, end, end_reg, resolver)?;
 
-            let flags = CmpInsFlags::default();
+            let affinity = comparison_affinity(lhs, start, referenced_tables, Some(resolver));
+            let flags = CmpInsFlags::default().with_affinity(affinity);
             let collation = program.curr_collation();
 
             if *not {
