@@ -9,7 +9,8 @@ use crate::schema::Schema;
 use crate::stats::AnalyzeStats;
 use crate::translate::expr::{as_binary_components, walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::{
-    convert_to_vtab_constraint, BinaryExprSide, Constraint, ConstraintOperator, RangeConstraintRef,
+    convert_to_vtab_constraint, ordered_materialized_key_columns, BinaryExprSide, Constraint,
+    ConstraintOperator, RangeConstraintRef,
 };
 use crate::translate::optimizer::cost::RowCountEstimate;
 use crate::translate::optimizer::cost_params::CostModelParams;
@@ -1146,11 +1147,15 @@ fn find_best_access_method_for_subquery(
         }));
     }
 
-    // If this is the first/only table in the join and materialization is not requested, use coroutine.
-    // Note: materialize_hint is set for explicit WITH MATERIALIZED hints.
-    // Multi-reference CTE materialization decisions are handled at emission time via reference counting.
+    // If this is the first/only table in the join, a one-shot coroutine is
+    // usually cheaper than materializing into an ephemeral seek index.
+    //
+    // Keep CTE references eligible, though: explicit MATERIALIZED hints and
+    // multi-ref CTE sharing can materialize them later in emission, and we want
+    // the planner to preserve any seekable shape on top of that materialized
+    // result instead of forcing a scan here.
     let is_leftmost = join_order.len() <= 1;
-    if is_leftmost && !subquery.materialize_hint {
+    if is_leftmost && !subquery.materialize_hint && subquery.cte_id.is_none() {
         return Ok(Some(AccessMethod {
             cost: estimate_cost_for_scan_or_seek(
                 None,
@@ -1167,10 +1172,10 @@ fn find_best_access_method_for_subquery(
         }));
     }
 
-    // Find usable equality constraints on subquery columns.
-    // We need to build constraint refs from the raw constraints, similar to how
-    // ephemeral index building works for regular tables.
-    // Filter to usable constraints that target a table column and are equality ops.
+    // Build synthetic index columns from the constraints this materialized
+    // subquery could probe. Because the index is ephemeral, we can order its
+    // key columns to fit the chosen seek shape: equality columns first, then
+    // range-only columns, then the remaining payload columns.
     let usable: Vec<(usize, &Constraint)> = rhs_constraints
         .constraints
         .iter()
@@ -1178,12 +1183,21 @@ fn find_best_access_method_for_subquery(
         .filter(|(_, c)| {
             c.usable
                 && c.table_col_pos.is_some()
-                && c.operator.as_ast_operator() == Some(ast::Operator::Equals)
+                && matches!(
+                    c.operator.as_ast_operator(),
+                    Some(
+                        ast::Operator::Equals
+                            | ast::Operator::Greater
+                            | ast::Operator::GreaterEquals
+                            | ast::Operator::Less
+                            | ast::Operator::LessEquals
+                    )
+                )
         })
         .collect();
 
     if usable.is_empty() {
-        // No usable equality constraints - fall back to coroutine
+        // No usable probe constraints - fall back to coroutine
         return Ok(Some(AccessMethod {
             cost: estimate_cost_for_scan_or_seek(
                 None,
@@ -1200,23 +1214,22 @@ fn find_best_access_method_for_subquery(
         }));
     }
 
-    // Build a mapping from table_col_pos to index_col_pos.
-    // Multiple constraints on the same column should share the same index_col_pos.
-    let mut unique_col_positions: Vec<usize> = usable
+    let usable_constraints: Vec<&Constraint> = usable.iter().map(|(_, c)| *c).collect();
+    let key_col_positions = ordered_materialized_key_columns(&usable_constraints);
+    let key_col_pos_to_index_pos: HashMap<usize, usize> = key_col_positions
         .iter()
-        .map(|(_, c)| c.table_col_pos.expect("table_col_pos was Some above"))
+        .enumerate()
+        .map(|(index_col_pos, table_col_pos)| (*table_col_pos, index_col_pos))
         .collect();
-    unique_col_positions.sort_unstable();
-    unique_col_positions.dedup();
 
     // Map each usable constraint to a ConstraintRef
     let mut temp_constraint_refs: Vec<ConstraintRef> = usable
         .iter()
         .map(|(orig_idx, c)| {
             let table_col_pos = c.table_col_pos.expect("table_col_pos was Some above");
-            let index_col_pos = unique_col_positions
-                .binary_search(&table_col_pos)
-                .expect("table_col_pos must exist in unique_col_positions");
+            let index_col_pos = *key_col_pos_to_index_pos
+                .get(&table_col_pos)
+                .expect("table_col_pos must exist in key_col_positions");
             ConstraintRef {
                 constraint_vec_pos: *orig_idx,
                 index_col_pos,

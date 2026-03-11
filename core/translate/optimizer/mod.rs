@@ -1931,19 +1931,18 @@ fn optimize_table_access(
                 index,
                 constraint_refs,
             } => {
-                // Mark constraints as consumed
-                // RangeConstraintRef.eq contains the position in the constraints array for equality constraints
                 let table_constraints = constraints_per_table
                     .iter()
                     .find(|c| c.table_id == table_references.joined_tables()[table_idx].internal_id)
                     .expect("should have constraints for this table");
 
-                for cref in constraint_refs.iter() {
-                    if let Some(ref eq) = cref.eq {
-                        let constraint = &table_constraints.constraints[eq.constraint_pos];
-                        where_clause[constraint.where_clause_pos.0].consumed = true;
-                    }
-                }
+                mark_seek_constraints_consumed(
+                    &table_constraints.constraints,
+                    constraint_refs,
+                    where_clause,
+                    false,
+                    false,
+                );
 
                 // Build seek definition from the constraints
                 let seek_def = build_seek_def_from_constraints(

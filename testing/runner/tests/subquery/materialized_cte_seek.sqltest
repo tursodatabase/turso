@@ -1,0 +1,377 @@
+@database :memory:
+
+setup catalog_seed {
+    CREATE TABLE products (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        category_id INTEGER,
+        price REAL NOT NULL,
+        stock INTEGER DEFAULT 0
+    );
+
+    CREATE TABLE categories (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        parent_id INTEGER
+    );
+
+    CREATE TABLE orders (
+        id INTEGER PRIMARY KEY,
+        customer_id INTEGER NOT NULL,
+        order_date DATE NOT NULL,
+        total_amount REAL
+    );
+
+    CREATE TABLE order_items (
+        id INTEGER PRIMARY KEY,
+        order_id INTEGER NOT NULL,
+        product_id INTEGER NOT NULL,
+        quantity INTEGER NOT NULL,
+        unit_price REAL NOT NULL
+    );
+
+    CREATE TABLE customers (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        email TEXT,
+        created_at DATE
+    );
+
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        manager_id INTEGER,
+        department TEXT,
+        salary REAL
+    );
+
+    CREATE INDEX idx_products_category ON products(category_id);
+    CREATE INDEX idx_orders_customer ON orders(customer_id);
+    CREATE INDEX idx_order_items_order ON order_items(order_id);
+    CREATE INDEX idx_order_items_product ON order_items(product_id);
+    CREATE INDEX idx_employees_manager ON employees(manager_id);
+
+    INSERT INTO categories VALUES
+        (1, 'Electronics', NULL),
+        (2, 'Furniture', NULL),
+        (3, 'Accessories', 1);
+
+    INSERT INTO products VALUES
+        (1, 'Laptop', 1, 1200.0, 5),
+        (2, 'Mouse', 1, 25.0, 50),
+        (3, 'Desk', 2, 300.0, 10),
+        (4, 'Chair', 2, 150.0, 20),
+        (5, 'Tripod', 3, 80.0, 15),
+        (6, 'Monitor', 1, 200.0, 12),
+        (7, 'Tablet', 1, 600.0, 7),
+        (8, 'Keyboard', 1, 90.0, 30),
+        (9, 'Phone', 1, 900.0, 9);
+
+    INSERT INTO customers VALUES
+        (1, 'Alice', 'alice@example.test', '2023-01-01'),
+        (2, 'Bob', 'bob@example.test', '2023-02-01'),
+        (3, 'Cara', 'cara@example.test', '2023-03-01'),
+        (4, 'Dan', 'dan@example.test', '2022-12-01');
+
+    INSERT INTO orders VALUES
+        (1, 1, '2024-01-10', 700.0),
+        (2, 1, '2024-01-11', 500.0),
+        (3, 2, '2024-02-01', 200.0),
+        (4, 3, '2024-03-05', 1500.0),
+        (5, 3, '2024-03-07', 200.0),
+        (6, 4, '2022-12-30', 50.0);
+
+    INSERT INTO order_items VALUES
+        (1, 1, 1, 1, 1200.0),
+        (2, 2, 6, 2, 200.0),
+        (3, 3, 3, 1, 300.0),
+        (4, 4, 7, 2, 600.0),
+        (5, 4, 9, 1, 900.0),
+        (6, 5, 1, 1, 1200.0),
+        (7, 5, 8, 3, 90.0),
+        (8, 5, 4, 1, 150.0);
+
+    INSERT INTO employees VALUES
+        (1, 'Ann', NULL, 'Engineering', 180.0),
+        (2, 'Ben', 1, 'Engineering', 100.0),
+        (3, 'Cy', 1, 'Engineering', 110.0),
+        (4, 'Dee', NULL, 'HR', 90.0),
+        (5, 'Eve', 4, 'HR', 50.0),
+        (6, 'Fox', NULL, 'Sales', NULL);
+}
+
+setup sequence_points_seed {
+    CREATE TABLE sample_points(point_value INTEGER);
+    INSERT INTO sample_points VALUES (1), (2), (4), (7), (8);
+}
+
+@setup catalog_seed
+test cte-aggregation-results {
+    WITH category_stats AS (
+        SELECT
+            category_id,
+            count(*) AS product_count,
+            avg(price) AS avg_price,
+            sum(stock) AS total_stock
+        FROM products
+        GROUP BY category_id
+    )
+    SELECT c.name, cs.product_count, round(cs.avg_price, 1)
+    FROM category_stats cs
+    JOIN categories c ON c.id = cs.category_id
+    WHERE cs.product_count > 5
+    ORDER BY c.name;
+}
+expect {
+    Electronics|6|502.5
+}
+
+@setup catalog_seed
+test cte-referenced-multiple-times-results {
+    WITH order_totals AS (
+        SELECT customer_id, sum(total_amount) AS total
+        FROM orders
+        GROUP BY customer_id
+    )
+    SELECT
+        c.name,
+        round(ot.total, 1),
+        round((SELECT avg(total) FROM order_totals), 3)
+    FROM customers c
+    JOIN order_totals ot ON ot.customer_id = c.id
+    WHERE ot.total > (SELECT avg(total) FROM order_totals)
+    ORDER BY c.name;
+}
+expect {
+    Alice|1200.0|787.5
+    Cara|1700.0|787.5
+}
+expect @js {
+    Alice|1200|787.5
+    Cara|1700|787.5
+}
+
+@setup catalog_seed
+test cte-self-join-results {
+    WITH employee_salaries AS (
+        SELECT id, name, department, salary
+        FROM employees
+        WHERE salary IS NOT NULL
+    )
+    SELECT
+        e1.name AS employee,
+        e1.salary AS emp_salary,
+        e2.name AS colleague,
+        e2.salary AS col_salary
+    FROM employee_salaries e1
+    JOIN employee_salaries e2 ON e1.department = e2.department
+        AND e1.id < e2.id
+    WHERE e1.salary > e2.salary * 1.5
+    ORDER BY employee, colleague;
+}
+expect {
+    Ann|180.0|Ben|100.0
+    Ann|180.0|Cy|110.0
+    Dee|90.0|Eve|50.0
+}
+expect @js {
+    Ann|180|Ben|100
+    Ann|180|Cy|110
+    Dee|90|Eve|50
+}
+
+@setup catalog_seed
+test cte-with-correlated-subquery-results {
+    WITH dept_avg AS (
+        SELECT department, avg(salary) AS avg_salary
+        FROM employees
+        GROUP BY department
+    )
+    SELECT e.name, e.department, e.salary
+    FROM employees e
+    WHERE e.salary > (
+        SELECT da.avg_salary
+        FROM dept_avg da
+        WHERE da.department = e.department
+    )
+    ORDER BY e.name;
+}
+expect {
+    Ann|Engineering|180.0
+    Dee|HR|90.0
+}
+expect @js {
+    Ann|Engineering|180
+    Dee|HR|90
+}
+
+@setup catalog_seed
+test derived-table-join-results {
+    SELECT c.name, order_stats.total_orders, round(order_stats.total_spent, 1)
+    FROM customers c
+    JOIN (
+        SELECT
+            customer_id,
+            count(*) AS total_orders,
+            sum(total_amount) AS total_spent
+        FROM orders
+        GROUP BY customer_id
+    ) AS order_stats ON order_stats.customer_id = c.id
+    WHERE order_stats.total_spent > 500
+    ORDER BY c.name;
+}
+expect {
+    Alice|2|1200.0
+    Cara|2|1700.0
+}
+expect @js {
+    Alice|2|1200
+    Cara|2|1700
+}
+
+@setup catalog_seed
+test subquery-within-cte-results {
+    WITH filtered_products AS (
+        SELECT p.id, p.name, p.price
+        FROM products p
+        WHERE p.category_id IN (
+            SELECT id FROM categories WHERE parent_id IS NULL
+        )
+    )
+    SELECT fp.name, fp.price
+    FROM filtered_products fp
+    WHERE fp.price > 100
+    ORDER BY fp.price DESC;
+}
+expect {
+    Laptop|1200.0
+    Phone|900.0
+    Tablet|600.0
+    Desk|300.0
+    Monitor|200.0
+    Chair|150.0
+}
+expect @js {
+    Laptop|1200
+    Phone|900
+    Tablet|600
+    Desk|300
+    Monitor|200
+    Chair|150
+}
+
+@setup catalog_seed
+test cte-referencing-previous-results {
+    WITH
+    product_sales AS (
+        SELECT
+            oi.product_id,
+            sum(oi.quantity) AS total_quantity,
+            sum(oi.quantity * oi.unit_price) AS total_revenue
+        FROM order_items oi
+        GROUP BY oi.product_id
+    ),
+    top_products AS (
+        SELECT product_id, total_quantity, total_revenue
+        FROM product_sales
+        WHERE total_revenue > 1000
+    ),
+    top_product_details AS (
+        SELECT p.name, p.category_id, tp.total_quantity, tp.total_revenue
+        FROM top_products tp
+        JOIN products p ON p.id = tp.product_id
+    )
+    SELECT tpd.name, c.name AS category_name, round(tpd.total_revenue, 1)
+    FROM top_product_details tpd
+    JOIN categories c ON c.id = tpd.category_id
+    ORDER BY tpd.total_revenue DESC, tpd.name;
+}
+expect {
+    Laptop|Electronics|2400.0
+    Tablet|Electronics|1200.0
+}
+expect @js {
+    Laptop|Electronics|2400
+    Tablet|Electronics|1200
+}
+
+@setup sequence_points_seed
+test cte-correlated-range-probe-results {
+    WITH ordered_points AS (
+        SELECT DISTINCT point_value AS point_key
+        FROM sample_points
+        ORDER BY point_key
+    ),
+    previous_points AS (
+        SELECT point_key,
+               (
+                   SELECT MAX(p2.point_key)
+                   FROM ordered_points p2
+                   WHERE p2.point_key < p1.point_key
+               ) AS previous_point
+        FROM ordered_points p1
+    )
+    SELECT point_key, ifnull(previous_point, -1)
+    FROM previous_points
+    ORDER BY point_key;
+}
+expect {
+    1|-1
+    2|1
+    4|2
+    7|4
+    8|7
+}
+
+@setup sequence_points_seed
+test cte-materialized-scalar-probe-results {
+    WITH ordered_points AS (
+        SELECT DISTINCT point_value AS point_key
+        FROM sample_points
+        ORDER BY point_key
+    ),
+    previous_points AS (
+        SELECT point_key,
+               (
+                   SELECT MAX(p2.point_key)
+                   FROM ordered_points p2
+                   WHERE p2.point_key < p1.point_key
+               ) AS previous_point
+        FROM ordered_points p1
+    ),
+    run_markers AS (
+        SELECT point_key,
+               previous_point,
+               CASE
+                   WHEN point_key - previous_point = 1 THEN 0
+                   ELSE 1
+               END AS run_start
+        FROM previous_points
+    ),
+    run_ids AS (
+        SELECT point_key,
+               SUM(run_start) OVER (ORDER BY point_key) AS run_id
+        FROM run_markers
+    ),
+    run_lengths AS (
+        SELECT run_id,
+               MIN(point_key) AS start_key,
+               MAX(point_key) AS end_key,
+               COUNT(*) AS run_length
+        FROM run_ids
+        GROUP BY run_id
+    )
+    SELECT start_key, end_key, run_length
+    FROM run_lengths
+    WHERE run_id = (
+        SELECT run_id
+        FROM run_ids
+        WHERE point_key = (
+            SELECT MAX(point_key)
+            FROM ordered_points
+        )
+    );
+}
+expect {
+    7|8|2
+}

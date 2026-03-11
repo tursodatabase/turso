@@ -493,3 +493,82 @@ snapshot subquery-within-cte {
     WHERE fp.price > 100
     ORDER BY fp.price DESC;
 }
+
+setup sequence_points_schema {
+    CREATE TABLE sample_points(point_value INTEGER);
+    INSERT INTO sample_points VALUES (1), (2), (4), (7), (8);
+}
+
+# Correlated range probes into a multi-ref CTE should be able to seek the
+# materialized CTE instead of rescanning it for each outer row.
+@setup sequence_points_schema
+snapshot-eqp cte-correlated-range-probe {
+    WITH ordered_points AS (
+        SELECT DISTINCT point_value AS point_key
+        FROM sample_points
+        ORDER BY point_key
+    ),
+    previous_points AS (
+        SELECT point_key,
+               (
+                   SELECT MAX(p2.point_key)
+                   FROM ordered_points p2
+                   WHERE p2.point_key < p1.point_key
+               ) AS previous_point
+        FROM ordered_points p1
+    )
+    SELECT point_key, previous_point
+    FROM previous_points;
+}
+
+# Family-4-shaped multi-ref CTE query: after materialization, the scalar
+# subquery should probe the run identifier CTE by point key rather than scan it.
+@setup sequence_points_schema
+snapshot-eqp cte-materialized-scalar-probe {
+    WITH ordered_points AS (
+        SELECT DISTINCT point_value AS point_key
+        FROM sample_points
+        ORDER BY point_key
+    ),
+    previous_points AS (
+        SELECT point_key,
+               (
+                   SELECT MAX(p2.point_key)
+                   FROM ordered_points p2
+                   WHERE p2.point_key < p1.point_key
+               ) AS previous_point
+        FROM ordered_points p1
+    ),
+    run_markers AS (
+        SELECT point_key,
+               previous_point,
+               CASE
+                   WHEN point_key - previous_point = 1 THEN 0
+                   ELSE 1
+               END AS run_start
+        FROM previous_points
+    ),
+    run_ids AS (
+        SELECT point_key,
+               SUM(run_start) OVER (ORDER BY point_key) AS run_id
+        FROM run_markers
+    ),
+    run_lengths AS (
+        SELECT run_id,
+               MIN(point_key) AS start_key,
+               MAX(point_key) AS end_key,
+               COUNT(*) AS run_length
+        FROM run_ids
+        GROUP BY run_id
+    )
+    SELECT start_key, end_key, run_length
+    FROM run_lengths
+    WHERE run_id = (
+        SELECT run_id
+        FROM run_ids
+        WHERE point_key = (
+            SELECT MAX(point_key)
+            FROM ordered_points
+        )
+    );
+}
