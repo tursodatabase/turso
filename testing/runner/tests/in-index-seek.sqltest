@@ -425,6 +425,151 @@ expect {
     1
 }
 
+setup desc_index {
+    CREATE TABLE td (
+        id INTEGER PRIMARY KEY,
+        x INTEGER,
+        y INTEGER
+    );
+    CREATE INDEX idx_td_x_desc ON td(x DESC);
+    INSERT INTO td VALUES(1, 1, 10);
+    INSERT INTO td VALUES(2, 2, 20);
+    INSERT INTO td VALUES(3, 3, 30);
+    INSERT INTO td VALUES(4, 1, 40);
+}
+
+@setup desc_index
+test in-desc-index-select {
+    SELECT id, x FROM td WHERE x IN (1, 3) ORDER BY id;
+}
+expect {
+    1|1
+    3|3
+    4|1
+}
+
+@setup desc_index
+test in-desc-index-update {
+    UPDATE td SET y = y + 100 WHERE x IN (1, 3);
+    SELECT id, y FROM td ORDER BY id;
+}
+expect {
+    1|110
+    2|20
+    3|130
+    4|140
+}
+
+@setup desc_index
+test in-desc-index-delete {
+    DELETE FROM td WHERE x IN (1, 3);
+    SELECT id, x, y FROM td ORDER BY id;
+}
+expect {
+    2|2|20
+}
+
+setup replace_inseek {
+    CREATE TABLE tr (
+        id INTEGER PRIMARY KEY,
+        n INTEGER,
+        u INTEGER UNIQUE
+    );
+    CREATE INDEX idx_tr_n ON tr(n);
+    INSERT INTO tr VALUES(1, 10, 100);
+    INSERT INTO tr VALUES(2, 20, 200);
+    INSERT INTO tr VALUES(3, 30, 300);
+}
+
+@setup replace_inseek
+test in-index-update-or-replace {
+    UPDATE OR REPLACE tr SET u = 200 WHERE n IN (10);
+    SELECT id, n, u FROM tr ORDER BY id;
+}
+expect {
+    1|10|200
+    3|30|300
+}
+
+@setup replace_inseek
+test in-index-update-or-replace-multirow {
+    UPDATE OR REPLACE tr SET u = 999 WHERE n IN (10, 30);
+    SELECT id, n, u FROM tr ORDER BY id;
+}
+expect {
+    2|20|200
+    3|30|999
+}
+
+setup partial_inseek {
+    CREATE TABLE tp (
+        id INTEGER PRIMARY KEY,
+        n INTEGER,
+        keep INTEGER
+    );
+    CREATE INDEX idx_tp_n_keep1 ON tp(n) WHERE keep = 1;
+    INSERT INTO tp VALUES(1, 10, 1);
+    INSERT INTO tp VALUES(2, 10, 0);
+    INSERT INTO tp VALUES(3, 20, 1);
+    INSERT INTO tp VALUES(4, 20, 0);
+}
+
+@setup partial_inseek
+test in-partial-index-predicate-implied {
+    SELECT id FROM tp WHERE n IN (10, 20) AND keep = 1 ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+@setup partial_inseek
+test in-partial-index-predicate-not-implied {
+    SELECT id FROM tp WHERE n IN (10, 20) ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+setup returning_inseek {
+    CREATE TABLE tret (
+        id INTEGER PRIMARY KEY,
+        n INTEGER,
+        v TEXT
+    );
+    CREATE INDEX idx_tret_n ON tret(n);
+    INSERT INTO tret VALUES(1, 10, 'a');
+    INSERT INTO tret VALUES(2, 20, 'b');
+    INSERT INTO tret VALUES(3, 10, 'c');
+}
+
+@setup returning_inseek
+test in-index-update-returning {
+    UPDATE tret SET v = v || '!' WHERE n IN (10) RETURNING id, v;
+    SELECT id, n, v FROM tret ORDER BY id;
+}
+expect {
+    1|a!
+    3|c!
+    1|10|a!
+    2|20|b
+    3|10|c!
+}
+
+@setup returning_inseek
+test in-index-delete-returning {
+    DELETE FROM tret WHERE n IN (20) RETURNING id, v;
+    SELECT id, n, v FROM tret ORDER BY id;
+}
+expect {
+    2|b
+    1|10|a
+    3|10|c
+}
+
 # NOT IN with NULL - three-valued logic: NOT IN returns empty when NULL is in the list
 setup nulls {
     CREATE TABLE tn (
