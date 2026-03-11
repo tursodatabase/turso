@@ -32,7 +32,7 @@ pub(crate) fn create_trigger_to_sql(
         sql.push_str(" IF NOT EXISTS");
     }
     sql.push(' ');
-    sql.push_str(trigger_name.name.as_str());
+    sql.push_str(&trigger_name.name.as_ident());
     sql.push(' ');
 
     if let Some(t) = time {
@@ -53,13 +53,13 @@ pub(crate) fn create_trigger_to_sql(
                 if i > 0 {
                     sql.push_str(", ");
                 }
-                sql.push_str(col.as_str());
+                sql.push_str(&col.as_ident());
             }
         }
     }
 
     sql.push_str(" ON ");
-    sql.push_str(tbl_name.name.as_str());
+    sql.push_str(&tbl_name.name.as_ident());
     if for_each_row {
         sql.push_str(" FOR EACH ROW");
     }
