@@ -1,6 +1,7 @@
 use super::*;
 use crate::translate::plan::{MultiIndexBranch, MultiIndexBranchAccess};
 
+#[expect(clippy::too_many_arguments)]
 fn emit_multi_index_rowset_update(
     program: &mut ProgramBuilder,
     is_intersection: bool,
@@ -45,6 +46,7 @@ fn emit_multi_index_rowset_update(
     }
 }
 
+#[expect(clippy::too_many_arguments)]
 fn emit_multi_index_branch_residuals(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,

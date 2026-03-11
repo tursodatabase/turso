@@ -133,6 +133,7 @@ fn flatten_and_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
 /// `constraints_from_where_clause()`. Branch-local planning should have a
 /// direct constraint-extraction path that does not fabricate top-level planner
 /// terms.
+#[expect(clippy::too_many_arguments)]
 fn get_table_local_constraints_for_branch(
     exprs: &[ast::Expr],
     from_outer_join: Option<TableInternalId>,
@@ -928,12 +929,12 @@ pub fn consider_multi_index_union(
     None
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Analyze top-level AND terms for AND-by-intersection optimization.
 ///
 /// This is more restrictive than OR-by-union because every branch must be a
 /// local term on the current table, and the final plan only survives if it
 /// beats the best ordinary access path.
+#[expect(clippy::too_many_arguments)]
 pub fn consider_multi_index_intersection(
     rhs_table: &JoinedTable,
     where_clause: &[WhereTerm],

@@ -1435,6 +1435,7 @@ pub struct MultiIndexBranch {
 
 /// Access shape for a single multi-index branch.
 #[derive(Debug, Clone)]
+#[expect(clippy::large_enum_variant)]
 pub enum MultiIndexBranchAccess {
     /// Ordinary seek/range scan on either the rowid btree or a secondary index.
     Seek { seek_def: SeekDef },
