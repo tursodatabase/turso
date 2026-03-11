@@ -1523,3 +1523,57 @@ expect {
     2|1|1|
     3|3|3|
 }
+
+@cross-check-integrity
+test left-hash-join-on-left-in-list-preserves-unmatched-rows {
+    CREATE TABLE l(id INTEGER PRIMARY KEY, x INTEGER);
+    CREATE TABLE r(id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO l VALUES (1, 10), (2, 20), (3, 30), (4, NULL);
+    INSERT INTO r VALUES (1, 10), (2, 20), (3, 40);
+    SELECT l.id, ifnull(r.id, -1)
+    FROM l
+    LEFT JOIN r ON l.x = r.x AND l.x IN (10)
+    ORDER BY 1, 2;
+}
+expect {
+    1|1
+    2|-1
+    3|-1
+    4|-1
+}
+
+@cross-check-integrity
+test left-hash-join-on-left-equality-preserves-unmatched-rows {
+    CREATE TABLE l(id INTEGER PRIMARY KEY, x INTEGER);
+    CREATE TABLE r(id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO l VALUES (1, 10), (2, 20), (3, 30), (4, NULL);
+    INSERT INTO r VALUES (1, 10), (2, 20), (3, 40);
+    SELECT l.id, ifnull(r.id, -1)
+    FROM l
+    LEFT JOIN r ON l.x = r.x AND l.x = 10
+    ORDER BY 1, 2;
+}
+expect {
+    1|1
+    2|-1
+    3|-1
+    4|-1
+}
+
+@cross-check-integrity
+test left-hash-join-on-left-not-in-list-preserves-unmatched-rows {
+    CREATE TABLE l(id INTEGER PRIMARY KEY, x INTEGER);
+    CREATE TABLE r(id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO l VALUES (1, 10), (2, 20), (3, 30), (4, NULL);
+    INSERT INTO r VALUES (1, 10), (2, 20), (3, 40);
+    SELECT l.id, ifnull(r.id, -1)
+    FROM l
+    LEFT JOIN r ON l.x = r.x AND l.x NOT IN (10, NULL)
+    ORDER BY 1, 2;
+}
+expect {
+    1|-1
+    2|-1
+    3|-1
+    4|-1
+}
