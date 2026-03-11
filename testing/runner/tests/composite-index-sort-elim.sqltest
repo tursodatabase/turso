@@ -305,6 +305,168 @@ expect {
     2|2024-01-15|Widget|5
 }
 
+setup join_outer_const_schema {
+    CREATE TABLE lhs_orders (
+        id INTEGER PRIMARY KEY,
+        customer_id INTEGER NOT NULL
+    );
+    CREATE INDEX idx_lhs_customer ON lhs_orders(customer_id);
+
+    CREATE TABLE rhs_items (
+        id INTEGER PRIMARY KEY,
+        order_id INTEGER NOT NULL,
+        product TEXT NOT NULL,
+        qty INTEGER NOT NULL
+    );
+    CREATE INDEX idx_rhs_product_qty ON rhs_items(product, qty);
+
+    INSERT INTO lhs_orders VALUES (6, 300);
+    INSERT INTO lhs_orders VALUES (7, 300);
+
+    INSERT INTO rhs_items VALUES (8, 6, 'x', 2);
+    INSERT INTO rhs_items VALUES (9, 6, 'x', 1);
+    INSERT INTO rhs_items VALUES (10, 6, 'y', 9);
+}
+
+# LEFT JOIN ON-clause constants are not query-global constants:
+# unmatched rows still produce NULLs on the right-hand side.
+# Skipping the constant prefix would incorrectly emit matched rows before
+# the NULL-extended row for the same outer ordering key.
+@setup join_outer_const_schema
+test join-left-on-constant-is-not-global-order {
+    SELECT o.customer_id, o.id, i.product, i.qty
+    FROM lhs_orders o
+    LEFT JOIN rhs_items i
+        ON i.order_id = o.id
+       AND i.product = 'x'
+    WHERE o.customer_id = 300
+    ORDER BY o.customer_id, i.product, i.qty;
+}
+expect {
+    300|7||
+    300|6|x|1
+    300|6|x|2
+}
+
+# Ordering by only outer-table columns must still work across a LEFT JOIN.
+@setup join_outer_const_schema
+test join-left-order-outer-only {
+    SELECT o.customer_id, o.id, i.product, i.qty
+    FROM lhs_orders o
+    LEFT JOIN rhs_items i
+        ON i.order_id = o.id
+       AND i.product = 'x'
+    WHERE o.customer_id = 300
+    ORDER BY o.customer_id, o.id, i.qty;
+}
+expect {
+    300|6|x|1
+    300|6|x|2
+    300|7||
+}
+
+setup expr_sort_elim {
+    CREATE TABLE expr_articles (
+        id INTEGER PRIMARY KEY,
+        status TEXT NOT NULL,
+        title TEXT NOT NULL,
+        score INTEGER NOT NULL
+    );
+    CREATE INDEX idx_expr_articles ON expr_articles(status, lower(title), score DESC);
+
+    INSERT INTO expr_articles VALUES (1, 'active',   'Beta',  7);
+    INSERT INTO expr_articles VALUES (2, 'active',   'alpha', 3);
+    INSERT INTO expr_articles VALUES (3, 'active',   'ALPHA', 9);
+    INSERT INTO expr_articles VALUES (4, 'active',   'gamma', 1);
+    INSERT INTO expr_articles VALUES (5, 'inactive', 'alpha', 8);
+    INSERT INTO expr_articles VALUES (6, 'active',   'beta',  2);
+}
+
+# Eq prefix on a composite expression index, ORDER BY the indexed expression and suffix.
+@setup expr_sort_elim
+test expr-index-eq-prefix-order-suffix {
+    SELECT id, lower(title), score
+    FROM expr_articles
+    WHERE status = 'active'
+    ORDER BY lower(title), score DESC;
+}
+expect {
+    3|alpha|9
+    2|alpha|3
+    1|beta|7
+    6|beta|2
+    4|gamma|1
+}
+
+# Equality on the expression-index prefix should allow ordering by the trailing column.
+@setup expr_sort_elim
+test expr-index-two-eq-order-last {
+    SELECT id, score
+    FROM expr_articles
+    WHERE status = 'active' AND lower(title) = 'alpha'
+    ORDER BY score DESC;
+}
+expect {
+    3|9
+    2|3
+}
+
+# GROUP BY should also work with the same expression-index prefix skip.
+@setup expr_sort_elim
+test expr-index-group-by-eq-prefix {
+    SELECT lower(title), COUNT(*), MAX(score)
+    FROM expr_articles
+    WHERE status = 'active'
+    GROUP BY lower(title)
+    ORDER BY lower(title);
+}
+expect {
+    alpha|2|9
+    beta|2|7
+    gamma|1|1
+}
+
+setup expr_outer_join_sort_elim {
+    CREATE TABLE lhs_groups (
+        id INTEGER PRIMARY KEY,
+        grp INTEGER NOT NULL
+    );
+
+    CREATE TABLE rhs_names (
+        id INTEGER PRIMARY KEY,
+        lhs_id INTEGER NOT NULL,
+        tag TEXT NOT NULL,
+        name TEXT NOT NULL,
+        score INTEGER NOT NULL
+    );
+    CREATE INDEX idx_rhs_names ON rhs_names(tag, lower(name), score DESC);
+
+    INSERT INTO lhs_groups VALUES (1, 1);
+    INSERT INTO lhs_groups VALUES (2, 1);
+
+    INSERT INTO rhs_names VALUES (1, 1, 'keep', 'Alice', 9);
+    INSERT INTO rhs_names VALUES (2, 1, 'keep', 'alice', 3);
+    INSERT INTO rhs_names VALUES (3, 1, 'skip', 'Bob', 8);
+}
+
+# Expression-index ordering on the RHS of a LEFT JOIN is not globally valid:
+# NULL-extended rows still need to sort ahead of the matched expression values.
+@setup expr_outer_join_sort_elim
+test join-left-expr-index-is-not-global-order {
+    SELECT l.id, lower(r.name), r.score
+    FROM lhs_groups l
+    LEFT JOIN rhs_names r
+        ON r.lhs_id = l.id
+       AND r.tag = 'keep'
+    WHERE l.grp = 1
+    ORDER BY lower(r.name), r.score DESC;
+}
+expect {
+    2||
+    1|alice|9
+    1|alice|3
+}
+
 # =============================================================================
 # Two-table join with separate composite indexes and eq-skip on both
 # =============================================================================

@@ -192,6 +192,21 @@ pub fn plan_satisfies_order_target(
         let access_method = &access_methods_arena[*access_method_index];
         let table_ref = &joined_tables[*table_index];
 
+        // Outer joins can emit an extra row with NULLs on the right-hand side
+        // when no match is found. Because that row is produced after the scan or
+        // seek, we cannot rely on the right-hand table's access order to satisfy
+        // ORDER BY / GROUP BY terms that reference that table.
+        if table_ref
+            .join_info
+            .as_ref()
+            .is_some_and(|join_info| join_info.is_outer())
+            && order_target.0[target_col_idx..]
+                .iter()
+                .any(|target_col| target_col.table_id == table_ref.internal_id)
+        {
+            return false;
+        }
+
         // Check if this table has an access method that provides the right ordering.
         let consumed = match &access_method.params {
             AccessMethodParams::BTreeTable {
