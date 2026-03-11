@@ -268,6 +268,20 @@ expect {
     {}
 }
 
+test jsonb-group-array-empty {
+    SELECT json(jsonb_group_array(name)) FROM products WHERE 1=0;
+}
+expect {
+    []
+}
+
+test jsonb-group-object-empty {
+    SELECT json(jsonb_group_object('k', name)) FROM products WHERE 1=0;
+}
+expect {
+    {}
+}
+
 test select-distinct-agg-functions {
     SELECT sum(distinct age), count(distinct age), avg(distinct age) FROM users;
 }
