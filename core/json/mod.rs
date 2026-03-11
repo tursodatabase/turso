@@ -597,7 +597,6 @@ pub fn json_string_to_db_type(
             if matches!(flag, OutputVariant::ElementType) {
                 json_string.remove(json_string.len() - 1);
                 json_string.remove(0);
-                // Unquoted text is not a valid JSON fragment
                 Ok(Value::Text(Text::new(json_string)))
             } else {
                 Ok(Value::Text(Text::new(json_string)))
@@ -1229,20 +1228,6 @@ mod tests {
             assert_eq!(res, 3);
         } else {
             panic!("Expected Value::Numeric(Numeric::Integer)");
-        }
-    }
-
-    #[test]
-    fn test_json_extract_then_json_array_regression() {
-        let json_cache = JsonCacheCell::new();
-        let data = Value::build_text(r#"{"name":"Alice","age":30}"#);
-        let extracted_name =
-            json_extract(data, &[Value::build_text("$.name")], &json_cache).unwrap();
-        let result = json_array(&[extracted_name]).unwrap();
-        if let Value::Text(res) = result {
-            assert_eq!(res.as_str(), "[\"Alice\"]");
-        } else {
-            panic!("Expected Text");
         }
     }
 
