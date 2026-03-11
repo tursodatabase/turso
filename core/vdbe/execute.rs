@@ -24,6 +24,7 @@ use crate::util::{
     escape_sql_string_literal, normalize_ident, rename_identifiers, rewrite_check_expr_table_refs,
     rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
     rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
+    rewrite_trigger_cmd_column_refs, rewrite_trigger_cmd_table_refs,
     rewrite_view_sql_for_column_rename, trim_ascii_whitespace, RewrittenView,
 };
 use crate::vdbe::affinity::{
@@ -7695,6 +7696,66 @@ pub fn op_function(
                                     Some(new_stmt.to_string())
                                 }
                             }
+                            ast::Stmt::CreateTrigger {
+                                temporary,
+                                if_not_exists,
+                                trigger_name,
+                                time,
+                                event,
+                                tbl_name: trigger_tbl_name,
+                                for_each_row,
+                                mut when_clause,
+                                mut commands,
+                            } => {
+                                let trigger_tbl =
+                                    normalize_ident(trigger_tbl_name.name.as_str());
+
+                                // Rewrite ON table name if it matches the renamed table
+                                let new_trigger_tbl_name = if trigger_tbl == rename_from {
+                                    ast::QualifiedName {
+                                        db_name: trigger_tbl_name.db_name,
+                                        name: ast::Name::exact(
+                                            original_rename_to.to_string(),
+                                        ),
+                                        alias: None,
+                                    }
+                                } else {
+                                    trigger_tbl_name
+                                };
+
+                                // Rewrite WHEN clause qualified refs
+                                if let Some(ref mut when) = when_clause {
+                                    rewrite_check_expr_table_refs(
+                                        when,
+                                        &rename_from,
+                                        original_rename_to.as_str(),
+                                    );
+                                }
+
+                                // Rewrite table references in trigger body commands
+                                for cmd in &mut commands {
+                                    rewrite_trigger_cmd_table_refs(
+                                        cmd,
+                                        &rename_from,
+                                        original_rename_to.as_str(),
+                                    );
+                                }
+
+                                Some(
+                                    ast::Stmt::CreateTrigger {
+                                        temporary,
+                                        if_not_exists,
+                                        trigger_name,
+                                        time,
+                                        event,
+                                        tbl_name: new_trigger_tbl_name,
+                                        for_each_row,
+                                        when_clause,
+                                        commands,
+                                    }
+                                    .to_string(),
+                                )
+                            }
                             _ => None,
                         }
                     };
@@ -7972,6 +8033,68 @@ pub fn op_function(
                                         },
                                         temporary,
                                         if_not_exists,
+                                    }
+                                    .to_string(),
+                                )
+                            }
+                            ast::Stmt::CreateTrigger {
+                                temporary,
+                                if_not_exists,
+                                trigger_name,
+                                time,
+                                mut event,
+                                tbl_name: trigger_tbl_name,
+                                for_each_row,
+                                mut when_clause,
+                                mut commands,
+                            } => {
+                                let trigger_tbl =
+                                    normalize_ident(trigger_tbl_name.name.as_str());
+
+                                // Rewrite UPDATE OF column list if trigger is on the target table
+                                if trigger_tbl == table {
+                                    if let ast::TriggerEvent::UpdateOf(ref mut cols) = event {
+                                        for col in cols {
+                                            if normalize_ident(col.as_str()) == rename_from {
+                                                *col = ast::Name::exact(
+                                                    column_def.col_name.as_str().to_owned(),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Rewrite WHEN clause column refs
+                                if let Some(ref mut when) = when_clause {
+                                    rename_identifiers(
+                                        when,
+                                        &rename_from,
+                                        column_def.col_name.as_str(),
+                                    );
+                                }
+
+                                // Rewrite column references in trigger body commands
+                                for cmd in &mut commands {
+                                    rewrite_trigger_cmd_column_refs(
+                                        cmd,
+                                        &table,
+                                        &trigger_tbl,
+                                        &rename_from,
+                                        column_def.col_name.as_str(),
+                                    );
+                                }
+
+                                Some(
+                                    ast::Stmt::CreateTrigger {
+                                        temporary,
+                                        if_not_exists,
+                                        trigger_name,
+                                        time,
+                                        event,
+                                        tbl_name: trigger_tbl_name,
+                                        for_each_row,
+                                        when_clause,
+                                        commands,
                                     }
                                     .to_string(),
                                 )
@@ -11456,6 +11579,38 @@ pub fn op_rename_table(
             }
         }
 
+        // Update triggers: move from old table name key to new, and update
+        // each trigger's table_name field and body commands.
+        if let Some(mut triggers) = schema.triggers.remove(&normalized_from) {
+            for trigger_arc in &mut triggers {
+                let trigger = Arc::make_mut(trigger_arc);
+                normalized_to.clone_into(&mut trigger.table_name);
+                // Rewrite table references in trigger body commands
+                for cmd in &mut trigger.commands {
+                    rewrite_trigger_cmd_table_refs(cmd, &normalized_from, &normalized_to);
+                }
+                // Rewrite WHEN clause qualified refs
+                if let Some(ref mut when) = trigger.when_clause {
+                    rewrite_check_expr_table_refs(when, &normalized_from, &normalized_to);
+                }
+            }
+            schema.triggers.insert(normalized_to.to_owned(), triggers);
+        }
+
+        // Also update triggers on OTHER tables that reference the renamed table
+        // in their body commands (e.g., INSERT INTO old_name in a trigger on another table)
+        for (_, triggers) in schema.triggers.iter_mut() {
+            for trigger_arc in triggers.iter_mut() {
+                let trigger = Arc::make_mut(trigger_arc);
+                for cmd in &mut trigger.commands {
+                    rewrite_trigger_cmd_table_refs(cmd, &normalized_from, &normalized_to);
+                }
+                if let Some(ref mut when) = trigger.when_clause {
+                    rewrite_check_expr_table_refs(when, &normalized_from, &normalized_to);
+                }
+            }
+        }
+
         Ok(())
     })?;
 
@@ -11786,6 +11941,45 @@ pub fn op_alter_column(
     });
 
     if *rename {
+        let old_col = old_column_name.clone();
+        let new_col = new_name;
+        let tbl_name = normalized_table_name.clone();
+        // Update in-memory trigger objects for the renamed column
+        conn.with_database_schema_mut(*db, move |schema| {
+            for (_, triggers) in schema.triggers.iter_mut() {
+                for trigger_arc in triggers.iter_mut() {
+                    let trigger_tbl = normalize_ident(&trigger_arc.table_name);
+                    let trigger = Arc::make_mut(trigger_arc);
+                    // Rewrite WHEN clause
+                    if let Some(ref mut when) = trigger.when_clause {
+                        rename_identifiers(when, &old_col, &new_col);
+                    }
+                    // Rewrite UPDATE OF columns if trigger is on the renamed table
+                    if trigger_tbl == tbl_name {
+                        if let ast::TriggerEvent::UpdateOf(ref mut cols) = trigger.event {
+                            for col in cols {
+                                if normalize_ident(col.as_str())
+                                    == normalize_ident(&old_col)
+                                {
+                                    *col = ast::Name::exact(new_col.clone());
+                                }
+                            }
+                        }
+                    }
+                    // Rewrite trigger body commands
+                    for cmd in &mut trigger.commands {
+                        rewrite_trigger_cmd_column_refs(
+                            cmd,
+                            &tbl_name,
+                            &trigger_tbl,
+                            &old_col,
+                            &new_col,
+                        );
+                    }
+                }
+            }
+        });
+
         let rewrites = view_rewrites;
         conn.with_database_schema_mut(*db, move |schema| -> crate::Result<()> {
             for (view_name, rewritten) in rewrites {

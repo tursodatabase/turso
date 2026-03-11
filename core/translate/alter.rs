@@ -1290,50 +1290,6 @@ pub fn translate_alter_table(
                 for trigger in &all_triggers {
                     let trigger_table_name_norm = normalize_ident(&trigger.table_name);
 
-                    // SQLite fails RENAME COLUMN if a trigger's WHEN clause references the column
-                    // or if trigger commands contain qualified references to the trigger table (e.g., t.x)
-                    if trigger_table_name_norm == target_table_name_norm {
-                        let column_name_norm = normalize_ident(from);
-                        let trigger_table = resolver
-                            .with_schema(database_id, |s| {
-                                s.get_btree_table(&trigger_table_name_norm)
-                            })
-                            .ok_or_else(|| {
-                                LimboError::ParseError(format!(
-                                    "trigger table not found: {trigger_table_name_norm}"
-                                ))
-                            })?;
-
-                        // Check WHEN clause
-                        if let Some(ref when_expr) = trigger.when_clause {
-                            if expr_references_trigger_column(
-                                when_expr,
-                                &trigger_table,
-                                &trigger_table_name_norm,
-                                &column_name_norm,
-                            )? {
-                                return Err(LimboError::ParseError(format!(
-                                    "error in trigger {}: no such column: {}",
-                                    trigger.name, from
-                                )));
-                            }
-                        }
-
-                        // Check trigger commands for qualified references to trigger table (e.g., t.x)
-                        // SQLite fails RENAME COLUMN if triggers contain qualified references like t.x
-                        if check_trigger_has_qualified_ref_to_column(
-                            trigger,
-                            &trigger_table,
-                            &trigger_table_name_norm,
-                            &column_name_norm,
-                        )? {
-                            return Err(LimboError::ParseError(format!(
-                                "error in trigger {}: no such column: {}",
-                                trigger.name, from
-                            )));
-                        }
-                    }
-
                     // Check if trigger references the column being renamed
                     // This includes:
                     // 1. References from the trigger's owning table (NEW.x, OLD.x, unqualified x)
@@ -1697,240 +1653,6 @@ Here are some helpers related to that: */
 /// Check if a trigger contains qualified references to a specific column in its owning table.
 /// This is used to detect cases like `t.x` in a trigger on table `t`, which SQLite fails on RENAME COLUMN.
 /// Only checks for qualified table references (e.g., t.x), not NEW.x, OLD.x, or unqualified x.
-fn check_trigger_has_qualified_ref_to_column(
-    trigger: &crate::schema::Trigger,
-    trigger_table: &crate::schema::BTreeTable,
-    trigger_table_name_norm: &str,
-    column_name_norm: &str,
-) -> Result<bool> {
-    use crate::translate::expr::walk_expr;
-    use std::cell::Cell;
-
-    let found = Cell::new(false);
-
-    // Helper callback to check for qualified references to trigger table
-    let mut check_qualified_ref = |e: &ast::Expr| -> Result<crate::translate::expr::WalkControl> {
-        if let ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) = e {
-            let ns_norm = normalize_ident(ns.as_str());
-            let col_norm = normalize_ident(col.as_str());
-            // Only check for qualified refs to trigger table (not NEW/OLD)
-            if !ns_norm.eq_ignore_ascii_case("new")
-                && !ns_norm.eq_ignore_ascii_case("old")
-                && ns_norm == trigger_table_name_norm
-                && col_norm == column_name_norm
-                && trigger_table.get_column(&col_norm).is_some()
-            {
-                found.set(true);
-                return Ok(crate::translate::expr::WalkControl::SkipChildren);
-            }
-        }
-        Ok(crate::translate::expr::WalkControl::Continue)
-    };
-
-    for cmd in &trigger.commands {
-        match cmd {
-            ast::TriggerCmd::Update {
-                sets, where_clause, ..
-            } => {
-                for set in sets {
-                    walk_expr(&set.expr, &mut check_qualified_ref)?;
-                    if found.get() {
-                        return Ok(true);
-                    }
-                }
-                if let Some(ref where_expr) = where_clause {
-                    walk_expr(where_expr, &mut check_qualified_ref)?;
-                    if found.get() {
-                        return Ok(true);
-                    }
-                }
-            }
-            ast::TriggerCmd::Insert { select, .. } | ast::TriggerCmd::Select(select) => {
-                // Walk through all expressions in SELECT checking for qualified refs
-                if let Some(ref with_clause) = select.with {
-                    for cte in &with_clause.ctes {
-                        if walk_one_select_expressions_for_qualified_ref(
-                            &cte.select.body.select,
-                            &mut check_qualified_ref,
-                        )? {
-                            return Ok(true);
-                        }
-                    }
-                }
-                if walk_one_select_expressions_for_qualified_ref(
-                    &select.body.select,
-                    &mut check_qualified_ref,
-                )? {
-                    return Ok(true);
-                }
-                for compound in &select.body.compounds {
-                    if walk_one_select_expressions_for_qualified_ref(
-                        &compound.select,
-                        &mut check_qualified_ref,
-                    )? {
-                        return Ok(true);
-                    }
-                }
-                for sorted_col in &select.order_by {
-                    walk_expr(&sorted_col.expr, &mut check_qualified_ref)?;
-                    if found.get() {
-                        return Ok(true);
-                    }
-                }
-                if let Some(ref limit) = select.limit {
-                    walk_expr(&limit.expr, &mut check_qualified_ref)?;
-                    if found.get() {
-                        return Ok(true);
-                    }
-                    if let Some(ref offset) = limit.offset {
-                        walk_expr(offset, &mut check_qualified_ref)?;
-                        if found.get() {
-                            return Ok(true);
-                        }
-                    }
-                }
-            }
-            ast::TriggerCmd::Delete { where_clause, .. } => {
-                if let Some(ref where_expr) = where_clause {
-                    walk_expr(where_expr, &mut check_qualified_ref)?;
-                    if found.get() {
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(false)
-}
-
-/// Helper to walk OneSelect expressions checking for qualified references
-/// Uses a callback that can mutate the found flag through a closure
-fn walk_one_select_expressions_for_qualified_ref<F>(
-    one_select: &ast::OneSelect,
-    check_fn: &mut F,
-) -> Result<bool>
-where
-    F: FnMut(&ast::Expr) -> Result<crate::translate::expr::WalkControl>,
-{
-    use crate::translate::expr::walk_expr;
-
-    match one_select {
-        ast::OneSelect::Select {
-            columns,
-            from,
-            where_clause,
-            group_by,
-            window_clause,
-            ..
-        } => {
-            for col in columns {
-                if let ast::ResultColumn::Expr(expr, _) = col {
-                    if matches!(
-                        walk_expr(expr, check_fn)?,
-                        crate::translate::expr::WalkControl::SkipChildren
-                    ) {
-                        return Ok(true);
-                    }
-                }
-            }
-            if let Some(ref from_clause) = from {
-                // Walk FROM clause expressions manually using walk_expr
-                match from_clause.select.as_ref() {
-                    ast::SelectTable::Select(select, _) => {
-                        // Recursively check the subquery
-                        if walk_one_select_expressions_for_qualified_ref(
-                            &select.body.select,
-                            check_fn,
-                        )? {
-                            return Ok(true);
-                        }
-                    }
-                    ast::SelectTable::TableCall(_, args, _) => {
-                        for arg in args {
-                            if matches!(
-                                walk_expr(arg, check_fn)?,
-                                crate::translate::expr::WalkControl::SkipChildren
-                            ) {
-                                return Ok(true);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                for join in &from_clause.joins {
-                    if let Some(ast::JoinConstraint::On(ref expr)) = join.constraint {
-                        let skip_children = matches!(
-                            walk_expr(expr, check_fn)?,
-                            crate::translate::expr::WalkControl::SkipChildren
-                        );
-                        if skip_children {
-                            return Ok(true);
-                        }
-                    }
-                }
-            }
-            if let Some(ref where_expr) = where_clause {
-                if matches!(
-                    walk_expr(where_expr, check_fn)?,
-                    crate::translate::expr::WalkControl::SkipChildren
-                ) {
-                    return Ok(true);
-                }
-            }
-            if let Some(ref group_by) = group_by {
-                for expr in &group_by.exprs {
-                    if matches!(
-                        walk_expr(expr, check_fn)?,
-                        crate::translate::expr::WalkControl::SkipChildren
-                    ) {
-                        return Ok(true);
-                    }
-                }
-                if let Some(ref having_expr) = group_by.having {
-                    if matches!(
-                        walk_expr(having_expr, check_fn)?,
-                        crate::translate::expr::WalkControl::SkipChildren
-                    ) {
-                        return Ok(true);
-                    }
-                }
-            }
-            for window_def in window_clause {
-                for expr in &window_def.window.partition_by {
-                    if matches!(
-                        walk_expr(expr, check_fn)?,
-                        crate::translate::expr::WalkControl::SkipChildren
-                    ) {
-                        return Ok(true);
-                    }
-                }
-                for sorted_col in &window_def.window.order_by {
-                    if matches!(
-                        walk_expr(&sorted_col.expr, check_fn)?,
-                        crate::translate::expr::WalkControl::SkipChildren
-                    ) {
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-        ast::OneSelect::Values(values) => {
-            for row in values {
-                for expr in row {
-                    if matches!(
-                        walk_expr(expr, check_fn)?,
-                        crate::translate::expr::WalkControl::SkipChildren
-                    ) {
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-    }
-    Ok(false)
-}
-
 /// Check if an expression references a specific column from a trigger's owning table.
 /// Checks for NEW.column, OLD.column, unqualified column references, and qualified
 /// references to the trigger table (e.g., t.x in a trigger on table t).
@@ -2582,9 +2304,22 @@ fn rewrite_trigger_sql_for_column_rename(
         event
     };
 
-    // Note: SQLite fails RENAME COLUMN if a trigger's WHEN clause references the column.
-    // We check for this earlier and fail the operation immediately, matching SQLite.
-    // If we reach here, the WHEN clause doesn't reference the column, so we keep it unchanged.
+    // Rewrite WHEN clause column references if present
+    let new_when_clause = when_clause
+        .map(|e| {
+            rewrite_expr_for_column_rename(
+                &e,
+                &trigger_table,
+                trigger_table_name_raw,
+                &target_table_name,
+                &old_col_norm,
+                &new_col_norm,
+                None,
+                resolver,
+            )
+            .map(Box::new)
+        })
+        .transpose()?;
 
     let mut new_commands = Vec::new();
     for cmd in commands {
@@ -2611,7 +2346,7 @@ fn rewrite_trigger_sql_for_column_rename(
         &new_event,
         &tbl_name,
         for_each_row,
-        when_clause.as_deref(),
+        new_when_clause.as_deref(),
         &new_commands,
     );
 

@@ -3154,6 +3154,371 @@ pub fn rewrite_inline_col_fk_target_if_needed(
     changed
 }
 
+/// Rewrite table name references inside a trigger's body commands for ALTER TABLE RENAME.
+/// Updates tbl_name fields in INSERT/UPDATE/DELETE commands and table references
+/// in FROM clauses and qualified expressions throughout the trigger body.
+pub fn rewrite_trigger_cmd_table_refs(cmd: &mut ast::TriggerCmd, old_tbl: &str, new_tbl: &str) {
+    let old_normalized = normalize_ident(old_tbl);
+    match cmd {
+        ast::TriggerCmd::Update {
+            tbl_name,
+            sets,
+            from,
+            where_clause,
+            ..
+        } => {
+            if normalize_ident(tbl_name.as_str()) == old_normalized {
+                *tbl_name = ast::Name::exact(new_tbl.to_owned());
+            }
+            for set in sets {
+                rewrite_check_expr_table_refs(&mut set.expr, old_tbl, new_tbl);
+            }
+            if let Some(ref mut from) = from {
+                rewrite_from_clause_table_refs(from, old_tbl, new_tbl);
+            }
+            if let Some(ref mut wc) = where_clause {
+                rewrite_check_expr_table_refs(wc, old_tbl, new_tbl);
+            }
+        }
+        ast::TriggerCmd::Insert {
+            tbl_name,
+            select,
+            upsert,
+            ..
+        } => {
+            if normalize_ident(tbl_name.as_str()) == old_normalized {
+                *tbl_name = ast::Name::exact(new_tbl.to_owned());
+            }
+            rewrite_select_table_refs(select, old_tbl, new_tbl);
+            if let Some(ref mut upsert) = upsert {
+                rewrite_upsert_table_refs(upsert, old_tbl, new_tbl);
+            }
+        }
+        ast::TriggerCmd::Delete {
+            tbl_name,
+            where_clause,
+        } => {
+            if normalize_ident(tbl_name.as_str()) == old_normalized {
+                *tbl_name = ast::Name::exact(new_tbl.to_owned());
+            }
+            if let Some(ref mut wc) = where_clause {
+                rewrite_check_expr_table_refs(wc, old_tbl, new_tbl);
+            }
+        }
+        ast::TriggerCmd::Select(select) => {
+            rewrite_select_table_refs(select, old_tbl, new_tbl);
+        }
+    }
+}
+
+/// Rewrite column references inside a trigger's body commands for ALTER TABLE RENAME COLUMN.
+/// Updates column names in expressions, INSERT column lists, UPDATE SET targets,
+/// and qualified NEW/OLD references.
+pub fn rewrite_trigger_cmd_column_refs(
+    cmd: &mut ast::TriggerCmd,
+    table: &str,
+    trigger_table: &str,
+    old_col: &str,
+    new_col: &str,
+) {
+    let table_normalized = normalize_ident(table);
+    let trigger_table_normalized = normalize_ident(trigger_table);
+    match cmd {
+        ast::TriggerCmd::Update {
+            tbl_name,
+            sets,
+            from,
+            where_clause,
+            ..
+        } => {
+            let targets_table = normalize_ident(tbl_name.as_str()) == table_normalized
+                || normalize_ident(tbl_name.as_str()) == trigger_table_normalized;
+            if targets_table {
+                for set in sets {
+                    for col_name in &mut set.col_names {
+                        if normalize_ident(col_name.as_str()) == normalize_ident(old_col) {
+                            *col_name = ast::Name::exact(new_col.to_owned());
+                        }
+                    }
+                    rename_identifiers(&mut set.expr, old_col, new_col);
+                }
+                if let Some(ref mut wc) = where_clause {
+                    rename_identifiers(wc, old_col, new_col);
+                }
+            }
+            if let Some(ref mut from) = from {
+                rewrite_from_clause_column_refs(from, old_col, new_col);
+            }
+        }
+        ast::TriggerCmd::Insert {
+            tbl_name,
+            col_names,
+            select,
+            upsert,
+            ..
+        } => {
+            let targets_table = normalize_ident(tbl_name.as_str()) == table_normalized
+                || normalize_ident(tbl_name.as_str()) == trigger_table_normalized;
+            if targets_table {
+                for col_name in col_names {
+                    if normalize_ident(col_name.as_str()) == normalize_ident(old_col) {
+                        *col_name = ast::Name::exact(new_col.to_owned());
+                    }
+                }
+            }
+            rewrite_select_column_refs(select, old_col, new_col);
+            if let Some(ref mut upsert) = upsert {
+                rewrite_upsert_column_refs(upsert, old_col, new_col);
+            }
+        }
+        ast::TriggerCmd::Delete {
+            tbl_name,
+            where_clause,
+        } => {
+            let targets_table = normalize_ident(tbl_name.as_str()) == table_normalized
+                || normalize_ident(tbl_name.as_str()) == trigger_table_normalized;
+            if targets_table {
+                if let Some(ref mut wc) = where_clause {
+                    rename_identifiers(wc, old_col, new_col);
+                }
+            }
+        }
+        ast::TriggerCmd::Select(select) => {
+            rewrite_select_column_refs(select, old_col, new_col);
+        }
+    }
+}
+
+fn rewrite_select_table_refs(select: &mut ast::Select, old_tbl: &str, new_tbl: &str) {
+    rewrite_one_select_table_refs(&mut select.body.select, old_tbl, new_tbl);
+    for compound in &mut select.body.compounds {
+        rewrite_one_select_table_refs(&mut compound.select, old_tbl, new_tbl);
+    }
+    for col in &mut select.order_by {
+        rewrite_check_expr_table_refs(&mut col.expr, old_tbl, new_tbl);
+    }
+}
+
+fn rewrite_one_select_table_refs(one: &mut ast::OneSelect, old_tbl: &str, new_tbl: &str) {
+    match one {
+        ast::OneSelect::Select {
+            from,
+            where_clause,
+            columns,
+            group_by,
+            ..
+        } => {
+            if let Some(ref mut from) = from {
+                rewrite_from_clause_table_refs(from, old_tbl, new_tbl);
+            }
+            if let Some(ref mut wc) = where_clause {
+                rewrite_check_expr_table_refs(wc, old_tbl, new_tbl);
+            }
+            for col in columns {
+                match col {
+                    ast::ResultColumn::Expr(ref mut expr, _) => {
+                        rewrite_check_expr_table_refs(expr, old_tbl, new_tbl);
+                    }
+                    ast::ResultColumn::TableStar(ref mut name) => {
+                        if normalize_ident(name.as_str()) == normalize_ident(old_tbl) {
+                            *name = ast::Name::exact(new_tbl.to_owned());
+                        }
+                    }
+                    ast::ResultColumn::Star => {}
+                }
+            }
+            if let Some(ref mut gb) = group_by {
+                for expr in &mut gb.exprs {
+                    rewrite_check_expr_table_refs(expr, old_tbl, new_tbl);
+                }
+                if let Some(ref mut having) = gb.having {
+                    rewrite_check_expr_table_refs(having, old_tbl, new_tbl);
+                }
+            }
+        }
+        ast::OneSelect::Values(rows) => {
+            for row in rows {
+                for expr in row {
+                    rewrite_check_expr_table_refs(expr, old_tbl, new_tbl);
+                }
+            }
+        }
+    }
+}
+
+fn rewrite_from_clause_table_refs(from: &mut ast::FromClause, old_tbl: &str, new_tbl: &str) {
+    rewrite_select_table_entry_table_refs(&mut from.select, old_tbl, new_tbl);
+    for join in &mut from.joins {
+        rewrite_select_table_entry_table_refs(&mut join.table, old_tbl, new_tbl);
+        if let Some(ast::JoinConstraint::On(ref mut expr)) = join.constraint {
+            rewrite_check_expr_table_refs(expr, old_tbl, new_tbl);
+        }
+    }
+}
+
+fn rewrite_select_table_entry_table_refs(
+    st: &mut ast::SelectTable,
+    old_tbl: &str,
+    new_tbl: &str,
+) {
+    let old_normalized = normalize_ident(old_tbl);
+    match st {
+        ast::SelectTable::Table(ref mut name, _, _) => {
+            if normalize_ident(name.name.as_str()) == old_normalized {
+                name.name = ast::Name::exact(new_tbl.to_owned());
+            }
+        }
+        ast::SelectTable::TableCall(ref mut name, ref mut args, _) => {
+            if normalize_ident(name.name.as_str()) == old_normalized {
+                name.name = ast::Name::exact(new_tbl.to_owned());
+            }
+            for arg in args {
+                rewrite_check_expr_table_refs(arg, old_tbl, new_tbl);
+            }
+        }
+        ast::SelectTable::Select(ref mut select, _) => {
+            rewrite_select_table_refs(select, old_tbl, new_tbl);
+        }
+        ast::SelectTable::Sub(ref mut from, _) => {
+            rewrite_from_clause_table_refs(from, old_tbl, new_tbl);
+        }
+    }
+}
+
+fn rewrite_upsert_table_refs(upsert: &mut ast::Upsert, old_tbl: &str, new_tbl: &str) {
+    if let Some(ref mut index) = upsert.index {
+        if let Some(ref mut wc) = index.where_clause {
+            rewrite_check_expr_table_refs(wc, old_tbl, new_tbl);
+        }
+    }
+    if let ast::UpsertDo::Set {
+        ref mut sets,
+        ref mut where_clause,
+    } = upsert.do_clause
+    {
+        for set in sets {
+            rewrite_check_expr_table_refs(&mut set.expr, old_tbl, new_tbl);
+        }
+        if let Some(ref mut wc) = where_clause {
+            rewrite_check_expr_table_refs(wc, old_tbl, new_tbl);
+        }
+    }
+    if let Some(ref mut next) = upsert.next {
+        rewrite_upsert_table_refs(next, old_tbl, new_tbl);
+    }
+}
+
+fn rewrite_select_column_refs(select: &mut ast::Select, old_col: &str, new_col: &str) {
+    rewrite_one_select_column_refs(&mut select.body.select, old_col, new_col);
+    for compound in &mut select.body.compounds {
+        rewrite_one_select_column_refs(&mut compound.select, old_col, new_col);
+    }
+    for col in &mut select.order_by {
+        rename_identifiers(&mut col.expr, old_col, new_col);
+    }
+}
+
+fn rewrite_one_select_column_refs(one: &mut ast::OneSelect, old_col: &str, new_col: &str) {
+    match one {
+        ast::OneSelect::Select {
+            from,
+            where_clause,
+            columns,
+            group_by,
+            ..
+        } => {
+            if let Some(ref mut from) = from {
+                rewrite_from_clause_column_refs(from, old_col, new_col);
+            }
+            if let Some(ref mut wc) = where_clause {
+                rename_identifiers(wc, old_col, new_col);
+            }
+            for col in columns {
+                if let ast::ResultColumn::Expr(ref mut expr, _) = col {
+                    rename_identifiers(expr, old_col, new_col);
+                }
+            }
+            if let Some(ref mut gb) = group_by {
+                for expr in &mut gb.exprs {
+                    rename_identifiers(expr, old_col, new_col);
+                }
+                if let Some(ref mut having) = gb.having {
+                    rename_identifiers(having, old_col, new_col);
+                }
+            }
+        }
+        ast::OneSelect::Values(rows) => {
+            for row in rows {
+                for expr in row {
+                    rename_identifiers(expr, old_col, new_col);
+                }
+            }
+        }
+    }
+}
+
+fn rewrite_from_clause_column_refs(from: &mut ast::FromClause, old_col: &str, new_col: &str) {
+    rewrite_select_table_entry_column_refs(&mut from.select, old_col, new_col);
+    for join in &mut from.joins {
+        rewrite_select_table_entry_column_refs(&mut join.table, old_col, new_col);
+        if let Some(ast::JoinConstraint::On(ref mut expr)) = join.constraint {
+            rename_identifiers(expr, old_col, new_col);
+        }
+    }
+}
+
+fn rewrite_select_table_entry_column_refs(
+    st: &mut ast::SelectTable,
+    old_col: &str,
+    new_col: &str,
+) {
+    match st {
+        ast::SelectTable::TableCall(_, ref mut args, _) => {
+            for arg in args {
+                rename_identifiers(arg, old_col, new_col);
+            }
+        }
+        ast::SelectTable::Select(ref mut select, _) => {
+            rewrite_select_column_refs(select, old_col, new_col);
+        }
+        ast::SelectTable::Sub(ref mut from, _) => {
+            rewrite_from_clause_column_refs(from, old_col, new_col);
+        }
+        ast::SelectTable::Table(..) => {}
+    }
+}
+
+fn rewrite_upsert_column_refs(upsert: &mut ast::Upsert, old_col: &str, new_col: &str) {
+    if let Some(ref mut index) = upsert.index {
+        for target in &mut index.targets {
+            rename_identifiers(&mut target.expr, old_col, new_col);
+        }
+        if let Some(ref mut wc) = index.where_clause {
+            rename_identifiers(wc, old_col, new_col);
+        }
+    }
+    if let ast::UpsertDo::Set {
+        ref mut sets,
+        ref mut where_clause,
+    } = upsert.do_clause
+    {
+        for set in sets {
+            for col_name in &mut set.col_names {
+                if normalize_ident(col_name.as_str()) == normalize_ident(old_col) {
+                    *col_name = ast::Name::exact(new_col.to_owned());
+                }
+            }
+            rename_identifiers(&mut set.expr, old_col, new_col);
+        }
+        if let Some(ref mut wc) = where_clause {
+            rename_identifiers(wc, old_col, new_col);
+        }
+    }
+    if let Some(ref mut next) = upsert.next {
+        rewrite_upsert_column_refs(next, old_col, new_col);
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
