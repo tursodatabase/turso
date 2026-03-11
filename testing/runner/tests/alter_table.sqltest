@@ -1213,3 +1213,165 @@ test alter-table-rename-column-trigger-insert-other-table {
 expect {
     1|2
 }
+
+test alter-table-rename-column-scoping-other-table {
+    DROP TABLE IF EXISTS t1;
+    DROP TABLE IF EXISTS t2;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE t1 (a, b);
+    CREATE TABLE t2 (a, b);
+    INSERT INTO t2 VALUES (1, 999);
+    CREATE TABLE log (v);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN
+        INSERT INTO log SELECT t2.b FROM t2 WHERE t2.a = new.a;
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO c;
+    INSERT INTO t1 VALUES (1, 0);
+    SELECT * FROM log;
+}
+expect {
+    999
+}
+
+test alter-table-rename-column-subquery {
+    DROP TABLE IF EXISTS t1;
+    DROP TABLE IF EXISTS t2;
+    CREATE TABLE t1 (a, b);
+    CREATE TABLE t2 (x, y);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN
+        INSERT INTO t2 VALUES (new.a, (SELECT b FROM t1 WHERE a = new.a));
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO c;
+    INSERT INTO t1 VALUES (1, 55);
+    SELECT * FROM t2;
+}
+expect {
+    1|55
+}
+
+test alter-table-rename-trigger-exists-subquery {
+    DROP TABLE IF EXISTS t1;
+    DROP TABLE IF EXISTS t2;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE t1 (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE t2 (x, y);
+    CREATE TABLE log (v);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN
+        INSERT INTO log SELECT b FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x = t1.a);
+    END;
+    INSERT INTO t2 VALUES (1, 0);
+    ALTER TABLE t1 RENAME COLUMN b TO c;
+    INSERT INTO t1 VALUES (1, 42);
+    SELECT * FROM log;
+}
+expect {
+    42
+}
+
+test alter-table-rename-then-rename-column-trigger {
+    DROP TABLE IF EXISTS t1;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE t1 (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE log (v);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN
+        INSERT INTO log VALUES (new.b + 100);
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO c;
+    INSERT INTO t1 VALUES (1, 77);
+    SELECT * FROM log;
+}
+expect {
+    177
+}
+
+test alter-table-rename-column-case-expr-trigger {
+    DROP TABLE IF EXISTS t1;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE t1 (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE log (v);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN
+        INSERT INTO log VALUES (CASE WHEN new.b > 10 THEN 'big' ELSE 'small' END);
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO c;
+    INSERT INTO t1 VALUES (1, 50);
+    INSERT INTO t1 VALUES (2, 5);
+    SELECT * FROM log ORDER BY rowid;
+}
+expect {
+    big
+    small
+}
+
+test alter-table-rename-column-union-trigger {
+    DROP TABLE IF EXISTS t1;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE t1 (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE log (v);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN
+        INSERT INTO log SELECT new.b UNION ALL SELECT new.b * 2;
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO c;
+    INSERT INTO t1 VALUES (1, 10);
+    SELECT * FROM log ORDER BY v;
+}
+expect {
+    10
+    20
+}
+
+test alter-table-rename-column-old-ref-trigger {
+    DROP TABLE IF EXISTS t1;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE t1 (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE log (old_val, new_val);
+    CREATE TRIGGER trig1 AFTER UPDATE ON t1 BEGIN
+        INSERT INTO log VALUES (old.b, new.b);
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO c;
+    INSERT INTO t1 VALUES (1, 10);
+    UPDATE t1 SET c = 20 WHERE a = 1;
+    SELECT * FROM log;
+}
+expect {
+    10|20
+}
+
+test alter-table-rename-column-multiple-triggers {
+    DROP TABLE IF EXISTS t1;
+    DROP TABLE IF EXISTS log1;
+    DROP TABLE IF EXISTS log2;
+    CREATE TABLE t1 (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE log1 (v);
+    CREATE TABLE log2 (v);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN
+        INSERT INTO log1 VALUES (new.b);
+    END;
+    CREATE TRIGGER trig2 AFTER INSERT ON t1 BEGIN
+        INSERT INTO log2 VALUES (new.b * 10);
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO c;
+    INSERT INTO t1 VALUES (1, 7);
+    SELECT * FROM log1;
+}
+expect {
+    7
+}
+
+test alter-table-rename-column-cross-table-insert {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE dst (x, y);
+    CREATE TABLE log (v);
+    INSERT INTO src VALUES (1, 500);
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT b FROM src WHERE a = new.x;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    INSERT INTO dst VALUES (1, 0);
+    SELECT * FROM log;
+}
+expect {
+    500
+}
