@@ -50,14 +50,14 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode                    p1   p2  p3  p4              p5  comment
-   0          Init               0  141   0                   0  Start at 141
-   1          OpenEphemeral      0    1   0                   0  cursor=0 is_table=true
-   2          OpenEphemeral      1    1   0                   0  cursor=1 is_table=true
-   3          OpenEphemeral      2    1   0                   0  cursor=2 is_table=true
+   0          Init               0  111   0                   0  Start at 111
+   1          OpenEphemeral      0    0   0                   0  cursor=0 is_table=false
+   2          OpenEphemeral      1    0   0                   0  cursor=1 is_table=false
+   3          OpenEphemeral      2    0   0                   0  cursor=2 is_table=false
    4          Null               0   19  20                   0  r[19..20]=NULL
    5          Integer            0   16   0                   0  r[16]=0; clear group by abort flag
    6          Null               0   17   0                   0  r[17]=NULL; initialize group by comparison registers to NULL
-   7          Gosub             25   45   0                   0  ; go to clear accumulator subroutine
+   7          Gosub             25   48   0                   0  ; go to clear accumulator subroutine
    8          OpenRead           3    5   0  k(5,B,B,B,B,B)   0  table=order_items, root=5, iDb=0
    9          OpenRead           4   11   0  k(2,B)           0  index=idx_order_items_product, root=11, iDb=0
   10          Rewind             4   30   0                   0  Rewind index idx_order_items_product
@@ -72,8 +72,8 @@ addr  opcode                    p1   p2  p3  p4              p5  comment
   19            Jump            20   24  20                   0  ; start new group if comparison is not equal
   20            Gosub           14   34   0                   0  ; check if ended group had data, and output if so
   21            Move            22   17   1                   0  r[17..17]=r[22..22]
-  22            IfPos           16   48   0                   0  r[16]>0 -> r[16]-=0, goto 48; check abort flag
-  23            Gosub           25   45   0                   0  ; goto clear accumulator subroutine
+  22            IfPos           16   51   0                   0  r[16]>0 -> r[16]-=0, goto 51; check abort flag
+  23            Gosub           25   48   0                   0  ; goto clear accumulator subroutine
   24            AggStep          0   23  19  sum              0  accum=r[19] step(r[23])
   25            AggStep          0   24  20  sum              0  accum=r[20] step(r[24])
   26            If              15   28   0                   0  if r[15] goto 28; don't emit group columns if continuing existing group
@@ -81,7 +81,7 @@ addr  opcode                    p1   p2  p3  p4              p5  comment
   28            Integer          1   15   0                   0  r[15]=1; indicate data in accumulator
   29          Next               4   11   0                   0
   30          Gosub             14   34   0                   0  ; emit row for final group
-  31          Goto               0   48   0                   0  ; group by finished
+  31          Goto               0   51   0                   0  ; group by finished
   32          Integer            1   16   0                   0  r[16]=1
   33        Return              14    0   0                   0
   34        IfPos               15   36   0                   0  r[15]>0 -> r[15]-=0, goto 36; output group by row subroutine start
@@ -91,105 +91,75 @@ addr  opcode                    p1   p2  p3  p4              p5  comment
   38      Copy                  18   11   0                   0  r[11]=r[18]
   39      Copy                  19   12   0                   0  r[12]=r[19]
   40      Copy                  20   13   0                   0  r[13]=r[20]
-  41      MakeRecord            11    3  28                   0  r[28]=mkrec(r[11..13]); for
-  42      NewRowid               2   29   0                   0  r[29]=rowid
-  43      Insert                 2   28  29                   4  intkey=r[29] data=r[28]
-  44    Return                  14    0   0                   0
-  45    Null                     0   18  20                   0  r[18..20]=NULL; clear accumulator subroutine start
-  46    Integer                  0   15   0                   0  r[15]=0
-  47  Return                    25    0   0                   0
-  48  Once                      58    0   0                   0  goto 58
-  49  OpenAutoindex              5    0   0                   0  cursor=5
-  50  Rewind                     2   51   0                   0  Rewind  ephemeral()
-  51    Column                   2    2  33                   0  r[33]=ephemeral().total_revenue
-  52    Column                   2    0  34                   0  r[34]=ephemeral().product_id
-  53    Column                   2    1  35                   0  r[35]=ephemeral().total_quantity
-  54    RowId                    2   36   0                   0  r[36]=ephemeral().rowid
-  55    MakeRecord              33    4  37                   0  r[37]=mkrec(r[33..36]); for ephemeral_subquery_t3
-  56    IdxInsert                5   37  33                   0  key=r[37]
-  57  Next                       2   51   0                   0
-  58  Integer                 1000   38   0                   0  r[38]=1000
-  59  SeekGT                     5   71  38                   0  key=[38..38]
-  60    DeferredSeek             5    2   0                   0
-  61    Column                   2    0   8                   0  r[8]=ephemeral().product_id
-  62    Column                   2    1   9                   0  r[9]=ephemeral().total_quantity
-  63    Column                   2    2  10                   0  r[10]=ephemeral().total_revenue
-  64    Column                   5    1  30                   0  r[30]=ephemeral(ephemeral_subquery_t3).product_id
-  65    Column                   5    2  31                   0  r[31]=ephemeral(ephemeral_subquery_t3).total_quantity
-  66    Column                   5    0  32                   0  r[32]=ephemeral(ephemeral_subquery_t3).total_revenue
-  67    MakeRecord              30    3  39                   0  r[39]=mkrec(r[30..32]); for
-  68    NewRowid                 1   40   0                   0  r[40]=rowid
-  69    Insert                   1   39  40                   4  intkey=r[40] data=r[39]
-  70  Next                       5   60   0                   0
-  71  OpenRead                   7    2   0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
-  72  Rewind                     7  101   0                   0  Rewind table products
-  73    Once                    84    0   0                   0  goto 84
-  74    OpenAutoindex            6    0   0                   0  cursor=6
-  75    Rewind                   1   76   0                   0  Rewind  ephemeral()
-  76      Column                 1    0  45                   0  r[45]=ephemeral().product_id
-  77      Column                 1    1  46                   0  r[46]=ephemeral().total_quantity
-  78      Column                 1    2  47                   0  r[47]=ephemeral().total_revenue
-  79      RowId                  1   48   0                   0  r[48]=ephemeral().rowid
-  80      MakeRecord            45    4  49                   0  r[49]=mkrec(r[45..48]); for ephemeral_subquery_t5
-  81      FilterAdd              6   45   1                   0  bloom_filter_add(r[45..46])
-  82      IdxInsert              6   49  45                   0  key=r[49]
-  83    Next                     1   76   0                   0
-  84    RowId                    7   50   0                   0  r[50]=products.rowid
-  85    Filter                   6  100  50                   1  if !bloom_filter(r[50..51]) goto 100
-  86    SeekGE                   6  100  50                   0  key=[50..50]
-  87      IdxGT                  6  100  50                   0  key=[50..50]
-  88      DeferredSeek           6    1   0                   0
-  89      Column                 1    0   5                   0  r[5]=ephemeral().product_id
-  90      Column                 1    1   6                   0  r[6]=ephemeral().total_quantity
-  91      Column                 1    2   7                   0  r[7]=ephemeral().total_revenue
-  92      Column                 7    1  41                   0  r[41]=products.name
-  93      Column                 7    2  42                   0  r[42]=products.category_id
-  94      Column                 6    1  43                   0  r[43]=ephemeral(ephemeral_subquery_t5).total_quantity
-  95      Column                 6    2  44                   0  r[44]=ephemeral(ephemeral_subquery_t5).total_revenue
-  96      MakeRecord            41    4  51                   0  r[51]=mkrec(r[41..44]); for
-  97      NewRowid               0   52   0                   0  r[52]=rowid
-  98      Insert                 0   51  52                   4  intkey=r[52] data=r[51]
-  99    Next                     6   87   0                   0
- 100  Next                       7   73   0                   0
- 101  SorterOpen                 8    1   0  k(1,-B)          0  cursor=8
- 102  OpenRead                  10    3   0  k(3,B,B,B)       0  table=categories, root=3, iDb=0
- 103  Rewind                    10  132   0                   0  Rewind table categories
- 104    Once                   116    0   0                   0  goto 116
- 105    OpenAutoindex            9    0   0                   0  cursor=9
- 106    Rewind                   0  107   0                   0  Rewind  ephemeral()
- 107      Column                 0    1  57                   0  r[57]=ephemeral().category_id
- 108      Column                 0    0  58                   0  r[58]=ephemeral().name
- 109      Column                 0    2  59                   0  r[59]=ephemeral().total_quantity
- 110      Column                 0    3  60                   0  r[60]=ephemeral().total_revenue
- 111      RowId                  0   61   0                   0  r[61]=ephemeral().rowid
- 112      MakeRecord            57    5  62                   0  r[62]=mkrec(r[57..61]); for ephemeral_subquery_t7
- 113      FilterAdd              9   57   1                   0  bloom_filter_add(r[57..58])
- 114      IdxInsert              9   62  57                   0  key=r[62]
- 115    Next                     0  107   0                   0
- 116    RowId                   10   63   0                   0  r[63]=categories.rowid
- 117    Filter                   9  131  63                   1  if !bloom_filter(r[63..64]) goto 131
- 118    SeekGE                   9  131  63                   0  key=[63..63]
- 119      IdxGT                  9  131  63                   0  key=[63..63]
- 120      DeferredSeek           9    0   0                   0
- 121      Column                 0    0   1                   0  r[1]=ephemeral().name
- 122      Column                 0    1   2                   0  r[2]=ephemeral().category_id
- 123      Column                 0    2   3                   0  r[3]=ephemeral().total_quantity
- 124      Column                 0    3   4                   0  r[4]=ephemeral().total_revenue
- 125      Column                 9    3  64                   0  r[64]=ephemeral(ephemeral_subquery_t7).total_revenue
- 126      Column                 9    1  65                   0  r[65]=ephemeral(ephemeral_subquery_t7).name
- 127      Column                10    1  66                   0  r[66]=categories.name
- 128      MakeRecord            64    3  56                   0  r[56]=mkrec(r[64..66])
- 129      SorterInsert           8   56   0  0                0  key=r[56]
- 130    Next                     9  119   0                   0
- 131  Next                      10  104   0                   0
- 132  OpenPseudo                11   56   3                   0  3 columns in r[56]
- 133  SorterSort                 8  140   0                   0
- 134    SorterData               8   56  11                   0  r[56]=data
- 135    Column                  11    1  53                   0  r[53]=pseudo.column 1
- 136    Column                  11    2  54                   0  r[54]=pseudo.column 2
- 137    Column                  11    0  55                   0  r[55]=pseudo.column 0
- 138    ResultRow               53    3   0                   0  output=r[53..55]
- 139  SorterNext                 8  134   0                   0
- 140  Halt                       0    0   0                   0
- 141  Transaction                0    1  11                   0  iDb=0 tx_mode=Read
- 142  Goto                       0    1   0                   0
+  41      Copy                  13   29   0                   0  r[29]=r[13]
+  42      Copy                  11   30   0                   0  r[30]=r[11]
+  43      Copy                  12   31   0                   0  r[31]=r[12]
+  44      Sequence               2   32   0                   0
+  45      MakeRecord            29    4  28                   0  r[28]=mkrec(r[29..32]); for ephemeral_subquery_t3
+  46      IdxInsert              2   28   0                   8  key=r[28]
+  47    Return                  14    0   0                   0
+  48    Null                     0   18  20                   0  r[18..20]=NULL; clear accumulator subroutine start
+  49    Integer                  0   15   0                   0  r[15]=0
+  50  Return                    25    0   0                   0
+  51  Integer                 1000   36   0                   0  r[36]=1000
+  52  SeekGT                     2   64  36                   0  key=[36..36]
+  53    Column                   2    1   8                   0  r[8]=ephemeral(ephemeral_subquery_t3).product_id
+  54    Column                   2    2   9                   0  r[9]=ephemeral(ephemeral_subquery_t3).total_quantity
+  55    Column                   2    0  10                   0  r[10]=ephemeral(ephemeral_subquery_t3).total_revenue
+  56    Column                   2    1  33                   0  r[33]=ephemeral(ephemeral_subquery_t3).product_id
+  57    Column                   2    2  34                   0  r[34]=ephemeral(ephemeral_subquery_t3).total_quantity
+  58    Column                   2    0  35                   0  r[35]=ephemeral(ephemeral_subquery_t3).total_revenue
+  59    Copy                    33   38   2                   0  r[38]=r[33]
+  60    Sequence                 1   41   0                   0
+  61    MakeRecord              38    4  37                   0  r[37]=mkrec(r[38..41]); for ephemeral_subquery_t5
+  62    IdxInsert                1   37   0                   8  key=r[37]
+  63  Next                       2   53   0                   0
+  64  OpenRead                   5    2   0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
+  65  Rewind                     5   85   0                   0  Rewind table products
+  66    RowId                    5   46   0                   0  r[46]=products.rowid
+  67    SeekGE                   1   84  46                   0  key=[46..46]
+  68      IdxGT                  1   84  46                   0  key=[46..46]
+  69      Column                 1    0   5                   0  r[5]=ephemeral(ephemeral_subquery_t5).product_id
+  70      Column                 1    1   6                   0  r[6]=ephemeral(ephemeral_subquery_t5).total_quantity
+  71      Column                 1    2   7                   0  r[7]=ephemeral(ephemeral_subquery_t5).total_revenue
+  72      Column                 5    1  42                   0  r[42]=products.name
+  73      Column                 5    2  43                   0  r[43]=products.category_id
+  74      Column                 1    1  44                   0  r[44]=ephemeral(ephemeral_subquery_t5).total_quantity
+  75      Column                 1    2  45                   0  r[45]=ephemeral(ephemeral_subquery_t5).total_revenue
+  76      Copy                  43   48   0                   0  r[48]=r[43]
+  77      Copy                  42   49   0                   0  r[49]=r[42]
+  78      Copy                  44   50   0                   0  r[50]=r[44]
+  79      Copy                  45   51   0                   0  r[51]=r[45]
+  80      Sequence               0   52   0                   0
+  81      MakeRecord            48    5  47                   0  r[47]=mkrec(r[48..52]); for ephemeral_subquery_t7
+  82      IdxInsert              0   47   0                   8  key=r[47]
+  83    Next                     1   68   0                   0
+  84  Next                       5   66   0                   0
+  85  SorterOpen                 6    1   0  k(1,-B)          0  cursor=6
+  86  OpenRead                   7    3   0  k(3,B,B,B)       0  table=categories, root=3, iDb=0
+  87  Rewind                     7  102   0                   0  Rewind table categories
+  88    RowId                    7   57   0                   0  r[57]=categories.rowid
+  89    SeekGE                   0  101  57                   0  key=[57..57]
+  90      IdxGT                  0  101  57                   0  key=[57..57]
+  91      Column                 0    1   1                   0  r[1]=ephemeral(ephemeral_subquery_t7).name
+  92      Column                 0    0   2                   0  r[2]=ephemeral(ephemeral_subquery_t7).category_id
+  93      Column                 0    2   3                   0  r[3]=ephemeral(ephemeral_subquery_t7).total_quantity
+  94      Column                 0    3   4                   0  r[4]=ephemeral(ephemeral_subquery_t7).total_revenue
+  95      Column                 0    3  58                   0  r[58]=ephemeral(ephemeral_subquery_t7).total_revenue
+  96      Column                 0    1  59                   0  r[59]=ephemeral(ephemeral_subquery_t7).name
+  97      Column                 7    1  60                   0  r[60]=categories.name
+  98      MakeRecord            58    3  56                   0  r[56]=mkrec(r[58..60])
+  99      SorterInsert           6   56   0  0                0  key=r[56]
+ 100    Next                     0   90   0                   0
+ 101  Next                       7   88   0                   0
+ 102  OpenPseudo                 8   56   3                   0  3 columns in r[56]
+ 103  SorterSort                 6  110   0                   0
+ 104    SorterData               6   56   8                   0  r[56]=data
+ 105    Column                   8    1  53                   0  r[53]=pseudo.column 1
+ 106    Column                   8    2  54                   0  r[54]=pseudo.column 2
+ 107    Column                   8    0  55                   0  r[55]=pseudo.column 0
+ 108    ResultRow               53    3   0                   0  output=r[53..55]
+ 109  SorterNext                 6  104   0                   0
+ 110  Halt                       0    0   0                   0
+ 111  Transaction                0    1  11                   0  iDb=0 tx_mode=Read
+ 112  Goto                       0    1   0                   0

@@ -17,7 +17,7 @@ use crate::{
         planner::determine_where_to_eval_term,
     },
     vdbe::{
-        affinity::Affinity,
+        affinity::{self, Affinity},
         builder::{CursorKey, CursorType, ProgramBuilder},
         insn::{HashDistinctData, Insn},
         BranchOffset, CursorID,
@@ -1842,8 +1842,8 @@ impl JoinedTable {
 
                 let index_cursor_id = index
                     .map(|index| {
-                        program.alloc_cursor_index(
-                            Some(CursorKey::index(self.internal_id, index.clone())),
+                        program.alloc_cursor_index_if_not_exists(
+                            CursorKey::index(self.internal_id, index.clone()),
                             index,
                         )
                     })
@@ -1861,8 +1861,8 @@ impl JoinedTable {
             Table::FromClauseSubquery(..) => {
                 let index_cursor_id = index
                     .map(|index| {
-                        program.alloc_cursor_index(
-                            Some(CursorKey::index(self.internal_id, index.clone())),
+                        program.alloc_cursor_index_if_not_exists(
+                            CursorKey::index(self.internal_id, index.clone()),
                             index,
                         )
                     })
@@ -2078,6 +2078,27 @@ impl SeekDef {
             _t: PhantomData,
         }
     }
+}
+
+/// Build the affinity string for a synthesized ephemeral seek index.
+///
+/// The seek key only constrains the leading key prefix, but the backing record
+/// stored in the ephemeral index still includes the remaining payload columns
+/// (and possibly a synthetic rowid). Pad those trailing slots with NONE affinity
+/// so MakeRecord sees the same layout the index insert path produced.
+pub fn synthesized_seek_affinity_str(index: &Index, seek_def: &SeekDef) -> Option<Arc<String>> {
+    let num_key_cols = seek_def.size(&seek_def.start);
+    let total_cols = index.columns.len() + if index.has_rowid { 1 } else { 0 };
+    let mut aff: String = seek_def
+        .iter_affinity(&seek_def.start)
+        .map(|a| a.aff_mask())
+        .collect();
+    for _ in num_key_cols..total_cols {
+        aff.push(affinity::SQLITE_AFF_NONE);
+    }
+    aff.chars()
+        .any(|c| c != affinity::SQLITE_AFF_NONE)
+        .then(|| Arc::new(aff))
 }
 
 /// [SeekKeyComponent] represents the optional trailing component of a seek key.

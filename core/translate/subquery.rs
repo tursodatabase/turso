@@ -23,7 +23,7 @@ use crate::{
     types::Value,
     util::parse_signed_number,
     vdbe::{
-        builder::{CursorType, MaterializedCteInfo, ProgramBuilder},
+        builder::{CursorKey, CursorType, MaterializedCteInfo, ProgramBuilder},
         insn::Insn,
         CursorID,
     },
@@ -36,6 +36,37 @@ use super::{
     plan::{Aggregate, Operation, QueryDestination, Scan, Search, SelectPlan},
     planner::resolve_window_and_aggregate_functions,
 };
+
+struct DirectMaterializedSubquery {
+    index: Arc<Index>,
+    affinity_str: Option<Arc<String>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MaterializedFromClauseSubqueryStorage {
+    TableBacked,
+    DirectIndex,
+}
+
+enum FromClauseSubqueryExecutionMode {
+    Coroutine,
+    MaterializedTable,
+    DirectMaterializedIndex(DirectMaterializedSubquery),
+}
+
+pub(crate) fn materialized_from_clause_subquery_storage(
+    subquery: &crate::schema::FromClauseSubquery,
+) -> Option<MaterializedFromClauseSubqueryStorage> {
+    match subquery.plan.select_query_destination() {
+        Some(QueryDestination::EphemeralTable { .. }) => {
+            Some(MaterializedFromClauseSubqueryStorage::TableBacked)
+        }
+        Some(QueryDestination::EphemeralIndex { .. }) => {
+            Some(MaterializedFromClauseSubqueryStorage::DirectIndex)
+        }
+        _ => None,
+    }
+}
 
 // Compute query plans for subqueries occurring in any position other than the FROM clause.
 // This includes the WHERE clause, HAVING clause, GROUP BY clause, ORDER BY clause, LIMIT clause, and OFFSET clause.
@@ -831,6 +862,50 @@ fn pre_materialize_multi_ref_ctes_in_tables(
     Ok(())
 }
 
+fn choose_from_clause_subquery_execution_mode(
+    program: &ProgramBuilder,
+    operation: &Operation,
+    from_clause_subquery: &crate::schema::FromClauseSubquery,
+) -> FromClauseSubqueryExecutionMode {
+    let is_multi_ref_cte = from_clause_subquery
+        .cte_id
+        .is_some_and(|id| program.get_cte_reference_count(id) > 1);
+    let needs_materialized_seek = matches!(
+        operation,
+        Operation::Search(Search::Seek {
+            index: Some(index), ..
+        }) if index.ephemeral
+    );
+
+    // Compound SELECTs still need their own internal ephemeral indexes for
+    // UNION/INTERSECT/EXCEPT bookkeeping. Reusing the subquery's synthesized
+    // seek index as the storage target would collapse those roles together and
+    // break set-operation semantics, so keep the direct-index fast path limited
+    // to simple SELECT plans.
+    let supports_direct_index_materialization =
+        matches!(from_clause_subquery.plan.as_ref(), Plan::Select(_));
+    let can_direct_materialize_index = supports_direct_index_materialization
+        && !from_clause_subquery.materialize_hint
+        && !is_multi_ref_cte;
+
+    match operation {
+        Operation::Search(Search::Seek {
+            index: Some(index),
+            seek_def,
+        }) if index.ephemeral && can_direct_materialize_index => {
+            FromClauseSubqueryExecutionMode::DirectMaterializedIndex(DirectMaterializedSubquery {
+                index: index.clone(),
+                affinity_str: super::plan::synthesized_seek_affinity_str(index, seek_def),
+            })
+        }
+        _ if needs_materialized_seek => FromClauseSubqueryExecutionMode::MaterializedTable,
+        _ if from_clause_subquery.materialize_hint || is_multi_ref_cte => {
+            FromClauseSubqueryExecutionMode::MaterializedTable
+        }
+        _ => FromClauseSubqueryExecutionMode::Coroutine,
+    }
+}
+
 /// Emit the subqueries contained in the FROM clause.
 /// This is done first so the results can be read in the main query loop.
 pub fn emit_from_clause_subqueries(
@@ -873,6 +948,7 @@ pub fn emit_from_clause_subqueries(
 
     for table_index in visit_order {
         let table_reference = &mut tables.joined_tables_mut()[table_index];
+        let table_op = table_reference.op.clone();
         let left_join_suffix = if outer_table_set.contains(&table_index) {
             " LEFT-JOIN"
         } else {
@@ -1026,60 +1102,48 @@ pub fn emit_from_clause_subqueries(
                 }
             }
 
-            let seek_index = match &table_reference.op {
-                Operation::Search(Search::Seek {
-                    index: Some(idx), ..
-                }) if idx.ephemeral => Some(idx.clone()),
-                _ => None,
+            let result_columns_start = match choose_from_clause_subquery_execution_mode(
+                program,
+                &table_op,
+                from_clause_subquery,
+            ) {
+                FromClauseSubqueryExecutionMode::Coroutine => {
+                    emit_from_clause_subquery(program, from_clause_subquery.plan.as_mut(), t_ctx)?
+                }
+                FromClauseSubqueryExecutionMode::MaterializedTable => {
+                    let (result_columns_start, cte_cursor_id, cte_table) = emit_materialized_cte(
+                        program,
+                        from_clause_subquery.plan.as_mut(),
+                        t_ctx,
+                        &from_clause_subquery.columns,
+                    )?;
+                    if let Some(cte_id) = from_clause_subquery.cte_id {
+                        program.register_materialized_cte(
+                            cte_id,
+                            MaterializedCteInfo {
+                                cursor_id: cte_cursor_id,
+                                table: cte_table,
+                                num_columns: from_clause_subquery.columns.len(),
+                            },
+                        );
+                    }
+                    result_columns_start
+                }
+                FromClauseSubqueryExecutionMode::DirectMaterializedIndex(direct_index) => {
+                    emit_indexed_materialized_subquery(
+                        program,
+                        from_clause_subquery.plan.as_mut(),
+                        t_ctx,
+                        table_reference.internal_id,
+                        direct_index.index,
+                        direct_index.affinity_str,
+                        from_clause_subquery.columns.len(),
+                    )?
+                }
             };
 
-            // Determine if this CTE/subquery should be materialized into an
-            // ephemeral table:
-            // - materialize_hint=true: from WITH ... AS MATERIALIZED hint
-            // - Multi-reference CTE: materialize once, share via OpenDup
-            // - Any seekable materialized subquery: keep a table backing so
-            //   scans preserve insertion order while searches probe an
-            //   auxiliary ephemeral index built by the normal open-loop path
-            // - Remaining single-reference subqueries: use a coroutine
-            let is_multi_ref_cte = from_clause_subquery
-                .cte_id
-                .is_some_and(|id| program.get_cte_reference_count(id) > 1);
-            let should_materialize_subquery =
-                from_clause_subquery.materialize_hint || is_multi_ref_cte || seek_index.is_some();
-
-            if should_materialize_subquery {
-                // CTE sharing path: EphemeralTable + optional seek index
-                // Must use EphemeralTable to enable sharing via OpenDup
-                let (result_columns_start, cte_cursor_id, cte_table) = emit_materialized_cte(
-                    program,
-                    from_clause_subquery.plan.as_mut(),
-                    t_ctx,
-                    &from_clause_subquery.columns,
-                )?;
-                // Register CTE for future references via OpenDup
-                if let Some(cte_id) = from_clause_subquery.cte_id {
-                    program.register_materialized_cte(
-                        cte_id,
-                        MaterializedCteInfo {
-                            cursor_id: cte_cursor_id,
-                            table: cte_table,
-                            num_columns: from_clause_subquery.columns.len(),
-                        },
-                    );
-                }
-                from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
-                program.set_subquery_result_reg(table_reference.internal_id, result_columns_start);
-            } else {
-                // Emit the subquery as a coroutine and get the start register of the result columns.
-                let result_columns_start =
-                    emit_from_clause_subquery(program, from_clause_subquery.plan.as_mut(), t_ctx)?;
-                // Set the start register of the subquery's result columns.
-                // This is done so that translate_expr() can read the result columns of the subquery,
-                // as if it were reading from a regular table.
-                from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
-                // Also store in program builder so nested subqueries can look it up by internal_id.
-                program.set_subquery_result_reg(table_reference.internal_id, result_columns_start);
-            }
+            from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
+            program.set_subquery_result_reg(table_reference.internal_id, result_columns_start);
         }
 
         program.pop_current_parent_explain();
@@ -1183,12 +1247,86 @@ pub fn emit_from_clause_subquery(
     program.preassign_label_to_next_insn(subquery_body_end_label);
     Ok(result_column_start_reg)
 }
-/// Materialize a CTE/subquery into an ephemeral table (not index).
-/// This is used for CTEs to enable sharing via OpenDup - the ephemeral table holds
-/// the CTE data, and subsequent references can alias it with OpenDup.
+/// Materialize a single-reference seekable FROM-subquery directly into an
+/// ephemeral index.
 ///
-/// Returns (result_columns_start_reg, cursor_id, table) where table is the ephemeral
-/// table definition needed for allocating dup cursors.
+/// This skips the intermediate EphemeralTable when we only need seek access and do
+/// not need table-backed sharing via OpenDup. Result columns for this path are read
+/// back from the index using `pos_in_table` mapping rather than raw index position.
+fn emit_indexed_materialized_subquery(
+    program: &mut ProgramBuilder,
+    plan: &mut Plan,
+    t_ctx: &mut TranslateCtx,
+    internal_id: ast::TableInternalId,
+    index: Arc<Index>,
+    affinity_str: Option<Arc<String>>,
+    num_columns: usize,
+) -> Result<usize> {
+    let cursor_id = program
+        .alloc_cursor_index_if_not_exists(CursorKey::index(internal_id, index.clone()), &index)?;
+    let result_columns_start_reg = program.alloc_registers(num_columns);
+
+    if let Some(dest) = plan.select_query_destination_mut() {
+        *dest = QueryDestination::EphemeralIndex {
+            cursor_id,
+            index,
+            affinity_str,
+            is_delete: false,
+        };
+    }
+
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id,
+        is_table: false,
+    });
+
+    match plan {
+        Plan::Select(select_plan) => {
+            let mut metadata = TranslateCtx {
+                labels_main_loop: (0..select_plan.joined_tables().len())
+                    .map(|_| LoopLabels::new(program))
+                    .collect(),
+                label_main_loop_end: None,
+                meta_group_by: None,
+                meta_left_joins: (0..select_plan.joined_tables().len())
+                    .map(|_| None)
+                    .collect(),
+                meta_semi_anti_joins: (0..select_plan.joined_tables().len())
+                    .map(|_| None)
+                    .collect(),
+                meta_sort: None,
+                reg_agg_start: None,
+                reg_nonagg_emit_once_flag: None,
+                reg_result_cols_start: None,
+                limit_ctx: None,
+                reg_offset: None,
+                reg_limit_offset_sum: None,
+                resolver: t_ctx.resolver.fork(),
+                non_aggregate_expressions: Vec::new(),
+                cdc_cursor_id: None,
+                meta_window: None,
+                meta_in_seeks: (0..select_plan.joined_tables().len())
+                    .map(|_| None)
+                    .collect(),
+                materialized_build_inputs: HashMap::default(),
+                hash_table_contexts: HashMap::default(),
+                unsafe_testing: t_ctx.unsafe_testing,
+            };
+            emit_query(program, select_plan, &mut metadata)?;
+        }
+        Plan::CompoundSelect { .. } => {
+            let plan_clone = plan.clone();
+            let resolver = t_ctx.resolver.fork();
+            emit_program_for_compound_select(program, &resolver, plan_clone)?;
+        }
+        Plan::Delete(_) | Plan::Update(_) => {
+            unreachable!("DELETE/UPDATE plans cannot be FROM clause subqueries")
+        }
+    }
+
+    Ok(result_columns_start_reg)
+}
+
 fn emit_materialized_cte(
     program: &mut ProgramBuilder,
     plan: &mut Plan,
