@@ -11,7 +11,7 @@
 mod cte_tests {
     use rand::Rng;
     use rand_chacha::ChaCha8Rng;
-    use rusqlite::params;
+    use rusqlite::{params, types::Value};
 
     use crate::helpers;
     use core_tester::common::{
@@ -104,6 +104,28 @@ mod cte_tests {
         }
 
         (format!("SELECT {}", cols.join(", ")), aliases)
+    }
+
+    fn sort_rows_for_unordered_compare(rows: &[Vec<Value>]) -> Vec<Vec<Value>> {
+        let mut sorted = rows.to_vec();
+        sorted.sort_by_cached_key(|row| format!("{row:?}"));
+        sorted
+    }
+
+    fn assert_query_row_parity(
+        query: &str,
+        limbo_result: &[Vec<Value>],
+        sqlite_result: &[Vec<Value>],
+        context: &str,
+    ) {
+        if query.contains("ORDER BY") {
+            assert_eq!(limbo_result, sqlite_result, "{context}");
+            return;
+        }
+
+        let limbo_sorted = sort_rows_for_unordered_compare(limbo_result);
+        let sqlite_sorted = sort_rows_for_unordered_compare(sqlite_result);
+        assert_eq!(limbo_sorted, sqlite_sorted, "{context}");
     }
 
     #[turso_macros::test]
@@ -511,9 +533,13 @@ mod cte_tests {
             let limbo_result = limbo_exec_rows(&limbo_conn, &query);
             let sqlite_result = sqlite_exec_rows(&sqlite_conn, &query);
 
-            assert_eq!(
-                limbo_result, sqlite_result,
-                "CTE feature interaction mismatch!\nseed: {seed}\niteration: {i}\nscenario: {scenario}\nquery: {query}\nlimbo: {limbo_result:?}\nsqlite: {sqlite_result:?}"
+            assert_query_row_parity(
+                &query,
+                &limbo_result,
+                &sqlite_result,
+                &format!(
+                    "CTE feature interaction mismatch!\nseed: {seed}\niteration: {i}\nscenario: {scenario}\nquery: {query}\nlimbo: {limbo_result:?}\nsqlite: {sqlite_result:?}"
+                ),
             );
         }
     }
@@ -914,15 +940,22 @@ mod cte_tests {
                 query = format!("{query} ORDER BY 1 {dir}");
             }
             if rng.random_bool(0.3) {
+                if !query.contains("ORDER BY") {
+                    query = format!("{query} ORDER BY 1 ASC");
+                }
                 query = format!("{} LIMIT {}", query, rng.random_range(1..20));
             }
 
             let limbo_result = limbo_exec_rows(&limbo_conn, &query);
             let sqlite_result = sqlite_exec_rows(&sqlite_conn, &query);
 
-            assert_eq!(
-                limbo_result, sqlite_result,
-                "CTE comprehensive mismatch!\nseed: {seed}\niteration: {i}\nquery: {query}\nlimbo: {limbo_result:?}\nsqlite: {sqlite_result:?}"
+            assert_query_row_parity(
+                &query,
+                &limbo_result,
+                &sqlite_result,
+                &format!(
+                    "CTE comprehensive mismatch!\nseed: {seed}\niteration: {i}\nquery: {query}\nlimbo: {limbo_result:?}\nsqlite: {sqlite_result:?}"
+                ),
             );
         }
     }
@@ -1472,9 +1505,12 @@ mod cte_tests {
                     // Use a proper join condition instead
                     format!(
                         "SELECT t1.{}, t2.{} FROM {} t1 LEFT JOIN {} t2 ON t1.{} = t2.{} ORDER BY 1, 2",
-                        last_cte.columns[0], other_cte.columns[0],
-                        last_cte.name, other_cte.name,
-                        last_cte.columns[0], other_cte.columns[0]
+                        last_cte.columns[0],
+                        other_cte.columns[0],
+                        last_cte.name,
+                        other_cte.name,
+                        last_cte.columns[0],
+                        other_cte.columns[0]
                     )
                 }
             }
@@ -1500,9 +1536,12 @@ mod cte_tests {
                 if other_cte.has_numeric_cols {
                     format!(
                         "SELECT t1.{}, t2.{} FROM {} t1 INNER JOIN {} t2 ON t1.{} = t2.{} ORDER BY 1, 2",
-                        last_cte.columns[0], other_cte.columns[0],
-                        last_cte.name, other_cte.name,
-                        last_cte.columns[0], other_cte.columns[0]
+                        last_cte.columns[0],
+                        other_cte.columns[0],
+                        last_cte.name,
+                        other_cte.name,
+                        last_cte.columns[0],
+                        other_cte.columns[0]
                     )
                 } else {
                     format!(
@@ -1579,14 +1618,12 @@ mod cte_tests {
     fn add_modifiers(rng: &mut ChaCha8Rng, query: &str, _cte: &CteInfo) -> String {
         let mut q = query.to_string();
 
-        // Add ORDER BY if not already present
-        if !q.contains("ORDER BY") && rng.random_bool(0.4) {
-            let dir = if rng.random_bool(0.5) { "ASC" } else { "DESC" };
-            q = format!("{q} ORDER BY 1 {dir}");
-        }
-
         // Add LIMIT (and sometimes OFFSET)
         if rng.random_bool(0.3) {
+            if !q.contains("ORDER BY") {
+                let dir = if rng.random_bool(0.5) { "ASC" } else { "DESC" };
+                q = format!("{q} ORDER BY 1 {dir}");
+            }
             let limit = rng.random_range(1..20);
             if rng.random_bool(0.3) {
                 let offset = rng.random_range(0..5);
@@ -1594,6 +1631,9 @@ mod cte_tests {
             } else {
                 q = format!("{q} LIMIT {limit}");
             }
+        } else if !q.contains("ORDER BY") && rng.random_bool(0.4) {
+            let dir = if rng.random_bool(0.5) { "ASC" } else { "DESC" };
+            q = format!("{q} ORDER BY 1 {dir}");
         }
 
         q
@@ -1653,9 +1693,13 @@ mod cte_tests {
             let limbo_result = limbo_exec_rows(&limbo_conn, &query);
             let sqlite_result = sqlite_exec_rows(&sqlite_conn, &query);
 
-            assert_eq!(
-                limbo_result, sqlite_result,
-                "CTE RNG-driven mismatch!\nseed: {seed}\niteration: {i}\nquery: {query}\nlimbo: {limbo_result:?}\nsqlite: {sqlite_result:?}"
+            assert_query_row_parity(
+                &query,
+                &limbo_result,
+                &sqlite_result,
+                &format!(
+                    "CTE RNG-driven mismatch!\nseed: {seed}\niteration: {i}\nquery: {query}\nlimbo: {limbo_result:?}\nsqlite: {sqlite_result:?}"
+                ),
             );
         }
     }

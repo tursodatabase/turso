@@ -242,8 +242,6 @@ pub struct MaterializedCteInfo {
     pub cursor_id: CursorID,
     /// The table definition, needed for allocating dup cursors with the same CursorType.
     pub table: Arc<BTreeTable>,
-    /// Start register for reading result columns.
-    pub result_columns_start_reg: usize,
     /// Number of result columns.
     pub num_columns: usize,
 }

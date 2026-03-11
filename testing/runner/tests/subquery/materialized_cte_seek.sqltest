@@ -375,3 +375,69 @@ test cte-materialized-scalar-probe-results {
 expect {
     7|8|2
 }
+
+test cte-seek-index-preserves-result-column-order {
+    WITH raw AS (
+        VALUES (2, 62), (1, 56), (1, 28), (2, 55), (2, 89), (1, 90)
+    ),
+    filtered AS (
+        SELECT column1 AS cat, column2 AS amt
+        FROM raw
+        WHERE column2 > 0
+    ),
+    transformed AS (
+        SELECT cat, amt, ABS(amt) AS abs_amt
+        FROM filtered
+    ),
+    aggregated AS (
+        SELECT cat, SUM(abs_amt) AS total, COUNT(*) AS cnt
+        FROM transformed
+        GROUP BY cat
+    )
+    SELECT *
+    FROM aggregated
+    ORDER BY cat;
+}
+expect {
+    1|174|3
+    2|206|3
+}
+
+test cte-seek-index-limit-with-order-by {
+    WITH cte1 AS (
+        SELECT column1 AS c1
+        FROM (VALUES (30), (99), (7))
+    ),
+    cte2 AS (
+        SELECT c1 AS c2
+        FROM cte1
+        WHERE c1 > -8
+    )
+    SELECT *
+    FROM cte2
+    WHERE c2 IN (SELECT c2 FROM cte2)
+    ORDER BY c2
+    LIMIT 3;
+}
+expect {
+    7
+    30
+    99
+}
+
+test cte-materialized-hint-limit-with-order-by {
+    WITH cte1 AS MATERIALIZED (
+        SELECT column1 AS c1
+        FROM (VALUES (30), (99), (7))
+    )
+    SELECT *
+    FROM cte1
+    WHERE c1 IN (SELECT c1 FROM cte1)
+    ORDER BY c1
+    LIMIT 3;
+}
+expect {
+    7
+    30
+    99
+}

@@ -1113,9 +1113,10 @@ fn expr_is_simple_column_from_table(expr: &ast::Expr, table_id: TableInternalId)
 
 /// Find the best access method for a FROM clause subquery.
 ///
-/// For subqueries not in the first join position (which would be scanned multiple times),
-/// we try to create an ephemeral index on columns used in equality join conditions.
-/// This allows seeking into the materialized subquery results instead of scanning.
+/// Uncorrelated FROM-subqueries can either stay as coroutine scans or be treated
+/// like a table-backed row source with a synthesized ephemeral probe index. When
+/// the latter is worthwhile, we materialize the subquery into an EphemeralTable
+/// and later build the probe index lazily in the main-loop open phase.
 fn find_best_access_method_for_subquery(
     rhs_table: &JoinedTable,
     subquery: &FromClauseSubquery,
@@ -1131,31 +1132,6 @@ fn find_best_access_method_for_subquery(
     // they must re-execute for each outer row. Use coroutine for these.
     // This check must come first because correlated CTEs should NOT share materialized data.
     if plan_is_correlated(&subquery.plan) {
-        return Ok(Some(AccessMethod {
-            cost: estimate_cost_for_scan_or_seek(
-                None,
-                &[],
-                &[],
-                input_cardinality,
-                base_row_count,
-                false,
-                params,
-            ),
-            estimated_rows_per_outer_row: *base_row_count,
-            post_access_filter: PostAccessFilter::AllConstraints,
-            params: AccessMethodParams::Subquery,
-        }));
-    }
-
-    // If this is the first/only table in the join, a one-shot coroutine is
-    // usually cheaper than materializing into an ephemeral seek index.
-    //
-    // Keep CTE references eligible, though: explicit MATERIALIZED hints and
-    // multi-ref CTE sharing can materialize them later in emission, and we want
-    // the planner to preserve any seekable shape on top of that materialized
-    // result instead of forcing a scan here.
-    let is_leftmost = join_order.len() <= 1;
-    if is_leftmost && !subquery.materialize_hint && subquery.cte_id.is_none() {
         return Ok(Some(AccessMethod {
             cost: estimate_cost_for_scan_or_seek(
                 None,

@@ -3087,8 +3087,9 @@ pub fn translate_expr(
                     Ok(target_register)
                 }
                 Table::FromClauseSubquery(from_clause_subquery) => {
-                    // For outer-scope references to materialized subqueries, read from the index cursor
-                    // (the coroutine result registers are not updated during index scans).
+                    // For outer-scope references during table-backed materialized-subquery
+                    // seeks, read from the auxiliary index cursor: coroutine result
+                    // registers are not refreshed while the seek path is iterating.
                     if is_from_outer_query_scope {
                         if let Some(cursor_id) =
                             program.resolve_any_index_cursor_id_for_table_safe(*table_ref_id)

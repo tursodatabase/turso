@@ -1,6 +1,25 @@
 use super::*;
 use crate::translate::main_loop::{conditions::LoopConditionEmitter, hash::HashProbeSetupEmitter};
 
+fn emit_materialized_subquery_result_columns(
+    program: &mut ProgramBuilder,
+    from_clause_subquery: &crate::schema::FromClauseSubquery,
+    table_cursor_id: CursorID,
+) {
+    let Some(start_reg) = from_clause_subquery.result_columns_start_reg else {
+        return;
+    };
+
+    for col_idx in 0..from_clause_subquery.columns.len() {
+        program.emit_insn(Insn::Column {
+            cursor_id: table_cursor_id,
+            column: col_idx,
+            dest: start_reg + col_idx,
+            default: None,
+        });
+    }
+}
+
 /// Opens the main loop for each table in the join order, emitting instructions to initialize
 /// cursors and perform index seeks as necessary.
 pub struct OpenLoop;
@@ -202,7 +221,9 @@ impl OpenLoop {
                     }
                 }
                 Operation::Search(search) => {
-                    // Check if this is a FROM clause subquery with a materialized ephemeral index
+                    // Detect the table-backed materialized-subquery seek path:
+                    // rows live in an EphemeralTable, and an auxiliary ephemeral
+                    // index is built lazily over that table for probing.
                     let is_materialized_subquery = matches!(
                         &table.table,
                         Table::FromClauseSubquery(_)
@@ -236,13 +257,35 @@ impl OpenLoop {
                         } => {
                             // Otherwise, it's an index/rowid scan, i.e. first a seek is performed and then a scan until the comparison expression is not satisfied anymore.
                             let mut bloom_filter = false;
+                            let seek_affinity_str = if is_materialized_subquery {
+                                let index = index
+                                    .as_ref()
+                                    .expect("materialized subquery seek requires an index");
+                                let num_key_cols = seek_def.size(&seek_def.start);
+                                let total_cols =
+                                    index.columns.len() + if index.has_rowid { 1 } else { 0 };
+                                let mut aff: String = seek_def
+                                    .iter_affinity(&seek_def.start)
+                                    .map(|a| a.aff_mask())
+                                    .collect();
+                                for _ in num_key_cols..total_cols {
+                                    aff.push(affinity::SQLITE_AFF_NONE);
+                                }
+                                aff.chars()
+                                    .any(|c| c != affinity::SQLITE_AFF_NONE)
+                                    .then(|| Arc::new(aff))
+                            } else {
+                                None
+                            };
                             if let Some(index) = index {
-                                if index.ephemeral && !is_materialized_subquery {
-                                    // For regular tables with ephemeral indexes, build the auto-index now.
-                                    // For materialized subqueries, the index was already built during emission.
+                                if index.ephemeral {
+                                    // Build auxiliary ephemeral indexes lazily from the row source,
+                                    // whether it is a base table or a materialized subquery table.
                                     let table_has_rowid = if let Table::BTree(btree) = &table.table
                                     {
                                         btree.has_rowid
+                                    } else if matches!(&table.table, Table::FromClauseSubquery(_)) {
+                                        true
                                     } else {
                                         false
                                     };
@@ -260,12 +303,14 @@ impl OpenLoop {
                                         table_has_rowid,
                                         num_seek_keys,
                                         seek_def,
+                                        seek_affinity_str.as_ref(),
                                     )?;
                                     bloom_filter = use_bloom_filter;
                                 }
                             }
 
-                            // For materialized subqueries, use the index cursor directly
+                            // Materialized subquery seeks iterate the auxiliary index cursor,
+                            // then DeferredSeek back to the table cursor for result columns.
                             let seek_cursor_id = if is_materialized_subquery {
                                 index_cursor_id
                                     .expect("materialized subquery must have index cursor")
@@ -296,26 +341,22 @@ impl OpenLoop {
                             .emit(loop_start, bloom_filter)?;
 
                             if is_materialized_subquery {
-                                // For materialized subqueries with seek indexes, emit Column
-                                // instructions to populate result registers from the covering index.
-                                // The index contains all columns so we can read directly from it.
+                                let table_cursor_id = table_cursor_id
+                                    .expect("materialized subquery must have table cursor");
+                                let index_cursor_id = index_cursor_id
+                                    .expect("materialized subquery seek requires index cursor");
+                                program.emit_insn(Insn::DeferredSeek {
+                                    index_cursor_id,
+                                    table_cursor_id,
+                                });
                                 if let Table::FromClauseSubquery(from_clause_subquery) =
                                     &table.table
                                 {
-                                    if let Some(start_reg) =
-                                        from_clause_subquery.result_columns_start_reg
-                                    {
-                                        let index_cursor = index_cursor_id
-                                            .expect("materialized subquery must have index cursor");
-                                        for col_idx in 0..from_clause_subquery.columns.len() {
-                                            program.emit_insn(Insn::Column {
-                                                cursor_id: index_cursor,
-                                                column: col_idx,
-                                                dest: start_reg + col_idx,
-                                                default: None,
-                                            });
-                                        }
-                                    }
+                                    emit_materialized_subquery_result_columns(
+                                        program,
+                                        from_clause_subquery,
+                                        table_cursor_id,
+                                    );
                                 }
                             } else {
                                 // Only emit DeferredSeek for non-subquery tables
@@ -599,12 +640,12 @@ impl OpenLoop {
 
         if subqueries.iter().any(|s| !s.has_been_evaluated()) {
             crate::bail_parse_error!(
-            "all subqueries should have already been emitted, but found {} unevaluated subqueries",
-            subqueries
-                .iter()
-                .filter(|s| !s.has_been_evaluated())
-                .count()
-        );
+                "all subqueries should have already been emitted, but found {} unevaluated subqueries",
+                subqueries
+                    .iter()
+                    .filter(|s| !s.has_been_evaluated())
+                    .count()
+            );
         }
 
         Ok(())

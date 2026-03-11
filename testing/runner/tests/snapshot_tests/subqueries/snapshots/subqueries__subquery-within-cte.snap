@@ -31,8 +31,8 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode             p1  p2  p3  p4              p5  comment
-   0  Init                0  53   0                   0  Start at 53
-   1  OpenEphemeral       1   0   0                   0  cursor=1 is_table=false
+   0  Init                0  61   0                   0  Start at 61
+   1  OpenEphemeral       1   1   0                   0  cursor=1 is_table=true
    2  Once               12   0   0                   0  goto 12
    3  OpenEphemeral       0   0   0                   0  cursor=0 is_table=false
    4  OpenRead            2   3   0  k(3,B,B,B)       0  table=categories, root=3, iDb=0
@@ -46,43 +46,51 @@ addr  opcode             p1  p2  p3  p4              p5  comment
   12  OpenRead            3   2   0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
   13  OpenRead            4   8   0  k(2,B)           0  index=idx_products_category, root=8, iDb=0
   14  NullRow             0   0   0                   0  Set cursor 0 to a (pseudo) NULL row
-  15  Rewind              0  33   0                   0  Rewind  ephemeral(ephemeral_index_where_sub_t2)
+  15  Rewind              0  30   0                   0  Rewind  ephemeral(ephemeral_index_where_sub_t2)
   16    Column            0   0  10                   0  r[10]=ephemeral(ephemeral_index_where_sub_t2).id
-  17    IsNull           10  32   0                   0  if (r[10]==NULL) goto 32
-  18    SeekGE            4  32  10                   0  key=[10..10]
-  19      IdxGT           4  32  10                   0  key=[10..10]
+  17    IsNull           10  29   0                   0  if (r[10]==NULL) goto 29
+  18    SeekGE            4  29  10                   0  key=[10..10]
+  19      IdxGT           4  29  10                   0  key=[10..10]
   20      DeferredSeek    4   3   0                   0
   21      IdxRowId        4   7   0                   0  r[7]=cursor 4 for index idx_products_category.rowid
   22      Column          3   1   8                   0  r[8]=products.name
   23      Column          3   3   9                   0  r[9]=products.price
   24      RealAffinity    9   0   0                   0
-  25      Copy            9  12   0                   0  r[12]=r[9]
-  26      Copy            7  13   0                   0  r[13]=r[7]
-  27      Copy            8  14   0                   0  r[14]=r[8]
-  28      Sequence        1  15   0                   0
-  29      MakeRecord     12   4  11                   0  r[11]=mkrec(r[12..15]); for ephemeral_subquery_t4
-  30      IdxInsert       1  11   0                   8  key=r[11]
-  31    Next              4  19   0                   0
-  32  Next                0  16   0                   0
-  33  SorterOpen          5   1   0  k(1,-B)          0  cursor=5
-  34  Integer           100  19   0                   0  r[19]=100
-  35  SeekGT              1  45  19                   0  key=[19..19]
-  36    Column            1   0   1                   0  r[1]=ephemeral(ephemeral_subquery_t4).price
-  37    Column            1   1   2                   0  r[2]=ephemeral(ephemeral_subquery_t4).id
-  38    Column            1   2   3                   0  r[3]=ephemeral(ephemeral_subquery_t4).name
-  39    Column            1   0  20                   0  r[20]=ephemeral(ephemeral_subquery_t4).price
-  40    RealAffinity     20   0   0                   0
-  41    Column            1   2  21                   0  r[21]=ephemeral(ephemeral_subquery_t4).name
-  42    MakeRecord       20   2  18                   0  r[18]=mkrec(r[20..21])
-  43    SorterInsert      5  18   0  0                0  key=r[18]
-  44  Next                1  36   0                   0
-  45  OpenPseudo          6  18   2                   0  2 columns in r[18]
-  46  SorterSort          5  52   0                   0
-  47    SorterData        5  18   6                   0  r[18]=data
-  48    Column            6   1  16                   0  r[16]=pseudo.column 1
-  49    Column            6   0  17                   0  r[17]=pseudo.column 0
-  50    ResultRow        16   2   0                   0  output=r[16..17]
-  51  SorterNext          5  47   0                   0
-  52  Halt                0   0   0                   0
-  53  Transaction         0   1  11                   0  iDb=0 tx_mode=Read
-  54  Goto                0   1   0                   0
+  25      MakeRecord      7   3  11                   0  r[11]=mkrec(r[7..9]); for
+  26      NewRowid        1  12   0                   0  r[12]=rowid
+  27      Insert          1  11  12                   4  intkey=r[12] data=r[11]
+  28    Next              4  19   0                   0
+  29  Next                0  16   0                   0
+  30  SorterOpen          5   1   0  k(1,-B)          0  cursor=5
+  31  Once               41   0   0                   0  goto 41
+  32  OpenAutoindex       6   0   0                   0  cursor=6
+  33  Rewind              1  34   0                   0  Rewind  ephemeral()
+  34    Column            1   2  16                   0  r[16]=ephemeral().price
+  35    Column            1   0  17                   0  r[17]=ephemeral().id
+  36    Column            1   1  18                   0  r[18]=ephemeral().name
+  37    RowId             1  19   0                   0  r[19]=ephemeral().rowid
+  38    MakeRecord       16   4  20                   0  r[20]=mkrec(r[16..19]); for ephemeral_subquery_t4
+  39    IdxInsert         6  20  16                   0  key=r[20]
+  40  Next                1  34   0                   0
+  41  Integer           100  21   0                   0  r[21]=100
+  42  SeekGT              6  53  21                   0  key=[21..21]
+  43    DeferredSeek      6   1   0                   0
+  44    Column            1   0   1                   0  r[1]=ephemeral().id
+  45    Column            1   1   2                   0  r[2]=ephemeral().name
+  46    Column            1   2   3                   0  r[3]=ephemeral().price
+  47    Column            6   0  22                   0  r[22]=ephemeral(ephemeral_subquery_t4).price
+  48    RealAffinity     22   0   0                   0
+  49    Column            6   2  23                   0  r[23]=ephemeral(ephemeral_subquery_t4).name
+  50    MakeRecord       22   2  15                   0  r[15]=mkrec(r[22..23])
+  51    SorterInsert      5  15   0  0                0  key=r[15]
+  52  Next                6  43   0                   0
+  53  OpenPseudo          7  15   2                   0  2 columns in r[15]
+  54  SorterSort          5  60   0                   0
+  55    SorterData        5  15   7                   0  r[15]=data
+  56    Column            7   1  13                   0  r[13]=pseudo.column 1
+  57    Column            7   0  14                   0  r[14]=pseudo.column 0
+  58    ResultRow        13   2   0                   0  output=r[13..14]
+  59  SorterNext          5  55   0                   0
+  60  Halt                0   0   0                   0
+  61  Transaction         0   1  11                   0  iDb=0 tx_mode=Read
+  62  Goto                0   1   0                   0

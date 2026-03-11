@@ -156,7 +156,8 @@ impl CloseLoop {
                         {
                             *ephemeral_table_cursor_id
                         } else if is_materialized_subquery {
-                            // For materialized subqueries, use the index cursor
+                            // Table-backed materialized subquery seeks iterate the
+                            // auxiliary ephemeral index cursor.
                             index_cursor_id.expect("materialized subquery must have index cursor")
                         } else {
                             index_cursor_id.unwrap_or_else(|| {
@@ -417,6 +418,7 @@ pub(super) fn emit_autoindex(
     table_has_rowid: bool,
     num_seek_keys: usize,
     seek_def: &SeekDef,
+    affinity_str: Option<&Arc<String>>,
 ) -> Result<AutoIndexResult> {
     turso_assert!(index.ephemeral, "index must be ephemeral", { "index_name": &index.name });
     let label_ephemeral_build_end = program.allocate_label();
@@ -454,7 +456,7 @@ pub(super) fn emit_autoindex(
         count: to_u16(num_regs_to_reserve),
         dest_reg: to_u16(record_reg),
         index_name: Some(index.name.clone()),
-        affinity_str: None,
+        affinity_str: affinity_str.map(|s| (**s).clone()),
     });
     // Skip bloom filter for non-binary collations since it uses binary hashing.
     let use_bloom_filter = index.columns.iter().take(num_seek_keys).all(|col| {

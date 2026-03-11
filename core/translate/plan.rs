@@ -1858,7 +1858,17 @@ impl JoinedTable {
                 let index_cursor_id = None;
                 Ok((table_cursor_id, index_cursor_id))
             }
-            Table::FromClauseSubquery(..) => Ok((None, None)),
+            Table::FromClauseSubquery(..) => {
+                let index_cursor_id = index
+                    .map(|index| {
+                        program.alloc_cursor_index(
+                            Some(CursorKey::index(self.internal_id, index.clone())),
+                            index,
+                        )
+                    })
+                    .transpose()?;
+                Ok((None, index_cursor_id))
+            }
         }
     }
 
@@ -1869,16 +1879,20 @@ impl JoinedTable {
         mode: OperationMode,
     ) -> Result<(Option<CursorID>, Option<CursorID>)> {
         let index = self.op.index();
-        let table_cursor_id =
-            if let OperationMode::UPDATE(UpdateRowSource::PrebuiltEphemeralTable {
-                target_table,
-                ..
-            }) = &mode
-            {
-                program.resolve_cursor_id_safe(&CursorKey::table(target_table.internal_id))
-            } else {
-                program.resolve_cursor_id_safe(&CursorKey::table(self.internal_id))
-            };
+        let table_cursor_id = if let Table::FromClauseSubquery(from_clause_subquery) = &self.table {
+            match from_clause_subquery.plan.select_query_destination() {
+                Some(QueryDestination::EphemeralTable { cursor_id, .. }) => Some(*cursor_id),
+                _ => None,
+            }
+        } else if let OperationMode::UPDATE(UpdateRowSource::PrebuiltEphemeralTable {
+            target_table,
+            ..
+        }) = &mode
+        {
+            program.resolve_cursor_id_safe(&CursorKey::table(target_table.internal_id))
+        } else {
+            program.resolve_cursor_id_safe(&CursorKey::table(self.internal_id))
+        };
         let index_cursor_id = index.map(|index| {
             program.resolve_cursor_id(&CursorKey::index(self.internal_id, index.clone()))
         });
