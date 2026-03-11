@@ -303,6 +303,133 @@ fn residual_exprs_for_branch(
         .collect()
 }
 
+/// Estimate selectivity for a residual predicate that remains after a branch
+/// seek is chosen.
+///
+/// We keep this intentionally heuristic: recurse through boolean structure and,
+/// for leaf predicates, reuse normal constraint selectivity analysis when the
+/// expression can be recognized as a single-table constraint.
+#[allow(clippy::too_many_arguments)]
+fn estimate_residual_expr_selectivity(
+    expr: &ast::Expr,
+    rhs_table: &JoinedTable,
+    table_references: &TableReferences,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    subqueries: &[NonFromClauseSubquery],
+    schema: &Schema,
+    params: &CostModelParams,
+) -> f64 {
+    let Ok(expr) = crate::translate::expr::unwrap_parens(expr) else {
+        return params.sel_other;
+    };
+
+    match expr {
+        ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
+            estimate_residual_expr_selectivity(
+                lhs,
+                rhs_table,
+                table_references,
+                available_indexes,
+                subqueries,
+                schema,
+                params,
+            ) * estimate_residual_expr_selectivity(
+                rhs,
+                rhs_table,
+                table_references,
+                available_indexes,
+                subqueries,
+                schema,
+                params,
+            )
+        }
+        ast::Expr::Binary(lhs, ast::Operator::Or, rhs) => {
+            let lhs_selectivity = estimate_residual_expr_selectivity(
+                lhs,
+                rhs_table,
+                table_references,
+                available_indexes,
+                subqueries,
+                schema,
+                params,
+            );
+            let rhs_selectivity = estimate_residual_expr_selectivity(
+                rhs,
+                rhs_table,
+                table_references,
+                available_indexes,
+                subqueries,
+                schema,
+                params,
+            );
+            1.0 - (1.0 - lhs_selectivity) * (1.0 - rhs_selectivity)
+        }
+        ast::Expr::Unary(ast::UnaryOperator::Not, inner) => {
+            1.0 - estimate_residual_expr_selectivity(
+                inner,
+                rhs_table,
+                table_references,
+                available_indexes,
+                subqueries,
+                schema,
+                params,
+            )
+        }
+        _ => {
+            let Ok((_, table_constraints)) = table_constraints_from_exprs(
+                &[expr.clone()],
+                rhs_table,
+                table_references,
+                available_indexes,
+                subqueries,
+                schema,
+                params,
+            ) else {
+                return params.sel_other;
+            };
+
+            table_constraints
+                .constraints
+                .iter()
+                .filter(|constraint| constraint.where_clause_pos.0 == 0)
+                .map(|constraint| constraint.selectivity)
+                // A single residual expression can sometimes yield multiple
+                // derived constraints (for example, self-comparisons). Use the
+                // strongest single estimate instead of multiplying duplicates.
+                .reduce(f64::min)
+                .unwrap_or(params.sel_other)
+        }
+    }
+    .clamp(0.0, 1.0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn estimate_residual_selectivity(
+    residual_exprs: &[ast::Expr],
+    rhs_table: &JoinedTable,
+    table_references: &TableReferences,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    subqueries: &[NonFromClauseSubquery],
+    schema: &Schema,
+    params: &CostModelParams,
+) -> f64 {
+    residual_exprs
+        .iter()
+        .map(|expr| {
+            estimate_residual_expr_selectivity(
+                expr,
+                rhs_table,
+                table_references,
+                available_indexes,
+                subqueries,
+                schema,
+                params,
+            )
+        })
+        .product::<f64>()
+        .clamp(0.0, 1.0)
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Evaluate a fully decomposed multi-index plan and return it if it beats the
 /// current best non-multi-index access cost.
@@ -312,6 +439,10 @@ fn evaluate_multi_index_branches(
     where_term_idx: usize,
     additional_consumed_terms: Vec<usize>,
     rhs_table: &JoinedTable,
+    table_references: &TableReferences,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    subqueries: &[NonFromClauseSubquery],
+    schema: &Schema,
     base_row_count: RowCountEstimate,
     input_cardinality: f64,
     params: &CostModelParams,
@@ -339,6 +470,15 @@ fn evaluate_multi_index_branches(
         );
         params_for_branch.residual_exprs = branch.residual_exprs;
         params_for_branch.requires_table_cursor = branch.requires_table_cursor;
+        params_for_branch.estimated_rows *= estimate_residual_selectivity(
+            &params_for_branch.residual_exprs,
+            rhs_table,
+            table_references,
+            available_indexes,
+            subqueries,
+            schema,
+            params,
+        );
 
         branch_costs.push(cost);
         branch_rows.push(params_for_branch.estimated_rows);
@@ -615,6 +755,10 @@ pub fn consider_multi_index_union(
             where_term_idx,
             vec![],
             rhs_table,
+            table_references,
+            available_indexes,
+            subqueries,
+            schema,
             base_row_count,
             input_cardinality,
             params,
@@ -690,6 +834,10 @@ pub fn consider_multi_index_intersection(
         where_term_idx,
         additional_consumed_terms,
         rhs_table,
+        table_references,
+        available_indexes,
+        subqueries,
+        schema,
         base_row_count,
         input_cardinality,
         params,
@@ -1176,5 +1324,160 @@ mod tests {
                 "branch should use both id and kind in the compound seek"
             );
         }
+    }
+
+    #[test]
+    fn test_multi_index_union_residual_selectivity_reduces_row_estimate() {
+        let link = create_btree_table(
+            "link",
+            vec![
+                create_column_of_type("src", Type::Integer),
+                create_column_of_type("dst", Type::Integer),
+            ],
+        );
+        let item = create_btree_table(
+            "item",
+            vec![
+                create_column_of_type("id", Type::Integer),
+                create_column_of_type("kind", Type::Integer),
+            ],
+        );
+
+        let mut table_id_counter = TableRefIdCounter::new();
+        let joined_tables = vec![
+            create_table_reference(link, None, table_id_counter.next()),
+            create_table_reference(
+                item,
+                Some(JoinInfo {
+                    join_type: JoinType::Inner,
+                    using: vec![],
+                }),
+                table_id_counter.next(),
+            ),
+        ];
+
+        const LINK: usize = 0;
+        const ITEM: usize = 1;
+        let link_id = joined_tables[LINK].internal_id;
+        let item_id = joined_tables[ITEM].internal_id;
+
+        let mut available_indexes = HashMap::default();
+        available_indexes.insert(
+            "item".to_string(),
+            VecDeque::from([Arc::new(Index {
+                name: "idx_item_id".to_string(),
+                table_name: "item".to_string(),
+                where_clause: None,
+                columns: vec![IndexColumn {
+                    name: "id".to_string(),
+                    order: SortOrder::Asc,
+                    pos_in_table: 0,
+                    collation: None,
+                    default: None,
+                    expr: None,
+                }],
+                unique: false,
+                ephemeral: false,
+                root_page: 2,
+                has_rowid: true,
+                index_method: None,
+            })]),
+        );
+
+        let make_branch = |literal_col, join_col, item_kind: Option<&str>| {
+            let branch = Expr::Binary(
+                Box::new(Expr::Binary(
+                    Box::new(create_column_expr(
+                        link_id,
+                        literal_col,
+                        false,
+                    )),
+                    Operator::Equals,
+                    Box::new(create_numeric_literal("1")),
+                )),
+                Operator::And,
+                Box::new(Expr::Binary(
+                    Box::new(create_column_expr(
+                        item_id,
+                        0,
+                        false,
+                    )),
+                    Operator::Equals,
+                    Box::new(create_column_expr(
+                        link_id,
+                        join_col,
+                        false,
+                    )),
+                )),
+            );
+
+            if let Some(kind) = item_kind {
+                Expr::Binary(
+                    Box::new(branch),
+                    Operator::And,
+                    Box::new(Expr::Binary(
+                        Box::new(create_column_expr(
+                            item_id,
+                            1,
+                            false,
+                        )),
+                        Operator::Equals,
+                        Box::new(create_numeric_literal(kind)),
+                    )),
+                )
+            } else {
+                branch
+            }
+        };
+        let make_join_expr = |item_kind: Option<&str>| {
+            vec![WhereTerm {
+                expr: Expr::Binary(
+                    Box::new(make_branch(0, 1, item_kind)),
+                    Operator::Or,
+                    Box::new(make_branch(1, 0, item_kind)),
+                ),
+                from_outer_join: None,
+                consumed: false,
+            }]
+        };
+
+        let table_references = TableReferences::new(joined_tables, vec![]);
+        let lhs_mask = TableMask::from_table_number_iter([LINK].into_iter());
+        let base_row_count = RowCountEstimate::hardcoded_fallback(&DEFAULT_PARAMS);
+
+        let without_residual = consider_multi_index_union(
+            &table_references.joined_tables()[ITEM],
+            &make_join_expr(None),
+            &available_indexes,
+            &table_references,
+            &[],
+            &empty_schema(),
+            1.0,
+            base_row_count,
+            &DEFAULT_PARAMS,
+            Cost(f64::INFINITY),
+            &lhs_mask,
+        )
+        .expect("plain OR branches should produce a multi-index union");
+
+        let with_residual = consider_multi_index_union(
+            &table_references.joined_tables()[ITEM],
+            &make_join_expr(Some("7")),
+            &available_indexes,
+            &table_references,
+            &[],
+            &empty_schema(),
+            1.0,
+            base_row_count,
+            &DEFAULT_PARAMS,
+            Cost(f64::INFINITY),
+            &lhs_mask,
+        )
+        .expect("residual-filtered OR branches should still produce a multi-index union");
+
+        assert!(
+            with_residual.estimated_rows_per_outer_row < without_residual.estimated_rows_per_outer_row,
+            "branch-local residual filters must reduce the multi-index row estimate"
+        );
     }
 }
