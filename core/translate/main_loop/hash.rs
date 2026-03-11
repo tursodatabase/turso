@@ -340,6 +340,13 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                 [planner.hash_join_op.build_table_idx].into_iter(),
             );
             for cond in planner.predicates.iter() {
+                if cond.from_outer_join.is_some() {
+                    // OUTER JOIN predicates must stay on the right-table loop
+                    // recorded in `from_outer_join`; applying them while
+                    // building the hash table would drop unmatched build rows
+                    // before null-extension.
+                    continue;
+                }
                 let mask = table_mask_from_expr(
                     &cond.expr,
                     planner.table_references,
