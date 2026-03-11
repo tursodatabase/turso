@@ -4,7 +4,7 @@ use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, JoinConstraint, TableInternalId};
 
 use super::emitter::Resolver;
-use super::plan::{JoinInfo, ResultSetColumn, TableReferences};
+use super::plan::{JoinInfo, TableReferences};
 use crate::schema::Table;
 use crate::util::normalize_ident;
 use crate::Result;
@@ -234,6 +234,19 @@ impl BindScope {
     }
 }
 
+// ── BoundColumn ─────────────────────────────────────────────────────────
+
+/// A resolved result column from a SELECT list.
+/// Used for alias resolution in later phases (WHERE, GROUP BY, ORDER BY)
+/// and for propagating column names to CTEs/subqueries.
+#[derive(Clone)]
+pub struct BoundColumn {
+    /// The column name — explicit alias or inferred from the expression.
+    pub name: String,
+    /// The original expression (before binding), cloned into alias references.
+    pub expr: ast::Expr,
+}
+
 // ── BindTracking ─────────────────────────────────────────────────────────
 
 /// Records what was accessed during binding.
@@ -321,9 +334,9 @@ pub struct BindContext<'a, G: IdGenerator> {
     /// CTE definitions visible in the current query.
     ctes: HashMap<String, CteEntry>,
 
-    /// SELECT aliases for the current query.
-    /// Empty until phase 4 populates them.
-    aliases: Vec<ResultSetColumn>,
+    /// SELECT result columns for alias resolution in later phases.
+    /// Populated after binding the SELECT list.
+    aliases: Vec<BoundColumn>,
 
     /// Current binding phase — controls alias visibility.
     phase: BindPhase,
@@ -413,11 +426,11 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         self.phase
     }
 
-    fn set_aliases(&mut self, aliases: Vec<ResultSetColumn>) {
+    fn set_aliases(&mut self, aliases: Vec<BoundColumn>) {
         self.aliases = aliases;
     }
 
-    fn aliases(&self) -> &[ResultSetColumn] {
+    fn aliases(&self) -> &[BoundColumn] {
         &self.aliases
     }
 
@@ -446,70 +459,86 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         result
     }
 
-    /// Extract result column names from a SELECT list before binding.
+    /// Extract result columns from a SELECT list before the main bind pass.
     ///
-    /// These names are used for:
-    /// - CTE column resolution (when referenced in FROM)
-    /// - FROM subquery column resolution
+    /// Captures the name and a bound expression for each result column.
+    /// For identifiers and star expansions, the expression is resolved
+    /// to `Expr::Column` immediately. For complex expressions, the
+    /// original AST is cloned and bound via `bind_expr`.
     ///
-    /// The name is determined by:
-    /// - Explicit alias (`SELECT expr AS foo` → "foo")
-    /// - Bare column reference (`SELECT x` → "x", `SELECT t.x` → "x")
-    /// - Star expansion (`SELECT *` → all column names from scope)
-    /// - Complex expressions without alias are unreferenceable by name,
-    ///   so we use an empty string placeholder.
-    fn select_result_column_names(
-        columns: &[ast::ResultColumn],
+    /// Must be called before `bind_select_list` rewrites the AST in-place,
+    /// since we need the raw identifiers to infer column names.
+    fn extract_bound_columns(
+        &mut self,
+        columns: &mut [ast::ResultColumn],
         scope: &BindScope,
-    ) -> Result<Vec<String>> {
-        let mut names = Vec::with_capacity(columns.len());
+    ) -> Result<Vec<BoundColumn>> {
+        let mut result = Vec::with_capacity(columns.len());
         for col in columns {
             match col {
                 ast::ResultColumn::Expr(expr, alias) => {
-                    // Explicit alias takes priority
-                    if let Some(a) = alias {
-                        let name = match a {
+                    // Determine the column name
+                    let name = if let Some(a) = alias {
+                        match a {
                             ast::As::As(id) | ast::As::Elided(id) => normalize_ident(id.as_str()),
-                        };
-                        names.push(name);
-                        continue;
-                    }
-                    // Bare or qualified column reference — extract the column part
-                    let name = match expr.as_ref() {
-                        ast::Expr::Id(id) => normalize_ident(id.as_str()),
-                        ast::Expr::Qualified(_, id) => normalize_ident(id.as_str()),
-                        ast::Expr::DoublyQualified(_, _, id) => normalize_ident(id.as_str()),
-                        // Complex expressions (count(*), x+1, etc.) without an alias
-                        // can't be referenced by name from outer queries.
-                        _ => String::new(),
+                        }
+                    } else {
+                        match expr.as_ref() {
+                            ast::Expr::Id(id) => normalize_ident(id.as_str()),
+                            ast::Expr::Qualified(_, id) => normalize_ident(id.as_str()),
+                            ast::Expr::DoublyQualified(_, _, id) => normalize_ident(id.as_str()),
+                            // Complex expressions without an alias can't be
+                            // referenced by name from outer queries.
+                            _ => String::new(),
+                        }
                     };
-                    names.push(name);
+                    // Resolve the expression
+                    self.bind_expr(expr, scope)?;
+                    result.push(BoundColumn {
+                        name,
+                        expr: *expr.clone(),
+                    });
                 }
                 ast::ResultColumn::Star => {
-                    // Expand * into all column names from all tables in scope
+                    // Expand * — each column becomes a resolved Expr::Column
                     for st in &scope.tables {
-                        for col in st.table.columns() {
-                            names.push(col.name.to_string());
+                        for col_ref in st.table.columns() {
+                            result.push(BoundColumn {
+                                name: col_ref.name.to_string(),
+                                expr: ast::Expr::Column {
+                                    database: None,
+                                    table: st.internal_id,
+                                    column: col_ref.idx,
+                                    is_rowid_alias: col_ref.is_rowid_alias,
+                                },
+                            });
                         }
                     }
                 }
                 ast::ResultColumn::TableStar(table_name) => {
-                    // Expand table.* into that table's column names
                     let Some(st) = scope.find_table_by_identifier(table_name.as_str()) else {
                         crate::bail_parse_error!("no such table: {}", table_name);
                     };
-                    for col in st.table.columns() {
-                        names.push(col.name.to_string());
+                    for col_ref in st.table.columns() {
+                        result.push(BoundColumn {
+                            name: col_ref.name.to_string(),
+                            expr: ast::Expr::Column {
+                                database: None,
+                                table: st.internal_id,
+                                column: col_ref.idx,
+                                is_rowid_alias: col_ref.is_rowid_alias,
+                            },
+                        });
                     }
                 }
             }
         }
-        Ok(names)
+        Ok(result)
     }
 
     /// Bind a SELECT statement, resolving all name references in-place.
-    /// Returns the result column names of the SELECT.
-    fn bind_select(&mut self, select: &mut ast::Select) -> Result<Vec<String>> {
+    /// Returns the bound result columns of the SELECT.
+    fn bind_select(&mut self, select: &mut ast::Select) -> Result<Vec<BoundColumn>> {
         // 1. Bind CTEs from WITH clause
         if let Some(with) = &mut select.with {
             self.bind_cte(with)?;
@@ -539,8 +568,8 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         Ok(result_columns)
     }
 
-    /// Bind a single SELECT (not compound). Returns result column names.
-    fn bind_one_select(&mut self, one: &mut ast::OneSelect) -> Result<Vec<String>> {
+    /// Bind a single SELECT (not compound). Returns bound result columns.
+    fn bind_one_select(&mut self, one: &mut ast::OneSelect) -> Result<Vec<BoundColumn>> {
         self.with_scope(|ctx| {
             match one {
                 ast::OneSelect::Select {
@@ -556,11 +585,14 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         None => BindScope::empty(),
                     };
 
-                    // 2. Extract result column names before binding expressions
-                    //    (binding rewrites Expr::Id into Expr::Column, losing the name)
-                    let result_names = Self::select_result_column_names(columns, &scope)?;
+                    // 2. Extract bound columns (names + resolved exprs) before
+                    //    the main bind pass rewrites the AST in-place.
+                    let bound_columns = ctx.extract_bound_columns(columns, &scope)?;
 
-                    // 3. Bind SELECT expressions (NoAliases phase)
+                    // 3. Store as aliases for later phases (WHERE, GROUP BY, ORDER BY)
+                    ctx.set_aliases(bound_columns.clone());
+
+                    // 4. Bind SELECT expressions in-place (NoAliases phase)
                     ctx.with_phase(BindPhase::NoAliases, |ctx| {
                         ctx.bind_select_list(columns, &scope)
                     })?;
@@ -579,11 +611,11 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         })?;
                     }
 
-                    Ok(result_names)
+                    Ok(bound_columns)
                 }
                 ast::OneSelect::Values(_) => {
                     // VALUES clauses have no column references to bind
-                    Ok(vec![])
+                    Ok(Vec::new())
                 }
             }
         })
@@ -648,11 +680,11 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         // Pass 2: bind each CTE body and populate resolved columns
         for cte in &mut with.ctes {
             let cte_name = normalize_ident(cte.tbl_name.as_str());
-            let result_columns = self.bind_select(&mut cte.select)?;
+            let bound_columns = self.bind_select(&mut cte.select)?;
 
             let entry = self.ctes.get_mut(&cte_name).unwrap();
             if entry.explicit_columns.is_empty() {
-                entry.resolved_columns = result_columns;
+                entry.resolved_columns = bound_columns.into_iter().map(|bc| bc.name).collect();
             } else {
                 entry.resolved_columns = entry.explicit_columns.clone();
             }
@@ -717,15 +749,16 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         ast::As::As(id) | ast::As::Elided(id) => normalize_ident(id.as_str()),
                     })
                     .unwrap_or_else(|| String::from("subquery"));
+                // TODO: change subquery name
 
                 // FROM subqueries don't correlate with the query being built.
                 // The outer_scopes stack already contains any enclosing query scopes.
-                let result_columns = self.bind_select(subselect)?;
+                let bound_columns = self.bind_select(subselect)?;
 
-                // 5-6. Build Arc<CteTable> with the result column names
+                // Build CteTable with the result column names
                 let subquery_table = Arc::new(CteTable {
                     name: identifier.clone(),
-                    columns: result_columns,
+                    columns: bound_columns.into_iter().map(|bc| bc.name).collect(),
                 });
 
                 // 7. Generate internal_id
@@ -844,13 +877,4 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
         Ok(scope)
     }
-}
-
-// ── BoundSelect ──────────────────────────────────────────────────────────
-
-/// Result of binding a SELECT statement.
-pub struct BoundSelect {
-    /// Bound result columns with aliases extracted.
-    /// `contains_aggregates` is `false` — the planner fills it in.
-    pub result_columns: Vec<ResultSetColumn>,
 }
