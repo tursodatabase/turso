@@ -70,6 +70,52 @@ expect {
 }
 
 @cross-check-integrity
+test window-with-correlated-scalar-subquery {
+    CREATE TABLE t(id INT, grp TEXT, val INT);
+    INSERT INTO t VALUES (1,'a',10),(2,'a',20),(3,'b',30);
+    SELECT t.id,
+      (SELECT COUNT(*) FROM t t2 WHERE t2.grp = t.grp) as grp_cnt,
+      SUM(t.val) OVER () as total
+    FROM t ORDER BY t.id;
+}
+expect {
+    1|2|60
+    2|2|60
+    3|1|60
+}
+
+@cross-check-integrity
+test window-with-correlated-scalar-subquery-partition {
+    CREATE TABLE t(id INT, grp TEXT, val INT);
+    INSERT INTO t VALUES (1,'a',10),(2,'a',20),(3,'b',30),(4,'b',40);
+    SELECT t.id,
+      (SELECT SUM(val) FROM t t2 WHERE t2.grp = t.grp) as grp_sum,
+      SUM(t.val) OVER (PARTITION BY t.grp) as part_total
+    FROM t ORDER BY t.id;
+}
+expect {
+    1|30|30
+    2|30|30
+    3|70|70
+    4|70|70
+}
+
+@cross-check-integrity
+test window-with-uncorrelated-scalar-subquery {
+    CREATE TABLE t(id INT, val INT);
+    INSERT INTO t VALUES (1,10),(2,20),(3,30);
+    SELECT t.id,
+      (SELECT MAX(val) FROM t) as max_val,
+      SUM(t.val) OVER () as total
+    FROM t ORDER BY t.id;
+}
+expect {
+    1|30|60
+    2|30|60
+    3|30|60
+}
+
+@cross-check-integrity
 test window-in-exists-subquery-referencing-outer-column {
     CREATE TABLE t1 (a);
     INSERT INTO t1 VALUES (1), (2), (3);
