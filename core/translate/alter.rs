@@ -1,5 +1,5 @@
 use crate::sync::Arc;
-use crate::{turso_assert_eq, turso_assert_ne};
+use crate::{schema::BTreeTable, turso_assert_eq, turso_assert_ne};
 use turso_parser::{
     ast::{self, TableInternalId},
     parser::Parser,
@@ -297,7 +297,7 @@ fn strict_default_type_mismatch(column: &Column) -> Result<bool> {
 
 fn emit_add_column_default_type_validation(
     program: &mut ProgramBuilder,
-    original_btree: &Arc<crate::schema::BTreeTable>,
+    original_btree: &Arc<BTreeTable>,
 ) -> Result<()> {
     let check_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
     program.emit_insn(Insn::OpenRead {
@@ -334,8 +334,8 @@ fn emit_add_column_default_type_validation(
 #[allow(clippy::too_many_arguments)]
 fn emit_add_column_check_validation(
     program: &mut ProgramBuilder,
-    btree: &crate::schema::BTreeTable,
-    original_btree: &Arc<crate::schema::BTreeTable>,
+    btree: &BTreeTable,
+    original_btree: &Arc<BTreeTable>,
     new_column_name: &str,
     column: &Column,
     constraints: &[ast::NamedColumnConstraint],
@@ -1659,7 +1659,7 @@ Here are some helpers related to that: */
 /// Returns true if the column is found, false otherwise.
 fn expr_references_trigger_column(
     expr: &ast::Expr,
-    table: &crate::schema::BTreeTable,
+    table: &BTreeTable,
     trigger_table_name: &str,
     column_name_norm: &str,
 ) -> Result<bool> {
@@ -1712,7 +1712,7 @@ fn expr_references_trigger_column(
 /// Returns true if the column is referenced as old.x, new.x, or unqualified x.
 fn trigger_references_column(
     trigger: &crate::schema::Trigger,
-    table: &crate::schema::BTreeTable,
+    table: &BTreeTable,
     column_name: &str,
 ) -> Result<bool> {
     let column_name_norm = normalize_ident(column_name);
@@ -1816,7 +1816,7 @@ fn trigger_references_column(
 /// Also checks for qualified references to the trigger table (e.g., t.x).
 fn check_column_ref(
     e: &ast::Expr,
-    table: &crate::schema::BTreeTable,
+    table: &BTreeTable,
     trigger_table_name: &str,
     column_name_norm: &str,
     found: &mut bool,
@@ -1907,7 +1907,7 @@ fn trigger_references_column_in_other_tables(
 /// Walk through all expressions in a SELECT statement
 fn walk_select_expressions(
     select: &ast::Select,
-    table: &crate::schema::BTreeTable,
+    table: &BTreeTable,
     trigger_table_name: &str,
     column_name_norm: &str,
     found: &mut bool,
@@ -1994,7 +1994,7 @@ fn walk_select_expressions(
 /// Walk through all expressions in a OneSelect
 fn walk_one_select_expressions(
     one_select: &ast::OneSelect,
-    table: &crate::schema::BTreeTable,
+    table: &BTreeTable,
     trigger_table_name: &str,
     column_name_norm: &str,
     found: &mut bool,
@@ -2102,7 +2102,7 @@ fn walk_one_select_expressions(
 /// Walk through expressions in a FROM clause (including JOIN conditions)
 fn walk_from_clause_expressions(
     from_clause: &ast::FromClause,
-    table: &crate::schema::BTreeTable,
+    table: &BTreeTable,
     trigger_table_name: &str,
     column_name_norm: &str,
     found: &mut bool,
@@ -2154,7 +2154,7 @@ fn walk_from_clause_expressions(
 /// Walk through expressions in a SelectTable (table, subquery, or table function)
 fn walk_select_table_expressions(
     select_table: &ast::SelectTable,
-    table: &crate::schema::BTreeTable,
+    table: &BTreeTable,
     trigger_table_name: &str,
     column_name_norm: &str,
     found: &mut bool,
@@ -2193,7 +2193,7 @@ fn walk_select_table_expressions(
 /// Walk through expressions in a Window definition
 fn walk_window_expressions(
     window: &ast::Window,
-    table: &crate::schema::BTreeTable,
+    table: &BTreeTable,
     trigger_table_name: &str,
     column_name_norm: &str,
     found: &mut bool,
@@ -2361,7 +2361,7 @@ fn rewrite_trigger_sql_for_column_rename(
 #[allow(clippy::too_many_arguments)]
 fn rewrite_expr_for_column_rename(
     expr: &ast::Expr,
-    trigger_table: &crate::schema::BTreeTable,
+    trigger_table: &BTreeTable,
     trigger_table_name: &str,
     target_table_name: &str,
     old_col_norm: &str,
@@ -2369,14 +2369,12 @@ fn rewrite_expr_for_column_rename(
     context_table_name: Option<&str>,
     resolver: &Resolver,
 ) -> Result<ast::Expr> {
-    use crate::translate::expr::walk_expr_mut;
-
     let trigger_table_name_norm = normalize_ident(trigger_table_name);
     let target_table_name_norm = normalize_ident(target_table_name);
     let is_renaming_trigger_table = trigger_table_name_norm == target_table_name_norm;
 
     // Get context table if provided (for UPDATE/DELETE WHERE clauses)
-    let context_table_info: Option<(crate::sync::Arc<crate::schema::BTreeTable>, String, bool)> =
+    let context_table_info: Option<(Arc<BTreeTable>, String, bool)> =
         if let Some(ctx_name) = context_table_name {
             let ctx_name_norm = normalize_ident(ctx_name);
             let is_renaming = ctx_name_norm == target_table_name_norm;
@@ -2414,8 +2412,8 @@ fn rewrite_expr_for_column_rename(
 #[allow(clippy::too_many_arguments)]
 fn rewrite_trigger_cmd_for_column_rename(
     cmd: ast::TriggerCmd,
-    trigger_table: &crate::schema::BTreeTable,
-    target_table: &crate::schema::BTreeTable,
+    trigger_table: &BTreeTable,
+    target_table: &BTreeTable,
     trigger_table_name: &str,
     target_table_name: &str,
     old_col_norm: &str,
@@ -2575,8 +2573,8 @@ fn rewrite_trigger_cmd_for_column_rename(
 /// Rewrite a SELECT statement to replace column references
 fn rewrite_select_for_column_rename(
     select: ast::Select,
-    trigger_table: &crate::schema::BTreeTable,
-    _target_table: &crate::schema::BTreeTable,
+    trigger_table: &BTreeTable,
+    _target_table: &BTreeTable,
     trigger_table_name: &str,
     target_table_name: &str,
     old_col_norm: &str,
@@ -2656,7 +2654,7 @@ fn rewrite_select_for_column_rename(
 /// Rewrite a OneSelect to replace column references
 fn rewrite_one_select_for_column_rename(
     one_select: &mut ast::OneSelect,
-    trigger_table: &crate::schema::BTreeTable,
+    trigger_table: &BTreeTable,
     trigger_table_name: &str,
     target_table_name: &str,
     old_col_norm: &str,
@@ -2745,7 +2743,7 @@ fn rewrite_one_select_for_column_rename(
 /// Rewrite expressions in a FROM clause (including JOIN conditions)
 fn rewrite_from_clause_for_column_rename(
     from_clause: &mut ast::FromClause,
-    trigger_table: &crate::schema::BTreeTable,
+    trigger_table: &BTreeTable,
     trigger_table_name: &str,
     target_table_name: &str,
     old_col_norm: &str,
@@ -2802,7 +2800,7 @@ fn rewrite_from_clause_for_column_rename(
 /// Rewrite expressions in a SelectTable (table, subquery, or table function)
 fn rewrite_select_table_for_column_rename(
     select_table: &mut ast::SelectTable,
-    trigger_table: &crate::schema::BTreeTable,
+    trigger_table: &BTreeTable,
     trigger_table_name: &str,
     target_table_name: &str,
     old_col_norm: &str,
@@ -2861,7 +2859,7 @@ fn rewrite_select_table_for_column_rename(
 /// Rewrite expressions in a Window definition
 fn rewrite_window_for_column_rename(
     window: &mut ast::Window,
-    trigger_table: &crate::schema::BTreeTable,
+    trigger_table: &BTreeTable,
     trigger_table_name: &str,
     target_table_name: &str,
     old_col_norm: &str,
@@ -2912,12 +2910,12 @@ fn rewrite_window_for_column_rename(
 ///                  target tables. If `None`, unqualified references refer to the trigger's owning table.
 fn rewrite_expr_column_ref_with_context(
     e: &mut ast::Expr,
-    trigger_table: &crate::schema::BTreeTable,
+    trigger_table: &BTreeTable,
     trigger_table_name: &str,
     old_col_norm: &str,
     new_col_norm: &str,
     is_renaming_trigger_table: bool,
-    context_table: Option<(&crate::schema::BTreeTable, &String, bool)>,
+    context_table: Option<(&BTreeTable, &String, bool)>,
 ) -> Result<()> {
     match e {
         ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) => {
@@ -2981,7 +2979,7 @@ fn rewrite_expr_column_ref_with_context(
 /// Rewrite a single expression's column reference (convenience wrapper for non-context cases)
 fn rewrite_expr_column_ref(
     e: &mut ast::Expr,
-    trigger_table: &crate::schema::BTreeTable,
+    trigger_table: &BTreeTable,
     trigger_table_name: &str,
     target_table_name: &str,
     old_col_norm: &str,
