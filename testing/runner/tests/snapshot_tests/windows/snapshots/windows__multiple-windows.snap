@@ -30,7 +30,7 @@ QUERY PLAN
    |  |--SCAN window_subquery_2
    |  |  |--SCAN window_subquery_3
    |  |  |  |--SCAN employees AS e
-   |  |  |  |--SEARCH s USING INDEX idx_sales_emp_id
+   |  |  |  |--SEARCH s USING INDEX idx_sales_emp_id (emp_id=?)
    |  |  |  `--USE SORTER FOR ORDER BY
    |  |  `--USE SORTER FOR ORDER BY
    |  `--USE SORTER FOR ORDER BY
