@@ -1251,11 +1251,15 @@ pub fn translate_expr(
             end,
         } => {
             // Handle BETWEEN natively to avoid exponential AST growth from cloning.
-            // x BETWEEN start AND end  =>  (start <= lhs) AND (lhs <= end)  =>  1 if both true, 0 if either false, NULL if null
+            // Evaluate each comparison into its own register with proper NULL handling,
+            // then combine with And/Or which correctly implements SQL 3-valued logic.
+            // x BETWEEN start AND end  =>  (start <= lhs) AND (lhs <= end)
             // x NOT BETWEEN start AND end  =>  (start > lhs) OR (lhs > end)
             let lhs_reg = program.alloc_register();
             let start_reg = program.alloc_register();
             let end_reg = program.alloc_register();
+            let cmp1_reg = program.alloc_register();
+            let cmp2_reg = program.alloc_register();
             translate_expr(program, referenced_tables, lhs, lhs_reg, resolver)?;
             translate_expr(program, referenced_tables, start, start_reg, resolver)?;
             translate_expr(program, referenced_tables, end, end_reg, resolver)?;
@@ -1265,103 +1269,78 @@ pub fn translate_expr(
 
             if *not {
                 // NOT BETWEEN: (start > lhs) OR (lhs > end)
-                // Result: 1 if either is true, 0 if both are false, NULL if null
                 let if_true_label1 = program.allocate_label();
+                wrap_eval_jump_expr_zero_or_null(
+                    program,
+                    Insn::Gt {
+                        lhs: start_reg,
+                        rhs: lhs_reg,
+                        target_pc: if_true_label1,
+                        flags,
+                        collation,
+                    },
+                    cmp1_reg,
+                    if_true_label1,
+                    start_reg,
+                    lhs_reg,
+                );
                 let if_true_label2 = program.allocate_label();
-                let done_label = program.allocate_label();
-
-                // Default to 0 (false)
-                program.emit_insn(Insn::Integer {
-                    value: 0,
+                wrap_eval_jump_expr_zero_or_null(
+                    program,
+                    Insn::Gt {
+                        lhs: lhs_reg,
+                        rhs: end_reg,
+                        target_pc: if_true_label2,
+                        flags,
+                        collation,
+                    },
+                    cmp2_reg,
+                    if_true_label2,
+                    lhs_reg,
+                    end_reg,
+                );
+                program.emit_insn(Insn::Or {
+                    lhs: cmp1_reg,
+                    rhs: cmp2_reg,
                     dest: target_register,
                 });
-                // start > lhs? If true, result is 1
-                program.emit_insn(Insn::Gt {
-                    lhs: start_reg,
-                    rhs: lhs_reg,
-                    target_pc: if_true_label1,
-                    flags,
-                    collation,
-                });
-                // If first comparison involved NULL, target_register may need to be NULL
-                program.emit_insn(Insn::ZeroOrNull {
-                    rg1: start_reg,
-                    rg2: lhs_reg,
-                    dest: target_register,
-                });
-                // lhs > end? If true, result is 1
-                program.emit_insn(Insn::Gt {
-                    lhs: lhs_reg,
-                    rhs: end_reg,
-                    target_pc: if_true_label2,
-                    flags,
-                    collation,
-                });
-                // If second comparison involved NULL, target_register may need to be NULL
-                program.emit_insn(Insn::ZeroOrNull {
-                    rg1: lhs_reg,
-                    rg2: end_reg,
-                    dest: target_register,
-                });
-                program.emit_insn(Insn::Goto {
-                    target_pc: done_label,
-                });
-                program.preassign_label_to_next_insn(if_true_label1);
-                program.preassign_label_to_next_insn(if_true_label2);
-                program.emit_insn(Insn::Integer {
-                    value: 1,
-                    dest: target_register,
-                });
-                program.preassign_label_to_next_insn(done_label);
             } else {
                 // BETWEEN: (start <= lhs) AND (lhs <= end)
-                // Result: 1 if both true, 0 if either false, NULL if null
                 let if_true_label1 = program.allocate_label();
+                wrap_eval_jump_expr_zero_or_null(
+                    program,
+                    Insn::Le {
+                        lhs: start_reg,
+                        rhs: lhs_reg,
+                        target_pc: if_true_label1,
+                        flags,
+                        collation,
+                    },
+                    cmp1_reg,
+                    if_true_label1,
+                    start_reg,
+                    lhs_reg,
+                );
                 let if_true_label2 = program.allocate_label();
-                let done_label = program.allocate_label();
-
-                // Default to 1 (true)
-                program.emit_insn(Insn::Integer {
-                    value: 1,
+                wrap_eval_jump_expr_zero_or_null(
+                    program,
+                    Insn::Le {
+                        lhs: lhs_reg,
+                        rhs: end_reg,
+                        target_pc: if_true_label2,
+                        flags,
+                        collation,
+                    },
+                    cmp2_reg,
+                    if_true_label2,
+                    lhs_reg,
+                    end_reg,
+                );
+                program.emit_insn(Insn::And {
+                    lhs: cmp1_reg,
+                    rhs: cmp2_reg,
                     dest: target_register,
                 });
-                // start <= lhs? (Le jumps if true)
-                program.emit_insn(Insn::Le {
-                    lhs: start_reg,
-                    rhs: lhs_reg,
-                    target_pc: if_true_label1,
-                    flags,
-                    collation,
-                });
-                // First comparison false or null
-                program.emit_insn(Insn::ZeroOrNull {
-                    rg1: start_reg,
-                    rg2: lhs_reg,
-                    dest: target_register,
-                });
-                program.emit_insn(Insn::Goto {
-                    target_pc: done_label,
-                });
-                program.preassign_label_to_next_insn(if_true_label1);
-                // lhs <= end?
-                program.emit_insn(Insn::Le {
-                    lhs: lhs_reg,
-                    rhs: end_reg,
-                    target_pc: if_true_label2,
-                    flags,
-                    collation,
-                });
-                // Second comparison false or null
-                program.emit_insn(Insn::ZeroOrNull {
-                    rg1: lhs_reg,
-                    rg2: end_reg,
-                    dest: target_register,
-                });
-                program.emit_insn(Insn::Goto {
-                    target_pc: done_label,
-                });
-                program.preassign_label_to_next_insn(if_true_label2);
-                program.preassign_label_to_next_insn(done_label);
             }
 
             if let Some(span) = constant_span {

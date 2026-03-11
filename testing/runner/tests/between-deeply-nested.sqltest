@@ -117,6 +117,41 @@ expect {
     1
 }
 
+test between-null-start {
+    SELECT 3 BETWEEN NULL AND 5;
+}
+expect {
+
+}
+
+test between-null-end {
+    SELECT 3 BETWEEN 1 AND NULL;
+}
+expect {
+
+}
+
+test not-between-null-start {
+    SELECT 3 NOT BETWEEN NULL AND 5;
+}
+expect {
+
+}
+
+test not-between-null-end {
+    SELECT 3 NOT BETWEEN 1 AND NULL;
+}
+expect {
+
+}
+
+test between-boundary-inclusive {
+    SELECT 0 BETWEEN 0 AND 3, 3 BETWEEN 0 AND 3;
+}
+expect {
+    1|1
+}
+
 test between-check-constraint {
     CREATE TABLE t9(x CHECK(x BETWEEN 1 AND 10));
     INSERT INTO t9 VALUES(5);
