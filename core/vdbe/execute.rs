@@ -8405,6 +8405,27 @@ pub fn op_insert(
                         Value::Numeric(Numeric::Integer(i)) => *i,
                         _ => unreachable!("expected integer key"),
                     };
+
+                    if table_name == SQLITE_SEQUENCE_TABLE_NAME
+                        && program.connection.mv_store().is_some()
+                    {
+                        let cursor = state.get_cursor(*cursor_id);
+                        let cursor = cursor.as_btree_mut() as &mut dyn Any;
+                        if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
+                            mvcc_cursor.register_sqlite_sequence_table_id();
+                        }
+                    }
+
+                    if flag.has(InsertFlags::UPDATE_ROWID_CHANGE)
+                        && program.connection.mv_store().is_some()
+                    {
+                        let cursor = state.get_cursor(*cursor_id);
+                        let cursor = cursor.as_btree_mut() as &mut dyn Any;
+                        if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
+                            mvcc_cursor.suppress_next_rowid_allocator_update();
+                        }
+                    }
+
                     let record = match &state.registers[*record_reg] {
                         Register::Record(r) => std::borrow::Cow::Borrowed(r),
                         Register::Value(value) => {
@@ -8416,6 +8437,7 @@ pub fn op_insert(
                             unreachable!("Cannot insert an aggregate value.")
                         }
                     };
+
                     let cursor = get_cursor!(state, *cursor_id);
                     let cursor = cursor.as_btree_mut();
                     return_if_io!(cursor.insert(&BTreeKey::new_table_rowid(key, Some(&record))));
@@ -8947,8 +8969,19 @@ pub enum OpNewRowidState {
     Start,
     SeekingToLast {
         mvcc_already_initialized: bool,
+        /// The AUTOINCREMENT floor: `max(sqlite_sequence.seq, table_max_rowid)`,
+        /// read from `prev_largest_reg` at `Start`. Threaded through each state
+        /// so `bump_rowid_floor()` can be called wherever the allocator is
+        /// initialized or consulted, ensuring the allocator never hands out a
+        /// rowid at or below the sequence high-water mark — even when the B-tree
+        /// has not yet been checkpointed with the latest MVCC writes.
+        /// Zero means no floor (non-AUTOINCREMENT path).
+        requested_prev_largest: i64,
     },
-    ReadingMaxRowid,
+    ReadingMaxRowid {
+        /// See `SeekingToLast::requested_prev_largest`.
+        requested_prev_largest: i64,
+    },
     GeneratingRandom {
         attempts: u32,
     },
@@ -9010,6 +9043,14 @@ fn new_rowid_inner(
     loop {
         match state.op_new_rowid_state {
             OpNewRowidState::Start => {
+                let requested_prev_largest = if *prev_largest_reg > 0 {
+                    match state.registers[*prev_largest_reg].get_value() {
+                        Value::Numeric(Numeric::Integer(v)) if *v > 0 => *v,
+                        _ => 0,
+                    }
+                } else {
+                    0
+                };
                 if mv_store.is_some() {
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut() as &mut dyn Any;
@@ -9018,12 +9059,32 @@ fn new_rowid_inner(
                             NextRowidResult::Uninitialized => {
                                 state.op_new_rowid_state = OpNewRowidState::SeekingToLast {
                                     mvcc_already_initialized: false,
+                                    requested_prev_largest,
                                 };
                             }
                             NextRowidResult::Next {
-                                new_rowid,
-                                prev_rowid,
+                                mut new_rowid,
+                                mut prev_rowid,
                             } => {
+                                if requested_prev_largest > 0 {
+                                    mvcc_cursor.bump_rowid_floor(requested_prev_largest);
+                                    if new_rowid <= requested_prev_largest {
+                                        match mvcc_cursor.allocate_next_rowid() {
+                                            Some((next_rowid, next_prev_rowid)) => {
+                                                new_rowid = next_rowid;
+                                                prev_rowid = next_prev_rowid;
+                                            }
+                                            None => {
+                                                mvcc_cursor.end_new_rowid();
+                                                state.op_new_rowid_state =
+                                                    OpNewRowidState::GeneratingRandom {
+                                                        attempts: 0,
+                                                    };
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
                                 // Allocator already initialized — release lock immediately
                                 mvcc_cursor.end_new_rowid();
                                 state.registers[*rowid_reg] =
@@ -9034,6 +9095,7 @@ fn new_rowid_inner(
                                 }
                                 state.op_new_rowid_state = OpNewRowidState::SeekingToLast {
                                     mvcc_already_initialized: true,
+                                    requested_prev_largest,
                                 };
                             }
                             NextRowidResult::FindRandom => {
@@ -9052,17 +9114,20 @@ fn new_rowid_inner(
                         );
                         state.op_new_rowid_state = OpNewRowidState::SeekingToLast {
                             mvcc_already_initialized: false,
+                            requested_prev_largest: 0,
                         };
                     }
                 } else {
                     state.op_new_rowid_state = OpNewRowidState::SeekingToLast {
                         mvcc_already_initialized: false,
+                        requested_prev_largest: 0,
                     };
                 }
             }
 
             OpNewRowidState::SeekingToLast {
                 mvcc_already_initialized,
+                requested_prev_largest,
             } => {
                 {
                     let cursor = state.get_cursor(*cursor);
@@ -9076,16 +9141,21 @@ fn new_rowid_inner(
                 if mvcc_already_initialized {
                     state.op_new_rowid_state = OpNewRowidState::GoNext;
                 } else {
-                    state.op_new_rowid_state = OpNewRowidState::ReadingMaxRowid;
+                    state.op_new_rowid_state = OpNewRowidState::ReadingMaxRowid {
+                        requested_prev_largest,
+                    };
                 }
             }
 
-            OpNewRowidState::ReadingMaxRowid => {
+            OpNewRowidState::ReadingMaxRowid {
+                requested_prev_largest,
+            } => {
                 let current_max = {
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut();
                     return_if_io!(cursor.rowid())
                 };
+                let current_max_for_newrowid = current_max.map(|v| v.max(0));
 
                 if mv_store.is_some() {
                     let cursor = state.get_cursor(*cursor);
@@ -9094,7 +9164,10 @@ fn new_rowid_inner(
                         // Initialize the monotonic counter from the btree max.
                         // The allocator lock is held, so no other thread can
                         // race between this read and initialize.
-                        mvcc_cursor.initialize_max_rowid(current_max)?;
+                        mvcc_cursor.initialize_max_rowid(current_max_for_newrowid)?;
+                        if requested_prev_largest > 0 {
+                            mvcc_cursor.bump_rowid_floor(requested_prev_largest);
+                        }
                         // Allocate the first rowid from the freshly initialized counter.
                         match mvcc_cursor.allocate_next_rowid() {
                             Some((new_rowid, prev_rowid)) => {
@@ -9121,10 +9194,10 @@ fn new_rowid_inner(
                 // Non-MVCC path (or ephemeral cursor in MVCC mode)
                 if *prev_largest_reg > 0 {
                     state.registers[*prev_largest_reg] =
-                        Register::Value(Value::from_i64(current_max.unwrap_or(0)));
+                        Register::Value(Value::from_i64(current_max_for_newrowid.unwrap_or(0)));
                 }
-                match current_max {
-                    Some(rowid) if rowid < MAX_ROWID => {
+                match current_max_for_newrowid {
+                    Some(rowid) if rowid > 0 && rowid < MAX_ROWID => {
                         state.registers[*rowid_reg] = Register::Value(Value::from_i64(rowid + 1));
                         tracing::trace!("new_rowid={}", rowid + 1);
                         state.op_new_rowid_state = OpNewRowidState::GoNext;
