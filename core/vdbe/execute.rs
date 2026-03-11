@@ -13162,6 +13162,8 @@ pub(crate) struct OpVacuumIntoState {
     table_names: Vec<String>,
     /// Column names for the current table being copied
     current_table_columns: Vec<String>,
+    /// Unescaped column names for shadowed rowid alias detection
+    current_table_column_names: Vec<String>,
     /// Meta values read from source database header
     source_user_version: i32,
     source_application_id: i32,
@@ -13542,6 +13544,7 @@ fn op_vacuum_into_inner(
                 let pragma_sql = format!("PRAGMA table_info(\"{escaped_table_name}\")");
                 let column_stmt = program.connection.prepare(&pragma_sql)?;
                 vacuum_state.current_table_columns.clear();
+                vacuum_state.current_table_column_names.clear();
                 vacuum_state.sub_state = OpVacuumIntoSubState::CollectColumnInfo {
                     dest_conn,
                     column_stmt: Box::new(column_stmt),
@@ -13562,6 +13565,9 @@ fn op_vacuum_into_inner(
                             .expect("StepResult::Row but row() returned None");
                         // Column name is at index 1
                         if let Value::Text(name) = row.get_value(1) {
+                            vacuum_state
+                                .current_table_column_names
+                                .push(name.as_str().to_string());
                             // Escape double quotes in column name for safe SQL
                             let escaped_name = name.as_str().replace('"', "\"\"");
                             let col_name = format!("\"{escaped_name}\"");
@@ -13585,17 +13591,49 @@ fn op_vacuum_into_inner(
                         // Prepare SELECT and INSERT statements for this table
                         let table_name = &vacuum_state.table_names[table_idx];
                         let escaped_table_name = table_name.replace('"', "\"\"");
-                        let select_sql = format!("SELECT * FROM \"{escaped_table_name}\"");
+                        let table_has_rowid = program
+                            .connection
+                            .schema
+                            .read()
+                            .get_btree_table(table_name)
+                            .map(|table| table.has_rowid)
+                            .unwrap_or(false);
+                        let rowid_alias = if table_has_rowid {
+                            ["rowid", "_rowid_", "oid"].iter().copied().find(|alias| {
+                                !vacuum_state
+                                    .current_table_column_names
+                                    .iter()
+                                    .any(|col| col.eq_ignore_ascii_case(alias))
+                            })
+                        } else {
+                            None
+                        };
+                        let (select_sql, rowid_insert_alias) = if let Some(alias) = rowid_alias {
+                            (
+                                format!("SELECT {alias}, * FROM \"{escaped_table_name}\""),
+                                Some(alias),
+                            )
+                        } else {
+                            (format!("SELECT * FROM \"{escaped_table_name}\""), None)
+                        };
                         let select_stmt = program.connection.prepare(&select_sql)?;
 
                         // Prepare INSERT statement once per table (reused for all rows)
                         let column_names = vacuum_state.current_table_columns.join(", ");
-                        let placeholders: String = (0..vacuum_state.current_table_columns.len())
-                            .map(|_| "?")
-                            .collect::<Vec<_>>()
-                            .join(", ");
+                        let bind_count = if rowid_insert_alias.is_some() {
+                            vacuum_state.current_table_columns.len() + 1
+                        } else {
+                            vacuum_state.current_table_columns.len()
+                        };
+                        let placeholders: String =
+                            (0..bind_count).map(|_| "?").collect::<Vec<_>>().join(", ");
+                        let insert_columns = if let Some(alias) = rowid_insert_alias {
+                            format!("{alias}, {column_names}")
+                        } else {
+                            column_names
+                        };
                         let insert_sql = format!(
-                            "INSERT INTO \"{escaped_table_name}\" ({column_names}) VALUES ({placeholders})"
+                            "INSERT INTO \"{escaped_table_name}\" ({insert_columns}) VALUES ({placeholders})"
                         );
 
                         // Internal tables need nested mode to bypass "may not

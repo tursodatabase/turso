@@ -639,6 +639,137 @@ fn test_vacuum_into_preserves_autoincrement(tmp_db: TempDatabase) -> anyhow::Res
     Ok(())
 }
 
+/// Test VACUUM INTO preserves hidden rowid values for ordinary rowid tables.
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_preserves_rowid_for_rowid_tables(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (a TEXT)")?;
+    conn.execute("INSERT INTO t(rowid, a) VALUES(5, 'x')")?;
+    conn.execute("INSERT INTO t(rowid, a) VALUES(42, 'y')")?;
+
+    let source_rows: Vec<(i64, String)> = conn.exec_rows("SELECT rowid, a FROM t ORDER BY rowid");
+    assert_eq!(
+        source_rows,
+        vec![(5, "x".to_string()), (42, "y".to_string())]
+    );
+
+    let source_hash = compute_dbhash(&tmp_db);
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed_rowid.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    if !tmp_db.enable_mvcc {
+        assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+    }
+
+    let dest_rows: Vec<(i64, String)> =
+        dest_conn.exec_rows("SELECT rowid, a FROM t ORDER BY rowid");
+    assert_eq!(dest_rows, vec![(5, "x".to_string()), (42, "y".to_string())]);
+
+    Ok(())
+}
+
+/// Test VACUUM INTO preserves hidden rowid values when "rowid" column name is shadowed.
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_preserves_rowid_when_rowid_alias_is_shadowed(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (rowid TEXT, a TEXT)")?;
+    conn.execute("INSERT INTO t(_rowid_, rowid, a) VALUES(77, 'visible', 'x')")?;
+
+    let source_rows: Vec<(i64, String, String)> =
+        conn.exec_rows("SELECT _rowid_, rowid, a FROM t ORDER BY _rowid_");
+    assert_eq!(
+        source_rows,
+        vec![(77, "visible".to_string(), "x".to_string())]
+    );
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed_rowid_shadowed.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+
+    let dest_rows: Vec<(i64, String, String)> =
+        dest_conn.exec_rows("SELECT _rowid_, rowid, a FROM t ORDER BY _rowid_");
+    assert_eq!(
+        dest_rows,
+        vec![(77, "visible".to_string(), "x".to_string())]
+    );
+
+    Ok(())
+}
+
+/// Test VACUUM INTO succeeds when all hidden rowid aliases are shadowed by real columns.
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_when_all_rowid_aliases_are_shadowed(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (rowid TEXT, _rowid_ TEXT, oid TEXT, a TEXT)")?;
+    conn.execute("INSERT INTO t(rowid, _rowid_, oid, a) VALUES('r1', 'u1', 'o1', 'x')")?;
+    conn.execute("INSERT INTO t(rowid, _rowid_, oid, a) VALUES('r2', 'u2', 'o2', 'y')")?;
+
+    let source_rows: Vec<(String, String, String, String)> =
+        conn.exec_rows("SELECT rowid, _rowid_, oid, a FROM t ORDER BY a");
+    assert_eq!(
+        source_rows,
+        vec![
+            (
+                "r1".to_string(),
+                "u1".to_string(),
+                "o1".to_string(),
+                "x".to_string()
+            ),
+            (
+                "r2".to_string(),
+                "u2".to_string(),
+                "o2".to_string(),
+                "y".to_string()
+            ),
+        ]
+    );
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed_all_aliases_shadowed.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+
+    let dest_rows: Vec<(String, String, String, String)> =
+        dest_conn.exec_rows("SELECT rowid, _rowid_, oid, a FROM t ORDER BY a");
+    assert_eq!(
+        dest_rows,
+        vec![
+            (
+                "r1".to_string(),
+                "u1".to_string(),
+                "o1".to_string(),
+                "x".to_string()
+            ),
+            (
+                "r2".to_string(),
+                "u2".to_string(),
+                "o2".to_string(),
+                "y".to_string()
+            ),
+        ]
+    );
+
+    Ok(())
+}
+
 /// Test that a table with "sqlite_sequence" in its SQL (e.g., default value) is NOT skipped
 #[turso_macros::test(mvcc)]
 fn test_vacuum_into_table_with_sqlite_sequence_in_sql(tmp_db: TempDatabase) -> anyhow::Result<()> {
