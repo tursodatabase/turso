@@ -568,3 +568,48 @@ expect {
     150
     200
 }
+
+# Regression test for materialized hash joins dropping build-side LEFT JOIN ON predicates.
+@cross-check-integrity
+test left-hash-join-materialized-prefix-keeps-build-side-on-const {
+    create table a(id integer primary key, x integer, y integer);
+    create table b(id integer primary key, x integer, y integer);
+    create table c(id integer primary key, x integer, y integer);
+    create index idx_a_x on a(x);
+    create index idx_b_x on b(x);
+    insert into a values (1,10,100),(2,20,200),(3,30,300);
+    insert into b values (1,10,1000),(2,20,2000),(3,30,3000);
+    insert into c values (1,10,7),(2,20,8),(3,30,9);
+    select a.id, b.id, ifnull(c.id, -1)
+    from a
+    join b on a.x = b.x
+    left join c on b.x = 10 and b.x = c.x
+    order by 1, 2, 3;
+}
+expect {
+    1|1|1
+    2|2|-1
+    3|3|-1
+}
+
+@cross-check-integrity
+test left-hash-join-materialized-prefix-keeps-build-side-on-in-list {
+    create table a(id integer primary key, x integer, y integer);
+    create table b(id integer primary key, x integer, y integer);
+    create table c(id integer primary key, x integer, y integer);
+    create index idx_a_x on a(x);
+    create index idx_b_x on b(x);
+    insert into a values (1,10,100),(2,20,200),(3,30,300);
+    insert into b values (1,10,1000),(2,20,2000),(3,30,3000);
+    insert into c values (1,10,7),(2,20,8),(3,30,9);
+    select a.id, b.id, ifnull(c.id, -1)
+    from a
+    join b on a.x = b.x
+    left join c on b.x in (10, 30) and b.x = c.x
+    order by 1, 2, 3;
+}
+expect {
+    1|1|1
+    2|2|-1
+    3|3|3
+}
