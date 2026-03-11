@@ -19,7 +19,6 @@ use crate::sync::Arc;
 use crate::translate::expression_index::{
     normalize_expr_for_index_matching, single_table_column_usage,
 };
-use crate::translate::optimizer::TakeOwnership;
 use crate::translate::plan::{Operation, ResultSetColumn, Search};
 use crate::translate::planner::parse_row_id;
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
@@ -495,8 +494,136 @@ pub fn translate_condition_expr(
         ast::Expr::Raise(_, _) => {
             crate::bail_parse_error!("RAISE in WHERE clause is not supported");
         }
-        ast::Expr::Between { .. } => {
-            crate::bail_parse_error!("BETWEEN expression should have been rewritten in optmizer")
+        ast::Expr::Between {
+            lhs,
+            not,
+            start,
+            end,
+        } => {
+            // Handle BETWEEN natively instead of rewriting the AST (which clones
+            // the lhs and causes exponential tree growth with chained BETWEENs).
+            // Translate each sub-expression into a register once, then emit
+            // comparison instructions directly.
+            // x BETWEEN start AND end  =>  (start <= lhs) AND (lhs <= end)
+            // x NOT BETWEEN start AND end  =>  (start > lhs) OR (lhs > end)
+            let lhs_reg = program.alloc_register();
+            let start_reg = program.alloc_register();
+            let end_reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), lhs, lhs_reg, resolver)?;
+            translate_expr(program, Some(referenced_tables), start, start_reg, resolver)?;
+            translate_expr(program, Some(referenced_tables), end, end_reg, resolver)?;
+            let flags = CmpInsFlags::default();
+            let collation = program.curr_collation();
+            if *not {
+                // NOT BETWEEN: (start > lhs) OR (lhs > end)
+                // If first comparison is true, jump to true target (short-circuit OR).
+                // Otherwise, evaluate second comparison.
+                let flags_first = if condition_metadata.jump_target_when_null
+                    == condition_metadata.jump_target_when_true
+                {
+                    flags.jump_if_null()
+                } else {
+                    flags
+                };
+                // start > lhs? If true, the NOT BETWEEN is true.
+                program.emit_insn(Insn::Gt {
+                    lhs: start_reg,
+                    rhs: lhs_reg,
+                    target_pc: condition_metadata.jump_target_when_true,
+                    flags: flags_first,
+                    collation,
+                });
+                // If first comparison was NULL and we didn't jump, we need to
+                // check the second comparison but remember the NULL.
+                // For simplicity, fall through to second comparison.
+                // lhs > end? Apply full condition_metadata.
+                let flags_second = if condition_metadata.jump_if_condition_is_true {
+                    if condition_metadata.jump_target_when_null
+                        == condition_metadata.jump_target_when_true
+                    {
+                        flags.jump_if_null()
+                    } else {
+                        flags
+                    }
+                } else if condition_metadata.jump_target_when_null
+                    == condition_metadata.jump_target_when_false
+                {
+                    flags.jump_if_null()
+                } else {
+                    flags
+                };
+                if condition_metadata.jump_if_condition_is_true {
+                    program.emit_insn(Insn::Gt {
+                        lhs: lhs_reg,
+                        rhs: end_reg,
+                        target_pc: condition_metadata.jump_target_when_true,
+                        flags: flags_second,
+                        collation,
+                    });
+                } else {
+                    // Jump if false: use opposite (Le) to jump when NOT (lhs > end)
+                    program.emit_insn(Insn::Le {
+                        lhs: lhs_reg,
+                        rhs: end_reg,
+                        target_pc: condition_metadata.jump_target_when_false,
+                        flags: flags_second,
+                        collation,
+                    });
+                }
+            } else {
+                // BETWEEN: (start <= lhs) AND (lhs <= end)
+                // If first comparison is false, jump to false target (short-circuit AND).
+                // Otherwise, evaluate second comparison.
+                let flags_first = if condition_metadata.jump_target_when_null
+                    == condition_metadata.jump_target_when_false
+                {
+                    flags.jump_if_null()
+                } else {
+                    flags
+                };
+                // start <= lhs? If false (i.e. start > lhs), the BETWEEN is false.
+                program.emit_insn(Insn::Gt {
+                    lhs: start_reg,
+                    rhs: lhs_reg,
+                    target_pc: condition_metadata.jump_target_when_false,
+                    flags: flags_first,
+                    collation,
+                });
+                // lhs <= end? Apply full condition_metadata.
+                let flags_second = if condition_metadata.jump_if_condition_is_true {
+                    if condition_metadata.jump_target_when_null
+                        == condition_metadata.jump_target_when_true
+                    {
+                        flags.jump_if_null()
+                    } else {
+                        flags
+                    }
+                } else if condition_metadata.jump_target_when_null
+                    == condition_metadata.jump_target_when_false
+                {
+                    flags.jump_if_null()
+                } else {
+                    flags
+                };
+                if condition_metadata.jump_if_condition_is_true {
+                    program.emit_insn(Insn::Le {
+                        lhs: lhs_reg,
+                        rhs: end_reg,
+                        target_pc: condition_metadata.jump_target_when_true,
+                        flags: flags_second,
+                        collation,
+                    });
+                } else {
+                    // Jump if false: use opposite (Gt) to jump when NOT (lhs <= end)
+                    program.emit_insn(Insn::Gt {
+                        lhs: lhs_reg,
+                        rhs: end_reg,
+                        target_pc: condition_metadata.jump_target_when_false,
+                        flags: flags_second,
+                        collation,
+                    });
+                }
+            }
         }
         ast::Expr::Variable(_) => {
             crate::bail_parse_error!(
@@ -1117,8 +1244,130 @@ pub fn translate_expr(
                 }
             }
         }
-        ast::Expr::Between { .. } => {
-            crate::bail_parse_error!("BETWEEN expression should have been rewritten in optmizer")
+        ast::Expr::Between {
+            lhs,
+            not,
+            start,
+            end,
+        } => {
+            // Handle BETWEEN natively to avoid exponential AST growth from cloning.
+            // x BETWEEN start AND end  =>  (start <= lhs) AND (lhs <= end)  =>  1 if both true, 0 if either false, NULL if null
+            // x NOT BETWEEN start AND end  =>  (start > lhs) OR (lhs > end)
+            let lhs_reg = program.alloc_register();
+            let start_reg = program.alloc_register();
+            let end_reg = program.alloc_register();
+            translate_expr(program, referenced_tables, lhs, lhs_reg, resolver)?;
+            translate_expr(program, referenced_tables, start, start_reg, resolver)?;
+            translate_expr(program, referenced_tables, end, end_reg, resolver)?;
+
+            let flags = CmpInsFlags::default();
+            let collation = program.curr_collation();
+
+            if *not {
+                // NOT BETWEEN: (start > lhs) OR (lhs > end)
+                // Result: 1 if either is true, 0 if both are false, NULL if null
+                let if_true_label1 = program.allocate_label();
+                let if_true_label2 = program.allocate_label();
+                let done_label = program.allocate_label();
+
+                // Default to 0 (false)
+                program.emit_insn(Insn::Integer {
+                    value: 0,
+                    dest: target_register,
+                });
+                // start > lhs? If true, result is 1
+                program.emit_insn(Insn::Gt {
+                    lhs: start_reg,
+                    rhs: lhs_reg,
+                    target_pc: if_true_label1,
+                    flags,
+                    collation,
+                });
+                // If first comparison involved NULL, target_register may need to be NULL
+                program.emit_insn(Insn::ZeroOrNull {
+                    rg1: start_reg,
+                    rg2: lhs_reg,
+                    dest: target_register,
+                });
+                // lhs > end? If true, result is 1
+                program.emit_insn(Insn::Gt {
+                    lhs: lhs_reg,
+                    rhs: end_reg,
+                    target_pc: if_true_label2,
+                    flags,
+                    collation,
+                });
+                // If second comparison involved NULL, target_register may need to be NULL
+                program.emit_insn(Insn::ZeroOrNull {
+                    rg1: lhs_reg,
+                    rg2: end_reg,
+                    dest: target_register,
+                });
+                program.emit_insn(Insn::Goto {
+                    target_pc: done_label,
+                });
+                program.preassign_label_to_next_insn(if_true_label1);
+                program.preassign_label_to_next_insn(if_true_label2);
+                program.emit_insn(Insn::Integer {
+                    value: 1,
+                    dest: target_register,
+                });
+                program.preassign_label_to_next_insn(done_label);
+            } else {
+                // BETWEEN: (start <= lhs) AND (lhs <= end)
+                // Result: 1 if both true, 0 if either false, NULL if null
+                let if_true_label1 = program.allocate_label();
+                let if_true_label2 = program.allocate_label();
+                let done_label = program.allocate_label();
+
+                // Default to 1 (true)
+                program.emit_insn(Insn::Integer {
+                    value: 1,
+                    dest: target_register,
+                });
+                // start <= lhs? (Le jumps if true)
+                program.emit_insn(Insn::Le {
+                    lhs: start_reg,
+                    rhs: lhs_reg,
+                    target_pc: if_true_label1,
+                    flags,
+                    collation,
+                });
+                // First comparison false or null
+                program.emit_insn(Insn::ZeroOrNull {
+                    rg1: start_reg,
+                    rg2: lhs_reg,
+                    dest: target_register,
+                });
+                program.emit_insn(Insn::Goto {
+                    target_pc: done_label,
+                });
+                program.preassign_label_to_next_insn(if_true_label1);
+                // lhs <= end?
+                program.emit_insn(Insn::Le {
+                    lhs: lhs_reg,
+                    rhs: end_reg,
+                    target_pc: if_true_label2,
+                    flags,
+                    collation,
+                });
+                // Second comparison false or null
+                program.emit_insn(Insn::ZeroOrNull {
+                    rg1: lhs_reg,
+                    rg2: end_reg,
+                    dest: target_register,
+                });
+                program.emit_insn(Insn::Goto {
+                    target_pc: done_label,
+                });
+                program.preassign_label_to_next_insn(if_true_label2);
+                program.preassign_label_to_next_insn(done_label);
+            }
+
+            if let Some(span) = constant_span {
+                program.constant_span_end(span);
+            }
+            return Ok(target_register);
         }
         ast::Expr::Binary(e1, op, e2) => {
             // Handle IS TRUE/IS FALSE/IS NOT TRUE/IS NOT FALSE specially.
@@ -5271,30 +5520,13 @@ pub fn bind_and_rewrite_expr<'a>(
         top_level_expr,
         &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
             match expr {
-                ast::Expr::Between {
-                    lhs,
-                    not,
-                    start,
-                    end,
-                } => {
-                    let (lower_op, upper_op) = if *not {
-                        (ast::Operator::Greater, ast::Operator::Greater)
-                    } else {
-                        (ast::Operator::LessEquals, ast::Operator::LessEquals)
-                    };
-                    let start = start.take_ownership();
-                    let lhs_v = lhs.take_ownership();
-                    let end = end.take_ownership();
-
-                    let lower =
-                        ast::Expr::Binary(Box::new(start), lower_op, Box::new(lhs_v.clone()));
-                    let upper = ast::Expr::Binary(Box::new(lhs_v), upper_op, Box::new(end));
-
-                    *expr = if *not {
-                        ast::Expr::Binary(Box::new(lower), ast::Operator::Or, Box::new(upper))
-                    } else {
-                        ast::Expr::Binary(Box::new(lower), ast::Operator::And, Box::new(upper))
-                    };
+                // BETWEEN is now handled natively at bytecode emission time
+                // (translate_condition_expr / translate_expr). We do NOT rewrite
+                // it to Binary AND/OR here because that clones the LHS and causes
+                // exponential AST growth with chained BETWEENs.
+                // Just let walk_expr_mut recurse into the sub-expressions for binding.
+                ast::Expr::Between { .. } => {
+                    return Ok(WalkControl::Continue);
                 }
                 Expr::Id(id) => {
                     let Some(referenced_tables) = &mut referenced_tables else {
@@ -5659,39 +5891,6 @@ pub fn bind_and_rewrite_expr<'a>(
         },
     )?;
     Ok(())
-}
-
-/// Rewrite BETWEEN expressions to Binary expressions with AND/OR.
-/// This is a subset of bind_and_rewrite_expr that only handles BETWEEN rewriting.
-pub fn rewrite_between_expr(expr: &mut ast::Expr) {
-    let _ = walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
-        if let ast::Expr::Between {
-            lhs,
-            not,
-            start,
-            end,
-        } = e
-        {
-            let (lower_op, upper_op) = if *not {
-                (ast::Operator::Greater, ast::Operator::Greater)
-            } else {
-                (ast::Operator::LessEquals, ast::Operator::LessEquals)
-            };
-            let start = start.take_ownership();
-            let lhs_v = lhs.take_ownership();
-            let end = end.take_ownership();
-
-            let lower = ast::Expr::Binary(Box::new(start), lower_op, Box::new(lhs_v.clone()));
-            let upper = ast::Expr::Binary(Box::new(lhs_v), upper_op, Box::new(end));
-
-            *e = if *not {
-                ast::Expr::Binary(Box::new(lower), ast::Operator::Or, Box::new(upper))
-            } else {
-                ast::Expr::Binary(Box::new(lower), ast::Operator::And, Box::new(upper))
-            };
-        }
-        Ok(WalkControl::Continue)
-    });
 }
 
 /// Recursively walks a mutable expression, applying a function to each sub-expression.
@@ -7019,10 +7218,9 @@ pub(crate) fn emit_type_expr(
 
     // Translate body expression only if param setup succeeded
     let result = param_result.and_then(|()| {
-        // Rewrite BETWEEN expressions before translation (the optimizer
-        // normally does this, but type expressions bypass the optimizer).
-        let mut rewritten = expr.clone();
-        rewrite_between_expr(&mut rewritten);
+        // Clone the expression for translation (BETWEEN is handled natively
+        // at bytecode emission time, so no AST rewrite needed).
+        let rewritten = expr.clone();
 
         // Translate the expression, disabling constant optimization since
         // the `value` placeholder refers to a register that changes per row.

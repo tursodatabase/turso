@@ -1,0 +1,135 @@
+@database :memory:
+
+test between-basic-value {
+    CREATE TABLE t1(x);
+    INSERT INTO t1 VALUES(1);
+    INSERT INTO t1 VALUES(0);
+    INSERT INTO t1 VALUES(5);
+    SELECT x, x BETWEEN 0 AND 3 FROM t1 ORDER BY x;
+}
+expect {
+    0|1
+    1|1
+    5|0
+}
+
+test not-between-basic-value {
+    CREATE TABLE t2(x);
+    INSERT INTO t2 VALUES(1);
+    INSERT INTO t2 VALUES(0);
+    INSERT INTO t2 VALUES(5);
+    SELECT x, x NOT BETWEEN 0 AND 3 FROM t2 ORDER BY x;
+}
+expect {
+    0|0
+    1|0
+    5|1
+}
+
+test between-null {
+    CREATE TABLE t3(x);
+    INSERT INTO t3 VALUES(NULL);
+    SELECT x BETWEEN 0 AND 3 FROM t3;
+}
+expect {
+
+}
+
+test not-between-null {
+    CREATE TABLE t4(x);
+    INSERT INTO t4 VALUES(NULL);
+    SELECT x NOT BETWEEN 0 AND 3 FROM t4;
+}
+expect {
+
+}
+
+test between-where-clause {
+    CREATE TABLE t5(x);
+    INSERT INTO t5 VALUES(1);
+    INSERT INTO t5 VALUES(0);
+    INSERT INTO t5 VALUES(5);
+    SELECT x FROM t5 WHERE x BETWEEN 0 AND 3 ORDER BY x;
+}
+expect {
+    0
+    1
+}
+
+test not-between-where-clause {
+    CREATE TABLE t6(x);
+    INSERT INTO t6 VALUES(1);
+    INSERT INTO t6 VALUES(0);
+    INSERT INTO t6 VALUES(5);
+    SELECT x FROM t6 WHERE x NOT BETWEEN 0 AND 3 ORDER BY x;
+}
+expect {
+    5
+}
+
+test between-with-case {
+    CREATE TABLE t7(x);
+    INSERT INTO t7 VALUES(1);
+    INSERT INTO t7 VALUES(0);
+    INSERT INTO t7 VALUES(5);
+    SELECT x BETWEEN 0 AND CASE WHEN 1 THEN 3 END FROM t7 WHERE x IS NOT NULL ORDER BY x;
+}
+expect {
+    1
+    1
+    0
+}
+
+test deeply-nested-between-partial-index {
+    CREATE TABLE t8(x);
+    CREATE INDEX i8 ON t8(x) WHERE
+      x BETWEEN 0 AND CASE WHEN 1 THEN 1 END
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0;
+    INSERT INTO t8 VALUES(1);
+    SELECT * FROM t8;
+}
+expect {
+    1
+}
+
+test chained-between-value {
+    SELECT 1 BETWEEN 0 AND 2 BETWEEN 0 AND 1;
+}
+expect {
+    1
+}
+
+test chained-not-between {
+    SELECT 5 NOT BETWEEN 0 AND 3 BETWEEN 0 AND 1;
+}
+expect {
+    1
+}
+
+test between-check-constraint {
+    CREATE TABLE t9(x CHECK(x BETWEEN 1 AND 10));
+    INSERT INTO t9 VALUES(5);
+    SELECT * FROM t9;
+}
+expect {
+    5
+}
+
+test between-check-constraint-violation {
+    CREATE TABLE t10(x CHECK(x BETWEEN 1 AND 10));
+    INSERT INTO t10 VALUES(20);
+}
+expect error {
+    CHECK constraint failed
+}
