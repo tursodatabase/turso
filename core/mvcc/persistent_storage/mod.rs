@@ -33,6 +33,15 @@ pub trait DurableStorage: Send + Sync + Debug {
     ///
     /// Called during recovery to seed the CRC state from the header's salt.
     fn set_header(&self, header: logical_log::LogHeader);
+
+    /// Called when a checkpoint begins, before any rows are written to the B-tree.
+    /// `durable_txid_max` is the transaction watermark that will be durably persisted
+    /// once the checkpoint completes.
+    fn on_checkpoint_start(&self, _durable_txid_max: u64) {}
+
+    /// Called after the checkpoint has fully completed: rows are flushed, WAL is
+    /// truncated, and the logical log is reset.
+    fn on_checkpoint_end(&self, _durable_txid_max: u64) {}
 }
 
 pub struct Storage {
