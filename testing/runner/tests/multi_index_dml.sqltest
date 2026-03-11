@@ -36,6 +36,69 @@ setup multi_index_null_residual_schema {
         (5, 0, 0, 40, NULL);
 }
 
+setup multi_index_fk_update_schema {
+    PRAGMA foreign_keys = ON;
+
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    INSERT INTO parent VALUES (1), (2);
+
+    CREATE TABLE t (
+        id INTEGER PRIMARY KEY,
+        i1 INTEGER,
+        i2 INTEGER,
+        pid INTEGER REFERENCES parent(id),
+        note TEXT
+    );
+    CREATE INDEX t_i1 ON t(i1);
+    CREATE INDEX t_i2 ON t(i2);
+
+    CREATE TABLE audit(msg TEXT);
+    CREATE TRIGGER tr_log_update
+    AFTER UPDATE ON t
+    BEGIN
+        INSERT INTO audit VALUES ('updated=' || NEW.id || ':' || NEW.pid);
+    END;
+
+    INSERT INTO t VALUES
+        (1, 5, 0, 1, 'skip'),
+        (2, 5, 6, 1, 'move'),
+        (3, 0, 6, 1, 'skip');
+}
+
+setup multi_index_fk_delete_schema {
+    PRAGMA foreign_keys = ON;
+
+    CREATE TABLE parent (
+        id INTEGER PRIMARY KEY,
+        i1 INTEGER,
+        i2 INTEGER,
+        tag TEXT
+    );
+    CREATE INDEX parent_i1 ON parent(i1);
+    CREATE INDEX parent_i2 ON parent(i2);
+
+    CREATE TABLE child (
+        id INTEGER PRIMARY KEY,
+        parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE,
+        payload TEXT
+    );
+
+    CREATE TABLE audit(msg TEXT);
+    CREATE TRIGGER tr_log_delete
+    AFTER DELETE ON parent
+    BEGIN
+        INSERT INTO audit VALUES ('deleted=' || OLD.id);
+    END;
+
+    INSERT INTO parent VALUES
+        (1, 5, 0, 'keep'),
+        (2, 5, 6, 'drop'),
+        (3, 0, 6, 'keep');
+    INSERT INTO child VALUES
+        (1, 2, 'c2'),
+        (2, 3, 'c3');
+}
+
 @setup multi_index_dml_schema
 snapshot-eqp multi-index-or-access-shape {
     SELECT id FROM t WHERE i1 = 5 OR i2 = 6;
@@ -311,6 +374,47 @@ expect {
     3|30
     1|5|0|10
     4|0|0|40
+}
+
+@setup multi_index_fk_update_schema
+@cross-check-integrity
+@requires trigger "requires trigger support"
+test update-multi-index-and-returning-with-trigger-and-fk {
+    UPDATE t
+    SET pid = 2
+    WHERE i1 = 5 AND i2 = 6
+    RETURNING id, pid;
+
+    SELECT * FROM audit;
+    SELECT id, pid FROM t ORDER BY id;
+}
+expect {
+    2|2
+    updated=2:2
+    1|1
+    2|2
+    3|1
+}
+
+@setup multi_index_fk_delete_schema
+@cross-check-integrity
+@requires trigger "requires trigger support"
+test delete-multi-index-compound-or-returning-with-trigger-and-fk {
+    DELETE FROM parent
+    WHERE (i1 = 5 AND tag = 'drop')
+       OR (i2 = 999 AND tag = 'keep')
+    RETURNING id, tag;
+
+    SELECT * FROM audit ORDER BY rowid;
+    SELECT id, parent_id, payload FROM child ORDER BY id;
+    SELECT id, i1, i2, tag FROM parent ORDER BY id;
+}
+expect {
+    2|drop
+    deleted=2
+    2|3|c3
+    1|5|0|keep
+    3|0|6|keep
 }
 
 @setup multi_index_null_residual_schema

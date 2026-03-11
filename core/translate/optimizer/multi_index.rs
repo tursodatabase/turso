@@ -847,7 +847,9 @@ pub fn consider_multi_index_intersection(
 
 #[cfg(test)]
 mod tests {
-    use super::{consider_multi_index_union, MultiIndexBranchParams};
+    use super::{
+        consider_multi_index_intersection, consider_multi_index_union, MultiIndexBranchParams,
+    };
     use crate::{
         schema::{BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table, Type},
         translate::{
@@ -1138,6 +1140,100 @@ mod tests {
         assert!(
             access_method.is_none(),
             "future-table residuals must not produce a multi-index OR access method"
+        );
+    }
+
+    #[test]
+    fn test_multi_index_intersection_supports_rowid_and_secondary_index_branches() {
+        let item = create_btree_table(
+            "item",
+            vec![
+                create_column(&TestColumn {
+                    name: "id".to_string(),
+                    ty: Type::Integer,
+                    is_rowid_alias: true,
+                }),
+                create_column_of_type("a", Type::Integer),
+            ],
+        );
+
+        let mut table_id_counter = TableRefIdCounter::new();
+        let joined_tables = vec![create_table_reference(item, None, table_id_counter.next())];
+        let item_id = joined_tables[0].internal_id;
+
+        let mut available_indexes = HashMap::default();
+        available_indexes.insert(
+            "item".to_string(),
+            VecDeque::from([Arc::new(Index {
+                name: "idx_item_a".to_string(),
+                table_name: "item".to_string(),
+                where_clause: None,
+                columns: vec![IndexColumn {
+                    name: "a".to_string(),
+                    order: SortOrder::Asc,
+                    pos_in_table: 1,
+                    collation: None,
+                    default: None,
+                    expr: None,
+                }],
+                unique: false,
+                ephemeral: false,
+                root_page: 2,
+                has_rowid: true,
+                index_method: None,
+            })]),
+        );
+
+        let where_clause = vec![
+            WhereTerm {
+                expr: Expr::Binary(
+                    Box::new(create_column_expr(item_id, 0, true)),
+                    Operator::Greater,
+                    Box::new(create_numeric_literal("10")),
+                ),
+                from_outer_join: None,
+                consumed: false,
+            },
+            WhereTerm {
+                expr: Expr::Binary(
+                    Box::new(create_column_expr(item_id, 1, false)),
+                    Operator::Equals,
+                    Box::new(create_numeric_literal("7")),
+                ),
+                from_outer_join: None,
+                consumed: false,
+            },
+        ];
+
+        let table_references = TableReferences::new(joined_tables, vec![]);
+        let base_row_count = RowCountEstimate::hardcoded_fallback(&DEFAULT_PARAMS);
+
+        let access_method = consider_multi_index_intersection(
+            &table_references.joined_tables()[0],
+            &where_clause,
+            &available_indexes,
+            &table_references,
+            &[],
+            &empty_schema(),
+            1.0,
+            base_row_count,
+            &DEFAULT_PARAMS,
+            Cost(f64::INFINITY),
+            &TableMask::new(),
+        )
+        .expect("rowid and secondary-index terms should be eligible for intersection");
+
+        let branches = assert_is_multi_index(&access_method);
+        assert_eq!(branches.len(), 2);
+        assert!(
+            branches.iter().any(|branch| branch.index.is_none()),
+            "expected one rowid branch"
+        );
+        assert!(
+            branches.iter().any(
+                |branch| branch.index.as_ref().map(|idx| idx.name.as_str()) == Some("idx_item_a")
+            ),
+            "expected one secondary-index branch"
         );
     }
 
