@@ -365,6 +365,24 @@ expect {
     300|7||
 }
 
+# The rowid appended to a rowid-table index should preserve ORDER BY ties
+# on the non-nullable side of a LEFT JOIN.
+@setup join_outer_const_schema
+test join-left-order-outer-rowid-suffix {
+    SELECT o.customer_id, o.id
+    FROM lhs_orders o
+    LEFT JOIN rhs_items i
+        ON i.order_id = o.id
+       AND i.product = 'x'
+    WHERE o.customer_id = 300
+    ORDER BY o.customer_id, o.id;
+}
+expect {
+    300|6
+    300|6
+    300|7
+}
+
 setup expr_sort_elim {
     CREATE TABLE expr_articles (
         id INTEGER PRIMARY KEY,

@@ -3,6 +3,7 @@ use crate::{
     schema::Schema,
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
+        expression_index::normalize_expr_for_index_matching,
         optimizer::access_method::AccessMethodParams,
         plan::{GroupBy, HashJoinType, IterationDirection, JoinedTable, TableReferences},
         planner::table_mask_from_expr,
@@ -274,6 +275,14 @@ pub fn plan_satisfies_order_target(
                     // non-equality columns the index must provide the right order.
                     let mut col_idx = 0; // consumed target columns
                     let mut idx_pos = 0; // current index column position
+                                         // Secondary indexes on rowid tables implicitly end with rowid.
+                                         // If all declared index columns match, that hidden suffix can
+                                         // still satisfy one more ORDER BY term as a tie-breaker.
+                    let rowid_alias_col = table_ref
+                        .table
+                        .columns()
+                        .iter()
+                        .position(|c| c.is_rowid_alias());
                     while target_col_idx + col_idx < num_cols_in_order_target
                         && idx_pos < index.columns.len()
                     {
@@ -285,16 +294,8 @@ pub fn plan_satisfies_order_target(
                         if eq_positions.contains(&idx_pos) {
                             let target_col = &order_target.0[target_col_idx + col_idx];
                             let idx_col = &index.columns[idx_pos];
-                            let same_col = target_col.table_id == table_ref.internal_id
-                                && match (&target_col.target, &idx_col.expr) {
-                                    (ColumnTarget::Column(col_no), None) => {
-                                        idx_col.pos_in_table == *col_no
-                                    }
-                                    (ColumnTarget::Expr(expr), Some(idx_expr)) => {
-                                        exprs_are_equivalent(unsafe { &**expr }, idx_expr)
-                                    }
-                                    _ => false,
-                                };
+                            let same_col =
+                                target_matches_index_column(target_col, idx_col, table_ref);
                             if same_col {
                                 col_idx += 1; // target satisfied by constant
                             }
@@ -307,14 +308,8 @@ pub fn plan_satisfies_order_target(
                             break;
                         }
                         let idx_col = &index.columns[idx_pos];
-                        let column_matches = match (&target_col.target, &idx_col.expr) {
-                            (ColumnTarget::Column(col_no), None) => idx_col.pos_in_table == *col_no,
-                            (ColumnTarget::Expr(expr), Some(idx_expr)) => {
-                                exprs_are_equivalent(unsafe { &**expr }, idx_expr)
-                            }
-                            (ColumnTarget::RowId, _) => false,
-                            _ => false,
-                        };
+                        let column_matches =
+                            target_matches_index_column(target_col, idx_col, table_ref);
                         if !column_matches {
                             break;
                         }
@@ -350,6 +345,36 @@ pub fn plan_satisfies_order_target(
                         col_idx += 1;
                         idx_pos += 1;
                     }
+
+                    // SQLite-style rowid tables keep entries with equal index keys
+                    // ordered by rowid. That means an index on (a, b) can also
+                    // satisfy ORDER BY a, b, rowid, even though rowid is not
+                    // written explicitly in the index definition.
+                    if target_col_idx + col_idx < num_cols_in_order_target
+                        && idx_pos == index.columns.len()
+                        && index.has_rowid
+                    {
+                        let target_col = &order_target.0[target_col_idx + col_idx];
+                        let rowid_matches = match target_col.target {
+                            ColumnTarget::RowId => true,
+                            ColumnTarget::Column(col_no) => {
+                                rowid_alias_col.is_some_and(|alias| alias == col_no)
+                            }
+                            ColumnTarget::Expr(_) => false,
+                        };
+                        let correct_order = if *iter_dir == IterationDirection::Forwards {
+                            target_col.order == SortOrder::Asc
+                        } else {
+                            target_col.order == SortOrder::Desc
+                        };
+                        if target_col.table_id == table_ref.internal_id
+                            && rowid_matches
+                            && correct_order
+                        {
+                            col_idx += 1;
+                        }
+                    }
+
                     if col_idx == 0 {
                         return false;
                     }
@@ -432,4 +457,31 @@ fn expr_to_column_order(
         order,
         collation,
     })
+}
+
+fn target_matches_index_column(
+    target_col: &ColumnOrder,
+    idx_col: &crate::schema::IndexColumn,
+    table_ref: &JoinedTable,
+) -> bool {
+    if target_col.table_id != table_ref.internal_id {
+        return false;
+    }
+    match (&target_col.target, &idx_col.expr) {
+        (ColumnTarget::Column(col_no), None) => idx_col.pos_in_table == *col_no,
+        (ColumnTarget::Expr(expr), Some(idx_expr)) => {
+            let target_expr = unsafe { &**expr };
+            if exprs_are_equivalent(target_expr, idx_expr) {
+                return true;
+            }
+            // Expression indexes are compared against the normalized form that
+            // was stored in the schema. A query may write the same expression in
+            // a slightly different but equivalent way, so normalize before the
+            // final comparison.
+            let refs = TableReferences::new(vec![table_ref.clone()], Vec::new());
+            let normalized = normalize_expr_for_index_matching(target_expr, table_ref, &refs);
+            exprs_are_equivalent(&normalized, idx_expr)
+        }
+        _ => false,
+    }
 }

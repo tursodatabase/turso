@@ -1,0 +1,18 @@
+---
+source: sorting.sqltest
+expression: |-
+  SELECT lower(title), COUNT(*), MAX(score)
+      FROM expr_articles
+      WHERE status = 'active'
+      GROUP BY lower(title)
+      ORDER BY lower(title);
+info:
+  statement_type: SELECT
+  tables:
+  - expr_articles
+  setup_blocks:
+  - expr_sort_elim
+  database: ':memory:'
+---
+QUERY PLAN
+`--SEARCH expr_articles USING INDEX idx_expr_articles (status=?)
