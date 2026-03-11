@@ -8,6 +8,7 @@ use crate::translate::{
     translate_inner, ProgramBuilder, ProgramBuilderOpts,
 };
 use crate::util::normalize_ident;
+use crate::vdbe::affinity::Affinity;
 use crate::vdbe::insn::Insn;
 use crate::vdbe::BranchOffset;
 use crate::HashSet;
@@ -666,8 +667,56 @@ pub fn fire_trigger(
         // Rewrite NEW/OLD references in WHEN clause to use registers
         rewrite_trigger_expr_for_when_clause(&mut when_expr, &ctx.table, ctx)?;
 
+        // Populate register affinities for NEW/OLD registers so that
+        // comparison_affinity can determine the correct type affinity
+        // for comparisons involving trigger column references (which have
+        // been rewritten to Expr::Register by this point).
+        let columns = ctx.table.columns.as_slice();
+        if let Some(new_regs) = &ctx.new_registers {
+            for (idx, col) in columns.iter().enumerate() {
+                if idx < new_regs.len() {
+                    resolver
+                        .register_affinities
+                        .insert(new_regs[idx], col.affinity());
+                }
+            }
+            // The last register is the rowid
+            if let Some(&rowid_reg) = new_regs.last() {
+                resolver
+                    .register_affinities
+                    .insert(rowid_reg, Affinity::Integer);
+            }
+        }
+        if let Some(old_regs) = &ctx.old_registers {
+            for (idx, col) in columns.iter().enumerate() {
+                if idx < old_regs.len() {
+                    resolver
+                        .register_affinities
+                        .insert(old_regs[idx], col.affinity());
+                }
+            }
+            // The last register is the rowid
+            if let Some(&rowid_reg) = old_regs.last() {
+                resolver
+                    .register_affinities
+                    .insert(rowid_reg, Affinity::Integer);
+            }
+        }
+
         let when_reg = program.alloc_register();
         translate_expr(program, None, &when_expr, when_reg, resolver)?;
+
+        // Clean up register affinities after WHEN clause evaluation
+        if let Some(new_regs) = &ctx.new_registers {
+            for reg in new_regs {
+                resolver.register_affinities.remove(reg);
+            }
+        }
+        if let Some(old_regs) = &ctx.old_registers {
+            for reg in old_regs {
+                resolver.register_affinities.remove(reg);
+            }
+        }
 
         let skip_label = program.allocate_label();
         program.emit_insn(Insn::IfNot {

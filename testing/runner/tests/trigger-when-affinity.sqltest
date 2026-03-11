@@ -1,0 +1,84 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE log(msg TEXT);
+}
+
+@setup schema
+test trigger-when-integer-vs-string {
+    CREATE TRIGGER t_ai AFTER INSERT ON t WHEN NEW.a = '3' BEGIN
+      INSERT INTO log VALUES('match');
+    END;
+    INSERT INTO t VALUES(3, 'z');
+    SELECT * FROM log;
+}
+expect {
+    match
+}
+
+@setup schema
+test trigger-when-integer-vs-string-no-match {
+    CREATE TRIGGER t_ai AFTER INSERT ON t WHEN NEW.a = '4' BEGIN
+      INSERT INTO log VALUES('no_match');
+    END;
+    INSERT INTO t VALUES(3, 'z');
+    SELECT COUNT(*) FROM log;
+}
+expect {
+    0
+}
+
+@setup schema
+test trigger-when-null-no-match {
+    CREATE TRIGGER t_null AFTER INSERT ON t WHEN NEW.a = '3' BEGIN
+      INSERT INTO log VALUES('null_match');
+    END;
+    INSERT INTO t VALUES(NULL, 'z');
+    SELECT COUNT(*) FROM log;
+}
+expect {
+    0
+}
+
+setup schema_update {
+    CREATE TABLE t4(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE log4(msg TEXT);
+    INSERT INTO t4 VALUES(3, 'old');
+}
+
+@setup schema_update
+test trigger-when-old-affinity {
+    CREATE TRIGGER t4_bu BEFORE UPDATE ON t4 WHEN OLD.a = '3' BEGIN
+      INSERT INTO log4 VALUES('old_match');
+    END;
+    UPDATE t4 SET b = 'new' WHERE a = 3;
+    SELECT * FROM log4;
+}
+expect {
+    old_match
+}
+
+@setup schema
+test trigger-when-integer-gt-string {
+    CREATE TRIGGER t_gt AFTER INSERT ON t WHEN NEW.a > '2' BEGIN
+      INSERT INTO log VALUES('gt_match');
+    END;
+    INSERT INTO t VALUES(3, 'z');
+    SELECT * FROM log;
+}
+expect {
+    gt_match
+}
+
+@setup schema
+test trigger-when-integer-ne-string {
+    CREATE TRIGGER t_ne AFTER INSERT ON t WHEN NEW.a != '5' BEGIN
+      INSERT INTO log VALUES('ne_match');
+    END;
+    INSERT INTO t VALUES(3, 'z');
+    SELECT * FROM log;
+}
+expect {
+    ne_match
+}
