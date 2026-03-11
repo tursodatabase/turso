@@ -79,7 +79,7 @@ impl Operation {
                             // Keep deterministic behavior for unread tail bytes.
                             buf[to_copy..].fill(0);
                         }
-                        to_copy as i32
+                        to_copy as i64
                     }
                 };
                 completion.complete(bytes_read);
@@ -91,7 +91,7 @@ impl Operation {
             } => {
                 let file = files.get(fd.as_str()).unwrap();
                 let buf_size = file.write_buf(buffer.as_slice(), offset);
-                completion.complete(buf_size as i32);
+                completion.complete(buf_size as i64);
             }
             OperationType::WriteV {
                 buffers,
@@ -108,7 +108,7 @@ impl Operation {
                     pos += buf_size;
                     written + buf_size
                 });
-                completion.complete(written as i32);
+                completion.complete(written as i64);
             }
             OperationType::Sync { completion, .. } => {
                 // There is no Sync for in memory

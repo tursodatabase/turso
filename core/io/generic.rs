@@ -78,7 +78,7 @@ impl File for GenericFile {
             let r = c.as_read();
             let buf = r.buf();
             let buf = buf.as_mut_slice();
-            file.read(buf).map_err(|e| io_error(e, "pread"))? as i32
+            file.read(buf).map_err(|e| io_error(e, "pread"))? as i64
         };
         c.complete(nr);
         Ok(c)
@@ -90,7 +90,7 @@ impl File for GenericFile {
         file.seek(std::io::SeekFrom::Start(pos)).map_err(|e| io_error(e, "pwrite"))?;
         let buf = buffer.as_slice();
         file.write_all(buf).map_err(|e| io_error(e, "pwrite"))?;
-        c.complete(buffer.len() as i32);
+        c.complete(buffer.len() as i64);
         Ok(c)
     }
 

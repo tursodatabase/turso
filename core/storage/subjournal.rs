@@ -69,12 +69,12 @@ impl Subjournal {
         );
         let c = Completion::new_read(
             page_id_buffer,
-            move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+            move |res: Result<(Arc<Buffer>, i64), CompletionError>| {
                 let Ok((buf, bytes_read)) = res else {
                     return None;
                 };
                 let expected = buf.len();
-                if bytes_read != expected as i32 {
+                if bytes_read != expected as i64 {
                     tracing::error!(
                         "subjournal short read: expected {expected} bytes, got {bytes_read}"
                     );
@@ -101,12 +101,12 @@ impl Subjournal {
         turso_assert_eq!(buffer.len(), page_size, "buffer length should be page_size");
         let c = Completion::new_read(
             buffer,
-            move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+            move |res: Result<(Arc<Buffer>, i64), CompletionError>| {
                 let Ok((buf, bytes_read)) = res else {
                     return None;
                 };
                 let page_idx = page.get().id;
-                if bytes_read != page_size as i32 {
+                if bytes_read != page_size as i64 {
                     tracing::error!(
                         "subjournal short read on page {page_idx}: expected {page_size} bytes, got {bytes_read}"
                     );
@@ -125,7 +125,7 @@ impl Subjournal {
     }
 
     pub fn truncate(&self, offset: u64) -> Result<Completion> {
-        let c = Completion::new_trunc(move |res: Result<i32, CompletionError>| {
+        let c = Completion::new_trunc(move |res: Result<i64, CompletionError>| {
             let Ok(_) = res else {
                 return;
             };

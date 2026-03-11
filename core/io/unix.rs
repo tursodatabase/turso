@@ -218,7 +218,7 @@ impl File for UnixFile {
         } else {
             trace!("pread n: {}", result);
             // Read succeeded immediately
-            c.complete(result as i32);
+            c.complete(result as i64);
             Ok(c)
         }
     }
@@ -265,7 +265,7 @@ impl File for UnixFile {
             trace!("pwrite iteration: wrote {written}, total {total_written}/{total_size}");
         }
         trace!("pwrite complete: wrote {total_written} bytes");
-        c.complete(total_written as i32);
+        c.complete(total_written as i64);
         Ok(c)
     }
 
@@ -340,7 +340,7 @@ impl File for UnixFile {
             }
         }
         trace!("pwritev complete: wrote {total_written} bytes");
-        c.complete(total_written as i32);
+        c.complete(total_written as i64);
         Ok(c)
     }
 
