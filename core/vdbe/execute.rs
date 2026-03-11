@@ -3739,6 +3739,9 @@ pub enum OpProgramState {
     Step {
         is_trigger: bool,
         statement: Box<Statement>,
+        /// Saved last_insert_rowid to restore after trigger subprogram completes.
+        /// Per SQLite docs, trigger-body INSERTs must not overwrite the top-level rowid.
+        saved_last_insert_rowid: Option<i64>,
     },
 }
 
@@ -3770,12 +3773,14 @@ pub fn op_program(
                 statement.reset()?;
 
                 // Check if this is a trigger subprogram - if so, track execution
-                let is_trigger = if let Some(ref trigger) = statement.get_trigger() {
-                    program.connection.start_trigger_execution(trigger.clone());
-                    true
-                } else {
-                    false
-                };
+                // and save last_insert_rowid so it can be restored after the trigger finishes.
+                let (is_trigger, saved_last_insert_rowid) =
+                    if let Some(ref trigger) = statement.get_trigger() {
+                        program.connection.start_trigger_execution(trigger.clone());
+                        (true, Some(program.connection.last_insert_rowid()))
+                    } else {
+                        (false, None)
+                    };
 
                 // Extract register values from params (which contain register indices encoded as negative integers)
                 // and bind them to the subprogram's parameters
@@ -3805,13 +3810,16 @@ pub fn op_program(
                 state.op_program_state = OpProgramState::Step {
                     is_trigger,
                     statement: Box::new(statement),
+                    saved_last_insert_rowid,
                 };
             }
             OpProgramState::Step {
                 is_trigger,
                 statement,
+                saved_last_insert_rowid,
             } => {
                 let is_trigger = *is_trigger;
+                let saved_last_insert_rowid = *saved_last_insert_rowid;
                 let mut raise_ignore = false;
                 // Track whether the subprogram aborted with an error. When abort()
                 // runs inside the subprogram, it already calls end_trigger_execution(),
@@ -3854,6 +3862,12 @@ pub fn op_program(
                 // already called end_trigger_execution() via abort() in the subprogram.
                 if is_trigger && !subprogram_aborted {
                     program.connection.end_trigger_execution();
+                }
+
+                // Restore last_insert_rowid after trigger execution, per SQLite semantics:
+                // trigger-body INSERTs must not overwrite the top-level rowid.
+                if let Some(rowid) = saved_last_insert_rowid {
+                    program.connection.update_last_rowid(rowid);
                 }
 
                 state.op_program_state = OpProgramState::Start;
