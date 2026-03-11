@@ -3097,8 +3097,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 .store(true, Ordering::Release);
             *tx.value().header.write() = header;
             tracing::trace!(
-                "begin_exclusive_tx(tx_id={}) - upgraded existing transaction",
-                tx_id
+                "begin_exclusive_tx(tx_id={}, begin_ts={}) - upgraded existing transaction",
+                tx_id,
+                begin_ts
             );
             tracing::debug!("begin_exclusive_tx: tx_id={} succeeded", tx_id);
             return Ok(tx_id);
@@ -3107,8 +3108,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let tx = Transaction::new(tx_id, begin_ts, header);
         tx.pager_commit_lock_held.store(true, Ordering::Release);
         tracing::trace!(
-            "begin_exclusive_tx(tx_id={}) - exclusive write logical log transaction",
-            tx_id
+            "begin_exclusive_tx(tx_id={}, begin_ts={}) - exclusive write logical log transaction",
+            tx_id,
+            begin_ts
         );
         tracing::debug!("begin_exclusive_tx: tx_id={} succeeded", tx_id);
         self.txs.insert(tx_id, tx);
@@ -3131,7 +3133,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // Set txn's header to the global header
         let header = self.get_new_transaction_database_header(&pager);
         let tx = Transaction::new(tx_id, begin_ts, header);
-        tracing::trace!("begin_tx(tx_id={})", tx_id);
+        tracing::trace!("begin_tx(tx_id={}, begin_ts={})", tx_id, begin_ts);
         self.txs.insert(tx_id, tx);
 
         Ok(tx_id)
