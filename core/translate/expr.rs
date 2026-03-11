@@ -495,8 +495,125 @@ pub fn translate_condition_expr(
         ast::Expr::Raise(_, _) => {
             crate::bail_parse_error!("RAISE in WHERE clause is not supported");
         }
-        ast::Expr::Between { .. } => {
-            crate::bail_parse_error!("BETWEEN expression should have been rewritten in optmizer")
+        ast::Expr::Between {
+            lhs,
+            not,
+            start,
+            end,
+        } => {
+            // Handle BETWEEN natively to avoid exponential expression tree growth
+            // from the AST-level rewrite which clones the LHS expression.
+            let lhs_reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), lhs, lhs_reg, resolver)?;
+
+            let start_reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), start, start_reg, resolver)?;
+
+            let end_reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), end, end_reg, resolver)?;
+
+            let affinity1 =
+                comparison_affinity(start, lhs, Some(referenced_tables), Some(resolver));
+            let affinity2 = comparison_affinity(lhs, end, Some(referenced_tables), Some(resolver));
+
+            if *not {
+                // NOT BETWEEN: (start > lhs) OR (lhs > end)
+                // Same pattern as Binary OR
+                let null_jump_true = condition_metadata.jump_target_when_null
+                    == condition_metadata.jump_target_when_true;
+                let null_jump_false = condition_metadata.jump_target_when_null
+                    == condition_metadata.jump_target_when_false;
+
+                // First condition: start > lhs → true for NOT BETWEEN
+                let flags1 = CmpInsFlags::default().with_affinity(affinity1);
+                // Like OR: jump to true if first is true, otherwise check second
+                program.emit_insn(Insn::Gt {
+                    lhs: start_reg,
+                    rhs: lhs_reg,
+                    target_pc: condition_metadata.jump_target_when_true,
+                    flags: if null_jump_true {
+                        flags1.jump_if_null()
+                    } else {
+                        flags1
+                    },
+                    collation: program.curr_collation(),
+                });
+
+                // Second condition: lhs > end
+                let flags2 = CmpInsFlags::default().with_affinity(affinity2);
+                if condition_metadata.jump_if_condition_is_true {
+                    program.emit_insn(Insn::Gt {
+                        lhs: lhs_reg,
+                        rhs: end_reg,
+                        target_pc: condition_metadata.jump_target_when_true,
+                        flags: if null_jump_true {
+                            flags2.jump_if_null()
+                        } else {
+                            flags2
+                        },
+                        collation: program.curr_collation(),
+                    });
+                } else {
+                    program.emit_insn(Insn::Le {
+                        lhs: lhs_reg,
+                        rhs: end_reg,
+                        target_pc: condition_metadata.jump_target_when_false,
+                        flags: if null_jump_false {
+                            flags2.jump_if_null()
+                        } else {
+                            flags2
+                        },
+                        collation: program.curr_collation(),
+                    });
+                }
+            } else {
+                // BETWEEN: (start <= lhs) AND (lhs <= end)
+                // Same pattern as Binary AND
+                let null_jump_false = condition_metadata.jump_target_when_null
+                    == condition_metadata.jump_target_when_false;
+
+                // First condition: start <= lhs (if false, jump to false)
+                let flags1 = CmpInsFlags::default().with_affinity(affinity1);
+                program.emit_insn(Insn::Gt {
+                    lhs: start_reg,
+                    rhs: lhs_reg,
+                    target_pc: condition_metadata.jump_target_when_false,
+                    flags: if null_jump_false {
+                        flags1.jump_if_null()
+                    } else {
+                        flags1
+                    },
+                    collation: program.curr_collation(),
+                });
+
+                // Second condition: lhs <= end
+                let flags2 = CmpInsFlags::default().with_affinity(affinity2);
+                if condition_metadata.jump_if_condition_is_true {
+                    program.emit_insn(Insn::Le {
+                        lhs: lhs_reg,
+                        rhs: end_reg,
+                        target_pc: condition_metadata.jump_target_when_true,
+                        flags: if null_jump_false {
+                            flags2.jump_if_null()
+                        } else {
+                            flags2
+                        },
+                        collation: program.curr_collation(),
+                    });
+                } else {
+                    program.emit_insn(Insn::Gt {
+                        lhs: lhs_reg,
+                        rhs: end_reg,
+                        target_pc: condition_metadata.jump_target_when_false,
+                        flags: if null_jump_false {
+                            flags2.jump_if_null()
+                        } else {
+                            flags2
+                        },
+                        collation: program.curr_collation(),
+                    });
+                }
+            }
         }
         ast::Expr::Variable(_) => {
             crate::bail_parse_error!(
@@ -1117,8 +1234,109 @@ pub fn translate_expr(
                 }
             }
         }
-        ast::Expr::Between { .. } => {
-            crate::bail_parse_error!("BETWEEN expression should have been rewritten in optmizer")
+        ast::Expr::Between {
+            lhs,
+            not,
+            start,
+            end,
+        } => {
+            // Handle BETWEEN natively instead of rewriting to avoid exponential
+            // expression tree growth when BETWEENs are chained (each rewrite clones the LHS).
+            let lhs_reg = program.alloc_register();
+            translate_expr(program, referenced_tables, lhs, lhs_reg, resolver)?;
+
+            let start_reg = program.alloc_register();
+            translate_expr(program, referenced_tables, start, start_reg, resolver)?;
+
+            let end_reg = program.alloc_register();
+            translate_expr(program, referenced_tables, end, end_reg, resolver)?;
+
+            let affinity1 = comparison_affinity(start, lhs, referenced_tables, Some(resolver));
+            let affinity2 = comparison_affinity(lhs, end, referenced_tables, Some(resolver));
+
+            let cmp1_reg = program.alloc_register();
+            let cmp2_reg = program.alloc_register();
+
+            if *not {
+                // NOT BETWEEN: (start > lhs) OR (lhs > end)
+                let if_true1 = program.allocate_label();
+                wrap_eval_jump_expr_zero_or_null(
+                    program,
+                    Insn::Gt {
+                        lhs: start_reg,
+                        rhs: lhs_reg,
+                        target_pc: if_true1,
+                        flags: CmpInsFlags::default().with_affinity(affinity1),
+                        collation: program.curr_collation(),
+                    },
+                    cmp1_reg,
+                    if_true1,
+                    start_reg,
+                    lhs_reg,
+                );
+                let if_true2 = program.allocate_label();
+                wrap_eval_jump_expr_zero_or_null(
+                    program,
+                    Insn::Gt {
+                        lhs: lhs_reg,
+                        rhs: end_reg,
+                        target_pc: if_true2,
+                        flags: CmpInsFlags::default().with_affinity(affinity2),
+                        collation: program.curr_collation(),
+                    },
+                    cmp2_reg,
+                    if_true2,
+                    lhs_reg,
+                    end_reg,
+                );
+                program.emit_insn(Insn::Or {
+                    lhs: cmp1_reg,
+                    rhs: cmp2_reg,
+                    dest: target_register,
+                });
+            } else {
+                // BETWEEN: (start <= lhs) AND (lhs <= end)
+                let if_true1 = program.allocate_label();
+                wrap_eval_jump_expr_zero_or_null(
+                    program,
+                    Insn::Le {
+                        lhs: start_reg,
+                        rhs: lhs_reg,
+                        target_pc: if_true1,
+                        flags: CmpInsFlags::default().with_affinity(affinity1),
+                        collation: program.curr_collation(),
+                    },
+                    cmp1_reg,
+                    if_true1,
+                    start_reg,
+                    lhs_reg,
+                );
+                let if_true2 = program.allocate_label();
+                wrap_eval_jump_expr_zero_or_null(
+                    program,
+                    Insn::Le {
+                        lhs: lhs_reg,
+                        rhs: end_reg,
+                        target_pc: if_true2,
+                        flags: CmpInsFlags::default().with_affinity(affinity2),
+                        collation: program.curr_collation(),
+                    },
+                    cmp2_reg,
+                    if_true2,
+                    lhs_reg,
+                    end_reg,
+                );
+                program.emit_insn(Insn::And {
+                    lhs: cmp1_reg,
+                    rhs: cmp2_reg,
+                    dest: target_register,
+                });
+            }
+
+            if let Some(span) = constant_span {
+                program.constant_span_end(span);
+            }
+            return Ok(target_register);
         }
         ast::Expr::Binary(e1, op, e2) => {
             // Handle IS TRUE/IS FALSE/IS NOT TRUE/IS NOT FALSE specially.
@@ -5632,39 +5850,6 @@ pub fn bind_and_rewrite_expr<'a>(
     Ok(())
 }
 
-/// Rewrite BETWEEN expressions to Binary expressions with AND/OR.
-/// This is a subset of bind_and_rewrite_expr that only handles BETWEEN rewriting.
-pub fn rewrite_between_expr(expr: &mut ast::Expr) {
-    let _ = walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
-        if let ast::Expr::Between {
-            lhs,
-            not,
-            start,
-            end,
-        } = e
-        {
-            let (lower_op, upper_op) = if *not {
-                (ast::Operator::Greater, ast::Operator::Greater)
-            } else {
-                (ast::Operator::LessEquals, ast::Operator::LessEquals)
-            };
-            let start = start.take_ownership();
-            let lhs_v = lhs.take_ownership();
-            let end = end.take_ownership();
-
-            let lower = ast::Expr::Binary(Box::new(start), lower_op, Box::new(lhs_v.clone()));
-            let upper = ast::Expr::Binary(Box::new(lhs_v), upper_op, Box::new(end));
-
-            *e = if *not {
-                ast::Expr::Binary(Box::new(lower), ast::Operator::Or, Box::new(upper))
-            } else {
-                ast::Expr::Binary(Box::new(lower), ast::Operator::And, Box::new(upper))
-            };
-        }
-        Ok(WalkControl::Continue)
-    });
-}
-
 /// Recursively walks a mutable expression, applying a function to each sub-expression.
 pub fn walk_expr_mut<F>(expr: &mut ast::Expr, func: &mut F) -> Result<WalkControl>
 where
@@ -6990,17 +7175,12 @@ pub(crate) fn emit_type_expr(
 
     // Translate body expression only if param setup succeeded
     let result = param_result.and_then(|()| {
-        // Rewrite BETWEEN expressions before translation (the optimizer
-        // normally does this, but type expressions bypass the optimizer).
-        let mut rewritten = expr.clone();
-        rewrite_between_expr(&mut rewritten);
-
         // Translate the expression, disabling constant optimization since
         // the `value` placeholder refers to a register that changes per row.
         translate_expr_no_constant_opt(
             program,
             None,
-            &rewritten,
+            expr,
             dest_reg,
             resolver,
             NoConstantOptReason::RegisterReuse,

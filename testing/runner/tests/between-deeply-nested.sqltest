@@ -1,0 +1,156 @@
+@database :memory:
+
+# Test that deeply nested BETWEEN with CASE in partial index doesn't panic (issue #5767)
+@cross-check-integrity
+test deeply_nested_between_partial_index {
+    CREATE TABLE t(x);
+    CREATE INDEX i ON t(x) WHERE
+      x BETWEEN 0 AND CASE WHEN 1 THEN 1 END
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0;
+    INSERT INTO t VALUES(1);
+    SELECT * FROM t;
+}
+expect {
+    1
+}
+
+# Basic BETWEEN in value context
+@cross-check-integrity
+test between_value_basic {
+    SELECT 5 BETWEEN 1 AND 10;
+}
+expect {
+    1
+}
+
+# BETWEEN false case
+@cross-check-integrity
+test between_value_false {
+    SELECT 0 BETWEEN 1 AND 10;
+}
+expect {
+    0
+}
+
+# NOT BETWEEN true case
+@cross-check-integrity
+test not_between_true {
+    SELECT 15 NOT BETWEEN 1 AND 10;
+}
+expect {
+    1
+}
+
+# NOT BETWEEN false case
+@cross-check-integrity
+test not_between_false {
+    SELECT 5 NOT BETWEEN 1 AND 10;
+}
+expect {
+    0
+}
+
+# BETWEEN with NULL operands returns NULL
+@cross-check-integrity
+test between_null_lhs {
+    SELECT NULL BETWEEN 1 AND 10 IS NULL;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test between_null_start {
+    SELECT 5 BETWEEN NULL AND 10 IS NULL;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test between_null_end {
+    SELECT 5 BETWEEN 1 AND NULL IS NULL;
+}
+expect {
+    1
+}
+
+# BETWEEN in WHERE clause
+@cross-check-integrity
+test between_where_clause {
+    CREATE TABLE t2(x);
+    INSERT INTO t2 VALUES(1),(5),(10),(15);
+    SELECT x FROM t2 WHERE x BETWEEN 3 AND 12 ORDER BY x;
+}
+expect {
+    5
+    10
+}
+
+# NOT BETWEEN in WHERE clause
+@cross-check-integrity
+test not_between_where_clause {
+    CREATE TABLE t3(x);
+    INSERT INTO t3 VALUES(1),(5),(10),(15);
+    SELECT x FROM t3 WHERE x NOT BETWEEN 3 AND 12 ORDER BY x;
+}
+expect {
+    1
+    15
+}
+
+# BETWEEN with CASE expression (simpler version)
+@cross-check-integrity
+test between_with_case {
+    SELECT 5 BETWEEN 1 AND CASE WHEN 1 THEN 10 END;
+}
+expect {
+    1
+}
+
+# Chained BETWEEN (3 levels)
+@cross-check-integrity
+test chained_between_three {
+    CREATE TABLE t4(x);
+    CREATE INDEX i4 ON t4(x) WHERE
+      x BETWEEN 0 AND CASE WHEN 1 THEN 1 END
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0;
+    INSERT INTO t4 VALUES(1);
+    SELECT * FROM t4;
+}
+expect {
+    1
+}
+
+# BETWEEN with CHECK constraint
+@cross-check-integrity
+test between_check_constraint {
+    CREATE TABLE t5(x CHECK(x BETWEEN 1 AND 100));
+    INSERT INTO t5 VALUES(50);
+    SELECT * FROM t5;
+}
+expect {
+    50
+}
+
+# BETWEEN CHECK constraint violation
+@cross-check-integrity
+test between_check_constraint_violation {
+    CREATE TABLE t6(x CHECK(x BETWEEN 1 AND 100));
+    INSERT INTO t6 VALUES(200);
+}
+expect error {
+    CHECK constraint failed
+}
