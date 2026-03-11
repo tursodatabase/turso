@@ -1353,6 +1353,67 @@ expect {
     triggered for id 1
 }
 
+# https://github.com/tursodatabase/turso/issues/5844
+# BEFORE UPDATE trigger WHEN should see the updated rowid alias value
+@cross-check-integrity
+test trigger-before-update-rowid-change-when-sees-new-rowid {
+    CREATE TABLE t_5844_when(id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO t_5844_when VALUES(1, 'hello');
+    CREATE TRIGGER tr_5844_when BEFORE UPDATE ON t_5844_when WHEN NEW.id = 5 BEGIN
+      SELECT RAISE(ABORT, 'blocked');
+    END;
+    UPDATE t_5844_when SET id = 5 WHERE id = 1;
+}
+expect error {
+    blocked
+}
+
+# BEFORE UPDATE trigger body should see the updated rowid alias value
+@cross-check-integrity
+test trigger-before-update-rowid-change-body-sees-new-rowid {
+    CREATE TABLE t_5844_body(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE log_5844_body(val INTEGER);
+    INSERT INTO t_5844_body VALUES(1, 'hello');
+    CREATE TRIGGER tr_5844_body BEFORE UPDATE ON t_5844_body BEGIN
+      INSERT INTO log_5844_body VALUES(NEW.id);
+    END;
+    UPDATE t_5844_body SET id = 5 WHERE id = 1;
+    SELECT * FROM log_5844_body;
+}
+expect {
+    5
+}
+
+# BEFORE UPDATE trigger WHEN should see the updated bare rowid value
+@cross-check-integrity
+test trigger-before-update-bare-rowid-change-when-sees-new-rowid {
+    CREATE TABLE t_5844_rowid_when(id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO t_5844_rowid_when VALUES(1, 'hello');
+    CREATE TRIGGER tr_5844_rowid_when BEFORE UPDATE ON t_5844_rowid_when WHEN NEW.rowid = 5 BEGIN
+      SELECT RAISE(ABORT, 'blocked');
+    END;
+    UPDATE t_5844_rowid_when SET rowid = 5 WHERE id = 1;
+}
+expect error {
+    blocked
+}
+
+# BEFORE UPDATE trigger body should see the updated bare rowid value
+@cross-check-integrity
+test trigger-before-update-bare-rowid-change-body-sees-new-rowid {
+    CREATE TABLE t_5844_rowid_body(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE log_5844_rowid_body(val INTEGER);
+    INSERT INTO t_5844_rowid_body VALUES(1, 'hello');
+    CREATE TRIGGER tr_5844_rowid_body BEFORE UPDATE ON t_5844_rowid_body BEGIN
+      INSERT INTO log_5844_rowid_body VALUES(NEW.rowid);
+    END;
+    UPDATE t_5844_rowid_body SET rowid = 5 WHERE id = 1;
+    SELECT * FROM log_5844_rowid_body;
+}
+expect {
+    5
+}
+
 # https://github.com/tursodatabase/turso/issues/5175
 # Subquery in trigger body UPDATE SET clause
 @cross-check-integrity
