@@ -87,23 +87,17 @@ pub fn simple_aggregate_order_target(
     simple_aggregate: &SimpleAggregate,
     tables: &TableReferences,
 ) -> Option<OrderTarget> {
-    let SimpleAggregate::MinMax {
-        argument,
-        order,
-        collation,
-        ..
-    } = simple_aggregate
-    else {
+    let SimpleAggregate::MinMax(min_max) = simple_aggregate else {
         return None;
     };
 
     let mut target = OrderTarget::maybe_from_iterator(
-        std::iter::once((argument, *order)),
+        std::iter::once((&min_max.argument, min_max.order)),
         tables,
         EliminatesSortBy::Order,
     )?;
-    if let Some(coll) = collation {
-        target.0[0].collation = *coll;
+    if let Some(coll) = min_max.collation {
+        target.0[0].collation = coll;
     }
     Some(target)
 }

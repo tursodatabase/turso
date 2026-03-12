@@ -464,19 +464,22 @@ impl DistinctCtx {
 /// `SelectPlan`, the emitter can use a specialised fast path instead of a full
 /// scan + accumulate loop.
 #[derive(Debug, Clone)]
+pub struct MinMaxDef {
+    pub func: AggFunc,
+    pub argument: ast::Expr,
+    pub order: SortOrder,
+    /// Explicit COLLATE override, if any. `None` means use the column default.
+    pub collation: Option<CollationSeq>,
+}
+
+#[derive(Debug, Clone)]
 pub enum SimpleAggregate {
     /// `SELECT count(*) FROM <tbl>` — uses the `Insn::Count` opcode directly.
     Count,
     /// `SELECT min(expr) FROM …` or `SELECT max(expr) FROM …` — the optimizer
     /// will pick an index that delivers rows in the right order so the emitter
     /// only needs to read the first (non-NULL for MIN) row.
-    MinMax {
-        func: AggFunc,
-        argument: ast::Expr,
-        order: SortOrder,
-        /// Explicit COLLATE override, if any. `None` means use the column default.
-        collation: Option<CollationSeq>,
-    },
+    MinMax(Box<MinMaxDef>),
 }
 
 #[derive(Debug, Clone)]

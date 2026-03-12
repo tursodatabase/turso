@@ -226,19 +226,19 @@ fn emit_loop_source<'a>(
             let start_reg = t_ctx
                 .reg_agg_start
                 .expect("aggregate registers must be initialized");
-            if let Some(SimpleAggregate::MinMax { func, argument, .. }) = &plan.simple_aggregate {
+            if let Some(SimpleAggregate::MinMax(min_max)) = &plan.simple_aggregate {
                 let expr_reg = program.alloc_register();
                 translate_expr(
                     program,
                     Some(&plan.table_references),
-                    argument,
+                    &min_max.argument,
                     expr_reg,
                     &t_ctx.resolver,
                 )?;
                 let loop_end = t_ctx
                     .label_main_loop_end
                     .expect("simple min/max requires the main-loop end label");
-                let label_on_null = if matches!(func, crate::function::AggFunc::Min) {
+                let label_on_null = if matches!(min_max.func, crate::function::AggFunc::Min) {
                     // Ascending index order places NULLs first. Keep scanning until
                     // the first non-NULL value, then jump straight to AggFinal.
                     let label_on_null = program.allocate_label();
@@ -251,14 +251,17 @@ fn emit_loop_source<'a>(
                     None
                 };
 
-                emit_collseq_if_needed(program, &plan.table_references, argument);
-                let comparator_func_name =
-                    custom_type_lt_func(argument, &plan.table_references, t_ctx.resolver.schema());
+                emit_collseq_if_needed(program, &plan.table_references, &min_max.argument);
+                let comparator_func_name = custom_type_lt_func(
+                    &min_max.argument,
+                    &plan.table_references,
+                    t_ctx.resolver.schema(),
+                );
                 program.emit_insn(Insn::AggStep {
                     acc_reg: start_reg,
                     col: expr_reg,
                     delimiter: 0,
-                    func: func.clone(),
+                    func: min_max.func.clone(),
                     comparator_func_name,
                 });
                 program.emit_insn(Insn::Goto {

@@ -54,8 +54,8 @@ use super::{
     emitter::Resolver,
     plan::{
         DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinOrderMember, JoinType,
-        JoinedTable, MultiIndexBranch, MultiIndexScanOp, Operation, Plan, Search, SeekDef, SeekKey,
-        SelectPlan, SimpleAggregate, TableReferences, UpdatePlan, WhereTerm,
+        JoinedTable, MinMaxDef, MultiIndexBranch, MultiIndexScanOp, Operation, Plan, Search,
+        SeekDef, SeekKey, SelectPlan, SimpleAggregate, TableReferences, UpdatePlan, WhereTerm,
     },
     planner::TableMask,
 };
@@ -540,12 +540,12 @@ fn detect_simple_aggregate(plan: &SelectPlan) -> Option<SimpleAggregate> {
             let collation = get_collseq_from_expr(&argument, &plan.table_references)
                 .ok()
                 .flatten();
-            Some(SimpleAggregate::MinMax {
+            Some(SimpleAggregate::MinMax(Box::new(MinMaxDef {
                 func: agg.func.clone(),
                 argument,
                 order,
                 collation,
-            })
+            })))
         }
         _ => None,
     }
@@ -607,7 +607,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
         &mut plan.offset,
     )?;
 
-    if matches!(plan.simple_aggregate, Some(SimpleAggregate::MinMax { .. }))
+    if matches!(plan.simple_aggregate, Some(SimpleAggregate::MinMax(_)))
         && !best_join_order
             .as_ref()
             .is_some_and(|result| result.min_max_fast_path)
@@ -2148,7 +2148,7 @@ fn optimize_table_access(
     Ok(Some(OptimizeTableAccessResult {
         join_order: best_join_order,
         output_rows: final_output_cardinality,
-        min_max_fast_path: matches!(simple_aggregate, Some(SimpleAggregate::MinMax { .. }))
+        min_max_fast_path: matches!(simple_aggregate, Some(SimpleAggregate::MinMax(_)))
             && sort_eliminated,
     }))
 }
