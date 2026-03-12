@@ -73,7 +73,7 @@ QUERY PLAN
 |        |  `--SCAN previous_points
 |        |     |--SCAN ordered_points AS p1
 |        |     `--CORRELATED SCALAR SUBQUERY 3
-|        |        `--SEARCH p2 USING INDEX ephemeral_subquery_t59 (point_key>=?)
+|        |        `--SEARCH p2 USING INDEX ephemeral_subquery_t59 (point_key<?)
 |        `--USE SORTER FOR ORDER BY
 `--SCAN run_lengths
    |--SCAN run_ids
@@ -82,6 +82,6 @@ QUERY PLAN
    |     |  `--SCAN previous_points
    |     |     |--SCAN ordered_points AS p1
    |     |     `--CORRELATED SCALAR SUBQUERY 4
-   |     |        `--SEARCH p2 USING INDEX ephemeral_subquery_t45 (point_key>=?)
+   |     |        `--SEARCH p2 USING INDEX ephemeral_subquery_t45 (point_key<?)
    |     `--USE SORTER FOR ORDER BY
    `--USE SORTER FOR GROUP BY

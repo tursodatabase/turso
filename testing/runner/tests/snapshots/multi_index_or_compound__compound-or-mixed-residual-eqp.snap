@@ -20,5 +20,5 @@ info:
 ---
 QUERY PLAN
 |--SCAN item AS i
-|--MULTI-INDEX OR l (idx_link_dst, idx_link_src)
+|--MULTI-INDEX OR l (idx_link_src, idx_link_dst)
 `--USE HASH TABLE FOR DISTINCT

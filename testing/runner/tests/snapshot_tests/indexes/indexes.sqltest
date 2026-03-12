@@ -365,6 +365,25 @@ setup in-or-indexed {
     );
 }
 
+setup relation-history {
+    CREATE TABLE timeline_items (
+        id INTEGER PRIMARY KEY,
+        item_kind TEXT,
+        created_ms INTEGER
+    );
+
+    CREATE TABLE item_links (
+        id INTEGER PRIMARY KEY,
+        source_id INTEGER,
+        target_id INTEGER,
+        link_kind TEXT
+    );
+
+    CREATE INDEX idx_item_links_kind ON item_links(link_kind);
+    CREATE INDEX idx_item_links_source ON item_links(source_id);
+    CREATE INDEX idx_item_links_target ON item_links(target_id);
+}
+
 @setup in-or-indexed
 snapshot-eqp in-subquery-or-in-subquery-indexed {
     SELECT id
@@ -380,6 +399,34 @@ snapshot-eqp in-subquery-or-in-list-left-join {
     LEFT JOIN in_or_tags
       ON in_or_values.c = in_or_tags.c
      AND (a IN (SELECT v FROM in_or_rhs_a) OR b IN (200, 500));
+}
+
+@setup relation-history
+snapshot-eqp aggregate-over-in-subquery-or-in-subquery {
+    SELECT item_id,
+           MIN(seen_ms) AS first_seen_ms,
+           MAX(seen_ms) AS last_seen_ms,
+           COUNT(*) AS seen_count
+    FROM (
+        SELECT t.id AS item_id,
+               t.created_ms AS seen_ms
+        FROM timeline_items t
+        WHERE t.item_kind = 'entry'
+          AND (
+              t.id IN (
+                  SELECT l.source_id
+                  FROM item_links l
+                  WHERE l.link_kind = 'links'
+                    AND l.target_id = 500
+              )
+              OR t.id IN (
+                  SELECT l.target_id
+                  FROM item_links l
+                  WHERE l.link_kind = 'links'
+                    AND l.source_id = 500
+              )
+          )
+    ) AS matched_entries;
 }
 
 # =============================================================================

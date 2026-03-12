@@ -13,7 +13,7 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-
+`--SEARCH products USING INDEX idx_products_category (category=?)
 
 BYTECODE
 addr  opcode            p1  p2  p3  p4              p5  comment

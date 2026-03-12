@@ -21,6 +21,7 @@ expect {
     3|10|100|3000|30000
 }
 
+# Prefer single index since we cannot currently estimate the predicates are uncorrelated; assuming they multiply each other's selectivities typically overestimates reality
 @setup multi_index_schema
 snapshot-eqp multi-index-and-2-way-eqp {
     SELECT id FROM t WHERE a = 10 AND b = 100;

@@ -499,6 +499,30 @@ setup sequence_points_schema {
     INSERT INTO sample_points VALUES (1), (2), (4), (7), (8);
 }
 
+setup signal-day-sources {
+    CREATE TABLE user_messages (
+        id INTEGER PRIMARY KEY,
+        created_ms INTEGER,
+        actor TEXT
+    );
+
+    CREATE TABLE session_starts (
+        id INTEGER PRIMARY KEY,
+        started_ms INTEGER
+    );
+
+    CREATE TABLE observed_items (
+        id INTEGER PRIMARY KEY,
+        created_ms INTEGER,
+        item_kind TEXT
+    );
+
+    CREATE TABLE journal_entries (
+        id INTEGER PRIMARY KEY,
+        created_ms INTEGER
+    );
+}
+
 # Correlated range probes into a multi-ref CTE should be able to seek the
 # materialized CTE instead of rescanning it for each outer row.
 @setup sequence_points_schema
@@ -571,4 +595,124 @@ snapshot-eqp cte-materialized-scalar-probe {
             FROM ordered_points
         )
     );
+}
+
+@setup signal-day-sources
+snapshot-eqp run-length-current-window {
+    WITH signal_days AS (
+        SELECT DISTINCT date(datetime(ts_ms / 1000, 'unixepoch', '+60 minutes')) AS signal_day
+        FROM (
+            SELECT id, created_ms AS ts_ms FROM user_messages WHERE actor = 'user'
+            UNION ALL
+            SELECT id, started_ms AS ts_ms FROM session_starts
+            UNION ALL
+            SELECT id, created_ms AS ts_ms FROM observed_items WHERE item_kind = 'note' OR item_kind = 'alert'
+            UNION ALL
+            SELECT id, created_ms AS ts_ms FROM observed_items WHERE item_kind = 'alert'
+            UNION ALL
+            SELECT id, created_ms AS ts_ms FROM observed_items WHERE item_kind = 'note'
+            UNION ALL
+            SELECT id, created_ms AS ts_ms FROM journal_entries
+        )
+        ORDER BY signal_day
+    ),
+    prior_days AS (
+        SELECT signal_day,
+               (
+                   SELECT MAX(d2.signal_day)
+                   FROM signal_days d2
+                   WHERE d2.signal_day < d1.signal_day
+               ) AS previous_day
+        FROM signal_days d1
+    ),
+    run_boundaries AS (
+        SELECT signal_day,
+               previous_day,
+               JULIANDAY(signal_day) - JULIANDAY(previous_day) AS day_gap,
+               CASE
+                   WHEN JULIANDAY(signal_day) - JULIANDAY(previous_day) = 1 THEN 0
+                   ELSE 1
+               END AS run_start
+        FROM prior_days
+    ),
+    run_ids AS (
+        SELECT signal_day,
+               SUM(run_start) OVER (ORDER BY signal_day) AS run_id
+        FROM run_boundaries
+    ),
+    run_lengths AS (
+        SELECT run_id,
+               MIN(signal_day) AS start_day,
+               MAX(signal_day) AS end_day,
+               COUNT(*) AS run_length
+        FROM run_ids
+        GROUP BY run_id
+    )
+    SELECT start_day, end_day, run_length
+    FROM run_lengths
+    WHERE run_id = (
+        SELECT run_id
+        FROM run_ids
+        WHERE signal_day = (
+            SELECT MAX(signal_day)
+            FROM signal_days
+        )
+    );
+}
+
+@setup signal-day-sources
+snapshot-eqp run-length-longest-window {
+    WITH signal_days AS (
+        SELECT DISTINCT date(datetime(ts_ms / 1000, 'unixepoch', '+60 minutes')) AS signal_day
+        FROM (
+            SELECT id, created_ms AS ts_ms FROM user_messages WHERE actor = 'user'
+            UNION ALL
+            SELECT id, started_ms AS ts_ms FROM session_starts
+            UNION ALL
+            SELECT id, created_ms AS ts_ms FROM observed_items WHERE item_kind = 'note' OR item_kind = 'alert'
+            UNION ALL
+            SELECT id, created_ms AS ts_ms FROM observed_items WHERE item_kind = 'alert'
+            UNION ALL
+            SELECT id, created_ms AS ts_ms FROM observed_items WHERE item_kind = 'note'
+            UNION ALL
+            SELECT id, created_ms AS ts_ms FROM journal_entries
+        )
+        ORDER BY signal_day
+    ),
+    prior_days AS (
+        SELECT signal_day,
+               (
+                   SELECT MAX(d2.signal_day)
+                   FROM signal_days d2
+                   WHERE d2.signal_day < d1.signal_day
+               ) AS previous_day
+        FROM signal_days d1
+    ),
+    run_boundaries AS (
+        SELECT signal_day,
+               previous_day,
+               JULIANDAY(signal_day) - JULIANDAY(previous_day) AS day_gap,
+               CASE
+                   WHEN JULIANDAY(signal_day) - JULIANDAY(previous_day) = 1 THEN 0
+                   ELSE 1
+               END AS run_start
+        FROM prior_days
+    ),
+    run_ids AS (
+        SELECT signal_day,
+               SUM(run_start) OVER (ORDER BY signal_day) AS run_id
+        FROM run_boundaries
+    ),
+    run_lengths AS (
+        SELECT run_id,
+               MIN(signal_day) AS start_day,
+               MAX(signal_day) AS end_day,
+               COUNT(*) AS run_length
+        FROM run_ids
+        GROUP BY run_id
+    )
+    SELECT start_day, end_day, run_length
+    FROM run_lengths
+    ORDER BY run_length DESC
+    LIMIT 1;
 }
