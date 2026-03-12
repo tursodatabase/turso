@@ -124,7 +124,7 @@ pub fn estimate_index_cost(
     Cost((io_cost + cpu_cost - params.index_bonus).max(0.001))
 }
 
-fn is_unique_point_lookup(
+pub(crate) fn is_unique_point_lookup(
     index_info: IndexInfo,
     usable_constraint_refs: &[RangeConstraintRef],
 ) -> bool {

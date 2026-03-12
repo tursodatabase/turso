@@ -16,7 +16,11 @@ use crate::{
 };
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
-use super::{access_method::AccessMethod, join::JoinN};
+use super::{
+    access_method::AccessMethod,
+    cost::{is_unique_point_lookup, IndexInfo},
+    join::JoinN,
+};
 
 /// Target component in an ORDER BY/GROUP BY that may be a plain column or an expression.
 #[derive(Debug, PartialEq, Clone)]
@@ -245,7 +249,7 @@ pub fn plan_satisfies_order_target(
 
     let mut target_col_idx = 0;
     let num_cols_in_order_target = order_target.columns.len();
-    for (table_index, access_method_index) in plan.data.iter() {
+    for (loop_pos, (table_index, access_method_index)) in plan.data.iter().enumerate() {
         let access_method = &access_methods_arena[*access_method_index];
         let table_ref = &joined_tables[*table_index];
 
@@ -319,8 +323,110 @@ pub fn plan_satisfies_order_target(
         if target_col_idx == num_cols_in_order_target {
             return true;
         }
+
+        // The next ORDER BY column can only come from a deeper loop if the rows
+        // output by this loop are unique for the columns so far. If they're not unique,
+        // the inner loop would repeat the same values for each duplicate, resulting in
+        // an output like `A B C ... A B C ...` instead of the correct fully sorted order `A A B B ...`.
+        let next_term_comes_from_later_loop =
+            order_target
+                .columns
+                .get(target_col_idx)
+                .is_some_and(|target_col| {
+                    plan.data[loop_pos + 1..]
+                        .iter()
+                        .any(|(later_table_index, _)| {
+                            joined_tables[*later_table_index].internal_id == target_col.table_id
+                        })
+                });
+        if next_term_comes_from_later_loop
+            && !access_method_emits_unique_order_prefix(access_method, consumed)
+        {
+            return false;
+        }
     }
     target_col_idx == num_cols_in_order_target
+}
+
+fn access_method_emits_unique_order_prefix(
+    access_method: &AccessMethod,
+    consumed_order_terms: usize,
+) -> bool {
+    match &access_method.params {
+        AccessMethodParams::BTreeTable {
+            index,
+            constraint_refs,
+            ..
+        } => access_path_makes_consumed_prefix_unique(
+            index.as_deref(),
+            constraint_refs,
+            consumed_order_terms,
+        ),
+        AccessMethodParams::MaterializedSubquery {
+            index,
+            constraint_refs,
+            ..
+        } => access_path_makes_consumed_prefix_unique(
+            Some(index.as_ref()),
+            constraint_refs,
+            consumed_order_terms,
+        ),
+        AccessMethodParams::Subquery { .. }
+        | AccessMethodParams::HashJoin { .. }
+        | AccessMethodParams::VirtualTable { .. }
+        | AccessMethodParams::IndexMethod { .. }
+        | AccessMethodParams::MultiIndexScan { .. }
+        | AccessMethodParams::InSeek { .. } => false,
+    }
+}
+
+fn access_path_makes_consumed_prefix_unique(
+    index: Option<&Index>,
+    constraint_refs: &[RangeConstraintRef],
+    consumed_order_terms: usize,
+) -> bool {
+    if is_unique_point_lookup(index_info_for_access(index), constraint_refs) {
+        return true;
+    }
+
+    match index {
+        // Table scans only provide rowid order. If that rowid term was consumed,
+        // the prefix is unique even though the scan obviously returns many rows.
+        None => consumed_order_terms >= 1,
+        Some(index) => {
+            let eq_prefix_len = constraint_refs
+                .iter()
+                .take_while(|constraint| constraint.eq.is_some())
+                .count();
+            let unique_prefix_terms = eq_prefix_len + consumed_order_terms;
+
+            // Unique indexes become prefix-unique once all key columns are either
+            // fixed by equality or consumed as ORDER BY terms.
+            if index.unique && unique_prefix_terms >= index.columns.len() {
+                return true;
+            }
+
+            // Rowid tables keep duplicate secondary-index keys ordered by rowid.
+            // If the consumed ORDER BY terms already include that implicit rowid
+            // suffix, the emitted prefix is unique too.
+            index.has_rowid && unique_prefix_terms > index.columns.len()
+        }
+    }
+}
+
+fn index_info_for_access(index: Option<&Index>) -> IndexInfo {
+    match index {
+        Some(index) => IndexInfo {
+            unique: index.unique,
+            column_count: index.columns.len(),
+            covering: false,
+        },
+        None => IndexInfo {
+            unique: true,
+            column_count: 1,
+            covering: false,
+        },
+    }
 }
 
 /// Return how many leading target columns a FROM-subquery can provide from its
