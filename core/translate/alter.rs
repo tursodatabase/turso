@@ -15,8 +15,8 @@ use crate::{
         plan::{ColumnUsedMask, OuterQueryReference, TableReferences},
     },
     util::{
-        check_expr_references_column, normalize_ident, parse_numeric_literal,
-        rewrite_view_sql_for_column_rename,
+        check_expr_references_column, escape_sql_string_literal, normalize_ident,
+        parse_numeric_literal, rewrite_view_sql_for_column_rename,
     },
     vdbe::{
         affinity::Affinity,
@@ -685,11 +685,12 @@ pub fn translate_alter_table(
 
             let sql = btree.to_sql().replace('\'', "''");
 
+            let escaped_table_name = escape_sql_string_literal(table_name);
             let stmt = format!(
                 r#"
                     UPDATE {qualified_schema_table}
                     SET sql = '{sql}'
-                    WHERE name = '{table_name}' COLLATE NOCASE AND type = 'table'
+                    WHERE name = '{escaped_table_name}' COLLATE NOCASE AND type = 'table'
                 "#,
             );
 
@@ -958,11 +959,12 @@ pub fn translate_alter_table(
                 }
             }
 
+            let escaped_table_name = escape_sql_string_literal(table_name);
             let stmt = format!(
                 r#"
                     UPDATE {qualified_schema_table}
                     SET sql = '{escaped}'
-                    WHERE name = '{table_name}' COLLATE NOCASE AND type = 'table'
+                    WHERE name = '{escaped_table_name}' COLLATE NOCASE AND type = 'table'
                 "#,
             );
 
@@ -1488,11 +1490,12 @@ pub fn translate_alter_table(
             // Update trigger SQL for renamed columns
             for (trigger_name, new_sql) in triggers_to_rewrite {
                 let escaped_sql = new_sql.replace('\'', "''");
+                let escaped_trigger_name = escape_sql_string_literal(&trigger_name);
                 let update_stmt = format!(
                     r#"
                         UPDATE {qualified_schema_table}
                         SET sql = '{escaped_sql}'
-                        WHERE name = '{trigger_name}' COLLATE NOCASE AND type = 'trigger'
+                        WHERE name = '{escaped_trigger_name}' COLLATE NOCASE AND type = 'trigger'
                     "#,
                 );
 

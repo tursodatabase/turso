@@ -964,3 +964,68 @@ test alter-add-column-default-string-spaces {
 expect {
     1|hello world|text
 }
+
+# https://github.com/tursodatabase/turso/issues/5632
+@cross-check-integrity
+test alter_table_add_column_with_single_quote_in_name {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE TABLE t3(c);
+    CREATE INDEX i1 ON t1(a);
+    CREATE INDEX i2 ON t2(b);
+
+    CREATE TABLE "z' OR 1=1 -- "(x);
+    ALTER TABLE "z' OR 1=1 -- " ADD COLUMN y;
+
+    SELECT lower(rtrim(name)) FROM sqlite_schema WHERE type = 'table' ORDER BY lower(name);
+    SELECT replace(replace(lower(sql), '"', ''), ' ', '')
+    FROM sqlite_schema
+    WHERE type = 'table' AND lower(name) LIKE 'z'' or 1=1 -- %';
+    PRAGMA integrity_check;
+}
+expect {
+    t1
+    t2
+    t3
+    z' or 1=1 --
+    createtablez'or1=1--(x,y)
+    ok
+}
+
+# https://github.com/tursodatabase/turso/issues/5632
+@cross-check-integrity
+test alter_table_drop_column_with_single_quote_in_name {
+    CREATE TABLE "z' OR 1=1 -- "(x, y);
+    CREATE TABLE ok(v);
+    INSERT INTO ok VALUES(1);
+
+    ALTER TABLE "z' OR 1=1 -- " DROP COLUMN y;
+
+    SELECT * FROM ok;
+    SELECT replace(replace(lower(sql), '"', ''), ' ', '')
+    FROM sqlite_schema
+    WHERE type = 'table' AND lower(name) LIKE 'z'' or 1=1 -- %';
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    createtablez'or1=1--(x)
+    ok
+}
+
+# Regression for quoted table names with spaces after ADD COLUMN.
+# If sqlite_schema.sql drops quotes around the table name, reopening the DB can fail to parse schema.
+@cross-check-integrity
+test alter_table_add_column_with_space_in_name_keeps_quoted_schema_sql {
+    CREATE TABLE "t t"("a a" TEXT, "b b" TEXT);
+    ALTER TABLE "t t" ADD COLUMN "c c" TEXT;
+
+    SELECT sql LIKE 'CREATE TABLE "t t"%' FROM sqlite_schema WHERE type = 'table' AND name = 't t';
+    SELECT instr(sql, 'c c') > 0 FROM sqlite_schema WHERE type = 'table' AND name = 't t';
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    1
+    ok
+}
