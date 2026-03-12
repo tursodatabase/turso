@@ -1,8 +1,10 @@
 use super::{Resolver, Result, TranslateCtx};
 use crate::{
+    emit_explain,
     schema::BTreeTable,
     sync::Arc,
     translate::{
+        display::format_eqp_detail,
         emitter::{
             emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
             emit_index_column_value_old_image, emit_program_for_select,
@@ -223,6 +225,14 @@ pub fn emit_program_for_delete(
         program.preassign_label_to_next_insn(rowset_loop_end);
     } else {
         // Normal DELETE path without RowSet
+
+        // Emit EXPLAIN QUERY PLAN annotation
+        let table_ref = plan
+            .table_references
+            .joined_tables()
+            .first()
+            .expect("DELETE always has one joined table");
+        emit_explain!(program, true, format_eqp_detail(table_ref));
 
         // Set up main query execution loop
         OpenLoop::emit(

@@ -20,6 +20,105 @@ use super::plan::{
     SelectPlan, SetOperation, UpdatePlan,
 };
 
+/// Format the EXPLAIN QUERY PLAN detail string for a table operation.
+/// Used by DELETE/UPDATE emitters to emit EQP annotations.
+pub(crate) fn format_eqp_detail(table: &JoinedTable) -> String {
+    match &table.op {
+        Operation::Scan(scan) => {
+            let table_name = if table.table.get_name() == table.identifier {
+                table.identifier.clone()
+            } else {
+                format!("{} AS {}", table.table.get_name(), table.identifier)
+            };
+            match scan {
+                Scan::BTreeTable { index, .. } => {
+                    if let Some(index) = index {
+                        if table.utilizes_covering_index() {
+                            format!("SCAN {table_name} USING COVERING INDEX {}", index.name)
+                        } else {
+                            format!("SCAN {table_name} USING INDEX {}", index.name)
+                        }
+                    } else {
+                        format!("SCAN {table_name}")
+                    }
+                }
+                Scan::VirtualTable { .. } | Scan::Subquery => {
+                    format!("SCAN {table_name}")
+                }
+            }
+        }
+        Operation::Search(search) => match search {
+            Search::RowidEq { .. }
+            | Search::Seek { index: None, .. }
+            | Search::InSeek { index: None, .. } => {
+                format!(
+                    "SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
+                    table.identifier
+                )
+            }
+            Search::Seek {
+                index: Some(index),
+                seek_def,
+            } => {
+                let constraints = seek_constraint_annotation(index, seek_def);
+                format!(
+                    "SEARCH {} USING INDEX {}{}",
+                    table.identifier, index.name, constraints
+                )
+            }
+            Search::InSeek {
+                index: Some(index), ..
+            } => {
+                let constraint = if let Some(col) = index.columns.first() {
+                    format!(" ({}=?)", col.name)
+                } else {
+                    String::new()
+                };
+                format!(
+                    "SEARCH {} USING INDEX {}{}",
+                    table.identifier, index.name, constraint
+                )
+            }
+        },
+        Operation::MultiIndexScan(multi_idx) => {
+            let index_names: Vec<&str> = multi_idx
+                .branches
+                .iter()
+                .map(|b| {
+                    b.index
+                        .as_ref()
+                        .map(|i| i.name.as_str())
+                        .unwrap_or("PRIMARY KEY")
+                })
+                .collect();
+            format!(
+                "MULTI-INDEX {} {} ({})",
+                match multi_idx.set_op {
+                    SetOperation::Union => "OR",
+                    SetOperation::Intersection => "AND",
+                },
+                table.identifier,
+                index_names.join(", ")
+            )
+        }
+        Operation::IndexMethodQuery(query) => {
+            let index_method = query.index.index_method.as_ref().unwrap();
+            format!(
+                "QUERY INDEX METHOD {}",
+                index_method.definition().method_name
+            )
+        }
+        Operation::HashJoin(_) => {
+            let table_name = if table.table.get_name() == table.identifier {
+                table.identifier.clone()
+            } else {
+                format!("{} AS {}", table.table.get_name(), table.identifier)
+            };
+            format!("HASH JOIN {table_name}")
+        }
+    }
+}
+
 /// Build SQLite-style constraint annotation string for an index seek.
 /// e.g. "(label=? AND fromId>?)"
 pub(crate) fn seek_constraint_annotation(

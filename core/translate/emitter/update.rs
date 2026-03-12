@@ -1,10 +1,11 @@
 use super::TranslateCtx;
 use crate::{
-    ast,
+    ast, emit_explain,
     error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{BTreeTable, CheckConstraint, Index, ROWID_SENTINEL},
     sync::Arc,
     translate::{
+        display::format_eqp_detail,
         emitter::{
             check_expr_references_columns, delete::emit_fk_child_decrement_on_delete,
             emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
@@ -239,6 +240,17 @@ pub fn emit_program_for_update(
         };
         let record_reg = program.alloc_register();
         index_cursors.push((index_cursor, record_reg));
+    }
+
+    // Emit EXPLAIN QUERY PLAN annotation (only for non-ephemeral path;
+    // ephemeral path already emits EQP via emit_program_for_select).
+    if !has_ephemeral_table {
+        let table_ref = plan
+            .table_references
+            .joined_tables()
+            .first()
+            .expect("UPDATE must have a joined table");
+        emit_explain!(program, true, format_eqp_detail(table_ref));
     }
 
     // Open the main loop
