@@ -1,5 +1,6 @@
-use std::{fmt::Display, hash::Hash, ops::Deref};
+use std::{collections::HashMap, fmt::Display, hash::Hash, ops::Deref};
 
+use indexmap::IndexSet;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use turso_core::{numeric::Numeric, types, LimboError};
@@ -141,11 +142,113 @@ impl Display for ColumnType {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Index {
     pub table_name: String,
     pub index_name: String,
-    pub columns: Vec<(String, SortOrder)>,
+    pub columns: Vec<IndexColumn>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IndexColumn {
+    pub kind: IndexColumnKind,
+    pub order: SortOrder,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum IndexColumnKind {
+    Column { name: String },
+    Expr { expr: Box<ast::Expr> },
+}
+
+impl IndexColumn {
+    /// Returns the set of table column names referenced by this index column.
+    pub fn referenced_columns(&self, table_columns: &[Column]) -> Vec<String> {
+        match &self.kind {
+            IndexColumnKind::Column { name } => vec![name.clone()],
+            IndexColumnKind::Expr { expr } => extract_column_refs(expr, table_columns),
+        }
+    }
+
+    // case-insensitive
+    pub fn rename_column_refs(&mut self, from: &str, to: &str) {
+        match &mut self.kind {
+            IndexColumnKind::Column { name } => {
+                if name.eq_ignore_ascii_case(from) {
+                    *name = to.to_owned();
+                }
+            }
+            IndexColumnKind::Expr { expr } => {
+                rename_column_in_expr(expr, from, to);
+            }
+        }
+    }
+}
+
+impl Index {
+    pub fn referenced_columns<'a>(
+        &'a self,
+        table_columns: &'a [Column],
+    ) -> impl Iterator<Item = String> + 'a {
+        self.columns
+            .iter()
+            .flat_map(move |c| c.referenced_columns(table_columns))
+    }
+
+    pub fn rename_column_refs(&mut self, from: &str, to: &str) {
+        for col in &mut self.columns {
+            col.rename_column_refs(from, to);
+        }
+    }
+}
+
+/// Extract column name references from an expression, returning only those that match known table columns.
+fn extract_column_refs(expr: &ast::Expr, columns: &[Column]) -> Vec<String> {
+    let known: HashMap<String, &str> = columns
+        .iter()
+        .map(|c| (c.name.to_ascii_lowercase(), c.name.as_str()))
+        .collect();
+    let mut refs = IndexSet::new();
+    turso_core::walk_expr(expr, &mut |e| {
+        let name_str = match e {
+            ast::Expr::Id(name) | ast::Expr::Name(name) => Some(name.as_str()),
+            ast::Expr::Qualified(_, col) | ast::Expr::DoublyQualified(_, _, col) => {
+                Some(col.as_str())
+            }
+            _ => None,
+        };
+        if let Some(n) = name_str {
+            if let Some(canonical) = known.get(&n.to_ascii_lowercase()) {
+                refs.insert((*canonical).to_owned());
+            }
+        }
+        Ok(turso_core::WalkControl::Continue)
+    })
+    .unwrap();
+    refs.into_iter().collect()
+}
+
+fn rename_column_in_expr(expr: &mut ast::Expr, from: &str, to: &str) {
+    if from.is_empty() || from.eq_ignore_ascii_case(to) {
+        return;
+    }
+    turso_core::walk_expr_mut(expr, &mut |e| {
+        match e {
+            ast::Expr::Id(name) | ast::Expr::Name(name) => {
+                if name.as_str().eq_ignore_ascii_case(from) {
+                    *name = ast::Name::exact(to.to_owned());
+                }
+            }
+            ast::Expr::Qualified(_, col) | ast::Expr::DoublyQualified(_, _, col) => {
+                if col.as_str().eq_ignore_ascii_case(from) {
+                    *col = ast::Name::exact(to.to_owned());
+                }
+            }
+            _ => {}
+        }
+        Ok(turso_core::WalkControl::Continue)
+    })
+    .unwrap();
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -430,10 +533,7 @@ impl From<&SimValue> for ast::Literal {
 impl From<Option<bool>> for SimValue {
     #[inline]
     fn from(value: Option<bool>) -> Self {
-        if value.is_none() {
-            return SimValue::NULL;
-        }
-        SimValue::from(value.unwrap())
+        value.map_or(SimValue::NULL, SimValue::from)
     }
 }
 
