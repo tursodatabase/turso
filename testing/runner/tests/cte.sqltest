@@ -1088,6 +1088,21 @@ expect {
     from_cte
 }
 
+test cte-table-call-is-not-function {
+    WITH cte AS (SELECT 1 as x) SELECT * FROM cte(1);
+}
+expect error {
+    .*is not a function.*
+}
+
+test cte-table-call-is-not-function-in-nested-subquery {
+    WITH cte AS (SELECT 1 as x)
+    SELECT EXISTS(SELECT 1 WHERE EXISTS(SELECT 1 FROM cte(1)));
+}
+expect error {
+    .*is not a function.*
+}
+
 # Self-referencing non-recursive CTE with same name as view = circular reference
 @setup cte_shadow_view
 test cte-circular-ref-view {

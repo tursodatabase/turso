@@ -2602,6 +2602,17 @@ expect {
     c|3|integer
 }
 
+test json_each_nested_subquery_table_call_keeps_arguments {
+    SELECT EXISTS (
+        SELECT 1
+        FROM json_each('["delete"]')
+        WHERE value IN (SELECT value FROM json_each('["delete"]'))
+    );
+}
+expect {
+    1
+}
+
 test json-each-no-arguments {
     SELECT * FROM json_each();
 }
