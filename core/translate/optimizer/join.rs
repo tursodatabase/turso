@@ -37,6 +37,23 @@ use crate::{
     LimboError, Result,
 };
 
+#[derive(Debug, Clone, Copy)]
+/// Small bag of planner context that needs to flow through join enumeration.
+///
+/// Keeping this as a struct avoids threading more ad-hoc parameters through the
+/// join planner as we add order-aware access path choices.
+pub(crate) struct JoinPlanningContext<'a> {
+    pub maybe_order_target: Option<&'a OrderTarget>,
+}
+
+impl<'a> JoinPlanningContext<'a> {
+    /// Convenience constructor used by the default planner entrypoints and tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn default_with_order_target(maybe_order_target: Option<&'a OrderTarget>) -> Self {
+        Self { maybe_order_target }
+    }
+}
+
 // Upper bound on rowids to materialize for a hash build input.
 // This is a safety limit, not a cost tuning parameter.
 const MAX_MATERIALIZED_BUILD_ROWS: f64 = 200_000.0;
@@ -137,7 +154,7 @@ pub fn join_lhs_and_rhs<'a>(
     all_constraints: &'a [TableConstraints],
     base_table_rows: &[RowCountEstimate],
     join_order: &[JoinOrderMember],
-    maybe_order_target: Option<&OrderTarget>,
+    planning_context: JoinPlanningContext<'_>,
     access_methods_arena: &'a mut Vec<AccessMethod>,
     cost_upper_bound: Cost,
     joined_tables: &[JoinedTable],
@@ -166,7 +183,7 @@ pub fn join_lhs_and_rhs<'a>(
         rhs_table_reference,
         rhs_constraints,
         join_order,
-        maybe_order_target,
+        planning_context,
         where_clause,
         available_indexes,
         table_references,
@@ -865,10 +882,48 @@ pub struct BestJoinOrderResult {
 /// Compute the best way to join a given set of tables.
 /// Returns the best [JoinN] if one exists, otherwise returns None.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn compute_best_join_order<'a>(
     joined_tables: &[JoinedTable],
     initial_input_cardinality: f64,
     maybe_order_target: Option<&OrderTarget>,
+    constraints: &'a [TableConstraints],
+    base_table_rows: &[RowCountEstimate],
+    access_methods_arena: &'a mut Vec<AccessMethod>,
+    where_clause: &mut [WhereTerm],
+    subqueries: &[NonFromClauseSubquery],
+    index_method_candidates: &[IndexMethodCandidate],
+    params: &CostModelParams,
+    analyze_stats: &AnalyzeStats,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    table_references: &TableReferences,
+    schema: &Schema,
+) -> Result<Option<BestJoinOrderResult>> {
+    compute_best_join_order_with_context(
+        joined_tables,
+        initial_input_cardinality,
+        JoinPlanningContext::default_with_order_target(maybe_order_target),
+        constraints,
+        base_table_rows,
+        access_methods_arena,
+        where_clause,
+        subqueries,
+        index_method_candidates,
+        params,
+        analyze_stats,
+        available_indexes,
+        table_references,
+        schema,
+    )
+}
+
+/// Enumerate join orders while carrying a small amount of planner context that
+/// influences access-path scoring, such as an order target for sort elimination
+/// or simple MIN/MAX planning.
+pub(crate) fn compute_best_join_order_with_context<'a>(
+    joined_tables: &[JoinedTable],
+    initial_input_cardinality: f64,
+    planning_context: JoinPlanningContext<'_>,
     constraints: &'a [TableConstraints],
     base_table_rows: &[RowCountEstimate],
     access_methods_arena: &'a mut Vec<AccessMethod>,
@@ -897,7 +952,7 @@ pub fn compute_best_join_order<'a>(
         return compute_greedy_join_order(
             joined_tables,
             initial_input_cardinality,
-            maybe_order_target,
+            planning_context,
             constraints,
             base_table_rows,
             access_methods_arena,
@@ -917,7 +972,7 @@ pub fn compute_best_join_order<'a>(
     let naive_plan = compute_naive_left_deep_plan(
         joined_tables,
         initial_input_cardinality,
-        maybe_order_target,
+        planning_context,
         base_table_rows,
         access_methods_arena,
         constraints,
@@ -936,16 +991,17 @@ pub fn compute_best_join_order<'a>(
     // We assign Some Cost (tm) to any required sort operation, so the best ordered plan may end up being
     // the one we choose, if the cost reduction from avoiding sorting brings it below the cost of the overall best one.
     let mut best_ordered_plan: Option<JoinN> = None;
-    let mut best_plan_is_also_ordered = match (naive_plan.as_ref(), maybe_order_target) {
-        (Some(plan), Some(order_target)) => plan_satisfies_order_target(
-            plan,
-            access_methods_arena,
-            joined_tables,
-            order_target,
-            schema,
-        ),
-        _ => false,
-    };
+    let mut best_plan_is_also_ordered =
+        match (naive_plan.as_ref(), planning_context.maybe_order_target) {
+            (Some(plan), Some(order_target)) => plan_satisfies_order_target(
+                plan,
+                access_methods_arena,
+                joined_tables,
+                order_target,
+                schema,
+            ),
+            _ => false,
+        };
 
     // If we have one table, then the "naive left-to-right plan" is always the best.
     if joined_tables.len() == 1 {
@@ -1006,7 +1062,7 @@ pub fn compute_best_join_order<'a>(
             constraints,
             base_table_rows,
             &join_order,
-            maybe_order_target,
+            planning_context,
             access_methods_arena,
             cost_upper_bound,
             joined_tables,
@@ -1145,7 +1201,7 @@ pub fn compute_best_join_order<'a>(
                         constraints,
                         base_table_rows,
                         &join_order,
-                        maybe_order_target,
+                        planning_context,
                         access_methods_arena,
                         cost_upper_bound,
                         joined_tables,
@@ -1165,17 +1221,18 @@ pub fn compute_best_join_order<'a>(
                         continue;
                     };
 
-                    let satisfies_order_target = if let Some(order_target) = maybe_order_target {
-                        plan_satisfies_order_target(
-                            &rel,
-                            access_methods_arena,
-                            joined_tables,
-                            order_target,
-                            schema,
-                        )
-                    } else {
-                        false
-                    };
+                    let satisfies_order_target =
+                        if let Some(order_target) = planning_context.maybe_order_target {
+                            plan_satisfies_order_target(
+                                &rel,
+                                access_methods_arena,
+                                joined_tables,
+                                order_target,
+                                schema,
+                            )
+                        } else {
+                            false
+                        };
 
                     // If this plan is worse than our overall best, it might still be the best ordered plan.
                     if rel.cost >= cost_upper_bound {
@@ -1208,17 +1265,18 @@ pub fn compute_best_join_order<'a>(
                     if cost_upper_bound <= rel.cost {
                         continue;
                     }
-                    let satisfies_order_target = if let Some(order_target) = maybe_order_target {
-                        plan_satisfies_order_target(
-                            &rel,
-                            access_methods_arena,
-                            joined_tables,
-                            order_target,
-                            schema,
-                        )
-                    } else {
-                        false
-                    };
+                    let satisfies_order_target =
+                        if let Some(order_target) = planning_context.maybe_order_target {
+                            plan_satisfies_order_target(
+                                &rel,
+                                access_methods_arena,
+                                joined_tables,
+                                order_target,
+                                schema,
+                            )
+                        } else {
+                            false
+                        };
                     if best_plan.as_ref().is_none_or(|plan| rel.cost < plan.cost) {
                         best_plan = Some(rel);
                         best_plan_is_also_ordered = satisfies_order_target;
@@ -1295,7 +1353,7 @@ pub const GREEDY_JOIN_THRESHOLD: usize = 12;
 pub fn compute_greedy_join_order<'a>(
     joined_tables: &[JoinedTable],
     initial_input_cardinality: f64,
-    maybe_order_target: Option<&OrderTarget>,
+    planning_context: JoinPlanningContext<'_>,
     constraints: &'a [TableConstraints],
     base_table_rows: &[RowCountEstimate],
     access_methods_arena: &'a mut Vec<AccessMethod>,
@@ -1354,7 +1412,7 @@ pub fn compute_greedy_join_order<'a>(
         constraints,
         base_table_rows,
         &join_order,
-        maybe_order_target,
+        planning_context,
         access_methods_arena,
         Cost(f64::MAX),
         joined_tables,
@@ -1442,7 +1500,7 @@ pub fn compute_greedy_join_order<'a>(
                 constraints,
                 base_table_rows,
                 &join_order,
-                maybe_order_target,
+                planning_context,
                 access_methods_arena,
                 Cost(f64::MAX),
                 joined_tables,
@@ -1556,7 +1614,7 @@ fn find_best_starting_table(
 pub fn compute_naive_left_deep_plan<'a>(
     joined_tables: &[JoinedTable],
     initial_input_cardinality: f64,
-    maybe_order_target: Option<&OrderTarget>,
+    planning_context: JoinPlanningContext<'_>,
     base_table_rows: &[RowCountEstimate],
     access_methods_arena: &'a mut Vec<AccessMethod>,
     constraints: &'a [TableConstraints],
@@ -1592,7 +1650,7 @@ pub fn compute_naive_left_deep_plan<'a>(
         constraints,
         base_table_rows,
         &join_order[..1],
-        maybe_order_target,
+        planning_context,
         access_methods_arena,
         Cost(f64::MAX),
         joined_tables,
@@ -1620,7 +1678,7 @@ pub fn compute_naive_left_deep_plan<'a>(
             constraints,
             base_table_rows,
             &join_order[..=i],
-            maybe_order_target,
+            planning_context,
             access_methods_arena,
             Cost(f64::MAX),
             joined_tables,

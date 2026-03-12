@@ -177,12 +177,20 @@ impl OpenLoop {
                             });
                             program.preassign_label_to_next_insn(loop_start);
                         }
-                        (Scan::Subquery, Table::FromClauseSubquery(from_clause_subquery)) => {
+                        (
+                            Scan::Subquery { iter_dir },
+                            Table::FromClauseSubquery(from_clause_subquery),
+                        ) => {
                             match from_clause_subquery.plan.select_query_destination() {
                                 Some(QueryDestination::CoroutineYield {
                                     yield_reg,
                                     coroutine_implementation_start,
                                 }) => {
+                                    turso_assert_eq!(
+                                        *iter_dir,
+                                        IterationDirection::Forwards,
+                                        "coroutine-backed subqueries cannot scan backwards"
+                                    );
                                     // Coroutine-based subquery execution
                                     // In case the subquery is an inner loop, it needs to be reinitialized on each iteration of the outer loop.
                                     program.emit_insn(Insn::InitCoroutine {
@@ -202,10 +210,17 @@ impl OpenLoop {
                                 }
                                 Some(QueryDestination::EphemeralTable { cursor_id, .. }) => {
                                     // Materialized CTE - scan the ephemeral table with Rewind/Next
-                                    program.emit_insn(Insn::Rewind {
-                                        cursor_id: *cursor_id,
-                                        pc_if_empty: loop_end,
-                                    });
+                                    if *iter_dir == IterationDirection::Backwards {
+                                        program.emit_insn(Insn::Last {
+                                            cursor_id: *cursor_id,
+                                            pc_if_empty: loop_end,
+                                        });
+                                    } else {
+                                        program.emit_insn(Insn::Rewind {
+                                            cursor_id: *cursor_id,
+                                            pc_if_empty: loop_end,
+                                        });
+                                    }
                                     program.preassign_label_to_next_insn(loop_start);
                                     emit_materialized_subquery_result_columns(
                                         program,

@@ -98,7 +98,7 @@ QUERY PLAN
 |  |  `--SCAN signal_days
 |  |--SCAN signal_days AS d1
 |  |--CORRELATED SCALAR SUBQUERY 3
-|  |  `--SEARCH d2 USING INDEX ephemeral_subquery_t107 (signal_day<?)
+|  |  `--SCAN signal_days AS d2
 |  |--SCAN prior_days
 |  |--SCAN window_subquery_0
 |  |  |--SCAN run_boundaries

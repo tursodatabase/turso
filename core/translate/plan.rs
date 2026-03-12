@@ -1485,7 +1485,9 @@ impl Operation {
                 idx_str: None,
                 constraints: Vec::new(),
             }),
-            Table::FromClauseSubquery(_) => Operation::Scan(Scan::Subquery),
+            Table::FromClauseSubquery(_) => Operation::Scan(Scan::Subquery {
+                iter_dir: IterationDirection::Forwards,
+            }),
         }
     }
 
@@ -2154,8 +2156,13 @@ pub enum Scan {
         /// The order of expressions matches the argument order expected by the virtual table.
         constraints: Vec<Expr>,
     },
-    /// A scan of a subquery in the `FROM` clause (using coroutines).
-    Subquery,
+    /// A scan of a subquery in the `FROM` clause.
+    Subquery {
+        /// Coroutine-backed scans run forwards. Materialized subqueries may
+        /// also be scanned backwards when the planner relies on intrinsic
+        /// subquery order for an extremum fast path.
+        iter_dir: IterationDirection,
+    },
 }
 
 /// An enum that represents a search operation that can be used to search for a row in a table using an index

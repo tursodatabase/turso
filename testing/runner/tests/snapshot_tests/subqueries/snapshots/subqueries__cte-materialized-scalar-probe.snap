@@ -69,7 +69,7 @@ QUERY PLAN
 |  |  `--SCAN ordered_points
 |  |--SCAN ordered_points AS p1
 |  |--CORRELATED SCALAR SUBQUERY 3
-|  |  `--SEARCH p2 USING INDEX ephemeral_subquery_t59 (point_key<?)
+|  |  `--SCAN ordered_points AS p2
 |  |--SCAN previous_points
 |  |--SCAN window_subquery_0
 |  |  |--SCAN run_markers

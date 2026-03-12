@@ -42,7 +42,7 @@ pub(crate) fn format_eqp_detail(table: &JoinedTable) -> String {
                         format!("SCAN {table_name}")
                     }
                 }
-                Scan::VirtualTable { .. } | Scan::Subquery => {
+                Scan::VirtualTable { .. } | Scan::Subquery { .. } => {
                     format!("SCAN {table_name}")
                 }
             }
@@ -270,7 +270,7 @@ impl Display for SelectPlan {
                                 writeln!(f, "{indent}SCAN {table_name}")?;
                             }
                         }
-                        Scan::VirtualTable { .. } | Scan::Subquery => {
+                        Scan::VirtualTable { .. } | Scan::Subquery { .. } => {
                             writeln!(f, "{indent}SCAN {table_name}")?;
                         }
                     }
@@ -393,7 +393,7 @@ impl Display for DeletePlan {
                                 writeln!(f, "{indent}DELETE FROM {table_name}")?;
                             }
                         }
-                        Scan::VirtualTable { .. } | Scan::Subquery => {
+                        Scan::VirtualTable { .. } | Scan::Subquery { .. } => {
                             writeln!(f, "{indent}DELETE FROM {table_name}")?;
                         }
                     }
@@ -517,7 +517,7 @@ impl fmt::Display for UpdatePlan {
                                 writeln!(f, "{indent}{action} {table_name}")?;
                             }
                         }
-                        Scan::VirtualTable { .. } | Scan::Subquery => {
+                        Scan::VirtualTable { .. } | Scan::Subquery { .. } => {
                             if i == 0 {
                                 writeln!(f, "{indent}UPDATE {table_name}")?;
                             } else {

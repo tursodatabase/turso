@@ -104,19 +104,30 @@ impl CloseLoop {
                                 pc_if_next: loop_labels.loop_start,
                             });
                         }
-                        Scan::Subquery => {
+                        Scan::Subquery { iter_dir } => {
                             // Check if this is a materialized CTE (EphemeralTable) or coroutine
                             if let Table::FromClauseSubquery(subquery) = &table.table {
                                 if let Some(QueryDestination::EphemeralTable {
                                     cursor_id, ..
                                 }) = subquery.plan.select_query_destination()
                                 {
-                                    // Materialized CTE - use Next to iterate
-                                    program.emit_insn(Insn::Next {
-                                        cursor_id: *cursor_id,
-                                        pc_if_next: loop_labels.loop_start,
-                                    });
+                                    if *iter_dir == IterationDirection::Backwards {
+                                        program.emit_insn(Insn::Prev {
+                                            cursor_id: *cursor_id,
+                                            pc_if_prev: loop_labels.loop_start,
+                                        });
+                                    } else {
+                                        program.emit_insn(Insn::Next {
+                                            cursor_id: *cursor_id,
+                                            pc_if_next: loop_labels.loop_start,
+                                        });
+                                    }
                                 } else {
+                                    turso_assert_eq!(
+                                        *iter_dir,
+                                        IterationDirection::Forwards,
+                                        "coroutine-backed subqueries cannot scan backwards"
+                                    );
                                     // Coroutine-based subquery - use Goto to Yield
                                     program.emit_insn(Insn::Goto {
                                         target_pc: loop_labels.loop_start,
