@@ -3533,6 +3533,80 @@ fn rewrite_select_table_entry_column_refs_scoped(
     }
 }
 
+fn rename_excluded_column_refs(expr: &mut ast::Expr, old_col: &str, new_col: &str) {
+    let old_col_normalized = normalize_ident(old_col);
+    let _ = walk_expr_mut(
+        expr,
+        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
+            if let ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) = e {
+                if normalize_ident(ns.as_str()) == "excluded"
+                    && normalize_ident(col.as_str()) == old_col_normalized
+                {
+                    *col = ast::Name::exact(new_col.to_owned());
+                }
+            }
+            Ok(WalkControl::Continue)
+        },
+    );
+}
+
+fn rewrite_upsert_column_refs_scoped(
+    upsert: &mut ast::Upsert,
+    table: &str,
+    trigger_table: &str,
+    insert_table: &str,
+    old_col: &str,
+    new_col: &str,
+) {
+    let insert_targets_renamed_table = normalize_ident(insert_table) == normalize_ident(table);
+    let rewrite_expr = |expr: &mut ast::Expr| {
+        if insert_targets_renamed_table {
+            rename_identifiers_scoped(expr, table, trigger_table, old_col, new_col);
+            rename_excluded_column_refs(expr, old_col, new_col);
+        } else {
+            rename_identifiers_scoped_when_clause(expr, table, trigger_table, old_col, new_col);
+        }
+    };
+
+    if let Some(ref mut index) = upsert.index {
+        for target in &mut index.targets {
+            rewrite_expr(&mut target.expr);
+        }
+        if let Some(ref mut wc) = index.where_clause {
+            rewrite_expr(wc);
+        }
+    }
+    if let ast::UpsertDo::Set {
+        ref mut sets,
+        ref mut where_clause,
+    } = upsert.do_clause
+    {
+        for set in sets {
+            if insert_targets_renamed_table {
+                for col_name in &mut set.col_names {
+                    if normalize_ident(col_name.as_str()) == normalize_ident(old_col) {
+                        *col_name = ast::Name::exact(new_col.to_owned());
+                    }
+                }
+            }
+            rewrite_expr(&mut set.expr);
+        }
+        if let Some(ref mut wc) = where_clause {
+            rewrite_expr(wc);
+        }
+    }
+    if let Some(ref mut next) = upsert.next {
+        rewrite_upsert_column_refs_scoped(
+            next,
+            table,
+            trigger_table,
+            insert_table,
+            old_col,
+            new_col,
+        );
+    }
+}
+
 /// Rewrite column references inside a trigger's body commands for ALTER TABLE RENAME COLUMN.
 /// Uses scope-aware renaming: only renames qualified refs when the qualifier matches
 /// the target table (or NEW/OLD for the trigger's owning table).
@@ -3544,7 +3618,6 @@ pub fn rewrite_trigger_cmd_column_refs(
     new_col: &str,
 ) {
     let table_normalized = normalize_ident(table);
-    let trigger_table_normalized = normalize_ident(trigger_table);
     match cmd {
         ast::TriggerCmd::Update {
             tbl_name,
@@ -3554,9 +3627,8 @@ pub fn rewrite_trigger_cmd_column_refs(
             ..
         } => {
             let cmd_tbl_norm = normalize_ident(tbl_name.as_str());
-            let targets_table =
-                cmd_tbl_norm == table_normalized || cmd_tbl_norm == trigger_table_normalized;
-            if targets_table {
+            let targets_renamed_table = cmd_tbl_norm == table_normalized;
+            if targets_renamed_table {
                 for set in sets {
                     for col_name in &mut set.col_names {
                         if normalize_ident(col_name.as_str()) == normalize_ident(old_col) {
@@ -3573,6 +3645,25 @@ pub fn rewrite_trigger_cmd_column_refs(
                 }
                 if let Some(ref mut wc) = where_clause {
                     rename_identifiers_scoped(wc, table, trigger_table, old_col, new_col);
+                }
+            } else {
+                for set in sets {
+                    rename_identifiers_scoped_when_clause(
+                        &mut set.expr,
+                        table,
+                        trigger_table,
+                        old_col,
+                        new_col,
+                    );
+                }
+                if let Some(ref mut wc) = where_clause {
+                    rename_identifiers_scoped_when_clause(
+                        wc,
+                        table,
+                        trigger_table,
+                        old_col,
+                        new_col,
+                    );
                 }
             }
             if let Some(ref mut from) = from {
@@ -3593,9 +3684,8 @@ pub fn rewrite_trigger_cmd_column_refs(
             ..
         } => {
             let cmd_tbl_norm = normalize_ident(tbl_name.as_str());
-            let targets_table =
-                cmd_tbl_norm == table_normalized || cmd_tbl_norm == trigger_table_normalized;
-            if targets_table {
+            let targets_renamed_table = cmd_tbl_norm == table_normalized;
+            if targets_renamed_table {
                 for col_name in col_names {
                     if normalize_ident(col_name.as_str()) == normalize_ident(old_col) {
                         *col_name = ast::Name::exact(new_col.to_owned());
@@ -3604,7 +3694,14 @@ pub fn rewrite_trigger_cmd_column_refs(
             }
             rewrite_select_column_refs_scoped(select, table, trigger_table, old_col, new_col);
             if let Some(ref mut upsert) = upsert {
-                rewrite_upsert_column_refs(upsert, old_col, new_col);
+                rewrite_upsert_column_refs_scoped(
+                    upsert,
+                    table,
+                    trigger_table,
+                    tbl_name.as_str(),
+                    old_col,
+                    new_col,
+                );
             }
         }
         ast::TriggerCmd::Delete {
@@ -3612,12 +3709,13 @@ pub fn rewrite_trigger_cmd_column_refs(
             where_clause,
         } => {
             let cmd_tbl_norm = normalize_ident(tbl_name.as_str());
-            let targets_table =
-                cmd_tbl_norm == table_normalized || cmd_tbl_norm == trigger_table_normalized;
-            if targets_table {
+            let targets_renamed_table = cmd_tbl_norm == table_normalized;
+            if targets_renamed_table {
                 if let Some(ref mut wc) = where_clause {
                     rename_identifiers_scoped(wc, table, trigger_table, old_col, new_col);
                 }
+            } else if let Some(ref mut wc) = where_clause {
+                rename_identifiers_scoped_when_clause(wc, table, trigger_table, old_col, new_col);
             }
         }
         ast::TriggerCmd::Select(select) => {
@@ -3738,37 +3836,6 @@ fn rewrite_upsert_table_refs(upsert: &mut ast::Upsert, old_tbl: &str, new_tbl: &
     }
     if let Some(ref mut next) = upsert.next {
         rewrite_upsert_table_refs(next, old_tbl, new_tbl);
-    }
-}
-
-fn rewrite_upsert_column_refs(upsert: &mut ast::Upsert, old_col: &str, new_col: &str) {
-    if let Some(ref mut index) = upsert.index {
-        for target in &mut index.targets {
-            rename_identifiers(&mut target.expr, old_col, new_col);
-        }
-        if let Some(ref mut wc) = index.where_clause {
-            rename_identifiers(wc, old_col, new_col);
-        }
-    }
-    if let ast::UpsertDo::Set {
-        ref mut sets,
-        ref mut where_clause,
-    } = upsert.do_clause
-    {
-        for set in sets {
-            for col_name in &mut set.col_names {
-                if normalize_ident(col_name.as_str()) == normalize_ident(old_col) {
-                    *col_name = ast::Name::exact(new_col.to_owned());
-                }
-            }
-            rename_identifiers(&mut set.expr, old_col, new_col);
-        }
-        if let Some(ref mut wc) = where_clause {
-            rename_identifiers(wc, old_col, new_col);
-        }
-    }
-    if let Some(ref mut next) = upsert.next {
-        rewrite_upsert_column_refs(next, old_col, new_col);
     }
 }
 

@@ -1296,6 +1296,7 @@ pub fn translate_alter_table(
                         table_name,
                         from,
                         col_name,
+                        database_id,
                         resolver,
                     ) {
                         Ok(new_sql) => {
@@ -2152,6 +2153,7 @@ fn rewrite_trigger_sql_for_column_rename(
     table_name: &str,
     old_column_name: &str,
     new_column_name: &str,
+    database_id: usize,
     resolver: &Resolver,
 ) -> Result<String> {
     use turso_parser::parser::Parser;
@@ -2185,8 +2187,9 @@ fn rewrite_trigger_sql_for_column_rename(
     let trigger_table_name_raw = tbl_name.name.as_str();
     let trigger_table_name = normalize_ident(trigger_table_name_raw);
     let trigger_table = resolver
-        .schema()
-        .get_btree_table(&trigger_table_name)
+        .with_schema(database_id, |schema| {
+            schema.get_btree_table(&trigger_table_name)
+        })
         .ok_or_else(|| {
             LimboError::ParseError(format!("trigger table not found: {trigger_table_name}"))
         })?;
@@ -2195,8 +2198,9 @@ fn rewrite_trigger_sql_for_column_rename(
     // We need to check if the column exists in the table being renamed
     let target_table_name = normalize_ident(table_name);
     let target_table = resolver
-        .schema()
-        .get_btree_table(&target_table_name)
+        .with_schema(database_id, |schema| {
+            schema.get_btree_table(&target_table_name)
+        })
         .ok_or_else(|| {
             LimboError::ParseError(format!("target table not found: {target_table_name}"))
         })?;
@@ -2286,6 +2290,7 @@ fn rewrite_trigger_sql_for_column_rename(
             &target_table_name,
             &old_col_norm,
             &new_col_norm,
+            database_id,
             resolver,
         )?;
         new_commands.push(new_cmd);
@@ -2322,6 +2327,7 @@ fn rewrite_expr_for_column_rename(
     old_col_norm: &str,
     new_col_norm: &str,
     context_table_name: Option<&str>,
+    database_id: usize,
     resolver: &Resolver,
 ) -> Result<ast::Expr> {
     let trigger_table_name_norm = normalize_ident(trigger_table_name);
@@ -2334,8 +2340,7 @@ fn rewrite_expr_for_column_rename(
             let ctx_name_norm = normalize_ident(ctx_name);
             let is_renaming = ctx_name_norm == target_table_name_norm;
             let table = resolver
-                .schema()
-                .get_btree_table(&ctx_name_norm)
+                .with_schema(database_id, |schema| schema.get_btree_table(&ctx_name_norm))
                 .ok_or_else(|| {
                     LimboError::ParseError(format!("context table not found: {ctx_name_norm}"))
                 })?;
@@ -2400,6 +2405,7 @@ fn rewrite_trigger_cmd_for_column_rename(
     target_table_name: &str,
     old_col_norm: &str,
     new_col_norm: &str,
+    database_id: usize,
     resolver: &Resolver,
 ) -> Result<ast::TriggerCmd> {
     match cmd {
@@ -2437,6 +2443,7 @@ fn rewrite_trigger_cmd_for_column_rename(
                     old_col_norm,
                     new_col_norm,
                     Some(&update_table_name_norm),
+                    database_id,
                     resolver,
                 )?);
             }
@@ -2452,6 +2459,7 @@ fn rewrite_trigger_cmd_for_column_rename(
                         old_col_norm,
                         new_col_norm,
                         Some(&update_table_name_norm), // UPDATE WHERE: unqualified refs refer to UPDATE target
+                        database_id,
                         resolver,
                     )
                     .map(Box::new)
@@ -2495,6 +2503,22 @@ fn rewrite_trigger_cmd_for_column_rename(
                 old_col_norm,
                 new_col_norm,
             )?;
+            let upsert = upsert
+                .map(|upsert| {
+                    rewrite_upsert_for_column_rename(
+                        *upsert,
+                        trigger_table,
+                        trigger_table_name,
+                        target_table_name,
+                        tbl_name.as_str(),
+                        old_col_norm,
+                        new_col_norm,
+                        database_id,
+                        resolver,
+                    )
+                    .map(Box::new)
+                })
+                .transpose()?;
             Ok(ast::TriggerCmd::Insert {
                 or_conflict,
                 tbl_name,
@@ -2522,6 +2546,7 @@ fn rewrite_trigger_cmd_for_column_rename(
                         old_col_norm,
                         new_col_norm,
                         Some(&delete_table_name_norm), // DELETE WHERE: unqualified refs refer to DELETE target
+                        database_id,
                         resolver,
                     )
                     .map(Box::new)
@@ -2544,6 +2569,133 @@ fn rewrite_trigger_cmd_for_column_rename(
             Ok(ast::TriggerCmd::Select(select))
         }
     }
+}
+
+fn rename_excluded_column_refs(
+    expr: &mut ast::Expr,
+    old_col_norm: &str,
+    new_col_norm: &str,
+) -> Result<()> {
+    walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
+        if let ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) = e {
+            if normalize_ident(ns.as_str()) == "excluded"
+                && normalize_ident(col.as_str()) == *old_col_norm
+            {
+                *col = ast::Name::from_string(new_col_norm);
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rewrite_upsert_for_column_rename(
+    mut upsert: ast::Upsert,
+    trigger_table: &BTreeTable,
+    trigger_table_name: &str,
+    target_table_name: &str,
+    insert_table_name: &str,
+    old_col_norm: &str,
+    new_col_norm: &str,
+    database_id: usize,
+    resolver: &Resolver,
+) -> Result<ast::Upsert> {
+    let insert_table_name_norm = normalize_ident(insert_table_name);
+    let insert_targets_renamed_table = insert_table_name_norm == *target_table_name;
+
+    if let Some(index) = &mut upsert.index {
+        for target in &mut index.targets {
+            target.expr = Box::new(rewrite_expr_for_column_rename(
+                &target.expr,
+                trigger_table,
+                trigger_table_name,
+                target_table_name,
+                old_col_norm,
+                new_col_norm,
+                Some(&insert_table_name_norm),
+                database_id,
+                resolver,
+            )?);
+            if insert_targets_renamed_table {
+                rename_excluded_column_refs(&mut target.expr, old_col_norm, new_col_norm)?;
+            }
+        }
+        if let Some(where_clause) = &mut index.where_clause {
+            **where_clause = rewrite_expr_for_column_rename(
+                where_clause,
+                trigger_table,
+                trigger_table_name,
+                target_table_name,
+                old_col_norm,
+                new_col_norm,
+                Some(&insert_table_name_norm),
+                database_id,
+                resolver,
+            )?;
+            if insert_targets_renamed_table {
+                rename_excluded_column_refs(where_clause, old_col_norm, new_col_norm)?;
+            }
+        }
+    }
+
+    if let ast::UpsertDo::Set { sets, where_clause } = &mut upsert.do_clause {
+        for set in sets {
+            if insert_targets_renamed_table {
+                for col_name in &mut set.col_names {
+                    if normalize_ident(col_name.as_str()) == *old_col_norm {
+                        *col_name = ast::Name::from_string(new_col_norm);
+                    }
+                }
+            }
+            set.expr = Box::new(rewrite_expr_for_column_rename(
+                &set.expr,
+                trigger_table,
+                trigger_table_name,
+                target_table_name,
+                old_col_norm,
+                new_col_norm,
+                Some(&insert_table_name_norm),
+                database_id,
+                resolver,
+            )?);
+            if insert_targets_renamed_table {
+                rename_excluded_column_refs(&mut set.expr, old_col_norm, new_col_norm)?;
+            }
+        }
+        if let Some(expr) = where_clause {
+            **expr = rewrite_expr_for_column_rename(
+                expr,
+                trigger_table,
+                trigger_table_name,
+                target_table_name,
+                old_col_norm,
+                new_col_norm,
+                Some(&insert_table_name_norm),
+                database_id,
+                resolver,
+            )?;
+            if insert_targets_renamed_table {
+                rename_excluded_column_refs(expr, old_col_norm, new_col_norm)?;
+            }
+        }
+    }
+
+    if let Some(next) = upsert.next.take() {
+        upsert.next = Some(Box::new(rewrite_upsert_for_column_rename(
+            *next,
+            trigger_table,
+            trigger_table_name,
+            target_table_name,
+            insert_table_name,
+            old_col_norm,
+            new_col_norm,
+            database_id,
+            resolver,
+        )?));
+    }
+
+    Ok(upsert)
 }
 
 /// Walk an expression tree for column renaming, handling subqueries that walk_expr_mut skips.
