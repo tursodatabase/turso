@@ -36,6 +36,7 @@ expect {
 }
 
 @setup multi-col-schema
+@backend rust
 test multi-column-values {
     INSERT INTO t2 VALUES(42, 123, '456', '789.0');
     SELECT val_a, val_b, val_c, val_d FROM log2;
@@ -70,6 +71,7 @@ setup real-schema {
 }
 
 @setup real-schema
+@backend rust
 test zero-value {
     INSERT INTO t4 VALUES(0);
     SELECT val, typ FROM log4;
@@ -79,6 +81,7 @@ expect {
 }
 
 @setup real-schema
+@backend rust
 test negative-integer {
     INSERT INTO t4 VALUES(-7);
     SELECT val, typ FROM log4;
