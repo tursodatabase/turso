@@ -174,12 +174,12 @@ impl BranchOffset {
     /// Adds an integer value to the branch offset.
     /// Returns a new branch offset.
     /// Panics if the branch offset is a label or placeholder.
-    #[expect(clippy::should_implement_trait)]
+    #[allow(clippy::should_implement_trait)]
     pub fn add<N: Into<u32>>(self, n: N) -> BranchOffset {
         BranchOffset::Offset(self.as_offset_int() + n.into())
     }
 
-    #[expect(clippy::should_implement_trait)]
+    #[allow(clippy::should_implement_trait)]
     pub fn sub<N: Into<u32>>(self, n: N) -> BranchOffset {
         BranchOffset::Offset(self.as_offset_int() - n.into())
     }
@@ -1880,6 +1880,8 @@ impl Program {
                     match effective_resolve {
                         ResolveType::Rollback => {
                             self.rollback_current_txn(pager);
+                            // All deferred FK violations are undone by the full rollback.
+                            self.connection.clear_deferred_foreign_key_violations();
                         }
                         ResolveType::Fail => {
                             // FAIL: Don't rollback the transaction.

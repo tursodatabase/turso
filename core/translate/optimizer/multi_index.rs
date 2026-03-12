@@ -1100,6 +1100,7 @@ mod tests {
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
+            pk_conflict_clause: None,
         })
     }
 
@@ -1220,6 +1221,7 @@ mod tests {
                 root_page: 2,
                 has_rowid: true,
                 index_method: None,
+                on_conflict: None,
             })]),
         );
 
@@ -1367,6 +1369,7 @@ mod tests {
                 root_page: 2,
                 has_rowid: true,
                 index_method: None,
+                on_conflict: None,
             })]),
         );
 
@@ -1488,6 +1491,7 @@ mod tests {
                 root_page: 2,
                 has_rowid: true,
                 index_method: None,
+                on_conflict: None,
             })]),
         );
 
@@ -1672,6 +1676,7 @@ mod tests {
                 root_page: 2,
                 has_rowid: true,
                 index_method: None,
+                on_conflict: None,
             })]),
         );
 

@@ -1472,9 +1472,12 @@ mod cte_tests {
                     // Use a proper join condition instead
                     format!(
                         "SELECT t1.{}, t2.{} FROM {} t1 LEFT JOIN {} t2 ON t1.{} = t2.{} ORDER BY 1, 2",
-                        last_cte.columns[0], other_cte.columns[0],
-                        last_cte.name, other_cte.name,
-                        last_cte.columns[0], other_cte.columns[0]
+                        last_cte.columns[0],
+                        other_cte.columns[0],
+                        last_cte.name,
+                        other_cte.name,
+                        last_cte.columns[0],
+                        other_cte.columns[0]
                     )
                 }
             }
@@ -1500,9 +1503,12 @@ mod cte_tests {
                 if other_cte.has_numeric_cols {
                     format!(
                         "SELECT t1.{}, t2.{} FROM {} t1 INNER JOIN {} t2 ON t1.{} = t2.{} ORDER BY 1, 2",
-                        last_cte.columns[0], other_cte.columns[0],
-                        last_cte.name, other_cte.name,
-                        last_cte.columns[0], other_cte.columns[0]
+                        last_cte.columns[0],
+                        other_cte.columns[0],
+                        last_cte.name,
+                        other_cte.name,
+                        last_cte.columns[0],
+                        other_cte.columns[0]
                     )
                 } else {
                     format!(

@@ -868,6 +868,7 @@ fn add_ephemeral_table_to_update_plan(
         unique_sets: vec![],
         foreign_keys: vec![],
         check_constraints: vec![],
+        pk_conflict_clause: None,
     });
 
     let temp_cursor_id = program.alloc_cursor_id_keyed(
@@ -2697,6 +2698,7 @@ fn ephemeral_index_build(
             .btree()
             .is_some_and(|btree| btree.has_rowid),
         index_method: None,
+        on_conflict: None,
     };
 
     ephemeral_index

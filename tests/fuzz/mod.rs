@@ -732,11 +732,15 @@ mod fuzz_tests {
             limbo_exec_rows(&limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
-            let get_constraint_type = |rng: &mut ChaCha8Rng| match rng.random_range(0..3) {
-                0 => "INTEGER PRIMARY KEY",
-                1 => "UNIQUE",
-                2 => "PRIMARY KEY",
-                _ => unreachable!(),
+            let get_constraint_type = |rng: &mut ChaCha8Rng| {
+                let base = match rng.random_range(0..3) {
+                    0 => "INTEGER PRIMARY KEY",
+                    1 => "UNIQUE",
+                    2 => "PRIMARY KEY",
+                    _ => unreachable!(),
+                };
+                let oc = random_on_conflict_clause(rng);
+                format!("{base}{oc}")
             };
 
             // Mix of immediate and deferred FK constraints
@@ -765,15 +769,16 @@ mod fuzz_tests {
             limbo_exec_rows(&limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
-            let composite_constraint = match rng.random_range(0..2) {
+            let composite_base = match rng.random_range(0..2) {
                 0 => "PRIMARY KEY",
                 1 => "UNIQUE",
                 _ => unreachable!(),
             };
+            let composite_oc = random_on_conflict_clause(&mut rng);
             // Composite key parent for deferred testing
-            let s = log_and_exec(
-                &format!("CREATE TABLE parent_comp(a INT NOT NULL, b INT NOT NULL, c INT, {composite_constraint}(a,b))"),
-            );
+            let s = log_and_exec(&format!(
+                "CREATE TABLE parent_comp(a INT NOT NULL, b INT NOT NULL, c INT, {composite_base}(a,b){composite_oc})"
+            ));
             limbo_exec_rows(&limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
@@ -1029,8 +1034,8 @@ mod fuzz_tests {
                         };
                         let z = rng.random_range(0..=10);
                         format!(
-                                "INSERT INTO child_comp_deferred VALUES ({id}, {ca}, {cb}, {z}) ON CONFLICT DO NOTHING"
-                            )
+                            "INSERT INTO child_comp_deferred VALUES ({id}, {ca}, {cb}, {z}) ON CONFLICT DO NOTHING"
+                        )
                     }
                     // Insert composite parent
                     7 => {
@@ -1076,6 +1081,13 @@ mod fuzz_tests {
                 let sres = sqlite.execute(&stmt, params![]);
                 let lres = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
 
+                // ON CONFLICT ROLLBACK can auto-rollback the transaction on
+                // constraint violation. Detect this by checking if sqlite went
+                // back to autocommit mode after a failed in-tx operation.
+                if in_tx && sres.is_err() && sqlite.is_autocommit() {
+                    in_tx = false;
+                }
+
                 if !start_a_transaction && !in_tx {
                     match (sres, lres) {
                         (Ok(_), Ok(_)) | (Err(_), Err(_)) => {}
@@ -1089,7 +1101,9 @@ mod fuzz_tests {
                             }
                             eprintln!("turso path: {}", limbo_db.path.display());
                             eprintln!("sqlite path: {}", sqlite_db.path.display());
-                            panic!("Non-transactional operation mismatch, file written to 'tests/fk_deferred.sql'");
+                            panic!(
+                                "Non-transactional operation mismatch, file written to 'tests/fk_deferred.sql'"
+                            );
                         }
                     }
                 }
@@ -1118,8 +1132,13 @@ mod fuzz_tests {
                                 let lres = limbo_exec_rows_fallible(&limbo_db, &limbo, &s);
                                 match (sres, lres) {
                                     (Ok(_), Ok(_)) => {}
+                                    // Both failed on ROLLBACK - OK, the transaction was
+                                    // already rolled back (e.g. by ON CONFLICT ROLLBACK).
+                                    (Err(_), Err(_)) => {}
                                     (s, l) => {
-                                        eprintln!("Post-failed-commit cleanup mismatch: sqlite={s:?}, limbo={l:?}");
+                                        eprintln!(
+                                            "Post-failed-commit cleanup mismatch: sqlite={s:?}, limbo={l:?}"
+                                        );
                                         let mut file =
                                             std::fs::File::create("fk_deferred.sql").unwrap();
                                         for stmt in stmts.iter() {
@@ -1127,7 +1146,9 @@ mod fuzz_tests {
                                         }
                                         eprintln!("turso path: {}", limbo_db.path.display());
                                         eprintln!("sqlite path: {}", sqlite_db.path.display());
-                                        panic!("Post-failed-commit cleanup mismatch, file written to 'tests/fk_deferred.sql'");
+                                        panic!(
+                                            "Post-failed-commit cleanup mismatch, file written to 'tests/fk_deferred.sql'"
+                                        );
                                     }
                                 }
                             }
@@ -1194,8 +1215,8 @@ mod fuzz_tests {
             sqlite.execute(&s, params![]).unwrap();
 
             let s = log_and_exec(
-            "CREATE TABLE c(id INTEGER PRIMARY KEY, x INT, y INT, FOREIGN KEY(x) REFERENCES p(id))",
-        );
+                "CREATE TABLE c(id INTEGER PRIMARY KEY, x INT, y INT, FOREIGN KEY(x) REFERENCES p(id))",
+            );
             limbo_exec_rows(&limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
@@ -1451,7 +1472,9 @@ mod fuzz_tests {
                             let _ = file.write_fmt(format_args!("{s};\n"));
                         }
                         file.flush().unwrap();
-                        panic!("DML outcome mismatch, statements written to tests/fk_fuzz_statements.sql");
+                        panic!(
+                            "DML outcome mismatch, statements written to tests/fk_fuzz_statements.sql"
+                        );
                     }
                 }
             }
@@ -1882,7 +1905,7 @@ mod fuzz_tests {
             // Child with composite FK and CASCADE
             let s = log_and_exec(
                 "CREATE TABLE child_comp(id INTEGER PRIMARY KEY, ca INT, cb INT, z INT, \
-                 FOREIGN KEY(ca,cb) REFERENCES parent_comp(a,b) ON DELETE CASCADE ON UPDATE CASCADE)"
+                 FOREIGN KEY(ca,cb) REFERENCES parent_comp(a,b) ON DELETE CASCADE ON UPDATE CASCADE)",
             );
             limbo_exec_rows(&limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
@@ -2092,19 +2115,25 @@ mod fuzz_tests {
                         let new_a = rng.random_range(-5..=25);
                         let new_b = rng.random_range(-5..=25);
                         parent_ids.insert(id);
-                        format!("INSERT INTO parent VALUES({id}, {new_a}, {new_b}) ON CONFLICT(id) DO UPDATE SET a={new_a}, b={new_b}")
+                        format!(
+                            "INSERT INTO parent VALUES({id}, {new_a}, {new_b}) ON CONFLICT(id) DO UPDATE SET a={new_a}, b={new_b}"
+                        )
                     }
                     // UPSERT on composite parent that updates columns (triggers ON UPDATE action)
                     _ => {
                         if let Some((a, b)) = comp_pairs.iter().choose(&mut rng).cloned() {
                             let new_c = rng.random_range(0..=20);
-                            format!("INSERT INTO parent_comp VALUES({a}, {b}, {new_c}) ON CONFLICT(a,b) DO UPDATE SET c={new_c}")
+                            format!(
+                                "INSERT INTO parent_comp VALUES({a}, {b}, {new_c}) ON CONFLICT(a,b) DO UPDATE SET c={new_c}"
+                            )
                         } else {
                             let a = rng.random_range(-3..=10);
                             let b = rng.random_range(-3..=10);
                             let c = rng.random_range(0..=20);
                             comp_pairs.insert((a as i64, b as i64));
-                            format!("INSERT INTO parent_comp VALUES({a}, {b}, {c}) ON CONFLICT(a,b) DO UPDATE SET c={c}")
+                            format!(
+                                "INSERT INTO parent_comp VALUES({a}, {b}, {c}) ON CONFLICT(a,b) DO UPDATE SET c={c}"
+                            )
                         }
                     }
                 };
@@ -2387,12 +2416,16 @@ mod fuzz_tests {
                     10 => {
                         if let Some(id) = gp_ids.iter().choose(&mut rng).cloned() {
                             let new_v = rng.random_range(0..=100);
-                            format!("INSERT INTO gp VALUES({id}, {new_v}) ON CONFLICT(id) DO UPDATE SET v={new_v}")
+                            format!(
+                                "INSERT INTO gp VALUES({id}, {new_v}) ON CONFLICT(id) DO UPDATE SET v={new_v}"
+                            )
                         } else {
                             let id = rng.random_range(1..=50);
                             let v = rng.random_range(0..=100);
                             gp_ids.insert(id as i64);
-                            format!("INSERT INTO gp VALUES({id}, {v}) ON CONFLICT(id) DO UPDATE SET v={v}")
+                            format!(
+                                "INSERT INTO gp VALUES({id}, {v}) ON CONFLICT(id) DO UPDATE SET v={v}"
+                            )
                         }
                     }
                     // UPSERT on parent that updates value (doesn't change FK key)
@@ -2400,7 +2433,9 @@ mod fuzz_tests {
                         if let Some(id) = p_ids.iter().choose(&mut rng).cloned() {
                             if let Some(gp_id) = gp_ids.iter().choose(&mut rng) {
                                 let new_v = rng.random_range(0..=100);
-                                format!("INSERT INTO p VALUES({id}, {gp_id}, {new_v}) ON CONFLICT(id) DO UPDATE SET v={new_v}")
+                                format!(
+                                    "INSERT INTO p VALUES({id}, {gp_id}, {new_v}) ON CONFLICT(id) DO UPDATE SET v={new_v}"
+                                )
                             } else {
                                 continue;
                             }
@@ -2651,7 +2686,9 @@ mod fuzz_tests {
                             let _ = writeln!(&file, "{s};");
                         }
                         file.flush().unwrap();
-                        panic!("DML outcome mismatch, sql file written to tests/fk_composite_fuzz_statements.sql");
+                        panic!(
+                            "DML outcome mismatch, sql file written to tests/fk_composite_fuzz_statements.sql"
+                        );
                     }
                 }
             }
@@ -3003,7 +3040,9 @@ mod fuzz_tests {
                         } else {
                             rng.random_range(0..1000).to_string()
                         };
-                        format!("UPDATE t SET c{update_col} = {new_value} WHERE c{update_col} {op} {threshold}")
+                        format!(
+                            "UPDATE t SET c{update_col} = {new_value} WHERE c{update_col} {op} {threshold}"
+                        )
                     }
                     2 => {
                         // DELETE action
@@ -3067,8 +3106,12 @@ mod fuzz_tests {
                 };
 
                 let where_clause = match where_kind {
-                    WhereClause::Normal => format!("WHERE c{predicate_col} {comparison} {predicate_value}"),
-                    WhereClause::Gaps => format!("WHERE c{predicate_col} {comparison} {predicate_value} AND c{predicate_col} % 2 = 0"),
+                    WhereClause::Normal => {
+                        format!("WHERE c{predicate_col} {comparison} {predicate_value}")
+                    }
+                    WhereClause::Gaps => format!(
+                        "WHERE c{predicate_col} {comparison} {predicate_value} AND c{predicate_col} % 2 = 0"
+                    ),
                     WhereClause::Omit => "".to_string(),
                 };
 
@@ -3794,10 +3837,14 @@ mod fuzz_tests {
             };
 
             let mut has_primary_key = false;
+            // Track columns that already have an ON CONFLICT clause to avoid SQLite's
+            // "conflicting ON CONFLICT clauses" error when a column appears in multiple constraints.
+            let mut cols_with_on_conflict: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
 
             // Column definitions with optional types and column-level constraints
             let mut column_defs: Vec<String> = Vec::new();
-            for name in col_names.iter() {
+            for (col_idx, name) in col_names.iter().enumerate() {
                 let mut parts = vec![name.clone()];
                 if rng.random_bool(0.7) {
                     let types = ["INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC"];
@@ -3806,9 +3853,17 @@ mod fuzz_tests {
                 }
                 if !use_table_pk && !has_primary_key && rng.random_bool(0.3) {
                     has_primary_key = true;
-                    parts.push("PRIMARY KEY".to_string());
+                    let oc = random_on_conflict_clause(&mut rng);
+                    parts.push(format!("PRIMARY KEY{oc}"));
+                    if !oc.is_empty() {
+                        cols_with_on_conflict.insert(col_idx);
+                    }
                 } else if rng.random_bool(0.2) {
-                    parts.push("UNIQUE".to_string());
+                    let oc = random_on_conflict_clause(&mut rng);
+                    parts.push(format!("UNIQUE{oc}"));
+                    if !oc.is_empty() {
+                        cols_with_on_conflict.insert(col_idx);
+                    }
                 }
                 column_defs.push(parts.join(" "));
             }
@@ -3825,7 +3880,26 @@ mod fuzz_tests {
                         spec_parts.push(col.clone());
                     }
                 }
-                table_constraints.push(format!("PRIMARY KEY ({})", spec_parts.join(", ")));
+                // Only add ON CONFLICT if none of the PK columns already have one
+                let pk_col_indices: Vec<usize> = pk_cols
+                    .iter()
+                    .filter_map(|c| col_names.iter().position(|n| n == c))
+                    .collect();
+                let oc = if pk_col_indices
+                    .iter()
+                    .any(|i| cols_with_on_conflict.contains(i))
+                {
+                    ""
+                } else {
+                    let oc = random_on_conflict_clause(&mut rng);
+                    if !oc.is_empty() {
+                        for &i in &pk_col_indices {
+                            cols_with_on_conflict.insert(i);
+                        }
+                    }
+                    oc
+                };
+                table_constraints.push(format!("PRIMARY KEY ({}){oc}", spec_parts.join(", ")));
             }
 
             let num_uniques = if num_cols >= 2 {
@@ -3840,12 +3914,29 @@ mod fuzz_tests {
                     rng.random_range(1..=num_cols.min(3))
                 };
                 let start = rng.random_range(0..num_cols);
+                let mut uniq_col_indices: Vec<usize> = Vec::new();
                 let mut uniq_cols: Vec<String> = Vec::new();
                 for k in 0..len {
                     let idx = (start + k) % num_cols;
+                    uniq_col_indices.push(idx);
                     uniq_cols.push(col_names[idx].clone());
                 }
-                table_constraints.push(format!("UNIQUE ({})", uniq_cols.join(", ")));
+                // Only add ON CONFLICT if none of these columns already have one
+                let oc = if uniq_col_indices
+                    .iter()
+                    .any(|i| cols_with_on_conflict.contains(i))
+                {
+                    ""
+                } else {
+                    let oc = random_on_conflict_clause(&mut rng);
+                    if !oc.is_empty() {
+                        for &i in &uniq_col_indices {
+                            cols_with_on_conflict.insert(i);
+                        }
+                    }
+                    oc
+                };
+                table_constraints.push(format!("UNIQUE ({}){oc}", uniq_cols.join(", ")));
             }
 
             let mut elements = column_defs;
@@ -4738,7 +4829,9 @@ mod fuzz_tests {
                 &limbo_conn,
                 &sqlite_conn,
                 &insert,
-                &format!("iteration: {iteration}, seed: {seed}, affinity: {affinity}, values: {values:?}"),
+                &format!(
+                    "iteration: {iteration}, seed: {seed}, affinity: {affinity}, values: {values:?}"
+                ),
             );
 
             // Query values and their types to verify affinity rules are applied correctly
@@ -4747,7 +4840,9 @@ mod fuzz_tests {
                 &limbo_conn,
                 &sqlite_conn,
                 query,
-                &format!("iteration: {iteration}, seed: {seed}, affinity: {affinity}, values: {values:?}"),
+                &format!(
+                    "iteration: {iteration}, seed: {seed}, affinity: {affinity}, values: {values:?}"
+                ),
             );
 
             // Also test with ORDER BY to ensure affinity affects sorting
@@ -4756,7 +4851,9 @@ mod fuzz_tests {
                 &limbo_conn,
                 &sqlite_conn,
                 query_ordered,
-                &format!("iteration: {iteration}, seed: {seed}, affinity: {affinity}, values: {values:?}"),
+                &format!(
+                    "iteration: {iteration}, seed: {seed}, affinity: {affinity}, values: {values:?}"
+                ),
             );
         }
     }
@@ -5042,7 +5139,14 @@ mod fuzz_tests {
             let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
 
             if limbo.len() != sqlite.len() {
-                panic!("MISMATCHING ROW COUNT (limbo: {}, sqlite: {}) for query: {}\n\n limbo: {:?}\n\n sqlite: {:?}", limbo.len(), sqlite.len(), query, limbo, sqlite);
+                panic!(
+                    "MISMATCHING ROW COUNT (limbo: {}, sqlite: {}) for query: {}\n\n limbo: {:?}\n\n sqlite: {:?}",
+                    limbo.len(),
+                    sqlite.len(),
+                    query,
+                    limbo,
+                    sqlite
+                );
             }
             // find first row where limbo and sqlite differ
             let diff_rows = limbo
@@ -5056,7 +5160,15 @@ mod fuzz_tests {
                 // check if all limbo rows are present in sqlite
                 let all_present = limbo.iter().all(|l| sqlite.iter().any(|s| l == s));
                 if !all_present {
-                    panic!("MISMATCHING ROWS (limbo: {}, sqlite: {}) for query: {}\n\n limbo: {:?}\n\n sqlite: {:?}\n\n differences: {:?}", limbo.len(), sqlite.len(), query, limbo, sqlite, diff_rows);
+                    panic!(
+                        "MISMATCHING ROWS (limbo: {}, sqlite: {}) for query: {}\n\n limbo: {:?}\n\n sqlite: {:?}\n\n differences: {:?}",
+                        limbo.len(),
+                        sqlite.len(),
+                        query,
+                        limbo,
+                        sqlite,
+                        diff_rows
+                    );
                 }
             }
         }
@@ -5381,7 +5493,10 @@ mod fuzz_tests {
                 tracing::debug!(new_pending_byte);
 
                 // Insert more than enough to pass the PENDING_BYTE
-                let query = format!("insert into t select replace(zeroblob({PAGE_SIZE}), x'00', 'A') from generate_series(1, {});", MAX_PAGENO * 2);
+                let query = format!(
+                    "insert into t select replace(zeroblob({PAGE_SIZE}), x'00', 'A') from generate_series(1, {});",
+                    MAX_PAGENO * 2
+                );
 
                 let conn = db.connect_limbo();
 
@@ -6348,7 +6463,9 @@ mod fuzz_tests {
                     if agg_col == "*" {
                         q = format!("SELECT {group_expr} AS g, COUNT(*) AS c FROM {main_table}");
                     } else {
-                        q = format!("SELECT {group_expr} AS g, {agg_func}({agg_col}) AS a FROM {main_table}");
+                        q = format!(
+                            "SELECT {group_expr} AS g, {agg_func}({agg_col}) AS a FROM {main_table}"
+                        );
                     }
                     if rng.random_bool(0.5) {
                         q.push_str(&format!(
@@ -6910,6 +7027,21 @@ mod fuzz_tests {
 
     const COLLATIONS: [&str; 3] = ["BINARY", "NOCASE", "RTRIM"];
     const TYPES: [&str; 5] = ["INT", "TEXT", "REAL", "BLOB", "NUMERIC"];
+
+    fn random_on_conflict_clause<R: Rng>(rng: &mut R) -> &'static str {
+        if rng.random_bool(0.4) {
+            match rng.random_range(0..5) {
+                0 => " ON CONFLICT ROLLBACK",
+                1 => " ON CONFLICT ABORT",
+                2 => " ON CONFLICT FAIL",
+                3 => " ON CONFLICT IGNORE",
+                4 => " ON CONFLICT REPLACE",
+                _ => unreachable!(),
+            }
+        } else {
+            ""
+        }
+    }
 
     fn random_collation<R: Rng>(rng: &mut R) -> Option<&'static str> {
         if rng.random_bool(0.65) {

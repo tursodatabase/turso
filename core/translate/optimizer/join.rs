@@ -1957,6 +1957,7 @@ mod tests {
             root_page: 1,
             has_rowid: true,
             index_method: None,
+            on_conflict: None,
         });
         available_indexes.insert("test_table".to_string(), VecDeque::from([index]));
 
@@ -2048,6 +2049,7 @@ mod tests {
             root_page: 1,
             has_rowid: true,
             index_method: None,
+            on_conflict: None,
         });
         available_indexes.insert("table1".to_string(), VecDeque::from([index1]));
 
@@ -2188,6 +2190,7 @@ mod tests {
                     root_page: 1,
                     has_rowid: true,
                     index_method: None,
+                    on_conflict: None,
                 });
                 available_indexes.insert(table_name.to_string(), VecDeque::from([index]));
             });
@@ -2208,6 +2211,7 @@ mod tests {
             root_page: 1,
             has_rowid: true,
             index_method: None,
+            on_conflict: None,
         });
         let order_id_idx = Arc::new(Index {
             name: "order_items_order_id_idx".to_string(),
@@ -2226,6 +2230,7 @@ mod tests {
             root_page: 1,
             has_rowid: true,
             index_method: None,
+            on_conflict: None,
         });
 
         available_indexes
@@ -2725,6 +2730,7 @@ mod tests {
             ephemeral: false,
             has_rowid: true,
             index_method: None,
+            on_conflict: None,
         });
 
         let mut available_indexes = HashMap::default();
@@ -2842,6 +2848,7 @@ mod tests {
             ephemeral: false,
             has_rowid: true,
             index_method: None,
+            on_conflict: None,
         });
         available_indexes.insert("t1".to_string(), VecDeque::from([index]));
 
@@ -2978,6 +2985,7 @@ mod tests {
             has_rowid: true,
             unique: false,
             index_method: None,
+            on_conflict: None,
         });
         available_indexes.insert("t1".to_string(), VecDeque::from([index]));
 
@@ -3138,6 +3146,7 @@ mod tests {
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
+            pk_conflict_clause: None,
         })
     }
 
@@ -3253,6 +3262,7 @@ mod tests {
             root_page: 2,
             has_rowid: true,
             index_method: None,
+            on_conflict: None,
         });
         available_indexes.insert("t2".to_string(), VecDeque::from([index_t2_a]));
 
