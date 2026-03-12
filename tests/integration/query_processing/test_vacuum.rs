@@ -24,7 +24,7 @@ fn run_integrity_check(conn: &Arc<Connection>) -> String {
         .join("\n")
 }
 
-fn quote_sqlite_literal(text: &str) -> String {
+fn escape_sqlite_string_literal(text: &str) -> String {
     text.replace('\'', "''")
 }
 
@@ -704,7 +704,7 @@ fn test_vacuum_into_rowid_compat_with_sqlite_reference(tmp_db: TempDatabase) -> 
          INSERT INTO t(rowid, a) VALUES(5, 'x');
          INSERT INTO t(rowid, a) VALUES(42, 'y');",
     )?;
-    let sqlite_dest_escaped = quote_sqlite_literal(sqlite_dest.to_str().unwrap());
+    let sqlite_dest_escaped = escape_sqlite_string_literal(sqlite_dest.to_str().unwrap());
     sqlite_conn.execute(&format!("VACUUM INTO '{sqlite_dest_escaped}'"), [])?;
     drop(sqlite_conn);
 
@@ -770,7 +770,7 @@ fn test_vacuum_into_integer_pk_and_indexes_compat_with_sqlite(
          INSERT INTO t_idx(id, a, b) VALUES (25, 'beta', 150);
          INSERT INTO t_idx(id, a, b) VALUES (50, 'gamma', 200);",
     )?;
-    let sqlite_dest_escaped = quote_sqlite_literal(sqlite_dest.to_str().unwrap());
+    let sqlite_dest_escaped = escape_sqlite_string_literal(sqlite_dest.to_str().unwrap());
     sqlite_conn.execute(&format!("VACUUM INTO '{sqlite_dest_escaped}'"), [])?;
     drop(sqlite_conn);
 

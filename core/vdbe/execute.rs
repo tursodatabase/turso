@@ -13588,6 +13588,7 @@ fn op_vacuum_into_inner(
                         let source_btree_table =
                             program.connection.schema.read().get_btree_table(table_name);
                         let rowid_alias = source_btree_table
+                            .as_ref()
                             .filter(|table| table.has_rowid)
                             .and_then(|table| {
                                 ["rowid", "_rowid_", "oid"]
@@ -13595,27 +13596,61 @@ fn op_vacuum_into_inner(
                                     .copied()
                                     .find(|alias| table.get_column(alias).is_none())
                             });
-                        let (select_sql, rowid_insert_alias) = if let Some(alias) = rowid_alias {
-                            (
-                                format!("SELECT {alias}, * FROM \"{escaped_table_name}\""),
-                                Some(alias),
-                            )
-                        } else {
-                            (format!("SELECT * FROM \"{escaped_table_name}\""), None)
+                        let rowid_alias_column_index = source_btree_table
+                            .as_ref()
+                            .and_then(|table| table.get_rowid_alias_column().map(|(idx, _)| idx));
+
+                        let mut data_columns: Vec<&str> = vacuum_state
+                            .current_table_columns
+                            .iter()
+                            .map(String::as_str)
+                            .collect();
+                        let mut excluded_rowid_alias_column = false;
+                        if rowid_alias.is_some() {
+                            if let Some(idx) = rowid_alias_column_index {
+                                turso_assert!(
+                                    idx < data_columns.len(),
+                                    "rowid alias column index out of bounds for table columns",
+                                    { "idx": idx, "columns_len": data_columns.len() }
+                                );
+                                data_columns.remove(idx);
+                                excluded_rowid_alias_column = true;
+                            }
+                        }
+                        let column_names = data_columns.join(", ");
+
+                        let select_sql = match rowid_alias {
+                            Some(alias)
+                                if excluded_rowid_alias_column && column_names.is_empty() =>
+                            {
+                                format!("SELECT {alias} FROM \"{escaped_table_name}\"")
+                            }
+                            Some(alias) if excluded_rowid_alias_column => {
+                                format!(
+                                    "SELECT {alias}, {column_names} FROM \"{escaped_table_name}\""
+                                )
+                            }
+                            Some(alias) => {
+                                format!("SELECT {alias}, * FROM \"{escaped_table_name}\"")
+                            }
+                            None => format!("SELECT * FROM \"{escaped_table_name}\""),
                         };
                         let select_stmt = program.connection.prepare(&select_sql)?;
 
                         // Prepare INSERT statement once per table (reused for all rows)
-                        let column_names = vacuum_state.current_table_columns.join(", ");
-                        let bind_count = if rowid_insert_alias.is_some() {
-                            vacuum_state.current_table_columns.len() + 1
+                        let bind_count = if rowid_alias.is_some() {
+                            data_columns.len() + 1
                         } else {
-                            vacuum_state.current_table_columns.len()
+                            data_columns.len()
                         };
                         let placeholders: String =
                             (0..bind_count).map(|_| "?").collect::<Vec<_>>().join(", ");
-                        let insert_columns = if let Some(alias) = rowid_insert_alias {
-                            format!("{alias}, {column_names}")
+                        let insert_columns = if let Some(alias) = rowid_alias {
+                            if column_names.is_empty() {
+                                alias.to_string()
+                            } else {
+                                format!("{alias}, {column_names}")
+                            }
                         } else {
                             column_names
                         };
