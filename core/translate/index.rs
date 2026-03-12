@@ -25,7 +25,7 @@ use crate::{bail_parse_error, CaptureDataChangesExt, LimboError};
 use crate::{
     schema::{BTreeTable, Index, IndexColumn, PseudoCursorType},
     storage::pager::CreateBTreeFlags,
-    util::normalize_ident,
+    util::{escape_sql_string_literal, normalize_ident},
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::{IdxInsertFlags, Insn, RegisterOrLiteral},
@@ -538,7 +538,8 @@ pub fn translate_create_index(
         p5: 0,
     });
     // Parse the schema table to get the index root page and add new index to Schema
-    let parse_schema_where_clause = format!("name = '{idx_name}' AND type = 'index'");
+    let escaped_idx_name = escape_sql_string_literal(&idx_name);
+    let parse_schema_where_clause = format!("name = '{escaped_idx_name}' AND type = 'index'");
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(parse_schema_where_clause),
