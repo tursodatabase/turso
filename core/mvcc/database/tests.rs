@@ -7407,7 +7407,7 @@ fn test_autoincrement_no_reuse_after_delete_and_restart() {
 /// tx2: starts
 /// tx1: upserts the row, commits
 /// tx3: upserts the same row, which sets end=TxID(T3) on tx1's version (speculative delete)
-/// tx2: upserts the same row, should get WriteWriteConflict at commit time because tx1 committed previously 
+/// tx2: upserts the same row, should get WriteWriteConflict at commit time because tx1 committed previously
 #[test]
 fn test_speculative_delete_hides_committed_version_sql() {
     let mut db = MvccTestDbNoConn::new_with_random_db();
@@ -7441,16 +7441,16 @@ fn test_speculative_delete_hides_committed_version_sql() {
 
     // T1: auto-commit UPSERT → insert_btree_resident, commits.
     let conn1 = db.connect();
-    conn1.execute(&upsert("b")).unwrap();
+    conn1.execute(upsert("b")).unwrap();
     conn1.close().unwrap();
 
     // T3: UPSERT → sets end=TxID(T3) on T1's version.
     let conn3 = db.connect();
     conn3.execute("BEGIN CONCURRENT").unwrap();
-    conn3.execute(&upsert("d")).unwrap();
+    conn3.execute(upsert("d")).unwrap();
 
     // T2: UPSERT → insert_btree_resident (T1 invisible, T3 invisible).
-    conn2.execute(&upsert("c")).unwrap();
+    conn2.execute(upsert("c")).unwrap();
 
     // T2: COMMIT → must detect conflict with T1.
     let result = conn2.execute("COMMIT");
@@ -7459,7 +7459,6 @@ fn test_speculative_delete_hides_committed_version_sql() {
         "Expected WriteWriteConflict, got: {result:?}."
     );
 }
-
 
 /// Regression test for Elle bug (https://github.com/tursodatabase/turso/actions/runs/22855976911/job/66296309873?pr=5819#logs)
 /// Previously, `check_version_conflicts` skipped any version with `end.is_some()`,
@@ -7599,7 +7598,7 @@ fn test_speculative_delete_hides_committed_version() {
         .unwrap();
 
     // T2: commit → must fail with WriteWriteConflict.
-    let result = commit_tx(db.mvcc_store.clone(), &conn2, tx2);
+    let result = commit_tx(db.mvcc_store, &conn2, tx2);
     assert!(
         matches!(&result, Err(LimboError::WriteWriteConflict)),
         "Expected WriteWriteConflict, got: {result:?}. \
@@ -7607,3 +7606,112 @@ fn test_speculative_delete_hides_committed_version() {
     );
 }
 
+/// Verify that a committed pure delete (tombstone) is detected as a conflict.
+///
+/// Scenario: Td deletes a row and commits. Between Td's Commit and CommitEnd
+/// (when TxID→Timestamp conversion happens), the tombstone still has
+/// end=TxID(Td). T2 does insert_btree_resident for the same row and tries to
+/// commit. The tombstone's begin=None, end=TxID(Td) should be caught by the
+/// B-tree tombstone check in check_version_conflicts.
+///
+/// Timeline:
+///   T1: insert row 1, commit
+///   T2: begin (will write later)
+///   Td: delete row 1, commit
+///   T2: insert_btree_resident row 1
+///   T2: commit → must detect conflict with Td's tombstone
+#[test]
+fn test_committed_delete_tombstone_conflict() {
+    let db = MvccTestDb::new();
+    let table_id: MVTableId = (-2).into();
+
+    // T1: insert row 1 and commit.
+    let tx1 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    let row_v1 = generate_simple_string_row(table_id, 1, "v1");
+    db.mvcc_store.insert(tx1, row_v1).unwrap();
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
+
+    // T2: begin (will write later).
+    let conn2 = db.db.connect().unwrap();
+    let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
+
+    // Td: delete row 1 and commit.
+    let conn_d = db.db.connect().unwrap();
+    let tx_d = db.mvcc_store.begin_tx(conn_d.pager.load().clone()).unwrap();
+    assert!(db
+        .mvcc_store
+        .delete(tx_d, RowID::new(table_id, RowKey::Int(1)))
+        .unwrap());
+    commit_tx(db.mvcc_store.clone(), &conn_d, tx_d).unwrap();
+
+    // T2: insert_btree_resident for the same row.
+    let row_v2 = generate_simple_string_row(table_id, 1, "v2");
+    db.mvcc_store
+        .insert_btree_resident_to_table_or_index(tx2, row_v2, None)
+        .unwrap();
+
+    // T2: commit → must detect conflict with Td.
+    let result = commit_tx(db.mvcc_store, &conn2, tx2);
+    assert!(
+        matches!(&result, Err(LimboError::WriteWriteConflict)),
+        "Expected WriteWriteConflict, got: {result:?}. \
+         Td's committed delete (tombstone) must be detected as a conflict."
+    );
+}
+
+/// Verify that when a transaction (Td) updates a row and commits, another
+/// transaction (T2) that also writes to the same row detects the conflict —
+/// even though T1's version has end=TxID(Td) with Td committed.
+///
+/// This tests the `Committed(_) => continue` branch in our fix: skipping T1's
+/// version is safe because Td's NEW version (begin=TxID(Td)) catches the conflict.
+/// (regression test: test_speculative_delete_hides_committed_version_sql)
+///
+/// Timeline:
+///   T1: insert row 1, commit
+///   T2: begin (will write later)
+///   Td: update row 1 (sets end=TxID(Td) on T1's version, creates new version), commit
+///   T2: insert_btree_resident row 1
+///   T2: commit → must detect conflict with Td's new version
+#[test]
+fn test_committed_update_version_conflict() {
+    let db = MvccTestDb::new();
+    let table_id: MVTableId = (-2).into();
+
+    // T1: insert row 1 and commit.
+    let tx1 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    let row_v1 = generate_simple_string_row(table_id, 1, "v1");
+    db.mvcc_store.insert(tx1, row_v1).unwrap();
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
+
+    // T2: begin (will write later).
+    let conn2 = db.db.connect().unwrap();
+    let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
+
+    // Td: update row 1 and commit.
+    let conn_d = db.db.connect().unwrap();
+    let tx_d = db.mvcc_store.begin_tx(conn_d.pager.load().clone()).unwrap();
+    let row_vd = generate_simple_string_row(table_id, 1, "vd");
+    assert!(db.mvcc_store.update(tx_d, row_vd).unwrap());
+    commit_tx(db.mvcc_store.clone(), &conn_d, tx_d).unwrap();
+
+    // T2: insert_btree_resident for the same row.
+    let row_v2 = generate_simple_string_row(table_id, 1, "v2");
+    db.mvcc_store
+        .insert_btree_resident_to_table_or_index(tx2, row_v2, None)
+        .unwrap();
+
+    // T2: commit → must detect conflict with Td.
+    let result = commit_tx(db.mvcc_store, &conn2, tx2);
+    assert!(
+        matches!(&result, Err(LimboError::WriteWriteConflict)),
+        "Expected WriteWriteConflict, got: {result:?}. \
+         Td's committed update must be detected via Td's new version."
+    );
+}
