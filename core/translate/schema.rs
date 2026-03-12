@@ -17,8 +17,9 @@ use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
-use crate::util::normalize_ident;
-use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
+use crate::util::{
+    escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
+};
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{
     to_u16, {CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral},
@@ -728,16 +729,6 @@ fn validate(body: &ast::CreateTableBody, table_name: &str, resolver: &Resolver) 
                     ast::ColumnConstraint::Generated { .. } => {
                         bail_parse_error!("GENERATED columns are not supported yet");
                     }
-                    ast::ColumnConstraint::NotNull {
-                        conflict_clause, ..
-                    }
-                    | ast::ColumnConstraint::PrimaryKey {
-                        conflict_clause, ..
-                    } if conflict_clause.is_some() => {
-                        bail_parse_error!(
-                            "ON CONFLICT clauses are not supported yet in column definitions"
-                        );
-                    }
                     ast::ColumnConstraint::Default(expr) => {
                         let expr =
                             translate_ident_to_string_literal(expr).unwrap_or_else(|| expr.clone());
@@ -1100,8 +1091,9 @@ pub fn translate_create_table(
     });
 
     // TODO: remove format, it sucks for performance but is convenient
+    let escaped_tbl_name = escape_sql_string_literal(&normalized_tbl_name);
     let mut parse_schema_where_clause =
-        format!("tbl_name = '{normalized_tbl_name}' AND type != 'trigger'");
+        format!("tbl_name = '{escaped_tbl_name}' AND type != 'trigger'");
     if created_sequence_table {
         parse_schema_where_clause.push_str(" OR tbl_name = 'sqlite_sequence'");
     }
@@ -1422,7 +1414,9 @@ pub fn translate_create_virtual_table(
         value: resolver.schema().schema_version as i32 + 1,
         p5: 0,
     });
-    let parse_schema_where_clause = format!("tbl_name = '{table_name}' AND type != 'trigger'");
+    let escaped_table_name = escape_sql_string_literal(&table_name);
+    let parse_schema_where_clause =
+        format!("tbl_name = '{escaped_table_name}' AND type != 'trigger'");
     program.emit_insn(Insn::ParseSchema {
         db: sqlite_schema_cursor_id,
         where_clause: Some(parse_schema_where_clause),
@@ -1678,6 +1672,7 @@ pub fn translate_drop_table(
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
+            pk_conflict_clause: None,
         });
         // cursor id 2
         let ephemeral_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(simple_table_rc));

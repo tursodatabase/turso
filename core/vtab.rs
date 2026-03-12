@@ -24,6 +24,9 @@ pub struct VirtualTable {
     vtab_type: VirtualTableType,
     // identifier to tie a cursor to a specific instantiated virtual table instance
     vtab_id: u64,
+    // Whether this virtual table is safe to use from within triggers and views.
+    // Corresponds to SQLite's SQLITE_VTAB_INNOCUOUS flag.
+    pub(crate) innocuous: bool,
 }
 
 impl VirtualTable {
@@ -48,6 +51,7 @@ impl VirtualTable {
             kind: VTabKind::TableValuedFunction,
             vtab_type: VirtualTableType::Internal(Arc::new(RwLock::new(dbpage_table))),
             vtab_id: 0,
+            innocuous: true,
         };
         Arc::new(dbpage_vtab)
     }
@@ -62,6 +66,7 @@ impl VirtualTable {
             kind: VTabKind::TableValuedFunction,
             vtab_type: VirtualTableType::Internal(Arc::new(RwLock::new(btree_dump_table))),
             vtab_id: 0,
+            innocuous: true,
         };
         Arc::new(vtab)
     }
@@ -75,6 +80,7 @@ impl VirtualTable {
             kind: VTabKind::TableValuedFunction,
             vtab_type: VirtualTableType::Internal(Arc::new(RwLock::new(table))),
             vtab_id: 0,
+            innocuous: true,
         };
         Arc::new(vtab)
     }
@@ -90,6 +96,7 @@ impl VirtualTable {
                     kind: VTabKind::TableValuedFunction,
                     vtab_type: VirtualTableType::Pragma(tab),
                     vtab_id: 0,
+                    innocuous: true,
                 };
                 Arc::new(vtab)
             })
@@ -124,6 +131,7 @@ impl VirtualTable {
             kind: VTabKind::TableValuedFunction,
             vtab_type: VirtualTableType::Internal(Arc::new(RwLock::new(json_each))),
             vtab_id: 0,
+            innocuous: true,
         };
 
         let json_tree = JsonVirtualTable::json_tree();
@@ -135,6 +143,7 @@ impl VirtualTable {
             kind: VTabKind::TableValuedFunction,
             vtab_type: VirtualTableType::Internal(Arc::new(RwLock::new(json_tree))),
             vtab_id: 0,
+            innocuous: true,
         };
 
         vec![
@@ -160,6 +169,7 @@ impl VirtualTable {
             kind: VTabKind::TableValuedFunction,
             vtab_type,
             vtab_id: 0,
+            innocuous: false,
         };
         Ok(Arc::new(vtab))
     }
@@ -179,6 +189,7 @@ impl VirtualTable {
             kind: VTabKind::VirtualTable,
             vtab_type: VirtualTableType::External(table),
             vtab_id: VTAB_ID_COUNTER.fetch_add(1, Ordering::Acquire),
+            innocuous: false,
         };
         Ok(Arc::new(vtab))
     }

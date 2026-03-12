@@ -225,8 +225,16 @@ fn test_chain_join_fuzz() {
                     detail.contains("SEARCH") && detail.contains("USING INDEX")
                 })
                 .count();
-            assert_eq!(scans, 1, "Expected 1 SCAN in EXPLAIN QUERY PLAN for a {chain_length}-way chain join, got {scans}");
-            assert_eq!(index_searches, chain_length - 1, "Expected {} INDEX SEARCHes in EXPLAIN QUERY PLAN for a {chain_length}-way chain join, got {index_searches}", chain_length - 1);
+            assert_eq!(
+                scans, 1,
+                "Expected 1 SCAN in EXPLAIN QUERY PLAN for a {chain_length}-way chain join, got {scans}"
+            );
+            assert_eq!(
+                index_searches,
+                chain_length - 1,
+                "Expected {} INDEX SEARCHes in EXPLAIN QUERY PLAN for a {chain_length}-way chain join, got {index_searches}",
+                chain_length - 1
+            );
         }
 
         let query = format!(

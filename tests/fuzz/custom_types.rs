@@ -1005,14 +1005,14 @@ mod tests {
                                 Value::Text(s) => s.clone(),
                                 Value::Null => String::new(),
                                 _ => {
-                                    return Err(format!("[{iter}] multi-col sort: bad label type"))
+                                    return Err(format!("[{iter}] multi-col sort: bad label type"));
                                 }
                             };
                             let cur_label = match &rows[i][0] {
                                 Value::Text(s) => s.clone(),
                                 Value::Null => String::new(),
                                 _ => {
-                                    return Err(format!("[{iter}] multi-col sort: bad label type"))
+                                    return Err(format!("[{iter}] multi-col sort: bad label type"));
                                 }
                             };
                             let prev_val = parse_numeric_value(&rows[i - 1][1]);

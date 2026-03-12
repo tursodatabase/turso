@@ -726,6 +726,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 self.durable_txid_max_new = durable_old.max(committed_max);
                 self.maybe_stage_mvcc_metadata_write()?;
 
+                self.mvstore
+                    .storage
+                    .on_checkpoint_start(self.durable_txid_max_new);
+
                 if self.write_set.is_empty() && self.index_write_set.is_empty() {
                     // Nothing to checkpoint, skip pager txn and go straight to WAL checkpoint.
                     self.state = CheckpointState::CheckpointWal;
@@ -1493,6 +1497,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     .store(self.durable_txid_max_new, Ordering::SeqCst);
                 self.gc_checkpointed_versions();
                 self.mvstore.drop_unused_row_versions();
+                self.mvstore
+                    .storage
+                    .on_checkpoint_end(self.durable_txid_max_new);
                 self.checkpoint_lock.unlock();
                 self.finalize(&())?;
                 Ok(TransitionResult::Done(

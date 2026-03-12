@@ -1,0 +1,702 @@
+@database :memory:
+
+# Tests for ON CONFLICT clause in column and table constraint definitions.
+# https://github.com/tursodatabase/turso/issues/5339
+
+# ---- Column-level PRIMARY KEY ON CONFLICT ----
+
+setup pk-replace {
+    CREATE TABLE t_pk_replace(x PRIMARY KEY ON CONFLICT REPLACE, y);
+    INSERT INTO t_pk_replace VALUES(1, 'first');
+    INSERT INTO t_pk_replace VALUES(2, 'second');
+}
+
+@setup pk-replace
+test pk-on-conflict-replace {
+    INSERT INTO t_pk_replace VALUES(1, 'replaced');
+    SELECT * FROM t_pk_replace ORDER BY x;
+}
+expect {
+    1|replaced
+    2|second
+}
+
+setup pk-ignore {
+    CREATE TABLE t_pk_ignore(x PRIMARY KEY ON CONFLICT IGNORE, y);
+    INSERT INTO t_pk_ignore VALUES(1, 'first');
+    INSERT INTO t_pk_ignore VALUES(2, 'second');
+}
+
+@setup pk-ignore
+test pk-on-conflict-ignore {
+    INSERT INTO t_pk_ignore VALUES(1, 'ignored');
+    SELECT * FROM t_pk_ignore ORDER BY x;
+}
+expect {
+    1|first
+    2|second
+}
+
+setup pk-abort {
+    CREATE TABLE t_pk_abort(x PRIMARY KEY ON CONFLICT ABORT, y);
+    INSERT INTO t_pk_abort VALUES(1, 'first');
+}
+
+@setup pk-abort
+test pk-on-conflict-abort {
+    INSERT INTO t_pk_abort VALUES(1, 'abort');
+}
+expect error {
+}
+
+setup pk-fail {
+    CREATE TABLE t_pk_fail(x PRIMARY KEY ON CONFLICT FAIL, y);
+    INSERT INTO t_pk_fail VALUES(1, 'first');
+}
+
+@setup pk-fail
+test pk-on-conflict-fail {
+    INSERT INTO t_pk_fail VALUES(1, 'fail');
+}
+expect error {
+}
+
+setup pk-rollback {
+    CREATE TABLE t_pk_rollback(x PRIMARY KEY ON CONFLICT ROLLBACK, y);
+    INSERT INTO t_pk_rollback VALUES(1, 'first');
+}
+
+@setup pk-rollback
+test pk-on-conflict-rollback {
+    INSERT INTO t_pk_rollback VALUES(1, 'rollback');
+}
+expect error {
+}
+
+# ---- Column-level UNIQUE ON CONFLICT ----
+
+setup uniq-replace {
+    CREATE TABLE t_uniq_replace(x, y UNIQUE ON CONFLICT REPLACE);
+    INSERT INTO t_uniq_replace VALUES('a', 1);
+    INSERT INTO t_uniq_replace VALUES('b', 2);
+}
+
+@setup uniq-replace
+test unique-on-conflict-replace {
+    INSERT INTO t_uniq_replace VALUES('c', 1);
+    SELECT * FROM t_uniq_replace ORDER BY y;
+}
+expect {
+    c|1
+    b|2
+}
+
+setup uniq-ignore {
+    CREATE TABLE t_uniq_ignore(x, y UNIQUE ON CONFLICT IGNORE);
+    INSERT INTO t_uniq_ignore VALUES('a', 1);
+    INSERT INTO t_uniq_ignore VALUES('b', 2);
+}
+
+@setup uniq-ignore
+test unique-on-conflict-ignore {
+    INSERT INTO t_uniq_ignore VALUES('c', 1);
+    SELECT * FROM t_uniq_ignore ORDER BY y;
+}
+expect {
+    a|1
+    b|2
+}
+
+# ---- Table-level PRIMARY KEY ON CONFLICT ----
+
+setup tbl-pk-replace {
+    CREATE TABLE t_tbl_pk_replace(x, y, PRIMARY KEY(x) ON CONFLICT REPLACE);
+    INSERT INTO t_tbl_pk_replace VALUES(1, 'first');
+    INSERT INTO t_tbl_pk_replace VALUES(2, 'second');
+}
+
+@setup tbl-pk-replace
+test table-pk-on-conflict-replace {
+    INSERT INTO t_tbl_pk_replace VALUES(1, 'replaced');
+    SELECT * FROM t_tbl_pk_replace ORDER BY x;
+}
+expect {
+    1|replaced
+    2|second
+}
+
+# ---- Table-level UNIQUE ON CONFLICT ----
+
+setup tbl-uniq-ignore {
+    CREATE TABLE t_tbl_uniq_ignore(x, y, UNIQUE(y) ON CONFLICT IGNORE);
+    INSERT INTO t_tbl_uniq_ignore VALUES('a', 1);
+    INSERT INTO t_tbl_uniq_ignore VALUES('b', 2);
+}
+
+@setup tbl-uniq-ignore
+test table-unique-on-conflict-ignore {
+    INSERT INTO t_tbl_uniq_ignore VALUES('c', 1);
+    SELECT * FROM t_tbl_uniq_ignore ORDER BY y;
+}
+expect {
+    a|1
+    b|2
+}
+
+# ---- NOT NULL ON CONFLICT ----
+
+setup nn-ignore {
+    CREATE TABLE t_nn_ignore(x, y NOT NULL ON CONFLICT IGNORE);
+    INSERT INTO t_nn_ignore VALUES('a', 1);
+}
+
+@setup nn-ignore
+test notnull-on-conflict-ignore {
+    INSERT INTO t_nn_ignore VALUES('b', NULL);
+    SELECT * FROM t_nn_ignore;
+}
+expect {
+    a|1
+}
+
+setup nn-replace {
+    CREATE TABLE t_nn_replace(x, y NOT NULL ON CONFLICT REPLACE DEFAULT 99);
+}
+
+@setup nn-replace
+test notnull-on-conflict-replace-with-default {
+    INSERT INTO t_nn_replace VALUES('a', NULL);
+    SELECT * FROM t_nn_replace;
+}
+expect {
+    a|99
+}
+
+# ---- Statement-level OR overrides constraint-level ----
+
+setup stmt-override {
+    CREATE TABLE t_override(x PRIMARY KEY ON CONFLICT REPLACE, y);
+    INSERT INTO t_override VALUES(1, 'first');
+}
+
+@setup stmt-override
+test statement-or-overrides-constraint {
+    INSERT OR ABORT INTO t_override VALUES(1, 'abort');
+}
+expect error {
+}
+
+setup stmt-override2 {
+    CREATE TABLE t_override2(x PRIMARY KEY ON CONFLICT ABORT, y);
+    INSERT INTO t_override2 VALUES(1, 'first');
+}
+
+@setup stmt-override2
+test statement-or-ignore-overrides-abort {
+    INSERT OR IGNORE INTO t_override2 VALUES(1, 'ignored');
+    SELECT * FROM t_override2;
+}
+expect {
+    1|first
+}
+
+# ---- INTEGER PRIMARY KEY (rowid alias) ON CONFLICT ----
+
+setup rowid-replace {
+    CREATE TABLE t_rowid_replace(x INTEGER PRIMARY KEY ON CONFLICT REPLACE, y);
+    INSERT INTO t_rowid_replace VALUES(1, 'first');
+    INSERT INTO t_rowid_replace VALUES(2, 'second');
+}
+
+@setup rowid-replace
+test rowid-pk-on-conflict-replace {
+    INSERT INTO t_rowid_replace VALUES(1, 'replaced');
+    SELECT * FROM t_rowid_replace ORDER BY x;
+}
+expect {
+    1|replaced
+    2|second
+}
+
+setup rowid-ignore {
+    CREATE TABLE t_rowid_ignore(x INTEGER PRIMARY KEY ON CONFLICT IGNORE, y);
+    INSERT INTO t_rowid_ignore VALUES(1, 'first');
+}
+
+@setup rowid-ignore
+test rowid-pk-on-conflict-ignore {
+    INSERT INTO t_rowid_ignore VALUES(1, 'ignored');
+    SELECT * FROM t_rowid_ignore;
+}
+expect {
+    1|first
+}
+
+# ---- FAIL semantics: constraint-level FAIL raises correct error ----
+# Note: The test runner stops execution on error, so we cannot verify partial
+# data state in the same test block. Data-state verification for FAIL vs ABORT
+# semantics is covered by the differential fuzz tests (fk_deferred_constraints_and_triggers_fuzz).
+
+setup pk-fail-multi {
+    CREATE TABLE t_pk_fail_multi(x PRIMARY KEY ON CONFLICT FAIL, y);
+}
+
+@setup pk-fail-multi
+test pk-fail-preserves-partial-changes {
+    INSERT INTO t_pk_fail_multi VALUES(1, 'a'), (2, 'b'), (3, 'c');
+    INSERT INTO t_pk_fail_multi VALUES(4, 'd'), (2, 'dup'), (5, 'e');
+}
+expect error {
+    UNIQUE constraint failed
+}
+
+setup uniq-fail-multi {
+    CREATE TABLE t_uniq_fail_multi(x, y UNIQUE ON CONFLICT FAIL);
+}
+
+@setup uniq-fail-multi
+test uniq-fail-preserves-partial-changes {
+    INSERT INTO t_uniq_fail_multi VALUES('a', 1), ('b', 2), ('c', 3);
+    INSERT INTO t_uniq_fail_multi VALUES('d', 4), ('e', 2), ('f', 5);
+}
+expect error {
+    UNIQUE constraint failed
+}
+
+# ---- ROLLBACK semantics: entire transaction rolled back ----
+
+setup pk-rollback-txn {
+    CREATE TABLE t_pk_rb(x PRIMARY KEY ON CONFLICT ROLLBACK, y);
+}
+
+@setup pk-rollback-txn
+test pk-rollback-rolls-back-transaction {
+    BEGIN;
+    INSERT INTO t_pk_rb VALUES(1, 'a');
+    INSERT INTO t_pk_rb VALUES(2, 'b');
+    INSERT INTO t_pk_rb VALUES(1, 'dup');
+    SELECT * FROM t_pk_rb ORDER BY x;
+}
+expect error {
+}
+
+# ---- FK + ON CONFLICT REPLACE with CASCADE ----
+
+setup fk-replace-cascade {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent_rc(id PRIMARY KEY ON CONFLICT REPLACE, val);
+    CREATE TABLE child_rc(cid, pid REFERENCES parent_rc(id) ON DELETE CASCADE);
+    INSERT INTO parent_rc VALUES(1, 'old');
+    INSERT INTO child_rc VALUES(100, 1);
+}
+
+@setup fk-replace-cascade
+test fk-replace-cascade-deletes-children {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO parent_rc VALUES(1, 'new');
+    SELECT * FROM parent_rc;
+    SELECT * FROM child_rc;
+}
+expect {
+    1|new
+}
+
+# ---- FK + ON CONFLICT REPLACE with SET NULL ----
+
+setup fk-replace-setnull {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent_sn(id UNIQUE ON CONFLICT REPLACE, val);
+    CREATE TABLE child_sn(cid, pid REFERENCES parent_sn(id) ON DELETE SET NULL);
+    INSERT INTO parent_sn VALUES(1, 'old');
+    INSERT INTO child_sn VALUES(100, 1);
+}
+
+@setup fk-replace-setnull
+test fk-replace-setnull-nullifies-children {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO parent_sn VALUES(1, 'new');
+    SELECT * FROM parent_sn;
+    SELECT * FROM child_sn;
+}
+expect {
+    1|new
+    100|
+}
+
+# ---- FK + ON CONFLICT REPLACE with RESTRICT ----
+
+setup fk-replace-restrict {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent_rst(id PRIMARY KEY ON CONFLICT REPLACE, val);
+    CREATE TABLE child_rst(cid, pid REFERENCES parent_rst(id) ON DELETE RESTRICT);
+    INSERT INTO parent_rst VALUES(1, 'old');
+    INSERT INTO child_rst VALUES(100, 1);
+}
+
+@setup fk-replace-restrict
+test fk-replace-restrict-raises-error {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO parent_rst VALUES(1, 'new');
+}
+expect error {
+}
+
+# ---- FK + ON CONFLICT IGNORE ----
+
+setup fk-ignore-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent_ig(id PRIMARY KEY ON CONFLICT IGNORE, val);
+    CREATE TABLE child_ig(cid, pid REFERENCES parent_ig(id));
+    INSERT INTO parent_ig VALUES(1, 'first');
+}
+
+@setup fk-ignore-parent
+test fk-ignore-no-fk-relationship-created {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO parent_ig VALUES(1, 'dup');
+    SELECT * FROM parent_ig;
+}
+expect {
+    1|first
+}
+
+# ---- UPDATE with constraint-level FAIL ----
+
+setup update-uniq-fail {
+    CREATE TABLE t_upd_fail(x, y UNIQUE ON CONFLICT FAIL);
+    INSERT INTO t_upd_fail VALUES('a', 1);
+    INSERT INTO t_upd_fail VALUES('b', 2);
+    INSERT INTO t_upd_fail VALUES('c', 3);
+}
+
+@setup update-uniq-fail
+test update-unique-fail {
+    UPDATE t_upd_fail SET y = 1 WHERE x = 'b';
+}
+expect error {
+}
+
+# ---- UPDATE with constraint-level ROLLBACK ----
+
+setup update-pk-rollback {
+    CREATE TABLE t_upd_rb(x INTEGER PRIMARY KEY ON CONFLICT ROLLBACK, y);
+    INSERT INTO t_upd_rb VALUES(1, 'a');
+    INSERT INTO t_upd_rb VALUES(2, 'b');
+}
+
+@setup update-pk-rollback
+test update-pk-rollback {
+    BEGIN;
+    UPDATE t_upd_rb SET y = 'modified' WHERE x = 1;
+    UPDATE t_upd_rb SET x = 1 WHERE x = 2;
+}
+expect error {
+    UNIQUE constraint failed
+}
+
+# ==============================================================================
+# Targeted regression tests for constraint-level FAIL/ROLLBACK semantics.
+#
+# Before the fix, constraint-level FAIL/ROLLBACK silently behaved as ABORT
+# because the Halt instruction's on_error field was always None, causing the
+# VM to fall back to program.resolve_type (always ABORT for constraint defs).
+# ==============================================================================
+
+# ---- FAIL vs ABORT: constraint-level FAIL must keep partial inserts ----
+# ABORT rolls back the entire statement. FAIL keeps rows inserted before the
+# conflict. This test distinguishes them: if FAIL incorrectly acts as ABORT,
+# the row (10,'before') would be rolled back and the table would be empty.
+
+setup regression-fail-vs-abort {
+    CREATE TABLE t_fva(id INTEGER PRIMARY KEY ON CONFLICT FAIL, val);
+}
+
+@setup regression-fail-vs-abort
+test constraint-fail-keeps-partial-insert {
+    INSERT INTO t_fva VALUES(10, 'before'), (20, 'before');
+    INSERT INTO t_fva VALUES(30, 'row1'), (10, 'conflict'), (40, 'row3');
+}
+expect error {
+    UNIQUE constraint failed
+}
+
+# Same test with UNIQUE constraint (not PK)
+setup regression-fail-vs-abort-uniq {
+    CREATE TABLE t_fvau(id, code UNIQUE ON CONFLICT FAIL);
+}
+
+@setup regression-fail-vs-abort-uniq
+test constraint-fail-keeps-partial-insert-unique {
+    INSERT INTO t_fvau VALUES(1, 'A'), (2, 'B');
+    INSERT INTO t_fvau VALUES(3, 'C'), (4, 'A'), (5, 'D');
+}
+expect error {
+    UNIQUE constraint failed
+}
+
+# ---- FAIL in explicit transaction: tx stays active, changes persist ----
+# After a FAIL error, the transaction must remain active and prior changes
+# within the tx must persist. If FAIL acts as ABORT, the tx also stays active
+# but the failing statement's partial changes are lost.
+
+setup regression-fail-in-tx {
+    CREATE TABLE t_fit(id PRIMARY KEY ON CONFLICT FAIL, val);
+}
+
+@setup regression-fail-in-tx
+test constraint-fail-in-transaction-keeps-partial {
+    BEGIN;
+    INSERT INTO t_fit VALUES(1, 'committed-before');
+    INSERT INTO t_fit VALUES(2, 'partial'), (1, 'dup'), (3, 'skipped');
+}
+expect error {
+    UNIQUE constraint failed
+}
+
+# ---- ROLLBACK vs ABORT in explicit transaction ----
+# ABORT: rolls back just the failing statement; transaction stays active.
+# ROLLBACK: rolls back the ENTIRE transaction; transaction is terminated.
+# If ROLLBACK acts as ABORT, the INSERT(1,'a') from before the conflict
+# would survive and the table would not be empty after the error.
+
+setup regression-rollback-vs-abort {
+    CREATE TABLE t_rva(id PRIMARY KEY ON CONFLICT ROLLBACK, val);
+}
+
+@setup regression-rollback-vs-abort
+test constraint-rollback-terminates-transaction {
+    BEGIN;
+    INSERT INTO t_rva VALUES(1, 'a');
+    INSERT INTO t_rva VALUES(2, 'b');
+    INSERT INTO t_rva VALUES(1, 'conflict');
+    SELECT * FROM t_rva;
+}
+expect error {
+}
+
+# Same test with UNIQUE constraint
+setup regression-rollback-vs-abort-uniq {
+    CREATE TABLE t_rvau(id, code UNIQUE ON CONFLICT ROLLBACK);
+}
+
+@setup regression-rollback-vs-abort-uniq
+test constraint-rollback-terminates-transaction-unique {
+    BEGIN;
+    INSERT INTO t_rvau VALUES(1, 'X');
+    INSERT INTO t_rvau VALUES(2, 'Y');
+    INSERT INTO t_rvau VALUES(3, 'X');
+    SELECT * FROM t_rvau;
+}
+expect error {
+}
+
+# ---- ROLLBACK + deferred FK: violations cleared after rollback ----
+# When ROLLBACK rolls back the transaction, deferred FK violations from
+# that transaction must be discarded. A subsequent transaction that has
+# no violations must be able to COMMIT successfully.
+
+setup regression-rollback-clears-fk {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t_rcf_parent(id PRIMARY KEY ON CONFLICT ROLLBACK);
+    CREATE TABLE t_rcf_child(cid, pid REFERENCES t_rcf_parent(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO t_rcf_parent VALUES(1);
+}
+
+@setup regression-rollback-clears-fk
+test rollback-clears-deferred-fk-violations {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    INSERT INTO t_rcf_child VALUES(100, 999);
+    INSERT INTO t_rcf_parent VALUES(1);
+}
+expect error {
+    UNIQUE constraint failed
+}
+
+# ---- Table-level FAIL on composite PK ----
+
+setup regression-composite-fail {
+    CREATE TABLE t_cf(a, b, c, PRIMARY KEY(a, b) ON CONFLICT FAIL);
+}
+
+@setup regression-composite-fail
+test composite-pk-fail-keeps-partial {
+    INSERT INTO t_cf VALUES(1, 1, 'first'), (1, 2, 'second');
+    INSERT INTO t_cf VALUES(2, 1, 'new'), (1, 1, 'dup'), (2, 2, 'skipped');
+}
+expect error {
+    UNIQUE constraint failed
+}
+
+# ---- Table-level ROLLBACK on composite UNIQUE ----
+
+setup regression-composite-rollback {
+    CREATE TABLE t_cr(a, b, c, UNIQUE(a, b) ON CONFLICT ROLLBACK);
+}
+
+@setup regression-composite-rollback
+test composite-unique-rollback-terminates-tx {
+    BEGIN;
+    INSERT INTO t_cr VALUES(1, 1, 'first');
+    INSERT INTO t_cr VALUES(1, 2, 'second');
+    INSERT INTO t_cr VALUES(1, 1, 'dup');
+    SELECT * FROM t_cr;
+}
+expect error {
+}
+
+# ---- UPDATE with constraint-level FAIL preserves prior row updates ----
+# UPDATE processes rows one at a time. With FAIL, rows updated before the
+# conflict must persist. With ABORT, all updates from the statement are
+# rolled back.
+
+setup regression-update-fail {
+    CREATE TABLE t_uf(id INTEGER PRIMARY KEY, val UNIQUE ON CONFLICT FAIL);
+    INSERT INTO t_uf VALUES(1, 'a');
+    INSERT INTO t_uf VALUES(2, 'b');
+    INSERT INTO t_uf VALUES(3, 'c');
+}
+
+@setup regression-update-fail
+test update-fail-keeps-prior-updates {
+    UPDATE t_uf SET val = 'a' WHERE id = 3;
+    SELECT * FROM t_uf ORDER BY id;
+}
+expect error {
+}
+
+# ---- UPDATE with constraint-level ROLLBACK inside transaction ----
+
+setup regression-update-rollback-tx {
+    CREATE TABLE t_urt(id INTEGER PRIMARY KEY ON CONFLICT ROLLBACK, val);
+    INSERT INTO t_urt VALUES(1, 'a');
+    INSERT INTO t_urt VALUES(2, 'b');
+}
+
+@setup regression-update-rollback-tx
+test update-rollback-terminates-transaction {
+    BEGIN;
+    INSERT INTO t_urt VALUES(3, 'c');
+    UPDATE t_urt SET id = 1 WHERE id = 2;
+}
+expect error {
+    UNIQUE constraint failed
+}
+
+# ==============================================================================
+# DDL validation: reject improper ON CONFLICT definitions
+# ==============================================================================
+
+# ---- Conflicting ON CONFLICT on same UNIQUE columns ----
+# Column-level UNIQUE ON CONFLICT X + table-level UNIQUE(same_col) ON CONFLICT Y
+# must be rejected when X != Y.
+
+test ddl-reject-conflicting-unique-on-conflict {
+    CREATE TABLE t_bad1(a UNIQUE ON CONFLICT FAIL, b, UNIQUE(a) ON CONFLICT IGNORE);
+}
+expect error {
+    conflicting ON CONFLICT clauses
+}
+
+test ddl-reject-conflicting-unique-on-conflict-replace-rollback {
+    CREATE TABLE t_bad2(a UNIQUE ON CONFLICT REPLACE, b, UNIQUE(a) ON CONFLICT ROLLBACK);
+}
+expect error {
+    conflicting ON CONFLICT clauses
+}
+
+# ---- Conflicting ON CONFLICT on composite UNIQUE ----
+
+test ddl-reject-conflicting-composite-unique {
+    CREATE TABLE t_bad3(a, b, UNIQUE(a, b) ON CONFLICT FAIL, UNIQUE(a, b) ON CONFLICT IGNORE);
+}
+expect error {
+    conflicting ON CONFLICT clauses
+}
+
+# ---- Same ON CONFLICT clause on duplicate UNIQUE: allowed ----
+
+test ddl-allow-same-on-conflict-unique {
+    CREATE TABLE t_ok1(a UNIQUE ON CONFLICT FAIL, b, UNIQUE(a) ON CONFLICT FAIL);
+    INSERT INTO t_ok1 VALUES(1, 'x');
+    SELECT * FROM t_ok1;
+}
+expect {
+    1|x
+}
+
+# ---- Only one has ON CONFLICT: allowed ----
+
+test ddl-allow-one-on-conflict-unique {
+    CREATE TABLE t_ok2(a UNIQUE ON CONFLICT FAIL, b, UNIQUE(a));
+    INSERT INTO t_ok2 VALUES(1, 'x');
+    SELECT * FROM t_ok2;
+}
+expect {
+    1|x
+}
+
+test ddl-allow-one-on-conflict-unique-reversed {
+    CREATE TABLE t_ok3(a UNIQUE, b, UNIQUE(a) ON CONFLICT FAIL);
+    INSERT INTO t_ok3 VALUES(1, 'x');
+    SELECT * FROM t_ok3;
+}
+expect {
+    1|x
+}
+
+# ---- Different columns: allowed even with different ON CONFLICT ----
+
+test ddl-allow-different-cols-different-on-conflict {
+    CREATE TABLE t_ok4(a UNIQUE ON CONFLICT FAIL, b UNIQUE ON CONFLICT IGNORE);
+    INSERT INTO t_ok4 VALUES(1, 2);
+    SELECT * FROM t_ok4;
+}
+expect {
+    1|2
+}
+
+# ---- Different column order on composite: allowed (creates separate indexes) ----
+
+test ddl-allow-different-order-composite {
+    CREATE TABLE t_ok5(a, b, UNIQUE(a, b) ON CONFLICT FAIL, UNIQUE(b, a) ON CONFLICT IGNORE);
+    INSERT INTO t_ok5 VALUES(1, 2);
+    SELECT * FROM t_ok5;
+}
+expect {
+    1|2
+}
+
+# ---- Multiple PRIMARY KEY always rejected ----
+
+test ddl-reject-multiple-pk-column-and-table {
+    CREATE TABLE t_bad4(a PRIMARY KEY, b, PRIMARY KEY(a));
+}
+expect error {
+    more than one primary key
+}
+
+test ddl-reject-multiple-pk-columns {
+    CREATE TABLE t_bad5(a PRIMARY KEY, b PRIMARY KEY);
+}
+expect error {
+    more than one primary key
+}
+
+test ddl-reject-multiple-pk-table-level {
+    CREATE TABLE t_bad6(a, b, PRIMARY KEY(a), PRIMARY KEY(b));
+}
+expect error {
+    more than one primary key
+}
+
+# ---- NOT NULL ON CONFLICT + PRIMARY KEY ON CONFLICT on same column: allowed ----
+
+test ddl-allow-notnull-and-pk-on-conflict {
+    CREATE TABLE t_ok6(a NOT NULL ON CONFLICT FAIL PRIMARY KEY ON CONFLICT IGNORE);
+    INSERT INTO t_ok6 VALUES(1);
+    SELECT * FROM t_ok6;
+}
+expect {
+    1
+}

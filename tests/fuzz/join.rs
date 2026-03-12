@@ -109,7 +109,9 @@ mod join_fuzz_tests {
                 2 => {
                     // With aggregate
                     (
-                        format!("SELECT a, sum(b) AS sum_b, max(c) AS max_c, count(*) AS cnt FROM {table} GROUP BY a"),
+                        format!(
+                            "SELECT a, sum(b) AS sum_b, max(c) AS max_c, count(*) AS cnt FROM {table} GROUP BY a"
+                        ),
                         vec!["a"],
                     )
                 }
@@ -332,19 +334,19 @@ mod join_fuzz_tests {
                 eprintln!("=== END ===\n");
 
                 panic!(
-                "JOIN FUZZ MISMATCH (add_indexes={})\nseed: {}\niteration: {}\nquery: {}\n\
+                    "JOIN FUZZ MISMATCH (add_indexes={})\nseed: {}\niteration: {}\nquery: {}\n\
                  sqlite ({} rows): {:?}\nlimbo ({} rows): {:?}\nsqlite path: {:?}\nlimbo path: {:?}",
-                add_indexes,
-                seed,
-                iter,
-                query,
-                sqlite_rows.len(),
-                sqlite_rows,
-                limbo_rows.len(),
-                limbo_rows,
-                sqlite_db.path,
-                limbo_db.path,
-            );
+                    add_indexes,
+                    seed,
+                    iter,
+                    query,
+                    sqlite_rows.len(),
+                    sqlite_rows,
+                    limbo_rows.len(),
+                    limbo_rows,
+                    sqlite_db.path,
+                    limbo_db.path,
+                );
             }
         }
     }

@@ -1750,7 +1750,7 @@ pub enum TriggerCmd {
 }
 
 /// Conflict resolution types
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ResolveType {
     /// `ROLLBACK`

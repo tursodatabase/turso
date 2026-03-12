@@ -1498,6 +1498,7 @@ fn materialized_subquery_ephemeral_index(
         where_clause: None,
         has_rowid: true,
         index_method: None,
+        on_conflict: None,
     })
 }
 

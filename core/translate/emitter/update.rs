@@ -1,4 +1,5 @@
 use super::TranslateCtx;
+use crate::translate::insert::halt_desc_and_on_error;
 use crate::{
     ast, emit_explain,
     error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
@@ -54,6 +55,7 @@ pub fn emit_program_for_update(
     after: impl FnOnce(&mut ProgramBuilder),
 ) -> Result<()> {
     program.set_resolve_type(plan.or_conflict.unwrap_or(ResolveType::Abort));
+    program.has_statement_conflict = plan.or_conflict.is_some();
 
     let mut t_ctx = TranslateCtx::new(
         program,
@@ -410,6 +412,7 @@ fn emit_update_column_values<'a>(
     t_ctx: &mut TranslateCtx<'a>,
     skip_set_clauses: bool,
     skip_row_label: BranchOffset,
+    skip_notnull_checks: bool,
 ) -> crate::Result<()> {
     let or_conflict = program.resolve_type;
     if has_direct_rowid_update {
@@ -486,8 +489,15 @@ fn emit_update_column_values<'a>(
                             &t_ctx.resolver,
                         )?;
                     }
-                    if table_column.notnull() {
-                        match or_conflict {
+                    if table_column.notnull() && !skip_notnull_checks {
+                        let notnull_conflict = if program.has_statement_conflict {
+                            or_conflict
+                        } else {
+                            table_column
+                                .notnull_conflict_clause
+                                .unwrap_or(ResolveType::Abort)
+                        };
+                        match notnull_conflict {
                             ResolveType::Ignore => {
                                 // For IGNORE, skip this row on NOT NULL violation
                                 program.emit_insn(Insn::IsNull {
@@ -621,6 +631,89 @@ fn emit_update_column_values<'a>(
                 program.mark_last_insn_constant();
                 program.emit_null(value_reg, None);
                 program.mark_last_insn_constant();
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Emit NOT NULL constraint checks for SET clause columns after BEFORE triggers have fired.
+/// This is deferred from the first `emit_update_column_values` call so that triggers
+/// run before constraint checks, matching SQLite's behavior.
+#[allow(clippy::too_many_arguments)]
+fn emit_deferred_notnull_checks<'a>(
+    program: &mut ProgramBuilder,
+    table_references: &mut TableReferences,
+    target_table: &Arc<JoinedTable>,
+    set_clauses: &[(usize, Box<ast::Expr>)],
+    start: usize,
+    table_name: &str,
+    skip_row_label: BranchOffset,
+    t_ctx: &mut TranslateCtx<'a>,
+) -> crate::Result<()> {
+    let or_conflict = program.resolve_type;
+    for (idx, table_column) in target_table.table.columns().iter().enumerate() {
+        if !table_column.notnull() {
+            continue;
+        }
+        // Only check columns that are in SET clauses
+        if !set_clauses.iter().any(|(i, _)| *i == idx) {
+            continue;
+        }
+        let target_reg = start + idx;
+        match or_conflict {
+            ResolveType::Ignore => {
+                program.emit_insn(Insn::IsNull {
+                    reg: target_reg,
+                    target_pc: skip_row_label,
+                });
+            }
+            ResolveType::Replace => {
+                if let Some(default_expr) = table_column.default.as_ref() {
+                    let continue_label = program.allocate_label();
+                    program.emit_insn(Insn::NotNull {
+                        reg: target_reg,
+                        target_pc: continue_label,
+                    });
+                    translate_expr_no_constant_opt(
+                        program,
+                        Some(table_references),
+                        default_expr,
+                        target_reg,
+                        &t_ctx.resolver,
+                        NoConstantOptReason::RegisterReuse,
+                    )?;
+                    program.preassign_label_to_next_insn(continue_label);
+                } else {
+                    use crate::error::SQLITE_CONSTRAINT_NOTNULL;
+                    program.emit_insn(Insn::HaltIfNull {
+                        target_reg,
+                        err_code: SQLITE_CONSTRAINT_NOTNULL,
+                        description: format!(
+                            "{}.{}",
+                            table_name,
+                            table_column
+                                .name
+                                .as_ref()
+                                .expect("Column name must be present")
+                        ),
+                    });
+                }
+            }
+            _ => {
+                use crate::error::SQLITE_CONSTRAINT_NOTNULL;
+                program.emit_insn(Insn::HaltIfNull {
+                    target_reg,
+                    err_code: SQLITE_CONSTRAINT_NOTNULL,
+                    description: format!(
+                        "{}.{}",
+                        table_name,
+                        table_column
+                            .name
+                            .as_ref()
+                            .expect("Column name must be present")
+                    ),
+                });
             }
         }
     }
@@ -827,6 +920,27 @@ fn emit_update_insns<'a>(
 
     let skip_set_clauses = false;
 
+    // Check early whether BEFORE UPDATE triggers exist, so we can defer NOT NULL
+    // constraint checks until after the triggers fire (matching SQLite behavior).
+    let update_database_id = target_table.database_id;
+    let has_before_triggers_early = if let Some(btree_table) = target_table.table.btree() {
+        let updated_column_indices: HashSet<usize> =
+            set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
+        t_ctx.resolver.with_schema(update_database_id, |s| {
+            get_relevant_triggers_type_and_time(
+                s,
+                TriggerEvent::Update,
+                TriggerTime::Before,
+                Some(updated_column_indices),
+                &btree_table,
+            )
+            .next()
+            .is_some()
+        })
+    } else {
+        false
+    };
+
     emit_update_column_values(
         program,
         table_references,
@@ -846,6 +960,7 @@ fn emit_update_insns<'a>(
         t_ctx,
         skip_set_clauses,
         skip_row_label,
+        has_before_triggers_early,
     )?;
 
     // For non-STRICT tables, apply column affinity to the NEW values early.
@@ -869,7 +984,6 @@ fn emit_update_insns<'a>(
     }
 
     // Fire BEFORE UPDATE triggers and preserve old_registers for AFTER triggers
-    let update_database_id = target_table.database_id;
     let mut has_before_triggers = false;
     let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) =
         target_table.table.btree()
@@ -936,13 +1050,23 @@ fn emit_update_insns<'a>(
                 .chain(std::iter::once(new_rowid_reg))
                 .collect();
 
-            // If the program has a trigger_conflict_override, propagate it to the trigger context.
+            // Propagate conflict resolution to trigger context:
+            // 1. UPSERT DO UPDATE override takes precedence
+            // 2. Outer UPDATE's explicit ON CONFLICT overrides trigger body
+            // 3. Otherwise, use trigger's own conflict resolution
             let trigger_ctx = if let Some(override_conflict) = program.trigger_conflict_override {
                 TriggerContext::new_with_override_conflict(
                     btree_table,
                     Some(new_registers),
                     Some(old_registers.clone()), // Clone for AFTER trigger
                     override_conflict,
+                )
+            } else if !matches!(or_conflict, ResolveType::Abort) {
+                TriggerContext::new_with_override_conflict(
+                    btree_table,
+                    Some(new_registers),
+                    Some(old_registers.clone()),
+                    or_conflict,
                 )
             } else {
                 TriggerContext::new(
@@ -1014,6 +1138,8 @@ fn emit_update_insns<'a>(
     // 2|666|666
     if target_table.table.btree().is_some() && has_before_triggers {
         let skip_set_clauses = true;
+        // Re-read non-SET columns (triggers may have changed them).
+        // NOT NULL checks are NOT skipped here — they cover non-SET columns.
         emit_update_column_values(
             program,
             table_references,
@@ -1033,6 +1159,21 @@ fn emit_update_insns<'a>(
             t_ctx,
             skip_set_clauses,
             skip_row_label,
+            false,
+        )?;
+
+        // Now emit NOT NULL checks for SET clause columns that were deferred
+        // from the first emit_update_column_values call. In SQLite, NOT NULL
+        // constraint checks happen after BEFORE triggers fire.
+        emit_deferred_notnull_checks(
+            program,
+            table_references,
+            &target_table,
+            set_clauses,
+            start,
+            table_name,
+            skip_row_label,
+            t_ctx,
         )?;
     }
 
@@ -1102,10 +1243,19 @@ fn emit_update_insns<'a>(
     // Without this, the per-index loop would interleave constraint checks with IdxDelete/IdxInsert,
     // leaving orphan index entries if a later constraint fails.
     // REPLACE is excluded because it handles conflicts by deleting conflicting rows inline.
-    if matches!(
+    //
+    // Also check per-constraint ON CONFLICT clauses from CREATE TABLE.
+    let needs_preflight = matches!(
         or_conflict,
         ResolveType::Abort | ResolveType::Ignore | ResolveType::Fail | ResolveType::Rollback
-    ) {
+    ) || (!program.has_statement_conflict
+        && indexes_to_update.iter().any(|idx| {
+            matches!(
+                idx.on_conflict,
+                Some(ResolveType::Ignore | ResolveType::Fail | ResolveType::Rollback)
+            )
+        }));
+    if needs_preflight {
         let rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
         for (index, (idx_cursor_id, _record_reg)) in indexes_to_update.iter().zip(index_cursors) {
             if !index.unique {
@@ -1180,15 +1330,21 @@ fn emit_update_insns<'a>(
                 collation: program.curr_collation(),
             });
 
-            // Conflict with a different row - handle based on conflict resolution mode
-            match or_conflict {
+            // Conflict with a different row - handle based on conflict resolution mode.
+            // Use per-constraint ON CONFLICT when no statement-level OR clause.
+            let idx_conflict = if program.has_statement_conflict {
+                or_conflict
+            } else {
+                index.on_conflict.unwrap_or(ResolveType::Abort)
+            };
+            match idx_conflict {
                 ResolveType::Ignore => {
                     // Skip this row's update and continue with the next row
                     program.emit_insn(Insn::Goto {
                         target_pc: skip_row_label,
                     });
                 }
-                ResolveType::Abort | ResolveType::Fail | ResolveType::Rollback => {
+                ResolveType::Fail | ResolveType::Rollback | ResolveType::Abort => {
                     // Halt with UNIQUE constraint error
                     let column_names = index.columns.iter().enumerate().fold(
                         String::with_capacity(50),
@@ -1202,16 +1358,19 @@ fn emit_update_insns<'a>(
                             accum
                         },
                     );
+                    let (description, on_error) = halt_desc_and_on_error(
+                        &column_names,
+                        idx_conflict,
+                        program.has_statement_conflict,
+                    );
                     program.emit_insn(Insn::Halt {
                         err_code: SQLITE_CONSTRAINT_UNIQUE,
-                        description: column_names,
-                        on_error: None,
+                        description,
+                        on_error,
                         description_reg: None,
                     });
                 }
-                _ => unreachable!(
-                    "Only ABORT, IGNORE, FAIL, and ROLLBACK should reach preflight check"
-                ),
+                _ => {}
             }
 
             program.preassign_label_to_next_insn(no_conflict_label);
@@ -1238,17 +1397,32 @@ fn emit_update_insns<'a>(
                 target_pc: no_rowid_conflict_label,
             });
 
-            // Conflict found - handle based on conflict resolution mode
-            match or_conflict {
+            // Conflict found - handle based on conflict resolution mode.
+            // Use per-constraint ON CONFLICT when no statement-level OR clause.
+            let pk_conflict = if program.has_statement_conflict {
+                or_conflict
+            } else {
+                target_table
+                    .table
+                    .btree()
+                    .and_then(|bt| {
+                        bt.unique_sets
+                            .iter()
+                            .find(|us| us.is_primary_key)
+                            .and_then(|us| us.conflict_clause)
+                    })
+                    .unwrap_or(ResolveType::Abort)
+            };
+            match pk_conflict {
                 ResolveType::Ignore => {
                     // Skip this row's update and continue with the next row
                     program.emit_insn(Insn::Goto {
                         target_pc: skip_row_label,
                     });
                 }
-                ResolveType::Abort | ResolveType::Fail | ResolveType::Rollback => {
+                ResolveType::Fail | ResolveType::Rollback | ResolveType::Abort => {
                     // Halt with PRIMARY KEY constraint error
-                    let description = if let Some(idx) = rowid_alias_index {
+                    let raw_desc = if let Some(idx) = rowid_alias_index {
                         String::from(table_name)
                             + "."
                             + target_table
@@ -1262,16 +1436,19 @@ fn emit_update_insns<'a>(
                     } else {
                         String::from(table_name) + ".rowid"
                     };
+                    let (description, on_error) = halt_desc_and_on_error(
+                        &raw_desc,
+                        pk_conflict,
+                        program.has_statement_conflict,
+                    );
                     program.emit_insn(Insn::Halt {
                         err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                         description,
-                        on_error: None,
+                        on_error,
                         description_reg: None,
                     });
                 }
-                _ => unreachable!(
-                    "Only ABORT, IGNORE, FAIL, and ROLLBACK should reach preflight check"
-                ),
+                _ => {}
             }
 
             program.preassign_label_to_next_insn(no_rowid_conflict_label);
@@ -1690,7 +1867,12 @@ fn emit_update_insns<'a>(
                 collation: program.curr_collation(),
             });
 
-            match or_conflict {
+            let idx_conflict = if program.has_statement_conflict {
+                or_conflict
+            } else {
+                index.on_conflict.unwrap_or(ResolveType::Abort)
+            };
+            match idx_conflict {
                 ResolveType::Ignore => {
                     // For IGNORE, skip this row's update but continue with other rows
                     program.emit_insn(Insn::Goto {
@@ -1816,7 +1998,7 @@ fn emit_update_insns<'a>(
                     program.preassign_label_to_next_insn(continue_label);
                 }
                 _ => {
-                    // Default ABORT behavior
+                    // ABORT/FAIL/ROLLBACK behavior
                     let column_names = index.columns.iter().enumerate().fold(
                         String::with_capacity(50),
                         |mut accum, (idx, col)| {
@@ -1829,11 +2011,15 @@ fn emit_update_insns<'a>(
                             accum
                         },
                     );
-
+                    let (description, on_error) = halt_desc_and_on_error(
+                        &column_names,
+                        idx_conflict,
+                        program.has_statement_conflict,
+                    );
                     program.emit_insn(Insn::Halt {
                         err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-                        description: column_names,
-                        on_error: None,
+                        description,
+                        on_error,
                         description_reg: None,
                     });
                 }
@@ -1927,8 +2113,23 @@ fn emit_update_insns<'a>(
                 target_pc: record_label,
             });
 
-            // Handle conflict resolution for rowid/primary key conflict
-            match or_conflict {
+            // Handle conflict resolution for rowid/primary key conflict.
+            // Use per-constraint ON CONFLICT when no statement-level OR clause.
+            let pk_conflict = if program.has_statement_conflict {
+                or_conflict
+            } else {
+                target_table
+                    .table
+                    .btree()
+                    .and_then(|bt| {
+                        bt.unique_sets
+                            .iter()
+                            .find(|us| us.is_primary_key)
+                            .and_then(|us| us.conflict_clause)
+                    })
+                    .unwrap_or(ResolveType::Abort)
+            };
+            match pk_conflict {
                 ResolveType::Ignore => {
                     // For IGNORE, skip this row's update but continue with other rows
                     program.emit_insn(Insn::Goto {
@@ -1936,8 +2137,8 @@ fn emit_update_insns<'a>(
                     });
                 }
                 _ => {
-                    // Default ABORT behavior
-                    let description = if let Some(idx) = rowid_alias_index {
+                    // ABORT/FAIL/ROLLBACK behavior
+                    let raw_desc = if let Some(idx) = rowid_alias_index {
                         String::from(table_name)
                             + "."
                             + target_table
@@ -1951,11 +2152,15 @@ fn emit_update_insns<'a>(
                     } else {
                         String::from(table_name) + ".rowid"
                     };
-
+                    let (description, on_error) = halt_desc_and_on_error(
+                        &raw_desc,
+                        pk_conflict,
+                        program.has_statement_conflict,
+                    );
                     program.emit_insn(Insn::Halt {
                         err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                         description,
-                        on_error: None,
+                        on_error,
                         description_reg: None,
                     });
                 }
@@ -2109,7 +2314,7 @@ fn emit_update_insns<'a>(
                 // Use preserved OLD registers from BEFORE trigger
                 let old_registers_after = preserved_old_registers;
 
-                // If the program has a trigger_conflict_override, propagate it to the trigger context.
+                // Propagate conflict resolution to AFTER trigger context (same logic as BEFORE)
                 let trigger_ctx_after =
                     if let Some(override_conflict) = program.trigger_conflict_override {
                         TriggerContext::new_after_with_override_conflict(
@@ -2117,6 +2322,13 @@ fn emit_update_insns<'a>(
                             Some(new_registers_after),
                             old_registers_after, // OLD values preserved from BEFORE trigger
                             override_conflict,
+                        )
+                    } else if !matches!(or_conflict, ResolveType::Abort) {
+                        TriggerContext::new_after_with_override_conflict(
+                            btree_table,
+                            Some(new_registers_after),
+                            old_registers_after,
+                            or_conflict,
                         )
                     } else {
                         TriggerContext::new_after(
