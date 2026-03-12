@@ -87,7 +87,7 @@ int sqlite3_progress_handler(sqlite3 *_db, int _n, int (*_callback)(void), void 
 
 int sqlite3_busy_timeout(sqlite3 *_db, int _ms);
 
-int sqlite3_set_authorizer(sqlite3 *_db, int (*_callback)(void), void *_context);
+int sqlite3_set_authorizer(sqlite3 *_db, int (*_callback)(void*, int, const char*, const char*, const char*, const char*), void *_context);
 
 void *sqlite3_context_db_handle(void *_context);
 

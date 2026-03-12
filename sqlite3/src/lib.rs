@@ -502,13 +502,63 @@ pub unsafe extern "C" fn sqlite3_busy_timeout(db: *mut sqlite3, ms: ffi::c_int) 
     SQLITE_OK
 }
 
+type AuthorizerFn = unsafe extern "C" fn(
+    *mut ffi::c_void,
+    ffi::c_int,
+    *const ffi::c_char,
+    *const ffi::c_char,
+    *const ffi::c_char,
+    *const ffi::c_char,
+) -> ffi::c_int;
+
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_set_authorizer(
-    _db: *mut sqlite3,
-    _callback: Option<unsafe extern "C" fn() -> ffi::c_int>,
-    _context: *mut ffi::c_void,
+    db: *mut sqlite3,
+    callback: Option<AuthorizerFn>,
+    context: *mut ffi::c_void,
 ) -> ffi::c_int {
-    stub!();
+    if db.is_null() {
+        return SQLITE_MISUSE;
+    }
+
+    let db_ref = &*db;
+    let inner = match db_ref.inner.lock() {
+        Ok(guard) => guard,
+        Err(_) => return SQLITE_MISUSE,
+    };
+
+    match callback {
+        None => {
+            inner.conn.set_authorizer(None);
+        }
+        Some(c_callback) => {
+            let ctx = context as usize;
+            let cb = c_callback;
+            inner.conn.set_authorizer(Some(Box::new(
+                move |action, arg3, arg4, db_name, trigger| {
+                    use turso_core::authorizer::AuthResult;
+                    let action_code = action as ffi::c_int;
+                    let c_arg3 = arg3.map(|s| std::ffi::CString::new(s).unwrap());
+                    let c_arg4 = arg4.map(|s| std::ffi::CString::new(s).unwrap());
+                    let c_db = db_name.map(|s| std::ffi::CString::new(s).unwrap());
+                    let c_trigger = trigger.map(|s| std::ffi::CString::new(s).unwrap());
+                    let rc = unsafe {
+                        cb(
+                            ctx as *mut ffi::c_void,
+                            action_code,
+                            c_arg3.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+                            c_arg4.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+                            c_db.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+                            c_trigger.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+                        )
+                    };
+                    AuthResult::from_i32(rc)
+                },
+            )));
+        }
+    }
+
+    SQLITE_OK
 }
 
 #[no_mangle]
@@ -2533,6 +2583,7 @@ fn limbo_err_code(err: &LimboError) -> i32 {
         LimboError::TableLocked => SQLITE_LOCKED,
         LimboError::ReadOnly => SQLITE_READONLY,
         LimboError::Busy => SQLITE_BUSY,
+        LimboError::AuthorizationDenied(_) => SQLITE_AUTH,
         _ => SQLITE_ERROR,
     }
 }

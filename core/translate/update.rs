@@ -62,6 +62,15 @@ pub fn translate_update(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> crate::Result<()> {
+    let database_id = resolver.resolve_database_id(&body.tbl_name)?;
+    let table_name_str = normalize_ident(body.tbl_name.name.as_str());
+    crate::authorizer::check_auth(
+        connection,
+        crate::authorizer::AuthAction::Update,
+        Some(&table_name_str),
+        None,
+        resolver.get_database_name_by_index(database_id).as_deref(),
+    )?;
     let mut plan = prepare_update_plan(program, resolver, body, connection, false)?;
 
     // Plan subqueries in the WHERE clause and SET clause

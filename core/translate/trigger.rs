@@ -92,6 +92,7 @@ pub fn translate_create_trigger(
     sql: String,
     commands: &[ast::TriggerCmd],
     when_clause: Option<&ast::Expr>,
+    connection: &crate::sync::Arc<crate::Connection>,
 ) -> Result<()> {
     let database_id = resolver.resolve_database_id(&trigger_name)?;
     if crate::is_attached_db(database_id) {
@@ -101,6 +102,13 @@ pub fn translate_create_trigger(
     program.begin_write_operation();
     let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
     let normalized_table_name = normalize_ident(tbl_name.name.as_str());
+    crate::authorizer::check_auth(
+        connection,
+        crate::authorizer::AuthAction::CreateTrigger,
+        Some(&normalized_trigger_name),
+        Some(&normalized_table_name),
+        resolver.get_database_name_by_index(database_id).as_deref(),
+    )?;
 
     // Validate that trigger body does not reference other databases.
     validate_trigger_no_cross_db_refs(
@@ -422,6 +430,7 @@ pub fn translate_drop_trigger(
     trigger_name: &ast::QualifiedName,
     if_exists: bool,
     program: &mut ProgramBuilder,
+    connection: &crate::sync::Arc<crate::Connection>,
 ) -> Result<()> {
     let database_id = resolver.resolve_database_id(trigger_name)?;
     if crate::is_attached_db(database_id) {
@@ -430,6 +439,13 @@ pub fn translate_drop_trigger(
     }
     program.begin_write_operation();
     let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
+    crate::authorizer::check_auth(
+        connection,
+        crate::authorizer::AuthAction::DropTrigger,
+        Some(&normalized_trigger_name),
+        None,
+        resolver.get_database_name_by_index(database_id).as_deref(),
+    )?;
 
     // Check if trigger exists
     if resolver.with_schema(database_id, |s| {

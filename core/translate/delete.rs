@@ -33,6 +33,13 @@ pub fn translate_delete(
 ) -> Result<()> {
     let database_id = resolver.resolve_database_id(tbl_name)?;
     let tbl_name = normalize_ident(tbl_name.name.as_str());
+    crate::authorizer::check_auth(
+        connection,
+        crate::authorizer::AuthAction::Delete,
+        Some(&tbl_name),
+        None,
+        resolver.get_database_name_by_index(database_id).as_deref(),
+    )?;
 
     // Check if this is a system table that should be protected from direct writes
     if !connection.is_nested_stmt()

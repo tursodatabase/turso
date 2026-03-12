@@ -72,6 +72,17 @@ pub fn translate_pragma(
     };
 
     let database_id = resolver.resolve_database_id(name)?;
+    let pragma_arg = match &body {
+        Some(ast::PragmaBody::Equals(val) | ast::PragmaBody::Call(val)) => Some(val.to_string()),
+        None => None,
+    };
+    crate::authorizer::check_auth(
+        &connection,
+        crate::authorizer::AuthAction::Pragma,
+        Some(name.name.as_str()),
+        pragma_arg.as_deref(),
+        resolver.get_database_name_by_index(database_id).as_deref(),
+    )?;
 
     let mode = match body {
         None => query_pragma(

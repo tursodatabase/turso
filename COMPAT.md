@@ -596,7 +596,7 @@ Modifiers:
 | sqlite3_busy_timeout     | ✅ Yes     |         |
 | sqlite3_trace_v2         | ❌ No      | Stub    |
 | sqlite3_progress_handler | ❌ No      | Stub    |
-| sqlite3_set_authorizer   | ❌ No      | Stub    |
+| sqlite3_set_authorizer   | ✅ Yes     |         |
 | sqlite3_commit_hook      | ❌ No      |         |
 | sqlite3_rollback_hook    | ❌ No      |         |
 | sqlite3_update_hook      | ❌ No      |         |
