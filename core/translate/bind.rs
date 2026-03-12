@@ -685,6 +685,15 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 Ok(())
             })?;
 
+            // 5. Bind LIMIT/OFFSET (no scope — these are standalone expressions)
+            if let Some(ref mut limit) = select.limit {
+                let empty = BindScope::empty();
+                ctx.bind_expr(&mut limit.expr, &empty)?;
+                if let Some(ref mut offset) = limit.offset {
+                    ctx.bind_expr(offset, &empty)?;
+                }
+            }
+
             Ok(BoundSelect {
                 result_columns,
                 main_scope,
@@ -2113,6 +2122,53 @@ mod tests {
                     ast::Operator::Add,
                     ast::Expr::Literal(ast::Literal::Numeric("1".into())).into_boxed(),
                 )
+            );
+        });
+    }
+
+    #[test]
+    fn limit_clause_is_bound() {
+        with_bind_context(&["CREATE TABLE t(a)"], |ctx| {
+            let mut select = parse_select("SELECT a FROM t LIMIT 10");
+            ctx.bind_select(&mut select).unwrap();
+
+            let limit = select.limit.as_ref().expect("expected LIMIT clause");
+            assert_eq!(
+                limit.expr.as_ref(),
+                &ast::Expr::Literal(ast::Literal::Numeric("10".into()))
+            );
+        });
+    }
+
+    #[test]
+    fn limit_with_offset_is_bound() {
+        with_bind_context(&["CREATE TABLE t(a)"], |ctx| {
+            let mut select = parse_select("SELECT a FROM t LIMIT 10 OFFSET 5");
+            ctx.bind_select(&mut select).unwrap();
+
+            let limit = select.limit.as_ref().expect("expected LIMIT clause");
+            assert_eq!(
+                limit.expr.as_ref(),
+                &ast::Expr::Literal(ast::Literal::Numeric("10".into()))
+            );
+            let offset = limit.offset.as_ref().expect("expected OFFSET");
+            assert_eq!(
+                offset.as_ref(),
+                &ast::Expr::Literal(ast::Literal::Numeric("5".into()))
+            );
+        });
+    }
+
+    #[test]
+    fn limit_double_quoted_string_becomes_literal() {
+        with_bind_context(&["CREATE TABLE t(a)"], |ctx| {
+            let mut select = parse_select("SELECT a FROM t LIMIT \"1\"");
+            ctx.bind_select(&mut select).unwrap();
+
+            let limit = select.limit.as_ref().expect("expected LIMIT clause");
+            assert_eq!(
+                limit.expr.as_ref(),
+                &ast::Expr::Literal(ast::Literal::String("'1'".into()))
             );
         });
     }
