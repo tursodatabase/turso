@@ -46,14 +46,16 @@ pub(crate) fn seek_constraint_annotation(
             parts.push(format!("{}{op_str}?", col.name));
         }
     }
-    // Range constraint from end key
+    // Range constraint from end key.
+    // The end key's SeekOp is the B-tree termination condition (the negation of the
+    // user-facing SQL operator), so we reverse it for display.
     if let SeekKeyComponent::Expr(_) = &seek_def.end.last_component {
         if let Some(col) = index.columns.get(range_col_idx) {
             let op_str = match seek_def.end.op {
-                SeekOp::LE { .. } => "<=",
-                SeekOp::LT => "<",
-                SeekOp::GE { .. } => ">=",
-                SeekOp::GT => ">",
+                SeekOp::GE { .. } => "<",
+                SeekOp::GT => "<=",
+                SeekOp::LE { .. } => ">",
+                SeekOp::LT => ">=",
             };
             parts.push(format!("{}{op_str}?", col.name));
         }
