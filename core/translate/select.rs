@@ -58,7 +58,7 @@ pub fn translate_select(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<usize> {
-    let mut select_plan = prepare_select_plan(
+    let mut select_plan = bind_prepare_select_plan(
         select,
         resolver,
         program,
