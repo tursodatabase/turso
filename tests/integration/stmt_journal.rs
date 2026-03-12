@@ -138,17 +138,20 @@ fn insert_select_source(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Single-row INSERT with FK constraints → multi-write (FK counter modifications
-/// need statement journal protection). Mirrors SQLite's sqlite3VdbeMultiWrite
-/// (fkey.c:452-453): always multi-write when FKs are active.
+/// Single-row INSERT with immediate FK constraints does NOT need a statement journal.
+/// Immediate FK violations emit a direct Halt before any writes (matching SQLite's
+/// usesStmtJournal=0 for this case), so there's nothing to roll back.
 #[turso_macros::test(init_sql = "CREATE TABLE parent (id INTEGER PRIMARY KEY);")]
-fn insert_single_row_with_fk(tmp_db: TempDatabase) -> anyhow::Result<()> {
+fn insert_single_row_with_immediate_fk(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
     conn.execute("PRAGMA foreign_keys = ON")?;
     conn.execute(
         "CREATE TABLE child (id UNIQUE, pid INT, FOREIGN KEY(pid) REFERENCES parent(id))",
     )?;
-    assert!(needs_stmt_journal(&conn, "INSERT INTO child VALUES (1, 1)"));
+    assert!(!needs_stmt_journal(
+        &conn,
+        "INSERT INTO child VALUES (1, 1)"
+    ));
     Ok(())
 }
 
