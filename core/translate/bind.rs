@@ -1505,14 +1505,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         for join in &mut from.joins {
             let mut st = self.resolve_select_table(&mut join.table)?;
 
-            // Determine join type and USING columns from AST
-            let using_cols = match &join.constraint {
-                Some(JoinConstraint::Using(cols)) => {
-                    cols.iter().cloned().collect::<Vec<_>>()
-                }
-                _ => vec![],
-            };
-            let (is_outer, is_full_outer, is_right, is_cross) =
+            let (is_outer, is_full_outer, is_right, is_cross, is_natural) =
                 match &join.operator {
                     ast::JoinOperator::TypedJoin(Some(jt)) => {
                         let is_left = jt.contains(ast::JoinType::LEFT);
@@ -1521,10 +1514,58 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         let is_full =
                             (is_left && is_right) || (is_outer && !is_left && !is_right);
                         let is_cross = jt.contains(ast::JoinType::CROSS);
-                        (is_outer && !is_full, is_full, is_right && !is_left && !is_full, is_cross)
+                        let is_natural = jt.contains(ast::JoinType::NATURAL);
+                        (is_outer && !is_full, is_full, is_right && !is_left && !is_full, is_cross, is_natural)
                     }
-                    _ => (false, false, false, false),
+                    _ => (false, false, false, false, false),
                 };
+
+            // NATURAL JOIN: find common columns and rewrite constraint to USING
+            if is_natural {
+                if join.constraint.is_some() {
+                    crate::bail_parse_error!(
+                        "NATURAL JOIN cannot be combined with ON or USING clause"
+                    );
+                }
+                let right_table: &dyn BindTable = st.table.as_ref();
+                let mut common_cols: Vec<ast::Name> = Vec::new();
+                for right_col in right_table.columns() {
+                    if right_col.is_hidden {
+                        continue;
+                    }
+                    let mut found = false;
+                    for left_st in &tables {
+                        let left_table: &dyn BindTable = left_st.table.as_ref();
+                        for left_col in left_table.columns() {
+                            if left_col.is_hidden {
+                                continue;
+                            }
+                            if left_col.name == right_col.name {
+                                found = true;
+                                break;
+                            }
+                        }
+                        if found {
+                            break;
+                        }
+                    }
+                    if found {
+                        common_cols.push(ast::Name::exact(right_col.name.to_string()));
+                    }
+                }
+                if common_cols.is_empty() {
+                    crate::bail_parse_error!("No columns found to NATURAL join on");
+                }
+                join.constraint = Some(JoinConstraint::Using(common_cols));
+            }
+
+            // Determine USING columns from (possibly rewritten) constraint
+            let using_cols = match &join.constraint {
+                Some(JoinConstraint::Using(cols)) => {
+                    cols.iter().cloned().collect::<Vec<_>>()
+                }
+                _ => vec![],
+            };
 
             // RIGHT JOIN: swap tables
             if is_right {
@@ -1576,8 +1617,20 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 Some(JoinConstraint::On(expr)) => {
                     self.bind_expr(expr, &scope)?;
                 }
-                Some(JoinConstraint::Using(_)) => {
-                    // USING columns already validated during scope construction
+                Some(JoinConstraint::Using(cols)) => {
+                    // Record USING columns as used so they get marked in TableReferences
+                    for col_name in cols.iter() {
+                        let name = normalize_ident(col_name.as_str());
+                        for st in &scope.tables {
+                            let bt: &dyn BindTable = st.table.as_ref();
+                            for col_ref in bt.columns() {
+                                if col_ref.name == name {
+                                    self.tracking.record_column(st.internal_id, col_ref.idx);
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
                 None => {}
             }
@@ -2682,6 +2735,115 @@ mod tests {
             let bound = ctx.bind_select(&mut select).unwrap();
 
             assert!(bound.main_join_order.is_empty());
+        });
+    }
+
+    // ── NATURAL JOIN tests ──────────────────────────────────────────────
+
+    fn join_constraint(select: &ast::Select) -> &Option<ast::JoinConstraint> {
+        match &select.body.select {
+            ast::OneSelect::Select { from, .. } => {
+                let from = from.as_ref().expect("expected FROM clause");
+                &from.joins[0].constraint
+            }
+            other => panic!("expected SELECT core, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn natural_join_rewrites_to_using_with_common_columns() {
+        with_bind_context(&["CREATE TABLE t(a, b)", "CREATE TABLE u(b, c)"], |ctx| {
+            let mut select = parse_select("SELECT * FROM t NATURAL JOIN u");
+            ctx.bind_select(&mut select).unwrap();
+
+            match join_constraint(&select) {
+                Some(JoinConstraint::Using(cols)) => {
+                    assert_eq!(cols.len(), 1);
+                    assert_eq!(cols[0].as_str(), "b");
+                }
+                other => panic!("expected USING constraint, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn natural_join_multiple_common_columns() {
+        with_bind_context(
+            &["CREATE TABLE t(a, b, c)", "CREATE TABLE u(b, c, d)"],
+            |ctx| {
+                let mut select = parse_select("SELECT * FROM t NATURAL JOIN u");
+                ctx.bind_select(&mut select).unwrap();
+
+                match join_constraint(&select) {
+                    Some(JoinConstraint::Using(cols)) => {
+                        assert_eq!(cols.len(), 2);
+                        let names: Vec<&str> = cols.iter().map(|c| c.as_str()).collect();
+                        assert!(names.contains(&"b"));
+                        assert!(names.contains(&"c"));
+                    }
+                    other => panic!("expected USING constraint, got {other:?}"),
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn natural_join_no_common_columns_errors() {
+        with_bind_context(&["CREATE TABLE t(a)", "CREATE TABLE u(b)"], |ctx| {
+            let err = bind_select_error(ctx, "SELECT * FROM t NATURAL JOIN u").to_string();
+            assert!(
+                err.contains("No columns found to NATURAL join on"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn natural_join_with_on_clause_errors() {
+        with_bind_context(&["CREATE TABLE t(a, b)", "CREATE TABLE u(b, c)"], |ctx| {
+            let err =
+                bind_select_error(ctx, "SELECT * FROM t NATURAL JOIN u ON t.b = u.b").to_string();
+            assert!(
+                err.contains("NATURAL JOIN cannot be combined with ON or USING clause"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn natural_join_star_deduplicates_common_columns() {
+        with_bind_context(&["CREATE TABLE t(a, b)", "CREATE TABLE u(b, c)"], |ctx| {
+            let mut select = parse_select("SELECT * FROM t NATURAL JOIN u");
+            ctx.bind_select(&mut select).unwrap();
+
+            let cols = select_columns(&select);
+            // t.a, t.b, u.c — u.b is deduped by USING(b)
+            assert_eq!(cols.len(), 3);
+            assert_column_expr(select_expr(&select, 0), 0, 0); // t.a
+            assert_column_expr(select_expr(&select, 1), 0, 1); // t.b
+            assert_column_expr(select_expr(&select, 2), 1, 1); // u.c
+        });
+    }
+
+    #[test]
+    fn natural_join_tracks_using_columns_as_used() {
+        with_bind_context(&["CREATE TABLE t(a, b)", "CREATE TABLE u(b, c)"], |ctx| {
+            let mut select = parse_select("SELECT a FROM t NATURAL JOIN u");
+            let bound = ctx.bind_select(&mut select).unwrap();
+
+            // Column b should be tracked as used in both tables (for USING equality)
+            assert!(bound
+                .tracking
+                .columns_used
+                .contains(&(TableInternalId::from(0usize), 0))); // t.a from SELECT
+            assert!(bound
+                .tracking
+                .columns_used
+                .contains(&(TableInternalId::from(0usize), 1))); // t.b from USING
+            assert!(bound
+                .tracking
+                .columns_used
+                .contains(&(TableInternalId::from(1usize), 0))); // u.b from USING
         });
     }
 }
