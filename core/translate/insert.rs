@@ -19,8 +19,8 @@ use crate::{
         },
         fkeys::{
             build_index_affinity_string, emit_fk_restrict_halt, emit_fk_violation,
-            emit_guarded_fk_decrement, index_probe,
-            open_read_index, open_read_table, ForeignKeyActions,
+            emit_guarded_fk_decrement, index_probe, open_read_index, open_read_table,
+            ForeignKeyActions,
         },
         plan::{
             ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
