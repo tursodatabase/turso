@@ -251,6 +251,7 @@ fn estimate_rows_from_analyze_stats(
 }
 
 /// Estimate the cost of a scan or seek operation.
+#[expect(clippy::too_many_arguments)]
 pub fn estimate_cost_for_scan_or_seek(
     index_info: Option<IndexInfo>,
     constraints: &[Constraint],

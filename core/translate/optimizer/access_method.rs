@@ -1192,6 +1192,7 @@ fn intrinsic_extremum_subquery_scan_direction(
 /// like a table-backed row source with a synthesized ephemeral probe index. When
 /// the latter is worthwhile, we materialize the subquery into an EphemeralTable
 /// and later build the probe index lazily in the main-loop open phase.
+#[expect(clippy::too_many_arguments)]
 fn find_best_access_method_for_subquery(
     rhs_table: &JoinedTable,
     subquery: &FromClauseSubquery,

@@ -920,6 +920,7 @@ pub fn compute_best_join_order<'a>(
 /// Enumerate join orders while carrying a small amount of planner context that
 /// influences access-path scoring, such as an order target for sort elimination
 /// or simple MIN/MAX planning.
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn compute_best_join_order_with_context<'a>(
     joined_tables: &[JoinedTable],
     initial_input_cardinality: f64,
