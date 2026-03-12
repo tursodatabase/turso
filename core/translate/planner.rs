@@ -1168,6 +1168,53 @@ fn transform_args_into_where_terms(
     Ok(())
 }
 
+/// Walk the FROM clause AST and generate virtual-table argument predicates.
+///
+/// Called after binding — `TableReferences` already contains the resolved
+/// `JoinedTable`s. For each `TableCall` node in the AST we find the matching
+/// joined table by identifier and call `transform_args_into_where_terms`,
+/// which is the same transform that `parse_table` used to do inline.
+pub fn collect_vtab_predicates(
+    from: &ast::FromClause,
+    table_references: &TableReferences,
+    vtab_predicates: &mut Vec<Expr>,
+) -> Result<()> {
+    collect_vtab_predicates_for_table(&from.select, table_references, vtab_predicates)?;
+    for join in &from.joins {
+        collect_vtab_predicates_for_table(&join.table, table_references, vtab_predicates)?;
+    }
+    Ok(())
+}
+
+fn collect_vtab_predicates_for_table(
+    select_table: &ast::SelectTable,
+    table_references: &TableReferences,
+    vtab_predicates: &mut Vec<Expr>,
+) -> Result<()> {
+    if let ast::SelectTable::TableCall(qualified_name, args, maybe_alias) = select_table {
+        if args.is_empty() {
+            return Ok(());
+        }
+        let table_name = normalize_ident(qualified_name.name.as_str());
+        let identifier = maybe_alias
+            .as_ref()
+            .map(|a| match a {
+                ast::As::As(id) | ast::As::Elided(id) => normalize_ident(id.as_str()),
+            })
+            .unwrap_or_else(|| table_name.clone());
+
+        // Find the matching JoinedTable by identifier
+        let joined_table = table_references
+            .joined_tables()
+            .iter()
+            .find(|jt| jt.identifier == identifier);
+        if let Some(jt) = joined_table {
+            transform_args_into_where_terms(args, jt.internal_id, vtab_predicates, &jt.table)?;
+        }
+    }
+    Ok(())
+}
+
 /// Build a stable outer-scope reference set for CTE planning.
 /// Current WITH-scope CTE entries are excluded to avoid cloning/replanning cascades.
 fn base_outer_refs_for_cte_planning(
@@ -1348,6 +1395,129 @@ pub fn parse_where(
     } else {
         Ok(())
     }
+}
+
+/// Fold JOIN ON/USING constraints into WhereTerms.
+///
+/// Called after binding — table resolution is already done, ON expressions are
+/// already bound to `Expr::Column`. This function:
+/// - Breaks ON expressions at AND boundaries and tags them with `from_outer_join`
+/// - Synthesizes equality predicates for USING columns
+/// - NATURAL is already transformed to USING by the binder
+pub fn fold_join_constraints(
+    from: &ast::FromClause,
+    table_references: &TableReferences,
+    out_where_clause: &mut Vec<WhereTerm>,
+) -> Result<()> {
+    for (join_idx, join) in from.joins.iter().enumerate() {
+        // The first table is from.select (index 0 in joined_tables),
+        // joins start at index 1.
+        let table_idx = join_idx + 1;
+        // For right_join_swapped, the binder swapped table positions so
+        // index 0 is the originally-right table (no join_info) and index 1
+        // is the originally-left table (with LeftOuter join_info).
+        // The ON/USING constraint should be tagged with the outer table's id.
+        let actual_table_idx = if table_references.right_join_swapped() && table_idx == 1 {
+            // After swap: the originally-left table (now at idx 0) is the outer one
+            0
+        } else {
+            table_idx
+        };
+
+        let outer = table_references.joined_tables()[actual_table_idx]
+            .join_info
+            .as_ref()
+            .is_some_and(|j| j.is_outer());
+        let outer_table_id = table_references.joined_tables()[actual_table_idx].internal_id;
+
+        match &join.constraint {
+            Some(ast::JoinConstraint::On(expr)) => {
+                let start_idx = out_where_clause.len();
+                break_predicate_at_and_boundaries(expr, out_where_clause);
+                for predicate in out_where_clause[start_idx..].iter_mut() {
+                    predicate.from_outer_join = if outer { Some(outer_table_id) } else { None };
+                }
+            }
+            Some(ast::JoinConstraint::Using(cols)) => {
+                // USING join is replaced with a list of equality predicates.
+                // NATURAL joins have already been transformed to USING by the binder.
+                // Column usage is already tracked by the binder.
+                let right_table_idx = if table_references.right_join_swapped() && table_idx == 1 {
+                    0
+                } else {
+                    table_idx
+                };
+                let left_range_end = right_table_idx;
+                let tables = table_references.joined_tables();
+                let left_tables = &tables[..left_range_end];
+                let right_table = &tables[right_table_idx];
+
+                for col_name in cols.iter() {
+                    let name_normalized = normalize_ident(col_name.as_str());
+
+                    // Find column in left tables
+                    let mut left_col = None;
+                    for left_table in left_tables.iter() {
+                        left_col = left_table
+                            .columns()
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, col)| !col.hidden())
+                            .find(|(_, col)| {
+                                col.name
+                                    .as_ref()
+                                    .is_some_and(|name| *name == name_normalized)
+                            })
+                            .map(|(idx, col)| (left_table.internal_id, idx, col.is_rowid_alias()));
+                        if left_col.is_some() {
+                            break;
+                        }
+                    }
+                    let Some((left_table_id, left_col_idx, left_is_rowid_alias)) = left_col else {
+                        crate::bail_parse_error!(
+                            "cannot join using column {} - column not present in all tables",
+                            col_name.as_str()
+                        );
+                    };
+
+                    // Find column in right table
+                    let right_col = right_table.columns().iter().enumerate().find(|(_, col)| {
+                        col.name
+                            .as_ref()
+                            .is_some_and(|name| *name == name_normalized)
+                    });
+                    let Some((right_col_idx, right_col)) = right_col else {
+                        crate::bail_parse_error!(
+                            "cannot join using column {} - column not present in all tables",
+                            col_name.as_str()
+                        );
+                    };
+
+                    out_where_clause.push(WhereTerm {
+                        expr: Expr::Binary(
+                            Box::new(Expr::Column {
+                                database: None,
+                                table: left_table_id,
+                                column: left_col_idx,
+                                is_rowid_alias: left_is_rowid_alias,
+                            }),
+                            ast::Operator::Equals,
+                            Box::new(Expr::Column {
+                                database: None,
+                                table: right_table.internal_id,
+                                column: right_col_idx,
+                                is_rowid_alias: right_col.is_rowid_alias(),
+                            }),
+                        ),
+                        from_outer_join: if outer { Some(outer_table_id) } else { None },
+                        consumed: false,
+                    });
+                }
+            }
+            None => {}
+        }
+    }
+    Ok(())
 }
 
 /**

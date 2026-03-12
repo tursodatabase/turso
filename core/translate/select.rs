@@ -12,8 +12,8 @@ use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan, SubqueryState};
 use crate::translate::planner::{
-    break_predicate_at_and_boundaries, parse_from, parse_where, plan_ctes_as_outer_refs,
-    resolve_window_and_aggregate_functions,
+    break_predicate_at_and_boundaries, collect_vtab_predicates, fold_join_constraints, parse_from,
+    parse_where, plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
 };
 use crate::translate::result_row::emit_select_result;
 use crate::translate::subquery::{plan_subqueries_from_select_plan, plan_subqueries_from_values};
@@ -23,6 +23,7 @@ use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::Insn;
 use crate::{vdbe::builder::ProgramBuilder, Result};
 use std::borrow::Cow;
+use turso_macros::turso_assert;
 use turso_parser::ast::ResultColumn;
 use turso_parser::ast::{self, CompoundSelect, Expr};
 
@@ -39,15 +40,15 @@ pub fn bind_prepare_select_plan(
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
     let mut binder = BindContext::new(resolver, &mut program.table_reference_counter);
-    // TODO: use return value to avoid more work in planning stage
-    let _bound = binder.bind_select(&mut select)?;
+    let bound = binder.bind_select(&mut select)?;
+    let all_table_refs = bound.into_table_references()?;
     prepare_select_plan(
         select,
         resolver,
         program,
-        outer_query_refs,
         query_destination,
         connection,
+        all_table_refs.into_iter(),
     )
 }
 
@@ -155,29 +156,37 @@ pub fn prepare_select_plan(
     select: ast::Select,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
-    outer_query_refs: &[OuterQueryReference],
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
+    mut table_refs: impl Iterator<Item = TableReferences>,
 ) -> Result<Plan> {
     let compounds = select.body.compounds;
     match compounds.is_empty() {
-        true => Ok(Plan::Select(prepare_one_select_plan(
-            select.body.select,
-            resolver,
-            program,
-            select.limit,
-            select.order_by,
-            select.with,
-            outer_query_refs,
-            query_destination,
-            connection,
-        )?)),
+        true => {
+            let tr = table_refs
+                .next()
+                .expect("missing table references for main select");
+            Ok(Plan::Select(prepare_one_select_plan(
+                select.body.select,
+                resolver,
+                program,
+                select.limit,
+                select.order_by,
+                select.with,
+                query_destination,
+                connection,
+                tr,
+            )?))
+        }
         false => {
             // For compound SELECTs, the WITH clause applies to all parts.
             // We clone the WITH clause for each SELECT in the compound so that
             // each one can resolve CTE references independently.
             let with = select.with;
 
+            let tr = table_refs
+                .next()
+                .expect("missing table references for main select");
             let mut last = prepare_one_select_plan(
                 select.body.select,
                 resolver,
@@ -185,16 +194,20 @@ pub fn prepare_select_plan(
                 None,
                 vec![],
                 with.clone(),
-                outer_query_refs,
                 query_destination.clone(),
                 connection,
+                tr,
             )?;
 
-            let mut left = Vec::with_capacity(compounds.len());
-            for CompoundSelect {
-                select: compound_select,
-                operator,
-            } in compounds
+            let compounds_len = compounds.len();
+            let mut left = Vec::with_capacity(compounds_len);
+            for (
+                CompoundSelect {
+                    select: compound_select,
+                    operator,
+                },
+                tr,
+            ) in compounds.into_iter().zip(table_refs)
             {
                 left.push((last, operator));
                 last = prepare_one_select_plan(
@@ -204,11 +217,14 @@ pub fn prepare_select_plan(
                     None,
                     vec![],
                     with.clone(),
-                    outer_query_refs,
                     query_destination.clone(),
                     connection,
+                    tr,
                 )?;
             }
+
+            // Make sure that the remaining table_refs iterator are of the same size of `compounds`
+            turso_assert!(left.len() == compounds_len);
 
             // Ensure all subplans have the same number of result columns
             let right_most_num_result_columns = last.result_columns.len();
@@ -247,9 +263,9 @@ fn prepare_one_select_plan(
     limit: Option<ast::Limit>,
     order_by: Vec<ast::SortedColumn>,
     with: Option<ast::With>,
-    outer_query_refs: &[OuterQueryReference],
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
+    table_references: TableReferences,
 ) -> Result<SelectPlan> {
     if order_by
         .iter()
@@ -275,7 +291,7 @@ fn prepare_one_select_plan(
             let mut where_predicates = vec![];
             let mut vtab_predicates = vec![];
 
-            let mut table_references = TableReferences::new(vec![], outer_query_refs.to_vec());
+            let table_references = table_references;
 
             if from.is_none() {
                 for column in &columns {
@@ -285,27 +301,12 @@ fn prepare_one_select_plan(
                 }
             }
 
-            // Parse the FROM clause into a vec of TableReferences. Fold all the join conditions expressions into the WHERE clause.
-            let preplan_ctes_for_non_from_subqueries = with.is_some()
-                && select_has_non_from_subqueries(
-                    &columns,
-                    where_clause.as_deref(),
-                    group_by.as_ref(),
-                    &window_clause,
-                    &order_by,
-                    limit.as_ref(),
-                );
-            parse_from(
-                from,
-                resolver,
-                program,
-                with,
-                preplan_ctes_for_non_from_subqueries,
-                &mut where_predicates,
-                &mut vtab_predicates,
-                &mut table_references,
-                connection,
-            )?;
+            // Fold JOIN ON/USING constraints into where_predicates.
+            // Collect virtual table argument predicates.
+            if let Some(ref from) = from {
+                fold_join_constraints(from, &table_references, &mut where_predicates)?;
+                collect_vtab_predicates(from, &table_references, &mut vtab_predicates)?;
+            }
 
             // Preallocate space for the result columns
             let result_columns = Vec::with_capacity(
@@ -611,7 +612,7 @@ fn prepare_one_select_plan(
                 });
             }
 
-            let mut table_references = TableReferences::new(vec![], outer_query_refs.to_vec());
+            let mut table_references = table_references;
 
             // Plan CTEs from WITH clause so they're available for subqueries in VALUES
             plan_ctes_as_outer_refs(with, resolver, program, &mut table_references, connection)?;
