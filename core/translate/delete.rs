@@ -7,7 +7,7 @@ use crate::translate::plan::{
     DeletePlan, DmlSafety, DmlSafetyReason, IterationDirection, JoinOrderMember, Operation, Plan,
     QueryDestination, ResultSetColumn, Scan, SelectPlan,
 };
-use crate::translate::planner::{parse_limit, parse_where, plan_ctes_as_outer_refs};
+use crate::translate::planner::{parse_where, plan_ctes_as_outer_refs};
 use crate::translate::subquery::{
     plan_subqueries_from_returning, plan_subqueries_from_select_plan,
     plan_subqueries_from_where_clause,
@@ -228,7 +228,7 @@ pub fn prepare_delete_plan(
 
     // Parse the LIMIT/OFFSET clause
     let (resolved_limit, resolved_offset) =
-        limit.map_or(Ok((None, None)), |l| parse_limit(l, resolver))?;
+        limit.map_or((None, None), |l| (Some(l.expr), l.offset));
 
     // Check if there are DELETE triggers. If so, we need to materialize the write set into a RowSet first.
     // This is done in SQLite for all DELETE triggers on the affected table even if the trigger would not have an impact

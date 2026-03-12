@@ -1963,27 +1963,3 @@ where
     }
     Ok(None)
 }
-
-#[allow(clippy::type_complexity)]
-pub fn parse_limit(
-    mut limit: Limit,
-    resolver: &Resolver,
-) -> Result<(Option<Box<Expr>>, Option<Box<Expr>>)> {
-    bind_and_rewrite_expr(
-        &mut limit.expr,
-        None,
-        None,
-        resolver,
-        BindingBehavior::TryResultColumnsFirst,
-    )?;
-    if let Some(ref mut off_expr) = limit.offset {
-        bind_and_rewrite_expr(
-            off_expr,
-            None,
-            None,
-            resolver,
-            BindingBehavior::TryResultColumnsFirst,
-        )?;
-    }
-    Ok((Some(limit.expr), limit.offset))
-}

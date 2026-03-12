@@ -6,7 +6,7 @@ use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::{Operation, Scan};
-use crate::translate::planner::{parse_limit, ROWID_STRS};
+use crate::translate::planner::ROWID_STRS;
 use crate::{
     bail_parse_error,
     schema::{Schema, Table},
@@ -438,7 +438,7 @@ pub fn prepare_update_plan(
     // Parse the LIMIT/OFFSET clause
     let (limit, offset) = body
         .limit
-        .map_or(Ok((None, None)), |l| parse_limit(l, resolver))?;
+        .map_or((None, None), |l| (Some(l.expr), l.offset));
 
     // Check what indexes will need to be updated by checking set_clauses and see
     // if a column is contained in an index.

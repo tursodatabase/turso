@@ -686,10 +686,10 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             })?;
 
             // 5. Bind LIMIT/OFFSET (no scope — these are standalone expressions)
-            if let Some(ref mut limit) = select.limit {
+            if let Some(limit) = select.limit.as_mut() {
                 let empty = BindScope::empty();
                 ctx.bind_expr(&mut limit.expr, &empty)?;
-                if let Some(ref mut offset) = limit.offset {
+                if let Some(offset) = limit.offset.as_mut() {
                     ctx.bind_expr(offset, &empty)?;
                 }
             }
@@ -2214,10 +2214,7 @@ mod tests {
     fn values_unquoted_identifier_errors() {
         with_bind_context(&[], |ctx| {
             let err = bind_select_error(ctx, "VALUES (x)").to_string();
-            assert!(
-                err.contains("no such column: x"),
-                "unexpected error: {err}"
-            );
+            assert!(err.contains("no such column: x"), "unexpected error: {err}");
         });
     }
 

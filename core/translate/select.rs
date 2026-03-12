@@ -12,8 +12,8 @@ use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan, SubqueryState};
 use crate::translate::planner::{
-    break_predicate_at_and_boundaries, parse_from, parse_limit, parse_where,
-    plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
+    break_predicate_at_and_boundaries, parse_from, parse_where, plan_ctes_as_outer_refs,
+    resolve_window_and_aggregate_functions,
 };
 use crate::translate::result_row::emit_select_result;
 use crate::translate::subquery::{plan_subqueries_from_select_plan, plan_subqueries_from_values};
@@ -222,7 +222,7 @@ pub fn prepare_select_plan(
             }
             let (limit, offset) = select
                 .limit
-                .map_or(Ok((None, None)), |l| parse_limit(l, resolver))?;
+                .map_or((None, None), |l| (Some(l.expr), l.offset));
 
             // FIXME: handle ORDER BY for compound selects
             if !select.order_by.is_empty() {
@@ -578,8 +578,7 @@ fn prepare_one_select_plan(
             }
 
             // Parse the LIMIT/OFFSET clause
-            (plan.limit, plan.offset) =
-                limit.map_or(Ok((None, None)), |l| parse_limit(l, resolver))?;
+            (plan.limit, plan.offset) = limit.map_or((None, None), |l| (Some(l.expr), l.offset));
 
             if !windows.is_empty() {
                 plan_windows(
