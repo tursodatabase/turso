@@ -396,7 +396,7 @@ async fn run_tests(
                 eprintln!("Expected .node file in {}", native_dir.display());
                 eprintln!();
                 eprintln!("Build the bindings first:");
-                eprintln!("  make -C testing/runner build-js-bindings");
+                eprintln!("  make -C testing/sqltests build-js-bindings");
                 eprintln!();
                 eprintln!("Or manually:");
                 eprintln!("  cd bindings/javascript");
