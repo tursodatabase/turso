@@ -25,9 +25,9 @@ jobs:
         with:
           prefix-key: "v1-rust"
       - name: Build test runner
-        run: make -C testing/runner build-runner
+        run: make -C testing/sqltests build-runner
       - name: Check test syntax
-        run: make -C testing/runner check
+        run: make -C testing/sqltests check
 
   sqltest-run-cli:
     name: Run SQL tests (CLI backend)
@@ -41,13 +41,13 @@ jobs:
       - uses: "./.github/shared/setup-sccache"
       - uses: "./.github/shared/install_sqlite"
       - name: Build tursodb
-        run: make -C testing/runner build-tursodb
+        run: make -C testing/sqltests build-tursodb
       - name: Build test runner
-        run: make -C testing/runner build-runner
+        run: make -C testing/sqltests build-runner
       - name: Run tests
-        run: make -C testing/runner run-cli CROSS_CHECK_BINARY=sqlite3
+        run: make -C testing/sqltests run-cli CROSS_CHECK_BINARY=sqlite3
       - name: Run tests (MVCC)
-        run: make -C testing/runner run-cli MVCC=1
+        run: make -C testing/sqltests run-cli MVCC=1
 
   sqltest-run-rust:
     name: Run SQL tests (Rust backend)
@@ -59,11 +59,11 @@ jobs:
         with:
           prefix-key: "v1-rust"
       - name: Build test runner
-        run: make -C testing/runner build-runner
+        run: make -C testing/sqltests build-runner
       - name: Run tests
-        run: make -C testing/runner run-rust
+        run: make -C testing/sqltests run-rust
       - name: Run tests (MVCC)
-        run: make -C testing/runner run-rust MVCC=1
+        run: make -C testing/sqltests run-rust MVCC=1
 
   sqltest-run-js:
     name: Run SQL tests (JS backend)
@@ -91,13 +91,13 @@ jobs:
       - name: Build TypeScript
         run: yarn workspace @tursodatabase/database tsc-build
       - name: Build test runner
-        working-directory: testing/runner
+        working-directory: testing/sqltests
         run: cargo build --release
       - name: Run tests
-        working-directory: testing/runner
+        working-directory: testing/sqltests
         run: make run-js
       - name: Run tests (MVCC)
-        working-directory: testing/runner
+        working-directory: testing/sqltests
         run: make run-js MVCC=1
 
   sqltest-sqlite:
@@ -111,6 +111,6 @@ jobs:
           prefix-key: "v1-rust"
       - uses: "./.github/shared/install_sqlite"
       - name: Build test runner
-        run: make -C testing/runner build-runner
+        run: make -C testing/sqltests build-runner
       - name: Run tests against SQLite
-        run: make -C testing/runner test-sqlite
+        run: make -C testing/sqltests test-sqlite

@@ -13,7 +13,7 @@ cargo run -q --bin tursodb -- -q # run the interactive cli
 
 make test                      # TCL compat + sqlite3 + extensions + MVCC
 make test-single TEST=foo.test # single TCL test
-make -C testing/runner run-rust  # sqltest runner (preferred for new tests)
+make -C testing/sqltests run-rust  # sqltest runner (preferred for new tests)
 ```
 
 ## Structure
@@ -43,7 +43,7 @@ limbo/
 | Add extension | `extensions/core/` | ExtensionApi, scalar/aggregate/vtab traits |
 | Add binding | `bindings/` | PyO3, NAPI, JNI, FRB, CGO patterns |
 | Deterministic tests | `testing/simulator/` | Fault injection, differential testing |
-| New SQL tests | `testing/runner/tests/` | `.sqltest` format preferred |
+| New SQL tests | `testing/sqltests/tests/` | `.sqltest` format preferred |
 
 ## Guides
 
