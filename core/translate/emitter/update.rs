@@ -398,6 +398,7 @@ fn emit_update_column_values<'a>(
     t_ctx: &mut TranslateCtx<'a>,
     skip_set_clauses: bool,
     skip_row_label: BranchOffset,
+    skip_notnull_checks: bool,
 ) -> crate::Result<()> {
     let or_conflict = program.resolve_type;
     if has_direct_rowid_update {
@@ -474,7 +475,7 @@ fn emit_update_column_values<'a>(
                             &t_ctx.resolver,
                         )?;
                     }
-                    if table_column.notnull() {
+                    if table_column.notnull() && !skip_notnull_checks {
                         match or_conflict {
                             ResolveType::Ignore => {
                                 // For IGNORE, skip this row on NOT NULL violation
@@ -609,6 +610,89 @@ fn emit_update_column_values<'a>(
                 program.mark_last_insn_constant();
                 program.emit_null(value_reg, None);
                 program.mark_last_insn_constant();
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Emit NOT NULL constraint checks for SET clause columns after BEFORE triggers have fired.
+/// This is deferred from the first `emit_update_column_values` call so that triggers
+/// run before constraint checks, matching SQLite's behavior.
+#[allow(clippy::too_many_arguments)]
+fn emit_deferred_notnull_checks<'a>(
+    program: &mut ProgramBuilder,
+    table_references: &mut TableReferences,
+    target_table: &Arc<JoinedTable>,
+    set_clauses: &[(usize, Box<ast::Expr>)],
+    start: usize,
+    table_name: &str,
+    skip_row_label: BranchOffset,
+    t_ctx: &mut TranslateCtx<'a>,
+) -> crate::Result<()> {
+    let or_conflict = program.resolve_type;
+    for (idx, table_column) in target_table.table.columns().iter().enumerate() {
+        if !table_column.notnull() {
+            continue;
+        }
+        // Only check columns that are in SET clauses
+        if !set_clauses.iter().any(|(i, _)| *i == idx) {
+            continue;
+        }
+        let target_reg = start + idx;
+        match or_conflict {
+            ResolveType::Ignore => {
+                program.emit_insn(Insn::IsNull {
+                    reg: target_reg,
+                    target_pc: skip_row_label,
+                });
+            }
+            ResolveType::Replace => {
+                if let Some(default_expr) = table_column.default.as_ref() {
+                    let continue_label = program.allocate_label();
+                    program.emit_insn(Insn::NotNull {
+                        reg: target_reg,
+                        target_pc: continue_label,
+                    });
+                    translate_expr_no_constant_opt(
+                        program,
+                        Some(table_references),
+                        default_expr,
+                        target_reg,
+                        &t_ctx.resolver,
+                        NoConstantOptReason::RegisterReuse,
+                    )?;
+                    program.preassign_label_to_next_insn(continue_label);
+                } else {
+                    use crate::error::SQLITE_CONSTRAINT_NOTNULL;
+                    program.emit_insn(Insn::HaltIfNull {
+                        target_reg,
+                        err_code: SQLITE_CONSTRAINT_NOTNULL,
+                        description: format!(
+                            "{}.{}",
+                            table_name,
+                            table_column
+                                .name
+                                .as_ref()
+                                .expect("Column name must be present")
+                        ),
+                    });
+                }
+            }
+            _ => {
+                use crate::error::SQLITE_CONSTRAINT_NOTNULL;
+                program.emit_insn(Insn::HaltIfNull {
+                    target_reg,
+                    err_code: SQLITE_CONSTRAINT_NOTNULL,
+                    description: format!(
+                        "{}.{}",
+                        table_name,
+                        table_column
+                            .name
+                            .as_ref()
+                            .expect("Column name must be present")
+                    ),
+                });
             }
         }
     }
@@ -810,6 +894,27 @@ fn emit_update_insns<'a>(
 
     let skip_set_clauses = false;
 
+    // Check early whether BEFORE UPDATE triggers exist, so we can defer NOT NULL
+    // constraint checks until after the triggers fire (matching SQLite behavior).
+    let update_database_id = target_table.database_id;
+    let has_before_triggers_early = if let Some(btree_table) = target_table.table.btree() {
+        let updated_column_indices: HashSet<usize> =
+            set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
+        t_ctx.resolver.with_schema(update_database_id, |s| {
+            get_relevant_triggers_type_and_time(
+                s,
+                TriggerEvent::Update,
+                TriggerTime::Before,
+                Some(updated_column_indices),
+                &btree_table,
+            )
+            .next()
+            .is_some()
+        })
+    } else {
+        false
+    };
+
     emit_update_column_values(
         program,
         table_references,
@@ -829,6 +934,7 @@ fn emit_update_insns<'a>(
         t_ctx,
         skip_set_clauses,
         skip_row_label,
+        has_before_triggers_early,
     )?;
 
     // For non-STRICT tables, apply column affinity to the NEW values early.
@@ -852,7 +958,6 @@ fn emit_update_insns<'a>(
     }
 
     // Fire BEFORE UPDATE triggers and preserve old_registers for AFTER triggers
-    let update_database_id = target_table.database_id;
     let mut has_before_triggers = false;
     let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) =
         target_table.table.btree()
@@ -1007,6 +1112,8 @@ fn emit_update_insns<'a>(
     // 2|666|666
     if target_table.table.btree().is_some() && has_before_triggers {
         let skip_set_clauses = true;
+        // Re-read non-SET columns (triggers may have changed them).
+        // NOT NULL checks are NOT skipped here — they cover non-SET columns.
         emit_update_column_values(
             program,
             table_references,
@@ -1026,6 +1133,21 @@ fn emit_update_insns<'a>(
             t_ctx,
             skip_set_clauses,
             skip_row_label,
+            false,
+        )?;
+
+        // Now emit NOT NULL checks for SET clause columns that were deferred
+        // from the first emit_update_column_values call. In SQLite, NOT NULL
+        // constraint checks happen after BEFORE triggers fire.
+        emit_deferred_notnull_checks(
+            program,
+            table_references,
+            &target_table,
+            set_clauses,
+            start,
+            table_name,
+            skip_row_label,
+            t_ctx,
         )?;
     }
 

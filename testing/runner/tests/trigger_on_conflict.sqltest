@@ -318,6 +318,108 @@ expect {
     1|150
 }
 
+# =============================================================================
+# UPDATE OR IGNORE with BEFORE triggers
+# In SQLite, BEFORE UPDATE triggers fire before constraint checks. With
+# UPDATE OR IGNORE, the trigger fires first, then the constraint violation
+# is silently ignored. https://github.com/tursodatabase/turso/issues/5873
+# =============================================================================
+
+# Test: Basic reproducer from issue #5873 - BEFORE UPDATE trigger fires
+# even when OR IGNORE suppresses NOT NULL violation
+@cross-check-integrity
+test update-or-ignore-notnull-fires-before-trigger {
+    CREATE TABLE t(a, b NOT NULL);
+    CREATE TABLE log(msg);
+    CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN
+        INSERT INTO log VALUES('trigger ran');
+    END;
+    INSERT INTO t VALUES(1, 'hello');
+    UPDATE OR IGNORE t SET b = NULL WHERE a = 1;
+    SELECT * FROM log;
+    SELECT * FROM t;
+}
+expect {
+    trigger ran
+    1|hello
+}
+
+# Test: UPDATE OR IGNORE with BEFORE trigger - no constraint violation
+@cross-check-integrity
+test update-or-ignore-notnull-no-violation {
+    CREATE TABLE t(a, b NOT NULL);
+    CREATE TABLE log(msg);
+    CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN
+        INSERT INTO log VALUES('trigger ran');
+    END;
+    INSERT INTO t VALUES(1, 'hello');
+    UPDATE OR IGNORE t SET b = 'world' WHERE a = 1;
+    SELECT * FROM log;
+    SELECT * FROM t;
+}
+expect {
+    trigger ran
+    1|world
+}
+
+# Test: UPDATE OR IGNORE with multiple rows - trigger fires for each row
+@cross-check-integrity
+test update-or-ignore-notnull-multiple-rows {
+    CREATE TABLE t(a, b NOT NULL);
+    CREATE TABLE log(msg);
+    CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN
+        INSERT INTO log VALUES('trigger for a=' || OLD.a);
+    END;
+    INSERT INTO t VALUES(1, 'x');
+    INSERT INTO t VALUES(2, 'y');
+    INSERT INTO t VALUES(3, 'z');
+    UPDATE OR IGNORE t SET b = NULL;
+    SELECT * FROM log ORDER BY rowid;
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    trigger for a=1
+    trigger for a=2
+    trigger for a=3
+    1|x
+    2|y
+    3|z
+}
+
+# Test: UPDATE OR IGNORE with BEFORE trigger and UNIQUE constraint
+@cross-check-integrity
+test update-or-ignore-unique-fires-before-trigger {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    CREATE TABLE log(msg);
+    CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN
+        INSERT INTO log VALUES('trigger ran');
+    END;
+    INSERT INTO t VALUES(1, 'hello');
+    INSERT INTO t VALUES(2, 'world');
+    UPDATE OR IGNORE t SET b = 'hello' WHERE a = 2;
+    SELECT * FROM log;
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    trigger ran
+    1|hello
+    2|world
+}
+
+# Test: Plain UPDATE (ABORT) with NOT NULL violation still errors after trigger
+@cross-check-integrity
+test update-abort-notnull-trigger-fires-then-errors {
+    CREATE TABLE t(a, b NOT NULL);
+    CREATE TABLE log(msg);
+    CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN
+        INSERT INTO log VALUES('trigger ran');
+    END;
+    INSERT INTO t VALUES(1, 'hello');
+    UPDATE t SET b = NULL WHERE a = 1;
+}
+expect error {
+}
+
 # NEW.column in UPSERT where delta is negative and WHERE filters it out
 @cross-check-integrity
 test trigger-upsert-new-in-where-no-update {
