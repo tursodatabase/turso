@@ -1,10 +1,11 @@
 use crate::turso_assert_greater_than_or_equal;
 use crate::{
-    schema::Schema,
+    schema::{Index, Schema},
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         expression_index::normalize_expr_for_index_matching,
         optimizer::access_method::AccessMethodParams,
+        optimizer::constraints::RangeConstraintRef,
         plan::{GroupBy, HashJoinType, IterationDirection, JoinedTable, TableReferences},
         planner::table_mask_from_expr,
     },
@@ -46,6 +47,17 @@ pub enum EliminatesSortBy {
 /// so that if a given join ordering and its access methods satisfy the [OrderTarget],
 /// then the join ordering and its access methods are preferred, all other things being equal.
 pub struct OrderTarget(pub Vec<ColumnOrder>, pub EliminatesSortBy);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EqualityPrefixScope {
+    /// Candidate scoring may skip any equality-constrained seek prefix because
+    /// it only reasons about the order within that specific seek.
+    AnyEquality,
+    /// Final ORDER BY / GROUP BY elimination may only skip globally constant
+    /// equality prefixes. Join-dependent equalities vary per outer row and do
+    /// not guarantee a globally ordered concatenation of inner scans.
+    ConstantEquality,
+}
 
 impl OrderTarget {
     /// Build an `OrderTarget` from a list of expressions if they can all be
@@ -214,187 +226,21 @@ pub fn plan_satisfies_order_target(
                 iter_dir,
                 index: index_opt,
                 constraint_refs,
-            } => match index_opt {
-                None => {
-                    // Only rowid order is available without an index.
-                    if target_col_idx >= num_cols_in_order_target {
-                        continue;
-                    }
-                    let target_col = &order_target.0[target_col_idx];
-                    if target_col.table_id != table_ref.internal_id {
-                        return false;
-                    }
-                    let rowid_alias_col = table_ref
-                        .table
-                        .columns()
-                        .iter()
-                        .position(|c| c.is_rowid_alias());
-                    match target_col.target {
-                        ColumnTarget::RowId => {}
-                        ColumnTarget::Column(col_no) => {
-                            let Some(rowid_alias_col) = rowid_alias_col else {
-                                return false;
-                            };
-                            if col_no != rowid_alias_col {
-                                return false;
-                            }
-                        }
-                        ColumnTarget::Expr(_) => {
-                            return false;
-                        }
-                    }
-                    let correct_order = if *iter_dir == IterationDirection::Forwards {
-                        target_col.order == SortOrder::Asc
-                    } else {
-                        target_col.order == SortOrder::Desc
-                    };
-                    if !correct_order {
-                        return false;
-                    }
-                    1
-                }
-                Some(index) => {
-                    // Collect the set of index column positions that have constant
-                    // equality constraints (WHERE, not join-dependent).  Only
-                    // globally constant values can be skipped for ORDER BY: a
-                    // join-condition eq varies per outer row, so duplicate outer
-                    // keys would interleave inner scans and break global ordering.
-                    let eq_positions: Vec<usize> = (0..index.columns.len())
-                        .take_while(|&pos| {
-                            constraint_refs.iter().any(|c| {
-                                c.index_col_pos == pos
-                                    && c.eq.as_ref().is_some_and(|eq| eq.is_const)
-                            })
-                        })
-                        .collect();
-
-                    // Walk through the ORDER BY / GROUP BY target columns and
-                    // the index columns together.  A constant equality-constrained
-                    // column satisfies the target trivially (its value is fixed),
-                    // so we can skip it in *both* the target and the index.  For
-                    // non-equality columns the index must provide the right order.
-                    let mut col_idx = 0; // consumed target columns
-                    let mut idx_pos = 0; // current index column position
-                                         // Secondary indexes on rowid tables implicitly end with rowid.
-                                         // If all declared index columns match, that hidden suffix can
-                                         // still satisfy one more ORDER BY term as a tie-breaker.
-                    let rowid_alias_col = table_ref
-                        .table
-                        .columns()
-                        .iter()
-                        .position(|c| c.is_rowid_alias());
-                    while target_col_idx + col_idx < num_cols_in_order_target
-                        && idx_pos < index.columns.len()
-                    {
-                        // If this index column is equality-constrained, check
-                        // whether the current target column refers to the same
-                        // column.  If so, skip both (constant value → trivially
-                        // sorted).  If not, just advance the index position —
-                        // the equality column doesn't break ordering.
-                        if eq_positions.contains(&idx_pos) {
-                            let target_col = &order_target.0[target_col_idx + col_idx];
-                            let idx_col = &index.columns[idx_pos];
-                            let same_col =
-                                target_matches_index_column(target_col, idx_col, table_ref);
-                            if same_col {
-                                // An equality constraint only makes the ORDER BY term
-                                // "constant" if it compares values the same way that
-                                // ORDER BY does. For example, `a = 'x'` under NOCASE
-                                // does not make `ORDER BY a COLLATE BINARY` constant:
-                                // both 'x' and 'X' can match the filter but still sort
-                                // differently under BINARY.
-                                let same_collation =
-                                    target_col.collation == idx_col.collation.unwrap_or_default();
-                                if !same_collation {
-                                    break;
-                                }
-                                col_idx += 1; // target satisfied by constant
-                            }
-                            idx_pos += 1; // advance index regardless
-                            continue;
-                        }
-
-                        let target_col = &order_target.0[target_col_idx + col_idx];
-                        if target_col.table_id != table_ref.internal_id {
-                            break;
-                        }
-                        let idx_col = &index.columns[idx_pos];
-                        let column_matches =
-                            target_matches_index_column(target_col, idx_col, table_ref);
-                        if !column_matches {
-                            break;
-                        }
-
-                        // Custom type columns store encoded blobs. The B-tree's
-                        // blob ordering (memcmp) doesn't match the custom type's
-                        // semantic ordering, so the index can't satisfy ORDER BY.
-                        if let ColumnTarget::Column(col_no) = &target_col.target {
-                            if let Some(col) = table_ref.table.columns().get(*col_no) {
-                                if schema
-                                    .get_type_def(&col.ty_str, table_ref.table.is_strict())
-                                    .is_some()
-                                {
-                                    break;
-                                }
-                            }
-                        }
-
-                        // Index columns without explicit COLLATE use BINARY.
-                        // Treat them as BINARY for ordering compatibility checks.
-                        if target_col.collation != idx_col.collation.unwrap_or_default() {
-                            break;
-                        }
-
-                        let correct_order = if *iter_dir == IterationDirection::Forwards {
-                            target_col.order == idx_col.order
-                        } else {
-                            target_col.order != idx_col.order
-                        };
-                        if !correct_order {
-                            break;
-                        }
-                        col_idx += 1;
-                        idx_pos += 1;
-                    }
-
-                    // SQLite-style rowid tables keep entries with equal index keys
-                    // ordered by rowid. That means an index on (a, b) can also
-                    // satisfy ORDER BY a, b, rowid, even though rowid is not
-                    // written explicitly in the index definition.
-                    if target_col_idx + col_idx < num_cols_in_order_target
-                        && idx_pos == index.columns.len()
-                        && index.has_rowid
-                    {
-                        let target_col = &order_target.0[target_col_idx + col_idx];
-                        let rowid_matches = match target_col.target {
-                            ColumnTarget::RowId => true,
-                            ColumnTarget::Column(col_no) => {
-                                rowid_alias_col.is_some_and(|alias| alias == col_no)
-                            }
-                            ColumnTarget::Expr(_) => false,
-                        };
-                        let correct_order = if *iter_dir == IterationDirection::Forwards {
-                            target_col.order == SortOrder::Asc
-                        } else {
-                            target_col.order == SortOrder::Desc
-                        };
-                        if target_col.table_id == table_ref.internal_id
-                            && rowid_matches
-                            && correct_order
-                        {
-                            col_idx += 1;
-                        }
-                    }
-
-                    if col_idx == 0 {
-                        return false;
-                    }
-                    col_idx
-                }
-            },
+            } => btree_access_order_consumed(
+                table_ref,
+                *iter_dir,
+                index_opt.as_deref(),
+                constraint_refs,
+                &order_target.0[target_col_idx..],
+                schema,
+                EqualityPrefixScope::ConstantEquality,
+            ),
             _ => return false,
         };
 
+        if consumed == 0 {
+            return false;
+        }
         target_col_idx += consumed;
         if target_col_idx == num_cols_in_order_target {
             return true;
@@ -494,5 +340,152 @@ fn target_matches_index_column(
             exprs_are_equivalent(&normalized, idx_expr)
         }
         _ => false,
+    }
+}
+
+/// Return how many leading `order_target` columns this single-table btree
+/// access path can satisfy.
+///
+/// This is shared by both candidate scoring and final ORDER BY / GROUP BY
+/// elimination so they use the same column-matching, collation, custom-type,
+/// and hidden-rowid-suffix rules. The caller supplies
+/// [`EqualityPrefixScope`] because candidate scoring may skip any equality
+/// prefix in the chosen seek key, while final global ordering proof may only
+/// skip prefixes that are constant across all output rows.
+pub(super) fn btree_access_order_consumed(
+    table_ref: &JoinedTable,
+    iter_dir: IterationDirection,
+    index: Option<&Index>,
+    constraint_refs: &[RangeConstraintRef],
+    order_target: &[ColumnOrder],
+    schema: &Schema,
+    equality_prefix_scope: EqualityPrefixScope,
+) -> usize {
+    let Some(first_target_col) = order_target.first() else {
+        return 0;
+    };
+
+    let rowid_alias_col = table_ref
+        .table
+        .columns()
+        .iter()
+        .position(|c| c.is_rowid_alias());
+
+    match index {
+        None => {
+            // Without an index, only rowid order is available.
+            if first_target_col.table_id != table_ref.internal_id {
+                return 0;
+            }
+            match first_target_col.target {
+                ColumnTarget::RowId => {}
+                ColumnTarget::Column(col_no) => {
+                    let Some(rowid_alias_col) = rowid_alias_col else {
+                        return 0;
+                    };
+                    if col_no != rowid_alias_col {
+                        return 0;
+                    }
+                }
+                ColumnTarget::Expr(_) => return 0,
+            }
+            let correct_order = if iter_dir == IterationDirection::Forwards {
+                first_target_col.order == SortOrder::Asc
+            } else {
+                first_target_col.order == SortOrder::Desc
+            };
+            usize::from(correct_order)
+        }
+        Some(index) => {
+            let mut col_idx = 0;
+            let mut idx_pos = 0;
+            while col_idx < order_target.len() && idx_pos < index.columns.len() {
+                let target_col = &order_target[col_idx];
+                if target_col.table_id != table_ref.internal_id {
+                    break;
+                }
+
+                let idx_col = &index.columns[idx_pos];
+                let eq_prefix_usable = constraint_refs.iter().any(|constraint| {
+                    constraint.index_col_pos == idx_pos
+                        && constraint.eq.as_ref().is_some_and(|eq| {
+                            equality_prefix_scope == EqualityPrefixScope::AnyEquality || eq.is_const
+                        })
+                });
+                if eq_prefix_usable {
+                    // Equality-constrained prefix columns produce a single value
+                    // per seek, so they do not disturb the ordering of the
+                    // remaining suffix. If the ORDER BY / GROUP BY also mentions
+                    // the same column with the same collation, that target term
+                    // is satisfied trivially and can be consumed here too.
+                    if target_matches_index_column(target_col, idx_col, table_ref) {
+                        let same_collation =
+                            target_col.collation == idx_col.collation.unwrap_or_default();
+                        if !same_collation {
+                            break;
+                        }
+                        col_idx += 1;
+                    }
+                    idx_pos += 1;
+                    continue;
+                }
+
+                if !target_matches_index_column(target_col, idx_col, table_ref) {
+                    break;
+                }
+
+                // Custom type columns store encoded blobs. The B-tree's bytewise
+                // ordering does not match the custom type's semantic ordering, so
+                // the index cannot satisfy ORDER BY for those columns.
+                if let ColumnTarget::Column(col_no) = &target_col.target {
+                    if let Some(col) = table_ref.table.columns().get(*col_no) {
+                        if schema
+                            .get_type_def(&col.ty_str, table_ref.table.is_strict())
+                            .is_some()
+                        {
+                            break;
+                        }
+                    }
+                }
+
+                if target_col.collation != idx_col.collation.unwrap_or_default() {
+                    break;
+                }
+
+                let correct_order = if iter_dir == IterationDirection::Forwards {
+                    target_col.order == idx_col.order
+                } else {
+                    target_col.order != idx_col.order
+                };
+                if !correct_order {
+                    break;
+                }
+                col_idx += 1;
+                idx_pos += 1;
+            }
+
+            // SQLite-style rowid tables keep equal secondary-index keys ordered
+            // by rowid. That implicit suffix can satisfy one extra ORDER BY term.
+            if col_idx < order_target.len() && idx_pos == index.columns.len() && index.has_rowid {
+                let target_col = &order_target[col_idx];
+                let rowid_matches = match target_col.target {
+                    ColumnTarget::RowId => true,
+                    ColumnTarget::Column(col_no) => {
+                        rowid_alias_col.is_some_and(|alias| alias == col_no)
+                    }
+                    ColumnTarget::Expr(_) => false,
+                };
+                let correct_order = if iter_dir == IterationDirection::Forwards {
+                    target_col.order == SortOrder::Asc
+                } else {
+                    target_col.order == SortOrder::Desc
+                };
+                if target_col.table_id == table_ref.internal_id && rowid_matches && correct_order {
+                    col_idx += 1;
+                }
+            }
+
+            col_idx
+        }
     }
 }
