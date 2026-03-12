@@ -3526,6 +3526,11 @@ pub fn translate_expr(
         },
         ast::Expr::Variable(name) => {
             let index = program.parameters.push(name);
+            if let Some(collation) = resolver.parameter_collations.get(&index.get()).copied() {
+                // Preserve column-derived collation when a column reference has been
+                // rewritten to Expr::Variable (e.g. trigger NEW/OLD in subprogram bodies).
+                program.set_collation(Some((collation, false)));
+            }
             program.emit_insn(Insn::Variable {
                 index,
                 dest: target_register,
@@ -3533,6 +3538,11 @@ pub fn translate_expr(
             Ok(target_register)
         }
         ast::Expr::Register(src_reg) => {
+            if let Some(collation) = resolver.register_collations.get(src_reg).copied() {
+                // Preserve column-derived collation when a column reference has been
+                // rewritten to Expr::Register (e.g. trigger WHEN NEW/OLD references).
+                program.set_collation(Some((collation, false)));
+            }
             // For DBSP expression compilation: copy from source register to target
             program.emit_insn(Insn::Copy {
                 src_reg: *src_reg,
