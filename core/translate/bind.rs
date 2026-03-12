@@ -313,6 +313,7 @@ pub struct BoundColumn {
 pub struct BoundSelect {
     pub result_columns: Vec<BoundColumn>,
     pub main_scope: BindScope,
+    pub compound_scopes: Vec<BindScope>,
     pub tracking: BindTracking,
 }
 
@@ -323,9 +324,24 @@ struct OuterQueryFrame {
 }
 
 impl BoundSelect {
-    pub fn into_table_references(self) -> Result<TableReferences> {
-        let joined_tables = self
-            .main_scope
+    pub fn into_table_references(self) -> Result<Vec<TableReferences>> {
+        let mut all = Vec::with_capacity(1 + self.compound_scopes.len());
+
+        let main_refs = Self::scope_to_table_references(self.main_scope, &self.tracking)?;
+        all.push(main_refs);
+
+        for scope in self.compound_scopes {
+            all.push(Self::scope_to_table_references(scope, &self.tracking)?);
+        }
+
+        Ok(all)
+    }
+
+    fn scope_to_table_references(
+        scope: BindScope,
+        tracking: &BindTracking,
+    ) -> Result<TableReferences> {
+        let joined_tables = scope
             .tables
             .into_iter()
             .map(|scope_table| match scope_table.source {
@@ -349,7 +365,7 @@ impl BoundSelect {
             .collect::<Result<Vec<_>>>()?;
 
         let mut table_references = TableReferences::new(joined_tables, Vec::new());
-        self.tracking.flush(&mut table_references);
+        tracking.flush(&mut table_references);
         Ok(table_references)
     }
 }
@@ -687,8 +703,10 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             let (result_columns, main_scope) = ctx.bind_one_select(&mut select.body.select)?;
 
             // 3. Bind compound selects (UNION, INTERSECT, EXCEPT)
+            let mut compound_scopes = Vec::with_capacity(select.body.compounds.len());
             for compound in &mut select.body.compounds {
-                ctx.bind_one_select(&mut compound.select)?;
+                let (_compound_cols, compound_scope) = ctx.bind_one_select(&mut compound.select)?;
+                compound_scopes.push(compound_scope);
             }
 
             // 4. Bind ORDER BY (AliasFirst phase — aliases take priority)
@@ -713,6 +731,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             Ok(BoundSelect {
                 result_columns,
                 main_scope,
+                compound_scopes,
                 tracking: std::mem::take(&mut ctx.tracking),
             })
         })
@@ -1581,8 +1600,10 @@ mod tests {
         with_bind_context(&["CREATE TABLE t(a, b)"], |ctx| {
             let mut select = parse_select("SELECT b FROM t WHERE a = 1");
             let bound = ctx.bind_select(&mut select).unwrap();
-            let table_references = bound.into_table_references().unwrap();
+            let mut all_refs = bound.into_table_references().unwrap();
 
+            assert_eq!(all_refs.len(), 1);
+            let table_references = all_refs.remove(0);
             assert_eq!(table_references.joined_tables().len(), 1);
             let table = &table_references.joined_tables()[0];
             assert_eq!(table.identifier, "t");
