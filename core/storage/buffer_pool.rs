@@ -1,7 +1,7 @@
 use super::{slot_bitmap::SlotBitmap, sqlite3_ondisk::WAL_FRAME_HEADER_SIZE};
 use crate::fast_lock::SpinLock;
 use crate::io::TEMP_BUFFER_CACHE;
-use crate::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use crate::sync::atomic::{AtomicUsize, Ordering};
 use crate::sync::{Arc, Weak};
 use crate::turso_assert;
 use crate::{Buffer, LimboError, IO};
@@ -369,7 +369,10 @@ const UNREGISTERED_START: u32 = 2;
 
 /// ID's for an Arena which is not registered with `io_uring`
 /// registered arena will always have id = 0..=1
-static NEXT_ID: AtomicU32 = AtomicU32::new(UNREGISTERED_START);
+/// we purposely use std::sync::AtomicU32 instead of core::sync::AtomicU32 because
+/// this is a global static variable and can mess with shuttle tests
+static NEXT_ID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(UNREGISTERED_START);
 
 impl Arena {
     /// Create a new arena with the given size and page size.
