@@ -1,4 +1,5 @@
 use crate::sync::Arc;
+use crate::vdbe::builder::TableRefIdCounter;
 
 use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, JoinConstraint, TableInternalId};
@@ -16,6 +17,12 @@ use crate::Result;
 
 pub trait IdGenerator {
     fn next_id(&mut self) -> TableInternalId;
+}
+
+impl IdGenerator for TableRefIdCounter {
+    fn next_id(&mut self) -> TableInternalId {
+        self.next()
+    }
 }
 
 // ── BindTable ───────────────────────────────────────────────────────────
@@ -1891,7 +1898,10 @@ mod tests {
                 parse_select("SELECT -a AS b, a, t.b FROM t ORDER BY (SELECT b)");
             ctx.bind_select(&mut source_preferred).unwrap();
             let order_subquery = subquery_expr(order_by_expr(&source_preferred, 0));
-            assert_eq!(select_expr(order_subquery, 0), select_expr(&source_preferred, 2));
+            assert_eq!(
+                select_expr(order_subquery, 0),
+                select_expr(&source_preferred, 2)
+            );
         });
     }
 
