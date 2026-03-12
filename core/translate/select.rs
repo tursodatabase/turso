@@ -447,13 +447,7 @@ fn prepare_one_select_plan(
             add_vtab_predicates_to_where_clause(&mut vtab_predicates, &mut plan)?;
 
             // Parse the actual WHERE clause and add its conditions to the plan WHERE clause that already contains the join conditions.
-            parse_where(
-                where_clause.as_deref(),
-                &mut plan.table_references,
-                Some(&plan.result_columns),
-                &mut plan.where_clause,
-                resolver,
-            )?;
+            parse_where(where_clause.as_deref(), &mut plan.where_clause)?;
 
             if let Some(group_by) = group_by {
                 // Process HAVING clause if present

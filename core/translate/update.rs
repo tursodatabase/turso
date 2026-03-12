@@ -427,13 +427,7 @@ pub fn prepare_update_plan(
     let columns = table.columns();
     let mut where_clause = vec![];
     // Parse the WHERE clause
-    parse_where(
-        body.where_clause.as_deref(),
-        &mut table_references,
-        Some(&result_columns),
-        &mut where_clause,
-        resolver,
-    )?;
+    parse_where(body.where_clause.as_deref(), &mut where_clause)?;
 
     // Parse the LIMIT/OFFSET clause
     let (limit, offset) = body

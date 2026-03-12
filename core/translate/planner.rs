@@ -7,7 +7,7 @@ use super::{
     plan::{
         Aggregate, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
         JoinOrderMember, JoinType as PlanJoinType, JoinedTable, Operation, OuterQueryReference,
-        Plan, QueryDestination, ResultSetColumn, Scan, TableReferences, WhereTerm,
+        Plan, QueryDestination, Scan, TableReferences, WhereTerm,
     },
     select::prepare_select_plan,
 };
@@ -17,7 +17,6 @@ use crate::translate::{
     plan::{NonFromClauseSubquery, SubqueryState},
 };
 use crate::{
-    ast::Limit,
     function::Func,
     schema::Table,
     util::{exprs_are_equivalent, normalize_ident, validate_aggregate_function_tail},
@@ -1318,24 +1317,12 @@ pub fn parse_from(
 
 pub fn parse_where(
     where_clause: Option<&Expr>,
-    table_references: &mut TableReferences,
-    result_columns: Option<&[ResultSetColumn]>,
     out_where_clause: &mut Vec<WhereTerm>,
-    resolver: &Resolver,
 ) -> Result<()> {
     if let Some(where_expr) = where_clause {
         let start_idx = out_where_clause.len();
         break_predicate_at_and_boundaries(where_expr, out_where_clause);
-        for expr in out_where_clause[start_idx..].iter_mut() {
-            bind_and_rewrite_expr(
-                &mut expr.expr,
-                Some(table_references),
-                result_columns,
-                resolver,
-                BindingBehavior::TryCanonicalColumnsFirst,
-            )?;
-        }
-        // BETWEEN is rewritten to (lhs >= start) AND (lhs <= end) by bind_and_rewrite_expr.
+        // BETWEEN is rewritten to (lhs >= start) AND (lhs <= end) by the binder.
         // Re-break any ANDs that were created so they become separate WhereTerms for
         // constraint extraction.
         let mut i = start_idx;

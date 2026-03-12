@@ -204,13 +204,7 @@ pub fn prepare_delete_plan(
     let mut where_predicates = vec![];
 
     // Parse the WHERE clause
-    parse_where(
-        where_clause.as_deref(),
-        &mut table_references,
-        None,
-        &mut where_predicates,
-        resolver,
-    )?;
+    parse_where(where_clause.as_deref(), &mut where_predicates)?;
 
     // Plan subqueries in RETURNING expressions before processing
     // (so SubqueryResult nodes are cloned into result_columns)
