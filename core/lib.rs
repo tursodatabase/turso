@@ -1345,6 +1345,7 @@ impl Database {
             fk_deferred_violations: AtomicIsize::new(0),
             n_active_writes: AtomicI32::new(0),
             check_constraints_pragma: AtomicBool::new(false),
+            automatic_index_pragma: AtomicBool::new(true),
             vtab_txn_states: RwLock::new(HashSet::default()),
             prepare_context_generation: AtomicU64::new(0),
         });

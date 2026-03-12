@@ -124,6 +124,8 @@ pub struct Connection {
     pub(crate) n_active_writes: AtomicI32,
     /// Whether pragma ignore_check_constraints=ON for this connection
     pub(super) check_constraints_pragma: AtomicBool,
+    /// Whether pragma automatic_index is enabled for this connection (default: true)
+    pub(super) automatic_index_pragma: AtomicBool,
     /// Track when each virtual table instance is currently in transaction.
     pub(crate) vtab_txn_states: RwLock<HashSet<u64>>,
     /// Generation counter bumped whenever any setting that affects PrepareContext
@@ -763,6 +765,15 @@ impl Connection {
 
     pub fn check_constraints_ignored(&self) -> bool {
         self.check_constraints_pragma.load(Ordering::Acquire)
+    }
+
+    pub fn set_automatic_index_enabled(&self, enable: bool) {
+        self.automatic_index_pragma.store(enable, Ordering::Release);
+        self.bump_prepare_context_generation();
+    }
+
+    pub fn automatic_index_enabled(&self) -> bool {
+        self.automatic_index_pragma.load(Ordering::Acquire)
     }
 
     pub(crate) fn clear_deferred_foreign_key_violations(&self) -> isize {

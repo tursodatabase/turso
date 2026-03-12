@@ -1585,6 +1585,8 @@ pub type PragmaValue = Box<Expr>; // TODO
 pub enum PragmaName {
     /// Returns the application ID of the database file.
     ApplicationId,
+    /// Enable or disable automatic indices
+    AutomaticIndex,
     /// set the autovacuum mode
     AutoVacuum,
     /// set the busy_timeout (see https://www.sqlite.org/pragma.html#pragma_busy_timeout)
