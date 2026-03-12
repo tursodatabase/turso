@@ -1288,7 +1288,8 @@ fn test_vacuum_into_with_partial_indexes(tmp_db: TempDatabase) -> anyhow::Result
     )?;
     conn.execute(
         "CREATE INDEX idx_pending_orders ON orders (customer, amount) WHERE status = 'pending'",
-    )?;
+    )
+    .unwrap();
     // create another partial index for variety
     conn.execute("CREATE INDEX idx_large_orders ON orders (customer) WHERE amount > 1000")?;
 
@@ -1398,9 +1399,7 @@ fn test_vacuum_into_with_mixed_index_types(tmp_db: TempDatabase) -> anyhow::Resu
     let dest_conn = dest_db.connect_limbo();
 
     assert_eq!(run_integrity_check(&dest_conn), "ok");
-    if !tmp_db.enable_mvcc {
-        assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
-    }
+    assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
 
     let index_defs: Vec<(String, String)> = dest_conn.exec_rows(
         "SELECT name, sql FROM sqlite_schema
