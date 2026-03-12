@@ -24,7 +24,6 @@ use crate::vdbe::hash_table::DEFAULT_MEM_BUDGET;
 use crate::{
     schema::{FromClauseSubquery, Index, IndexColumn, Table},
     translate::plan::{IndexMethodQuery, IterationDirection, JoinOrderMember, JoinedTable},
-    turso_assert,
     vtab::VirtualTable,
     LimboError, Result,
 };
@@ -34,8 +33,8 @@ use super::{
         usable_constraints_for_join_order, usable_constraints_for_lhs_mask, TableConstraints,
     },
     cost::{
-        estimate_cost_for_scan_or_seek, estimate_index_cost, estimate_rows_per_seek, Cost,
-        IndexInfo,
+        estimate_cost_for_scan_or_seek, estimate_index_cost, estimate_rows_per_seek, AnalyzeCtx,
+        Cost, IndexInfo,
     },
     multi_index::{
         consider_multi_index_intersection, consider_multi_index_union, MultiIndexBranchParams,
@@ -199,6 +198,7 @@ pub(super) fn choose_best_btree_candidate(
     rhs_table_idx: usize,
     maybe_order_target: Option<&OrderTarget>,
     schema: &Schema,
+    analyze_stats: Option<&AnalyzeStats>,
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
@@ -211,6 +211,7 @@ pub(super) fn choose_best_btree_candidate(
         base_row_count,
         false,
         params,
+        None,
     );
     let mut best_choice = ChosenBtreeCandidate {
         iter_dir: IterationDirection::Forwards,
@@ -291,6 +292,11 @@ pub(super) fn choose_best_btree_candidate(
                 (IterationDirection::Forwards, false, Cost(0.0))
             };
 
+        let analyze_ctx = analyze_stats.map(|stats| AnalyzeCtx {
+            rhs_table,
+            index: candidate.index.as_ref(),
+            stats,
+        });
         let cost = estimate_cost_for_scan_or_seek(
             Some(index_info),
             &rhs_constraints.constraints,
@@ -299,6 +305,7 @@ pub(super) fn choose_best_btree_candidate(
             base_row_count,
             is_index_ordered,
             params,
+            analyze_ctx.as_ref(),
         );
         // Prerequisite tiebreaker (mirrors SQLite's whereLoopFindLesser).
         // When costs are equal, prefer fewer outer-table prerequisites: a
@@ -522,56 +529,6 @@ fn consider_in_seek_access_method(
     }))
 }
 
-/// Estimate rows produced per outer row for an ordinary btree access path using
-/// the join-order heuristic that the planner expects for btree lookups.
-fn estimate_btree_rows_per_outer_row(
-    rhs_table: &JoinedTable,
-    index: Option<&Arc<Index>>,
-    constraint_refs: &[RangeConstraintRef],
-    analyze_stats: &AnalyzeStats,
-    params: &CostModelParams,
-) -> f64 {
-    turso_assert!(
-        !constraint_refs.is_empty(),
-        "btree row-estimate helper expects a lookup, not a full scan"
-    );
-
-    if index.is_none() {
-        return params.fanout_index_seek_unique;
-    }
-
-    let index = index.expect("checked above");
-    let matched_cols = constraint_refs.len();
-    let total_cols = index.columns.len();
-    let unmatched = total_cols.saturating_sub(matched_cols);
-    let table_name = rhs_table.table.get_name();
-    if let Some(fanout) = analyze_stats
-        .table_stats(table_name)
-        .and_then(|ts| ts.index_stats.get(&index.name))
-        .and_then(|stats| {
-            if matched_cols > 0 && matched_cols <= stats.avg_rows_per_distinct_prefix.len() {
-                Some(stats.avg_rows_per_distinct_prefix[matched_cols - 1] as f64)
-            } else {
-                None
-            }
-        })
-    {
-        return fanout;
-    }
-
-    if matched_cols >= total_cols {
-        if index.unique {
-            params.fanout_index_seek_unique
-        } else {
-            params.fanout_index_seek_non_unique
-        }
-    } else {
-        params
-            .fanout_index_seek_per_unmatched_column
-            .powi(unmatched as i32)
-    }
-}
-
 /// Return the best [AccessMethod] for a given join order.
 #[allow(clippy::too_many_arguments)]
 pub fn find_best_access_method_for_join_order(
@@ -655,25 +612,45 @@ fn find_best_access_method_for_btree(
         rhs_table_idx,
         maybe_order_target,
         schema,
+        Some(analyze_stats),
         input_cardinality,
         base_row_count,
         params,
     )
     .expect("btree candidate selection must always consider the rowid candidate");
 
+    let estimated_rows_per_outer_row = if best.constraint_refs.is_empty() {
+        *base_row_count
+    } else {
+        let index_info = match best.index.as_ref() {
+            Some(index) => IndexInfo {
+                unique: index.unique,
+                covering: rhs_table.index_is_covering(index),
+                column_count: index.columns.len(),
+            },
+            None => IndexInfo {
+                unique: true,
+                covering: true,
+                column_count: 1,
+            },
+        };
+        let analyze_ctx = AnalyzeCtx {
+            rhs_table,
+            index: best.index.as_ref(),
+            stats: analyze_stats,
+        };
+        estimate_rows_per_seek(
+            index_info,
+            &rhs_constraints.constraints,
+            &best.constraint_refs,
+            base_row_count,
+            Some(&analyze_ctx),
+            params,
+        )
+    };
     let mut best_access_method = AccessMethod {
         cost: best.cost,
-        estimated_rows_per_outer_row: if best.constraint_refs.is_empty() {
-            *base_row_count
-        } else {
-            estimate_btree_rows_per_outer_row(
-                rhs_table,
-                best.index.as_ref(),
-                &best.constraint_refs,
-                analyze_stats,
-                params,
-            )
-        },
+        estimated_rows_per_outer_row,
         residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
         consumed_where_terms: consumed_where_terms_from_constraint_refs(
             &rhs_constraints.constraints,
@@ -711,6 +688,7 @@ fn find_best_access_method_for_btree(
             params,
             best_access_method.cost,
             &lhs_mask,
+            Some(analyze_stats),
         ) {
             best_access_method = multi_idx_method;
         }
@@ -727,6 +705,7 @@ fn find_best_access_method_for_btree(
             params,
             best_access_method.cost,
             &lhs_mask,
+            Some(analyze_stats),
         ) {
             best_access_method = multi_idx_and_method;
         }
@@ -761,6 +740,7 @@ fn find_best_access_method_for_vtab(
                     base_row_count,
                     false,
                     params,
+                    None,
                 ),
                 estimated_rows_per_outer_row: *base_row_count,
                 residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
@@ -1166,6 +1146,7 @@ fn find_best_access_method_for_subquery(
         base_row_count,
         false,
         params,
+        None,
     );
     let coroutine_reexecution_overhead =
         Cost((input_cardinality - 1.0).max(0.0) * *base_row_count * params.cpu_cost_per_seek);
@@ -1350,9 +1331,11 @@ fn find_best_access_method_for_subquery(
         &rhs_constraints.constraints,
         &usable_constraint_refs,
         base_row_count,
+        None,
+        params,
     );
     let one_pass_scan_cost =
-        estimate_cost_for_scan_or_seek(None, &[], &[], 1.0, base_row_count, false, params);
+        estimate_cost_for_scan_or_seek(None, &[], &[], 1.0, base_row_count, false, params, None);
     let append_build_cost = Cost(*base_row_count * params.cpu_cost_per_seek);
     let seek_setup_cost = if table_materialization_required || can_direct_materialize_index {
         // Both table-backed materialization and direct-index materialization avoid
