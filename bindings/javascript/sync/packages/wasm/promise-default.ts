@@ -248,7 +248,7 @@ class Database extends DatabasePromise {
      * Prepares a SQL statement for execution.
      * When remoteWrites is enabled, returns a wrapper that routes writes to remote.
      */
-    override prepare(sql: string) {
+    override prepare<S extends string>(sql: S) {
         const localStmt = super.prepare(sql);
 
         if (!this.#remoteWriter) {
