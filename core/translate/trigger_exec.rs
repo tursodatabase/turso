@@ -1,6 +1,9 @@
 use crate::schema::{BTreeTable, Trigger};
 use crate::sync::Arc;
 use crate::translate::expr::WalkControl;
+use crate::translate::subquery::{
+    emit_non_from_clause_subquery, plan_subqueries_from_trigger_when_clause,
+};
 use crate::translate::{
     emitter::Resolver,
     expr::{self, rewrite_between_expr, translate_expr, walk_expr_mut},
@@ -656,6 +659,30 @@ pub fn fire_trigger(
         rewrite_between_expr(&mut when_expr);
         // Rewrite NEW/OLD references in WHEN clause to use registers
         rewrite_trigger_expr_for_when_clause(&mut when_expr, &ctx.table, ctx)?;
+
+        // Plan and emit any subqueries in the WHEN clause (e.g. IN (SELECT ...), EXISTS, scalar subqueries).
+        // This transforms InSelect/Exists/Subquery nodes into SubqueryResult nodes that translate_expr can handle.
+        let mut subqueries = Vec::new();
+        plan_subqueries_from_trigger_when_clause(
+            program,
+            &mut subqueries,
+            &mut when_expr,
+            resolver,
+            connection,
+        )?;
+        // Emit the planned subqueries so their results are available when we evaluate the WHEN expression.
+        // Always treat these as correlated (no `Once` caching) because the WHEN clause is evaluated
+        // per-row, and trigger bodies may modify the tables referenced by the subquery between evaluations.
+        for subquery in &mut subqueries {
+            let plan = subquery.consume_plan(crate::translate::plan::EvalAt::BeforeLoop);
+            emit_non_from_clause_subquery(
+                program,
+                resolver,
+                *plan,
+                &subquery.query_type,
+                true, // always re-evaluate: trigger WHEN is checked per-row
+            )?;
+        }
 
         let when_reg = program.alloc_register();
         translate_expr(program, None, &when_expr, when_reg, resolver)?;
