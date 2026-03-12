@@ -679,6 +679,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             ctx.set_aliases(result_columns.clone());
             ctx.with_phase(BindPhase::AliasFirst, |ctx| {
                 for sort_col in &mut select.order_by {
+                    ctx.replace_column_number(&mut sort_col.expr)?;
                     ctx.bind_expr(&mut sort_col.expr, &main_scope)?;
                 }
                 Ok(())
@@ -789,11 +790,36 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         Ok(())
     }
 
+    /// Replace a numeric literal (e.g. `1`, `2`) with the corresponding
+    /// SELECT result column expression. Per SQLite semantics, only positive
+    /// integer literals are treated as column references; floats and negative
+    /// numbers are left as constant expressions.
+    fn replace_column_number(&self, expr: &mut ast::Expr) -> Result<()> {
+        if let ast::Expr::Literal(ast::Literal::Numeric(num)) = expr {
+            if let Ok(column_number) = num.parse::<usize>() {
+                if column_number == 0 {
+                    crate::bail_parse_error!("invalid column index: {}", column_number);
+                }
+                let aliases = self.aliases();
+                match aliases.get(column_number - 1) {
+                    Some(bound_col) => {
+                        *expr = bound_col.expr.clone();
+                    }
+                    None => {
+                        crate::bail_parse_error!("invalid column index: {}", column_number);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Bind GROUP BY expressions and HAVING clause.
     fn bind_group_by(&mut self, group_by: &mut ast::GroupBy, scope: &BindScope) -> Result<()> {
         let saved_outer_query_frames = std::mem::take(&mut self.outer_query_frames);
         let group_result: Result<()> = (|| {
             for expr in &mut group_by.exprs {
+                self.replace_column_number(expr)?;
                 self.bind_expr(expr, scope)?;
             }
             Ok(())
@@ -2006,6 +2032,88 @@ mod tests {
             assert!(
                 err.contains("no such column: z"),
                 "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn order_by_column_number_replaces_with_result_expr() {
+        with_bind_context(&["CREATE TABLE t(a, b)"], |ctx| {
+            let mut select = parse_select("SELECT a, b FROM t ORDER BY 2");
+            ctx.bind_select(&mut select).unwrap();
+
+            // ORDER BY 2 should resolve to column b (index 1)
+            assert_column_expr(order_by_expr(&select, 0), 0, 1);
+        });
+    }
+
+    #[test]
+    fn group_by_column_number_replaces_with_result_expr() {
+        with_bind_context(&["CREATE TABLE t(a, b)"], |ctx| {
+            let mut select = parse_select("SELECT a, b FROM t GROUP BY 1");
+            ctx.bind_select(&mut select).unwrap();
+
+            // GROUP BY 1 should resolve to column a (index 0)
+            assert_column_expr(group_by_expr(&select, 0), 0, 0);
+        });
+    }
+
+    #[test]
+    fn column_number_zero_is_invalid() {
+        with_bind_context(&["CREATE TABLE t(a)"], |ctx| {
+            let err = bind_select_error(ctx, "SELECT a FROM t ORDER BY 0").to_string();
+            assert!(
+                err.contains("invalid column index: 0"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn column_number_out_of_range_is_invalid() {
+        with_bind_context(&["CREATE TABLE t(a)"], |ctx| {
+            let err = bind_select_error(ctx, "SELECT a FROM t ORDER BY 5").to_string();
+            assert!(
+                err.contains("invalid column index: 5"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn float_literal_in_order_by_is_not_treated_as_column_number() {
+        with_bind_context(&["CREATE TABLE t(a)"], |ctx| {
+            let mut select = parse_select("SELECT a FROM t ORDER BY 1.5");
+            ctx.bind_select(&mut select).unwrap();
+
+            // 1.5 should remain as a numeric literal, not replaced
+            assert_eq!(
+                order_by_expr(&select, 0),
+                &ast::Expr::Literal(ast::Literal::Numeric("1.5".into()))
+            );
+        });
+    }
+
+    #[test]
+    fn order_by_column_number_with_complex_result_expr() {
+        with_bind_context(&["CREATE TABLE t(a, b)"], |ctx| {
+            let mut select = parse_select("SELECT a + 1, b FROM t ORDER BY 1");
+            ctx.bind_select(&mut select).unwrap();
+
+            // ORDER BY 1 should expand to the expression `a + 1` (already bound)
+            assert_eq!(
+                order_by_expr(&select, 0),
+                &ast::Expr::Binary(
+                    ast::Expr::Column {
+                        database: None,
+                        table: TableInternalId::from(0usize),
+                        column: 0,
+                        is_rowid_alias: false,
+                    }
+                    .into_boxed(),
+                    ast::Operator::Add,
+                    ast::Expr::Literal(ast::Literal::Numeric("1".into())).into_boxed(),
+                )
             );
         });
     }
