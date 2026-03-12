@@ -1,3 +1,4 @@
+use super::bind::BindContext;
 use super::emitter::{emit_program, TranslateCtx};
 use super::plan::{
     select_star, Distinctness, InSeekSource, JoinOrderMember, Operation, OuterQueryReference,
@@ -6,7 +7,7 @@ use super::plan::{
 use crate::schema::Table;
 use crate::sync::Arc;
 use crate::translate::emitter::{OperationMode, Resolver};
-use crate::translate::expr::{bind_and_rewrite_expr, expr_vector_size, BindingBehavior};
+use crate::translate::expr::expr_vector_size;
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan, SubqueryState};
@@ -28,6 +29,27 @@ use turso_parser::ast::{self, CompoundSelect, Expr};
 /// Maximum number of columns in a result set.
 /// SQLite's default SQLITE_MAX_COLUMN is 2000, with a hard upper limit of 32767.
 const SQLITE_MAX_COLUMN: usize = 2000;
+
+pub fn bind_prepare_select_plan(
+    mut select: ast::Select,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    outer_query_refs: &[OuterQueryReference],
+    query_destination: QueryDestination,
+    connection: &Arc<crate::Connection>,
+) -> Result<Plan> {
+    let mut binder = BindContext::new(resolver, &mut program.table_reference_counter);
+    // TODO: use return value to avoid more work in planning stage
+    let _bound = binder.bind_select(&mut select)?;
+    prepare_select_plan(
+        select,
+        resolver,
+        program,
+        outer_query_refs,
+        query_destination,
+        connection,
+    )
+}
 
 pub fn translate_select(
     select: ast::Select,
@@ -341,26 +363,7 @@ fn prepare_one_select_plan(
             let mut windows = Vec::with_capacity(window_clause.len());
             for window_def in window_clause.iter() {
                 let name = normalize_ident(window_def.name.as_str());
-                let mut window = Window::new(Some(name), &window_def.window)?;
-
-                for expr in window.partition_by.iter_mut() {
-                    bind_and_rewrite_expr(
-                        expr,
-                        Some(&mut plan.table_references),
-                        None,
-                        resolver,
-                        BindingBehavior::ResultColumnsNotAllowed,
-                    )?;
-                }
-                for (expr, _) in window.order_by.iter_mut() {
-                    bind_and_rewrite_expr(
-                        expr,
-                        Some(&mut plan.table_references),
-                        None,
-                        resolver,
-                        BindingBehavior::ResultColumnsNotAllowed,
-                    )?;
-                }
+                let window = Window::new(Some(name), &window_def.window)?;
 
                 windows.push(window);
             }
@@ -415,14 +418,7 @@ fn prepare_one_select_plan(
                             table.mark_column_used(idx);
                         }
                     }
-                    ResultColumn::Expr(mut expr, maybe_alias) => {
-                        bind_and_rewrite_expr(
-                            &mut expr,
-                            Some(&mut plan.table_references),
-                            None,
-                            resolver,
-                            BindingBehavior::ResultColumnsNotAllowed,
-                        )?;
+                    ResultColumn::Expr(expr, maybe_alias) => {
                         let contains_aggregates = resolve_window_and_aggregate_functions(
                             &expr,
                             resolver,
@@ -448,7 +444,7 @@ fn prepare_one_select_plan(
             // This step can only be performed at this point, because all table references are now available.
             // Virtual table predicates may depend on column bindings from tables to the right in the join order,
             // so we must wait until the full set of references has been collected.
-            add_vtab_predicates_to_where_clause(&mut vtab_predicates, &mut plan, resolver)?;
+            add_vtab_predicates_to_where_clause(&mut vtab_predicates, &mut plan)?;
 
             // Parse the actual WHERE clause and add its conditions to the plan WHERE clause that already contains the join conditions.
             parse_where(
@@ -459,12 +455,11 @@ fn prepare_one_select_plan(
                 resolver,
             )?;
 
-            if let Some(mut group_by) = group_by {
+            if let Some(group_by) = group_by {
                 // Process HAVING clause if present
                 let having_predicates = if let Some(having) = group_by.having {
                     Some(process_having_clause(
                         having,
-                        &mut plan.table_references,
                         &plan.result_columns,
                         resolver,
                         &mut aggregate_expressions,
@@ -474,22 +469,10 @@ fn prepare_one_select_plan(
                 };
 
                 if !group_by.exprs.is_empty() {
-                    // Normal GROUP BY with expressions
-                    for expr in group_by.exprs.iter_mut() {
-                        replace_column_number_with_copy_of_column_expr(expr, &plan.result_columns)?;
-                        bind_and_rewrite_expr(
-                            expr,
-                            Some(&mut plan.table_references),
-                            Some(&plan.result_columns),
-                            resolver,
-                            BindingBehavior::TryResultColumnsFirst,
-                        )?;
-                    }
-
                     plan.group_by = Some(GroupBy {
                         sort_order: Vec::new(),
                         sort_elided: false,
-                        exprs: group_by.exprs.iter().map(|expr| *expr.clone()).collect(),
+                        exprs: group_by.exprs.into_iter().map(|expr| *expr).collect(),
                         having: having_predicates,
                     });
                 } else {
@@ -518,16 +501,7 @@ fn prepare_one_select_plan(
             // Parse the ORDER BY clause
             let mut key = Vec::new();
 
-            for mut o in order_by {
-                replace_column_number_with_copy_of_column_expr(&mut o.expr, &plan.result_columns)?;
-
-                bind_and_rewrite_expr(
-                    &mut o.expr,
-                    Some(&mut plan.table_references),
-                    Some(&plan.result_columns),
-                    resolver,
-                    BindingBehavior::TryResultColumnsFirst,
-                )?;
+            for o in order_by {
                 resolve_window_and_aggregate_functions(
                     &o.expr,
                     resolver,
@@ -648,20 +622,6 @@ fn prepare_one_select_plan(
 
             // Plan CTEs from WITH clause so they're available for subqueries in VALUES
             plan_ctes_as_outer_refs(with, resolver, program, &mut table_references, connection)?;
-
-            for value_row in values.iter_mut() {
-                for value in value_row.iter_mut() {
-                    // Before binding, we check for unquoted literals. Sqlite throws an error in this case
-                    bind_and_rewrite_expr(
-                        value,
-                        Some(&mut table_references),
-                        None,
-                        resolver,
-                        // Allow sqlite quirk of inserting "double-quoted" literals (which our AST maps as identifiers)
-                        BindingBehavior::TryResultColumnsFirst,
-                    )?;
-                }
-            }
 
             // Plan subqueries in VALUES expressions
             let mut non_from_clause_subqueries = vec![];
@@ -788,17 +748,7 @@ fn validate_expr_correct_column_counts(plan: &SelectPlan) -> Result<()> {
 fn add_vtab_predicates_to_where_clause(
     vtab_predicates: &mut Vec<Expr>,
     plan: &mut SelectPlan,
-    resolver: &Resolver,
 ) -> Result<()> {
-    for expr in vtab_predicates.iter_mut() {
-        bind_and_rewrite_expr(
-            expr,
-            Some(&mut plan.table_references),
-            Some(&plan.result_columns),
-            resolver,
-            BindingBehavior::TryCanonicalColumnsFirst,
-        )?;
-    }
     for expr in vtab_predicates.drain(..) {
         // Virtual table argument predicates (e.g. the 't2' in pragma_table_info('t2'))
         // must be associated with the virtual table's outer join context if the table is
@@ -832,38 +782,6 @@ fn vtab_predicate_table_id(expr: &Expr) -> Option<ast::TableInternalId> {
         },
         _ => None,
     }
-}
-
-/// Replaces a column number in an ORDER BY or GROUP BY expression with a copy of the column expression.
-/// For example, in SELECT u.first_name, count(1) FROM users u GROUP BY 1 ORDER BY 2,
-/// the column number 1 is replaced with u.first_name and the column number 2 is replaced with count(1).
-///
-/// Per SQLite documentation, only constant integers are treated as column references.
-/// Non-integer numeric literals (floats) are treated as constant expressions.
-fn replace_column_number_with_copy_of_column_expr(
-    order_by_or_group_by_expr: &mut ast::Expr,
-    columns: &[ResultSetColumn],
-) -> Result<()> {
-    if let ast::Expr::Literal(ast::Literal::Numeric(num)) = order_by_or_group_by_expr {
-        // Only treat as column reference if it parses as a positive integer.
-        // Float literals like "0.5" or "1.0" are valid constant expressions, not column references.
-        if let Ok(column_number) = num.parse::<usize>() {
-            if column_number == 0 {
-                crate::bail_parse_error!("invalid column index: {}", column_number);
-            }
-            let maybe_result_column = columns.get(column_number - 1);
-            match maybe_result_column {
-                Some(ResultSetColumn { expr, .. }) => {
-                    *order_by_or_group_by_expr = expr.clone();
-                }
-                None => {
-                    crate::bail_parse_error!("invalid column index: {}", column_number)
-                }
-            };
-        }
-        // Otherwise, leave the expression as-is (constant expression, case 3 per SQLite docs)
-    }
-    Ok(())
 }
 
 /// Count required cursors for a Plan (either Select or CompoundSelect)
@@ -1268,7 +1186,6 @@ pub fn emit_simple_count(
 
 fn process_having_clause(
     having: Box<ast::Expr>,
-    table_references: &mut TableReferences,
     result_columns: &[ResultSetColumn],
     resolver: &Resolver,
     aggregate_expressions: &mut Vec<super::plan::Aggregate>,
@@ -1286,13 +1203,6 @@ fn process_having_clause(
     }
 
     for expr in predicates.iter_mut() {
-        bind_and_rewrite_expr(
-            expr,
-            Some(table_references),
-            Some(result_columns),
-            resolver,
-            BindingBehavior::TryResultColumnsFirst,
-        )?;
         resolve_window_and_aggregate_functions(expr, resolver, aggregate_expressions, None)?;
     }
 
