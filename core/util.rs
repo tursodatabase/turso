@@ -2048,6 +2048,20 @@ pub fn rename_identifiers_scoped(
     from: &str,
     to: &str,
 ) {
+    rename_identifiers_scoped_inner(expr, target_table, trigger_table, from, to, true);
+}
+
+/// Inner implementation with `rename_unqualified` flag controlling whether bare `Expr::Id`
+/// references should be renamed. When `false`, only qualified refs (table.col, NEW.col, OLD.col)
+/// are renamed — used when the enclosing SELECT's FROM clause does NOT reference the target table.
+fn rename_identifiers_scoped_inner(
+    expr: &mut ast::Expr,
+    target_table: &str,
+    trigger_table: &str,
+    from: &str,
+    to: &str,
+    rename_unqualified: bool,
+) {
     let from_normalized = normalize_ident(from);
     let target_normalized = normalize_ident(target_table);
     let trigger_normalized = normalize_ident(trigger_table);
@@ -2077,7 +2091,8 @@ pub fn rename_identifiers_scoped(
                     // lhs will be walked by walk_expr_mut
                 }
                 ast::Expr::Id(ref name) | ast::Expr::Name(ref name)
-                    if normalize_ident(name.as_str()) == from_normalized =>
+                    if rename_unqualified
+                        && normalize_ident(name.as_str()) == from_normalized =>
                 {
                     *e = ast::Expr::Id(ast::Name::exact(to.to_owned()));
                 }
@@ -3301,9 +3316,43 @@ fn rewrite_select_column_refs_scoped(
             new_col,
         );
     }
+    // ORDER BY is in the same scope as the body's FROM
+    let body_from_has_target = match &select.body.select {
+        ast::OneSelect::Select { from, .. } => from_clause_has_target(from, target_table),
+        _ => false,
+    };
+    let target_normalized = normalize_ident(target_table);
+    let trigger_normalized = normalize_ident(trigger_table);
+    let rename_unqualified = body_from_has_target || target_normalized == trigger_normalized;
     for col in &mut select.order_by {
-        rename_identifiers_scoped(&mut col.expr, target_table, trigger_table, old_col, new_col);
+        rename_identifiers_scoped_inner(
+            &mut col.expr,
+            target_table,
+            trigger_table,
+            old_col,
+            new_col,
+            rename_unqualified,
+        );
     }
+}
+
+/// Check if a FROM clause contains a reference to the given table name.
+fn from_clause_has_target(from: &Option<ast::FromClause>, target_table: &str) -> bool {
+    let Some(from_clause) = from else {
+        return false;
+    };
+    let target_normalized = normalize_ident(target_table);
+    let check_table = |st: &ast::SelectTable| -> bool {
+        matches!(
+            st,
+            ast::SelectTable::Table(name, _, _)
+                if normalize_ident(name.name.as_str()) == target_normalized
+        )
+    };
+    if check_table(&from_clause.select) {
+        return true;
+    }
+    from_clause.joins.iter().any(|j| check_table(&j.table))
 }
 
 fn rewrite_one_select_column_refs_scoped(
@@ -3321,6 +3370,14 @@ fn rewrite_one_select_column_refs_scoped(
             group_by,
             ..
         } => {
+            // Check if FROM clause references the target table to determine
+            // whether unqualified Expr::Id should be renamed in this scope
+            let from_has_target = from_clause_has_target(from, target_table);
+            let target_normalized = normalize_ident(target_table);
+            let trigger_normalized = normalize_ident(trigger_table);
+            let rename_unqualified =
+                from_has_target || target_normalized == trigger_normalized;
+
             if let Some(ref mut from) = from {
                 rewrite_from_clause_column_refs_scoped(
                     from,
@@ -3331,36 +3388,46 @@ fn rewrite_one_select_column_refs_scoped(
                 );
             }
             if let Some(ref mut wc) = where_clause {
-                rename_identifiers_scoped(wc, target_table, trigger_table, old_col, new_col);
+                rename_identifiers_scoped_inner(
+                    wc,
+                    target_table,
+                    trigger_table,
+                    old_col,
+                    new_col,
+                    rename_unqualified,
+                );
             }
             for col in columns {
                 if let ast::ResultColumn::Expr(ref mut expr, _) = col {
-                    rename_identifiers_scoped(
+                    rename_identifiers_scoped_inner(
                         expr,
                         target_table,
                         trigger_table,
                         old_col,
                         new_col,
+                        rename_unqualified,
                     );
                 }
             }
             if let Some(ref mut gb) = group_by {
                 for expr in &mut gb.exprs {
-                    rename_identifiers_scoped(
+                    rename_identifiers_scoped_inner(
                         expr,
                         target_table,
                         trigger_table,
                         old_col,
                         new_col,
+                        rename_unqualified,
                     );
                 }
                 if let Some(ref mut having) = gb.having {
-                    rename_identifiers_scoped(
+                    rename_identifiers_scoped_inner(
                         having,
                         target_table,
                         trigger_table,
                         old_col,
                         new_col,
+                        rename_unqualified,
                     );
                 }
             }
@@ -3388,6 +3455,22 @@ fn rewrite_from_clause_column_refs_scoped(
     old_col: &str,
     new_col: &str,
 ) {
+    // Check if this FROM clause references the target table for JOIN ON expressions
+    let from_has_target = {
+        let target_normalized = normalize_ident(target_table);
+        let check_table = |st: &ast::SelectTable| -> bool {
+            matches!(
+                st,
+                ast::SelectTable::Table(name, _, _)
+                    if normalize_ident(name.name.as_str()) == target_normalized
+            )
+        };
+        check_table(&from.select) || from.joins.iter().any(|j| check_table(&j.table))
+    };
+    let target_normalized = normalize_ident(target_table);
+    let trigger_normalized = normalize_ident(trigger_table);
+    let rename_unqualified = from_has_target || target_normalized == trigger_normalized;
+
     rewrite_select_table_entry_column_refs_scoped(
         &mut from.select,
         target_table,
@@ -3404,7 +3487,14 @@ fn rewrite_from_clause_column_refs_scoped(
             new_col,
         );
         if let Some(ast::JoinConstraint::On(ref mut expr)) = join.constraint {
-            rename_identifiers_scoped(expr, target_table, trigger_table, old_col, new_col);
+            rename_identifiers_scoped_inner(
+                expr,
+                target_table,
+                trigger_table,
+                old_col,
+                new_col,
+                rename_unqualified,
+            );
         }
     }
 }

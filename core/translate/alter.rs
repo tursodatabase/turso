@@ -1282,64 +1282,33 @@ pub fn translate_alter_table(
             let mut triggers_to_rewrite: Vec<(String, String)> = Vec::new();
             let mut views_to_rewrite: Vec<(String, String)> = Vec::new();
             if rename {
-                // Find all triggers that might reference this column
-                let target_table_name_norm = normalize_ident(table_name);
+                // Try to rewrite every trigger's SQL for the column rename.
+                // If the rewritten SQL differs from the original, include it
+                // in the update list. This matches SQLite's approach and avoids
+                // incomplete detection heuristics that miss expression-level refs
+                // (e.g., `SELECT b FROM src` in a trigger on a different table).
                 let all_triggers: Vec<_> = resolver.with_schema(database_id, |s| {
                     s.triggers.values().flatten().cloned().collect()
                 });
                 for trigger in &all_triggers {
-                    let trigger_table_name_norm = normalize_ident(&trigger.table_name);
-
-                    // Check if trigger references the column being renamed
-                    // This includes:
-                    // 1. References from the trigger's owning table (NEW.x, OLD.x, unqualified x)
-                    // 2. References in INSERT column lists targeting the table being renamed
-                    // 3. References in UPDATE SET column lists targeting the table being renamed
-                    let mut needs_rewrite = false;
-
-                    if trigger_table_name_norm == target_table_name_norm {
-                        // Trigger is on the table being renamed - check for references
-                        let trigger_table = resolver
-                            .with_schema(database_id, |s| {
-                                s.get_btree_table(&trigger_table_name_norm)
-                            })
-                            .ok_or_else(|| {
-                                LimboError::ParseError(format!(
-                                    "trigger table not found: {trigger_table_name_norm}"
-                                ))
-                            })?;
-
-                        needs_rewrite = trigger_references_column(trigger, &trigger_table, from)?;
-                    }
-
-                    // Also check if trigger references the column in INSERT/UPDATE targeting other tables
-                    // Parse the trigger to check INSERT column lists and UPDATE SET column lists
-                    if !needs_rewrite {
-                        needs_rewrite = trigger_references_column_in_other_tables(
-                            trigger,
-                            &target_table_name_norm,
-                            from,
-                        )?;
-                    }
-
-                    if needs_rewrite {
-                        match rewrite_trigger_sql_for_column_rename(
-                            &trigger.sql,
-                            table_name,
-                            from,
-                            col_name,
-                            resolver,
-                        ) {
-                            Ok(new_sql) => {
+                    match rewrite_trigger_sql_for_column_rename(
+                        &trigger.sql,
+                        table_name,
+                        from,
+                        col_name,
+                        resolver,
+                    ) {
+                        Ok(new_sql) => {
+                            if new_sql != trigger.sql {
                                 triggers_to_rewrite.push((trigger.name.clone(), new_sql));
                             }
-                            Err(e) => {
-                                // If we can't rewrite the trigger, fail the ALTER TABLE operation
-                                return Err(LimboError::ParseError(format!(
-                                    "error in trigger {} after rename column: {}",
-                                    trigger.name, e
-                                )));
-                            }
+                        }
+                        Err(e) => {
+                            // If we can't rewrite the trigger, fail the ALTER TABLE operation
+                            return Err(LimboError::ParseError(format!(
+                                "error in trigger {} after rename column: {}",
+                                trigger.name, e
+                            )));
                         }
                     }
                 }
@@ -1852,57 +1821,6 @@ fn check_column_ref(
     Ok(())
 }
 
-/// Check if a trigger references a column from a table other than its owning table.
-/// This checks INSERT column lists and UPDATE SET column lists that target the table being renamed.
-fn trigger_references_column_in_other_tables(
-    trigger: &crate::schema::Trigger,
-    target_table_name: &str,
-    column_name: &str,
-) -> Result<bool> {
-    let column_name_norm = normalize_ident(column_name);
-    let target_table_name_norm = normalize_ident(target_table_name);
-
-    // Check all trigger commands for INSERT/UPDATE targeting the table being renamed
-    for cmd in &trigger.commands {
-        match cmd {
-            ast::TriggerCmd::Insert {
-                tbl_name,
-                col_names,
-                ..
-            } => {
-                // Check if INSERT targets the table being renamed
-                let insert_table_name_norm = normalize_ident(tbl_name.as_str());
-                if insert_table_name_norm == target_table_name_norm {
-                    // Check if column name appears in INSERT column list
-                    for col_name in col_names {
-                        let col_norm = normalize_ident(col_name.as_str());
-                        if col_norm == column_name_norm {
-                            return Ok(true);
-                        }
-                    }
-                }
-            }
-            ast::TriggerCmd::Update { tbl_name, sets, .. } => {
-                // Check if UPDATE targets the table being renamed
-                let update_table_name_norm = normalize_ident(tbl_name.as_str());
-                if update_table_name_norm == target_table_name_norm {
-                    // Check if column name appears in UPDATE SET column list
-                    for set in sets {
-                        for col_name in &set.col_names {
-                            let col_norm = normalize_ident(col_name.as_str());
-                            if col_norm == column_name_norm {
-                                return Ok(true);
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    Ok(false)
-}
 
 /// Walk through all expressions in a SELECT statement
 fn walk_select_expressions(
@@ -2425,6 +2343,7 @@ fn rewrite_expr_for_column_rename(
                     context_table_info
                         .as_ref()
                         .map(|(t, n, r)| (t.as_ref(), n, *r)),
+                    None,
                 )?;
             }
         }
@@ -2470,7 +2389,12 @@ fn rewrite_trigger_cmd_for_column_rename(
                 }
             }
 
-            // Rewrite SET expressions
+            // Rewrite SET expressions — unqualified refs in SET refer to the UPDATE target
+            let set_from_target = if is_renaming_update_table {
+                Some(target_table_name)
+            } else {
+                None
+            };
             for set in &mut sets {
                 walk_expr_for_column_rename(
                     &mut set.expr,
@@ -2479,6 +2403,7 @@ fn rewrite_trigger_cmd_for_column_rename(
                     target_table_name,
                     old_col_norm,
                     new_col_norm,
+                    set_from_target,
                 )?;
             }
 
@@ -2596,6 +2521,7 @@ fn walk_expr_for_column_rename(
     target_table_name: &str,
     old_col_norm: &str,
     new_col_norm: &str,
+    from_target: Option<&str>,
 ) -> Result<()> {
     use crate::translate::expr::walk_expr_mut;
 
@@ -2630,6 +2556,7 @@ fn walk_expr_for_column_rename(
                     target_table_name,
                     old_col_norm,
                     new_col_norm,
+                    from_target,
                 )?;
             }
         }
@@ -2683,6 +2610,18 @@ fn rewrite_select_for_column_rename(
         )?;
     }
 
+    // Compute from_target for ORDER BY / LIMIT (same scope as body's FROM)
+    let body_from_target = match &select.body.select {
+        ast::OneSelect::Select { from, .. } => {
+            if from_clause_references_target(from, target_table_name) {
+                Some(target_table_name)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+
     // Rewrite ORDER BY
     for sorted_col in &mut select.order_by {
         walk_expr_for_column_rename(
@@ -2692,6 +2631,7 @@ fn rewrite_select_for_column_rename(
             target_table_name,
             old_col_norm,
             new_col_norm,
+            body_from_target,
         )?;
     }
 
@@ -2704,6 +2644,7 @@ fn rewrite_select_for_column_rename(
             target_table_name,
             old_col_norm,
             new_col_norm,
+            body_from_target,
         )?;
         if let Some(ref mut offset) = limit.offset {
             walk_expr_for_column_rename(
@@ -2713,6 +2654,7 @@ fn rewrite_select_for_column_rename(
                 target_table_name,
                 old_col_norm,
                 new_col_norm,
+                body_from_target,
             )?;
         }
     }
@@ -2738,6 +2680,13 @@ fn rewrite_one_select_for_column_rename(
             window_clause,
             ..
         } => {
+            // Check if FROM references the target table (for cross-table column rename)
+            let from_target = if from_clause_references_target(from, target_table_name) {
+                Some(target_table_name)
+            } else {
+                None
+            };
+
             // Rewrite columns
             for col in columns {
                 if let ast::ResultColumn::Expr(expr, _) = col {
@@ -2748,6 +2697,7 @@ fn rewrite_one_select_for_column_rename(
                         target_table_name,
                         old_col_norm,
                         new_col_norm,
+                        from_target,
                     )?;
                 }
             }
@@ -2761,6 +2711,7 @@ fn rewrite_one_select_for_column_rename(
                     target_table_name,
                     old_col_norm,
                     new_col_norm,
+                    from_target,
                 )?;
             }
 
@@ -2773,6 +2724,7 @@ fn rewrite_one_select_for_column_rename(
                     target_table_name,
                     old_col_norm,
                     new_col_norm,
+                    from_target,
                 )?;
             }
 
@@ -2786,6 +2738,7 @@ fn rewrite_one_select_for_column_rename(
                         target_table_name,
                         old_col_norm,
                         new_col_norm,
+                        from_target,
                     )?;
                 }
                 if let Some(ref mut having_expr) = group_by.having {
@@ -2796,6 +2749,7 @@ fn rewrite_one_select_for_column_rename(
                         target_table_name,
                         old_col_norm,
                         new_col_norm,
+                        from_target,
                     )?;
                 }
             }
@@ -2809,6 +2763,7 @@ fn rewrite_one_select_for_column_rename(
                     target_table_name,
                     old_col_norm,
                     new_col_norm,
+                    from_target,
                 )?;
             }
         }
@@ -2822,6 +2777,7 @@ fn rewrite_one_select_for_column_rename(
                         target_table_name,
                         old_col_norm,
                         new_col_norm,
+                        None,
                     )?;
                 }
             }
@@ -2838,6 +2794,7 @@ fn rewrite_from_clause_for_column_rename(
     target_table_name: &str,
     old_col_norm: &str,
     new_col_norm: &str,
+    from_target: Option<&str>,
 ) -> Result<()> {
     // Rewrite main table (could be a subquery)
     rewrite_select_table_for_column_rename(
@@ -2869,6 +2826,7 @@ fn rewrite_from_clause_for_column_rename(
                         target_table_name,
                         old_col_norm,
                         new_col_norm,
+                        from_target,
                     )?;
                 }
                 ast::JoinConstraint::Using(_) => {
@@ -2908,6 +2866,7 @@ fn rewrite_select_table_for_column_rename(
                 target_table_name,
                 old_col_norm,
                 new_col_norm,
+                None,
             )?;
         }
         ast::SelectTable::TableCall(_, args, _) => {
@@ -2919,6 +2878,7 @@ fn rewrite_select_table_for_column_rename(
                     target_table_name,
                     old_col_norm,
                     new_col_norm,
+                    None,
                 )?;
             }
         }
@@ -2937,6 +2897,7 @@ fn rewrite_window_for_column_rename(
     target_table_name: &str,
     old_col_norm: &str,
     new_col_norm: &str,
+    from_target: Option<&str>,
 ) -> Result<()> {
     // Rewrite PARTITION BY expressions
     for expr in &mut window.partition_by {
@@ -2947,6 +2908,7 @@ fn rewrite_window_for_column_rename(
             target_table_name,
             old_col_norm,
             new_col_norm,
+            from_target,
         )?;
     }
 
@@ -2959,10 +2921,37 @@ fn rewrite_window_for_column_rename(
             target_table_name,
             old_col_norm,
             new_col_norm,
+            from_target,
         )?;
     }
 
     Ok(())
+}
+
+/// Check if a FROM clause references the target table being renamed.
+/// Returns the normalized target table name if found, None otherwise.
+fn from_clause_references_target(
+    from: &Option<ast::FromClause>,
+    target_table_name: &str,
+) -> bool {
+    let Some(from_clause) = from else {
+        return false;
+    };
+    if select_table_is_target(&from_clause.select, target_table_name) {
+        return true;
+    }
+    from_clause
+        .joins
+        .iter()
+        .any(|j| select_table_is_target(&j.table, target_table_name))
+}
+
+fn select_table_is_target(select_table: &ast::SelectTable, target_table_name: &str) -> bool {
+    matches!(
+        select_table,
+        ast::SelectTable::Table(name, _, _)
+            if normalize_ident(name.name.as_str()) == *target_table_name
+    )
 }
 
 /// Rewrite a single expression's column reference
@@ -2973,12 +2962,13 @@ fn rewrite_window_for_column_rename(
 /// - Unqualified references (e.g., x): Resolution order:
 ///   1. If `context_table` is provided (UPDATE/DELETE WHERE clauses), check the context table first
 ///   2. Otherwise, check the trigger's owning table
-///
-/// This matches SQLite's column resolution order where unqualified columns in UPDATE/DELETE
-/// WHERE clauses refer to the target table, not the trigger's owning table.
+///   3. If `from_target` is provided (FROM clause has target table), rename the column
 ///
 /// `context_table`: Optional tuple of (table, normalized_name, is_renaming) for UPDATE/DELETE
-///                  target tables. If `None`, unqualified references refer to the trigger's owning table.
+///                  target tables.
+/// `from_target`: Normalized target table name when the enclosing SELECT's FROM clause
+///                references the table being renamed.
+#[allow(clippy::too_many_arguments)]
 fn rewrite_expr_column_ref_with_context(
     e: &mut ast::Expr,
     trigger_table: &BTreeTable,
@@ -2987,6 +2977,7 @@ fn rewrite_expr_column_ref_with_context(
     new_col_norm: &str,
     is_renaming_trigger_table: bool,
     context_table: Option<(&BTreeTable, &String, bool)>,
+    from_target: Option<&str>,
 ) -> Result<()> {
     match e {
         ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) => {
@@ -3020,6 +3011,13 @@ fn rewrite_expr_column_ref_with_context(
                         *col = ast::Name::from_string(new_col_norm);
                     }
                 }
+                // Check if it's a qualified reference to a FROM clause table that is the
+                // rename target (e.g., src.b in SELECT src.b FROM src)
+                if let Some(target_name) = from_target {
+                    if ns_norm == *target_name {
+                        *col = ast::Name::from_string(new_col_norm);
+                    }
+                }
             }
         }
         ast::Expr::Id(col) => {
@@ -3036,8 +3034,11 @@ fn rewrite_expr_column_ref_with_context(
                         return Ok(());
                     }
                 }
-                // Otherwise, check trigger's owning table
-                if is_renaming_trigger_table && trigger_table.get_column(&col_norm).is_some() {
+                // Check trigger's owning table or FROM clause target table
+                if (is_renaming_trigger_table
+                    && trigger_table.get_column(&col_norm).is_some())
+                    || from_target.is_some()
+                {
                     *e = ast::Expr::Id(ast::Name::from_string(new_col_norm));
                 }
             }
@@ -3055,6 +3056,7 @@ fn rewrite_expr_column_ref(
     target_table_name: &str,
     old_col_norm: &str,
     new_col_norm: &str,
+    from_target: Option<&str>,
 ) -> Result<()> {
     let trigger_table_name_norm = normalize_ident(trigger_table_name);
     let target_table_name_norm = normalize_ident(target_table_name);
@@ -3068,5 +3070,6 @@ fn rewrite_expr_column_ref(
         new_col_norm,
         is_renaming_trigger_table,
         None,
+        from_target,
     )
 }
