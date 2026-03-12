@@ -15,9 +15,9 @@ use crate::{
         },
         optimizer::optimize_select_plan,
         plan::{
-            plan_is_correlated, ColumnUsedMask, JoinOrderMember, NonFromClauseSubquery,
-            OuterQueryReference, Plan, SetOperation, SubqueryPosition, SubqueryState,
-            TableReferences, WhereTerm,
+            plan_has_outer_scope_dependency, plan_is_correlated, ColumnUsedMask, JoinOrderMember,
+            NonFromClauseSubquery, OuterQueryReference, Plan, SetOperation, SubqueryPosition,
+            SubqueryState, TableReferences, WhereTerm,
         },
         select::prepare_select_plan,
     },
@@ -95,12 +95,24 @@ fn mark_shared_cte_materialization_requirements(program: &ProgramBuilder, plan: 
     for table in plan.table_references.joined_tables_mut().iter_mut() {
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table.table {
             let from_clause_subquery = Arc::make_mut(from_clause_subquery);
-            from_clause_subquery.set_shared_materialization(
-                from_clause_subquery.cte_id().is_some_and(|cte_id| {
-                    program.get_cte_reference_count(cte_id) > 1
-                        && !plan_is_correlated(&from_clause_subquery.plan)
-                }),
-            );
+            let shared_materialization = from_clause_subquery.cte_id().is_some_and(|cte_id| {
+                program.get_cte_reference_count(cte_id) > 1
+                    && !plan_has_outer_scope_dependency(&from_clause_subquery.plan)
+            });
+            from_clause_subquery.set_shared_materialization(shared_materialization);
+            if let Some(cte_id) = from_clause_subquery.cte_id() {
+                tracing::trace!(
+                    cte_id,
+                    reference_count = program.get_cte_reference_count(cte_id),
+                    shared_materialization,
+                    outer_scope_dependency = plan_has_outer_scope_dependency(
+                        &from_clause_subquery.plan,
+                    ),
+                    contains_nested_correlation = plan_is_correlated(&from_clause_subquery.plan),
+                    identifier = %table.identifier,
+                    "annotated CTE materialization requirements"
+                );
+            }
             annotate_plan(program, from_clause_subquery.plan.as_mut());
         }
     }
@@ -843,29 +855,47 @@ fn pre_materialize_multi_ref_ctes(
 ) -> Result<()> {
     match plan {
         Plan::Select(select_plan) => {
-            pre_materialize_multi_ref_ctes_in_tables(
-                program,
-                &mut select_plan.table_references,
-                t_ctx,
-            )?;
+            pre_materialize_multi_ref_ctes_in_select_plan(program, select_plan, t_ctx)?;
         }
         Plan::CompoundSelect {
             left, right_most, ..
         } => {
             for (select_plan, _) in left.iter_mut() {
-                pre_materialize_multi_ref_ctes_in_tables(
-                    program,
-                    &mut select_plan.table_references,
-                    t_ctx,
-                )?;
+                pre_materialize_multi_ref_ctes_in_select_plan(program, select_plan, t_ctx)?;
             }
-            pre_materialize_multi_ref_ctes_in_tables(
-                program,
-                &mut right_most.table_references,
-                t_ctx,
-            )?;
+            pre_materialize_multi_ref_ctes_in_select_plan(program, right_most, t_ctx)?;
         }
         Plan::Delete(_) | Plan::Update(_) => {}
+    }
+    Ok(())
+}
+
+fn pre_materialize_multi_ref_ctes_in_select_plan(
+    program: &mut ProgramBuilder,
+    plan: &mut SelectPlan,
+    t_ctx: &mut TranslateCtx,
+) -> Result<()> {
+    pre_materialize_multi_ref_ctes_in_tables(program, &mut plan.table_references, t_ctx)?;
+    pre_materialize_multi_ref_ctes_in_non_from_subqueries(
+        program,
+        &mut plan.non_from_clause_subqueries,
+        t_ctx,
+    )
+}
+
+fn pre_materialize_multi_ref_ctes_in_non_from_subqueries(
+    program: &mut ProgramBuilder,
+    subqueries: &mut [NonFromClauseSubquery],
+    t_ctx: &mut TranslateCtx,
+) -> Result<()> {
+    for subquery in subqueries.iter_mut() {
+        let SubqueryState::Unevaluated {
+            plan: Some(subquery_plan),
+        } = &mut subquery.state
+        else {
+            continue;
+        };
+        pre_materialize_multi_ref_ctes_in_select_plan(program, subquery_plan.as_mut(), t_ctx)?;
     }
     Ok(())
 }
@@ -887,6 +917,11 @@ fn pre_materialize_multi_ref_ctes_in_tables(
                     continue;
                 }
                 if from_clause_subquery.requires_table_materialization() {
+                    tracing::trace!(
+                        cte_id,
+                        identifier = %table_reference.identifier,
+                        "pre-materializing shared CTE"
+                    );
                     let (result_columns_start, cte_cursor_id, cte_table) =
                         emit_materialized_subquery_table(
                             program,
@@ -1120,6 +1155,11 @@ pub fn emit_from_clause_subqueries(
             if let Some(cte_id) = from_clause_subquery.cte_id() {
                 if let Some(cte_info) = program.get_materialized_cte(cte_id).cloned() {
                     if from_clause_subquery.materialized_cursor_id.is_some() {
+                        tracing::trace!(
+                            cte_id,
+                            identifier = %table_reference.identifier,
+                            "reusing pre-materialized CTE on original reference"
+                        );
                         program.pop_current_parent_explain();
                         continue;
                     }
@@ -1131,6 +1171,13 @@ pub fn emit_from_clause_subqueries(
                         new_cursor_id: dup_cursor_id,
                         original_cursor_id: cte_info.cursor_id,
                     });
+                    tracing::trace!(
+                        cte_id,
+                        identifier = %table_reference.identifier,
+                        original_cursor_id = cte_info.cursor_id,
+                        dup_cursor_id,
+                        "opening duplicate cursor for materialized CTE"
+                    );
 
                     // Update the plan's query destination to EphemeralTable so that
                     // main_loop knows to use Rewind/Next instead of coroutine Yield

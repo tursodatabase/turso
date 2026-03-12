@@ -96,21 +96,14 @@ QUERY PLAN
 |  |  |--USE HASH TABLE FOR DISTINCT
 |  |  |--USE SORTER FOR ORDER BY
 |  |  `--SCAN signal_days
-|  `--SCAN run_ids
-|     `--SCAN window_subquery_0
-|        |--SCAN run_boundaries
-|        |  `--SCAN prior_days
-|        |     |--SCAN signal_days AS d1
-|        |     `--CORRELATED SCALAR SUBQUERY 3
-|        |        `--SEARCH d2 USING INDEX ephemeral_subquery_t107 (signal_day<?)
-|        `--USE SORTER FOR ORDER BY
+|  |--SCAN signal_days AS d1
+|  |--CORRELATED SCALAR SUBQUERY 3
+|  |  `--SEARCH d2 USING INDEX ephemeral_subquery_t107 (signal_day<?)
+|  |--SCAN prior_days
+|  |--SCAN window_subquery_0
+|  |  |--SCAN run_boundaries
+|  |  `--USE SORTER FOR ORDER BY
+|  `--SEARCH run_ids USING INDEX ephemeral_subquery_t111 (signal_day=?)
 `--SCAN run_lengths
    |--SCAN run_ids
-   |  `--SCAN window_subquery_0
-   |     |--SCAN run_boundaries
-   |     |  `--SCAN prior_days
-   |     |     |--SCAN signal_days AS d1
-   |     |     `--CORRELATED SCALAR SUBQUERY 4
-   |     |        `--SEARCH d2 USING INDEX ephemeral_subquery_t81 (signal_day<?)
-   |     `--USE SORTER FOR ORDER BY
    `--USE SORTER FOR GROUP BY

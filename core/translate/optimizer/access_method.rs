@@ -16,8 +16,8 @@ use crate::translate::optimizer::constraints::{
 use crate::translate::optimizer::cost::RowCountEstimate;
 use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::plan::{
-    plan_is_correlated, HashJoinKey, HashJoinType, NonFromClauseSubquery, SetOperation,
-    SubqueryState, TableReferences, WhereTerm,
+    plan_has_outer_scope_dependency, HashJoinKey, HashJoinType, NonFromClauseSubquery,
+    SetOperation, SubqueryState, TableReferences, WhereTerm,
 };
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::hash_table::DEFAULT_MEM_BUDGET;
@@ -1164,10 +1164,10 @@ fn find_best_access_method_for_subquery(
         coroutine_cost
     };
 
-    // Correlated subqueries (referencing outer tables) cannot be materialized once -
+    // Plans with outer-scope dependencies cannot be materialized once -
     // they must re-execute for each outer row. Use coroutine for these.
     // This check must come first because correlated CTEs should NOT share materialized data.
-    if plan_is_correlated(&subquery.plan) {
+    if plan_has_outer_scope_dependency(&subquery.plan) {
         return Ok(Some(AccessMethod {
             // Correlated subqueries always rerun for each outer row, even if the
             // enclosing CTE/subquery might otherwise be shareable.
