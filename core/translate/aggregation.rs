@@ -169,7 +169,7 @@ pub fn emit_ungrouped_aggregation<'a>(
     Ok(())
 }
 
-fn emit_collseq_if_needed(
+pub(crate) fn emit_collseq_if_needed(
     program: &mut ProgramBuilder,
     referenced_tables: &TableReferences,
     expr: &ast::Expr,

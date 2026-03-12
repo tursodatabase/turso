@@ -314,6 +314,7 @@ fn choose_multi_index_branch_access(
     branch_terms: &[WhereTerm],
     lhs_mask: &TableMask,
     rhs_idx: usize,
+    schema: &Schema,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
 ) -> crate::Result<Option<MultiIdxBranch>> {
@@ -323,6 +324,7 @@ fn choose_multi_index_branch_access(
         lhs_mask,
         rhs_idx,
         None,
+        schema,
         1.0,
         base_row_count,
         params,
@@ -882,6 +884,7 @@ pub fn consider_multi_index_union(
                     &synthetic_where_terms,
                     lhs_mask,
                     rhs_idx,
+                    schema,
                     base_row_count,
                     params,
                 )

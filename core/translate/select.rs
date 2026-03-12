@@ -14,12 +14,14 @@ use crate::translate::planner::{
     break_predicate_at_and_boundaries, parse_from, parse_limit, parse_where,
     plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
 };
+use crate::translate::result_row::emit_select_result;
 use crate::translate::subquery::{plan_subqueries_from_select_plan, plan_subqueries_from_values};
 use crate::translate::window::plan_windows;
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::Insn;
 use crate::{vdbe::builder::ProgramBuilder, Result};
+use std::borrow::Cow;
 use turso_parser::ast::ResultColumn;
 use turso_parser::ast::{self, CompoundSelect, Expr};
 
@@ -330,6 +332,7 @@ fn prepare_one_select_plan(
                 window: None,
                 non_from_clause_subqueries: vec![],
                 estimated_output_rows: None,
+                simple_aggregate: None,
             };
 
             let mut windows = Vec::with_capacity(window_clause.len());
@@ -681,6 +684,7 @@ fn prepare_one_select_plan(
                 window: None,
                 non_from_clause_subqueries,
                 estimated_output_rows: None,
+                simple_aggregate: None,
             };
 
             validate_expr_correct_column_counts(&plan)?;
@@ -1194,7 +1198,7 @@ fn estimate_num_labels_for_simple_select(select: &SelectPlan) -> usize {
 
 pub fn emit_simple_count(
     program: &mut ProgramBuilder,
-    _t_ctx: &mut TranslateCtx,
+    t_ctx: &mut TranslateCtx,
     plan: &SelectPlan,
 ) -> Result<bool> {
     let cursors = plan
@@ -1216,7 +1220,6 @@ pub fn emit_simple_count(
         return Ok(false);
     }
 
-    // TODO: I think this allocation can be avoided if we are smart with the `TranslateCtx`
     let target_reg = program.alloc_register();
 
     program.emit_insn(Insn::Count {
@@ -1226,13 +1229,29 @@ pub fn emit_simple_count(
     });
 
     program.emit_insn(Insn::Close { cursor_id });
-    let output_reg = program.alloc_register();
-    program.emit_insn(Insn::Copy {
-        src_reg: target_reg,
-        dst_reg: output_reg,
-        extra_amount: 0,
-    });
-    program.emit_result_row(output_reg, 1);
+
+    let agg = plan
+        .aggregates
+        .first()
+        .expect("simple count requires exactly one aggregate");
+    t_ctx.resolver.expr_to_reg_cache.push((
+        Cow::Owned(agg.original_expr.clone()),
+        target_reg,
+        false,
+    ));
+    t_ctx.resolver.enable_expr_to_reg_cache();
+
+    emit_select_result(
+        program,
+        &t_ctx.resolver,
+        plan,
+        None,
+        None,
+        None,
+        None,
+        t_ctx.reg_result_cols_start.unwrap(),
+        t_ctx.limit_ctx,
+    )?;
     Ok(true)
 }
 

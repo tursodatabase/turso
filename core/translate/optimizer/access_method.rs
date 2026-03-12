@@ -17,7 +17,6 @@ use crate::translate::plan::{
     plan_is_correlated, HashJoinKey, HashJoinType, NonFromClauseSubquery, SetOperation,
     SubqueryState, TableReferences, WhereTerm,
 };
-use crate::util::exprs_are_equivalent;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::hash_table::DEFAULT_MEM_BUDGET;
 use crate::{
@@ -36,9 +35,8 @@ use super::{
     multi_index::{
         consider_multi_index_intersection, consider_multi_index_union, MultiIndexBranchParams,
     },
-    order::OrderTarget,
+    order::{btree_access_order_consumed, EqualityPrefixScope, OrderTarget},
 };
-use crate::translate::optimizer::order::ColumnTarget;
 use crate::translate::planner::TableMask;
 
 #[derive(Debug, Clone)]
@@ -197,6 +195,7 @@ pub(super) fn choose_best_btree_candidate(
     lhs_mask: &TableMask,
     rhs_table_idx: usize,
     maybe_order_target: Option<&OrderTarget>,
+    schema: &Schema,
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
@@ -217,8 +216,6 @@ pub(super) fn choose_best_btree_candidate(
         cost: best_cost,
     };
     let mut best_prereq_count = usize::MAX;
-    let table_no = rhs_table.internal_id;
-    let rowid_column_idx = rhs_table.columns().iter().position(|c| c.is_rowid_alias());
 
     // Estimate cost for each candidate index (including the rowid index) and
     // keep the best candidate.
@@ -243,74 +240,53 @@ pub(super) fn choose_best_btree_candidate(
             },
         };
 
-        let (iter_dir, is_index_ordered, order_satisfiability_bonus) = if let Some(order_target) =
-            maybe_order_target
-        {
-            // If the index delivers rows in the same direction, or the exact
-            // reverse direction, as the order target, then it satisfies the
-            // ORDER BY and we can credit the access path with the saved sort.
-            let mut all_same_direction = true;
-            let mut all_opposite_direction = true;
-            for i in 0..order_target.0.len().min(index_info.column_count) {
-                let target = &order_target.0[i];
-                let correct_table = target.table_id == table_no;
-                let correct_column = match (&target.target, &candidate.index) {
-                    // Regular column target on a normal index: compare the table
-                    // column position against the indexed column.
-                    (ColumnTarget::Column(col_no), Some(index)) => {
-                        index.columns[i].expr.is_none() && index.columns[i].pos_in_table == *col_no
-                    }
-                    // Expression target on an expression index: compare the
-                    // normalized expressions for equivalence.
-                    (ColumnTarget::Expr(expr), Some(index)) => index.columns[i]
-                        .expr
-                        .as_ref()
-                        .is_some_and(|e| exprs_are_equivalent(e, unsafe { &**expr })),
-                    // Normal column target on the rowid access path.
-                    (ColumnTarget::Column(col_no), None) => {
-                        rowid_column_idx.is_some_and(|idx| idx == *col_no)
-                    }
-                    // Explicit rowid target on the rowid access path.
-                    (ColumnTarget::RowId, None) => true,
-                    _ => false,
-                };
-                if !correct_table || !correct_column {
-                    all_same_direction = false;
-                    all_opposite_direction = false;
-                    break;
-                }
-                let correct_order = match &candidate.index {
-                    Some(index) => target.order == index.columns[i].order,
-                    None => target.order == SortOrder::Asc,
-                };
-                if correct_order {
-                    all_opposite_direction = false;
-                } else {
-                    all_same_direction = false;
-                }
-            }
+        let (iter_dir, is_index_ordered, order_satisfiability_bonus) =
+            if let Some(order_target) = maybe_order_target {
+                // Reuse the same index-vs-order matching logic as final plan
+                // validation, but allow any equality-constrained seek prefix to
+                // be skipped here. Candidate scoring only needs to know whether
+                // this specific access path can emit rows ordered after its seek
+                // key; final global ORDER BY validation is stricter and only
+                // skips globally constant prefixes.
+                let all_same_direction = btree_access_order_consumed(
+                    rhs_table,
+                    IterationDirection::Forwards,
+                    candidate.index.as_deref(),
+                    &usable_constraint_refs,
+                    &order_target.0,
+                    schema,
+                    EqualityPrefixScope::AnyEquality,
+                ) == order_target.0.len();
+                let all_opposite_direction = btree_access_order_consumed(
+                    rhs_table,
+                    IterationDirection::Backwards,
+                    candidate.index.as_deref(),
+                    &usable_constraint_refs,
+                    &order_target.0,
+                    schema,
+                    EqualityPrefixScope::AnyEquality,
+                ) == order_target.0.len();
 
-            let satisfies_order =
-                (all_same_direction || all_opposite_direction) && !order_target.0.is_empty();
-            if satisfies_order {
-                // Bonus = estimated sort cost saved. Sorting is O(n log n).
-                let n = *base_row_count;
-                let sort_cost_saved = Cost(n * (n.max(1.0).log2()) * params.sort_cpu_per_row);
-                (
-                    if all_same_direction {
-                        IterationDirection::Forwards
-                    } else {
-                        IterationDirection::Backwards
-                    },
-                    true,
-                    sort_cost_saved,
-                )
+                let satisfies_order = all_same_direction || all_opposite_direction;
+                if satisfies_order {
+                    // Bonus = estimated sort cost saved. Sorting is O(n log n).
+                    let n = *base_row_count;
+                    let sort_cost_saved = Cost(n * (n.max(1.0).log2()) * params.sort_cpu_per_row);
+                    (
+                        if all_same_direction {
+                            IterationDirection::Forwards
+                        } else {
+                            IterationDirection::Backwards
+                        },
+                        true,
+                        sort_cost_saved,
+                    )
+                } else {
+                    (IterationDirection::Forwards, false, Cost(0.0))
+                }
             } else {
                 (IterationDirection::Forwards, false, Cost(0.0))
-            }
-        } else {
-            (IterationDirection::Forwards, false, Cost(0.0))
-        };
+            };
 
         let cost = estimate_cost_for_scan_or_seek(
             Some(index_info),
@@ -651,6 +627,7 @@ fn find_best_access_method_for_btree(
         &lhs_mask,
         rhs_table_idx,
         maybe_order_target,
+        schema,
         input_cardinality,
         base_row_count,
         params,

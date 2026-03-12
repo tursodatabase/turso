@@ -1,4 +1,9 @@
-use crate::translate::{order_by::EmitOrderBy, window::EmitWindow};
+use crate::translate::plan::SimpleAggregate;
+use crate::translate::{
+    aggregation::emit_collseq_if_needed,
+    order_by::{custom_type_lt_func, EmitOrderBy},
+    window::EmitWindow,
+};
 
 use super::*;
 
@@ -221,6 +226,53 @@ fn emit_loop_source<'a>(
             let start_reg = t_ctx
                 .reg_agg_start
                 .expect("aggregate registers must be initialized");
+            if let Some(SimpleAggregate::MinMax(min_max)) = &plan.simple_aggregate {
+                let expr_reg = program.alloc_register();
+                translate_expr(
+                    program,
+                    Some(&plan.table_references),
+                    &min_max.argument,
+                    expr_reg,
+                    &t_ctx.resolver,
+                )?;
+                let loop_end = t_ctx
+                    .label_main_loop_end
+                    .expect("simple min/max requires the main-loop end label");
+                let label_on_null = if matches!(min_max.func, crate::function::AggFunc::Min) {
+                    // Ascending index order places NULLs first. Keep scanning until
+                    // the first non-NULL value, then jump straight to AggFinal.
+                    let label_on_null = program.allocate_label();
+                    program.emit_insn(Insn::IsNull {
+                        reg: expr_reg,
+                        target_pc: label_on_null,
+                    });
+                    Some(label_on_null)
+                } else {
+                    None
+                };
+
+                emit_collseq_if_needed(program, &plan.table_references, &min_max.argument);
+                let comparator_func_name = custom_type_lt_func(
+                    &min_max.argument,
+                    &plan.table_references,
+                    t_ctx.resolver.schema(),
+                );
+                program.emit_insn(Insn::AggStep {
+                    acc_reg: start_reg,
+                    col: expr_reg,
+                    delimiter: 0,
+                    func: min_max.func.clone(),
+                    comparator_func_name,
+                });
+                program.emit_insn(Insn::Goto {
+                    target_pc: loop_end,
+                });
+
+                if let Some(label_on_null) = label_on_null {
+                    program.preassign_label_to_next_insn(label_on_null);
+                }
+                return Ok(());
+            }
 
             // In planner.rs, we have collected all aggregates from the SELECT clause, including ones where the aggregate is embedded inside
             // a more complex expression. Some examples: length(sum(x)), sum(x) + avg(y), sum(x) + 1, etc.

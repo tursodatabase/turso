@@ -80,6 +80,12 @@ snapshot scalar-subquery-cross-table {
     FROM customers c;
 }
 
+# Non-correlated scalar subquery should still use the simple COUNT(*) fast path.
+@setup schema
+snapshot scalar-subquery-simple-count {
+    SELECT (SELECT count(*) FROM orders) AS order_count;
+}
+
 # =============================================================================
 # EXISTS SUBQUERIES
 # =============================================================================
