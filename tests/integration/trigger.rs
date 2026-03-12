@@ -1481,6 +1481,31 @@ fn test_alter_table_rename_column_qualified_reference_to_trigger_table(db: TempD
     );
 }
 
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_same_connection_cross_table_update_new_ref(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE src(id INTEGER PRIMARY KEY, b)")
+        .unwrap();
+    conn.execute("CREATE TABLE other(id INTEGER PRIMARY KEY, z)")
+        .unwrap();
+    conn.execute("INSERT INTO src VALUES (1, 1)").unwrap();
+    conn.execute("INSERT INTO other VALUES (1, 0)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER trig AFTER UPDATE ON src BEGIN
+         UPDATE other SET z = NEW.b WHERE id = NEW.id;
+        END",
+    )
+    .unwrap();
+
+    conn.execute("ALTER TABLE src RENAME COLUMN b TO c")
+        .unwrap();
+    conn.execute("UPDATE src SET c = 5 WHERE id = 1").unwrap();
+
+    let results: Vec<(i64,)> = conn.exec_rows("SELECT z FROM other WHERE id = 1");
+    assert_eq!(results, vec![(5,)]);
+}
+
 /// Regression test for issue #4801: AFTER trigger INSERT corrupts index cursor position.
 ///
 /// When an AFTER UPDATE trigger does INSERT on the same table, it modifies the index being
@@ -1875,6 +1900,55 @@ fn test_trigger_mixed_same_and_cross_table_persists() -> anyhow::Result<()> {
     conn2.execute("UPDATE src SET c = 99 WHERE a = 1").unwrap();
     let results: Vec<(i64,)> = conn2.exec_rows("SELECT v FROM log ORDER BY rowid");
     assert_eq!(results, vec![(50,), (99,)]);
+
+    Ok(())
+}
+
+/// Trigger UPSERT clauses must be rewritten in sqlite_schema so they survive reopen.
+#[test]
+fn test_trigger_upsert_clause_persists_after_rename() -> anyhow::Result<()> {
+    let path = tempfile::TempDir::new()
+        .unwrap()
+        .keep()
+        .join("trigger_upsert_persist");
+    let db = TempDatabase::new_with_existent(&path);
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE src(id INTEGER PRIMARY KEY, b)")
+        .unwrap();
+    conn.execute("CREATE TABLE dst(x, y)").unwrap();
+    conn.execute("INSERT INTO src VALUES (1, 1)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER trig AFTER INSERT ON dst BEGIN \
+         INSERT INTO src(id, b) VALUES (NEW.x, NEW.y) \
+         ON CONFLICT(id) DO UPDATE SET b = excluded.b + b WHERE b < NEW.y; \
+         END",
+    )
+    .unwrap();
+
+    conn.execute("ALTER TABLE src RENAME COLUMN b TO c")
+        .unwrap();
+
+    let trigger_sql: Vec<(String,)> =
+        conn.exec_rows("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='trig'");
+    assert_eq!(trigger_sql.len(), 1);
+    assert!(
+        trigger_sql[0]
+            .0
+            .contains("DO UPDATE SET c = excluded.c + c WHERE c < NEW.y"),
+        "trigger SQL was not fully rewritten: {}",
+        trigger_sql[0].0
+    );
+
+    do_flush(&conn, &db)?;
+    conn.close()?;
+
+    let db2 = TempDatabase::new_with_existent(&path);
+    let conn2 = db2.connect_limbo();
+
+    conn2.execute("INSERT INTO dst VALUES (1, 5)").unwrap();
+    let results: Vec<(i64,)> = conn2.exec_rows("SELECT c FROM src WHERE id = 1");
+    assert_eq!(results, vec![(6,)]);
 
     Ok(())
 }

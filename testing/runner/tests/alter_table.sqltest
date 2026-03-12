@@ -197,6 +197,22 @@ expect error {
     cannot reference
 }
 
+@skip-if mvcc "ATTACH is not supported in MVCC mode"
+test alter-table-rename-column-trigger-attached-db-same-db {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t (a, b);
+    CREATE TABLE aux.log (v);
+    CREATE TRIGGER aux.trig AFTER INSERT ON t BEGIN
+        INSERT INTO log VALUES (NEW.b);
+    END;
+    ALTER TABLE aux.t RENAME COLUMN b TO c;
+    INSERT INTO aux.t VALUES (1, 7);
+    SELECT * FROM aux.log;
+}
+expect {
+    7
+}
+
 # https://github.com/tursodatabase/turso/issues/5246
 @cross-check-integrity
 test alter-table-rename-column-case-insensitive {
