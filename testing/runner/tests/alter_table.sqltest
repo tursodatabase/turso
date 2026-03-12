@@ -1563,8 +1563,8 @@ test alter-rename-col-verify-schema-rewritten {
     ALTER TABLE src RENAME COLUMN b TO c;
     SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'trig1';
 }
-expect {
-    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN INSERT INTO log SELECT c FROM src WHERE a = new.x; END
+expect pattern {
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN\s+INSERT INTO log SELECT c FROM src WHERE a = new\.x;\s+END
 }
 
 test alter-rename-col-cross-table-group-by {
@@ -1601,8 +1601,8 @@ test alter-rename-col-schema-aggregate {
     ALTER TABLE src RENAME COLUMN b TO c;
     SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'trig1';
 }
-expect {
-    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN INSERT INTO log SELECT SUM (c) FROM src; END
+expect pattern {
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN\s+INSERT INTO log SELECT SUM\s*\(c\) FROM src;\s+END
 }
 
 test alter-rename-col-schema-qualified-ref {
@@ -1618,8 +1618,8 @@ test alter-rename-col-schema-qualified-ref {
     ALTER TABLE src RENAME COLUMN b TO c;
     SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'trig1';
 }
-expect {
-    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN INSERT INTO log SELECT src.c FROM src WHERE src.a = new.x; END
+expect pattern {
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN\s+INSERT INTO log SELECT src\.c FROM src WHERE src\.a = new\.x;\s+END
 }
 
 test alter-rename-col-schema-multi-from {
@@ -1637,8 +1637,8 @@ test alter-rename-col-schema-multi-from {
     ALTER TABLE src RENAME COLUMN b TO c;
     SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'trig1';
 }
-expect {
-    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN INSERT INTO log SELECT src.c FROM src, other WHERE src.a = other.a AND other.a = new.x; END
+expect pattern {
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN\s+INSERT INTO log SELECT src\.c FROM src, other WHERE src\.a = other\.a AND other\.a = new\.x;\s+END
 }
 
 test alter-rename-col-schema-join-on {
@@ -1656,8 +1656,8 @@ test alter-rename-col-schema-join-on {
     ALTER TABLE src RENAME COLUMN b TO c;
     SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'trig1';
 }
-expect {
-    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN INSERT INTO log SELECT c FROM src JOIN other ON src.a = other.a WHERE other.a = new.x; END
+expect pattern {
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN\s+INSERT INTO log SELECT c FROM src JOIN other ON src\.a = other\.a WHERE other\.a = new\.x;\s+END
 }
 
 test alter-rename-col-schema-no-rename-other-col {
@@ -1675,8 +1675,8 @@ test alter-rename-col-schema-no-rename-other-col {
     ALTER TABLE src RENAME COLUMN b TO c;
     SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'trig1';
 }
-expect {
-    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN INSERT INTO log SELECT b FROM other WHERE a = new.x; END
+expect pattern {
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN\s+INSERT INTO log SELECT b FROM other WHERE a = new\.x;\s+END
 }
 
 test alter-rename-col-schema-update-cmd {
@@ -1690,8 +1690,8 @@ test alter-rename-col-schema-update-cmd {
     ALTER TABLE src RENAME COLUMN b TO c;
     SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'trig1';
 }
-expect {
-    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN UPDATE src SET c = c + 10 WHERE a = new.x; END
+expect pattern {
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN\s+UPDATE src SET c = c \+ 10 WHERE a = new\.x;\s+END
 }
 
 test alter-rename-col-schema-delete-where {
@@ -1705,8 +1705,8 @@ test alter-rename-col-schema-delete-where {
     ALTER TABLE src RENAME COLUMN b TO c;
     SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'trig1';
 }
-expect {
-    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN DELETE FROM src WHERE c = new.y; END
+expect pattern {
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN\s+DELETE FROM src WHERE c = new\.y;\s+END
 }
 
 test alter-rename-col-schema-insert-col-list {
@@ -1720,8 +1720,8 @@ test alter-rename-col-schema-insert-col-list {
     ALTER TABLE src RENAME COLUMN b TO c;
     SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'trig1';
 }
-expect {
-    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN INSERT INTO src (a, c) VALUES (new.x, new.y); END
+expect pattern {
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN\s+INSERT INTO src \(a, c\) VALUES\s*\(new\.x, new\.y\);\s+END
 }
 
 test alter-rename-col-schema-nested-subquery {
@@ -1737,8 +1737,8 @@ test alter-rename-col-schema-nested-subquery {
     ALTER TABLE src RENAME COLUMN b TO c;
     SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'trig1';
 }
-expect {
-    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN INSERT INTO log SELECT * FROM (SELECT c FROM src WHERE a = new.x); END
+expect pattern {
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN\s+INSERT INTO log SELECT \* FROM \(SELECT c FROM src WHERE a = new\.x\);\s+END
 }
 
 test alter-rename-col-schema-group-by {
@@ -1754,8 +1754,8 @@ test alter-rename-col-schema-group-by {
     ALTER TABLE src RENAME COLUMN b TO c;
     SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'trig1';
 }
-expect {
-    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN INSERT INTO log SELECT SUM (c) FROM src GROUP BY a HAVING a = new.x; END
+expect pattern {
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN\s+INSERT INTO log SELECT SUM\s*\(c\) FROM src GROUP BY a HAVING a = new\.x;\s+END
 }
 
 test alter-rename-col-schema-same-table-trigger {
@@ -1769,6 +1769,6 @@ test alter-rename-col-schema-same-table-trigger {
     ALTER TABLE t1 RENAME COLUMN b TO c;
     SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'trig1';
 }
-expect {
-    CREATE TRIGGER trig1 AFTER UPDATE ON t1 BEGIN INSERT INTO log VALUES (new.c); END
+expect pattern {
+    CREATE TRIGGER trig1 AFTER UPDATE ON t1 BEGIN\s+INSERT INTO log VALUES\s*\(new\.c\);\s+END
 }

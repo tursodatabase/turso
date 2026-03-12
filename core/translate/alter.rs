@@ -2221,22 +2221,60 @@ fn rewrite_trigger_sql_for_column_rename(
         event
     };
 
-    // Rewrite WHEN clause column references if present
+    // Rewrite WHEN clause column references if present.
+    // In WHEN clauses, only NEW.col / OLD.col qualified references are valid;
+    // bare column names are not valid in trigger WHEN clauses per SQLite semantics,
+    // so we only rewrite qualified NEW/OLD references here.
     let new_when_clause = when_clause
         .map(|e| {
-            rewrite_expr_for_column_rename(
-                &e,
-                &trigger_table,
-                trigger_table_name_raw,
-                &target_table_name,
-                &old_col_norm,
-                &new_col_norm,
-                None,
-                resolver,
-            )
-            .map(Box::new)
+            let mut expr = *e;
+            walk_expr_mut(
+                &mut expr,
+                &mut |ex: &mut ast::Expr| -> Result<WalkControl> {
+                    if let ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) =
+                        ex
+                    {
+                        let ns_norm = normalize_ident(ns.as_str());
+                        let col_norm = normalize_ident(col.as_str());
+                        if (ns_norm.eq_ignore_ascii_case("new")
+                            || ns_norm.eq_ignore_ascii_case("old"))
+                            && col_norm == *old_col_norm
+                            && is_renaming_trigger_table
+                            && trigger_table.get_column(&col_norm).is_some()
+                        {
+                            *col = ast::Name::from_string(&*new_col_norm);
+                        }
+                    }
+                    Ok(WalkControl::Continue)
+                },
+            )?;
+            Ok::<Box<ast::Expr>, LimboError>(Box::new(expr))
         })
         .transpose()?;
+
+    // Validate: if the WHEN clause still contains a bare reference to the old column,
+    // SQLite would error with "no such column". We must do the same.
+    if let Some(ref when_expr) = new_when_clause {
+        let mut has_bare_old_col = false;
+        let _ = walk_expr_mut(
+            &mut when_expr.clone(),
+            &mut |ex: &mut ast::Expr| -> Result<WalkControl> {
+                if let ast::Expr::Id(ref name) | ast::Expr::Name(ref name) = ex {
+                    if normalize_ident(name.as_str()) == *old_col_norm {
+                        has_bare_old_col = true;
+                    }
+                }
+                Ok(WalkControl::Continue)
+            },
+        );
+        if has_bare_old_col {
+            return Err(LimboError::ParseError(format!(
+                "error in trigger {}: no such column: {}",
+                trigger_name.name.as_str(),
+                old_col_norm
+            )));
+        }
+    }
 
     let mut new_commands = Vec::new();
     for cmd in commands {
@@ -2388,22 +2426,19 @@ fn rewrite_trigger_cmd_for_column_rename(
                 }
             }
 
-            // Rewrite SET expressions — unqualified refs in SET refer to the UPDATE target
-            let set_from_target = if is_renaming_update_table {
-                Some(target_table_name)
-            } else {
-                None
-            };
+            // Rewrite SET expressions — unqualified refs in SET refer to the UPDATE target.
+            // Pass context_table so invalid qualified refs to trigger table are caught.
             for set in &mut sets {
-                walk_expr_for_column_rename(
-                    &mut set.expr,
+                set.expr = Box::new(rewrite_expr_for_column_rename(
+                    &set.expr,
                     trigger_table,
                     trigger_table_name,
                     target_table_name,
                     old_col_norm,
                     new_col_norm,
-                    set_from_target,
-                )?;
+                    Some(&update_table_name_norm),
+                    resolver,
+                )?);
             }
 
             // Rewrite WHERE clause - unqualified column references refer to UPDATE target table
@@ -2998,12 +3033,26 @@ fn rewrite_expr_column_ref_with_context(
                     }
                 }
                 // Also check if it's a qualified reference to the trigger's owning table
-                // (e.g., t.x in a trigger on table t)
+                // (e.g., t.x in a trigger on table t).
+                // Only do this when there's no context table (i.e., in a SELECT), or when
+                // the trigger table IS the context table. In UPDATE/DELETE on a different
+                // table, qualified refs to the trigger table (t.x) are invalid in SQLite
+                // — only NEW.x/OLD.x are allowed — so we must not rename them.
                 if is_renaming_trigger_table {
                     let trigger_table_name_norm = normalize_ident(trigger_table_name);
                     if ns_norm == trigger_table_name_norm
                         && trigger_table.get_column(&col_norm).is_some()
                     {
+                        // If we're inside an UPDATE/DELETE targeting a different table,
+                        // a qualified ref to the trigger table (t.x) is invalid in SQLite.
+                        let ctx_is_different_table = context_table
+                            .as_ref()
+                            .is_some_and(|(_, ctx_name, _)| **ctx_name != trigger_table_name_norm);
+                        if ctx_is_different_table {
+                            return Err(LimboError::ParseError(format!(
+                                "no such column: {trigger_table_name}.{col_norm}"
+                            )));
+                        }
                         *col = ast::Name::from_string(new_col_norm);
                     }
                 }

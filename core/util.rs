@@ -2051,6 +2051,19 @@ pub fn rename_identifiers_scoped(
     rename_identifiers_scoped_inner(expr, target_table, trigger_table, from, to, true);
 }
 
+/// Rename column references in a trigger WHEN clause.
+/// Only renames qualified NEW.col / OLD.col references — bare column names
+/// are invalid in WHEN clauses per SQLite semantics and must not be renamed.
+pub fn rename_identifiers_scoped_when_clause(
+    expr: &mut ast::Expr,
+    target_table: &str,
+    trigger_table: &str,
+    from: &str,
+    to: &str,
+) {
+    rename_identifiers_scoped_inner(expr, target_table, trigger_table, from, to, false);
+}
+
 /// Inner implementation with `rename_unqualified` flag controlling whether bare `Expr::Id`
 /// references should be renamed. When `false`, only qualified refs (table.col, NEW.col, OLD.col)
 /// are renamed — used when the enclosing SELECT's FROM clause does NOT reference the target table.

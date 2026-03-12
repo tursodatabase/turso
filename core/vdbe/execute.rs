@@ -21,12 +21,12 @@ use crate::types::{
     ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
 };
 use crate::util::{
-    escape_sql_string_literal, normalize_ident, rename_identifiers, rename_identifiers_scoped,
-    rewrite_check_expr_table_refs, rewrite_column_references_if_needed,
-    rewrite_fk_parent_cols_if_self_ref, rewrite_fk_parent_table_if_needed,
-    rewrite_inline_col_fk_target_if_needed, rewrite_trigger_cmd_column_refs,
-    rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename, trim_ascii_whitespace,
-    RewrittenView,
+    escape_sql_string_literal, normalize_ident, rename_identifiers,
+    rename_identifiers_scoped_when_clause, rewrite_check_expr_table_refs,
+    rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
+    rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
+    rewrite_trigger_cmd_column_refs, rewrite_trigger_cmd_table_refs,
+    rewrite_view_sql_for_column_rename, trim_ascii_whitespace, RewrittenView,
 };
 use crate::vdbe::affinity::{
     apply_numeric_affinity, try_for_float, Affinity, NumericParseResult, ParsedNumber,
@@ -11889,9 +11889,11 @@ pub fn op_alter_column(
                 for trigger_arc in triggers.iter_mut() {
                     let trigger_tbl = normalize_ident(&trigger_arc.table_name);
                     let trigger = Arc::make_mut(trigger_arc);
-                    // Rewrite WHEN clause (scope-aware to avoid renaming columns from other tables)
+                    // Rewrite WHEN clause: only rename NEW.col / OLD.col qualified refs.
+                    // Bare column names in WHEN clauses are invalid per SQLite semantics,
+                    // so we must not rename them (SQLite would error on such triggers).
                     if let Some(ref mut when) = trigger.when_clause {
-                        rename_identifiers_scoped(
+                        rename_identifiers_scoped_when_clause(
                             when,
                             &tbl_name,
                             &trigger_tbl,
