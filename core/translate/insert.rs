@@ -18,7 +18,8 @@ use crate::{
             ReturningBufferCtx, WalkControl,
         },
         fkeys::{
-            build_index_affinity_string, emit_fk_violation, emit_guarded_fk_decrement, index_probe,
+            build_index_affinity_string, emit_fk_restrict_halt, emit_fk_violation,
+            emit_guarded_fk_decrement, index_probe,
             open_read_index, open_read_table, ForeignKeyActions,
         },
         plan::{
@@ -769,16 +770,10 @@ pub fn translate_insert(
         affinity_str: Some(affinity_str),
     });
 
-    // Emit deferred index inserts for cases where preflight only checked constraints
-    // but didn't insert. This covers UPSERT and non-REPLACE conflict types (ABORT/FAIL/
-    // IGNORE/ROLLBACK). REPLACE inserts eagerly in the preflight phase because it needs
-    // to delete-then-insert per index.
-    if has_upsert || !on_replace {
-        emit_commit_phase(program, resolver, &insertion, &ctx)?;
-    }
-
     if has_fks {
-        // Child-side check must run before Insert (may HALT or increment deferred counter)
+        // Child-side FK check must run before any writes (IdxInsert / Insert).
+        // For immediate FKs this emits a direct Halt, so no index entry is written
+        // when the parent is missing — matching SQLite's bytecode order.
         emit_fk_child_insert_checks(
             program,
             &btree_table,
@@ -787,6 +782,14 @@ pub fn translate_insert(
             resolver,
             database_id,
         )?;
+    }
+
+    // Emit deferred index inserts for cases where preflight only checked constraints
+    // but didn't insert. This covers UPSERT and non-REPLACE conflict types (ABORT/FAIL/
+    // IGNORE/ROLLBACK). REPLACE inserts eagerly in the preflight phase because it needs
+    // to delete-then-insert per index.
+    if has_upsert || !on_replace {
+        emit_commit_phase(program, resolver, &insertion, &ctx)?;
     }
 
     let mut insert_flags = InsertFlags::new();
@@ -3521,10 +3524,14 @@ pub fn emit_fk_child_insert_checks(
             program.emit_insn(Insn::Close { cursor_id: pcur });
             program.emit_insn(Insn::Goto { target_pc: fk_ok });
 
-            // Missing parent: immediate vs deferred as usual
+            // Missing parent: immediate → Halt before Insert; deferred → counter
             program.preassign_label_to_next_insn(violation);
             program.emit_insn(Insn::Close { cursor_id: pcur });
-            emit_fk_violation(program, &fk_ref.fk)?;
+            if fk_ref.fk.deferred {
+                emit_fk_violation(program, &fk_ref.fk)?;
+            } else {
+                emit_fk_restrict_halt(program)?;
+            }
             program.preassign_label_to_next_insn(fk_ok);
         } else {
             let idx = fk_ref
@@ -3612,9 +3619,13 @@ pub fn emit_fk_child_insert_checks(
                 ncols,
                 // on_found: parent exists, FK satisfied
                 |_p| Ok(()),
-                // on_not_found: behave like a normal FK
+                // on_not_found: immediate → Halt; deferred → counter
                 |p| {
-                    emit_fk_violation(p, &fk_ref.fk)?;
+                    if fk_ref.fk.deferred {
+                        emit_fk_violation(p, &fk_ref.fk)?;
+                    } else {
+                        emit_fk_restrict_halt(p)?;
+                    }
                     Ok(())
                 },
             )?;
