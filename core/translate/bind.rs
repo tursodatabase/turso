@@ -704,6 +704,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     from,
                     where_clause,
                     group_by,
+                    window_clause,
                     ..
                 } => {
                     // 1. Bind FROM → build scope
@@ -712,26 +713,31 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         None => BindScope::empty(),
                     };
 
-                    // 2. Extract bound columns (names + resolved exprs) before
+                    // 2. Bind WINDOW definitions (NoAliases — same phase as SELECT list)
+                    ctx.with_phase(BindPhase::NoAliases, |ctx| {
+                        ctx.bind_window_defs(window_clause, &scope)
+                    })?;
+
+                    // 3. Extract bound columns (names + resolved exprs) before
                     //    the main bind pass rewrites the AST in-place.
                     let bound_columns = ctx.extract_bound_columns(columns, &scope)?;
 
-                    // 3. Store as aliases for later phases (WHERE, GROUP BY, ORDER BY)
+                    // 4. Store as aliases for later phases (WHERE, GROUP BY, ORDER BY)
                     ctx.set_aliases(bound_columns.clone());
 
-                    // 4. Bind SELECT expressions in-place (NoAliases phase)
+                    // 5. Bind SELECT expressions in-place (NoAliases phase)
                     ctx.with_phase(BindPhase::NoAliases, |ctx| {
                         ctx.bind_select_list(columns, &scope)
                     })?;
 
-                    // 4. Bind WHERE (TableFirst phase — table columns first, aliases as fallback)
+                    // 6. Bind WHERE (TableFirst phase — table columns first, aliases as fallback)
                     if let Some(where_expr) = where_clause {
                         ctx.with_phase(BindPhase::TableFirst, |ctx| {
                             ctx.bind_expr(where_expr, &scope)
                         })?;
                     }
 
-                    // 5. Bind GROUP BY and HAVING (table columns win in GROUP BY)
+                    // 7. Bind GROUP BY and HAVING (table columns win in GROUP BY)
                     if let Some(group_by) = group_by {
                         ctx.with_phase(BindPhase::TableFirst, |ctx| {
                             ctx.bind_group_by(group_by, &scope)
@@ -761,6 +767,23 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 }
                 // Star and TableStar don't contain expressions to bind
                 ast::ResultColumn::Star | ast::ResultColumn::TableStar(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Bind WINDOW definition expressions (PARTITION BY, ORDER BY).
+    fn bind_window_defs(
+        &mut self,
+        window_defs: &mut [ast::WindowDef],
+        scope: &BindScope,
+    ) -> Result<()> {
+        for def in window_defs.iter_mut() {
+            for expr in &mut def.window.partition_by {
+                self.bind_expr(expr, scope)?;
+            }
+            for sorted_col in &mut def.window.order_by {
+                self.bind_expr(&mut sorted_col.expr, scope)?;
             }
         }
         Ok(())
@@ -1935,6 +1958,72 @@ mod tests {
             let first_exists = exists_subquery(&nested_where);
             let second_exists = exists_subquery(first_exists);
             assert_eq!(select_expr(second_exists, 0), select_expr(&nested_where, 0));
+        });
+    }
+
+    fn window_clause(select: &ast::Select) -> &[ast::WindowDef] {
+        match &select.body.select {
+            ast::OneSelect::Select { window_clause, .. } => window_clause,
+            other => panic!("expected SELECT core, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn window_partition_by_and_order_by_are_bound() {
+        with_bind_context(&["CREATE TABLE t(a, b, c)"], |ctx| {
+            let mut select =
+                parse_select("SELECT a FROM t WINDOW w AS (PARTITION BY b ORDER BY c)");
+            ctx.bind_select(&mut select).unwrap();
+
+            let defs = window_clause(&select);
+            assert_eq!(defs.len(), 1);
+            assert_column_expr(&defs[0].window.partition_by[0], 0, 1);
+            assert_column_expr(&defs[0].window.order_by[0].expr, 0, 2);
+        });
+    }
+
+    #[test]
+    fn window_binds_qualified_column_refs() {
+        with_bind_context(&["CREATE TABLE t(x, y)"], |ctx| {
+            let mut select =
+                parse_select("SELECT x FROM t WINDOW w AS (PARTITION BY t.y ORDER BY t.x)");
+            ctx.bind_select(&mut select).unwrap();
+
+            let defs = window_clause(&select);
+            assert_column_expr(&defs[0].window.partition_by[0], 0, 1);
+            assert_column_expr(&defs[0].window.order_by[0].expr, 0, 0);
+        });
+    }
+
+    #[test]
+    fn window_does_not_resolve_aliases() {
+        with_bind_context(&["CREATE TABLE t(a)"], |ctx| {
+            let err = bind_select_error(
+                ctx,
+                "SELECT a AS z FROM t WINDOW w AS (PARTITION BY z)",
+            )
+            .to_string();
+            assert!(
+                err.contains("no such column: z"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn multiple_window_defs_are_all_bound() {
+        with_bind_context(&["CREATE TABLE t(a, b, c)"], |ctx| {
+            let mut select = parse_select(
+                "SELECT a FROM t WINDOW w1 AS (PARTITION BY a), w2 AS (ORDER BY b, c)",
+            );
+            ctx.bind_select(&mut select).unwrap();
+
+            let defs = window_clause(&select);
+            assert_eq!(defs.len(), 2);
+            assert_column_expr(&defs[0].window.partition_by[0], 0, 0);
+            assert_eq!(defs[1].window.order_by.len(), 2);
+            assert_column_expr(&defs[1].window.order_by[0].expr, 0, 1);
+            assert_column_expr(&defs[1].window.order_by[1].expr, 0, 2);
         });
     }
 }
