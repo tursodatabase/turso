@@ -11,9 +11,10 @@ use super::{
     },
     select::prepare_select_plan,
 };
+use crate::function::{AggFunc, ExtFunc};
 use crate::translate::{
     emitter::Resolver,
-    expr::{expr_vector_size, unwrap_parens, BindingBehavior, WalkControl},
+    expr::{expr_vector_size, unwrap_parens, WalkControl},
     plan::{NonFromClauseSubquery, SubqueryState},
 };
 use crate::{
@@ -21,10 +22,6 @@ use crate::{
     schema::Table,
     util::{exprs_are_equivalent, normalize_ident, validate_aggregate_function_tail},
     Result,
-};
-use crate::{
-    function::{AggFunc, ExtFunc},
-    translate::expr::bind_and_rewrite_expr,
 };
 use crate::{
     translate::plan::{Window, WindowFunction},
@@ -1791,13 +1788,6 @@ fn parse_join(
                     } else {
                         None
                     };
-                    bind_and_rewrite_expr(
-                        &mut predicate.expr,
-                        Some(table_references),
-                        None,
-                        resolver,
-                        BindingBehavior::TryResultColumnsFirst,
-                    )?;
                 }
             }
             ast::JoinConstraint::Using(distinct_names) => {

@@ -1283,9 +1283,11 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     let start = start.take_ownership();
                     let lhs_v = lhs.take_ownership();
                     let end = end.take_ownership();
+
                     let lower =
                         ast::Expr::Binary(Box::new(start), lower_op, Box::new(lhs_v.clone()));
                     let upper = ast::Expr::Binary(Box::new(lhs_v), upper_op, Box::new(end));
+
                     *expr = if *not {
                         ast::Expr::Binary(Box::new(lower), ast::Operator::Or, Box::new(upper))
                     } else {
