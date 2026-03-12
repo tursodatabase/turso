@@ -1,5 +1,6 @@
 use crate::sync::Arc;
 use rustc_hash::FxHashMap as HashMap;
+use smallvec::SmallVec;
 use std::collections::VecDeque;
 
 use turso_ext::{ConstraintInfo, ConstraintUsage, ResultCode};
@@ -32,7 +33,10 @@ use super::{
     constraints::{
         usable_constraints_for_join_order, usable_constraints_for_lhs_mask, TableConstraints,
     },
-    cost::{estimate_cost_for_scan_or_seek, estimate_index_cost, Cost, IndexInfo},
+    cost::{
+        estimate_cost_for_scan_or_seek, estimate_index_cost, estimate_rows_per_seek, Cost,
+        IndexInfo,
+    },
     multi_index::{
         consider_multi_index_intersection, consider_multi_index_union, MultiIndexBranchParams,
     },
@@ -48,26 +52,24 @@ pub struct AccessMethod {
     pub cost: Cost,
     /// Estimated rows produced per outer row before applying remaining filters.
     pub estimated_rows_per_outer_row: f64,
-    /// Which remaining filter multiplier join cardinality estimation should apply.
-    pub post_access_filter: PostAccessFilter,
+    /// Whether join cardinality should still apply planner-side selectivity after
+    /// using this access path's own row estimate.
+    pub residual_constraints: ResidualConstraintMode,
+    /// WHERE-term indices already accounted for by this access path's row estimate.
+    pub consumed_where_terms: SmallVec<[usize; 4]>,
     /// Table-type specific access method details.
     pub params: AccessMethodParams,
 }
 
-/// Describes which remaining WHERE-term selectivity join planning must still
-/// apply after choosing an access path.
+/// Describes whether join planning should still apply residual WHERE-term
+/// selectivity after choosing an access path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PostAccessFilter {
-    /// Full scans and virtual-table scans still need join planning to apply all
-    /// relevant WHERE-term selectivity, because the access path itself did not
-    /// consume any specific seek predicates.
-    AllConstraints,
-    /// Rowid seeks, ordinary index seeks, and `MultiIndexScan` branches already
-    /// account for the lookup predicates that drive the access path, so join
-    /// planning should only apply remaining local/self residual filters.
-    LocalOnly,
-    /// Index-method access paths such as FTS return their own output estimate, so
-    /// join planning should not apply any extra filter multiplier here.
+pub enum ResidualConstraintMode {
+    /// Apply the selectivity of all relevant WHERE terms that this access path
+    /// did not already consume.
+    ApplyUnconsumed,
+    /// The access path already provided its own final row estimate; do not
+    /// multiply any planner-side residual selectivity on top.
     None,
 }
 
@@ -332,6 +334,29 @@ pub(super) fn choose_best_btree_candidate(
     Some(best_choice)
 }
 
+fn consumed_where_terms_from_constraint_refs(
+    constraints: &[Constraint],
+    constraint_refs: &[RangeConstraintRef],
+) -> SmallVec<[usize; 4]> {
+    let mut consumed = SmallVec::new();
+    for cref in constraint_refs {
+        for constraint_idx in [
+            cref.eq.as_ref().map(|eq| eq.constraint_pos),
+            cref.lower_bound,
+            cref.upper_bound,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let where_term_idx = constraints[constraint_idx].where_clause_pos.0;
+            if !consumed.contains(&where_term_idx) {
+                consumed.push(where_term_idx);
+            }
+        }
+    }
+    consumed
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Evaluate whether an `IN (...)` predicate should replace the ordinary btree
 /// access path with repeated equality seeks.
@@ -487,7 +512,8 @@ fn consider_in_seek_access_method(
     .map(|chosen| AccessMethod {
         cost: chosen.cost,
         estimated_rows_per_outer_row: chosen.estimated_rows_per_outer_row,
-        post_access_filter: PostAccessFilter::LocalOnly,
+        residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
+        consumed_where_terms: smallvec::smallvec![chosen.constraint_idx],
         params: AccessMethodParams::InSeek {
             index: chosen.index,
             affinity: chosen.affinity,
@@ -648,11 +674,11 @@ fn find_best_access_method_for_btree(
                 params,
             )
         },
-        post_access_filter: if best.constraint_refs.is_empty() {
-            PostAccessFilter::AllConstraints
-        } else {
-            PostAccessFilter::LocalOnly
-        },
+        residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
+        consumed_where_terms: consumed_where_terms_from_constraint_refs(
+            &rhs_constraints.constraints,
+            &best.constraint_refs,
+        ),
         params: AccessMethodParams::BTreeTable {
             iter_dir: best.iter_dir,
             index: best.index,
@@ -737,7 +763,8 @@ fn find_best_access_method_for_vtab(
                     params,
                 ),
                 estimated_rows_per_outer_row: *base_row_count,
-                post_access_filter: PostAccessFilter::AllConstraints,
+                residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
+                consumed_where_terms: SmallVec::new(),
                 params: AccessMethodParams::VirtualTable {
                     idx_num: index_info.idx_num,
                     idx_str: index_info.idx_str,
@@ -1089,7 +1116,8 @@ pub fn try_hash_join_access_method(
     Some(AccessMethod {
         cost,
         estimated_rows_per_outer_row: probe_cardinality,
-        post_access_filter: PostAccessFilter::AllConstraints,
+        residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
+        consumed_where_terms: join_keys.iter().map(|key| key.where_clause_idx).collect(),
         params: AccessMethodParams::HashJoin {
             build_table_idx,
             probe_table_idx,
@@ -1128,22 +1156,44 @@ fn find_best_access_method_for_subquery(
 ) -> Result<Option<AccessMethod>> {
     use super::constraints::ConstraintRef;
 
+    let table_materialization_required = subquery.requires_table_materialization();
+    let can_direct_materialize_index = subquery.supports_direct_index_materialization();
+    let coroutine_scan_cost = estimate_cost_for_scan_or_seek(
+        None,
+        &[],
+        &[],
+        input_cardinality,
+        base_row_count,
+        false,
+        params,
+    );
+    let coroutine_reexecution_overhead =
+        Cost((input_cardinality - 1.0).max(0.0) * *base_row_count * params.cpu_cost_per_seek);
+    let coroutine_cost = coroutine_scan_cost + coroutine_reexecution_overhead;
+    let scan_cost = if table_materialization_required {
+        // Explicit MATERIALIZED hints and shared CTEs already produce a table-backed
+        // row source. Scanning them behaves like rescanning cached rows, not rerunning
+        // a coroutine body for each outer probe.
+        coroutine_scan_cost
+    } else {
+        // The generic scan model treats repeated probes like cached rescans of a
+        // row source. A coroutine-backed subquery is slightly more expensive: each
+        // extra outer row reruns the subquery program instead of probing a
+        // materialized result. Charge that extra work explicitly here.
+        coroutine_cost
+    };
+
     // Correlated subqueries (referencing outer tables) cannot be materialized once -
     // they must re-execute for each outer row. Use coroutine for these.
     // This check must come first because correlated CTEs should NOT share materialized data.
     if plan_is_correlated(&subquery.plan) {
         return Ok(Some(AccessMethod {
-            cost: estimate_cost_for_scan_or_seek(
-                None,
-                &[],
-                &[],
-                input_cardinality,
-                base_row_count,
-                false,
-                params,
-            ),
+            // Correlated subqueries always rerun for each outer row, even if the
+            // enclosing CTE/subquery might otherwise be shareable.
+            cost: coroutine_cost,
             estimated_rows_per_outer_row: *base_row_count,
-            post_access_filter: PostAccessFilter::AllConstraints,
+            residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
+            consumed_where_terms: SmallVec::new(),
             params: AccessMethodParams::Subquery,
         }));
     }
@@ -1173,19 +1223,11 @@ fn find_best_access_method_for_subquery(
         .collect();
 
     if usable.is_empty() {
-        // No usable probe constraints - fall back to coroutine
         return Ok(Some(AccessMethod {
-            cost: estimate_cost_for_scan_or_seek(
-                None,
-                &[],
-                &[],
-                input_cardinality,
-                base_row_count,
-                false,
-                params,
-            ),
+            cost: scan_cost,
             estimated_rows_per_outer_row: *base_row_count,
-            post_access_filter: PostAccessFilter::AllConstraints,
+            residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
+            consumed_where_terms: SmallVec::new(),
             params: AccessMethodParams::Subquery,
         }));
     }
@@ -1224,19 +1266,11 @@ fn find_best_access_method_for_subquery(
     );
 
     if usable_constraint_refs.is_empty() {
-        // No usable constraints after join order filtering - fall back to coroutine
         return Ok(Some(AccessMethod {
-            cost: estimate_cost_for_scan_or_seek(
-                None,
-                &[],
-                &[],
-                input_cardinality,
-                base_row_count,
-                false,
-                params,
-            ),
+            cost: scan_cost,
             estimated_rows_per_outer_row: *base_row_count,
-            post_access_filter: PostAccessFilter::AllConstraints,
+            residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
+            consumed_where_terms: SmallVec::new(),
             params: AccessMethodParams::Subquery,
         }));
     }
@@ -1267,19 +1301,11 @@ fn find_best_access_method_for_subquery(
     }
 
     if index_columns.is_empty() {
-        // Couldn't build index columns - fall back to coroutine
         return Ok(Some(AccessMethod {
-            cost: estimate_cost_for_scan_or_seek(
-                None,
-                &[],
-                &[],
-                input_cardinality,
-                base_row_count,
-                false,
-                params,
-            ),
+            cost: scan_cost,
             estimated_rows_per_outer_row: *base_row_count,
-            post_access_filter: PostAccessFilter::AllConstraints,
+            residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
+            consumed_where_terms: SmallVec::new(),
             params: AccessMethodParams::Subquery,
         }));
     }
@@ -1315,16 +1341,54 @@ fn find_best_access_method_for_subquery(
         index_method: None,
     });
 
-    // Estimate cost: materialization (one scan of subquery) + index seeks
-    // This is much cheaper than nested loop (input_cardinality * subquery_size)
-    let materialization_cost = *base_row_count; // RowCountEstimate implements Deref to f64
-    let seek_cost = input_cardinality * params.cpu_cost_per_seek;
-    let total_cost = Cost(materialization_cost + seek_cost);
+    let estimated_rows_per_outer_row = estimate_rows_per_seek(
+        IndexInfo {
+            unique: false,
+            column_count: key_col_positions.len(),
+            covering: true,
+        },
+        &rhs_constraints.constraints,
+        &usable_constraint_refs,
+        base_row_count,
+    );
+    let one_pass_scan_cost =
+        estimate_cost_for_scan_or_seek(None, &[], &[], 1.0, base_row_count, false, params);
+    let append_build_cost = Cost(*base_row_count * params.cpu_cost_per_seek);
+    let seek_setup_cost = if table_materialization_required || can_direct_materialize_index {
+        // Both table-backed materialization and direct-index materialization avoid
+        // the extra "scan table into probe index" pass. They differ in storage,
+        // not in setup work.
+        one_pass_scan_cost + append_build_cost
+    } else {
+        // Compound SELECTs and other table-backed materializations need two passes:
+        // first produce the ephemeral table, then scan it once to build the probe
+        // index used by SEARCH.
+        one_pass_scan_cost + one_pass_scan_cost + append_build_cost
+    };
+    let seek_cost = Cost(
+        input_cardinality * params.cpu_cost_per_seek
+            + input_cardinality * estimated_rows_per_outer_row * params.cpu_cost_per_row,
+    );
+    let total_cost = seek_setup_cost + seek_cost;
+
+    if scan_cost <= total_cost {
+        return Ok(Some(AccessMethod {
+            cost: scan_cost,
+            estimated_rows_per_outer_row: *base_row_count,
+            residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
+            consumed_where_terms: SmallVec::new(),
+            params: AccessMethodParams::Subquery,
+        }));
+    }
 
     Ok(Some(AccessMethod {
         cost: total_cost,
-        estimated_rows_per_outer_row: *base_row_count,
-        post_access_filter: PostAccessFilter::AllConstraints,
+        estimated_rows_per_outer_row,
+        residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
+        consumed_where_terms: consumed_where_terms_from_constraint_refs(
+            &rhs_constraints.constraints,
+            &usable_constraint_refs,
+        ),
         params: AccessMethodParams::MaterializedSubquery {
             index: ephemeral_index,
             constraint_refs: usable_constraint_refs,

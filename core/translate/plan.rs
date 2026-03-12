@@ -515,6 +515,12 @@ pub struct SelectPlan {
     pub window: Option<Window>,
     /// Subqueries that appear in any part of the query apart from the FROM clause
     pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
+    /// Estimated number of times this SELECT will be invoked by its parent scope.
+    ///
+    /// Top-level queries and standalone FROM-subqueries default to 1. Correlated
+    /// non-FROM subqueries may be re-optimized after their parent join order is
+    /// known so their inner FROM-subqueries can cost repeated probes correctly.
+    pub input_cardinality_hint: Option<f64>,
     /// Estimated output rows from the optimizer's join order computation.
     /// Used to propagate cardinality estimates for CTE/subquery tables.
     pub estimated_output_rows: Option<f64>,
@@ -1588,8 +1594,8 @@ impl JoinedTable {
             plan: Box::new(Plan::Select(plan)),
             columns,
             result_columns_start_reg: None,
-            cte_id: None,
-            materialize_hint: false,
+            materialized_cursor_id: None,
+            cte: None,
         }));
         Ok(Self {
             op: Operation::default_scan_for(&table),
@@ -1678,13 +1684,18 @@ impl JoinedTable {
         // materialize_hint is set true for explicit WITH ... AS MATERIALIZED hint.
         // Multi-reference CTEs are also detected at emission time via reference counting,
         // and they may be materialized regardless of explicit keyword usage.
+        let cte = cte_id.map(|id| crate::schema::FromClauseSubqueryCteMetadata {
+            id,
+            shared_materialization: false,
+            materialize_hint,
+        });
         let table = Table::FromClauseSubquery(Arc::new(FromClauseSubquery {
             name: identifier.clone(),
             plan: Box::new(plan),
             columns,
             result_columns_start_reg: None,
-            cte_id,
-            materialize_hint,
+            materialized_cursor_id: None,
+            cte,
         }));
         Ok(Self {
             op: Operation::default_scan_for(&table),
@@ -1880,10 +1891,7 @@ impl JoinedTable {
     ) -> Result<(Option<CursorID>, Option<CursorID>)> {
         let index = self.op.index();
         let table_cursor_id = if let Table::FromClauseSubquery(from_clause_subquery) = &self.table {
-            match from_clause_subquery.plan.select_query_destination() {
-                Some(QueryDestination::EphemeralTable { cursor_id, .. }) => Some(*cursor_id),
-                _ => None,
-            }
+            from_clause_subquery.materialized_cursor_id
         } else if let OperationMode::UPDATE(UpdateRowSource::PrebuiltEphemeralTable {
             target_table,
             ..

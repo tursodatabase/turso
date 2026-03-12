@@ -9,6 +9,8 @@
 
 #[cfg(test)]
 mod cte_tests {
+    use std::cmp::Ordering;
+
     use rand::Rng;
     use rand_chacha::ChaCha8Rng;
     use rusqlite::{params, types::Value};
@@ -108,8 +110,36 @@ mod cte_tests {
 
     fn sort_rows_for_unordered_compare(rows: &[Vec<Value>]) -> Vec<Vec<Value>> {
         let mut sorted = rows.to_vec();
-        sorted.sort_by_cached_key(|row| format!("{row:?}"));
+        sorted.sort_by(|lhs, rhs| compare_rows(lhs, rhs));
         sorted
+    }
+
+    fn compare_rows(lhs: &[Value], rhs: &[Value]) -> Ordering {
+        lhs.iter()
+            .zip(rhs.iter())
+            .map(|(lhs, rhs)| compare_values(lhs, rhs))
+            .find(|ordering| *ordering != Ordering::Equal)
+            .unwrap_or_else(|| lhs.len().cmp(&rhs.len()))
+    }
+
+    fn compare_values(lhs: &Value, rhs: &Value) -> Ordering {
+        use Value::{Blob, Integer, Null, Real, Text};
+
+        match (lhs, rhs) {
+            (Null, Null) => Ordering::Equal,
+            (Null, _) => Ordering::Less,
+            (_, Null) => Ordering::Greater,
+            (Integer(lhs), Integer(rhs)) => lhs.cmp(rhs),
+            (Integer(_), _) => Ordering::Less,
+            (_, Integer(_)) => Ordering::Greater,
+            (Real(lhs), Real(rhs)) => lhs.total_cmp(rhs),
+            (Real(_), _) => Ordering::Less,
+            (_, Real(_)) => Ordering::Greater,
+            (Text(lhs), Text(rhs)) => lhs.cmp(rhs),
+            (Text(_), Blob(_)) => Ordering::Less,
+            (Blob(_), Text(_)) => Ordering::Greater,
+            (Blob(lhs), Blob(rhs)) => lhs.cmp(rhs),
+        }
     }
 
     fn assert_query_row_parity(

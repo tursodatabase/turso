@@ -23,7 +23,7 @@ use crate::{
         optimizer::{
             access_method::{
                 estimate_hash_join_cost, try_hash_join_access_method, AccessMethodParams,
-                PostAccessFilter,
+                ResidualConstraintMode,
             },
             cost::{Cost, RowCountEstimate},
             order::plan_satisfies_order_target,
@@ -40,6 +40,60 @@ use crate::{
 // Upper bound on rowids to materialize for a hash build input.
 // This is a safety limit, not a cost tuning parameter.
 const MAX_MATERIALIZED_BUILD_ROWS: f64 = 200_000.0;
+
+fn constraint_output_multipliers(
+    rhs_constraints: &TableConstraints,
+    lhs_mask: &TableMask,
+    rhs_self_mask: TableMask,
+    consumed_where_terms: &[usize],
+    params: &CostModelParams,
+) -> f64 {
+    let mut multiplier = 1.0;
+    let mut bounds: SmallVec<[(Option<usize>, bool, bool); 4]> = SmallVec::new();
+
+    let record_bound = |bounds: &mut SmallVec<[(Option<usize>, bool, bool); 4]>,
+                        dominated_col: Option<usize>,
+                        is_lower: bool,
+                        is_upper: bool| {
+        if !(is_lower || is_upper) {
+            return;
+        }
+        if let Some(entry) = bounds.iter_mut().find(|(col, _, _)| *col == dominated_col) {
+            entry.1 |= is_lower;
+            entry.2 |= is_upper;
+        } else {
+            bounds.push((dominated_col, is_lower, is_upper));
+        }
+    };
+
+    for constraint in rhs_constraints.constraints.iter().filter(|constraint| {
+        (lhs_mask.contains_all(&constraint.lhs_mask)
+            || constraint.lhs_mask == rhs_self_mask
+            || constraint.lhs_mask.is_empty())
+            && !consumed_where_terms.contains(&constraint.where_clause_pos.0)
+    }) {
+        multiplier *= constraint.selectivity;
+
+        let dominated_col = constraint.table_col_pos;
+        let is_lower = matches!(
+            constraint.operator.as_ast_operator(),
+            Some(Operator::Greater | Operator::GreaterEquals)
+        );
+        let is_upper = matches!(
+            constraint.operator.as_ast_operator(),
+            Some(Operator::Less | Operator::LessEquals)
+        );
+        record_bound(&mut bounds, dominated_col, is_lower, is_upper);
+    }
+
+    for (_, has_lower, has_upper) in &bounds {
+        if *has_lower && *has_upper {
+            multiplier *= params.closed_range_selectivity_factor;
+        }
+    }
+
+    multiplier
+}
 
 /// Represents an n-ary join, anywhere from 1 table to N tables.
 #[derive(Debug, Clone)]
@@ -77,6 +131,7 @@ impl JoinN {
 #[allow(clippy::too_many_arguments)]
 pub fn join_lhs_and_rhs<'a>(
     lhs: Option<&JoinN>,
+    initial_input_cardinality: f64,
     rhs_table_reference: &JoinedTable,
     rhs_constraints: &'a TableConstraints,
     all_constraints: &'a [TableConstraints],
@@ -99,7 +154,7 @@ pub fn join_lhs_and_rhs<'a>(
     // The input cardinality for this join is the output cardinality of the previous join.
     // For example, in a 2-way join, if the left table has 1000 rows, and the right table will return 2 rows for each of the left table's rows,
     // then the output cardinality of the join will be 2000.
-    let input_cardinality = lhs.map_or(1.0, |l| l.output_cardinality);
+    let input_cardinality = lhs.map_or(initial_input_cardinality, |l| l.output_cardinality);
 
     let rhs_table_number = join_order.last().unwrap().original_idx;
     let rhs_base_rows = base_table_rows
@@ -170,83 +225,6 @@ pub fn join_lhs_and_rhs<'a>(
         m
     };
 
-    // ============================================================================
-    // OUTPUT CARDINALITY ESTIMATION
-    // ============================================================================
-    //
-    // Estimate output rows to compare join orders in the DP algorithm.
-    //
-    // CONSTRAINT TYPES:
-    // 1. EQUI-JOIN: References LHS tables (e.g., t1.a = t2.b). Enables index seeks.
-    // 2. LITERAL: Column vs constant (e.g., t2.x > 5). No table references.
-    // 3. SELF: Compares columns within same table (e.g., t2.y = t2.z).
-    //
-    // TWO MULTIPLIERS:
-    // - all_multiplier: All constraints. Used for FULL SCANS.
-    // - local_filter_multiplier: Only literal + self-constraints. Used for INDEX/ROWID
-    //   SEEKS where equi-join selectivity is already accounted for by the fanout
-    //   of the seek itself.
-    //
-    let (output_cardinality_multiplier, local_filter_multiplier) = {
-        let mut all_multiplier = 1.0;
-        let mut local_multiplier = 1.0;
-        // Track range bounds to detect closed ranges like "x > 5 AND x < 10"
-        let mut column_bounds: SmallVec<[(Option<usize>, bool, bool); 4]> = SmallVec::new();
-
-        for c in rhs_constraints.constraints.iter().filter(|c| {
-            // Include constraint if:
-            // - All tables it references are in LHS (equi-join, can use for seek)
-            // - OR it's a self-constraint (compares columns within same table)
-            // - OR it's a literal constraint (e.g., col > 5, no table refs)
-            lhs_mask.contains_all(&c.lhs_mask)
-                || c.lhs_mask == rhs_self_mask
-                || c.lhs_mask.is_empty()
-        }) {
-            all_multiplier *= c.selectivity;
-
-            // Local filters: only self-constraints and literals (NOT equi-joins)
-            let is_local_filter = c.lhs_mask == rhs_self_mask || c.lhs_mask.is_empty();
-            if is_local_filter {
-                local_multiplier *= c.selectivity;
-            }
-
-            // Track range bounds per column for closed-range detection
-            let dominated_col = c.table_col_pos;
-            let dominated_col_is_lower = matches!(
-                c.operator.as_ast_operator(),
-                Some(Operator::Greater | Operator::GreaterEquals)
-            );
-            let dominated_col_is_upper = matches!(
-                c.operator.as_ast_operator(),
-                Some(Operator::Less | Operator::LessEquals)
-            );
-            if dominated_col_is_lower || dominated_col_is_upper {
-                if let Some(entry) = column_bounds
-                    .iter_mut()
-                    .find(|(col, _, _)| *col == dominated_col)
-                {
-                    entry.1 |= dominated_col_is_lower;
-                    entry.2 |= dominated_col_is_upper;
-                } else {
-                    column_bounds.push((
-                        dominated_col,
-                        dominated_col_is_lower,
-                        dominated_col_is_upper,
-                    ));
-                }
-            }
-        }
-
-        // Apply closed-range bonus for columns with both lower and upper bounds
-        for (_, has_lower, has_upper) in &column_bounds {
-            if *has_lower && *has_upper {
-                all_multiplier *= params.closed_range_selectivity_factor;
-                local_multiplier *= params.closed_range_selectivity_factor;
-            }
-        }
-
-        (all_multiplier, local_multiplier)
-    };
     let rhs_internal_id = rhs_table_reference.internal_id;
     let lhs_internal_ids: HashSet<TableInternalId> = lhs
         .map(|l| {
@@ -697,7 +675,8 @@ pub fn join_lhs_and_rhs<'a>(
                 best_access_method = AccessMethod {
                     cost: fts_cost,
                     estimated_rows_per_outer_row: cost_estimate.estimated_rows as f64,
-                    post_access_filter: PostAccessFilter::None,
+                    residual_constraints: ResidualConstraintMode::None,
+                    consumed_where_terms: candidate.where_covered.into_iter().collect(),
                     params: AccessMethodParams::IndexMethod {
                         query: candidate.to_query(),
                         where_covered: candidate.where_covered,
@@ -745,17 +724,22 @@ pub fn join_lhs_and_rhs<'a>(
     // - multi-index OR/AND scans
     // - index-method access such as FTS
     //
-    // Join planning only applies the remaining filter class that the chosen
-    // access path did not already account for.
+    // Join planning only applies the selectivity of WHERE terms that the chosen
+    // access path did not already consume.
     //
-    let post_access_filter_multiplier = match best_access_method.post_access_filter {
-        PostAccessFilter::AllConstraints => output_cardinality_multiplier,
-        PostAccessFilter::LocalOnly => local_filter_multiplier,
-        PostAccessFilter::None => 1.0,
+    let unconsumed_constraint_multiplier = constraint_output_multipliers(
+        rhs_constraints,
+        &lhs_mask,
+        rhs_self_mask,
+        &best_access_method.consumed_where_terms,
+        params,
+    );
+    let residual_multiplier = match best_access_method.residual_constraints {
+        ResidualConstraintMode::ApplyUnconsumed => unconsumed_constraint_multiplier,
+        ResidualConstraintMode::None => 1.0,
     };
-    let output_cardinality = input_cardinality
-        * best_access_method.estimated_rows_per_outer_row
-        * post_access_filter_multiplier;
+    let output_cardinality =
+        input_cardinality * best_access_method.estimated_rows_per_outer_row * residual_multiplier;
 
     access_methods_arena.push(best_access_method);
 
@@ -883,6 +867,7 @@ pub struct BestJoinOrderResult {
 #[allow(clippy::too_many_arguments)]
 pub fn compute_best_join_order<'a>(
     joined_tables: &[JoinedTable],
+    initial_input_cardinality: f64,
     maybe_order_target: Option<&OrderTarget>,
     constraints: &'a [TableConstraints],
     base_table_rows: &[RowCountEstimate],
@@ -911,6 +896,7 @@ pub fn compute_best_join_order<'a>(
     if num_tables > GREEDY_JOIN_THRESHOLD {
         return compute_greedy_join_order(
             joined_tables,
+            initial_input_cardinality,
             maybe_order_target,
             constraints,
             base_table_rows,
@@ -930,6 +916,7 @@ pub fn compute_best_join_order<'a>(
     // Compute naive left-to-right plan to use as pruning threshold
     let naive_plan = compute_naive_left_deep_plan(
         joined_tables,
+        initial_input_cardinality,
         maybe_order_target,
         base_table_rows,
         access_methods_arena,
@@ -1013,6 +1000,7 @@ pub fn compute_best_join_order<'a>(
         turso_assert_eq!(join_order.len(), 1);
         let rel = join_lhs_and_rhs(
             None,
+            initial_input_cardinality,
             table_ref,
             &constraints[i],
             constraints,
@@ -1151,6 +1139,7 @@ pub fn compute_best_join_order<'a>(
                     // Calculate the best way to join LHS with RHS.
                     let rel = join_lhs_and_rhs(
                         Some(lhs),
+                        initial_input_cardinality,
                         &joined_tables[rhs_idx],
                         &constraints[rhs_idx],
                         constraints,
@@ -1305,6 +1294,7 @@ pub const GREEDY_JOIN_THRESHOLD: usize = 12;
 #[allow(clippy::too_many_arguments)]
 pub fn compute_greedy_join_order<'a>(
     joined_tables: &[JoinedTable],
+    initial_input_cardinality: f64,
     maybe_order_target: Option<&OrderTarget>,
     constraints: &'a [TableConstraints],
     base_table_rows: &[RowCountEstimate],
@@ -1358,6 +1348,7 @@ pub fn compute_greedy_join_order<'a>(
 
     let mut current_plan: Option<JoinN> = join_lhs_and_rhs(
         None,
+        initial_input_cardinality,
         first_table,
         &constraints[first_idx],
         constraints,
@@ -1445,6 +1436,7 @@ pub fn compute_greedy_join_order<'a>(
 
             if let Some(plan) = join_lhs_and_rhs(
                 current_plan.as_ref(),
+                initial_input_cardinality,
                 table,
                 &constraints[idx],
                 constraints,
@@ -1563,6 +1555,7 @@ fn find_best_starting_table(
 #[allow(clippy::too_many_arguments)]
 pub fn compute_naive_left_deep_plan<'a>(
     joined_tables: &[JoinedTable],
+    initial_input_cardinality: f64,
     maybe_order_target: Option<&OrderTarget>,
     base_table_rows: &[RowCountEstimate],
     access_methods_arena: &'a mut Vec<AccessMethod>,
@@ -1593,6 +1586,7 @@ pub fn compute_naive_left_deep_plan<'a>(
     // Start with first table
     let mut best_plan = join_lhs_and_rhs(
         None,
+        initial_input_cardinality,
         &joined_tables[0],
         &constraints[0],
         constraints,
@@ -1620,6 +1614,7 @@ pub fn compute_naive_left_deep_plan<'a>(
     for i in 1..n {
         best_plan = join_lhs_and_rhs(
             best_plan.as_ref(),
+            initial_input_cardinality,
             &joined_tables[i],
             &constraints[i],
             constraints,
@@ -1793,6 +1788,7 @@ mod tests {
         let schema = empty_schema();
         let result = compute_best_join_order(
             table_references.joined_tables(),
+            1.0,
             None,
             &table_constraints,
             &base_table_rows,
@@ -1837,6 +1833,7 @@ mod tests {
         let schema = empty_schema();
         let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
             table_references.joined_tables(),
+            1.0,
             None,
             &table_constraints,
             &base_table_rows,
@@ -1891,6 +1888,7 @@ mod tests {
         let schema = empty_schema();
         let result = compute_best_join_order(
             table_references.joined_tables(),
+            1.0,
             None,
             &table_constraints,
             &base_table_rows,
@@ -1975,6 +1973,7 @@ mod tests {
         let schema = empty_schema();
         let result = compute_best_join_order(
             table_references.joined_tables(),
+            1.0,
             None,
             &table_constraints,
             &base_table_rows,
@@ -2075,6 +2074,7 @@ mod tests {
         let schema = empty_schema();
         let result = compute_best_join_order(
             table_references.joined_tables(),
+            1.0,
             None,
             &table_constraints,
             &base_table_rows,
@@ -2277,6 +2277,7 @@ mod tests {
         let schema = empty_schema();
         let result = compute_best_join_order(
             table_references.joined_tables(),
+            1.0,
             None,
             &table_constraints,
             &base_table_rows,
@@ -2405,6 +2406,7 @@ mod tests {
         let schema = empty_schema();
         let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
             table_references.joined_tables(),
+            1.0,
             None,
             &table_constraints,
             &base_table_rows,
@@ -2530,6 +2532,7 @@ mod tests {
         let schema = empty_schema();
         let result = compute_best_join_order(
             table_references.joined_tables(),
+            1.0,
             None,
             &table_constraints,
             &base_table_rows,
@@ -2632,6 +2635,7 @@ mod tests {
         let schema = empty_schema();
         let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
             table_references.joined_tables(),
+            1.0,
             None,
             &table_constraints,
             &base_table_rows,
@@ -2775,6 +2779,7 @@ mod tests {
         let schema = empty_schema();
         let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
             table_references.joined_tables(),
+            1.0,
             None,
             &table_constraints,
             &base_table_rows,
@@ -2906,6 +2911,7 @@ mod tests {
         let schema = empty_schema();
         let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
             table_references.joined_tables(),
+            1.0,
             None,
             &table_constraints,
             &base_table_rows,
@@ -3056,6 +3062,7 @@ mod tests {
         let schema = empty_schema();
         let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
             table_references.joined_tables(),
+            1.0,
             None,
             &table_constraints,
             &base_table_rows,
@@ -3279,6 +3286,7 @@ mod tests {
         let schema = empty_schema();
         let result = compute_best_join_order(
             table_references.joined_tables(),
+            1.0,
             None,
             &table_constraints,
             &base_table_rows,

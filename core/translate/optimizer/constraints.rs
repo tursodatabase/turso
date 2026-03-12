@@ -1416,7 +1416,8 @@ pub fn usable_constraints_for_join_order<'a>(
 /// Unlike ordinary index analysis, the ephemeral index does not have a fixed
 /// on-disk column order, so we can choose one that matches the intended probe
 /// shape. Equalities come first, followed by columns that are constrained only
-/// by ranges.
+/// by ranges. Columns that have both equality and range predicates stay in the
+/// equality prefix; the range side is redundant for key ordering.
 pub fn ordered_materialized_key_columns(constraints: &[&Constraint]) -> Vec<usize> {
     let mut equality_cols = Vec::new();
     let mut range_only_cols = Vec::new();

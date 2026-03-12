@@ -331,6 +331,7 @@ fn prepare_one_select_plan(
                 values: vec![],
                 window: None,
                 non_from_clause_subqueries: vec![],
+                input_cardinality_hint: None,
                 estimated_output_rows: None,
                 simple_aggregate: None,
             };
@@ -683,6 +684,7 @@ fn prepare_one_select_plan(
                     .collect(),
                 window: None,
                 non_from_clause_subqueries,
+                input_cardinality_hint: None,
                 estimated_output_rows: None,
                 simple_aggregate: None,
             };

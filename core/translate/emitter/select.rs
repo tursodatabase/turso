@@ -981,6 +981,7 @@ fn build_materialized_build_input_plan(
         values: vec![],
         window: None,
         non_from_clause_subqueries: plan.non_from_clause_subqueries.clone(),
+        input_cardinality_hint: None,
         estimated_output_rows: None,
         simple_aggregate: None,
     };

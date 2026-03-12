@@ -859,7 +859,7 @@ fn parse_table(
         let cte_id = outer_ref.cte_id;
         let outer_table = outer_ref.table.clone();
         let materialize_hint = match &outer_table {
-            Table::FromClauseSubquery(subquery) => subquery.materialize_hint,
+            Table::FromClauseSubquery(subquery) => subquery.materialize_hint(),
             _ => false,
         };
 

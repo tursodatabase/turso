@@ -10,7 +10,7 @@ use crate::schema::{Index, Schema};
 use crate::translate::expr::expr_references_any_subquery;
 use crate::translate::optimizer::access_method::{
     choose_best_btree_candidate, choose_best_in_seek_candidate, AccessMethod, AccessMethodParams,
-    BranchReadMode, ChosenInSeekCandidate, PostAccessFilter,
+    BranchReadMode, ChosenInSeekCandidate, ResidualConstraintMode,
 };
 use crate::translate::optimizer::constraints::{
     analyze_binary_term_for_index, constraints_from_where_clause, Constraint, RangeConstraintRef,
@@ -25,6 +25,7 @@ use crate::translate::plan::{
 };
 use crate::translate::planner::{table_mask_from_expr, TableMask};
 use rustc_hash::FxHashMap as HashMap;
+use smallvec::SmallVec;
 use std::{collections::VecDeque, sync::Arc};
 use turso_parser::ast::{self, TableInternalId};
 
@@ -667,10 +668,28 @@ fn evaluate_multi_index_branches(
     };
 
     if multi_index_cost < best_cost {
+        let mut consumed_where_terms = SmallVec::<[usize; 4]>::new();
+        consumed_where_terms.push(where_term_idx);
+        for term_idx in additional_consumed_terms.iter().copied() {
+            if !consumed_where_terms.contains(&term_idx) {
+                consumed_where_terms.push(term_idx);
+            }
+        }
+        for branch in &branch_params {
+            if let MultiIndexBranchAccessParams::Seek { constraints, .. } = &branch.access {
+                for constraint in constraints {
+                    let where_term_idx = constraint.where_clause_pos.0;
+                    if !consumed_where_terms.contains(&where_term_idx) {
+                        consumed_where_terms.push(where_term_idx);
+                    }
+                }
+            }
+        }
         Some(AccessMethod {
             cost: multi_index_cost,
             estimated_rows_per_outer_row: estimated_rows,
-            post_access_filter: PostAccessFilter::LocalOnly,
+            residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
+            consumed_where_terms,
             params: AccessMethodParams::MultiIndexScan {
                 branches: branch_params,
                 where_term_idx,

@@ -28,9 +28,9 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN big AS b
+|--SCAN tiny AS t
 |  `--SCAN items
 |--SEARCH m USING INDEX ephemeral_subquery_t4 (id=?)
 |  `--SCAN items
-`--SEARCH t USING INDEX ephemeral_subquery_t2 (id=?)
+`--SEARCH b USING INDEX ephemeral_subquery_t6 (id=?)
    `--SCAN items

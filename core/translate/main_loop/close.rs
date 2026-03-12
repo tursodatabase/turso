@@ -407,20 +407,32 @@ pub(super) struct AutoIndexResult {
     pub(super) use_bloom_filter: bool,
 }
 
+pub(super) struct AutoIndexBuild<'a> {
+    pub(super) index: &'a Arc<Index>,
+    pub(super) table_cursor_id: CursorID,
+    pub(super) index_cursor_id: CursorID,
+    pub(super) table_has_rowid: bool,
+    pub(super) num_seek_keys: usize,
+    pub(super) seek_def: &'a SeekDef,
+    pub(super) affinity_str: Option<&'a Arc<String>>,
+}
+
 /// Open an ephemeral index cursor and build an automatic index on a table.
 /// This is used as a last-resort to avoid a nested full table scan
 /// Returns the cursor id of the ephemeral index cursor.
-#[expect(clippy::too_many_arguments)]
 pub(super) fn emit_autoindex(
     program: &mut ProgramBuilder,
-    index: &Arc<Index>,
-    table_cursor_id: CursorID,
-    index_cursor_id: CursorID,
-    table_has_rowid: bool,
-    num_seek_keys: usize,
-    seek_def: &SeekDef,
-    affinity_str: Option<&Arc<String>>,
+    build: AutoIndexBuild<'_>,
 ) -> Result<AutoIndexResult> {
+    let AutoIndexBuild {
+        index,
+        table_cursor_id,
+        index_cursor_id,
+        table_has_rowid,
+        num_seek_keys,
+        seek_def,
+        affinity_str,
+    } = build;
     turso_assert!(index.ephemeral, "index must be ephemeral", { "index_name": &index.name });
     let label_ephemeral_build_end = program.allocate_label();
     // Since this typically happens in an inner loop, we only build it once.

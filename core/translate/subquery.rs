@@ -15,8 +15,9 @@ use crate::{
         },
         optimizer::optimize_select_plan,
         plan::{
-            ColumnUsedMask, JoinOrderMember, NonFromClauseSubquery, OuterQueryReference, Plan,
-            SetOperation, SubqueryPosition, SubqueryState, TableReferences, WhereTerm,
+            plan_is_correlated, ColumnUsedMask, JoinOrderMember, NonFromClauseSubquery,
+            OuterQueryReference, Plan, SetOperation, SubqueryPosition, SubqueryState,
+            TableReferences, WhereTerm,
         },
         select::prepare_select_plan,
     },
@@ -65,6 +66,53 @@ pub(crate) fn materialized_from_clause_subquery_storage(
             Some(MaterializedFromClauseSubqueryStorage::DirectIndex)
         }
         _ => None,
+    }
+}
+
+/// Mark CTE references that must be materialized once and shared across
+/// multiple reads of the same query tree.
+///
+/// Correlated plans are explicitly excluded: they must re-run for each outer
+/// row, so sharing a single materialized result would be semantically wrong.
+fn mark_shared_cte_materialization_requirements(program: &ProgramBuilder, plan: &mut SelectPlan) {
+    fn annotate_plan(program: &ProgramBuilder, plan: &mut Plan) {
+        match plan {
+            Plan::Select(select_plan) => {
+                mark_shared_cte_materialization_requirements(program, select_plan)
+            }
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => {
+                for (select_plan, _) in left.iter_mut() {
+                    mark_shared_cte_materialization_requirements(program, select_plan);
+                }
+                mark_shared_cte_materialization_requirements(program, right_most);
+            }
+            Plan::Delete(_) | Plan::Update(_) => unreachable!("DML plans cannot be subqueries"),
+        }
+    }
+
+    for table in plan.table_references.joined_tables_mut().iter_mut() {
+        if let Table::FromClauseSubquery(from_clause_subquery) = &mut table.table {
+            let from_clause_subquery = Arc::make_mut(from_clause_subquery);
+            from_clause_subquery.set_shared_materialization(
+                from_clause_subquery.cte_id().is_some_and(|cte_id| {
+                    program.get_cte_reference_count(cte_id) > 1
+                        && !plan_is_correlated(&from_clause_subquery.plan)
+                }),
+            );
+            annotate_plan(program, from_clause_subquery.plan.as_mut());
+        }
+    }
+
+    for subquery in plan.non_from_clause_subqueries.iter_mut() {
+        let SubqueryState::Unevaluated {
+            plan: Some(subquery_plan),
+        } = &mut subquery.state
+        else {
+            continue;
+        };
+        mark_shared_cte_materialization_requirements(program, subquery_plan);
     }
 }
 
@@ -172,6 +220,8 @@ pub fn plan_subqueries_from_select_plan(
     if !plan.aggregates.is_empty() {
         recollect_aggregates(plan, resolver)?;
     }
+
+    mark_shared_cte_materialization_requirements(program, plan);
 
     update_column_used_masks(
         &mut plan.table_references,
@@ -316,7 +366,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
             .map(|t| {
                 // Extract cte_id from FromClauseSubquery if this is a CTE reference
                 let cte_id = match &t.table {
-                    Table::FromClauseSubquery(subq) => subq.cte_id,
+                    Table::FromClauseSubquery(subq) => subq.cte_id(),
                     _ => None,
                 };
                 OuterQueryReference {
@@ -832,18 +882,18 @@ fn pre_materialize_multi_ref_ctes_in_tables(
             pre_materialize_multi_ref_ctes(program, from_clause_subquery.plan.as_mut(), t_ctx)?;
 
             // Then check if THIS CTE should be materialized
-            if let Some(cte_id) = from_clause_subquery.cte_id {
+            if let Some(cte_id) = from_clause_subquery.cte_id() {
                 if program.get_materialized_cte(cte_id).is_some() {
                     continue;
                 }
-                let is_multi_ref = program.get_cte_reference_count(cte_id) > 1;
-                if from_clause_subquery.materialize_hint || is_multi_ref {
-                    let (result_columns_start, cte_cursor_id, cte_table) = emit_materialized_cte(
-                        program,
-                        from_clause_subquery.plan.as_mut(),
-                        t_ctx,
-                        &from_clause_subquery.columns,
-                    )?;
+                if from_clause_subquery.requires_table_materialization() {
+                    let (result_columns_start, cte_cursor_id, cte_table) =
+                        emit_materialized_subquery_table(
+                            program,
+                            from_clause_subquery.plan.as_mut(),
+                            t_ctx,
+                            &from_clause_subquery.columns,
+                        )?;
                     program.register_materialized_cte(
                         cte_id,
                         MaterializedCteInfo {
@@ -852,6 +902,7 @@ fn pre_materialize_multi_ref_ctes_in_tables(
                             num_columns: from_clause_subquery.columns.len(),
                         },
                     );
+                    from_clause_subquery.materialized_cursor_id = Some(cte_cursor_id);
                     from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
                     program
                         .set_subquery_result_reg(table_reference.internal_id, result_columns_start);
@@ -863,13 +914,9 @@ fn pre_materialize_multi_ref_ctes_in_tables(
 }
 
 fn choose_from_clause_subquery_execution_mode(
-    program: &ProgramBuilder,
     operation: &Operation,
     from_clause_subquery: &crate::schema::FromClauseSubquery,
 ) -> FromClauseSubqueryExecutionMode {
-    let is_multi_ref_cte = from_clause_subquery
-        .cte_id
-        .is_some_and(|id| program.get_cte_reference_count(id) > 1);
     let needs_materialized_seek = matches!(
         operation,
         Operation::Search(Search::Seek {
@@ -882,11 +929,7 @@ fn choose_from_clause_subquery_execution_mode(
     // seek index as the storage target would collapse those roles together and
     // break set-operation semantics, so keep the direct-index fast path limited
     // to simple SELECT plans.
-    let supports_direct_index_materialization =
-        matches!(from_clause_subquery.plan.as_ref(), Plan::Select(_));
-    let can_direct_materialize_index = supports_direct_index_materialization
-        && !from_clause_subquery.materialize_hint
-        && !is_multi_ref_cte;
+    let can_direct_materialize_index = from_clause_subquery.supports_direct_index_materialization();
 
     match operation {
         Operation::Search(Search::Seek {
@@ -899,7 +942,7 @@ fn choose_from_clause_subquery_execution_mode(
             })
         }
         _ if needs_materialized_seek => FromClauseSubqueryExecutionMode::MaterializedTable,
-        _ if from_clause_subquery.materialize_hint || is_multi_ref_cte => {
+        _ if from_clause_subquery.requires_table_materialization() => {
             FromClauseSubqueryExecutionMode::MaterializedTable
         }
         _ => FromClauseSubqueryExecutionMode::Coroutine,
@@ -948,7 +991,6 @@ pub fn emit_from_clause_subqueries(
 
     for table_index in visit_order {
         let table_reference = &mut tables.joined_tables_mut()[table_index];
-        let table_op = table_reference.op.clone();
         let left_join_suffix = if outer_table_set.contains(&table_index) {
             " LEFT-JOIN"
         } else {
@@ -1066,10 +1108,21 @@ pub fn emit_from_clause_subqueries(
         );
 
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table_reference.table {
+            let execution_mode = {
+                let from_clause_subquery = from_clause_subquery.as_ref();
+                choose_from_clause_subquery_execution_mode(
+                    &table_reference.op,
+                    from_clause_subquery,
+                )
+            };
             let from_clause_subquery = Arc::make_mut(from_clause_subquery);
             // Check if this is a CTE that's already materialized
-            if let Some(cte_id) = from_clause_subquery.cte_id {
+            if let Some(cte_id) = from_clause_subquery.cte_id() {
                 if let Some(cte_info) = program.get_materialized_cte(cte_id).cloned() {
+                    if from_clause_subquery.materialized_cursor_id.is_some() {
+                        program.pop_current_parent_explain();
+                        continue;
+                    }
                     // === SUBSEQUENT CTE REFERENCE: Use OpenDup ===
                     // Create a dup cursor pointing to the same ephemeral table
                     let dup_cursor_id =
@@ -1094,6 +1147,7 @@ pub fn emit_from_clause_subqueries(
                     // iterators of the same CTE (e.g., outer query and subquery) would
                     // overwrite each other's values when reading columns from their cursors.
                     let result_columns_start = program.alloc_registers(cte_info.num_columns);
+                    from_clause_subquery.materialized_cursor_id = Some(dup_cursor_id);
                     from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
                     program
                         .set_subquery_result_reg(table_reference.internal_id, result_columns_start);
@@ -1102,22 +1156,20 @@ pub fn emit_from_clause_subqueries(
                 }
             }
 
-            let result_columns_start = match choose_from_clause_subquery_execution_mode(
-                program,
-                &table_op,
-                from_clause_subquery,
-            ) {
+            let result_columns_start = match execution_mode {
                 FromClauseSubqueryExecutionMode::Coroutine => {
                     emit_from_clause_subquery(program, from_clause_subquery.plan.as_mut(), t_ctx)?
                 }
                 FromClauseSubqueryExecutionMode::MaterializedTable => {
-                    let (result_columns_start, cte_cursor_id, cte_table) = emit_materialized_cte(
-                        program,
-                        from_clause_subquery.plan.as_mut(),
-                        t_ctx,
-                        &from_clause_subquery.columns,
-                    )?;
-                    if let Some(cte_id) = from_clause_subquery.cte_id {
+                    let (result_columns_start, cte_cursor_id, cte_table) =
+                        emit_materialized_subquery_table(
+                            program,
+                            from_clause_subquery.plan.as_mut(),
+                            t_ctx,
+                            &from_clause_subquery.columns,
+                        )?;
+                    from_clause_subquery.materialized_cursor_id = Some(cte_cursor_id);
+                    if let Some(cte_id) = from_clause_subquery.cte_id() {
                         program.register_materialized_cte(
                             cte_id,
                             MaterializedCteInfo {
@@ -1327,7 +1379,7 @@ fn emit_indexed_materialized_subquery(
     Ok(result_columns_start_reg)
 }
 
-fn emit_materialized_cte(
+fn emit_materialized_subquery_table(
     program: &mut ProgramBuilder,
     plan: &mut Plan,
     t_ctx: &mut TranslateCtx,
@@ -1352,7 +1404,6 @@ fn emit_materialized_cte(
         check_constraints: vec![],
     });
 
-    // Allocate cursor for the ephemeral table
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ephemeral_table.clone()));
 
     // Allocate registers for reading result columns

@@ -17,5 +17,5 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-`--SEARCH subq USING INDEX ephemeral_subquery_t2 (avg_price>?)
+`--SCAN subq
    `--SCAN products USING INDEX idx_products_category

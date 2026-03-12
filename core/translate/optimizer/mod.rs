@@ -605,6 +605,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
         &plan.non_from_clause_subqueries,
         &mut plan.limit,
         &mut plan.offset,
+        plan.input_cardinality_hint.unwrap_or(1.0),
     )?;
 
     if matches!(plan.simple_aggregate, Some(SimpleAggregate::MinMax(_)))
@@ -647,6 +648,8 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
         plan.estimated_output_rows = Some(est);
     }
 
+    reoptimize_correlated_subqueries(plan, schema)?;
+
     Ok(())
 }
 
@@ -678,6 +681,7 @@ fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
         &plan.non_from_clause_subqueries,
         &mut plan.limit,
         &mut plan.offset,
+        1.0,
     )?;
 
     Ok(())
@@ -710,6 +714,7 @@ fn optimize_update_plan(
         &plan.non_from_clause_subqueries,
         &mut plan.limit,
         &mut plan.offset,
+        1.0,
     )?;
 
     if let Some(reason) = first_update_safety_reason(plan, resolver)? {
@@ -966,6 +971,7 @@ fn add_ephemeral_table_to_update_plan(
         distinctness: super::plan::Distinctness::NonDistinct,
         values: vec![],
         window: None,
+        input_cardinality_hint: None,
         estimated_output_rows: None,
         // Only move WHERE clause subqueries to the ephemeral plan.
         // SET clause and RETURNING clause subqueries must remain in the main update plan
@@ -1023,6 +1029,79 @@ fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Re-run correlated subqueries once the enclosing plan has learned a better
+/// estimate for how many times they will be invoked.
+///
+/// This converges because `input_cardinality_hint` is monotonic within one
+/// optimization pass: once a plan receives a hint, later re-entry compares
+/// against that stored hint and skips re-optimization unless the new hint is
+/// strictly larger. The recursive call therefore only propagates larger hints
+/// down the subquery tree; it does not oscillate based on newly estimated row
+/// counts.
+fn reoptimize_correlated_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
+    let Some(invocation_hint) = plan
+        .input_cardinality_hint
+        .or(plan.estimated_output_rows)
+        .filter(|hint| *hint > 1.0)
+    else {
+        return Ok(());
+    };
+
+    for subquery in &mut plan.non_from_clause_subqueries {
+        if !subquery.correlated {
+            continue;
+        }
+        let SubqueryState::Unevaluated {
+            plan: Some(inner_plan),
+        } = &mut subquery.state
+        else {
+            continue;
+        };
+        if !select_plan_contains_cte_from_clause_subquery(inner_plan) {
+            continue;
+        }
+
+        if inner_plan
+            .input_cardinality_hint
+            .is_some_and(|hint| hint >= invocation_hint)
+        {
+            continue;
+        }
+
+        inner_plan.input_cardinality_hint = Some(invocation_hint);
+        optimize_select_plan(inner_plan, schema)?;
+    }
+
+    Ok(())
+}
+
+/// Return whether this plan contains any FROM-clause CTE reference whose
+/// access-path choice may change when the enclosing invocation count grows.
+fn select_plan_contains_cte_from_clause_subquery(plan: &SelectPlan) -> bool {
+    plan.table_references
+        .joined_tables()
+        .iter()
+        .any(|table| match &table.table {
+            Table::FromClauseSubquery(subquery) => {
+                subquery.cte_id().is_some()
+                    || match subquery.plan.as_ref() {
+                        Plan::Select(select_plan) => {
+                            select_plan_contains_cte_from_clause_subquery(select_plan)
+                        }
+                        Plan::CompoundSelect {
+                            left, right_most, ..
+                        } => {
+                            left.iter().any(|(select_plan, _)| {
+                                select_plan_contains_cte_from_clause_subquery(select_plan)
+                            }) || select_plan_contains_cte_from_clause_subquery(right_most)
+                        }
+                        Plan::Delete(_) | Plan::Update(_) => false,
+                    }
+            }
+            _ => false,
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1374,6 +1453,7 @@ fn optimize_table_access(
     subqueries: &[NonFromClauseSubquery],
     limit: &mut Option<Box<Expr>>,
     offset: &mut Option<Box<Expr>>,
+    initial_input_cardinality: f64,
 ) -> Result<Option<OptimizeTableAccessResult>> {
     // When optimizer_params feature is enabled, use lazily-loaded params (cached process-wide).
     // Otherwise, use the compile-time static for zero overhead.
@@ -1538,6 +1618,7 @@ fn optimize_table_access(
 
     let Some(best_join_order_result) = compute_best_join_order(
         table_references.joined_tables(),
+        initial_input_cardinality,
         maybe_order_target.as_ref(),
         &constraints_per_table,
         &base_table_rows,

@@ -1,6 +1,7 @@
 use super::*;
 use crate::translate::main_loop::{conditions::LoopConditionEmitter, hash::HashProbeSetupEmitter};
 use crate::translate::{
+    main_loop::close::AutoIndexBuild,
     plan,
     subquery::{materialized_from_clause_subquery_storage, MaterializedFromClauseSubqueryStorage},
 };
@@ -15,9 +16,21 @@ fn emit_materialized_subquery_result_columns(
         return;
     };
 
+    let index_to_table = index.map(|index| {
+        let mut source_cols = vec![None; from_clause_subquery.columns.len()];
+        for (source_col, idx_col) in index.columns.iter().enumerate() {
+            source_cols[idx_col.pos_in_table] = Some(source_col);
+        }
+        source_cols
+    });
+
     for col_idx in 0..from_clause_subquery.columns.len() {
-        let source_col = index
-            .and_then(|index| index.columns.iter().position(|c| c.pos_in_table == col_idx))
+        let source_col = index_to_table
+            .as_ref()
+            .map(|source_cols| {
+                source_cols[col_idx]
+                    .expect("direct materialized subquery index must cover every result column")
+            })
             .unwrap_or(col_idx);
         program.emit_insn(Insn::Column {
             cursor_id,
@@ -281,17 +294,22 @@ impl OpenLoop {
                                         use_bloom_filter, ..
                                     } = emit_autoindex(
                                         program,
-                                        index,
-                                        table_cursor_id.expect(
-                                            "an ephemeral index must have a source table cursor",
-                                        ),
-                                        index_cursor_id
-                                            .expect("an ephemeral index must have an index cursor"),
-                                        table_has_rowid,
-                                        num_seek_keys,
-                                        seek_def,
-                                        plan::synthesized_seek_affinity_str(index, seek_def)
+                                        AutoIndexBuild {
+                                            index,
+                                            table_cursor_id: table_cursor_id.expect(
+                                                "an ephemeral index must have a source table cursor",
+                                            ),
+                                            index_cursor_id: index_cursor_id.expect(
+                                                "an ephemeral index must have an index cursor",
+                                            ),
+                                            table_has_rowid,
+                                            num_seek_keys,
+                                            seek_def,
+                                            affinity_str: plan::synthesized_seek_affinity_str(
+                                                index, seek_def,
+                                            )
                                             .as_ref(),
+                                        },
                                     )?;
                                     bloom_filter = use_bloom_filter;
                                 }
