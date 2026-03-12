@@ -230,6 +230,9 @@ test materialized-cte-max-with-where {
 expect {
     25.0
 }
+expect @js {
+    25
+}
 
 test materialized-cte-min-with-where-skips-null {
     CREATE TABLE products(price REAL);
@@ -243,6 +246,9 @@ test materialized-cte-min-with-where-skips-null {
 }
 expect {
     10.0
+}
+expect @js {
+    10
 }
 
 test materialized-cte-max-without-where {
@@ -258,8 +264,11 @@ test materialized-cte-max-without-where {
 expect {
     125.0
 }
+expect @js {
+    125
+}
 
-test materialized-cte-correlated-max-without-explicit-order {
+test materialized-cte-correlated-max-with-implicit-inner-order {
     CREATE TABLE products(price REAL NOT NULL);
     CREATE INDEX idx_products_price ON products(price);
     INSERT INTO products VALUES (10), (25), (15), (125);
@@ -273,12 +282,18 @@ test materialized-cte-correlated-max-without-explicit-order {
         WHERE p2.price < p1.price
     )
     FROM prices p1
-    WHERE p1.price < 100;
+    WHERE p1.price < 100
+    ORDER BY p1.price;
 }
 expect {
     10.0|
     15.0|10.0
     25.0|15.0
+}
+expect @js {
+    10|
+    15|10
+    25|15
 }
 
 test unordered-materialized-cte-max-without-where {
@@ -292,6 +307,9 @@ test unordered-materialized-cte-max-without-where {
 }
 expect {
     125.0
+}
+expect @js {
+    125
 }
 
 test unordered-materialized-cte-correlated-max {
@@ -307,12 +325,18 @@ test unordered-materialized-cte-correlated-max {
         WHERE p2.price < p1.price
     )
     FROM prices p1
-    WHERE p1.price < 100;
+    WHERE p1.price < 100
+    ORDER BY p1.price;
 }
 expect {
     10.0|
-    25.0|15.0
     15.0|10.0
+    25.0|15.0
+}
+expect @js {
+    10|
+    15|10
+    25|15
 }
 
 # ============================================================
