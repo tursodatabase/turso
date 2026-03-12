@@ -434,7 +434,7 @@ pub struct BindContext<'a, G: IdGenerator> {
 }
 
 impl<'a, G: IdGenerator> BindContext<'a, G> {
-    fn new(resolver: &'a Resolver<'a>, id_gen: &'a mut G) -> Self {
+    pub fn new(resolver: &'a Resolver<'a>, id_gen: &'a mut G) -> Self {
         Self {
             resolver,
             id_gen,
@@ -659,7 +659,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
     /// Bind a SELECT statement, resolving all name references in-place.
     /// Returns the bound query result needed by planning.
-    fn bind_select(&mut self, select: &mut ast::Select) -> Result<BoundSelect> {
+    pub fn bind_select(&mut self, select: &mut ast::Select) -> Result<BoundSelect> {
         self.with_query(|ctx| {
             // 1. Bind CTEs from WITH clause
             if let Some(with) = &mut select.with {
@@ -747,9 +747,14 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
                     Ok((bound_columns, scope))
                 }
-                ast::OneSelect::Values(_) => {
-                    // VALUES clauses have no column references to bind
-                    Ok((Vec::new(), BindScope::empty()))
+                ast::OneSelect::Values(rows) => {
+                    let scope = BindScope::empty();
+                    for row in rows.iter_mut() {
+                        for expr in row.iter_mut() {
+                            ctx.bind_expr(expr, &scope)?;
+                        }
+                    }
+                    Ok((Vec::new(), scope))
                 }
             }
         })
@@ -2024,15 +2029,9 @@ mod tests {
     #[test]
     fn window_does_not_resolve_aliases() {
         with_bind_context(&["CREATE TABLE t(a)"], |ctx| {
-            let err = bind_select_error(
-                ctx,
-                "SELECT a AS z FROM t WINDOW w AS (PARTITION BY z)",
-            )
-            .to_string();
-            assert!(
-                err.contains("no such column: z"),
-                "unexpected error: {err}"
-            );
+            let err = bind_select_error(ctx, "SELECT a AS z FROM t WINDOW w AS (PARTITION BY z)")
+                .to_string();
+            assert!(err.contains("no such column: z"), "unexpected error: {err}");
         });
     }
 
@@ -2114,6 +2113,54 @@ mod tests {
                     ast::Operator::Add,
                     ast::Expr::Literal(ast::Literal::Numeric("1".into())).into_boxed(),
                 )
+            );
+        });
+    }
+
+    fn values_exprs(select: &ast::Select) -> &[Vec<Box<ast::Expr>>] {
+        match &select.body.select {
+            ast::OneSelect::Values(rows) => rows,
+            other => panic!("expected VALUES, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn values_double_quoted_identifier_becomes_string_literal() {
+        with_bind_context(&[], |ctx| {
+            let mut select = parse_select("VALUES (\"hello\")");
+            ctx.bind_select(&mut select).unwrap();
+
+            let rows = values_exprs(&select);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0][0].as_ref(),
+                &ast::Expr::Literal(ast::Literal::String("'hello'".into()))
+            );
+        });
+    }
+
+    #[test]
+    fn values_numeric_literals_are_untouched() {
+        with_bind_context(&[], |ctx| {
+            let mut select = parse_select("VALUES (1, 2, 3)");
+            ctx.bind_select(&mut select).unwrap();
+
+            let rows = values_exprs(&select);
+            assert_eq!(rows[0].len(), 3);
+            assert_eq!(
+                rows[0][0].as_ref(),
+                &ast::Expr::Literal(ast::Literal::Numeric("1".into()))
+            );
+        });
+    }
+
+    #[test]
+    fn values_unquoted_identifier_errors() {
+        with_bind_context(&[], |ctx| {
+            let err = bind_select_error(ctx, "VALUES (x)").to_string();
+            assert!(
+                err.contains("no such column: x"),
+                "unexpected error: {err}"
             );
         });
     }
