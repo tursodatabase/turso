@@ -2037,3 +2037,172 @@ test trigger-returning-delete-rejected {
 expect error {
     RETURNING
 }
+
+# NOT IN (SELECT ...) subquery in WHEN clause
+@cross-check-integrity
+test trigger-when-not-in-subquery {
+    CREATE TABLE t_src(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t_lookup(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE t_log(msg TEXT);
+    INSERT INTO t_lookup VALUES(1, 'alice');
+    INSERT INTO t_lookup VALUES(2, 'bob');
+    CREATE TRIGGER tr_not_in AFTER INSERT ON t_src
+        WHEN NEW.a NOT IN (SELECT id FROM t_lookup)
+    BEGIN
+        INSERT INTO t_log VALUES('new id: ' || NEW.a);
+    END;
+    INSERT INTO t_src VALUES(1, 'exists');
+    INSERT INTO t_src VALUES(3, 'new');
+    INSERT INTO t_src VALUES(2, 'exists too');
+    INSERT INTO t_src VALUES(5, 'also new');
+    SELECT * FROM t_log ORDER BY rowid;
+}
+expect {
+    new id: 3
+    new id: 5
+}
+
+# IN (SELECT ...) subquery in WHEN clause
+@cross-check-integrity
+test trigger-when-in-subquery {
+    CREATE TABLE t_in_src(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t_in_lookup(id INTEGER PRIMARY KEY);
+    CREATE TABLE t_in_log(msg TEXT);
+    INSERT INTO t_in_lookup VALUES(10);
+    INSERT INTO t_in_lookup VALUES(20);
+    CREATE TRIGGER tr_in AFTER INSERT ON t_in_src
+        WHEN NEW.a IN (SELECT id FROM t_in_lookup)
+    BEGIN
+        INSERT INTO t_in_log VALUES('matched: ' || NEW.a);
+    END;
+    INSERT INTO t_in_src VALUES(10, 'yes');
+    INSERT INTO t_in_src VALUES(15, 'no');
+    INSERT INTO t_in_src VALUES(20, 'yes');
+    SELECT * FROM t_in_log ORDER BY rowid;
+}
+expect {
+    matched: 10
+    matched: 20
+}
+
+# EXISTS subquery in WHEN clause (correlated)
+@cross-check-integrity
+test trigger-when-exists-correlated {
+    CREATE TABLE t_ex_src(a INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE t_ex_ref(id INTEGER PRIMARY KEY, threshold INTEGER);
+    CREATE TABLE t_ex_log(msg TEXT);
+    INSERT INTO t_ex_ref VALUES(1, 50);
+    INSERT INTO t_ex_ref VALUES(2, 100);
+    CREATE TRIGGER tr_exists AFTER INSERT ON t_ex_src
+        WHEN EXISTS (SELECT 1 FROM t_ex_ref WHERE threshold < NEW.val)
+    BEGIN
+        INSERT INTO t_ex_log VALUES('val exceeds some threshold: ' || NEW.val);
+    END;
+    INSERT INTO t_ex_src VALUES(1, 30);
+    INSERT INTO t_ex_src VALUES(2, 75);
+    INSERT INTO t_ex_src VALUES(3, 150);
+    SELECT * FROM t_ex_log ORDER BY rowid;
+}
+expect {
+    val exceeds some threshold: 75
+    val exceeds some threshold: 150
+}
+
+# NOT EXISTS subquery in WHEN clause
+@cross-check-integrity
+test trigger-when-not-exists {
+    CREATE TABLE t_nex_src(a INTEGER PRIMARY KEY, category TEXT);
+    CREATE TABLE t_nex_blocked(cat TEXT);
+    CREATE TABLE t_nex_log(msg TEXT);
+    INSERT INTO t_nex_blocked VALUES('spam');
+    INSERT INTO t_nex_blocked VALUES('junk');
+    CREATE TRIGGER tr_not_exists BEFORE INSERT ON t_nex_src
+        WHEN NOT EXISTS (SELECT 1 FROM t_nex_blocked WHERE cat = NEW.category)
+    BEGIN
+        INSERT INTO t_nex_log VALUES('accepted: ' || NEW.category);
+    END;
+    INSERT INTO t_nex_src VALUES(1, 'good');
+    INSERT INTO t_nex_src VALUES(2, 'spam');
+    INSERT INTO t_nex_src VALUES(3, 'great');
+    INSERT INTO t_nex_src VALUES(4, 'junk');
+    SELECT * FROM t_nex_log ORDER BY rowid;
+}
+expect {
+    accepted: good
+    accepted: great
+}
+
+# Scalar subquery in WHEN clause
+@cross-check-integrity
+test trigger-when-scalar-subquery {
+    CREATE TABLE t_sc_src(a INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE t_sc_config(threshold INTEGER);
+    CREATE TABLE t_sc_log(msg TEXT);
+    INSERT INTO t_sc_config VALUES(10);
+    CREATE TRIGGER tr_scalar AFTER INSERT ON t_sc_src
+        WHEN NEW.val > (SELECT threshold FROM t_sc_config LIMIT 1)
+    BEGIN
+        INSERT INTO t_sc_log VALUES('over threshold: ' || NEW.val);
+    END;
+    INSERT INTO t_sc_src VALUES(1, 5);
+    INSERT INTO t_sc_src VALUES(2, 15);
+    INSERT INTO t_sc_src VALUES(3, 8);
+    INSERT INTO t_sc_src VALUES(4, 20);
+    SELECT * FROM t_sc_log ORDER BY rowid;
+}
+expect {
+    over threshold: 15
+    over threshold: 20
+}
+
+# DELETE trigger with OLD in WHEN subquery
+@cross-check-integrity
+test trigger-when-subquery-old-ref {
+    CREATE TABLE t_del_src(a INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE t_del_protected(id INTEGER PRIMARY KEY);
+    CREATE TABLE t_del_log(msg TEXT);
+    INSERT INTO t_del_protected VALUES(1);
+    INSERT INTO t_del_protected VALUES(3);
+    INSERT INTO t_del_src VALUES(1, 10);
+    INSERT INTO t_del_src VALUES(2, 20);
+    INSERT INTO t_del_src VALUES(3, 30);
+    CREATE TRIGGER tr_del_protect BEFORE DELETE ON t_del_src
+        WHEN OLD.a IN (SELECT id FROM t_del_protected)
+    BEGIN
+        INSERT INTO t_del_log VALUES('attempted delete of protected id: ' || OLD.a);
+    END;
+    DELETE FROM t_del_src WHERE a = 1;
+    DELETE FROM t_del_src WHERE a = 2;
+    DELETE FROM t_del_src WHERE a = 3;
+    SELECT * FROM t_del_log ORDER BY rowid;
+}
+expect {
+    attempted delete of protected id: 1
+    attempted delete of protected id: 3
+}
+
+# UPDATE trigger with WHEN subquery using both OLD and NEW
+@cross-check-integrity
+test trigger-when-subquery-update-old-new {
+    CREATE TABLE t_upd_src(a INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE t_upd_limits(id INTEGER PRIMARY KEY, max_val INTEGER);
+    CREATE TABLE t_upd_log(msg TEXT);
+    INSERT INTO t_upd_limits VALUES(1, 100);
+    INSERT INTO t_upd_limits VALUES(2, 50);
+    INSERT INTO t_upd_src VALUES(1, 10);
+    INSERT INTO t_upd_src VALUES(2, 20);
+    CREATE TRIGGER tr_upd_check AFTER UPDATE ON t_upd_src
+        WHEN NEW.val > (SELECT max_val FROM t_upd_limits WHERE id = NEW.a)
+    BEGIN
+        INSERT INTO t_upd_log VALUES('exceeded limit for id ' || NEW.a || ': ' || NEW.val);
+    END;
+    UPDATE t_upd_src SET val = 50 WHERE a = 1;
+    UPDATE t_upd_src SET val = 200 WHERE a = 1;
+    UPDATE t_upd_src SET val = 30 WHERE a = 2;
+    UPDATE t_upd_src SET val = 60 WHERE a = 2;
+    SELECT * FROM t_upd_log ORDER BY rowid;
+}
+expect {
+    exceeded limit for id 1: 200
+    exceeded limit for id 2: 60
+}
