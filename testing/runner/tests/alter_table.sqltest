@@ -213,6 +213,18 @@ expect {
     7
 }
 
+@skip-if mvcc "ATTACH is not supported in MVCC mode"
+test alter-table-rename-column-view-attached-db-same-db {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t (a, b);
+    CREATE VIEW aux.v AS SELECT b FROM t;
+    ALTER TABLE aux.t RENAME COLUMN b TO c;
+    SELECT sql FROM aux.sqlite_schema WHERE type = 'view' AND name = 'v';
+}
+expect {
+    CREATE VIEW v AS SELECT c FROM t
+}
+
 # https://github.com/tursodatabase/turso/issues/5246
 @cross-check-integrity
 test alter-table-rename-column-case-insensitive {
@@ -1708,6 +1720,23 @@ test alter-rename-col-schema-update-cmd {
 }
 expect pattern {
     CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN\s+UPDATE src SET c = c \+ 10 WHERE a = new\.x;\s+END
+}
+
+test alter-rename-col-schema-update-cmd-from {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS aux;
+    DROP TABLE IF EXISTS dst;
+    CREATE TABLE src (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE aux (a INTEGER PRIMARY KEY, z);
+    CREATE TABLE dst (x);
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN
+        UPDATE aux SET z = src.b FROM src WHERE aux.a = src.a AND src.a = new.x;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'trig1';
+}
+expect pattern {
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN\s+UPDATE aux SET z = src\.c FROM src WHERE aux\.a = src\.a AND src\.a = new\.x;\s+END
 }
 
 test alter-rename-col-schema-delete-where {
