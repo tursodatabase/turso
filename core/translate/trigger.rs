@@ -125,20 +125,46 @@ pub fn translate_create_trigger(
         bail_parse_error!("Trigger {} already exists", normalized_trigger_name);
     }
 
-    // Verify the table exists
-    let table = resolver.with_schema(database_id, |s| s.get_table(&normalized_table_name));
-    let Some(table) = table else {
-        bail_parse_error!("no such table: {}", normalized_table_name);
-    };
-    if table.virtual_table().is_some() {
-        bail_parse_error!("cannot create triggers on virtual tables");
-    }
+    let trigger_time = time.unwrap_or(ast::TriggerTime::Before);
+    let (target_table, target_view) = resolver.with_schema(database_id, |s| {
+        (
+            s.get_table(&normalized_table_name),
+            s.get_view(&normalized_table_name),
+        )
+    });
 
-    if time
-        .as_ref()
-        .is_some_and(|t| *t == ast::TriggerTime::InsteadOf)
-    {
-        bail_parse_error!("INSTEAD OF triggers are not supported yet");
+    match trigger_time {
+        ast::TriggerTime::InsteadOf => {
+            if target_view.is_none() {
+                if target_table.is_some() {
+                    bail_parse_error!(
+                        "cannot create INSTEAD OF trigger on table: {}",
+                        normalized_table_name
+                    );
+                }
+                bail_parse_error!("no such table: {}", normalized_table_name);
+            }
+        }
+        ast::TriggerTime::Before | ast::TriggerTime::After => {
+            let Some(target_table) = target_table else {
+                if target_view.is_some() {
+                    let trigger_time_name = match trigger_time {
+                        ast::TriggerTime::Before => "BEFORE",
+                        ast::TriggerTime::After => "AFTER",
+                        ast::TriggerTime::InsteadOf => unreachable!(),
+                    };
+                    bail_parse_error!(
+                        "cannot create {} trigger on view: {}",
+                        trigger_time_name,
+                        normalized_table_name
+                    );
+                }
+                bail_parse_error!("no such table: {}", normalized_table_name);
+            };
+            if target_table.virtual_table().is_some() {
+                bail_parse_error!("cannot create triggers on virtual tables");
+            }
+        }
     }
 
     if temporary {

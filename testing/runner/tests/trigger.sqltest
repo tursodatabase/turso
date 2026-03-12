@@ -2206,3 +2206,61 @@ expect {
     exceeded limit for id 1: 200
     exceeded limit for id 2: 60
 }
+
+# regression test for https://github.com/tursodatabase/turso/issues/5865
+test trigger-instead-of-on-view-creation {
+    CREATE TABLE t(a, b);
+    CREATE VIEW v AS SELECT a, b FROM t;
+    CREATE TRIGGER tr_v_insert INSTEAD OF INSERT ON v BEGIN
+      INSERT INTO t VALUES(NEW.a, NEW.b);
+    END;
+    SELECT type, name, tbl_name FROM sqlite_schema WHERE type='trigger' AND name='tr_v_insert';
+}
+expect {
+    trigger|tr_v_insert|v
+}
+
+test trigger-instead-of-on-attached-view-creation {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t(a, b);
+    CREATE VIEW aux.v AS SELECT a, b FROM t;
+    CREATE TRIGGER aux.tr_aux INSTEAD OF INSERT ON v BEGIN
+      INSERT INTO t VALUES(NEW.a, NEW.b);
+    END;
+    SELECT type, name, tbl_name FROM aux.sqlite_schema WHERE type='trigger' AND name='tr_aux';
+}
+expect {
+    trigger|tr_aux|v
+}
+
+test trigger-instead-of-on-table-rejected {
+    CREATE TABLE t(a, b);
+    CREATE TRIGGER tr_bad INSTEAD OF INSERT ON t BEGIN
+      SELECT 1;
+    END;
+}
+expect error {
+    cannot create INSTEAD OF trigger on table
+}
+
+test trigger-before-on-view-rejected {
+    CREATE TABLE t(a, b);
+    CREATE VIEW v AS SELECT a, b FROM t;
+    CREATE TRIGGER tr_bad BEFORE INSERT ON v BEGIN
+      SELECT 1;
+    END;
+}
+expect error {
+    cannot create BEFORE trigger on view
+}
+
+test trigger-after-on-view-rejected {
+    CREATE TABLE t(a, b);
+    CREATE VIEW v AS SELECT a, b FROM t;
+    CREATE TRIGGER tr_bad AFTER INSERT ON v BEGIN
+      SELECT 1;
+    END;
+}
+expect error {
+    cannot create AFTER trigger on view
+}
