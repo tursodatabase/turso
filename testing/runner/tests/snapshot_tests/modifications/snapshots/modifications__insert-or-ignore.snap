@@ -28,16 +28,16 @@ addr  opcode         p1  p2  p3  p4                p5  comment
   11  Goto            0  13   0                     0
   12  NewRowid        1   2   0                     0  r[2]=rowid
   13  Affinity        3   4   0                     0  r[3..7] = D, B, B, B
-  14  NotExists       1  16   2                     0
-  15  Goto            0  32   0                     0
-  16  Copy            4   8   0                     0  r[8]=r[4]
-  17  Copy            2   9   0                     0  r[9]=r[2]
-  18  Affinity        8   1   0                     0  r[8..9] = B
-  19  NoConflict      0  22   8  1                  0  key=r[8..8]
-  20  Goto            0  32   0                     0
-  21  Halt         2067   0   0  users.email        0
-  22  IsNull          4  32   0                     0  if (r[4]==NULL) goto 32
-  23  IsNull          5  32   0                     0  if (r[5]==NULL) goto 32
+  14  IsNull          4  32   0                     0  if (r[4]==NULL) goto 32
+  15  IsNull          5  32   0                     0  if (r[5]==NULL) goto 32
+  16  NotExists       1  18   2                     0
+  17  Goto            0  32   0                     0
+  18  Copy            4   8   0                     0  r[8]=r[4]
+  19  Copy            2   9   0                     0  r[9]=r[2]
+  20  Affinity        8   1   0                     0  r[8..9] = B
+  21  NoConflict      0  24   8  1                  0  key=r[8..8]
+  22  Goto            0  32   0                     0
+  23  Halt         2067   0   0  users.email        0
   24  MakeRecord      3   4   7                     0  r[7]=mkrec(r[3..6])
   25  Copy            4  10   0                     0  r[10]=r[4]
   26  Copy            2  11   0                     0  r[11]=r[2]

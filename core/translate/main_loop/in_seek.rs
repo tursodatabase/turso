@@ -40,6 +40,7 @@ pub(super) fn open_in_seek_source_cursor(
                 has_rowid: false,
                 where_clause: None,
                 index_method: None,
+                on_conflict: None,
             });
             let eph_cursor = program.alloc_cursor_id(CursorType::BTreeIndex(ephemeral_index));
             program.emit_insn(Insn::OpenEphemeral {
