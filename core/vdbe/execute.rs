@@ -10591,6 +10591,7 @@ pub fn op_alter_column(
             db,
             table: table_name,
             column_index,
+            triggers_to_rewrite,
             definition,
             rename,
         },
@@ -10616,7 +10617,7 @@ pub fn op_alter_column(
     let new_column = crate::schema::Column::try_from(definition.as_ref())?;
     let new_name = definition.col_name.as_str().to_owned();
 
-    conn.with_database_schema_mut(*db, |schema| {
+    conn.with_database_schema_mut(*db, |schema| -> crate::Result<()> {
         let table_arc = schema
             .tables
             .get_mut(&normalized_table_name)
@@ -10718,7 +10719,47 @@ pub fn op_alter_column(
                 }
             }
         }
-    });
+
+        // Reparse each trigger with updated SQL and refresh the in-memory schema cache.
+        // The disk (sqlite_master) was already updated by the bytecode emitted in alter.rs.
+        for (trigger_name, new_sql) in triggers_to_rewrite.iter() {
+            use crate::schema::Trigger;
+            use turso_parser::ast::{Cmd, Stmt};
+            let mut parser = Parser::new(new_sql.as_bytes());
+            let Ok(Some(Cmd::Stmt(Stmt::CreateTrigger {
+                temporary,
+                if_not_exists: _,
+                trigger_name: _,
+                time,
+                event,
+                tbl_name,
+                for_each_row,
+                when_clause,
+                commands,
+            }))) = parser.next_cmd()
+            else {
+                return Err(crate::LimboError::ParseError(format!(
+                    "invalid trigger sql: {new_sql}"
+                )));
+            };
+            schema.remove_trigger(trigger_name)?;
+            schema.add_trigger(
+                Trigger::new(
+                    trigger_name.clone(),
+                    new_sql.to_string(),
+                    tbl_name.name.to_string(),
+                    time,
+                    event,
+                    for_each_row,
+                    when_clause.map(|e| *e),
+                    commands,
+                    temporary,
+                ),
+                tbl_name.name.as_str(),
+            )?;
+        }
+        Ok(())
+    })?;
 
     if *rename {
         conn.with_schema(*db, |schema| -> crate::Result<()> {

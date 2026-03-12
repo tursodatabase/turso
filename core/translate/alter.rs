@@ -1357,6 +1357,10 @@ pub fn translate_alter_table(
             });
 
             // Update trigger SQL for renamed columns
+            // Clone before the loop since `for` takes ownership of the Vec.
+            // The clone is passed into AlterColumn so op_alter_column can
+            // update the in-memory schema triggers cache.
+            let triggers_for_insn = triggers_to_rewrite.clone();
             for (trigger_name, new_sql) in triggers_to_rewrite {
                 let escaped_sql = new_sql.replace('\'', "''");
                 let update_stmt = format!(
@@ -1399,6 +1403,7 @@ pub fn translate_alter_table(
                 db: database_id,
                 table: table_name.to_owned(),
                 column_index,
+                triggers_to_rewrite: triggers_for_insn,
                 definition: Box::new(definition),
                 rename,
             });

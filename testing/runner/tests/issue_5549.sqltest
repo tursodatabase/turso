@@ -1,0 +1,18 @@
+@database :memory:
+
+test trigger_cache_after_rename_column {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER tr AFTER INSERT ON t
+    BEGIN
+      INSERT INTO log VALUES('name=' || NEW.name);
+    END;
+    INSERT INTO t VALUES(1, 'test');
+    ALTER TABLE t RENAME COLUMN name TO full_name;
+    INSERT INTO t VALUES(2, 'hello');
+    SELECT msg FROM log ORDER BY msg;
+}
+expect {
+    name=hello
+    name=test
+}

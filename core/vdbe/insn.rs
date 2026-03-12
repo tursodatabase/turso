@@ -1338,6 +1338,7 @@ pub enum Insn {
     AlterColumn {
         db: usize,
         table: String,
+        triggers_to_rewrite: Vec<(String, String)>,
         column_index: usize,
         definition: Box<turso_parser::ast::ColumnDefinition>,
         rename: bool,
