@@ -14,7 +14,7 @@ use crate::{
         order_by::EmitOrderBy,
         plan::{
             Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinOrderMember, Operation,
-            QueryDestination, Scan, Search, SeekKeyComponent, SelectPlan,
+            QueryDestination, Scan, Search, SeekKeyComponent, SelectPlan, SimpleAggregate,
         },
         planner::table_mask_from_expr,
         select::emit_simple_count,
@@ -226,7 +226,9 @@ pub fn emit_query<'a>(
         &mut plan.non_from_clause_subqueries,
     )?;
 
-    if plan.is_simple_count() && emit_simple_count(program, t_ctx, plan)? {
+    if matches!(plan.simple_aggregate, Some(SimpleAggregate::Count))
+        && emit_simple_count(program, t_ctx, plan)?
+    {
         // Keep LIMIT's early-exit jump target valid even on the simple_count fast path.
         // init_limit may emit an IfNot to after_main_loop_label (e.g. scalar subquery injects LIMIT 1).
         // Without resolving this label before the early return, bytecode assembly fails
@@ -980,6 +982,7 @@ fn build_materialized_build_input_plan(
         window: None,
         non_from_clause_subqueries: plan.non_from_clause_subqueries.clone(),
         estimated_output_rows: None,
+        simple_aggregate: None,
     };
 
     prune_join_order_for_materialized_inputs(&mut materialize_plan, materialized_build_inputs)?;

@@ -458,6 +458,27 @@ impl DistinctCtx {
     }
 }
 
+/// Detected simple-aggregate optimization.
+///
+/// Analogous to SQLite's `isSimpleCount()` / `minMaxQuery()`. When set on a
+/// `SelectPlan`, the emitter can use a specialised fast path instead of a full
+/// scan + accumulate loop.
+#[derive(Debug, Clone)]
+pub enum SimpleAggregate {
+    /// `SELECT count(*) FROM <tbl>` — uses the `Insn::Count` opcode directly.
+    Count,
+    /// `SELECT min(expr) FROM …` or `SELECT max(expr) FROM …` — the optimizer
+    /// will pick an index that delivers rows in the right order so the emitter
+    /// only needs to read the first (non-NULL for MIN) row.
+    MinMax {
+        func: AggFunc,
+        argument: ast::Expr,
+        order: SortOrder,
+        /// Explicit COLLATE override, if any. `None` means use the column default.
+        collation: Option<CollationSeq>,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct SelectPlan {
     pub table_references: TableReferences,
@@ -494,6 +515,9 @@ pub struct SelectPlan {
     /// Estimated output rows from the optimizer's join order computation.
     /// Used to propagate cardinality estimates for CTE/subquery tables.
     pub estimated_output_rows: Option<f64>,
+    /// When set, this query is a simple aggregate (COUNT(*), MIN, or MAX)
+    /// that can be satisfied without a full table scan.
+    pub simple_aggregate: Option<SimpleAggregate>,
 }
 
 impl SelectPlan {
@@ -520,40 +544,6 @@ impl SelectPlan {
                     Table::FromClauseSubquery(subquery) => plan_is_correlated(&subquery.plan),
                     _ => false,
                 })
-    }
-
-    /// Reference: https://github.com/sqlite/sqlite/blob/5db695197b74580c777b37ab1b787531f15f7f9f/src/select.c#L8613
-    ///
-    /// Checks to see if the query is of the format `SELECT count(*) FROM <tbl>`
-    pub fn is_simple_count(&self) -> bool {
-        if !self.where_clause.is_empty()
-            || self.aggregates.len() != 1
-            || !matches!(self.query_destination, QueryDestination::ResultRows)
-            || self.table_references.joined_tables().len() != 1
-            || !self.table_references.outer_query_refs().is_empty()
-            || self.result_columns.len() != 1
-            || self.group_by.is_some()
-            || self.limit.is_some()
-            || self.offset.is_some()
-            || self.contains_constant_false_condition
-        // TODO: (pedrocarlo) maybe can optimize to use the count optmization with more columns
-        {
-            return false;
-        }
-        let table_ref = self.table_references.joined_tables().first().unwrap();
-        if !matches!(table_ref.table, crate::schema::Table::BTree(..)) {
-            return false;
-        }
-        let agg = self
-            .aggregates
-            .first()
-            .expect("we already checked aggregates.len() == 1");
-        let result_expr = &self
-            .result_columns
-            .first()
-            .expect("we already checked result_columns.len() == 1")
-            .expr;
-        matches!(agg.func, AggFunc::Count0) && exprs_are_equivalent(result_expr, &agg.original_expr)
     }
 }
 

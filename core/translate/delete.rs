@@ -379,6 +379,7 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
         // WHERE subqueries should already be planned into this SelectPlan when needed.
         non_from_clause_subqueries: vec![],
         estimated_output_rows: None,
+        simple_aggregate: None,
     };
     plan.rowset_plan = Some(rowset_plan);
 }

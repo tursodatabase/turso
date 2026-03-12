@@ -1,0 +1,105 @@
+@database :memory:
+
+test unindexed-max-does-not-early-exit {
+    CREATE TABLE measurements(value INTEGER);
+    INSERT INTO measurements VALUES (10), (25), (15);
+
+    SELECT MAX(value) FROM measurements;
+}
+expect {
+    25
+}
+
+test unindexed-min-does-not-early-exit {
+    CREATE TABLE measurements(value INTEGER);
+    INSERT INTO measurements VALUES (20), (10), (25), (15);
+
+    SELECT MIN(value) FROM measurements;
+}
+expect {
+    10
+}
+
+test simple-count-scalar-subquery {
+    CREATE TABLE measurements(value INTEGER);
+    INSERT INTO measurements VALUES (10), (25), (15);
+
+    SELECT (SELECT COUNT(*) FROM measurements);
+}
+expect {
+    3
+}
+
+test indexed-max-result {
+    CREATE TABLE measurements(value INTEGER);
+    CREATE INDEX idx_measurements_value ON measurements(value);
+    INSERT INTO measurements VALUES (NULL), (10), (25), (15);
+
+    SELECT MAX(value) FROM measurements;
+}
+expect {
+    25
+}
+
+test indexed-min-result-skips-null {
+    CREATE TABLE measurements(value INTEGER);
+    CREATE INDEX idx_measurements_value ON measurements(value);
+    INSERT INTO measurements VALUES (NULL), (10), (25), (15);
+
+    SELECT MIN(value) FROM measurements;
+}
+expect {
+    10
+}
+
+test indexed-min-all-null-returns-null {
+    CREATE TABLE measurements(value INTEGER);
+    CREATE INDEX idx_measurements_value ON measurements(value);
+    INSERT INTO measurements VALUES (NULL), (NULL), (NULL);
+
+    SELECT MIN(value) FROM measurements;
+}
+expect {
+
+}
+
+test indexed-min-empty-table-returns-null {
+    CREATE TABLE measurements(value INTEGER);
+    CREATE INDEX idx_measurements_value ON measurements(value);
+
+    SELECT MIN(value) FROM measurements;
+}
+expect {
+
+}
+
+test indexed-max-with-equality-prefix {
+    CREATE TABLE measurements(category TEXT, value INTEGER);
+    CREATE INDEX idx_measurements_category_value ON measurements(category, value);
+    INSERT INTO measurements VALUES
+        ('a', 10),
+        ('a', 25),
+        ('a', 15),
+        ('b', 99);
+
+    SELECT MAX(value) FROM measurements WHERE category = 'a';
+}
+expect {
+    25
+}
+
+test indexed-min-with-equality-prefix-skips-null {
+    CREATE TABLE measurements(category TEXT, value INTEGER);
+    CREATE INDEX idx_measurements_category_value ON measurements(category, value);
+    INSERT INTO measurements VALUES
+        ('a', NULL),
+        ('a', 10),
+        ('a', 25),
+        ('a', 15),
+        ('b', 1);
+
+    SELECT MIN(value) FROM measurements WHERE category = 'a';
+}
+expect {
+    10
+}

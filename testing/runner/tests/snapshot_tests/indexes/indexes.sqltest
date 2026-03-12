@@ -82,6 +82,16 @@ setup schema {
     );
 }
 
+setup min_max_equality_prefix {
+    CREATE TABLE measurements (
+        category TEXT NOT NULL,
+        value INTEGER
+    );
+
+    CREATE INDEX idx_measurements_category_value
+        ON measurements(category, value);
+}
+
 # =============================================================================
 # 1. Simple Index Lookup - WHERE indexed_col = ?
 # =============================================================================
@@ -445,8 +455,23 @@ snapshot-eqp index-for-min {
 }
 
 @setup schema
+snapshot index-for-min-bytecode {
+    SELECT MIN(price) FROM products;
+}
+
+@setup schema
 snapshot-eqp index-for-max {
     SELECT MAX(price) FROM products;
+}
+
+@setup schema
+snapshot index-for-max-bytecode {
+    SELECT MAX(price) FROM products;
+}
+
+@setup min_max_equality_prefix
+snapshot max-with-equality-prefix-bytecode {
+    SELECT MAX(value) FROM measurements WHERE category = 'a';
 }
 
 # Index with NOT equal (typically cannot use index efficiently)

@@ -1,7 +1,7 @@
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::MultiIndexBranchAccess;
 use crate::{
-    function::Deterministic,
+    function::{AggFunc, Deterministic},
     index_method::IndexMethodCostEstimate,
     numeric::Numeric,
     schema::{BTreeTable, Index, IndexColumn, Schema, Table, ROWID_SENTINEL},
@@ -40,18 +40,22 @@ use constraints::{
 use cost::Cost;
 use join::{compute_best_join_order, BestJoinOrderResult};
 use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
-use order::{compute_order_target, plan_satisfies_order_target, EliminatesSortBy};
+use order::{
+    compute_order_target, plan_satisfies_order_target, simple_aggregate_order_target,
+    EliminatesSortBy,
+};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
 use turso_parser::ast::{self, Expr, SortOrder, SubqueryType, TriggerEvent};
 
 use super::{
+    collate::get_collseq_from_expr,
     emitter::Resolver,
     plan::{
         DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinOrderMember, JoinType,
         JoinedTable, MultiIndexBranch, MultiIndexScanOp, Operation, Plan, Search, SeekDef, SeekKey,
-        SelectPlan, TableReferences, UpdatePlan, WhereTerm,
+        SelectPlan, SimpleAggregate, TableReferences, UpdatePlan, WhereTerm,
     },
     planner::TableMask,
 };
@@ -490,6 +494,69 @@ fn transform_match_to_fts_match(where_clause: &mut [WhereTerm]) {
     }
 }
 
+/// Detect whether this plan qualifies for the simple-aggregate fast path.
+///
+/// Analogous to SQLite's `isSimpleCount()` + `minMaxQuery()`.
+/// Must be called before `optimize_table_access` so the order target is available.
+fn detect_simple_aggregate(plan: &SelectPlan) -> Option<SimpleAggregate> {
+    // Common preconditions shared by count(*) and min/max.
+    if plan.aggregates.len() != 1
+        || plan.table_references.joined_tables().len() != 1
+        || !plan.table_references.outer_query_refs().is_empty()
+        || plan.result_columns.len() != 1
+        || plan.group_by.is_some()
+        || plan.contains_constant_false_condition
+    {
+        return None;
+    }
+
+    let table_ref = plan.table_references.joined_tables().first().unwrap();
+    if !matches!(table_ref.table, Table::BTree(..)) {
+        return None;
+    }
+
+    let agg = plan.aggregates.first().unwrap();
+    let result_expr = &plan.result_columns.first().unwrap().expr;
+
+    // The result column must be exactly the aggregate expression (not wrapped in
+    // something like `length(count(*))`).
+    if !exprs_are_equivalent(result_expr, &agg.original_expr) {
+        return None;
+    }
+
+    match agg.func {
+        AggFunc::Count0
+            if plan.where_clause.is_empty() && plan.limit.is_none() && plan.offset.is_none() =>
+        {
+            Some(SimpleAggregate::Count)
+        }
+        AggFunc::Min | AggFunc::Max if agg.args.len() == 1 => {
+            let argument = agg.args[0].clone();
+            let order = if matches!(agg.func, AggFunc::Min) {
+                SortOrder::Asc
+            } else {
+                SortOrder::Desc
+            };
+            let collation = get_collseq_from_expr(&argument, &plan.table_references)
+                .ok()
+                .flatten();
+            Some(SimpleAggregate::MinMax {
+                func: agg.func.clone(),
+                argument,
+                order,
+                collation,
+            })
+        }
+        _ => None,
+    }
+}
+
+struct OptimizeTableAccessResult {
+    join_order: Vec<JoinOrderMember>,
+    output_rows: f64,
+    min_max_fast_path: bool,
+}
+
 /**
  * Make a few passes over the plan to optimize it.
  * TODO: these could probably be done in less passes,
@@ -524,6 +591,8 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
         return Ok(());
     }
 
+    plan.simple_aggregate = detect_simple_aggregate(plan);
+
     let best_join_order = optimize_table_access(
         schema,
         &mut plan.result_columns,
@@ -532,13 +601,27 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
         &mut plan.where_clause,
         &mut plan.order_by,
         &mut plan.group_by,
+        plan.simple_aggregate.as_ref(),
         &plan.non_from_clause_subqueries,
         &mut plan.limit,
         &mut plan.offset,
     )?;
 
-    if let Some((best_join_order, output_rows)) = best_join_order {
-        plan.join_order = best_join_order;
+    if matches!(plan.simple_aggregate, Some(SimpleAggregate::MinMax { .. }))
+        && !best_join_order
+            .as_ref()
+            .is_some_and(|result| result.min_max_fast_path)
+    {
+        plan.simple_aggregate = None;
+    }
+
+    if let Some(OptimizeTableAccessResult {
+        join_order,
+        output_rows,
+        ..
+    }) = best_join_order
+    {
+        plan.join_order = join_order;
         let mut est = output_rows;
         // Clamp to LIMIT when it's a literal non-negative number.
         // Negative LIMIT means "no limit" in SQLite, so we skip those.
@@ -591,6 +674,7 @@ fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
         &mut plan.where_clause,
         &mut plan.order_by,
         &mut None,
+        None,
         &plan.non_from_clause_subqueries,
         &mut plan.limit,
         &mut plan.offset,
@@ -622,6 +706,7 @@ fn optimize_update_plan(
         &mut plan.where_clause,
         &mut plan.order_by,
         &mut None,
+        None,
         &plan.non_from_clause_subqueries,
         &mut plan.limit,
         &mut plan.offset,
@@ -901,6 +986,7 @@ fn add_ephemeral_table_to_update_plan(
             plan.non_from_clause_subqueries = remaining;
             ephemeral_subs
         },
+        simple_aggregate: None,
     };
 
     plan.ephemeral_plan = Some(ephemeral_plan);
@@ -1284,10 +1370,11 @@ fn optimize_table_access(
     where_clause: &mut [WhereTerm],
     order_by: &mut Vec<(Box<ast::Expr>, SortOrder)>,
     group_by: &mut Option<GroupBy>,
+    simple_aggregate: Option<&SimpleAggregate>,
     subqueries: &[NonFromClauseSubquery],
     limit: &mut Option<Box<Expr>>,
     offset: &mut Option<Box<Expr>>,
-) -> Result<Option<(Vec<JoinOrderMember>, f64)>> {
+) -> Result<Option<OptimizeTableAccessResult>> {
     // When optimizer_params feature is enabled, use lazily-loaded params (cached process-wide).
     // Otherwise, use the compile-time static for zero overhead.
     #[cfg(feature = "optimizer_params")]
@@ -1364,7 +1451,9 @@ fn optimize_table_access(
     } else {
         Vec::new()
     };
-    let maybe_order_target = compute_order_target(order_by, group_by.as_mut(), table_references);
+    let maybe_order_target = simple_aggregate
+        .and_then(|sa| simple_aggregate_order_target(sa, table_references))
+        .or_else(|| compute_order_target(order_by, group_by.as_mut(), table_references));
     let mut constraints_per_table = constraints_from_where_clause(
         where_clause,
         table_references,
@@ -2056,7 +2145,12 @@ fn optimize_table_access(
         }
     }
 
-    Ok(Some((best_join_order, final_output_cardinality)))
+    Ok(Some(OptimizeTableAccessResult {
+        join_order: best_join_order,
+        output_rows: final_output_cardinality,
+        min_max_fast_path: matches!(simple_aggregate, Some(SimpleAggregate::MinMax { .. }))
+            && sort_eliminated,
+    }))
 }
 
 fn build_vtab_scan_op(

@@ -6,7 +6,10 @@ use crate::{
         expression_index::normalize_expr_for_index_matching,
         optimizer::access_method::AccessMethodParams,
         optimizer::constraints::RangeConstraintRef,
-        plan::{GroupBy, HashJoinType, IterationDirection, JoinedTable, TableReferences},
+        plan::{
+            GroupBy, HashJoinType, IterationDirection, JoinedTable, SimpleAggregate,
+            TableReferences,
+        },
         planner::table_mask_from_expr,
     },
     util::exprs_are_equivalent,
@@ -77,6 +80,32 @@ impl OrderTarget {
         }
         Some(OrderTarget(cols, eliminates_sort))
     }
+}
+
+/// Build the synthetic ordering requirement used by simple MIN/MAX aggregation.
+pub fn simple_aggregate_order_target(
+    simple_aggregate: &SimpleAggregate,
+    tables: &TableReferences,
+) -> Option<OrderTarget> {
+    let SimpleAggregate::MinMax {
+        argument,
+        order,
+        collation,
+        ..
+    } = simple_aggregate
+    else {
+        return None;
+    };
+
+    let mut target = OrderTarget::maybe_from_iterator(
+        std::iter::once((argument, *order)),
+        tables,
+        EliminatesSortBy::Order,
+    )?;
+    if let Some(coll) = collation {
+        target.0[0].collation = *coll;
+    }
+    Some(target)
 }
 
 /// Compute an [OrderTarget] for the join optimizer to use.
