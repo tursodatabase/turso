@@ -1455,7 +1455,7 @@ pub fn translate_alter_table(
                 let escaped_sql = new_sql.replace('\'', "''");
                 let update_stmt = format!(
                     r#"
-                        UPDATE {SQLITE_TABLEID}
+                        UPDATE {qualified_schema_table}
                         SET sql = '{escaped_sql}'
                         WHERE name = '{view_name}' COLLATE NOCASE AND type = 'view'
                     "#,
@@ -2327,6 +2327,7 @@ fn rewrite_expr_for_column_rename(
     old_col_norm: &str,
     new_col_norm: &str,
     context_table_name: Option<&str>,
+    from_target: Option<&str>,
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<ast::Expr> {
@@ -2385,7 +2386,7 @@ fn rewrite_expr_for_column_rename(
                     context_table_info
                         .as_ref()
                         .map(|(t, n, r)| (t.as_ref(), n, *r)),
-                    None,
+                    from_target,
                 )?;
             }
         }
@@ -2419,6 +2420,11 @@ fn rewrite_trigger_cmd_for_column_rename(
             // Get the UPDATE target table to check if we're renaming a column in it
             let update_table_name_norm = normalize_ident(tbl_name.as_str());
             let is_renaming_update_table = update_table_name_norm == *target_table_name;
+            let from_target = if from_clause_references_target(&from, target_table_name) {
+                Some(target_table_name)
+            } else {
+                None
+            };
 
             // Rewrite SET column names if renaming a column in the UPDATE target table
             if is_renaming_update_table {
@@ -2443,6 +2449,7 @@ fn rewrite_trigger_cmd_for_column_rename(
                     old_col_norm,
                     new_col_norm,
                     Some(&update_table_name_norm),
+                    from_target,
                     database_id,
                     resolver,
                 )?);
@@ -2459,12 +2466,25 @@ fn rewrite_trigger_cmd_for_column_rename(
                         old_col_norm,
                         new_col_norm,
                         Some(&update_table_name_norm), // UPDATE WHERE: unqualified refs refer to UPDATE target
+                        from_target,
                         database_id,
                         resolver,
                     )
                     .map(Box::new)
                 })
                 .transpose()?;
+            let mut from = from;
+            if let Some(ref mut from_clause) = from {
+                rewrite_from_clause_for_column_rename(
+                    from_clause,
+                    trigger_table,
+                    trigger_table_name,
+                    target_table_name,
+                    old_col_norm,
+                    new_col_norm,
+                    None,
+                )?;
+            }
             Ok(ast::TriggerCmd::Update {
                 or_conflict,
                 tbl_name,
@@ -2546,6 +2566,7 @@ fn rewrite_trigger_cmd_for_column_rename(
                         old_col_norm,
                         new_col_norm,
                         Some(&delete_table_name_norm), // DELETE WHERE: unqualified refs refer to DELETE target
+                        None,
                         database_id,
                         resolver,
                     )
@@ -2614,6 +2635,7 @@ fn rewrite_upsert_for_column_rename(
                 old_col_norm,
                 new_col_norm,
                 Some(&insert_table_name_norm),
+                None,
                 database_id,
                 resolver,
             )?);
@@ -2630,6 +2652,7 @@ fn rewrite_upsert_for_column_rename(
                 old_col_norm,
                 new_col_norm,
                 Some(&insert_table_name_norm),
+                None,
                 database_id,
                 resolver,
             )?;
@@ -2656,6 +2679,7 @@ fn rewrite_upsert_for_column_rename(
                 old_col_norm,
                 new_col_norm,
                 Some(&insert_table_name_norm),
+                None,
                 database_id,
                 resolver,
             )?);
@@ -2672,6 +2696,7 @@ fn rewrite_upsert_for_column_rename(
                 old_col_norm,
                 new_col_norm,
                 Some(&insert_table_name_norm),
+                None,
                 database_id,
                 resolver,
             )?;

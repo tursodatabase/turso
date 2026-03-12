@@ -11938,25 +11938,27 @@ pub fn op_alter_column(
             Ok(())
         })?;
 
-        conn.with_schema(*db, |schema| -> crate::Result<()> {
-            let table = schema
-                .tables
-                .get(&normalized_table_name)
-                .expect("table being ALTERed should be in schema");
-            let _column = table
-                .get_column_at(*column_index)
-                .expect("column being ALTERed should be in schema");
-            for (view_name, view) in schema.views.iter() {
-                let view_select_sql = format!("SELECT * FROM {view_name}");
-                let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
-                    LimboError::ParseError(format!(
-                        "cannot rename column \"{}\": referenced in VIEW {view_name}: {}. {e}",
-                        old_column_name, view.sql,
-                    ))
-                })?;
-            }
-            Ok(())
-        })?;
+        if !crate::is_attached_db(*db) {
+            conn.with_schema(*db, |schema| -> crate::Result<()> {
+                let table = schema
+                    .tables
+                    .get(&normalized_table_name)
+                    .expect("table being ALTERed should be in schema");
+                let _column = table
+                    .get_column_at(*column_index)
+                    .expect("column being ALTERed should be in schema");
+                for (view_name, view) in schema.views.iter() {
+                    let view_select_sql = format!("SELECT * FROM {view_name}");
+                    let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
+                        LimboError::ParseError(format!(
+                            "cannot rename column \"{}\": referenced in VIEW {view_name}: {}. {e}",
+                            old_column_name, view.sql,
+                        ))
+                    })?;
+                }
+                Ok(())
+            })?;
+        }
     }
 
     state.pc += 1;
