@@ -437,3 +437,108 @@ test trigger-upsert-new-in-where-no-update {
 expect {
     1|100
 }
+
+# =============================================================================
+# Outer statement ON CONFLICT propagation to trigger body
+# Per SQLite docs: "if an ON CONFLICT clause is specified as part of the
+# statement causing the trigger to fire, then conflict handling policy of
+# the outer statement is used instead."
+# =============================================================================
+
+# Test: INSERT OR REPLACE on outer statement overrides INSERT OR IGNORE in trigger
+@cross-check-integrity
+test outer-replace-overrides-trigger-ignore {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t2(b INTEGER PRIMARY KEY, c TEXT);
+    CREATE TRIGGER tr AFTER INSERT ON t1 BEGIN
+      INSERT OR IGNORE INTO t2 VALUES(NEW.a, NEW.val);
+    END;
+    INSERT INTO t1 VALUES(1, 'first');
+    INSERT OR REPLACE INTO t1 VALUES(1, 'second');
+    SELECT * FROM t2;
+}
+expect {
+    1|second
+}
+
+# Test: INSERT OR IGNORE on outer statement overrides INSERT OR REPLACE in trigger
+@cross-check-integrity
+test outer-ignore-overrides-trigger-replace {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t2(b INTEGER PRIMARY KEY, c TEXT);
+    CREATE TRIGGER tr AFTER INSERT ON t1 BEGIN
+      INSERT OR REPLACE INTO t2 VALUES(NEW.a, NEW.val);
+    END;
+    INSERT INTO t1 VALUES(1, 'first');
+    INSERT OR IGNORE INTO t1 VALUES(1, 'duplicate');
+    SELECT * FROM t2;
+}
+expect {
+    1|first
+}
+
+# Test: INSERT OR REPLACE on outer propagates through BEFORE trigger too
+@cross-check-integrity
+test outer-replace-propagates-before-trigger {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t2(b INTEGER PRIMARY KEY, c TEXT);
+    CREATE TRIGGER tr BEFORE INSERT ON t1 BEGIN
+      INSERT OR IGNORE INTO t2 VALUES(NEW.a, NEW.val);
+    END;
+    INSERT INTO t1 VALUES(1, 'first');
+    INSERT OR REPLACE INTO t1 VALUES(1, 'second');
+    SELECT * FROM t2;
+}
+expect {
+    1|second
+}
+
+# Test: Plain INSERT (default ABORT) does NOT override trigger body's conflict clause
+@cross-check-integrity
+test default-abort-does-not-override-trigger {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t2(b INTEGER PRIMARY KEY, c TEXT);
+    CREATE TRIGGER tr AFTER INSERT ON t1 BEGIN
+      INSERT OR IGNORE INTO t2 VALUES(NEW.a, NEW.val);
+    END;
+    INSERT INTO t1 VALUES(1, 'first');
+    INSERT INTO t1 VALUES(2, 'second');
+    SELECT * FROM t2 ORDER BY b;
+}
+expect {
+    1|first
+    2|second
+}
+
+# Test: INSERT OR FAIL on outer statement propagates to trigger body,
+# causing the trigger's INSERT OR IGNORE to behave as INSERT OR FAIL
+@cross-check-integrity
+test outer-fail-overrides-trigger-ignore {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY);
+    CREATE TABLE t2(b INTEGER PRIMARY KEY);
+    CREATE TRIGGER tr AFTER INSERT ON t1 BEGIN
+      INSERT OR IGNORE INTO t2 VALUES(NEW.a);
+    END;
+    INSERT INTO t1 VALUES(1);
+    INSERT INTO t2 VALUES(2);
+    INSERT OR FAIL INTO t1 VALUES(2);
+}
+expect error {
+}
+
+# Test: UPDATE OR REPLACE on outer statement overrides trigger body's conflict clause
+@cross-check-integrity
+test outer-update-replace-overrides-trigger-ignore {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t2(b INTEGER PRIMARY KEY, c TEXT);
+    CREATE TRIGGER tr AFTER UPDATE ON t1 BEGIN
+      INSERT OR IGNORE INTO t2 VALUES(NEW.a, NEW.val);
+    END;
+    INSERT INTO t1 VALUES(1, 'first');
+    INSERT INTO t2 VALUES(1, 'old');
+    UPDATE OR REPLACE t1 SET val = 'updated' WHERE a = 1;
+    SELECT * FROM t2;
+}
+expect {
+    1|updated
+}
