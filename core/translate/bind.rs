@@ -1,3 +1,4 @@
+use crate::function::Func;
 use crate::sync::Arc;
 use crate::vdbe::builder::TableRefIdCounter;
 
@@ -32,6 +33,7 @@ pub trait BindTable {
     fn column_count(&self) -> usize;
     fn column_name(&self, idx: usize) -> Option<&str>;
     fn column_is_rowid_alias(&self, idx: usize) -> bool;
+    fn column_is_hidden(&self, idx: usize) -> bool;
 }
 
 impl dyn BindTable {
@@ -53,6 +55,7 @@ pub struct BindColumnRef<'a> {
     pub idx: usize,
     pub name: &'a str,
     pub is_rowid_alias: bool,
+    pub is_hidden: bool,
 }
 
 impl<'a, T: BindTable + ?Sized> Iterator for BindColumnIter<'a, T> {
@@ -68,6 +71,7 @@ impl<'a, T: BindTable + ?Sized> Iterator for BindColumnIter<'a, T> {
             idx: i,
             name: self.table.column_name(i).unwrap(),
             is_rowid_alias: self.table.column_is_rowid_alias(i),
+            is_hidden: self.table.column_is_hidden(i),
         })
     }
 
@@ -89,6 +93,10 @@ impl BindTable for Table {
     fn column_is_rowid_alias(&self, idx: usize) -> bool {
         self.columns().get(idx).is_some_and(|c| c.is_rowid_alias())
     }
+
+    fn column_is_hidden(&self, idx: usize) -> bool {
+        self.columns().get(idx).is_some_and(|c| c.hidden())
+    }
 }
 
 /// Lightweight table for CTEs — just column names, no schema object.
@@ -109,6 +117,10 @@ impl BindTable for CteTable {
     fn column_is_rowid_alias(&self, _idx: usize) -> bool {
         false
     }
+
+    fn column_is_hidden(&self, _idx: usize) -> bool {
+        false
+    }
 }
 
 #[derive(Clone)]
@@ -127,6 +139,10 @@ impl BindTable for DerivedTable {
     }
 
     fn column_is_rowid_alias(&self, _idx: usize) -> bool {
+        false
+    }
+
+    fn column_is_hidden(&self, _idx: usize) -> bool {
         false
     }
 }
@@ -1306,6 +1322,40 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 ast::Expr::InSelect { rhs, .. } => {
                     self.bind_subquery_expr(rhs, scope)?;
                 }
+                ast::Expr::FunctionCallStar { name, filter_over } => {
+                    if let Ok(func) = Func::resolve_function(name.as_str(), 0) {
+                        if func.needs_star_expansion() && !scope.tables.is_empty() {
+                            let mut args: Vec<Box<ast::Expr>> = Vec::new();
+                            for st in &scope.tables {
+                                for col_ref in st.table.columns() {
+                                    if col_ref.is_hidden {
+                                        continue;
+                                    }
+                                    // Column name as string literal
+                                    let quoted = format!("'{}'", col_ref.name);
+                                    args.push(Box::new(ast::Expr::Literal(ast::Literal::String(
+                                        quoted,
+                                    ))));
+                                    // Column reference
+                                    args.push(Box::new(ast::Expr::Column {
+                                        database: None,
+                                        table: st.internal_id,
+                                        column: col_ref.idx,
+                                        is_rowid_alias: col_ref.is_rowid_alias,
+                                    }));
+                                    self.tracking.record_column(st.internal_id, col_ref.idx);
+                                }
+                            }
+                            *expr = ast::Expr::FunctionCall {
+                                name: name.clone(),
+                                distinctness: None,
+                                args,
+                                filter_over: filter_over.clone(),
+                                order_by: vec![],
+                            };
+                        }
+                    }
+                }
                 _ => {}
             }
             Ok(WalkControl::Continue)
@@ -2172,6 +2222,48 @@ mod tests {
                 limit.expr.as_ref(),
                 &ast::Expr::Literal(ast::Literal::String("'1'".into()))
             );
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "json")]
+    fn function_call_star_expands_to_column_pairs() {
+        with_bind_context(&["CREATE TABLE t(x, y)"], |ctx| {
+            let mut select = parse_select("SELECT json_object(*) FROM t");
+            ctx.bind_select(&mut select).unwrap();
+
+            match select_expr(&select, 0) {
+                ast::Expr::FunctionCall { name, args, .. } => {
+                    assert_eq!(name.as_str(), "json_object");
+                    // 2 columns × 2 (name + ref) = 4 args
+                    assert_eq!(args.len(), 4);
+                    assert_eq!(
+                        args[0].as_ref(),
+                        &ast::Expr::Literal(ast::Literal::String("'x'".into()))
+                    );
+                    assert_column_expr(&args[1], 0, 0);
+                    assert_eq!(
+                        args[2].as_ref(),
+                        &ast::Expr::Literal(ast::Literal::String("'y'".into()))
+                    );
+                    assert_column_expr(&args[3], 0, 1);
+                }
+                other => panic!("expected FunctionCall, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn function_call_star_without_expansion_stays_unchanged() {
+        with_bind_context(&["CREATE TABLE t(a)"], |ctx| {
+            let mut select = parse_select("SELECT count(*) FROM t");
+            ctx.bind_select(&mut select).unwrap();
+
+            // count(*) should remain as FunctionCallStar (not expanded)
+            assert!(matches!(
+                select_expr(&select, 0),
+                ast::Expr::FunctionCallStar { .. }
+            ));
         });
     }
 
