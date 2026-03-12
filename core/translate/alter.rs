@@ -1821,7 +1821,6 @@ fn check_column_ref(
     Ok(())
 }
 
-
 /// Walk through all expressions in a SELECT statement
 fn walk_select_expressions(
     select: &ast::Select,
@@ -2930,10 +2929,7 @@ fn rewrite_window_for_column_rename(
 
 /// Check if a FROM clause references the target table being renamed.
 /// Returns the normalized target table name if found, None otherwise.
-fn from_clause_references_target(
-    from: &Option<ast::FromClause>,
-    target_table_name: &str,
-) -> bool {
+fn from_clause_references_target(from: &Option<ast::FromClause>, target_table_name: &str) -> bool {
     let Some(from_clause) = from else {
         return false;
     };
@@ -3035,8 +3031,7 @@ fn rewrite_expr_column_ref_with_context(
                     }
                 }
                 // Check trigger's owning table or FROM clause target table
-                if (is_renaming_trigger_table
-                    && trigger_table.get_column(&col_norm).is_some())
+                if (is_renaming_trigger_table && trigger_table.get_column(&col_norm).is_some())
                     || from_target.is_some()
                 {
                     *e = ast::Expr::Id(ast::Name::from_string(new_col_norm));

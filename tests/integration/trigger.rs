@@ -1,4 +1,4 @@
-use crate::common::{ExecRows, TempDatabase};
+use crate::common::{do_flush, ExecRows, TempDatabase};
 
 #[turso_macros::test(mvcc)]
 fn test_create_trigger(db: TempDatabase) {
@@ -1553,4 +1553,328 @@ fn test_after_trigger_insert_does_not_corrupt_index_cursor(db: TempDatabase) {
              This indicates either a regression back to the bug in issue #4801 or a new bug",
         );
     }
+}
+
+/// Regression test: trigger on table `dst` referencing `SELECT b FROM src`
+/// must persist correctly after `ALTER TABLE src RENAME COLUMN b TO c`.
+/// Previously, the trigger SQL in sqlite_schema was not updated for cross-table
+/// expression-level column refs, causing "no such column: b" after DB reopen.
+#[test]
+fn test_trigger_cross_table_rename_column_persists() -> anyhow::Result<()> {
+    let path = tempfile::TempDir::new()
+        .unwrap()
+        .keep()
+        .join("trigger_rename_persist");
+    let db = TempDatabase::new_with_existent(&path);
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE src (a INTEGER PRIMARY KEY, b)")
+        .unwrap();
+    conn.execute("CREATE TABLE dst (x, y)").unwrap();
+    conn.execute("CREATE TABLE log (v)").unwrap();
+    conn.execute("INSERT INTO src VALUES (1, 500)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN \
+         INSERT INTO log SELECT b FROM src WHERE a = new.x; \
+         END",
+    )
+    .unwrap();
+
+    conn.execute("ALTER TABLE src RENAME COLUMN b TO c")
+        .unwrap();
+
+    conn.execute("INSERT INTO dst VALUES (1, 0)").unwrap();
+    let results: Vec<(i64,)> = conn.exec_rows("SELECT v FROM log");
+    assert_eq!(results, vec![(500,)]);
+
+    do_flush(&conn, &db)?;
+    conn.close()?;
+
+    let db2 = TempDatabase::new_with_existent(&path);
+    let conn2 = db2.connect_limbo();
+
+    conn2.execute("INSERT INTO dst VALUES (1, 0)").unwrap();
+    let results2: Vec<(i64,)> = conn2.exec_rows("SELECT v FROM log");
+    assert_eq!(results2, vec![(500,), (500,)]);
+
+    Ok(())
+}
+
+/// Cross-table trigger with qualified refs (src.b) persists after rename + reopen.
+#[test]
+fn test_trigger_cross_table_qualified_ref_persists() -> anyhow::Result<()> {
+    let path = tempfile::TempDir::new()
+        .unwrap()
+        .keep()
+        .join("trigger_qualified_persist");
+    let db = TempDatabase::new_with_existent(&path);
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE src (a INTEGER PRIMARY KEY, b)")
+        .unwrap();
+    conn.execute("CREATE TABLE dst (x, y)").unwrap();
+    conn.execute("CREATE TABLE log (v)").unwrap();
+    conn.execute("INSERT INTO src VALUES (1, 42)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN \
+         INSERT INTO log SELECT src.b FROM src WHERE src.a = new.x; \
+         END",
+    )
+    .unwrap();
+
+    conn.execute("ALTER TABLE src RENAME COLUMN b TO c")
+        .unwrap();
+
+    do_flush(&conn, &db)?;
+    conn.close()?;
+
+    let db2 = TempDatabase::new_with_existent(&path);
+    let conn2 = db2.connect_limbo();
+
+    conn2.execute("INSERT INTO dst VALUES (1, 0)").unwrap();
+    let results: Vec<(i64,)> = conn2.exec_rows("SELECT v FROM log");
+    assert_eq!(results, vec![(42,)]);
+
+    Ok(())
+}
+
+/// Cross-table trigger with UPDATE command persists after rename + reopen.
+#[test]
+fn test_trigger_cross_table_update_persists() -> anyhow::Result<()> {
+    let path = tempfile::TempDir::new()
+        .unwrap()
+        .keep()
+        .join("trigger_update_persist");
+    let db = TempDatabase::new_with_existent(&path);
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE src (a INTEGER PRIMARY KEY, b)")
+        .unwrap();
+    conn.execute("CREATE TABLE dst (x, y)").unwrap();
+    conn.execute("INSERT INTO src VALUES (1, 0)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN \
+         UPDATE src SET b = b + 1 WHERE a = new.x; \
+         END",
+    )
+    .unwrap();
+
+    conn.execute("ALTER TABLE src RENAME COLUMN b TO c")
+        .unwrap();
+
+    do_flush(&conn, &db)?;
+    conn.close()?;
+
+    let db2 = TempDatabase::new_with_existent(&path);
+    let conn2 = db2.connect_limbo();
+
+    conn2.execute("INSERT INTO dst VALUES (1, 0)").unwrap();
+    conn2.execute("INSERT INTO dst VALUES (1, 0)").unwrap();
+    let results: Vec<(i64,)> = conn2.exec_rows("SELECT c FROM src WHERE a = 1");
+    assert_eq!(results, vec![(2,)]);
+
+    Ok(())
+}
+
+/// Cross-table trigger with DELETE command persists after rename + reopen.
+#[test]
+fn test_trigger_cross_table_delete_persists() -> anyhow::Result<()> {
+    let path = tempfile::TempDir::new()
+        .unwrap()
+        .keep()
+        .join("trigger_delete_persist");
+    let db = TempDatabase::new_with_existent(&path);
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE src (a INTEGER PRIMARY KEY, b)")
+        .unwrap();
+    conn.execute("CREATE TABLE dst (x, y)").unwrap();
+    conn.execute("INSERT INTO src VALUES (1, 100)").unwrap();
+    conn.execute("INSERT INTO src VALUES (2, 200)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN \
+         DELETE FROM src WHERE b = new.y; \
+         END",
+    )
+    .unwrap();
+
+    conn.execute("ALTER TABLE src RENAME COLUMN b TO c")
+        .unwrap();
+
+    do_flush(&conn, &db)?;
+    conn.close()?;
+
+    let db2 = TempDatabase::new_with_existent(&path);
+    let conn2 = db2.connect_limbo();
+
+    conn2.execute("INSERT INTO dst VALUES (1, 100)").unwrap();
+    let results: Vec<(i64, i64)> = conn2.exec_rows("SELECT a, c FROM src");
+    assert_eq!(results, vec![(2, 200)]);
+
+    Ok(())
+}
+
+/// Trigger referencing column from a DIFFERENT table (not being renamed)
+/// must NOT have its SQL rewritten, and must survive reopen.
+#[test]
+fn test_trigger_no_false_rename_persists() -> anyhow::Result<()> {
+    let path = tempfile::TempDir::new()
+        .unwrap()
+        .keep()
+        .join("trigger_no_false_rename");
+    let db = TempDatabase::new_with_existent(&path);
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE src (a INTEGER PRIMARY KEY, b)")
+        .unwrap();
+    conn.execute("CREATE TABLE other (a INTEGER PRIMARY KEY, b)")
+        .unwrap();
+    conn.execute("CREATE TABLE dst (x, y)").unwrap();
+    conn.execute("CREATE TABLE log (v)").unwrap();
+    conn.execute("INSERT INTO other VALUES (1, 999)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN \
+         INSERT INTO log SELECT b FROM other WHERE a = new.x; \
+         END",
+    )
+    .unwrap();
+
+    // Rename src.b — trigger references other.b, must NOT be changed
+    conn.execute("ALTER TABLE src RENAME COLUMN b TO c")
+        .unwrap();
+
+    do_flush(&conn, &db)?;
+    conn.close()?;
+
+    let db2 = TempDatabase::new_with_existent(&path);
+    let conn2 = db2.connect_limbo();
+
+    conn2.execute("INSERT INTO dst VALUES (1, 0)").unwrap();
+    let results: Vec<(i64,)> = conn2.exec_rows("SELECT v FROM log");
+    assert_eq!(results, vec![(999,)]);
+
+    Ok(())
+}
+
+/// Same-table trigger (ON the table being renamed) with NEW.col refs persists.
+#[test]
+fn test_trigger_same_table_new_ref_persists() -> anyhow::Result<()> {
+    let path = tempfile::TempDir::new()
+        .unwrap()
+        .keep()
+        .join("trigger_same_table_persist");
+    let db = TempDatabase::new_with_existent(&path);
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE t1 (a INTEGER PRIMARY KEY, b)")
+        .unwrap();
+    conn.execute("CREATE TABLE log (v)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN \
+         INSERT INTO log VALUES (new.b); \
+         END",
+    )
+    .unwrap();
+
+    conn.execute("ALTER TABLE t1 RENAME COLUMN b TO c").unwrap();
+
+    do_flush(&conn, &db)?;
+    conn.close()?;
+
+    let db2 = TempDatabase::new_with_existent(&path);
+    let conn2 = db2.connect_limbo();
+
+    conn2.execute("INSERT INTO t1 VALUES (1, 77)").unwrap();
+    let results: Vec<(i64,)> = conn2.exec_rows("SELECT v FROM log");
+    assert_eq!(results, vec![(77,)]);
+
+    Ok(())
+}
+
+/// Trigger with aggregate function (SUM) on cross-table column persists.
+#[test]
+fn test_trigger_cross_table_aggregate_persists() -> anyhow::Result<()> {
+    let path = tempfile::TempDir::new()
+        .unwrap()
+        .keep()
+        .join("trigger_agg_persist");
+    let db = TempDatabase::new_with_existent(&path);
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE src (a INTEGER PRIMARY KEY, b)")
+        .unwrap();
+    conn.execute("CREATE TABLE dst (x, y)").unwrap();
+    conn.execute("CREATE TABLE log (v)").unwrap();
+    conn.execute("INSERT INTO src VALUES (1, 10)").unwrap();
+    conn.execute("INSERT INTO src VALUES (2, 20)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN \
+         INSERT INTO log SELECT SUM(b) FROM src; \
+         END",
+    )
+    .unwrap();
+
+    conn.execute("ALTER TABLE src RENAME COLUMN b TO c")
+        .unwrap();
+
+    do_flush(&conn, &db)?;
+    conn.close()?;
+
+    let db2 = TempDatabase::new_with_existent(&path);
+    let conn2 = db2.connect_limbo();
+
+    conn2.execute("INSERT INTO dst VALUES (1, 0)").unwrap();
+    let results: Vec<(i64,)> = conn2.exec_rows("SELECT v FROM log");
+    assert_eq!(results, vec![(30,)]);
+
+    Ok(())
+}
+
+/// Multiple triggers, one cross-table and one same-table, both persist correctly.
+#[test]
+fn test_trigger_mixed_same_and_cross_table_persists() -> anyhow::Result<()> {
+    let path = tempfile::TempDir::new()
+        .unwrap()
+        .keep()
+        .join("trigger_mixed_persist");
+    let db = TempDatabase::new_with_existent(&path);
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE src (a INTEGER PRIMARY KEY, b)")
+        .unwrap();
+    conn.execute("CREATE TABLE dst (x, y)").unwrap();
+    conn.execute("CREATE TABLE log (v)").unwrap();
+    conn.execute("INSERT INTO src VALUES (1, 50)").unwrap();
+    // Cross-table trigger
+    conn.execute(
+        "CREATE TRIGGER cross_trig AFTER INSERT ON dst BEGIN \
+         INSERT INTO log SELECT b FROM src WHERE a = new.x; \
+         END",
+    )
+    .unwrap();
+    // Same-table trigger
+    conn.execute(
+        "CREATE TRIGGER same_trig AFTER UPDATE ON src BEGIN \
+         INSERT INTO log VALUES (new.b); \
+         END",
+    )
+    .unwrap();
+
+    conn.execute("ALTER TABLE src RENAME COLUMN b TO c")
+        .unwrap();
+
+    do_flush(&conn, &db)?;
+    conn.close()?;
+
+    let db2 = TempDatabase::new_with_existent(&path);
+    let conn2 = db2.connect_limbo();
+
+    // Fire cross-table trigger
+    conn2.execute("INSERT INTO dst VALUES (1, 0)").unwrap();
+    // Fire same-table trigger
+    conn2.execute("UPDATE src SET c = 99 WHERE a = 1").unwrap();
+    let results: Vec<(i64,)> = conn2.exec_rows("SELECT v FROM log ORDER BY rowid");
+    assert_eq!(results, vec![(50,), (99,)]);
+
+    Ok(())
 }

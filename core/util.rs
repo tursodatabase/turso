@@ -2081,18 +2081,11 @@ fn rename_identifiers_scoped_inner(
                     );
                 }
                 ast::Expr::InSelect { rhs, .. } => {
-                    rewrite_select_column_refs_scoped(
-                        rhs,
-                        target_table,
-                        trigger_table,
-                        from,
-                        to,
-                    );
+                    rewrite_select_column_refs_scoped(rhs, target_table, trigger_table, from, to);
                     // lhs will be walked by walk_expr_mut
                 }
                 ast::Expr::Id(ref name) | ast::Expr::Name(ref name)
-                    if rename_unqualified
-                        && normalize_ident(name.as_str()) == from_normalized =>
+                    if rename_unqualified && normalize_ident(name.as_str()) == from_normalized =>
                 {
                     *e = ast::Expr::Id(ast::Name::exact(to.to_owned()));
                 }
@@ -3375,8 +3368,7 @@ fn rewrite_one_select_column_refs_scoped(
             let from_has_target = from_clause_has_target(from, target_table);
             let target_normalized = normalize_ident(target_table);
             let trigger_normalized = normalize_ident(trigger_table);
-            let rename_unqualified =
-                from_has_target || target_normalized == trigger_normalized;
+            let rename_unqualified = from_has_target || target_normalized == trigger_normalized;
 
             if let Some(ref mut from) = from {
                 rewrite_from_clause_column_refs_scoped(
@@ -3435,13 +3427,7 @@ fn rewrite_one_select_column_refs_scoped(
         ast::OneSelect::Values(rows) => {
             for row in rows {
                 for expr in row {
-                    rename_identifiers_scoped(
-                        expr,
-                        target_table,
-                        trigger_table,
-                        old_col,
-                        new_col,
-                    );
+                    rename_identifiers_scoped(expr, target_table, trigger_table, old_col, new_col);
                 }
             }
         }
@@ -3513,7 +3499,13 @@ fn rewrite_select_table_entry_column_refs_scoped(
             }
         }
         ast::SelectTable::Select(ref mut select, _) => {
-            rewrite_select_column_refs_scoped(select, target_table, trigger_table, old_col, new_col);
+            rewrite_select_column_refs_scoped(
+                select,
+                target_table,
+                trigger_table,
+                old_col,
+                new_col,
+            );
         }
         ast::SelectTable::Sub(ref mut from, _) => {
             rewrite_from_clause_column_refs_scoped(
@@ -3688,11 +3680,7 @@ fn rewrite_from_clause_table_refs(from: &mut ast::FromClause, old_tbl: &str, new
     }
 }
 
-fn rewrite_select_table_entry_table_refs(
-    st: &mut ast::SelectTable,
-    old_tbl: &str,
-    new_tbl: &str,
-) {
+fn rewrite_select_table_entry_table_refs(st: &mut ast::SelectTable, old_tbl: &str, new_tbl: &str) {
     let old_normalized = normalize_ident(old_tbl);
     match st {
         ast::SelectTable::Table(ref mut name, _, _) => {

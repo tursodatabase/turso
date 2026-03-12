@@ -21,11 +21,12 @@ use crate::types::{
     ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
 };
 use crate::util::{
-    escape_sql_string_literal, normalize_ident, rename_identifiers, rewrite_check_expr_table_refs,
-    rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
-    rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
-    rename_identifiers_scoped, rewrite_trigger_cmd_column_refs, rewrite_trigger_cmd_table_refs,
-    rewrite_view_sql_for_column_rename, trim_ascii_whitespace, RewrittenView,
+    escape_sql_string_literal, normalize_ident, rename_identifiers, rename_identifiers_scoped,
+    rewrite_check_expr_table_refs, rewrite_column_references_if_needed,
+    rewrite_fk_parent_cols_if_self_ref, rewrite_fk_parent_table_if_needed,
+    rewrite_inline_col_fk_target_if_needed, rewrite_trigger_cmd_column_refs,
+    rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename, trim_ascii_whitespace,
+    RewrittenView,
 };
 use crate::vdbe::affinity::{
     apply_numeric_affinity, try_for_float, Affinity, NumericParseResult, ParsedNumber,
@@ -7707,16 +7708,13 @@ pub fn op_function(
                                 mut when_clause,
                                 mut commands,
                             } => {
-                                let trigger_tbl =
-                                    normalize_ident(trigger_tbl_name.name.as_str());
+                                let trigger_tbl = normalize_ident(trigger_tbl_name.name.as_str());
 
                                 // Rewrite ON table name if it matches the renamed table
                                 let new_trigger_tbl_name = if trigger_tbl == rename_from {
                                     ast::QualifiedName {
                                         db_name: trigger_tbl_name.db_name,
-                                        name: ast::Name::exact(
-                                            original_rename_to.to_string(),
-                                        ),
+                                        name: ast::Name::exact(original_rename_to.to_string()),
                                         alias: None,
                                     }
                                 } else {
@@ -11893,15 +11891,19 @@ pub fn op_alter_column(
                     let trigger = Arc::make_mut(trigger_arc);
                     // Rewrite WHEN clause (scope-aware to avoid renaming columns from other tables)
                     if let Some(ref mut when) = trigger.when_clause {
-                        rename_identifiers_scoped(when, &tbl_name, &trigger_tbl, &old_col, &new_col);
+                        rename_identifiers_scoped(
+                            when,
+                            &tbl_name,
+                            &trigger_tbl,
+                            &old_col,
+                            &new_col,
+                        );
                     }
                     // Rewrite UPDATE OF columns if trigger is on the renamed table
                     if trigger_tbl == tbl_name {
                         if let ast::TriggerEvent::UpdateOf(ref mut cols) = trigger.event {
                             for col in cols {
-                                if normalize_ident(col.as_str())
-                                    == normalize_ident(&old_col)
-                                {
+                                if normalize_ident(col.as_str()) == normalize_ident(&old_col) {
                                     *col = ast::Name::exact(new_col.clone());
                                 }
                             }
