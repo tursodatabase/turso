@@ -1116,9 +1116,43 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                 continue;
             }
 
-            // Skip non-tombstone deleted versions, we check these at `delete` via atomic update of `end` field.
-            if version.end.is_some() {
-                continue;
+            match version.end {
+                Some(TxTimestampOrID::Timestamp(_)) => {
+                    // Committed deletion. If end_ts > our begin_ts, the conflict
+                    // would have been already caught earlier when we iterate through
+                    // the row versions in reverse. If end_ts <= our
+                    // begin_ts, the deletion predates our snapshot — no conflict.
+                    continue;
+                }
+                Some(TxTimestampOrID::TxID(end_tx_id)) => {
+                    // Deletion not yet finalized; the deleting transaction may still be in Preparing.
+                    if end_tx_id == self.tx_id {
+                        // We deleted this version ourselves, so it cannot conflict with our commit.
+                        continue;
+                    }
+
+                    match lookup_tx_state(
+                        &mvcc_store.txs,
+                        &mvcc_store.finalized_tx_states,
+                        end_tx_id,
+                    ) {
+                        Some(TransactionState::Committed(committed_end_ts)) => {
+                            turso_assert!(committed_end_ts != tx.begin_ts, "committed end_ts and begin_ts cannot be equal: txn timestamps are strictly monotonic");
+                            if committed_end_ts > tx.begin_ts {
+                                return Err(LimboError::WriteWriteConflict);
+                            }
+                            continue;
+                        }
+                        _ => {
+                            // Deleting tx is Active, Preparing, Aborted, or gone.
+                            // The deletion may not stick, so this version may still be live.
+                            // Fall through to check begin for conflicts.
+                        }
+                    }
+                }
+                None => {
+                    // No end — version is live. Fall through to check begin.
+                }
             }
 
             match version.begin {
