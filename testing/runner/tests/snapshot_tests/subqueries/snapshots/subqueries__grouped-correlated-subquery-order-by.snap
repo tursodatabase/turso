@@ -1,0 +1,98 @@
+---
+source: subqueries.sqltest
+expression: |-
+  SELECT gv.grp, SUM(gv.val) AS total
+      FROM grouped_values gv
+      GROUP BY gv.grp
+      ORDER BY (
+          SELECT MAX(gv2.val)
+          FROM grouped_values gv2
+          WHERE gv2.grp = gv.grp
+      ) DESC;
+info:
+  statement_type: SELECT
+  tables:
+  - grouped_values
+  setup_blocks:
+  - grouped_subquery_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN grouped_values AS gv USING INDEX idx_grouped_values_grp
+|--CORRELATED SCALAR SUBQUERY 1
+|  `--SEARCH gv2 USING INDEX idx_grouped_values_grp (grp=?)
+`--USE SORTER FOR ORDER BY
+
+BYTECODE
+addr  opcode                    p1  p2  p3  p4              p5  comment
+   0            Init             0  69   0                   0  Start at 69
+   1            SorterOpen       0   2   0  k(2,-B,Binary)   0  cursor=0
+   2            Null             0  10   0                   0  r[10]=NULL
+   3            Integer          0   7   0                   0  r[7]=0; clear group by abort flag
+   4            Null             0   8   0                   0  r[8]=NULL; initialize group by comparison registers to NULL
+   5            Gosub           14  58   0                   0  ; go to clear accumulator subroutine
+   6            OpenRead         1   2   0  k(3,B,B)         0  table=grouped_values, root=2, iDb=0
+   7            OpenRead         2   3   0  k(2,B)           0  index=idx_grouped_values_grp, root=3, iDb=0
+   8            Rewind           2  23   0                   0  Rewind index idx_grouped_values_grp
+   9              DeferredSeek   2   1   0                   0
+  10              Column         1   0  12                   0  r[12]=grouped_values.grp
+  11              Column         1   1  13                   0  r[13]=grouped_values.val
+  12              Compare        8  12   1  k(1, Binary)     0  r[8..8]==r[12..12]
+  13              Jump          14  18  14                   0  ; start new group if comparison is not equal
+  14              Gosub          5  27   0                   0  ; check if ended group had data, and output if so
+  15              Move          12   8   1                   0  r[8..8]=r[12..12]
+  16              IfPos          7  61   0                   0  r[7]>0 -> r[7]-=0, goto 61; check abort flag
+  17              Gosub         14  58   0                   0  ; goto clear accumulator subroutine
+  18              AggStep        0  13  10  sum              0  accum=r[10] step(r[13])
+  19              If             6  21   0                   0  if r[6] goto 21; don't emit group columns if continuing existing group
+  20              Column         1   0   9                   0  r[9]=grouped_values.grp
+  21              Integer        1   6   0                   0  r[6]=1; indicate data in accumulator
+  22            Next             2   9   0                   0
+  23            Gosub            5  27   0                   0  ; emit row for final group
+  24            Goto             0  61   0                   0  ; group by finished
+  25            Integer          1   7   0                   0  r[7]=1
+  26          Return             5   0   0                   0
+  27          IfPos              6  29   0                   0  r[6]>0 -> r[6]-=0, goto 29; output group by row subroutine start
+  28        Return               5   0   0                   0
+  29        AggFinal             0  10   0  sum              0  accum=r[10]
+  30        BeginSubrtn         15   0   0                   0  r[15]=NULL
+  31        Null                 0   1   0                   0  r[1]=NULL
+  32        Null                 0  17   0                   0  r[17]=NULL
+  33        Integer              1  18   0                   0  r[18]=1; LIMIT counter
+  34        IfNot               18  47   0                   0  if !r[18] goto 47
+  35        OpenRead             3   2   0  k(3,B,B)         0  table=grouped_values, root=2, iDb=0
+  36        OpenRead             4   3   0  k(2,B)           0  index=idx_grouped_values_grp, root=3, iDb=0
+  37        Copy                 9  19   0                   0  r[19]=r[9]
+  38        IsNull              19  47   0                   0  if (r[19]==NULL) goto 47
+  39        Affinity            19   1   0                   0  r[19..20] = B
+  40        SeekGE               4  47  19                   0  key=[19..19]
+  41          IdxGT              4  47  19                   0  key=[19..19]
+  42          DeferredSeek       4   3   0                   0
+  43          Column             3   1  20                   0  r[20]=grouped_values.val
+  44          CollSeq            0   0   0  Binary           0  collation=Binary
+  45          AggStep            0  20  17  max              0  accum=r[17] step(r[20])
+  46        Next                 4  41   0                   0
+  47        AggFinal             0  17   0  max              0  accum=r[17]
+  48        Copy                17  16   0                   0  r[16]=r[17]
+  49        Copy                16   1   0                   0  r[1]=r[16]
+  50      Return                15   0   1                   0
+  51      Copy                   1  21   0                   0  r[21]=r[1]
+  52      Sequence               0  22   0                   0
+  53      Copy                   9  23   0                   0  r[23]=r[9]
+  54      Copy                  10  24   0                   0  r[24]=r[10]
+  55      MakeRecord            21   4   4                   0  r[4]=mkrec(r[21..24])
+  56      SorterInsert           0   4   0  0                0  key=r[4]
+  57    Return                   5   0   0                   0
+  58    Null                     0   9  10                   0  r[9..10]=NULL; clear accumulator subroutine start
+  59    Integer                  0   6   0                   0  r[6]=0
+  60  Return                    14   0   0                   0
+  61  OpenPseudo                 5   4   4                   0  4 columns in r[4]
+  62  SorterSort                 0  68   0                   0
+  63    SorterData               0   4   5                   0  r[4]=data
+  64    Column                   5   2   2                   0  r[2]=pseudo.column 2
+  65    Column                   5   3   3                   0  r[3]=pseudo.column 3
+  66    ResultRow                2   2   0                   0  output=r[2..3]
+  67  SorterNext                 0  63   0                   0
+  68  Halt                       0   0   0                   0
+  69  Transaction                0   1   2                   0  iDb=0 tx_mode=Read
+  70  Goto                       0   1   0                   0

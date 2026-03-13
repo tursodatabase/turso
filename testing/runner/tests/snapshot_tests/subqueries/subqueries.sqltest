@@ -226,6 +226,43 @@ snapshot correlated-subquery-count {
     ) >= 3;
 }
 
+setup grouped_subquery_schema {
+    CREATE TABLE grouped_values (
+        grp TEXT,
+        val INTEGER
+    );
+
+    CREATE INDEX idx_grouped_values_grp ON grouped_values(grp);
+}
+
+# Correlated subquery in HAVING on grouped output.
+# This exercises the grouped-output scheduling path rather than plain WHERE-time correlation.
+@setup grouped_subquery_schema
+snapshot grouped-correlated-subquery-having {
+    SELECT gv.grp, SUM(gv.val) AS total
+    FROM grouped_values gv
+    GROUP BY gv.grp
+    HAVING (
+        SELECT MAX(gv2.val)
+        FROM grouped_values gv2
+        WHERE gv2.grp = gv.grp
+    ) IS NOT NULL;
+}
+
+# Correlated subquery in ORDER BY on grouped output.
+# The subquery should run against grouped rows instead of being forced into pre-group evaluation.
+@setup grouped_subquery_schema
+snapshot grouped-correlated-subquery-order-by {
+    SELECT gv.grp, SUM(gv.val) AS total
+    FROM grouped_values gv
+    GROUP BY gv.grp
+    ORDER BY (
+        SELECT MAX(gv2.val)
+        FROM grouped_values gv2
+        WHERE gv2.grp = gv.grp
+    ) DESC;
+}
+
 # =============================================================================
 # DERIVED TABLES (Subqueries in FROM)
 # =============================================================================
@@ -734,6 +771,18 @@ setup grp_schema {
     CREATE TABLE t(grp TEXT, val INTEGER);
 }
 
+setup returning_subquery_schema {
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        grp INTEGER,
+        val INTEGER
+    );
+
+    INSERT INTO t VALUES (1, 1, 10);
+    INSERT INTO t VALUES (2, 1, 20);
+    INSERT INTO t VALUES (3, 2, 30);
+}
+
 # Materialized CTE with ORDER BY DESC, outer query ORDER BY same direction.
 # The sorter should be eliminated because the materialized table's intrinsic
 # order matches the outer ORDER BY.
@@ -820,6 +869,29 @@ snapshot-eqp cte-materialized-order-aggregate-opposite-dir {
         ORDER BY grp ASC
     )
     SELECT * FROM agg ORDER BY grp DESC;
+}
+
+# =============================================================================
+# DML RETURNING SUBQUERIES
+# =============================================================================
+
+# UPDATE RETURNING target-table self-read should be emitted in the post-write path,
+# so the scalar subquery reruns against the updated table image.
+@setup returning_subquery_schema
+snapshot update-returning-target-selfread {
+    UPDATE t
+    SET val = val + 1
+    WHERE id < 3
+    RETURNING id, (SELECT count(*) FROM t WHERE val >= 21);
+}
+
+# DELETE RETURNING target-table self-read should run after the row delete while
+# direct row-value references continue to come from the cached old row image.
+@setup returning_subquery_schema
+snapshot delete-returning-target-selfread {
+    DELETE FROM t
+    WHERE id < 3
+    RETURNING id, (SELECT count(*) FROM t);
 }
 
 # --- Negative: outer ORDER BY extends beyond CTE's ORDER BY (needs sorter) ---
