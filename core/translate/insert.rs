@@ -613,6 +613,15 @@ pub fn translate_insert(
         }) = ctx.autoincrement_meta
         {
             turso_assert!(ctx.table.has_autoincrement);
+            reload_autoincrement_state(
+                program,
+                AutoincMeta {
+                    seq_cursor_id,
+                    r_seq,
+                    r_seq_rowid,
+                    table_name_reg,
+                },
+            );
             // Existing sqlite_sequence row: update only when explicit key advances seq.
             let missing_row_label = program.allocate_label();
             let explicit_done_label = program.allocate_label();
@@ -890,6 +899,15 @@ pub fn translate_insert(
         table_name_reg,
     }) = ctx.autoincrement_meta
     {
+        reload_autoincrement_state(
+            program,
+            AutoincMeta {
+                seq_cursor_id,
+                r_seq,
+                r_seq_rowid,
+                table_name_reg,
+            },
+        );
         let no_update_needed_label = program.allocate_label();
         program.emit_insn(Insn::Le {
             lhs: insertion.key_register(),
@@ -1211,6 +1229,15 @@ fn emit_rowid_generation(
         ..
     }) = ctx.autoincrement_meta
     {
+        reload_autoincrement_state(
+            program,
+            AutoincMeta {
+                seq_cursor_id,
+                r_seq,
+                r_seq_rowid,
+                table_name_reg,
+            },
+        );
         let r_max = program.alloc_register();
 
         let dummy_reg = program.alloc_register();
@@ -1360,6 +1387,20 @@ fn init_autoincrement(
     ctx: &mut InsertEmitCtx,
     resolver: &Resolver,
 ) -> Result<()> {
+    open_autoincrement_state(program, ctx, resolver)?;
+    reload_autoincrement_state(
+        program,
+        ctx.autoincrement_meta
+            .expect("AUTOINCREMENT metadata should be initialized"),
+    );
+    Ok(())
+}
+
+fn open_autoincrement_state(
+    program: &mut ProgramBuilder,
+    ctx: &mut InsertEmitCtx,
+    resolver: &Resolver,
+) -> Result<()> {
     let seq_table = get_valid_sqlite_sequence_table(resolver, ctx.database_id)?;
     let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
     program.emit_insn(Insn::OpenWrite {
@@ -1378,6 +1419,25 @@ fn init_autoincrement(
         r_seq_rowid,
         table_name_reg,
     });
+
+    program.emit_insn(Insn::Integer {
+        dest: r_seq,
+        value: 0,
+    });
+    program.emit_insn(Insn::Null {
+        dest: r_seq_rowid,
+        dest_end: None,
+    });
+    Ok(())
+}
+
+fn reload_autoincrement_state(program: &mut ProgramBuilder, meta: AutoincMeta) {
+    let AutoincMeta {
+        seq_cursor_id,
+        r_seq,
+        r_seq_rowid,
+        table_name_reg,
+    } = meta;
 
     program.emit_insn(Insn::Integer {
         dest: r_seq,
@@ -1423,7 +1483,6 @@ fn init_autoincrement(
         pc_if_next: loop_start_label,
     });
     program.preassign_label_to_next_insn(loop_end_label);
-    Ok(())
 }
 
 fn emit_notnulls(
@@ -1958,6 +2017,7 @@ fn init_source_emission<'a>(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
 pub struct AutoincMeta {
     seq_cursor_id: usize,
     r_seq: usize,
