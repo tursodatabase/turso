@@ -7666,9 +7666,9 @@ fn test_committed_delete_tombstone_conflict() {
 /// transaction (T2) that also writes to the same row detects the conflict —
 /// even though T1's version has end=TxID(Td) with Td committed.
 ///
-/// This tests the `Committed(_) => continue` branch in our fix: skipping T1's
-/// version is safe because Td's NEW version (begin=TxID(Td)) catches the conflict.
-/// (regression test: test_speculative_delete_hides_committed_version_sql)
+/// This tests the `Committed(_) => continue` branch in `check_version_conflicts`:
+/// skipping T1's version is safe because Td's NEW version (begin=TxID(Td)) catches
+/// the conflict.
 ///
 /// Timeline:
 ///   T1: insert row 1, commit

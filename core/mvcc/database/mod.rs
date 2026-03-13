@@ -1117,11 +1117,15 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             }
 
             match version.end {
-                Some(TxTimestampOrID::Timestamp(_)) => {
+                Some(TxTimestampOrID::Timestamp(end_ts)) => {
                     // Committed deletion. If end_ts > our begin_ts, the conflict
                     // would have been already caught earlier when we iterate through
-                    // the row versions in reverse. If end_ts <= our
+                    // the row versions in reverse. If end_ts < our
                     // begin_ts, the deletion predates our snapshot — no conflict.
+                    turso_assert!(
+                        end_ts < tx.begin_ts,
+                        "row version's end_ts cannot be greater than txns begin_ts"
+                    );
                     continue;
                 }
                 Some(TxTimestampOrID::TxID(end_tx_id)) => {
