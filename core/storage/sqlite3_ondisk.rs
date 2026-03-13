@@ -1416,6 +1416,7 @@ pub fn write_varint_to_vec(value: u64, payload: &mut Vec<u8>) {
 pub fn build_shared_wal(
     file: &Arc<dyn File>,
     io: &Arc<dyn crate::IO>,
+    path: &str,
 ) -> Result<Arc<RwLock<WalFileShared>>> {
     let size = file.size()?;
 
@@ -1443,6 +1444,8 @@ pub fn build_shared_wal(
         checkpoint_lock: TursoRwLock::new(),
         initialized: AtomicBool::new(false),
         epoch: AtomicU32::new(0),
+        wal_path: path.to_string(),
+        sealed: None,
     }));
 
     if size < WAL_HEADER_SIZE as u64 {
@@ -2256,7 +2259,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let shared = build_shared_wal(&file, &io).unwrap();
+        let shared = build_shared_wal(&file, &io, "test.wal").unwrap();
         let guard = shared.read();
         assert_eq!(guard.max_frame.load(Ordering::Acquire), 1);
         assert_eq!(guard.last_checksum, commit_checksum);

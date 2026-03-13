@@ -154,6 +154,20 @@ impl IO for SimulatorIO {
         Ok(())
     }
 
+    fn rename_file(&self, from: &str, to: &str) -> Result<()> {
+        let mut files = self.files.lock().unwrap();
+        for entry in files.iter_mut() {
+            if entry.0 == from {
+                entry.0 = to.to_string();
+                break;
+            }
+        }
+        if !self.keep_files {
+            let _ = std::fs::rename(from, to);
+        }
+        Ok(())
+    }
+
     fn step(&self) -> Result<()> {
         // Complete any pending IO operations
         let mut pending = self.pending.lock().unwrap();

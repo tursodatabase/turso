@@ -155,6 +155,10 @@ impl IO for SimulatorIO {
         Ok(())
     }
 
+    fn rename_file(&self, from: &str, to: &str) -> Result<()> {
+        self.inner.rename_file(from, to)
+    }
+
     fn step(&self) -> Result<()> {
         let now = self.current_time_wall_clock();
         for file in self.files.borrow().iter() {

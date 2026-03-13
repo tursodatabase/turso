@@ -315,6 +315,13 @@ impl IO for WindowsIOCP {
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
+    fn rename_file(&self, from: &str, to: &str) -> Result<()> {
+        trace!("rename_file(from = {}, to = {})", from, to);
+        std::fs::rename(from, to).map_err(|e| io_error(e, "rename_file"))?;
+        Ok(())
+    }
+
+    #[instrument(err, skip_all, level = Level::TRACE)]
     fn cancel(&self, completions: &[Completion]) -> Result<()> {
         for cmpl in completions {
             trace!("cancelling {}", get_unique_key_from_completion(cmpl).addr());

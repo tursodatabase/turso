@@ -2775,6 +2775,11 @@ impl Pager {
             return Ok((page, c));
         }
 
+        if let Some(frame_id) = wal.find_frame_sealed(page_idx as u64)? {
+            let c = wal.read_frame_sealed(frame_id, page.clone(), self.buffer_pool.clone())?;
+            return Ok((page, c));
+        }
+
         let c =
             self.begin_read_disk_page(page_idx as usize, page.clone(), allow_empty_read, &io_ctx)?;
         Ok((page, c))
@@ -3917,6 +3922,18 @@ impl Pager {
                 } => {
                     let res = return_if_io!(wal.checkpoint(self, mode));
                     let mut state = self.checkpoint_state.write();
+
+                    if res.sealed_complete {
+                        // Sealed WAL: backfill done, need DB sync then cleanup
+                        if sync_mode == crate::SyncMode::Off {
+                            state.phase = CheckpointPhase::Finalize { clear_page_cache };
+                        } else {
+                            state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
+                        }
+                        state.result = Some(res);
+                        continue;
+                    }
+
                     if matches!(mode, CheckpointMode::Truncate { .. })
                         // `should_truncate` will be true for successful truncate checkpoint
                         && res.should_truncate()
@@ -4032,17 +4049,29 @@ impl Pager {
                             !self.syncing.load(Ordering::SeqCst),
                             "syncing should be done"
                         );
-                        // After DB is synced, truncate WAL if in TRUNCATE mode
-                        let is_truncate_mode = {
+                        let is_sealed = {
                             let state = self.checkpoint_state.read();
-                            matches!(state.mode, Some(CheckpointMode::Truncate { .. }))
+                            state.result.as_ref()
+                                .map(|r| r.sealed_complete)
+                                .unwrap_or(false)
                         };
-                        if is_truncate_mode {
-                            self.checkpoint_state.write().phase =
-                                CheckpointPhase::TruncateWalFile { clear_page_cache };
-                        } else {
+                        if is_sealed {
+                            // Sealed WAL: no WAL truncation needed, go to Finalize
                             self.checkpoint_state.write().phase =
                                 CheckpointPhase::Finalize { clear_page_cache };
+                        } else {
+                            // After DB is synced, truncate WAL if in TRUNCATE mode
+                            let is_truncate_mode = {
+                                let state = self.checkpoint_state.read();
+                                matches!(state.mode, Some(CheckpointMode::Truncate { .. }))
+                            };
+                            if is_truncate_mode {
+                                self.checkpoint_state.write().phase =
+                                    CheckpointPhase::TruncateWalFile { clear_page_cache };
+                            } else {
+                                self.checkpoint_state.write().phase =
+                                    CheckpointPhase::Finalize { clear_page_cache };
+                            }
                         }
                         continue;
                     }
@@ -4105,6 +4134,13 @@ impl Pager {
 
                     // Release checkpoint guard
                     res.release_guard();
+
+                    // Clean up sealed WAL if present
+                    if res.sealed_complete {
+                        if let Some(wal) = self.wal.as_ref() {
+                            wal.cleanup_sealed_wal()?;
+                        }
+                    }
 
                     return Ok(IOResult::Done(res));
                 }
@@ -5126,6 +5162,7 @@ mod ptrmap_tests {
         let wal_shared = WalFileShared::new_shared(
             io.open_file("test.db-wal", OpenFlags::Create, false)
                 .unwrap(),
+            "test.db-wal",
         )
         .unwrap();
         let last_checksum_and_max_frame = wal_shared.read().last_checksum_and_max_frame();

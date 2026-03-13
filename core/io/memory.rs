@@ -77,6 +77,14 @@ impl IO for MemoryIO {
         files.remove(path);
         Ok(())
     }
+
+    fn rename_file(&self, from: &str, to: &str) -> Result<()> {
+        let mut files = self.files.lock();
+        if let Some(file) = files.remove(from) {
+            files.insert(to.to_string(), file);
+        }
+        Ok(())
+    }
 }
 
 pub struct MemoryFile {
