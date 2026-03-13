@@ -16,5 +16,5 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SEARCH o USING INDEX idx_orders_customer_date (customer_id=?)
-`--SCAN inventory AS i USING COVERING INDEX idx_inventory_covering
+|--SCAN inventory AS i USING COVERING INDEX idx_inventory_covering
+`--SEARCH o USING INTEGER PRIMARY KEY (rowid=?)

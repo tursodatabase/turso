@@ -23,7 +23,8 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN order_items AS oi USING INDEX idx_order_items_product_id
-|--SEARCH o USING INTEGER PRIMARY KEY (rowid=?)
+|--SCAN orders AS o USING COVERING INDEX idx_orders_customer_id
+|--SEARCH oi USING INDEX idx_order_items_order_id (order_id=?)
 |--SEARCH c USING INTEGER PRIMARY KEY (rowid=?)
+|--USE SORTER FOR GROUP BY
 `--USE HASH TABLE FOR count(DISTINCT)

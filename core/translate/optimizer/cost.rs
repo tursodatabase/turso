@@ -159,9 +159,9 @@ impl std::ops::Deref for RowCountEstimate {
     }
 }
 
-/// Optional ANALYZE-based context for cost estimation.
-/// When available, uses sqlite_stat1 histogram data for row estimates
-/// instead of heuristic selectivity multipliers.
+/// ANALYZE-based context for cost estimation.
+/// Uses sqlite_stat1 histogram data for row estimates when available,
+/// otherwise falls through to heuristic selectivity multipliers.
 pub struct AnalyzeCtx<'a> {
     pub rhs_table: &'a JoinedTable,
     pub index: Option<&'a Arc<Index>>,
@@ -174,16 +174,16 @@ pub(crate) fn estimate_rows_per_seek(
     usable_constraint_refs: &[RangeConstraintRef],
     base_row_count: RowCountEstimate,
     analyze_ctx: Option<&AnalyzeCtx>,
-    params: &CostModelParams,
 ) -> f64 {
     if is_unique_point_lookup(index_info, usable_constraint_refs) {
         return 1.0;
     }
 
-    // When ANALYZE stats are available and we have constraints, use histogram-based estimation.
     if let Some(ctx) = analyze_ctx {
         if !usable_constraint_refs.is_empty() {
-            return estimate_rows_from_analyze_stats(ctx, usable_constraint_refs, params);
+            if let Some(rows) = estimate_rows_from_analyze_stats(ctx, usable_constraint_refs) {
+                return rows;
+            }
         }
     }
 
@@ -208,45 +208,26 @@ pub(crate) fn estimate_rows_per_seek(
 }
 
 /// Estimate rows per seek using ANALYZE stats (sqlite_stat1 histogram data).
+/// Returns `None` when no actual stats exist for this index, signaling the
+/// caller to fall back to selectivity-based estimation.
 fn estimate_rows_from_analyze_stats(
     ctx: &AnalyzeCtx,
     constraint_refs: &[RangeConstraintRef],
-    params: &CostModelParams,
-) -> f64 {
-    let Some(index) = ctx.index else {
-        return params.fanout_index_seek_unique;
-    };
+) -> Option<f64> {
+    let index = ctx.index?;
 
     let matched_cols = constraint_refs.len();
-    let total_cols = index.columns.len();
-    let unmatched = total_cols.saturating_sub(matched_cols);
     let table_name = ctx.rhs_table.table.get_name();
 
-    if let Some(fanout) = ctx
-        .stats
-        .table_stats(table_name)
-        .and_then(|ts| ts.index_stats.get(&index.name))
-        .and_then(|stats| {
-            if matched_cols > 0 && matched_cols <= stats.avg_rows_per_distinct_prefix.len() {
-                Some(stats.avg_rows_per_distinct_prefix[matched_cols - 1] as f64)
-            } else {
-                None
-            }
-        })
-    {
-        return fanout;
-    }
+    let table_stats = ctx.stats.table_stats(table_name)?;
+    let idx_stats = table_stats.index_stats.get(&index.name)?;
 
-    if matched_cols >= total_cols {
-        if index.unique {
-            params.fanout_index_seek_unique
-        } else {
-            params.fanout_index_seek_non_unique
-        }
+    if matched_cols > 0 && matched_cols <= idx_stats.avg_rows_per_distinct_prefix.len() {
+        Some(idx_stats.avg_rows_per_distinct_prefix[matched_cols - 1] as f64)
     } else {
-        params
-            .fanout_index_seek_per_unmatched_column
-            .powi(unmatched as i32)
+        // Stats exist for this index but don't cover the matched prefix length.
+        // Return None to fall through to selectivity-based estimation.
+        None
     }
 }
 
@@ -295,7 +276,6 @@ pub fn estimate_cost_for_scan_or_seek(
         usable_constraint_refs,
         RowCountEstimate::AnalyzeStats(base_row_count),
         analyze_ctx,
-        params,
     );
 
     let base_cost = estimate_index_cost(

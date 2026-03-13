@@ -206,7 +206,7 @@ pub(super) fn choose_best_btree_candidate(
     rhs_table_idx: usize,
     maybe_order_target: Option<&OrderTarget>,
     schema: &Schema,
-    analyze_stats: Option<&AnalyzeStats>,
+    analyze_stats: &AnalyzeStats,
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
@@ -300,11 +300,11 @@ pub(super) fn choose_best_btree_candidate(
                 (IterationDirection::Forwards, false, Cost(0.0))
             };
 
-        let analyze_ctx = analyze_stats.map(|stats| AnalyzeCtx {
+        let analyze_ctx = AnalyzeCtx {
             rhs_table,
             index: candidate.index.as_ref(),
-            stats,
-        });
+            stats: analyze_stats,
+        };
         let cost = estimate_cost_for_scan_or_seek(
             Some(index_info),
             &rhs_constraints.constraints,
@@ -313,7 +313,7 @@ pub(super) fn choose_best_btree_candidate(
             base_row_count,
             is_index_ordered,
             params,
-            analyze_ctx.as_ref(),
+            Some(&analyze_ctx),
         );
         // Prerequisite tiebreaker (mirrors SQLite's whereLoopFindLesser).
         // When costs are equal, prefer fewer outer-table prerequisites: a
@@ -622,7 +622,7 @@ fn find_best_access_method_for_btree(
         rhs_table_idx,
         maybe_order_target,
         schema,
-        Some(analyze_stats),
+        analyze_stats,
         input_cardinality,
         base_row_count,
         params,
@@ -655,7 +655,6 @@ fn find_best_access_method_for_btree(
             &best.constraint_refs,
             base_row_count,
             Some(&analyze_ctx),
-            params,
         )
     };
     let mut best_access_method = AccessMethod {
@@ -698,7 +697,7 @@ fn find_best_access_method_for_btree(
             params,
             best_access_method.cost,
             &lhs_mask,
-            Some(analyze_stats),
+            analyze_stats,
         ) {
             best_access_method = multi_idx_method;
         }
@@ -715,7 +714,7 @@ fn find_best_access_method_for_btree(
             params,
             best_access_method.cost,
             &lhs_mask,
-            Some(analyze_stats),
+            analyze_stats,
         ) {
             best_access_method = multi_idx_and_method;
         }
@@ -1394,7 +1393,6 @@ fn find_best_access_method_for_subquery(
         &usable_constraint_refs,
         base_row_count,
         None,
-        params,
     );
     let one_pass_scan_cost =
         estimate_cost_for_scan_or_seek(None, &[], &[], 1.0, base_row_count, false, params, None);

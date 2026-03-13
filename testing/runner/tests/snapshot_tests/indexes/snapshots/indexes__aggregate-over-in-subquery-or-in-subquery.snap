@@ -37,7 +37,7 @@ info:
 QUERY PLAN
 `--SCAN matched_entries
    |--LIST SUBQUERY 1
-   |  `--SEARCH l USING INDEX idx_item_links_target (target_id=?)
+   |  `--MULTI-INDEX AND l (idx_item_links_kind, idx_item_links_target)
    |--LIST SUBQUERY 2
-   |  `--SEARCH l USING INDEX idx_item_links_source (source_id=?)
+   |  `--MULTI-INDEX AND l (idx_item_links_kind, idx_item_links_source)
    `--MULTI-INDEX OR t (PRIMARY KEY, PRIMARY KEY)

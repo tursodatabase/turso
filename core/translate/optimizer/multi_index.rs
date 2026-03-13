@@ -319,7 +319,7 @@ fn choose_multi_index_branch_access(
     rhs_idx: usize,
     schema: &Schema,
     base_row_count: RowCountEstimate,
-    analyze_stats: Option<&AnalyzeStats>,
+    analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
 ) -> crate::Result<Option<MultiIdxBranch>> {
     let chosen_seek = choose_best_btree_candidate(
@@ -345,11 +345,11 @@ fn choose_multi_index_branch_access(
                 BranchReadMode::RowIdOnly,
             )
             .expect("multi-index branches always have costable access");
-            let analyze_ctx = analyze_stats.map(|stats| AnalyzeCtx {
+            let analyze_ctx = AnalyzeCtx {
                 rhs_table,
                 index: chosen.index.as_ref(),
-                stats,
-            });
+                stats: analyze_stats,
+            };
             let branch_cost = estimate_cost_for_scan_or_seek(
                 Some(index_info),
                 &table_constraints.constraints,
@@ -358,7 +358,7 @@ fn choose_multi_index_branch_access(
                 base_row_count,
                 false,
                 params,
-                analyze_ctx.as_ref(),
+                Some(&analyze_ctx),
             );
             MultiIdxBranch {
                 index: chosen.index.clone(),
@@ -372,8 +372,7 @@ fn choose_multi_index_branch_access(
                     &table_constraints.constraints,
                     &chosen.constraint_refs,
                     base_row_count,
-                    analyze_ctx.as_ref(),
-                    params,
+                    Some(&analyze_ctx),
                 ),
                 residual_exprs: vec![],
                 requires_table_cursor: false,
@@ -859,7 +858,7 @@ pub fn consider_multi_index_union(
     params: &CostModelParams,
     best_cost: Cost,
     lhs_mask: &TableMask,
-    analyze_stats: Option<&AnalyzeStats>,
+    analyze_stats: &AnalyzeStats,
 ) -> Option<AccessMethod> {
     for (where_term_idx, term) in where_clause.iter().enumerate() {
         if term.consumed {
@@ -983,7 +982,7 @@ pub fn consider_multi_index_intersection(
     params: &CostModelParams,
     best_cost: Cost,
     lhs_mask: &TableMask,
-    analyze_stats: Option<&AnalyzeStats>,
+    analyze_stats: &AnalyzeStats,
 ) -> Option<AccessMethod> {
     let decomposition = analyze_and_terms_for_multi_index(
         rhs_table,
@@ -1015,11 +1014,11 @@ pub fn consider_multi_index_intersection(
             let index_info =
                 index_info_for_branch(b.index.as_deref(), rhs_table, BranchReadMode::RowIdOnly)
                     .expect("intersection branches always have costable access");
-            let analyze_ctx = analyze_stats.map(|stats| AnalyzeCtx {
+            let analyze_ctx = AnalyzeCtx {
                 rhs_table,
                 index: b.index.as_ref(),
-                stats,
-            });
+                stats: analyze_stats,
+            };
             MultiIdxBranch {
                 index: b.index.clone(),
                 access: MultiIdxBranchAccess::Seek {
@@ -1034,15 +1033,14 @@ pub fn consider_multi_index_intersection(
                     base_row_count,
                     false,
                     params,
-                    analyze_ctx.as_ref(),
+                    Some(&analyze_ctx),
                 ),
                 estimated_rows: estimate_rows_per_seek(
                     index_info,
                     &constraints,
                     &b.constraint_refs,
                     base_row_count,
-                    analyze_ctx.as_ref(),
-                    params,
+                    Some(&analyze_ctx),
                 ),
                 residual_exprs: vec![],
                 requires_table_cursor: false,
@@ -1074,7 +1072,8 @@ pub fn consider_multi_index_intersection(
 #[cfg(test)]
 mod tests {
     use super::{
-        consider_multi_index_intersection, consider_multi_index_union, MultiIndexBranchParams,
+        consider_multi_index_intersection, consider_multi_index_union, AnalyzeStats,
+        MultiIndexBranchParams,
     };
     use crate::{
         schema::{BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table, Type},
@@ -1365,7 +1364,7 @@ mod tests {
             &DEFAULT_PARAMS,
             Cost(f64::INFINITY),
             &lhs_mask,
-            None,
+            &AnalyzeStats::default(),
         );
 
         assert!(
@@ -1452,7 +1451,7 @@ mod tests {
             &DEFAULT_PARAMS,
             Cost(f64::INFINITY),
             &TableMask::new(),
-            None,
+            &AnalyzeStats::default(),
         )
         .expect("rowid and secondary-index terms should be eligible for intersection");
 
@@ -1640,7 +1639,7 @@ mod tests {
             &DEFAULT_PARAMS,
             Cost(f64::INFINITY),
             &lhs_mask,
-            None,
+            &AnalyzeStats::default(),
         )
         .expect("compound OR branches should produce a multi-index union");
 
@@ -1782,7 +1781,7 @@ mod tests {
             &DEFAULT_PARAMS,
             Cost(f64::INFINITY),
             &lhs_mask,
-            None,
+            &AnalyzeStats::default(),
         )
         .expect("plain OR branches should produce a multi-index union");
 
@@ -1798,7 +1797,7 @@ mod tests {
             &DEFAULT_PARAMS,
             Cost(f64::INFINITY),
             &lhs_mask,
-            None,
+            &AnalyzeStats::default(),
         )
         .expect("residual-filtered OR branches should still produce a multi-index union");
 
