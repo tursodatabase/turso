@@ -628,6 +628,74 @@ expect {
     1|30
 }
 
+@cross-check-integrity
+test subquery-correlated-in-having-grouped-scalar-null {
+    create table t(g int, x int);
+    create table thresholds(g int, min_total int);
+    insert into t values (1, 10), (1, 20), (2, 5), (3, 7), (3, 8);
+    insert into thresholds values (1, 25), (2, 10);
+    select g, sum(x) as total
+      from t
+     group by g
+    having total > (select min_total from thresholds th where th.g = t.g)
+     order by g;
+}
+expect {
+    1|30
+}
+
+@cross-check-integrity
+test subquery-correlated-in-having-grouped-in-subquery {
+    create table t(g int, x int);
+    insert into t values (1, 10), (1, 20), (2, 15), (2, 1), (3, 8);
+    select g, sum(x) as total
+      from t
+     group by g
+    having g in (
+        select t2.g
+          from t t2
+         where t2.g = t.g
+           and t2.x >= 15
+    )
+     order by g;
+}
+expect {
+    1|30
+    2|16
+}
+
+@cross-check-integrity
+test subquery-correlated-in-order-by-grouped-desc {
+    create table t(g int, x int);
+    insert into t values (1, 10), (1, 20), (2, 15), (2, 1), (3, 50);
+    select g, sum(x) as total
+      from t
+     group by g
+     order by (select count(*) from t t2 where t2.g = t.g and t2.x >= 10) desc, g desc;
+}
+expect {
+    1|30
+    3|50
+    2|16
+}
+
+@cross-check-integrity
+test subquery-correlated-in-order-by-grouped-null {
+    create table t(g int, x int);
+    create table weights(g int, w int);
+    insert into t values (1, 5), (1, 6), (2, 7), (3, 8);
+    insert into weights values (2, 10);
+    select g, sum(x) as total
+      from t
+     group by g
+     order by (select w from weights where weights.g = t.g) desc, g;
+}
+expect {
+    2|7
+    1|11
+    3|8
+}
+
 # Uncorrelated IN-subquery in HAVING clause
 @cross-check-integrity
 test subquery-uncorrelated-in-having-in {
