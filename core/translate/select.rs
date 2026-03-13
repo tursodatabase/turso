@@ -481,7 +481,7 @@ fn prepare_one_select_plan(
                             Some(&mut plan.table_references),
                             Some(&plan.result_columns),
                             resolver,
-                            BindingBehavior::TryResultColumnsFirst,
+                            BindingBehavior::TryCanonicalColumnsFirst,
                         )?;
                     }
 
