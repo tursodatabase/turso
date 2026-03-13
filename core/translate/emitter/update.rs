@@ -2347,36 +2347,41 @@ fn emit_update_insns<'a>(
             }
         }
 
-        let cache_state = seed_returning_row_image_in_cache(
-            program,
-            table_references,
-            start,
-            rowid_set_clause_reg.unwrap_or(beg),
-            &mut t_ctx.resolver,
-        )?;
-        let result: Result<()> = (|| {
-            // Emit RETURNING subqueries after Insert so correlated references
-            // resolve against the post-write row image, not the old cursor state.
-            for subquery in non_from_clause_subqueries
-                .iter_mut()
-                .filter(|s| !s.has_been_evaluated() && s.is_post_write_returning())
-            {
-                let rerun_for_target_scan =
-                    subquery.reads_table(target_table.database_id, target_table.table.get_name());
-                let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
-                emit_non_from_clause_subquery(
-                    program,
-                    &t_ctx.resolver,
-                    *subquery_plan,
-                    &subquery.query_type,
-                    subquery.correlated || rerun_for_target_scan,
-                    true,
-                )?;
-            }
-            Ok(())
-        })();
-        restore_returning_row_image_in_cache(&mut t_ctx.resolver, cache_state);
-        result?;
+        let has_post_write_returning_subqueries = non_from_clause_subqueries
+            .iter()
+            .any(|s| !s.has_been_evaluated() && s.is_post_write_returning());
+        if has_post_write_returning_subqueries {
+            let cache_state = seed_returning_row_image_in_cache(
+                program,
+                table_references,
+                start,
+                rowid_set_clause_reg.unwrap_or(beg),
+                &mut t_ctx.resolver,
+            )?;
+            let result: Result<()> = (|| {
+                // Emit RETURNING subqueries after Insert so correlated references
+                // resolve against the post-write row image, not the old cursor state.
+                for subquery in non_from_clause_subqueries
+                    .iter_mut()
+                    .filter(|s| !s.has_been_evaluated() && s.is_post_write_returning())
+                {
+                    let rerun_for_target_scan = subquery
+                        .reads_table(target_table.database_id, target_table.table.get_name());
+                    let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
+                    emit_non_from_clause_subquery(
+                        program,
+                        &t_ctx.resolver,
+                        *subquery_plan,
+                        &subquery.query_type,
+                        subquery.correlated || rerun_for_target_scan,
+                        true,
+                    )?;
+                }
+                Ok(())
+            })();
+            restore_returning_row_image_in_cache(&mut t_ctx.resolver, cache_state);
+            result?;
+        }
 
         // Emit RETURNING results if specified
         if let Some(returning_columns) = &returning {
