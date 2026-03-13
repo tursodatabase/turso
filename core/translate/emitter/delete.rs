@@ -11,8 +11,9 @@ use crate::{
             get_relevant_triggers_type_and_time, init_limit, OperationMode, TriggerTime,
         },
         expr::{
-            emit_returning_results, emit_returning_scan_back, translate_expr_no_constant_opt,
-            NoConstantOptReason, ReturningBufferCtx,
+            emit_returning_results, emit_returning_scan_back, restore_returning_row_image_in_cache,
+            seed_returning_row_image_in_cache, translate_expr_no_constant_opt, NoConstantOptReason,
+            ReturningBufferCtx,
         },
         fkeys::{
             build_index_affinity_string, emit_guarded_fk_decrement, open_read_index,
@@ -20,10 +21,10 @@ use crate::{
         },
         main_loop::{CloseLoop, InitLoop, OpenLoop},
         plan::{
-            DeletePlan, EvalAt, JoinOrderMember, JoinedTable, Operation, ResultSetColumn, Search,
-            TableReferences,
+            DeletePlan, EvalAt, JoinOrderMember, JoinedTable, NonFromClauseSubquery, Operation,
+            ResultSetColumn, Search, TableReferences,
         },
-        subquery::emit_non_from_clause_subqueries_for_eval_at,
+        subquery::{emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery},
         trigger_exec::{fire_trigger, has_relevant_triggers_type_only, TriggerContext},
     },
     vdbe::{
@@ -199,6 +200,7 @@ pub fn emit_program_for_delete(
             program,
             &mut t_ctx,
             &mut plan.table_references,
+            &mut plan.non_from_clause_subqueries,
             &plan.result_columns,
             rowid_reg,
             table_cursor_id,
@@ -241,6 +243,7 @@ pub fn emit_program_for_delete(
             program,
             &mut t_ctx,
             &mut plan.table_references,
+            &mut plan.non_from_clause_subqueries,
             &plan.result_columns,
             resolver,
             returning_buffer.as_ref(),
@@ -418,6 +421,7 @@ fn emit_delete_insns<'a>(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx<'a>,
     table_references: &mut TableReferences,
+    non_from_clause_subqueries: &mut [NonFromClauseSubquery],
     result_columns: &'a [ResultSetColumn],
     resolver: &Resolver,
     returning_buffer: Option<&ReturningBufferCtx>,
@@ -548,6 +552,7 @@ fn emit_delete_insns<'a>(
         program,
         t_ctx,
         table_references,
+        non_from_clause_subqueries,
         result_columns,
         table_reference,
         rowid_reg,
@@ -592,6 +597,7 @@ fn emit_delete_row_common(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
     table_references: &mut TableReferences,
+    non_from_clause_subqueries: &mut [NonFromClauseSubquery],
     result_columns: &[ResultSetColumn],
     table_reference: *const JoinedTable,
     rowid_reg: usize,
@@ -762,27 +768,57 @@ fn emit_delete_row_common(
             )?;
         }
 
-        // Emit RETURNING results if specified (must be before DELETE)
-        if !result_columns.is_empty() {
-            let columns_start_reg = columns_start_reg
-                .expect("columns_start_reg must be provided when there are triggers or RETURNING");
-            // Emit RETURNING results using the values we just read
-            emit_returning_results(
-                program,
-                table_references,
-                result_columns,
-                columns_start_reg,
-                rowid_reg,
-                &mut t_ctx.resolver,
-                returning_buffer,
-            )?;
-        }
-
         program.emit_insn(Insn::Delete {
             cursor_id: main_table_cursor_id,
             table_name: table_name.to_string(),
             is_part_of_update: false,
         });
+    }
+
+    // Emit RETURNING after the row is deleted, but against the cached OLD row image.
+    // This matches SQLite: target-table scans inside RETURNING see the post-delete table
+    // state, while direct column references still resolve to the deleted row.
+    if !result_columns.is_empty() {
+        let columns_start_reg = columns_start_reg
+            .expect("columns_start_reg must be provided when there are triggers or RETURNING");
+        let delete_table = unsafe { &*table_reference };
+        let cache_state = seed_returning_row_image_in_cache(
+            program,
+            table_references,
+            columns_start_reg,
+            rowid_reg,
+            &mut t_ctx.resolver,
+        )?;
+        let result: Result<()> = (|| {
+            for subquery in non_from_clause_subqueries
+                .iter_mut()
+                .filter(|s| !s.has_been_evaluated() && s.is_post_write_returning())
+            {
+                let rerun_for_target_scan =
+                    subquery.reads_table(delete_table.database_id, delete_table.table.get_name());
+                let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
+                emit_non_from_clause_subquery(
+                    program,
+                    &t_ctx.resolver,
+                    *subquery_plan,
+                    &subquery.query_type,
+                    subquery.correlated || rerun_for_target_scan,
+                    true,
+                )?;
+            }
+            Ok(())
+        })();
+        restore_returning_row_image_in_cache(&mut t_ctx.resolver, cache_state);
+        result?;
+        emit_returning_results(
+            program,
+            table_references,
+            result_columns,
+            columns_start_reg,
+            rowid_reg,
+            &mut t_ctx.resolver,
+            returning_buffer,
+        )?;
     }
 
     // Phase 2: After Delete - fire CASCADE/SetNull/SetDefault FK actions.
@@ -809,6 +845,7 @@ fn emit_delete_insns_when_triggers_present(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
     table_references: &mut TableReferences,
+    non_from_clause_subqueries: &mut [NonFromClauseSubquery],
     result_columns: &[ResultSetColumn],
     rowid_reg: usize,
     main_table_cursor_id: usize,
@@ -917,6 +954,7 @@ fn emit_delete_insns_when_triggers_present(
         program,
         t_ctx,
         table_references,
+        non_from_clause_subqueries,
         result_columns,
         table_reference,
         rowid_reg,

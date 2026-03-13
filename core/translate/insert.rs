@@ -979,6 +979,10 @@ pub fn translate_insert(
     }
 
     if !returning_subqueries.is_empty() {
+        let target_table = table_references
+            .joined_tables()
+            .first()
+            .expect("INSERT RETURNING target table must exist");
         let cache_state = seed_returning_row_image_in_cache(
             program,
             &table_references,
@@ -991,13 +995,15 @@ pub fn translate_insert(
                 .iter_mut()
                 .filter(|s| !s.has_been_evaluated())
             {
+                let rerun_for_target_scan =
+                    subquery.reads_table(target_table.database_id, target_table.table.get_name());
                 let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
                 emit_non_from_clause_subquery(
                     program,
                     resolver,
                     *subquery_plan,
                     &subquery.query_type,
-                    subquery.correlated,
+                    subquery.correlated || rerun_for_target_scan,
                     true,
                 )?;
             }

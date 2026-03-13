@@ -26,8 +26,8 @@ use crate::{
         main_loop::{CloseLoop, InitLoop, OpenLoop},
         plan::{
             EvalAt, JoinOrderMember, JoinedTable, NonFromClauseSubquery, Operation,
-            QueryDestination, ResultSetColumn, Scan, Search, SelectPlan, TableReferences,
-            UpdatePlan,
+            QueryDestination, ResultSetColumn, Scan, Search, SelectPlan, SubqueryEvalPhase,
+            TableReferences, UpdatePlan,
         },
         planner::ROWID_STRS,
         subquery::{emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery},
@@ -169,24 +169,23 @@ pub fn emit_program_for_update(
         )?;
     }
 
-    // For the ephemeral path, SET clause subqueries remain in plan.non_from_clause_subqueries
-    // (WHERE clause subqueries were moved to the ephemeral plan by the optimizer).
-    // These SET clause subqueries must be emitted inside the update loop, after NotExists
-    // positions the write cursor, so correlated references resolve to the correct cursor.
-    // Drain them into a separate Vec so init_loop/open_loop don't try to evaluate them.
-    let mut update_subqueries = if has_ephemeral_table {
-        plan.non_from_clause_subqueries.drain(..).collect()
-    } else {
-        Vec::new()
-    };
-
-    // Drain RETURNING subqueries so they aren't evaluated during the main loop scan.
-    // RETURNING subqueries must be emitted after Insert so that correlated column
-    // references read post-UPDATE values from the cursor.
+    // Drain write-phase subqueries so init_loop/open_loop only handle WHERE-clause
+    // subqueries. SET subqueries must run after NotExists positions the write cursor,
+    // and RETURNING subqueries must run after the row has been written.
+    // This applies to both the normal and ephemeral UPDATE paths.
+    let mut update_subqueries = Vec::new();
     {
         let mut i = 0;
         while i < plan.non_from_clause_subqueries.len() {
-            if plan.non_from_clause_subqueries[i].is_post_write_returning() {
+            let subquery = &plan.non_from_clause_subqueries[i];
+            if subquery.eval_phase == SubqueryEvalPhase::BeforeLoop {
+                i += 1;
+                continue;
+            }
+            if matches!(
+                subquery.eval_phase,
+                SubqueryEvalPhase::PreWrite | SubqueryEvalPhase::PostWriteReturning
+            ) {
                 update_subqueries.push(plan.non_from_clause_subqueries.remove(i));
             } else {
                 i += 1;
@@ -2362,13 +2361,15 @@ fn emit_update_insns<'a>(
                 .iter_mut()
                 .filter(|s| !s.has_been_evaluated() && s.is_post_write_returning())
             {
+                let rerun_for_target_scan =
+                    subquery.reads_table(target_table.database_id, target_table.table.get_name());
                 let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
                 emit_non_from_clause_subquery(
                     program,
                     &t_ctx.resolver,
                     *subquery_plan,
                     &subquery.query_type,
-                    subquery.correlated,
+                    subquery.correlated || rerun_for_target_scan,
                     true,
                 )?;
             }
