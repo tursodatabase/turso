@@ -1,3 +1,4 @@
+use crate::schema::Table;
 use crate::turso_assert_greater_than_or_equal;
 use crate::{
     schema::{FromClauseSubquery, Index, Schema},
@@ -296,14 +297,11 @@ pub fn plan_satisfies_order_target(
                 schema,
                 EqualityPrefixScope::ConstantEquality,
             ),
-            AccessMethodParams::Subquery { iter_dir }
-                if order_target.is_extremum()
-                    && matches!(table_ref.table, crate::schema::Table::FromClauseSubquery(_)) =>
-            {
-                let crate::schema::Table::FromClauseSubquery(from_clause_subquery) =
-                    &table_ref.table
-                else {
-                    unreachable!("guard above ensured subquery table");
+            AccessMethodParams::Subquery { iter_dir } => {
+                let Table::FromClauseSubquery(from_clause_subquery) = &table_ref.table else {
+                    unreachable!(
+                        "access_method.params::Subquery must be for a FromClauseSubquery table"
+                    );
                 };
                 subquery_intrinsic_order_consumed(
                     table_ref.internal_id,

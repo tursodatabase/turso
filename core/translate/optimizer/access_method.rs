@@ -1129,48 +1129,30 @@ fn expr_is_simple_column_from_table(expr: &ast::Expr, table_id: TableInternalId)
     )
 }
 
-/// Check whether a materialized subquery can satisfy an extremum (MIN/MAX) query by
-/// scanning its existing row order directly.
+/// Check whether a subquery's intrinsic row order (from its ORDER BY or
+/// finalized inner scan) already satisfies the outer order target, and if so
+/// in which direction.
 ///
-/// This is the sqlite-shaped fast path: if the subquery already produces rows
-/// in the needed order, `MAX/MIN` should scan that materialized cursor with
-/// `Last/Prev` or `Rewind/Next` instead of fabricating a second temporary index.
-fn intrinsic_extremum_subquery_scan_direction(
+/// Backwards iteration (`Last`/`Prev`) is only possible when
+/// `table_materialization_required` is true — coroutine scans cannot be
+/// reversed at runtime.
+fn intrinsic_subquery_scan_direction(
     rhs_table: &JoinedTable,
     subquery: &FromClauseSubquery,
-    usable: &[(usize, &Constraint)],
     maybe_order_target: Option<&OrderTarget>,
     table_materialization_required: bool,
     schema: &Schema,
 ) -> Option<IterationDirection> {
     let order_target = maybe_order_target?;
-    if !order_target.is_extremum() {
-        return None;
-    }
-    let [target_col] = order_target.columns.as_slice() else {
-        return None;
-    };
-    let ColumnTarget::Column(target_col_pos) = target_col.target else {
-        return None;
-    };
-    // We only reuse intrinsic order when every usable bound is on the extremum
-    // column itself. Once other key columns participate, the direct table scan
-    // no longer has a simple "walk from one end until the predicate matches"
-    // shape.
-    if usable
-        .iter()
-        .any(|(_, c)| c.table_col_pos != Some(target_col_pos))
-    {
-        return None;
-    }
+    let cols = &order_target.columns;
 
     let matches_forwards = subquery_intrinsic_order_consumed(
         rhs_table.internal_id,
         subquery,
         IterationDirection::Forwards,
-        &order_target.columns,
+        cols,
         schema,
-    ) == order_target.columns.len();
+    ) == cols.len();
     if matches_forwards {
         return Some(IterationDirection::Forwards);
     }
@@ -1180,9 +1162,9 @@ fn intrinsic_extremum_subquery_scan_direction(
             rhs_table.internal_id,
             subquery,
             IterationDirection::Backwards,
-            &order_target.columns,
+            cols,
             schema,
-        ) == order_target.columns.len();
+        ) == cols.len();
     matches_backwards.then_some(IterationDirection::Backwards)
 }
 
@@ -1276,21 +1258,42 @@ fn find_best_access_method_for_subquery(
         })
         .collect();
 
-    if let Some(iter_dir) = intrinsic_extremum_subquery_scan_direction(
-        rhs_table,
-        subquery,
-        &usable,
-        maybe_order_target,
-        table_materialization_required,
-        schema,
-    ) {
-        return Ok(Some(AccessMethod {
-            cost: scan_cost,
-            estimated_rows_per_outer_row: *base_row_count,
-            residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
-            consumed_where_terms: SmallVec::new(),
-            params: AccessMethodParams::Subquery { iter_dir },
-        }));
+    // For extremum (MIN/MAX) targets we can reuse the subquery's intrinsic
+    // order as a plain scan when every usable constraint is on the extremum
+    // column itself. Once other key columns participate, the direct table
+    // scan no longer has a simple "walk from one end" shape.
+    let extremum_constraints_compatible = maybe_order_target.is_some_and(|ot| ot.is_extremum())
+        && match maybe_order_target
+            .and_then(|ot| ot.columns.first())
+            .map(|c| &c.target)
+        {
+            Some(ColumnTarget::Column(pos)) => {
+                usable.iter().all(|(_, c)| c.table_col_pos == Some(*pos))
+            }
+            _ => false,
+        };
+
+    // Try to reuse the subquery's intrinsic row order (from its ORDER BY or
+    // finalized inner scan) to satisfy the outer order target directly.
+    // For non-extremum targets this only applies when there are no seek
+    // constraints — with constraints, we fall through to the materialized
+    // index path which has its own order-satisfaction logic.
+    if extremum_constraints_compatible || usable.is_empty() {
+        if let Some(iter_dir) = intrinsic_subquery_scan_direction(
+            rhs_table,
+            subquery,
+            maybe_order_target,
+            table_materialization_required,
+            schema,
+        ) {
+            return Ok(Some(AccessMethod {
+                cost: scan_cost,
+                estimated_rows_per_outer_row: *base_row_count,
+                residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
+                consumed_where_terms: SmallVec::new(),
+                params: AccessMethodParams::Subquery { iter_dir },
+            }));
+        }
     }
 
     if usable.is_empty() {

@@ -716,3 +716,33 @@ snapshot-eqp run-length-longest-window {
     ORDER BY run_length DESC
     LIMIT 1;
 }
+
+# =============================================================================
+# CTE MATERIALIZED ORDER REUSE
+# =============================================================================
+
+setup ordered_cte_schema {
+    CREATE TABLE t(x);
+    CREATE INDEX xdesc ON t(x DESC);
+}
+
+# Materialized CTE with ORDER BY DESC, outer query ORDER BY same direction.
+# The sorter should be eliminated because the materialized table's intrinsic
+# order matches the outer ORDER BY.
+@setup ordered_cte_schema
+snapshot-eqp cte-materialized-order-reused-same-dir {
+    WITH descending AS MATERIALIZED (
+        SELECT * FROM t ORDER BY x DESC
+    )
+    SELECT * FROM descending ORDER BY descending.x DESC;
+}
+
+# Materialized CTE with ORDER BY DESC, outer query ORDER BY ASC.
+# With backwards scan support the sorter should be eliminated too.
+@setup ordered_cte_schema
+snapshot-eqp cte-materialized-order-reused-opposite-dir {
+    WITH descending AS MATERIALIZED (
+        SELECT * FROM t ORDER BY x DESC
+    )
+    SELECT * FROM descending ORDER BY descending.x ASC;
+}

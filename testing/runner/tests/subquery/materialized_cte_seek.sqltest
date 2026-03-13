@@ -441,3 +441,35 @@ expect {
     30
     99
 }
+
+test cte-materialized-order-reused-same-direction {
+    CREATE TABLE t(x);
+    CREATE INDEX xdesc ON t(x DESC);
+    INSERT INTO t VALUES (1),(2),(3);
+
+    WITH descending AS MATERIALIZED (
+        SELECT * FROM t ORDER BY x DESC
+    )
+    SELECT * FROM descending ORDER BY descending.x DESC;
+}
+expect {
+    3
+    2
+    1
+}
+
+test cte-materialized-order-reused-opposite-direction {
+    CREATE TABLE t(x);
+    CREATE INDEX xdesc ON t(x DESC);
+    INSERT INTO t VALUES (1),(2),(3);
+
+    WITH descending AS MATERIALIZED (
+        SELECT * FROM t ORDER BY x DESC
+    )
+    SELECT * FROM descending ORDER BY descending.x ASC;
+}
+expect {
+    1
+    2
+    3
+}

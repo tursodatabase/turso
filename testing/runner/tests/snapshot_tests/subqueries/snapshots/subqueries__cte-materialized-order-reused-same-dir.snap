@@ -1,0 +1,19 @@
+---
+source: subqueries.sqltest
+expression: |-
+  WITH descending AS MATERIALIZED (
+          SELECT * FROM t ORDER BY x DESC
+      )
+      SELECT * FROM descending ORDER BY descending.x DESC;
+info:
+  statement_type: WITH (CTE)
+  tables:
+  - descending
+  - t
+  setup_blocks:
+  - ordered_cte_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN t USING COVERING INDEX xdesc
+`--SCAN descending
