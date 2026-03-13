@@ -155,6 +155,13 @@ extern "C" {
     fn sqlite3_db_handle(stmt: *mut sqlite3_stmt) -> *mut sqlite3;
     fn sqlite3_value_int(value: *mut libc::c_void) -> i32;
     fn sqlite3_result_int(context: *mut libc::c_void, val: i32);
+    fn sqlite3_column_value(stmt: *mut sqlite3_stmt, idx: i32) -> *mut libc::c_void;
+    fn sqlite3_value_int64(value: *mut libc::c_void) -> i64;
+    fn sqlite3_value_double(value: *mut libc::c_void) -> f64;
+    fn sqlite3_value_text(value: *mut libc::c_void) -> *const libc::c_char;
+    fn sqlite3_value_dup(value: *mut libc::c_void) -> *mut libc::c_void;
+    fn sqlite3_value_free(value: *mut libc::c_void);
+    fn sqlite3_context_db_handle(context: *mut libc::c_void) -> *mut libc::c_void;
 }
 
 const SQLITE_OK: i32 = 0;
@@ -2841,6 +2848,173 @@ mod tests {
             assert!(null_db.is_null());
 
             assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "sqlite3"))]
+    fn test_sqlite3_column_value_and_value_dup_free() {
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("test.db");
+            let path_cstr = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(path_cstr.as_ptr(), &mut db), SQLITE_OK);
+
+            // Create table and insert rows with various types
+            let mut errmsg: *mut libc::c_char = ptr::null_mut();
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE t2 (i INTEGER, f REAL, t TEXT, b BLOB);".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg,
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"INSERT INTO t2 VALUES (42, 1.5, 'hello', X'DEADBEEF');".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg,
+                ),
+                SQLITE_OK
+            );
+
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT i, f, t, b FROM t2".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+
+            // Test integer column value
+            let val0 = sqlite3_column_value(stmt, 0);
+            assert!(!val0.is_null());
+            assert_eq!(sqlite3_value_type(val0), SQLITE_INTEGER);
+            assert_eq!(sqlite3_value_int64(val0), 42);
+
+            // Test float column value
+            let val1 = sqlite3_column_value(stmt, 1);
+            assert!(!val1.is_null());
+            assert_eq!(sqlite3_value_type(val1), SQLITE_FLOAT);
+            assert!((sqlite3_value_double(val1) - 1.5).abs() < 0.001);
+
+            // Test text column value
+            let val2 = sqlite3_column_value(stmt, 2);
+            assert!(!val2.is_null());
+            assert_eq!(sqlite3_value_type(val2), SQLITE_TEXT);
+            let text_ptr = sqlite3_value_text(val2);
+            assert!(!text_ptr.is_null());
+            let text_len = sqlite3_value_bytes(val2) as usize;
+            let text =
+                std::str::from_utf8(std::slice::from_raw_parts(text_ptr as *const u8, text_len))
+                    .unwrap();
+            assert_eq!(text, "hello");
+
+            // Test blob column value
+            let val3 = sqlite3_column_value(stmt, 3);
+            assert!(!val3.is_null());
+            assert_eq!(sqlite3_value_type(val3), SQLITE_BLOB);
+            assert_eq!(sqlite3_value_bytes(val3), 4);
+
+            // Test sqlite3_value_dup — deep copy the integer value
+            let dup = sqlite3_value_dup(val0);
+            assert!(!dup.is_null());
+            assert_eq!(sqlite3_value_type(dup), SQLITE_INTEGER);
+            assert_eq!(sqlite3_value_int64(dup), 42);
+
+            // The dup should survive after finalize
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_value_int64(dup), 42);
+
+            // Free the duped value
+            sqlite3_value_free(dup);
+
+            // Null safety
+            sqlite3_value_free(ptr::null_mut());
+            let null_dup = sqlite3_value_dup(ptr::null_mut());
+            assert!(null_dup.is_null());
+
+            // Null column_value
+            let null_val = sqlite3_column_value(ptr::null_mut(), 0);
+            assert!(null_val.is_null());
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "sqlite3"))]
+    fn test_sqlite3_context_db_handle() {
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("test.db");
+            let path_cstr = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(path_cstr.as_ptr(), &mut db), SQLITE_OK);
+
+            // Register a custom function that checks sqlite3_context_db_handle
+            use std::sync::atomic::{AtomicPtr, Ordering};
+            static CAPTURED_DB: AtomicPtr<libc::c_void> = AtomicPtr::new(ptr::null_mut());
+
+            unsafe extern "C" fn test_func(
+                ctx: *mut libc::c_void,
+                _argc: i32,
+                _argv: *mut *mut libc::c_void,
+            ) {
+                CAPTURED_DB.store(sqlite3_context_db_handle(ctx), Ordering::SeqCst);
+                sqlite3_result_int(ctx, 1);
+            }
+
+            assert_eq!(
+                sqlite3_create_function_v2(
+                    db,
+                    c"test_db_handle".as_ptr(),
+                    0,
+                    SQLITE_UTF8,
+                    ptr::null_mut(),
+                    Some(test_func),
+                    None,
+                    None,
+                    None,
+                ),
+                SQLITE_OK
+            );
+
+            // Call the function
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT test_db_handle()".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+
+            // The captured db handle should match our db pointer
+            assert_eq!(CAPTURED_DB.load(Ordering::SeqCst), db as *mut libc::c_void);
+
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            // Null safety
+            let null_handle = sqlite3_context_db_handle(ptr::null_mut());
+            assert!(null_handle.is_null());
+
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
     }
