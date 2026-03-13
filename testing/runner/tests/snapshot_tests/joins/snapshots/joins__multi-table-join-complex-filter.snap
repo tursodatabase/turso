@@ -31,8 +31,8 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN customers AS c
-|--SEARCH o USING INDEX idx_orders_customer_id (customer_id=?)
-|--SEARCH oi USING INDEX idx_order_items_order_id (order_id=?)
+|--SCAN order_items AS oi
+|--SEARCH o USING INTEGER PRIMARY KEY (rowid=?)
+|--SEARCH c USING INTEGER PRIMARY KEY (rowid=?)
 |--SEARCH p USING INTEGER PRIMARY KEY (rowid=?)
 `--USE SORTER FOR ORDER BY

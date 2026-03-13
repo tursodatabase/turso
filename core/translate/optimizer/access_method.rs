@@ -206,7 +206,7 @@ pub(super) fn choose_best_btree_candidate(
     rhs_table_idx: usize,
     maybe_order_target: Option<&OrderTarget>,
     schema: &Schema,
-    analyze_stats: Option<&AnalyzeStats>,
+    analyze_stats: &AnalyzeStats,
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
@@ -227,7 +227,11 @@ pub(super) fn choose_best_btree_candidate(
         constraint_refs: vec![],
         cost: best_cost,
     };
-    let mut best_prereq_count = usize::MAX;
+    let mut best_adjusted_output = f64::MAX;
+
+    // Build a mask for the rhs table itself.
+    let mut rhs_table_mask = TableMask::new();
+    rhs_table_mask.add_table(rhs_table_idx);
 
     // Estimate cost for each candidate index (including the rowid index) and
     // keep the best candidate.
@@ -300,11 +304,11 @@ pub(super) fn choose_best_btree_candidate(
                 (IterationDirection::Forwards, false, Cost(0.0))
             };
 
-        let analyze_ctx = analyze_stats.map(|stats| AnalyzeCtx {
+        let analyze_ctx = AnalyzeCtx {
             rhs_table,
             index: candidate.index.as_ref(),
-            stats,
-        });
+            stats: analyze_stats,
+        };
         let cost = estimate_cost_for_scan_or_seek(
             Some(index_info),
             &rhs_constraints.constraints,
@@ -313,13 +317,48 @@ pub(super) fn choose_best_btree_candidate(
             base_row_count,
             is_index_ordered,
             params,
-            analyze_ctx.as_ref(),
+            Some(&analyze_ctx),
         );
-        // Prerequisite tiebreaker (mirrors SQLite's whereLoopFindLesser).
-        // When costs are equal, prefer fewer outer-table prerequisites: a
-        // constant-bound seek touches the same key range each iteration, while a
-        // join-dependent seek may bounce around the index.
-        let prereq_count: usize = usable_constraint_refs
+
+        // Residual filter output adjustment (mirrors SQLite's whereLoopOutputAdjust).
+        //
+        // When two indexes have the same seek cost, the one whose seek
+        // prerequisites already cover more residual WHERE constraints will
+        // produce fewer output rows (because those residual filters can be
+        // accounted for). This breaks ties correctly: a join-driven seek
+        // like fromId=e1.toId (prereqs={e1}) can claim credit for the
+        // constant residual label='requires', but a constant seek like
+        // label='requires' (prereqs={}) cannot claim credit for the
+        // join-dependent residual fromId=e1.toId.
+        let loop_prereq_mask = {
+            let mut mask = TableMask::new();
+            for ucref in usable_constraint_refs.iter() {
+                for idx in [
+                    ucref.eq.as_ref().map(|e| e.constraint_pos),
+                    ucref.lower_bound,
+                    ucref.upper_bound,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    let c = &rhs_constraints.constraints[idx];
+                    mask = TableMask::from_table_number_iter(
+                        mask.tables_iter().chain(c.lhs_mask.tables_iter()),
+                    );
+                }
+            }
+            mask
+        };
+        // Tables whose constraints this loop can account for: the loop's own
+        // prerequisite tables plus the current table itself.
+        let allowed_mask = TableMask::from_table_number_iter(
+            loop_prereq_mask
+                .tables_iter()
+                .chain(rhs_table_mask.tables_iter()),
+        );
+
+        // Collect which constraint positions are consumed by the index seek.
+        let consumed: SmallVec<[usize; 8]> = usable_constraint_refs
             .iter()
             .flat_map(|ucref| {
                 [
@@ -328,15 +367,40 @@ pub(super) fn choose_best_btree_candidate(
                     ucref.upper_bound,
                 ]
                 .into_iter()
+                .flatten()
             })
-            .flatten()
-            .map(|idx| rhs_constraints.constraints[idx].lhs_mask.table_count())
-            .sum();
+            .collect();
+
+        // Multiply selectivities of residual constraints whose prerequisites
+        // are within the allowed mask (i.e. already satisfied by this loop).
+        let residual_selectivity: f64 = rhs_constraints
+            .constraints
+            .iter()
+            .enumerate()
+            .filter(|(i, c)| {
+                !consumed.contains(i)
+                    && c.usable
+                    && allowed_mask.contains_all(&c.lhs_mask)
+                    && matches!(
+                        c.operator,
+                        ConstraintOperator::AstNativeOperator(ast::Operator::Equals)
+                            | ConstraintOperator::AstNativeOperator(ast::Operator::Greater)
+                            | ConstraintOperator::AstNativeOperator(ast::Operator::GreaterEquals)
+                            | ConstraintOperator::AstNativeOperator(ast::Operator::Less)
+                            | ConstraintOperator::AstNativeOperator(ast::Operator::LessEquals)
+                    )
+            })
+            .map(|(_, c)| c.selectivity)
+            .product();
+
+        // Adjusted output: lower means the loop delivers fewer rows downstream.
+        let adjusted_output = residual_selectivity;
+
         let adjusted_best = best_cost + order_satisfiability_bonus;
         let costs_equal = (cost.0 - adjusted_best.0).abs() < 1e-9;
-        if cost < adjusted_best || (costs_equal && prereq_count < best_prereq_count) {
+        if cost < adjusted_best || (costs_equal && adjusted_output < best_adjusted_output - 1e-12) {
             best_cost = cost;
-            best_prereq_count = prereq_count;
+            best_adjusted_output = adjusted_output;
             best_choice = ChosenBtreeCandidate {
                 iter_dir,
                 index: candidate.index.clone(),
@@ -622,7 +686,7 @@ fn find_best_access_method_for_btree(
         rhs_table_idx,
         maybe_order_target,
         schema,
-        Some(analyze_stats),
+        analyze_stats,
         input_cardinality,
         base_row_count,
         params,
@@ -655,7 +719,6 @@ fn find_best_access_method_for_btree(
             &best.constraint_refs,
             base_row_count,
             Some(&analyze_ctx),
-            params,
         )
     };
     let mut best_access_method = AccessMethod {
@@ -698,7 +761,7 @@ fn find_best_access_method_for_btree(
             params,
             best_access_method.cost,
             &lhs_mask,
-            Some(analyze_stats),
+            analyze_stats,
         ) {
             best_access_method = multi_idx_method;
         }
@@ -715,7 +778,7 @@ fn find_best_access_method_for_btree(
             params,
             best_access_method.cost,
             &lhs_mask,
-            Some(analyze_stats),
+            analyze_stats,
         ) {
             best_access_method = multi_idx_and_method;
         }
@@ -1394,7 +1457,6 @@ fn find_best_access_method_for_subquery(
         &usable_constraint_refs,
         base_row_count,
         None,
-        params,
     );
     let one_pass_scan_cost =
         estimate_cost_for_scan_or_seek(None, &[], &[], 1.0, base_row_count, false, params, None);
