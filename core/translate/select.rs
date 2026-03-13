@@ -48,6 +48,9 @@ pub fn bind_prepare_select_plan(
     let cte_definitions = std::mem::take(&mut bound.cte_definitions);
     let mut planned_ctes = plan_bound_ctes(cte_definitions, resolver, program, connection)?;
 
+    // Extract pre-bound subqueries for inline planning in the walker.
+    let subquery_bindings = std::mem::take(&mut bound.subquery_bindings);
+
     let all_table_refs = bound.into_table_references(&mut planned_ctes)?;
     prepare_select_plan(
         select,
@@ -56,6 +59,7 @@ pub fn bind_prepare_select_plan(
         query_destination,
         connection,
         all_table_refs.into_iter(),
+        subquery_bindings,
     )
 }
 
@@ -167,6 +171,7 @@ pub fn prepare_select_plan(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
     mut table_refs: impl Iterator<Item = TableReferences>,
+    bound_subqueries: rustc_hash::FxHashMap<ast::TableInternalId, super::bind::BoundSubquery>,
 ) -> Result<Plan> {
     let compounds = select.body.compounds;
     match compounds.is_empty() {
@@ -184,6 +189,7 @@ pub fn prepare_select_plan(
                 query_destination,
                 connection,
                 tr,
+                bound_subqueries,
             )?))
         }
         false => {
@@ -205,6 +211,7 @@ pub fn prepare_select_plan(
                 query_destination.clone(),
                 connection,
                 tr,
+                rustc_hash::FxHashMap::default(),
             )?;
 
             let compounds_len = compounds.len();
@@ -228,6 +235,7 @@ pub fn prepare_select_plan(
                     query_destination.clone(),
                     connection,
                     tr,
+                    rustc_hash::FxHashMap::default(),
                 )?;
             }
 
@@ -274,6 +282,7 @@ fn prepare_one_select_plan(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
     table_references: TableReferences,
+    bound_subqueries: rustc_hash::FxHashMap<ast::TableInternalId, super::bind::BoundSubquery>,
 ) -> Result<SelectPlan> {
     if order_by
         .iter()
@@ -592,7 +601,7 @@ fn prepare_one_select_plan(
                 )?;
             }
 
-            plan_subqueries_from_select_plan(program, &mut plan, resolver, connection)?;
+            plan_subqueries_from_select_plan(program, &mut plan, resolver, connection, bound_subqueries)?;
 
             validate_expr_correct_column_counts(&plan)?;
 

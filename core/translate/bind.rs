@@ -352,14 +352,34 @@ impl BoundSelect {
         self,
         planned_ctes: &mut HashMap<String, super::plan::JoinedTable>,
     ) -> Result<Vec<TableReferences>> {
+        self.into_table_references_with_outer_refs(planned_ctes, Vec::new())
+    }
+
+    /// Like `into_table_references`, but also sets outer query references
+    /// on the main scope's `TableReferences` so that column usage tracking
+    /// for correlated columns can find their target tables.
+    pub fn into_table_references_with_outer_refs(
+        self,
+        planned_ctes: &mut HashMap<String, super::plan::JoinedTable>,
+        outer_query_refs: Vec<super::plan::OuterQueryReference>,
+    ) -> Result<Vec<TableReferences>> {
         let mut all = Vec::with_capacity(1 + self.compound_scopes.len());
 
-        let main_refs =
-            Self::scope_to_table_references(self.main_scope, &self.tracking, planned_ctes)?;
+        let main_refs = Self::scope_to_table_references(
+            self.main_scope,
+            &self.tracking,
+            planned_ctes,
+            outer_query_refs,
+        )?;
         all.push(main_refs);
 
         for scope in self.compound_scopes {
-            all.push(Self::scope_to_table_references(scope, &self.tracking, planned_ctes)?);
+            all.push(Self::scope_to_table_references(
+                scope,
+                &self.tracking,
+                planned_ctes,
+                Vec::new(),
+            )?);
         }
 
         Ok(all)
@@ -369,6 +389,7 @@ impl BoundSelect {
         scope: BindScope,
         tracking: &BindTracking,
         planned_ctes: &mut HashMap<String, super::plan::JoinedTable>,
+        outer_query_refs: Vec<super::plan::OuterQueryReference>,
     ) -> Result<TableReferences> {
         let joined_tables = scope
             .tables
@@ -405,7 +426,7 @@ impl BoundSelect {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let mut table_references = TableReferences::new(joined_tables, Vec::new());
+        let mut table_references = TableReferences::new(joined_tables, outer_query_refs);
         tracking.flush(&mut table_references);
         Ok(table_references)
     }

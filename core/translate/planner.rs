@@ -622,8 +622,9 @@ fn plan_one_bound_cte(
         .expect("CTE inner binding should be present");
     let cte_select = entry.select.clone();
 
-    // Extract nested CTE definitions (from inner WITH clauses) before consuming inner_bound.
+    // Extract nested CTE definitions and subquery bindings before consuming inner_bound.
     let inner_cte_defs = std::mem::take(&mut inner_bound.cte_definitions);
+    let inner_subquery_bindings = std::mem::take(&mut inner_bound.subquery_bindings);
 
     // Block circular references during planning.
     program.push_cte_being_defined(name.clone());
@@ -650,6 +651,7 @@ fn plan_one_bound_cte(
         QueryDestination::placeholder_for_subquery(),
         connection,
         all_table_refs.into_iter(),
+        inner_subquery_bindings,
     );
     program.pop_cte_being_defined();
     let cte_plan = cte_plan?;
