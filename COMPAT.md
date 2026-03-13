@@ -446,7 +446,7 @@ Modifiers:
 | sqlite3_close_v2       | ✅ Yes     | Same as sqlite3_close |
 | sqlite3_db_filename    | ✅ Yes     |         |
 | sqlite3_db_config      | ❌ No      | Stub    |
-| sqlite3_db_handle      | ❌ No      | Stub    |
+| sqlite3_db_handle      | ✅ Yes     |         |
 | sqlite3_db_readonly    | ❌ No      |         |
 | sqlite3_db_status      | ❌ No      |         |
 | sqlite3_db_cacheflush  | ❌ No      |         |
@@ -465,7 +465,7 @@ Modifiers:
 |-----------------------------|---------|---------|
 | sqlite3_prepare             | ❌ No      |         |
 | sqlite3_prepare_v2          | ✅ Yes     |         |
-| sqlite3_prepare_v3          | ❌ No      |         |
+| sqlite3_prepare_v3          | ✅ Yes     | Delegates to prepare_v2, prepFlags ignored |
 | sqlite3_prepare16           | ❌ No      |         |
 | sqlite3_prepare16_v2        | ❌ No      |         |
 | sqlite3_finalize            | ✅ Yes     |         |
@@ -531,7 +531,7 @@ Modifiers:
 | Interface              | Status  | Comment |
 |------------------------|---------|---------|
 | sqlite3_value_type     | ✅ Yes     |         |
-| sqlite3_value_int      | ❌ No      |         |
+| sqlite3_value_int      | ✅ Yes     |         |
 | sqlite3_value_int64    | ✅ Yes     |         |
 | sqlite3_value_double   | ✅ Yes     |         |
 | sqlite3_value_text     | ✅ Yes     |         |
