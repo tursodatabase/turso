@@ -128,6 +128,23 @@ fn get_collseq_parts_from_expr(
     top_expr: &Expr,
     referenced_tables: &TableReferences,
 ) -> Result<(Option<CollationSeq>, Option<CollationSeq>)> {
+    get_collseq_parts_from_expr_ext(top_expr, Some(referenced_tables), |_| None)
+}
+
+/// Like `get_collseq_parts_from_expr`, but allows callers to supply additional
+/// column-collation sources for rewritten expression nodes (for example
+/// trigger NEW/OLD rewrites to Register/Variable).
+///
+/// The returned tuple preserves SQLite collation precedence semantics:
+/// `(leftmost_explicit_collation, leftmost_column_collation)`.
+pub(crate) fn get_collseq_parts_from_expr_ext<F>(
+    top_expr: &Expr,
+    referenced_tables: Option<&TableReferences>,
+    mut extra_column_collation: F,
+) -> Result<(Option<CollationSeq>, Option<CollationSeq>)>
+where
+    F: FnMut(&Expr) -> Option<CollationSeq>,
+{
     let mut maybe_column_collseq = None;
     let mut maybe_explicit_collseq = None;
 
@@ -143,31 +160,41 @@ fn get_collseq_parts_from_expr(
                 return Ok(WalkControl::SkipChildren);
             }
             Expr::Column { table, column, .. } => {
-                let (_, table_ref) = referenced_tables
-                    .find_table_by_internal_id(*table)
-                    .ok_or_else(|| crate::LimboError::ParseError("table not found".to_string()))?;
-                let column = table_ref
-                    .get_column_at(*column)
-                    .ok_or_else(|| crate::LimboError::ParseError("column not found".to_string()))?;
                 if maybe_column_collseq.is_none() {
-                    maybe_column_collseq = column.collation_opt();
+                    if let Some(tables) = referenced_tables {
+                        let (_, table_ref) =
+                            tables.find_table_by_internal_id(*table).ok_or_else(|| {
+                                crate::LimboError::ParseError("table not found".to_string())
+                            })?;
+                        let column = table_ref.get_column_at(*column).ok_or_else(|| {
+                            crate::LimboError::ParseError("column not found".to_string())
+                        })?;
+                        maybe_column_collseq = column.collation_opt();
+                    }
                 }
                 return Ok(WalkControl::Continue);
             }
             Expr::RowId { table, .. } => {
-                let (_, table_ref) = referenced_tables
-                    .find_table_by_internal_id(*table)
-                    .ok_or_else(|| crate::LimboError::ParseError("table not found".to_string()))?;
-                if let Some(btree) = table_ref.btree() {
-                    if let Some((_, rowid_alias_col)) = btree.get_rowid_alias_column() {
-                        if maybe_column_collseq.is_none() {
-                            maybe_column_collseq = rowid_alias_col.collation_opt();
+                if maybe_column_collseq.is_none() {
+                    if let Some(tables) = referenced_tables {
+                        let (_, table_ref) =
+                            tables.find_table_by_internal_id(*table).ok_or_else(|| {
+                                crate::LimboError::ParseError("table not found".to_string())
+                            })?;
+                        if let Some(btree) = table_ref.btree() {
+                            if let Some((_, rowid_alias_col)) = btree.get_rowid_alias_column() {
+                                maybe_column_collseq = rowid_alias_col.collation_opt();
+                            }
                         }
                     }
                 }
                 return Ok(WalkControl::Continue);
             }
-            _ => {}
+            _ => {
+                if maybe_column_collseq.is_none() {
+                    maybe_column_collseq = extra_column_collation(expr);
+                }
+            }
         }
         Ok(WalkControl::Continue)
     })?;

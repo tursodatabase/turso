@@ -33,7 +33,7 @@ use crate::vdbe::{
 use crate::{LimboError, Numeric, Result, Value};
 use std::collections::HashSet;
 
-use super::collate::{get_collseq_from_expr, CollationSeq};
+use super::collate::{get_collseq_parts_from_expr_ext, CollationSeq};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ConditionMetadata {
@@ -3994,42 +3994,43 @@ fn row_component_affinity_collation(
     let rhs_for_cmp = row_value_component_expr(rhs_expr, idx)?.unwrap_or(rhs_expr);
     Ok((
         comparison_affinity(lhs_for_cmp, rhs_for_cmp, referenced_tables, resolver),
-        comparison_collation(lhs_for_cmp, rhs_for_cmp, referenced_tables)?,
+        comparison_collation(lhs_for_cmp, rhs_for_cmp, referenced_tables, resolver)?,
     ))
 }
 
-fn explicit_collation(expr: &Expr) -> Result<Option<CollationSeq>> {
-    let mut found = None;
-    walk_expr(expr, &mut |e| -> Result<WalkControl> {
-        if let Expr::Collate(_, seq) = e {
-            if found.is_none() {
-                found = Some(CollationSeq::new(seq.as_str()).unwrap_or_default());
-            }
-            return Ok(WalkControl::SkipChildren);
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(found)
+fn param_collation_from_variable_name(name: &str, resolver: &Resolver) -> Option<CollationSeq> {
+    name.parse::<usize>()
+        .ok()
+        .and_then(|idx| resolver.parameter_collations.get(&idx).copied())
+}
+
+fn rewritten_expr_column_collation(
+    expr: &Expr,
+    resolver: Option<&Resolver>,
+) -> Option<CollationSeq> {
+    let resolver = resolver?;
+    match expr {
+        Expr::Register(reg) => resolver.register_collations.get(reg).copied(),
+        Expr::Variable(name) => param_collation_from_variable_name(name, resolver),
+        _ => None,
+    }
 }
 
 fn comparison_collation(
     lhs_expr: &Expr,
     rhs_expr: &Expr,
     referenced_tables: Option<&TableReferences>,
+    resolver: Option<&Resolver>,
 ) -> Result<Option<CollationSeq>> {
-    if let Some(tables) = referenced_tables {
-        let lhs_collation = get_collseq_from_expr(lhs_expr, tables)?;
-        if lhs_collation.is_some() {
-            return Ok(lhs_collation);
-        }
-        return get_collseq_from_expr(rhs_expr, tables);
-    }
-
-    let lhs_collation = explicit_collation(lhs_expr)?;
-    if lhs_collation.is_some() {
-        return Ok(lhs_collation);
-    }
-    explicit_collation(rhs_expr)
+    let (lhs_explicit, lhs_column) =
+        get_collseq_parts_from_expr_ext(lhs_expr, referenced_tables, |expr| {
+            rewritten_expr_column_collation(expr, resolver)
+        })?;
+    let (rhs_explicit, rhs_column) =
+        get_collseq_parts_from_expr_ext(rhs_expr, referenced_tables, |expr| {
+            rewritten_expr_column_collation(expr, resolver)
+        })?;
+    Ok(lhs_explicit.or(rhs_explicit).or(lhs_column).or(rhs_column))
 }
 
 #[allow(clippy::too_many_arguments)]

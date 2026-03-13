@@ -162,8 +162,10 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
-            register_collations: HashMap::default(),
-            parameter_collations: HashMap::default(),
+            // Preserve trigger rewrite metadata across forked resolvers so NEW/OLD
+            // comparisons in nested SELECT compilation keep column collation semantics.
+            register_collations: self.register_collations.clone(),
+            parameter_collations: self.parameter_collations.clone(),
             enable_custom_types: self.enable_custom_types,
             trigger_context: self.trigger_context.clone(),
         }

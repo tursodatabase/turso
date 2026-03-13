@@ -233,6 +233,64 @@ expect {
     1
 }
 
+# Trigger body INSERT...SELECT should preserve NEW column collation through forked resolver paths
+@cross-check-integrity
+test trigger-body-insert-select-new-column-collation {
+    CREATE TABLE test11_body_select_collate (name TEXT COLLATE NOCASE);
+    CREATE TABLE log11_body_select_collate (v INTEGER);
+    CREATE TRIGGER t11_body_select_collate AFTER INSERT ON test11_body_select_collate
+    BEGIN
+        INSERT INTO log11_body_select_collate
+        SELECT NEW.name = 'hello';
+    END;
+    INSERT INTO test11_body_select_collate VALUES ('HELLO');
+    SELECT * FROM log11_body_select_collate ORDER BY rowid;
+}
+expect {
+    1
+}
+
+# Row-value comparisons in trigger WHEN should honor NEW column collations per component
+@cross-check-integrity
+test trigger-when-row-value-new-column-collation {
+    CREATE TABLE test11_row_value_collate (
+        a TEXT COLLATE NOCASE,
+        b TEXT COLLATE NOCASE
+    );
+    CREATE TABLE log11_row_value_collate (msg TEXT);
+    CREATE TRIGGER t11_row_value_collate AFTER INSERT ON test11_row_value_collate
+    WHEN (NEW.a, NEW.b) = ('hello', 'world')
+    BEGIN
+        INSERT INTO log11_row_value_collate VALUES('matched');
+    END;
+    INSERT INTO test11_row_value_collate VALUES ('HELLO', 'WORLD');
+    SELECT * FROM log11_row_value_collate ORDER BY rowid;
+}
+expect {
+    matched
+}
+
+# Row-value comparisons in trigger WHEN should honor OLD column collations per component
+@cross-check-integrity
+test trigger-when-row-value-old-column-collation {
+    CREATE TABLE test11_row_value_old_collate (
+        a TEXT COLLATE NOCASE,
+        b TEXT COLLATE NOCASE
+    );
+    CREATE TABLE log11_row_value_old_collate (msg TEXT);
+    INSERT INTO test11_row_value_old_collate VALUES ('HELLO', 'WORLD');
+    CREATE TRIGGER t11_row_value_old_collate AFTER UPDATE ON test11_row_value_old_collate
+    WHEN (OLD.a, OLD.b) = ('hello', 'world')
+    BEGIN
+        INSERT INTO log11_row_value_old_collate VALUES('matched');
+    END;
+    UPDATE test11_row_value_old_collate SET a = 'x', b = 'y';
+    SELECT * FROM log11_row_value_old_collate ORDER BY rowid;
+}
+expect {
+    matched
+}
+
 # Multiple triggers on same event
 @cross-check-integrity
 test trigger-multiple-same-event {
