@@ -94,8 +94,8 @@ test regexp_integer_operands {
     SELECT 456 REGEXP '1.*3';
 }
 expect {
-
-
+    1
+    0
 }
 
 test regexp_complex_patterns {
@@ -117,4 +117,62 @@ test regexp_in_subquery {
 expect {
     def|1
     abcdef|1
+}
+
+test regexp_real_operands {
+    SELECT 3.14 REGEXP '3\.14';
+    SELECT 3.14 REGEXP '3\.99';
+    SELECT 45.6 REGEXP '45';
+    SELECT -1.5 REGEXP '-1';
+}
+expect {
+    1
+    0
+    1
+    1
+}
+
+test regexp_negative_integer {
+    SELECT -42 REGEXP '-4';
+    SELECT -42 REGEXP '99';
+}
+expect {
+    1
+    0
+}
+
+test regexp_zero {
+    SELECT 0 REGEXP '^0$';
+}
+expect {
+    1
+}
+
+test regexp_blob_operands {
+    SELECT X'414243' REGEXP 'ABC';
+    SELECT X'414243' REGEXP '41';
+    SELECT X'68656C6C6F' REGEXP 'hello';
+}
+expect {
+    1
+    0
+    1
+}
+
+test regexp_non_text_pattern {
+    SELECT 'hello' REGEXP 123;
+    SELECT 123 REGEXP 456;
+}
+expect {
+    0
+    0
+}
+
+test regexp_mixed_types_in_table {
+    CREATE TABLE t_mixed(a INTEGER, b REAL, c TEXT, d BLOB);
+    INSERT INTO t_mixed VALUES(123, 45.6, '789', X'414243');
+    SELECT a REGEXP '12', b REGEXP '45', c REGEXP '78', d REGEXP 'AB' FROM t_mixed;
+}
+expect {
+    1|1|1|1
 }
