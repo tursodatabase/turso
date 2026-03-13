@@ -498,6 +498,9 @@ fn create_result_from_significand(
     }
 
     let mut final_result: f64 = result.into();
+    if final_result.is_nan() {
+        final_result = f64::INFINITY;
+    }
     if sign < 0 {
         final_result = -final_result;
     }
@@ -640,12 +643,14 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_numeric_affinity_nan_like_parse_keeps_text() {
-        // Regression: this text can parse into a NaN float in the numeric-affinity
-        // path. We must not coerce it to NULL.
+    fn test_apply_numeric_affinity_extreme_exponent_gives_infinity() {
         let val = Value::Text("3139353734372E383932303939343135".into());
         let res = apply_numeric_affinity(val.as_value_ref(), false);
-        assert!(res.is_none());
+        assert!(res.is_some());
+        match res.unwrap() {
+            ValueRef::Numeric(Numeric::Float(f)) => assert!(f64::from(f).is_infinite()),
+            other => panic!("expected Float, got {other:?}"),
+        }
     }
 
     #[test]
