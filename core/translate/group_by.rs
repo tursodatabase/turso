@@ -135,7 +135,8 @@ impl EmitGroupBy {
         let column_count = plan.agg_args_count() + t_ctx.non_aggregate_expressions.len();
         let reg_group_by_source_cols_start = program.alloc_registers(column_count);
 
-        let row_source = if let Some(sort_order) = group_by.sort_order.as_ref() {
+        let row_source = if !group_by.sort_elided {
+            let sort_order = &group_by.sort_order;
             let sort_cursor = program.alloc_cursor_id(CursorType::Sorter);
             // Should work the same way as Order By
             /*

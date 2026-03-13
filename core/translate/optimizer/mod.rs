@@ -1685,13 +1685,17 @@ fn optimize_table_access(
         if satisfies_order_target {
             match &order_target.purpose {
                 OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Group) => {
-                    let _ = group_by.as_mut().and_then(|g| g.sort_order.take());
+                    if let Some(g) = group_by.as_mut() {
+                        g.sort_elided = true;
+                    }
                 }
                 OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order) => {
                     order_by.clear();
                 }
                 OrderTargetPurpose::EliminatesSort(EliminatesSortBy::GroupByAndOrder) => {
-                    let _ = group_by.as_mut().and_then(|g| g.sort_order.take());
+                    if let Some(g) = group_by.as_mut() {
+                        g.sort_elided = true;
+                    }
                     order_by.clear();
                 }
                 OrderTargetPurpose::Extremum => {}

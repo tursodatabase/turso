@@ -473,3 +473,139 @@ expect {
     2
     3
 }
+
+test cte-materialized-order-multi-col-same-direction {
+    CREATE TABLE t(a INTEGER, b INTEGER);
+    INSERT INTO t VALUES (1,10),(1,20),(2,5),(2,15),(3,1);
+
+    WITH ordered AS MATERIALIZED (
+        SELECT * FROM t ORDER BY a ASC, b ASC
+    )
+    SELECT * FROM ordered ORDER BY a ASC, b ASC;
+}
+expect {
+    1|10
+    1|20
+    2|5
+    2|15
+    3|1
+}
+
+test cte-materialized-order-multi-col-all-flipped {
+    CREATE TABLE t(a INTEGER, b INTEGER);
+    INSERT INTO t VALUES (1,10),(1,20),(2,5),(2,15),(3,1);
+
+    WITH ordered AS MATERIALIZED (
+        SELECT * FROM t ORDER BY a DESC, b DESC
+    )
+    SELECT * FROM ordered ORDER BY a ASC, b ASC;
+}
+expect {
+    1|10
+    1|20
+    2|5
+    2|15
+    3|1
+}
+
+test cte-materialized-order-multi-col-mixed-flips-cleanly {
+    CREATE TABLE t(a INTEGER, b INTEGER);
+    INSERT INTO t VALUES (1,10),(1,20),(2,5),(2,15),(3,1);
+
+    WITH ordered AS MATERIALIZED (
+        SELECT * FROM t ORDER BY a ASC, b DESC
+    )
+    SELECT * FROM ordered ORDER BY a DESC, b ASC;
+}
+expect {
+    3|1
+    2|5
+    2|15
+    1|10
+    1|20
+}
+
+test cte-materialized-order-multi-col-partial-mismatch-still-sorts {
+    CREATE TABLE t(a INTEGER, b INTEGER);
+    INSERT INTO t VALUES (1,10),(1,20),(2,5),(2,15),(3,1);
+
+    WITH ordered AS MATERIALIZED (
+        SELECT * FROM t ORDER BY a ASC, b DESC
+    )
+    SELECT * FROM ordered ORDER BY a ASC, b ASC;
+}
+expect {
+    1|10
+    1|20
+    2|5
+    2|15
+    3|1
+}
+
+test cte-materialized-order-prefix-match {
+    CREATE TABLE t(a INTEGER, b INTEGER);
+    INSERT INTO t VALUES (2,5),(1,20),(3,1),(1,10),(2,15);
+
+    WITH ordered AS MATERIALIZED (
+        SELECT * FROM t ORDER BY a ASC, b ASC
+    )
+    SELECT * FROM ordered ORDER BY a ASC;
+}
+expect {
+    1|10
+    1|20
+    2|5
+    2|15
+    3|1
+}
+
+test cte-materialized-order-aggregate-with-order-by {
+    CREATE TABLE t(grp TEXT, val INTEGER);
+    INSERT INTO t VALUES ('a',3),('b',1),('a',7),('c',2),('b',5);
+
+    WITH agg AS MATERIALIZED (
+        SELECT grp, SUM(val) AS total
+        FROM t GROUP BY grp
+        ORDER BY grp ASC
+    )
+    SELECT * FROM agg ORDER BY grp ASC;
+}
+expect {
+    a|10
+    b|6
+    c|2
+}
+
+test cte-materialized-order-aggregate-opposite {
+    CREATE TABLE t(grp TEXT, val INTEGER);
+    INSERT INTO t VALUES ('a',3),('b',1),('a',7),('c',2),('b',5);
+
+    WITH agg AS MATERIALIZED (
+        SELECT grp, SUM(val) AS total
+        FROM t GROUP BY grp
+        ORDER BY grp ASC
+    )
+    SELECT * FROM agg ORDER BY grp DESC;
+}
+expect {
+    c|2
+    b|6
+    a|10
+}
+
+test cte-materialized-order-outer-beyond-cte-order {
+    CREATE TABLE t(a INTEGER, b INTEGER);
+    INSERT INTO t VALUES (1,20),(2,5),(1,10),(2,15),(3,1);
+
+    WITH ordered AS MATERIALIZED (
+        SELECT * FROM t ORDER BY a ASC
+    )
+    SELECT * FROM ordered ORDER BY a ASC, b ASC;
+}
+expect {
+    1|10
+    1|20
+    2|5
+    2|15
+    3|1
+}

@@ -487,14 +487,16 @@ fn prepare_one_select_plan(
                     }
 
                     plan.group_by = Some(GroupBy {
-                        sort_order: None,
+                        sort_order: Vec::new(),
+                        sort_elided: false,
                         exprs: group_by.exprs.iter().map(|expr| *expr.clone()).collect(),
                         having: having_predicates,
                     });
                 } else {
                     // HAVING without GROUP BY: treat as ungrouped aggregation with filter
                     plan.group_by = Some(GroupBy {
-                        sort_order: None,
+                        sort_order: Vec::new(),
+                        sort_elided: false,
                         exprs: vec![],
                         having: having_predicates,
                     });
@@ -588,12 +590,17 @@ fn prepare_one_select_plan(
             if let Some(group_by) = &mut plan.group_by {
                 // now that we have resolved the ORDER BY expressions and aggregates, we can
                 // compute the necessary sort order for the GROUP BY clause
-                group_by.sort_order = Some(compute_group_by_sort_order(
+                group_by.sort_order = compute_group_by_sort_order(
                     &group_by.exprs,
                     &plan.order_by,
                     &plan.aggregates,
                     resolver,
-                ));
+                );
+                debug_assert_eq!(
+                    group_by.exprs.len(),
+                    group_by.sort_order.len(),
+                    "GROUP BY exprs and sort_order must have the same length"
+                );
             }
 
             // Parse the LIMIT/OFFSET clause

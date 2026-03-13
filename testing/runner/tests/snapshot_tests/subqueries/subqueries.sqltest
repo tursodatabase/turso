@@ -726,6 +726,14 @@ setup ordered_cte_schema {
     CREATE INDEX xdesc ON t(x DESC);
 }
 
+setup multi_col_schema {
+    CREATE TABLE t(a INTEGER, b INTEGER);
+}
+
+setup grp_schema {
+    CREATE TABLE t(grp TEXT, val INTEGER);
+}
+
 # Materialized CTE with ORDER BY DESC, outer query ORDER BY same direction.
 # The sorter should be eliminated because the materialized table's intrinsic
 # order matches the outer ORDER BY.
@@ -745,4 +753,80 @@ snapshot-eqp cte-materialized-order-reused-opposite-dir {
         SELECT * FROM t ORDER BY x DESC
     )
     SELECT * FROM descending ORDER BY descending.x ASC;
+}
+
+# --- Positive: multi-column same direction (should eliminate sorter) ---
+@setup multi_col_schema
+snapshot-eqp cte-materialized-order-multi-col-same-dir {
+    WITH ordered AS MATERIALIZED (
+        SELECT * FROM t ORDER BY a ASC, b ASC
+    )
+    SELECT * FROM ordered ORDER BY a ASC, b ASC;
+}
+
+# --- Positive: multi-column all flipped (should eliminate sorter via backwards scan) ---
+@setup multi_col_schema
+snapshot-eqp cte-materialized-order-multi-col-all-flipped {
+    WITH ordered AS MATERIALIZED (
+        SELECT * FROM t ORDER BY a DESC, b DESC
+    )
+    SELECT * FROM ordered ORDER BY a ASC, b ASC;
+}
+
+# --- Positive: multi-column mixed directions that flip cleanly (should eliminate sorter) ---
+@setup multi_col_schema
+snapshot-eqp cte-materialized-order-multi-col-mixed-clean-flip {
+    WITH ordered AS MATERIALIZED (
+        SELECT * FROM t ORDER BY a ASC, b DESC
+    )
+    SELECT * FROM ordered ORDER BY a DESC, b ASC;
+}
+
+# --- Negative: partial direction mismatch, neither fwd nor bwd works (needs sorter) ---
+@setup multi_col_schema
+snapshot-eqp cte-materialized-order-multi-col-partial-mismatch {
+    WITH ordered AS MATERIALIZED (
+        SELECT * FROM t ORDER BY a ASC, b DESC
+    )
+    SELECT * FROM ordered ORDER BY a ASC, b ASC;
+}
+
+# --- Positive: prefix match, CTE orders by (a,b) but outer only needs (a) ---
+@setup multi_col_schema
+snapshot-eqp cte-materialized-order-prefix-match {
+    WITH ordered AS MATERIALIZED (
+        SELECT * FROM t ORDER BY a ASC, b ASC
+    )
+    SELECT * FROM ordered ORDER BY a ASC;
+}
+
+# --- Positive: aggregate CTE with explicit ORDER BY, same direction ---
+@setup grp_schema
+snapshot-eqp cte-materialized-order-aggregate-same-dir {
+    WITH agg AS MATERIALIZED (
+        SELECT grp, SUM(val) AS total
+        FROM t GROUP BY grp
+        ORDER BY grp ASC
+    )
+    SELECT * FROM agg ORDER BY grp ASC;
+}
+
+# --- Positive: aggregate CTE with explicit ORDER BY, opposite direction ---
+@setup grp_schema
+snapshot-eqp cte-materialized-order-aggregate-opposite-dir {
+    WITH agg AS MATERIALIZED (
+        SELECT grp, SUM(val) AS total
+        FROM t GROUP BY grp
+        ORDER BY grp ASC
+    )
+    SELECT * FROM agg ORDER BY grp DESC;
+}
+
+# --- Negative: outer ORDER BY extends beyond CTE's ORDER BY (needs sorter) ---
+@setup multi_col_schema
+snapshot-eqp cte-materialized-order-outer-beyond-cte {
+    WITH ordered AS MATERIALIZED (
+        SELECT * FROM t ORDER BY a ASC
+    )
+    SELECT * FROM ordered ORDER BY a ASC, b ASC;
 }

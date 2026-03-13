@@ -108,8 +108,14 @@ impl ResultSetColumn {
 #[derive(Debug, Clone)]
 pub struct GroupBy {
     pub exprs: Vec<ast::Expr>,
-    /// sort order, if a sorter is required (= the columns aren't already in the correct order)
-    pub sort_order: Option<Vec<SortOrder>>,
+    /// Sort direction for each GROUP BY key column. Always present once
+    /// `compute_group_by_sort_order` has run; the outer optimizer reads
+    /// this to derive the materialized CTE's output order.
+    pub sort_order: Vec<SortOrder>,
+    /// When true the scan already provides the GROUP BY order and no
+    /// sorter is emitted. The `sort_order` is kept so that the outer
+    /// query can still read the effective output order.
+    pub sort_elided: bool,
     /// having clause split into a vec at 'AND' boundaries.
     pub having: Option<Vec<ast::Expr>>,
 }

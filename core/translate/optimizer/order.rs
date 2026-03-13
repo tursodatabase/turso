@@ -194,10 +194,7 @@ pub fn compute_order_target(
             // it contains all the necessary columns required for the ORDER BY, and the GROUP BY columns are now in the correct order.
             // First, however, we need to make sure the GROUP BY sorter's column sort directions match the ORDER BY requirements.
             turso_assert_greater_than_or_equal!(group_by.exprs.len(), order_by.len());
-            let sort_order = group_by
-                .sort_order
-                .as_mut()
-                .expect("GROUP BY should have a sort order before optimization is run");
+            let sort_order = &mut group_by.sort_order;
             for (i, (_, order_by_dir)) in order_by.iter().enumerate() {
                 sort_order[i] = *order_by_dir;
             }
@@ -214,13 +211,7 @@ pub fn compute_order_target(
                 group_by
                     .exprs
                     .iter()
-                    .zip(
-                        group_by
-                            .sort_order
-                            .as_ref()
-                            .expect("GROUP BY should have a sort order before optimization is run")
-                            .iter(),
-                    )
+                    .zip(group_by.sort_order.iter())
                     .map(|(expr, dir)| (expr, *dir)),
                 tables,
                 OrderTargetPurpose::EliminatesSort(EliminatesSortBy::GroupByAndOrder),
@@ -430,9 +421,10 @@ fn index_info_for_access(index: Option<&Index>) -> IndexInfo {
 /// Return how many leading target columns a FROM-subquery can provide from its
 /// own output order, without fabricating an extra probe index.
 ///
-/// We recognize two sources of intrinsic order:
+/// We recognize three sources of intrinsic order:
 /// 1. An explicit final `ORDER BY` on the subquery.
-/// 2. A simple single-source finalized scan whose output order is already known.
+/// 2. GROUP BY keys (we always use a sorter, never hashing - FOR NOW).
+/// 3. A simple single-source finalized scan whose output order is already known.
 pub fn subquery_intrinsic_order_consumed(
     table_id: TableInternalId,
     subquery: &FromClauseSubquery,
@@ -441,42 +433,65 @@ pub fn subquery_intrinsic_order_consumed(
     schema: &Schema,
 ) -> usize {
     let Plan::Select(select_plan) = subquery.plan.as_ref() else {
+        // Don't consider sort elision for compound selects
         return 0;
     };
+    // Explicit ORDER BY takes priority.
     if !select_plan.order_by.is_empty() {
-        return explicit_subquery_order_consumed(table_id, select_plan, iter_dir, target);
+        let intrinsic = build_intrinsic_order(
+            table_id,
+            select_plan,
+            select_plan
+                .order_by
+                .iter()
+                .map(|(expr, order)| (expr.as_ref(), *order)),
+        );
+        return match_intrinsic_order(&intrinsic, iter_dir, target);
+    }
+    // When ORDER BY was merged into GROUP BY and cleared, the GROUP BY
+    // sort_order still describes the output row order.
+    if let Some(group_by) = &select_plan.group_by {
+        let intrinsic = build_intrinsic_order(
+            table_id,
+            select_plan,
+            group_by
+                .exprs
+                .iter()
+                .zip(group_by.sort_order.iter().copied()),
+        );
+        let consumed = match_intrinsic_order(&intrinsic, iter_dir, target);
+        if consumed > 0 {
+            return consumed;
+        }
     }
     finalized_scan_subquery_order_consumed(table_id, select_plan, iter_dir, target, schema)
 }
 
-/// Match requested order against a subquery's explicit final `ORDER BY`.
-///
-/// This is the closest analogue to SQLite's `pOrderBy` propagation for
-/// materialized subqueries: if the final output already promises an order, the
-/// outer query can reuse it directly.
-fn explicit_subquery_order_consumed(
+/// Build a `ColumnOrder` list from expressions and sort directions by mapping
+/// each expression to a result column position.
+fn build_intrinsic_order(
     table_id: TableInternalId,
     select_plan: &crate::translate::plan::SelectPlan,
-    iter_dir: IterationDirection,
-    target: &[ColumnOrder],
-) -> usize {
-    let mut intrinsic = Vec::with_capacity(select_plan.order_by.len());
-    for (order_expr, order) in &select_plan.order_by {
+    exprs: impl Iterator<Item = (impl std::borrow::Borrow<ast::Expr>, SortOrder)>,
+) -> Vec<ColumnOrder> {
+    let mut intrinsic = Vec::new();
+    for (expr, order) in exprs {
+        let expr = expr.borrow();
         let Some((col_idx, result_col)) = select_plan
             .result_columns
             .iter()
             .enumerate()
-            .find(|(_, result_col)| exprs_are_equivalent(order_expr, &result_col.expr))
+            .find(|(_, result_col)| exprs_are_equivalent(expr, &result_col.expr))
         else {
-            return 0;
+            break;
         };
-        let Ok(collation) = get_collseq_from_expr(order_expr, &select_plan.table_references) else {
-            return 0;
+        let Ok(collation) = get_collseq_from_expr(expr, &select_plan.table_references) else {
+            break;
         };
         intrinsic.push(ColumnOrder {
             table_id,
             target: ColumnTarget::Column(col_idx),
-            order: *order,
+            order,
             collation: collation.unwrap_or_else(|| {
                 get_collseq_from_expr(&result_col.expr, &select_plan.table_references)
                     .ok()
@@ -485,7 +500,17 @@ fn explicit_subquery_order_consumed(
             }),
         });
     }
+    intrinsic
+}
 
+/// Compare a subquery's intrinsic column order against an outer order target,
+/// accounting for iteration direction. Returns how many leading target columns
+/// are satisfied.
+fn match_intrinsic_order(
+    intrinsic: &[ColumnOrder],
+    iter_dir: IterationDirection,
+    target: &[ColumnOrder],
+) -> usize {
     let target_len = target.len().min(intrinsic.len());
     for (intrinsic_col, target_col) in intrinsic.iter().zip(target.iter()).take(target_len) {
         if intrinsic_col.table_id != target_col.table_id
@@ -505,7 +530,6 @@ fn explicit_subquery_order_consumed(
             return 0;
         }
     }
-
     target_len
 }
 
