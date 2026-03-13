@@ -1,0 +1,970 @@
+@database :memory:
+
+setup sort_data {
+    CREATE TABLE t1(a INT, b TEXT);
+    INSERT INTO t1 VALUES(3,'c'),(1,'a'),(4,'d'),(1,'b'),(5,'e'),(2,'f');
+}
+
+setup multi_col {
+    CREATE TABLE mc(a INT, b INT, c INT);
+    INSERT INTO mc VALUES(1,2,9),(1,1,8),(2,1,7),(2,2,6),(1,3,5);
+}
+
+setup grp_data {
+    CREATE TABLE g1(a INT, b INT);
+    INSERT INTO g1 VALUES(1,10),(1,20),(2,30),(2,40),(3,50),(3,60);
+}
+
+setup range_data {
+    CREATE TABLE r1(a INT, b TEXT);
+    INSERT INTO r1 VALUES(1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
+}
+
+setup null_data {
+    CREATE TABLE n1(a INT, b TEXT);
+    INSERT INTO n1 VALUES(NULL,'null'),(1,'a'),(2,'b'),(NULL,'null2'),(3,'c');
+}
+
+setup composite_data {
+    CREATE TABLE comp(grp INT, val INT, label TEXT);
+    INSERT INTO comp VALUES(1,10,'a'),(1,20,'b'),(1,30,'c'),(2,10,'d'),(2,20,'e'),(2,30,'f');
+}
+
+setup join_data {
+    CREATE TABLE j1(a INT, b TEXT);
+    INSERT INTO j1 VALUES(1,'x'),(2,'y'),(3,'z');
+    CREATE TABLE j2(a INT, c TEXT);
+    INSERT INTO j2 VALUES(1,'p'),(2,'q'),(4,'r');
+}
+
+setup sales_data {
+    CREATE TABLE sales(region TEXT, amount INT);
+    INSERT INTO sales VALUES('east',100),('west',200),('east',150),('west',50),('north',300);
+}
+
+setup or_data {
+    CREATE TABLE o1(a INT, b TEXT);
+    CREATE INDEX idx_o1_a ON o1(a);
+    INSERT INTO o1 VALUES(1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
+}
+
+setup or_multi {
+    CREATE TABLE om(a INT, b INT, c TEXT);
+    CREATE INDEX idx_om_a ON om(a);
+    CREATE INDEX idx_om_b ON om(b);
+    INSERT INTO om VALUES(1,10,'x'),(2,20,'y'),(3,30,'z'),(4,10,'w');
+}
+
+@setup sort_data
+test sort-elision-cte-limit-parent-order {
+    WITH cte AS (SELECT a, b FROM t1 ORDER BY a LIMIT 4)
+    SELECT * FROM cte ORDER BY a;
+}
+expect {
+    1|a
+    1|b
+    2|f
+    3|c
+}
+
+@setup sort_data
+test sort-elision-cte-asc-parent-desc {
+    WITH cte AS (SELECT a, b FROM t1 ORDER BY a ASC)
+    SELECT * FROM cte ORDER BY a DESC;
+}
+expect {
+    5|e
+    4|d
+    3|c
+    2|f
+    1|a
+    1|b
+}
+
+@setup multi_col
+test sort-elision-multi-col-same {
+    WITH cte AS (SELECT a, b, c FROM mc ORDER BY a, b)
+    SELECT * FROM cte ORDER BY a, b;
+}
+expect {
+    1|1|8
+    1|2|9
+    1|3|5
+    2|1|7
+    2|2|6
+}
+
+@setup multi_col
+test sort-elision-multi-col-different {
+    WITH cte AS (SELECT a, b, c FROM mc ORDER BY a, b)
+    SELECT * FROM cte ORDER BY a, c;
+}
+expect {
+    1|3|5
+    1|1|8
+    1|2|9
+    2|2|6
+    2|1|7
+}
+
+test sort-elision-mixed-asc-desc {
+    CREATE TABLE sd(a INT, b INT);
+    INSERT INTO sd VALUES(1,3),(1,1),(1,2),(2,2),(2,1),(2,3);
+    WITH cte AS (SELECT a, b FROM sd ORDER BY a ASC, b DESC)
+    SELECT * FROM cte ORDER BY a ASC, b ASC;
+}
+expect {
+    1|1
+    1|2
+    1|3
+    2|1
+    2|2
+    2|3
+}
+
+@setup grp_data
+test sort-elision-group-by {
+    WITH cte AS (SELECT a, b FROM g1 ORDER BY a)
+    SELECT a, SUM(b) FROM cte GROUP BY a ORDER BY a;
+}
+expect {
+    1|30
+    2|70
+    3|110
+}
+
+@setup grp_data
+@skip-if sqlite "SQLite planner bug: GROUP BY sort elision swallows the outer ORDER BY direction when a CTE provides pre-ordered rows, causing the CTE's internal order to leak through"
+test sort-elision-group-by-opposite-dir {
+    WITH cte AS (SELECT a, b FROM g1 ORDER BY a)
+    SELECT a, SUM(b) AS total FROM cte GROUP BY a ORDER BY a DESC;
+}
+expect {
+    3|110
+    2|70
+    1|30
+}
+
+@setup sort_data
+test sort-elision-cte-desc-parent-asc {
+    WITH cte AS (SELECT a, b FROM t1 ORDER BY a DESC)
+    SELECT * FROM cte ORDER BY a ASC;
+}
+expect {
+    1|a
+    1|b
+    2|f
+    3|c
+    4|d
+    5|e
+}
+
+test sort-elision-expression-order {
+    CREATE TABLE eo(a INT, b INT);
+    INSERT INTO eo VALUES(3,1),(1,2),(2,3);
+    WITH cte AS (SELECT a, b, a+b AS s FROM eo ORDER BY a+b)
+    SELECT * FROM cte ORDER BY s;
+}
+expect {
+    1|2|3
+    3|1|4
+    2|3|5
+}
+
+test sort-elision-collate-nocase-vs-default {
+    CREATE TABLE names(name TEXT);
+    INSERT INTO names VALUES('Alice'),('bob'),('Charlie'),('dave');
+    WITH cte AS (SELECT name FROM names ORDER BY name COLLATE NOCASE)
+    SELECT * FROM cte ORDER BY name;
+}
+expect {
+    Alice
+    Charlie
+    bob
+    dave
+}
+
+test sort-elision-nulls-in-order-by {
+    CREATE TABLE nn(a INT);
+    INSERT INTO nn VALUES(3),(NULL),(1),(NULL),(2);
+    WITH cte AS (SELECT a FROM nn ORDER BY a)
+    SELECT * FROM cte ORDER BY a;
+}
+expect {
+
+
+    1
+    2
+    3
+}
+
+test sort-elision-limit-offset {
+    CREATE TABLE lo(a INT);
+    INSERT INTO lo VALUES(5),(3),(1),(4),(2);
+    WITH cte AS (SELECT a FROM lo ORDER BY a)
+    SELECT * FROM cte ORDER BY a LIMIT 3 OFFSET 1;
+}
+expect {
+    2
+    3
+    4
+}
+
+test sort-elision-distinct {
+    CREATE TABLE dd(a INT, b INT);
+    INSERT INTO dd VALUES(1,1),(2,1),(1,2),(2,2),(3,1);
+    WITH cte AS (SELECT DISTINCT a FROM dd ORDER BY a)
+    SELECT * FROM cte ORDER BY a;
+}
+expect {
+    1
+    2
+    3
+}
+
+test sort-elision-cte-order-total-parent-order-a {
+    CREATE TABLE oa(a INT, b INT);
+    INSERT INTO oa VALUES(1,5),(2,4),(3,3),(4,2),(5,1);
+    WITH cte AS (SELECT a, b, a+b AS total FROM oa ORDER BY total)
+    SELECT * FROM cte ORDER BY a;
+}
+expect {
+    1|5|6
+    2|4|6
+    3|3|6
+    4|2|6
+    5|1|6
+}
+
+@setup range_data
+test range-scan-equality {
+    WITH cte AS (SELECT a, b FROM r1)
+    SELECT * FROM cte WHERE a = 3;
+}
+expect {
+    3|c
+}
+
+@setup range_data
+test range-scan-between {
+    WITH cte AS (SELECT a, b FROM r1)
+    SELECT * FROM cte WHERE a BETWEEN 2 AND 4 ORDER BY a;
+}
+expect {
+    2|b
+    3|c
+    4|d
+}
+
+@setup range_data
+test range-scan-strict-inequality {
+    WITH cte AS (SELECT a, b FROM r1)
+    SELECT * FROM cte WHERE a > 2 AND a < 5 ORDER BY a;
+}
+expect {
+    3|c
+    4|d
+}
+
+@setup range_data
+test range-scan-inclusive {
+    WITH cte AS (SELECT a, b FROM r1)
+    SELECT * FROM cte WHERE a >= 2 AND a <= 4 ORDER BY a;
+}
+expect {
+    2|b
+    3|c
+    4|d
+}
+
+@setup null_data
+test range-scan-nulls-excluded {
+    WITH cte AS (SELECT a, b FROM n1)
+    SELECT * FROM cte WHERE a > 0 ORDER BY a;
+}
+expect {
+    1|a
+    2|b
+    3|c
+}
+
+@setup null_data
+test range-scan-is-null {
+    WITH cte AS (SELECT a, b FROM n1)
+    SELECT * FROM cte WHERE a IS NULL ORDER BY b;
+}
+expect {
+    |null
+    |null2
+}
+
+test range-scan-empty-table {
+    CREATE TABLE empty(a INT, b TEXT);
+    WITH cte AS (SELECT a, b FROM empty)
+    SELECT * FROM cte WHERE a = 1;
+}
+expect {
+}
+
+test range-scan-duplicates {
+    CREATE TABLE dup(a INT, b TEXT);
+    INSERT INTO dup VALUES(1,'a'),(1,'b'),(1,'c'),(2,'d'),(2,'e');
+    WITH cte AS (SELECT a, b FROM dup)
+    SELECT * FROM cte WHERE a = 1 ORDER BY b;
+}
+expect {
+    1|a
+    1|b
+    1|c
+}
+
+test range-scan-double-filter {
+    CREATE TABLE df(a INT, b INT);
+    INSERT INTO df VALUES(1,100),(2,200),(3,300),(4,400),(5,500);
+    WITH cte AS (SELECT a, b FROM df WHERE a > 1)
+    SELECT * FROM cte WHERE b < 400 ORDER BY a;
+}
+expect {
+    2|200
+    3|300
+}
+
+@setup composite_data
+test range-scan-composite-eq-plus-range {
+    WITH cte AS (SELECT grp, val, label FROM comp ORDER BY grp, val)
+    SELECT * FROM cte WHERE grp = 1 AND val > 10 ORDER BY val;
+}
+expect {
+    1|20|b
+    1|30|c
+}
+
+test range-scan-negative-numbers {
+    CREATE TABLE neg(a INT);
+    INSERT INTO neg VALUES(-5),(-3),(-1),(0),(1),(3),(5);
+    WITH cte AS (SELECT a FROM neg)
+    SELECT * FROM cte WHERE a >= -3 AND a <= 1 ORDER BY a;
+}
+expect {
+    -3
+    -1
+    0
+    1
+}
+
+@setup range_data
+test range-scan-in-clause {
+    WITH cte AS (SELECT a, b FROM r1)
+    SELECT * FROM cte WHERE a IN (1,3,5) ORDER BY a;
+}
+expect {
+    1|a
+    3|c
+    5|e
+}
+
+@setup range_data
+test range-scan-not-in {
+    WITH cte AS (SELECT a, b FROM r1)
+    SELECT * FROM cte WHERE a NOT IN (1,3,5) ORDER BY a;
+}
+expect {
+    2|b
+    4|d
+}
+
+test range-scan-aliased-columns {
+    CREATE TABLE al(a INT, b INT);
+    INSERT INTO al VALUES(1,10),(2,20),(3,30),(4,40),(5,50);
+    WITH cte AS (SELECT a AS key, b AS value FROM al)
+    SELECT * FROM cte WHERE key > 2 AND key < 5 ORDER BY key;
+}
+expect {
+    3|30
+    4|40
+}
+
+test range-scan-text-vs-int-affinity {
+    CREATE TABLE ta(a TEXT, b INT);
+    INSERT INTO ta VALUES('1',10),('2',20),('10',100),('3',30);
+    WITH cte AS (SELECT a, b FROM ta)
+    SELECT * FROM cte WHERE a > 2 ORDER BY a;
+}
+expect {
+    3|30
+}
+
+@setup grp_data
+test min-max-basic-min {
+    WITH cte AS (SELECT a FROM g1 ORDER BY a)
+    SELECT MIN(a) FROM cte;
+}
+expect {
+    1
+}
+
+@setup grp_data
+test min-max-basic-max {
+    WITH cte AS (SELECT a FROM g1 ORDER BY a)
+    SELECT MAX(a) FROM cte;
+}
+expect {
+    3
+}
+
+test min-max-empty {
+    CREATE TABLE empty_mm(a INT);
+    WITH cte AS (SELECT a FROM empty_mm ORDER BY a)
+    SELECT MIN(a) FROM cte;
+}
+expect {
+
+}
+
+test min-max-all-null {
+    CREATE TABLE all_null(a INT);
+    INSERT INTO all_null VALUES(NULL),(NULL),(NULL);
+    WITH cte AS (SELECT a FROM all_null ORDER BY a)
+    SELECT MIN(a) FROM cte;
+}
+expect {
+
+}
+
+test min-max-with-nulls {
+    CREATE TABLE mn(a INT);
+    INSERT INTO mn VALUES(NULL),(3),(NULL),(1),(NULL);
+    WITH cte AS (SELECT a FROM mn ORDER BY a)
+    SELECT MAX(a) FROM cte;
+}
+expect {
+    3
+}
+
+test min-max-both-together {
+    CREATE TABLE mm(a INT);
+    INSERT INTO mm VALUES(3),(1),(4),(1),(5);
+    WITH cte AS (SELECT a FROM mm ORDER BY a)
+    SELECT MIN(a), MAX(a) FROM cte;
+}
+expect {
+    1|5
+}
+
+test min-max-with-where {
+    CREATE TABLE mw(a INT, b INT);
+    INSERT INTO mw VALUES(1,100),(2,200),(3,300),(4,400),(5,500);
+    WITH cte AS (SELECT a, b FROM mw ORDER BY a)
+    SELECT MIN(a) FROM cte WHERE b > 200;
+}
+expect {
+    3
+}
+
+test min-max-on-cte-with-limit {
+    CREATE TABLE ml(a INT);
+    INSERT INTO ml VALUES(3),(1),(4),(1),(5);
+    WITH cte AS (SELECT a FROM ml ORDER BY a LIMIT 3)
+    SELECT MAX(a) FROM cte;
+}
+expect {
+    3
+}
+
+test min-max-text-column {
+    CREATE TABLE mt(a TEXT);
+    INSERT INTO mt VALUES('banana'),('apple'),('cherry'),('date');
+    WITH cte AS (SELECT a FROM mt ORDER BY a)
+    SELECT MIN(a) FROM mt;
+}
+expect {
+    apple
+}
+
+test min-max-group-by-min-on-cte {
+    CREATE TABLE gm(grp TEXT, val INT);
+    INSERT INTO gm VALUES('a',3),('a',1),('b',4),('b',2),('a',5),('b',6);
+    WITH cte AS (SELECT grp, val FROM gm ORDER BY grp, val)
+    SELECT grp, MIN(val) FROM cte GROUP BY grp ORDER BY grp;
+}
+expect {
+    a|1
+    b|2
+}
+
+@setup grp_data
+test min-max-correlated-from-cte {
+    WITH cte AS (SELECT a AS grp, b AS val FROM g1 ORDER BY val)
+    SELECT grp, (SELECT MAX(val) FROM cte c2 WHERE c2.grp = t.grp)
+    FROM (SELECT DISTINCT a AS grp FROM g1) t ORDER BY grp;
+}
+expect {
+    1|20
+    2|40
+    3|60
+}
+
+@setup or_data
+test multi-or-basic {
+    SELECT * FROM o1 WHERE a = 1 OR a = 3 OR a = 5 ORDER BY a;
+}
+expect {
+    1|a
+    3|c
+    5|e
+}
+
+@setup or_data
+test multi-or-range {
+    SELECT * FROM o1 WHERE a < 2 OR a > 4 ORDER BY a;
+}
+expect {
+    1|a
+    5|e
+}
+
+@setup or_multi
+test multi-or-different-columns {
+    SELECT * FROM om WHERE a = 1 OR b = 30 ORDER BY a;
+}
+expect {
+    1|10|x
+    3|30|z
+}
+
+@setup or_data
+test multi-or-delete {
+    DELETE FROM o1 WHERE a = 2 OR a = 4;
+    SELECT * FROM o1 ORDER BY a;
+}
+expect {
+    1|a
+    3|c
+    5|e
+}
+
+test multi-or-update {
+    CREATE TABLE ou(a INT, b TEXT);
+    CREATE INDEX idx_ou_a ON ou(a);
+    INSERT INTO ou VALUES(1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
+    UPDATE ou SET b = 'updated' WHERE a = 1 OR a = 5;
+    SELECT * FROM ou ORDER BY a;
+}
+expect {
+    1|updated
+    2|b
+    3|c
+    4|d
+    5|updated
+}
+
+test multi-or-dedup {
+    CREATE TABLE od(a INT, b INT);
+    CREATE INDEX idx_od_a ON od(a);
+    CREATE INDEX idx_od_b ON od(b);
+    INSERT INTO od VALUES(1,1),(2,2),(3,3),(4,4),(5,5);
+    SELECT * FROM od WHERE a = 3 OR b = 3 ORDER BY a;
+}
+expect {
+    3|3
+}
+
+@setup or_data
+test multi-or-with-limit {
+    SELECT * FROM o1 WHERE a = 1 OR a = 3 OR a = 5 ORDER BY a LIMIT 2;
+}
+expect {
+    1|a
+    3|c
+}
+
+test complex-cte-self-join {
+    CREATE TABLE sj(a INT, b TEXT);
+    INSERT INTO sj VALUES(1,'x'),(2,'y'),(3,'z'),(4,'w');
+    WITH cte AS (SELECT a, b FROM sj ORDER BY a)
+    SELECT c1.a, c2.b FROM cte c1 JOIN cte c2 ON c1.a = c2.a WHERE c1.a > 1 ORDER BY c1.a;
+}
+expect {
+    2|y
+    3|z
+    4|w
+}
+
+test complex-cte-in-subquery-and-main {
+    CREATE TABLE sm(a INT);
+    INSERT INTO sm VALUES(1),(2),(3),(4),(5);
+    WITH cte AS (SELECT a FROM sm)
+    SELECT a FROM cte WHERE a > (SELECT MIN(a) FROM cte) ORDER BY a;
+}
+expect {
+    2
+    3
+    4
+    5
+}
+
+test complex-cte-chain {
+    CREATE TABLE ch(a INT);
+    INSERT INTO ch VALUES(1),(2),(3),(4),(5);
+    WITH
+      c1 AS (SELECT a FROM ch WHERE a > 1),
+      c2 AS (SELECT a FROM c1 WHERE a < 5),
+      c3 AS (SELECT a*2 AS a FROM c2)
+    SELECT * FROM c3 ORDER BY a;
+}
+expect {
+    4
+    6
+    8
+}
+
+test complex-cte-union {
+    CREATE TABLE u1(a INT);
+    INSERT INTO u1 VALUES(1),(2),(3);
+    CREATE TABLE u2(a INT);
+    INSERT INTO u2 VALUES(2),(3),(4);
+    WITH cte AS (SELECT a FROM u1 UNION SELECT a FROM u2)
+    SELECT * FROM cte ORDER BY a;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+test complex-cte-with-having {
+    CREATE TABLE hv(grp TEXT, val INT);
+    INSERT INTO hv VALUES('a',1),('a',2),('b',3),('b',4),('c',5);
+    WITH cte AS (SELECT grp, SUM(val) as s FROM hv GROUP BY grp HAVING SUM(val) > 3)
+    SELECT * FROM cte ORDER BY grp;
+}
+expect {
+    b|7
+    c|5
+}
+
+test complex-cte-chain-aggregation {
+    CREATE TABLE ca(id INT, customer_id INT, amount REAL);
+    INSERT INTO ca VALUES(1,1,10.0),(2,1,20.0),(3,2,30.0),(4,2,40.0),(5,3,50.0);
+    WITH
+      totals AS (SELECT customer_id, SUM(amount) as total FROM ca GROUP BY customer_id),
+      ranked AS (SELECT customer_id, total FROM totals WHERE total > 25)
+    SELECT * FROM ranked ORDER BY customer_id;
+}
+expect {
+    1|30.0
+    2|70.0
+    3|50.0
+}
+
+@setup join_data
+test cte-join-table {
+    WITH cte AS (SELECT a, b FROM j1)
+    SELECT cte.a, cte.b, j2.c FROM cte JOIN j2 ON cte.a = j2.a ORDER BY cte.a;
+}
+expect {
+    1|x|p
+    2|y|q
+}
+
+@setup join_data
+test cte-left-join-table {
+    WITH cte AS (SELECT a, b FROM j1)
+    SELECT cte.a, cte.b, j2.c FROM cte LEFT JOIN j2 ON cte.a = j2.a ORDER BY cte.a;
+}
+expect {
+    1|x|p
+    2|y|q
+    3|z|
+}
+
+test cte-exists-subquery {
+    CREATE TABLE ex1(a INT);
+    INSERT INTO ex1 VALUES(1),(2),(3),(4),(5);
+    CREATE TABLE ex2(a INT);
+    INSERT INTO ex2 VALUES(2),(4),(6);
+    WITH cte AS (SELECT a FROM ex1)
+    SELECT * FROM cte WHERE EXISTS (SELECT 1 FROM ex2 WHERE ex2.a = cte.a) ORDER BY a;
+}
+expect {
+    2
+    4
+}
+
+test cte-cross-join-self {
+    CREATE TABLE cj(a INT);
+    INSERT INTO cj VALUES(1),(2),(3);
+    WITH cte AS (SELECT a FROM cj ORDER BY a)
+    SELECT c1.a AS x, c2.a AS y FROM cte c1, cte c2 ORDER BY c1.a, c2.a;
+}
+expect {
+    1|1
+    1|2
+    1|3
+    2|1
+    2|2
+    2|3
+    3|1
+    3|2
+    3|3
+}
+
+test cte-order-by-join-preserves-order {
+    CREATE TABLE jp1(id INT PRIMARY KEY, a INT);
+    INSERT INTO jp1 VALUES(1,30),(2,10),(3,20);
+    CREATE TABLE jp2(id INT PRIMARY KEY, b INT);
+    INSERT INTO jp2 VALUES(1,300),(2,100),(3,200);
+    WITH cte AS (SELECT id, a FROM jp1 ORDER BY a)
+    SELECT cte.a, jp2.b FROM cte JOIN jp2 ON cte.id = jp2.id ORDER BY cte.a;
+}
+expect {
+    10|100
+    20|200
+    30|300
+}
+
+test cte-left-join-order-preserved {
+    CREATE TABLE lj1(a INT);
+    INSERT INTO lj1 VALUES(1),(2),(3),(4),(5);
+    CREATE TABLE lj2(a INT, b TEXT);
+    INSERT INTO lj2 VALUES(2,'two'),(4,'four');
+    WITH cte AS (SELECT a FROM lj1 ORDER BY a)
+    SELECT cte.a, lj2.b FROM cte LEFT JOIN lj2 ON cte.a = lj2.a ORDER BY cte.a;
+}
+expect {
+    1|
+    2|two
+    3|
+    4|four
+    5|
+}
+
+test evil-cte-from-where-subquery {
+    CREATE TABLE ew(a INT, b INT);
+    INSERT INTO ew VALUES(1,50),(2,40),(3,30),(4,20),(5,10);
+    WITH cte AS (SELECT a, b FROM ew ORDER BY a)
+    SELECT * FROM cte c1
+    WHERE c1.b > (SELECT AVG(b) FROM cte)
+    ORDER BY c1.a;
+}
+expect {
+    1|50
+    2|40
+}
+
+test evil-cte-limit-then-different-order {
+    CREATE TABLE el(a INT, b TEXT);
+    INSERT INTO el VALUES(1,'z'),(2,'y'),(3,'x'),(4,'w'),(5,'v'),(6,'u'),(7,'t');
+    WITH cte AS (SELECT a, b FROM el ORDER BY a LIMIT 5)
+    SELECT * FROM cte WHERE a > 2 ORDER BY b;
+}
+expect {
+    5|v
+    4|w
+    3|x
+}
+
+test evil-two-ctes-different-orders-joined {
+    CREATE TABLE ej(a INT, b TEXT);
+    INSERT INTO ej VALUES(1,'c'),(2,'a'),(3,'b');
+    WITH
+      c1 AS (SELECT a, b FROM ej ORDER BY a),
+      c2 AS (SELECT a, b FROM ej ORDER BY b)
+    SELECT c1.a, c1.b AS c1b, c2.a AS c2a, c2.b AS c2b
+    FROM c1 JOIN c2 ON c1.a = c2.a
+    ORDER BY c1.a;
+}
+expect {
+    1|c|1|c
+    2|a|2|a
+    3|b|3|b
+}
+
+test evil-cte-groupby-having-order-flip {
+    CREATE TABLE ef(a INT, b INT, c TEXT);
+    INSERT INTO ef VALUES(1,10,'x'),(1,20,'y'),(2,30,'z'),(2,5,'w'),(3,15,'v');
+    WITH cte AS (
+      SELECT a, SUM(b) AS total, GROUP_CONCAT(c) AS items
+      FROM ef GROUP BY a HAVING SUM(b) > 10 ORDER BY total DESC
+    )
+    SELECT * FROM cte ORDER BY a;
+}
+expect {
+    1|30|x,y
+    2|35|z,w
+    3|15|v
+}
+
+test evil-cte-correlated-scalar-plus-range {
+    CREATE TABLE ec1(a INT, b INT);
+    INSERT INTO ec1 VALUES(1,10),(2,20),(3,30);
+    CREATE TABLE ec2(x INT, y INT);
+    INSERT INTO ec2 VALUES(1,100),(2,200),(3,300);
+    WITH cte AS (
+      SELECT a, (SELECT y FROM ec2 WHERE ec2.x = ec1.a) AS looked_up FROM ec1
+    )
+    SELECT * FROM cte WHERE a > 1 ORDER BY a;
+}
+expect {
+    2|200
+    3|300
+}
+
+@setup sales_data
+test evil-cte-aggregate-then-range {
+    WITH cte AS (SELECT region, SUM(amount) AS total FROM sales GROUP BY region)
+    SELECT * FROM cte WHERE total > 100 ORDER BY region;
+}
+expect {
+    east|250
+    north|300
+    west|250
+}
+
+test evil-chained-ctes-flip-order {
+    CREATE TABLE cf(x INT);
+    INSERT INTO cf VALUES(1),(2),(3),(4),(5);
+    WITH
+      a AS (SELECT x FROM cf WHERE x > 1 ORDER BY x),
+      b AS (SELECT x FROM a WHERE x < 5 ORDER BY x DESC),
+      c AS (SELECT x FROM b ORDER BY x)
+    SELECT * FROM c ORDER BY x;
+}
+expect {
+    2
+    3
+    4
+}
+
+test evil-cte-with-internal-filter-parent-range {
+    CREATE TABLE ir(a INT, b INT);
+    INSERT INTO ir VALUES(1,100),(2,200),(3,300),(4,400),(5,500),(6,600);
+    WITH cte AS (SELECT a, b FROM ir WHERE b >= 200)
+    SELECT * FROM cte WHERE a <= 4 ORDER BY a;
+}
+expect {
+    2|200
+    3|300
+    4|400
+}
+
+test evil-self-join-offset-seek {
+    CREATE TABLE ss(a INT, b INT);
+    INSERT INTO ss VALUES(1,10),(2,20),(3,30),(4,40),(5,50);
+    WITH cte AS (SELECT a, b FROM ss)
+    SELECT c1.a, c1.b, c2.a AS a2, c2.b AS b2
+    FROM cte c1 JOIN cte c2 ON c1.a + 1 = c2.a
+    ORDER BY c1.a;
+}
+expect {
+    1|10|2|20
+    2|20|3|30
+    3|30|4|40
+    4|40|5|50
+}
+
+test from-sub-basic-elision {
+    CREATE TABLE fs(a INT, b TEXT);
+    INSERT INTO fs VALUES(3,'c'),(1,'a'),(2,'b'),(5,'e'),(4,'d');
+    SELECT * FROM (SELECT a, b FROM fs ORDER BY a) sub ORDER BY a;
+}
+expect {
+    1|a
+    2|b
+    3|c
+    4|d
+    5|e
+}
+
+test from-sub-desc-parent-asc {
+    CREATE TABLE fd(a INT);
+    INSERT INTO fd VALUES(3),(1),(2),(5),(4);
+    SELECT * FROM (SELECT a FROM fd ORDER BY a DESC) sub ORDER BY a ASC;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+}
+
+test from-sub-nested {
+    CREATE TABLE fn(a INT);
+    INSERT INTO fn VALUES(5),(3),(1),(4),(2);
+    SELECT * FROM (
+      SELECT * FROM (
+        SELECT a FROM fn ORDER BY a
+      ) inner_sub
+    ) outer_sub ORDER BY a;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+}
+
+test from-sub-aggregate-different-order {
+    CREATE TABLE fa(grp TEXT, val INT);
+    INSERT INTO fa VALUES('a',1),('b',2),('a',3),('b',4),('c',5);
+    SELECT * FROM (
+      SELECT grp, SUM(val) AS total FROM fa GROUP BY grp ORDER BY grp
+    ) sub ORDER BY total DESC;
+}
+expect {
+    b|6
+    c|5
+    a|4
+}
+
+test from-sub-joined {
+    CREATE TABLE fj1(a INT, b TEXT);
+    INSERT INTO fj1 VALUES(1,'x'),(2,'y'),(3,'z');
+    CREATE TABLE fj2(a INT, c TEXT);
+    INSERT INTO fj2 VALUES(1,'p'),(2,'q'),(3,'r');
+    SELECT sub.a, sub.b, fj2.c
+    FROM (SELECT a, b FROM fj1 ORDER BY a) sub
+    JOIN fj2 ON sub.a = fj2.a
+    ORDER BY sub.a;
+}
+expect {
+    1|x|p
+    2|y|q
+    3|z|r
+}
+
+@setup grp_data
+test group-by-cte-order-feeds-groupby-no-parent-order {
+    WITH cte AS (SELECT a, b FROM g1 ORDER BY a)
+    SELECT a, SUM(b) AS total FROM cte GROUP BY a;
+}
+expect {
+    1|30
+    2|70
+    3|110
+}
+
+@setup sales_data
+test group-by-count-star {
+    WITH cte AS (SELECT region, amount FROM sales ORDER BY region)
+    SELECT region, COUNT(*) AS cnt FROM cte GROUP BY region ORDER BY region;
+}
+expect {
+    east|2
+    north|1
+    west|2
+}
+
+@setup grp_data
+test group-by-cte-order-on-different-col {
+    WITH cte AS (SELECT a, b FROM g1 ORDER BY b)
+    SELECT a, SUM(b) FROM cte GROUP BY a ORDER BY a;
+}
+expect {
+    1|30
+    2|70
+    3|110
+}
