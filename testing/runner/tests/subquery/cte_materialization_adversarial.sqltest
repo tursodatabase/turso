@@ -55,6 +55,21 @@ setup or_multi {
     INSERT INTO om VALUES(1,10,'x'),(2,20,'y'),(3,30,'z'),(4,10,'w');
 }
 
+setup wtf_data {
+    CREATE TABLE t(x INTEGER, y TEXT, z REAL);
+    INSERT INTO t VALUES(1,'a',1.5),(2,'b',2.5),(3,'c',3.5),(4,'d',4.5),(5,'e',5.5);
+    INSERT INTO t VALUES(NULL,NULL,NULL),(0,'',0.0),(-1,'z',-1.5);
+}
+
+setup business_data {
+    CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INT, amount REAL, status TEXT);
+    CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT, tier TEXT);
+    INSERT INTO customers VALUES(1,'Alice','gold'),(2,'Bob','silver'),(3,'Carol','gold'),(4,'Dave','bronze');
+    INSERT INTO orders VALUES(1,1,100.0,'shipped'),(2,1,200.0,'pending'),(3,2,50.0,'shipped');
+    INSERT INTO orders VALUES(4,2,75.0,'shipped'),(5,3,300.0,'cancelled'),(6,3,150.0,'shipped');
+    INSERT INTO orders VALUES(7,4,25.0,'pending'),(8,NULL,999.0,'shipped'),(9,1,0.0,'shipped');
+}
+
 @setup sort_data
 test sort-elision-cte-limit-parent-order {
     WITH cte AS (SELECT a, b FROM t1 ORDER BY a LIMIT 4)
@@ -1416,4 +1431,619 @@ expect {
     2|2|40
     2|1|30
     1|2|20
+}
+
+@setup wtf_data
+test wtf-empty-cte-left-join {
+    WITH empty AS (SELECT x, y FROM t WHERE 1=0 ORDER BY x)
+    SELECT t.x, e.y FROM t LEFT JOIN empty e ON t.x = e.x ORDER BY t.x;
+}
+expect {
+    |
+    -1|
+    0|
+    1|
+    2|
+    3|
+    4|
+    5|
+}
+
+@setup wtf_data
+test wtf-expr-order-elision {
+    WITH c AS (SELECT x, y, x*x AS xsq FROM t WHERE x IS NOT NULL ORDER BY x*x DESC)
+    SELECT xsq, y FROM c ORDER BY xsq DESC LIMIT 5;
+}
+expect {
+    25|e
+    16|d
+    9|c
+    4|b
+    1|a
+}
+
+@setup wtf_data
+test wtf-cte-self-join-sum-condition {
+    WITH c AS (SELECT x, y FROM t WHERE x IS NOT NULL ORDER BY x)
+    SELECT a.x, b.x, a.y, b.y FROM c a JOIN c b ON a.x + b.x = 5 ORDER BY a.x, b.x;
+}
+expect {
+    0|5||e
+    1|4|a|d
+    2|3|b|c
+    3|2|c|b
+    4|1|d|a
+    5|0|e|
+}
+
+@setup wtf_data
+test wtf-all-nulls-cte-aggregate {
+    WITH nulls AS (SELECT NULL AS a, NULL AS b, NULL AS c FROM t)
+    SELECT COUNT(*), COUNT(a), SUM(a), MIN(a), MAX(a), GROUP_CONCAT(a) FROM nulls;
+}
+expect {
+    8|0||||
+}
+
+@setup wtf_data
+test wtf-cte-four-ways {
+    WITH c AS (SELECT x, y FROM t WHERE x > 0 ORDER BY x)
+    SELECT x, y,
+      (SELECT COUNT(*) FROM c WHERE c.x <= outer_t.x) AS rank,
+      CASE WHEN EXISTS (SELECT 1 FROM c WHERE c.x = outer_t.x + 1) THEN 'has_next' ELSE 'last' END AS status
+    FROM (SELECT x, y FROM c) outer_t
+    WHERE x IN (SELECT x FROM c WHERE x % 2 = 1)
+    ORDER BY x;
+}
+expect {
+    1|a|1|has_next
+    3|c|3|has_next
+    5|e|5|last
+}
+
+@setup wtf_data
+test wtf-cte-chain-conflicting-orders {
+    WITH
+      c1 AS (SELECT x, y FROM t WHERE x IS NOT NULL ORDER BY x ASC),
+      c2 AS (SELECT x, y FROM c1 WHERE x > 0 ORDER BY x DESC),
+      c3 AS (SELECT x, y FROM c2 WHERE x < 5 ORDER BY y ASC)
+    SELECT * FROM c3 ORDER BY x ASC;
+}
+expect {
+    1|a
+    2|b
+    3|c
+    4|d
+}
+
+@setup wtf_data
+test wtf-union-all-partition-aggregate {
+    WITH c AS (
+      SELECT x, 'pos' AS label FROM t WHERE x > 0
+      UNION ALL
+      SELECT x, 'neg' AS label FROM t WHERE x < 0
+      UNION ALL
+      SELECT x, 'zero' AS label FROM t WHERE x = 0
+      UNION ALL
+      SELECT x, 'null' AS label FROM t WHERE x IS NULL
+    )
+    SELECT label, COUNT(*), MIN(x), MAX(x) FROM c GROUP BY label ORDER BY label;
+}
+expect {
+    neg|1|-1|-1
+    null|1||
+    pos|5|1|5
+    zero|1|0|0
+}
+
+@setup wtf_data
+test wtf-case-in-order-by {
+    WITH c AS (
+      SELECT x, y,
+        CASE WHEN x IS NULL THEN 999
+             WHEN x < 0 THEN 500 - x
+             ELSE x END AS sort_key
+      FROM t
+      ORDER BY sort_key
+    )
+    SELECT x, y, sort_key FROM c ORDER BY sort_key;
+}
+expect {
+    0||0
+    1|a|1
+    2|b|2
+    3|c|3
+    4|d|4
+    5|e|5
+    -1|z|501
+    ||999
+}
+
+@setup wtf_data
+test wtf-triple-self-join-combos {
+    WITH c AS (SELECT x FROM t WHERE x > 0 ORDER BY x)
+    SELECT a.x, b.x, cc.x FROM c a, c b, c cc
+    WHERE a.x < b.x AND b.x < cc.x
+    ORDER BY a.x, b.x, cc.x;
+}
+expect {
+    1|2|3
+    1|2|4
+    1|2|5
+    1|3|4
+    1|3|5
+    1|4|5
+    2|3|4
+    2|3|5
+    2|4|5
+    3|4|5
+}
+
+@setup wtf_data
+test wtf-huge-limit-offset {
+    WITH c AS (SELECT x, y FROM t WHERE x IS NOT NULL ORDER BY x ASC LIMIT 999 OFFSET 2)
+    SELECT * FROM c ORDER BY x;
+}
+expect {
+    1|a
+    2|b
+    3|c
+    4|d
+    5|e
+}
+
+@setup wtf_data
+test wtf-correlated-not-exists {
+    WITH c AS (SELECT x, y FROM t WHERE x IS NOT NULL)
+    SELECT a.x, a.y FROM c a
+    WHERE NOT EXISTS (SELECT 1 FROM c b WHERE b.x = a.x + 1)
+    ORDER BY a.x;
+}
+expect {
+    5|e
+}
+
+@setup wtf_data
+test wtf-coalesce-nullif-iif-typeof {
+    WITH c AS (
+      SELECT COALESCE(x, -999) AS cx, y, NULLIF(y, '') AS ny,
+        IIF(z > 2.0, 'big', 'small') AS category, TYPEOF(x) AS tx
+      FROM t ORDER BY cx
+    )
+    SELECT category, COUNT(*), MIN(cx), MAX(cx), GROUP_CONCAT(tx) FROM c
+    GROUP BY category ORDER BY category;
+}
+expect {
+    big|4|2|5|integer,integer,integer,integer
+    small|4|-999|1|null,integer,integer,integer
+}
+
+@setup wtf_data
+test wtf-cte-order-ignored-by-parent-group {
+    WITH c AS (SELECT x, y, z FROM t WHERE x IS NOT NULL ORDER BY z DESC)
+    SELECT y, SUM(x) AS sx FROM c WHERE x > 0 GROUP BY y ORDER BY y;
+}
+expect {
+    a|1
+    b|2
+    c|3
+    d|4
+    e|5
+}
+
+@setup wtf_data
+test wtf-cte-scalar-sub-everywhere {
+    WITH c AS (SELECT x, z FROM t WHERE x > 0 ORDER BY x)
+    SELECT x, z,
+      (SELECT SUM(z) FROM c) AS grand_total,
+      z * 100.0 / (SELECT SUM(z) FROM c) AS pct
+    FROM c
+    WHERE z > (SELECT MIN(z) FROM c)
+    ORDER BY x;
+}
+expect {
+    2|2.5|17.5|14.2857142857143
+    3|3.5|17.5|20.0
+    4|4.5|17.5|25.7142857142857
+    5|5.5|17.5|31.4285714285714
+}
+expect @js {
+    2|2.5|17.5|14.2857142857143
+    3|3.5|17.5|20
+    4|4.5|17.5|25.7142857142857
+    5|5.5|17.5|31.4285714285714
+}
+
+@setup wtf_data
+test wtf-column-is-correlated-subquery {
+    WITH c AS (
+      SELECT x, (SELECT COUNT(*) FROM t t2 WHERE t2.x < t.x AND t2.x IS NOT NULL) AS rank_val
+      FROM t WHERE x IS NOT NULL
+    )
+    SELECT * FROM c ORDER BY rank_val DESC, x DESC;
+}
+expect {
+    5|6
+    4|5
+    3|4
+    2|3
+    1|2
+    0|1
+    -1|0
+}
+
+@setup wtf_data
+test wtf-cte-as-config-variable {
+    WITH config AS (SELECT 3 AS threshold, 'x' AS sort_col)
+    SELECT t.x, t.y, t.z FROM t, config
+    WHERE t.x > config.threshold
+    ORDER BY t.x;
+}
+expect {
+    4|d|4.5
+    5|e|5.5
+}
+
+@setup wtf_data
+test wtf-distinct-modulo-cte {
+    WITH c AS (SELECT DISTINCT x % 3 AS bucket FROM t WHERE x IS NOT NULL ORDER BY x % 3)
+    SELECT * FROM c ORDER BY bucket;
+}
+expect {
+    -1
+    0
+    1
+    2
+}
+
+@setup wtf_data
+test wtf-limit-chop-then-group-by {
+    WITH c AS (SELECT x % 2 AS parity, z FROM t WHERE x IS NOT NULL ORDER BY x LIMIT 4)
+    SELECT parity, SUM(z), COUNT(*) FROM c GROUP BY parity ORDER BY parity;
+}
+expect {
+    -1|-1.5|1
+    0|2.5|2
+    1|1.5|1
+}
+
+@setup wtf_data
+test wtf-text-between-range-scan {
+    WITH c AS (SELECT x, y, z FROM t WHERE y IS NOT NULL ORDER BY y)
+    SELECT * FROM c WHERE y BETWEEN 'b' AND 'd' ORDER BY y;
+}
+expect {
+    2|b|2.5
+    3|c|3.5
+    4|d|4.5
+}
+
+@setup wtf_data
+test wtf-cross-join-two-ctes {
+    WITH
+      a AS (SELECT x AS ax FROM t WHERE x > 0 AND x < 4),
+      b AS (SELECT x AS bx FROM t WHERE x > 2 AND x < 6)
+    SELECT ax, bx, ax * bx AS product FROM a, b
+    WHERE ax <> bx
+    ORDER BY product, ax;
+}
+expect {
+    1|3|3
+    1|4|4
+    1|5|5
+    2|3|6
+    2|4|8
+    2|5|10
+    3|4|12
+    3|5|15
+}
+
+@setup wtf_data
+test wtf-five-cte-chain-join-all {
+    WITH
+      c1 AS (SELECT x FROM t WHERE x IS NOT NULL),
+      c2 AS (SELECT x, x*2 AS x2 FROM c1 WHERE x > 0),
+      c3 AS (SELECT x, x2, x*3 AS x3 FROM c2 WHERE x < 5),
+      c4 AS (SELECT x, x2, x3, x2+x3 AS combo FROM c3),
+      c5 AS (SELECT x, combo, combo*combo AS combo_sq FROM c4)
+    SELECT c5.x, c2.x2, c3.x3, c4.combo, c5.combo_sq
+    FROM c5 JOIN c4 ON c5.x = c4.x JOIN c3 ON c4.x = c3.x JOIN c2 ON c3.x = c2.x
+    ORDER BY c5.x;
+}
+expect {
+    1|2|3|5|25
+    2|4|6|10|100
+    3|6|9|15|225
+    4|8|12|20|400
+}
+
+@setup wtf_data
+test wtf-empty-zero-null-group-by {
+    WITH horrors AS (
+      SELECT '' AS val UNION ALL SELECT '' UNION ALL SELECT '0'
+      UNION ALL SELECT 0 UNION ALL SELECT NULL UNION ALL SELECT NULL UNION ALL SELECT 0.0
+    )
+    SELECT TYPEOF(val), val, COUNT(*) FROM horrors GROUP BY val ORDER BY TYPEOF(val), val;
+}
+expect {
+    integer|0|2
+    null||2
+    text||2
+    text|0|1
+}
+
+@setup wtf_data
+test wtf-cte-bounds-filter {
+    WITH
+      bounds AS (SELECT MIN(x) AS lo, MAX(x) AS hi FROM t WHERE x IS NOT NULL),
+      middle AS (SELECT x, y FROM t WHERE x > (SELECT lo FROM bounds) AND x < (SELECT hi FROM bounds) ORDER BY x)
+    SELECT COUNT(*), MIN(x), MAX(x), GROUP_CONCAT(y, '-') FROM middle;
+}
+expect {
+    5|0|4|-a-b-c-d
+}
+
+@setup wtf_data
+test wtf-cte-array-indexing {
+    WITH ordered AS (SELECT x, y FROM t WHERE x IS NOT NULL ORDER BY x)
+    SELECT
+      (SELECT y FROM ordered LIMIT 1 OFFSET 0) AS first_y,
+      (SELECT y FROM ordered LIMIT 1 OFFSET 2) AS third_y,
+      (SELECT x FROM ordered LIMIT 1 OFFSET 4) AS fifth_x,
+      (SELECT COUNT(*) FROM ordered) AS total;
+}
+expect {
+    z|a|3|7
+}
+
+@setup wtf_data
+test wtf-fake-factorial-self-join {
+    WITH nums AS (SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5)
+    SELECT a.n,
+      CASE a.n WHEN 1 THEN 1 WHEN 2 THEN 2 WHEN 3 THEN 6 WHEN 4 THEN 24 WHEN 5 THEN 120 END AS factorial,
+      (SELECT COUNT(*) FROM nums b, nums c WHERE b.n <= a.n AND c.n <= a.n) AS n_squared
+    FROM nums a ORDER BY a.n;
+}
+expect {
+    1|1|1
+    2|2|4
+    3|6|9
+    4|24|16
+    5|120|25
+}
+
+@setup wtf_data
+test wtf-linear-regression-cte {
+    WITH stats AS (
+      SELECT COUNT(*) AS n, SUM(x) AS sx, SUM(x*x) AS sxx, SUM(z) AS sz, SUM(x*z) AS sxz
+      FROM t WHERE x IS NOT NULL AND z IS NOT NULL
+    )
+    SELECT n, sx, sz,
+      CAST((n * sxz - sx * sz) AS REAL) / (n * sxx - sx * sx) AS slope,
+      CAST(sz AS REAL) / n - (CAST((n * sxz - sx * sz) AS REAL) / (n * sxx - sx * sx)) * CAST(sx AS REAL) / n AS intercept
+    FROM stats;
+}
+expect {
+    7|14|16.0|1.14285714285714|0.0
+}
+expect @js {
+    7|14|16|1.14285714285714|0
+}
+
+@setup wtf_data
+test wtf-cte-union-with-itself {
+    WITH c AS (SELECT x, y FROM t WHERE x > 0 AND x <= 3)
+    SELECT * FROM (SELECT x, y, 'first' AS src FROM c UNION ALL SELECT x, y, 'second' FROM c) combo
+    ORDER BY src, x;
+}
+expect {
+    1|a|first
+    2|b|first
+    3|c|first
+    1|a|second
+    2|b|second
+    3|c|second
+}
+
+@setup wtf_data
+test wtf-agg-of-agg-with-subquery {
+    WITH c AS (
+      SELECT x % 3 AS bucket, COUNT(*) AS cnt, SUM(z) AS total
+      FROM t WHERE x IS NOT NULL GROUP BY x % 3
+    )
+    SELECT MIN(cnt), MAX(cnt), MIN(total), MAX(total),
+      (SELECT bucket FROM c ORDER BY cnt DESC, bucket ASC LIMIT 1) AS biggest_bucket
+    FROM c;
+}
+expect {
+    1|2|-1.5|8.0|0
+}
+expect @js {
+    1|2|-1.5|8|0
+}
+
+@setup wtf_data
+test wtf-group-expr-having-order-diff-agg {
+    WITH c AS (
+      SELECT ABS(x) AS ax, SUM(z) AS sz, COUNT(*) AS cnt
+      FROM t WHERE x IS NOT NULL
+      GROUP BY ABS(x) HAVING COUNT(*) = 1
+      ORDER BY SUM(z) DESC
+    )
+    SELECT * FROM c ORDER BY sz DESC;
+}
+expect {
+    5|5.5|1
+    4|4.5|1
+    3|3.5|1
+    2|2.5|1
+    0|0.0|1
+}
+expect @js {
+    5|5.5|1
+    4|4.5|1
+    3|3.5|1
+    2|2.5|1
+    0|0|1
+}
+
+@setup wtf_data
+test wtf-pure-literal-cte-aggregate {
+    WITH constants AS (
+      SELECT 42 AS magic, 'hello' AS greeting UNION ALL SELECT 0, 'world'
+      UNION ALL SELECT -1, 'goodbye' UNION ALL SELECT 42, 'duplicate'
+    )
+    SELECT magic, COUNT(*), GROUP_CONCAT(greeting, ' | ') FROM constants
+    GROUP BY magic ORDER BY magic;
+}
+expect {
+    -1|1|goodbye
+    0|1|world
+    42|2|hello | duplicate
+}
+
+@setup wtf_data
+test wtf-coalesce-join-negation {
+    WITH c AS (SELECT COALESCE(x, -42) AS cx, y FROM t ORDER BY cx)
+    SELECT a.cx, a.y, b.cx, b.y FROM c a JOIN c b ON a.cx = -b.cx
+    ORDER BY a.cx;
+}
+expect {
+    -1|z|1|a
+    0||0|
+    1|a|-1|z
+}
+
+@setup wtf_data
+test wtf-divide-by-null-cte {
+    WITH total AS (SELECT SUM(x) AS s FROM t WHERE x > 999)
+    SELECT t.x, t.z,
+      CASE WHEN (SELECT s FROM total) IS NULL THEN 'N/A'
+           ELSE CAST(t.z / (SELECT s FROM total) AS TEXT) END AS ratio
+    FROM t WHERE x IS NOT NULL ORDER BY x;
+}
+expect {
+    -1|-1.5|N/A
+    0|0.0|N/A
+    1|1.5|N/A
+    2|2.5|N/A
+    3|3.5|N/A
+    4|4.5|N/A
+    5|5.5|N/A
+}
+expect @js {
+    -1|-1.5|N/A
+    0|0|N/A
+    1|1.5|N/A
+    2|2.5|N/A
+    3|3.5|N/A
+    4|4.5|N/A
+    5|5.5|N/A
+}
+
+@setup business_data
+test wtf-running-total-correlated-join {
+    WITH ranked_orders AS (
+      SELECT o.id, o.customer_id, o.amount, o.status,
+        (SELECT SUM(o2.amount) FROM orders o2 WHERE o2.customer_id = o.customer_id AND o2.id <= o.id) AS running_total
+      FROM orders o
+      WHERE o.customer_id IS NOT NULL AND o.status = 'shipped'
+      ORDER BY o.customer_id, o.id
+    )
+    SELECT c.name, r.id, r.amount, r.running_total
+    FROM ranked_orders r JOIN customers c ON r.customer_id = c.id
+    ORDER BY c.name, r.id;
+}
+expect {
+    Alice|1|100.0|100.0
+    Alice|9|0.0|300.0
+    Bob|3|50.0|50.0
+    Bob|4|75.0|125.0
+    Carol|6|150.0|450.0
+}
+expect @js {
+    Alice|1|100|100
+    Alice|9|0|300
+    Bob|3|50|50
+    Bob|4|75|125
+    Carol|6|150|450
+}
+
+@setup business_data
+test wtf-cte-chain-filter-back {
+    WITH
+      c1 AS (SELECT customer_id, SUM(amount) AS total FROM orders
+             WHERE customer_id IS NOT NULL AND status='shipped' GROUP BY customer_id),
+      c2 AS (SELECT customer_id, total FROM c1 WHERE total > (SELECT AVG(total) FROM c1)),
+      c3 AS (SELECT c.name, c2.total FROM c2 JOIN customers c ON c2.customer_id = c.id)
+    SELECT * FROM c3 ORDER BY total DESC;
+}
+expect {
+    Carol|150.0
+}
+expect @js {
+    Carol|150
+}
+
+@setup business_data
+test wtf-tier-cross-join-comparison {
+    WITH tier_stats AS (
+      SELECT c.tier, COUNT(DISTINCT c.id) AS num_customers,
+        COALESCE(SUM(o.amount), 0) AS total_amount, COUNT(o.id) AS num_orders
+      FROM customers c LEFT JOIN orders o ON c.id = o.customer_id
+      GROUP BY c.tier ORDER BY c.tier
+    )
+    SELECT a.tier AS tier_a, b.tier AS tier_b,
+      CASE WHEN a.total_amount > b.total_amount THEN a.tier ELSE b.tier END AS winner
+    FROM tier_stats a CROSS JOIN tier_stats b
+    WHERE a.tier < b.tier ORDER BY a.tier, b.tier;
+}
+expect {
+    bronze|gold|gold
+    bronze|silver|silver
+    gold|silver|gold
+}
+
+@setup business_data
+test wtf-nested-aggregate-cte {
+    WITH inner_agg AS (
+      SELECT customer_id, COUNT(*) AS order_cnt, SUM(amount) AS order_sum
+      FROM orders WHERE customer_id IS NOT NULL GROUP BY customer_id
+    ),
+    outer_agg AS (
+      SELECT MIN(order_cnt) AS min_orders, MAX(order_cnt) AS max_orders,
+        SUM(order_sum) AS grand_total, COUNT(*) AS num_customers
+      FROM inner_agg
+    )
+    SELECT *, grand_total / num_customers AS avg_per_customer FROM outer_agg;
+}
+expect {
+    1|3|900.0|4|225.0
+}
+expect @js {
+    1|3|900|4|225
+}
+
+@setup business_data
+test wtf-insert-select-cte {
+    CREATE TABLE summary(name TEXT, total REAL);
+    INSERT INTO summary
+      WITH order_totals AS (
+        SELECT c.name, SUM(o.amount) AS total
+        FROM customers c JOIN orders o ON c.id = o.customer_id
+        GROUP BY c.name
+      ) SELECT * FROM order_totals;
+    SELECT * FROM summary ORDER BY name;
+}
+expect {
+    Alice|300.0
+    Bob|125.0
+    Carol|450.0
+    Dave|25.0
+}
+expect @js {
+    Alice|300
+    Bob|125
+    Carol|450
+    Dave|25
 }
