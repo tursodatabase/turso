@@ -138,6 +138,53 @@ fn insert_select_source(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Single-row INSERT with immediate FK constraints does NOT need a statement journal.
+/// Immediate FK violations emit a direct Halt before any writes (matching SQLite's
+/// usesStmtJournal=0 for this case), so there's nothing to roll back.
+#[turso_macros::test(init_sql = "CREATE TABLE parent (id INTEGER PRIMARY KEY);")]
+fn insert_single_row_with_immediate_fk(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute(
+        "CREATE TABLE child (id UNIQUE, pid INT, FOREIGN KEY(pid) REFERENCES parent(id))",
+    )?;
+    assert!(!needs_stmt_journal(
+        &conn,
+        "INSERT INTO child VALUES (1, 1)"
+    ));
+    Ok(())
+}
+
+/// Regression: single-row INSERT FK violation inside an explicit transaction must
+/// rollback the inserted row. Without the statement journal, the row persisted
+/// despite the FK error, causing phantom UNIQUE constraint violations later.
+#[turso_macros::test]
+fn insert_fk_violation_in_tx_rolls_back_row(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")?;
+    conn.execute(
+        "CREATE TABLE child (id UNIQUE, pid INT, FOREIGN KEY(pid) REFERENCES parent(id))",
+    )?;
+    conn.execute("INSERT INTO parent VALUES (1)")?;
+
+    conn.execute("BEGIN")?;
+    // pid=999 doesn't exist → immediate FK violation, row must be rolled back.
+    let result = conn.execute("INSERT INTO child VALUES (100, 999)");
+    assert!(result.is_err(), "INSERT should fail with FK violation");
+    conn.execute("COMMIT")?;
+
+    // The failed INSERT must not have left a phantom row.
+    let rows = query_rows(&conn, "SELECT count(*) FROM child");
+    assert_eq!(rows, vec!["0"], "child table should be empty");
+
+    // Re-inserting the same key with a valid parent must succeed.
+    conn.execute("INSERT INTO child VALUES (100, 1)")?;
+    let rows = query_rows(&conn, "SELECT * FROM child");
+    assert_eq!(rows, vec!["100|1"]);
+    Ok(())
+}
+
 // ──────────────────────────────────────────────────────────
 // UPDATE
 // ──────────────────────────────────────────────────────────
