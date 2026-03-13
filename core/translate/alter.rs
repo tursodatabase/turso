@@ -683,6 +683,35 @@ pub fn translate_alter_table(
                 }
             }
 
+            // Like SQLite, re-validate ALL triggers after the drop. Any trigger whose
+            // body references a nonexistent column (in the altered table or any other
+            // table) causes the DROP to fail. This catches cross-table references to
+            // the dropped column as well as pre-existing errors that would surface at
+            // trigger execution time.
+            let post_drop_btree = {
+                let mut t = btree.clone();
+                t.columns.remove(dropped_index);
+                t
+            };
+            let all_triggers: Vec<_> = resolver.with_schema(database_id, |s| {
+                s.triggers.values().flatten().cloned().collect()
+            });
+            let table_name_norm = normalize_ident(table_name);
+            for trigger in &all_triggers {
+                if let Some(bad_col) = validate_trigger_columns_after_drop(
+                    trigger,
+                    &table_name_norm,
+                    &post_drop_btree,
+                    resolver,
+                    database_id,
+                )? {
+                    return Err(LimboError::ParseError(format!(
+                        "error in trigger {} after drop column: no such column: {}",
+                        trigger.name, bad_col
+                    )));
+                }
+            }
+
             btree.columns.remove(dropped_index);
 
             let sql = btree.to_sql().replace('\'', "''");
@@ -3293,4 +3322,179 @@ fn rewrite_expr_column_ref(
         None,
         from_target,
     )
+}
+
+/// Validate all column references in a trigger after a DROP COLUMN operation.
+/// Like SQLite, this re-validates the entire trigger — any unresolvable column
+/// reference (whether related to the drop or pre-existing) causes the drop to fail.
+///
+/// Returns `Some(column_name)` if a bad column reference is found, `None` if all OK.
+fn validate_trigger_columns_after_drop(
+    trigger: &crate::schema::Trigger,
+    altered_table_norm: &str,
+    post_drop_table: &BTreeTable,
+    resolver: &Resolver,
+    database_id: usize,
+) -> Result<Option<String>> {
+    let trigger_table_norm = normalize_ident(&trigger.table_name);
+
+    // Determine the trigger's owning table columns (post-drop if it's the altered table)
+    let owning_table_columns: Option<Vec<String>> =
+        if trigger_table_norm == *altered_table_norm {
+            Some(
+                post_drop_table
+                    .columns
+                    .iter()
+                    .filter_map(|c| c.name.as_deref().map(normalize_ident))
+                    .collect(),
+            )
+        } else {
+            resolver.with_schema(database_id, |s| {
+                s.get_table(&trigger_table_norm).and_then(|t| {
+                    t.btree().map(|bt| {
+                        bt.columns
+                            .iter()
+                            .filter_map(|c| c.name.as_deref().map(normalize_ident))
+                            .collect()
+                    })
+                })
+            })
+        };
+
+    // Validate WHEN clause — NEW/OLD refs resolve against the trigger's owning table
+    if let Some(ref when_expr) = trigger.when_clause {
+        if let Some(ref cols) = owning_table_columns {
+            if let Some(bad) = find_bad_column_in_expr(when_expr, cols)? {
+                return Ok(Some(bad));
+            }
+        }
+    }
+
+    for cmd in &trigger.commands {
+        match cmd {
+            ast::TriggerCmd::Update {
+                tbl_name,
+                sets,
+                where_clause,
+                ..
+            } => {
+                let cmd_table_norm = normalize_ident(tbl_name.as_str());
+                let cmd_table_cols = get_table_columns(
+                    &cmd_table_norm,
+                    altered_table_norm,
+                    post_drop_table,
+                    resolver,
+                    database_id,
+                );
+                // Check expressions in SET values and WHERE — these can reference
+                // both the command target table and the trigger's owning table (via NEW/OLD).
+                // Note: SET target column names are NOT checked here — SQLite defers
+                // that validation to trigger execution time.
+                let all_cols = merge_cols(&cmd_table_cols, &owning_table_columns);
+                for set in sets {
+                    if let Some(bad) = find_bad_column_in_expr(&set.expr, &all_cols)? {
+                        return Ok(Some(bad));
+                    }
+                }
+                if let Some(ref where_expr) = where_clause {
+                    if let Some(bad) = find_bad_column_in_expr(where_expr, &all_cols)? {
+                        return Ok(Some(bad));
+                    }
+                }
+            }
+            // Note: INSERT column lists are NOT checked — SQLite defers that
+            // validation to trigger execution time.
+            ast::TriggerCmd::Insert { .. } => {}
+            ast::TriggerCmd::Delete {
+                tbl_name,
+                where_clause,
+                ..
+            } => {
+                let cmd_table_norm = normalize_ident(tbl_name.as_str());
+                let cmd_table_cols = get_table_columns(
+                    &cmd_table_norm,
+                    altered_table_norm,
+                    post_drop_table,
+                    resolver,
+                    database_id,
+                );
+                if let Some(ref where_expr) = where_clause {
+                    let all_cols = merge_cols(&cmd_table_cols, &owning_table_columns);
+                    if let Some(bad) = find_bad_column_in_expr(where_expr, &all_cols)? {
+                        return Ok(Some(bad));
+                    }
+                }
+            }
+            ast::TriggerCmd::Select(_) => {}
+        }
+    }
+
+    Ok(None)
+}
+
+/// Get the column names for a table, using the post-drop schema if it's the altered table.
+fn get_table_columns(
+    table_name_norm: &str,
+    altered_table_norm: &str,
+    post_drop_table: &BTreeTable,
+    resolver: &Resolver,
+    database_id: usize,
+) -> Option<Vec<String>> {
+    if table_name_norm == altered_table_norm {
+        Some(
+            post_drop_table
+                .columns
+                .iter()
+                .filter_map(|c| c.name.as_deref().map(normalize_ident))
+                .collect(),
+        )
+    } else {
+        resolver.with_schema(database_id, |s| {
+            s.get_table(table_name_norm).and_then(|t| {
+                t.btree().map(|bt| {
+                    bt.columns
+                        .iter()
+                        .filter_map(|c| c.name.as_deref().map(normalize_ident))
+                        .collect()
+                })
+            })
+        })
+    }
+}
+
+/// Merge two optional column lists into one combined list for expression validation.
+fn merge_cols(a: &Option<Vec<String>>, b: &Option<Vec<String>>) -> Vec<String> {
+    let mut result = Vec::new();
+    if let Some(cols) = a {
+        result.extend(cols.iter().cloned());
+    }
+    if let Some(cols) = b {
+        for c in cols {
+            if !result.contains(c) {
+                result.push(c.clone());
+            }
+        }
+    }
+    result
+}
+
+/// Walk an expression and return the first unqualified column reference that doesn't
+/// exist in `valid_columns`. Qualified references (t.col, NEW.col, OLD.col) are skipped
+/// since they're validated separately or refer to the trigger's owning table.
+fn find_bad_column_in_expr(
+    expr: &ast::Expr,
+    valid_columns: &[String],
+) -> Result<Option<String>> {
+    let mut bad: Option<String> = None;
+    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        if let ast::Expr::Id(col) = e {
+            let col_norm = normalize_ident(col.as_str());
+            if !valid_columns.contains(&col_norm) {
+                bad = Some(col.to_string());
+                return Ok(WalkControl::SkipChildren);
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(bad)
 }
