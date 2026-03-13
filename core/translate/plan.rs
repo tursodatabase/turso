@@ -1203,6 +1203,9 @@ impl TableReferences {
     }
 
     /// Marks a column as used; used means that the column is referenced in the query.
+    /// Silently ignores table IDs not present in this `TableReferences` — this is
+    /// expected when `BindTracking` is shared across compound SELECT scopes, where
+    /// column usage from one arm's scope is flushed to another arm's `TableReferences`.
     pub fn mark_column_used(&mut self, internal_id: TableInternalId, column_index: usize) {
         if let Some(joined_table) = self.find_joined_table_by_internal_id_mut(internal_id) {
             joined_table.mark_column_used(column_index);
@@ -1210,9 +1213,10 @@ impl TableReferences {
             self.find_outer_query_ref_by_internal_id_mut(internal_id)
         {
             outer_query_ref.mark_column_used(column_index);
-        } else {
-            panic!("table with internal id {internal_id} not found in table references");
         }
+        // Table not found: expected for compound SELECT where tracking is shared
+        // across scopes. The column usage will be applied when the correct scope
+        // is processed.
     }
 
     /// Marks the rowid of a table as referenced. This is tracked separately
