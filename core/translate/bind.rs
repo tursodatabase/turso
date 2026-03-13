@@ -439,7 +439,9 @@ impl BoundSelect {
                     database_id: 0,
                 }),
                 ScopeTableSource::Cte { name, .. } => {
-                    let mut cte_table = planned_ctes.remove(&name).ok_or_else(|| {
+                    // Clone rather than remove: the same CTE may be referenced
+                    // multiple times (e.g. FROM cte t1 JOIN cte t2).
+                    let mut cte_table = planned_ctes.get(&name).cloned().ok_or_else(|| {
                         crate::LimboError::InternalError(format!(
                             "CTE '{name}' was not planned before into_table_references"
                         ))
@@ -875,9 +877,18 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 }
             }
 
-            // 6. Extract CTE definitions before with_query restores them
-            let cte_definitions: Vec<(String, CteEntry)> = if select.with.is_some() {
-                std::mem::take(&mut ctx.ctes).into_iter().collect()
+            // 6. Extract CTE definitions in definition order before with_query
+            //    restores them. Using definition order is critical because
+            //    referenced_cte_indices are offsets into this order.
+            let cte_definitions: Vec<(String, CteEntry)> = if let Some(with) = &select.with {
+                let mut ctes = std::mem::take(&mut ctx.ctes);
+                with.ctes
+                    .iter()
+                    .filter_map(|cte| {
+                        let name = normalize_ident(cte.tbl_name.as_str());
+                        ctes.remove(&name).map(|entry| (name, entry))
+                    })
+                    .collect()
             } else {
                 vec![]
             };
@@ -1935,9 +1946,17 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 }
             }
 
-            // 8. Extract CTE definitions
-            let cte_definitions: Vec<(String, CteEntry)> = if update.with.is_some() {
-                std::mem::take(&mut ctx.ctes).into_iter().collect()
+            // 8. Extract CTE definitions in definition order (critical for
+            //    referenced_cte_indices correctness).
+            let cte_definitions: Vec<(String, CteEntry)> = if let Some(with) = &update.with {
+                let mut ctes = std::mem::take(&mut ctx.ctes);
+                with.ctes
+                    .iter()
+                    .filter_map(|cte| {
+                        let name = normalize_ident(cte.tbl_name.as_str());
+                        ctes.remove(&name).map(|entry| (name, entry))
+                    })
+                    .collect()
             } else {
                 vec![]
             };
@@ -3397,6 +3416,64 @@ mod tests {
                 .tracking
                 .columns_used
                 .contains(&(TableInternalId::from(1usize), 0))); // u.b from USING
+        });
+    }
+
+    #[test]
+    fn bind_cte_multi_reference_produces_separate_scope_tables() {
+        // When the same CTE is referenced twice (e.g. FROM cte t1 JOIN cte t2),
+        // into_table_references must produce two JoinedTables — not fail because
+        // the CTE was consumed by the first reference.
+        with_bind_context(&["CREATE TABLE t(x)"], |ctx| {
+            let mut select =
+                parse_select("WITH c AS (SELECT x FROM t) SELECT t1.x, t2.x FROM c t1, c t2");
+            let bound = ctx.bind_select(&mut select).unwrap();
+
+            // The scope should have two tables (c t1 and c t2) with distinct internal_ids.
+            assert_eq!(bound.main_scope.tables.len(), 2);
+            assert_ne!(
+                bound.main_scope.tables[0].internal_id,
+                bound.main_scope.tables[1].internal_id
+            );
+            assert_eq!(bound.main_scope.tables[0].identifier, "t1");
+            assert_eq!(bound.main_scope.tables[1].identifier, "t2");
+        });
+    }
+
+    #[test]
+    fn bind_cte_definitions_preserve_definition_order() {
+        // referenced_cte_indices are offsets into the cte_definitions vec.
+        // If cte_definitions were collected in arbitrary HashMap iteration order,
+        // the indices would point to the wrong CTEs, causing infinite recursion
+        // during planning.
+        with_bind_context(&["CREATE TABLE t(x)"], |ctx| {
+            let mut select = parse_select(
+                "WITH a AS (SELECT x FROM t), \
+                      b AS (SELECT x FROM a), \
+                      c AS (SELECT x FROM a) \
+                 SELECT * FROM c",
+            );
+            let bound = ctx.bind_select(&mut select).unwrap();
+
+            // Validate that referenced_cte_indices actually point to the right CTEs.
+            // b references a, and c references a. Regardless of iteration order,
+            // the index stored must resolve to "a" in the cte_definitions vec.
+            for (name, entry) in &bound.cte_definitions {
+                if name == "b" || name == "c" {
+                    assert_eq!(
+                        entry.referenced_cte_indices.len(),
+                        1,
+                        "CTE '{name}' should reference exactly one sibling"
+                    );
+                    let ref_idx = entry.referenced_cte_indices[0];
+                    assert_eq!(
+                        bound.cte_definitions[ref_idx].0, "a",
+                        "CTE '{name}' references index {ref_idx} which should be 'a', \
+                         but found '{}' — cte_definitions is not in definition order",
+                        bound.cte_definitions[ref_idx].0
+                    );
+                }
+            }
         });
     }
 }
