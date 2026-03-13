@@ -361,6 +361,18 @@ macro_rules! emit_explain {
 }
 
 impl ProgramBuilder {
+    /// Run a nested emission scope without leaking its result-column register base
+    /// into the surrounding builder state.
+    pub fn with_scoped_result_cols_start<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> crate::Result<T>,
+    ) -> crate::Result<T> {
+        let saved = self.reg_result_cols_start;
+        let result = f(self);
+        self.reg_result_cols_start = saved;
+        result
+    }
+
     pub fn new(
         query_mode: QueryMode,
         capture_data_changes_info: Option<CaptureDataChangesInfo>,
