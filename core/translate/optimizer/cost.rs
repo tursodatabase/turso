@@ -76,7 +76,7 @@ pub fn estimate_index_cost(
     base_row_count: f64,
     tree_depth: f64,
     index_info: IndexInfo,
-    num_seeks: f64,
+    input_cardinality: f64,
     rows_per_seek: f64,
     params: &CostModelParams,
 ) -> Cost {
@@ -85,11 +85,16 @@ pub fn estimate_index_cost(
     let is_full_scan = (rows_per_seek - base_row_count).abs() < 1.0;
 
     // Cost of B-tree traversals: each seek traverses tree_depth pages.
-    // For a full scan, we only do one initial seek to the start of the index.
     let seek_cost = if is_full_scan {
-        tree_depth // Single seek to start
+        // Full scan: one seek to start, then sequential reads.
+        // When re-scanned (nested loop inner), first scan is cold, rest are cached.
+        if input_cardinality <= 1.0 {
+            tree_depth
+        } else {
+            tree_depth + (input_cardinality - 1.0) * tree_depth * params.cache_reuse_factor
+        }
     } else {
-        num_seeks * tree_depth
+        input_cardinality * tree_depth
     };
 
     // Cost of reading leaf pages after seeking.
@@ -101,9 +106,18 @@ pub fn estimate_index_cost(
     };
     let leaf_pages = (rows_per_seek / rows_per_page).max(1.0);
     let leaf_scan_cost = if is_full_scan {
-        leaf_pages // Sequential scan of all leaf pages
+        // Full scan of all leaf pages. Repeated scans benefit from caching.
+        if input_cardinality <= 1.0 {
+            leaf_pages
+        } else {
+            leaf_pages + (input_cardinality - 1.0) * leaf_pages * params.cache_reuse_factor
+        }
+    } else if rows_per_seek <= 1.0 {
+        // Point lookup: the leaf page is the last page of the B-tree traversal,
+        // already counted in seek_cost.
+        0.0
     } else {
-        num_seeks * leaf_pages
+        input_cardinality * leaf_pages
     };
 
     // For non-covering indexes, we need to fetch from the table for each row.
@@ -112,14 +126,15 @@ pub fn estimate_index_cost(
     } else {
         let table_pages = (base_row_count / params.rows_per_page).max(1.0);
         let selectivity = rows_per_seek / base_row_count.max(1.0);
-        num_seeks * selectivity * table_pages
+        input_cardinality * selectivity * table_pages
     };
 
     let io_cost = seek_cost + leaf_scan_cost + table_lookup_cost;
 
     // CPU cost: key comparisons during seeks + row processing
-    let total_rows = num_seeks * rows_per_seek;
-    let cpu_cost = num_seeks * params.cpu_cost_per_seek + total_rows * params.cpu_cost_per_row;
+    let total_rows = input_cardinality * rows_per_seek;
+    let cpu_cost =
+        input_cardinality * params.cpu_cost_per_seek + total_rows * params.cpu_cost_per_row;
 
     Cost((io_cost + cpu_cost - params.index_bonus).max(0.001))
 }

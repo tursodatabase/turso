@@ -109,7 +109,7 @@ impl CostModelParams {
 
             // Selectivity fallbacks
             sel_eq_unindexed: 0.1,
-            sel_eq_indexed: 0.01,
+            sel_eq_indexed: 0.001,
             sel_range: 0.4,
             sel_is_null: 0.1,
             sel_is_not_null: 0.9,
@@ -120,7 +120,7 @@ impl CostModelParams {
 
             // Scan/Seek costs
             cache_reuse_factor: 0.2,
-            cpu_cost_per_row: 0.001,
+            cpu_cost_per_row: 0.003,
             cpu_cost_per_seek: 0.01,
             index_bonus: 0.5,
             covering_index_density: 2.0,
