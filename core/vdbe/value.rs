@@ -1,12 +1,14 @@
 use crate::turso_assert;
 use crate::{
     function::MathFunc,
+    functions::printf::round_half_away_from_zero,
     numeric::{format_float, format_float_for_quote, NullableInteger, Numeric},
     translate::collate::CollationSeq,
     types::{compare_immutable_single, AsValueRef, SeekOp},
     vdbe::affinity::{real_to_i64, Affinity},
     LimboError, Result, Value, ValueRef,
 };
+use std::num::NonZeroUsize;
 
 // we use math functions from Rust stdlib in order to be as portable as possible for the production version of the tursodb
 #[cfg(not(test))]
@@ -646,9 +648,10 @@ impl Value {
             return Value::from_f64(((f + if f < 0.0 { -0.5 } else { 0.5 }) as i64) as f64);
         }
 
-        let f: f64 = crate::numeric::str_to_f64(format!("{f:.precision$}"))
-            .expect("formatted float should always parse successfully")
-            .into();
+        let f = round_half_away_from_zero(
+            f,
+            NonZeroUsize::new(precision).expect("precision should be non-zero"),
+        );
 
         Value::from_f64(f)
     }
@@ -2348,6 +2351,33 @@ mod tests {
         let input_val = Value::from_f64(100.123);
         let expected_val = Value::Null;
         assert_eq!(input_val.exec_round(Some(&Value::Null)), expected_val);
+
+        let input_val = Value::from_f64(2.25);
+        let precision_val = Value::from_i64(1);
+        let expected_val = Value::from_f64(2.3);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
+
+        let input_val = Value::from_f64(-2.25);
+        let precision_val = Value::from_i64(1);
+        let expected_val = Value::from_f64(-2.3);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
+
+        let input_val = Value::from_f64(-0.04);
+        let precision_val = Value::from_i64(1);
+        let result = input_val.exec_round(Some(&precision_val));
+        match result {
+            Value::Numeric(Numeric::Float(f)) => {
+                let f = f64::from(f);
+                assert_eq!(f, 0.0);
+                assert!(!f.is_sign_negative());
+            }
+            _ => panic!("exec_round did not return a Float variant"),
+        }
+
+        let input_val = Value::from_f64(123.456);
+        let precision_val = Value::from_i64(4294967297);
+        let expected_val = Value::from_f64(123.456);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
     }
 
     #[test]
