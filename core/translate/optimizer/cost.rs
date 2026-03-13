@@ -196,8 +196,30 @@ pub(crate) fn estimate_rows_per_seek(
 
     if let Some(ctx) = analyze_ctx {
         if !usable_constraint_refs.is_empty() {
-            if let Some(rows) = estimate_rows_from_analyze_stats(ctx, usable_constraint_refs) {
-                return rows;
+            if let Some(eq_prefix_rows) =
+                estimate_rows_from_analyze_stats(ctx, usable_constraint_refs)
+            {
+                // Apply range selectivity for any trailing non-equality constraints
+                // beyond the equality prefix. SQLite does this via whereRangeAdjust
+                // which divides by ~4 per range bound.
+                let eq_prefix_len = usable_constraint_refs
+                    .iter()
+                    .take_while(|cref| cref.eq.is_some())
+                    .count();
+                let range_selectivity: f64 = usable_constraint_refs[eq_prefix_len..]
+                    .iter()
+                    .map(|cref| {
+                        let mut sel = 1.0;
+                        if let Some(lb) = cref.lower_bound {
+                            sel *= constraints[lb].selectivity;
+                        }
+                        if let Some(ub) = cref.upper_bound {
+                            sel *= constraints[ub].selectivity;
+                        }
+                        sel
+                    })
+                    .product();
+                return (eq_prefix_rows * range_selectivity).max(1.0);
             }
         }
     }
@@ -231,16 +253,30 @@ fn estimate_rows_from_analyze_stats(
 ) -> Option<f64> {
     let index = ctx.index?;
 
-    let matched_cols = constraint_refs.len();
+    // Only count leading equality-constrained columns. ANALYZE stats give
+    // avg rows per distinct prefix value, which is only meaningful for
+    // equality lookups. A range constraint (>, <, >=, <=) scans a portion
+    // of the index rather than fixing a prefix value, so it should not
+    // consume a prefix position in the stats lookup.
+    let eq_prefix_len = constraint_refs
+        .iter()
+        .take_while(|cref| cref.eq.is_some())
+        .count();
+
+    if eq_prefix_len == 0 {
+        // Pure range scan — ANALYZE per-distinct-value stats don't apply.
+        return None;
+    }
+
     let table_name = ctx.rhs_table.table.get_name();
 
     let table_stats = ctx.stats.table_stats(table_name)?;
     let idx_stats = table_stats.index_stats.get(&index.name)?;
 
-    if matched_cols > 0 && matched_cols <= idx_stats.avg_rows_per_distinct_prefix.len() {
-        Some(idx_stats.avg_rows_per_distinct_prefix[matched_cols - 1] as f64)
+    if eq_prefix_len <= idx_stats.avg_rows_per_distinct_prefix.len() {
+        Some(idx_stats.avg_rows_per_distinct_prefix[eq_prefix_len - 1] as f64)
     } else {
-        // Stats exist for this index but don't cover the matched prefix length.
+        // Stats exist for this index but don't cover the equality prefix length.
         // Return None to fall through to selectivity-based estimation.
         None
     }
