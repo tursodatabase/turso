@@ -520,7 +520,7 @@ Modifiers:
 | sqlite3_column_blob      | ✅ Yes     |         |
 | sqlite3_column_bytes     | ✅ Yes     |         |
 | sqlite3_column_bytes16   | ❌ No      |         |
-| sqlite3_column_value     | ❌ No      |         |
+| sqlite3_column_value     | ✅ Yes     |         |
 | sqlite3_column_table_name| ✅ Yes     |         |
 | sqlite3_column_database_name | ❌ No  |         |
 | sqlite3_column_origin_name | ❌ No    |         |
@@ -539,8 +539,8 @@ Modifiers:
 | sqlite3_value_blob     | ✅ Yes     |         |
 | sqlite3_value_bytes    | ✅ Yes     |         |
 | sqlite3_value_bytes16  | ❌ No      |         |
-| sqlite3_value_dup      | ❌ No      |         |
-| sqlite3_value_free     | ❌ No      |         |
+| sqlite3_value_dup      | ✅ Yes     |         |
+| sqlite3_value_free     | ✅ Yes     |         |
 | sqlite3_value_nochange | ❌ No      |         |
 | sqlite3_value_frombind | ❌ No      |         |
 | sqlite3_value_subtype  | ❌ No      |         |
@@ -614,7 +614,7 @@ Modifiers:
 | sqlite3_create_window_function | ❌ No    | Stub    |
 | sqlite3_aggregate_context    | ❌ No      | Stub    |
 | sqlite3_user_data            | ❌ No      | Stub    |
-| sqlite3_context_db_handle    | ❌ No      | Stub    |
+| sqlite3_context_db_handle    | ✅ Yes     |         |
 | sqlite3_get_auxdata          | ❌ No      |         |
 | sqlite3_set_auxdata          | ❌ No      |         |
 | sqlite3_result_null          | ❌ No      | Stub    |
