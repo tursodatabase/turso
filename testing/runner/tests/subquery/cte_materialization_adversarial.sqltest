@@ -660,7 +660,7 @@ expect {
 expect @js {
     1|30
     2|70
-    3|50    
+    3|50
 }
 
 @setup join_data
@@ -972,4 +972,448 @@ expect {
     1|30
     2|70
     3|110
+}
+
+test join-two-ctes-different-cardinalities {
+    CREATE TABLE small(id INT PRIMARY KEY, val TEXT);
+    INSERT INTO small VALUES(1,'a'),(2,'b'),(3,'c');
+    CREATE TABLE big(id INT PRIMARY KEY, sid INT, data TEXT);
+    INSERT INTO big VALUES(1,1,'x1'),(2,1,'x2'),(3,2,'x3'),(4,2,'x4'),(5,3,'x5'),(6,3,'x6');
+    WITH s AS (SELECT id, val FROM small),
+         b AS (SELECT id, sid, data FROM big)
+    SELECT s.val, b.data FROM s JOIN b ON s.id = b.sid ORDER BY b.id;
+}
+expect {
+    a|x1
+    a|x2
+    b|x3
+    b|x4
+    c|x5
+    c|x6
+}
+
+test join-three-way-cte-table-cte {
+    CREATE TABLE jt1(id INT PRIMARY KEY, a TEXT);
+    INSERT INTO jt1 VALUES(1,'x'),(2,'y'),(3,'z');
+    CREATE TABLE jt2(id INT PRIMARY KEY, t1_id INT, t3_id INT);
+    INSERT INTO jt2 VALUES(1,1,1),(2,1,2),(3,2,1),(4,3,3);
+    CREATE TABLE jt3(id INT PRIMARY KEY, b TEXT);
+    INSERT INTO jt3 VALUES(1,'p'),(2,'q'),(3,'r');
+    WITH c1 AS (SELECT id, a FROM jt1),
+         c3 AS (SELECT id, b FROM jt3)
+    SELECT c1.a, jt2.id AS link, c3.b
+    FROM c1 JOIN jt2 ON c1.id = jt2.t1_id JOIN c3 ON jt2.t3_id = c3.id
+    ORDER BY jt2.id;
+}
+expect {
+    x|1|p
+    x|2|q
+    y|3|p
+    z|4|r
+}
+
+test join-anti-join-left-join-is-null {
+    CREATE TABLE all_ids(id INT PRIMARY KEY);
+    INSERT INTO all_ids VALUES(1),(2),(3),(4),(5);
+    CREATE TABLE used_ids(id INT PRIMARY KEY);
+    INSERT INTO used_ids VALUES(2),(4);
+    WITH cte AS (SELECT id FROM used_ids)
+    SELECT a.id FROM all_ids a LEFT JOIN cte ON a.id = cte.id
+    WHERE cte.id IS NULL ORDER BY a.id;
+}
+expect {
+    1
+    3
+    5
+}
+
+test join-cte-self-non-equi {
+    CREATE TABLE vals(v INT);
+    INSERT INTO vals VALUES(1),(2),(3),(4),(5);
+    WITH cte AS (SELECT v FROM vals)
+    SELECT a.v AS lo, b.v AS hi FROM cte a JOIN cte b ON a.v < b.v
+    ORDER BY a.v, b.v;
+}
+expect {
+    1|2
+    1|3
+    1|4
+    1|5
+    2|3
+    2|4
+    2|5
+    3|4
+    3|5
+    4|5
+}
+
+test join-cte-self-graph-walk {
+    CREATE TABLE edges(src INT, dst INT);
+    INSERT INTO edges VALUES(1,2),(2,3),(3,4),(1,3);
+    WITH cte AS (SELECT src, dst FROM edges)
+    SELECT a.src, a.dst, b.dst AS dst2
+    FROM cte a JOIN cte b ON a.dst = b.src
+    ORDER BY a.src, a.dst, b.dst;
+}
+expect {
+    1|2|3
+    1|3|4
+    2|3|4
+}
+
+test join-aggregate-cte-to-table {
+    CREATE TABLE jsales(id INT, product TEXT, amount REAL);
+    INSERT INTO jsales VALUES(1,'a',10),(2,'a',20),(3,'b',30),(4,'b',40),(5,'c',50);
+    CREATE TABLE jproducts(name TEXT PRIMARY KEY, category TEXT);
+    INSERT INTO jproducts VALUES('a','cat1'),('b','cat1'),('c','cat2');
+    WITH totals AS (SELECT product, SUM(amount) AS total FROM jsales GROUP BY product)
+    SELECT p.category, t.product, t.total
+    FROM totals t JOIN jproducts p ON t.product = p.name
+    ORDER BY p.category, t.product;
+}
+expect {
+    cat1|a|30.0
+    cat1|b|70.0
+    cat2|c|50.0
+}
+expect @js {
+    cat1|a|30
+    cat1|b|70
+    cat2|c|50
+}
+
+test join-correlated-sub-from-cte-in-select {
+    CREATE TABLE departments(id INT PRIMARY KEY, name TEXT);
+    INSERT INTO departments VALUES(1,'eng'),(2,'sales'),(3,'hr');
+    CREATE TABLE employees(id INT PRIMARY KEY, dept_id INT, salary INT);
+    INSERT INTO employees VALUES(1,1,100),(2,1,120),(3,2,80),(4,2,90),(5,3,70);
+    WITH emp AS (SELECT id, dept_id, salary FROM employees)
+    SELECT d.name,
+           (SELECT COUNT(*) FROM emp WHERE emp.dept_id = d.id) AS cnt,
+           (SELECT MAX(salary) FROM emp WHERE emp.dept_id = d.id) AS max_sal
+    FROM departments d ORDER BY d.id;
+}
+expect {
+    eng|2|120
+    sales|2|90
+    hr|1|70
+}
+
+test join-distinct-cte-to-table {
+    CREATE TABLE jlog(ts INT, user_id INT, action TEXT);
+    INSERT INTO jlog VALUES(1,1,'view'),(2,1,'click'),(3,2,'view'),(4,1,'view'),(5,3,'click');
+    CREATE TABLE jusers(id INT PRIMARY KEY, name TEXT);
+    INSERT INTO jusers VALUES(1,'alice'),(2,'bob'),(3,'carol');
+    WITH active AS (SELECT DISTINCT user_id FROM jlog)
+    SELECT u.name FROM active a JOIN jusers u ON a.user_id = u.id ORDER BY u.name;
+}
+expect {
+    alice
+    bob
+    carol
+}
+
+test min-max-no-order-in-cte {
+    CREATE TABLE mm_no(a INT);
+    INSERT INTO mm_no VALUES(5),(3),(1),(4),(2);
+    WITH cte AS (SELECT a FROM mm_no)
+    SELECT MIN(a), MAX(a) FROM cte;
+}
+expect {
+    1|5
+}
+
+test min-max-min-on-desc-cte {
+    CREATE TABLE mm_desc(a INT);
+    INSERT INTO mm_desc VALUES(5),(3),(1),(4),(2);
+    WITH cte AS (SELECT a FROM mm_desc ORDER BY a DESC)
+    SELECT MIN(a) FROM cte;
+}
+expect {
+    1
+}
+
+test min-max-group-by-both {
+    CREATE TABLE mm_grp(grp INT, val INT);
+    INSERT INTO mm_grp VALUES(1,10),(1,50),(1,30),(2,20),(2,40),(2,60);
+    WITH cte AS (SELECT grp, val FROM mm_grp ORDER BY grp, val)
+    SELECT grp, MIN(val), MAX(val) FROM cte GROUP BY grp ORDER BY grp;
+}
+expect {
+    1|10|50
+    2|20|60
+}
+
+test min-max-multiple-aggregates {
+    CREATE TABLE mm_multi(a INT);
+    INSERT INTO mm_multi VALUES(10),(20),(30),(40),(50);
+    WITH cte AS (SELECT a FROM mm_multi ORDER BY a)
+    SELECT COUNT(*), MIN(a), MAX(a), SUM(a) FROM cte;
+}
+expect {
+    5|10|50|150
+}
+
+test min-max-limit-zero {
+    CREATE TABLE mm_lz(a INT);
+    INSERT INTO mm_lz VALUES(1),(2),(3);
+    WITH cte AS (SELECT a FROM mm_lz ORDER BY a LIMIT 0)
+    SELECT MIN(a), MAX(a) FROM cte;
+}
+expect {
+    |
+}
+
+test compound-cte-except {
+    CREATE TABLE ce1(a INT);
+    INSERT INTO ce1 VALUES(1),(2),(3),(4),(5);
+    CREATE TABLE ce2(a INT);
+    INSERT INTO ce2 VALUES(2),(4);
+    WITH cte AS (SELECT a FROM ce1 EXCEPT SELECT a FROM ce2)
+    SELECT * FROM cte ORDER BY a;
+}
+expect {
+    1
+    3
+    5
+}
+
+test compound-cte-intersect {
+    CREATE TABLE ci1(a INT);
+    INSERT INTO ci1 VALUES(1),(2),(3),(4),(5);
+    CREATE TABLE ci2(a INT);
+    INSERT INTO ci2 VALUES(2),(4),(6);
+    WITH cte AS (SELECT a FROM ci1 INTERSECT SELECT a FROM ci2)
+    SELECT * FROM cte ORDER BY a;
+}
+expect {
+    2
+    4
+}
+
+test compound-not-exists-with-cte {
+    CREATE TABLE ne1(id INT PRIMARY KEY, val TEXT);
+    INSERT INTO ne1 VALUES(1,'a'),(2,'b'),(3,'c'),(4,'d');
+    CREATE TABLE ne2(t1_id INT);
+    INSERT INTO ne2 VALUES(1),(3);
+    WITH cte AS (SELECT t1_id FROM ne2)
+    SELECT val FROM ne1 WHERE NOT EXISTS (SELECT 1 FROM cte WHERE cte.t1_id = ne1.id) ORDER BY id;
+}
+expect {
+    b
+    d
+}
+
+test compound-cte-in-case-expr {
+    CREATE TABLE cc1(a INT);
+    INSERT INTO cc1 VALUES(1),(2),(3),(4),(5);
+    WITH cte AS (SELECT AVG(a) AS avg_a FROM cc1)
+    SELECT a, CASE WHEN a > (SELECT avg_a FROM cte) THEN 'above' ELSE 'below' END AS label
+    FROM cc1 ORDER BY a;
+}
+expect {
+    1|below
+    2|below
+    3|below
+    4|above
+    5|above
+}
+
+test compound-double-aggregate {
+    CREATE TABLE da(grp INT, val INT);
+    INSERT INTO da VALUES(1,10),(1,20),(2,30),(2,40),(3,50);
+    WITH grp_totals AS (SELECT grp, SUM(val) AS total FROM da GROUP BY grp)
+    SELECT MIN(total), MAX(total), SUM(total) FROM grp_totals;
+}
+expect {
+    30|70|150
+}
+
+test internals-range-desc-on-ephemeral {
+    CREATE TABLE rd(a INT, b TEXT);
+    INSERT INTO rd VALUES(1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
+    WITH cte AS (SELECT a, b FROM rd)
+    SELECT * FROM cte WHERE a >= 2 AND a <= 4 ORDER BY a DESC;
+}
+expect {
+    4|d
+    3|c
+    2|b
+}
+
+test internals-equality-non-first-col {
+    CREATE TABLE enf(a INT, b INT, c TEXT);
+    INSERT INTO enf VALUES(1,10,'x'),(2,20,'y'),(3,10,'z'),(4,20,'w'),(5,10,'v');
+    WITH cte AS (SELECT a, b, c FROM enf)
+    SELECT * FROM cte WHERE b = 10 ORDER BY a;
+}
+expect {
+    1|10|x
+    3|10|z
+    5|10|v
+}
+
+test internals-null-in-join-col {
+    CREATE TABLE njc1(id INT);
+    INSERT INTO njc1 VALUES(1),(2),(NULL),(3);
+    CREATE TABLE njc2(id INT, val TEXT);
+    INSERT INTO njc2 VALUES(1,'a'),(2,'b'),(3,'c'),(NULL,'null');
+    WITH cte AS (SELECT id, val FROM njc2)
+    SELECT njc1.id, cte.val FROM njc1 JOIN cte ON njc1.id = cte.id ORDER BY njc1.id;
+}
+expect {
+    1|a
+    2|b
+    3|c
+}
+
+test internals-materialized-cte-probed-per-outer-row {
+    CREATE TABLE probe_outer(key INT);
+    INSERT INTO probe_outer VALUES(1),(3),(5);
+    CREATE TABLE probe_inner(a INT, b TEXT);
+    INSERT INTO probe_inner VALUES(1,'one'),(2,'two'),(3,'three'),(4,'four'),(5,'five');
+    WITH cte AS (SELECT a, b FROM probe_inner)
+    SELECT o.key, cte.b FROM probe_outer o JOIN cte ON o.key = cte.a ORDER BY o.key;
+}
+expect {
+    1|one
+    3|three
+    5|five
+}
+
+test internals-delete-via-cte-in {
+    CREATE TABLE del_t(id INT PRIMARY KEY, val TEXT);
+    INSERT INTO del_t VALUES(1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
+    CREATE TABLE del_bl(id INT);
+    INSERT INTO del_bl VALUES(2),(4);
+    WITH bl AS (SELECT id FROM del_bl)
+    DELETE FROM del_t WHERE id IN (SELECT id FROM bl);
+    SELECT * FROM del_t ORDER BY id;
+}
+expect {
+    1|a
+    3|c
+    5|e
+}
+
+test internals-update-via-correlated-cte {
+    CREATE TABLE upd_t(id INT PRIMARY KEY, val INT);
+    INSERT INTO upd_t VALUES(1,0),(2,0),(3,0);
+    CREATE TABLE upd_src(id INT, new_val INT);
+    INSERT INTO upd_src VALUES(1,100),(3,300);
+    WITH cte AS (SELECT id, new_val FROM upd_src)
+    UPDATE upd_t SET val = (SELECT new_val FROM cte WHERE cte.id = upd_t.id)
+    WHERE id IN (SELECT id FROM cte);
+    SELECT * FROM upd_t ORDER BY id;
+}
+expect {
+    1|100
+    2|0
+    3|300
+}
+
+test join-order-3table-order-across {
+    CREATE TABLE jo_a(id INT PRIMARY KEY, val INT);
+    INSERT INTO jo_a VALUES(1,30),(2,10),(3,20);
+    CREATE TABLE jo_b(id INT PRIMARY KEY, a_id INT, c_id INT, label TEXT);
+    INSERT INTO jo_b VALUES(1,1,1,'b1'),(2,2,2,'b2'),(3,3,1,'b3'),(4,1,2,'b4');
+    CREATE TABLE jo_c(id INT PRIMARY KEY, name TEXT);
+    INSERT INTO jo_c VALUES(1,'x'),(2,'y');
+    SELECT jo_a.val, jo_b.label, jo_c.name
+    FROM jo_a JOIN jo_b ON jo_a.id = jo_b.a_id JOIN jo_c ON jo_b.c_id = jo_c.id
+    ORDER BY jo_a.val, jo_b.label;
+}
+expect {
+    10|b2|y
+    20|b3|x
+    30|b1|x
+    30|b4|y
+}
+
+test join-order-cte-ordered-parent-order-different-table {
+    CREATE TABLE joc1(id INT PRIMARY KEY, a INT);
+    INSERT INTO joc1 VALUES(1,30),(2,10),(3,20);
+    CREATE TABLE joc2(id INT PRIMARY KEY, t1_id INT, b INT);
+    INSERT INTO joc2 VALUES(1,1,5),(2,2,3),(3,3,7);
+    WITH cte AS (SELECT id, a FROM joc1 ORDER BY a)
+    SELECT cte.a, joc2.b FROM cte JOIN joc2 ON cte.id = joc2.t1_id ORDER BY joc2.b;
+}
+expect {
+    10|3
+    30|5
+    20|7
+}
+
+test join-order-left-join-order-by-nullable {
+    CREATE TABLE jol1(id INT PRIMARY KEY, name TEXT);
+    INSERT INTO jol1 VALUES(1,'alice'),(2,'bob'),(3,'carol');
+    CREATE TABLE jol2(id INT PRIMARY KEY, t1_id INT, score INT);
+    INSERT INTO jol2 VALUES(1,1,80),(2,3,90);
+    SELECT jol1.name, jol2.score FROM jol1 LEFT JOIN jol2 ON jol1.id = jol2.t1_id ORDER BY jol2.score, jol1.name;
+}
+expect {
+    bob|
+    alice|80
+    carol|90
+}
+
+test join-order-cte-agg-join-order-across {
+    CREATE TABLE jos(region TEXT, product TEXT, amount INT);
+    INSERT INTO jos VALUES('east','a',10),('east','b',20),('west','a',30),('west','b',40),('east','a',5);
+    CREATE TABLE jop(product TEXT PRIMARY KEY, category TEXT);
+    INSERT INTO jop VALUES('a','cat1'),('b','cat2');
+    WITH sales AS (SELECT region, product, SUM(amount) AS total FROM jos GROUP BY region, product)
+    SELECT jop.category, sales.region, sales.total
+    FROM sales JOIN jop ON sales.product = jop.product
+    ORDER BY jop.category, sales.total DESC;
+}
+expect {
+    cat1|west|30
+    cat1|east|15
+    cat2|west|40
+    cat2|east|20
+}
+
+test cost-large-table-small-cte {
+    CREATE TABLE cost_big(id INT PRIMARY KEY, val INT);
+    INSERT INTO cost_big VALUES(1,1),(2,2),(3,3),(4,4),(5,5),(6,6),(7,7),(8,8),(9,9),(10,10);
+    INSERT INTO cost_big SELECT id+10, val FROM cost_big;
+    INSERT INTO cost_big SELECT id+20, val FROM cost_big WHERE id <= 10;
+    WITH small_cte AS (SELECT DISTINCT val FROM cost_big WHERE val <= 3)
+    SELECT b.id, s.val FROM cost_big b JOIN small_cte s ON b.val = s.val ORDER BY b.id;
+}
+expect {
+    1|1
+    2|2
+    3|3
+    11|1
+    12|2
+    13|3
+    21|1
+    22|2
+    23|3
+}
+
+test cost-cte-order-plus-limit {
+    CREATE TABLE cost_lim(a INT, b INT);
+    INSERT INTO cost_lim VALUES(5,50),(3,30),(1,10),(4,40),(2,20);
+    WITH cte AS (SELECT a, b FROM cost_lim ORDER BY a)
+    SELECT * FROM cte LIMIT 2;
+}
+expect {
+    1|10
+    2|20
+}
+
+test cost-cte-multi-col-groupby-different-order {
+    CREATE TABLE cost_mcg(a INT, b INT, c INT);
+    INSERT INTO cost_mcg VALUES(1,1,10),(1,2,20),(2,1,30),(2,2,40),(1,1,50);
+    WITH cte AS (SELECT a, b, c FROM cost_mcg ORDER BY a, b)
+    SELECT a, b, SUM(c) FROM cte GROUP BY a, b ORDER BY SUM(c) DESC;
+}
+expect {
+    1|1|60
+    2|2|40
+    2|1|30
+    1|2|20
 }
