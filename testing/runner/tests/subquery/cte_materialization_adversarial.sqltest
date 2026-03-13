@@ -657,6 +657,11 @@ expect {
     2|70.0
     3|50.0
 }
+expect @js {
+    1|30
+    2|70
+    3|50    
+}
 
 @setup join_data
 test cte-join-table {
