@@ -1,7 +1,7 @@
 use super::bind::BindContext;
 use super::emitter::{emit_program, TranslateCtx};
 use super::plan::{
-    select_star, Distinctness, InSeekSource, JoinOrderMember, Operation, OuterQueryReference,
+    Distinctness, InSeekSource, JoinOrderMember, Operation, OuterQueryReference,
     QueryDestination, Search, TableReferences, WhereTerm, Window,
 };
 use crate::schema::Table;
@@ -12,7 +12,7 @@ use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan, SubqueryState};
 use crate::translate::planner::{
-    break_predicate_at_and_boundaries, collect_vtab_predicates, fold_join_constraints, parse_from,
+    break_predicate_at_and_boundaries, collect_vtab_predicates, fold_join_constraints,
     parse_where, plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
 };
 use crate::translate::result_row::emit_select_result;
@@ -310,14 +310,6 @@ fn prepare_one_select_plan(
 
             let table_references = table_references;
 
-            if from.is_none() {
-                for column in &columns {
-                    if matches!(column, ResultColumn::Star) {
-                        crate::bail_parse_error!("no tables specified");
-                    }
-                }
-            }
-
             // Fold JOIN ON/USING constraints into where_predicates.
             // Collect virtual table argument predicates.
             if let Some(ref from) = from {
@@ -325,29 +317,8 @@ fn prepare_one_select_plan(
                 collect_vtab_predicates(from, &table_references, &mut vtab_predicates)?;
             }
 
-            // Preallocate space for the result columns
-            let result_columns = Vec::with_capacity(
-                columns
-                    .iter()
-                    .map(|c| match c {
-                        // Allocate space for all columns in all tables
-                        ResultColumn::Star => table_references
-                            .joined_tables()
-                            .iter()
-                            .map(|t| t.columns().iter().filter(|col| !col.hidden()).count())
-                            .sum(),
-                        // Guess 5 columns if we can't find the table using the identifier (maybe it's in [brackets] or `tick_quotes`, or miXeDcAse)
-                        ResultColumn::TableStar(n) => table_references
-                            .joined_tables()
-                            .iter()
-                            .find(|t| t.identifier == n.as_str())
-                            .map(|t| t.columns().iter().filter(|col| !col.hidden()).count())
-                            .unwrap_or(5),
-                        // Otherwise allocate space for 1 column
-                        ResultColumn::Expr(_, _) => 1,
-                    })
-                    .sum(),
-            );
+            // Star/TableStar are already expanded by the binder into Expr columns.
+            let result_columns = Vec::with_capacity(columns.len());
             let mut plan = SelectPlan {
                 join_order: table_references
                     .joined_tables()
@@ -389,52 +360,9 @@ fn prepare_one_select_plan(
             let mut aggregate_expressions = Vec::new();
             for column in columns.into_iter() {
                 match column {
-                    ResultColumn::Star => {
-                        select_star(
-                            plan.table_references.joined_tables(),
-                            &mut plan.result_columns,
-                            plan.table_references.right_join_swapped(),
-                        );
-                        for table in plan.table_references.joined_tables_mut() {
-                            for idx in 0..table.columns().len() {
-                                let column = &table.columns()[idx];
-                                if column.hidden() {
-                                    continue;
-                                }
-                                table.mark_column_used(idx);
-                            }
-                        }
-                    }
-                    ResultColumn::TableStar(name) => {
-                        let name_normalized = normalize_ident(name.as_str());
-                        let referenced_table = plan
-                            .table_references
-                            .joined_tables_mut()
-                            .iter_mut()
-                            .find(|t| t.identifier == name_normalized);
-
-                        if referenced_table.is_none() {
-                            crate::bail_parse_error!("no such table: {}", name.as_str());
-                        }
-                        let table = referenced_table.unwrap();
-                        let num_columns = table.columns().len();
-                        for idx in 0..num_columns {
-                            let column = &table.columns()[idx];
-                            if column.hidden() {
-                                continue;
-                            }
-                            plan.result_columns.push(ResultSetColumn {
-                                expr: ast::Expr::Column {
-                                    database: None, // TODO: support different databases
-                                    table: table.internal_id,
-                                    column: idx,
-                                    is_rowid_alias: column.is_rowid_alias(),
-                                },
-                                alias: None,
-                                contains_aggregates: false,
-                            });
-                            table.mark_column_used(idx);
-                        }
+                    // Star/TableStar are expanded by the binder before reaching the planner.
+                    ResultColumn::Star | ResultColumn::TableStar(_) => {
+                        unreachable!("Star/TableStar should be expanded by the binder")
                     }
                     ResultColumn::Expr(expr, maybe_alias) => {
                         let contains_aggregates = resolve_window_and_aggregate_functions(

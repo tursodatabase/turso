@@ -865,7 +865,15 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     // 1. Bind FROM → build scope
                     let scope = match from {
                         Some(from) => ctx.bind_from(from)?,
-                        None => BindScope::empty(),
+                        None => {
+                            // Check for Star/TableStar without FROM before expansion
+                            for col in columns.iter() {
+                                if matches!(col, ast::ResultColumn::Star) {
+                                    crate::bail_parse_error!("no tables specified");
+                                }
+                            }
+                            BindScope::empty()
+                        }
                     };
 
                     // 2. Expand Star/TableStar in-place before any binding
