@@ -1,0 +1,27 @@
+# Copyright 2025 the Limbo authors. All rights reserved. MIT license.
+
+[package]
+name = "turso_crash_test"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Crash recovery test harness for Turso"
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "turso_crash_test"
+path = "main.rs"
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+rand = { workspace = true }
+tempfile = { workspace = true }
+turso_core = { workspace = true, features = ["fs"] }
+turso-dbhash = { workspace = true }
+rusqlite = { workspace = true }
+nix = { version = "0.29", features = ["signal", "process"] }
