@@ -128,6 +128,22 @@ extern "C" {
         pz_err_msg: *mut *mut libc::c_char,
     ) -> i32;
     fn sqlite3_free_table(az_result: *mut *mut libc::c_char);
+    fn sqlite3_bind_null(stmt: *mut sqlite3_stmt, idx: i32) -> i32;
+    fn sqlite3_value_type(value: *mut libc::c_void) -> i32;
+    fn sqlite3_value_blob(value: *mut libc::c_void) -> *const libc::c_void;
+    fn sqlite3_value_bytes(value: *mut libc::c_void) -> i32;
+    fn sqlite3_result_int64(context: *mut libc::c_void, val: i64);
+    fn sqlite3_create_function_v2(
+        db: *mut sqlite3,
+        name: *const libc::c_char,
+        n_args: i32,
+        enc: i32,
+        context: *mut libc::c_void,
+        func: Option<unsafe extern "C" fn(*mut libc::c_void, i32, *mut *mut libc::c_void)>,
+        step: Option<unsafe extern "C" fn()>,
+        final_: Option<unsafe extern "C" fn()>,
+        destroy: Option<unsafe extern "C" fn(*mut libc::c_void)>,
+    ) -> i32;
 }
 
 const SQLITE_OK: i32 = 0;
@@ -148,6 +164,7 @@ const SQLITE_TEXT: i32 = 3;
 const SQLITE3_TEXT: i32 = 3;
 const SQLITE_BLOB: i32 = 4;
 const SQLITE_NULL: i32 = 5;
+const SQLITE_UTF8: i32 = 1;
 
 #[cfg(not(target_os = "windows"))]
 mod tests {
@@ -2611,6 +2628,141 @@ mod tests {
         unsafe {
             // Passing null should not crash
             sqlite3_free_table(ptr::null_mut());
+        }
+    }
+
+    /// Regression test: sqlite3_value_blob returns a dangling pointer (use-after-free).
+    ///
+    /// The internal `ExtValue::to_blob()` returns `Option<Vec<u8>>`, so
+    /// `sqlite3_value_blob` calls `.as_ptr()` on a temporary Vec that is
+    /// immediately dropped, leaving the returned pointer dangling.
+    ///
+    /// This test creates a scalar function that receives a BLOB argument,
+    /// reads it via `sqlite3_value_blob` + `sqlite3_value_bytes`, and
+    /// verifies the data is correct. On the buggy version, the blob data
+    /// is corrupted (reads freed memory).
+    #[test]
+    fn test_sqlite3_value_blob_use_after_free() {
+        /// Scalar function callback: verifies that the first argument is a BLOB
+        /// with the expected content [0xDE, 0xAD, 0xBE, 0xEF].
+        /// Returns 1 if the blob matches, 0 otherwise.
+        unsafe extern "C" fn check_blob_fn(
+            ctx: *mut libc::c_void,
+            argc: i32,
+            argv: *mut *mut libc::c_void,
+        ) {
+            assert_eq!(argc, 1);
+            let value = *argv.add(0);
+            assert!(!value.is_null());
+
+            let vtype = sqlite3_value_type(value);
+            if vtype != SQLITE_BLOB {
+                sqlite3_result_int64(ctx, -1); // wrong type
+                return;
+            }
+
+            let blob_ptr = sqlite3_value_blob(value);
+            let blob_len = sqlite3_value_bytes(value);
+
+            if blob_ptr.is_null() || blob_len != 4 {
+                sqlite3_result_int64(ctx, -2); // null ptr or wrong length
+                return;
+            }
+
+            // Read the blob data
+            let data = std::slice::from_raw_parts(blob_ptr as *const u8, blob_len as usize);
+            let expected: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
+            if data == expected {
+                sqlite3_result_int64(ctx, 1); // match
+            } else {
+                // Print actual bytes for debugging
+                eprintln!("blob mismatch: expected {expected:?}, got {data:?}");
+                sqlite3_result_int64(ctx, 0); // corrupted data
+            }
+        }
+
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("test_value_blob.db");
+            let path_cstr = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(path_cstr.as_ptr(), &mut db), SQLITE_OK);
+
+            // Register the scalar function
+            assert_eq!(
+                sqlite3_create_function_v2(
+                    db,
+                    c"check_blob".as_ptr(),
+                    1,
+                    SQLITE_UTF8,
+                    ptr::null_mut(),
+                    Some(check_blob_fn),
+                    None,
+                    None,
+                    None,
+                ),
+                SQLITE_OK,
+                "create function failed"
+            );
+
+            // Create table and insert a row with a known BLOB
+            let mut errmsg: *mut libc::c_char = ptr::null_mut();
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg,
+                ),
+                SQLITE_OK
+            );
+
+            // Insert using prepared statement with bound BLOB
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"INSERT INTO t (id, data) VALUES (1, ?1)".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            let blob_data: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
+            assert_eq!(
+                sqlite3_bind_blob(stmt, 1, blob_data.as_ptr() as *const libc::c_void, 4, None,),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            // Call check_blob(data) via SELECT — this triggers sqlite3_value_blob
+            // on the ExtValue passed to the scalar function
+            let mut stmt2: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT check_blob(data) FROM t WHERE id = 1".as_ptr(),
+                    -1,
+                    &mut stmt2,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK,
+                "prepare SELECT with check_blob"
+            );
+            let rc = sqlite3_step(stmt2);
+            assert_eq!(rc, SQLITE_ROW, "expected SQLITE_ROW, got {rc}");
+
+            let result = sqlite3_column_int(stmt2, 0);
+            assert_eq!(
+                result, 1,
+                "check_blob returned {result}: blob data was corrupted (use-after-free in sqlite3_value_blob)"
+            );
+
+            assert_eq!(sqlite3_finalize(stmt2), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
     }
 }
