@@ -122,6 +122,7 @@ pub struct turso_sync_database_config_t {
     pub partial_bootstrap_prefetch: bool,
     pub remote_encryption_key: *const ::std::os::raw::c_char,
     pub remote_encryption_cipher: *const ::std::os::raw::c_char,
+    pub auth_token: *const ::std::os::raw::c_char,
 }
 impl Default for turso_sync_database_config_t {
     fn default() -> Self {
@@ -351,4 +352,28 @@ unsafe extern "C" {
 unsafe extern "C" {
     #[doc = " Deallocate a TursoDatabaseSyncChanges"]
     pub fn turso_sync_changes_deinit(self_: *const turso_sync_changes_t);
+}
+unsafe extern "C" {
+    #[doc = " Set the remote URL for sync operations.\n Can only set from None to Some, or to the same value."]
+    pub fn turso_sync_database_set_url(
+        self_: *const turso_sync_database_t,
+        url: *const ::std::os::raw::c_char,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " Set the authorization token for HTTP requests.\n Can be changed at any time."]
+    pub fn turso_sync_database_set_auth_token(
+        self_: *const turso_sync_database_t,
+        auth_token: *const ::std::os::raw::c_char,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " Set the encryption key for Turso Cloud.\n Can only set from None to Some, or to the same value."]
+    pub fn turso_sync_database_set_encryption_key(
+        self_: *const turso_sync_database_t,
+        key: *const ::std::os::raw::c_char,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
 }
