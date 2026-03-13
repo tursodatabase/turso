@@ -15,8 +15,9 @@ use crate::{
             rewrite_where_for_update_registers, OperationMode, Resolver, UpdateRowSource,
         },
         expr::{
-            emit_returning_results, emit_returning_scan_back, translate_expr,
-            translate_expr_no_constant_opt, NoConstantOptReason, ReturningBufferCtx,
+            emit_returning_results, emit_returning_scan_back, restore_returning_row_image_in_cache,
+            seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
+            NoConstantOptReason, ReturningBufferCtx,
         },
         fkeys::{
             emit_fk_child_update_counters, emit_fk_update_parent_actions, fire_fk_update_actions,
@@ -874,6 +875,7 @@ fn emit_update_insns<'a>(
             *subquery_plan,
             &subquery.query_type,
             subquery.correlated,
+            false,
         )?;
     }
 
@@ -2346,21 +2348,34 @@ fn emit_update_insns<'a>(
             }
         }
 
-        // Emit RETURNING subqueries after Insert so that correlated column
-        // references read post-UPDATE values from the cursor.
-        for subquery in non_from_clause_subqueries
-            .iter_mut()
-            .filter(|s| !s.has_been_evaluated() && s.is_post_write_returning())
-        {
-            let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
-            emit_non_from_clause_subquery(
-                program,
-                &t_ctx.resolver,
-                *subquery_plan,
-                &subquery.query_type,
-                subquery.correlated,
-            )?;
-        }
+        let cache_state = seed_returning_row_image_in_cache(
+            program,
+            table_references,
+            start,
+            rowid_set_clause_reg.unwrap_or(beg),
+            &mut t_ctx.resolver,
+        )?;
+        let result: Result<()> = (|| {
+            // Emit RETURNING subqueries after Insert so correlated references
+            // resolve against the post-write row image, not the old cursor state.
+            for subquery in non_from_clause_subqueries
+                .iter_mut()
+                .filter(|s| !s.has_been_evaluated() && s.is_post_write_returning())
+            {
+                let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
+                emit_non_from_clause_subquery(
+                    program,
+                    &t_ctx.resolver,
+                    *subquery_plan,
+                    &subquery.query_type,
+                    subquery.correlated,
+                    true,
+                )?;
+            }
+            Ok(())
+        })();
+        restore_returning_row_image_in_cache(&mut t_ctx.resolver, cache_state);
+        result?;
 
         // Emit RETURNING results if specified
         if let Some(returning_columns) = &returning {

@@ -3,13 +3,14 @@ use turso_parser::ast::{self, SortOrder};
 use super::{
     emitter::TranslateCtx,
     expr::{translate_condition_expr, translate_expr, ConditionMetadata},
-    plan::{Distinctness, GroupBy, SelectPlan},
+    plan::{Distinctness, GroupBy, SelectPlan, SubqueryEvalPhase, SubqueryOrigin},
     result_row::emit_select_result,
 };
 use crate::translate::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
     order_by::{custom_type_lt_func, EmitOrderBy},
-    plan::Aggregate,
+    plan::{Aggregate, NonFromClauseSubquery},
+    subquery::emit_non_from_clause_subqueries_for_phase,
 };
 use crate::translate::{
     emitter::Resolver,
@@ -351,6 +352,16 @@ fn collect_result_columns<'a>(
     plan: &SelectPlan,
     result_columns: &mut Vec<&'a ast::Expr>,
 ) -> Result<()> {
+    fn is_deferred_grouped_output_subquery(
+        plan: &SelectPlan,
+        subquery_id: turso_parser::ast::TableInternalId,
+    ) -> bool {
+        plan.non_from_clause_subqueries
+            .iter()
+            .find(|subquery| subquery.internal_id == subquery_id)
+            .is_some_and(|subquery| matches!(subquery.eval_phase, SubqueryEvalPhase::GroupedOutput))
+    }
+
     walk_expr(root_expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
         match expr {
             ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => {
@@ -369,7 +380,12 @@ fn collect_result_columns<'a>(
             //
             // However, if the subquery is of the form: 'aggregate_result IN (SELECT...)', we need to skip it because the aggregation
             // is done later.
-            ast::Expr::SubqueryResult { lhs, .. } => {
+            ast::Expr::SubqueryResult {
+                subquery_id, lhs, ..
+            } => {
+                if is_deferred_grouped_output_subquery(plan, *subquery_id) {
+                    return Ok(WalkControl::SkipChildren);
+                }
                 if let Some(ref lhs) = lhs {
                     let mut lhs_contains_agg = false;
                     walk_expr(lhs, &mut |expr: &ast::Expr| -> Result<WalkControl> {
@@ -768,7 +784,8 @@ pub fn group_by_agg_phase(
 pub fn group_by_emit_row_phase<'a>(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx<'a>,
-    plan: &'a SelectPlan,
+    plan: &SelectPlan,
+    non_from_clause_subqueries: &mut [NonFromClauseSubquery],
 ) -> Result<()> {
     let group_by = plan.group_by.as_ref().expect("group by not found");
     let GroupByMetadata {
@@ -834,7 +851,7 @@ pub fn group_by_emit_row_phase<'a>(
             func: agg.func.clone(),
         });
         t_ctx.resolver.expr_to_reg_cache.push((
-            std::borrow::Cow::Borrowed(&agg.original_expr),
+            std::borrow::Cow::Owned(agg.original_expr.clone()),
             agg_result_reg,
             false,
         ));
@@ -843,6 +860,16 @@ pub fn group_by_emit_row_phase<'a>(
     t_ctx.resolver.enable_expr_to_reg_cache();
 
     if let Some(having) = &group_by.having {
+        emit_non_from_clause_subqueries_for_phase(
+            program,
+            &t_ctx.resolver,
+            non_from_clause_subqueries,
+            &plan.join_order,
+            Some(&plan.table_references),
+            SubqueryEvalPhase::GroupedOutput,
+            |subquery| matches!(subquery.origin, SubqueryOrigin::SelectHaving),
+        )?;
+
         for expr in having.iter() {
             let if_true_target = program.allocate_label();
             translate_condition_expr(
@@ -867,6 +894,16 @@ pub fn group_by_emit_row_phase<'a>(
     // (targeting label_agg_final) to land in the init block, which ends
     // with Goto back to the start of the program, creating an infinite loop.
     let span_idx = program.constant_spans_next_idx();
+    emit_non_from_clause_subqueries_for_phase(
+        program,
+        &t_ctx.resolver,
+        non_from_clause_subqueries,
+        &plan.join_order,
+        Some(&plan.table_references),
+        SubqueryEvalPhase::GroupedOutput,
+        |subquery| !matches!(subquery.origin, SubqueryOrigin::SelectHaving),
+    )?;
+
     match plan.order_by.is_empty() {
         true => {
             emit_select_result(

@@ -6285,21 +6285,105 @@ pub(crate) fn emit_returning_results<'a>(
         return Ok(());
     }
 
+    let cache_state = seed_returning_row_image_in_cache(
+        program,
+        table_references,
+        reg_columns_start,
+        rowid_reg,
+        resolver,
+    )?;
+
+    let result = (|| {
+        let result_start_reg = program.alloc_registers(result_columns.len());
+
+        for (i, result_column) in result_columns.iter().enumerate() {
+            let reg = result_start_reg + i;
+            translate_expr_no_constant_opt(
+                program,
+                Some(table_references),
+                &result_column.expr,
+                reg,
+                resolver,
+                NoConstantOptReason::RegisterReuse,
+            )?;
+        }
+
+        // Decode array columns in RETURNING results (record blob -> JSON text).
+        super::result_row::emit_array_decode_for_results(
+            program,
+            result_columns,
+            table_references,
+            result_start_reg,
+            resolver,
+        )?;
+
+        if let Some(buf) = returning_buffer {
+            // Buffer into ephemeral table instead of yielding directly.
+            // All DML completes before any RETURNING rows are yielded to the caller.
+            let record_reg = program.alloc_register();
+            let eph_rowid_reg = program.alloc_register();
+            program.emit_insn(Insn::MakeRecord {
+                start_reg: crate::vdbe::insn::to_u16(result_start_reg),
+                count: crate::vdbe::insn::to_u16(result_columns.len()),
+                dest_reg: crate::vdbe::insn::to_u16(record_reg),
+                index_name: None,
+                affinity_str: None,
+            });
+            program.emit_insn(Insn::NewRowid {
+                cursor: buf.cursor_id,
+                rowid_reg: eph_rowid_reg,
+                prev_largest_reg: 0,
+            });
+            program.emit_insn(Insn::Insert {
+                cursor: buf.cursor_id,
+                key_reg: eph_rowid_reg,
+                record_reg,
+                flag: InsertFlags::new().is_ephemeral_table_insert(),
+                table_name: String::new(),
+            });
+        } else {
+            program.emit_insn(Insn::ResultRow {
+                start_reg: result_start_reg,
+                count: result_columns.len(),
+            });
+        }
+
+        Ok(())
+    })();
+
+    restore_returning_row_image_in_cache(resolver, cache_state);
+    result
+}
+
+pub(crate) struct ReturningRowImageCacheState {
+    cache_len: usize,
+    cache_enabled: bool,
+}
+
+pub(crate) fn seed_returning_row_image_in_cache<'a>(
+    program: &mut ProgramBuilder,
+    table_references: &TableReferences,
+    reg_columns_start: usize,
+    rowid_reg: usize,
+    resolver: &mut Resolver<'a>,
+) -> Result<ReturningRowImageCacheState> {
     turso_assert!(
         table_references.joined_tables().len() == 1,
         "RETURNING is only used with INSERT, UPDATE, or DELETE statements, which target a single table"
     );
     let table = table_references.joined_tables().first().unwrap();
 
-    resolver.enable_expr_to_reg_cache();
-    let expr = Expr::RowId {
-        database: None,
-        table: table.internal_id,
-    };
     let cache_len = resolver.expr_to_reg_cache.len();
-    resolver
-        .expr_to_reg_cache
-        .push((std::borrow::Cow::Owned(expr), rowid_reg, false));
+    let cache_enabled = resolver.expr_to_reg_cache_enabled;
+    resolver.enable_expr_to_reg_cache();
+    resolver.expr_to_reg_cache.push((
+        std::borrow::Cow::Owned(Expr::RowId {
+            database: None,
+            table: table.internal_id,
+        }),
+        rowid_reg,
+        false,
+    ));
     for (i, column) in table.columns().iter().enumerate() {
         let raw_reg = if column.is_rowid_alias() {
             rowid_reg
@@ -6329,68 +6413,18 @@ pub(crate) fn emit_returning_results<'a>(
             .push((std::borrow::Cow::Owned(expr), decoded_reg, false));
     }
 
-    let result_start_reg = program.alloc_registers(result_columns.len());
+    Ok(ReturningRowImageCacheState {
+        cache_len,
+        cache_enabled,
+    })
+}
 
-    for (i, result_column) in result_columns.iter().enumerate() {
-        let reg = result_start_reg + i;
-        translate_expr_no_constant_opt(
-            program,
-            Some(table_references),
-            &result_column.expr,
-            reg,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        )?;
-    }
-
-    // Decode array columns in RETURNING results (record blob → JSON text).
-    super::result_row::emit_array_decode_for_results(
-        program,
-        result_columns,
-        table_references,
-        result_start_reg,
-        resolver,
-    )?;
-
-    // Bit of a hack: this is required in case of e.g. INSERT ... ON CONFLICT DO UPDATE ... RETURNING
-    // where the result column values may either be the ones that were inserted, or the ones that were updated,
-    // depending on the row in question.
-    // meaning: emit_returning_results() may be called twice during translation and the cached expression values
-    // must be distinct for each call.
-    resolver.expr_to_reg_cache.truncate(cache_len);
-
-    if let Some(buf) = returning_buffer {
-        // Buffer into ephemeral table instead of yielding directly.
-        // All DML completes before any RETURNING rows are yielded to the caller.
-        let record_reg = program.alloc_register();
-        let eph_rowid_reg = program.alloc_register();
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: crate::vdbe::insn::to_u16(result_start_reg),
-            count: crate::vdbe::insn::to_u16(result_columns.len()),
-            dest_reg: crate::vdbe::insn::to_u16(record_reg),
-            index_name: None,
-            affinity_str: None,
-        });
-        program.emit_insn(Insn::NewRowid {
-            cursor: buf.cursor_id,
-            rowid_reg: eph_rowid_reg,
-            prev_largest_reg: 0,
-        });
-        program.emit_insn(Insn::Insert {
-            cursor: buf.cursor_id,
-            key_reg: eph_rowid_reg,
-            record_reg,
-            flag: InsertFlags::new().is_ephemeral_table_insert(),
-            table_name: String::new(),
-        });
-    } else {
-        program.emit_insn(Insn::ResultRow {
-            start_reg: result_start_reg,
-            count: result_columns.len(),
-        });
-    }
-
-    Ok(())
+pub(crate) fn restore_returning_row_image_in_cache(
+    resolver: &mut Resolver<'_>,
+    state: ReturningRowImageCacheState,
+) {
+    resolver.expr_to_reg_cache.truncate(state.cache_len);
+    resolver.expr_to_reg_cache_enabled = state.cache_enabled;
 }
 
 /// Get the number of values returned by an expression

@@ -34,10 +34,18 @@ use turso_parser::ast::Expr;
 pub fn emit_program_for_select(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
+    plan: SelectPlan,
+) -> Result<()> {
+    emit_program_for_select_with_resolver(program, resolver.fork(), plan)
+}
+
+pub fn emit_program_for_select_with_resolver(
+    program: &mut ProgramBuilder,
+    resolver: Resolver,
     mut plan: SelectPlan,
 ) -> Result<()> {
-    let materialized_build_inputs = emit_materialized_build_inputs(program, resolver, &mut plan)?;
-    emit_program_for_select_with_inputs(program, resolver, plan, materialized_build_inputs)
+    let materialized_build_inputs = emit_materialized_build_inputs(program, &resolver, &mut plan)?;
+    emit_program_for_select_with_inputs(program, &resolver, plan, materialized_build_inputs)
 }
 
 fn emit_program_for_select_with_inputs(
@@ -48,7 +56,7 @@ fn emit_program_for_select_with_inputs(
 ) -> Result<()> {
     let mut t_ctx = TranslateCtx::new(
         program,
-        resolver.fork(),
+        resolver.fork_with_expr_cache(),
         plan.table_references.joined_tables().len(),
         false,
     );
@@ -254,8 +262,9 @@ pub fn emit_query<'a>(
 
     program.preassign_label_to_next_insn(after_main_loop_label);
 
-    let order_by_necessary = !plan.order_by.is_empty() && !plan.contains_constant_false_condition;
-    let order_by = &plan.order_by;
+    let has_order_by = !plan.order_by.is_empty();
+    let order_by_necessary = has_order_by && !plan.contains_constant_false_condition;
+    let mut grouped_output_subqueries = plan.non_from_clause_subqueries.clone();
 
     // Handle GROUP BY and aggregation processing
     if has_group_by_exprs {
@@ -267,7 +276,7 @@ pub fn emit_query<'a>(
         if matches!(row_source, GroupByRowSource::Sorter { .. }) {
             group_by_agg_phase(program, t_ctx, plan)?;
         }
-        group_by_emit_row_phase(program, t_ctx, plan)?;
+        group_by_emit_row_phase(program, t_ctx, plan, &mut grouped_output_subqueries)?;
     } else if !plan.aggregates.is_empty() {
         // Handle aggregation without GROUP BY (or HAVING without GROUP BY)
         emit_ungrouped_aggregation(program, t_ctx, plan)?;
@@ -276,7 +285,7 @@ pub fn emit_query<'a>(
     }
 
     // Process ORDER BY results if needed
-    if !order_by.is_empty() && order_by_necessary {
+    if has_order_by && order_by_necessary {
         EmitOrderBy::emit(program, t_ctx, plan)?;
     }
 
