@@ -16,8 +16,8 @@ use crate::{
         optimizer::optimize_select_plan,
         plan::{
             plan_has_outer_scope_dependency, plan_is_correlated, ColumnUsedMask, JoinOrderMember,
-            NonFromClauseSubquery, OuterQueryReference, Plan, SetOperation, SubqueryPosition,
-            SubqueryState, TableReferences, WhereTerm,
+            NonFromClauseSubquery, OuterQueryReference, Plan, SetOperation, SubqueryOrigin,
+            SubqueryPosition, SubqueryState, TableReferences, WhereTerm,
         },
         select::prepare_select_plan,
     },
@@ -151,6 +151,7 @@ pub fn plan_subqueries_from_select_plan(
         plan.where_clause.iter_mut().map(|t| &mut t.expr),
         connection,
         SubqueryPosition::Where,
+        SubqueryOrigin::SelectWhere,
     )?;
 
     // GROUP BY
@@ -163,6 +164,7 @@ pub fn plan_subqueries_from_select_plan(
             group_by.exprs.iter_mut(),
             connection,
             SubqueryPosition::GroupBy,
+            SubqueryOrigin::SelectGroupBy,
         )?;
         if let Some(having) = group_by.having.as_mut() {
             plan_subqueries_with_outer_query_access(
@@ -173,6 +175,7 @@ pub fn plan_subqueries_from_select_plan(
                 having.iter_mut(),
                 connection,
                 SubqueryPosition::Having,
+                SubqueryOrigin::SelectHaving,
             )?;
         }
     }
@@ -186,6 +189,7 @@ pub fn plan_subqueries_from_select_plan(
         plan.result_columns.iter_mut().map(|c| &mut c.expr),
         connection,
         SubqueryPosition::ResultColumn,
+        SubqueryOrigin::SelectList,
     )?;
 
     // ORDER BY
@@ -197,6 +201,7 @@ pub fn plan_subqueries_from_select_plan(
         plan.order_by.iter_mut().map(|(expr, _)| &mut **expr),
         connection,
         SubqueryPosition::OrderBy,
+        SubqueryOrigin::SelectOrderBy,
     )?;
 
     // LIMIT and OFFSET cannot reference columns from the outer query
@@ -210,6 +215,7 @@ pub fn plan_subqueries_from_select_plan(
             connection,
             get_outer_query_refs,
             SubqueryPosition::LimitOffset,
+            SubqueryOrigin::SelectLimitOffset,
         );
         // Limit
         if let Some(limit) = &mut plan.limit {
@@ -262,6 +268,7 @@ pub fn plan_subqueries_from_where_clause(
         where_clause.iter_mut().map(|t| &mut t.expr),
         connection,
         SubqueryPosition::Where,
+        SubqueryOrigin::DmlWhere,
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries);
@@ -288,6 +295,7 @@ pub fn plan_subqueries_from_values(
         values.iter_mut().flatten().map(|e| e.as_mut()),
         connection,
         SubqueryPosition::ResultColumn, // VALUES are similar to result columns in terms of subquery handling
+        SubqueryOrigin::SelectList,
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries);
@@ -313,6 +321,7 @@ pub fn plan_subqueries_from_set_clauses(
         set_clauses.iter_mut().map(|(_, expr)| expr.as_mut()),
         connection,
         SubqueryPosition::ResultColumn, // SET clause subqueries are similar to result columns
+        SubqueryOrigin::DmlSet,
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries);
@@ -336,8 +345,6 @@ pub fn plan_subqueries_from_returning(
         ast::ResultColumn::Star | ast::ResultColumn::TableStar(_) => None,
     });
 
-    let count_before = non_from_clause_subqueries.len();
-
     plan_subqueries_with_outer_query_access(
         program,
         non_from_clause_subqueries,
@@ -346,13 +353,8 @@ pub fn plan_subqueries_from_returning(
         exprs,
         connection,
         SubqueryPosition::ResultColumn,
+        SubqueryOrigin::DmlReturning,
     )?;
-
-    // Mark newly added subqueries as RETURNING so the UPDATE emitter can
-    // defer their evaluation until after the Insert instruction.
-    for subquery in &mut non_from_clause_subqueries[count_before..] {
-        subquery.is_returning = true;
-    }
 
     update_column_used_masks(table_references, non_from_clause_subqueries);
     Ok(())
@@ -377,6 +379,7 @@ pub fn plan_subqueries_from_trigger_when_clause(
         std::iter::once(expr),
         connection,
         SubqueryPosition::Where,
+        SubqueryOrigin::TriggerWhen,
     )
 }
 
@@ -389,6 +392,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
     exprs: impl Iterator<Item = &'a mut ast::Expr>,
     connection: &Arc<Connection>,
     position: SubqueryPosition,
+    origin: SubqueryOrigin,
 ) -> Result<()> {
     // Most subqueries can reference columns from the outer query,
     // including nested cases where a subquery inside a subquery references columns from its parent's parent
@@ -442,6 +446,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
         connection,
         get_outer_query_refs,
         position,
+        origin,
     );
     for expr in exprs {
         walk_expr_mut(expr, &mut subquery_parser)?;
@@ -459,6 +464,7 @@ fn get_subquery_parser<'a>(
     connection: &'a Arc<Connection>,
     get_outer_query_refs: fn(&TableReferences) -> Vec<OuterQueryReference>,
     position: SubqueryPosition,
+    origin: SubqueryOrigin,
 ) -> impl FnMut(&mut ast::Expr) -> Result<WalkControl> + 'a {
     fn handle_unsupported_correlation(correlated: bool, position: SubqueryPosition) -> Result<()> {
         if correlated && !position.allow_correlated() {
@@ -511,7 +517,8 @@ fn get_subquery_parser<'a>(
                         plan: Some(Box::new(plan)),
                     },
                     correlated,
-                    is_returning: false,
+                    origin,
+                    eval_phase: origin.phase_floor(),
                 });
                 Ok(WalkControl::Continue)
             }
@@ -601,7 +608,8 @@ fn get_subquery_parser<'a>(
                         plan: Some(Box::new(plan)),
                     },
                     correlated,
-                    is_returning: false,
+                    origin,
+                    eval_phase: origin.phase_floor(),
                 });
                 Ok(WalkControl::Continue)
             }
@@ -729,7 +737,8 @@ fn get_subquery_parser<'a>(
                         plan: Some(Box::new(plan)),
                     },
                     correlated,
-                    is_returning: false,
+                    origin,
+                    eval_phase: origin.phase_floor(),
                 });
                 Ok(WalkControl::Continue)
             }

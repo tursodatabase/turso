@@ -195,7 +195,7 @@ pub fn emit_program_for_update(
     {
         let mut i = 0;
         while i < plan.non_from_clause_subqueries.len() {
-            if plan.non_from_clause_subqueries[i].is_returning {
+            if plan.non_from_clause_subqueries[i].is_post_write_returning() {
                 update_subqueries.push(plan.non_from_clause_subqueries.remove(i));
             } else {
                 i += 1;
@@ -875,7 +875,7 @@ fn emit_update_insns<'a>(
     // correlated column references read post-UPDATE values from the cursor.
     for subquery in non_from_clause_subqueries
         .iter_mut()
-        .filter(|s| !s.has_been_evaluated() && !s.is_returning)
+        .filter(|s| !s.has_been_evaluated() && !s.is_post_write_returning())
     {
         let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
         emit_non_from_clause_subquery(
@@ -2360,7 +2360,7 @@ fn emit_update_insns<'a>(
         // references read post-UPDATE values from the cursor.
         for subquery in non_from_clause_subqueries
             .iter_mut()
-            .filter(|s| !s.has_been_evaluated() && s.is_returning)
+            .filter(|s| !s.has_been_evaluated() && s.is_post_write_returning())
         {
             let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
             emit_non_from_clause_subquery(
