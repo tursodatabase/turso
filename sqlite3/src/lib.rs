@@ -1,6 +1,7 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(non_camel_case_types)]
 
+use std::collections::HashMap;
 use std::ffi::{self, CStr, CString};
 use std::num::{NonZero, NonZeroUsize};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -8,6 +9,21 @@ use tracing::trace;
 use turso_core::{CheckpointMode, LimboError, Value};
 use turso_ext::ScalarFunction;
 use turso_ext::Value as ExtValue;
+
+/// Registry of named in-memory databases. When a URI like
+/// `file:name?mode=memory&cache=shared` is opened, the MemoryIO is stored here
+/// so subsequent opens of the same name share the same in-memory storage
+/// (matching SQLite's cache=shared behavior for in-memory databases).
+static MEMORY_DB_REGISTRY: OnceLock<Mutex<HashMap<String, Arc<dyn turso_core::IO>>>> =
+    OnceLock::new();
+
+fn get_or_create_memory_io(name: &str) -> Arc<dyn turso_core::IO> {
+    let registry = MEMORY_DB_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = registry.lock().unwrap();
+    map.entry(name.to_string())
+        .or_insert_with(|| Arc::new(turso_core::MemoryIO::new()))
+        .clone()
+}
 
 macro_rules! stub {
     () => {
@@ -357,23 +373,22 @@ pub const SQLITE_OPEN_PRIVATECACHE: ffi::c_int = 0x00040000;
 pub const SQLITE_OPEN_NOFOLLOW: ffi::c_int = 0x01000000;
 
 /// Percent-decode a URI component (e.g., `%20` -> ` `, `%2F` -> `/`).
-/// Returns None if a percent sequence is malformed.
+/// Returns None if a percent sequence is malformed or the result is not valid UTF-8.
 fn percent_decode(input: &str) -> Option<String> {
-    let mut result = String::with_capacity(input.len());
-    let mut chars = input.as_bytes().iter();
-    while let Some(&b) = chars.next() {
+    let mut bytes = Vec::with_capacity(input.len());
+    let mut iter = input.as_bytes().iter();
+    while let Some(&b) = iter.next() {
         if b == b'%' {
-            let hi = *chars.next()?;
-            let lo = *chars.next()?;
+            let hi = *iter.next()?;
+            let lo = *iter.next()?;
             let hex = [hi, lo];
             let s = std::str::from_utf8(&hex).ok()?;
-            let byte = u8::from_str_radix(s, 16).ok()?;
-            result.push(byte as char);
+            bytes.push(u8::from_str_radix(s, 16).ok()?);
         } else {
-            result.push(b as char);
+            bytes.push(b);
         }
     }
-    Some(result)
+    String::from_utf8(bytes).ok()
 }
 
 /// Parse a URI filename (when SQLITE_OPEN_URI is set).
@@ -484,7 +499,14 @@ pub unsafe extern "C" fn sqlite3_open_v2(
         };
 
     let io: Arc<dyn turso_core::IO> = if use_memory {
-        Arc::new(turso_core::MemoryIO::new())
+        if effective_filename == ":memory:" {
+            // Plain :memory: always gets a fresh, independent MemoryIO
+            Arc::new(turso_core::MemoryIO::new())
+        } else {
+            // Named memory URIs (e.g. file:name?mode=memory&cache=shared)
+            // share the same MemoryIO so multiple connections see the same data
+            get_or_create_memory_io(&effective_filename)
+        }
     } else {
         match turso_core::PlatformIO::new() {
             Ok(io) => Arc::new(io),
@@ -493,18 +515,23 @@ pub unsafe extern "C" fn sqlite3_open_v2(
     };
 
     match turso_core::Database::open_file(io.clone(), &effective_filename) {
-        Ok(db) => {
-            let conn = db.connect().unwrap();
-            let stored_filename = if use_memory {
-                CString::new("".to_string()).unwrap()
-            } else {
-                CString::new(effective_filename).unwrap()
-            };
-            *db_out = Box::leak(Box::new(sqlite3::new(io, db, conn, stored_filename)));
-            SQLITE_OK
-        }
+        Ok(db) => match db.connect() {
+            Ok(conn) => {
+                let stored_filename = if use_memory {
+                    CString::new("".to_string()).unwrap()
+                } else {
+                    CString::new(effective_filename).unwrap()
+                };
+                *db_out = Box::leak(Box::new(sqlite3::new(io, db, conn, stored_filename)));
+                SQLITE_OK
+            }
+            Err(e) => {
+                trace!("error connecting to database: {:?}", e);
+                SQLITE_CANTOPEN
+            }
+        },
         Err(e) => {
-            trace!("error opening database {}: {:?}", effective_filename, e);
+            trace!("error opening database {effective_filename}: {e:?}");
             SQLITE_CANTOPEN
         }
     }
