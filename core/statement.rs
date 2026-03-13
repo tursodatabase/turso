@@ -22,7 +22,7 @@ use crate::{
         self,
         explain::{EXPLAIN_COLUMNS_TYPE, EXPLAIN_QUERY_PLAN_COLUMNS_TYPE},
     },
-    LimboError, MvStore, Pager, QueryMode, Result, Value, EXPLAIN_COLUMNS,
+    LimboError, MvStore, Pager, QueryMode, Result, TransactionState, Value, EXPLAIN_COLUMNS,
     EXPLAIN_QUERY_PLAN_COLUMNS,
 };
 
@@ -345,7 +345,21 @@ impl Statement {
             }
         }
 
-        *conn.schema.write() = conn.db.clone_schema();
+        // Skip refreshing the connection schema from the shared Database when
+        // this connection has uncommitted DDL changes (schema_did_change = true).
+        // In that case, the connection's schema already reflects the new tables/indexes
+        // from CREATE TABLE etc., but the shared Database schema hasn't been updated
+        // yet (that happens at COMMIT). Overwriting with the stale shared schema
+        // would lose the uncommitted DDL and cause an infinite SchemaUpdated loop.
+        let skip_refresh = matches!(
+            conn.get_tx_state(),
+            TransactionState::Write {
+                schema_did_change: true
+            }
+        );
+        if !skip_refresh {
+            *conn.schema.write() = conn.db.clone_schema();
+        }
         self.program = {
             let mut parser = Parser::new(self.program.sql.as_bytes());
             let cmd = parser.next_cmd()?;
