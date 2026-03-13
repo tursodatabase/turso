@@ -4076,7 +4076,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     fn logical_log_header_crc_valid(&self, pager: &Arc<Pager>) -> Result<bool> {
         let file = self.get_logical_log_file();
-        let mut reader = StreamingLogicalLogReader::new(file);
+        let mut reader = StreamingLogicalLogReader::new(file, None);
         match reader.try_read_header(&pager.io)? {
             HeaderReadResult::Valid(_) => Ok(true),
             HeaderReadResult::NoLog | HeaderReadResult::Invalid => Ok(false),
@@ -4102,7 +4102,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         let wal_max_frame = wal.get_max_frame_in_wal();
         let file = self.get_logical_log_file();
-        let mut reader = StreamingLogicalLogReader::new(file);
+        let mut reader = StreamingLogicalLogReader::new(file, None);
         let header_result = reader.try_read_header(&pager.io)?;
 
         let is_readonly = connection.db.is_readonly();
@@ -4205,7 +4205,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn maybe_recover_logical_log(&self, connection: Arc<Connection>) -> Result<bool> {
         let pager = connection.pager.load().clone();
         let file = self.get_logical_log_file();
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         let preserved_table_valued_functions =
             Self::capture_table_valued_functions(&connection.schema.read());
 

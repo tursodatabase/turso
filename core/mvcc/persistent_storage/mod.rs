@@ -1,4 +1,5 @@
 use crate::io::FileSyncType;
+use crate::storage::encryption::EncryptionContext;
 use crate::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use crate::sync::Arc;
 use crate::sync::RwLock;
@@ -66,9 +67,13 @@ pub struct Storage {
 }
 
 impl Storage {
-    pub fn new(file: Arc<dyn File>, io: Arc<dyn crate::IO>) -> Self {
+    pub fn new(
+        file: Arc<dyn File>,
+        io: Arc<dyn crate::IO>,
+        encryption_ctx: Option<EncryptionContext>,
+    ) -> Self {
         Self {
-            logical_log: RwLock::new(LogicalLog::new(file, io)),
+            logical_log: RwLock::new(LogicalLog::new(file, io, encryption_ctx)),
             log_offset: AtomicU64::new(0),
             checkpoint_threshold: AtomicI64::new(DEFAULT_LOG_CHECKPOINT_THRESHOLD),
         }

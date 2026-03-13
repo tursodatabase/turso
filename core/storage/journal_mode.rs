@@ -67,6 +67,7 @@ pub fn open_mv_store(
     db_path: impl AsRef<std::path::Path>,
     flags: OpenFlags,
     durable_storage: Option<Arc<dyn mvcc::persistent_storage::DurableStorage>>,
+    encryption_ctx: Option<crate::storage::encryption::EncryptionContext>,
 ) -> Result<Arc<MvStore>> {
     let storage: Arc<dyn mvcc::persistent_storage::DurableStorage> =
         if let Some(storage) = durable_storage {
@@ -79,7 +80,11 @@ pub fn open_mv_store(
                 .to_str()
                 .expect("path should be valid string");
             let file = io.open_file(string_path, flags, false)?;
-            Arc::new(mvcc::persistent_storage::Storage::new(file, io))
+            Arc::new(mvcc::persistent_storage::Storage::new(
+                file,
+                io,
+                encryption_ctx,
+            ))
         };
 
     let mv_store = MvStore::new(mvcc::MvccClock::new(), storage);
