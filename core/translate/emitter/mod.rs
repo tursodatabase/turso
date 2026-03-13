@@ -158,6 +158,20 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    pub fn fork_with_expr_cache(&self) -> Resolver<'a> {
+        Resolver {
+            schema: self.schema,
+            database_schemas: self.database_schemas,
+            attached_databases: self.attached_databases,
+            symbol_table: self.symbol_table,
+            expr_to_reg_cache_enabled: self.expr_to_reg_cache_enabled,
+            expr_to_reg_cache: self.expr_to_reg_cache.clone(),
+            register_affinities: self.register_affinities.clone(),
+            enable_custom_types: self.enable_custom_types,
+            trigger_context: self.trigger_context.clone(),
+        }
+    }
+
     pub fn require_custom_types(&self, feature: &str) -> crate::Result<()> {
         if !self.enable_custom_types {
             crate::bail_parse_error!("{} require --experimental-custom-types flag", feature);

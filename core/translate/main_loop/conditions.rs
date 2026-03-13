@@ -1,4 +1,5 @@
 use super::*;
+use crate::translate::subquery::emit_non_from_clause_subqueries_for_eval_at;
 
 fn condition_references_subquery(expr: &Expr, subqueries: &[NonFromClauseSubquery]) -> bool {
     subqueries
@@ -28,28 +29,19 @@ fn emit_correlated_subqueries(
     subqueries: &mut [NonFromClauseSubquery],
     on_only: bool,
 ) -> Result<()> {
-    for subquery in subqueries.iter_mut().filter(|s| !s.has_been_evaluated()) {
-        if !subquery.correlated {
-            continue;
-        }
-        if on_only && !subquery_referenced_in_predicates(predicates, true, subquery.internal_id) {
-            continue;
-        }
-        let eval_at = subquery.get_eval_at(join_order, Some(table_references))?;
-        if eval_at != EvalAt::Loop(join_index) {
-            continue;
-        }
-
-        let plan = subquery.consume_plan(eval_at);
-        emit_non_from_clause_subquery(
-            program,
-            resolver,
-            *plan,
-            &subquery.query_type,
-            subquery.correlated,
-        )?;
-    }
-    Ok(())
+    emit_non_from_clause_subqueries_for_eval_at(
+        program,
+        resolver,
+        subqueries,
+        join_order,
+        Some(table_references),
+        EvalAt::Loop(join_index),
+        |subquery| {
+            subquery.correlated
+                && (!on_only
+                    || subquery_referenced_in_predicates(predicates, true, subquery.internal_id))
+        },
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

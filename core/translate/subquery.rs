@@ -9,15 +9,18 @@ use crate::{
     translate::{
         collate::get_collseq_from_expr,
         compound_select::emit_program_for_compound_select,
-        emitter::select::{emit_program_for_select, emit_query},
+        emitter::select::{
+            emit_program_for_select, emit_program_for_select_with_resolver, emit_query,
+        },
         expr::{
             compare_affinity, get_expr_affinity_info, unwrap_parens, walk_expr_mut, WalkControl,
         },
         optimizer::optimize_select_plan,
         plan::{
-            plan_has_outer_scope_dependency, plan_is_correlated, ColumnUsedMask, JoinOrderMember,
-            NonFromClauseSubquery, OuterQueryReference, Plan, SetOperation, SubqueryPosition,
-            SubqueryState, TableReferences, WhereTerm,
+            plan_has_outer_scope_dependency, plan_is_correlated, ColumnUsedMask, EvalAt,
+            JoinOrderMember, NonFromClauseSubquery, OuterQueryReference, Plan, SetOperation,
+            SubqueryEvalPhase, SubqueryOrigin, SubqueryPosition, SubqueryState, TableReferences,
+            WhereTerm,
         },
         select::prepare_select_plan,
     },
@@ -151,6 +154,8 @@ pub fn plan_subqueries_from_select_plan(
         plan.where_clause.iter_mut().map(|t| &mut t.expr),
         connection,
         SubqueryPosition::Where,
+        SubqueryOrigin::SelectWhere,
+        SubqueryPosition::Where.allow_correlated(),
     )?;
 
     // GROUP BY
@@ -163,6 +168,8 @@ pub fn plan_subqueries_from_select_plan(
             group_by.exprs.iter_mut(),
             connection,
             SubqueryPosition::GroupBy,
+            SubqueryOrigin::SelectGroupBy,
+            SubqueryPosition::GroupBy.allow_correlated(),
         )?;
         if let Some(having) = group_by.having.as_mut() {
             plan_subqueries_with_outer_query_access(
@@ -173,6 +180,8 @@ pub fn plan_subqueries_from_select_plan(
                 having.iter_mut(),
                 connection,
                 SubqueryPosition::Having,
+                SubqueryOrigin::SelectHaving,
+                !group_by.exprs.is_empty(),
             )?;
         }
     }
@@ -186,6 +195,8 @@ pub fn plan_subqueries_from_select_plan(
         plan.result_columns.iter_mut().map(|c| &mut c.expr),
         connection,
         SubqueryPosition::ResultColumn,
+        SubqueryOrigin::SelectList,
+        SubqueryPosition::ResultColumn.allow_correlated(),
     )?;
 
     // ORDER BY
@@ -197,6 +208,8 @@ pub fn plan_subqueries_from_select_plan(
         plan.order_by.iter_mut().map(|(expr, _)| &mut **expr),
         connection,
         SubqueryPosition::OrderBy,
+        SubqueryOrigin::SelectOrderBy,
+        SubqueryPosition::OrderBy.allow_correlated(),
     )?;
 
     // LIMIT and OFFSET cannot reference columns from the outer query
@@ -210,6 +223,8 @@ pub fn plan_subqueries_from_select_plan(
             connection,
             get_outer_query_refs,
             SubqueryPosition::LimitOffset,
+            SubqueryOrigin::SelectLimitOffset,
+            false,
         );
         // Limit
         if let Some(limit) = &mut plan.limit {
@@ -233,6 +248,7 @@ pub fn plan_subqueries_from_select_plan(
         recollect_aggregates(plan, resolver)?;
     }
 
+    assign_select_subquery_eval_phases(plan);
     mark_shared_cte_materialization_requirements(program, plan);
 
     update_column_used_masks(
@@ -262,6 +278,8 @@ pub fn plan_subqueries_from_where_clause(
         where_clause.iter_mut().map(|t| &mut t.expr),
         connection,
         SubqueryPosition::Where,
+        SubqueryOrigin::DmlWhere,
+        SubqueryPosition::Where.allow_correlated(),
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries);
@@ -288,6 +306,8 @@ pub fn plan_subqueries_from_values(
         values.iter_mut().flatten().map(|e| e.as_mut()),
         connection,
         SubqueryPosition::ResultColumn, // VALUES are similar to result columns in terms of subquery handling
+        SubqueryOrigin::SelectList,
+        SubqueryPosition::ResultColumn.allow_correlated(),
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries);
@@ -313,6 +333,8 @@ pub fn plan_subqueries_from_set_clauses(
         set_clauses.iter_mut().map(|(_, expr)| expr.as_mut()),
         connection,
         SubqueryPosition::ResultColumn, // SET clause subqueries are similar to result columns
+        SubqueryOrigin::DmlSet,
+        SubqueryPosition::ResultColumn.allow_correlated(),
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries);
@@ -336,8 +358,6 @@ pub fn plan_subqueries_from_returning(
         ast::ResultColumn::Star | ast::ResultColumn::TableStar(_) => None,
     });
 
-    let count_before = non_from_clause_subqueries.len();
-
     plan_subqueries_with_outer_query_access(
         program,
         non_from_clause_subqueries,
@@ -346,13 +366,9 @@ pub fn plan_subqueries_from_returning(
         exprs,
         connection,
         SubqueryPosition::ResultColumn,
+        SubqueryOrigin::DmlReturning,
+        SubqueryPosition::ResultColumn.allow_correlated(),
     )?;
-
-    // Mark newly added subqueries as RETURNING so the UPDATE emitter can
-    // defer their evaluation until after the Insert instruction.
-    for subquery in &mut non_from_clause_subqueries[count_before..] {
-        subquery.is_returning = true;
-    }
 
     update_column_used_masks(table_references, non_from_clause_subqueries);
     Ok(())
@@ -377,10 +393,13 @@ pub fn plan_subqueries_from_trigger_when_clause(
         std::iter::once(expr),
         connection,
         SubqueryPosition::Where,
+        SubqueryOrigin::TriggerWhen,
+        false,
     )
 }
 
 /// Compute query plans for subqueries in the WHERE clause and HAVING clause (both of which have access to the outer query scope)
+#[allow(clippy::too_many_arguments)]
 fn plan_subqueries_with_outer_query_access<'a>(
     program: &mut ProgramBuilder,
     out_subqueries: &mut Vec<NonFromClauseSubquery>,
@@ -389,6 +408,8 @@ fn plan_subqueries_with_outer_query_access<'a>(
     exprs: impl Iterator<Item = &'a mut ast::Expr>,
     connection: &Arc<Connection>,
     position: SubqueryPosition,
+    origin: SubqueryOrigin,
+    allow_correlated: bool,
 ) -> Result<()> {
     // Most subqueries can reference columns from the outer query,
     // including nested cases where a subquery inside a subquery references columns from its parent's parent
@@ -442,6 +463,8 @@ fn plan_subqueries_with_outer_query_access<'a>(
         connection,
         get_outer_query_refs,
         position,
+        origin,
+        allow_correlated,
     );
     for expr in exprs {
         walk_expr_mut(expr, &mut subquery_parser)?;
@@ -450,7 +473,8 @@ fn plan_subqueries_with_outer_query_access<'a>(
     Ok(())
 }
 
-/// Create a closure that will walk the AST and replace subqueries with [ast::Expr::SubqueryResult] expressions.
+/// Create a closure that will walk the AST and replace subqueries with [ast::Expr::SubqueryResult] expressions.]
+#[allow(clippy::too_many_arguments)]
 fn get_subquery_parser<'a>(
     program: &'a mut ProgramBuilder,
     out_subqueries: &'a mut Vec<NonFromClauseSubquery>,
@@ -459,16 +483,19 @@ fn get_subquery_parser<'a>(
     connection: &'a Arc<Connection>,
     get_outer_query_refs: fn(&TableReferences) -> Vec<OuterQueryReference>,
     position: SubqueryPosition,
+    origin: SubqueryOrigin,
+    allow_correlated: bool,
 ) -> impl FnMut(&mut ast::Expr) -> Result<WalkControl> + 'a {
-    fn handle_unsupported_correlation(correlated: bool, position: SubqueryPosition) -> Result<()> {
-        if correlated && !position.allow_correlated() {
-            crate::bail_parse_error!(
-                "correlated subqueries in {} clause are not supported yet",
-                position.name()
-            );
-        }
-        Ok(())
-    }
+    let handle_unsupported_correlation =
+        |correlated: bool, position: SubqueryPosition, allow_correlated: bool| -> Result<()> {
+            if correlated && !allow_correlated {
+                crate::bail_parse_error!(
+                    "correlated subqueries in {} clause are not supported yet",
+                    position.name()
+                );
+            }
+            Ok(())
+        };
 
     move |expr: &mut ast::Expr| -> Result<WalkControl> {
         match expr {
@@ -503,7 +530,7 @@ fn get_subquery_parser<'a>(
                 };
                 optimize_select_plan(&mut plan, resolver.schema())?;
                 let correlated = plan.is_correlated();
-                handle_unsupported_correlation(correlated, position)?;
+                handle_unsupported_correlation(correlated, position, allow_correlated)?;
                 out_subqueries.push(NonFromClauseSubquery {
                     internal_id: subquery_id,
                     query_type: subquery_type,
@@ -511,7 +538,8 @@ fn get_subquery_parser<'a>(
                         plan: Some(Box::new(plan)),
                     },
                     correlated,
-                    is_returning: false,
+                    origin,
+                    eval_phase: origin.phase_floor(),
                 });
                 Ok(WalkControl::Continue)
             }
@@ -589,7 +617,7 @@ fn get_subquery_parser<'a>(
                 *num_regs = reg_count;
 
                 let correlated = plan.is_correlated();
-                handle_unsupported_correlation(correlated, position)?;
+                handle_unsupported_correlation(correlated, position, allow_correlated)?;
 
                 out_subqueries.push(NonFromClauseSubquery {
                     internal_id: *subquery_id,
@@ -601,7 +629,8 @@ fn get_subquery_parser<'a>(
                         plan: Some(Box::new(plan)),
                     },
                     correlated,
-                    is_returning: false,
+                    origin,
+                    eval_phase: origin.phase_floor(),
                 });
                 Ok(WalkControl::Continue)
             }
@@ -717,7 +746,7 @@ fn get_subquery_parser<'a>(
                 };
 
                 let correlated = plan.is_correlated();
-                handle_unsupported_correlation(correlated, position)?;
+                handle_unsupported_correlation(correlated, position, allow_correlated)?;
 
                 out_subqueries.push(NonFromClauseSubquery {
                     internal_id: subquery_id,
@@ -729,7 +758,8 @@ fn get_subquery_parser<'a>(
                         plan: Some(Box::new(plan)),
                     },
                     correlated,
-                    is_returning: false,
+                    origin,
+                    eval_phase: origin.phase_floor(),
                 });
                 Ok(WalkControl::Continue)
             }
@@ -1562,6 +1592,7 @@ pub fn emit_non_from_clause_subquery(
     plan: SelectPlan,
     query_type: &SubqueryType,
     is_correlated: bool,
+    preserve_outer_expr_cache: bool,
 ) -> Result<()> {
     program.nested(|program| {
         let subquery_id = program.next_subquery_eqp_id();
@@ -1608,7 +1639,15 @@ pub fn emit_non_from_clause_subquery(
                     value: 0,
                     dest: *result_reg,
                 });
-                emit_program_for_select(program, resolver, plan)?;
+                if preserve_outer_expr_cache {
+                    emit_program_for_select_with_resolver(
+                        program,
+                        resolver.fork_with_expr_cache(),
+                        plan,
+                    )?;
+                } else {
+                    emit_program_for_select(program, resolver, plan)?;
+                }
                 program.emit_insn(Insn::Return {
                     return_reg: subroutine_reg,
                     can_fallthrough: true,
@@ -1619,7 +1658,15 @@ pub fn emit_non_from_clause_subquery(
                     cursor_id: *cursor_id,
                     is_table: false,
                 });
-                emit_program_for_select(program, resolver, plan)?;
+                if preserve_outer_expr_cache {
+                    emit_program_for_select_with_resolver(
+                        program,
+                        resolver.fork_with_expr_cache(),
+                        plan,
+                    )?;
+                } else {
+                    emit_program_for_select(program, resolver, plan)?;
+                }
             }
             SubqueryType::RowValue {
                 result_reg_start,
@@ -1636,7 +1683,15 @@ pub fn emit_non_from_clause_subquery(
                         dest_end: None,
                     });
                 }
-                emit_program_for_select(program, resolver, plan)?;
+                if preserve_outer_expr_cache {
+                    emit_program_for_select_with_resolver(
+                        program,
+                        resolver.fork_with_expr_cache(),
+                        plan,
+                    )?;
+                } else {
+                    emit_program_for_select(program, resolver, plan)?;
+                }
                 program.emit_insn(Insn::Return {
                     return_reg: subroutine_reg,
                     can_fallthrough: true,
@@ -1652,4 +1707,98 @@ pub fn emit_non_from_clause_subquery(
         }
         Ok(())
     })
+}
+
+pub fn emit_non_from_clause_subqueries_for_phase(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    subqueries: &mut [NonFromClauseSubquery],
+    join_order: &[JoinOrderMember],
+    table_references: Option<&TableReferences>,
+    phase: SubqueryEvalPhase,
+    mut should_emit: impl FnMut(&NonFromClauseSubquery) -> bool,
+) -> Result<()> {
+    for subquery in subqueries.iter_mut() {
+        if subquery.has_been_evaluated() || !should_emit(subquery) {
+            continue;
+        }
+
+        let evaluated_at = match phase {
+            SubqueryEvalPhase::BeforeLoop | SubqueryEvalPhase::Loop(_) => {
+                if !matches!(subquery.eval_phase, SubqueryEvalPhase::BeforeLoop) {
+                    continue;
+                }
+                let expected_eval_at = match phase {
+                    SubqueryEvalPhase::BeforeLoop => EvalAt::BeforeLoop,
+                    SubqueryEvalPhase::Loop(loop_idx) => EvalAt::Loop(loop_idx),
+                    _ => unreachable!(),
+                };
+                let evaluated_at = subquery.get_eval_at(join_order, table_references)?;
+                if evaluated_at != expected_eval_at {
+                    continue;
+                }
+                evaluated_at
+            }
+            _ => {
+                if subquery.eval_phase != phase {
+                    continue;
+                }
+                subquery.get_eval_at(join_order, table_references)?
+            }
+        };
+
+        let subquery_plan = subquery.consume_plan(evaluated_at);
+        emit_non_from_clause_subquery(
+            program,
+            resolver,
+            *subquery_plan,
+            &subquery.query_type,
+            subquery.correlated,
+            !matches!(
+                phase,
+                SubqueryEvalPhase::BeforeLoop | SubqueryEvalPhase::Loop(_)
+            ),
+        )?;
+    }
+
+    Ok(())
+}
+
+pub fn emit_non_from_clause_subqueries_for_eval_at(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    subqueries: &mut [NonFromClauseSubquery],
+    join_order: &[JoinOrderMember],
+    table_references: Option<&TableReferences>,
+    eval_at: EvalAt,
+    should_emit: impl FnMut(&NonFromClauseSubquery) -> bool,
+) -> Result<()> {
+    emit_non_from_clause_subqueries_for_phase(
+        program,
+        resolver,
+        subqueries,
+        join_order,
+        table_references,
+        match eval_at {
+            EvalAt::BeforeLoop => SubqueryEvalPhase::BeforeLoop,
+            EvalAt::Loop(loop_idx) => SubqueryEvalPhase::Loop(loop_idx),
+        },
+        should_emit,
+    )
+}
+
+fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
+    let has_grouped_output = plan
+        .group_by
+        .as_ref()
+        .is_some_and(|group_by| !group_by.exprs.is_empty());
+
+    for subquery in plan.non_from_clause_subqueries.iter_mut() {
+        subquery.eval_phase = match subquery.origin {
+            SubqueryOrigin::SelectHaving | SubqueryOrigin::SelectOrderBy if has_grouped_output => {
+                SubqueryEvalPhase::GroupedOutput
+            }
+            _ => subquery.origin.phase_floor(),
+        };
+    }
 }

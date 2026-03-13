@@ -343,7 +343,7 @@ fn emit_loop_source<'a>(
                 .iter()
                 .filter(|rc| rc.contains_aggregates)
             {
-                walk_expr(&rc.expr, &mut |expr: &'a Expr| -> Result<WalkControl> {
+                walk_expr(&rc.expr, &mut |expr: &Expr| -> Result<WalkControl> {
                     match expr {
                         Expr::Column { .. } | Expr::RowId { .. } => {
                             let reg = program.alloc_register();
@@ -355,7 +355,7 @@ fn emit_loop_source<'a>(
                                 &t_ctx.resolver,
                             )?;
                             t_ctx.resolver.expr_to_reg_cache.push((
-                                Cow::Borrowed(expr),
+                                Cow::Owned(expr.clone()),
                                 reg,
                                 false,
                             ));

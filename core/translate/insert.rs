@@ -13,9 +13,9 @@ use crate::{
         },
         expr::{
             bind_and_rewrite_expr, emit_returning_results, emit_returning_scan_back,
-            process_returning_clause, rewrite_between_expr, translate_expr,
-            translate_expr_no_constant_opt, walk_expr_mut, BindingBehavior, NoConstantOptReason,
-            ReturningBufferCtx, WalkControl,
+            process_returning_clause, restore_returning_row_image_in_cache, rewrite_between_expr,
+            seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
+            walk_expr_mut, BindingBehavior, NoConstantOptReason, ReturningBufferCtx, WalkControl,
         },
         fkeys::{
             build_index_affinity_string, emit_fk_restrict_halt, emit_fk_violation,
@@ -28,7 +28,10 @@ use crate::{
         },
         planner::{plan_ctes_as_outer_refs, ROWID_STRS},
         select::translate_select,
-        subquery::{emit_non_from_clause_subquery, plan_subqueries_from_returning},
+        subquery::{
+            emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery,
+            plan_subqueries_from_returning,
+        },
         trigger_exec::{
             fire_trigger, get_relevant_triggers_type_and_time, has_relevant_triggers_type_only,
             TriggerContext,
@@ -431,24 +434,15 @@ pub fn translate_insert(
     )?;
 
     // Emit subqueries for RETURNING clause (uncorrelated subqueries are evaluated once)
-    for subquery in returning_subqueries
-        .iter_mut()
-        .filter(|s| !s.has_been_evaluated())
-    {
-        let eval_at = subquery.get_eval_at(&[], Some(&table_references))?;
-        if eval_at != EvalAt::BeforeLoop {
-            continue;
-        }
-        let subquery_plan = subquery.consume_plan(EvalAt::BeforeLoop);
-
-        emit_non_from_clause_subquery(
-            program,
-            resolver,
-            *subquery_plan,
-            &subquery.query_type,
-            subquery.correlated,
-        )?;
-    }
+    emit_non_from_clause_subqueries_for_eval_at(
+        program,
+        resolver,
+        &mut returning_subqueries,
+        &[],
+        Some(&table_references),
+        EvalAt::BeforeLoop,
+        |_| true,
+    )?;
 
     let has_user_provided_rowid = insertion.key.is_provided_by_user();
 
@@ -982,6 +976,41 @@ pub fn translate_insert(
             None,
             table_name.as_str(),
         )?;
+    }
+
+    if !returning_subqueries.is_empty() {
+        let target_table = table_references
+            .joined_tables()
+            .first()
+            .expect("INSERT RETURNING target table must exist");
+        let cache_state = seed_returning_row_image_in_cache(
+            program,
+            &table_references,
+            insertion.first_col_register(),
+            insertion.key_register(),
+            resolver,
+        )?;
+        let result: Result<()> = (|| {
+            for subquery in returning_subqueries
+                .iter_mut()
+                .filter(|s| !s.has_been_evaluated())
+            {
+                let rerun_for_target_scan =
+                    subquery.reads_table(target_table.database_id, target_table.table.get_name());
+                let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
+                emit_non_from_clause_subquery(
+                    program,
+                    resolver,
+                    *subquery_plan,
+                    &subquery.query_type,
+                    subquery.correlated || rerun_for_target_scan,
+                    true,
+                )?;
+            }
+            Ok(())
+        })();
+        restore_returning_row_image_in_cache(resolver, cache_state);
+        result?;
     }
 
     // Emit RETURNING results if specified

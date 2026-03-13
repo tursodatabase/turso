@@ -2,7 +2,7 @@ use super::*;
 use crate::translate::main_loop::{conditions::LoopConditionEmitter, hash::HashProbeSetupEmitter};
 use crate::translate::{
     main_loop::close::AutoIndexBuild,
-    plan,
+    plan::{self, SubqueryEvalPhase},
     subquery::{materialized_from_clause_subquery_storage, MaterializedFromClauseSubqueryStorage},
 };
 
@@ -675,12 +675,17 @@ impl OpenLoop {
             }
         }
 
-        if subqueries.iter().any(|s| !s.has_been_evaluated()) {
+        if subqueries.iter().any(|s| {
+            !s.has_been_evaluated() && matches!(s.eval_phase, SubqueryEvalPhase::BeforeLoop)
+        }) {
             crate::bail_parse_error!(
-                "all subqueries should have already been emitted, but found {} unevaluated subqueries",
+                "all before-loop subqueries should have already been emitted, but found {} unevaluated subqueries",
                 subqueries
                     .iter()
-                    .filter(|s| !s.has_been_evaluated())
+                    .filter(|s| {
+                        !s.has_been_evaluated()
+                            && matches!(s.eval_phase, SubqueryEvalPhase::BeforeLoop)
+                    })
                     .count()
             );
         }

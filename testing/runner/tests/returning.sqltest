@@ -827,6 +827,83 @@ expect {
     5|e
 }
 
+@cross-check-integrity
+test update-returning-target-selfread-reruns-per-row {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    UPDATE t
+    SET val = val + 1
+    WHERE id < 3
+    RETURNING id, (SELECT count(*) FROM t WHERE val >= 21);
+}
+expect {
+    1|1
+    2|2
+}
+
+@cross-check-integrity
+test update-returning-target-selfread-correlated-updated-group {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, grp INTEGER);
+    INSERT INTO t VALUES (1, 1), (2, 1), (3, 2);
+    UPDATE t
+    SET grp = grp + 10
+    WHERE id IN (1, 2)
+    RETURNING id, grp, (SELECT count(*) FROM t t2 WHERE t2.grp = t.grp);
+}
+expect {
+    1|11|1
+    2|11|2
+}
+
+@skip-if sqlite "Turso intentionally exposes same-row AFTER UPDATE trigger writes through UPDATE RETURNING"
+test update-returning-after-trigger-same-row-direct {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER);
+    INSERT INTO t VALUES (1, 10);
+    CREATE TRIGGER tr AFTER UPDATE ON t
+    BEGIN
+        UPDATE t SET val = val + 100 WHERE id = NEW.id;
+    END;
+    UPDATE t SET val = 20 WHERE id = 1 RETURNING val;
+    SELECT val FROM t;
+}
+expect {
+    120
+    120
+}
+
+@skip-if sqlite "Turso intentionally exposes same-row AFTER UPDATE trigger writes through UPDATE RETURNING"
+test update-returning-after-trigger-same-row-subquery {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER);
+    INSERT INTO t VALUES (1, 10);
+    CREATE TRIGGER tr AFTER UPDATE ON t
+    BEGIN
+        UPDATE t SET val = val + 100 WHERE id = NEW.id;
+    END;
+    UPDATE t SET val = 20 WHERE id = 1
+    RETURNING val, (SELECT val FROM t t2 WHERE t2.id = t.id);
+    SELECT val FROM t;
+}
+expect {
+    120|120
+    120
+}
+
+# INSERT RETURNING still exposes the inserted row image before AFTER INSERT triggers.
+@cross-check-integrity
+test insert-returning-before-after-trigger-same-row-direct {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TRIGGER tr AFTER INSERT ON t
+    BEGIN
+        UPDATE t SET val = val + 100 WHERE id = NEW.id;
+    END;
+    INSERT INTO t VALUES (1, 20) RETURNING val;
+    SELECT val FROM t;
+}
+expect {
+    20
+    120
+}
+
 # ============================================================================
 # DELETE RETURNING tests
 # ============================================================================
@@ -870,6 +947,25 @@ test delete-returning-table-qualified {
 }
 expect {
     1|test
+}
+
+@cross-check-integrity
+test delete-alias-correlated-subquery-returning {
+    CREATE TABLE t (id INTEGER, grp INTEGER, value INTEGER);
+    INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 5);
+    DELETE FROM t AS d
+    WHERE EXISTS (
+        SELECT 1
+        FROM t AS d2
+        WHERE d2.grp = d.grp AND d2.value < d.value
+    )
+    RETURNING id, grp, value;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    2|1|20
+    1|1|10
+    3|2|5
 }
 
 # Arbitrary expressions not referencing columns
@@ -1126,6 +1222,32 @@ expect {
     2|b
     4|d
     5|e
+}
+
+@cross-check-integrity
+test delete-returning-target-selfread-reruns-per-row {
+    CREATE TABLE t (id INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (1), (2), (3);
+    DELETE FROM t
+    WHERE id < 3
+    RETURNING id, (SELECT count(*) FROM t);
+}
+expect {
+    1|2
+    2|1
+}
+
+@cross-check-integrity
+test delete-returning-target-selfread-correlated-group-count {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, grp INTEGER);
+    INSERT INTO t VALUES (1, 1), (2, 1), (3, 2);
+    DELETE FROM t
+    WHERE id IN (1, 2)
+    RETURNING id, (SELECT count(*) FROM t t2 WHERE t2.grp = t.grp);
+}
+expect {
+    1|1
+    2|0
 }
 
 # Complex WHERE clauses with BETWEEN
@@ -2281,4 +2403,28 @@ test insert-returning-single-column-subquery {
 }
 expect {
     42
+}
+
+@cross-check-integrity
+test insert-returning-target-selfread-reruns-per-row {
+    CREATE TABLE t (id INTEGER);
+    INSERT INTO t VALUES (1);
+    INSERT INTO t VALUES (2), (3)
+    RETURNING id, (SELECT count(*) FROM t);
+}
+expect {
+    2|2
+    3|3
+}
+
+@cross-check-integrity
+test insert-returning-target-selfread-correlated-group-count {
+    CREATE TABLE t (id INTEGER, grp INTEGER);
+    INSERT INTO t VALUES (1, 10), (2, 10);
+    INSERT INTO t VALUES (3, 10), (4, 20)
+    RETURNING id, grp, (SELECT count(*) FROM t t2 WHERE t2.grp = t.grp);
+}
+expect {
+    3|10|3
+    4|20|1
 }

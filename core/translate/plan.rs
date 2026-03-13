@@ -245,6 +245,52 @@ impl Ord for EvalAt {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubqueryEvalPhase {
+    BeforeLoop,
+    Loop(usize),
+    GroupedOutput,
+    UngroupedAggregateOutput,
+    WindowOutput,
+    PreWrite,
+    PostWriteReturning,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubqueryOrigin {
+    SelectList,
+    SelectWhere,
+    SelectGroupBy,
+    SelectHaving,
+    SelectOrderBy,
+    SelectLimitOffset,
+    DmlWhere,
+    DmlSet,
+    DmlReturning,
+    TriggerWhen,
+}
+
+impl SubqueryOrigin {
+    pub fn phase_floor(self) -> SubqueryEvalPhase {
+        match self {
+            SubqueryOrigin::SelectList
+            | SubqueryOrigin::SelectWhere
+            | SubqueryOrigin::SelectGroupBy
+            | SubqueryOrigin::SelectHaving
+            | SubqueryOrigin::SelectOrderBy
+            | SubqueryOrigin::SelectLimitOffset
+            | SubqueryOrigin::TriggerWhen => SubqueryEvalPhase::BeforeLoop,
+            SubqueryOrigin::DmlWhere => SubqueryEvalPhase::BeforeLoop,
+            SubqueryOrigin::DmlSet => SubqueryEvalPhase::PreWrite,
+            SubqueryOrigin::DmlReturning => SubqueryEvalPhase::PostWriteReturning,
+        }
+    }
+
+    pub fn is_post_write_returning(self) -> bool {
+        matches!(self, SubqueryOrigin::DmlReturning)
+    }
+}
+
 /// A query plan is either a SELECT or a DELETE (for now)
 #[derive(Debug, Clone)]
 pub enum Plan {
@@ -316,6 +362,22 @@ impl Plan {
             Plan::Select(select_plan) => Some(&select_plan.table_references),
             Plan::CompoundSelect { right_most, .. } => Some(&right_most.table_references),
             Plan::Delete(_) | Plan::Update(_) => None,
+        }
+    }
+
+    /// Returns true if this plan or any of its subplans read from the given table.
+    /// (Not for Delete/Update plans)
+    fn reads_table(&self, database_id: usize, table_name: &str) -> bool {
+        match self {
+            Plan::Select(select_plan) => select_plan.reads_table(database_id, table_name),
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => {
+                left.iter()
+                    .any(|(select_plan, _)| select_plan.reads_table(database_id, table_name))
+                    || right_most.reads_table(database_id, table_name)
+            }
+            Plan::Delete(_) | Plan::Update(_) => false,
         }
     }
 }
@@ -559,6 +621,21 @@ impl SelectPlan {
                     Table::FromClauseSubquery(subquery) => plan_is_correlated(&subquery.plan),
                     _ => false,
                 })
+    }
+
+    fn reads_table(&self, database_id: usize, table_name: &str) -> bool {
+        self.table_references.joined_tables().iter().any(|table| {
+            table.matches(database_id, table_name)
+                || match &table.table {
+                    Table::FromClauseSubquery(subquery) => {
+                        subquery.plan.reads_table(database_id, table_name)
+                    }
+                    Table::BTree(_) | Table::Virtual(_) => false,
+                }
+        }) || self
+            .non_from_clause_subqueries
+            .iter()
+            .any(|subquery| subquery.reads_table(database_id, table_name))
     }
 }
 
@@ -1559,6 +1636,12 @@ impl JoinedTable {
         }
     }
 
+    fn matches(&self, database_id: usize, table_name: &str) -> bool {
+        self.database_id == database_id
+            && matches!(self.table, Table::BTree(_) | Table::Virtual(_))
+            && self.table.get_name().eq_ignore_ascii_case(table_name)
+    }
+
     /// Creates a new TableReference for a subquery from a SelectPlan.
     pub fn new_subquery(
         identifier: String,
@@ -2382,13 +2465,13 @@ pub enum SubqueryPosition {
 
 impl SubqueryPosition {
     /// Returns true if a subquery in this position of the SELECT can be correlated, i.e. if it can reference columns from the outer query.
-    /// FIXME: HAVING and ORDER BY should allow correlated subqueries, but our translation system currently does not support this well.
-    /// Subqueries in these positions should be evaluated after the main loop, AND they should also have access to aggregations computed
-    /// in the main query.
     pub fn allow_correlated(&self) -> bool {
         matches!(
             self,
-            SubqueryPosition::ResultColumn | SubqueryPosition::Where | SubqueryPosition::GroupBy
+            SubqueryPosition::ResultColumn
+                | SubqueryPosition::Where
+                | SubqueryPosition::GroupBy
+                | SubqueryPosition::OrderBy
         )
     }
 
@@ -2413,16 +2496,28 @@ pub struct NonFromClauseSubquery {
     pub query_type: SubqueryType,
     pub state: SubqueryState,
     pub correlated: bool,
-    /// Whether this subquery originates from a RETURNING clause.
-    /// RETURNING subqueries must be evaluated after the Insert instruction
-    /// so that correlated column references read post-UPDATE values.
-    pub is_returning: bool,
+    pub origin: SubqueryOrigin,
+    pub eval_phase: SubqueryEvalPhase,
 }
 
 impl NonFromClauseSubquery {
     /// Returns true if the subquery has been evaluated (translated into bytecode).
     pub fn has_been_evaluated(&self) -> bool {
         matches!(self.state, SubqueryState::Evaluated { .. })
+    }
+
+    pub fn is_post_write_returning(&self) -> bool {
+        self.origin.is_post_write_returning()
+            && matches!(self.eval_phase, SubqueryEvalPhase::PostWriteReturning)
+    }
+
+    pub fn reads_table(&self, database_id: usize, table_name: &str) -> bool {
+        match &self.state {
+            SubqueryState::Unevaluated { plan: Some(plan) } => {
+                plan.reads_table(database_id, table_name)
+            }
+            _ => false,
+        }
     }
 
     /// Returns the loop index where the subquery should be evaluated in this join order.
