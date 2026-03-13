@@ -315,6 +315,16 @@ pub struct BoundColumn {
     pub expr: ast::Expr,
 }
 
+/// A subquery expression that was bound during binding.
+/// The inner `ast::Select` is already bound (column refs resolved).
+/// The planner uses this to plan the subquery without re-binding.
+pub struct BoundSubquery {
+    /// The bound inner SELECT.
+    pub select: ast::Select,
+    /// Inner binding results (scopes → table references).
+    pub inner_bound: BoundSelect,
+}
+
 pub struct BoundSelect {
     pub result_columns: Vec<BoundColumn>,
     pub main_scope: BindScope,
@@ -322,6 +332,9 @@ pub struct BoundSelect {
     pub compound_scopes: Vec<BindScope>,
     pub compound_join_orders: Vec<Vec<JoinOrderMember>>,
     pub tracking: BindTracking,
+    /// Expression subqueries (EXISTS, scalar subquery, IN SELECT) keyed by
+    /// the `subquery_id` stored in the corresponding `Expr::SubqueryResult`.
+    pub subquery_bindings: HashMap<ast::TableInternalId, BoundSubquery>,
 }
 
 #[derive(Clone)]
@@ -470,6 +483,10 @@ pub struct BindContext<'a, G: IdGenerator> {
 
     /// Records column/rowid usage for post-binding flush.
     pub tracking: BindTracking,
+
+    /// Expression subqueries bound during this query, keyed by subquery_id.
+    /// Moved into `BoundSelect` when binding completes.
+    subquery_bindings: HashMap<ast::TableInternalId, BoundSubquery>,
 }
 
 impl<'a, G: IdGenerator> BindContext<'a, G> {
@@ -483,6 +500,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             aliases: Vec::new(),
             phase: BindPhase::NoAliases,
             tracking: BindTracking::default(),
+            subquery_bindings: HashMap::default(),
         }
     }
 
@@ -746,6 +764,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 compound_scopes,
                 compound_join_orders,
                 tracking: std::mem::take(&mut ctx.tracking),
+                subquery_bindings: std::mem::take(&mut ctx.subquery_bindings),
             })
         })
     }
@@ -1407,11 +1426,15 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         Ok(())
     }
 
-    fn bind_subquery_expr(&mut self, select: &mut ast::Select, scope: &BindScope) -> Result<()> {
+    fn bind_subquery_expr(
+        &mut self,
+        select: &mut ast::Select,
+        scope: &BindScope,
+    ) -> Result<BoundSelect> {
         self.append_outer_query_scope(Arc::new(scope.clone()), self.aliases.clone());
         let result = self.bind_select(select);
         self.pop_outer_query_scope();
-        result.map(|_| ())
+        result
     }
 
     /// Bind an expression, resolving column references against the given scope.
@@ -1448,12 +1471,85 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 | ast::Expr::DoublyQualified(_, _, _) => {
                     self.bind_identifier(expr, scope)?;
                 }
-                ast::Expr::Exists(select) | ast::Expr::Subquery(select) => {
-                    self.bind_subquery_expr(select, scope)?;
+                ast::Expr::Exists(_) => {
+                    let subquery_id = self.id_gen.next_table_id();
+                    let ast::Expr::Exists(mut select) =
+                        std::mem::replace(expr, ast::Expr::Literal(ast::Literal::Null))
+                    else {
+                        unreachable!();
+                    };
+                    let inner_bound = self.bind_subquery_expr(&mut select, scope)?;
+                    self.subquery_bindings.insert(
+                        subquery_id,
+                        BoundSubquery {
+                            select,
+                            inner_bound,
+                        },
+                    );
+                    *expr = ast::Expr::SubqueryResult {
+                        subquery_id,
+                        lhs: None,
+                        not_in: false,
+                        query_type: ast::SubqueryType::Exists { result_reg: 0 },
+                    };
                     return Ok(WalkControl::SkipChildren);
                 }
-                ast::Expr::InSelect { rhs, .. } => {
-                    self.bind_subquery_expr(rhs, scope)?;
+                ast::Expr::Subquery(_) => {
+                    let subquery_id = self.id_gen.next_table_id();
+                    let ast::Expr::Subquery(mut select) =
+                        std::mem::replace(expr, ast::Expr::Literal(ast::Literal::Null))
+                    else {
+                        unreachable!();
+                    };
+                    let inner_bound = self.bind_subquery_expr(&mut select, scope)?;
+                    self.subquery_bindings.insert(
+                        subquery_id,
+                        BoundSubquery {
+                            select,
+                            inner_bound,
+                        },
+                    );
+                    *expr = ast::Expr::SubqueryResult {
+                        subquery_id,
+                        lhs: None,
+                        not_in: false,
+                        query_type: ast::SubqueryType::RowValue {
+                            result_reg_start: 0,
+                            num_regs: 0,
+                        },
+                    };
+                    return Ok(WalkControl::SkipChildren);
+                }
+                ast::Expr::InSelect { .. } => {
+                    let subquery_id = self.id_gen.next_table_id();
+                    let ast::Expr::InSelect { lhs, not, rhs: mut select } =
+                        std::mem::replace(expr, ast::Expr::Literal(ast::Literal::Null))
+                    else {
+                        unreachable!();
+                    };
+                    // Bind lhs first against the current scope
+                    // (already handled by walker for non-subquery children,
+                    // but InSelect lhs needs explicit binding since we took ownership)
+                    let mut lhs = lhs;
+                    self.bind_expr(&mut lhs, scope)?;
+                    let inner_bound = self.bind_subquery_expr(&mut select, scope)?;
+                    self.subquery_bindings.insert(
+                        subquery_id,
+                        BoundSubquery {
+                            select,
+                            inner_bound,
+                        },
+                    );
+                    *expr = ast::Expr::SubqueryResult {
+                        subquery_id,
+                        lhs: Some(lhs),
+                        not_in: not,
+                        query_type: ast::SubqueryType::In {
+                            cursor_id: 0,
+                            affinity_str: Arc::new(String::new()),
+                        },
+                    };
+                    return Ok(WalkControl::SkipChildren);
                 }
                 ast::Expr::FunctionCallStar { name, filter_over } => {
                     if let Ok(func) = Func::resolve_function(name.as_str(), 0) {
@@ -1752,17 +1848,17 @@ mod tests {
         &select.order_by[idx].expr
     }
 
-    fn exists_subquery(select: &ast::Select) -> &ast::Select {
+    fn exists_subquery_id(select: &ast::Select) -> TableInternalId {
         match where_expr(select) {
-            ast::Expr::Exists(subquery) => subquery,
-            other => panic!("expected EXISTS subquery in WHERE, got {other:?}"),
+            ast::Expr::SubqueryResult { subquery_id, .. } => *subquery_id,
+            other => panic!("expected SubqueryResult in WHERE, got {other:?}"),
         }
     }
 
-    fn subquery_expr(expr: &ast::Expr) -> &ast::Select {
+    fn subquery_id_from_expr(expr: &ast::Expr) -> TableInternalId {
         match expr {
-            ast::Expr::Subquery(select) => select,
-            other => panic!("expected subquery expression, got {other:?}"),
+            ast::Expr::SubqueryResult { subquery_id, .. } => *subquery_id,
+            other => panic!("expected SubqueryResult expression, got {other:?}"),
         }
     }
 
@@ -2019,7 +2115,8 @@ mod tests {
                  )",
             );
             let bound = ctx.bind_select(&mut select).unwrap();
-            let subquery = exists_subquery(&select);
+            let sq_id = exists_subquery_id(&select);
+            let subquery = &bound.subquery_bindings[&sq_id].select;
 
             assert_eq!(
                 bound.tracking.columns_used,
@@ -2027,12 +2124,13 @@ mod tests {
             );
             assert!(bound.tracking.outer_refs_used.is_empty());
 
+            // t=0, subquery_id=1, u=2
             assert_eq!(
                 select_expr(subquery, 0),
                 &ast::Expr::Binary(
                     ast::Expr::Column {
                         database: None,
-                        table: TableInternalId::from(1usize),
+                        table: TableInternalId::from(2usize),
                         column: 1,
                         is_rowid_alias: false,
                     }
@@ -2045,7 +2143,7 @@ mod tests {
             let ast::Expr::Binary(lhs, ast::Operator::Equals, rhs) = where_expr(subquery) else {
                 panic!("expected bound inner WHERE binary expression");
             };
-            assert_column_expr(lhs, 1, 0);
+            assert_column_expr(lhs, 2, 0);
             assert_column_expr(rhs, 0, 0);
 
             assert_eq!(group_by_expr(subquery, 0), select_expr(subquery, 0));
@@ -2183,10 +2281,12 @@ mod tests {
         with_bind_context(&["CREATE TABLE t1(a, b)", "CREATE TABLE t3(a, x)"], |ctx| {
             let mut select =
                 parse_select("SELECT a FROM t1 WHERE EXISTS (SELECT x FROM t3 GROUP BY a)");
-            ctx.bind_select(&mut select).unwrap();
+            let bound = ctx.bind_select(&mut select).unwrap();
 
-            let subquery = exists_subquery(&select);
-            assert_column_expr(group_by_expr(subquery, 0), 1, 0);
+            let sq_id = exists_subquery_id(&select);
+            let subquery = &bound.subquery_bindings[&sq_id].select;
+            // t1=0, subquery_id=1, t3=2
+            assert_column_expr(group_by_expr(subquery, 0), 2, 0);
         });
     }
 
@@ -2247,8 +2347,9 @@ mod tests {
     fn order_by_subquery_can_see_select_alias_and_prefer_source_column() {
         with_bind_context(&["CREATE TABLE t(a, b)"], |ctx| {
             let mut alias_visible = parse_select("SELECT a, -a AS x FROM t ORDER BY (SELECT x)");
-            ctx.bind_select(&mut alias_visible).unwrap();
-            let order_subquery = subquery_expr(order_by_expr(&alias_visible, 0));
+            let bound = ctx.bind_select(&mut alias_visible).unwrap();
+            let sq_id = subquery_id_from_expr(order_by_expr(&alias_visible, 0));
+            let order_subquery = &bound.subquery_bindings[&sq_id].select;
             assert_eq!(
                 select_expr(order_subquery, 0),
                 &ast::Expr::Unary(
@@ -2265,8 +2366,9 @@ mod tests {
 
             let mut source_preferred =
                 parse_select("SELECT -a AS b, a, t.b FROM t ORDER BY (SELECT b)");
-            ctx.bind_select(&mut source_preferred).unwrap();
-            let order_subquery = subquery_expr(order_by_expr(&source_preferred, 0));
+            let bound = ctx.bind_select(&mut source_preferred).unwrap();
+            let sq_id = subquery_id_from_expr(order_by_expr(&source_preferred, 0));
+            let order_subquery = &bound.subquery_bindings[&sq_id].select;
             assert_eq!(
                 select_expr(order_subquery, 0),
                 select_expr(&source_preferred, 2)
@@ -2280,12 +2382,13 @@ mod tests {
             let mut having_select = parse_select(
                 "SELECT a % 2 AS g, SUM(b) AS s FROM t GROUP BY g HAVING (SELECT s) > 15 ORDER BY g",
             );
-            ctx.bind_select(&mut having_select).unwrap();
+            let bound = ctx.bind_select(&mut having_select).unwrap();
             let ast::Expr::Binary(lhs, ast::Operator::Greater, rhs) = having_expr(&having_select)
             else {
                 panic!("expected bound HAVING binary expression");
             };
-            let having_subquery = subquery_expr(lhs);
+            let sq_id = subquery_id_from_expr(lhs);
+            let having_subquery = &bound.subquery_bindings[&sq_id].select;
             assert_eq!(
                 select_expr(having_subquery, 0),
                 select_expr(&having_select, 1)
@@ -2300,9 +2403,14 @@ mod tests {
                  FROM t \
                  WHERE EXISTS (SELECT 1 WHERE EXISTS (SELECT x WHERE x < 0))",
             );
-            ctx.bind_select(&mut nested_where).unwrap();
-            let first_exists = exists_subquery(&nested_where);
-            let second_exists = exists_subquery(first_exists);
+            let bound = ctx.bind_select(&mut nested_where).unwrap();
+            let outer_id = exists_subquery_id(&nested_where);
+            let first_exists = &bound.subquery_bindings[&outer_id].select;
+            let inner_id = exists_subquery_id(first_exists);
+            let second_exists = &bound.subquery_bindings[&outer_id]
+                .inner_bound
+                .subquery_bindings[&inner_id]
+                .select;
             assert_eq!(select_expr(second_exists, 0), select_expr(&nested_where, 0));
         });
     }
