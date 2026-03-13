@@ -14,7 +14,7 @@ use crate::{
 use super::{
     emitter::{Resolver, TranslateCtx},
     expr::{
-        translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
+        resolve_expr, translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
         ConditionMetadata, NoConstantOptReason,
     },
     plan::{Aggregate, Distinctness, SelectPlan, TableReferences},
@@ -315,14 +315,7 @@ impl<'a> AggArgumentSource<'a> {
                 ..
             } => Ok(*start_reg + arg_idx),
             AggArgumentSource::Expression { args, .. } => {
-                let dest_reg = program.alloc_register();
-                translate_expr(
-                    program,
-                    Some(referenced_tables),
-                    &args[arg_idx],
-                    dest_reg,
-                    resolver,
-                )
+                resolve_expr(program, Some(referenced_tables), &args[arg_idx], resolver)
             }
         }
     }
