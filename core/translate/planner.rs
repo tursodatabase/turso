@@ -13,7 +13,7 @@ use super::{
 };
 use crate::translate::{
     emitter::Resolver,
-    expr::{expr_vector_size, unwrap_parens, BindingBehavior, WalkControl},
+    expr::{expr_vector_size, unwrap_parens, walk_expr_mut, BindingBehavior, WalkControl},
     plan::{NonFromClauseSubquery, SubqueryState},
 };
 use crate::{
@@ -174,6 +174,121 @@ fn collect_subquery_table_refs_in_expr(expr: &Expr, out: &mut Vec<String>) {
             _ => Ok(WalkControl::Continue),
         }
     });
+}
+
+fn qualify_select_table_db_name(
+    select_table: &mut ast::SelectTable,
+    db_name: &ast::Name,
+) -> Result<()> {
+    match select_table {
+        ast::SelectTable::Table(name, _, _) | ast::SelectTable::TableCall(name, _, _) => {
+            if name.db_name.is_none() {
+                name.db_name = Some(db_name.clone());
+            }
+        }
+        ast::SelectTable::Select(subselect, _) => {
+            qualify_select_db_name(subselect, db_name)?;
+        }
+        ast::SelectTable::Sub(from_clause, _) => {
+            qualify_from_clause_db_name(from_clause, db_name)?;
+        }
+    }
+    Ok(())
+}
+
+fn qualify_from_clause_db_name(
+    from_clause: &mut ast::FromClause,
+    db_name: &ast::Name,
+) -> Result<()> {
+    qualify_select_table_db_name(&mut from_clause.select, db_name)?;
+    for join in &mut from_clause.joins {
+        qualify_select_table_db_name(&mut join.table, db_name)?;
+        if let Some(ast::JoinConstraint::On(expr)) = &mut join.constraint {
+            qualify_subquery_db_name_in_expr(expr, db_name)?;
+        }
+    }
+    Ok(())
+}
+
+fn qualify_subquery_db_name_in_expr(expr: &mut Expr, db_name: &ast::Name) -> Result<()> {
+    walk_expr_mut(expr, &mut |node: &mut Expr| -> Result<WalkControl> {
+        match node {
+            Expr::Exists(select) | Expr::Subquery(select) => {
+                qualify_select_db_name(select, db_name)?;
+                Ok(WalkControl::SkipChildren)
+            }
+            Expr::InSelect { rhs, .. } => {
+                qualify_select_db_name(rhs, db_name)?;
+                Ok(WalkControl::Continue)
+            }
+            _ => Ok(WalkControl::Continue),
+        }
+    })?;
+    Ok(())
+}
+
+fn qualify_one_select_db_name(one_select: &mut ast::OneSelect, db_name: &ast::Name) -> Result<()> {
+    match one_select {
+        ast::OneSelect::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            ..
+        } => {
+            if let Some(from_clause) = from {
+                qualify_from_clause_db_name(from_clause, db_name)?;
+            }
+            for column in columns {
+                if let ast::ResultColumn::Expr(expr, _) = column {
+                    qualify_subquery_db_name_in_expr(expr, db_name)?;
+                }
+            }
+            if let Some(expr) = where_clause {
+                qualify_subquery_db_name_in_expr(expr, db_name)?;
+            }
+            if let Some(group_by) = group_by {
+                for expr in &mut group_by.exprs {
+                    qualify_subquery_db_name_in_expr(expr, db_name)?;
+                }
+                if let Some(having) = &mut group_by.having {
+                    qualify_subquery_db_name_in_expr(having, db_name)?;
+                }
+            }
+        }
+        ast::OneSelect::Values(rows) => {
+            for row in rows {
+                for expr in row {
+                    qualify_subquery_db_name_in_expr(expr, db_name)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn qualify_select_db_name(select: &mut Select, db_name: &ast::Name) -> Result<()> {
+    if let Some(with_clause) = &mut select.with {
+        for cte in &mut with_clause.ctes {
+            qualify_select_db_name(&mut cte.select, db_name)?;
+        }
+    }
+
+    qualify_one_select_db_name(&mut select.body.select, db_name)?;
+    for compound in &mut select.body.compounds {
+        qualify_one_select_db_name(&mut compound.select, db_name)?;
+    }
+
+    for sorted in &mut select.order_by {
+        qualify_subquery_db_name_in_expr(&mut sorted.expr, db_name)?;
+    }
+    if let Some(limit) = &mut select.limit {
+        qualify_subquery_db_name_in_expr(&mut limit.expr, db_name)?;
+        if let Some(offset) = &mut limit.offset {
+            qualify_subquery_db_name_in_expr(offset, db_name)?;
+        }
+    }
+    Ok(())
 }
 
 /// Valid ways to refer to the rowid of a btree table.
@@ -970,6 +1085,16 @@ fn parse_table(
         // Views are essentially query aliases, so just Expand the view as a subquery
         view.process()?;
         let mut view_select = view.select_stmt.clone();
+        let view_db_name = resolver
+            .get_database_name_by_index(database_id)
+            .ok_or_else(|| {
+                crate::LimboError::InternalError(format!(
+                    "missing database name for view '{}'",
+                    table_name.as_str()
+                ))
+            })
+            .map(ast::Name::exact)?;
+        qualify_select_db_name(&mut view_select, &view_db_name)?;
         if let ast::OneSelect::Select {
             ref mut columns, ..
         } = view_select.body.select

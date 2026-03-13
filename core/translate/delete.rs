@@ -1,4 +1,4 @@
-use crate::schema::Table;
+use crate::schema::{BTreeTable, Table};
 use crate::sync::Arc;
 use crate::translate::emitter::{emit_program, Resolver};
 use crate::translate::expr::{process_returning_clause, walk_expr, WalkControl};
@@ -8,15 +8,22 @@ use crate::translate::plan::{
     QueryDestination, ResultSetColumn, Scan, SelectPlan,
 };
 use crate::translate::planner::{parse_limit, parse_where, plan_ctes_as_outer_refs};
+use crate::translate::select::translate_select;
 use crate::translate::subquery::{
     plan_subqueries_from_returning, plan_subqueries_from_select_plan,
     plan_subqueries_from_where_clause,
 };
-use crate::translate::trigger_exec::has_relevant_triggers_type_only;
+use crate::translate::trigger_exec::{
+    fire_trigger, get_relevant_triggers_type_and_time, has_relevant_triggers_type_only,
+    TriggerContext,
+};
 use crate::util::normalize_ident;
-use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
+use crate::vdbe::builder::{CursorType, ProgramBuilder, ProgramBuilderOpts};
+use crate::vdbe::insn::{to_u16, InsertFlags, Insn};
 use crate::Result;
-use turso_parser::ast::{Expr, Limit, QualifiedName, ResultColumn, TriggerEvent, With};
+use turso_parser::ast::{
+    Expr, Limit, QualifiedName, ResultColumn, TriggerEvent, TriggerTime, With,
+};
 
 use super::plan::{ColumnUsedMask, JoinedTable, TableReferences, WhereTerm};
 
@@ -32,14 +39,14 @@ pub fn translate_delete(
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     let database_id = resolver.resolve_database_id(tbl_name)?;
-    let tbl_name = normalize_ident(tbl_name.name.as_str());
+    let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
 
     // Check if this is a system table that should be protected from direct writes
     if !connection.is_nested_stmt()
         && !connection.is_mvcc_bootstrap_connection()
-        && crate::schema::is_system_table(&tbl_name)
+        && crate::schema::is_system_table(&normalized_tbl_name)
     {
-        crate::bail_parse_error!("table {} may not be modified", tbl_name);
+        crate::bail_parse_error!("table {} may not be modified", normalized_tbl_name);
     }
 
     if crate::is_attached_db(database_id) {
@@ -47,10 +54,35 @@ pub fn translate_delete(
         program.begin_write_on_database(database_id, schema_cookie);
     }
 
+    let (table, view) = resolver.with_schema(database_id, |s| {
+        (
+            s.get_table(normalized_tbl_name.as_str()),
+            s.get_view(normalized_tbl_name.as_str()),
+        )
+    });
+    if table.is_none() {
+        if let Some(view) = view {
+            let mut resolver = resolver.fork();
+            return translate_delete_from_view(
+                tbl_name.clone(),
+                &mut resolver,
+                where_clause,
+                limit,
+                returning,
+                with,
+                program,
+                connection,
+                database_id,
+                view,
+                normalized_tbl_name,
+            );
+        }
+    }
+
     let mut delete_plan = prepare_delete_plan(
         program,
         resolver,
-        tbl_name,
+        normalized_tbl_name,
         where_clause,
         limit,
         returning,
@@ -128,6 +160,226 @@ pub fn translate_delete(
     };
     program.extend(&opts);
     emit_program(connection, resolver, program, delete_plan, |_| {})?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn translate_delete_from_view(
+    tbl_name: QualifiedName,
+    resolver: &mut Resolver,
+    where_clause: Option<Box<Expr>>,
+    limit: Option<Limit>,
+    returning: Vec<ResultColumn>,
+    with: Option<With>,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+    database_id: usize,
+    view: Arc<crate::schema::View>,
+    normalized_tbl_name: String,
+) -> Result<()> {
+    if !returning.is_empty() {
+        crate::bail_parse_error!("RETURNING is not supported for DELETE on views");
+    }
+
+    let view_table = Arc::new(BTreeTable {
+        root_page: 0,
+        name: normalized_tbl_name.clone(),
+        primary_key_columns: vec![],
+        columns: view.columns.clone(),
+        has_rowid: false,
+        is_strict: false,
+        has_autoincrement: false,
+        unique_sets: vec![],
+        foreign_keys: vec![],
+        check_constraints: vec![],
+        pk_conflict_clause: None,
+    });
+
+    let relevant_instead_delete_triggers: Vec<_> = resolver.with_schema(database_id, |s| {
+        get_relevant_triggers_type_and_time(
+            s,
+            TriggerEvent::Delete,
+            TriggerTime::InsteadOf,
+            None,
+            &view_table,
+        )
+        .collect()
+    });
+    if relevant_instead_delete_triggers.is_empty() {
+        crate::bail_parse_error!("cannot modify {} because it is a view", normalized_tbl_name);
+    }
+
+    let opts = ProgramBuilderOpts {
+        num_cursors: 1,
+        approx_num_insns: 40,
+        approx_num_labels: 8,
+    };
+    program.extend(&opts);
+
+    let mut source_columns = Vec::with_capacity(view_table.columns.len());
+    for col in &view_table.columns {
+        let col_name = col
+            .name
+            .as_ref()
+            .ok_or_else(|| crate::LimboError::InternalError("view column missing name".into()))?;
+        source_columns.push(turso_parser::ast::ResultColumn::Expr(
+            Box::new(Expr::Id(turso_parser::ast::Name::from_string(col_name))),
+            None,
+        ));
+    }
+    let source_select = turso_parser::ast::Select {
+        with,
+        body: turso_parser::ast::SelectBody {
+            select: turso_parser::ast::OneSelect::Select {
+                distinctness: None,
+                columns: source_columns,
+                from: Some(turso_parser::ast::FromClause {
+                    select: Box::new(turso_parser::ast::SelectTable::Table(
+                        QualifiedName {
+                            db_name: tbl_name.db_name,
+                            name: tbl_name.name,
+                            alias: None,
+                        },
+                        None,
+                        None,
+                    )),
+                    joins: vec![],
+                }),
+                where_clause,
+                group_by: None,
+                window_clause: vec![],
+            },
+            compounds: vec![],
+        },
+        order_by: vec![],
+        limit,
+    };
+
+    let yield_reg = program.alloc_register();
+    let jump_on_definition_label = program.allocate_label();
+    let start_offset_label = program.allocate_label();
+    program.emit_insn(Insn::InitCoroutine {
+        yield_reg,
+        jump_on_definition: jump_on_definition_label,
+        start_offset: start_offset_label,
+    });
+    program.preassign_label_to_next_insn(start_offset_label);
+
+    let coroutine_end = program.allocate_label();
+    let query_destination = QueryDestination::CoroutineYield {
+        yield_reg,
+        coroutine_implementation_start: coroutine_end,
+    };
+    let num_result_cols = program.nested(|program| {
+        translate_select(
+            source_select.clone(),
+            resolver,
+            program,
+            query_destination,
+            connection,
+        )
+    })?;
+    let expected_result_cols = view_table.columns.len();
+    if num_result_cols != expected_result_cols {
+        return Err(crate::LimboError::InternalError(format!(
+            "unexpected number of columns for DELETE view trigger source: expected {expected_result_cols}, got {num_result_cols}"
+        )));
+    }
+    program.emit_insn(Insn::EndCoroutine { yield_reg });
+    program.preassign_label_to_next_insn(jump_on_definition_label);
+
+    let temp_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(view_table.clone()));
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id: temp_cursor_id,
+        is_table: true,
+    });
+
+    let fill_loop = program.allocate_label();
+    let fill_done = program.allocate_label();
+    program.preassign_label_to_next_insn(fill_loop);
+    program.emit_insn(Insn::Yield {
+        yield_reg,
+        end_offset: fill_done,
+    });
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u16(program.reg_result_cols_start.unwrap_or(yield_reg + 1)),
+        count: to_u16(num_result_cols),
+        dest_reg: to_u16(record_reg),
+        index_name: None,
+        affinity_str: None,
+    });
+    let temp_rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: temp_cursor_id,
+        rowid_reg: temp_rowid_reg,
+        prev_largest_reg: 0,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: temp_cursor_id,
+        key_reg: temp_rowid_reg,
+        record_reg,
+        flag: InsertFlags::new().require_seek(),
+        table_name: String::new(),
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: fill_loop,
+    });
+    program.preassign_label_to_next_insn(fill_done);
+
+    let loop_start = program.allocate_label();
+    let loop_end = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: temp_cursor_id,
+        pc_if_empty: loop_end,
+    });
+    program.preassign_label_to_next_insn(loop_start);
+
+    let row_regs_start = program.alloc_registers(num_result_cols);
+    for i in 0..num_result_cols {
+        program.emit_insn(Insn::Column {
+            cursor_id: temp_cursor_id,
+            column: i,
+            dest: row_regs_start + i,
+            default: None,
+        });
+    }
+
+    let old_rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::RowId {
+        cursor_id: temp_cursor_id,
+        dest: old_rowid_reg,
+    });
+    let old_registers: Vec<usize> = (0..view_table.columns.len())
+        .map(|i| row_regs_start + i)
+        .chain(std::iter::once(old_rowid_reg))
+        .collect();
+    let trigger_ctx = TriggerContext::new(view_table, None, Some(old_registers));
+
+    let row_done = program.allocate_label();
+    for trigger in relevant_instead_delete_triggers {
+        fire_trigger(
+            program,
+            resolver,
+            trigger,
+            &trigger_ctx,
+            connection,
+            database_id,
+            row_done,
+        )?;
+    }
+    program.preassign_label_to_next_insn(row_done);
+
+    program.emit_insn(Insn::Next {
+        cursor_id: temp_cursor_id,
+        pc_if_next: loop_start,
+    });
+    program.preassign_label_to_next_insn(loop_end);
+    program.emit_insn(Insn::Close {
+        cursor_id: temp_cursor_id,
+    });
+    program.preassign_label_to_next_insn(coroutine_end);
+
     Ok(())
 }
 

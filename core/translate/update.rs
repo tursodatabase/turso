@@ -1,17 +1,26 @@
 use crate::sync::Arc;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use crate::schema::ROWID_SENTINEL;
+use crate::schema::{BTreeTable, ROWID_SENTINEL};
 use crate::translate::emitter::Resolver;
-use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
+use crate::translate::expr::{
+    bind_and_rewrite_expr, translate_expr_no_constant_opt, BindingBehavior, NoConstantOptReason,
+};
 use crate::translate::expression_index::expression_index_column_usage;
-use crate::translate::plan::{Operation, Scan};
+use crate::translate::plan::{Operation, QueryDestination, Scan};
 use crate::translate::planner::{parse_limit, ROWID_STRS};
+use crate::translate::select::translate_select;
+use crate::translate::trigger_exec::{
+    fire_trigger, get_relevant_triggers_type_and_time, TriggerContext,
+};
 use crate::{
     bail_parse_error,
     schema::{Schema, Table},
     util::normalize_ident,
-    vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
+    vdbe::{
+        builder::{CursorType, ProgramBuilder, ProgramBuilderOpts},
+        insn::{to_u16, InsertFlags, Insn},
+    },
     CaptureDataChangesExt, Connection,
 };
 use turso_parser::ast::{self, Expr, Indexed, SortOrder};
@@ -20,12 +29,14 @@ use super::emitter::emit_program;
 use super::expr::process_returning_clause;
 use super::optimizer::optimize_plan;
 use super::plan::{
-    ColumnUsedMask, DmlSafety, IterationDirection, JoinedTable, Plan, TableReferences, UpdatePlan,
+    ColumnUsedMask, DmlSafety, EvalAt, IterationDirection, JoinOrderMember, JoinedTable, Plan,
+    TableReferences, UpdatePlan,
 };
 use super::planner::{parse_where, plan_ctes_as_outer_refs};
 use super::subquery::{
-    plan_subqueries_from_returning, plan_subqueries_from_select_plan,
-    plan_subqueries_from_set_clauses, plan_subqueries_from_where_clause,
+    emit_non_from_clause_subquery, plan_subqueries_from_returning,
+    plan_subqueries_from_select_plan, plan_subqueries_from_set_clauses,
+    plan_subqueries_from_where_clause,
 };
 /*
 * Update is simple. By default we scan the table, and for each row, we check the WHERE
@@ -62,6 +73,27 @@ pub fn translate_update(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> crate::Result<()> {
+    let database_id = resolver.resolve_database_id(&body.tbl_name)?;
+    let (table, view) = resolver.with_schema(database_id, |s| {
+        (
+            s.get_table(body.tbl_name.name.as_str()),
+            s.get_view(body.tbl_name.name.as_str()),
+        )
+    });
+    if table.is_none() {
+        if let Some(view) = view {
+            let mut resolver = resolver.fork();
+            return translate_update_view(
+                body,
+                &mut resolver,
+                program,
+                connection,
+                database_id,
+                view,
+            );
+        }
+    }
+
     let mut plan = prepare_update_plan(program, resolver, body, connection, false)?;
 
     // Plan subqueries in the WHERE clause and SET clause
@@ -109,6 +141,467 @@ pub fn translate_update(
     };
     program.extend(&opts);
     emit_program(connection, resolver, program, plan, |_| {})?;
+    Ok(())
+}
+
+fn translate_update_view(
+    mut body: ast::Update,
+    resolver: &mut Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+    database_id: usize,
+    view: Arc<crate::schema::View>,
+) -> crate::Result<()> {
+    if body.from.is_some() {
+        bail_parse_error!("FROM clause is not supported in UPDATE");
+    }
+    if body
+        .indexed
+        .as_ref()
+        .is_some_and(|i| matches!(i, Indexed::IndexedBy(_)))
+    {
+        bail_parse_error!("INDEXED BY clause is not supported in UPDATE");
+    }
+    if !body.order_by.is_empty() {
+        bail_parse_error!("ORDER BY is not supported in UPDATE");
+    }
+    if !body.returning.is_empty() {
+        bail_parse_error!("RETURNING is not supported for UPDATE on views");
+    }
+
+    let table_name = normalize_ident(body.tbl_name.name.as_str());
+    let view_table = Arc::new(BTreeTable {
+        root_page: 0,
+        name: table_name.clone(),
+        primary_key_columns: vec![],
+        columns: view.columns.clone(),
+        has_rowid: false,
+        is_strict: false,
+        has_autoincrement: false,
+        unique_sets: vec![],
+        foreign_keys: vec![],
+        check_constraints: vec![],
+        pk_conflict_clause: None,
+    });
+
+    let column_lookup: HashMap<String, usize> = view_table
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(i, col)| col.name.as_ref().map(|name| (normalize_ident(name), i)))
+        .collect();
+
+    let mut set_clauses: Vec<(usize, Box<Expr>)> = Vec::with_capacity(body.sets.len());
+    for set in &mut body.sets {
+        let values = match set.expr.as_ref() {
+            Expr::Parenthesized(vals) => vals.clone(),
+            expr => vec![expr.clone().into()],
+        };
+
+        if set.col_names.len() != values.len() {
+            bail_parse_error!(
+                "{} columns assigned {} values",
+                set.col_names.len(),
+                values.len()
+            );
+        }
+
+        for (col_name, expr) in set.col_names.iter().zip(values.iter()) {
+            let ident = normalize_ident(col_name.as_str());
+
+            let col_index = match column_lookup.get(&ident) {
+                Some(idx) => *idx,
+                None => {
+                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&ident)) {
+                        ROWID_SENTINEL
+                    } else {
+                        bail_parse_error!("no such column: {}.{}", table_name, col_name);
+                    }
+                }
+            };
+
+            match set_clauses.iter_mut().find(|(idx, _)| *idx == col_index) {
+                Some((_, existing_expr)) => {
+                    if let Expr::FunctionCall {
+                        name,
+                        args: new_args,
+                        ..
+                    } = expr.as_ref()
+                    {
+                        if name.as_str().eq_ignore_ascii_case("array_set_element")
+                            && new_args.len() == 3
+                        {
+                            let mut composed_args = new_args.clone();
+                            composed_args[0].clone_from(existing_expr);
+                            *existing_expr = Box::new(Expr::FunctionCall {
+                                name: name.clone(),
+                                distinctness: None,
+                                args: composed_args,
+                                order_by: vec![],
+                                filter_over: turso_parser::ast::FunctionTail {
+                                    filter_clause: None,
+                                    over_clause: None,
+                                },
+                            });
+                        } else {
+                            existing_expr.clone_from(expr);
+                        }
+                    } else {
+                        existing_expr.clone_from(expr);
+                    }
+                }
+                None => set_clauses.push((col_index, expr.clone())),
+            }
+        }
+    }
+
+    let updated_column_indices: HashSet<usize> = set_clauses
+        .iter()
+        .filter_map(|(idx, _)| (*idx != ROWID_SENTINEL).then_some(*idx))
+        .collect();
+    let relevant_instead_update_triggers: Vec<_> = resolver.with_schema(database_id, |s| {
+        get_relevant_triggers_type_and_time(
+            s,
+            ast::TriggerEvent::Update,
+            ast::TriggerTime::InsteadOf,
+            Some(updated_column_indices.clone()),
+            &view_table,
+        )
+        .collect()
+    });
+    if relevant_instead_update_triggers.is_empty() {
+        bail_parse_error!("cannot modify {} because it is a view", table_name);
+    }
+
+    let mut table_references = TableReferences::new(
+        vec![JoinedTable {
+            table: Table::BTree(view_table.clone()),
+            identifier: body
+                .tbl_name
+                .alias
+                .as_ref()
+                .map_or_else(|| table_name.clone(), |alias| alias.as_str().to_string()),
+            internal_id: program.table_reference_counter.next(),
+            op: Operation::default_scan_for(&Table::BTree(view_table.clone())),
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            database_id,
+        }],
+        vec![],
+    );
+    plan_ctes_as_outer_refs(
+        body.with.clone(),
+        resolver,
+        program,
+        &mut table_references,
+        connection,
+    )?;
+    for (_idx, expr) in &mut set_clauses {
+        bind_and_rewrite_expr(
+            expr,
+            Some(&mut table_references),
+            None,
+            resolver,
+            BindingBehavior::ResultColumnsNotAllowed,
+        )?;
+    }
+    let mut set_subqueries = vec![];
+    plan_subqueries_from_set_clauses(
+        program,
+        &mut set_subqueries,
+        &mut table_references,
+        &mut set_clauses,
+        resolver,
+        connection,
+    )?;
+    let join_order = vec![JoinOrderMember {
+        table_id: table_references
+            .joined_tables()
+            .first()
+            .expect("view UPDATE table refs must contain one table")
+            .internal_id,
+        original_idx: 0,
+        is_outer: false,
+    }];
+    for subquery in set_subqueries
+        .iter_mut()
+        .filter(|s| !s.has_been_evaluated())
+    {
+        let eval_at = subquery.get_eval_at(&join_order, Some(&table_references))?;
+        match eval_at {
+            EvalAt::BeforeLoop => {
+                let subquery_plan = subquery.consume_plan(EvalAt::BeforeLoop);
+                emit_non_from_clause_subquery(
+                    program,
+                    resolver,
+                    *subquery_plan,
+                    &subquery.query_type,
+                    subquery.correlated,
+                )?;
+            }
+            EvalAt::Loop(0) => {
+                bail_parse_error!("correlated subqueries in UPDATE SET on views are not supported");
+            }
+            EvalAt::Loop(_) => {
+                return Err(crate::LimboError::InternalError(
+                    "unexpected evaluation loop for UPDATE SET view subquery".into(),
+                ));
+            }
+        }
+    }
+
+    let mut source_columns = Vec::with_capacity(view_table.columns.len());
+    for col in &view_table.columns {
+        let col_name = col
+            .name
+            .as_ref()
+            .ok_or_else(|| crate::LimboError::InternalError("view column missing name".into()))?;
+        source_columns.push(ast::ResultColumn::Expr(
+            Box::new(ast::Expr::Id(ast::Name::from_string(col_name))),
+            None,
+        ));
+    }
+    let source_select = ast::Select {
+        with: body.with.take(),
+        body: ast::SelectBody {
+            select: ast::OneSelect::Select {
+                distinctness: None,
+                columns: source_columns,
+                from: Some(ast::FromClause {
+                    select: Box::new(ast::SelectTable::Table(
+                        ast::QualifiedName {
+                            db_name: body.tbl_name.db_name.clone(),
+                            name: body.tbl_name.name.clone(),
+                            alias: None,
+                        },
+                        body.tbl_name.alias.clone().map(ast::As::As),
+                        None,
+                    )),
+                    joins: vec![],
+                }),
+                where_clause: body.where_clause.take(),
+                group_by: None,
+                window_clause: vec![],
+            },
+            compounds: vec![],
+        },
+        order_by: body.order_by,
+        limit: body.limit.take(),
+    };
+
+    let yield_reg = program.alloc_register();
+    let jump_on_definition_label = program.allocate_label();
+    let start_offset_label = program.allocate_label();
+    program.emit_insn(Insn::InitCoroutine {
+        yield_reg,
+        jump_on_definition: jump_on_definition_label,
+        start_offset: start_offset_label,
+    });
+    program.preassign_label_to_next_insn(start_offset_label);
+
+    let coroutine_end = program.allocate_label();
+    let query_destination = QueryDestination::CoroutineYield {
+        yield_reg,
+        coroutine_implementation_start: coroutine_end,
+    };
+    let num_result_cols = program.nested(|program| {
+        translate_select(
+            source_select.clone(),
+            resolver,
+            program,
+            query_destination,
+            connection,
+        )
+    })?;
+    let expected_result_cols = view_table.columns.len();
+    if num_result_cols != expected_result_cols {
+        return Err(crate::LimboError::InternalError(format!(
+            "unexpected number of columns for UPDATE view trigger source: expected {expected_result_cols}, got {num_result_cols}"
+        )));
+    }
+    program.emit_insn(Insn::EndCoroutine { yield_reg });
+    program.preassign_label_to_next_insn(jump_on_definition_label);
+
+    let temp_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(view_table.clone()));
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id: temp_cursor_id,
+        is_table: true,
+    });
+
+    let fill_loop = program.allocate_label();
+    let fill_done = program.allocate_label();
+    program.preassign_label_to_next_insn(fill_loop);
+    program.emit_insn(Insn::Yield {
+        yield_reg,
+        end_offset: fill_done,
+    });
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u16(program.reg_result_cols_start.unwrap_or(yield_reg + 1)),
+        count: to_u16(num_result_cols),
+        dest_reg: to_u16(record_reg),
+        index_name: None,
+        affinity_str: None,
+    });
+    let temp_rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: temp_cursor_id,
+        rowid_reg: temp_rowid_reg,
+        prev_largest_reg: 0,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: temp_cursor_id,
+        key_reg: temp_rowid_reg,
+        record_reg,
+        flag: InsertFlags::new().require_seek(),
+        table_name: String::new(),
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: fill_loop,
+    });
+    program.preassign_label_to_next_insn(fill_done);
+
+    let loop_start = program.allocate_label();
+    let loop_end = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: temp_cursor_id,
+        pc_if_empty: loop_end,
+    });
+    program.preassign_label_to_next_insn(loop_start);
+
+    let row_regs_start = program.alloc_registers(num_result_cols);
+    for i in 0..num_result_cols {
+        program.emit_insn(Insn::Column {
+            cursor_id: temp_cursor_id,
+            column: i,
+            dest: row_regs_start + i,
+            default: None,
+        });
+    }
+
+    let old_rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::RowId {
+        cursor_id: temp_cursor_id,
+        dest: old_rowid_reg,
+    });
+    let old_registers: Vec<usize> = (0..view_table.columns.len())
+        .map(|i| row_regs_start + i)
+        .chain(std::iter::once(old_rowid_reg))
+        .collect();
+    let new_cols_start = program.alloc_registers(view_table.columns.len());
+    let new_rowid_reg = program.alloc_register();
+    let table_ref = table_references
+        .joined_tables()
+        .first()
+        .expect("view UPDATE table refs must contain one table");
+
+    resolver.enable_expr_to_reg_cache();
+    let cache_len = resolver.expr_to_reg_cache.len();
+    resolver.expr_to_reg_cache.push((
+        std::borrow::Cow::Owned(ast::Expr::RowId {
+            database: None,
+            table: table_ref.internal_id,
+        }),
+        old_rowid_reg,
+        false,
+    ));
+    for i in 0..view_table.columns.len() {
+        resolver.expr_to_reg_cache.push((
+            std::borrow::Cow::Owned(ast::Expr::Column {
+                database: None,
+                table: table_ref.internal_id,
+                column: i,
+                is_rowid_alias: false,
+            }),
+            row_regs_start + i,
+            false,
+        ));
+    }
+
+    for idx in 0..view_table.columns.len() {
+        if let Some((_, expr)) = set_clauses.iter().find(|(col_idx, _)| *col_idx == idx) {
+            translate_expr_no_constant_opt(
+                program,
+                Some(&table_references),
+                expr,
+                new_cols_start + idx,
+                resolver,
+                NoConstantOptReason::RegisterReuse,
+            )?;
+        } else {
+            program.emit_insn(Insn::Copy {
+                src_reg: row_regs_start + idx,
+                dst_reg: new_cols_start + idx,
+                extra_amount: 0,
+            });
+        }
+    }
+    if let Some((_, expr)) = set_clauses.iter().find(|(idx, _)| *idx == ROWID_SENTINEL) {
+        translate_expr_no_constant_opt(
+            program,
+            Some(&table_references),
+            expr,
+            new_rowid_reg,
+            resolver,
+            NoConstantOptReason::RegisterReuse,
+        )?;
+    } else {
+        program.emit_insn(Insn::Copy {
+            src_reg: old_rowid_reg,
+            dst_reg: new_rowid_reg,
+            extra_amount: 0,
+        });
+    }
+    resolver.expr_to_reg_cache.truncate(cache_len);
+
+    let new_registers: Vec<usize> = (0..view_table.columns.len())
+        .map(|i| new_cols_start + i)
+        .chain(std::iter::once(new_rowid_reg))
+        .collect();
+    let trigger_ctx = if let Some(override_conflict) = program.trigger_conflict_override {
+        TriggerContext::new_with_override_conflict(
+            view_table,
+            Some(new_registers),
+            Some(old_registers),
+            override_conflict,
+        )
+    } else if matches!(body.or_conflict, Some(ast::ResolveType::Ignore)) {
+        TriggerContext::new_with_override_conflict(
+            view_table,
+            Some(new_registers),
+            Some(old_registers),
+            ast::ResolveType::Ignore,
+        )
+    } else {
+        TriggerContext::new(view_table, Some(new_registers), Some(old_registers))
+    };
+
+    let row_done = program.allocate_label();
+    for trigger in relevant_instead_update_triggers {
+        fire_trigger(
+            program,
+            resolver,
+            trigger,
+            &trigger_ctx,
+            connection,
+            database_id,
+            row_done,
+        )?;
+    }
+    program.preassign_label_to_next_insn(row_done);
+
+    program.emit_insn(Insn::Next {
+        cursor_id: temp_cursor_id,
+        pc_if_next: loop_start,
+    });
+    program.preassign_label_to_next_insn(loop_end);
+    program.emit_insn(Insn::Close {
+        cursor_id: temp_cursor_id,
+    });
+    program.preassign_label_to_next_insn(coroutine_end);
+
     Ok(())
 }
 
