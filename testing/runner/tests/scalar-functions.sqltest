@@ -1384,6 +1384,12 @@ test unicode-null {
 expect {
 }
 
+test unicode-char0 {
+    SELECT unicode(char(0));
+}
+expect {
+}
+
 test quote-string-embedded-nul {
     SELECT quote(concat('abc', char(0), 'def'))
 }
