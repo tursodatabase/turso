@@ -2206,3 +2206,53 @@ expect {
     exceeded limit for id 1: 200
     exceeded limit for id 2: 60
 }
+
+# AUTOINCREMENT must stay monotonic across trigger side effects on the same table.
+# Regression tests for BEFORE INSERT triggers properly handling sqlite_sequence/AUTOINCREMENT
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
+@cross-check-integrity
+test trigger-autoincrement-before-insert-delete-first-row {
+    CREATE TABLE t_auto(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE TRIGGER t_auto_bi BEFORE INSERT ON t_auto BEGIN
+        INSERT INTO t_auto(v) VALUES ('temp');
+        DELETE FROM t_auto WHERE id = last_insert_rowid();
+    END;
+    INSERT INTO t_auto(v) VALUES ('real');
+    SELECT id, v FROM t_auto ORDER BY id;
+}
+expect {
+    2|real
+}
+
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
+@cross-check-integrity
+test trigger-autoincrement-before-insert-delete-multiple-rows {
+    CREATE TABLE t_auto(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE TRIGGER t_auto_bi BEFORE INSERT ON t_auto BEGIN
+        INSERT INTO t_auto(v) VALUES ('temp');
+        DELETE FROM t_auto WHERE id = last_insert_rowid();
+    END;
+    INSERT INTO t_auto(v) VALUES ('real1');
+    INSERT INTO t_auto(v) VALUES ('real2');
+    SELECT id, v FROM t_auto ORDER BY id;
+}
+expect {
+    2|real1
+    4|real2
+}
+
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
+@cross-check-integrity
+test trigger-autoincrement-before-insert-delete-sequence {
+    CREATE TABLE t_auto(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE TRIGGER t_auto_bi BEFORE INSERT ON t_auto BEGIN
+        INSERT INTO t_auto(v) VALUES ('temp');
+        DELETE FROM t_auto WHERE id = last_insert_rowid();
+    END;
+    INSERT INTO t_auto(v) VALUES ('real1');
+    INSERT INTO t_auto(v) VALUES ('real2');
+    SELECT name, seq FROM sqlite_sequence ORDER BY name;
+}
+expect {
+    t_auto|4
+}
