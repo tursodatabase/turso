@@ -36,7 +36,7 @@ addr  opcode            p1  p2  p3  p4            p5  comment
   12    MakeRecord       2   1   6                 0  r[6]=mkrec(r[2..2]); for ephemeral_index_where_sub_t2
   13    IdxInsert        0   6   0                 8  key=r[6]
   14  Next               4   9   0                 0
-  15  OpenRead           5  12   0  k(2,B)         0  index=idx_orders_user_id, root=12, iDb=0
+  15  OpenRead           3  12   0  k(2,B)         0  index=idx_orders_user_id, root=12, iDb=0
   16  NullRow            0   0   0                 0  Set cursor 0 to a (pseudo) NULL row
   17  Rewind             0  27   0                 0  Rewind  ephemeral(ephemeral_index_where_sub_t2)
   18    Column           0   0   8                 0  r[8]=ephemeral(ephemeral_index_where_sub_t2).id
@@ -50,8 +50,8 @@ addr  opcode            p1  p2  p3  p4            p5  comment
   26  Next               0  18   0                 0
   27  Close              1   0   0                 0
   28  OpenWrite          1   5   0                 0  root=5; iDb=0
-  29  OpenWrite          6  13   0                 0  root=13; iDb=0
-  30  OpenWrite          7  12   0                 0  root=12; iDb=0
+  29  OpenWrite          5  13   0                 0  root=13; iDb=0
+  30  OpenWrite          6  12   0                 0  root=12; iDb=0
   31    RowSetRead       1  42   9                 0
   32    NotExists        1  41   9                 0
   33    NotExists        1  41   9                 0

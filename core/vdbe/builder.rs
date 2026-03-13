@@ -245,8 +245,6 @@ pub struct MaterializedCteInfo {
     pub cursor_id: CursorID,
     /// The table definition, needed for allocating dup cursors with the same CursorType.
     pub table: Arc<BTreeTable>,
-    /// Start register for reading result columns.
-    pub result_columns_start_reg: usize,
     /// Number of result columns.
     pub num_columns: usize,
 }
@@ -731,6 +729,18 @@ impl ProgramBuilder {
             }
         }
         Ok(self._alloc_cursor_id(key, CursorType::BTreeIndex(index.clone())))
+    }
+
+    pub fn alloc_cursor_index_if_not_exists(
+        &mut self,
+        key: CursorKey,
+        index: &Arc<Index>,
+    ) -> crate::Result<usize> {
+        if let Some(cursor_id) = self.resolve_cursor_id_safe(&key) {
+            Ok(cursor_id)
+        } else {
+            self.alloc_cursor_index(Some(key), index)
+        }
     }
 
     pub fn alloc_cursor_id(&mut self, cursor_type: CursorType) -> usize {

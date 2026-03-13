@@ -7,17 +7,19 @@
 //! top.
 
 use crate::schema::{Index, Schema};
+use crate::stats::AnalyzeStats;
 use crate::translate::expr::expr_references_any_subquery;
 use crate::translate::optimizer::access_method::{
     choose_best_btree_candidate, choose_best_in_seek_candidate, AccessMethod, AccessMethodParams,
-    BranchReadMode, ChosenInSeekCandidate, PostAccessFilter,
+    BranchReadMode, ChosenInSeekCandidate, ResidualConstraintMode,
 };
 use crate::translate::optimizer::constraints::{
     analyze_binary_term_for_index, constraints_from_where_clause, Constraint, RangeConstraintRef,
     TableConstraints,
 };
 use crate::translate::optimizer::cost::{
-    estimate_cost_for_scan_or_seek, estimate_rows_per_seek, Cost, IndexInfo, RowCountEstimate,
+    estimate_cost_for_scan_or_seek, estimate_rows_per_seek, AnalyzeCtx, Cost, IndexInfo,
+    RowCountEstimate,
 };
 use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::plan::{
@@ -25,6 +27,7 @@ use crate::translate::plan::{
 };
 use crate::translate::planner::{table_mask_from_expr, TableMask};
 use rustc_hash::FxHashMap as HashMap;
+use smallvec::SmallVec;
 use std::{collections::VecDeque, sync::Arc};
 use turso_parser::ast::{self, TableInternalId};
 
@@ -316,6 +319,7 @@ fn choose_multi_index_branch_access(
     rhs_idx: usize,
     schema: &Schema,
     base_row_count: RowCountEstimate,
+    analyze_stats: Option<&AnalyzeStats>,
     params: &CostModelParams,
 ) -> crate::Result<Option<MultiIdxBranch>> {
     let chosen_seek = choose_best_btree_candidate(
@@ -325,6 +329,7 @@ fn choose_multi_index_branch_access(
         rhs_idx,
         None,
         schema,
+        analyze_stats,
         1.0,
         base_row_count,
         params,
@@ -340,6 +345,11 @@ fn choose_multi_index_branch_access(
                 BranchReadMode::RowIdOnly,
             )
             .expect("multi-index branches always have costable access");
+            let analyze_ctx = analyze_stats.map(|stats| AnalyzeCtx {
+                rhs_table,
+                index: chosen.index.as_ref(),
+                stats,
+            });
             let branch_cost = estimate_cost_for_scan_or_seek(
                 Some(index_info),
                 &table_constraints.constraints,
@@ -348,6 +358,7 @@ fn choose_multi_index_branch_access(
                 base_row_count,
                 false,
                 params,
+                analyze_ctx.as_ref(),
             );
             MultiIdxBranch {
                 index: chosen.index.clone(),
@@ -361,6 +372,8 @@ fn choose_multi_index_branch_access(
                     &table_constraints.constraints,
                     &chosen.constraint_refs,
                     base_row_count,
+                    analyze_ctx.as_ref(),
+                    params,
                 ),
                 residual_exprs: vec![],
                 requires_table_cursor: false,
@@ -667,10 +680,28 @@ fn evaluate_multi_index_branches(
     };
 
     if multi_index_cost < best_cost {
+        let mut consumed_where_terms = SmallVec::<[usize; 4]>::new();
+        consumed_where_terms.push(where_term_idx);
+        for term_idx in additional_consumed_terms.iter().copied() {
+            if !consumed_where_terms.contains(&term_idx) {
+                consumed_where_terms.push(term_idx);
+            }
+        }
+        for branch in &branch_params {
+            if let MultiIndexBranchAccessParams::Seek { constraints, .. } = &branch.access {
+                for constraint in constraints {
+                    let where_term_idx = constraint.where_clause_pos.0;
+                    if !consumed_where_terms.contains(&where_term_idx) {
+                        consumed_where_terms.push(where_term_idx);
+                    }
+                }
+            }
+        }
         Some(AccessMethod {
             cost: multi_index_cost,
             estimated_rows_per_outer_row: estimated_rows,
-            post_access_filter: PostAccessFilter::LocalOnly,
+            residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
+            consumed_where_terms,
             params: AccessMethodParams::MultiIndexScan {
                 branches: branch_params,
                 where_term_idx,
@@ -828,6 +859,7 @@ pub fn consider_multi_index_union(
     params: &CostModelParams,
     best_cost: Cost,
     lhs_mask: &TableMask,
+    analyze_stats: Option<&AnalyzeStats>,
 ) -> Option<AccessMethod> {
     for (where_term_idx, term) in where_clause.iter().enumerate() {
         if term.consumed {
@@ -886,6 +918,7 @@ pub fn consider_multi_index_union(
                     rhs_idx,
                     schema,
                     base_row_count,
+                    analyze_stats,
                     params,
                 )
                 .ok()??;
@@ -950,6 +983,7 @@ pub fn consider_multi_index_intersection(
     params: &CostModelParams,
     best_cost: Cost,
     lhs_mask: &TableMask,
+    analyze_stats: Option<&AnalyzeStats>,
 ) -> Option<AccessMethod> {
     let decomposition = analyze_and_terms_for_multi_index(
         rhs_table,
@@ -981,6 +1015,11 @@ pub fn consider_multi_index_intersection(
             let index_info =
                 index_info_for_branch(b.index.as_deref(), rhs_table, BranchReadMode::RowIdOnly)
                     .expect("intersection branches always have costable access");
+            let analyze_ctx = analyze_stats.map(|stats| AnalyzeCtx {
+                rhs_table,
+                index: b.index.as_ref(),
+                stats,
+            });
             MultiIdxBranch {
                 index: b.index.clone(),
                 access: MultiIdxBranchAccess::Seek {
@@ -995,12 +1034,15 @@ pub fn consider_multi_index_intersection(
                     base_row_count,
                     false,
                     params,
+                    analyze_ctx.as_ref(),
                 ),
                 estimated_rows: estimate_rows_per_seek(
                     index_info,
                     &constraints,
                     &b.constraint_refs,
                     base_row_count,
+                    analyze_ctx.as_ref(),
+                    params,
                 ),
                 residual_exprs: vec![],
                 requires_table_cursor: false,
@@ -1323,6 +1365,7 @@ mod tests {
             &DEFAULT_PARAMS,
             Cost(f64::INFINITY),
             &lhs_mask,
+            None,
         );
 
         assert!(
@@ -1409,6 +1452,7 @@ mod tests {
             &DEFAULT_PARAMS,
             Cost(f64::INFINITY),
             &TableMask::new(),
+            None,
         )
         .expect("rowid and secondary-index terms should be eligible for intersection");
 
@@ -1596,6 +1640,7 @@ mod tests {
             &DEFAULT_PARAMS,
             Cost(f64::INFINITY),
             &lhs_mask,
+            None,
         )
         .expect("compound OR branches should produce a multi-index union");
 
@@ -1737,6 +1782,7 @@ mod tests {
             &DEFAULT_PARAMS,
             Cost(f64::INFINITY),
             &lhs_mask,
+            None,
         )
         .expect("plain OR branches should produce a multi-index union");
 
@@ -1752,6 +1798,7 @@ mod tests {
             &DEFAULT_PARAMS,
             Cost(f64::INFINITY),
             &lhs_mask,
+            None,
         )
         .expect("residual-filtered OR branches should still produce a multi-index union");
 

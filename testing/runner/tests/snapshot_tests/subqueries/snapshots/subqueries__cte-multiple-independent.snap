@@ -35,72 +35,82 @@ info:
 ---
 QUERY PLAN
 |--SCAN orders
-|--SCAN large_orders AS l
-`--SEARCH v USING INDEX ephemeral_subquery_t6 (id=?)
-   |--LIST SUBQUERY 1
-   |  `--SCAN large_orders
-   `--SEARCH customers USING INTEGER PRIMARY KEY (rowid=?)
+|--SCAN vip_customers AS v
+|  |--LIST SUBQUERY 1
+|  |  `--SCAN large_orders
+|  `--SEARCH customers USING INTEGER PRIMARY KEY (rowid=?)
+`--SEARCH l USING INDEX ephemeral_subquery_t8 (customer_id=?)
 
 BYTECODE
-addr  opcode            p1  p2  p3  p4            p5  comment
-   0  Init               0  58   0                 0  Start at 58
-   1  OpenEphemeral      1   1   0                 0  cursor=1 is_table=true
-   2  OpenRead           2   4   0  k(4,B,B,B,B)   0  table=orders, root=4, iDb=0
-   3  Rewind             2  15   0                 0  Rewind table orders
-   4    Column           2   3   8                 0  r[8]=orders.total_amount
-   5    RealAffinity     8   0   0                 0
-   6    Le               8   9  14  Binary         0  if r[8]<=r[9] goto 14
-   7    RowId            2   4   0                 0  r[4]=orders.rowid
-   8    Column           2   1   5                 0  r[5]=orders.customer_id
-   9    Column           2   3   6                 0  r[6]=orders.total_amount
-  10    RealAffinity     6   0   0                 0
-  11    MakeRecord       4   3  10                 0  r[10]=mkrec(r[4..6]); for
-  12    NewRowid         1  11   0                 0  r[11]=rowid
-  13    Insert           1  10  11                 4  intkey=r[11] data=r[10]
-  14  Next               2   4   0                 0
-  15  OpenDup            3   1   0                 0  new_cursor=3, original_cursor=1
-  16  OpenEphemeral      4   0   0                 0  cursor=4 is_table=false
-  17  Once              28   0   0                 0  goto 28
-  18  OpenEphemeral      0   0   0                 0  cursor=0 is_table=false
-  19  OpenDup            5   1   0                 0  new_cursor=5, original_cursor=1
-  20  Rewind             5  28   0                 0  Rewind  ephemeral()
-  21    Column           5   0  17                 0  r[17]=ephemeral().column 0
-  22    Column           5   1  18                 0  r[18]=ephemeral().column 1
-  23    Column           5   2  19                 0  r[19]=ephemeral().column 2
-  24    Copy            18  20   0                 0  r[20]=r[18]
-  25    MakeRecord      20   1  21                 0  r[21]=mkrec(r[20..20]); for ephemeral_index_where_sub_t4
-  26    IdxInsert        0  21   0                 8  key=r[21]
-  27  Next               5  21   0                 0
-  28  OpenRead           6   6   0  k(4,B,B,B,B)   0  table=customers, root=6, iDb=0
-  29  NullRow            0   0   0                 0  Set cursor 0 to a (pseudo) NULL row
-  30  Rewind             0  41   0                 0  Rewind  ephemeral(ephemeral_index_where_sub_t4)
-  31    Column           0   0  24                 0  r[24]=ephemeral(ephemeral_index_where_sub_t4).customer_id
-  32    IsNull          24  40   0                 0  if (r[24]==NULL) goto 40
-  33    SeekRowid        6  24  40                 0  if (r[24]!=cursor 6 for table customers.rowid) goto 40
-  34    RowId            6  22   0                 0  r[22]=customers.rowid
-  35    Column           6   1  23                 0  r[23]=customers.name
-  36    Copy            22  26   1                 0  r[26]=r[22]
-  37    Sequence         4  28   0                 0
-  38    MakeRecord      26   3  25                 0  r[25]=mkrec(r[26..28]); for ephemeral_subquery_t6
-  39    IdxInsert        4  25   0                 8  key=r[25]
-  40  Next               0  31   0                 0
-  41  Rewind             3  57   0                 0  Rewind  ephemeral()
-  42    Column           3   0  12                 0  r[12]=ephemeral().column 0
-  43    Column           3   1  13                 0  r[13]=ephemeral().column 1
-  44    Column           3   2  14                 0  r[14]=ephemeral().column 2
-  45    Copy            13  31   0                 0  r[31]=r[13]
-  46    IsNull          31  56   0                 0  if (r[31]==NULL) goto 56
-  47    Affinity        31   1   0                 0  r[31..32] = D
-  48    SeekGE           4  56  31                 0  key=[31..31]
-  49      IdxGT          4  56  31                 0  key=[31..31]
-  50      Column         4   0  15                 0  r[15]=ephemeral(ephemeral_subquery_t6).id
-  51      Column         4   1  16                 0  r[16]=ephemeral(ephemeral_subquery_t6).name
-  52      Column         4   1  29                 0  r[29]=ephemeral(ephemeral_subquery_t6).name
-  53      Copy          14  30   0                 0  r[30]=r[14]
-  54      ResultRow     29   2   0                 0  output=r[29..30]
-  55    Next             4  49   0                 0
-  56  Next               3  42   0                 0
-  57  Halt               0   0   0                 0
-  58  Transaction        0   1  11                 0  iDb=0 tx_mode=Read
-  59  Integer         1000   9   0                 0  r[9]=1000
-  60  Goto               0   1   0                 0
+addr  opcode              p1  p2  p3  p4            p5  comment
+   0  Init                 0  68   0                 0  Start at 68
+   1  OpenEphemeral        1   1   0                 0  cursor=1 is_table=true
+   2  OpenRead             2   4   0  k(4,B,B,B,B)   0  table=orders, root=4, iDb=0
+   3  Rewind               2  15   0                 0  Rewind table orders
+   4    Column             2   3   8                 0  r[8]=orders.total_amount
+   5    RealAffinity       8   0   0                 0
+   6    Le                 8   9  14  Binary         0  if r[8]<=r[9] goto 14
+   7    RowId              2   4   0                 0  r[4]=orders.rowid
+   8    Column             2   1   5                 0  r[5]=orders.customer_id
+   9    Column             2   3   6                 0  r[6]=orders.total_amount
+  10    RealAffinity       6   0   0                 0
+  11    MakeRecord         4   3  10                 0  r[10]=mkrec(r[4..6]); for
+  12    NewRowid           1  11   0                 0  r[11]=rowid
+  13    Insert             1  10  11                 4  intkey=r[11] data=r[10]
+  14  Next                 2   4   0                 0
+  15  InitCoroutine       12  37  16                 0
+  16  Once                26   0   0                 0  goto 26
+  17  OpenEphemeral        0   0   0                 0  cursor=0 is_table=false
+  18  Rewind               1  26   0                 0  Rewind  ephemeral()
+  19    Column             1   0   1                 0  r[1]=ephemeral().id
+  20    Column             1   1   2                 0  r[2]=ephemeral().customer_id
+  21    Column             1   2   3                 0  r[3]=ephemeral().total_amount
+  22    Copy               2  13   0                 0  r[13]=r[2]
+  23    MakeRecord        13   1  14                 0  r[14]=mkrec(r[13..13]); for ephemeral_index_where_sub_t4
+  24    IdxInsert          0  14   0                 8  key=r[14]
+  25  Next                 1  19   0                 0
+  26  OpenRead             3   6   0  k(4,B,B,B,B)   0  table=customers, root=6, iDb=0
+  27  NullRow              0   0   0                 0  Set cursor 0 to a (pseudo) NULL row
+  28  Rewind               0  36   0                 0  Rewind  ephemeral(ephemeral_index_where_sub_t4)
+  29    Column             0   0  17                 0  r[17]=ephemeral(ephemeral_index_where_sub_t4).customer_id
+  30    IsNull            17  35   0                 0  if (r[17]==NULL) goto 35
+  31    SeekRowid          3  17  35                 0  if (r[17]!=cursor 3 for table customers.rowid) goto 35
+  32    RowId              3  15   0                 0  r[15]=customers.rowid
+  33    Column             3   1  16                 0  r[16]=customers.name
+  34    Yield             12   0   0                 0
+  35  Next                 0  29   0                 0
+  36  EndCoroutine        12   0   0                 0
+  37  OpenDup              4   1   0                 0  new_cursor=4, original_cursor=1
+  38  InitCoroutine       12   0  16                 0
+  39    Yield             12  67   0                 0
+  40    Once              51   0   0                 0  goto 51
+  41    OpenAutoindex      5   0   0                 0  cursor=5
+  42    Rewind             4  43   0                 0  Rewind  ephemeral()
+  43      Column           4   1  23                 0  r[23]=ephemeral().customer_id
+  44      Column           4   0  24                 0  r[24]=ephemeral().id
+  45      Column           4   2  25                 0  r[25]=ephemeral().total_amount
+  46      RowId            4  26   0                 0  r[26]=ephemeral().rowid
+  47      MakeRecord      23   4  27                 0  r[27]=mkrec(r[23..26]); for ephemeral_subquery_t8
+  48      FilterAdd        5  23   1                 0  bloom_filter_add(r[23..24])
+  49      IdxInsert        5  27  23                 0  key=r[27]
+  50    Next               4  43   0                 0
+  51    Copy              15  28   0                 0  r[28]=r[15]
+  52    IsNull            28  66   0                 0  if (r[28]==NULL) goto 66
+  53    Affinity          28   1   0                 0  r[28..29] = D
+  54    Filter             5  66  28                 1  if !bloom_filter(r[28..29]) goto 66
+  55    SeekGE             5  66  28                 0  key=[28..28]
+  56      IdxGT            5  66  28                 0  key=[28..28]
+  57      DeferredSeek     5   4   0                 0
+  58      Column           4   0  18                 0  r[18]=ephemeral().id
+  59      Column           4   1  19                 0  r[19]=ephemeral().customer_id
+  60      Column           4   2  20                 0  r[20]=ephemeral().total_amount
+  61      Copy            16  21   0                 0  r[21]=r[16]
+  62      Column           5   2  22                 0  r[22]=ephemeral(ephemeral_subquery_t8).total_amount
+  63      RealAffinity    22   0   0                 0
+  64      ResultRow       21   2   0                 0  output=r[21..22]
+  65    Next               5  56   0                 0
+  66  Goto                 0  39   0                 0
+  67  Halt                 0   0   0                 0
+  68  Transaction          0   1  11                 0  iDb=0 tx_mode=Read
+  69  Integer           1000   9   0                 0  r[9]=1000
+  70  Goto                 0   1   0                 0

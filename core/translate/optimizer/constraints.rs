@@ -1411,6 +1411,44 @@ pub fn usable_constraints_for_join_order<'a>(
     usable_constraints_for_lhs_mask(constraints, refs, &lhs_mask, table_idx)
 }
 
+/// Order synthetic key columns for a materialized subquery seek index.
+///
+/// Unlike ordinary index analysis, the ephemeral index does not have a fixed
+/// on-disk column order, so we can choose one that matches the intended probe
+/// shape. Equalities come first, followed by columns that are constrained only
+/// by ranges. Columns that have both equality and range predicates stay in the
+/// equality prefix; the range side is redundant for key ordering.
+pub fn ordered_materialized_key_columns(constraints: &[&Constraint]) -> Vec<usize> {
+    let mut equality_cols = Vec::new();
+    let mut range_only_cols = Vec::new();
+
+    for constraint in constraints {
+        let Some(col_pos) = constraint.table_col_pos else {
+            continue;
+        };
+        match constraint.operator.as_ast_operator() {
+            Some(ast::Operator::Equals) => equality_cols.push(col_pos),
+            Some(
+                ast::Operator::Greater
+                | ast::Operator::GreaterEquals
+                | ast::Operator::Less
+                | ast::Operator::LessEquals,
+            ) => range_only_cols.push(col_pos),
+            _ => {}
+        }
+    }
+
+    equality_cols.sort_unstable();
+    equality_cols.dedup();
+    range_only_cols.sort_unstable();
+    range_only_cols.dedup();
+    range_only_cols.retain(|col_pos| !equality_cols.contains(col_pos));
+
+    let mut ordered = equality_cols;
+    ordered.extend(range_only_cols);
+    ordered
+}
+
 fn can_use_partial_index(index: &Index, query_where_clause: &[WhereTerm]) -> bool {
     let Some(index_where) = &index.where_clause else {
         // Full index, always usable

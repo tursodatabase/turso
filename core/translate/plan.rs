@@ -17,7 +17,7 @@ use crate::{
         planner::determine_where_to_eval_term,
     },
     vdbe::{
-        affinity::Affinity,
+        affinity::{self, Affinity},
         builder::{CursorKey, CursorType, ProgramBuilder},
         insn::{HashDistinctData, Insn},
         BranchOffset, CursorID,
@@ -108,8 +108,14 @@ impl ResultSetColumn {
 #[derive(Debug, Clone)]
 pub struct GroupBy {
     pub exprs: Vec<ast::Expr>,
-    /// sort order, if a sorter is required (= the columns aren't already in the correct order)
-    pub sort_order: Option<Vec<SortOrder>>,
+    /// Sort direction for each GROUP BY key column. Always present once
+    /// `compute_group_by_sort_order` has run; the outer optimizer reads
+    /// this to derive the materialized CTE's output order.
+    pub sort_order: Vec<SortOrder>,
+    /// When true the scan already provides the GROUP BY order and no
+    /// sorter is emitted. The `sort_order` is kept so that the outer
+    /// query can still read the effective output order.
+    pub sort_elided: bool,
     /// having clause split into a vec at 'AND' boundaries.
     pub having: Option<Vec<ast::Expr>>,
 }
@@ -515,6 +521,12 @@ pub struct SelectPlan {
     pub window: Option<Window>,
     /// Subqueries that appear in any part of the query apart from the FROM clause
     pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
+    /// Estimated number of times this SELECT will be invoked by its parent scope.
+    ///
+    /// Top-level queries and standalone FROM-subqueries default to 1. Correlated
+    /// non-FROM subqueries may be re-optimized after their parent join order is
+    /// known so their inner FROM-subqueries can cost repeated probes correctly.
+    pub input_cardinality_hint: Option<f64>,
     /// Estimated output rows from the optimizer's join order computation.
     /// Used to propagate cardinality estimates for CTE/subquery tables.
     pub estimated_output_rows: Option<f64>,
@@ -1479,7 +1491,9 @@ impl Operation {
                 idx_str: None,
                 constraints: Vec::new(),
             }),
-            Table::FromClauseSubquery(_) => Operation::Scan(Scan::Subquery),
+            Table::FromClauseSubquery(_) => Operation::Scan(Scan::Subquery {
+                iter_dir: IterationDirection::Forwards,
+            }),
         }
     }
 
@@ -1588,8 +1602,8 @@ impl JoinedTable {
             plan: Box::new(Plan::Select(plan)),
             columns,
             result_columns_start_reg: None,
-            cte_id: None,
-            materialize_hint: false,
+            materialized_cursor_id: None,
+            cte: None,
         }));
         Ok(Self {
             op: Operation::default_scan_for(&table),
@@ -1678,13 +1692,18 @@ impl JoinedTable {
         // materialize_hint is set true for explicit WITH ... AS MATERIALIZED hint.
         // Multi-reference CTEs are also detected at emission time via reference counting,
         // and they may be materialized regardless of explicit keyword usage.
+        let cte = cte_id.map(|id| crate::schema::FromClauseSubqueryCteMetadata {
+            id,
+            shared_materialization: false,
+            materialize_hint,
+        });
         let table = Table::FromClauseSubquery(Arc::new(FromClauseSubquery {
             name: identifier.clone(),
             plan: Box::new(plan),
             columns,
             result_columns_start_reg: None,
-            cte_id,
-            materialize_hint,
+            materialized_cursor_id: None,
+            cte,
         }));
         Ok(Self {
             op: Operation::default_scan_for(&table),
@@ -1842,8 +1861,8 @@ impl JoinedTable {
 
                 let index_cursor_id = index
                     .map(|index| {
-                        program.alloc_cursor_index(
-                            Some(CursorKey::index(self.internal_id, index.clone())),
+                        program.alloc_cursor_index_if_not_exists(
+                            CursorKey::index(self.internal_id, index.clone()),
                             index,
                         )
                     })
@@ -1858,7 +1877,17 @@ impl JoinedTable {
                 let index_cursor_id = None;
                 Ok((table_cursor_id, index_cursor_id))
             }
-            Table::FromClauseSubquery(..) => Ok((None, None)),
+            Table::FromClauseSubquery(..) => {
+                let index_cursor_id = index
+                    .map(|index| {
+                        program.alloc_cursor_index_if_not_exists(
+                            CursorKey::index(self.internal_id, index.clone()),
+                            index,
+                        )
+                    })
+                    .transpose()?;
+                Ok((None, index_cursor_id))
+            }
         }
     }
 
@@ -1869,16 +1898,17 @@ impl JoinedTable {
         mode: OperationMode,
     ) -> Result<(Option<CursorID>, Option<CursorID>)> {
         let index = self.op.index();
-        let table_cursor_id =
-            if let OperationMode::UPDATE(UpdateRowSource::PrebuiltEphemeralTable {
-                target_table,
-                ..
-            }) = &mode
-            {
-                program.resolve_cursor_id_safe(&CursorKey::table(target_table.internal_id))
-            } else {
-                program.resolve_cursor_id_safe(&CursorKey::table(self.internal_id))
-            };
+        let table_cursor_id = if let Table::FromClauseSubquery(from_clause_subquery) = &self.table {
+            from_clause_subquery.materialized_cursor_id
+        } else if let OperationMode::UPDATE(UpdateRowSource::PrebuiltEphemeralTable {
+            target_table,
+            ..
+        }) = &mode
+        {
+            program.resolve_cursor_id_safe(&CursorKey::table(target_table.internal_id))
+        } else {
+            program.resolve_cursor_id_safe(&CursorKey::table(self.internal_id))
+        };
         let index_cursor_id = index.map(|index| {
             program.resolve_cursor_id(&CursorKey::index(self.internal_id, index.clone()))
         });
@@ -2066,6 +2096,27 @@ impl SeekDef {
     }
 }
 
+/// Build the affinity string for a synthesized ephemeral seek index.
+///
+/// The seek key only constrains the leading key prefix, but the backing record
+/// stored in the ephemeral index still includes the remaining payload columns
+/// (and possibly a synthetic rowid). Pad those trailing slots with NONE affinity
+/// so MakeRecord sees the same layout the index insert path produced.
+pub fn synthesized_seek_affinity_str(index: &Index, seek_def: &SeekDef) -> Option<Arc<String>> {
+    let num_key_cols = seek_def.size(&seek_def.start);
+    let total_cols = index.columns.len() + if index.has_rowid { 1 } else { 0 };
+    let mut aff: String = seek_def
+        .iter_affinity(&seek_def.start)
+        .map(|a| a.aff_mask())
+        .collect();
+    for _ in num_key_cols..total_cols {
+        aff.push(affinity::SQLITE_AFF_NONE);
+    }
+    aff.chars()
+        .any(|c| c != affinity::SQLITE_AFF_NONE)
+        .then(|| Arc::new(aff))
+}
+
 /// [SeekKeyComponent] represents the optional trailing component of a seek key.
 /// Besides user-provided expressions, planner logic may inject a synthetic NULL sentinel
 /// to encode SQLite-compatible boundary behavior on composite indexes.
@@ -2111,8 +2162,13 @@ pub enum Scan {
         /// The order of expressions matches the argument order expected by the virtual table.
         constraints: Vec<Expr>,
     },
-    /// A scan of a subquery in the `FROM` clause (using coroutines).
-    Subquery,
+    /// A scan of a subquery in the `FROM` clause.
+    Subquery {
+        /// Coroutine-backed scans run forwards. Materialized subqueries may
+        /// also be scanned backwards when the planner relies on intrinsic
+        /// subquery order for an extremum fast path.
+        iter_dir: IterationDirection,
+    },
 }
 
 /// An enum that represents a search operation that can be used to search for a row in a table using an index
@@ -2461,6 +2517,88 @@ pub fn plan_is_correlated(plan: &Plan) -> bool {
         } => left.iter().any(|(plan, _)| plan.is_correlated()) || right_most.is_correlated(),
         Plan::Delete(_) | Plan::Update(_) => false,
     }
+}
+
+/// Returns true when evaluating this plan depends on table values from an
+/// enclosing query scope outside the plan itself.
+///
+/// This is narrower than [`plan_is_correlated()`]: a plan may contain
+/// internally correlated scalar subqueries (for example, a scalar subquery that
+/// references another table in the same CTE) without depending on an enclosing
+/// query row. Those plans are still safe to materialize once and reuse.
+pub fn plan_has_outer_scope_dependency(plan: &Plan) -> bool {
+    fn select_plan_has_outer_scope_dependency(
+        plan: &SelectPlan,
+        accessible_table_ids: &mut Vec<TableInternalId>,
+    ) -> bool {
+        let outer_scope_base_len = accessible_table_ids.len();
+        accessible_table_ids.extend(
+            plan.table_references
+                .joined_tables()
+                .iter()
+                .map(|table| table.internal_id),
+        );
+
+        let has_outer_scope_dependency =
+            plan.table_references
+                .outer_query_refs()
+                .iter()
+                .any(|outer_ref| {
+                    outer_ref.is_used() && !accessible_table_ids.contains(&outer_ref.internal_id)
+                })
+                || plan
+                    .non_from_clause_subqueries
+                    .iter()
+                    .any(|subquery| match &subquery.state {
+                        SubqueryState::Unevaluated {
+                            plan: Some(subquery_plan),
+                        } => select_plan_has_outer_scope_dependency(
+                            subquery_plan,
+                            accessible_table_ids,
+                        ),
+                        SubqueryState::Unevaluated { plan: None } => false,
+                        SubqueryState::Evaluated { outer_ref_ids, .. } => outer_ref_ids
+                            .iter()
+                            .any(|outer_ref_id| !accessible_table_ids.contains(outer_ref_id)),
+                    })
+                || plan
+                    .table_references
+                    .joined_tables()
+                    .iter()
+                    .any(|table| match &table.table {
+                        Table::FromClauseSubquery(subquery) => {
+                            plan_has_outer_scope_dependency_with_tables(
+                                subquery.plan.as_ref(),
+                                accessible_table_ids,
+                            )
+                        }
+                        _ => false,
+                    });
+
+        accessible_table_ids.truncate(outer_scope_base_len);
+        has_outer_scope_dependency
+    }
+
+    fn plan_has_outer_scope_dependency_with_tables(
+        plan: &Plan,
+        accessible_table_ids: &mut Vec<TableInternalId>,
+    ) -> bool {
+        match plan {
+            Plan::Select(select_plan) => {
+                select_plan_has_outer_scope_dependency(select_plan, accessible_table_ids)
+            }
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => {
+                left.iter().any(|(select_plan, _)| {
+                    select_plan_has_outer_scope_dependency(select_plan, accessible_table_ids)
+                }) || select_plan_has_outer_scope_dependency(right_most, accessible_table_ids)
+            }
+            Plan::Delete(_) | Plan::Update(_) => false,
+        }
+    }
+
+    plan_has_outer_scope_dependency_with_tables(plan, &mut Vec::new())
 }
 
 /// Determine when a SELECT plan can be evaluated, including nested non-FROM and FROM-clause subqueries.

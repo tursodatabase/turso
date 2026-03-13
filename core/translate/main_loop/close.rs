@@ -104,19 +104,30 @@ impl CloseLoop {
                                 pc_if_next: loop_labels.loop_start,
                             });
                         }
-                        Scan::Subquery => {
+                        Scan::Subquery { iter_dir } => {
                             // Check if this is a materialized CTE (EphemeralTable) or coroutine
                             if let Table::FromClauseSubquery(subquery) = &table.table {
                                 if let Some(QueryDestination::EphemeralTable {
                                     cursor_id, ..
                                 }) = subquery.plan.select_query_destination()
                                 {
-                                    // Materialized CTE - use Next to iterate
-                                    program.emit_insn(Insn::Next {
-                                        cursor_id: *cursor_id,
-                                        pc_if_next: loop_labels.loop_start,
-                                    });
+                                    if *iter_dir == IterationDirection::Backwards {
+                                        program.emit_insn(Insn::Prev {
+                                            cursor_id: *cursor_id,
+                                            pc_if_prev: loop_labels.loop_start,
+                                        });
+                                    } else {
+                                        program.emit_insn(Insn::Next {
+                                            cursor_id: *cursor_id,
+                                            pc_if_next: loop_labels.loop_start,
+                                        });
+                                    }
                                 } else {
+                                    turso_assert_eq!(
+                                        *iter_dir,
+                                        IterationDirection::Forwards,
+                                        "coroutine-backed subqueries cannot scan backwards"
+                                    );
                                     // Coroutine-based subquery - use Goto to Yield
                                     program.emit_insn(Insn::Goto {
                                         target_pc: loop_labels.loop_start,
@@ -156,7 +167,8 @@ impl CloseLoop {
                         {
                             *ephemeral_table_cursor_id
                         } else if is_materialized_subquery {
-                            // For materialized subqueries, use the index cursor
+                            // Table-backed materialized subquery seeks iterate the
+                            // auxiliary ephemeral index cursor.
                             index_cursor_id.expect("materialized subquery must have index cursor")
                         } else {
                             index_cursor_id.unwrap_or_else(|| {
@@ -406,18 +418,32 @@ pub(super) struct AutoIndexResult {
     pub(super) use_bloom_filter: bool,
 }
 
+pub(super) struct AutoIndexBuild<'a> {
+    pub(super) index: &'a Arc<Index>,
+    pub(super) table_cursor_id: CursorID,
+    pub(super) index_cursor_id: CursorID,
+    pub(super) table_has_rowid: bool,
+    pub(super) num_seek_keys: usize,
+    pub(super) seek_def: &'a SeekDef,
+    pub(super) affinity_str: Option<&'a Arc<String>>,
+}
+
 /// Open an ephemeral index cursor and build an automatic index on a table.
 /// This is used as a last-resort to avoid a nested full table scan
 /// Returns the cursor id of the ephemeral index cursor.
 pub(super) fn emit_autoindex(
     program: &mut ProgramBuilder,
-    index: &Arc<Index>,
-    table_cursor_id: CursorID,
-    index_cursor_id: CursorID,
-    table_has_rowid: bool,
-    num_seek_keys: usize,
-    seek_def: &SeekDef,
+    build: AutoIndexBuild<'_>,
 ) -> Result<AutoIndexResult> {
+    let AutoIndexBuild {
+        index,
+        table_cursor_id,
+        index_cursor_id,
+        table_has_rowid,
+        num_seek_keys,
+        seek_def,
+        affinity_str,
+    } = build;
     turso_assert!(index.ephemeral, "index must be ephemeral", { "index_name": &index.name });
     let label_ephemeral_build_end = program.allocate_label();
     // Since this typically happens in an inner loop, we only build it once.
@@ -454,7 +480,7 @@ pub(super) fn emit_autoindex(
         count: to_u16(num_regs_to_reserve),
         dest_reg: to_u16(record_reg),
         index_name: Some(index.name.clone()),
-        affinity_str: None,
+        affinity_str: affinity_str.map(|s| (**s).clone()),
     });
     // Skip bloom filter for non-binary collations since it uses binary hashing.
     let use_bloom_filter = index.columns.iter().take(num_seek_keys).all(|col| {

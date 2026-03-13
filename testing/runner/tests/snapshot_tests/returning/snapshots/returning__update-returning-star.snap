@@ -11,7 +11,7 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-
+`--SEARCH t1 USING INDEX idx_t1_name (name=?)
 
 BYTECODE
 addr  opcode          p1  p2  p3  p4     p5  comment

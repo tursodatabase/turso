@@ -5,7 +5,7 @@ use turso_parser::ast::{self, SortOrder, SubqueryType};
 
 use crate::{
     emit_explain,
-    schema::{BTreeTable, Index, IndexColumn, Table},
+    schema::{BTreeTable, Column, Index, IndexColumn, Table},
     translate::{
         collate::get_collseq_from_expr,
         compound_select::emit_program_for_compound_select,
@@ -15,16 +15,16 @@ use crate::{
         },
         optimizer::optimize_select_plan,
         plan::{
-            ColumnUsedMask, JoinOrderMember, NonFromClauseSubquery, OuterQueryReference, Plan,
-            SetOperation, SubqueryPosition, SubqueryState, TableReferences, WhereTerm,
+            plan_has_outer_scope_dependency, plan_is_correlated, ColumnUsedMask, JoinOrderMember,
+            NonFromClauseSubquery, OuterQueryReference, Plan, SetOperation, SubqueryPosition,
+            SubqueryState, TableReferences, WhereTerm,
         },
         select::prepare_select_plan,
     },
     types::Value,
     util::parse_signed_number,
     vdbe::{
-        affinity,
-        builder::{CursorType, MaterializedCteInfo, ProgramBuilder},
+        builder::{CursorKey, CursorType, MaterializedCteInfo, ProgramBuilder},
         insn::Insn,
         CursorID,
     },
@@ -37,8 +37,96 @@ use super::{
     plan::{Aggregate, Operation, QueryDestination, Scan, Search, SelectPlan},
     planner::resolve_window_and_aggregate_functions,
 };
-use crate::vdbe::builder::CursorKey;
-use turso_parser::ast::TableInternalId;
+
+struct DirectMaterializedSubquery {
+    index: Arc<Index>,
+    affinity_str: Option<Arc<String>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MaterializedFromClauseSubqueryStorage {
+    TableBacked,
+    DirectIndex,
+}
+
+enum FromClauseSubqueryExecutionMode {
+    Coroutine,
+    MaterializedTable,
+    DirectMaterializedIndex(DirectMaterializedSubquery),
+}
+
+pub(crate) fn materialized_from_clause_subquery_storage(
+    subquery: &crate::schema::FromClauseSubquery,
+) -> Option<MaterializedFromClauseSubqueryStorage> {
+    match subquery.plan.select_query_destination() {
+        Some(QueryDestination::EphemeralTable { .. }) => {
+            Some(MaterializedFromClauseSubqueryStorage::TableBacked)
+        }
+        Some(QueryDestination::EphemeralIndex { .. }) => {
+            Some(MaterializedFromClauseSubqueryStorage::DirectIndex)
+        }
+        _ => None,
+    }
+}
+
+/// Mark CTE references that must be materialized once and shared across
+/// multiple reads of the same query tree.
+///
+/// Correlated plans are explicitly excluded: they must re-run for each outer
+/// row, so sharing a single materialized result would be semantically wrong.
+fn mark_shared_cte_materialization_requirements(program: &ProgramBuilder, plan: &mut SelectPlan) {
+    fn annotate_plan(program: &ProgramBuilder, plan: &mut Plan) {
+        match plan {
+            Plan::Select(select_plan) => {
+                mark_shared_cte_materialization_requirements(program, select_plan)
+            }
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => {
+                for (select_plan, _) in left.iter_mut() {
+                    mark_shared_cte_materialization_requirements(program, select_plan);
+                }
+                mark_shared_cte_materialization_requirements(program, right_most);
+            }
+            Plan::Delete(_) | Plan::Update(_) => unreachable!("DML plans cannot be subqueries"),
+        }
+    }
+
+    for table in plan.table_references.joined_tables_mut().iter_mut() {
+        if let Table::FromClauseSubquery(from_clause_subquery) = &mut table.table {
+            let from_clause_subquery = Arc::make_mut(from_clause_subquery);
+            let shared_materialization = from_clause_subquery.cte_id().is_some_and(|cte_id| {
+                program.get_cte_reference_count(cte_id) > 1
+                    && !plan_has_outer_scope_dependency(&from_clause_subquery.plan)
+            });
+            from_clause_subquery.set_shared_materialization(shared_materialization);
+            if let Some(cte_id) = from_clause_subquery.cte_id() {
+                tracing::trace!(
+                    cte_id,
+                    reference_count = program.get_cte_reference_count(cte_id),
+                    shared_materialization,
+                    outer_scope_dependency = plan_has_outer_scope_dependency(
+                        &from_clause_subquery.plan,
+                    ),
+                    contains_nested_correlation = plan_is_correlated(&from_clause_subquery.plan),
+                    identifier = %table.identifier,
+                    "annotated CTE materialization requirements"
+                );
+            }
+            annotate_plan(program, from_clause_subquery.plan.as_mut());
+        }
+    }
+
+    for subquery in plan.non_from_clause_subqueries.iter_mut() {
+        let SubqueryState::Unevaluated {
+            plan: Some(subquery_plan),
+        } = &mut subquery.state
+        else {
+            continue;
+        };
+        mark_shared_cte_materialization_requirements(program, subquery_plan);
+    }
+}
 
 // Compute query plans for subqueries occurring in any position other than the FROM clause.
 // This includes the WHERE clause, HAVING clause, GROUP BY clause, ORDER BY clause, LIMIT clause, and OFFSET clause.
@@ -144,6 +232,8 @@ pub fn plan_subqueries_from_select_plan(
     if !plan.aggregates.is_empty() {
         recollect_aggregates(plan, resolver)?;
     }
+
+    mark_shared_cte_materialization_requirements(program, plan);
 
     update_column_used_masks(
         &mut plan.table_references,
@@ -310,7 +400,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
             .map(|t| {
                 // Extract cte_id from FromClauseSubquery if this is a CTE reference
                 let cte_id = match &t.table {
-                    Table::FromClauseSubquery(subq) => subq.cte_id,
+                    Table::FromClauseSubquery(subq) => subq.cte_id(),
                     _ => None,
                 };
                 OuterQueryReference {
@@ -788,29 +878,47 @@ fn pre_materialize_multi_ref_ctes(
 ) -> Result<()> {
     match plan {
         Plan::Select(select_plan) => {
-            pre_materialize_multi_ref_ctes_in_tables(
-                program,
-                &mut select_plan.table_references,
-                t_ctx,
-            )?;
+            pre_materialize_multi_ref_ctes_in_select_plan(program, select_plan, t_ctx)?;
         }
         Plan::CompoundSelect {
             left, right_most, ..
         } => {
             for (select_plan, _) in left.iter_mut() {
-                pre_materialize_multi_ref_ctes_in_tables(
-                    program,
-                    &mut select_plan.table_references,
-                    t_ctx,
-                )?;
+                pre_materialize_multi_ref_ctes_in_select_plan(program, select_plan, t_ctx)?;
             }
-            pre_materialize_multi_ref_ctes_in_tables(
-                program,
-                &mut right_most.table_references,
-                t_ctx,
-            )?;
+            pre_materialize_multi_ref_ctes_in_select_plan(program, right_most, t_ctx)?;
         }
         Plan::Delete(_) | Plan::Update(_) => {}
+    }
+    Ok(())
+}
+
+fn pre_materialize_multi_ref_ctes_in_select_plan(
+    program: &mut ProgramBuilder,
+    plan: &mut SelectPlan,
+    t_ctx: &mut TranslateCtx,
+) -> Result<()> {
+    pre_materialize_multi_ref_ctes_in_tables(program, &mut plan.table_references, t_ctx)?;
+    pre_materialize_multi_ref_ctes_in_non_from_subqueries(
+        program,
+        &mut plan.non_from_clause_subqueries,
+        t_ctx,
+    )
+}
+
+fn pre_materialize_multi_ref_ctes_in_non_from_subqueries(
+    program: &mut ProgramBuilder,
+    subqueries: &mut [NonFromClauseSubquery],
+    t_ctx: &mut TranslateCtx,
+) -> Result<()> {
+    for subquery in subqueries.iter_mut() {
+        let SubqueryState::Unevaluated {
+            plan: Some(subquery_plan),
+        } = &mut subquery.state
+        else {
+            continue;
+        };
+        pre_materialize_multi_ref_ctes_in_select_plan(program, subquery_plan.as_mut(), t_ctx)?;
     }
     Ok(())
 }
@@ -827,27 +935,32 @@ fn pre_materialize_multi_ref_ctes_in_tables(
             pre_materialize_multi_ref_ctes(program, from_clause_subquery.plan.as_mut(), t_ctx)?;
 
             // Then check if THIS CTE should be materialized
-            if let Some(cte_id) = from_clause_subquery.cte_id {
+            if let Some(cte_id) = from_clause_subquery.cte_id() {
                 if program.get_materialized_cte(cte_id).is_some() {
                     continue;
                 }
-                let is_multi_ref = program.get_cte_reference_count(cte_id) > 1;
-                if from_clause_subquery.materialize_hint || is_multi_ref {
-                    let (result_columns_start, cte_cursor_id, cte_table) = emit_materialized_cte(
-                        program,
-                        from_clause_subquery.plan.as_mut(),
-                        t_ctx,
-                        from_clause_subquery.columns.len(),
-                    )?;
+                if from_clause_subquery.requires_table_materialization() {
+                    tracing::trace!(
+                        cte_id,
+                        identifier = %table_reference.identifier,
+                        "pre-materializing shared CTE"
+                    );
+                    let (result_columns_start, cte_cursor_id, cte_table) =
+                        emit_materialized_subquery_table(
+                            program,
+                            from_clause_subquery.plan.as_mut(),
+                            t_ctx,
+                            &from_clause_subquery.columns,
+                        )?;
                     program.register_materialized_cte(
                         cte_id,
                         MaterializedCteInfo {
                             cursor_id: cte_cursor_id,
                             table: cte_table,
-                            result_columns_start_reg: result_columns_start,
                             num_columns: from_clause_subquery.columns.len(),
                         },
                     );
+                    from_clause_subquery.materialized_cursor_id = Some(cte_cursor_id);
                     from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
                     program
                         .set_subquery_result_reg(table_reference.internal_id, result_columns_start);
@@ -856,6 +969,42 @@ fn pre_materialize_multi_ref_ctes_in_tables(
         }
     }
     Ok(())
+}
+
+fn choose_from_clause_subquery_execution_mode(
+    operation: &Operation,
+    from_clause_subquery: &crate::schema::FromClauseSubquery,
+) -> FromClauseSubqueryExecutionMode {
+    let needs_materialized_seek = matches!(
+        operation,
+        Operation::Search(Search::Seek {
+            index: Some(index), ..
+        }) if index.ephemeral
+    );
+
+    // Compound SELECTs still need their own internal ephemeral indexes for
+    // UNION/INTERSECT/EXCEPT bookkeeping. Reusing the subquery's synthesized
+    // seek index as the storage target would collapse those roles together and
+    // break set-operation semantics, so keep the direct-index fast path limited
+    // to simple SELECT plans.
+    let can_direct_materialize_index = from_clause_subquery.supports_direct_index_materialization();
+
+    match operation {
+        Operation::Search(Search::Seek {
+            index: Some(index),
+            seek_def,
+        }) if index.ephemeral && can_direct_materialize_index => {
+            FromClauseSubqueryExecutionMode::DirectMaterializedIndex(DirectMaterializedSubquery {
+                index: index.clone(),
+                affinity_str: super::plan::synthesized_seek_affinity_str(index, seek_def),
+            })
+        }
+        _ if needs_materialized_seek => FromClauseSubqueryExecutionMode::MaterializedTable,
+        _ if from_clause_subquery.requires_table_materialization() => {
+            FromClauseSubqueryExecutionMode::MaterializedTable
+        }
+        _ => FromClauseSubqueryExecutionMode::Coroutine,
+    }
 }
 
 /// Emit the subqueries contained in the FROM clause.
@@ -870,46 +1019,10 @@ pub fn emit_from_clause_subqueries(
         emit_explain!(program, false, "SCAN CONSTANT ROW".to_owned());
     }
 
-    // FIRST PASS: Pre-materialize all multi-ref CTEs recursively.
-    // This ensures materialized CTEs are available BEFORE any coroutines that might
-    // reference them internally. Without this, a coroutine might try to materialize
-    // a CTE inside its bytecode, but the cursor wouldn't be opened until the coroutine
-    // runs, causing OpenDup failures in the main code path.
-    for table_reference in tables.joined_tables_mut().iter_mut() {
-        if let Table::FromClauseSubquery(from_clause_subquery) = &mut table_reference.table {
-            let from_clause_subquery = Arc::make_mut(from_clause_subquery);
-            // Recursively pre-materialize CTEs in this subquery's plan FIRST
-            pre_materialize_multi_ref_ctes(program, from_clause_subquery.plan.as_mut(), t_ctx)?;
-
-            // Then check if THIS subquery's CTE should be materialized
-            if let Some(cte_id) = from_clause_subquery.cte_id {
-                if program.get_materialized_cte(cte_id).is_some() {
-                    continue;
-                }
-                let is_multi_ref = program.get_cte_reference_count(cte_id) > 1;
-                if from_clause_subquery.materialize_hint || is_multi_ref {
-                    let (result_columns_start, cte_cursor_id, cte_table) = emit_materialized_cte(
-                        program,
-                        from_clause_subquery.plan.as_mut(),
-                        t_ctx,
-                        from_clause_subquery.columns.len(),
-                    )?;
-                    program.register_materialized_cte(
-                        cte_id,
-                        MaterializedCteInfo {
-                            cursor_id: cte_cursor_id,
-                            table: cte_table,
-                            result_columns_start_reg: result_columns_start,
-                            num_columns: from_clause_subquery.columns.len(),
-                        },
-                    );
-                    from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
-                    program
-                        .set_subquery_result_reg(table_reference.internal_id, result_columns_start);
-                }
-            }
-        }
-    }
+    // FIRST PASS: Pre-materialize all recursively reachable multi-ref / hinted CTEs
+    // before any coroutine bodies are emitted. Otherwise a coroutine could try to
+    // OpenDup a CTE whose backing table has not been created yet.
+    pre_materialize_multi_ref_ctes_in_tables(program, tables, t_ctx)?;
 
     // Build the iteration order: join_order first (execution order), then any
     // hash-join build tables that aren't already in the join order.
@@ -969,7 +1082,7 @@ pub fn emit_from_clause_subqueries(
                                 format!("SCAN {table_name}")
                             }
                         }
-                        Scan::VirtualTable { .. } | Scan::Subquery => {
+                        Scan::VirtualTable { .. } | Scan::Subquery { .. } => {
                             format!("SCAN {table_name}")
                         }
                     }
@@ -1053,10 +1166,26 @@ pub fn emit_from_clause_subqueries(
         );
 
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table_reference.table {
+            let execution_mode = {
+                let from_clause_subquery = from_clause_subquery.as_ref();
+                choose_from_clause_subquery_execution_mode(
+                    &table_reference.op,
+                    from_clause_subquery,
+                )
+            };
             let from_clause_subquery = Arc::make_mut(from_clause_subquery);
             // Check if this is a CTE that's already materialized
-            if let Some(cte_id) = from_clause_subquery.cte_id {
+            if let Some(cte_id) = from_clause_subquery.cte_id() {
                 if let Some(cte_info) = program.get_materialized_cte(cte_id).cloned() {
+                    if from_clause_subquery.materialized_cursor_id.is_some() {
+                        tracing::trace!(
+                            cte_id,
+                            identifier = %table_reference.identifier,
+                            "reusing pre-materialized CTE on original reference"
+                        );
+                        program.pop_current_parent_explain();
+                        continue;
+                    }
                     // === SUBSEQUENT CTE REFERENCE: Use OpenDup ===
                     // Create a dup cursor pointing to the same ephemeral table
                     let dup_cursor_id =
@@ -1065,43 +1194,13 @@ pub fn emit_from_clause_subqueries(
                         new_cursor_id: dup_cursor_id,
                         original_cursor_id: cte_info.cursor_id,
                     });
-
-                    // If this reference needs a seek index, build it from the dup cursor
-                    if let Operation::Search(Search::Seek {
-                        index: Some(index),
-                        seek_def,
-                        ..
-                    }) = &table_reference.op
-                    {
-                        if !index.ephemeral {
-                            panic!("subquery has non-ephemeral index: {}", index.name);
-                        }
-                        let dup_affinity_str = {
-                            let num_key_cols = seek_def.size(&seek_def.start);
-                            let total_cols =
-                                index.columns.len() + if index.has_rowid { 1 } else { 0 };
-                            let mut aff: String = seek_def
-                                .iter_affinity(&seek_def.start)
-                                .map(|a| a.aff_mask())
-                                .collect();
-                            for _ in num_key_cols..total_cols {
-                                aff.push(affinity::SQLITE_AFF_NONE);
-                            }
-                            if aff.chars().any(|c| c != affinity::SQLITE_AFF_NONE) {
-                                Some(Arc::new(aff))
-                            } else {
-                                None
-                            }
-                        };
-                        emit_seek_index_from_cursor(
-                            program,
-                            dup_cursor_id,
-                            index,
-                            table_reference.internal_id,
-                            cte_info.num_columns,
-                            dup_affinity_str.as_ref(),
-                        )?;
-                    }
+                    tracing::trace!(
+                        cte_id,
+                        identifier = %table_reference.identifier,
+                        original_cursor_id = cte_info.cursor_id,
+                        dup_cursor_id,
+                        "opening duplicate cursor for materialized CTE"
+                    );
 
                     // Update the plan's query destination to EphemeralTable so that
                     // main_loop knows to use Rewind/Next instead of coroutine Yield
@@ -1118,6 +1217,7 @@ pub fn emit_from_clause_subqueries(
                     // iterators of the same CTE (e.g., outer query and subquery) would
                     // overwrite each other's values when reading columns from their cursors.
                     let result_columns_start = program.alloc_registers(cte_info.num_columns);
+                    from_clause_subquery.materialized_cursor_id = Some(dup_cursor_id);
                     from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
                     program
                         .set_subquery_result_reg(table_reference.internal_id, result_columns_start);
@@ -1126,110 +1226,46 @@ pub fn emit_from_clause_subqueries(
                 }
             }
 
-            let (seek_index, seek_affinity_str) = match &table_reference.op {
-                Operation::Search(Search::Seek {
-                    index: Some(idx),
-                    seek_def,
-                    ..
-                }) if idx.ephemeral => {
-                    // Build affinity string for MakeRecord when inserting into the
-                    // ephemeral index. Key columns get the comparison affinity so that
-                    // cross-type seeks work (e.g. integer probe on text CTE values).
-                    // Non-key columns and rowid get NONE (no coercion).
-                    let num_key_cols = seek_def.size(&seek_def.start);
-                    let total_cols = idx.columns.len() + if idx.has_rowid { 1 } else { 0 };
-                    let mut aff: String = seek_def
-                        .iter_affinity(&seek_def.start)
-                        .map(|a| a.aff_mask())
-                        .collect();
-                    for _ in num_key_cols..total_cols {
-                        aff.push(affinity::SQLITE_AFF_NONE);
-                    }
-                    let has_non_none = aff.chars().any(|c| c != affinity::SQLITE_AFF_NONE);
-                    (
-                        Some(idx.clone()),
-                        if has_non_none {
-                            Some(Arc::new(aff))
-                        } else {
-                            None
-                        },
-                    )
+            let result_columns_start = match execution_mode {
+                FromClauseSubqueryExecutionMode::Coroutine => {
+                    emit_from_clause_subquery(program, from_clause_subquery.plan.as_mut(), t_ctx)?
                 }
-                _ => (None, None),
+                FromClauseSubqueryExecutionMode::MaterializedTable => {
+                    let (result_columns_start, cte_cursor_id, cte_table) =
+                        emit_materialized_subquery_table(
+                            program,
+                            from_clause_subquery.plan.as_mut(),
+                            t_ctx,
+                            &from_clause_subquery.columns,
+                        )?;
+                    from_clause_subquery.materialized_cursor_id = Some(cte_cursor_id);
+                    if let Some(cte_id) = from_clause_subquery.cte_id() {
+                        program.register_materialized_cte(
+                            cte_id,
+                            MaterializedCteInfo {
+                                cursor_id: cte_cursor_id,
+                                table: cte_table,
+                                num_columns: from_clause_subquery.columns.len(),
+                            },
+                        );
+                    }
+                    result_columns_start
+                }
+                FromClauseSubqueryExecutionMode::DirectMaterializedIndex(direct_index) => {
+                    emit_indexed_materialized_subquery(
+                        program,
+                        from_clause_subquery.plan.as_mut(),
+                        t_ctx,
+                        table_reference.internal_id,
+                        direct_index.index,
+                        direct_index.affinity_str,
+                        from_clause_subquery.columns.len(),
+                    )?
+                }
             };
 
-            // Determine if this CTE/subquery should be materialized:
-            // - materialize_hint=true: from WITH ... AS MATERIALIZED hint
-            // - Multi-reference CTE: materialize once, share via OpenDup
-            // - Single-reference CTE: use coroutine (more efficient)
-            let is_multi_ref_cte = from_clause_subquery
-                .cte_id
-                .is_some_and(|id| program.get_cte_reference_count(id) > 1);
-            let is_cte_and_should_materialize =
-                from_clause_subquery.materialize_hint || is_multi_ref_cte;
-
-            if is_cte_and_should_materialize {
-                // CTE sharing path: EphemeralTable + optional seek index
-                // Must use EphemeralTable to enable sharing via OpenDup
-                let (result_columns_start, cte_cursor_id, cte_table) = emit_materialized_cte(
-                    program,
-                    from_clause_subquery.plan.as_mut(),
-                    t_ctx,
-                    from_clause_subquery.columns.len(),
-                )?;
-
-                // Build seek index if needed
-                if let Some(index) = &seek_index {
-                    emit_seek_index_from_cursor(
-                        program,
-                        cte_cursor_id,
-                        index,
-                        table_reference.internal_id,
-                        from_clause_subquery.columns.len(),
-                        seek_affinity_str.as_ref(),
-                    )?;
-                }
-
-                // Register CTE for future references via OpenDup
-                if let Some(cte_id) = from_clause_subquery.cte_id {
-                    program.register_materialized_cte(
-                        cte_id,
-                        MaterializedCteInfo {
-                            cursor_id: cte_cursor_id,
-                            table: cte_table,
-                            result_columns_start_reg: result_columns_start,
-                            num_columns: from_clause_subquery.columns.len(),
-                        },
-                    );
-                }
-
-                from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
-                program.set_subquery_result_reg(table_reference.internal_id, result_columns_start);
-            } else if let Some(index) = seek_index {
-                // Seek-only path: materialize directly into EphemeralIndex.
-                // This works for both Select and CompoundSelect plans.
-                let result_columns_start = emit_indexed_materialized_subquery(
-                    program,
-                    from_clause_subquery.plan.as_mut(),
-                    t_ctx,
-                    &index,
-                    table_reference.internal_id,
-                    from_clause_subquery.columns.len(),
-                    seek_affinity_str,
-                )?;
-                from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
-                program.set_subquery_result_reg(table_reference.internal_id, result_columns_start);
-            } else {
-                // Emit the subquery as a coroutine and get the start register of the result columns.
-                let result_columns_start =
-                    emit_from_clause_subquery(program, from_clause_subquery.plan.as_mut(), t_ctx)?;
-                // Set the start register of the subquery's result columns.
-                // This is done so that translate_expr() can read the result columns of the subquery,
-                // as if it were reading from a regular table.
-                from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
-                // Also store in program builder so nested subqueries can look it up by internal_id.
-                program.set_subquery_result_reg(table_reference.internal_id, result_columns_start);
-            }
+            from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
+            program.set_subquery_result_reg(table_reference.internal_id, result_columns_start);
         }
 
         program.pop_current_parent_explain();
@@ -1333,27 +1369,102 @@ pub fn emit_from_clause_subquery(
     program.preassign_label_to_next_insn(subquery_body_end_label);
     Ok(result_column_start_reg)
 }
-/// Materialize a CTE/subquery into an ephemeral table (not index).
-/// This is used for CTEs to enable sharing via OpenDup - the ephemeral table holds
-/// the CTE data, and subsequent references can alias it with OpenDup.
+/// Materialize a single-reference seekable FROM-subquery directly into an
+/// ephemeral index.
 ///
-/// Returns (result_columns_start_reg, cursor_id, table) where table is the ephemeral
-/// table definition needed for allocating dup cursors.
-fn emit_materialized_cte(
+/// This skips the intermediate EphemeralTable when we only need seek access and do
+/// not need table-backed sharing via OpenDup. Result columns for this path are read
+/// back from the index using `pos_in_table` mapping rather than raw index position.
+fn emit_indexed_materialized_subquery(
     program: &mut ProgramBuilder,
     plan: &mut Plan,
     t_ctx: &mut TranslateCtx,
+    internal_id: ast::TableInternalId,
+    index: Arc<Index>,
+    affinity_str: Option<Arc<String>>,
     num_columns: usize,
+) -> Result<usize> {
+    let cursor_id = program
+        .alloc_cursor_index_if_not_exists(CursorKey::index(internal_id, index.clone()), &index)?;
+    let result_columns_start_reg = program.alloc_registers(num_columns);
+
+    if let Some(dest) = plan.select_query_destination_mut() {
+        *dest = QueryDestination::EphemeralIndex {
+            cursor_id,
+            index,
+            affinity_str,
+            is_delete: false,
+        };
+    }
+
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id,
+        is_table: false,
+    });
+
+    match plan {
+        Plan::Select(select_plan) => {
+            let mut metadata = TranslateCtx {
+                labels_main_loop: (0..select_plan.joined_tables().len())
+                    .map(|_| LoopLabels::new(program))
+                    .collect(),
+                label_main_loop_end: None,
+                meta_group_by: None,
+                meta_left_joins: (0..select_plan.joined_tables().len())
+                    .map(|_| None)
+                    .collect(),
+                meta_semi_anti_joins: (0..select_plan.joined_tables().len())
+                    .map(|_| None)
+                    .collect(),
+                meta_sort: None,
+                reg_agg_start: None,
+                reg_nonagg_emit_once_flag: None,
+                reg_result_cols_start: None,
+                limit_ctx: None,
+                reg_offset: None,
+                reg_limit_offset_sum: None,
+                resolver: t_ctx.resolver.fork(),
+                non_aggregate_expressions: Vec::new(),
+                cdc_cursor_id: None,
+                meta_window: None,
+                meta_in_seeks: (0..select_plan.joined_tables().len())
+                    .map(|_| None)
+                    .collect(),
+                materialized_build_inputs: HashMap::default(),
+                hash_table_contexts: HashMap::default(),
+                unsafe_testing: t_ctx.unsafe_testing,
+            };
+            emit_query(program, select_plan, &mut metadata)?;
+        }
+        Plan::CompoundSelect { .. } => {
+            let plan_clone = plan.clone();
+            let resolver = t_ctx.resolver.fork();
+            emit_program_for_compound_select(program, &resolver, plan_clone)?;
+        }
+        Plan::Delete(_) | Plan::Update(_) => {
+            unreachable!("DELETE/UPDATE plans cannot be FROM clause subqueries")
+        }
+    }
+
+    Ok(result_columns_start_reg)
+}
+
+fn emit_materialized_subquery_table(
+    program: &mut ProgramBuilder,
+    plan: &mut Plan,
+    t_ctx: &mut TranslateCtx,
+    columns: &[Column],
 ) -> Result<(usize, CursorID, Arc<BTreeTable>)> {
     use super::plan::EphemeralRowidMode;
 
-    // Create a dummy BTreeTable for the ephemeral table's cursor type.
     // EphemeralTable (not EphemeralIndex) is required because it preserves
-    // insertion order, which SQL semantics require for UNION ALL.
+    // insertion order, which SQL semantics require for UNION ALL. It also
+    // needs the subquery's column layout so later Column opcodes can read
+    // materialized rows through the normal table-cursor path.
     let ephemeral_table = Arc::new(BTreeTable {
         root_page: 0,
         name: String::new(),
-        columns: vec![],
+        columns: columns.to_vec(),
         primary_key_columns: vec![],
         has_rowid: true,
         is_strict: false,
@@ -1364,11 +1475,10 @@ fn emit_materialized_cte(
         pk_conflict_clause: None,
     });
 
-    // Allocate cursor for the ephemeral table
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ephemeral_table.clone()));
 
     // Allocate registers for reading result columns
-    let result_columns_start_reg = program.alloc_registers(num_columns);
+    let result_columns_start_reg = program.alloc_registers(columns.len());
 
     // Open the ephemeral table
     program.emit_insn(Insn::OpenEphemeral {
@@ -1432,196 +1542,6 @@ fn emit_materialized_cte(
     }
 
     Ok((result_columns_start_reg, cursor_id, ephemeral_table))
-}
-
-/// Materialize a simple SELECT subquery directly into an ephemeral index.
-/// This avoids the intermediate ephemeral table, halving materialization cost.
-///
-/// # Preconditions
-/// - Must be a simple SELECT plan, not CompoundSelect (UNION/INTERSECT/EXCEPT).
-///   Compound selects need separate deduplication indexes that conflict with seek indexes.
-/// - The index must be ephemeral and configured for seeking (has_rowid: true).
-///
-/// # Returns
-/// The `result_columns_start_reg` - the main loop will read columns into these registers
-/// when iterating the index via `Insn::Column`.
-fn emit_indexed_materialized_subquery(
-    program: &mut ProgramBuilder,
-    plan: &mut Plan,
-    t_ctx: &mut TranslateCtx,
-    index: &Arc<Index>,
-    table_internal_id: TableInternalId,
-    num_columns: usize,
-    affinity_str: Option<Arc<String>>,
-) -> Result<usize> {
-    // Allocate index cursor using CursorKey::index so main_loop can find it
-    let index_cursor_id = program.alloc_cursor_id_keyed(
-        CursorKey::index(table_internal_id, index.clone()),
-        CursorType::BTreeIndex(index.clone()),
-    );
-
-    // Set QueryDestination::EphemeralIndex on the plan
-    if let Some(dest) = plan.select_query_destination_mut() {
-        *dest = QueryDestination::EphemeralIndex {
-            cursor_id: index_cursor_id,
-            index: index.clone(),
-            affinity_str,
-            is_delete: false,
-        };
-    }
-
-    // Allocate registers for reading result columns
-    let result_columns_start_reg = program.alloc_registers(num_columns);
-
-    // Open the ephemeral index
-    program.emit_insn(Insn::OpenEphemeral {
-        cursor_id: index_cursor_id,
-        is_table: false, // false = index
-    });
-
-    // Emit the plan - it will insert rows directly into the index
-    match plan {
-        Plan::Select(select_plan) => {
-            let mut metadata = TranslateCtx {
-                labels_main_loop: (0..select_plan.joined_tables().len())
-                    .map(|_| LoopLabels::new(program))
-                    .collect(),
-                label_main_loop_end: None,
-                meta_group_by: None,
-                meta_left_joins: (0..select_plan.joined_tables().len())
-                    .map(|_| None)
-                    .collect(),
-                meta_semi_anti_joins: (0..select_plan.joined_tables().len())
-                    .map(|_| None)
-                    .collect(),
-                meta_sort: None,
-                reg_agg_start: None,
-                reg_nonagg_emit_once_flag: None,
-                reg_result_cols_start: None,
-                limit_ctx: None,
-                reg_offset: None,
-                reg_limit_offset_sum: None,
-                resolver: t_ctx.resolver.fork(),
-                non_aggregate_expressions: Vec::new(),
-                cdc_cursor_id: None,
-                meta_window: None,
-                meta_in_seeks: (0..select_plan.joined_tables().len())
-                    .map(|_| None)
-                    .collect(),
-                materialized_build_inputs: HashMap::default(),
-                hash_table_contexts: HashMap::default(),
-                unsafe_testing: t_ctx.unsafe_testing,
-            };
-            emit_query(program, select_plan, &mut metadata)?;
-        }
-        Plan::CompoundSelect { .. } => {
-            let plan_clone = plan.clone();
-            let resolver = t_ctx.resolver.fork();
-            emit_program_for_compound_select(program, &resolver, plan_clone)?;
-        }
-        Plan::Delete(_) | Plan::Update(_) => {
-            unreachable!("DELETE/UPDATE plans cannot be FROM clause subqueries")
-        }
-    }
-
-    Ok(result_columns_start_reg)
-}
-
-/// Build a seek index from an existing ephemeral table cursor.
-/// This is used when there is a materialized CTE that is used
-/// in multiple places (e.g. one place scans it and other wants to seek it),
-/// so it's first built into an ephmeral table elsewhere and then a separate
-/// index is constructed from that here.
-fn emit_seek_index_from_cursor(
-    program: &mut ProgramBuilder,
-    source_cursor_id: CursorID,
-    index: &Arc<Index>,
-    table_internal_id: TableInternalId,
-    num_columns: usize,
-    affinity_str: Option<&Arc<String>>,
-) -> Result<()> {
-    // Allocate cursor for the seek index
-    let index_cursor_id = program.alloc_cursor_id_keyed(
-        CursorKey::index(table_internal_id, index.clone()),
-        CursorType::BTreeIndex(index.clone()),
-    );
-
-    // Open the ephemeral index
-    program.emit_insn(Insn::OpenEphemeral {
-        cursor_id: index_cursor_id,
-        is_table: false,
-    });
-
-    // Rewind the source cursor to iterate all rows
-    let loop_start = program.allocate_label();
-    let loop_end = program.allocate_label();
-
-    program.emit_insn(Insn::Rewind {
-        cursor_id: source_cursor_id,
-        pc_if_empty: loop_end,
-    });
-
-    program.preassign_label_to_next_insn(loop_start);
-
-    // Read columns from source cursor and build index record
-    let record_reg = program.alloc_register();
-    let column_regs_start = program.alloc_registers(num_columns);
-
-    // Read all columns from source cursor
-    for i in 0..num_columns {
-        program.emit_insn(Insn::Column {
-            cursor_id: source_cursor_id,
-            column: i,
-            dest: column_regs_start + i,
-            default: None,
-        });
-    }
-
-    // Build the index key from the index columns
-    let num_key_cols = index.columns.len() + 1; // +1 for rowid
-    let key_regs_start = program.alloc_registers(num_key_cols);
-    for (i, col) in index.columns.iter().enumerate() {
-        program.emit_insn(Insn::Copy {
-            src_reg: column_regs_start + col.pos_in_table,
-            dst_reg: key_regs_start + i,
-            extra_amount: 0,
-        });
-    }
-
-    // Add rowid as last column of index key
-    program.emit_insn(Insn::RowId {
-        cursor_id: source_cursor_id,
-        dest: key_regs_start + index.columns.len(),
-    });
-
-    // Make record and insert into index.
-    // affinity_str coerces key columns so cross-type seeks work (e.g. integer
-    // probe on text CTE values).
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: key_regs_start as u16,
-        count: num_key_cols as u16,
-        dest_reg: record_reg as u16,
-        index_name: Some(index.name.clone()),
-        affinity_str: affinity_str.map(|s| (**s).clone()),
-    });
-
-    program.emit_insn(Insn::IdxInsert {
-        cursor_id: index_cursor_id,
-        record_reg,
-        unpacked_start: Some(key_regs_start),
-        unpacked_count: Some(num_key_cols as u16),
-        flags: crate::vdbe::insn::IdxInsertFlags::default(),
-    });
-
-    // Next row
-    program.emit_insn(Insn::Next {
-        cursor_id: source_cursor_id,
-        pc_if_next: loop_start,
-    });
-
-    program.preassign_label_to_next_insn(loop_end);
-
-    Ok(())
 }
 
 /// Translate a subquery that is not part of the FROM clause.

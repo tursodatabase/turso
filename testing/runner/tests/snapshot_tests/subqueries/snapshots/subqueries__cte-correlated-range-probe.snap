@@ -1,0 +1,37 @@
+---
+source: subqueries.sqltest
+expression: |-
+  WITH ordered_points AS (
+          SELECT DISTINCT point_value AS point_key
+          FROM sample_points
+          ORDER BY point_key
+      ),
+      previous_points AS (
+          SELECT point_key,
+                 (
+                     SELECT MAX(p2.point_key)
+                     FROM ordered_points p2
+                     WHERE p2.point_key < p1.point_key
+                 ) AS previous_point
+          FROM ordered_points p1
+      )
+      SELECT point_key, previous_point
+      FROM previous_points;
+info:
+  statement_type: WITH (CTE)
+  tables:
+  - ordered_points
+  - previous_points
+  - sample_points
+  setup_blocks:
+  - sequence_points_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN sample_points
+|--USE HASH TABLE FOR DISTINCT
+|--USE SORTER FOR ORDER BY
+`--SCAN previous_points
+   |--SCAN ordered_points AS p1
+   `--CORRELATED SCALAR SUBQUERY 1
+      `--SCAN ordered_points AS p2

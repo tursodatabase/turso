@@ -112,7 +112,7 @@ expect {
 test regexp_in_subquery {
     CREATE TABLE t5(a TEXT);
     INSERT INTO t5 VALUES ('abc'), ('def'), ('abcdef'), ('xyz');
-    SELECT * FROM (SELECT a, a REGEXP 'def' AS matches FROM t5) sub WHERE matches = 1;
+    SELECT * FROM (SELECT a, a REGEXP 'def' AS matches FROM t5) sub WHERE matches = 1 ORDER BY a DESC
 }
 expect {
     def|1

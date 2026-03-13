@@ -1,0 +1,22 @@
+---
+source: subqueries.sqltest
+expression: |-
+  WITH agg AS MATERIALIZED (
+          SELECT grp, SUM(val) AS total
+          FROM t GROUP BY grp
+          ORDER BY grp ASC
+      )
+      SELECT * FROM agg ORDER BY grp DESC;
+info:
+  statement_type: WITH (CTE)
+  tables:
+  - agg
+  - t
+  setup_blocks:
+  - grp_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN t
+|--USE SORTER FOR GROUP BY
+`--SCAN agg

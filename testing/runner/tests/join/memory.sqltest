@@ -154,6 +154,42 @@ expect {
     17|17|20|17
 }
 
+# regression test: ORDER BY cannot be satisfied by a deeper join loop when the
+# earlier loop can emit duplicate prefixes for the consumed order terms
+@cross-check-integrity
+test left-join-subquery-order-by-duplicate-prefix {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a INT, c INT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, a INT, c INT);
+    CREATE TABLE t3(id INTEGER PRIMARY KEY, c INT);
+    INSERT INTO t1 VALUES (43, 14, -4);
+    INSERT INTO t2 VALUES (10135, 14, -4), (10176, 14, -4);
+    INSERT INTO t3 VALUES
+        (20042, -4),
+        (20057, -4),
+        (20070, -4),
+        (20131, -4),
+        (20155, -4);
+
+    WITH cte_t2 AS NOT MATERIALIZED (SELECT * FROM t2)
+    SELECT t1.id, cte_t2.a, t3.id
+    FROM t1
+    LEFT JOIN cte_t2 ON t1.a = cte_t2.a AND t1.c = cte_t2.c
+    JOIN t3 ON cte_t2.c = t3.c
+    ORDER BY t1.id, cte_t2.a, t3.id;
+}
+expect {
+    43|14|20042
+    43|14|20042
+    43|14|20057
+    43|14|20057
+    43|14|20070
+    43|14|20070
+    43|14|20131
+    43|14|20131
+    43|14|20155
+    43|14|20155
+}
+
 @cross-check-integrity
 test test-spill-hash-join-count {
     CREATE TABLE t(a,b);

@@ -217,6 +217,128 @@ expect {
 
 }
 
+test materialized-cte-max-with-where {
+    CREATE TABLE products(price REAL NOT NULL);
+    CREATE INDEX idx_products_price ON products(price);
+    INSERT INTO products VALUES (10), (25), (15), (125);
+
+    WITH prices(price) AS MATERIALIZED (
+        SELECT price FROM products
+    )
+    SELECT MAX(price) FROM prices WHERE price < 100;
+}
+expect {
+    25.0
+}
+expect @js {
+    25
+}
+
+test materialized-cte-min-with-where-skips-null {
+    CREATE TABLE products(price REAL);
+    CREATE INDEX idx_products_price ON products(price);
+    INSERT INTO products VALUES (NULL), (10), (25), (15), (125);
+
+    WITH prices(price) AS MATERIALIZED (
+        SELECT price FROM products
+    )
+    SELECT MIN(price) FROM prices WHERE price < 100;
+}
+expect {
+    10.0
+}
+expect @js {
+    10
+}
+
+test materialized-cte-max-without-where {
+    CREATE TABLE products(price REAL NOT NULL);
+    CREATE INDEX idx_products_price ON products(price);
+    INSERT INTO products VALUES (10), (25), (15), (125);
+
+    WITH prices(price) AS MATERIALIZED (
+        SELECT price FROM products
+    )
+    SELECT MAX(price) FROM prices;
+}
+expect {
+    125.0
+}
+expect @js {
+    125
+}
+
+test materialized-cte-correlated-max-with-implicit-inner-order {
+    CREATE TABLE products(price REAL NOT NULL);
+    CREATE INDEX idx_products_price ON products(price);
+    INSERT INTO products VALUES (10), (25), (15), (125);
+
+    WITH prices(price) AS MATERIALIZED (
+        SELECT price FROM products
+    )
+    SELECT p1.price, (
+        SELECT MAX(p2.price)
+        FROM prices p2
+        WHERE p2.price < p1.price
+    )
+    FROM prices p1
+    WHERE p1.price < 100
+    ORDER BY p1.price;
+}
+expect {
+    10.0|
+    15.0|10.0
+    25.0|15.0
+}
+expect @js {
+    10|
+    15|10
+    25|15
+}
+
+test unordered-materialized-cte-max-without-where {
+    CREATE TABLE products(price REAL NOT NULL);
+    INSERT INTO products VALUES (10), (25), (15), (125);
+
+    WITH prices(price) AS MATERIALIZED (
+        SELECT price FROM products
+    )
+    SELECT MAX(price) FROM prices;
+}
+expect {
+    125.0
+}
+expect @js {
+    125
+}
+
+test unordered-materialized-cte-correlated-max {
+    CREATE TABLE products(price REAL NOT NULL);
+    INSERT INTO products VALUES (10), (25), (15), (125);
+
+    WITH prices(price) AS MATERIALIZED (
+        SELECT price FROM products
+    )
+    SELECT p1.price, (
+        SELECT MAX(p2.price)
+        FROM prices p2
+        WHERE p2.price < p1.price
+    )
+    FROM prices p1
+    WHERE p1.price < 100
+    ORDER BY p1.price;
+}
+expect {
+    10.0|
+    15.0|10.0
+    25.0|15.0
+}
+expect @js {
+    10|
+    15|10
+    25|15
+}
+
 # ============================================================
 # Indexed fast-path: collation
 # ============================================================

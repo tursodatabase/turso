@@ -1,0 +1,19 @@
+---
+source: indexes.sqltest
+expression: |-
+  WITH prices(price) AS MATERIALIZED (
+          SELECT price FROM products
+      )
+      SELECT MAX(price) FROM prices;
+info:
+  statement_type: WITH (CTE)
+  tables:
+  - prices
+  - products
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN products USING COVERING INDEX idx_products_price
+`--SCAN prices

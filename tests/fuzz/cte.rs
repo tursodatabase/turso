@@ -9,9 +9,11 @@
 
 #[cfg(test)]
 mod cte_tests {
+    use std::cmp::Ordering;
+
     use rand::Rng;
     use rand_chacha::ChaCha8Rng;
-    use rusqlite::params;
+    use rusqlite::{params, types::Value};
 
     use crate::helpers;
     use core_tester::common::{
@@ -104,6 +106,56 @@ mod cte_tests {
         }
 
         (format!("SELECT {}", cols.join(", ")), aliases)
+    }
+
+    fn sort_rows_for_unordered_compare(rows: &[Vec<Value>]) -> Vec<Vec<Value>> {
+        let mut sorted = rows.to_vec();
+        sorted.sort_by(|lhs, rhs| compare_rows(lhs, rhs));
+        sorted
+    }
+
+    fn compare_rows(lhs: &[Value], rhs: &[Value]) -> Ordering {
+        lhs.iter()
+            .zip(rhs.iter())
+            .map(|(lhs, rhs)| compare_values(lhs, rhs))
+            .find(|ordering| *ordering != Ordering::Equal)
+            .unwrap_or_else(|| lhs.len().cmp(&rhs.len()))
+    }
+
+    fn compare_values(lhs: &Value, rhs: &Value) -> Ordering {
+        use Value::{Blob, Integer, Null, Real, Text};
+
+        match (lhs, rhs) {
+            (Null, Null) => Ordering::Equal,
+            (Null, _) => Ordering::Less,
+            (_, Null) => Ordering::Greater,
+            (Integer(lhs), Integer(rhs)) => lhs.cmp(rhs),
+            (Integer(_), _) => Ordering::Less,
+            (_, Integer(_)) => Ordering::Greater,
+            (Real(lhs), Real(rhs)) => lhs.total_cmp(rhs),
+            (Real(_), _) => Ordering::Less,
+            (_, Real(_)) => Ordering::Greater,
+            (Text(lhs), Text(rhs)) => lhs.cmp(rhs),
+            (Text(_), Blob(_)) => Ordering::Less,
+            (Blob(_), Text(_)) => Ordering::Greater,
+            (Blob(lhs), Blob(rhs)) => lhs.cmp(rhs),
+        }
+    }
+
+    fn assert_query_row_parity(
+        query: &str,
+        limbo_result: &[Vec<Value>],
+        sqlite_result: &[Vec<Value>],
+        context: &str,
+    ) {
+        if query.contains("ORDER BY") {
+            assert_eq!(limbo_result, sqlite_result, "{context}");
+            return;
+        }
+
+        let limbo_sorted = sort_rows_for_unordered_compare(limbo_result);
+        let sqlite_sorted = sort_rows_for_unordered_compare(sqlite_result);
+        assert_eq!(limbo_sorted, sqlite_sorted, "{context}");
     }
 
     #[turso_macros::test]
@@ -511,9 +563,13 @@ mod cte_tests {
             let limbo_result = limbo_exec_rows(&limbo_conn, &query);
             let sqlite_result = sqlite_exec_rows(&sqlite_conn, &query);
 
-            assert_eq!(
-                limbo_result, sqlite_result,
-                "CTE feature interaction mismatch!\nseed: {seed}\niteration: {i}\nscenario: {scenario}\nquery: {query}\nlimbo: {limbo_result:?}\nsqlite: {sqlite_result:?}"
+            assert_query_row_parity(
+                &query,
+                &limbo_result,
+                &sqlite_result,
+                &format!(
+                    "CTE feature interaction mismatch!\nseed: {seed}\niteration: {i}\nscenario: {scenario}\nquery: {query}\nlimbo: {limbo_result:?}\nsqlite: {sqlite_result:?}"
+                ),
             );
         }
     }
@@ -914,15 +970,22 @@ mod cte_tests {
                 query = format!("{query} ORDER BY 1 {dir}");
             }
             if rng.random_bool(0.3) {
+                if !query.contains("ORDER BY") {
+                    query = format!("{query} ORDER BY 1 ASC");
+                }
                 query = format!("{} LIMIT {}", query, rng.random_range(1..20));
             }
 
             let limbo_result = limbo_exec_rows(&limbo_conn, &query);
             let sqlite_result = sqlite_exec_rows(&sqlite_conn, &query);
 
-            assert_eq!(
-                limbo_result, sqlite_result,
-                "CTE comprehensive mismatch!\nseed: {seed}\niteration: {i}\nquery: {query}\nlimbo: {limbo_result:?}\nsqlite: {sqlite_result:?}"
+            assert_query_row_parity(
+                &query,
+                &limbo_result,
+                &sqlite_result,
+                &format!(
+                    "CTE comprehensive mismatch!\nseed: {seed}\niteration: {i}\nquery: {query}\nlimbo: {limbo_result:?}\nsqlite: {sqlite_result:?}"
+                ),
             );
         }
     }
@@ -1585,14 +1648,12 @@ mod cte_tests {
     fn add_modifiers(rng: &mut ChaCha8Rng, query: &str, _cte: &CteInfo) -> String {
         let mut q = query.to_string();
 
-        // Add ORDER BY if not already present
-        if !q.contains("ORDER BY") && rng.random_bool(0.4) {
-            let dir = if rng.random_bool(0.5) { "ASC" } else { "DESC" };
-            q = format!("{q} ORDER BY 1 {dir}");
-        }
-
         // Add LIMIT (and sometimes OFFSET)
         if rng.random_bool(0.3) {
+            if !q.contains("ORDER BY") {
+                let dir = if rng.random_bool(0.5) { "ASC" } else { "DESC" };
+                q = format!("{q} ORDER BY 1 {dir}");
+            }
             let limit = rng.random_range(1..20);
             if rng.random_bool(0.3) {
                 let offset = rng.random_range(0..5);
@@ -1600,6 +1661,9 @@ mod cte_tests {
             } else {
                 q = format!("{q} LIMIT {limit}");
             }
+        } else if !q.contains("ORDER BY") && rng.random_bool(0.4) {
+            let dir = if rng.random_bool(0.5) { "ASC" } else { "DESC" };
+            q = format!("{q} ORDER BY 1 {dir}");
         }
 
         q
@@ -1659,9 +1723,13 @@ mod cte_tests {
             let limbo_result = limbo_exec_rows(&limbo_conn, &query);
             let sqlite_result = sqlite_exec_rows(&sqlite_conn, &query);
 
-            assert_eq!(
-                limbo_result, sqlite_result,
-                "CTE RNG-driven mismatch!\nseed: {seed}\niteration: {i}\nquery: {query}\nlimbo: {limbo_result:?}\nsqlite: {sqlite_result:?}"
+            assert_query_row_parity(
+                &query,
+                &limbo_result,
+                &sqlite_result,
+                &format!(
+                    "CTE RNG-driven mismatch!\nseed: {seed}\niteration: {i}\nquery: {query}\nlimbo: {limbo_result:?}\nsqlite: {sqlite_result:?}"
+                ),
             );
         }
     }

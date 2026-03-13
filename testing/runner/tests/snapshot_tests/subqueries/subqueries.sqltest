@@ -493,3 +493,340 @@ snapshot subquery-within-cte {
     WHERE fp.price > 100
     ORDER BY fp.price DESC;
 }
+
+setup sequence_points_schema {
+    CREATE TABLE sample_points(point_value INTEGER);
+    INSERT INTO sample_points VALUES (1), (2), (4), (7), (8);
+}
+
+setup signal-day-sources {
+    CREATE TABLE user_messages (
+        id INTEGER PRIMARY KEY,
+        created_ms INTEGER,
+        actor TEXT
+    );
+
+    CREATE TABLE session_starts (
+        id INTEGER PRIMARY KEY,
+        started_ms INTEGER
+    );
+
+    CREATE TABLE observed_items (
+        id INTEGER PRIMARY KEY,
+        created_ms INTEGER,
+        item_kind TEXT
+    );
+
+    CREATE TABLE journal_entries (
+        id INTEGER PRIMARY KEY,
+        created_ms INTEGER
+    );
+}
+
+# Correlated range probes into a multi-ref CTE should be able to seek the
+# materialized CTE instead of rescanning it for each outer row.
+@setup sequence_points_schema
+snapshot-eqp cte-correlated-range-probe {
+    WITH ordered_points AS (
+        SELECT DISTINCT point_value AS point_key
+        FROM sample_points
+        ORDER BY point_key
+    ),
+    previous_points AS (
+        SELECT point_key,
+               (
+                   SELECT MAX(p2.point_key)
+                   FROM ordered_points p2
+                   WHERE p2.point_key < p1.point_key
+               ) AS previous_point
+        FROM ordered_points p1
+    )
+    SELECT point_key, previous_point
+    FROM previous_points;
+}
+
+# Family-4-shaped multi-ref CTE query: after materialization, the scalar
+# subquery should probe the run identifier CTE by point key rather than scan it.
+@setup sequence_points_schema
+snapshot-eqp cte-materialized-scalar-probe {
+    WITH ordered_points AS (
+        SELECT DISTINCT point_value AS point_key
+        FROM sample_points
+        ORDER BY point_key
+    ),
+    previous_points AS (
+        SELECT point_key,
+               (
+                   SELECT MAX(p2.point_key)
+                   FROM ordered_points p2
+                   WHERE p2.point_key < p1.point_key
+               ) AS previous_point
+        FROM ordered_points p1
+    ),
+    run_markers AS (
+        SELECT point_key,
+               previous_point,
+               CASE
+                   WHEN point_key - previous_point = 1 THEN 0
+                   ELSE 1
+               END AS run_start
+        FROM previous_points
+    ),
+    run_ids AS (
+        SELECT point_key,
+               SUM(run_start) OVER (ORDER BY point_key) AS run_id
+        FROM run_markers
+    ),
+    run_lengths AS (
+        SELECT run_id,
+               MIN(point_key) AS start_key,
+               MAX(point_key) AS end_key,
+               COUNT(*) AS run_length
+        FROM run_ids
+        GROUP BY run_id
+    )
+    SELECT start_key, end_key, run_length
+    FROM run_lengths
+    WHERE run_id = (
+        SELECT run_id
+        FROM run_ids
+        WHERE point_key = (
+            SELECT MAX(point_key)
+            FROM ordered_points
+        )
+    );
+}
+
+@setup signal-day-sources
+snapshot-eqp run-length-current-window {
+    WITH signal_days AS (
+        SELECT DISTINCT date(datetime(ts_ms / 1000, 'unixepoch', '+60 minutes')) AS signal_day
+        FROM (
+            SELECT id, created_ms AS ts_ms FROM user_messages WHERE actor = 'user'
+            UNION ALL
+            SELECT id, started_ms AS ts_ms FROM session_starts
+            UNION ALL
+            SELECT id, created_ms AS ts_ms FROM observed_items WHERE item_kind = 'note' OR item_kind = 'alert'
+            UNION ALL
+            SELECT id, created_ms AS ts_ms FROM observed_items WHERE item_kind = 'alert'
+            UNION ALL
+            SELECT id, created_ms AS ts_ms FROM observed_items WHERE item_kind = 'note'
+            UNION ALL
+            SELECT id, created_ms AS ts_ms FROM journal_entries
+        )
+        ORDER BY signal_day
+    ),
+    prior_days AS (
+        SELECT signal_day,
+               (
+                   SELECT MAX(d2.signal_day)
+                   FROM signal_days d2
+                   WHERE d2.signal_day < d1.signal_day
+               ) AS previous_day
+        FROM signal_days d1
+    ),
+    run_boundaries AS (
+        SELECT signal_day,
+               previous_day,
+               JULIANDAY(signal_day) - JULIANDAY(previous_day) AS day_gap,
+               CASE
+                   WHEN JULIANDAY(signal_day) - JULIANDAY(previous_day) = 1 THEN 0
+                   ELSE 1
+               END AS run_start
+        FROM prior_days
+    ),
+    run_ids AS (
+        SELECT signal_day,
+               SUM(run_start) OVER (ORDER BY signal_day) AS run_id
+        FROM run_boundaries
+    ),
+    run_lengths AS (
+        SELECT run_id,
+               MIN(signal_day) AS start_day,
+               MAX(signal_day) AS end_day,
+               COUNT(*) AS run_length
+        FROM run_ids
+        GROUP BY run_id
+    )
+    SELECT start_day, end_day, run_length
+    FROM run_lengths
+    WHERE run_id = (
+        SELECT run_id
+        FROM run_ids
+        WHERE signal_day = (
+            SELECT MAX(signal_day)
+            FROM signal_days
+        )
+    );
+}
+
+@setup signal-day-sources
+snapshot-eqp run-length-longest-window {
+    WITH signal_days AS (
+        SELECT DISTINCT date(datetime(ts_ms / 1000, 'unixepoch', '+60 minutes')) AS signal_day
+        FROM (
+            SELECT id, created_ms AS ts_ms FROM user_messages WHERE actor = 'user'
+            UNION ALL
+            SELECT id, started_ms AS ts_ms FROM session_starts
+            UNION ALL
+            SELECT id, created_ms AS ts_ms FROM observed_items WHERE item_kind = 'note' OR item_kind = 'alert'
+            UNION ALL
+            SELECT id, created_ms AS ts_ms FROM observed_items WHERE item_kind = 'alert'
+            UNION ALL
+            SELECT id, created_ms AS ts_ms FROM observed_items WHERE item_kind = 'note'
+            UNION ALL
+            SELECT id, created_ms AS ts_ms FROM journal_entries
+        )
+        ORDER BY signal_day
+    ),
+    prior_days AS (
+        SELECT signal_day,
+               (
+                   SELECT MAX(d2.signal_day)
+                   FROM signal_days d2
+                   WHERE d2.signal_day < d1.signal_day
+               ) AS previous_day
+        FROM signal_days d1
+    ),
+    run_boundaries AS (
+        SELECT signal_day,
+               previous_day,
+               JULIANDAY(signal_day) - JULIANDAY(previous_day) AS day_gap,
+               CASE
+                   WHEN JULIANDAY(signal_day) - JULIANDAY(previous_day) = 1 THEN 0
+                   ELSE 1
+               END AS run_start
+        FROM prior_days
+    ),
+    run_ids AS (
+        SELECT signal_day,
+               SUM(run_start) OVER (ORDER BY signal_day) AS run_id
+        FROM run_boundaries
+    ),
+    run_lengths AS (
+        SELECT run_id,
+               MIN(signal_day) AS start_day,
+               MAX(signal_day) AS end_day,
+               COUNT(*) AS run_length
+        FROM run_ids
+        GROUP BY run_id
+    )
+    SELECT start_day, end_day, run_length
+    FROM run_lengths
+    ORDER BY run_length DESC
+    LIMIT 1;
+}
+
+# =============================================================================
+# CTE MATERIALIZED ORDER REUSE
+# =============================================================================
+
+setup ordered_cte_schema {
+    CREATE TABLE t(x);
+    CREATE INDEX xdesc ON t(x DESC);
+}
+
+setup multi_col_schema {
+    CREATE TABLE t(a INTEGER, b INTEGER);
+}
+
+setup grp_schema {
+    CREATE TABLE t(grp TEXT, val INTEGER);
+}
+
+# Materialized CTE with ORDER BY DESC, outer query ORDER BY same direction.
+# The sorter should be eliminated because the materialized table's intrinsic
+# order matches the outer ORDER BY.
+@setup ordered_cte_schema
+snapshot-eqp cte-materialized-order-reused-same-dir {
+    WITH descending AS MATERIALIZED (
+        SELECT * FROM t ORDER BY x DESC
+    )
+    SELECT * FROM descending ORDER BY descending.x DESC;
+}
+
+# Materialized CTE with ORDER BY DESC, outer query ORDER BY ASC.
+# With backwards scan support the sorter should be eliminated too.
+@setup ordered_cte_schema
+snapshot-eqp cte-materialized-order-reused-opposite-dir {
+    WITH descending AS MATERIALIZED (
+        SELECT * FROM t ORDER BY x DESC
+    )
+    SELECT * FROM descending ORDER BY descending.x ASC;
+}
+
+# --- Positive: multi-column same direction (should eliminate sorter) ---
+@setup multi_col_schema
+snapshot-eqp cte-materialized-order-multi-col-same-dir {
+    WITH ordered AS MATERIALIZED (
+        SELECT * FROM t ORDER BY a ASC, b ASC
+    )
+    SELECT * FROM ordered ORDER BY a ASC, b ASC;
+}
+
+# --- Positive: multi-column all flipped (should eliminate sorter via backwards scan) ---
+@setup multi_col_schema
+snapshot-eqp cte-materialized-order-multi-col-all-flipped {
+    WITH ordered AS MATERIALIZED (
+        SELECT * FROM t ORDER BY a DESC, b DESC
+    )
+    SELECT * FROM ordered ORDER BY a ASC, b ASC;
+}
+
+# --- Positive: multi-column mixed directions that flip cleanly (should eliminate sorter) ---
+@setup multi_col_schema
+snapshot-eqp cte-materialized-order-multi-col-mixed-clean-flip {
+    WITH ordered AS MATERIALIZED (
+        SELECT * FROM t ORDER BY a ASC, b DESC
+    )
+    SELECT * FROM ordered ORDER BY a DESC, b ASC;
+}
+
+# --- Negative: partial direction mismatch, neither fwd nor bwd works (needs sorter) ---
+@setup multi_col_schema
+snapshot-eqp cte-materialized-order-multi-col-partial-mismatch {
+    WITH ordered AS MATERIALIZED (
+        SELECT * FROM t ORDER BY a ASC, b DESC
+    )
+    SELECT * FROM ordered ORDER BY a ASC, b ASC;
+}
+
+# --- Positive: prefix match, CTE orders by (a,b) but outer only needs (a) ---
+@setup multi_col_schema
+snapshot-eqp cte-materialized-order-prefix-match {
+    WITH ordered AS MATERIALIZED (
+        SELECT * FROM t ORDER BY a ASC, b ASC
+    )
+    SELECT * FROM ordered ORDER BY a ASC;
+}
+
+# --- Positive: aggregate CTE with explicit ORDER BY, same direction ---
+@setup grp_schema
+snapshot-eqp cte-materialized-order-aggregate-same-dir {
+    WITH agg AS MATERIALIZED (
+        SELECT grp, SUM(val) AS total
+        FROM t GROUP BY grp
+        ORDER BY grp ASC
+    )
+    SELECT * FROM agg ORDER BY grp ASC;
+}
+
+# --- Positive: aggregate CTE with explicit ORDER BY, opposite direction ---
+@setup grp_schema
+snapshot-eqp cte-materialized-order-aggregate-opposite-dir {
+    WITH agg AS MATERIALIZED (
+        SELECT grp, SUM(val) AS total
+        FROM t GROUP BY grp
+        ORDER BY grp ASC
+    )
+    SELECT * FROM agg ORDER BY grp DESC;
+}
+
+# --- Negative: outer ORDER BY extends beyond CTE's ORDER BY (needs sorter) ---
+@setup multi_col_schema
+snapshot-eqp cte-materialized-order-outer-beyond-cte {
+    WITH ordered AS MATERIALIZED (
+        SELECT * FROM t ORDER BY a ASC
+    )
+    SELECT * FROM ordered ORDER BY a ASC, b ASC;
+}

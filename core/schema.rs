@@ -12,6 +12,7 @@ use crate::turso_assert;
 use crate::types::IOResult;
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::affinity::Affinity;
+use crate::vdbe::CursorID;
 use turso_macros::AtomicEnum;
 
 #[derive(Debug, Clone, AtomicEnum)]
@@ -2346,16 +2347,57 @@ pub struct FromClauseSubquery {
     /// The start register for the result columns of the derived table;
     /// must be set before data is read from it.
     pub result_columns_start_reg: Option<usize>,
-    /// CTE identity for sharing materialized data across multiple references.
-    /// None means this is a regular inline subquery (not from a CTE).
-    /// Some(id) means this references a CTE with the given identity.
-    /// Multiple references to the same CTE will have the same cte_id.
-    pub cte_id: Option<usize>,
-    /// If true, this subquery has an explicit hint to materialize itself into an ephemeral table
-    /// (not emitted as a coroutine). This is set for CTEs to enable sharing
-    /// materialized data across multiple references via OpenDup,
-    /// and also via WITH .., AS MATERIALIZED.
+    /// The table cursor backing a materialized EphemeralTable representation of
+    /// this subquery, if one was emitted.
+    pub materialized_cursor_id: Option<CursorID>,
+    /// CTE-specific materialization metadata, when this FROM-subquery is a CTE
+    /// reference rather than an inline derived table.
+    pub cte: Option<FromClauseSubqueryCteMetadata>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FromClauseSubqueryCteMetadata {
+    /// Identity shared by all references to the same CTE definition.
+    pub id: usize,
+    /// True when this CTE is referenced more than once inside the enclosing
+    /// query tree and therefore must be materialized once and shared.
+    pub shared_materialization: bool,
+    /// True for explicit WITH ... AS MATERIALIZED.
     pub materialize_hint: bool,
+}
+
+impl FromClauseSubquery {
+    pub fn cte_id(&self) -> Option<usize> {
+        self.cte.map(|cte| cte.id)
+    }
+
+    pub fn materialize_hint(&self) -> bool {
+        self.cte.is_some_and(|cte| cte.materialize_hint)
+    }
+
+    pub fn shared_materialization(&self) -> bool {
+        self.cte.is_some_and(|cte| cte.shared_materialization)
+    }
+
+    pub fn set_shared_materialization(&mut self, shared: bool) {
+        if let Some(cte) = &mut self.cte {
+            cte.shared_materialization = shared;
+        }
+    }
+
+    /// Shared CTE references and explicit MATERIALIZED hints both force a
+    /// table-backed materialization that can be scanned or probed later.
+    pub fn requires_table_materialization(&self) -> bool {
+        self.shared_materialization() || self.materialize_hint()
+    }
+
+    /// Only simple single-reference SELECT subqueries can safely use their
+    /// synthesized seek index as the storage target directly. Compound
+    /// subqueries still need table-backed storage so their set-operation
+    /// semantics are preserved before any later SEARCH shape is chosen.
+    pub fn supports_direct_index_materialization(&self) -> bool {
+        matches!(self.plan.as_ref(), Plan::Select(_)) && !self.requires_table_materialization()
+    }
 }
 
 pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> Result<BTreeTable> {

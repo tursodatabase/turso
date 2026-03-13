@@ -215,6 +215,7 @@ fn prepare_window_subquery(
         values: vec![],
         window: None,
         non_from_clause_subqueries: vec![],
+        input_cardinality_hint: None,
         estimated_output_rows: None,
         simple_aggregate: None,
     };
