@@ -3105,3 +3105,24 @@ test json107-1-8 {
 expect {
 		{"a":123,"b":456}
 }
+
+test json-set-field-null {
+    SELECT typeof(json_set(null, '$.field', 'value'));
+}
+expect {
+  null
+}
+
+test json-insert-null {
+    SELECT typeof(json_insert(NULL, '$.a', 1));
+}
+expect {
+  null
+}
+
+test json-remove-null {
+    SELECT typeof(json_remove(NULL, '$.a'));
+}
+expect {
+  null
+}
