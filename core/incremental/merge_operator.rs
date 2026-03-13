@@ -18,10 +18,11 @@ use std::hash::{Hash, Hasher};
 pub enum UnionMode {
     /// For UNION (distinct) - hash values only to merge duplicates
     Distinct,
-    /// For UNION ALL - include source table name in hash to keep duplicates separate
+    /// For UNION ALL - include a compiler-provided source+branch key in hash
+    /// to keep duplicates from different branches separate.
     All {
-        left_table: String,
-        right_table: String,
+        left_source_key: String,
+        right_source_key: String,
     },
 }
 
@@ -32,7 +33,7 @@ pub struct MergeOperator {
     operator_id: i64,
     union_mode: UnionMode,
     /// For UNION: tracks seen value hashes with their assigned rowids
-    /// For UNION ALL: tracks (source_id, original_rowid) -> assigned_rowid mappings
+    /// For UNION ALL: tracks (source_branch_id, original_rowid) -> assigned_rowid mappings
     seen_rows: HashMap<u64, i64>, // hash -> assigned_rowid
     /// Next rowid to assign for new rows
     next_rowid: i64,
@@ -80,27 +81,33 @@ impl MergeOperator {
                 output
             }
             UnionMode::All {
-                left_table,
-                right_table,
+                left_source_key,
+                right_source_key,
             } => {
-                // For UNION ALL, maintain consistent rowid mapping per source
-                let table = if is_left { left_table } else { right_table };
+                // For UNION ALL, maintain consistent rowid mapping per source/branch.
+                // The same base table can appear on both sides; branch side must be part
+                // of the identity so overlapping rowids do not collapse.
+                let source_key = if is_left {
+                    left_source_key
+                } else {
+                    right_source_key
+                };
                 let mut source_hasher = DefaultHasher::new();
-                table.hash(&mut source_hasher);
+                source_key.hash(&mut source_hasher);
                 let source_id = source_hasher.finish();
 
                 let mut output = Delta::new();
                 for (row, weight) in delta.changes {
-                    // Create a unique key for this (source, rowid) pair
+                    // Create a unique key for this (source-branch, rowid) pair.
                     let mut key_hasher = DefaultHasher::new();
                     source_id.hash(&mut key_hasher);
                     row.rowid.hash(&mut key_hasher);
                     let key_hash = key_hasher.finish();
 
-                    // Check if we've seen this (source, rowid) before
+                    // Check if we've seen this (source-branch, rowid) before.
                     let assigned_rowid =
                         if let Some(&existing_rowid) = self.seen_rows.get(&key_hash) {
-                            // Use existing rowid for this (source, rowid) pair
+                            // Use existing rowid for this (source-branch, rowid) pair.
                             existing_rowid
                         } else {
                             // New row - assign new rowid
