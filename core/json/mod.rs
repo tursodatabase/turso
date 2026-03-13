@@ -15,7 +15,10 @@ use crate::numeric::Numeric;
 use crate::types::{AsValueRef, Text, TextSubtype, Value, ValueType};
 use crate::{bail_constraint_error, bail_parse_error, LimboError, ValueRef};
 pub use cache::JsonCacheCell;
-use jsonb::{ElementType, Jsonb, JsonbHeader, PathOperationMode, SearchOperation, SetOperation};
+use jsonb::{
+    unescape_string, ElementType, Jsonb, JsonbHeader, PathOperationMode, SearchOperation,
+    SetOperation,
+};
 use std::borrow::Cow;
 use std::str::FromStr;
 
@@ -597,7 +600,7 @@ pub fn json_string_to_db_type(
             if matches!(flag, OutputVariant::ElementType) {
                 json_string.remove(json_string.len() - 1);
                 json_string.remove(0);
-                Ok(Value::Text(Text::new(json_string)))
+                Ok(Value::Text(Text::new(unescape_string(&json_string))))
             } else {
                 Ok(Value::Text(Text::new(json_string)))
             }
