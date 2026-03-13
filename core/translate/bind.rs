@@ -3,6 +3,7 @@ use crate::sync::Arc;
 use crate::vdbe::builder::ProgramBuilder;
 
 use rustc_hash::FxHashMap as HashMap;
+use smallvec::SmallVec;
 use turso_parser::ast::{self, JoinConstraint, TableInternalId};
 
 use super::emitter::Resolver;
@@ -196,7 +197,7 @@ pub enum ScopeTableSource {
     Cte {
         name: String,
         columns: Vec<String>,
-        cte_id: Option<usize>,
+        cte_id: usize,
         select: ast::Select,
     },
     Derived {
@@ -435,18 +436,41 @@ impl BindTracking {
 // ── CteEntry ─────────────────────────────────────────────────────────────
 
 /// A CTE definition stored in the binding context.
-#[derive(Clone)]
+///
+/// `Clone` copies metadata (name, columns, IDs) but sets `inner_bound` to `None`.
+/// This is intentional: `with_query` clones CTEs for subquery scoping, where only
+/// the column/name info is needed for resolution, not the full binding output.
 pub struct CteEntry {
-    /// The raw AST for re-planning on each reference.
+    /// The bound AST (column refs resolved).
     pub select: ast::Select,
     /// Explicit column names from `WITH t(a, b) AS (...)`.
     pub explicit_columns: Vec<String>,
-    /// CTE ID for materialization tracking.
-    pub cte_id: Option<usize>,
+    /// Globally unique CTE identity for materialization tracking.
+    pub cte_id: usize,
     /// Result column names, populated after binding the CTE body.
     /// If explicit_columns is non-empty, equals explicit_columns.
     /// Otherwise, extracted from the SELECT result columns.
     pub resolved_columns: Vec<String>,
+    /// Inner binding results (scopes, tracking, subquery bindings).
+    pub inner_bound: Option<BoundSelect>,
+    /// Indexes of CTEs (in definition order) that this CTE directly references.
+    pub referenced_cte_indices: SmallVec<[usize; 2]>,
+    /// True if `AS MATERIALIZED` was specified, forcing materialization.
+    pub materialize_hint: bool,
+}
+
+impl Clone for CteEntry {
+    fn clone(&self) -> Self {
+        Self {
+            select: self.select.clone(),
+            explicit_columns: self.explicit_columns.clone(),
+            cte_id: self.cte_id,
+            resolved_columns: self.resolved_columns.clone(),
+            inner_bound: None,
+            referenced_cte_indices: self.referenced_cte_indices.clone(),
+            materialize_hint: self.materialize_hint,
+        }
+    }
 }
 
 // ── BindContext ───────────────────────────────────────────────────────────
@@ -1019,7 +1043,10 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             crate::bail_parse_error!("Recursive CTEs are not yet supported");
         }
 
-        // Pass 1: register all CTE names
+        // Collect CTE names in definition order for referenced_cte_indices lookup.
+        let mut cte_names: Vec<String> = Vec::with_capacity(with.ctes.len());
+
+        // Pass 1: register all CTE names, allocate IDs, compute cross-references
         for cte in &with.ctes {
             let cte_name = normalize_ident(cte.tbl_name.as_str());
             if self.ctes.contains_key(&cte_name) {
@@ -1030,32 +1057,51 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 .iter()
                 .map(|c| normalize_ident(c.col_name.as_str()))
                 .collect();
+
+            let cte_id = self.id_gen.next_cte_id();
+            let materialize_hint =
+                cte.materialized == turso_parser::ast::Materialized::Yes;
+
+            // Determine which preceding CTEs this one directly references.
+            let mut referenced_tables = Vec::new();
+            super::planner::collect_from_clause_table_refs(&cte.select, &mut referenced_tables);
+            let idx = cte_names.len();
+            let referenced_cte_indices: SmallVec<[usize; 2]> = (0..idx)
+                .filter(|&i| referenced_tables.contains(&cte_names[i]))
+                .collect();
+
+            cte_names.push(cte_name.clone());
             self.insert_cte(
                 cte_name,
                 CteEntry {
                     select: cte.select.clone(),
                     explicit_columns,
-                    cte_id: None,
+                    cte_id,
                     resolved_columns: vec![],
+                    inner_bound: None,
+                    referenced_cte_indices,
+                    materialize_hint,
                 },
             );
         }
 
-        // Pass 2: bind each CTE body and populate resolved columns
+        // Pass 2: bind each CTE body and populate resolved columns + inner binding
         for cte in &mut with.ctes {
             let cte_name = normalize_ident(cte.tbl_name.as_str());
-            let bound_columns = self.bind_select(&mut cte.select)?;
+            let bound = self.bind_select(&mut cte.select)?;
 
             let entry = self.ctes.get_mut(&cte_name).unwrap();
             if entry.explicit_columns.is_empty() {
-                entry.resolved_columns = bound_columns
+                entry.resolved_columns = bound
                     .result_columns
-                    .into_iter()
-                    .map(|bc| bc.name)
+                    .iter()
+                    .map(|bc| bc.name.clone())
                     .collect();
             } else {
                 entry.resolved_columns = entry.explicit_columns.clone();
             }
+            entry.select = cte.select.clone();
+            entry.inner_bound = Some(bound);
         }
         Ok(())
     }
@@ -1958,6 +2004,58 @@ mod tests {
     }
 
     #[test]
+    fn bind_cte_allocates_cte_id_and_stores_inner_bound() {
+        with_bind_context(&["CREATE TABLE t(a, b)"], |ctx| {
+            let mut select =
+                parse_select("WITH c AS (SELECT a, b FROM t WHERE a > 1) SELECT * FROM c");
+            let with = select.with.as_mut().expect("expected WITH clause");
+            ctx.bind_cte(with).unwrap();
+
+            let cte = ctx.get_cte("c").expect("cte should exist");
+            // cte_id was allocated
+            assert_eq!(cte.cte_id, 0);
+            // inner_bound is populated
+            assert!(cte.inner_bound.is_some());
+            let inner = cte.inner_bound.as_ref().unwrap();
+            assert_eq!(inner.main_scope.tables.len(), 1);
+            assert_eq!(inner.main_scope.tables[0].identifier, "t");
+            // resolved columns inferred from SELECT list
+            assert_eq!(cte.resolved_columns, vec!["a", "b"]);
+        });
+    }
+
+    #[test]
+    fn bind_cte_tracks_referenced_cte_indices() {
+        with_bind_context(&["CREATE TABLE t(x)"], |ctx| {
+            let mut select = parse_select(
+                "WITH a AS (SELECT x FROM t), b AS (SELECT * FROM a) SELECT * FROM b",
+            );
+            let with = select.with.as_mut().expect("expected WITH clause");
+            ctx.bind_cte(with).unwrap();
+
+            let a = ctx.get_cte("a").expect("cte a should exist");
+            assert!(a.referenced_cte_indices.is_empty());
+
+            let b = ctx.get_cte("b").expect("cte b should exist");
+            assert_eq!(b.referenced_cte_indices.as_slice(), &[0]);
+        });
+    }
+
+    #[test]
+    fn bind_cte_materialize_hint() {
+        with_bind_context(&["CREATE TABLE t(a)"], |ctx| {
+            let mut select = parse_select(
+                "WITH c AS MATERIALIZED (SELECT a FROM t) SELECT * FROM c",
+            );
+            let with = select.with.as_mut().expect("expected WITH clause");
+            ctx.bind_cte(with).unwrap();
+
+            let cte = ctx.get_cte("c").expect("cte should exist");
+            assert!(cte.materialize_hint);
+        });
+    }
+
+    #[test]
     fn select_list_uses_no_aliases_phase() {
         with_bind_context(&["CREATE TABLE t(x, a)"], |ctx| {
             let mut select = parse_select("SELECT a AS x, x FROM t");
@@ -2221,10 +2319,11 @@ mod tests {
                 ScopeTableSource::Cte { .. }
             ));
 
+            // cte_id=0, t (inside CTE body)=1, cte (outer FROM)=2
             let alias_expr = ast::Expr::Binary(
                 ast::Expr::Column {
                     database: None,
-                    table: TableInternalId::from(1usize),
+                    table: TableInternalId::from(2usize),
                     column: 0,
                     is_rowid_alias: false,
                 }
@@ -2234,7 +2333,7 @@ mod tests {
             );
 
             assert_eq!(select_expr(&select, 0), &alias_expr);
-            assert_column_expr(group_by_expr(&select, 0), 1, 1);
+            assert_column_expr(group_by_expr(&select, 0), 2, 1);
 
             let ast::Expr::Binary(lhs, ast::Operator::Greater, rhs) = having_expr(&select) else {
                 panic!("expected bound HAVING binary expression");
