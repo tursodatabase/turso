@@ -340,15 +340,170 @@ pub unsafe extern "C" fn sqlite3_open(
     }
 }
 
+/// Flags for sqlite3_open_v2
+pub const SQLITE_OPEN_READONLY: ffi::c_int = 0x00000001;
+pub const SQLITE_OPEN_READWRITE: ffi::c_int = 0x00000002;
+pub const SQLITE_OPEN_CREATE: ffi::c_int = 0x00000004;
+pub const SQLITE_OPEN_URI: ffi::c_int = 0x00000040;
+pub const SQLITE_OPEN_MEMORY: ffi::c_int = 0x00000080;
+pub const SQLITE_OPEN_NOMUTEX: ffi::c_int = 0x00008000;
+pub const SQLITE_OPEN_FULLMUTEX: ffi::c_int = 0x00010000;
+pub const SQLITE_OPEN_SHAREDCACHE: ffi::c_int = 0x00020000;
+pub const SQLITE_OPEN_PRIVATECACHE: ffi::c_int = 0x00040000;
+pub const SQLITE_OPEN_NOFOLLOW: ffi::c_int = 0x01000000;
+
+/// Percent-decode a URI component (e.g., `%20` -> ` `, `%2F` -> `/`).
+/// Returns None if a percent sequence is malformed.
+fn percent_decode(input: &str) -> Option<String> {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.as_bytes().iter();
+    while let Some(&b) = chars.next() {
+        if b == b'%' {
+            let hi = *chars.next()?;
+            let lo = *chars.next()?;
+            let hex = [hi, lo];
+            let s = std::str::from_utf8(&hex).ok()?;
+            let byte = u8::from_str_radix(s, 16).ok()?;
+            result.push(byte as char);
+        } else {
+            result.push(b as char);
+        }
+    }
+    Some(result)
+}
+
+/// Parse a URI filename (when SQLITE_OPEN_URI is set).
+/// Returns (path, is_memory) where path is the file path extracted from the URI
+/// and is_memory indicates whether the database should be in-memory.
+///
+/// Supported URI forms (per SQLite docs):
+///   file::memory:           -> in-memory
+///   file:path?mode=memory   -> in-memory (path is just a name)
+///   file:path               -> real file at path
+///   file:///path             -> real file at /path (authority form)
+///   file://localhost/path    -> real file at /path
+fn parse_uri_filename(uri: &str) -> Result<(String, bool), ()> {
+    // Must start with "file:"
+    let after_file = &uri[5..];
+
+    // Extract path and query parts
+    let (raw_path, query) = match after_file.find('?') {
+        Some(pos) => (&after_file[..pos], Some(&after_file[pos + 1..])),
+        None => (after_file, None),
+    };
+
+    // Strip fragment if present (after #)
+    let raw_path = match raw_path.find('#') {
+        Some(pos) => &raw_path[..pos],
+        None => raw_path,
+    };
+
+    // Handle authority: file:///path or file://localhost/path
+    let path = if let Some(after_slashes) = raw_path.strip_prefix("//") {
+        // file:///path -> authority is empty, path starts at third /
+        // file://localhost/path -> authority is "localhost"
+        match after_slashes.find('/') {
+            Some(pos) => {
+                let authority = &after_slashes[..pos];
+                if !authority.is_empty() && authority != "localhost" {
+                    return Err(()); // non-local authority not supported
+                }
+                percent_decode(&after_slashes[pos..]).ok_or(())?
+            }
+            None => {
+                // file:// with no path after authority
+                return Err(());
+            }
+        }
+    } else {
+        percent_decode(raw_path).ok_or(())?
+    };
+
+    // Check for :memory: path
+    if path == ":memory:" {
+        return Ok((":memory:".to_string(), true));
+    }
+
+    // Parse query parameters
+    let mut is_memory = false;
+    if let Some(query) = query {
+        for param in query.split('&') {
+            let (key, value) = match param.find('=') {
+                Some(pos) => (&param[..pos], &param[pos + 1..]),
+                None => (param, ""),
+            };
+            if key == "mode" {
+                match value {
+                    "memory" => is_memory = true,
+                    "ro" | "rw" | "rwc" => {} // valid modes, no-op (Turso doesn't enforce read-only yet)
+                    _ => return Err(()),      // unknown mode -> SQLITE_CANTOPEN
+                }
+            }
+        }
+    }
+
+    Ok((path, is_memory))
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_open_v2(
     filename: *const ffi::c_char,
     db_out: *mut *mut sqlite3,
-    _flags: ffi::c_int,
+    flags: ffi::c_int,
     _z_vfs: *const ffi::c_char,
 ) -> ffi::c_int {
     trace!("sqlite3_open_v2");
-    sqlite3_open(filename, db_out)
+    let rc = sqlite3_initialize();
+    if rc != SQLITE_OK {
+        return rc;
+    }
+    if filename.is_null() || db_out.is_null() {
+        return SQLITE_MISUSE;
+    }
+    let filename_cstr = CStr::from_ptr(filename);
+    let filename_str = match filename_cstr.to_str() {
+        Ok(s) => s,
+        Err(_) => return SQLITE_MISUSE,
+    };
+
+    // Determine the effective filename and whether to use in-memory IO
+    let (effective_filename, use_memory) =
+        if (flags & SQLITE_OPEN_URI) != 0 && filename_str.starts_with("file:") {
+            match parse_uri_filename(filename_str) {
+                Ok((path, is_memory)) => (path, is_memory),
+                Err(()) => return SQLITE_CANTOPEN,
+            }
+        } else if (flags & SQLITE_OPEN_MEMORY) != 0 || filename_str == ":memory:" {
+            (":memory:".to_string(), true)
+        } else {
+            (filename_str.to_string(), false)
+        };
+
+    let io: Arc<dyn turso_core::IO> = if use_memory {
+        Arc::new(turso_core::MemoryIO::new())
+    } else {
+        match turso_core::PlatformIO::new() {
+            Ok(io) => Arc::new(io),
+            Err(_) => return SQLITE_CANTOPEN,
+        }
+    };
+
+    match turso_core::Database::open_file(io.clone(), &effective_filename) {
+        Ok(db) => {
+            let conn = db.connect().unwrap();
+            let stored_filename = if use_memory {
+                CString::new("".to_string()).unwrap()
+            } else {
+                CString::new(effective_filename).unwrap()
+            };
+            *db_out = Box::leak(Box::new(sqlite3::new(io, db, conn, stored_filename)));
+            SQLITE_OK
+        }
+        Err(e) => {
+            trace!("error opening database {}: {:?}", effective_filename, e);
+            SQLITE_CANTOPEN
+        }
+    }
 }
 
 #[no_mangle]
