@@ -144,6 +144,12 @@ extern "C" {
         final_: Option<unsafe extern "C" fn()>,
         destroy: Option<unsafe extern "C" fn(*mut libc::c_void)>,
     ) -> i32;
+    fn sqlite3_open_v2(
+        filename: *const libc::c_char,
+        db: *mut *mut sqlite3,
+        flags: i32,
+        z_vfs: *const libc::c_char,
+    ) -> i32;
 }
 
 const SQLITE_OK: i32 = 0;
@@ -165,6 +171,9 @@ const SQLITE3_TEXT: i32 = 3;
 const SQLITE_BLOB: i32 = 4;
 const SQLITE_NULL: i32 = 5;
 const SQLITE_UTF8: i32 = 1;
+const SQLITE_OPEN_READWRITE: i32 = 0x00000002;
+const SQLITE_OPEN_CREATE: i32 = 0x00000004;
+const SQLITE_OPEN_URI: i32 = 0x00000040;
 
 #[cfg(not(target_os = "windows"))]
 mod tests {
@@ -2763,6 +2772,342 @@ mod tests {
 
             assert_eq!(sqlite3_finalize(stmt2), SQLITE_OK);
             assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    /// Test: URI filename with mode=memory should create an in-memory database.
+    #[test]
+    fn test_uri_mode_memory() {
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("memtest.db");
+            let uri = format!("file:{}?mode=memory&cache=shared", db_path.display());
+            let uri_cstr = std::ffi::CString::new(uri).unwrap();
+
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            let rc = sqlite3_open_v2(
+                uri_cstr.as_ptr(),
+                &mut db,
+                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
+                ptr::null(),
+            );
+            assert_eq!(rc, SQLITE_OK, "open_v2 with URI mode=memory failed rc={rc}");
+            assert!(!db.is_null());
+
+            let mut errmsg: *mut libc::c_char = ptr::null_mut();
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg
+                ),
+                SQLITE_OK,
+                "CREATE TABLE in memory DB failed"
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"INSERT INTO t1 VALUES (1, 'hello')".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg
+                ),
+                SQLITE_OK,
+                "INSERT in memory DB failed"
+            );
+
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT val FROM t1 WHERE id = 1".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            let text = sqlite3_column_text(stmt, 0);
+            assert!(!text.is_null());
+            assert_eq!(std::ffi::CStr::from_ptr(text).to_str().unwrap(), "hello");
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+
+            assert!(
+                !db_path.exists(),
+                "URI mode=memory should NOT create a file on disk"
+            );
+        }
+    }
+
+    /// Test: file::memory: URI should behave like :memory:
+    #[test]
+    fn test_uri_file_colon_memory() {
+        unsafe {
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            let rc = sqlite3_open_v2(
+                c"file::memory:".as_ptr(),
+                &mut db,
+                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
+                ptr::null(),
+            );
+            assert_eq!(rc, SQLITE_OK, "open_v2 with file::memory: failed rc={rc}");
+
+            let mut errmsg: *mut libc::c_char = ptr::null_mut();
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE t1 (id INTEGER PRIMARY KEY)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"INSERT INTO t1 VALUES (42)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+
+            let mut db2: *mut sqlite3 = ptr::null_mut();
+            let rc = sqlite3_open_v2(
+                c"file::memory:".as_ptr(),
+                &mut db2,
+                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
+                ptr::null(),
+            );
+            assert_eq!(rc, SQLITE_OK);
+
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            let rc = sqlite3_prepare_v2(
+                db2,
+                c"SELECT id FROM t1".as_ptr(),
+                -1,
+                &mut stmt,
+                ptr::null_mut(),
+            );
+            assert_eq!(
+                rc, SQLITE_ERROR,
+                "file::memory: data persisted — not truly in-memory (rc={rc})"
+            );
+            assert_eq!(sqlite3_close(db2), SQLITE_OK);
+        }
+    }
+
+    /// Test: URI with file: prefix and no query params should open a real file.
+    #[test]
+    fn test_uri_file_path() {
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("uri_test.db");
+            let uri = format!("file:{}", db_path.to_str().unwrap());
+            let uri_cstr = std::ffi::CString::new(uri).unwrap();
+
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            let rc = sqlite3_open_v2(
+                uri_cstr.as_ptr(),
+                &mut db,
+                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
+                ptr::null(),
+            );
+            assert_eq!(rc, SQLITE_OK, "open_v2 with file: URI path failed rc={rc}");
+
+            let mut errmsg: *mut libc::c_char = ptr::null_mut();
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE t1 (id INTEGER PRIMARY KEY)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+
+            assert!(
+                db_path.exists(),
+                "file: URI with path should create a real database file"
+            );
+        }
+    }
+
+    /// Test: Multiple connections to the same in-memory database via file: URI
+    /// with mode=memory&cache=shared (r2d2/Diesel connection pool pattern).
+    ///
+    /// Connection 1 creates a table and inserts data. Connection 2 opens the
+    /// same URI and must see the table and data (shared in-memory database).
+    #[test]
+    fn test_shared_memory_uri_connections() {
+        unsafe {
+            let uri = c"file:shared_mem_pool_test?mode=memory&cache=shared";
+            let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI;
+
+            // Connection 1: create table and insert data
+            let mut db1: *mut sqlite3 = ptr::null_mut();
+            let rc = sqlite3_open_v2(uri.as_ptr(), &mut db1, flags, ptr::null());
+            assert_eq!(rc, SQLITE_OK, "first open failed rc={rc}");
+
+            let mut errmsg: *mut libc::c_char = ptr::null_mut();
+            assert_eq!(
+                sqlite3_exec(
+                    db1,
+                    c"CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg,
+                ),
+                SQLITE_OK,
+                "CREATE TABLE failed"
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    db1,
+                    c"INSERT INTO t1 VALUES (1, 'from_conn1')".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg,
+                ),
+                SQLITE_OK,
+                "INSERT failed"
+            );
+
+            // Connection 2: open same URI, must see the shared database
+            let mut db2: *mut sqlite3 = ptr::null_mut();
+            let rc = sqlite3_open_v2(uri.as_ptr(), &mut db2, flags, ptr::null());
+            assert_eq!(rc, SQLITE_OK, "second open failed rc={rc}");
+
+            // Query via connection 2 — should see data from connection 1
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db2,
+                    c"SELECT val FROM t1 WHERE id = 1".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK,
+                "SELECT on connection 2 failed — table not shared"
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            let text = sqlite3_column_text(stmt, 0);
+            assert!(!text.is_null());
+            let val = std::ffi::CStr::from_ptr(text).to_str().unwrap();
+            assert_eq!(val, "from_conn1");
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            assert_eq!(sqlite3_close(db2), SQLITE_OK);
+            assert_eq!(sqlite3_close(db1), SQLITE_OK);
+        }
+    }
+
+    /// Test: Concurrent writes from two connections sharing the same in-memory
+    /// database must return SQLITE_BUSY, not crash/panic.
+    #[test]
+    fn test_concurrent_write_returns_busy_not_panic() {
+        use std::sync::{Arc, Barrier};
+
+        unsafe {
+            let uri = c"file:concurrent_busy_mem?mode=memory&cache=shared";
+            let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI;
+
+            // Setup: create table (keep connection open to maintain shared cache)
+            let mut db_setup: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(
+                sqlite3_open_v2(uri.as_ptr(), &mut db_setup, flags, ptr::null()),
+                SQLITE_OK
+            );
+            let mut errmsg_setup: *mut libc::c_char = ptr::null_mut();
+            assert_eq!(
+                sqlite3_exec(
+                    db_setup,
+                    c"PRAGMA journal_mode = WAL".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg_setup
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    db_setup,
+                    c"CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg_setup
+                ),
+                SQLITE_OK
+            );
+
+            let barrier = Arc::new(Barrier::new(2));
+
+            let mut handles = vec![];
+            for thread_id in 0..2 {
+                let barrier = barrier.clone();
+                handles.push(std::thread::spawn(move || {
+                    let mut db: *mut sqlite3 = ptr::null_mut();
+                    assert_eq!(
+                        sqlite3_open_v2(uri.as_ptr(), &mut db, flags, ptr::null()),
+                        SQLITE_OK
+                    );
+
+                    let mut errmsg: *mut libc::c_char = ptr::null_mut();
+                    assert_eq!(
+                        sqlite3_exec(
+                            db,
+                            c"PRAGMA busy_timeout = 1000".as_ptr(),
+                            None,
+                            ptr::null_mut(),
+                            &mut errmsg
+                        ),
+                        SQLITE_OK
+                    );
+
+                    barrier.wait();
+
+                    let mut busy_count = 0;
+                    let mut ok_count = 0;
+
+                    for i in 0..50 {
+                        let sql = format!(
+                            "INSERT INTO t1 VALUES ({}, 'thread{thread_id}_row{i}')",
+                            thread_id * 1000 + i
+                        );
+                        let sql_c = std::ffi::CString::new(sql).unwrap();
+                        let rc =
+                            sqlite3_exec(db, sql_c.as_ptr(), None, ptr::null_mut(), &mut errmsg);
+                        match rc {
+                            0 => ok_count += 1,   // SQLITE_OK
+                            5 => busy_count += 1, // SQLITE_BUSY
+                            _ => panic!("thread {thread_id} got unexpected rc={rc} on insert {i}"),
+                        }
+                    }
+
+                    assert_eq!(sqlite3_close(db), SQLITE_OK);
+                    (thread_id, ok_count, busy_count)
+                }));
+            }
+
+            for h in handles {
+                let (tid, ok, busy) = h.join().expect(
+                    "thread panicked — concurrent write crashed instead of returning SQLITE_BUSY",
+                );
+                eprintln!("thread {tid}: {ok} ok, {busy} busy");
+                assert!(ok > 0, "thread {tid} never succeeded");
+            }
+
+            assert_eq!(sqlite3_close(db_setup), SQLITE_OK);
         }
     }
 }
