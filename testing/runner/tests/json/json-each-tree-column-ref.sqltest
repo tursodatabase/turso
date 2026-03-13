@@ -1,0 +1,81 @@
+@database :memory:
+
+setup tables {
+    CREATE TABLE t(id INT, data TEXT);
+    INSERT INTO t VALUES (1, '{"tags":["a","b"]}'), (2, '{"tags":["c"]}');
+    CREATE TABLE t2(id INT, data TEXT);
+    INSERT INTO t2 VALUES (1, '{"name":"alice","age":30}');
+}
+
+# Core bug: JSON_EACH with column reference + path returns empty
+@setup tables
+test json-each-column-ref-with-path {
+    SELECT t.id, j.value FROM t, JSON_EACH(t.data, '$.tags') j ORDER BY t.id, j.key;
+}
+expect {
+    1|a
+    1|b
+    2|c
+}
+
+# JSON_TREE with column reference + WHERE returns empty
+@setup tables
+test json-tree-column-ref-with-where {
+    SELECT j.key, j.value FROM t2, JSON_TREE(t2.data) j WHERE j.type = 'integer';
+}
+expect {
+    age|30
+}
+
+# JSON_EACH with column ref and no path (should already work, regression check)
+@setup tables
+test json-each-column-ref-no-path {
+    SELECT t.id, j.value FROM t, JSON_EACH(t.data) j ORDER BY t.id, j.key;
+}
+expect {
+    1|["a","b"]
+    2|["c"]
+}
+
+# JSON_TREE with column ref, filtering on type='text'
+@setup tables
+test json-tree-column-ref-where-text {
+    SELECT j.key, j.value FROM t2, JSON_TREE(t2.data) j WHERE j.type = 'text' ORDER BY j.key;
+}
+expect {
+    name|alice
+}
+
+# JSON_EACH with path on multiple rows, verifying all rows produce results
+@setup tables
+test json-each-column-ref-path-multiple-rows {
+    SELECT COUNT(*) FROM t, JSON_EACH(t.data, '$.tags') j;
+}
+expect {
+    3
+}
+
+# JSON_TREE with nested objects and column reference + path
+setup nested {
+    CREATE TABLE t4(id INT, data TEXT);
+    INSERT INTO t4 VALUES (1, '{"a":{"b":{"c":42}}}');
+}
+
+@setup nested
+test json-tree-column-ref-with-path {
+    SELECT j.key, j.value FROM t4, JSON_TREE(t4.data, '$.a') j WHERE j.type = 'integer';
+}
+expect {
+    c|42
+}
+
+# JSON_EACH with column ref + path in a subquery
+@setup tables
+test json-each-column-ref-in-subquery {
+    SELECT * FROM (SELECT t.id, j.value FROM t, JSON_EACH(t.data, '$.tags') j) sub ORDER BY sub.id, sub.value;
+}
+expect {
+    1|a
+    1|b
+    2|c
+}

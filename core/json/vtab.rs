@@ -91,6 +91,12 @@ impl InternalVirtualTable for JsonVirtualTable {
             constraints.len()
         ];
 
+        // Check if the required json column constraint exists at all
+        let has_json_constraint = constraints
+            .iter()
+            .any(|c| c.column_index as usize == COL_JSON && c.op == ConstraintOp::Eq);
+
+        // Find usable constraints for json and path columns
         let mut json_idx: Option<usize> = None;
         let mut path_idx: Option<usize> = None;
         for (i, c) in constraints.iter().enumerate() {
@@ -102,6 +108,14 @@ impl InternalVirtualTable for JsonVirtualTable {
                 COL_ROOT => path_idx = Some(i),
                 _ => {}
             }
+        }
+
+        // If there's a json constraint but it's not usable (i.e., the table it references
+        // is not yet available in this join order), reject this join order entirely.
+        // This prevents placing the virtual table as the outer table when it depends on
+        // columns from another table.
+        if has_json_constraint && json_idx.is_none() {
+            return Err(ResultCode::ConstraintViolation);
         }
 
         let argc = match (json_idx, path_idx) {
