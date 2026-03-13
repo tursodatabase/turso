@@ -39,7 +39,7 @@ pub fn bind_prepare_select_plan(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
-    let mut binder = BindContext::new(resolver, &mut program.table_reference_counter);
+    let mut binder = BindContext::new(resolver, program);
     let bound = binder.bind_select(&mut select)?;
     let all_table_refs = bound.into_table_references()?;
     prepare_select_plan(

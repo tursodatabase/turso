@@ -1,6 +1,6 @@
 use crate::function::Func;
 use crate::sync::Arc;
-use crate::vdbe::builder::TableRefIdCounter;
+use crate::vdbe::builder::ProgramBuilder;
 
 use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, JoinConstraint, TableInternalId};
@@ -17,12 +17,17 @@ use crate::Result;
 // ── IdGenerator ─────────────────────────────────────────────────────────
 
 pub trait IdGenerator {
-    fn next_id(&mut self) -> TableInternalId;
+    fn next_table_id(&mut self) -> TableInternalId;
+    fn next_cte_id(&mut self) -> usize;
 }
 
-impl IdGenerator for TableRefIdCounter {
-    fn next_id(&mut self) -> TableInternalId {
-        self.next()
+impl IdGenerator for ProgramBuilder {
+    fn next_table_id(&mut self) -> ast::TableInternalId {
+        self.table_reference_counter.next()
+    }
+
+    fn next_cte_id(&mut self) -> usize {
+        self.alloc_cte_id()
     }
 }
 
@@ -913,11 +918,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     };
                     for st in table_iter {
                         // Semi/anti-join tables don't contribute to SELECT *
-                        if st
-                            .join_info
-                            .as_ref()
-                            .is_some_and(|ji| ji.is_semi_or_anti())
-                        {
+                        if st.join_info.as_ref().is_some_and(|ji| ji.is_semi_or_anti()) {
                             continue;
                         }
                         for col_ref in st.table.columns() {
@@ -1061,10 +1062,10 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         name: table_name.clone(),
                         columns: cte.resolved_columns.clone(),
                     });
-                    // 4. Generate internal_id via self.id_gen.next_id()
+                    // 4. Generate internal_id via self.id_gen.next_table_id()
                     return Ok(ScopeTable {
                         identifier,
-                        internal_id: self.id_gen.next_id(),
+                        internal_id: self.id_gen.next_table_id(),
                         source: ScopeTableSource::Cte {
                             name: table_name,
                             columns: cte.resolved_columns.clone(),
@@ -1086,10 +1087,10 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                             crate::LimboError::ParseError(format!("no such table: {}", table_name))
                         })?;
 
-                // 4. Generate internal_id via self.id_gen.next_id()
+                // 4. Generate internal_id via self.id_gen.next_table_id()
                 Ok(ScopeTable {
                     identifier,
-                    internal_id: self.id_gen.next_id(),
+                    internal_id: self.id_gen.next_table_id(),
                     source: ScopeTableSource::Table(schema_table.clone()),
                     table: schema_table,
                     join_info: None,
@@ -1124,7 +1125,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 // 7. Generate internal_id
                 Ok(ScopeTable {
                     identifier,
-                    internal_id: self.id_gen.next_id(),
+                    internal_id: self.id_gen.next_table_id(),
                     source: ScopeTableSource::Derived {
                         name: subquery_table.name.clone(),
                         columns: subquery_columns,
@@ -1161,7 +1162,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 // 3. Build ScopeTable from the virtual table's columns
                 Ok(ScopeTable {
                     identifier,
-                    internal_id: self.id_gen.next_id(),
+                    internal_id: self.id_gen.next_table_id(),
                     source: ScopeTableSource::Table(schema_table.clone()),
                     table: schema_table,
                     join_info: None,
@@ -1196,7 +1197,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
                 Ok(ScopeTable {
                     identifier,
-                    internal_id: self.id_gen.next_id(),
+                    internal_id: self.id_gen.next_table_id(),
                     source: ScopeTableSource::Derived {
                         name: sub_table.name.clone(),
                         columns: sub_table.columns.clone(),
@@ -1505,20 +1506,24 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         for join in &mut from.joins {
             let mut st = self.resolve_select_table(&mut join.table)?;
 
-            let (is_outer, is_full_outer, is_right, is_cross, is_natural) =
-                match &join.operator {
-                    ast::JoinOperator::TypedJoin(Some(jt)) => {
-                        let is_left = jt.contains(ast::JoinType::LEFT);
-                        let is_right = jt.contains(ast::JoinType::RIGHT);
-                        let is_outer = jt.contains(ast::JoinType::OUTER) || is_left;
-                        let is_full =
-                            (is_left && is_right) || (is_outer && !is_left && !is_right);
-                        let is_cross = jt.contains(ast::JoinType::CROSS);
-                        let is_natural = jt.contains(ast::JoinType::NATURAL);
-                        (is_outer && !is_full, is_full, is_right && !is_left && !is_full, is_cross, is_natural)
-                    }
-                    _ => (false, false, false, false, false),
-                };
+            let (is_outer, is_full_outer, is_right, is_cross, is_natural) = match &join.operator {
+                ast::JoinOperator::TypedJoin(Some(jt)) => {
+                    let is_left = jt.contains(ast::JoinType::LEFT);
+                    let is_right = jt.contains(ast::JoinType::RIGHT);
+                    let is_outer = jt.contains(ast::JoinType::OUTER) || is_left;
+                    let is_full = (is_left && is_right) || (is_outer && !is_left && !is_right);
+                    let is_cross = jt.contains(ast::JoinType::CROSS);
+                    let is_natural = jt.contains(ast::JoinType::NATURAL);
+                    (
+                        is_outer && !is_full,
+                        is_full,
+                        is_right && !is_left && !is_full,
+                        is_cross,
+                        is_natural,
+                    )
+                }
+                _ => (false, false, false, false, false),
+            };
 
             // NATURAL JOIN: find common columns and rewrite constraint to USING
             if is_natural {
@@ -1561,9 +1566,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
             // Determine USING columns from (possibly rewritten) constraint
             let using_cols = match &join.constraint {
-                Some(JoinConstraint::Using(cols)) => {
-                    cols.iter().cloned().collect::<Vec<_>>()
-                }
+                Some(JoinConstraint::Using(cols)) => cols.iter().cloned().collect::<Vec<_>>(),
                 _ => vec![],
             };
 
@@ -1654,10 +1657,16 @@ mod tests {
     }
 
     impl IdGenerator for TestIdGenerator {
-        fn next_id(&mut self) -> TableInternalId {
+        fn next_table_id(&mut self) -> TableInternalId {
             let id = self.next;
             self.next += 1;
             id.into()
+        }
+
+        fn next_cte_id(&mut self) -> usize {
+            let id = self.next;
+            self.next += 1;
+            id
         }
     }
 
@@ -2668,9 +2677,9 @@ mod tests {
             let cols = select_columns(&select);
             // No FROM → no tables in scope → star expands to nothing
             assert_eq!(cols.len(), 1); // still Star before binding
-            // Binding should succeed but star expands to zero columns
-            // Actually the parser requires FROM for star, let's just test
-            // the expand_stars produces empty
+                                       // Binding should succeed but star expands to zero columns
+                                       // Actually the parser requires FROM for star, let's just test
+                                       // the expand_stars produces empty
             let scope = BindScope::empty();
             let mut columns = vec![ast::ResultColumn::Star];
             ctx.expand_stars(&mut columns, &scope);
