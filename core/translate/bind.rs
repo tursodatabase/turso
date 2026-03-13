@@ -336,6 +336,9 @@ pub struct BoundSelect {
     /// Expression subqueries (EXISTS, scalar subquery, IN SELECT) keyed by
     /// the `subquery_id` stored in the corresponding `Expr::SubqueryResult`.
     pub subquery_bindings: HashMap<ast::TableInternalId, BoundSubquery>,
+    /// CTE definitions from the WITH clause, in definition order.
+    /// Populated only for the top-level select that owns the WITH clause.
+    pub cte_definitions: Vec<(String, CteEntry)>,
 }
 
 #[derive(Clone)]
@@ -345,14 +348,18 @@ struct OuterQueryFrame {
 }
 
 impl BoundSelect {
-    pub fn into_table_references(self) -> Result<Vec<TableReferences>> {
+    pub fn into_table_references(
+        self,
+        planned_ctes: &mut HashMap<String, super::plan::JoinedTable>,
+    ) -> Result<Vec<TableReferences>> {
         let mut all = Vec::with_capacity(1 + self.compound_scopes.len());
 
-        let main_refs = Self::scope_to_table_references(self.main_scope, &self.tracking)?;
+        let main_refs =
+            Self::scope_to_table_references(self.main_scope, &self.tracking, planned_ctes)?;
         all.push(main_refs);
 
         for scope in self.compound_scopes {
-            all.push(Self::scope_to_table_references(scope, &self.tracking)?);
+            all.push(Self::scope_to_table_references(scope, &self.tracking, planned_ctes)?);
         }
 
         Ok(all)
@@ -361,6 +368,7 @@ impl BoundSelect {
     fn scope_to_table_references(
         scope: BindScope,
         tracking: &BindTracking,
+        planned_ctes: &mut HashMap<String, super::plan::JoinedTable>,
     ) -> Result<TableReferences> {
         let joined_tables = scope
             .tables
@@ -377,7 +385,19 @@ impl BoundSelect {
                     expression_index_usages: Vec::new(),
                     database_id: 0,
                 }),
-                ScopeTableSource::Cte { name, .. } | ScopeTableSource::Derived { name, .. } => {
+                ScopeTableSource::Cte { name, .. } => {
+                    let mut cte_table = planned_ctes.remove(&name).ok_or_else(|| {
+                        crate::LimboError::InternalError(format!(
+                            "CTE '{name}' was not planned before into_table_references"
+                        ))
+                    })?;
+                    // Use the scope's identifier (may be aliased) and internal_id
+                    cte_table.identifier = scope_table.identifier;
+                    cte_table.internal_id = scope_table.internal_id;
+                    cte_table.join_info = scope_table.join_info;
+                    Ok(cte_table)
+                }
+                ScopeTableSource::Derived { name, .. } => {
                     Err(crate::LimboError::InternalError(format!(
                         "derived bind source {name} cannot yet be converted into planner table references"
                     )))
@@ -585,8 +605,12 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
     // ── CTEs ─────────────────────────────────────────────────────────
 
-    fn insert_cte(&mut self, name: String, entry: CteEntry) {
+    pub fn insert_cte(&mut self, name: String, entry: CteEntry) {
         self.ctes.insert(name, entry);
+    }
+
+    pub fn has_cte(&self, name: &str) -> bool {
+        self.ctes.contains_key(name)
     }
 
     fn get_cte(&self, name: &str) -> Option<&CteEntry> {
@@ -781,6 +805,13 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 }
             }
 
+            // 6. Extract CTE definitions before with_query restores them
+            let cte_definitions: Vec<(String, CteEntry)> = if select.with.is_some() {
+                std::mem::take(&mut ctx.ctes).into_iter().collect()
+            } else {
+                vec![]
+            };
+
             Ok(BoundSelect {
                 result_columns,
                 main_scope,
@@ -789,6 +820,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 compound_join_orders,
                 tracking: std::mem::take(&mut ctx.tracking),
                 subquery_bindings: std::mem::take(&mut ctx.subquery_bindings),
+                cte_definitions,
             })
         })
     }
@@ -1085,7 +1117,11 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             );
         }
 
-        // Pass 2: bind each CTE body and populate resolved columns + inner binding
+        // Pass 2: bind each CTE body and populate resolved columns + inner binding.
+        // We collect inner_bound values separately because bind_select calls with_query
+        // which clones self.ctes (setting inner_bound = None via the custom Clone impl),
+        // then restores them — destroying inner_bound values set in prior iterations.
+        let mut inner_bounds: Vec<(String, BoundSelect)> = Vec::with_capacity(with.ctes.len());
         for cte in &mut with.ctes {
             let cte_name = normalize_ident(cte.tbl_name.as_str());
             let bound = self.bind_select(&mut cte.select)?;
@@ -1101,7 +1137,11 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 entry.resolved_columns = entry.explicit_columns.clone();
             }
             entry.select = cte.select.clone();
-            entry.inner_bound = Some(bound);
+            inner_bounds.push((cte_name, bound));
+        }
+        // Assign inner_bound values after all binding is done.
+        for (cte_name, bound) in inner_bounds {
+            self.ctes.get_mut(&cte_name).unwrap().inner_bound = Some(bound);
         }
         Ok(())
     }
@@ -1975,7 +2015,7 @@ mod tests {
         with_bind_context(&["CREATE TABLE t(a, b)"], |ctx| {
             let mut select = parse_select("SELECT b FROM t WHERE a = 1");
             let bound = ctx.bind_select(&mut select).unwrap();
-            let mut all_refs = bound.into_table_references().unwrap();
+            let mut all_refs = bound.into_table_references(&mut HashMap::default()).unwrap();
 
             assert_eq!(all_refs.len(), 1);
             let table_references = all_refs.remove(0);

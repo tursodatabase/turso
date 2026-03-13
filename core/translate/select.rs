@@ -39,9 +39,16 @@ pub fn bind_prepare_select_plan(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
+    use super::planner::plan_bound_ctes;
+
     let mut binder = BindContext::new(resolver, program);
-    let bound = binder.bind_select(&mut select)?;
-    let all_table_refs = bound.into_table_references()?;
+    let mut bound = binder.bind_select(&mut select)?;
+
+    // Plan CTEs using pre-bound data from the binder.
+    let cte_definitions = std::mem::take(&mut bound.cte_definitions);
+    let mut planned_ctes = plan_bound_ctes(cte_definitions, resolver, program, connection)?;
+
+    let all_table_refs = bound.into_table_references(&mut planned_ctes)?;
     prepare_select_plan(
         select,
         resolver,
@@ -51,6 +58,7 @@ pub fn bind_prepare_select_plan(
         all_table_refs.into_iter(),
     )
 }
+
 
 pub fn translate_select(
     select: ast::Select,

@@ -1,15 +1,17 @@
 use crate::sync::Arc;
 use crate::{turso_assert, turso_assert_greater_than_or_equal, turso_assert_less_than};
+use rustc_hash::FxHashMap;
 use std::cmp::PartialEq;
 
 use super::{
+    bind::CteEntry,
     expr::walk_expr,
     plan::{
         Aggregate, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
         JoinOrderMember, JoinType as PlanJoinType, JoinedTable, Operation, OuterQueryReference,
         Plan, QueryDestination, Scan, TableReferences, WhereTerm,
     },
-    select::prepare_select_plan,
+    select::bind_prepare_select_plan,
 };
 use crate::function::{AggFunc, ExtFunc};
 use crate::translate::{
@@ -58,7 +60,7 @@ struct CteDefinition {
 
 /// Collect all table names referenced in a SELECT's FROM clause.
 /// Used to determine which earlier CTEs a CTE directly depends on.
-fn collect_from_clause_table_refs(select: &Select, out: &mut Vec<String>) {
+pub fn collect_from_clause_table_refs(select: &Select, out: &mut Vec<String>) {
     collect_from_select_body(&select.body, out);
     collect_subquery_table_refs_in_select_exprs(select, out);
 }
@@ -489,7 +491,7 @@ fn plan_cte(
     program.push_cte_being_defined(cte_def.name.clone());
 
     // Plan this CTE with fresh IDs
-    let cte_plan = prepare_select_plan(
+    let cte_plan = bind_prepare_select_plan(
         cte_def.select.clone(),
         resolver,
         program,
@@ -547,6 +549,156 @@ fn plan_cte(
     }
 }
 
+/// Plan CTEs from binder-provided definitions.
+///
+/// Uses the same recursive approach as `plan_cte` to avoid exponential re-planning:
+/// only directly referenced CTEs are planned as dependencies.
+///
+/// Returns a map of CTE name → planned `JoinedTable` for use in
+/// `BoundSelect::into_table_references`.
+pub fn plan_bound_ctes(
+    mut cte_definitions: Vec<(String, CteEntry)>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+) -> Result<FxHashMap<String, JoinedTable>> {
+    let mut planned: FxHashMap<String, JoinedTable> = FxHashMap::default();
+    for idx in 0..cte_definitions.len() {
+        if !planned.contains_key(&cte_definitions[idx].0) {
+            plan_one_bound_cte(
+                idx,
+                &mut cte_definitions,
+                resolver,
+                program,
+                connection,
+                true,
+                &mut planned,
+            )?;
+        }
+    }
+    Ok(planned)
+}
+
+/// Plan a single CTE using its pre-bound data from the binder.
+///
+/// The binder already resolved all names and column references in the CTE body.
+/// This function takes the pre-bound `inner_bound` and converts it into a plan
+/// without re-binding. Referenced sibling CTEs are planned recursively first
+/// (with `count_reference = false`) to avoid exponential blowup.
+fn plan_one_bound_cte(
+    cte_idx: usize,
+    cte_definitions: &mut [(String, CteEntry)],
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+    count_reference: bool,
+    planned: &mut FxHashMap<String, JoinedTable>,
+) -> Result<JoinedTable> {
+    // Copy metadata needed before mutably borrowing the entry.
+    let name = cte_definitions[cte_idx].0.clone();
+    let referenced_indices = cte_definitions[cte_idx].1.referenced_cte_indices.clone();
+
+    // Recursively plan referenced sibling CTEs first.
+    for &ref_idx in &referenced_indices {
+        if !planned.contains_key(&cte_definitions[ref_idx].0) {
+            plan_one_bound_cte(
+                ref_idx,
+                cte_definitions,
+                resolver,
+                program,
+                connection,
+                false,
+                planned,
+            )?;
+        }
+    }
+
+    let entry = &mut cte_definitions[cte_idx].1;
+
+    // Take the pre-bound data produced by the binder.
+    let mut inner_bound = entry
+        .inner_bound
+        .take()
+        .expect("CTE inner binding should be present");
+    let cte_select = entry.select.clone();
+
+    // Extract nested CTE definitions (from inner WITH clauses) before consuming inner_bound.
+    let inner_cte_defs = std::mem::take(&mut inner_bound.cte_definitions);
+
+    // Block circular references during planning.
+    program.push_cte_being_defined(name.clone());
+
+    // Plan any nested CTEs from inner WITH clauses.
+    let mut inner_planned = plan_bound_ctes(inner_cte_defs, resolver, program, connection)?;
+
+    // Make already-planned sibling CTEs available for FROM references.
+    for &ref_idx in &referenced_indices {
+        let ref_name = &cte_definitions[ref_idx].0;
+        if !inner_planned.contains_key(ref_name) {
+            if let Some(ref_table) = planned.get(ref_name) {
+                inner_planned.insert(ref_name.clone(), ref_table.clone());
+            }
+        }
+    }
+
+    let all_table_refs = inner_bound.into_table_references(&mut inner_planned)?;
+
+    let cte_plan = super::select::prepare_select_plan(
+        cte_select,
+        resolver,
+        program,
+        QueryDestination::placeholder_for_subquery(),
+        connection,
+        all_table_refs.into_iter(),
+    );
+    program.pop_cte_being_defined();
+    let cte_plan = cte_plan?;
+
+    let entry = &cte_definitions[cte_idx].1;
+    let explicit_cols = if entry.explicit_columns.is_empty() {
+        None
+    } else {
+        Some(entry.explicit_columns.as_slice())
+    };
+
+    if count_reference {
+        program.increment_cte_reference(entry.cte_id);
+
+        if let Some(cols) = explicit_cols {
+            let result_col_count = cte_plan
+                .select_result_columns()
+                .expect("should be a select plan")
+                .len();
+            if cols.len() != result_col_count {
+                crate::bail_parse_error!(
+                    "table {} has {} columns but {} column names were provided",
+                    name,
+                    result_col_count,
+                    cols.len()
+                );
+            }
+        }
+    }
+
+    let cte_table = match cte_plan {
+        Plan::Select(_) | Plan::CompoundSelect { .. } => JoinedTable::new_subquery_from_plan(
+            name.clone(),
+            cte_plan,
+            None,
+            program.table_reference_counter.next(),
+            explicit_cols,
+            Some(entry.cte_id),
+            entry.materialize_hint,
+        )?,
+        Plan::Delete(_) | Plan::Update(_) => {
+            crate::bail_parse_error!("DELETE/UPDATE queries are not supported in CTEs")
+        }
+    };
+
+    planned.insert(name.clone(), cte_table.clone());
+    Ok(cte_table)
+}
+
 /// Plan CTEs from a WITH clause and add them as outer query references.
 /// This is used by DML statements (DELETE, UPDATE) to make CTEs available
 /// for subqueries in WHERE and SET clauses.
@@ -594,7 +746,7 @@ pub fn plan_ctes_as_outer_refs(
         program.push_cte_being_defined(cte_name.clone());
 
         // Plan the CTE SELECT
-        let cte_plan = prepare_select_plan(
+        let cte_plan = bind_prepare_select_plan(
             cte.select,
             resolver,
             program,
@@ -719,7 +871,7 @@ fn parse_from_clause_table(
                 });
             }
 
-            let subplan = prepare_select_plan(
+            let subplan = bind_prepare_select_plan(
                 subselect,
                 resolver,
                 program,
@@ -863,7 +1015,7 @@ fn parse_table(
             // Re-plan the CTE from its original AST to get fresh internal_ids.
             // This prevents cursor key collisions when the same CTE is
             // referenced multiple times in the same scope.
-            let cte_plan = prepare_select_plan(
+            let cte_plan = bind_prepare_select_plan(
                 cte_ast,
                 resolver,
                 program,
