@@ -2264,3 +2264,181 @@ test trigger-after-on-view-rejected {
 expect error {
     cannot create AFTER trigger on view
 }
+
+test trigger-instead-of-insert-on-view-runtime {
+    CREATE TABLE t(a, b);
+    CREATE VIEW v AS SELECT a, b FROM t;
+    CREATE TRIGGER tr_v_insert INSTEAD OF INSERT ON v BEGIN
+      INSERT INTO t VALUES(NEW.a, NEW.b);
+    END;
+    INSERT INTO v VALUES(1, 'x');
+    INSERT INTO v SELECT 2, 'y' UNION ALL SELECT 3, 'z';
+    SELECT a, b FROM t ORDER BY a;
+}
+expect {
+    1|x
+    2|y
+    3|z
+}
+
+test trigger-instead-of-insert-on-view-returning {
+    CREATE TABLE t(a, b);
+    CREATE VIEW v AS SELECT a, b FROM t;
+    CREATE TRIGGER tr_v_insert INSTEAD OF INSERT ON v BEGIN
+      INSERT INTO t VALUES(NEW.a, NEW.b);
+    END;
+    INSERT INTO v VALUES(10, 'ret') RETURNING a, b;
+}
+expect {
+    10|ret
+}
+
+test trigger-instead-of-insert-on-view-upsert-rejected {
+    CREATE TABLE t(a, b);
+    CREATE VIEW v AS SELECT a, b FROM t;
+    CREATE TRIGGER tr_v_insert INSTEAD OF INSERT ON v BEGIN
+      INSERT INTO t VALUES(NEW.a, NEW.b);
+    END;
+    INSERT INTO v VALUES(1, 2) ON CONFLICT(a) DO NOTHING;
+}
+expect error {
+    cannot UPSERT a view
+}
+
+@backend rust
+test trigger-instead-of-insert-on-view-new-rowid-default {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a);
+    CREATE VIEW v AS SELECT id, a FROM t;
+    CREATE TABLE log(rid, id, a);
+    CREATE TRIGGER tr_v_insert_rowid INSTEAD OF INSERT ON v BEGIN
+      INSERT INTO log VALUES(NEW.rowid, NEW.id, NEW.a);
+    END;
+    INSERT INTO v(id, a) VALUES(10, 'x');
+    INSERT INTO v(a) VALUES('y');
+    INSERT INTO v(rowid, a) VALUES(7, 'z');
+    SELECT rid, id, a FROM log ORDER BY rowid;
+}
+expect {
+    -1|10|x
+    -1||y
+    7||z
+}
+
+test trigger-instead-of-update-on-view-runtime {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b);
+    INSERT INTO t VALUES(1, 10, 'x');
+    INSERT INTO t VALUES(2, 20, 'y');
+    CREATE VIEW v AS SELECT id, a, b FROM t;
+    CREATE TRIGGER tr_v_update INSTEAD OF UPDATE ON v BEGIN
+      UPDATE t SET a = NEW.a, b = NEW.b WHERE id = OLD.id;
+    END;
+    UPDATE v SET a = a + 5, b = b || '_u' WHERE id = 2;
+    SELECT id, a, b FROM t ORDER BY id;
+}
+expect {
+    1|10|x
+    2|25|y_u
+}
+
+test trigger-instead-of-update-of-on-view-runtime {
+    CREATE TABLE t(a, b, c);
+    INSERT INTO t VALUES(1, 2, 3);
+    CREATE VIEW v AS SELECT a, b, c FROM t;
+    CREATE TRIGGER tr_v_update_of_b INSTEAD OF UPDATE OF b ON v BEGIN
+      UPDATE t
+      SET a = NEW.a,
+          b = NEW.b,
+          c = NEW.c
+      WHERE a = OLD.a AND b = OLD.b AND c = OLD.c;
+    END;
+    UPDATE v SET b = 20 WHERE a = 1;
+    SELECT a, b, c FROM t;
+}
+expect {
+    1|20|3
+}
+
+test trigger-instead-of-update-of-on-view-non-matching-columns {
+    CREATE TABLE t(a, b, c);
+    INSERT INTO t VALUES(1, 2, 3);
+    CREATE VIEW v AS SELECT a, b, c FROM t;
+    CREATE TRIGGER tr_v_update_of_b INSTEAD OF UPDATE OF b ON v BEGIN
+      UPDATE t
+      SET a = NEW.a,
+          b = NEW.b,
+          c = NEW.c
+      WHERE a = OLD.a AND b = OLD.b AND c = OLD.c;
+    END;
+    UPDATE v SET c = 30 WHERE a = 1;
+}
+expect error {
+    cannot modify v because it is a view
+}
+
+test trigger-instead-of-delete-on-view-runtime {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a);
+    INSERT INTO t VALUES(1, 'x');
+    INSERT INTO t VALUES(2, 'y');
+    CREATE VIEW v AS SELECT id, a FROM t;
+    CREATE TRIGGER tr_v_delete INSTEAD OF DELETE ON v BEGIN
+      DELETE FROM t WHERE id = OLD.id;
+    END;
+    DELETE FROM v WHERE id = 1;
+    SELECT id, a FROM t ORDER BY id;
+}
+expect {
+    2|y
+}
+
+test trigger-instead-of-update-of-on-attached-view-creation {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t(a, b, c);
+    CREATE VIEW aux.v AS SELECT a, b, c FROM t;
+    CREATE TRIGGER aux.tr_aux_update_of_b INSTEAD OF UPDATE OF b ON v BEGIN
+      UPDATE t
+      SET a = NEW.a,
+          b = NEW.b,
+          c = NEW.c
+      WHERE a = OLD.a AND b = OLD.b AND c = OLD.c;
+    END;
+    SELECT type, name, tbl_name FROM aux.sqlite_schema WHERE type='trigger' AND name='tr_aux_update_of_b';
+}
+expect {
+    trigger|tr_aux_update_of_b|v
+}
+
+test trigger-instead-of-delete-on-attached-view-creation {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t(a, b);
+    CREATE VIEW aux.v AS SELECT a, b FROM t;
+    CREATE TRIGGER aux.tr_aux_delete INSTEAD OF DELETE ON v BEGIN
+      DELETE FROM t WHERE a = OLD.a AND b = OLD.b;
+    END;
+    SELECT type, name, tbl_name FROM aux.sqlite_schema WHERE type='trigger' AND name='tr_aux_delete';
+}
+expect {
+    trigger|tr_aux_delete|v
+}
+
+test trigger-instead-of-view-runtime-attached-db {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t(id INTEGER PRIMARY KEY, a);
+    INSERT INTO aux.t VALUES(1, 'x');
+    CREATE VIEW aux.v AS SELECT id, a FROM t;
+    CREATE TRIGGER aux.tr_aux_insert INSTEAD OF INSERT ON v BEGIN
+      INSERT INTO t VALUES(NEW.id, NEW.a);
+    END;
+    CREATE TRIGGER aux.tr_aux_update INSTEAD OF UPDATE ON v BEGIN
+      UPDATE t SET a = NEW.a WHERE id = OLD.id;
+    END;
+    CREATE TRIGGER aux.tr_aux_delete INSTEAD OF DELETE ON v BEGIN
+      DELETE FROM t WHERE id = OLD.id;
+    END;
+    INSERT INTO aux.v VALUES(2, 'y');
+    UPDATE aux.v SET a = 'xx' WHERE id = 1;
+    DELETE FROM aux.v WHERE id = 2;
+    SELECT id, a FROM aux.t ORDER BY id;
+}
+expect {
+    1|xx
+}

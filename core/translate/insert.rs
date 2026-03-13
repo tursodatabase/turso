@@ -99,6 +99,424 @@ fn validate(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn translate_insert_into_view(
+    resolver: &mut Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+    database_id: usize,
+    view: Arc<crate::schema::View>,
+    table_name: &str,
+    on_conflict: Option<ResolveType>,
+    mut body: InsertBody,
+    columns: Vec<ast::Name>,
+    mut returning: Vec<ResultColumn>,
+    with_for_returning: Option<With>,
+) -> Result<()> {
+    if matches!(&body, InsertBody::Select(_, Some(_))) {
+        crate::bail_parse_error!("cannot UPSERT a view");
+    }
+
+    let view_table = Arc::new(BTreeTable {
+        root_page: 0,
+        name: normalize_ident(table_name),
+        primary_key_columns: vec![],
+        columns: view.columns.clone(),
+        has_rowid: false,
+        is_strict: false,
+        has_autoincrement: false,
+        unique_sets: vec![],
+        foreign_keys: vec![],
+        check_constraints: vec![],
+        pk_conflict_clause: None,
+    });
+    let view_table_ref = Table::BTree(view_table.clone());
+
+    let effective_conflict = on_conflict.unwrap_or(ResolveType::Abort);
+    let BoundInsertResult {
+        values,
+        upsert_actions: _upsert_actions,
+        inserting_multiple_rows,
+    } = bind_insert(
+        program,
+        resolver,
+        &view_table_ref,
+        &mut body,
+        effective_conflict,
+        database_id,
+    )?;
+
+    let relevant_instead_triggers: Vec<_> = resolver.with_schema(database_id, |s| {
+        get_relevant_triggers_type_and_time(
+            s,
+            TriggerEvent::Insert,
+            TriggerTime::InsteadOf,
+            None,
+            &view_table,
+        )
+        .collect()
+    });
+    if relevant_instead_triggers.is_empty() {
+        crate::bail_parse_error!("cannot modify {} because it is a view", table_name);
+    }
+
+    let mut table_references = TableReferences::new(
+        vec![JoinedTable {
+            table: Table::BTree(view_table.clone()),
+            identifier: table_name.to_string(),
+            internal_id: program.table_reference_counter.next(),
+            op: Operation::default_scan_for(&view_table_ref),
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            database_id,
+        }],
+        vec![],
+    );
+    plan_ctes_as_outer_refs(
+        with_for_returning,
+        resolver,
+        program,
+        &mut table_references,
+        connection,
+    )?;
+    let mut returning_subqueries = vec![];
+    plan_subqueries_from_returning(
+        program,
+        &mut returning_subqueries,
+        &mut table_references,
+        &mut returning,
+        resolver,
+        connection,
+    )?;
+    let result_columns = process_returning_clause(&mut returning, &mut table_references, resolver)?;
+    if !result_columns.is_empty() {
+        program.result_columns.clone_from(&result_columns);
+    }
+    let returning_buffer = if result_columns.is_empty() {
+        None
+    } else {
+        let ret_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(view_table.clone()));
+        program.emit_insn(Insn::OpenEphemeral {
+            cursor_id: ret_cursor_id,
+            is_table: true,
+        });
+        Some(ReturningBufferCtx {
+            cursor_id: ret_cursor_id,
+            num_columns: result_columns.len(),
+        })
+    };
+
+    for subquery in returning_subqueries
+        .iter_mut()
+        .filter(|s| !s.has_been_evaluated())
+    {
+        let eval_at = subquery.get_eval_at(&[], Some(&table_references))?;
+        if eval_at != EvalAt::BeforeLoop {
+            continue;
+        }
+        let subquery_plan = subquery.consume_plan(EvalAt::BeforeLoop);
+
+        emit_non_from_clause_subquery(
+            program,
+            resolver,
+            *subquery_plan,
+            &subquery.query_type,
+            subquery.correlated,
+        )?;
+    }
+
+    let required_column_count = if columns.is_empty() {
+        view_table.columns.iter().filter(|c| !c.hidden()).count()
+    } else {
+        columns.len()
+    };
+    if !values.is_empty() && values.len() != required_column_count {
+        crate::bail_parse_error!(
+            "{} values for {required_column_count} columns",
+            values.len()
+        );
+    }
+
+    // INSTEAD OF triggers run once per attempted row operation.
+    // For multi-row sources we materialize into an ephemeral table first, like SQLite's
+    // trigger-safe source handling for INSERT.
+    if inserting_multiple_rows {
+        let InsertBody::Select(select, _) = body else {
+            unreachable!("multi-row INSERT source must be a SELECT/VALUES form");
+        };
+
+        let yield_reg = program.alloc_register();
+        let jump_on_definition_label = program.allocate_label();
+        let start_offset_label = program.allocate_label();
+        program.emit_insn(Insn::InitCoroutine {
+            yield_reg,
+            jump_on_definition: jump_on_definition_label,
+            start_offset: start_offset_label,
+        });
+        program.preassign_label_to_next_insn(start_offset_label);
+
+        let coroutine_end = program.allocate_label();
+        let query_destination = QueryDestination::CoroutineYield {
+            yield_reg,
+            coroutine_implementation_start: coroutine_end,
+        };
+        let num_result_cols = program.nested(|program| {
+            translate_select(select, resolver, program, query_destination, connection)
+        })?;
+        if num_result_cols != required_column_count {
+            crate::bail_parse_error!(
+                "{} values for {required_column_count} columns",
+                num_result_cols
+            );
+        }
+        program.emit_insn(Insn::EndCoroutine { yield_reg });
+        program.preassign_label_to_next_insn(jump_on_definition_label);
+
+        let insertion = build_insertion(program, &view_table_ref, &columns, num_result_cols)?;
+
+        let temp_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(view_table.clone()));
+        program.emit_insn(Insn::OpenEphemeral {
+            cursor_id: temp_cursor_id,
+            is_table: true,
+        });
+
+        let fill_loop = program.allocate_label();
+        let fill_done = program.allocate_label();
+        program.preassign_label_to_next_insn(fill_loop);
+        program.emit_insn(Insn::Yield {
+            yield_reg,
+            end_offset: fill_done,
+        });
+
+        let record_reg = program.alloc_register();
+        let affinity_str = if columns.is_empty() {
+            view_table
+                .columns
+                .iter()
+                .filter(|col| !col.hidden())
+                .map(|col| col.affinity_with_strict(false).aff_mask())
+                .collect::<String>()
+        } else {
+            columns
+                .iter()
+                .map(|col_name| {
+                    let column_name = normalize_ident(col_name.as_str());
+                    if ROWID_STRS
+                        .iter()
+                        .any(|s| s.eq_ignore_ascii_case(&column_name))
+                    {
+                        return Ok(Affinity::Integer.aff_mask());
+                    }
+                    view_table_ref
+                        .get_column_by_name(&column_name)
+                        .map(|(_, col)| col.affinity_with_strict(false).aff_mask())
+                        .ok_or_else(|| {
+                            LimboError::ParseError(format!(
+                                "table {} has no column named {}",
+                                view_table_ref.get_name(),
+                                column_name
+                            ))
+                        })
+                })
+                .collect::<Result<String>>()?
+        };
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u16(program.reg_result_cols_start.unwrap_or(yield_reg + 1)),
+            count: to_u16(num_result_cols),
+            dest_reg: to_u16(record_reg),
+            index_name: None,
+            affinity_str: Some(affinity_str),
+        });
+
+        let temp_rowid_reg = program.alloc_register();
+        program.emit_insn(Insn::NewRowid {
+            cursor: temp_cursor_id,
+            rowid_reg: temp_rowid_reg,
+            prev_largest_reg: 0,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: temp_cursor_id,
+            key_reg: temp_rowid_reg,
+            record_reg,
+            flag: InsertFlags::new().require_seek(),
+            table_name: String::new(),
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: fill_loop,
+        });
+        program.preassign_label_to_next_insn(fill_done);
+
+        let temp_table_ctx = Some(TempTableCtx {
+            cursor_id: temp_cursor_id,
+            loop_start_label: program.allocate_label(),
+            loop_end_label: program.allocate_label(),
+        });
+        translate_rows_multiple(
+            program,
+            &insertion,
+            program.reg_result_cols_start.unwrap_or(yield_reg + 1),
+            resolver,
+            &temp_table_ctx,
+            false,
+        )?;
+
+        if !insertion.key.is_provided_by_user() {
+            // Match SQLite for INSTEAD OF INSERT triggers on views:
+            // NEW.rowid is -1 when not explicitly provided by the statement.
+            program.emit_insn(Insn::Integer {
+                dest: insertion.key_register(),
+                value: -1,
+            });
+        }
+
+        let new_registers: Vec<usize> = insertion
+            .col_mappings
+            .iter()
+            .map(|col_mapping| {
+                if col_mapping.column.is_rowid_alias() {
+                    insertion.key_register()
+                } else {
+                    col_mapping.register
+                }
+            })
+            .chain(std::iter::once(insertion.key_register()))
+            .collect();
+        let trigger_ctx = if let Some(override_conflict) = program.trigger_conflict_override {
+            TriggerContext::new_with_override_conflict(
+                view_table,
+                Some(new_registers),
+                None,
+                override_conflict,
+            )
+        } else if matches!(effective_conflict, ResolveType::Ignore) {
+            TriggerContext::new_with_override_conflict(
+                view_table,
+                Some(new_registers),
+                None,
+                ResolveType::Ignore,
+            )
+        } else {
+            TriggerContext::new(view_table, Some(new_registers), None)
+        };
+
+        let row_done = program.allocate_label();
+        for trigger in relevant_instead_triggers {
+            fire_trigger(
+                program,
+                resolver,
+                trigger,
+                &trigger_ctx,
+                connection,
+                database_id,
+                row_done,
+            )?;
+        }
+
+        if !result_columns.is_empty() {
+            emit_returning_results(
+                program,
+                &table_references,
+                &result_columns,
+                insertion.first_col_register(),
+                insertion.key_register(),
+                resolver,
+                returning_buffer.as_ref(),
+            )?;
+        }
+        program.preassign_label_to_next_insn(row_done);
+
+        let temp_ctx_ref = temp_table_ctx
+            .as_ref()
+            .expect("temp table context must be present");
+        program.emit_insn(Insn::Next {
+            cursor_id: temp_cursor_id,
+            pc_if_next: temp_ctx_ref.loop_start_label,
+        });
+        program.preassign_label_to_next_insn(temp_ctx_ref.loop_end_label);
+        program.emit_insn(Insn::Close {
+            cursor_id: temp_cursor_id,
+        });
+        program.preassign_label_to_next_insn(coroutine_end);
+    } else {
+        let insertion = build_insertion(program, &view_table_ref, &columns, values.len())?;
+        translate_rows_single(program, &values, &insertion, resolver, false)?;
+
+        if !insertion.key.is_provided_by_user() {
+            // Match SQLite for INSTEAD OF INSERT triggers on views:
+            // NEW.rowid is -1 when not explicitly provided by the statement.
+            program.emit_insn(Insn::Integer {
+                dest: insertion.key_register(),
+                value: -1,
+            });
+        }
+
+        let new_registers: Vec<usize> = insertion
+            .col_mappings
+            .iter()
+            .map(|col_mapping| {
+                if col_mapping.column.is_rowid_alias() {
+                    insertion.key_register()
+                } else {
+                    col_mapping.register
+                }
+            })
+            .chain(std::iter::once(insertion.key_register()))
+            .collect();
+        let trigger_ctx = if let Some(override_conflict) = program.trigger_conflict_override {
+            TriggerContext::new_with_override_conflict(
+                view_table,
+                Some(new_registers),
+                None,
+                override_conflict,
+            )
+        } else if matches!(effective_conflict, ResolveType::Ignore) {
+            TriggerContext::new_with_override_conflict(
+                view_table,
+                Some(new_registers),
+                None,
+                ResolveType::Ignore,
+            )
+        } else {
+            TriggerContext::new(view_table, Some(new_registers), None)
+        };
+
+        let stmt_done = program.allocate_label();
+        for trigger in relevant_instead_triggers {
+            fire_trigger(
+                program,
+                resolver,
+                trigger,
+                &trigger_ctx,
+                connection,
+                database_id,
+                stmt_done,
+            )?;
+        }
+        if !result_columns.is_empty() {
+            emit_returning_results(
+                program,
+                &table_references,
+                &result_columns,
+                insertion.first_col_register(),
+                insertion.key_register(),
+                resolver,
+                returning_buffer.as_ref(),
+            )?;
+        }
+        program.preassign_label_to_next_insn(stmt_done);
+    }
+
+    if let Some(ref buf) = returning_buffer {
+        program.emit_insn(Insn::FkCheck { deferred: false });
+        emit_returning_scan_back(program, buf);
+    }
+    program.table_references.extend(table_references);
+
+    Ok(())
+}
+
 pub struct TempTableCtx {
     cursor_id: usize,
     loop_start_label: BranchOffset,
@@ -273,9 +691,32 @@ pub fn translate_insert(
 
     let database_id = resolver.resolve_database_id(&tbl_name)?;
     let table_name = &tbl_name.name;
-    let table = match resolver.with_schema(database_id, |s| s.get_table(table_name.as_str())) {
+    let (table, maybe_view) = resolver.with_schema(database_id, |s| {
+        (
+            s.get_table(table_name.as_str()),
+            s.get_view(table_name.as_str()),
+        )
+    });
+    let table = match table {
         Some(table) => table,
-        None => crate::bail_parse_error!("no such table: {}", table_name),
+        None => {
+            if let Some(view) = maybe_view {
+                return translate_insert_into_view(
+                    resolver,
+                    program,
+                    connection,
+                    database_id,
+                    view,
+                    table_name.as_str(),
+                    on_conflict,
+                    body,
+                    columns,
+                    returning,
+                    with_for_returning,
+                );
+            }
+            crate::bail_parse_error!("no such table: {}", table_name);
+        }
     };
     if program.trigger.is_some() && table.virtual_table().is_some() {
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name.name.as_str());
