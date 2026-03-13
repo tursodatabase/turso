@@ -3105,3 +3105,104 @@ test json107-1-8 {
 expect {
 		{"a":123,"b":456}
 }
+
+test json_extract-unescape-double-quote {
+    SELECT JSON_EXTRACT('{"key":"value with \"quotes\""}', '$.key');
+}
+expect {
+    value with "quotes"
+}
+
+test json_extract-unescape-backslash {
+    SELECT JSON_EXTRACT('{"a":"back\\\\slash"}', '$.a');
+}
+expect {
+    back\slash
+}
+
+test json_extract-unescape-forward-slash {
+    SELECT JSON_EXTRACT('{"a":"for\\/ward"}', '$.a');
+}
+expect {
+    for/ward
+}
+
+test json_extract-unescape-newline {
+    SELECT JSON_EXTRACT('{"a":"line1\nline2"}', '$.a');
+}
+expect {
+    line1
+line2
+}
+
+test json_extract-unescape-tab {
+    SELECT JSON_EXTRACT('{"a":"col1\tcol2"}', '$.a');
+}
+expect {
+    col1	col2
+}
+
+test json_extract-unescape-carriage-return-length {
+    SELECT LENGTH(JSON_EXTRACT('{"a":"hello\rworld"}', '$.a'));
+}
+expect {
+    11
+}
+
+test json_extract-unescape-backspace-length {
+    SELECT LENGTH(JSON_EXTRACT('{"a":"hello\bworld"}', '$.a'));
+}
+expect {
+    11
+}
+
+test json_extract-unescape-formfeed-length {
+    SELECT LENGTH(JSON_EXTRACT('{"a":"hello\fworld"}', '$.a'));
+}
+expect {
+    11
+}
+
+test json_extract-unescape-unicode {
+    SELECT JSON_EXTRACT('{"a":"hello\\u0020world"}', '$.a');
+}
+expect {
+    hello world
+}
+
+test json_extract-unescape-unicode-emoji {
+    SELECT JSON_EXTRACT('{"a":"\\u263A"}', '$.a');
+}
+expect {
+    ☺
+}
+
+test json_extract-unescape-newline-length {
+    SELECT LENGTH(JSON_EXTRACT('{"a":"hello\nworld"}', '$.a'));
+}
+expect {
+    11
+}
+
+test json_extract-arrow-unescape-double-quote {
+    SELECT '{"key":"value with \"quotes\""}' ->> '$.key';
+}
+expect {
+    value with "quotes"
+}
+
+test json_extract-arrow-unescape-newline {
+    SELECT '{"a":"line1\nline2"}' ->> '$.a';
+}
+expect {
+    line1
+line2
+}
+
+test json_extract-combined-escapes {
+    SELECT JSON_EXTRACT('{"a":"tab\there\nnewline\ttab"}', '$.a');
+}
+expect {
+    tab	here
+newline	tab
+}
