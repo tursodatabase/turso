@@ -118,6 +118,9 @@ pub struct sqlite3_stmt {
     )>,
     pub(crate) next: *mut sqlite3_stmt,
     pub(crate) text_cache: Vec<Vec<u8>>,
+    /// Cached ExtValue instances for sqlite3_column_value().
+    /// Populated lazily per column; cleared on each step/reset.
+    pub(crate) value_cache: Vec<Option<ExtValue>>,
 }
 
 impl sqlite3_stmt {
@@ -129,6 +132,7 @@ impl sqlite3_stmt {
             destructors: Vec::new(),
             next: std::ptr::null_mut(),
             text_cache: vec![vec![]; n_cols],
+            value_cache: (0..n_cols).map(|_| None).collect(),
         }
     }
     #[inline]
@@ -136,6 +140,10 @@ impl sqlite3_stmt {
         // Drop per-column buffers for the previous row
         for r in &mut self.text_cache {
             r.clear();
+        }
+        // Drop cached ExtValues for the previous row
+        for v in &mut self.value_cache {
+            *v = None;
         }
     }
 }
@@ -147,6 +155,7 @@ impl sqlite3_stmt {
 pub struct SqliteContext {
     pub(crate) result: ExtValue,
     pub(crate) p_app: *mut ffi::c_void,
+    pub(crate) db: *mut sqlite3,
 }
 
 // SAFETY: SqliteContext is only used single-threaded within a function call.
@@ -157,6 +166,7 @@ struct FuncSlot {
     p_app: usize,   // *mut c_void stored as usize for Send
     destroy: usize, // Option<unsafe extern "C" fn(*mut c_void)> stored as usize for Send
     name: String,
+    db: usize, // *mut sqlite3 stored as usize for Send
 }
 
 // SAFETY: p_app lifetime is the caller's responsibility (same as SQLite C API).
@@ -171,10 +181,10 @@ fn func_slots() -> &'static Mutex<[Option<FuncSlot>; MAX_CUSTOM_FUNCS]> {
 }
 
 unsafe fn dispatch_func_bridge(slot_id: usize, argc: i32, argv: *const ExtValue) -> ExtValue {
-    let (x_func, p_app) = {
+    let (x_func, p_app, db) = {
         let slots = func_slots().lock().unwrap();
         match slots[slot_id].as_ref() {
-            Some(s) => (s.x_func, s.p_app),
+            Some(s) => (s.x_func, s.p_app, s.db),
             None => return ExtValue::null(),
         }
     };
@@ -188,6 +198,7 @@ unsafe fn dispatch_func_bridge(slot_id: usize, argc: i32, argv: *const ExtValue)
     let mut ctx = SqliteContext {
         result: ExtValue::null(),
         p_app: p_app as *mut ffi::c_void,
+        db: db as *mut sqlite3,
     };
 
     x_func(
@@ -512,8 +523,12 @@ pub unsafe extern "C" fn sqlite3_set_authorizer(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_context_db_handle(_context: *mut ffi::c_void) -> *mut ffi::c_void {
-    stub!();
+pub unsafe extern "C" fn sqlite3_context_db_handle(context: *mut ffi::c_void) -> *mut ffi::c_void {
+    if context.is_null() {
+        return std::ptr::null_mut();
+    }
+    let ctx = &*(context as *const SqliteContext);
+    ctx.db as *mut ffi::c_void
 }
 
 #[no_mangle]
@@ -553,6 +568,22 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
 
     *out_stmt = new_stmt;
     SQLITE_OK
+}
+
+/// sqlite3_prepare_v3 is identical to sqlite3_prepare_v2 but accepts a
+/// `prep_flags` parameter (e.g. SQLITE_PREPARE_PERSISTENT) which is a hint
+/// to the query planner. Turso does not use these hints yet, so we delegate
+/// directly to sqlite3_prepare_v2.
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_prepare_v3(
+    db: *mut sqlite3,
+    sql: *const ffi::c_char,
+    n_byte: ffi::c_int,
+    _prep_flags: ffi::c_uint,
+    out_stmt: *mut *mut sqlite3_stmt,
+    tail: *mut *const ffi::c_char,
+) -> ffi::c_int {
+    sqlite3_prepare_v2(db, sql, n_byte, out_stmt, tail)
 }
 
 unsafe fn stmt_run_to_completion(stmt: *mut sqlite3_stmt) -> ffi::c_int {
@@ -1027,8 +1058,11 @@ pub unsafe extern "C" fn sqlite3_db_config(_db: *mut sqlite3, _op: ffi::c_int) -
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_db_handle(_stmt: *mut sqlite3_stmt) -> *mut sqlite3 {
-    stub!();
+pub unsafe extern "C" fn sqlite3_db_handle(stmt: *mut sqlite3_stmt) -> *mut sqlite3 {
+    if stmt.is_null() {
+        return std::ptr::null_mut();
+    }
+    (*stmt).db
 }
 
 #[no_mangle]
@@ -1466,8 +1500,11 @@ pub unsafe extern "C" fn sqlite3_column_int64(stmt: *mut sqlite3_stmt, idx: ffi:
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_column_int(stmt: *mut sqlite3_stmt, idx: ffi::c_int) -> i64 {
-    sqlite3_column_int64(stmt, idx)
+pub unsafe extern "C" fn sqlite3_column_int(
+    stmt: *mut sqlite3_stmt,
+    idx: ffi::c_int,
+) -> ffi::c_int {
+    sqlite3_column_int64(stmt, idx) as ffi::c_int
 }
 
 #[no_mangle]
@@ -1544,6 +1581,11 @@ pub unsafe extern "C" fn sqlite3_value_int64(value: *mut ffi::c_void) -> i64 {
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn sqlite3_value_int(value: *mut ffi::c_void) -> ffi::c_int {
+    sqlite3_value_int64(value) as ffi::c_int
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_double(value: *mut ffi::c_void) -> f64 {
     if value.is_null() {
         return 0.0;
@@ -1589,6 +1631,40 @@ pub unsafe extern "C" fn sqlite3_value_bytes(value: *mut ffi::c_void) -> ffi::c_
     }
 }
 
+/// Deep-copies an `sqlite3_value`.  Returns a heap-allocated copy that must
+/// be freed with `sqlite3_value_free`.  Diesel uses this to create
+/// `OwnedSqliteValue` instances.
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_value_dup(value: *mut ffi::c_void) -> *mut ffi::c_void {
+    if value.is_null() {
+        return std::ptr::null_mut();
+    }
+    let v = &*(value as *const ExtValue);
+    let copy = match v.value_type() {
+        turso_ext::ValueType::Integer => ExtValue::from_integer(v.to_integer().unwrap_or(0)),
+        turso_ext::ValueType::Float => ExtValue::from_float(v.to_float().unwrap_or(0.0)),
+        turso_ext::ValueType::Text => {
+            let s = v.to_text().unwrap_or("");
+            ExtValue::from_text(s.to_owned())
+        }
+        turso_ext::ValueType::Blob => {
+            let b = v.to_blob().unwrap_or_default();
+            ExtValue::from_blob(b.to_vec())
+        }
+        _ => ExtValue::null(),
+    };
+    Box::into_raw(Box::new(copy)) as *mut ffi::c_void
+}
+
+/// Frees a value previously allocated by `sqlite3_value_dup`.
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_value_free(value: *mut ffi::c_void) {
+    if value.is_null() {
+        return;
+    }
+    let _ = Box::from_raw(value as *mut ExtValue);
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_column_text(
     stmt: *mut sqlite3_stmt,
@@ -1620,6 +1696,47 @@ pub unsafe extern "C" fn sqlite3_column_text(
         }
         _ => std::ptr::null(),
     }
+}
+
+/// Returns an `sqlite3_value*` (ExtValue pointer) for a column in the current
+/// result row.  The pointer remains valid until the next `sqlite3_step()`,
+/// `sqlite3_reset()`, or `sqlite3_finalize()`.  Diesel uses this via
+/// `sqlite3_column_value` → `sqlite3_value_dup` to read all column types.
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_column_value(
+    stmt: *mut sqlite3_stmt,
+    idx: ffi::c_int,
+) -> *mut ffi::c_void {
+    if stmt.is_null() || idx < 0 {
+        return std::ptr::null_mut();
+    }
+    let stmt = &mut *stmt;
+    let i = idx as usize;
+    if i >= stmt.value_cache.len() {
+        return std::ptr::null_mut();
+    }
+    // Return cached value if we already built one for this column.
+    if stmt.value_cache[i].is_some() {
+        return stmt.value_cache[i].as_mut().unwrap() as *mut ExtValue as *mut ffi::c_void;
+    }
+    let binding = stmt.stmt.row();
+    let row = match binding.as_ref() {
+        Some(row) => row,
+        None => return std::ptr::null_mut(),
+    };
+    let ext = match row.get::<&Value>(i) {
+        Ok(turso_core::Value::Numeric(turso_core::Numeric::Integer(n))) => {
+            ExtValue::from_integer(*n)
+        }
+        Ok(turso_core::Value::Numeric(turso_core::Numeric::Float(f))) => {
+            ExtValue::from_float(f64::from(*f))
+        }
+        Ok(turso_core::Value::Text(t)) => ExtValue::from_text(t.value.to_string()),
+        Ok(turso_core::Value::Blob(b)) => ExtValue::from_blob(b.clone()),
+        _ => ExtValue::null(),
+    };
+    stmt.value_cache[i] = Some(ext);
+    stmt.value_cache[i].as_mut().unwrap() as *mut ExtValue as *mut ffi::c_void
 }
 
 pub struct TabResult {
@@ -1799,6 +1916,11 @@ pub unsafe extern "C" fn sqlite3_result_int64(context: *mut ffi::c_void, val: i6
     }
     let ctx = &mut *(context as *mut SqliteContext);
     ctx.result = ExtValue::from_integer(val);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_result_int(context: *mut ffi::c_void, val: ffi::c_int) {
+    sqlite3_result_int64(context, val as i64);
 }
 
 #[no_mangle]
@@ -2015,6 +2137,7 @@ pub unsafe extern "C" fn sqlite3_create_function_v2(
         p_app: context as usize,
         destroy: destroy_fn.map_or(0, |f| f as usize),
         name: func_name.clone(),
+        db: db as usize,
     });
     drop(slots);
 
@@ -2533,6 +2656,7 @@ fn limbo_err_code(err: &LimboError) -> i32 {
         LimboError::TableLocked => SQLITE_LOCKED,
         LimboError::ReadOnly => SQLITE_READONLY,
         LimboError::Busy => SQLITE_BUSY,
+        LimboError::SchemaUpdated | LimboError::SchemaConflict => SQLITE_SCHEMA,
         _ => SQLITE_ERROR,
     }
 }
