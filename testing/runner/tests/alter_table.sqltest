@@ -1817,3 +1817,163 @@ test alter-rename-col-schema-same-table-trigger {
 expect pattern {
     CREATE TRIGGER trig1 AFTER UPDATE ON t1 BEGIN\s+INSERT INTO log VALUES\s*\(new\.c\);\s+END
 }
+
+# Cross-table trigger: UPDATE WHERE references dropped column → fail
+@cross-check-integrity
+test fail-drop-column-cross-table-trigger-update-where-expr {
+    CREATE TABLE t (n REAL);
+    CREATE TABLE t1 (m TEXT, d REAL);
+    CREATE TRIGGER trg BEFORE DELETE ON t BEGIN
+        UPDATE t1 SET m = 'x' WHERE m = 'y';
+    END;
+    ALTER TABLE t1 DROP COLUMN m;
+}
+expect error {
+    error in trigger trg after drop column: no such column: m
+}
+
+# Cross-table trigger: UPDATE WHERE only references dropped column → fail
+@cross-check-integrity
+test fail-drop-column-cross-table-trigger-update-where-only {
+    CREATE TABLE t (n REAL);
+    CREATE TABLE t1 (m TEXT, d REAL);
+    CREATE TRIGGER trg BEFORE DELETE ON t BEGIN
+        UPDATE t1 SET d = 0 WHERE m = 'y';
+    END;
+    ALTER TABLE t1 DROP COLUMN m;
+}
+expect error {
+    error in trigger trg after drop column: no such column: m
+}
+
+# Cross-table trigger: UPDATE SET value expr references dropped column → fail
+@cross-check-integrity
+test fail-drop-column-cross-table-trigger-set-value-expr {
+    CREATE TABLE t (n REAL);
+    CREATE TABLE t1 (m TEXT, d REAL);
+    CREATE TRIGGER trg BEFORE DELETE ON t BEGIN
+        UPDATE t1 SET d = m WHERE d = 1.0;
+    END;
+    ALTER TABLE t1 DROP COLUMN m;
+}
+expect error {
+    error in trigger trg after drop column: no such column: m
+}
+
+# Cross-table trigger: INSERT column list references dropped column → succeed
+# (SQLite defers INSERT column list validation to trigger execution time)
+@cross-check-integrity
+test drop-column-cross-table-trigger-insert-col-list-deferred {
+    CREATE TABLE t (n REAL);
+    CREATE TABLE t1 (m TEXT, d REAL);
+    CREATE TRIGGER trg BEFORE DELETE ON t BEGIN
+        INSERT INTO t1 (m, d) VALUES ('x', 1.0);
+    END;
+    ALTER TABLE t1 DROP COLUMN m;
+    SELECT sql FROM sqlite_schema WHERE name = 't1';
+}
+expect pattern {
+    CREATE TABLE t1\s*\(d REAL\)
+}
+
+# Cross-table trigger: UPDATE SET target is dropped col but WHERE is valid → succeed
+# (SQLite defers SET target name validation to trigger execution time)
+@cross-check-integrity
+test drop-column-cross-table-trigger-set-target-deferred {
+    CREATE TABLE t (n REAL);
+    CREATE TABLE t1 (m TEXT, d REAL);
+    CREATE TRIGGER trg BEFORE DELETE ON t BEGIN
+        UPDATE t1 SET m = 'x' WHERE d = 1.0;
+    END;
+    ALTER TABLE t1 DROP COLUMN m;
+    SELECT sql FROM sqlite_schema WHERE name = 't1';
+}
+expect pattern {
+    CREATE TABLE t1\s*\(d REAL\)
+}
+
+# Cross-table trigger: DELETE WHERE references dropped column → fail
+@cross-check-integrity
+test fail-drop-column-cross-table-trigger-delete-where {
+    CREATE TABLE t (n REAL);
+    CREATE TABLE t1 (m TEXT, d REAL);
+    CREATE TRIGGER trg BEFORE DELETE ON t BEGIN
+        DELETE FROM t1 WHERE m = 'y';
+    END;
+    ALTER TABLE t1 DROP COLUMN m;
+}
+expect error {
+    error in trigger trg after drop column: no such column: m
+}
+
+# Drop column NOT referenced by the cross-table trigger should succeed
+@cross-check-integrity
+test drop-column-cross-table-trigger-unreferenced {
+    CREATE TABLE t (n REAL);
+    CREATE TABLE t1 (m TEXT, d REAL, e INTEGER);
+    CREATE TRIGGER trg BEFORE DELETE ON t BEGIN
+        UPDATE t1 SET m = 'x' WHERE m = 'y';
+    END;
+    ALTER TABLE t1 DROP COLUMN e;
+    SELECT sql FROM sqlite_schema WHERE name = 't1';
+}
+expect {
+    CREATE TABLE t1 (m TEXT, d REAL)
+}
+
+# Trigger on owning table with invalid column ref in command targeting another table → fail
+@cross-check-integrity
+test fail-drop-column-trigger-invalid-col-ref-other-table {
+    CREATE TABLE t (x, y);
+    CREATE TABLE u (x, y);
+    CREATE TRIGGER tu BEFORE INSERT ON t BEGIN
+        UPDATE u SET x = NEW.y WHERE z = 1;
+    END;
+    ALTER TABLE t DROP COLUMN x;
+}
+expect error {
+    error in trigger tu
+}
+
+# INSERT col list on OTHER table refs dropped col → succeed (deferred)
+@cross-check-integrity
+test drop-column-other-table-trigger-insert-col-deferred {
+    CREATE TABLE t (x INTEGER PRIMARY KEY);
+    CREATE TABLE u (z INTEGER, zer INTEGER);
+    CREATE TRIGGER tu BEFORE INSERT ON t BEGIN
+        INSERT INTO u(z, zer) VALUES (NEW.x, NEW.x);
+    END;
+    ALTER TABLE u DROP COLUMN zer;
+    SELECT name FROM pragma_table_info('u');
+}
+expect {
+    z
+}
+
+# INSERT col list targets owning table → succeed (deferred)
+@cross-check-integrity
+test drop-column-owning-table-trigger-insert-col-deferred {
+    CREATE TABLE t (x INTEGER, y INTEGER);
+    CREATE TRIGGER tu BEFORE INSERT ON t BEGIN
+        INSERT INTO t(x) VALUES (NEW.y);
+    END;
+    ALTER TABLE t DROP COLUMN x;
+    SELECT name FROM pragma_table_info('t');
+}
+expect {
+    y
+}
+
+# UPDATE SET target on owning table → succeed (deferred)
+@cross-check-integrity
+test drop-column-owning-table-trigger-update-set-deferred {
+    CREATE TABLE t (x INTEGER, y INTEGER);
+    CREATE TRIGGER tu BEFORE INSERT ON t BEGIN
+        UPDATE t SET x = NEW.y WHERE y = 1;
+    END;
+    ALTER TABLE t DROP COLUMN x;
+    SELECT name FROM pragma_table_info('t');
+}
+expect {
+    y
+}
