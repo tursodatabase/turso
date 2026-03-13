@@ -416,6 +416,7 @@ pub fn emit_fk_child_decrement_on_delete(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_delete_insns<'a>(
     connection: &Arc<Connection>,
     program: &mut ProgramBuilder,

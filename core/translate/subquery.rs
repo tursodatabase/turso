@@ -399,6 +399,7 @@ pub fn plan_subqueries_from_trigger_when_clause(
 }
 
 /// Compute query plans for subqueries in the WHERE clause and HAVING clause (both of which have access to the outer query scope)
+#[allow(clippy::too_many_arguments)]
 fn plan_subqueries_with_outer_query_access<'a>(
     program: &mut ProgramBuilder,
     out_subqueries: &mut Vec<NonFromClauseSubquery>,
@@ -472,7 +473,8 @@ fn plan_subqueries_with_outer_query_access<'a>(
     Ok(())
 }
 
-/// Create a closure that will walk the AST and replace subqueries with [ast::Expr::SubqueryResult] expressions.
+/// Create a closure that will walk the AST and replace subqueries with [ast::Expr::SubqueryResult] expressions.]
+#[allow(clippy::too_many_arguments)]
 fn get_subquery_parser<'a>(
     program: &'a mut ProgramBuilder,
     out_subqueries: &'a mut Vec<NonFromClauseSubquery>,
@@ -484,19 +486,16 @@ fn get_subquery_parser<'a>(
     origin: SubqueryOrigin,
     allow_correlated: bool,
 ) -> impl FnMut(&mut ast::Expr) -> Result<WalkControl> + 'a {
-    fn handle_unsupported_correlation(
-        correlated: bool,
-        position: SubqueryPosition,
-        allow_correlated: bool,
-    ) -> Result<()> {
-        if correlated && !allow_correlated {
-            crate::bail_parse_error!(
-                "correlated subqueries in {} clause are not supported yet",
-                position.name()
-            );
-        }
-        Ok(())
-    }
+    let handle_unsupported_correlation =
+        |correlated: bool, position: SubqueryPosition, allow_correlated: bool| -> Result<()> {
+            if correlated && !allow_correlated {
+                crate::bail_parse_error!(
+                    "correlated subqueries in {} clause are not supported yet",
+                    position.name()
+                );
+            }
+            Ok(())
+        };
 
     move |expr: &mut ast::Expr| -> Result<WalkControl> {
         match expr {
