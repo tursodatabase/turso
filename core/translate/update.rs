@@ -1,31 +1,28 @@
 use crate::sync::Arc;
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashSet as HashSet;
 
 use crate::schema::ROWID_SENTINEL;
+use crate::translate::bind::BindContext;
 use crate::translate::emitter::Resolver;
-use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::{Operation, Scan};
-use crate::translate::planner::ROWID_STRS;
 use crate::{
     bail_parse_error,
     schema::{Schema, Table},
-    util::normalize_ident,
     vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
     CaptureDataChangesExt, Connection,
 };
-use turso_parser::ast::{self, Expr, Indexed, SortOrder};
+use turso_parser::ast::{self, Indexed, SortOrder};
 
 use super::emitter::emit_program;
-use super::expr::process_returning_clause;
 use super::optimizer::optimize_plan;
 use super::plan::{
-    ColumnUsedMask, DmlSafety, IterationDirection, JoinedTable, Plan, TableReferences, UpdatePlan,
+    DmlSafety, IterationDirection, Plan, ResultSetColumn, UpdatePlan,
 };
-use super::planner::{parse_where, plan_ctes_as_outer_refs};
+use super::planner::{parse_where, plan_bound_ctes};
 use super::subquery::{
-    plan_subqueries_from_returning, plan_subqueries_from_select_plan,
-    plan_subqueries_from_set_clauses, plan_subqueries_from_where_clause,
+    plan_subqueries_from_returning_with_bound, plan_subqueries_from_select_plan,
+    plan_subqueries_from_set_clauses_with_bound, plan_subqueries_from_where_clause_with_bound,
 };
 /*
 * Update is simple. By default we scan the table, and for each row, we check the WHERE
@@ -62,33 +59,43 @@ pub fn translate_update(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> crate::Result<()> {
-    let mut plan = prepare_update_plan(program, resolver, body, connection, false)?;
+    let (mut plan, mut bound_subqueries) = bind_prepare_update_plan(program, resolver, body, connection, false)?;
 
-    // Plan subqueries in the WHERE clause and SET clause
+    // Plan subqueries in the WHERE, SET, and RETURNING clauses
     if let Plan::Update(ref mut update_plan) = plan {
         if let Some(ref mut ephemeral_plan) = update_plan.ephemeral_plan {
-            // When using ephemeral plan (key columns are being updated), subqueries are in the ephemeral_plan's WHERE
             plan_subqueries_from_select_plan(program, ephemeral_plan, resolver, connection, Default::default())?;
         } else {
-            // Normal path: subqueries are in the UPDATE plan's WHERE
-            plan_subqueries_from_where_clause(
+            plan_subqueries_from_where_clause_with_bound(
                 program,
                 &mut update_plan.non_from_clause_subqueries,
                 &mut update_plan.table_references,
                 &mut update_plan.where_clause,
                 resolver,
                 connection,
+                &mut bound_subqueries,
             )?;
         }
-        // Plan subqueries in the SET clause (e.g. UPDATE t SET col = (SELECT ...))
-        plan_subqueries_from_set_clauses(
+        plan_subqueries_from_set_clauses_with_bound(
             program,
             &mut update_plan.non_from_clause_subqueries,
             &mut update_plan.table_references,
             &mut update_plan.set_clauses,
             resolver,
             connection,
+            &mut bound_subqueries,
         )?;
+        if let Some(ref mut returning) = update_plan.returning {
+            plan_subqueries_from_returning_with_bound(
+                program,
+                &mut update_plan.non_from_clause_subqueries,
+                &mut update_plan.table_references,
+                returning,
+                resolver,
+                connection,
+                &mut bound_subqueries,
+            )?;
+        }
     }
 
     optimize_plan(program, &mut plan, resolver)?;
@@ -120,7 +127,7 @@ pub fn translate_update_for_schema_change(
     ddl_query: &str,
     after: impl FnOnce(&mut ProgramBuilder),
 ) -> crate::Result<()> {
-    let mut plan = prepare_update_plan(program, resolver, body, connection, true)?;
+    let (mut plan, mut bound_subqueries) = bind_prepare_update_plan(program, resolver, body, connection, true)?;
 
     if let Plan::Update(update_plan) = &mut plan {
         if program.capture_data_changes_info().has_updates() {
@@ -131,24 +138,36 @@ pub fn translate_update_for_schema_change(
         if let Some(ref mut ephemeral_plan) = update_plan.ephemeral_plan {
             plan_subqueries_from_select_plan(program, ephemeral_plan, resolver, connection, Default::default())?;
         } else {
-            plan_subqueries_from_where_clause(
+            plan_subqueries_from_where_clause_with_bound(
                 program,
                 &mut update_plan.non_from_clause_subqueries,
                 &mut update_plan.table_references,
                 &mut update_plan.where_clause,
                 resolver,
                 connection,
+                &mut bound_subqueries,
             )?;
         }
-        // Plan subqueries in the SET clause (e.g. UPDATE t SET col = (SELECT ...))
-        plan_subqueries_from_set_clauses(
+        plan_subqueries_from_set_clauses_with_bound(
             program,
             &mut update_plan.non_from_clause_subqueries,
             &mut update_plan.table_references,
             &mut update_plan.set_clauses,
             resolver,
             connection,
+            &mut bound_subqueries,
         )?;
+        if let Some(ref mut returning) = update_plan.returning {
+            plan_subqueries_from_returning_with_bound(
+                program,
+                &mut update_plan.non_from_clause_subqueries,
+                &mut update_plan.table_references,
+                returning,
+                resolver,
+                connection,
+                &mut bound_subqueries,
+            )?;
+        }
     }
 
     optimize_plan(program, &mut plan, resolver)?;
@@ -212,13 +231,14 @@ fn validate_update(
     Ok(())
 }
 
-pub fn prepare_update_plan(
+/// Bind and prepare an UPDATE plan: runs binding then planning.
+fn bind_prepare_update_plan(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     mut body: ast::Update,
     connection: &Arc<crate::Connection>,
     is_internal_schema_change: bool,
-) -> crate::Result<Plan> {
+) -> crate::Result<(Plan, rustc_hash::FxHashMap<ast::TableInternalId, super::bind::BoundSubquery>)> {
     let database_id = resolver.resolve_database_id(&body.tbl_name)?;
     let schema = resolver.schema();
     let table_name = &body.tbl_name.name;
@@ -244,11 +264,38 @@ pub fn prepare_update_plan(
         connection,
     )?;
 
-    // Extract WITH and OR conflict clause before borrowing body mutably
-    let with = body.with.take();
-    let or_conflict = body.or_conflict.take();
+    // Bind phase
+    let mut binder = BindContext::new(resolver, program);
+    let mut bound = binder.bind_update(&mut body)?;
 
+    // Extract bound data before consuming `bound` for table references.
+    let cte_definitions = std::mem::take(&mut bound.cte_definitions);
+    let set_clauses = std::mem::take(&mut bound.set_clauses);
+    let bound_result_columns = std::mem::take(&mut bound.result_columns);
+    let subquery_bindings = std::mem::take(&mut bound.subquery_bindings);
+
+    // Plan CTEs using pre-bound data from the binder.
+    let mut planned_ctes = plan_bound_ctes(cte_definitions, resolver, program, connection)?;
+
+    let mut table_references = bound.into_table_references(&mut planned_ctes)?;
+
+    // Convert bound result columns to ResultSetColumn for the plan
+    let result_columns: Vec<ResultSetColumn> = bound_result_columns
+        .into_iter()
+        .map(|bc| ResultSetColumn {
+            expr: bc.expr,
+            alias: if bc.name.is_empty() {
+                None
+            } else {
+                Some(bc.name)
+            },
+            contains_aggregates: false,
+        })
+        .collect();
+
+    let or_conflict = body.or_conflict.take();
     let table_name = table.get_name();
+
     let iter_dir = body
         .order_by
         .first()
@@ -260,173 +307,20 @@ pub fn prepare_update_plan(
         })
         .unwrap_or(IterationDirection::Forwards);
 
-    let joined_tables = vec![JoinedTable {
-        table: match table.as_ref() {
-            Table::Virtual(vtab) => Table::Virtual(vtab.clone()),
-            Table::BTree(btree_table) => Table::BTree(btree_table.clone()),
-            _ => unreachable!(),
-        },
-        identifier: body.tbl_name.alias.as_ref().map_or_else(
-            || table_name.to_string(),
-            |alias| alias.as_str().to_string(),
-        ),
-        internal_id: program.table_reference_counter.next(),
-        op: build_scan_op(&table, iter_dir),
-        join_info: None,
-        col_used_mask: ColumnUsedMask::default(),
-        column_use_counts: Vec::new(),
-        expression_index_usages: Vec::new(),
-        database_id,
-    }];
-    let mut table_references = TableReferences::new(joined_tables, vec![]);
-
-    // Plan CTEs and add them as outer query references for subquery resolution
-    plan_ctes_as_outer_refs(with, resolver, program, &mut table_references, connection)?;
-
-    let column_lookup: HashMap<String, usize> = table
-        .columns()
-        .iter()
-        .enumerate()
-        .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
-        .collect();
-
-    let mut set_clauses: Vec<(usize, Box<Expr>)> = Vec::with_capacity(body.sets.len());
-
-    // Process each SET assignment and map column names to expressions
-    // e.g the statement `SET x = 1, y = 2, z = 3` has 3 set assigments
-    for set in &mut body.sets {
-        bind_and_rewrite_expr(
-            &mut set.expr,
-            Some(&mut table_references),
-            None,
-            resolver,
-            BindingBehavior::ResultColumnsNotAllowed,
-        )?;
-
-        let values = match set.expr.as_ref() {
-            Expr::Parenthesized(vals) => vals.clone(),
-            expr => vec![expr.clone().into()],
-        };
-
-        if set.col_names.len() != values.len() {
-            bail_parse_error!(
-                "{} columns assigned {} values",
-                set.col_names.len(),
-                values.len()
-            );
-        }
-
-        for (col_name, expr) in set.col_names.iter().zip(values.iter()) {
-            let ident = normalize_ident(col_name.as_str());
-
-            let col_index = match column_lookup.get(&ident) {
-                Some(idx) => *idx,
-                None => {
-                    // Check if this is the 'rowid' keyword
-                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&ident)) {
-                        // Find the rowid alias column if it exists
-                        if let Some((idx, _col)) = table
-                            .columns()
-                            .iter()
-                            .enumerate()
-                            .find(|(_i, c)| c.is_rowid_alias())
-                        {
-                            // Use the rowid alias column index
-                            match set_clauses.iter_mut().find(|(i, _)| i == &idx) {
-                                Some((_, existing_expr)) => existing_expr.clone_from(expr),
-                                None => set_clauses.push((idx, expr.clone())),
-                            }
-                            idx
-                        } else {
-                            // No rowid alias, use sentinel value for actual rowid
-                            match set_clauses.iter_mut().find(|(i, _)| *i == ROWID_SENTINEL) {
-                                Some((_, existing_expr)) => existing_expr.clone_from(expr),
-                                None => set_clauses.push((ROWID_SENTINEL, expr.clone())),
-                            }
-                            ROWID_SENTINEL
-                        }
-                    } else {
-                        crate::bail_parse_error!("no such column: {}.{}", table_name, col_name);
-                    }
-                }
-            };
-            match set_clauses.iter_mut().find(|(idx, _)| *idx == col_index) {
-                Some((_, existing_expr)) => {
-                    // When multiple SET col[n] = val for the same column are desugared,
-                    // compose them: replace the column reference in the new expression
-                    // with the existing expression, so
-                    //   col = array_set_element(col, 0, 'X')  then  col = array_set_element(col, 2, 'Z')
-                    // becomes col = array_set_element(array_set_element(col, 0, 'X'), 2, 'Z')
-                    if let Expr::FunctionCall {
-                        name,
-                        args: new_args,
-                        ..
-                    } = expr.as_ref()
-                    {
-                        if name.as_str().eq_ignore_ascii_case("array_set_element")
-                            && new_args.len() == 3
-                        {
-                            let mut composed_args = new_args.clone();
-                            composed_args[0].clone_from(existing_expr);
-                            *existing_expr = Box::new(Expr::FunctionCall {
-                                name: name.clone(),
-                                distinctness: None,
-                                args: composed_args,
-                                order_by: vec![],
-                                filter_over: turso_parser::ast::FunctionTail {
-                                    filter_clause: None,
-                                    over_clause: None,
-                                },
-                            });
-                        } else {
-                            existing_expr.clone_from(expr);
-                        }
-                    } else {
-                        existing_expr.clone_from(expr);
-                    }
-                }
-                None => set_clauses.push((col_index, expr.clone())),
-            }
-        }
+    // Set the scan operation based on iteration direction
+    if let Some(target) = table_references.joined_tables_mut().first_mut() {
+        target.op = build_scan_op(&table, iter_dir);
+        target.database_id = database_id;
     }
-
-    // Plan subqueries in RETURNING expressions before processing
-    // (so SubqueryResult nodes are cloned into result_columns)
-    let mut non_from_clause_subqueries = vec![];
-    plan_subqueries_from_returning(
-        program,
-        &mut non_from_clause_subqueries,
-        &mut table_references,
-        &mut body.returning,
-        resolver,
-        connection,
-    )?;
-
-    let result_columns =
-        process_returning_clause(&mut body.returning, &mut table_references, resolver)?;
 
     let order_by = body
         .order_by
-        .iter_mut()
-        .map(|o| {
-            let _ = bind_and_rewrite_expr(
-                &mut o.expr,
-                Some(&mut table_references),
-                Some(&result_columns),
-                resolver,
-                BindingBehavior::ResultColumnsNotAllowed,
-            );
-            (o.expr.clone(), o.order.unwrap_or(SortOrder::Asc))
-        })
+        .iter()
+        .map(|o| (o.expr.clone(), o.order.unwrap_or(SortOrder::Asc)))
         .collect();
 
-    // Sqlite determines we should create an ephemeral table if we do not have a FROM clause
-    // Difficult to say what items from the plan can be checked for this so currently just checking if a RowId Alias is referenced
-    // https://github.com/sqlite/sqlite/blob/master/src/update.c#L395
-    // https://github.com/sqlite/sqlite/blob/master/src/update.c#L670
-    let columns = table.columns();
-    let mut where_clause = vec![];
     // Parse the WHERE clause
+    let mut where_clause = vec![];
     parse_where(body.where_clause.as_deref(), &mut where_clause)?;
 
     // Parse the LIMIT/OFFSET clause
@@ -440,6 +334,7 @@ pub fn prepare_update_plan(
         s.get_indices(table_name).cloned().collect()
     });
     let updated_cols: HashSet<usize> = set_clauses.iter().map(|(i, _)| *i).collect();
+    let columns = table.columns();
     let rowid_alias_used = set_clauses
         .iter()
         .any(|(idx, _)| *idx == ROWID_SENTINEL || columns[*idx].is_rowid_alias());
@@ -490,7 +385,7 @@ pub fn prepare_update_plan(
         indexes_to_update
     };
 
-    Ok(Plan::Update(UpdatePlan {
+    Ok((Plan::Update(UpdatePlan {
         table_references,
         or_conflict,
         set_clauses,
@@ -507,9 +402,9 @@ pub fn prepare_update_plan(
         indexes_to_update,
         ephemeral_plan: None,
         cdc_update_alter_statement: None,
-        non_from_clause_subqueries,
+        non_from_clause_subqueries: vec![],
         safety: DmlSafety::default(),
-    }))
+    }), subquery_bindings))
 }
 
 fn build_scan_op(table: &Table, iter_dir: IterationDirection) -> Operation {

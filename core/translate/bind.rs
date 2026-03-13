@@ -1,4 +1,5 @@
 use crate::function::Func;
+use crate::schema::ROWID_SENTINEL;
 use crate::sync::Arc;
 use crate::vdbe::builder::ProgramBuilder;
 
@@ -10,7 +11,7 @@ use super::emitter::Resolver;
 use super::expr::{walk_expr, walk_expr_mut, WalkControl};
 use super::optimizer::TakeOwnership;
 use super::plan::{JoinInfo, TableReferences};
-use super::planner::parse_row_id;
+use super::planner::{parse_row_id, ROWID_STRS};
 use crate::schema::Table;
 use crate::util::normalize_ident;
 use crate::Result;
@@ -341,6 +342,30 @@ pub struct BoundSelect {
     /// `internal_id`. Planned before `into_table_references` and looked up
     /// by the `Derived` arm in `scope_to_table_references`.
     pub derived_bindings: HashMap<ast::TableInternalId, BoundSubquery>,
+}
+
+pub struct BoundUpdate {
+    pub scope: BindScope,
+    pub result_columns: Vec<BoundColumn>,
+    pub set_clauses: Vec<(usize, Box<ast::Expr>)>,
+    pub tracking: BindTracking,
+    pub subquery_bindings: HashMap<ast::TableInternalId, BoundSubquery>,
+    pub cte_definitions: Vec<(String, CteEntry)>,
+}
+
+impl BoundUpdate {
+    pub fn into_table_references(
+        self,
+        planned_ctes: &mut HashMap<String, super::plan::JoinedTable>,
+    ) -> Result<TableReferences> {
+        BoundSelect::scope_to_table_references(
+            self.scope,
+            &self.tracking,
+            planned_ctes,
+            &mut HashMap::default(),
+            Vec::new(),
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -1865,6 +1890,295 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         }
 
         Ok(scope)
+    }
+
+    // ── UPDATE binding ──────────────────────────────────────────────────
+
+    /// Bind an UPDATE statement, resolving all name references in-place.
+    pub fn bind_update(&mut self, update: &mut ast::Update) -> Result<BoundUpdate> {
+        self.with_query(|ctx| {
+            // 1. Bind CTEs from WITH clause
+            if let Some(with) = &mut update.with {
+                ctx.bind_cte(with)?;
+            }
+
+            // 2. Build scope with target table
+            let scope = ctx.build_table_scope(
+                &update.tbl_name.name,
+                update.tbl_name.alias.as_ref(),
+            )?;
+
+            // 3. Bind SET expressions + resolve column names to indices
+            let set_clauses = ctx.bind_set_clauses(&mut update.sets, &scope)?;
+
+            // 4. Bind WHERE clause
+            if let Some(where_expr) = &mut update.where_clause {
+                ctx.with_phase(BindPhase::NoAliases, |ctx| {
+                    ctx.bind_expr(where_expr, &scope)
+                })?;
+            }
+
+            // 5. Bind RETURNING (expand stars, bind exprs)
+            let result_columns = ctx.bind_returning(&mut update.returning, &scope)?;
+
+            // 6. Bind ORDER BY
+            for sort_col in &mut update.order_by {
+                ctx.bind_expr(&mut sort_col.expr, &scope)?;
+            }
+
+            // 7. Bind LIMIT/OFFSET
+            if let Some(limit) = update.limit.as_mut() {
+                let empty = BindScope::empty();
+                ctx.bind_expr(&mut limit.expr, &empty)?;
+                if let Some(offset) = limit.offset.as_mut() {
+                    ctx.bind_expr(offset, &empty)?;
+                }
+            }
+
+            // 8. Extract CTE definitions
+            let cte_definitions: Vec<(String, CteEntry)> = if update.with.is_some() {
+                std::mem::take(&mut ctx.ctes).into_iter().collect()
+            } else {
+                vec![]
+            };
+
+            Ok(BoundUpdate {
+                scope,
+                result_columns,
+                set_clauses,
+                tracking: std::mem::take(&mut ctx.tracking),
+                subquery_bindings: std::mem::take(&mut ctx.subquery_bindings),
+                cte_definitions,
+            })
+        })
+    }
+
+    /// Build a single-table scope for DML statements (UPDATE, DELETE).
+    fn build_table_scope(
+        &mut self,
+        table_name: &ast::Name,
+        alias: Option<&ast::Name>,
+    ) -> Result<BindScope> {
+        let normalized = normalize_ident(table_name.as_str());
+        let identifier = alias
+            .map(|a| normalize_ident(a.as_str()))
+            .unwrap_or_else(|| normalized.clone());
+
+        // Check CTEs first
+        if let Some(cte) = self.ctes.get(&normalized) {
+            let cte_table = Arc::new(CteTable {
+                name: normalized.clone(),
+                columns: cte.resolved_columns.clone(),
+            });
+            return Ok(BindScope {
+                tables: vec![ScopeTable {
+                    identifier,
+                    internal_id: self.id_gen.next_table_id(),
+                    source: ScopeTableSource::Cte {
+                        name: normalized,
+                        columns: cte.resolved_columns.clone(),
+                        cte_id: cte.cte_id,
+                        select: cte.select.clone(),
+                    },
+                    table: cte_table,
+                    join_info: None,
+                }],
+                right_join_swapped: false,
+            });
+        }
+
+        // Schema lookup
+        let schema_table = self
+            .resolver
+            .schema()
+            .get_table(&normalized)
+            .ok_or_else(|| {
+                crate::LimboError::ParseError(format!("no such table: {}", normalized))
+            })?;
+
+        Ok(BindScope {
+            tables: vec![ScopeTable {
+                identifier,
+                internal_id: self.id_gen.next_table_id(),
+                source: ScopeTableSource::Table(schema_table.clone()),
+                table: schema_table,
+                join_info: None,
+            }],
+            right_join_swapped: false,
+        })
+    }
+
+    /// Bind SET clause expressions and resolve column names to indices.
+    fn bind_set_clauses(
+        &mut self,
+        sets: &mut [ast::Set],
+        scope: &BindScope,
+    ) -> Result<Vec<(usize, Box<ast::Expr>)>> {
+        let table = &scope.tables[0];
+        let bt: &dyn BindTable = table.table.as_ref();
+
+        // Build column name → index lookup
+        let column_lookup: HashMap<String, usize> = bt
+            .columns()
+            .filter_map(|col| Some((col.name.to_lowercase(), col.idx)))
+            .collect();
+
+        let mut set_clauses: Vec<(usize, Box<ast::Expr>)> = Vec::with_capacity(sets.len());
+
+        for set in sets.iter_mut() {
+            // Bind the RHS expression
+            self.with_phase(BindPhase::NoAliases, |ctx| {
+                ctx.bind_expr(&mut set.expr, scope)
+            })?;
+
+            let values = match set.expr.as_ref() {
+                ast::Expr::Parenthesized(vals) => vals.clone(),
+                expr => vec![expr.clone().into()],
+            };
+
+            if set.col_names.len() != values.len() {
+                crate::bail_parse_error!(
+                    "{} columns assigned {} values",
+                    set.col_names.len(),
+                    values.len()
+                );
+            }
+
+            for (col_name, expr) in set.col_names.iter().zip(values.iter()) {
+                let ident = normalize_ident(col_name.as_str());
+
+                let col_index = match column_lookup.get(&ident) {
+                    Some(idx) => *idx,
+                    None => {
+                        if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&ident)) {
+                            // Find the rowid alias column if it exists
+                            if let Some(idx) = bt.columns().find_map(|col| {
+                                if col.is_rowid_alias {
+                                    Some(col.idx)
+                                } else {
+                                    None
+                                }
+                            }) {
+                                match set_clauses.iter_mut().find(|(i, _)| i == &idx) {
+                                    Some((_, existing_expr)) => existing_expr.clone_from(expr),
+                                    None => set_clauses.push((idx, expr.clone())),
+                                }
+                                idx
+                            } else {
+                                // No rowid alias, use sentinel value for actual rowid
+                                match set_clauses
+                                    .iter_mut()
+                                    .find(|(i, _)| *i == ROWID_SENTINEL)
+                                {
+                                    Some((_, existing_expr)) => existing_expr.clone_from(expr),
+                                    None => set_clauses.push((ROWID_SENTINEL, expr.clone())),
+                                }
+                                ROWID_SENTINEL
+                            }
+                        } else {
+                            let table_name = &table.identifier;
+                            crate::bail_parse_error!(
+                                "no such column: {}.{}",
+                                table_name,
+                                col_name
+                            );
+                        }
+                    }
+                };
+                match set_clauses.iter_mut().find(|(idx, _)| *idx == col_index) {
+                    Some((_, existing_expr)) => {
+                        // Compose array_set_element calls for same-column assignments
+                        if let ast::Expr::FunctionCall {
+                            name,
+                            args: new_args,
+                            ..
+                        } = expr.as_ref()
+                        {
+                            if name.as_str().eq_ignore_ascii_case("array_set_element")
+                                && new_args.len() == 3
+                            {
+                                let mut composed_args = new_args.clone();
+                                composed_args[0].clone_from(existing_expr);
+                                *existing_expr = Box::new(ast::Expr::FunctionCall {
+                                    name: name.clone(),
+                                    distinctness: None,
+                                    args: composed_args,
+                                    order_by: vec![],
+                                    filter_over: turso_parser::ast::FunctionTail {
+                                        filter_clause: None,
+                                        over_clause: None,
+                                    },
+                                });
+                            } else {
+                                existing_expr.clone_from(expr);
+                            }
+                        } else {
+                            existing_expr.clone_from(expr);
+                        }
+                    }
+                    None => set_clauses.push((col_index, expr.clone())),
+                }
+            }
+        }
+
+        Ok(set_clauses)
+    }
+
+    /// Bind a RETURNING clause: expand stars, bind expressions, return bound columns.
+    fn bind_returning(
+        &mut self,
+        returning: &mut Vec<ast::ResultColumn>,
+        scope: &BindScope,
+    ) -> Result<Vec<BoundColumn>> {
+        if returning.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Expand Star/TableStar in RETURNING
+        self.expand_stars(returning, scope);
+
+        let mut result = Vec::with_capacity(returning.len());
+        for rc in returning.iter_mut() {
+            match rc {
+                ast::ResultColumn::Expr(expr, alias) => {
+                    self.bind_expr(expr, scope)?;
+                    let name = alias
+                        .as_ref()
+                        .map(|a| match a {
+                            ast::As::As(id) | ast::As::Elided(id) => id.as_str().to_string(),
+                        })
+                        .unwrap_or_else(|| Self::infer_column_name(expr));
+                    result.push(BoundColumn {
+                        name,
+                        expr: *expr.clone(),
+                    });
+                }
+                ast::ResultColumn::Star | ast::ResultColumn::TableStar(_) => {
+                    unreachable!("Star/TableStar should be expanded before binding RETURNING")
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Infer a column name from an expression (for RETURNING without alias).
+    fn infer_column_name(expr: &ast::Expr) -> String {
+        match expr {
+            ast::Expr::Column {
+                database: _,
+                table: _,
+                column: _,
+                ..
+            } => {
+                // After binding, we can't easily recover the original name.
+                // The caller should use the alias or fall back to the original text.
+                String::new()
+            }
+            ast::Expr::Id(name) => name.as_str().to_string(),
+            ast::Expr::Qualified(_, name) => name.as_str().to_string(),
+            _ => String::new(),
+        }
     }
 }
 

@@ -278,6 +278,26 @@ pub fn plan_subqueries_from_where_clause(
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
+    plan_subqueries_from_where_clause_with_bound(
+        program,
+        non_from_clause_subqueries,
+        table_references,
+        where_clause,
+        resolver,
+        connection,
+        &mut Default::default(),
+    )
+}
+
+pub fn plan_subqueries_from_where_clause_with_bound(
+    program: &mut ProgramBuilder,
+    non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
+    table_references: &mut TableReferences,
+    where_clause: &mut [WhereTerm],
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    bound_subqueries: &mut HashMap<ast::TableInternalId, super::bind::BoundSubquery>,
+) -> Result<()> {
     plan_subqueries_with_outer_query_access(
         program,
         non_from_clause_subqueries,
@@ -288,7 +308,7 @@ pub fn plan_subqueries_from_where_clause(
         SubqueryPosition::Where,
         SubqueryOrigin::DmlWhere,
         SubqueryPosition::Where.allow_correlated(),
-        &mut Default::default(),
+        bound_subqueries,
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries);
@@ -335,6 +355,26 @@ pub fn plan_subqueries_from_set_clauses(
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
+    plan_subqueries_from_set_clauses_with_bound(
+        program,
+        non_from_clause_subqueries,
+        table_references,
+        set_clauses,
+        resolver,
+        connection,
+        &mut Default::default(),
+    )
+}
+
+pub fn plan_subqueries_from_set_clauses_with_bound(
+    program: &mut ProgramBuilder,
+    non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
+    table_references: &mut TableReferences,
+    set_clauses: &mut [(usize, Box<ast::Expr>)],
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    bound_subqueries: &mut HashMap<ast::TableInternalId, super::bind::BoundSubquery>,
+) -> Result<()> {
     plan_subqueries_with_outer_query_access(
         program,
         non_from_clause_subqueries,
@@ -345,7 +385,7 @@ pub fn plan_subqueries_from_set_clauses(
         SubqueryPosition::ResultColumn, // SET clause subqueries are similar to result columns
         SubqueryOrigin::DmlSet,
         SubqueryPosition::ResultColumn.allow_correlated(),
-        &mut Default::default(),
+        bound_subqueries,
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries);
@@ -381,6 +421,40 @@ pub fn plan_subqueries_from_returning(
         SubqueryPosition::ResultColumn.allow_correlated(),
         &mut Default::default(),
     )?;
+
+    update_column_used_masks(table_references, non_from_clause_subqueries);
+    Ok(())
+}
+
+pub fn plan_subqueries_from_returning_with_bound(
+    program: &mut ProgramBuilder,
+    non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
+    table_references: &mut TableReferences,
+    returning: &mut [ResultSetColumn],
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    bound_subqueries: &mut HashMap<ast::TableInternalId, super::bind::BoundSubquery>,
+) -> Result<()> {
+    let count_before = non_from_clause_subqueries.len();
+
+    plan_subqueries_with_outer_query_access(
+        program,
+        non_from_clause_subqueries,
+        table_references,
+        resolver,
+        returning.iter_mut().map(|rc| &mut rc.expr),
+        connection,
+        SubqueryPosition::ResultColumn,
+        SubqueryOrigin::DmlReturning,
+        SubqueryPosition::ResultColumn.allow_correlated(),
+        bound_subqueries,
+    )?;
+
+    // Mark newly added subqueries as RETURNING so the UPDATE emitter can
+    // defer their evaluation until after the Insert instruction.
+    for subquery in &mut non_from_clause_subqueries[count_before..] {
+        subquery.is_returning = true;
+    }
 
     update_column_used_masks(table_references, non_from_clause_subqueries);
     Ok(())
@@ -596,7 +670,7 @@ fn get_subquery_parser<'a>(
                         plan.query_destination =
                             QueryDestination::ExistsSubqueryResult { result_reg: reg };
                         let correlated = plan.is_correlated();
-                        handle_unsupported_correlation(correlated, position)?;
+                        handle_unsupported_correlation(correlated, position, allow_correlated)?;
                         out_subqueries.push(NonFromClauseSubquery {
                             internal_id: sq_id,
                             query_type: SubqueryType::Exists { result_reg: reg },
@@ -636,7 +710,7 @@ fn get_subquery_parser<'a>(
                                 ))));
                         }
                         let correlated = plan.is_correlated();
-                        handle_unsupported_correlation(correlated, position)?;
+                        handle_unsupported_correlation(correlated, position, allow_correlated)?;
                         out_subqueries.push(NonFromClauseSubquery {
                             internal_id: sq_id,
                             query_type: SubqueryType::RowValue {
@@ -720,6 +794,7 @@ fn get_subquery_parser<'a>(
                             unique: false,
                             where_clause: None,
                             index_method: None,
+                            on_conflict: None,
                         });
                         let cursor_id = program
                             .alloc_cursor_id(CursorType::BTreeIndex(ephemeral_index.clone()));
@@ -737,7 +812,7 @@ fn get_subquery_parser<'a>(
                         // Restore lhs that we took.
                         *lhs = Some(lhs_box);
                         let correlated = plan.is_correlated();
-                        handle_unsupported_correlation(correlated, position)?;
+                        handle_unsupported_correlation(correlated, position, allow_correlated)?;
                         out_subqueries.push(NonFromClauseSubquery {
                             internal_id: sq_id,
                             query_type: SubqueryType::In {
