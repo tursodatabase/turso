@@ -15,9 +15,9 @@ use crate::{
         },
         optimizer::optimize_select_plan,
         plan::{
-            plan_has_outer_scope_dependency, plan_is_correlated, ColumnUsedMask, JoinOrderMember,
-            NonFromClauseSubquery, OuterQueryReference, Plan, SetOperation, SubqueryOrigin,
-            SubqueryPosition, SubqueryState, TableReferences, WhereTerm,
+            plan_has_outer_scope_dependency, plan_is_correlated, ColumnUsedMask, EvalAt,
+            JoinOrderMember, NonFromClauseSubquery, OuterQueryReference, Plan, SetOperation,
+            SubqueryOrigin, SubqueryPosition, SubqueryState, TableReferences, WhereTerm,
         },
         select::prepare_select_plan,
     },
@@ -1661,4 +1661,35 @@ pub fn emit_non_from_clause_subquery(
         }
         Ok(())
     })
+}
+
+pub fn emit_non_from_clause_subqueries_for_eval_at(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    subqueries: &mut [NonFromClauseSubquery],
+    join_order: &[JoinOrderMember],
+    table_references: Option<&TableReferences>,
+    eval_at: EvalAt,
+    mut should_emit: impl FnMut(&NonFromClauseSubquery) -> bool,
+) -> Result<()> {
+    for subquery in subqueries.iter_mut() {
+        if subquery.has_been_evaluated() || !should_emit(subquery) {
+            continue;
+        }
+
+        if subquery.get_eval_at(join_order, table_references)? != eval_at {
+            continue;
+        }
+
+        let subquery_plan = subquery.consume_plan(eval_at);
+        emit_non_from_clause_subquery(
+            program,
+            resolver,
+            *subquery_plan,
+            &subquery.query_type,
+            subquery.correlated,
+        )?;
+    }
+
+    Ok(())
 }

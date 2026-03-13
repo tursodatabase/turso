@@ -23,7 +23,7 @@ use crate::{
             DeletePlan, EvalAt, JoinOrderMember, JoinedTable, Operation, ResultSetColumn, Search,
             TableReferences,
         },
-        subquery::emit_non_from_clause_subquery,
+        subquery::emit_non_from_clause_subqueries_for_eval_at,
         trigger_exec::{fire_trigger, has_relevant_triggers_type_only, TriggerContext},
     },
     vdbe::{
@@ -97,25 +97,15 @@ pub fn emit_program_for_delete(
     // Evaluate uncorrelated subqueries as early as possible (only for normal path without rowset)
     // For the rowset path, subqueries are handled by emit_program_for_select on the rowset_plan.
     if plan.rowset_plan.is_none() {
-        for subquery in plan
-            .non_from_clause_subqueries
-            .iter_mut()
-            .filter(|s| !s.has_been_evaluated())
-        {
-            let eval_at = subquery.get_eval_at(&join_order, Some(&plan.table_references))?;
-            if eval_at != EvalAt::BeforeLoop {
-                continue;
-            }
-            let subquery_plan = subquery.consume_plan(EvalAt::BeforeLoop);
-
-            emit_non_from_clause_subquery(
-                program,
-                &t_ctx.resolver,
-                *subquery_plan,
-                &subquery.query_type,
-                subquery.correlated,
-            )?;
-        }
+        emit_non_from_clause_subqueries_for_eval_at(
+            program,
+            &t_ctx.resolver,
+            &mut plan.non_from_clause_subqueries,
+            &join_order,
+            Some(&plan.table_references),
+            EvalAt::BeforeLoop,
+            |_| true,
+        )?;
     }
 
     // Initialize cursors and other resources needed for query execution

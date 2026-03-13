@@ -28,7 +28,7 @@ use crate::{
         },
         planner::{plan_ctes_as_outer_refs, ROWID_STRS},
         select::translate_select,
-        subquery::{emit_non_from_clause_subquery, plan_subqueries_from_returning},
+        subquery::{emit_non_from_clause_subqueries_for_eval_at, plan_subqueries_from_returning},
         trigger_exec::{
             fire_trigger, get_relevant_triggers_type_and_time, has_relevant_triggers_type_only,
             TriggerContext,
@@ -431,24 +431,15 @@ pub fn translate_insert(
     )?;
 
     // Emit subqueries for RETURNING clause (uncorrelated subqueries are evaluated once)
-    for subquery in returning_subqueries
-        .iter_mut()
-        .filter(|s| !s.has_been_evaluated())
-    {
-        let eval_at = subquery.get_eval_at(&[], Some(&table_references))?;
-        if eval_at != EvalAt::BeforeLoop {
-            continue;
-        }
-        let subquery_plan = subquery.consume_plan(EvalAt::BeforeLoop);
-
-        emit_non_from_clause_subquery(
-            program,
-            resolver,
-            *subquery_plan,
-            &subquery.query_type,
-            subquery.correlated,
-        )?;
-    }
+    emit_non_from_clause_subqueries_for_eval_at(
+        program,
+        resolver,
+        &mut returning_subqueries,
+        &[],
+        Some(&table_references),
+        EvalAt::BeforeLoop,
+        |_| true,
+    )?;
 
     let has_user_provided_rowid = insertion.key.is_provided_by_user();
 

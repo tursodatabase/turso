@@ -29,7 +29,7 @@ use crate::{
             UpdatePlan,
         },
         planner::ROWID_STRS,
-        subquery::emit_non_from_clause_subquery,
+        subquery::{emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery},
         trigger_exec::{fire_trigger, get_relevant_triggers_type_and_time, TriggerContext},
         ProgramBuilder,
     },
@@ -157,25 +157,15 @@ pub fn emit_program_for_update(
     // on the ephemeral_plan. SET clause subqueries remain in the main plan and are emitted
     // inside the update loop (after open_loop) where the write cursor is correctly positioned.
     if !has_ephemeral_table {
-        for subquery in plan
-            .non_from_clause_subqueries
-            .iter_mut()
-            .filter(|s| !s.has_been_evaluated())
-        {
-            let eval_at = subquery.get_eval_at(&join_order, Some(&plan.table_references))?;
-            if eval_at != EvalAt::BeforeLoop {
-                continue;
-            }
-            let subquery_plan = subquery.consume_plan(EvalAt::BeforeLoop);
-
-            emit_non_from_clause_subquery(
-                program,
-                &t_ctx.resolver,
-                *subquery_plan,
-                &subquery.query_type,
-                subquery.correlated,
-            )?;
-        }
+        emit_non_from_clause_subqueries_for_eval_at(
+            program,
+            &t_ctx.resolver,
+            &mut plan.non_from_clause_subqueries,
+            &join_order,
+            Some(&plan.table_references),
+            EvalAt::BeforeLoop,
+            |_| true,
+        )?;
     }
 
     // For the ephemeral path, SET clause subqueries remain in plan.non_from_clause_subqueries

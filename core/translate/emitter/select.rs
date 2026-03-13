@@ -18,7 +18,7 @@ use crate::{
         },
         planner::table_mask_from_expr,
         select::emit_simple_count,
-        subquery::{emit_from_clause_subqueries, emit_non_from_clause_subquery},
+        subquery::{emit_from_clause_subqueries, emit_non_from_clause_subqueries_for_eval_at},
         values::emit_values,
         window::{emit_window_results, EmitWindow},
         ProgramBuilder, Resolver,
@@ -80,25 +80,15 @@ pub fn emit_query<'a>(
 
     // Evaluate uncorrelated subqueries as early as possible, because even LIMIT can reference a subquery.
     // This must happen before VALUES emission since VALUES expressions may contain scalar subqueries.
-    for subquery in plan
-        .non_from_clause_subqueries
-        .iter_mut()
-        .filter(|s| !s.has_been_evaluated())
-    {
-        let eval_at = subquery.get_eval_at(&plan.join_order, Some(&plan.table_references))?;
-        if eval_at != EvalAt::BeforeLoop {
-            continue;
-        }
-        let plan = subquery.consume_plan(EvalAt::BeforeLoop);
-
-        emit_non_from_clause_subquery(
-            program,
-            &t_ctx.resolver,
-            *plan,
-            &subquery.query_type,
-            subquery.correlated,
-        )?;
-    }
+    emit_non_from_clause_subqueries_for_eval_at(
+        program,
+        &t_ctx.resolver,
+        &mut plan.non_from_clause_subqueries,
+        &plan.join_order,
+        Some(&plan.table_references),
+        EvalAt::BeforeLoop,
+        |_| true,
+    )?;
 
     // Handle VALUES clause - emit values after subqueries are prepared
     if !plan.values.is_empty() {
