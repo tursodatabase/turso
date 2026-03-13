@@ -8,7 +8,10 @@ use turso_parser::ast::{self, Expr, ResolveType, SubqueryType, TableInternalId, 
 use super::emitter::Resolver;
 use super::optimizer::Optimizable;
 use super::plan::TableReferences;
-#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[cfg(any(
+    all(feature = "fts", not(target_family = "wasm")),
+    feature = "wasm-fts"
+))]
 use crate::function::FtsFunc;
 #[cfg(feature = "json")]
 use crate::function::JsonFunc;
@@ -2671,7 +2674,10 @@ pub fn translate_expr(
                         Ok(target_register)
                     }
                 },
-                #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+                #[cfg(any(
+                    all(feature = "fts", not(target_family = "wasm")),
+                    feature = "wasm-fts"
+                ))]
                 Func::Fts(_) => {
                     // FTS functions are handled via index method pattern matching.
                     // If we reach here, no index matched, so translate as a regular function call.
@@ -4815,7 +4821,10 @@ fn translate_like_base(
                 },
             });
         }
-        #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+        #[cfg(any(
+            all(feature = "fts", not(target_family = "wasm")),
+            feature = "wasm-fts"
+        ))]
         ast::LikeOperator::Match => {
             // Transform MATCH to fts_match():
             // - `col MATCH 'query'` -> `fts_match(col, 'query')`
@@ -4848,9 +4857,12 @@ fn translate_like_base(
                 },
             });
         }
-        #[cfg(any(not(feature = "fts"), target_family = "wasm"))]
+        #[cfg(not(any(
+            all(feature = "fts", not(target_family = "wasm")),
+            feature = "wasm-fts"
+        )))]
         ast::LikeOperator::Match => {
-            crate::bail_parse_error!("MATCH requires the 'fts' feature to be enabled")
+            crate::bail_parse_error!("MATCH requires the 'fts' or 'wasm-fts' feature to be enabled")
         }
         ast::LikeOperator::Regexp => {
             if escape.is_some() {
