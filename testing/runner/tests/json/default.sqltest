@@ -2608,6 +2608,49 @@ test json-each-no-arguments {
 expect {
 }
 
+test json-each-join-table-column-order-by-issue-5904 {
+    WITH t1(id, a) AS (
+        VALUES (1, '[1,2]'), (2, '[3,4]')
+    )
+    SELECT t1.id, j.value
+    FROM t1, json_each(t1.a) AS j
+    ORDER BY t1.id, CAST(j.key AS INTEGER);
+}
+expect {
+    1|1
+    1|2
+    2|3
+    2|4
+}
+
+test json-each-join-table-column-two-arg-issue-5904 {
+    WITH t2(data) AS (
+        VALUES ('{"items":[1,2,3]}')
+    )
+    SELECT j.value
+    FROM t2, json_each(t2.data, '$.items') AS j
+    ORDER BY CAST(j.key AS INTEGER);
+}
+expect {
+    1
+    2
+    3
+}
+
+test json-each-join-complex-expression-where-issue-5904 {
+    WITH t3(id, data) AS (
+        VALUES (1, '{"items":[{"name":"a"},{"name":"b"},{"name":"c"}]}')
+    )
+    SELECT j.value
+    FROM t3, json_each(json_extract(t3.data, '$.items')) AS j
+    WHERE j.key > 0
+    ORDER BY CAST(j.key AS INTEGER);
+}
+expect {
+    {"name":"b"}
+    {"name":"c"}
+}
+
 test json_each_3_arguments {
     SELECT * FROM json_each(1, 2, 3);
 }
