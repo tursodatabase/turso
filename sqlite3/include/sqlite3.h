@@ -195,6 +195,8 @@ const void *sqlite3_column_blob(sqlite3_stmt *_stmt, int _idx);
 
 int sqlite3_column_bytes(sqlite3_stmt *_stmt, int _idx);
 
+void *sqlite3_column_value(sqlite3_stmt *_stmt, int _idx);
+
 int sqlite3_value_type(void *value);
 
 int64_t sqlite3_value_int64(void *value);
@@ -208,6 +210,10 @@ const unsigned char *sqlite3_value_text(void *value);
 const void *sqlite3_value_blob(void *value);
 
 int sqlite3_value_bytes(void *value);
+
+void *sqlite3_value_dup(void *value);
+
+void sqlite3_value_free(void *value);
 
 const unsigned char *sqlite3_column_text(sqlite3_stmt *stmt, int idx);
 
