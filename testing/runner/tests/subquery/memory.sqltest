@@ -584,6 +584,20 @@ expect {
     1|hat
 }
 
+@cross-check-integrity
+test subquery-correlated-in-order-by {
+    create table items(id, category_id);
+    insert into items values (1, 10), (2, 20), (3, 10);
+    select id, category_id
+      from items i
+     order by (select count(*) from items i2 where i2.category_id = i.category_id) desc, id;
+}
+expect {
+    1|10
+    3|10
+    2|20
+}
+
 # Uncorrelated subquery in HAVING clause
 @cross-check-integrity
 test subquery-uncorrelated-in-having {
@@ -598,6 +612,20 @@ test subquery-uncorrelated-in-having {
 }
 expect {
     100|200
+}
+
+@cross-check-integrity
+test subquery-correlated-in-having-grouped {
+    create table t(g int, x int);
+    insert into t values (1, 10), (1, 20), (2, 5);
+    select g, sum(x) as total
+      from t
+     group by g
+    having exists (select 1 from t t2 where t2.g = t.g and t2.x > 15)
+     order by g;
+}
+expect {
+    1|30
 }
 
 # Uncorrelated IN-subquery in HAVING clause

@@ -872,6 +872,25 @@ expect {
     1|test
 }
 
+@cross-check-integrity
+test delete-alias-correlated-subquery-returning {
+    CREATE TABLE t (id INTEGER, grp INTEGER, value INTEGER);
+    INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 5);
+    DELETE FROM t AS d
+    WHERE EXISTS (
+        SELECT 1
+        FROM t AS d2
+        WHERE d2.grp = d.grp AND d2.value < d.value
+    )
+    RETURNING id, grp, value;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    2|1|20
+    1|1|10
+    3|2|5
+}
+
 # Arbitrary expressions not referencing columns
 @cross-check-integrity
 test delete-returning-literal {
