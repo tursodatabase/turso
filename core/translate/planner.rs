@@ -2,7 +2,6 @@ use crate::sync::Arc;
 use crate::{turso_assert, turso_assert_greater_than_or_equal, turso_assert_less_than};
 use rustc_hash::FxHashMap;
 use std::cmp::PartialEq;
-
 use super::{
     bind::CteEntry,
     expr::walk_expr,
@@ -579,6 +578,86 @@ pub fn plan_bound_ctes(
     Ok(planned)
 }
 
+/// Plan derived tables (FROM-clause subqueries) from binder-provided bindings.
+///
+/// Each derived table's inner select is already bound. This function plans them
+/// and returns a map of `internal_id` → `JoinedTable` for use in
+/// `BoundSelect::into_table_references`.
+pub fn plan_derived_tables(
+    derived_bindings: FxHashMap<TableInternalId, super::bind::BoundSubquery>,
+    planned_ctes: &mut FxHashMap<String, JoinedTable>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+) -> Result<FxHashMap<TableInternalId, JoinedTable>> {
+    let mut planned: FxHashMap<TableInternalId, JoinedTable> = FxHashMap::default();
+
+    for (internal_id, bound_sq) in derived_bindings {
+        let mut inner_bound = bound_sq.inner_bound;
+
+        // Extract nested CTE definitions and subquery bindings.
+        let inner_cte_defs = std::mem::take(&mut inner_bound.cte_definitions);
+        let inner_subquery_bindings = std::mem::take(&mut inner_bound.subquery_bindings);
+        let inner_derived_bindings = std::mem::take(&mut inner_bound.derived_bindings);
+
+        // Plan any inner CTEs.
+        let mut inner_planned_ctes = plan_bound_ctes(inner_cte_defs, resolver, program, connection)?;
+
+        // Make parent CTEs available for inner references.
+        for (name, jt) in planned_ctes.iter() {
+            if !inner_planned_ctes.contains_key(name) {
+                inner_planned_ctes.insert(name.clone(), jt.clone());
+            }
+        }
+
+        // Plan any nested derived tables.
+        let mut inner_planned_derived = plan_derived_tables(
+            inner_derived_bindings,
+            &mut inner_planned_ctes,
+            resolver,
+            program,
+            connection,
+        )?;
+
+        let all_table_refs = inner_bound.into_table_references(
+            &mut inner_planned_ctes,
+            &mut inner_planned_derived,
+        )?;
+
+        let subplan = super::select::prepare_select_plan(
+            bound_sq.select,
+            resolver,
+            program,
+            QueryDestination::placeholder_for_subquery(),
+            connection,
+            all_table_refs.into_iter(),
+            inner_subquery_bindings,
+        )?;
+
+        match &subplan {
+            Plan::Select(_) | Plan::CompoundSelect { .. } => {}
+            Plan::Delete(_) | Plan::Update(_) => {
+                crate::bail_parse_error!(
+                    "DELETE/UPDATE queries are not supported in FROM clause subqueries"
+                );
+            }
+        }
+
+        let jt = JoinedTable::new_subquery_from_plan(
+            String::new(), // identifier set later by scope_to_table_references
+            subplan,
+            None,   // join_info set later
+            internal_id,
+            None,   // no explicit columns
+            None,   // not a CTE
+            false,  // no materialize hint
+        )?;
+        planned.insert(internal_id, jt);
+    }
+
+    Ok(planned)
+}
+
 /// Plan a single CTE using its pre-bound data from the binder.
 ///
 /// The binder already resolved all names and column references in the CTE body.
@@ -622,9 +701,10 @@ fn plan_one_bound_cte(
         .expect("CTE inner binding should be present");
     let cte_select = entry.select.clone();
 
-    // Extract nested CTE definitions and subquery bindings before consuming inner_bound.
+    // Extract nested CTE definitions, subquery bindings, and derived bindings.
     let inner_cte_defs = std::mem::take(&mut inner_bound.cte_definitions);
     let inner_subquery_bindings = std::mem::take(&mut inner_bound.subquery_bindings);
+    let inner_derived_bindings = std::mem::take(&mut inner_bound.derived_bindings);
 
     // Block circular references during planning.
     program.push_cte_being_defined(name.clone());
@@ -642,7 +722,17 @@ fn plan_one_bound_cte(
         }
     }
 
-    let all_table_refs = inner_bound.into_table_references(&mut inner_planned)?;
+    // Plan any derived tables (FROM subqueries).
+    let mut inner_planned_derived = plan_derived_tables(
+        inner_derived_bindings,
+        &mut inner_planned,
+        resolver,
+        program,
+        connection,
+    )?;
+
+    let all_table_refs =
+        inner_bound.into_table_references(&mut inner_planned, &mut inner_planned_derived)?;
 
     let cte_plan = super::select::prepare_select_plan(
         cte_select,

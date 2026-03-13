@@ -337,6 +337,10 @@ pub struct BoundSelect {
     /// CTE definitions from the WITH clause, in definition order.
     /// Populated only for the top-level select that owns the WITH clause.
     pub cte_definitions: Vec<(String, CteEntry)>,
+    /// FROM-clause subqueries (derived tables), keyed by the scope table's
+    /// `internal_id`. Planned before `into_table_references` and looked up
+    /// by the `Derived` arm in `scope_to_table_references`.
+    pub derived_bindings: HashMap<ast::TableInternalId, BoundSubquery>,
 }
 
 #[derive(Clone)]
@@ -349,8 +353,9 @@ impl BoundSelect {
     pub fn into_table_references(
         self,
         planned_ctes: &mut HashMap<String, super::plan::JoinedTable>,
+        planned_derived: &mut HashMap<ast::TableInternalId, super::plan::JoinedTable>,
     ) -> Result<Vec<TableReferences>> {
-        self.into_table_references_with_outer_refs(planned_ctes, Vec::new())
+        self.into_table_references_with_outer_refs(planned_ctes, planned_derived, Vec::new())
     }
 
     /// Like `into_table_references`, but also sets outer query references
@@ -359,6 +364,7 @@ impl BoundSelect {
     pub fn into_table_references_with_outer_refs(
         self,
         planned_ctes: &mut HashMap<String, super::plan::JoinedTable>,
+        planned_derived: &mut HashMap<ast::TableInternalId, super::plan::JoinedTable>,
         outer_query_refs: Vec<super::plan::OuterQueryReference>,
     ) -> Result<Vec<TableReferences>> {
         let mut all = Vec::with_capacity(1 + self.compound_scopes.len());
@@ -367,6 +373,7 @@ impl BoundSelect {
             self.main_scope,
             &self.tracking,
             planned_ctes,
+            planned_derived,
             outer_query_refs,
         )?;
         all.push(main_refs);
@@ -376,6 +383,7 @@ impl BoundSelect {
                 scope,
                 &self.tracking,
                 planned_ctes,
+                planned_derived,
                 Vec::new(),
             )?);
         }
@@ -387,6 +395,7 @@ impl BoundSelect {
         scope: BindScope,
         tracking: &BindTracking,
         planned_ctes: &mut HashMap<String, super::plan::JoinedTable>,
+        planned_derived: &mut HashMap<ast::TableInternalId, super::plan::JoinedTable>,
         outer_query_refs: Vec<super::plan::OuterQueryReference>,
     ) -> Result<TableReferences> {
         let joined_tables = scope
@@ -410,16 +419,24 @@ impl BoundSelect {
                             "CTE '{name}' was not planned before into_table_references"
                         ))
                     })?;
-                    // Use the scope's identifier (may be aliased) and internal_id
                     cte_table.identifier = scope_table.identifier;
                     cte_table.internal_id = scope_table.internal_id;
                     cte_table.join_info = scope_table.join_info;
                     Ok(cte_table)
                 }
-                ScopeTableSource::Derived { name, .. } => {
-                    Err(crate::LimboError::InternalError(format!(
-                        "derived bind source {name} cannot yet be converted into planner table references"
-                    )))
+                ScopeTableSource::Derived { .. } => {
+                    let mut derived_table = planned_derived
+                        .remove(&scope_table.internal_id)
+                        .ok_or_else(|| {
+                            crate::LimboError::InternalError(format!(
+                                "derived table '{}' was not planned before into_table_references",
+                                scope_table.identifier
+                            ))
+                        })?;
+                    derived_table.identifier = scope_table.identifier;
+                    derived_table.internal_id = scope_table.internal_id;
+                    derived_table.join_info = scope_table.join_info;
+                    Ok(derived_table)
                 }
             })
             .collect::<Result<Vec<_>>>()?;
@@ -550,6 +567,10 @@ pub struct BindContext<'a, G: IdGenerator> {
     /// Expression subqueries bound during this query, keyed by subquery_id.
     /// Moved into `BoundSelect` when binding completes.
     subquery_bindings: HashMap<ast::TableInternalId, BoundSubquery>,
+
+    /// FROM-clause subqueries (derived tables) bound during this query,
+    /// keyed by the scope table's `internal_id`.
+    derived_bindings: HashMap<ast::TableInternalId, BoundSubquery>,
 }
 
 impl<'a, G: IdGenerator> BindContext<'a, G> {
@@ -564,6 +585,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             phase: BindPhase::NoAliases,
             tracking: BindTracking::default(),
             subquery_bindings: HashMap::default(),
+            derived_bindings: HashMap::default(),
         }
     }
 
@@ -674,11 +696,17 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
     /// This mirrors DataFusion's per-query PlannerContext cloning semantics:
     /// subqueries inherit outer CTEs, but their own WITH items remain private.
     fn with_query<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
-        let saved_ctes = self.ctes.clone();
+        // Swap out current CTEs (preserving inner_bound) and give the inner
+        // query a clone (inner_bound = None is fine — inner queries don't plan
+        // outer CTEs, they only need names/columns for resolution).
+        let mut saved_ctes = self.ctes.clone(); // clone for inner query
+        std::mem::swap(&mut self.ctes, &mut saved_ctes); // saved_ctes now has originals
         let saved_aliases = std::mem::take(&mut self.aliases);
         let saved_phase = self.phase;
         let saved_outer_from_scope = self.outer_from_scope.clone();
         let saved_tracking = std::mem::take(&mut self.tracking);
+        let saved_subquery_bindings = std::mem::take(&mut self.subquery_bindings);
+        let saved_derived_bindings = std::mem::take(&mut self.derived_bindings);
 
         let result = f(self);
 
@@ -687,6 +715,8 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         self.phase = saved_phase;
         self.outer_from_scope = saved_outer_from_scope;
         self.tracking = saved_tracking;
+        self.subquery_bindings = saved_subquery_bindings;
+        self.derived_bindings = saved_derived_bindings;
 
         result
     }
@@ -834,6 +864,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 tracking: std::mem::take(&mut ctx.tracking),
                 subquery_bindings: std::mem::take(&mut ctx.subquery_bindings),
                 cte_definitions,
+                derived_bindings: std::mem::take(&mut ctx.derived_bindings),
             })
         })
     }
@@ -1206,34 +1237,40 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             }
             // Inline subquery in FROM: SELECT ... FROM (SELECT ...)
             ast::SelectTable::Select(subselect, alias) => {
-                // 1. Alias is required by SQLite for FROM subqueries
                 let identifier = alias
                     .as_ref()
                     .map(|a| match a {
                         ast::As::As(id) | ast::As::Elided(id) => normalize_ident(id.as_str()),
                     })
                     .unwrap_or_else(|| String::from("subquery"));
-                // TODO: change subquery name
 
                 // FROM subqueries don't correlate with the query being built.
-                // The outer_scopes stack already contains any enclosing query scopes.
                 let bound_select = self.bind_select(subselect)?;
 
-                // Build CteTable with the result column names
                 let subquery_columns: Vec<String> = bound_select
                     .result_columns
-                    .into_iter()
-                    .map(|bc| bc.name)
+                    .iter()
+                    .map(|bc| bc.name.clone())
                     .collect();
                 let subquery_table = Arc::new(DerivedTable {
                     name: identifier.clone(),
                     columns: subquery_columns.clone(),
                 });
 
-                // 7. Generate internal_id
+                let internal_id = self.id_gen.next_table_id();
+
+                // Store the binding for planning before into_table_references.
+                self.derived_bindings.insert(
+                    internal_id,
+                    BoundSubquery {
+                        select: subselect.clone(),
+                        inner_bound: bound_select,
+                    },
+                );
+
                 Ok(ScopeTable {
                     identifier,
-                    internal_id: self.id_gen.next_table_id(),
+                    internal_id,
                     source: ScopeTableSource::Derived {
                         name: subquery_table.name.clone(),
                         columns: subquery_columns,
@@ -2022,7 +2059,7 @@ mod tests {
             let mut select = parse_select("SELECT b FROM t WHERE a = 1");
             let bound = ctx.bind_select(&mut select).unwrap();
             let mut all_refs = bound
-                .into_table_references(&mut HashMap::default())
+                .into_table_references(&mut HashMap::default(), &mut HashMap::default())
                 .unwrap();
 
             assert_eq!(all_refs.len(), 1);

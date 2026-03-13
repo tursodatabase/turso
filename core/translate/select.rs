@@ -39,7 +39,7 @@ pub fn bind_prepare_select_plan(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
-    use super::planner::plan_bound_ctes;
+    use super::planner::{plan_bound_ctes, plan_derived_tables};
 
     let mut binder = BindContext::new(resolver, program);
     let mut bound = binder.bind_select(&mut select)?;
@@ -48,10 +48,16 @@ pub fn bind_prepare_select_plan(
     let cte_definitions = std::mem::take(&mut bound.cte_definitions);
     let mut planned_ctes = plan_bound_ctes(cte_definitions, resolver, program, connection)?;
 
+    // Plan derived tables (FROM subqueries) using pre-bound data.
+    let derived_bindings = std::mem::take(&mut bound.derived_bindings);
+    let mut planned_derived =
+        plan_derived_tables(derived_bindings, &mut planned_ctes, resolver, program, connection)?;
+
     // Extract pre-bound subqueries for inline planning in the walker.
     let subquery_bindings = std::mem::take(&mut bound.subquery_bindings);
 
-    let all_table_refs = bound.into_table_references(&mut planned_ctes)?;
+    let all_table_refs =
+        bound.into_table_references(&mut planned_ctes, &mut planned_derived)?;
     prepare_select_plan(
         select,
         resolver,

@@ -532,9 +532,10 @@ fn get_subquery_parser<'a>(
                 let outer_query_refs = get_outer_query_refs(referenced_tables);
                 let mut inner_bound = bound_sq.inner_bound;
 
-                // Extract nested subquery bindings and CTE definitions.
+                // Extract nested subquery bindings, CTE definitions, and derived bindings.
                 let nested_subquery_bindings = std::mem::take(&mut inner_bound.subquery_bindings);
                 let inner_cte_defs = std::mem::take(&mut inner_bound.cte_definitions);
+                let inner_derived_bindings = std::mem::take(&mut inner_bound.derived_bindings);
 
                 // Plan any inner CTEs.
                 let mut planned_ctes = super::planner::plan_bound_ctes(
@@ -544,8 +545,20 @@ fn get_subquery_parser<'a>(
                     connection,
                 )?;
 
-                let table_refs_vec = inner_bound
-                    .into_table_references_with_outer_refs(&mut planned_ctes, outer_query_refs)?;
+                // Plan any nested derived tables.
+                let mut planned_derived = super::planner::plan_derived_tables(
+                    inner_derived_bindings,
+                    &mut planned_ctes,
+                    resolver,
+                    program,
+                    connection,
+                )?;
+
+                let table_refs_vec = inner_bound.into_table_references_with_outer_refs(
+                    &mut planned_ctes,
+                    &mut planned_derived,
+                    outer_query_refs,
+                )?;
 
                 let plan = super::select::prepare_select_plan(
                     bound_sq.select,
