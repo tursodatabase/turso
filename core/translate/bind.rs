@@ -9,7 +9,7 @@ use turso_parser::ast::{self, JoinConstraint, TableInternalId};
 use super::emitter::Resolver;
 use super::expr::{walk_expr, walk_expr_mut, WalkControl};
 use super::optimizer::TakeOwnership;
-use super::plan::{JoinInfo, JoinOrderMember, TableReferences};
+use super::plan::{JoinInfo, TableReferences};
 use super::planner::parse_row_id;
 use crate::schema::Table;
 use crate::util::normalize_ident;
@@ -329,9 +329,7 @@ pub struct BoundSubquery {
 pub struct BoundSelect {
     pub result_columns: Vec<BoundColumn>,
     pub main_scope: BindScope,
-    pub main_join_order: Vec<JoinOrderMember>,
     pub compound_scopes: Vec<BindScope>,
-    pub compound_join_orders: Vec<Vec<JoinOrderMember>>,
     pub tracking: BindTracking,
     /// Expression subqueries (EXISTS, scalar subquery, IN SELECT) keyed by
     /// the `subquery_id` stored in the corresponding `Expr::SubqueryResult`.
@@ -794,17 +792,13 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
             // 2. Bind the main OneSelect. Its aliases and FROM scope are the ones
             // visible to the query-level ORDER BY.
-            let (result_columns, main_scope, main_join_order) =
-                ctx.bind_one_select(&mut select.body.select)?;
+            let (result_columns, main_scope) = ctx.bind_one_select(&mut select.body.select)?;
 
             // 3. Bind compound selects (UNION, INTERSECT, EXCEPT)
             let mut compound_scopes = Vec::with_capacity(select.body.compounds.len());
-            let mut compound_join_orders = Vec::with_capacity(select.body.compounds.len());
             for compound in &mut select.body.compounds {
-                let (_compound_cols, compound_scope, compound_join_order) =
-                    ctx.bind_one_select(&mut compound.select)?;
+                let (_compound_cols, compound_scope) = ctx.bind_one_select(&mut compound.select)?;
                 compound_scopes.push(compound_scope);
-                compound_join_orders.push(compound_join_order);
             }
 
             // 4. Bind ORDER BY (AliasFirst phase — aliases take priority)
@@ -836,9 +830,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             Ok(BoundSelect {
                 result_columns,
                 main_scope,
-                main_join_order,
                 compound_scopes,
-                compound_join_orders,
                 tracking: std::mem::take(&mut ctx.tracking),
                 subquery_bindings: std::mem::take(&mut ctx.subquery_bindings),
                 cte_definitions,
@@ -851,7 +843,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
     fn bind_one_select(
         &mut self,
         one: &mut ast::OneSelect,
-    ) -> Result<(Vec<BoundColumn>, BindScope, Vec<JoinOrderMember>)> {
+    ) -> Result<(Vec<BoundColumn>, BindScope)> {
         self.with_scope(|ctx| {
             match one {
                 ast::OneSelect::Select {
@@ -879,10 +871,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     // 2. Expand Star/TableStar in-place before any binding
                     ctx.expand_stars(columns, &scope);
 
-                    // 3. Build join order from scope
-                    let join_order = Self::build_join_order(&scope);
-
-                    // 4. Bind WINDOW definitions (NoAliases — same phase as SELECT list)
+                    // 3. Bind WINDOW definitions (NoAliases — same phase as SELECT list)
                     ctx.with_phase(BindPhase::NoAliases, |ctx| {
                         ctx.bind_window_defs(window_clause, &scope)
                     })?;
@@ -913,7 +902,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         })?;
                     }
 
-                    Ok((bound_columns, scope, join_order))
+                    Ok((bound_columns, scope))
                 }
                 ast::OneSelect::Values(rows) => {
                     let scope = BindScope::empty();
@@ -922,7 +911,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                             ctx.bind_expr(expr, &scope)?;
                         }
                     }
-                    Ok((Vec::new(), scope, vec![]))
+                    Ok((Vec::new(), scope))
                 }
             }
         })
@@ -1085,20 +1074,6 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         *columns = expanded;
     }
 
-    /// Build join order from scope tables.
-    fn build_join_order(scope: &BindScope) -> Vec<JoinOrderMember> {
-        scope
-            .tables
-            .iter()
-            .enumerate()
-            .map(|(i, st)| JoinOrderMember {
-                table_id: st.internal_id,
-                original_idx: i,
-                is_outer: st.join_info.as_ref().is_some_and(|ji| ji.is_outer()),
-            })
-            .collect()
-    }
-
     fn bind_cte(&mut self, with: &mut ast::With) -> Result<()> {
         if with.recursive {
             crate::bail_parse_error!("Recursive CTEs are not yet supported");
@@ -1120,8 +1095,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 .collect();
 
             let cte_id = self.id_gen.next_cte_id();
-            let materialize_hint =
-                cte.materialized == turso_parser::ast::Materialized::Yes;
+            let materialize_hint = cte.materialized == turso_parser::ast::Materialized::Yes;
 
             // Determine which preceding CTEs this one directly references.
             let mut referenced_tables = Vec::new();
@@ -1637,8 +1611,11 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 }
                 ast::Expr::InSelect { .. } => {
                     let subquery_id = self.id_gen.next_table_id();
-                    let ast::Expr::InSelect { lhs, not, rhs: mut select } =
-                        std::mem::replace(expr, ast::Expr::Literal(ast::Literal::Null))
+                    let ast::Expr::InSelect {
+                        lhs,
+                        not,
+                        rhs: mut select,
+                    } = std::mem::replace(expr, ast::Expr::Literal(ast::Literal::Null))
                     else {
                         unreachable!();
                     };
@@ -2044,7 +2021,9 @@ mod tests {
         with_bind_context(&["CREATE TABLE t(a, b)"], |ctx| {
             let mut select = parse_select("SELECT b FROM t WHERE a = 1");
             let bound = ctx.bind_select(&mut select).unwrap();
-            let mut all_refs = bound.into_table_references(&mut HashMap::default()).unwrap();
+            let mut all_refs = bound
+                .into_table_references(&mut HashMap::default())
+                .unwrap();
 
             assert_eq!(all_refs.len(), 1);
             let table_references = all_refs.remove(0);
@@ -2096,9 +2075,8 @@ mod tests {
     #[test]
     fn bind_cte_tracks_referenced_cte_indices() {
         with_bind_context(&["CREATE TABLE t(x)"], |ctx| {
-            let mut select = parse_select(
-                "WITH a AS (SELECT x FROM t), b AS (SELECT * FROM a) SELECT * FROM b",
-            );
+            let mut select =
+                parse_select("WITH a AS (SELECT x FROM t), b AS (SELECT * FROM a) SELECT * FROM b");
             let with = select.with.as_mut().expect("expected WITH clause");
             ctx.bind_cte(with).unwrap();
 
@@ -2113,9 +2091,8 @@ mod tests {
     #[test]
     fn bind_cte_materialize_hint() {
         with_bind_context(&["CREATE TABLE t(a)"], |ctx| {
-            let mut select = parse_select(
-                "WITH c AS MATERIALIZED (SELECT a FROM t) SELECT * FROM c",
-            );
+            let mut select =
+                parse_select("WITH c AS MATERIALIZED (SELECT a FROM t) SELECT * FROM c");
             let with = select.with.as_mut().expect("expected WITH clause");
             ctx.bind_cte(with).unwrap();
 
@@ -2960,66 +2937,6 @@ mod tests {
             let mut columns = vec![ast::ResultColumn::Star];
             ctx.expand_stars(&mut columns, &scope);
             assert_eq!(columns.len(), 0);
-        });
-    }
-
-    // ── build_join_order tests ──────────────────────────────────────────
-
-    #[test]
-    fn build_join_order_single_table() {
-        with_bind_context(&["CREATE TABLE t(a)"], |ctx| {
-            let mut select = parse_select("SELECT a FROM t");
-            let bound = ctx.bind_select(&mut select).unwrap();
-
-            assert_eq!(bound.main_join_order.len(), 1);
-            assert_eq!(
-                bound.main_join_order[0].table_id,
-                TableInternalId::from(0usize)
-            );
-            assert_eq!(bound.main_join_order[0].original_idx, 0);
-            assert!(!bound.main_join_order[0].is_outer);
-        });
-    }
-
-    #[test]
-    fn build_join_order_multiple_tables() {
-        with_bind_context(&["CREATE TABLE t(a)", "CREATE TABLE u(b)"], |ctx| {
-            let mut select = parse_select("SELECT a, b FROM t, u");
-            let bound = ctx.bind_select(&mut select).unwrap();
-
-            assert_eq!(bound.main_join_order.len(), 2);
-            assert_eq!(
-                bound.main_join_order[0].table_id,
-                TableInternalId::from(0usize)
-            );
-            assert_eq!(bound.main_join_order[0].original_idx, 0);
-            assert_eq!(
-                bound.main_join_order[1].table_id,
-                TableInternalId::from(1usize)
-            );
-            assert_eq!(bound.main_join_order[1].original_idx, 1);
-        });
-    }
-
-    #[test]
-    fn build_join_order_left_join_marks_outer() {
-        with_bind_context(&["CREATE TABLE t(a)", "CREATE TABLE u(b)"], |ctx| {
-            let mut select = parse_select("SELECT a FROM t LEFT JOIN u ON t.a = u.b");
-            let bound = ctx.bind_select(&mut select).unwrap();
-
-            assert_eq!(bound.main_join_order.len(), 2);
-            assert!(!bound.main_join_order[0].is_outer);
-            assert!(bound.main_join_order[1].is_outer);
-        });
-    }
-
-    #[test]
-    fn build_join_order_values_is_empty() {
-        with_bind_context(&[], |ctx| {
-            let mut select = parse_select("VALUES (1, 2), (3, 4)");
-            let bound = ctx.bind_select(&mut select).unwrap();
-
-            assert!(bound.main_join_order.is_empty());
         });
     }
 
