@@ -69,9 +69,6 @@ sudo dnf install mold
 
 # Ubuntu/Debian
 sudo apt install mold
-
-# macOS
-brew install mold
 ```
 
 Then configure Cargo to use mold by creating `.cargo/config.toml`:
@@ -80,18 +77,6 @@ Then configure Cargo to use mold by creating `.cargo/config.toml`:
 
 ```toml
 [target.x86_64-unknown-linux-gnu]
-linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
-```
-
-**For macOS:**
-
-```toml
-[target.x86_64-apple-darwin]
-linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
-
-[target.aarch64-apple-darwin]
 linker = "clang"
 rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 ```
