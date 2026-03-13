@@ -2220,6 +2220,7 @@ expect {
     trigger|tr_v_insert|v
 }
 
+@skip-if mvcc "attach is not supported for mvcc"
 test trigger-instead-of-on-attached-view-creation {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t(a, b);
@@ -2390,6 +2391,7 @@ expect {
     2|y
 }
 
+@skip-if mvcc "attach is not supported for mvcc"
 test trigger-instead-of-update-of-on-attached-view-creation {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t(a, b, c);
@@ -2407,6 +2409,7 @@ expect {
     trigger|tr_aux_update_of_b|v
 }
 
+@skip-if mvcc "attach is not supported for mvcc"
 test trigger-instead-of-delete-on-attached-view-creation {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t(a, b);
@@ -2420,6 +2423,7 @@ expect {
     trigger|tr_aux_delete|v
 }
 
+@skip-if mvcc "attach is not supported for mvcc"
 test trigger-instead-of-view-runtime-attached-db {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t(id INTEGER PRIMARY KEY, a);
