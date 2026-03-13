@@ -568,6 +568,97 @@ expect {
     South|Alice|150
 }
 
+# Correlated outer reference in GROUP BY inside an IN-subquery should fail.
+# SQLite errors with "no such column: t2.d".
+@cross-check-integrity
+test subquery-correlated-outer-ref-in-group-by-in-subquery {
+    create table t1(b, c);
+    insert into t1 values(1, 0);
+    create table t2(d);
+    insert into t2 values(2);
+
+    select t2.d from t2 left join t1 on t2.d in (
+      select t1.c from t1 as x group by t2.d having sum(x.b) > 100
+    ) order by 1;
+}
+expect error {
+    no such column: t2\.d
+}
+
+# Correlated outer reference wrapped in a scalar function in GROUP BY
+# should also be rejected.
+@cross-check-integrity
+test subquery-correlated-outer-ref-in-group-by-function-call {
+    create table t1(b, c);
+    insert into t1 values(1, 0);
+    create table t2(d);
+    insert into t2 values(2);
+
+    select d from t2
+    where exists(
+      select 1 from t1
+      group by abs(t2.d)
+    );
+}
+expect error {
+    no such column: t2\.d
+}
+
+# Correlated outer rowid aliases in GROUP BY are invalid.
+# SQLite reports the original alias token; Turso canonicalizes to rowid.
+@cross-check-integrity
+test subquery-correlated-outer-ref-in-group-by-rowid-alias-oid {
+    create table t1(b, c);
+    insert into t1 values(1, 0);
+    create table t2(d);
+    insert into t2 values(2);
+
+    select d from t2
+    where exists(
+      select 1 from t1
+      group by t2.oid
+    );
+}
+expect error {
+    no such column: t2\.(oid|rowid)
+}
+
+@cross-check-integrity
+test subquery-correlated-outer-ref-in-group-by-rowid-alias-underscore {
+    create table t1(b, c);
+    insert into t1 values(1, 0);
+    create table t2(d);
+    insert into t2 values(2);
+
+    select d from t2
+    where exists(
+      select 1 from t1
+      group by t2._rowid_
+    );
+}
+expect error {
+    no such column: t2\.(_rowid_|rowid)
+}
+
+# Correlated outer reference hidden in a nested scalar subquery in GROUP BY
+# should also fail with the same SQLite error.
+@cross-check-integrity
+test subquery-correlated-outer-ref-in-nested-group-by-subquery {
+    create table t1(b, c);
+    insert into t1 values(1, 0), (200, 1);
+    create table t2(d);
+    insert into t2 values(2);
+
+    select d from t2
+    where exists(
+      select 1 from t1
+      group by (select t2.d)
+    );
+}
+expect error {
+    no such column: t2\.d
+}
+
 # Uncorrelated IN-subquery in ORDER BY clause
 @cross-check-integrity
 test subquery-uncorrelated-in-order-by-in {
