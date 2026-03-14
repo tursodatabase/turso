@@ -28,6 +28,12 @@ jobs:
       # - name: Install dependencies
       #   run: npm install && npm run build
 
+      - name: Generate graph-queries DB
+        run: |
+          python3 perf/graph-queries/generate_seed.py | sqlite3 perf/graph-queries/graph-queries.db
+          cp perf/graph-queries/graph-queries.db perf/graph-queries/graph-queries-analyzed.db
+          sqlite3 perf/graph-queries/graph-queries-analyzed.db "ANALYZE;"
+
       - name: Bench
         run: make bench-exclude-tpc-h  2>&1 | tee output.txt
       - name: Analyze benchmark result with Nyrkiö
@@ -170,4 +176,5 @@ jobs:
           # Smaller p-value = less change points found. Larger p-value = more, but also more false positives.
           nyrkio-settings-pvalue: 0.00001
           nyrkio-settings-threshold: 0%
+
 
