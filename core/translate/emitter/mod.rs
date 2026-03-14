@@ -100,6 +100,13 @@ pub struct Resolver<'a> {
     /// mechanism, but operates as a side-channel since limbo rewrites the AST rather
     /// than redirecting column reads at codegen time.
     pub register_affinities: HashMap<usize, Affinity>,
+    /// Maps register indices to column collations when column references are rewritten
+    /// to `Expr::Register` (for example in trigger WHEN clauses).
+    /// This preserves SQLite collation precedence rules for register-backed comparisons.
+    pub register_collations: HashMap<usize, crate::translate::collate::CollationSeq>,
+    /// Maps parameter indices to column collations when column references are rewritten
+    /// to `Expr::Variable` (for example NEW/OLD references in trigger subprogram bodies).
+    pub parameter_collations: HashMap<usize, crate::translate::collate::CollationSeq>,
     pub enable_custom_types: bool,
     /// When set, we are compiling a trigger subprogram for this database.
     /// All table references must resolve to this same database; cross-database
@@ -135,6 +142,8 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
+            register_collations: HashMap::default(),
+            parameter_collations: HashMap::default(),
             enable_custom_types,
             trigger_context: None,
         }
@@ -153,6 +162,10 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
+            // Preserve trigger rewrite metadata across forked resolvers so NEW/OLD
+            // comparisons in nested SELECT compilation keep column collation semantics.
+            register_collations: self.register_collations.clone(),
+            parameter_collations: self.parameter_collations.clone(),
             enable_custom_types: self.enable_custom_types,
             trigger_context: self.trigger_context.clone(),
         }

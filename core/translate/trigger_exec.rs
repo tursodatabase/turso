@@ -1,5 +1,6 @@
 use crate::schema::{BTreeTable, Trigger};
 use crate::sync::Arc;
+use crate::translate::collate::CollationSeq;
 use crate::translate::expr::WalkControl;
 use crate::translate::subquery::{
     emit_non_from_clause_subquery, plan_subqueries_from_trigger_when_clause,
@@ -14,8 +15,8 @@ use crate::util::normalize_ident;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::insn::Insn;
 use crate::vdbe::BranchOffset;
-use crate::HashSet;
 use crate::{bail_parse_error, QueryMode, Result};
+use crate::{HashMap, HashSet};
 use std::num::NonZero;
 use turso_parser::ast::{self, Expr, TriggerEvent, TriggerTime};
 
@@ -503,6 +504,34 @@ fn execute_trigger_commands(
     // Restrict table resolution to the trigger's database during subprogram compilation.
     let prev_trigger_context = resolver.trigger_context.clone();
     resolver.set_trigger_context(database_id, trigger.name.clone());
+
+    // Preserve column collations for NEW/OLD references rewritten to parameters
+    // in trigger subprogram bodies.
+    let mut param_collations = Vec::with_capacity(ctx.table.columns.len() * 2);
+    for (col_idx, col_def) in ctx.table.columns.iter().enumerate() {
+        if let Some(param) = if col_def.is_rowid_alias() {
+            subprogram_ctx.get_new_rowid_param()
+        } else {
+            subprogram_ctx.get_new_param(col_idx)
+        } {
+            param_collations.push((param.get(), col_def.collation()));
+        }
+
+        if let Some(param) = if col_def.is_rowid_alias() {
+            subprogram_ctx.get_old_rowid_param()
+        } else {
+            subprogram_ctx.get_old_param(col_idx)
+        } {
+            param_collations.push((param.get(), col_def.collation()));
+        }
+    }
+
+    let mut previous_parameter_collations = Vec::with_capacity(param_collations.len());
+    for (param_idx, collation) in param_collations {
+        let previous = resolver.parameter_collations.insert(param_idx, collation);
+        previous_parameter_collations.push((param_idx, previous));
+    }
+
     let compile_result = (|| -> Result<()> {
         for command in trigger.commands.iter() {
             let stmt = trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?;
@@ -517,6 +546,17 @@ fn execute_trigger_commands(
         }
         Ok(())
     })();
+
+    for (param_idx, previous) in previous_parameter_collations {
+        if let Some(previous_collation) = previous {
+            resolver
+                .parameter_collations
+                .insert(param_idx, previous_collation);
+        } else {
+            resolver.parameter_collations.remove(&param_idx);
+        }
+    }
+
     // Restore previous trigger context (supports nested triggers).
     resolver.trigger_context = prev_trigger_context;
     compile_result?;
@@ -673,7 +713,13 @@ pub fn fire_trigger(
         // since translate_expr expects this rewrite to have already happened.
         rewrite_between_expr(&mut when_expr);
         // Rewrite NEW/OLD references in WHEN clause to use registers
-        rewrite_trigger_expr_for_when_clause(&mut when_expr, &ctx.table, ctx)?;
+        let mut when_register_collations: HashMap<usize, CollationSeq> = HashMap::default();
+        rewrite_trigger_expr_for_when_clause(
+            &mut when_expr,
+            &ctx.table,
+            ctx,
+            &mut when_register_collations,
+        )?;
 
         // Plan and emit any subqueries in the WHEN clause (e.g. IN (SELECT ...), EXISTS, scalar subqueries).
         // This transforms InSelect/Exists/Subquery nodes into SubqueryResult nodes that translate_expr can handle.
@@ -701,7 +747,26 @@ pub fn fire_trigger(
         }
 
         let when_reg = program.alloc_register();
-        translate_expr(program, None, &when_expr, when_reg, resolver)?;
+
+        // Temporarily expose trigger-register collation metadata while translating the
+        // WHEN expression, then restore resolver state.
+        let mut previous_when_register_collations =
+            Vec::with_capacity(when_register_collations.len());
+        for (&reg, &collation) in &when_register_collations {
+            let previous = resolver.register_collations.insert(reg, collation);
+            previous_when_register_collations.push((reg, previous));
+        }
+
+        let when_translate_result = translate_expr(program, None, &when_expr, when_reg, resolver);
+
+        for (reg, previous) in previous_when_register_collations {
+            if let Some(previous_collation) = previous {
+                resolver.register_collations.insert(reg, previous_collation);
+            } else {
+                resolver.register_collations.remove(&reg);
+            }
+        }
+        when_translate_result?;
 
         let skip_label = program.allocate_label();
         program.emit_insn(Insn::IfNot {
@@ -861,9 +926,10 @@ fn rewrite_trigger_expr_for_when_clause(
     expr: &mut ast::Expr,
     table: &BTreeTable,
     ctx: &TriggerContext,
+    register_collations: &mut HashMap<usize, CollationSeq>,
 ) -> Result<()> {
     walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
-        rewrite_trigger_expr_single_for_when_clause(e, table, ctx, false)?;
+        rewrite_trigger_expr_single_for_when_clause(e, table, ctx, false, register_collations)?;
         Ok(WalkControl::Continue)
     })?;
     Ok(())
@@ -874,9 +940,10 @@ fn rewrite_expressions_in_select_for_when_clause(
     select: &mut ast::Select,
     table: &BTreeTable,
     ctx: &TriggerContext,
+    register_collations: &mut HashMap<usize, CollationSeq>,
 ) -> Result<()> {
     rewrite_select_expressions(select, &mut |e: &mut ast::Expr| {
-        rewrite_trigger_expr_single_for_when_clause(e, table, ctx, true)
+        rewrite_trigger_expr_single_for_when_clause(e, table, ctx, true, register_collations)
     })
 }
 
@@ -1074,6 +1141,7 @@ fn rewrite_trigger_expr_single_for_when_clause(
     table: &BTreeTable,
     ctx: &TriggerContext,
     allow_non_trigger_qualified: bool,
+    register_collations: &mut HashMap<usize, CollationSeq>,
 ) -> Result<()> {
     match expr {
         // Bare column references are not valid in trigger WHEN clauses.
@@ -1088,11 +1156,11 @@ fn rewrite_trigger_expr_single_for_when_clause(
             return Ok(());
         }
         Expr::Exists(select) | Expr::Subquery(select) => {
-            rewrite_expressions_in_select_for_when_clause(select, table, ctx)?;
+            rewrite_expressions_in_select_for_when_clause(select, table, ctx, register_collations)?;
             return Ok(());
         }
         Expr::InSelect { rhs, .. } => {
-            rewrite_expressions_in_select_for_when_clause(rhs, table, ctx)?;
+            rewrite_expressions_in_select_for_when_clause(rhs, table, ctx, register_collations)?;
             return Ok(());
         }
         Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
@@ -1111,7 +1179,9 @@ fn rewrite_trigger_expr_single_for_when_clause(
                             return Ok(());
                         }
                         if idx < new_regs.len() {
-                            *expr = Expr::Register(new_regs[idx]);
+                            let reg = new_regs[idx];
+                            register_collations.insert(reg, col_def.collation());
+                            *expr = Expr::Register(reg);
                             return Ok(());
                         }
                     }
@@ -1137,9 +1207,11 @@ fn rewrite_trigger_expr_single_for_when_clause(
             // Handle OLD.column references
             if ns.eq_ignore_ascii_case("old") {
                 if let Some(old_regs) = &ctx.old_registers {
-                    if let Some((idx, _)) = table.get_column(&col) {
+                    if let Some((idx, col_def)) = table.get_column(&col) {
                         if idx < old_regs.len() {
-                            *expr = Expr::Register(old_regs[idx]);
+                            let reg = old_regs[idx];
+                            register_collations.insert(reg, col_def.collation());
+                            *expr = Expr::Register(reg);
                             return Ok(());
                         }
                     }

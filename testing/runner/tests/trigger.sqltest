@@ -143,6 +143,154 @@ expect {
     2
 }
 
+# Trigger WHEN should honor column collation for NEW/OLD references
+@cross-check-integrity
+test trigger-when-new-column-collation {
+    CREATE TABLE test11_collate (name TEXT COLLATE NOCASE);
+    CREATE TABLE log11_collate (msg TEXT);
+    CREATE TRIGGER t11_collate AFTER INSERT ON test11_collate
+    WHEN NEW.name = 'hello'
+    BEGIN
+        INSERT INTO log11_collate VALUES('matched:' || NEW.name);
+    END;
+    INSERT INTO test11_collate VALUES ('HELLO');
+    INSERT INTO test11_collate VALUES ('hello');
+    SELECT * FROM log11_collate ORDER BY rowid;
+}
+expect {
+    matched:HELLO
+    matched:hello
+}
+
+# Trigger WHEN OLD references should inherit table column collation
+@cross-check-integrity
+test trigger-when-old-column-collation {
+    CREATE TABLE test11_old_collate (name TEXT COLLATE NOCASE);
+    CREATE TABLE log11_old_collate (msg TEXT);
+    INSERT INTO test11_old_collate VALUES ('HELLO');
+    CREATE TRIGGER t11_old_collate AFTER UPDATE ON test11_old_collate
+    WHEN OLD.name = 'hello'
+    BEGIN
+        INSERT INTO log11_old_collate VALUES('old:' || OLD.name || ',new:' || NEW.name);
+    END;
+    UPDATE test11_old_collate SET name = 'world';
+    SELECT * FROM log11_old_collate ORDER BY rowid;
+}
+expect {
+    old:HELLO,new:world
+}
+
+# Explicit COLLATE in trigger WHEN must override inherited column collation
+@cross-check-integrity
+test trigger-when-explicit-collate-override {
+    CREATE TABLE test11_collate_override (name TEXT COLLATE NOCASE);
+    CREATE TABLE log11_collate_override (msg TEXT);
+    CREATE TRIGGER t11_collate_override AFTER INSERT ON test11_collate_override
+    WHEN NEW.name COLLATE BINARY = 'hello'
+    BEGIN
+        INSERT INTO log11_collate_override VALUES(NEW.name);
+    END;
+    INSERT INTO test11_collate_override VALUES ('HELLO');
+    INSERT INTO test11_collate_override VALUES ('hello');
+    SELECT * FROM log11_collate_override ORDER BY rowid;
+}
+expect {
+    hello
+}
+
+# Trigger body NEW/OLD references should also honor column collation in comparisons
+@cross-check-integrity
+test trigger-body-new-column-collation {
+    CREATE TABLE test11_body_collate (name TEXT COLLATE NOCASE);
+    CREATE TABLE log11_body_collate (v INTEGER);
+    CREATE TRIGGER t11_body_collate AFTER INSERT ON test11_body_collate
+    BEGIN
+        INSERT INTO log11_body_collate VALUES(NEW.name = 'hello');
+    END;
+    INSERT INTO test11_body_collate VALUES ('HELLO');
+    INSERT INTO test11_body_collate VALUES ('world');
+    SELECT * FROM log11_body_collate ORDER BY rowid;
+}
+expect {
+    1
+    0
+}
+
+# Trigger body OLD references should honor column collation in comparisons
+@cross-check-integrity
+test trigger-body-old-column-collation {
+    CREATE TABLE test11_body_old_collate (name TEXT COLLATE NOCASE);
+    CREATE TABLE log11_body_old_collate (v INTEGER);
+    INSERT INTO test11_body_old_collate VALUES ('HELLO');
+    CREATE TRIGGER t11_body_old_collate AFTER UPDATE ON test11_body_old_collate
+    BEGIN
+        INSERT INTO log11_body_old_collate VALUES(OLD.name = 'hello');
+    END;
+    UPDATE test11_body_old_collate SET name = 'world';
+    SELECT * FROM log11_body_old_collate ORDER BY rowid;
+}
+expect {
+    1
+}
+
+# Trigger body INSERT...SELECT should preserve NEW column collation through forked resolver paths
+@cross-check-integrity
+test trigger-body-insert-select-new-column-collation {
+    CREATE TABLE test11_body_select_collate (name TEXT COLLATE NOCASE);
+    CREATE TABLE log11_body_select_collate (v INTEGER);
+    CREATE TRIGGER t11_body_select_collate AFTER INSERT ON test11_body_select_collate
+    BEGIN
+        INSERT INTO log11_body_select_collate
+        SELECT NEW.name = 'hello';
+    END;
+    INSERT INTO test11_body_select_collate VALUES ('HELLO');
+    SELECT * FROM log11_body_select_collate ORDER BY rowid;
+}
+expect {
+    1
+}
+
+# Row-value comparisons in trigger WHEN should honor NEW column collations per component
+@cross-check-integrity
+test trigger-when-row-value-new-column-collation {
+    CREATE TABLE test11_row_value_collate (
+        a TEXT COLLATE NOCASE,
+        b TEXT COLLATE NOCASE
+    );
+    CREATE TABLE log11_row_value_collate (msg TEXT);
+    CREATE TRIGGER t11_row_value_collate AFTER INSERT ON test11_row_value_collate
+    WHEN (NEW.a, NEW.b) = ('hello', 'world')
+    BEGIN
+        INSERT INTO log11_row_value_collate VALUES('matched');
+    END;
+    INSERT INTO test11_row_value_collate VALUES ('HELLO', 'WORLD');
+    SELECT * FROM log11_row_value_collate ORDER BY rowid;
+}
+expect {
+    matched
+}
+
+# Row-value comparisons in trigger WHEN should honor OLD column collations per component
+@cross-check-integrity
+test trigger-when-row-value-old-column-collation {
+    CREATE TABLE test11_row_value_old_collate (
+        a TEXT COLLATE NOCASE,
+        b TEXT COLLATE NOCASE
+    );
+    CREATE TABLE log11_row_value_old_collate (msg TEXT);
+    INSERT INTO test11_row_value_old_collate VALUES ('HELLO', 'WORLD');
+    CREATE TRIGGER t11_row_value_old_collate AFTER UPDATE ON test11_row_value_old_collate
+    WHEN (OLD.a, OLD.b) = ('hello', 'world')
+    BEGIN
+        INSERT INTO log11_row_value_old_collate VALUES('matched');
+    END;
+    UPDATE test11_row_value_old_collate SET a = 'x', b = 'y';
+    SELECT * FROM log11_row_value_old_collate ORDER BY rowid;
+}
+expect {
+    matched
+}
+
 # Multiple triggers on same event
 @cross-check-integrity
 test trigger-multiple-same-event {
