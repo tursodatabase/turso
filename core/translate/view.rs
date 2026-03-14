@@ -267,7 +267,7 @@ pub fn translate_create_view(
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }
-    let normalized_view_name = normalize_ident(view_name.name.as_str());
+    let normalized_view_name = view_name.name.as_str().to_string();
 
     // Check for name conflicts with existing schema objects
     if let Some(object_type) =
