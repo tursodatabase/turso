@@ -562,12 +562,12 @@ fn finalized_scan_subquery_order_consumed(
     }
 
     let joined_table = &select_plan.joined_tables()[select_plan.join_order[0].original_idx];
-    let Operation::Scan(Scan::BTreeTable {
-        iter_dir: inner_iter_dir,
-        index,
-    }) = &joined_table.op
-    else {
-        return 0;
+
+    // Extract inner iteration direction from the scan operation.
+    let inner_iter_dir = match &joined_table.op {
+        Operation::Scan(Scan::BTreeTable { iter_dir, .. })
+        | Operation::Scan(Scan::Subquery { iter_dir }) => *iter_dir,
+        _ => return 0,
     };
 
     // The outer scan direction composes with the direction used to populate the
@@ -584,6 +584,7 @@ fn finalized_scan_subquery_order_consumed(
         }
     };
 
+    // Map outer target columns to inner scan columns through result column expressions.
     let mut mapped_target = Vec::with_capacity(target.len());
     for target_col in target {
         if target_col.table_id != table_id {
@@ -613,15 +614,30 @@ fn finalized_scan_subquery_order_consumed(
         mapped_target.push(inner_target_col);
     }
 
-    btree_access_order_consumed(
-        joined_table,
-        effective_iter_dir,
-        index.as_deref(),
-        &[],
-        &mapped_target,
-        schema,
-        EqualityPrefixScope::ConstantEquality,
-    )
+    match &joined_table.op {
+        Operation::Scan(Scan::BTreeTable { index, .. }) => btree_access_order_consumed(
+            joined_table,
+            effective_iter_dir,
+            index.as_deref(),
+            &[],
+            &mapped_target,
+            schema,
+            EqualityPrefixScope::ConstantEquality,
+        ),
+        Operation::Scan(Scan::Subquery { .. }) => {
+            let Table::FromClauseSubquery(from_clause_subquery) = &joined_table.table else {
+                return 0;
+            };
+            subquery_intrinsic_order_consumed(
+                joined_table.internal_id,
+                from_clause_subquery,
+                effective_iter_dir,
+                &mapped_target,
+                schema,
+            )
+        }
+        _ => 0,
+    }
 }
 
 fn expr_to_column_order(
