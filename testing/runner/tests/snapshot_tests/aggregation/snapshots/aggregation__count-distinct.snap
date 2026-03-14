@@ -20,7 +20,7 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN sales USING INDEX idx_sales_category_region
+|--SCAN sales USING INDEX idx_sales_category
 |--USE HASH TABLE FOR count(DISTINCT)
 |--USE HASH TABLE FOR count(DISTINCT)
 `--USE SORTER FOR ORDER BY
@@ -34,8 +34,8 @@ addr  opcode                          p1  p2  p3  p4                  p5  commen
    4          Null                     0   8   0                       0  r[8]=NULL; initialize group by comparison registers to NULL
    5          Gosub                   16  41   0                       0  ; go to clear accumulator subroutine
    6          OpenRead                 1   2   0  k(7,B,B,B,B,B,B,B)   0  table=sales, root=2, iDb=0
-   7          OpenRead                 2   5   0  k(3,B,B)             0  index=idx_sales_category_region, root=5, iDb=0
-   8          Rewind                   2  27   0                       0  Rewind index idx_sales_category_region
+   7          OpenRead                 2   4   0  k(2,B)               0  index=idx_sales_category, root=4, iDb=0
+   8          Rewind                   2  27   0                       0  Rewind index idx_sales_category
    9            DeferredSeek           2   1   0                       0
   10            Column                 1   1  13                       0  r[13]=sales.category
   11            Column                 1   6  14                       0  r[14]=sales.salesperson_id
