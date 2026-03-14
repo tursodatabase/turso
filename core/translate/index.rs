@@ -70,8 +70,8 @@ pub fn translate_create_index(
 
     let original_idx_name = idx_name;
     let database_id = resolver.resolve_database_id(&original_idx_name)?;
-    let idx_name = normalize_ident(original_idx_name.name.as_str());
-    let tbl_name = normalize_ident(tbl_name.as_str());
+    let idx_name = original_idx_name.name.as_str().to_string();
+    let tbl_name = tbl_name.as_str().to_string();
 
     if tbl_name.eq_ignore_ascii_case("sqlite_sequence") {
         crate::bail_parse_error!("table sqlite_sequence may not be indexed");

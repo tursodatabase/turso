@@ -127,3 +127,35 @@ test quoted_identifiers {
 expect {
     MixedCase
 }
+
+# Table and view names should preserve their original case in sqlite_schema
+
+@cross-check-integrity
+test table_name_case_in_sqlite_schema {
+    CREATE TABLE tTt(aAa);
+    SELECT name, tbl_name FROM sqlite_schema WHERE type = 'table';
+}
+expect {
+    tTt|tTt
+}
+
+@cross-check-integrity
+test view_name_case_in_sqlite_schema {
+    CREATE TABLE t(x);
+    CREATE VIEW vVv AS SELECT * FROM t;
+    SELECT name, tbl_name FROM sqlite_schema WHERE type = 'view';
+}
+expect {
+    vVv|vVv
+}
+
+@cross-check-integrity
+test mixed_case_table_and_index_names {
+    CREATE TABLE MyTable(Col1 INT);
+    CREATE INDEX MyIndex ON MyTable(Col1);
+    SELECT type, name, tbl_name FROM sqlite_schema ORDER BY type, name;
+}
+expect {
+    index|MyIndex|MyTable
+    table|MyTable|MyTable
+}
