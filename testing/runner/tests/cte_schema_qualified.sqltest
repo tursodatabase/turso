@@ -1,0 +1,37 @@
+@database :memory:
+# =============================================================================
+# Schema-qualified table reference bypasses CTE name resolution
+# =============================================================================
+
+test cte-schema-qualified-in-body {
+    CREATE TABLE t1(a INTEGER);
+    INSERT INTO t1 VALUES(1),(2),(3);
+    WITH t1 AS (SELECT a * 10 AS a FROM main.t1)
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    10
+    20
+    30
+}
+
+test cte-schema-qualified-in-outer-query {
+    CREATE TABLE t1(a INTEGER);
+    INSERT INTO t1 VALUES(1),(2),(3);
+    WITH t1 AS (SELECT 100 AS a)
+    SELECT * FROM main.t1 ORDER BY a;
+}
+expect {
+    1
+    2
+    3
+}
+
+test cte-unqualified-self-ref-is-circular {
+    CREATE TABLE t1(a INTEGER);
+    INSERT INTO t1 VALUES(1),(2),(3);
+    WITH t1 AS (SELECT * FROM t1) SELECT * FROM t1;
+}
+expect error {
+    circular reference: t1
+}
