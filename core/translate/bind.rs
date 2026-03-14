@@ -850,6 +850,20 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                             ast::Expr::Id(id) => normalize_ident(id.as_str()),
                             ast::Expr::Qualified(_, id) => normalize_ident(id.as_str()),
                             ast::Expr::DoublyQualified(_, _, id) => normalize_ident(id.as_str()),
+                            // After star expansion, columns are Expr::Column with
+                            // table internal_id and column index. Look up the name
+                            // from the scope.
+                            ast::Expr::Column {
+                                table: table_id,
+                                column: col_idx,
+                                ..
+                            } => scope
+                                .tables
+                                .iter()
+                                .find(|st| st.internal_id == *table_id)
+                                .and_then(|st| st.table.column_name(*col_idx))
+                                .map(|n| n.to_string())
+                                .unwrap_or_default(),
                             // Complex expressions without an alias can't be
                             // referenced by name from outer queries.
                             _ => String::new(),
