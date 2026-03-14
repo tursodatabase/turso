@@ -89,8 +89,11 @@ pub struct CachedExprReg<'a> {
     pub expr: Cow<'a, ast::Expr>,
     pub reg: usize,
     pub needs_decode: bool,
-    pub collation: Option<(CollationSeq, bool)>,
+    pub collation: CachedExprCollation,
 }
+
+pub type CachedExprCollation = Option<(CollationSeq, bool)>;
+pub type CachedExprRegHit = (usize, bool, CachedExprCollation);
 
 pub struct Resolver<'a> {
     schema: &'a Schema,
@@ -215,7 +218,7 @@ impl<'a> Resolver<'a> {
         expr: Cow<'a, ast::Expr>,
         reg: usize,
         needs_decode: bool,
-        collation: Option<(CollationSeq, bool)>,
+        collation: CachedExprCollation,
     ) {
         self.expr_to_reg_cache.push(CachedExprReg {
             expr,
@@ -244,10 +247,7 @@ impl<'a> Resolver<'a> {
     /// We scan from newest to oldest so later translations win when equivalent
     /// expressions are seen multiple times in the same translation pass.
     /// Returns `(register, needs_custom_type_decode, collation_ctx)`.
-    pub fn resolve_cached_expr_reg(
-        &self,
-        expr: &ast::Expr,
-    ) -> Option<(usize, bool, Option<(CollationSeq, bool)>)> {
+    pub fn resolve_cached_expr_reg(&self, expr: &ast::Expr) -> Option<CachedExprRegHit> {
         if self.expr_to_reg_cache_enabled {
             self.expr_to_reg_cache
                 .iter()

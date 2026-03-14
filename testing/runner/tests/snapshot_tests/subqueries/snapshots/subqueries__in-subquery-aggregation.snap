@@ -58,7 +58,7 @@ addr  opcode                    p1  p2  p3  p4            p5  comment
   30      Return                 2   0   0                 0
   31      AggFinal               0   7   0  sum            0  accum=r[7]
   32      Copy                   7  13   0                 0  r[13]=r[7]
-  33      Le                    13  14  30  Binary         0  if r[13]<=r[14] goto 30
+  33      Le                    13  14  30                 0  if r[13]<=r[14] goto 30
   34      Copy                   6   1   0                 0  r[1]=r[6]
   35      MakeRecord             1   1  15                 0  r[15]=mkrec(r[1..1]); for ephemeral_index_where_sub_t2
   36      IdxInsert              0  15   0                 8  key=r[15]
