@@ -135,15 +135,6 @@ fn emit_loop_source<'a>(
 ) -> Result<()> {
     match emit_target {
         LoopEmitTarget::GroupBy => {
-            // This function either:
-            // - creates a sorter for GROUP BY operations by allocating registers and translating expressions for three types of columns:
-            // 1) GROUP BY columns (used as sorting keys)
-            // 2) non-aggregate, non-GROUP BY columns
-            // 3) aggregate function arguments
-            // - or if the rows produced by the loop are already sorted in the order required by the GROUP BY keys,
-            // the group by comparisons are done directly inside the main loop.
-            let aggregates = &plan.aggregates;
-
             let GroupByMetadata {
                 row_source,
                 registers,
@@ -173,25 +164,6 @@ fn emit_loop_source<'a>(
                 )?;
             }
 
-            // Step 2: Process arguments for all aggregate functions
-            // For each aggregate, translate all its argument expressions
-            for agg in aggregates.iter() {
-                // For a query like: SELECT group_col, SUM(val1), AVG(val2) FROM table GROUP BY group_col
-                // we'll process val1 and val2 here, storing them in the sorter so they're available
-                // when computing the aggregates after sorting by group_col
-                for expr in agg.args.iter() {
-                    let agg_reg = cur_reg;
-                    cur_reg += 1;
-                    translate_expr(
-                        program,
-                        Some(&plan.table_references),
-                        expr,
-                        agg_reg,
-                        &t_ctx.resolver,
-                    )?;
-                }
-            }
-
             match row_source {
                 GroupByRowSource::Sorter {
                     sort_cursor,
@@ -199,6 +171,19 @@ fn emit_loop_source<'a>(
                     reg_sorter_key,
                     ..
                 } => {
+                    // Sorter path: store only unique leaf columns from aggregate args.
+                    // Full expressions are re-evaluated from the pseudo cursor during aggregation.
+                    for leaf_expr in t_ctx.agg_leaf_columns.iter() {
+                        let reg = cur_reg;
+                        cur_reg += 1;
+                        translate_expr(
+                            program,
+                            Some(&plan.table_references),
+                            leaf_expr,
+                            reg,
+                            &t_ctx.resolver,
+                        )?;
+                    }
                     sorter_insert(
                         program,
                         start_reg,
@@ -207,7 +192,22 @@ fn emit_loop_source<'a>(
                         *reg_sorter_key,
                     );
                 }
-                GroupByRowSource::MainLoop { .. } => group_by_agg_phase(program, t_ctx, plan)?,
+                GroupByRowSource::MainLoop { .. } => {
+                    for agg in plan.aggregates.iter() {
+                        for expr in agg.args.iter() {
+                            let agg_reg = cur_reg;
+                            cur_reg += 1;
+                            translate_expr(
+                                program,
+                                Some(&plan.table_references),
+                                expr,
+                                agg_reg,
+                                &t_ctx.resolver,
+                            )?;
+                        }
+                    }
+                    group_by_agg_phase(program, t_ctx, plan)?;
+                }
             }
 
             Ok(())

@@ -234,32 +234,18 @@ pub fn handle_distinct(
     });
 }
 
-/// Enum representing the source of the aggregate function arguments
+/// Source of aggregate function arguments during bytecode emission.
 ///
-/// Aggregate arguments can come from different sources, depending on how the aggregation
-/// is evaluated:
-/// * In the common grouped case, the aggregate function arguments are  first inserted
-///   into a sorter in the main loop, and in the group by aggregation phase we read
-///   the data from the sorter.
-/// * In grouped cases where no sorting is required, arguments are retrieved  directly
-///   from registers allocated in the main loop.
-/// * In ungrouped cases, arguments are computed directly from the `args` expressions.
+/// * `Register`: arguments were pre-computed into contiguous registers
+///   (used for GROUP BY without a sorter, where the main loop is already sorted).
+/// * `Expression`: arguments are evaluated on-the-fly from the original AST
+///   (used for ungrouped aggregates, window functions, and for the GROUP BY sorter
+///   path where leaf columns are cached in `expr_to_reg_cache` before evaluation).
 pub enum AggArgumentSource<'a> {
-    /// The aggregate function arguments are retrieved from a pseudo cursor
-    /// which reads from the GROUP BY sorter.
-    PseudoCursor {
-        cursor_id: usize,
-        col_start: usize,
-        dest_reg_start: usize,
-        aggregate: &'a Aggregate,
-    },
-    /// The aggregate function arguments are retrieved from a contiguous block of registers
-    /// allocated in the main loop for that given aggregate function.
     Register {
         src_reg_start: usize,
         aggregate: &'a Aggregate,
     },
-    /// The aggregate function arguments are retrieved by evaluating expressions.
     Expression {
         func: &'a AggFunc,
         args: &'a Vec<ast::Expr>,
@@ -268,23 +254,6 @@ pub enum AggArgumentSource<'a> {
 }
 
 impl<'a> AggArgumentSource<'a> {
-    /// Create a new [AggArgumentSource] that retrieves the values from a GROUP BY sorter.
-    pub fn new_from_cursor(
-        program: &mut ProgramBuilder,
-        cursor_id: usize,
-        col_start: usize,
-        aggregate: &'a Aggregate,
-    ) -> Self {
-        let dest_reg_start = program.alloc_registers(aggregate.args.len());
-        Self::PseudoCursor {
-            cursor_id,
-            col_start,
-            dest_reg_start,
-            aggregate,
-        }
-    }
-    /// Create a new [AggArgumentSource] that retrieves the values directly from an already
-    /// populated register or registers.
     pub fn new_from_registers(src_reg_start: usize, aggregate: &'a Aggregate) -> Self {
         Self::Register {
             src_reg_start,
@@ -292,7 +261,6 @@ impl<'a> AggArgumentSource<'a> {
         }
     }
 
-    /// Create a new [AggArgumentSource] that retrieves the values by evaluating `args` expressions.
     pub fn new_from_expression(
         func: &'a AggFunc,
         args: &'a Vec<ast::Expr>,
@@ -307,7 +275,6 @@ impl<'a> AggArgumentSource<'a> {
 
     pub fn distinctness(&self) -> &Distinctness {
         match self {
-            AggArgumentSource::PseudoCursor { aggregate, .. } => &aggregate.distinctness,
             AggArgumentSource::Register { aggregate, .. } => &aggregate.distinctness,
             AggArgumentSource::Expression { distinctness, .. } => distinctness,
         }
@@ -315,26 +282,26 @@ impl<'a> AggArgumentSource<'a> {
 
     pub fn agg_func(&self) -> &AggFunc {
         match self {
-            AggArgumentSource::PseudoCursor { aggregate, .. } => &aggregate.func,
             AggArgumentSource::Register { aggregate, .. } => &aggregate.func,
             AggArgumentSource::Expression { func, .. } => func,
         }
     }
+
     pub fn arg_at(&self, idx: usize) -> &ast::Expr {
         match self {
-            AggArgumentSource::PseudoCursor { aggregate, .. } => &aggregate.args[idx],
             AggArgumentSource::Register { aggregate, .. } => &aggregate.args[idx],
             AggArgumentSource::Expression { args, .. } => &args[idx],
         }
     }
+
     pub fn num_args(&self) -> usize {
         match self {
-            AggArgumentSource::PseudoCursor { aggregate, .. } => aggregate.args.len(),
             AggArgumentSource::Register { aggregate, .. } => aggregate.args.len(),
             AggArgumentSource::Expression { args, .. } => args.len(),
         }
     }
-    /// Read the value of an aggregate function argument
+
+    /// Emit bytecode to read an aggregate function argument into a register.
     pub fn translate(
         &self,
         program: &mut ProgramBuilder,
@@ -343,19 +310,6 @@ impl<'a> AggArgumentSource<'a> {
         arg_idx: usize,
     ) -> Result<usize> {
         match self {
-            AggArgumentSource::PseudoCursor {
-                cursor_id,
-                col_start,
-                dest_reg_start,
-                ..
-            } => {
-                program.emit_column_or_rowid(
-                    *cursor_id,
-                    *col_start + arg_idx,
-                    dest_reg_start + arg_idx,
-                );
-                Ok(dest_reg_start + arg_idx)
-            }
             AggArgumentSource::Register {
                 src_reg_start: start_reg,
                 ..

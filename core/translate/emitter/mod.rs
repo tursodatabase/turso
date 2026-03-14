@@ -473,6 +473,11 @@ pub struct TranslateCtx<'a> {
     /// - First: all `GROUP BY` expressions, in the order they appear in the `GROUP BY` clause.
     /// - Then: remaining non-aggregate expressions that are not part of `GROUP BY`.
     pub non_aggregate_expressions: Vec<(&'a Expr, bool)>,
+    /// Unique leaf column expressions extracted from aggregate function arguments.
+    /// Only populated when GROUP BY uses a sorter, enabling deferred expression
+    /// evaluation: the sorter stores raw columns instead of pre-computed expressions,
+    /// and full expressions are re-evaluated from the pseudo cursor during aggregation.
+    pub agg_leaf_columns: Vec<Expr>,
     /// Cursor id for cdc table (if capture_data_changes PRAGMA is set and query can modify the data)
     pub cdc_cursor_id: Option<usize>,
     pub meta_window: Option<WindowMetadata<'a>>,
@@ -513,6 +518,7 @@ impl<'a> TranslateCtx<'a> {
             materialized_build_inputs: HashMap::default(),
             resolver,
             non_aggregate_expressions: Vec::new(),
+            agg_leaf_columns: Vec::new(),
             cdc_cursor_id: None,
             meta_window: None,
             meta_in_seeks: (0..table_count).map(|_| None).collect(),
