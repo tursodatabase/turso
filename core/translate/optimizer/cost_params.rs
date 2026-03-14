@@ -20,12 +20,6 @@ pub struct CostModelParams {
     /// Estimated rows per table B-tree page.
     pub rows_per_table_page: f64,
 
-    /// Estimated rows per index leaf page. Index entries are typically smaller
-    /// than full table rows (only indexed columns + rowid), so more fit per
-    /// page. Only used for truly covering index scans; non-covering scans and
-    /// rowid-only multi-index branches use `rows_per_table_page`.
-    pub rows_per_index_page: f64,
-
     // === Selectivity Fallbacks ===
     /// Selectivity for equality predicate on unindexed column (e.g., `x = 5`).
     pub sel_eq_unindexed: f64,
@@ -108,7 +102,6 @@ impl CostModelParams {
             // Cardinality fallbacks
             rows_per_table_fallback: 1_000_000.0,
             rows_per_table_page: 50.0,
-            rows_per_index_page: 100.0,
 
             // Selectivity fallbacks
             sel_eq_unindexed: 0.1,
@@ -241,9 +234,6 @@ impl CostModelParams {
         }
         if self.rows_per_table_page <= 0.0 {
             return Err("rows_per_table_page must be positive".into());
-        }
-        if self.rows_per_index_page <= 0.0 {
-            return Err("rows_per_index_page must be positive".into());
         }
         if self.in_subquery_rows <= 0.0 {
             return Err("in_subquery_rows must be positive".into());

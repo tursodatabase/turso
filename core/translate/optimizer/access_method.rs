@@ -13,7 +13,7 @@ use crate::translate::optimizer::constraints::{
     convert_to_vtab_constraint, ordered_materialized_key_columns, BinaryExprSide, Constraint,
     ConstraintOperator, RangeConstraintRef,
 };
-use crate::translate::optimizer::cost::RowCountEstimate;
+use crate::translate::optimizer::cost::{rows_per_leaf_page_for_index, RowCountEstimate};
 use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::plan::{
     plan_has_outer_scope_dependency, HashJoinKey, HashJoinType, NonFromClauseSubquery,
@@ -247,11 +247,17 @@ pub(super) fn choose_best_btree_candidate(
                 unique: index.unique,
                 covering: rhs_table.index_is_covering(index),
                 column_count: index.columns.len(),
+                rows_per_leaf_page: rows_per_leaf_page_for_index(
+                    index.columns.len(),
+                    rhs_table,
+                    params.rows_per_table_page,
+                ),
             },
             None => IndexInfo {
                 unique: true,
                 covering: !usable_constraint_refs.is_empty(),
                 column_count: 1,
+                rows_per_leaf_page: params.rows_per_table_page,
             },
         };
 
@@ -494,11 +500,17 @@ pub(super) fn choose_best_in_seek_candidate(
                 unique: index.unique,
                 covering: rowid_only || rhs_table.index_is_covering(index),
                 column_count: index.columns.len(),
+                rows_per_leaf_page: rows_per_leaf_page_for_index(
+                    index.columns.len(),
+                    rhs_table,
+                    params.rows_per_table_page,
+                ),
             },
             None => IndexInfo {
                 unique: true,
                 covering: false,
                 column_count: 1,
+                rows_per_leaf_page: params.rows_per_table_page,
             },
         };
 
@@ -711,11 +723,17 @@ fn find_best_access_method_for_btree(
                 unique: index.unique,
                 covering: rhs_table.index_is_covering(index),
                 column_count: index.columns.len(),
+                rows_per_leaf_page: rows_per_leaf_page_for_index(
+                    index.columns.len(),
+                    rhs_table,
+                    params.rows_per_table_page,
+                ),
             },
             None => IndexInfo {
                 unique: true,
                 covering: true,
                 column_count: 1,
+                rows_per_leaf_page: params.rows_per_table_page,
             },
         };
         let analyze_ctx = AnalyzeCtx {
@@ -1462,6 +1480,7 @@ fn find_best_access_method_for_subquery(
             unique: false,
             column_count: key_col_positions.len(),
             covering: true,
+            rows_per_leaf_page: params.rows_per_table_page,
         },
         &rhs_constraints.constraints,
         &usable_constraint_refs,

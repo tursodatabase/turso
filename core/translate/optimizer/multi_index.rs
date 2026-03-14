@@ -18,8 +18,8 @@ use crate::translate::optimizer::constraints::{
     TableConstraints,
 };
 use crate::translate::optimizer::cost::{
-    estimate_cost_for_scan_or_seek, estimate_rows_per_seek, AnalyzeCtx, Cost, IndexInfo,
-    RowCountEstimate,
+    estimate_cost_for_scan_or_seek, estimate_rows_per_seek, rows_per_leaf_page_for_index,
+    AnalyzeCtx, Cost, IndexInfo, RowCountEstimate,
 };
 use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::plan::{
@@ -273,6 +273,7 @@ fn index_info_for_branch(
     index: Option<&Index>,
     rhs_table: &JoinedTable,
     read_mode: BranchReadMode,
+    rows_per_table_page: f64,
 ) -> Option<IndexInfo> {
     let rowid_only = matches!(read_mode, BranchReadMode::RowIdOnly);
     match index {
@@ -280,11 +281,17 @@ fn index_info_for_branch(
             unique: index.unique,
             covering: rowid_only || rhs_table.index_is_covering(index),
             column_count: index.columns.len(),
+            rows_per_leaf_page: rows_per_leaf_page_for_index(
+                index.columns.len(),
+                rhs_table,
+                rows_per_table_page,
+            ),
         }),
         None => Some(IndexInfo {
             unique: true,
             covering: true,
             column_count: 1,
+            rows_per_leaf_page: rows_per_table_page,
         }),
     }
 }
@@ -341,6 +348,7 @@ fn choose_multi_index_branch_access(
                 chosen.index.as_deref(),
                 rhs_table,
                 BranchReadMode::RowIdOnly,
+                params.rows_per_table_page,
             )
             .expect("multi-index branches always have costable access");
             let analyze_ctx = AnalyzeCtx {
@@ -1032,9 +1040,13 @@ pub fn consider_multi_index_intersection(
         .iter()
         .map(|b| {
             let constraints = vec![b.constraint.clone()];
-            let index_info =
-                index_info_for_branch(b.index.as_deref(), rhs_table, BranchReadMode::RowIdOnly)
-                    .expect("intersection branches always have costable access");
+            let index_info = index_info_for_branch(
+                b.index.as_deref(),
+                rhs_table,
+                BranchReadMode::RowIdOnly,
+                params.rows_per_table_page,
+            )
+            .expect("intersection branches always have costable access");
             let analyze_ctx = AnalyzeCtx {
                 rhs_table,
                 index: b.index.as_ref(),

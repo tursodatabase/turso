@@ -409,11 +409,13 @@ fn index_info_for_access(index: Option<&Index>) -> IndexInfo {
             unique: index.unique,
             column_count: index.columns.len(),
             covering: false,
+            rows_per_leaf_page: 0.0, // unused here — only unique/column_count matter
         },
         None => IndexInfo {
             unique: true,
             column_count: 1,
             covering: false,
+            rows_per_leaf_page: 0.0, // unused here — only unique/column_count matter
         },
     }
 }

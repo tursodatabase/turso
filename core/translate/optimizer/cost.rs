@@ -29,7 +29,7 @@ impl std::ops::Deref for Cost {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct IndexInfo {
     pub unique: bool,
     pub column_count: usize,
@@ -37,6 +37,42 @@ pub struct IndexInfo {
     /// True for genuinely covering indexes and for multi-index branches
     /// that only harvest rowids into a RowSet.
     pub covering: bool,
+    /// Estimated rows per index leaf page, derived from the column count
+    /// ratio between the index and its parent table.
+    pub rows_per_leaf_page: f64,
+}
+
+/// Estimate rows per index leaf page based on the index/table width ratio.
+/// Narrower indexes have smaller entries, fitting more rows per page.
+pub fn index_leaf_rows_per_page(
+    index_column_count: usize,
+    table_column_count: usize,
+    has_rowid_alias: bool,
+    rows_per_table_page: f64,
+) -> f64 {
+    // Table width: all columns + implicit rowid (unless one column IS the rowid alias).
+    let table_width = table_column_count as f64 + if has_rowid_alias { 0.0 } else { 1.0 };
+    // Index width: indexed columns + rowid suffix (always present).
+    let index_width = index_column_count as f64 + 1.0;
+    (rows_per_table_page * table_width / index_width).max(1.0)
+}
+
+/// Compute `rows_per_leaf_page` for an index on the given table.
+pub fn rows_per_leaf_page_for_index(
+    index_column_count: usize,
+    rhs_table: &JoinedTable,
+    rows_per_table_page: f64,
+) -> f64 {
+    let table_column_count = rhs_table.columns().len();
+    let has_rowid_alias = rhs_table
+        .btree()
+        .is_some_and(|bt| bt.get_rowid_alias_column().is_some());
+    index_leaf_rows_per_page(
+        index_column_count,
+        table_column_count,
+        has_rowid_alias,
+        rows_per_table_page,
+    )
 }
 
 /// Estimate IO and CPU cost for a full table scan.
@@ -100,7 +136,7 @@ pub fn estimate_index_cost(
         input_cardinality * tree_depth
     };
 
-    let index_leaf_pages_count = (rows_per_seek / params.rows_per_index_page).max(1.0);
+    let index_leaf_pages_count = (rows_per_seek / index_info.rows_per_leaf_page).max(1.0);
     let leaf_scan_cost = if is_full_scan {
         // Full scan of all leaf pages. Repeated scans benefit from caching.
         if input_cardinality <= 1.0 {
