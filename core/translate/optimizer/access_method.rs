@@ -226,6 +226,7 @@ pub(super) fn choose_best_btree_candidate(
         cost: best_cost,
     };
     let mut best_adjusted_output = f64::MAX;
+    let mut best_is_ordered = false;
 
     // Build a mask for the rhs table itself.
     let mut rhs_table_mask = TableMask::new();
@@ -394,11 +395,20 @@ pub(super) fn choose_best_btree_candidate(
         // Adjusted output: lower means the loop delivers fewer rows downstream.
         let adjusted_output = residual_selectivity;
 
-        let adjusted_best = best_cost + order_satisfiability_bonus;
+        // Only apply the order bonus when this candidate satisfies order but
+        // the current best does not. When both satisfy order, switching saves
+        // no additional sort cost.
+        let effective_bonus = if is_index_ordered && !best_is_ordered {
+            order_satisfiability_bonus
+        } else {
+            Cost(0.0)
+        };
+        let adjusted_best = best_cost + effective_bonus;
         let costs_equal = (cost.0 - adjusted_best.0).abs() < 1e-9;
         if cost < adjusted_best || (costs_equal && adjusted_output < best_adjusted_output - 1e-12) {
             best_cost = cost;
             best_adjusted_output = adjusted_output;
+            best_is_ordered = is_index_ordered;
             best_choice = ChosenBtreeCandidate {
                 iter_dir,
                 index: candidate.index.clone(),
@@ -465,7 +475,9 @@ pub(super) fn choose_best_in_seek_candidate(
     let tree_depth = if base <= 1.0 {
         1.0
     } else {
-        (base.ln() / params.rows_per_page.ln()).ceil().max(1.0)
+        (base.ln() / params.rows_per_table_page.ln())
+            .ceil()
+            .max(1.0)
     };
     let mut best_in_seek = None;
     let mut best_in_seek_cost = best_cost;
@@ -476,11 +488,11 @@ pub(super) fn choose_best_in_seek_candidate(
             .as_ref()
             .and_then(|idx| idx.columns.first().map(|c| c.pos_in_table));
 
+        let rowid_only = matches!(read_mode, BranchReadMode::RowIdOnly);
         let index_info = match candidate.index.as_ref() {
             Some(index) => IndexInfo {
                 unique: index.unique,
-                covering: matches!(read_mode, BranchReadMode::RowIdOnly)
-                    || rhs_table.index_is_covering(index),
+                covering: rowid_only || rhs_table.index_is_covering(index),
                 column_count: index.columns.len(),
             },
             None => IndexInfo {
@@ -947,8 +959,8 @@ pub fn estimate_hash_join_cost(
     // Grace hash join writes partitions and reads them back, so it's 2x the page IO.
     // Use page-based IO cost (rows / rows_per_page) rather than per-row IO.
     let spill_cost = if will_spill {
-        let build_pages = (build_cardinality / params.rows_per_page).ceil();
-        let probe_pages = (probe_cardinality / params.rows_per_page).ceil();
+        let build_pages = (build_cardinality / params.rows_per_table_page).ceil();
+        let probe_pages = (probe_cardinality / params.rows_per_table_page).ceil();
         // Write both sides to partitions, then read back: 2 * (build_pages + probe_pages)
         (build_pages + probe_pages) * 2.0 * probe_multiplier
     } else {
