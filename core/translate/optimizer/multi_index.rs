@@ -214,7 +214,7 @@ fn estimate_multi_index_scan_cost(
 
     // Table fetch cost mirrors single-index lookup costing, assuming some
     // locality benefit from rowid-ordered access after RowSet deduplication.
-    let table_pages = (base_row_count / params.rows_per_page).max(1.0);
+    let table_pages = (base_row_count / params.rows_per_table_page).max(1.0);
     let selectivity = estimated_unique_rows / base_row_count.max(1.0);
     let table_fetch_cost = selectivity * table_pages;
     let total_cost = (branch_scan_cost + rowset_ops_cost + table_fetch_cost) * input_cardinality;
@@ -257,7 +257,7 @@ fn estimate_multi_index_intersection_cost(
 
     // Table fetch cost mirrors single-index lookup costing, assuming some
     // locality benefit from rowid-ordered access after intersection.
-    let table_pages = (base_row_count / params.rows_per_page).max(1.0);
+    let table_pages = (base_row_count / params.rows_per_table_page).max(1.0);
     let selectivity = estimated_intersection_rows / base_row_count.max(1.0);
     let table_fetch_cost = selectivity * table_pages;
     let total_cost = (branch_scan_cost + rowset_ops_cost + table_fetch_cost) * input_cardinality;
@@ -274,11 +274,11 @@ fn index_info_for_branch(
     rhs_table: &JoinedTable,
     read_mode: BranchReadMode,
 ) -> Option<IndexInfo> {
+    let rowid_only = matches!(read_mode, BranchReadMode::RowIdOnly);
     match index {
         Some(index) => Some(IndexInfo {
             unique: index.unique,
-            covering: matches!(read_mode, BranchReadMode::RowIdOnly)
-                || rhs_table.index_is_covering(index),
+            covering: rowid_only || rhs_table.index_is_covering(index),
             column_count: index.columns.len(),
         }),
         None => Some(IndexInfo {
