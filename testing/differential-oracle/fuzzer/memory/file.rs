@@ -66,7 +66,7 @@ impl File for MemorySimFile {
             if read_len > 0 {
                 buf[..read_len].copy_from_slice(&file_buf[offset..][..read_len]);
             }
-            read_len as i32
+            read_len as i64
         };
         c.complete(buf_size);
         Ok(c)
@@ -79,7 +79,7 @@ impl File for MemorySimFile {
         c: Completion,
     ) -> Result<Completion> {
         let written = self.write_buf(buffer.as_slice(), pos as usize);
-        c.complete(written as i32);
+        c.complete(written as i64);
         Ok(c)
     }
 
@@ -103,7 +103,7 @@ impl File for MemorySimFile {
             total_written += written;
         }
 
-        c.complete(total_written as i32);
+        c.complete(total_written as i64);
         Ok(c)
     }
 

@@ -468,7 +468,7 @@ impl WrappedIOUring {
                 );
                 // write complete, return iovec to pool
                 state.free_last_iov(&mut self.iov_pool);
-                completion_from_key(user_data).complete(state.total_written as i32);
+                completion_from_key(user_data).complete(state.total_written as i64);
             }
             remaining => {
                 tracing::trace!(
@@ -563,7 +563,7 @@ impl IO for UringIO {
                     let err = std::io::Error::from_raw_os_error(errno);
                     completion_from_key(user_data).error(CompletionError::IOError(err.kind(), "io_uring_cqe"));
                 } else {
-                    completion_from_key(user_data).complete(result)
+                    completion_from_key(user_data).complete(result as i64)
                 }
             }
         }
@@ -617,7 +617,7 @@ impl IO for UringIO {
                 let err = std::io::Error::from_raw_os_error(errno);
                 completion_from_key(user_data).error(CompletionError::IOError(err.kind(), "io_uring_cqe"));
             } else {
-                completion_from_key(user_data).complete(result)
+                completion_from_key(user_data).complete(result as i64)
             }
         }
     }

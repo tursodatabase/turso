@@ -552,7 +552,7 @@ pub fn begin_read_page(
     let buf = buffer_pool.get_page();
     #[allow(clippy::arc_with_non_send_sync)]
     let buf = Arc::new(buf);
-    let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+    let complete = Box::new(move |res: Result<(Arc<Buffer>, i64), CompletionError>| {
         let Ok((buf, bytes_read)) = res else {
             page.clear_locked();
             return None; // IO error already captured in completion
@@ -570,7 +570,7 @@ pub fn begin_read_page(
                     actual: 0,
                 });
             }
-        } else if bytes_read != buf_len as i32 {
+        } else if bytes_read != buf_len as i64 {
             tracing::error!(
                 "short read on page {page_idx}: expected {buf_len} bytes, got {bytes_read}"
             );
@@ -621,7 +621,7 @@ pub fn begin_write_btree_page(pager: &Pager, page: &PageRef) -> Result<Completio
     let buf_len = buffer.len();
 
     let write_complete = {
-        Box::new(move |res: Result<i32, CompletionError>| {
+        Box::new(move |res: Result<i64, CompletionError>| {
             let Ok(bytes_written) = res else {
                 return;
             };
@@ -629,7 +629,7 @@ pub fn begin_write_btree_page(pager: &Pager, page: &PageRef) -> Result<Completio
 
             page_finish.clear_dirty();
             turso_assert!(
-                bytes_written == buf_len as i32,
+                bytes_written == buf_len as i64,
                 "wrote({bytes_written}) != expected({buf_len})"
             );
         })
@@ -700,7 +700,7 @@ pub fn write_pages_vectored(
         let done_cl = done_flag.clone();
         let err_cl = err.clone();
 
-        let expected_bytes = (page_sz * run_bufs.len()) as i32;
+        let expected_bytes = (page_sz * run_bufs.len()) as i64;
 
         let cmp = Completion::new_write(move |res| {
             // Record error/mismatch, but always resolve the batch progress.
@@ -1583,12 +1583,12 @@ impl StreamingWalReader {
         Ok((read_size, guard))
     }
 
-    fn handle_header_read(self: Arc<Self>, res: Result<(Arc<Buffer>, i32), CompletionError>) {
+    fn handle_header_read(self: Arc<Self>, res: Result<(Arc<Buffer>, i64), CompletionError>) {
         let Ok((buf, bytes_read)) = res else {
             self.finalize_loading();
             return;
         };
-        if bytes_read != WAL_HEADER_SIZE as i32 {
+        if bytes_read != WAL_HEADER_SIZE as i64 {
             self.finalize_loading();
             return;
         }
@@ -1633,7 +1633,7 @@ impl StreamingWalReader {
         self.page_atomic.store(page_sz as u64, Ordering::Release);
     }
 
-    fn handle_chunk_read(self: Arc<Self>, res: Result<(Arc<Buffer>, i32), CompletionError>) {
+    fn handle_chunk_read(self: Arc<Self>, res: Result<(Arc<Buffer>, i64), CompletionError>) {
         let Ok((buf, bytes_read)) = res else {
             self.finalize_loading();
             return;
@@ -1800,7 +1800,7 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
             let original_complete = complete;
 
             let decrypt_complete =
-                Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+                Box::new(move |res: Result<(Arc<Buffer>, i64), CompletionError>| {
                     let Ok((encrypted_buf, bytes_read)) = res else {
                         return original_complete(res);
                     };
@@ -1834,7 +1834,7 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
             let checksum_ctx = ctx.clone();
             let original_c = complete;
             let verify_complete =
-                Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+                Box::new(move |res: Result<(Arc<Buffer>, i64), CompletionError>| {
                     let Ok((buf, bytes_read)) = res else {
                         return original_c(res);
                     };
@@ -1938,12 +1938,12 @@ pub fn begin_write_wal_header<F: File + ?Sized>(io: &F, header: &WalHeader) -> R
         Arc::new(buffer)
     };
 
-    let write_complete = move |res: Result<i32, CompletionError>| {
+    let write_complete = move |res: Result<i64, CompletionError>| {
         let Ok(bytes_written) = res else {
             return;
         };
         turso_assert!(
-            bytes_written == WAL_HEADER_SIZE as i32,
+            bytes_written == WAL_HEADER_SIZE as i64,
             "wal header wrote({bytes_written}) != expected({WAL_HEADER_SIZE})"
         );
     };
