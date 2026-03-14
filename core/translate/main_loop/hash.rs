@@ -631,9 +631,8 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
             self.hash_join_op.join_type,
             HashJoinType::LeftOuter | HashJoinType::FullOuter
         ) {
-            self.program.emit_insn(Insn::HashResetMatched {
-                hash_table_id,
-            });
+            self.program
+                .emit_insn(Insn::HashResetMatched { hash_table_id });
         }
 
         self.program.emit_insn(Insn::Rewind {
@@ -880,7 +879,6 @@ pub(super) struct HashProbeCloseEmitter<'a, 'plan> {
 }
 
 impl<'a, 'plan> HashProbeCloseEmitter<'a, 'plan> {
-    #[allow(clippy::too_many_arguments)]
     /// Capture the mutable close-loop inputs for a single hash probe table.
     pub(super) fn new(
         program: &'a mut ProgramBuilder,
