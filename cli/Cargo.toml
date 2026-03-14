@@ -71,6 +71,7 @@ experimental_win_iocp = ["turso_core/experimental_win_iocp"]
 tracing_release = ["turso_core/tracing_release"]
 mimalloc = ["dep:mimalloc"]
 fts = ["turso_core/fts"]
+mvcc_repl = []
 
 [build-dependencies]
 syntect = { git = "https://github.com/trishume/syntect.git", rev = "64644ffe064457265cbcee12a0c1baf9485ba6ee", default-features = false, features = ["default-fancy"] }

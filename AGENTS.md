@@ -47,6 +47,7 @@ limbo/
 | Deterministic tests | `testing/simulator/` | Fault injection, differential testing |
 | New SQL tests | `testing/runner/tests/` | `.sqltest` format preferred |
 | Quick sqlite3 diff | `scripts/diff.sh` | Compare sqlite3 vs tursodb output for a query |
+| MVCC testing REPL | `cli/mvcc_repl.rs` | Multi-conn concurrent txn testing REPL        |
 
 ## Guides
 
