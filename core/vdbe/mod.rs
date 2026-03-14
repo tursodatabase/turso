@@ -314,6 +314,7 @@ impl Register {
 
     // Set the value of the register to NULL,
     // reusing the existing Register::Value(Value::Null) if possible.
+    #[inline(always)]
     pub fn set_null(&mut self) {
         match self {
             Register::Value(Value::Null) => {}
@@ -327,6 +328,7 @@ impl Register {
     }
 
     /// Set the register to a generic Value, attempting to reuse backing allocation if compatible.
+    #[inline(always)]
     pub fn set_value(&mut self, val: Value) {
         match self {
             Register::Value(v) => {
@@ -946,6 +948,7 @@ pub enum EndStatement {
 }
 
 impl Register {
+    #[inline(always)]
     pub fn get_value(&self) -> &Value {
         match self {
             Register::Value(v) => v,

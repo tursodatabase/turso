@@ -123,6 +123,7 @@ pub(super) enum ComparisonOp {
 }
 
 impl ComparisonOp {
+    #[inline(always)]
     pub(super) fn compare<V1: AsValueRef, V2: AsValueRef>(
         &self,
         lhs: V1,
@@ -140,6 +141,7 @@ impl ComparisonOp {
         }
     }
 
+    #[inline(always)]
     pub(super) fn compare_nulls<V1: AsValueRef, V2: AsValueRef>(
         &self,
         lhs: V1,
@@ -715,6 +717,7 @@ impl Value {
     }
 
     // exec_if returns whether you should jump
+    #[inline(always)]
     pub fn exec_if(&self, jump_if_null: bool, not: bool) -> bool {
         Numeric::from_value(self)
             .map(|v| v.to_bool())
@@ -931,30 +934,37 @@ impl Value {
         Value::from_f64(result)
     }
 
+    #[inline(always)]
     pub fn exec_add(&self, rhs: &Value) -> Value {
         (|| Numeric::from_value(self)?.checked_add(Numeric::from_value(rhs)?))().into()
     }
 
+    #[inline(always)]
     pub fn exec_subtract(&self, rhs: &Value) -> Value {
         (|| Numeric::from_value(self)?.checked_sub(Numeric::from_value(rhs)?))().into()
     }
 
+    #[inline(always)]
     pub fn exec_multiply(&self, rhs: &Value) -> Value {
         (|| Numeric::from_value(self)?.checked_mul(Numeric::from_value(rhs)?))().into()
     }
 
+    #[inline(always)]
     pub fn exec_divide(&self, rhs: &Value) -> Value {
         (|| Numeric::from_value(self)?.checked_div(Numeric::from_value(rhs)?))().into()
     }
 
+    #[inline(always)]
     pub fn exec_bit_and(&self, rhs: &Value) -> Value {
         (NullableInteger::from(self) & NullableInteger::from(rhs)).into()
     }
 
+    #[inline(always)]
     pub fn exec_bit_or(&self, rhs: &Value) -> Value {
         (NullableInteger::from(self) | NullableInteger::from(rhs)).into()
     }
 
+    #[inline(always)]
     pub fn exec_remainder(&self, rhs: &Value) -> Value {
         let convert_to_float = matches!(Numeric::from_value(self), Some(Numeric::Float(_)))
             || matches!(Numeric::from_value(rhs), Some(Numeric::Float(_)));
@@ -971,18 +981,22 @@ impl Value {
         }
     }
 
+    #[inline(always)]
     pub fn exec_bit_not(&self) -> Value {
         (!NullableInteger::from(self)).into()
     }
 
+    #[inline(always)]
     pub fn exec_shift_left(&self, rhs: &Value) -> Value {
         (NullableInteger::from(self) << NullableInteger::from(rhs)).into()
     }
 
+    #[inline(always)]
     pub fn exec_shift_right(&self, rhs: &Value) -> Value {
         (NullableInteger::from(self) >> NullableInteger::from(rhs)).into()
     }
 
+    #[inline(always)]
     pub fn exec_boolean_not(&self) -> Value {
         match Numeric::from_value(self).map(|v| v.to_bool()) {
             None => Value::Null,
@@ -990,6 +1004,7 @@ impl Value {
         }
     }
 
+    #[inline(always)]
     pub fn exec_concat(&self, rhs: &Value) -> Value {
         if let (Value::Blob(lhs), Value::Blob(rhs)) = (self, rhs) {
             return Value::Blob([lhs.as_slice(), rhs.as_slice()].concat().to_vec());
@@ -1006,6 +1021,7 @@ impl Value {
         Value::build_text(lhs + &rhs)
     }
 
+    #[inline(always)]
     pub fn exec_and(&self, rhs: &Value) -> Value {
         match (
             Numeric::from_value(self).map(|v| v.to_bool()),
@@ -1017,6 +1033,7 @@ impl Value {
         }
     }
 
+    #[inline(always)]
     pub fn exec_or(&self, rhs: &Value) -> Value {
         match (
             Numeric::from_value(self).map(|v| v.to_bool()),

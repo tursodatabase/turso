@@ -292,6 +292,7 @@ fn make_sort_comparator(func_name: &str) -> Option<crate::vdbe::sorter::SortComp
 
 /// Compare two values using the specified collation for text values.
 /// Non-text values are compared using their natural ordering.
+#[inline(always)]
 fn compare_with_collation(
     lhs: &Value,
     rhs: &Value,
@@ -12702,6 +12703,7 @@ fn advance_unmatched_scan(
     }
 }
 
+#[inline]
 fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
     if let Register::Value(value) = target {
         if matches!(value, Value::Blob(_)) {
@@ -12817,6 +12819,7 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
     true
 }
 
+#[inline]
 fn try_float_to_integer_affinity(value: &mut Value, fl: f64) -> bool {
     // Check if the float can be exactly represented as an integer
     if let Ok(int_val) = cast_real_to_integer(fl) {

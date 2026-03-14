@@ -4,6 +4,7 @@
 pub struct NonNan(f64);
 
 impl NonNan {
+    #[inline(always)]
     pub fn new(value: f64) -> Option<Self> {
         if value.is_nan() {
             return None;
@@ -38,12 +39,14 @@ impl PartialOrd<NonNan> for f64 {
 }
 
 impl From<i64> for NonNan {
+    #[inline(always)]
     fn from(value: i64) -> Self {
         NonNan(value as f64)
     }
 }
 
 impl From<NonNan> for f64 {
+    #[inline(always)]
     fn from(value: NonNan) -> Self {
         value.0
     }
@@ -52,6 +55,7 @@ impl From<NonNan> for f64 {
 impl std::ops::Deref for NonNan {
     type Target = f64;
 
+    #[inline(always)]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -60,6 +64,7 @@ impl std::ops::Deref for NonNan {
 impl std::ops::Add for NonNan {
     type Output = Option<NonNan>;
 
+    #[inline(always)]
     fn add(self, rhs: Self) -> Self::Output {
         Self::new(self.0 + rhs.0)
     }
@@ -68,6 +73,7 @@ impl std::ops::Add for NonNan {
 impl std::ops::Sub for NonNan {
     type Output = Option<NonNan>;
 
+    #[inline(always)]
     fn sub(self, rhs: Self) -> Self::Output {
         Self::new(self.0 - rhs.0)
     }
@@ -76,6 +82,7 @@ impl std::ops::Sub for NonNan {
 impl std::ops::Mul for NonNan {
     type Output = Option<NonNan>;
 
+    #[inline(always)]
     fn mul(self, rhs: Self) -> Self::Output {
         Self::new(self.0 * rhs.0)
     }
@@ -84,6 +91,7 @@ impl std::ops::Mul for NonNan {
 impl std::ops::Div for NonNan {
     type Output = Option<NonNan>;
 
+    #[inline(always)]
     fn div(self, rhs: Self) -> Self::Output {
         Self::new(self.0 / rhs.0)
     }
@@ -92,6 +100,7 @@ impl std::ops::Div for NonNan {
 impl std::ops::Rem for NonNan {
     type Output = Option<NonNan>;
 
+    #[inline(always)]
     fn rem(self, rhs: Self) -> Self::Output {
         Self::new(self.0 % rhs.0)
     }
@@ -106,6 +115,7 @@ impl std::fmt::Display for NonNan {
 impl std::ops::Neg for NonNan {
     type Output = Self;
 
+    #[inline(always)]
     fn neg(self) -> Self::Output {
         Self(-self.0)
     }

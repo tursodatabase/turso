@@ -47,6 +47,7 @@ pub enum Numeric {
 }
 
 impl Numeric {
+    #[inline(always)]
     pub fn from_value<T: AsValueRef>(value: T) -> Option<Self> {
         let value = value.as_value_ref();
 
@@ -183,6 +184,7 @@ impl From<Numeric> for Value {
 }
 
 impl From<Option<Numeric>> for Value {
+    #[inline(always)]
     fn from(value: Option<Numeric>) -> Self {
         value.map_or_else(|| Value::Null, Value::from)
     }
