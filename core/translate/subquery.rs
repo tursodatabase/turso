@@ -1186,7 +1186,7 @@ pub fn emit_from_clause_subqueries(
                         "MULTI-INDEX {} {} ({})",
                         match multi_idx.set_op {
                             SetOperation::Union => "OR",
-                            SetOperation::Intersection => "AND",
+                            SetOperation::Intersection { .. } => "AND",
                         },
                         table_reference.identifier,
                         index_names.join(", ")

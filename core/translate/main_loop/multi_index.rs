@@ -47,7 +47,7 @@ fn emit_multi_index_rowset_update(
 }
 
 #[expect(clippy::too_many_arguments)]
-fn emit_multi_index_branch_residuals(
+fn emit_multi_index_or_residual_filters(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
     table_references: &TableReferences,
@@ -120,6 +120,19 @@ fn emit_seek_multi_index_branch(
         table_cursor_id
     };
 
+    if let Some(r) = &branch.union_residuals {
+        emit_multi_index_or_residual_filters(
+            program,
+            t_ctx,
+            table_references,
+            &r.pre_filter_exprs,
+            branch_loop_end,
+            None,
+            table_cursor_id,
+            false,
+        )?;
+    }
+
     let max_key_regs = seek_def
         .size(&seek_def.start)
         .max(seek_def.size(&seek_def.end))
@@ -149,16 +162,18 @@ fn emit_seek_multi_index_branch(
         });
     }
 
-    emit_multi_index_branch_residuals(
-        program,
-        t_ctx,
-        table_references,
-        &branch.residual_exprs,
-        branch_next,
-        is_index.then_some(branch_cursor_id),
-        table_cursor_id,
-        branch.requires_table_cursor,
-    )?;
+    if let Some(r) = &branch.union_residuals {
+        emit_multi_index_or_residual_filters(
+            program,
+            t_ctx,
+            table_references,
+            &r.post_filter_exprs,
+            branch_next,
+            is_index.then_some(branch_cursor_id),
+            table_cursor_id,
+            r.requires_table_cursor,
+        )?;
+    }
 
     emit_multi_index_rowset_update(
         program,
@@ -218,10 +233,24 @@ fn emit_in_seek_multi_index_branch(
         source,
     )?;
 
+    let branch_loop_end = program.allocate_label();
+
+    if let Some(r) = &branch.union_residuals {
+        emit_multi_index_or_residual_filters(
+            program,
+            t_ctx,
+            table_references,
+            &r.pre_filter_exprs,
+            branch_loop_end,
+            None,
+            table_cursor_id,
+            false,
+        )?;
+    }
+
     program.emit_insn(Insn::NullRow {
         cursor_id: ephemeral_cursor_id,
     });
-    let branch_loop_end = program.allocate_label();
     program.emit_insn(Insn::Rewind {
         cursor_id: ephemeral_cursor_id,
         pc_if_empty: branch_loop_end,
@@ -265,16 +294,18 @@ fn emit_in_seek_multi_index_branch(
             cursor_id: branch_cursor_id,
             dest: rowid_reg,
         });
-        emit_multi_index_branch_residuals(
-            program,
-            t_ctx,
-            table_references,
-            &branch.residual_exprs,
-            branch_next,
-            Some(branch_cursor_id),
-            table_cursor_id,
-            branch.requires_table_cursor,
-        )?;
+        if let Some(r) = &branch.union_residuals {
+            emit_multi_index_or_residual_filters(
+                program,
+                t_ctx,
+                table_references,
+                &r.post_filter_exprs,
+                branch_next,
+                Some(branch_cursor_id),
+                table_cursor_id,
+                r.requires_table_cursor,
+            )?;
+        }
         emit_multi_index_rowset_update(
             program,
             is_intersection,
@@ -301,16 +332,18 @@ fn emit_in_seek_multi_index_branch(
             cursor_id: table_cursor_id,
             dest: rowid_reg,
         });
-        emit_multi_index_branch_residuals(
-            program,
-            t_ctx,
-            table_references,
-            &branch.residual_exprs,
-            next_value_label,
-            None,
-            table_cursor_id,
-            branch.requires_table_cursor,
-        )?;
+        if let Some(r) = &branch.union_residuals {
+            emit_multi_index_or_residual_filters(
+                program,
+                t_ctx,
+                table_references,
+                &r.post_filter_exprs,
+                next_value_label,
+                None,
+                table_cursor_id,
+                r.requires_table_cursor,
+            )?;
+        }
         emit_multi_index_rowset_update(
             program,
             is_intersection,
@@ -346,7 +379,7 @@ pub(super) fn emit_multi_index_scan_loop(
 ) -> Result<()> {
     let table_cursor_id = program.resolve_cursor_id(&CursorKey::table(table.internal_id));
     let rowid_reg = program.alloc_register();
-    let is_intersection = multi_idx_op.set_op == SetOperation::Intersection;
+    let is_intersection = matches!(multi_idx_op.set_op, SetOperation::Intersection { .. });
     let rowset1_reg = program.alloc_register();
     let rowset2_reg = if is_intersection {
         program.alloc_register()

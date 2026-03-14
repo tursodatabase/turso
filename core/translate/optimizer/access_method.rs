@@ -153,8 +153,6 @@ pub enum AccessMethodParams {
         where_term_idx: usize,
         /// The set operation (Union for OR, Intersection for AND).
         set_op: SetOperation,
-        /// For Intersection: additional WHERE term indices consumed.
-        additional_consumed_terms: Vec<usize>,
     },
     /// IN-list driven index seek.
     InSeek {
