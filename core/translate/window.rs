@@ -178,6 +178,30 @@ fn prepare_window_subquery(
         )?;
     }
 
+    // `current_window.functions` may contain duplicate expressions (e.g. the same window
+    // function referenced multiple times in SELECT/ORDER BY). During rewrite, equivalent
+    // expressions can collapse into one subquery column, so some duplicate entries may not be
+    // visited and can retain stale table references from the pre-rewrite plan.
+    // Ensure every window function expression is remapped to the current subquery.
+    let window_name = current_window
+        .name
+        .clone()
+        .expect("current_window must always have a name here");
+    for window_function in current_window.functions.iter_mut() {
+        if window_function_needs_subquery_rewrite(
+            &window_function.original_expr,
+            &subquery_id,
+            window_name.as_str(),
+        ) {
+            rewrite_expr_referencing_current_window(
+                &mut outer_plan.aggregates,
+                window_name.clone(),
+                &mut ctx,
+                &mut window_function.original_expr,
+            )?;
+        }
+    }
+
     // When there is no ORDER BY or PARTITION BY clause, the window function takes zero arguments,
     // and no other columns are selected (e.g., "SELECT count() OVER () FROM products"),
     // `subquery_result_columns` may be empty. Add a constant expression to keep the query valid.
@@ -385,6 +409,47 @@ fn rewrite_expr_referencing_current_window(
         _ => unreachable!("only functions can reference windows"),
     }
     Ok(())
+}
+
+fn window_function_needs_subquery_rewrite(
+    expr: &Expr,
+    subquery_id: &TableInternalId,
+    expected_window_name: &str,
+) -> bool {
+    fn is_subquery_column_reference(expr: &Expr, subquery_id: &TableInternalId) -> bool {
+        matches!(
+            expr,
+            Expr::Column {
+                database: Some(database),
+                table,
+                ..
+            } if *database == SUBQUERY_DATABASE_ID && table == subquery_id
+        )
+    }
+
+    fn over_clause_is_normalized(filter_over: &FunctionTail, expected_window_name: &str) -> bool {
+        matches!(
+            filter_over.over_clause.as_ref(),
+            Some(Over::Name(name)) if name.as_str() == expected_window_name
+        )
+    }
+
+    match expr {
+        Expr::FunctionCall {
+            args, filter_over, ..
+        } => {
+            let args_are_normalized = args
+                .iter()
+                .all(|arg| is_subquery_column_reference(arg, subquery_id));
+            let over_clause_is_normalized =
+                over_clause_is_normalized(filter_over, expected_window_name);
+            !(args_are_normalized && over_clause_is_normalized)
+        }
+        Expr::FunctionCallStar { filter_over, .. } => {
+            !over_clause_is_normalized(filter_over, expected_window_name)
+        }
+        _ => true,
+    }
 }
 
 /// Rewrites an expression into a reference to a subquery column.

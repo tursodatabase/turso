@@ -127,6 +127,27 @@ expect {
     sweatshirt|82.9389679823547
 }
 
+test window-rewrite-mixed-order-by-regression {
+    SELECT
+    count(p.id) OVER (ORDER BY 2),
+    count(p.id) OVER (ORDER BY p.id)
+    FROM products p
+    ORDER BY 2;
+}
+expect {
+    11|1
+    11|2
+    11|3
+    11|4
+    11|5
+    11|6
+    11|7
+    11|8
+    11|9
+    11|10
+    11|11
+}
+
 test window-partition-by-and-order-by {
     SELECT
     u.first_name,
@@ -200,6 +221,25 @@ expect {
     Selena|56
     Isaac|136
     Odessa|152
+}
+
+test window-rewrite-multiple-windows-arithmetic-regression {
+    SELECT
+    id,
+    age,
+    SUM(age) OVER (PARTITION BY city) AS city_total,
+    SUM(age) OVER () AS grand_total,
+    round(age * 100.0 / SUM(age) OVER (), 15) AS pct_of_total
+    FROM users
+    ORDER BY id
+    LIMIT 5;
+}
+expect {
+    1|31|46|504576|0.006143772196854
+    2|10|10|504576|0.001981861998985
+    3|83|83|504576|0.016449454591578
+    4|88|296|504576|0.017440385591071
+    5|39|39|504576|0.007729261796043
 }
 
 test window-multiple-functions {
