@@ -354,11 +354,12 @@ fn emit_loop_source<'a>(
                                 reg,
                                 &t_ctx.resolver,
                             )?;
-                            t_ctx.resolver.expr_to_reg_cache.push((
+                            t_ctx.resolver.cache_scalar_expr_reg(
                                 Cow::Owned(expr.clone()),
                                 reg,
                                 false,
-                            ));
+                                &plan.table_references,
+                            )?;
                             Ok(WalkControl::SkipChildren)
                         }
                         _ => {

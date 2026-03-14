@@ -1245,11 +1245,12 @@ pub fn emit_simple_count(
         .aggregates
         .first()
         .expect("simple count requires exactly one aggregate");
-    t_ctx.resolver.expr_to_reg_cache.push((
+    t_ctx.resolver.cache_expr_reg(
         Cow::Owned(agg.original_expr.clone()),
         target_reg,
         false,
-    ));
+        None,
+    );
     t_ctx.resolver.enable_expr_to_reg_cache();
 
     emit_select_result(

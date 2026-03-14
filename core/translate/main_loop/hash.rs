@@ -763,8 +763,7 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
         if payload_info.allow_seek && !payload_has_build_rowid && !build_table_is_live {
             self.t_ctx
                 .resolver
-                .expr_to_reg_cache
-                .push((Cow::Owned(rowid_expr), match_reg, false));
+                .cache_expr_reg(Cow::Owned(rowid_expr), match_reg, false, None);
         }
         if let Some(payload_reg) = payload_dest_reg {
             for (i, payload) in payload_columns.iter().enumerate() {
@@ -795,11 +794,21 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
                 if self.live_table_ids.contains(&payload_table_id) {
                     continue;
                 }
-                self.t_ctx.resolver.expr_to_reg_cache.push((
-                    Cow::Owned(expr),
-                    payload_reg + i,
-                    is_column,
-                ));
+                if is_column {
+                    self.t_ctx.resolver.cache_scalar_expr_reg(
+                        Cow::Owned(expr),
+                        payload_reg + i,
+                        true,
+                        self.table_references,
+                    )?;
+                } else {
+                    self.t_ctx.resolver.cache_expr_reg(
+                        Cow::Owned(expr),
+                        payload_reg + i,
+                        false,
+                        None,
+                    );
+                }
             }
         } else if payload_info.allow_seek && !build_table_is_live {
             self.program.emit_insn(Insn::SeekRowid {
