@@ -144,6 +144,7 @@ extern "C" {
         final_: Option<unsafe extern "C" fn()>,
         destroy: Option<unsafe extern "C" fn(*mut libc::c_void)>,
     ) -> i32;
+    fn sqlite3_initialize() -> i32;
 }
 
 const SQLITE_OK: i32 = 0;
@@ -2763,6 +2764,21 @@ mod tests {
 
             assert_eq!(sqlite3_finalize(stmt2), SQLITE_OK);
             assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    /// Test: sqlite3_initialize must not panic when a global tracing subscriber
+    /// is already installed.
+    #[test]
+    fn test_sqlite3_initialize_no_panic_with_existing_subscriber() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        unsafe {
+            let rc = sqlite3_initialize();
+            assert_eq!(rc, SQLITE_OK);
+
+            let rc2 = sqlite3_initialize();
+            assert_eq!(rc2, SQLITE_OK);
         }
     }
 }
