@@ -1048,12 +1048,21 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 }
                 ast::OneSelect::Values(rows) => {
                     let scope = BindScope::empty();
+                    // Generate column1, column2, ... names from the arity
+                    // of the first VALUES row (matching SQLite behavior).
+                    let num_cols = rows.first().map_or(0, |row| row.len());
+                    let bound_columns: Vec<BoundColumn> = (0..num_cols)
+                        .map(|i| BoundColumn {
+                            name: format!("column{}", i + 1),
+                            expr: ast::Expr::Literal(ast::Literal::Numeric(i.to_string())),
+                        })
+                        .collect();
                     for row in rows.iter_mut() {
                         for expr in row.iter_mut() {
                             ctx.bind_expr(expr, &scope)?;
                         }
                     }
-                    Ok((Vec::new(), scope))
+                    Ok((bound_columns, scope))
                 }
             }
         })
@@ -1227,7 +1236,9 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         // Pass 1: register all CTE names, allocate IDs, compute cross-references
         for cte in &with.ctes {
             let cte_name = normalize_ident(cte.tbl_name.as_str());
-            if self.ctes.contains_key(&cte_name) {
+            // Check for duplicates within the same WITH clause only.
+            // Inner WITH clauses are allowed to shadow outer CTE names.
+            if cte_names.contains(&cte_name) {
                 crate::bail_parse_error!("duplicate WITH table name: {}", cte.tbl_name.as_str());
             }
             let explicit_columns: Vec<String> = cte
