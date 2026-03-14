@@ -843,6 +843,30 @@ pub fn translate_expr_no_constant_opt(
     Ok(translated)
 }
 
+/// Resolve an expression to a register, reusing an existing register when possible.
+///
+/// Unlike `translate_expr`, this does not require a pre-allocated target register.
+/// If the expression is found in the `expr_to_reg_cache`, the cached register is
+/// returned directly without emitting a Copy instruction. Otherwise, a new register
+/// is allocated and the expression is translated into it.
+///
+/// Callers MUST use the returned register — they cannot assume a specific destination.
+#[must_use = "the returned register must be used, because that is where the expression value is stored"]
+pub fn resolve_expr(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    expr: &ast::Expr,
+    resolver: &Resolver,
+) -> Result<usize> {
+    if let Some((reg, needs_decode)) = resolver.resolve_cached_expr_reg(expr) {
+        if !needs_decode {
+            return Ok(reg);
+        }
+    }
+    let dest_reg = program.alloc_register();
+    translate_expr(program, referenced_tables, expr, dest_reg, resolver)
+}
+
 /// Translate an expression into bytecode.
 pub fn translate_expr(
     program: &mut ProgramBuilder,
