@@ -11,13 +11,15 @@ use crate::translate::plan::{
 };
 use crate::translate::planner::resolve_window_and_aggregate_functions;
 use crate::translate::result_row::emit_select_result;
+use crate::translate::subquery::plan_subqueries_from_select_plan;
 use crate::types::KeyInfo;
 use crate::util::exprs_are_equivalent;
-use crate::vdbe::builder::{CursorType, ProgramBuilder, TableRefIdCounter};
+use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{
     to_u16, {InsertFlags, Insn},
 };
 use crate::vdbe::{BranchOffset, CursorID};
+use crate::Connection;
 use crate::Result;
 use crate::{turso_assert, turso_assert_eq};
 use std::mem;
@@ -86,9 +88,10 @@ struct WindowSubqueryContext<'a> {
 /// );
 /// ```
 pub fn plan_windows(
+    program: &mut ProgramBuilder,
     plan: &mut SelectPlan,
     resolver: &Resolver,
-    table_ref_counter: &mut TableRefIdCounter,
+    connection: &Arc<Connection>,
     windows: &mut Vec<Window>,
 ) -> crate::Result<()> {
     // Remove named windows that are not referenced by any function, as they can be ignored.
@@ -102,24 +105,30 @@ pub fn plan_windows(
         );
     }
 
-    prepare_window_subquery(plan, resolver, table_ref_counter, windows, 0)
+    prepare_window_subquery(program, plan, resolver, connection, windows, 0)
 }
 
 fn prepare_window_subquery(
+    program: &mut ProgramBuilder,
     outer_plan: &mut SelectPlan,
     resolver: &Resolver,
-    table_ref_counter: &mut TableRefIdCounter,
+    connection: &Arc<Connection>,
     windows: &mut Vec<Window>,
     processed_window_count: usize,
 ) -> crate::Result<()> {
     if windows.is_empty() {
+        // The innermost plan holds the original FROM/WHERE/GROUP BY plus any
+        // raw subquery expressions pushed down from outer window layers.
+        // Plan them now so they become SubqueryResult nodes with entries in
+        // non_from_clause_subqueries.
+        plan_subqueries_from_select_plan(program, outer_plan, resolver, connection)?;
         return Ok(());
     }
 
     let mut current_window = windows.swap_remove(0);
     let mut subquery_result_columns = Vec::new();
     let mut subquery_order_by = Vec::new();
-    let subquery_id = table_ref_counter.next();
+    let subquery_id = program.table_reference_counter.next();
 
     if current_window.name.is_none() {
         // This is part of normalizing the window definition. The remaining logic lives in
@@ -221,9 +230,10 @@ fn prepare_window_subquery(
     };
 
     prepare_window_subquery(
+        program,
         &mut inner_plan,
         resolver,
-        table_ref_counter,
+        connection,
         windows,
         processed_window_count + 1,
     )?;
@@ -326,6 +336,13 @@ fn rewrite_terminal_expr(
                 }
                 Expr::RowId { .. } | Expr::Column { .. } => {
                     rewrite_expr_as_subquery_column(expr, ctx, false);
+                }
+                Expr::SubqueryResult { .. }
+                | Expr::Exists(..)
+                | Expr::InSelect { .. }
+                | Expr::Subquery(..) => {
+                    rewrite_expr_as_subquery_column(expr, ctx, false);
+                    return Ok(WalkControl::SkipChildren);
                 }
                 _ => {}
             }
