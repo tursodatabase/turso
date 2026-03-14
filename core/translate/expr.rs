@@ -5377,7 +5377,10 @@ pub fn bind_and_rewrite_expr<'a>(
                                     }
                                 }
                                 if !ok {
-                                    crate::bail_parse_error!("Column {} is ambiguous", id.as_str());
+                                    crate::bail_parse_error!(
+                                        "ambiguous column name: {}",
+                                        id.as_str()
+                                    );
                                 }
                             } else {
                                 let col =
@@ -5428,7 +5431,10 @@ pub fn bind_and_rewrite_expr<'a>(
                             });
                             if col_idx.is_some() {
                                 if match_result.is_some() {
-                                    crate::bail_parse_error!("Column {} is ambiguous", id.as_str());
+                                    crate::bail_parse_error!(
+                                        "ambiguous column name: {}",
+                                        id.as_str()
+                                    );
                                 }
                                 let col = outer_ref.table.columns().get(col_idx.unwrap()).unwrap();
                                 match_result = Some((
@@ -5488,6 +5494,14 @@ pub fn bind_and_rewrite_expr<'a>(
                         );
                     };
                     let normalized_table_name = normalize_ident(tbl.as_str());
+                    // Check for ambiguous table references (e.g. FROM t AS A, t AS A)
+                    if referenced_tables.has_duplicate_identifier(&normalized_table_name) {
+                        crate::bail_parse_error!(
+                            "ambiguous column name: {}.{}",
+                            tbl.as_str(),
+                            id.as_str()
+                        );
+                    }
                     let matching_tbl = referenced_tables
                         .find_table_and_internal_id_by_identifier(&normalized_table_name);
                     if matching_tbl.is_none() {

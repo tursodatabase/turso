@@ -1896,3 +1896,83 @@ test glob-is-not-null-precedence {
 expect {
     1
 }
+
+# Ambiguous column name error messages should match SQLite format
+
+@cross-check-integrity
+test ambiguous-column-name-same-table {
+    CREATE TABLE t1(f1 INT, f2 INT);
+    INSERT INTO t1 VALUES (11, 22);
+    SELECT f1 FROM t1 AS A, t1 AS B;
+}
+expect error {
+    ambiguous column name: f1
+}
+
+@cross-check-integrity
+test ambiguous-column-name-two-tables {
+    CREATE TABLE t1(f1 INT, f2 INT);
+    CREATE TABLE t2(f1 INT, t1 TEXT);
+    INSERT INTO t1 VALUES (11, 22);
+    INSERT INTO t2 VALUES (33, 'abc');
+    SELECT f1 FROM t1, t2;
+}
+expect error {
+    ambiguous column name: f1
+}
+
+@cross-check-integrity
+test ambiguous-column-name-two-tables-f2 {
+    CREATE TABLE t1(f1 INT, f2 INT);
+    CREATE TABLE t2(f2 INT, t1 TEXT);
+    INSERT INTO t1 VALUES (11, 22);
+    INSERT INTO t2 VALUES (33, 'abc');
+    SELECT f2 FROM t1, t2;
+}
+expect error {
+    ambiguous column name: f2
+}
+
+@cross-check-integrity
+test ambiguous-column-name-aliased-join {
+    CREATE TABLE t1(x INT);
+    CREATE TABLE t2(x INT);
+    INSERT INTO t1 VALUES (1);
+    INSERT INTO t2 VALUES (2);
+    SELECT x FROM t1 JOIN t2;
+}
+expect error {
+    ambiguous column name: x
+}
+
+@cross-check-integrity
+test ambiguous-column-name-duplicate-alias-qualified {
+    CREATE TABLE t1(f1 INT, f2 INT);
+    INSERT INTO t1 VALUES (11, 22);
+    SELECT A.f1, f1 FROM t1 AS A, t1 AS A ORDER BY f2;
+}
+expect error {
+    ambiguous column name: A.f1
+}
+
+@cross-check-integrity
+test ambiguous-column-name-duplicate-alias-unqualified {
+    CREATE TABLE t1(f1 INT, f2 INT);
+    INSERT INTO t1 VALUES (11, 22);
+    SELECT f1 FROM t1 AS A, t1 AS A;
+}
+expect error {
+    ambiguous column name: f1
+}
+
+@cross-check-integrity
+test ambiguous-column-not-ambiguous-with-using {
+    CREATE TABLE t1(id INT, a INT);
+    CREATE TABLE t2(id INT, b INT);
+    INSERT INTO t1 VALUES (1, 10);
+    INSERT INTO t2 VALUES (1, 20);
+    SELECT id FROM t1 JOIN t2 USING(id);
+}
+expect {
+    1
+}

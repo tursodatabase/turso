@@ -1182,6 +1182,15 @@ impl TableReferences {
             })
     }
 
+    /// Returns true if more than one joined table shares the given identifier.
+    pub fn has_duplicate_identifier(&self, identifier: &str) -> bool {
+        self.joined_tables
+            .iter()
+            .filter(|t| t.identifier == identifier)
+            .count()
+            > 1
+    }
+
     /// Returns an immutable reference to the [JoinedTable] with the given internal ID.
     pub fn find_joined_table_by_internal_id(
         &self,

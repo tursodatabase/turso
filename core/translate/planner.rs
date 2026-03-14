@@ -1734,27 +1734,12 @@ fn parse_join(
         crate::bail_parse_error!("NATURAL JOIN cannot be combined with ON or USING clause");
     }
 
-    // this is called once for each join, so we only need to check the rightmost table
-    // against all previous tables for duplicates
     let rightmost_table = table_references.joined_tables().last().unwrap();
-    let has_duplicate = table_references
-        .joined_tables()
-        .iter()
-        .take(table_references.joined_tables().len() - 1)
-        .any(|t| t.identifier == rightmost_table.identifier);
 
-    if has_duplicate
-        && !natural
-        && constraint
-            .as_ref()
-            .is_none_or(|c| !matches!(c, ast::JoinConstraint::Using(_)))
-    {
-        // Duplicate table names are only allowed for NATURAL or USING joins
-        crate::bail_parse_error!(
-            "table name {} specified more than once - use an alias to disambiguate",
-            rightmost_table.identifier
-        );
-    }
+    // SQLite allows duplicate table names/aliases in FROM clauses and only
+    // errors when an ambiguous column reference is made. We match that
+    // behavior by deferring the check to column resolution, except for
+    // NATURAL or USING joins which need deduplication handling below.
     let constraint = if natural {
         turso_assert_greater_than_or_equal!(table_references.joined_tables().len(), 2);
         // NATURAL JOIN is first transformed into a USING join with the common columns
@@ -1953,7 +1938,7 @@ where
         .any(|s| s.eq_ignore_ascii_case(column_name))
     {
         if fn_check() {
-            crate::bail_parse_error!("ROWID is ambiguous");
+            crate::bail_parse_error!("ambiguous column name: rowid");
         }
 
         return Ok(Some(Expr::RowId {
