@@ -1548,6 +1548,17 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         col_name: &str,
         scope: &BindScope,
     ) -> Result<Option<ast::Expr>> {
+        // Check for rowid pseudo-column first (before find_column_qualified
+        // which would error with "no such column" for rowid on a found table).
+        if let Some(st) = scope.find_table_by_identifier(table_name) {
+            if let Some(row_id_expr) =
+                parse_row_id(col_name, st.internal_id, || false)?
+            {
+                self.tracking.record_rowid(st.internal_id);
+                return Ok(Some(row_id_expr));
+            }
+        }
+
         if let Some((table_id, col_idx, is_rowid_alias)) =
             scope.find_column_qualified(table_name, col_name)?
         {
@@ -1560,24 +1571,49 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             }));
         }
 
-        let outer_match = {
+        // Check outer scopes for rowid and columns
+        let outer_match: Option<Result<ast::Expr>> = {
             let mut result = None;
             for outer_scope in self.outer_scopes_iter() {
-                if let Some(found) = outer_scope.find_column_qualified(table_name, col_name)? {
-                    result = Some(found);
+                // Check rowid first (before find_column_qualified errors)
+                if let Some(st) = outer_scope.find_table_by_identifier(table_name) {
+                    if let Some(row_id_expr) =
+                        parse_row_id(col_name, st.internal_id, || false)?
+                    {
+                        result = Some(Ok(row_id_expr));
+                        break;
+                    }
+                }
+                if let Some((table_id, col_idx, is_rowid_alias)) =
+                    outer_scope.find_column_qualified(table_name, col_name)?
+                {
+                    result = Some(Ok(ast::Expr::Column {
+                        database: None,
+                        table: table_id,
+                        column: col_idx,
+                        is_rowid_alias,
+                    }));
                     break;
                 }
             }
             result
         };
-        if let Some((table_id, col_idx, is_rowid_alias)) = outer_match {
-            self.tracking.record_outer_ref(table_id, col_idx);
-            return Ok(Some(ast::Expr::Column {
-                database: None,
-                table: table_id,
-                column: col_idx,
-                is_rowid_alias,
-            }));
+        if let Some(outer_result) = outer_match {
+            let resolved = outer_result?;
+            match &resolved {
+                ast::Expr::Column {
+                    table: table_id,
+                    column: col_idx,
+                    ..
+                } => {
+                    self.tracking.record_outer_ref(*table_id, *col_idx);
+                }
+                ast::Expr::RowId { table: table_id, .. } => {
+                    self.tracking.record_rowid(*table_id);
+                }
+                _ => {}
+            }
+            return Ok(Some(resolved));
         }
 
         Ok(None)
