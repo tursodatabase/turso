@@ -188,14 +188,16 @@ fn value_to_bigdecimal(val: &Value) -> Result<bigdecimal::BigDecimal> {
     }
 }
 
-/// Create a sort comparator closure from a custom type `<` operator function name.
-/// Returns None if the function name is not recognized as a comparator.
-fn make_sort_comparator(func_name: &str) -> Option<crate::vdbe::sorter::SortComparator> {
+/// Create a sort comparator closure from a SortComparatorType enum.
+fn make_sort_comparator(
+    cmp_type: &crate::vdbe::insn::SortComparatorType,
+) -> crate::vdbe::sorter::SortComparator {
     use crate::types::ValueRef;
+    use crate::vdbe::insn::SortComparatorType;
     use std::cmp::Ordering;
-    match func_name {
-        "numeric_lt" => Some(std::sync::Arc::new(
-            |a: &ValueRef, b: &ValueRef| -> Ordering {
+    match cmp_type {
+        SortComparatorType::NumericLt => {
+            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Ordering {
                 match (a, b) {
                     (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
                     (ValueRef::Null, _) => Ordering::Less,
@@ -210,10 +212,10 @@ fn make_sort_comparator(func_name: &str) -> Option<crate::vdbe::sorter::SortComp
                         }
                     }
                 }
-            },
-        )),
-        "string_reverse" => Some(std::sync::Arc::new(
-            |a: &ValueRef, b: &ValueRef| -> Ordering {
+            })
+        }
+        SortComparatorType::StringReverse => {
+            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Ordering {
                 fn reverse_str(v: &ValueRef) -> String {
                     match v {
                         ValueRef::Text(t) => t.to_string().chars().rev().collect(),
@@ -226,10 +228,10 @@ fn make_sort_comparator(func_name: &str) -> Option<crate::vdbe::sorter::SortComp
                     (_, ValueRef::Null) => Ordering::Greater,
                     _ => reverse_str(a).cmp(&reverse_str(b)),
                 }
-            },
-        )),
-        "test_uint_lt" => Some(std::sync::Arc::new(
-            |a: &ValueRef, b: &ValueRef| -> Ordering {
+            })
+        }
+        SortComparatorType::TestUintLt => {
+            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Ordering {
                 fn to_u64(v: &ValueRef) -> Option<u64> {
                     match v {
                         ValueRef::Null => None,
@@ -253,10 +255,10 @@ fn make_sort_comparator(func_name: &str) -> Option<crate::vdbe::sorter::SortComp
                         _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
                     },
                 }
-            },
-        )),
-        "array_lt" => Some(std::sync::Arc::new(
-            |a: &ValueRef, b: &ValueRef| -> Ordering {
+            })
+        }
+        SortComparatorType::ArrayLt => {
+            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Ordering {
                 match (a, b) {
                     (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
                     (ValueRef::Null, _) => Ordering::Less,
@@ -284,9 +286,8 @@ fn make_sort_comparator(func_name: &str) -> Option<crate::vdbe::sorter::SortComp
                     }
                     _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
                 }
-            },
-        )),
-        _ => None,
+            })
+        }
     }
 }
 
@@ -5428,7 +5429,7 @@ pub fn op_agg_step(
             col,
             delimiter,
             func,
-            comparator_func_name,
+            comparator,
         },
         insn
     );
@@ -5460,9 +5461,7 @@ pub fn op_agg_step(
     }
 
     // Resolve custom type comparator for MIN/MAX if provided
-    let comparator = comparator_func_name
-        .as_deref()
-        .and_then(make_sort_comparator);
+    let comparator = comparator.as_ref().map(make_sort_comparator);
 
     // Step the aggregate
     match func {
@@ -5622,7 +5621,7 @@ pub fn op_sorter_open(
             cursor_id,
             columns: _,
             order_and_collations,
-            comparator_func_names,
+            comparators,
         },
         insn
     );
@@ -5646,9 +5645,9 @@ pub fn op_sorter_open(
         .iter()
         .map(|(ord, coll)| (*ord, coll.unwrap_or_default()))
         .unzip();
-    let comparators = comparator_func_names
+    let comparators = comparators
         .iter()
-        .map(|name| name.as_deref().and_then(make_sort_comparator))
+        .map(|c| c.as_ref().map(make_sort_comparator))
         .collect();
     let temp_store = program.connection.get_temp_store();
     let cursor = Sorter::new(

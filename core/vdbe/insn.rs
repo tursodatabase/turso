@@ -24,6 +24,16 @@ use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
 use turso_macros::Description;
 use turso_parser::ast::{ResolveType, SortOrder};
 
+/// Known custom type comparator functions for sorting and MIN/MAX aggregates.
+/// These replace heap-allocated String names with a compact enum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortComparatorType {
+    NumericLt,
+    StringReverse,
+    TestUintLt,
+    ArrayLt,
+}
+
 /// Flags provided to comparison instructions (e.g. Eq, Ne) which determine behavior related to NULL values.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CmpInsFlags(usize);
@@ -897,8 +907,8 @@ pub enum Insn {
         col: usize,
         delimiter: usize,
         func: AggFunc,
-        /// Optional custom type comparator function name for MIN/MAX aggregates.
-        comparator_func_name: Option<String>,
+        /// Optional custom type comparator for MIN/MAX aggregates.
+        comparator: Option<SortComparatorType>,
     },
 
     AggFinal {
@@ -921,9 +931,9 @@ pub enum Insn {
         columns: usize,      // P2
         /// Combined order and collation per column (keeps Insn small, and order+collations are always the same length).
         order_and_collations: Vec<(SortOrder, Option<CollationSeq>)>,
-        /// Per-column custom type comparator function names for ORDER BY sorting.
+        /// Per-column custom type comparators for ORDER BY sorting.
         /// When present, the comparator is used instead of standard value comparison.
-        comparator_func_names: Vec<Option<String>>,
+        comparators: Vec<Option<SortComparatorType>>,
     },
 
     /// Insert a row into the sorter.
