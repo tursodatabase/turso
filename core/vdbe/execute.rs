@@ -69,7 +69,6 @@ use branches::{mark_unlikely, unlikely};
 use either::Either;
 use smallvec::SmallVec;
 use std::any::Any;
-use std::env::temp_dir;
 use std::str::FromStr;
 use std::{
     borrow::BorrowMut,
@@ -10816,9 +10815,10 @@ pub fn op_open_ephemeral(
             ));
             let conn = program.connection.clone();
             let io = conn.pager.load().io.clone();
-            let rand_num = io.generate_random_number();
             let db_file: Arc<dyn DatabaseStorage>;
             let db_file_io: Arc<dyn crate::IO>;
+            #[allow(unused_mut, unused_assignments)]
+            let mut is_temp_file = false;
 
             // we support OPFS in WASM - but it require files to be pre-opened in the browser before use
             // we can fix this if we will make open_file interface async
@@ -10841,17 +10841,14 @@ pub fn op_open_ephemeral(
                     let file = db_file_io.open_file("temp-file", OpenFlags::Create, false)?;
                     db_file = Arc::new(DatabaseFile::new(file));
                 } else {
-                    let temp_dir = temp_dir();
-                    let rand_path = std::path::Path::new(&temp_dir)
-                        .join(format!("tursodb-ephemeral-{rand_num}"));
-                    let Some(rand_path_str) = rand_path.to_str() else {
-                        return Err(LimboError::InternalError(
-                            "Failed to convert path to string".to_string(),
-                        ));
-                    };
-                    let file = io.open_file(rand_path_str, OpenFlags::Create, false)?;
-                    db_file = Arc::new(DatabaseFile::new(file));
+                    // Use LazyFile so that small ephemeral tables (IN lists, etc.)
+                    // never touch the filesystem. The file is only created on first
+                    // cache spill.
+                    use crate::io::LazyFile;
+                    let lazy_file: Arc<dyn crate::io::File> = Arc::new(LazyFile::new(io.clone()));
+                    db_file = Arc::new(DatabaseFile::new(lazy_file));
                     db_file_io = io;
+                    is_temp_file = true;
                 }
             }
 
@@ -10872,6 +10869,9 @@ pub fn op_open_ephemeral(
             )?);
 
             pager.set_page_size(page_size);
+            if is_temp_file {
+                pager.set_temp_file(true);
+            }
 
             state.op_open_ephemeral_state = OpOpenEphemeralState::StartingTxn { pager };
         }
