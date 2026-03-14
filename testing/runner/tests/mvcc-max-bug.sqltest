@@ -1,0 +1,60 @@
+@database :temp:
+@skip-file-if sqlite "MVCC is not supported in SQLite"
+
+# Regression test: MAX() on non-rowid PK after delete should return the next max value, not NULL.
+
+test mvcc-max-after-delete {
+    CREATE TABLE t(id INT PRIMARY KEY, v INT);
+    PRAGMA journal_mode='MVCC';
+    INSERT INTO t VALUES (1, 10);
+    INSERT INTO t VALUES (2, 20);
+    INSERT INTO t VALUES (3, 30);
+    DELETE FROM t WHERE id = 3;
+    SELECT MAX(id) FROM t;
+}
+expect {
+    mvcc
+    2
+}
+
+test mvcc-min-after-delete {
+    CREATE TABLE t(id INT PRIMARY KEY, v INT);
+    PRAGMA journal_mode='MVCC';
+    INSERT INTO t VALUES (1, 10);
+    INSERT INTO t VALUES (2, 20);
+    INSERT INTO t VALUES (3, 30);
+    DELETE FROM t WHERE id = 1;
+    SELECT MIN(id) FROM t;
+}
+expect {
+    mvcc
+    2
+}
+
+test mvcc-count-after-delete {
+    CREATE TABLE t(id INT PRIMARY KEY, v INT);
+    PRAGMA journal_mode='MVCC';
+    INSERT INTO t VALUES (1, 10);
+    INSERT INTO t VALUES (2, 20);
+    INSERT INTO t VALUES (3, 30);
+    DELETE FROM t WHERE id = 3;
+    SELECT COUNT(*) FROM t;
+}
+expect {
+    mvcc
+    2
+}
+
+test mvcc-max-all-deleted {
+    CREATE TABLE t(id INT PRIMARY KEY, v INT);
+    PRAGMA journal_mode='MVCC';
+    INSERT INTO t VALUES (1, 10);
+    INSERT INTO t VALUES (2, 20);
+    DELETE FROM t WHERE id = 1;
+    DELETE FROM t WHERE id = 2;
+    SELECT MAX(id) FROM t;
+}
+expect {
+    mvcc
+
+}
