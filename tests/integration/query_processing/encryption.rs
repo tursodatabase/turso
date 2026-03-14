@@ -2,8 +2,8 @@ use crate::common::{do_flush, run_query, run_query_on_row, TempDatabase};
 use rand::{rng, RngCore};
 use std::sync::Arc;
 use turso_core::{
-    CipherMode, Database, DatabaseOpts, EncryptionKey, EncryptionOpts, OpenFlags, PlatformIO, Row,
-    IO,
+    CipherMode, Database, DatabaseOpts, EncryptionKey, EncryptionOpts, LimboError, OpenFlags,
+    PlatformIO, Row, IO,
 };
 
 const ENABLE_ENCRYPTION: bool = true;
@@ -1046,7 +1046,23 @@ fn test_encrypted_db_then_enable_mvcc(_db: TempDatabase) -> anyhow::Result<()> {
         );
     }
 
-    // Phase 2: Reopen with correct key — MVCC recovery should replay the encrypted log
+    // Phase 2: Reopen without key material — db open must fail before MVCC
+    // recovery can inspect the logical log.
+    {
+        let result = Database::open_file_with_flags(
+            io.clone(),
+            db_path_str,
+            OpenFlags::default(),
+            opts,
+            None,
+        );
+        assert!(
+            matches!(result, Err(LimboError::NotADB)),
+            "opening an encrypted MVCC db without key material must fail during db open"
+        );
+    }
+
+    // Phase 3: Reopen with correct key — MVCC recovery should replay the encrypted log
     {
         let db = Database::open_file_with_flags(
             io.clone(),

@@ -1,7 +1,7 @@
 use crate::common::{ExecRows, TempDatabase};
 use std::path::Path;
 use std::sync::Arc;
-use turso_core::{Database, DatabaseOpts, OpenFlags, StepResult};
+use turso_core::{Database, DatabaseOpts, EncryptionKey, EncryptionOpts, OpenFlags, StepResult};
 
 /// Create a new database file at `path` with MVCC journal mode enabled.
 /// This is needed because ATTACH requires the attached DB's journal mode
@@ -828,5 +828,43 @@ fn test_attach_memory_db_always_allowed(tmp_db: TempDatabase) -> anyhow::Result<
     conn.execute("INSERT INTO mem_aux.t VALUES (42)")?;
     let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM mem_aux.t");
     assert_eq!(rows, vec![(42,)]);
+    Ok(())
+}
+
+/// The same attach-memory path must also work when the main database is both
+/// encrypted and running in MVCC mode.
+#[turso_macros::test]
+fn test_attach_memory_db_allowed_on_encrypted_mvcc_main(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let db_path = tmp_db.path.with_extension("encrypted_mvcc_main.db");
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let opts = DatabaseOpts::new().with_encryption(true).with_attach(true);
+    let enc_opts = Some(EncryptionOpts {
+        cipher: "aes256gcm".to_string(),
+        hexkey: hex_key.to_string(),
+    });
+    let db = Database::open_file_with_flags(
+        tmp_db.io.clone(),
+        db_path.to_str().unwrap(),
+        OpenFlags::default(),
+        opts,
+        enc_opts,
+    )?;
+    let key = EncryptionKey::from_hex_string(hex_key)?;
+    let conn = db.connect_with_encryption(Some(key))?;
+
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+    conn.execute("CREATE TABLE main_t(x INTEGER)")?;
+    conn.execute("INSERT INTO main_t VALUES (7)")?;
+
+    conn.execute("ATTACH ':memory:' AS mem_aux")?;
+    conn.execute("CREATE TABLE mem_aux.t(x INTEGER)")?;
+    conn.execute("INSERT INTO mem_aux.t VALUES (42)")?;
+
+    let main_rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM main_t");
+    assert_eq!(main_rows, vec![(7,)]);
+    let aux_rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM mem_aux.t");
+    assert_eq!(aux_rows, vec![(42,)]);
     Ok(())
 }

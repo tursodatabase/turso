@@ -12,7 +12,7 @@ use crate::storage::sqlite3_ondisk::{
 };
 use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::RwLock;
-use crate::{Buffer, Completion, DatabaseOpts, EncryptionKey, OpenFlags};
+use crate::{Buffer, Completion, DatabaseOpts, EncryptionKey, LimboError, OpenFlags};
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
 use rand::{Rng, SeedableRng};
@@ -7548,6 +7548,74 @@ fn test_mvcc_encrypted_log_recovery_and_wrong_key() {
     assert!(
         db.restart_result().is_err(),
         "Expected error when reopening encrypted MVCC DB with wrong key"
+    );
+}
+
+/// Enabling MVCC on a file-backed database must still bootstrap durable MVCC
+/// metadata even if encryption has only been opted-in and no key/cipher exists yet.
+#[test]
+fn test_mvcc_late_encryption_setup_keeps_metadata_bootstrapped() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir
+        .path()
+        .join(format!("test_{}", rand::random::<u64>()));
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let opts = DatabaseOpts::new().with_encryption(true);
+    let db = Database::open_file_with_flags(
+        io,
+        path.as_os_str().to_str().unwrap(),
+        OpenFlags::default(),
+        opts,
+        None,
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+
+    // Reproduce the deferred-key flow: encryption is enabled as a feature, but
+    // the session has not configured any key/cipher when MVCC bootstrap runs.
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+
+    let metadata_root = metadata_root_page(&conn);
+    assert!(
+        metadata_root > 0,
+        "metadata table must be present after enabling MVCC on a file-backed db",
+    );
+
+    let meta = get_rows(
+        &conn,
+        "SELECT k, v FROM __turso_internal_mvcc_meta ORDER BY rowid",
+    );
+    assert_eq!(meta.len(), 1);
+    assert_eq!(meta[0][0].to_string(), "persistent_tx_ts_max");
+    assert_eq!(meta[0][1].as_int().unwrap(), 0);
+}
+
+/// Reopening an encrypted MVCC database without any key material must fail before
+/// logical-log recovery, even if there is an outstanding MVCC log tail on disk.
+#[test]
+fn test_mvcc_encrypted_restart_without_key_fails_before_recovery() {
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
+    let log_path = std::path::PathBuf::from(db.path.as_ref().unwrap()).with_extension("db-log");
+
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'secret')").unwrap();
+        conn.close().unwrap();
+    }
+
+    let log_bytes = std::fs::read(&log_path).expect("db-log should exist after MVCC writes");
+    assert!(
+        log_bytes.len() > LOG_HDR_SIZE,
+        "db-log should contain at least one frame before restart"
+    );
+
+    db.enc_opts = None;
+    assert!(
+        matches!(db.restart_result(), Err(LimboError::NotADB)),
+        "reopening an encrypted MVCC database without a key must fail during db open, before recovery",
     );
 }
 
