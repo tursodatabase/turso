@@ -1040,3 +1040,31 @@ expect {
     50|50
     ok
 }
+
+# Long lhs BETWEEN chain in partial-index predicate should not explode
+# codegen with u16 overflow during INSERT.
+@cross-check-integrity
+test partial-index-long-between-chain {
+    CREATE TABLE t_chain(x);
+    CREATE INDEX i_chain ON t_chain(x) WHERE
+      x BETWEEN 0 AND CASE WHEN 1 THEN 1 END
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0
+      BETWEEN 0 AND 0;
+    INSERT INTO t_chain VALUES(1);
+    SELECT x FROM t_chain;
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    ok
+}
