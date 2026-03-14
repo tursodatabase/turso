@@ -295,7 +295,6 @@ impl CloseLoop {
                             hash_join_op,
                             &hash_ctx,
                             select_plan,
-                            table_index,
                             probe_cursor_id,
                         )?;
                     }
@@ -438,14 +437,12 @@ pub(super) struct AutoIndexResult {
 
 /// Emit the grace hash join processing loop after the probe cursor is exhausted.
 /// At runtime, HashGraceInit/Next are no-ops if the build side didn't spill.
-#[allow(clippy::too_many_arguments)]
 fn emit_grace_hash_join_loop<'a>(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx<'a>,
     hash_join_op: &HashJoinOp,
     hash_ctx: &HashCtx,
     select_plan: Option<&'a SelectPlan>,
-    _table_index: usize,
     probe_cursor_id: CursorID,
 ) -> Result<()> {
     // Only emit grace loop for INNER and LEFT OUTER (v1 scope)

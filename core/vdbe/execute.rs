@@ -12606,6 +12606,20 @@ pub fn op_hash_clear(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_hash_reset_matched(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(HashResetMatched { hash_table_id }, insn);
+    if let Some(hash_table) = state.hash_tables.get_mut(hash_table_id) {
+        hash_table.reset_matched_bits();
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_hash_mark_matched(
     _program: &Program,
     state: &mut ProgramState,

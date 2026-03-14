@@ -2260,6 +2260,15 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
+        Insn::HashResetMatched { hash_table_id } => (
+            "HashResetMatched",
+            *hash_table_id as i64,
+            0,
+            0,
+            Value::build_text(""),
+            0,
+            String::new(),
+        ),
         Insn::HashScanUnmatched { hash_table_id, dest_reg, target_pc, payload_dest_reg, num_payload } => {
             let payload_info = if let Some(p_reg) = payload_dest_reg {
                 format!(" payload=r[{}]..r[{}]", p_reg, p_reg + num_payload - 1)

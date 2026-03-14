@@ -1579,6 +1579,13 @@ pub enum Insn {
         hash_table_id: usize,
     },
 
+    /// Reset all matched_bits in a hash table to false.
+    /// Emitted at the start of each outer-loop iteration so that marks from
+    /// a previous probe pass don't suppress NULL-fill rows in the current one.
+    HashResetMatched {
+        hash_table_id: usize,
+    },
+
     /// Begin scanning unmatched entries in the hash table (for FULL OUTER JOIN).
     /// Writes the first unmatched entry's rowid to dest_reg and payload to payload_dest_reg.
     /// If no unmatched entries exist, jumps to target_pc.
@@ -1858,6 +1865,7 @@ impl InsnVariants {
             InsnVariants::HashClose => execute::op_hash_close,
             InsnVariants::HashClear => execute::op_hash_clear,
             InsnVariants::HashMarkMatched => execute::op_hash_mark_matched,
+            InsnVariants::HashResetMatched => execute::op_hash_reset_matched,
             InsnVariants::HashScanUnmatched => execute::op_hash_scan_unmatched,
             InsnVariants::HashNextUnmatched => execute::op_hash_next_unmatched,
             InsnVariants::HashGraceInit => execute::op_hash_grace_init,
