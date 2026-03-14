@@ -1990,6 +1990,22 @@ impl HashTable {
         }
     }
 
+    /// Reset all matched_bits to false. Called at the start of each outer-loop
+    /// iteration so that marks from a previous iteration don't suppress NULL-fill
+    /// rows in the current one.
+    pub fn reset_matched_bits(&mut self) {
+        if let Some(spill_state) = self.spill_state.as_mut() {
+            for partition in &mut spill_state.partitions {
+                for bits in &mut partition.matched_bits {
+                    bits.fill(false);
+                }
+            }
+        }
+        for bits in &mut self.matched_bits {
+            bits.fill(false);
+        }
+    }
+
     /// Reset the unmatched scan state to the beginning.
     pub fn begin_unmatched_scan(&mut self) {
         self.unmatched_scan_bucket = 0;
@@ -2597,7 +2613,7 @@ impl HashTable {
         probe_state: &mut ProbeSpillState,
         partition_idx: usize,
         io: &Arc<dyn IO>,
-        mut metrics: Option<&mut HashJoinMetrics>,
+        metrics: Option<&mut HashJoinMetrics>,
     ) -> Result<Option<Completion>> {
         let partition = &probe_state.partition_buffers[partition_idx];
         if partition.is_empty() {
@@ -2641,7 +2657,7 @@ impl HashTable {
             io_state
         };
 
-        if let Some(metrics) = metrics.as_deref_mut() {
+        if let Some(metrics) = metrics {
             metrics.probe_spill_bytes_written = metrics
                 .probe_spill_bytes_written
                 .saturating_add(total_size as u64);
@@ -2892,7 +2908,7 @@ impl HashTable {
         let buffer = &probe_state.partition_buffers[partition_idx];
         if !buffer.is_empty() {
             let grace = self.grace_state.as_mut().expect("grace state");
-            grace.probe_entries = buffer.entries.clone();
+            grace.probe_entries.clone_from(&buffer.entries);
             return Ok(());
         }
 
@@ -2932,7 +2948,7 @@ impl HashTable {
         // Synchronous read for probe chunks (they are read sequentially, not random)
         let read_buffer = Arc::new(Buffer::new_temporary(chunk.size_bytes));
         let io_state = Arc::new(AtomicSpillIOState::new(SpillIOState::WaitingForRead));
-        let io_state_clone = io_state.clone();
+        let io_state_clone = io_state;
         let buffer_clone = read_buffer.clone();
         let read_complete =
             Box::new(
@@ -4437,7 +4453,7 @@ mod hashtests {
         // Buffer a probe row with NULL key - should be skipped
         let null_key = vec![Value::Null];
         // NULL keys can't match, so we just verify no crash
-        let partition_idx = ht.partition_for_keys(&vec![Value::from_i64(0)]);
+        let partition_idx = ht.partition_for_keys(&[Value::from_i64(0)]);
         if !ht.is_partition_loaded(partition_idx) {
             // Buffer with a valid key to ensure grace processing runs
             let _ = ht

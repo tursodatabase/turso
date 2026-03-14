@@ -624,6 +624,18 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
         let hash_table_id: usize = build_table.internal_id.into();
         let num_keys = self.hash_join_op.join_keys.len();
 
+        // For LEFT/FULL OUTER hash joins, reset matched_bits at the start of
+        // each outer-loop iteration so marks from a previous probe pass don't
+        // suppress NULL-fill rows in the current one.
+        if matches!(
+            self.hash_join_op.join_type,
+            HashJoinType::LeftOuter | HashJoinType::FullOuter
+        ) {
+            self.program.emit_insn(Insn::HashResetMatched {
+                hash_table_id,
+            });
+        }
+
         self.program.emit_insn(Insn::Rewind {
             cursor_id: self.probe_cursor_id,
             pc_if_empty: self.loop_end,
