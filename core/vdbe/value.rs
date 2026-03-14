@@ -232,6 +232,20 @@ impl Value {
         }))
     }
 
+    fn string_context_bytes(&self) -> Option<std::borrow::Cow<'_, [u8]>> {
+        match self {
+            Value::Null => None,
+            Value::Text(text) => Some(std::borrow::Cow::Borrowed(text.as_bytes())),
+            Value::Blob(blob) => Some(std::borrow::Cow::Borrowed(blob)),
+            Value::Numeric(Numeric::Integer(i)) => {
+                Some(std::borrow::Cow::Owned(i.to_string().into_bytes()))
+            }
+            Value::Numeric(Numeric::Float(f)) => Some(std::borrow::Cow::Owned(
+                format_float(f64::from(*f)).into_bytes(),
+            )),
+        }
+    }
+
     /// Generates the Soundex code for a given word
     pub fn exec_soundex(&self) -> Value {
         let s = match self {
@@ -571,10 +585,8 @@ impl Value {
 
     pub fn exec_hex(&self) -> Value {
         match self {
-            Value::Text(_) | Value::Numeric(_) => {
-                let text = self.to_string();
-                Value::build_text(hex::encode_upper(text))
-            }
+            Value::Text(text) => Value::build_text(hex::encode_upper(text.as_bytes())),
+            Value::Numeric(_) => Value::build_text(hex::encode_upper(self.to_string())),
             Value::Blob(blob_bytes) => Value::build_text(hex::encode_upper(blob_bytes)),
             Value::Null => Value::build_text(""),
         }
@@ -729,19 +741,18 @@ impl Value {
         match Affinity::affinity(datatype) {
             // NONE	Casting a value to a type-name with no affinity causes the value to be converted into a BLOB. Casting to a BLOB consists of first casting the value to TEXT in the encoding of the database connection, then interpreting the resulting byte sequence as a BLOB instead of as TEXT.
             // Historically called NONE, but it's the same as BLOB
-            Affinity::Blob => {
-                // Convert to TEXT first, then interpret as BLOB
-                // TODO: handle encoding
-                let text = self.to_string();
-                Value::Blob(text.into_bytes())
-            }
+            Affinity::Blob => match self {
+                Value::Blob(blob) => Value::Blob(blob.clone()),
+                Value::Text(text) => Value::Blob(text.as_bytes().to_vec()),
+                _ => Value::Blob(self.to_string().into_bytes()),
+            },
             // TEXT To cast a BLOB value to TEXT, the sequence of bytes that make up the BLOB is interpreted as text encoded using the database encoding.
             // Casting an INTEGER or REAL value into TEXT renders the value as if via sqlite3_snprintf() except that the resulting TEXT uses the encoding of the database connection.
-            Affinity::Text => {
-                // Convert everything to text representation
-                // TODO: handle encoding and whatever sqlite3_snprintf does
-                Value::build_text(self.to_string())
-            }
+            Affinity::Text => match self {
+                Value::Text(text) => Value::Text(text.clone()),
+                Value::Blob(blob) => Value::build_text_from_bytes(blob.clone()),
+                _ => Value::build_text(self.to_string()),
+            },
             Affinity::Real => match self {
                 Value::Blob(b) => {
                     let text = String::from_utf8_lossy(b);
@@ -802,24 +813,39 @@ impl Value {
             return Value::Null;
         }
 
-        let source = source.exec_cast("TEXT");
-        let pattern = pattern.exec_cast("TEXT");
-        let replacement = replacement.exec_cast("TEXT");
+        let source_bytes = source
+            .string_context_bytes()
+            .expect("NULL case returned early");
+        let pattern_bytes = pattern
+            .string_context_bytes()
+            .expect("NULL case returned early");
+        let replacement_bytes = replacement
+            .string_context_bytes()
+            .expect("NULL case returned early");
 
-        // If any of the casts failed, panic as text casting is not expected to fail.
-        match (&source, &pattern, &replacement) {
-            (Value::Text(source), Value::Text(pattern), Value::Text(replacement)) => {
-                if pattern.as_str().is_empty() || pattern.as_str().starts_with('\0') {
-                    return Value::Text(source.clone());
-                }
+        let source_bytes = source_bytes.as_ref();
+        let pattern_bytes = pattern_bytes.as_ref();
+        let replacement_bytes = replacement_bytes.as_ref();
 
-                let result = source
-                    .as_str()
-                    .replace(pattern.as_str(), replacement.as_str());
-                Value::build_text(result)
-            }
-            _ => unreachable!("text cast should never fail"),
+        if pattern_bytes.is_empty() || pattern_bytes[0] == b'\0' {
+            return Value::build_text_from_bytes(source_bytes.to_vec());
         }
+
+        let mut result = Vec::with_capacity(source_bytes.len());
+        let mut idx = 0;
+
+        while idx + pattern_bytes.len() <= source_bytes.len() {
+            if &source_bytes[idx..idx + pattern_bytes.len()] == pattern_bytes {
+                result.extend_from_slice(replacement_bytes);
+                idx += pattern_bytes.len();
+            } else {
+                result.push(source_bytes[idx]);
+                idx += 1;
+            }
+        }
+        result.extend_from_slice(&source_bytes[idx..]);
+
+        Value::build_text_from_bytes(result)
     }
 
     pub fn exec_math_unary(&self, function: &MathFunc) -> Value {
@@ -991,19 +1017,18 @@ impl Value {
     }
 
     pub fn exec_concat(&self, rhs: &Value) -> Value {
-        if let (Value::Blob(lhs), Value::Blob(rhs)) = (self, rhs) {
-            return Value::Blob([lhs.as_slice(), rhs.as_slice()].concat().to_vec());
-        }
-
-        let Some(lhs) = self.cast_text() else {
+        let Some(lhs) = self.string_context_bytes() else {
             return Value::Null;
         };
 
-        let Some(rhs) = rhs.cast_text() else {
+        let Some(rhs) = rhs.string_context_bytes() else {
             return Value::Null;
         };
 
-        Value::build_text(lhs + &rhs)
+        let mut concatenated = Vec::with_capacity(lhs.len() + rhs.len());
+        concatenated.extend_from_slice(lhs.as_ref());
+        concatenated.extend_from_slice(rhs.as_ref());
+        Value::build_text_from_bytes(concatenated)
     }
 
     pub fn exec_and(&self, rhs: &Value) -> Value {
@@ -1144,21 +1169,23 @@ impl Value {
         let Value::Text(text) = self else {
             panic!("concat_to_text must be called only on Value::Text");
         };
-        text.value.to_mut().push_str(&other.to_string());
+
+        let mut concatenated = Vec::with_capacity(text.as_bytes().len());
+        concatenated.extend_from_slice(text.as_bytes());
+        if let Some(other_bytes) = other.string_context_bytes() {
+            concatenated.extend_from_slice(other_bytes.as_ref());
+        }
+        *self = Value::build_text_from_bytes(concatenated);
     }
 
     pub fn exec_concat_strings<'a, T: Iterator<Item = &'a Self>>(registers: T) -> Self {
-        let mut result = String::new();
+        let mut result = Vec::new();
         for val in registers {
-            match val {
-                Value::Null => continue,
-                Value::Text(s) => result.push_str(s.as_str()),
-                Value::Blob(b) => result.push_str(&String::from_utf8_lossy(b)),
-                Value::Numeric(Numeric::Integer(i)) => result.push_str(&i.to_string()),
-                Value::Numeric(Numeric::Float(f)) => result.push_str(&format_float(f64::from(*f))),
+            if let Some(bytes) = val.string_context_bytes() {
+                result.extend_from_slice(bytes.as_ref());
             }
         }
-        Value::build_text(result)
+        Value::build_text_from_bytes(result)
     }
 
     pub fn exec_concat_ws<'a, T: ExactSizeIterator<Item = &'a Self>>(mut registers: T) -> Self {
@@ -2769,5 +2796,32 @@ mod tests {
             Value::exec_replace(&input_str, &pattern_str, &replace_str),
             expected_str
         );
+    }
+
+    #[test]
+    fn test_concat_preserves_blob_bytes_in_text_context() {
+        let lhs = Value::Blob(vec![0xAB]);
+        let rhs = Value::build_text("text");
+        let result = lhs.exec_concat(&rhs);
+        assert_eq!(result.exec_typeof(), Value::build_text("text"));
+        assert_eq!(result.exec_hex(), Value::build_text("AB74657874"));
+
+        let reverse_result = rhs.exec_concat(&lhs);
+        assert_eq!(reverse_result.exec_typeof(), Value::build_text("text"));
+        assert_eq!(reverse_result.exec_hex(), Value::build_text("74657874AB"));
+
+        let both_blobs = Value::Blob(vec![0xAA]).exec_concat(&Value::Blob(vec![0xBB]));
+        assert_eq!(both_blobs.exec_typeof(), Value::build_text("text"));
+        assert_eq!(both_blobs.exec_hex(), Value::build_text("AABB"));
+    }
+
+    #[test]
+    fn test_replace_preserves_blob_bytes_in_text_context() {
+        let source = Value::Blob(vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x03]);
+        let pattern = Value::Blob(vec![0x03]);
+        let replacement = Value::Blob(vec![0xFF]);
+        let result = Value::exec_replace(&source, &pattern, &replacement);
+        assert_eq!(result.exec_typeof(), Value::build_text("text"));
+        assert_eq!(result.exec_hex(), Value::build_text("0102FF0405FF"));
     }
 }

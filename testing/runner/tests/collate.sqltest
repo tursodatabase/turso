@@ -790,3 +790,338 @@ test agg_collate_no_leak_with_count {
 expect {
     a|a|2
 }
+
+@cross-check-integrity
+test collate-invalid-bytes-storage-roundtrip {
+    CREATE TABLE t_blob_text_roundtrip(x);
+    INSERT INTO t_blob_text_roundtrip VALUES(CAST(x'AB' AS TEXT));
+    SELECT hex(x), typeof(x) FROM t_blob_text_roundtrip;
+}
+expect {
+    AB|text
+}
+
+test collate-invalid-bytes-binary-comparison {
+    SELECT CAST(x'80' AS TEXT)=CAST(x'81' AS TEXT), CAST(x'80' AS TEXT)<CAST(x'81' AS TEXT);
+}
+expect {
+    0|1
+}
+
+test collate-invalid-bytes-nocase-compare {
+    SELECT CAST(X'8041' AS TEXT)=CAST(X'8061' AS TEXT) COLLATE NOCASE,
+           CAST(X'8041' AS TEXT)=CAST(X'8061' AS TEXT) COLLATE BINARY;
+}
+expect {
+    1|0
+}
+
+@cross-check-integrity
+test collate-invalid-bytes-nocase-order {
+    CREATE TABLE t_collate_nocase_invalid(x);
+    INSERT INTO t_collate_nocase_invalid VALUES
+      (CAST(X'8042' AS TEXT)),
+      (CAST(X'8061' AS TEXT)),
+      (CAST(X'8041' AS TEXT)),
+      (CAST(X'7A' AS TEXT));
+    SELECT hex(x) FROM t_collate_nocase_invalid ORDER BY x COLLATE NOCASE, hex(x);
+}
+expect {
+    7A
+    8041
+    8061
+    8042
+}
+
+test collate-invalid-bytes-rtrim-compare {
+    SELECT CAST(X'AB20' AS TEXT)=CAST(X'AB2020' AS TEXT) COLLATE RTRIM,
+           CAST(X'AB20' AS TEXT)=CAST(X'AB2020' AS TEXT) COLLATE BINARY;
+}
+expect {
+    1|0
+}
+
+@cross-check-integrity
+test collate-invalid-bytes-rtrim-order {
+    CREATE TABLE t_collate_rtrim_invalid(x);
+    INSERT INTO t_collate_rtrim_invalid VALUES
+      (CAST(X'AB2020' AS TEXT)),
+      (CAST(X'AB21' AS TEXT)),
+      (CAST(X'AB20' AS TEXT));
+    SELECT hex(x) FROM t_collate_rtrim_invalid ORDER BY x COLLATE RTRIM, hex(x);
+}
+expect {
+    AB20
+    AB2020
+    AB21
+}
+
+@cross-check-integrity
+test collate-invalid-bytes-index-binary-seek {
+    CREATE TABLE t_idx_binary_invalid(x TEXT);
+    CREATE INDEX t_idx_binary_invalid_x ON t_idx_binary_invalid(x);
+    INSERT INTO t_idx_binary_invalid VALUES
+      (CAST(X'80' AS TEXT)),
+      (CAST(X'81' AS TEXT)),
+      (CAST(X'80' AS TEXT));
+    SELECT hex(x)
+    FROM t_idx_binary_invalid
+    WHERE x = CAST(X'80' AS TEXT)
+    ORDER BY rowid;
+    SELECT hex(x)
+    FROM t_idx_binary_invalid
+    WHERE x >= CAST(X'80' AS TEXT)
+    ORDER BY x, rowid;
+}
+expect {
+    80
+    80
+    80
+    80
+    81
+}
+
+@cross-check-integrity
+test collate-invalid-bytes-index-nocase-seek-order {
+    CREATE TABLE t_idx_nocase_invalid(x TEXT COLLATE NOCASE);
+    CREATE INDEX t_idx_nocase_invalid_x ON t_idx_nocase_invalid(x COLLATE NOCASE);
+    INSERT INTO t_idx_nocase_invalid VALUES
+      (CAST(X'8041' AS TEXT)),
+      (CAST(X'8061' AS TEXT)),
+      (CAST(X'8042' AS TEXT));
+    SELECT count(*)
+    FROM t_idx_nocase_invalid
+    WHERE x = CAST(X'8041' AS TEXT);
+    SELECT hex(x)
+    FROM t_idx_nocase_invalid
+    WHERE x >= CAST(X'8041' AS TEXT)
+    ORDER BY x COLLATE NOCASE, hex(x);
+}
+expect {
+    2
+    8041
+    8061
+    8042
+}
+
+@cross-check-integrity
+test collate-invalid-bytes-index-rtrim-seek-order {
+    CREATE TABLE t_idx_rtrim_invalid(x TEXT COLLATE RTRIM);
+    CREATE INDEX t_idx_rtrim_invalid_x ON t_idx_rtrim_invalid(x COLLATE RTRIM);
+    INSERT INTO t_idx_rtrim_invalid VALUES
+      (CAST(X'AB20' AS TEXT)),
+      (CAST(X'AB2020' AS TEXT)),
+      (CAST(X'AB21' AS TEXT));
+    SELECT count(*)
+    FROM t_idx_rtrim_invalid
+    WHERE x = CAST(X'AB20' AS TEXT);
+    SELECT hex(x)
+    FROM t_idx_rtrim_invalid
+    WHERE x >= CAST(X'AB20' AS TEXT)
+    ORDER BY x COLLATE RTRIM, hex(x);
+}
+expect {
+    2
+    AB20
+    AB2020
+    AB21
+}
+
+@cross-check-integrity
+test collate-invalid-bytes-distinct-binary {
+    CREATE TABLE t_distinct_group_invalid(x);
+    INSERT INTO t_distinct_group_invalid VALUES
+      ('A'),
+      (CAST(X'80' AS TEXT)),
+      (CAST(X'80' AS TEXT)),
+      (CAST(X'81' AS TEXT));
+    SELECT hex(x) FROM (SELECT DISTINCT x FROM t_distinct_group_invalid) ORDER BY x;
+}
+expect {
+    41
+    80
+    81
+}
+
+@cross-check-integrity
+test collate-invalid-bytes-group-by-binary {
+    CREATE TABLE t_distinct_group_invalid_2(x);
+    INSERT INTO t_distinct_group_invalid_2 VALUES
+      ('A'),
+      (CAST(X'80' AS TEXT)),
+      (CAST(X'80' AS TEXT)),
+      (CAST(X'81' AS TEXT));
+    SELECT hex(x), count(*) FROM t_distinct_group_invalid_2 GROUP BY x ORDER BY x;
+}
+expect {
+    41|1
+    80|2
+    81|1
+}
+
+@cross-check-integrity
+test collate-invalid-bytes-distinct-group-by-nocase {
+    CREATE TABLE t_distinct_group_nocase_invalid(x);
+    INSERT INTO t_distinct_group_nocase_invalid VALUES
+      (CAST(X'8041' AS TEXT)),
+      (CAST(X'8061' AS TEXT)),
+      (CAST(X'8042' AS TEXT)),
+      (CAST(X'7A' AS TEXT));
+    SELECT count(*) FROM (SELECT DISTINCT x COLLATE NOCASE FROM t_distinct_group_nocase_invalid);
+    SELECT min(c), max(c), count(*)
+    FROM (
+        SELECT count(*) AS c
+        FROM t_distinct_group_nocase_invalid
+        GROUP BY x COLLATE NOCASE
+    );
+}
+expect {
+    3
+    1|2|3
+}
+
+@cross-check-integrity
+test collate-invalid-bytes-join-binary {
+    CREATE TABLE t_join_left_invalid(x);
+    CREATE TABLE t_join_right_invalid(x);
+    INSERT INTO t_join_left_invalid VALUES
+      (CAST(X'80' AS TEXT)),
+      (CAST(X'81' AS TEXT)),
+      (CAST(X'8041' AS TEXT));
+    INSERT INTO t_join_right_invalid VALUES
+      (CAST(X'81' AS TEXT)),
+      (CAST(X'80' AS TEXT)),
+      (CAST(X'8061' AS TEXT));
+    SELECT hex(l.x), hex(r.x)
+    FROM t_join_left_invalid l
+    JOIN t_join_right_invalid r ON l.x = r.x
+    ORDER BY l.x, r.x;
+}
+expect {
+    80|80
+    81|81
+}
+
+@cross-check-integrity
+test collate-invalid-bytes-join-nocase {
+    CREATE TABLE t_join_left_invalid_2(x);
+    CREATE TABLE t_join_right_invalid_2(x);
+    INSERT INTO t_join_left_invalid_2 VALUES
+      (CAST(X'80' AS TEXT)),
+      (CAST(X'81' AS TEXT)),
+      (CAST(X'8041' AS TEXT));
+    INSERT INTO t_join_right_invalid_2 VALUES
+      (CAST(X'81' AS TEXT)),
+      (CAST(X'80' AS TEXT)),
+      (CAST(X'8061' AS TEXT));
+    SELECT hex(l.x), hex(r.x)
+    FROM t_join_left_invalid_2 l
+    JOIN t_join_right_invalid_2 r ON l.x COLLATE NOCASE = r.x
+    ORDER BY l.x COLLATE NOCASE, r.x COLLATE NOCASE, hex(l.x), hex(r.x);
+}
+expect {
+    80|80
+    8041|8061
+    81|81
+}
+
+@cross-check-integrity
+test collate-invalid-bytes-join-nocase-cross-product {
+    CREATE TABLE t_join_left_invalid_3(x);
+    CREATE TABLE t_join_right_invalid_3(x);
+    INSERT INTO t_join_left_invalid_3 VALUES
+      (CAST(X'8041' AS TEXT)),
+      (CAST(X'8061' AS TEXT)),
+      (CAST(X'8042' AS TEXT));
+    INSERT INTO t_join_right_invalid_3 VALUES
+      (CAST(X'8041' AS TEXT)),
+      (CAST(X'8061' AS TEXT)),
+      (CAST(X'8042' AS TEXT));
+    SELECT count(*)
+    FROM t_join_left_invalid_3 l
+    JOIN t_join_right_invalid_3 r ON l.x COLLATE NOCASE = r.x;
+    SELECT hex(l.x), hex(r.x)
+    FROM t_join_left_invalid_3 l
+    JOIN t_join_right_invalid_3 r ON l.x COLLATE NOCASE = r.x
+    ORDER BY l.x COLLATE NOCASE, r.x COLLATE NOCASE, hex(l.x), hex(r.x);
+}
+expect {
+    5
+    8041|8041
+    8041|8061
+    8061|8041
+    8061|8061
+    8042|8042
+}
+
+test collate-embedded-nul-boundaries {
+    SELECT ('A'||char(0)||'B') = ('A'||char(0)||'C') COLLATE NOCASE,
+           ('A'||char(0)||'B') = ('A'||char(0)||'C') COLLATE BINARY,
+           ('A'||char(0)||'B') < ('A'||char(0)||'C') COLLATE BINARY;
+    SELECT ('A'||char(0)||'B') > 'A' COLLATE NOCASE,
+           ('A'||char(0)||'B') = 'A' COLLATE NOCASE;
+    SELECT ('A'||char(0)||'B ') = ('A'||char(0)||'B  ') COLLATE RTRIM,
+           ('A'||char(0)||'B ') = ('A'||char(0)||'B  ') COLLATE BINARY;
+}
+expect {
+    1|0|1
+    1|0
+    1|0
+}
+
+@cross-check-integrity
+test collate-embedded-nul-order-by-boundaries {
+    CREATE TABLE t_nul_order_boundaries(x);
+    INSERT INTO t_nul_order_boundaries VALUES
+      ('A'||char(0)||'C'),
+      ('A'||char(0)||'B'),
+      ('A '),
+      ('A');
+    SELECT hex(x) FROM t_nul_order_boundaries ORDER BY x COLLATE BINARY;
+    SELECT hex(x) FROM t_nul_order_boundaries ORDER BY x COLLATE RTRIM, hex(x);
+}
+expect {
+    41
+    410042
+    410043
+    4120
+    41
+    4120
+    410042
+    410043
+}
+
+@cross-check-integrity
+test collate-embedded-nul-order-by-nocase {
+    CREATE TABLE t_nul_nocase_order(x);
+    INSERT INTO t_nul_nocase_order VALUES
+      ('A'||char(0)||'b'),
+      ('a'||char(0)||'B'),
+      ('A'||char(0)||'C');
+    SELECT hex(x) FROM t_nul_nocase_order ORDER BY x COLLATE NOCASE, hex(x);
+}
+expect {
+    410043
+    410062
+    610042
+}
+
+@cross-check-integrity
+test collate-embedded-nul-distinct-group-by-nocase {
+    CREATE TABLE t_nul_group(x);
+    INSERT INTO t_nul_group VALUES
+      ('A'||char(0)||'B'),
+      ('a'||char(0)||'C'),
+      ('A'||char(0)||'D');
+    SELECT count(*) FROM (SELECT DISTINCT x COLLATE NOCASE FROM t_nul_group);
+    SELECT min(c), max(c), count(*)
+    FROM (
+        SELECT count(*) AS c
+        FROM t_nul_group
+        GROUP BY x COLLATE NOCASE
+    );
+}
+expect {
+    1
+    3|3|1
+}

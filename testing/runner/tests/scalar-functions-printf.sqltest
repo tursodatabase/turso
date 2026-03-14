@@ -1374,3 +1374,45 @@ test printf-blob-s-nul {
 expect {
     1
 }
+
+test printf-blob-invalid-utf8-preserves-bytes {
+    SELECT hex(printf('%s', x'AB'));
+}
+expect {
+    AB
+}
+
+test printf-blob-invalid-utf8-preserves-bytes-type {
+    SELECT typeof(printf('%s', x'AB'));
+}
+expect {
+    text
+}
+
+test printf-blob-invalid-utf8-with-prefix {
+    SELECT hex(printf('x%s', x'AB'));
+}
+expect {
+    78AB
+}
+
+test printf-blob-invalid-utf8-with-prefix-type {
+    SELECT typeof(printf('x%s', x'AB'));
+}
+expect {
+    text
+}
+
+test printf-text-s-truncates-at-first-nul {
+    SELECT hex(printf('%s', 'A'||char(0)||'B'));
+}
+expect {
+    41
+}
+
+test printf-string-precision-is-byte-based-invalid-utf8 {
+    SELECT hex(printf('%.1s', char(233)));
+}
+expect {
+    C3
+}

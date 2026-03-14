@@ -328,6 +328,20 @@ expect {
     hello
 }
 
+test replace-blob-invalid-bytes-preserves-bytes {
+    select hex(replace(x'010203040503', x'03', x'ff'));
+}
+expect {
+    0102FF0405FF
+}
+
+test replace-blob-invalid-bytes-type {
+    select typeof(replace(x'010203040503', x'03', x'ff'));
+}
+expect {
+    text
+}
+
 test hex {
     select hex('limbo')
 }

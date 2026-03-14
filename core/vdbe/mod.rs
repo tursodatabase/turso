@@ -2147,7 +2147,7 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
     #[inline(always)]
     fn nth_into_register(&mut self, n: usize, dest: &mut Register) -> Option<Result<()>> {
         use crate::storage::sqlite3_ondisk::read_varint;
-        use crate::types::{get_serial_type_size, Extendable, Text};
+        use crate::types::{get_serial_type_size, Extendable, Text, TextSubtype};
 
         let mut header = self.header_section_ref();
         let mut data = self.data_section_ref();
@@ -2325,25 +2325,22 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                 }
                 self.set_data_section(&data[content_size..]);
                 let text_data = &data[..content_size];
-                // SAFETY: TEXT serial type contains valid UTF-8
-                let text_str = if cfg!(debug_assertions) {
-                    match std::str::from_utf8(text_data) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            return Some(Err(LimboError::InternalError(format!(
-                                "Invalid UTF-8 in TEXT serial type: {e}"
-                            ))));
-                        }
-                    }
-                } else {
-                    unsafe { std::str::from_utf8_unchecked(text_data) }
-                };
                 match dest {
                     Register::Value(Value::Text(existing_text)) => {
-                        existing_text.do_extend(&text_str);
+                        if let Ok(text_str) = std::str::from_utf8(text_data) {
+                            existing_text.do_extend(&text_str);
+                        } else {
+                            *existing_text = Text::from_bytes_with_subtype(
+                                text_data.to_vec(),
+                                TextSubtype::Text,
+                            );
+                        }
                     }
                     _ => {
-                        *dest = Register::Value(Value::Text(Text::new(text_str.to_string())));
+                        *dest = Register::Value(Value::Text(Text::from_bytes_with_subtype(
+                            text_data.to_vec(),
+                            TextSubtype::Text,
+                        )));
                     }
                 }
             }

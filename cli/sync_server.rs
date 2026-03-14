@@ -638,6 +638,7 @@ fn convert_value_to_core(value: &Value) -> CoreValue {
         Value::Float { value } => CoreValue::from_f64(*value),
         Value::Text { value } => CoreValue::Text(turso_core::types::Text {
             value: std::borrow::Cow::Owned(value.clone()),
+            raw_bytes: None,
             subtype: turso_core::types::TextSubtype::Text,
         }),
         Value::Blob { value } => CoreValue::Blob(value.to_vec()),

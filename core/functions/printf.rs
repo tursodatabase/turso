@@ -196,6 +196,26 @@ fn coerce_to_string(value: &Value) -> String {
     }
 }
 
+fn coerce_printf_string_bytes(value: &Value) -> Vec<u8> {
+    match value {
+        Value::Null => Vec::new(),
+        Value::Numeric(Numeric::Integer(i)) => i.to_string().into_bytes(),
+        Value::Numeric(Numeric::Float(f)) => format_float(f64::from(*f)).into_bytes(),
+        Value::Text(t) => {
+            let bytes = t.as_bytes();
+            let end = bytes
+                .iter()
+                .position(|&byte| byte == 0)
+                .unwrap_or(bytes.len());
+            bytes[..end].to_vec()
+        }
+        Value::Blob(b) => {
+            let end = b.iter().position(|&byte| byte == 0).unwrap_or(b.len());
+            b[..end].to_vec()
+        }
+    }
+}
+
 // ── Formatting helpers ──────────────────────────────────────────
 
 /// Insert comma separators into a digit string (e.g. "1234567" → "1,234,567").
@@ -1042,32 +1062,42 @@ fn format_general_inner(output: &mut String, f: f64, spec: &FormatSpec, uppercas
     apply_width(output, prefix, &content, spec.width, &spec.flags, false);
 }
 
-fn format_string(output: &mut String, value: &Value, spec: &FormatSpec) {
-    // For blobs, truncate at first NUL byte (SQLite behavior)
-    let s = match value {
-        Value::Blob(b) => {
-            let end = b.iter().position(|&byte| byte == 0).unwrap_or(b.len());
-            String::from_utf8_lossy(&b[..end]).to_string()
-        }
-        _ => coerce_to_string(value),
-    };
-    let truncated = if let Some(prec) = spec.precision {
-        // Truncate by character count (not bytes). SQLite uses bytes by default
-        // and chars with !, but since blobs are already lossy-converted to UTF-8,
-        // character-based truncation avoids mid-char splits.
-        if let Some((byte_idx, _)) = s.char_indices().nth(prec) {
-            &s[..byte_idx]
-        } else {
-            &s
-        }
-    } else {
-        &s
-    };
+fn truncate_bytes_to_precision(bytes: &[u8], precision: Option<usize>) -> Vec<u8> {
+    precision
+        .map(|precision| bytes[..bytes.len().min(precision)].to_vec())
+        .unwrap_or_else(|| bytes.to_vec())
+}
 
-    // Zero-pad flag is ignored for string specifiers
+fn apply_width_bytes(
+    output: &mut Vec<u8>,
+    content: &[u8],
+    width: Option<usize>,
+    flags: &FormatFlags,
+) {
+    let width = width.unwrap_or(0);
+    if width <= content.len() {
+        output.extend_from_slice(content);
+        return;
+    }
+
+    let pad_len = width - content.len();
+    if flags.left_justify {
+        output.extend_from_slice(content);
+        output.extend(repeat_n(b' ', pad_len));
+    } else {
+        output.extend(repeat_n(b' ', pad_len));
+        output.extend_from_slice(content);
+    }
+}
+
+fn format_string(output: &mut Vec<u8>, value: &Value, spec: &FormatSpec) {
+    let s = coerce_printf_string_bytes(value);
+    let truncated = truncate_bytes_to_precision(&s, spec.precision);
+
+    // Zero-pad flag is ignored for string specifiers.
     let mut flags = spec.flags.clone();
     flags.zero_pad = false;
-    apply_width(output, "", truncated, spec.width, &flags, false);
+    apply_width_bytes(output, &truncated, spec.width, &flags);
 }
 
 fn format_char(output: &mut String, value: &Value, spec: &FormatSpec) {
@@ -1271,7 +1301,7 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
         }
     };
 
-    let mut result = String::new();
+    let mut result = Vec::new();
     let mut args_index = 1;
     let mut chars = format_str.chars().peekable();
     // Track whether any output or specifier processing happened. SQLite's
@@ -1284,7 +1314,8 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
     while let Some(c) = chars.next() {
         if c != '%' {
             touched = true;
-            result.push(c);
+            let mut buf = [0u8; 4];
+            result.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
             continue;
         }
 
@@ -1292,13 +1323,13 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
         if chars.peek() == Some(&'%') {
             touched = true;
             chars.next();
-            result.push('%');
+            result.push(b'%');
             continue;
         }
 
         // Trailing '%' at end of format string is preserved
         if chars.peek().is_none() {
-            result.push('%');
+            result.push(b'%');
             break;
         }
 
@@ -1320,25 +1351,26 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
             &null_val
         };
 
+        let mut formatted = String::new();
         match spec.spec_type {
-            'd' | 'i' => format_signed_int(&mut result, arg, &spec),
-            'u' => format_unsigned_int(&mut result, arg, &spec),
-            'f' => format_float_decimal(&mut result, arg, &spec),
-            'e' => format_exponential(&mut result, arg, &spec, false),
-            'E' => format_exponential(&mut result, arg, &spec, true),
-            'g' => format_general(&mut result, arg, &spec, false),
-            'G' => format_general(&mut result, arg, &spec, true),
-            'x' => format_hex(&mut result, arg, &spec, false),
-            'X' => format_hex(&mut result, arg, &spec, true),
-            'o' => format_octal(&mut result, arg, &spec),
-            'p' => format_hex(&mut result, arg, &spec, true),
+            'd' | 'i' => format_signed_int(&mut formatted, arg, &spec),
+            'u' => format_unsigned_int(&mut formatted, arg, &spec),
+            'f' => format_float_decimal(&mut formatted, arg, &spec),
+            'e' => format_exponential(&mut formatted, arg, &spec, false),
+            'E' => format_exponential(&mut formatted, arg, &spec, true),
+            'g' => format_general(&mut formatted, arg, &spec, false),
+            'G' => format_general(&mut formatted, arg, &spec, true),
+            'x' => format_hex(&mut formatted, arg, &spec, false),
+            'X' => format_hex(&mut formatted, arg, &spec, true),
+            'o' => format_octal(&mut formatted, arg, &spec),
+            'p' => format_hex(&mut formatted, arg, &spec, true),
             's' | 'z' => format_string(&mut result, arg, &spec),
-            'c' => format_char(&mut result, arg, &spec),
-            'q' => format_sql_quote(&mut result, arg, &spec),
-            'Q' => format_sql_quote_wrap(&mut result, arg, &spec),
-            'w' => format_sql_identifier(&mut result, arg, &spec),
-            'r' => format_ordinal(&mut result, arg, &spec),
-            'n' => { /* silently ignored, no arg consumed */ }
+            'c' => format_char(&mut formatted, arg, &spec),
+            'q' => format_sql_quote(&mut formatted, arg, &spec),
+            'Q' => format_sql_quote_wrap(&mut formatted, arg, &spec),
+            'w' => format_sql_identifier(&mut formatted, arg, &spec),
+            'r' => format_ordinal(&mut formatted, arg, &spec),
+            'n' => {}
             _ => {
                 // Unknown specifier: return NULL if nothing was processed
                 // before this point, otherwise return accumulated text.
@@ -1350,10 +1382,14 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 break;
             }
         }
+
+        if !formatted.is_empty() {
+            result.extend_from_slice(formatted.as_bytes());
+        }
         touched = true;
     }
 
-    Ok(Value::build_text(result))
+    Ok(Value::build_text_from_bytes(result))
 }
 
 #[cfg(test)]
@@ -1898,6 +1934,35 @@ mod tests {
             exec_printf(&[text("%s"), blob_hello]).unwrap(),
             *text("Hello").get_value()
         );
+    }
+
+    #[test]
+    fn test_text_nul_truncation() {
+        let text_val = Register::Value(Value::build_text("A\0B"));
+        let result = exec_printf(&[text("%s"), text_val]).unwrap();
+        assert_eq!(result.exec_hex(), Value::build_text("41"));
+    }
+
+    #[test]
+    fn test_string_precision_is_byte_based() {
+        let result = exec_printf(&[text("%.1s"), text("\u{00E9}")]).unwrap();
+        assert_eq!(result.exec_hex(), Value::build_text("C3"));
+    }
+
+    #[test]
+    fn test_blob_invalid_utf8_preserves_raw_bytes() {
+        let blob_val = Register::Value(Value::Blob(vec![0xAB]));
+        let result = exec_printf(&[text("%s"), blob_val]).unwrap();
+        assert_eq!(result.exec_typeof(), Value::build_text("text"));
+        assert_eq!(result.exec_hex(), Value::build_text("AB"));
+    }
+
+    #[test]
+    fn test_blob_invalid_utf8_preserved_with_literal_prefix() {
+        let blob_val = Register::Value(Value::Blob(vec![0xAB]));
+        let result = exec_printf(&[text("x%s"), blob_val]).unwrap();
+        assert_eq!(result.exec_typeof(), Value::build_text("text"));
+        assert_eq!(result.exec_hex(), Value::build_text("78AB"));
     }
 
     #[test]

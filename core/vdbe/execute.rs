@@ -300,7 +300,19 @@ fn compare_with_collation(
     match (lhs, rhs) {
         (Value::Text(lhs_text), Value::Text(rhs_text)) => {
             if let Some(coll) = collation {
-                coll.compare_strings(lhs_text.as_str(), rhs_text.as_str())
+                crate::types::compare_text_refs(
+                    crate::types::TextRef {
+                        value: lhs_text.as_str(),
+                        raw_bytes: lhs_text.raw_bytes.as_deref(),
+                        subtype: lhs_text.subtype,
+                    },
+                    crate::types::TextRef {
+                        value: rhs_text.as_str(),
+                        raw_bytes: rhs_text.raw_bytes.as_deref(),
+                        subtype: rhs_text.subtype,
+                    },
+                    coll,
+                )
             } else {
                 lhs.cmp(rhs)
             }
@@ -5242,7 +5254,11 @@ fn update_agg_payload(
             let acc = &mut payload[0];
             if matches!(acc, Value::Null) {
                 // First non-null value: convert to Text
-                *acc = Value::build_text(arg.to_string());
+                *acc = match &arg {
+                    Value::Text(text) => Value::build_text_from_bytes(text.as_bytes().to_vec()),
+                    Value::Blob(blob) => Value::build_text_from_bytes(blob.clone()),
+                    _ => Value::build_text(arg.to_string()),
+                };
             } else {
                 acc.exec_group_concat(&delimiter);
                 acc.exec_group_concat(&arg);

@@ -40,3 +40,31 @@ test concat-blob {
 expect {
     0102
 }
+
+test concat-blob-text-invalid-bytes-left {
+    SELECT hex(x'AB' || 'text');
+}
+expect {
+    AB74657874
+}
+
+test concat-blob-text-invalid-bytes-left-type {
+    SELECT typeof(x'AB' || 'text');
+}
+expect {
+    text
+}
+
+test concat-blob-text-invalid-bytes-right {
+    SELECT hex('text' || x'AB');
+}
+expect {
+    74657874AB
+}
+
+test concat-blob-text-invalid-bytes-right-type {
+    SELECT typeof('text' || x'AB');
+}
+expect {
+    text
+}

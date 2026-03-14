@@ -957,6 +957,18 @@ pub fn validate_serial_type(value: u64) -> Result<()> {
     Ok(())
 }
 
+#[inline(always)]
+fn decode_text_ref(data: &[u8]) -> TextRef<'_> {
+    match std::str::from_utf8(data) {
+        Ok(value) => TextRef::new(value, TextSubtype::Text),
+        Err(_) => {
+            // TextRef is a borrowed view; preserve authoritative bytes in `raw_bytes`.
+            // Callers that need an owned value reconstruct a lossy string in ValueRef::to_owned.
+            TextRef::new_with_raw("", data, TextSubtype::Text)
+        }
+    }
+}
+
 /// Reads a value that might reference the buffer it is reading from. Be sure to store RefValue with the buffer
 /// always.
 #[inline(always)]
@@ -1078,12 +1090,7 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                     content_size
                 ))
             })?;
-            // SAFETY: SerialTypeKind is Text so this buffer is a valid string
-            let val = unsafe { std::str::from_utf8_unchecked(data) };
-            Ok((
-                ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
-                content_size,
-            ))
+            Ok((ValueRef::Text(decode_text_ref(data)), content_size))
         }
     }
 }
@@ -1206,12 +1213,7 @@ pub fn read_value_serial_type<'a>(
                         content_size
                     ))
                 })?;
-                // SAFETY: SerialTypeKind is Text so this buffer is a valid string
-                let val = unsafe { std::str::from_utf8_unchecked(data) };
-                Ok((
-                    ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
-                    content_size,
-                ))
+                Ok((ValueRef::Text(decode_text_ref(data)), content_size))
             }
             _ => unreachable!(),
         },
@@ -2058,6 +2060,7 @@ mod tests {
     #[case(&[1, 2, 3], SerialType::blob(3), Value::Blob(vec![1, 2, 3]))]
     #[case(&[], SerialType::blob(0), Value::Blob(vec![]))] // empty blob
     #[case(&[65, 66, 67], SerialType::text(3), Value::build_text("ABC"))]
+    #[case(&[0xAB], SerialType::text(1), Value::build_text_from_bytes(vec![0xAB]))]
     #[case(&[0x80], SerialType::i8(), Value::from_i64(-128))]
     #[case(&[0x80, 0], SerialType::i16(), Value::from_i64(-32768))]
     #[case(&[0x80, 0, 0], SerialType::i24(), Value::from_i64(-8388608))]
@@ -2077,6 +2080,13 @@ mod tests {
     ) {
         let result = read_value(buf, serial_type).unwrap();
         assert_eq!(result.0.to_owned(), expected);
+    }
+
+    #[test]
+    fn test_read_value_serial_type_invalid_utf8_text() {
+        let (value, consumed) = read_value_serial_type(&[0xAB], 15).unwrap();
+        assert_eq!(consumed, 1);
+        assert_eq!(value.to_owned(), Value::build_text_from_bytes(vec![0xAB]));
     }
 
     #[test]

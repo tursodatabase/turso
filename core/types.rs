@@ -69,6 +69,7 @@ pub enum TextSubtype {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Text {
     pub value: Cow<'static, str>,
+    pub raw_bytes: Option<Cow<'static, [u8]>>,
     pub subtype: TextSubtype,
 }
 
@@ -82,13 +83,39 @@ impl Text {
     pub fn new(value: impl Into<Cow<'static, str>>) -> Self {
         Self {
             value: value.into(),
+            raw_bytes: None,
             subtype: TextSubtype::Text,
         }
     }
+
+    pub fn from_bytes_with_subtype(bytes: Vec<u8>, subtype: TextSubtype) -> Self {
+        match String::from_utf8(bytes) {
+            Ok(value) => Self {
+                value: value.into(),
+                raw_bytes: None,
+                subtype,
+            },
+            Err(err) => {
+                let bytes = err.into_bytes();
+                let value = String::from_utf8_lossy(&bytes).into_owned();
+                Self {
+                    value: value.into(),
+                    raw_bytes: Some(bytes.into()),
+                    subtype,
+                }
+            }
+        }
+    }
+
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self::from_bytes_with_subtype(bytes, TextSubtype::Text)
+    }
+
     #[cfg(feature = "json")]
     pub fn json(value: String) -> Self {
         Self {
             value: value.into(),
+            raw_bytes: None,
             subtype: TextSubtype::Json,
         }
     }
@@ -96,22 +123,46 @@ impl Text {
     pub fn as_str(&self) -> &str {
         &self.value
     }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        self.raw_bytes
+            .as_deref()
+            .unwrap_or_else(|| self.value.as_bytes())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct TextRef<'a> {
     pub value: &'a str,
+    pub raw_bytes: Option<&'a [u8]>,
     pub subtype: TextSubtype,
 }
 
 impl<'a> TextRef<'a> {
     pub fn new(value: &'a str, subtype: TextSubtype) -> Self {
-        Self { value, subtype }
+        Self {
+            value,
+            raw_bytes: None,
+            subtype,
+        }
+    }
+
+    pub fn new_with_raw(value: &'a str, raw_bytes: &'a [u8], subtype: TextSubtype) -> Self {
+        Self {
+            value,
+            raw_bytes: Some(raw_bytes),
+            subtype,
+        }
     }
 
     #[inline]
     pub fn as_str(&self) -> &'a str {
         self.value
+    }
+
+    #[inline]
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.raw_bytes.unwrap_or(self.value.as_bytes())
     }
 }
 
@@ -161,6 +212,7 @@ impl<T: AnyText> Extendable<T> for Text {
                 self.value = Cow::Owned(other_str.to_owned());
             }
         }
+        self.raw_bytes = None;
         self.subtype = other.subtype();
     }
 }
@@ -230,6 +282,7 @@ impl From<&str> for Text {
     fn from(value: &str) -> Self {
         Text {
             value: value.to_owned().into(),
+            raw_bytes: None,
             subtype: TextSubtype::Text,
         }
     }
@@ -239,6 +292,7 @@ impl From<String> for Text {
     fn from(value: String) -> Self {
         Text {
             value: Cow::from(value),
+            raw_bytes: None,
             subtype: TextSubtype::Text,
         }
     }
@@ -362,6 +416,7 @@ impl Value {
             Value::Numeric(n) => ValueRef::Numeric(*n),
             Value::Text(v) => ValueRef::Text(TextRef {
                 value: &v.value,
+                raw_bytes: v.raw_bytes.as_deref(),
                 subtype: v.subtype,
             }),
             Value::Blob(v) => ValueRef::Blob(v.as_slice()),
@@ -371,6 +426,10 @@ impl Value {
     // A helper function that makes building a text Value easier.
     pub fn build_text(text: impl Into<Cow<'static, str>>) -> Self {
         Self::Text(Text::new(text))
+    }
+
+    pub fn build_text_from_bytes(bytes: Vec<u8>) -> Self {
+        Self::Text(Text::from_bytes(bytes))
     }
 
     pub fn to_blob(&self) -> Option<&[u8]> {
@@ -458,7 +517,7 @@ impl Value {
                 let fval: f64 = (*f).into();
                 out.extend_from_slice(&fval.to_be_bytes());
             }
-            Value::Text(t) => out.extend_from_slice(t.value.as_bytes()),
+            Value::Text(t) => out.extend_from_slice(t.as_bytes()),
             Value::Blob(b) => out.extend_from_slice(b),
         };
     }
@@ -811,26 +870,32 @@ impl std::ops::AddAssign for Value {
                 *self = sum.into();
             }
             (Self::Text(string_left), Self::Text(string_right)) => {
-                string_left.value.to_mut().push_str(&string_right.value);
-                string_left.subtype = TextSubtype::Text;
+                let mut bytes = Vec::with_capacity(
+                    string_left.as_bytes().len() + string_right.as_bytes().len(),
+                );
+                bytes.extend_from_slice(string_left.as_bytes());
+                bytes.extend_from_slice(string_right.as_bytes());
+                *string_left = Text::from_bytes_with_subtype(bytes, TextSubtype::Text);
             }
             (Self::Text(string_left), Self::Numeric(Numeric::Integer(int_right))) => {
-                let string_right = int_right.to_string();
-                string_left.value.to_mut().push_str(&string_right);
-                string_left.subtype = TextSubtype::Text;
+                let mut bytes = string_left.as_bytes().to_vec();
+                bytes.extend_from_slice(int_right.to_string().as_bytes());
+                *string_left = Text::from_bytes_with_subtype(bytes, TextSubtype::Text);
             }
             (Self::Numeric(Numeric::Integer(int_left)), Self::Text(string_right)) => {
-                let string_left = int_left.to_string();
-                *self = Self::build_text(string_left + string_right.as_str());
+                let mut bytes = int_left.to_string().into_bytes();
+                bytes.extend_from_slice(string_right.as_bytes());
+                *self = Self::build_text_from_bytes(bytes);
             }
             (Self::Text(string_left), Self::Numeric(Numeric::Float(_))) => {
-                let string_right = rhs.to_string();
-                string_left.value.to_mut().push_str(&string_right);
-                string_left.subtype = TextSubtype::Text;
+                let mut bytes = string_left.as_bytes().to_vec();
+                bytes.extend_from_slice(rhs.to_string().as_bytes());
+                *string_left = Text::from_bytes_with_subtype(bytes, TextSubtype::Text);
             }
             (Self::Numeric(Numeric::Float(_)), Self::Text(string_right)) => {
-                let string_left = self.to_string();
-                *self = Self::build_text(string_left + string_right.as_str());
+                let mut bytes = self.to_string().into_bytes();
+                bytes.extend_from_slice(string_right.as_bytes());
+                *self = Self::build_text_from_bytes(bytes);
             }
             (_, Self::Null) => {}
             (Self::Null, _) => *self = rhs,
@@ -907,7 +972,7 @@ impl<'a> TryFrom<ValueRef<'a>> for &'a str {
     #[inline]
     fn try_from(value: ValueRef<'a>) -> Result<Self, Self::Error> {
         match value {
-            ValueRef::Text(s) => Ok(s.as_str()),
+            ValueRef::Text(s) if s.raw_bytes.is_none() => Ok(s.as_str()),
             _ => Err(LimboError::ConversionError("Expected text value".into())),
         }
     }
@@ -1247,7 +1312,7 @@ impl ImmutableRecord {
                     writer.extend_from_slice(&fval.to_be_bytes());
                 }
                 ValueRef::Text(t) => {
-                    writer.extend_from_slice(t.value.as_bytes());
+                    writer.extend_from_slice(t.as_bytes());
                 }
                 ValueRef::Blob(b) => {
                     writer.extend_from_slice(b);
@@ -1698,7 +1763,12 @@ impl<'a> ValueRef<'a> {
             ValueRef::Null => Value::Null,
             ValueRef::Numeric(n) => Value::from(*n),
             ValueRef::Text(text) => Value::Text(Text {
-                value: text.value.to_string().into(),
+                value: text
+                    .raw_bytes
+                    .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                    .unwrap_or_else(|| text.value.to_string())
+                    .into(),
+                raw_bytes: text.raw_bytes.map(|bytes| bytes.to_vec().into()),
                 subtype: text.subtype,
             }),
             ValueRef::Blob(b) => Value::Blob(b.to_vec()),
@@ -1737,7 +1807,7 @@ impl<'a> PartialEq<ValueRef<'a>> for ValueRef<'a> {
             (Self::Null, Self::Null) => true,
             (Self::Numeric(a), Self::Numeric(b)) => a == b,
             (Self::Text(text_left), Self::Text(text_right)) => {
-                text_left.value.as_bytes() == text_right.value.as_bytes()
+                text_left.as_bytes() == text_right.as_bytes()
             }
             (Self::Blob(blob_left), Self::Blob(blob_right)) => blob_left.eq(blob_right),
             _ => false,
@@ -1774,7 +1844,7 @@ impl<'a> Ord for ValueRef<'a> {
             (_, Self::Numeric(_)) => std::cmp::Ordering::Greater,
 
             (Self::Text(text_left), Self::Text(text_right)) => {
-                text_left.value.as_bytes().cmp(text_right.value.as_bytes())
+                text_left.as_bytes().cmp(text_right.as_bytes())
             }
             (Self::Text(_), Self::Blob(_)) => std::cmp::Ordering::Less,
             (Self::Blob(_), Self::Text(_)) => std::cmp::Ordering::Greater,
@@ -1926,8 +1996,21 @@ where
     let l = l.as_value_ref();
     let r = r.as_value_ref();
     match (l, r) {
-        (ValueRef::Text(left), ValueRef::Text(right)) => collation.compare_strings(&left, &right),
+        (ValueRef::Text(left), ValueRef::Text(right)) => compare_text_refs(left, right, collation),
         _ => l.cmp(&r),
+    }
+}
+
+#[inline]
+pub fn compare_text_refs(
+    lhs: TextRef<'_>,
+    rhs: TextRef<'_>,
+    collation: CollationSeq,
+) -> std::cmp::Ordering {
+    if lhs.raw_bytes.is_some() || rhs.raw_bytes.is_some() {
+        collation.compare_bytes(lhs.as_bytes(), rhs.as_bytes())
+    } else {
+        collation.compare_strings(lhs.as_str(), rhs.as_str())
     }
 }
 
@@ -2190,7 +2273,7 @@ where
     };
 
     let collation = index_info.key_info[0].collation;
-    let comparison = collation.compare_strings(&lhs_text, &rhs_text);
+    let comparison = compare_text_refs(lhs_text, rhs_text, collation);
 
     let final_comparison = match index_info.key_info[0].sort_order {
         SortOrder::Asc => comparison,
@@ -2199,7 +2282,7 @@ where
 
     match final_comparison {
         std::cmp::Ordering::Equal => {
-            let len_cmp = lhs_text.len().cmp(&rhs_text.len());
+            let len_cmp = lhs_text.as_bytes().len().cmp(&rhs_text.as_bytes().len());
             if len_cmp != std::cmp::Ordering::Equal {
                 let adjusted = match index_info.key_info[0].sort_order {
                     SortOrder::Asc => len_cmp,
@@ -2315,9 +2398,11 @@ where
         };
 
         let comparison = match (&lhs_value, rhs_value) {
-            (ValueRef::Text(lhs_text), ValueRef::Text(rhs_text)) => index_info.key_info[field_idx]
-                .collation
-                .compare_strings(lhs_text, rhs_text),
+            (ValueRef::Text(lhs_text), ValueRef::Text(rhs_text)) => compare_text_refs(
+                *lhs_text,
+                *rhs_text,
+                index_info.key_info[field_idx].collation,
+            ),
 
             _ => lhs_value.cmp(rhs_value),
         };
@@ -2524,7 +2609,7 @@ impl<T: AsValueRef> From<T> for SerialType {
                 _ => SerialType::i64(),
             },
             ValueRef::Numeric(Numeric::Float(_)) => SerialType::f64(),
-            ValueRef::Text(t) => SerialType::text(t.value.len() as u64),
+            ValueRef::Text(t) => SerialType::text(t.as_bytes().len() as u64),
             ValueRef::Blob(b) => SerialType::blob(b.len() as u64),
         }
     }
@@ -2622,7 +2707,7 @@ impl Record {
                 Value::Numeric(Numeric::Float(f)) => {
                     buf.extend_from_slice(&f64::from(*f).to_be_bytes())
                 }
-                Value::Text(t) => buf.extend_from_slice(t.value.as_bytes()),
+                Value::Text(t) => buf.extend_from_slice(t.as_bytes()),
                 Value::Blob(b) => buf.extend_from_slice(b),
             };
         }
@@ -3125,7 +3210,7 @@ mod tests {
 
             let cmp = match (&l[i], &r[i]) {
                 (ValueRef::Text(left), ValueRef::Text(right)) => {
-                    collation.compare_strings(left, right)
+                    compare_text_refs(*left, *right, collation)
                 }
                 _ => l[i].partial_cmp(&r[i]).unwrap_or(std::cmp::Ordering::Equal),
             };
@@ -3997,5 +4082,33 @@ mod tests {
                 "column_count should be {num_values}, not {cnt}"
             );
         }
+    }
+
+    #[test]
+    fn test_text_built_from_invalid_bytes_preserves_storage_bytes() {
+        let value = Value::build_text_from_bytes(vec![0xAB, 0xCD]);
+
+        assert_eq!(value.value_type(), ValueType::Text);
+        if let Value::Text(text) = &value {
+            assert_eq!(text.as_bytes(), &[0xAB, 0xCD]);
+        } else {
+            panic!("expected text value");
+        }
+
+        let serial = SerialType::from(&value);
+        assert_eq!(serial.kind(), SerialTypeKind::Text);
+        assert_eq!(serial.size(), 2);
+
+        let mut out = Vec::new();
+        value.serialize_serial(&mut out);
+        assert_eq!(out, vec![0xAB, 0xCD]);
+    }
+
+    #[test]
+    fn test_valueref_to_str_fails_for_invalid_utf8_text() {
+        let raw = [0xAB];
+        let value = ValueRef::Text(TextRef::new_with_raw("", &raw, TextSubtype::Text));
+        let as_str = <&str>::try_from(value);
+        assert!(as_str.is_err());
     }
 }

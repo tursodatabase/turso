@@ -441,4 +441,19 @@ expect {
     �,��
 }
 
+@cross-check-integrity
+test group-concat-blob-invalid-bytes-preserves-bytes {
+    SELECT hex(GROUP_CONCAT(v, '')) FROM (SELECT x'AB' AS v UNION ALL SELECT 'text');
+}
+expect {
+    AB74657874
+}
+
+@cross-check-integrity
+test group-concat-blob-invalid-bytes-type {
+    SELECT typeof(GROUP_CONCAT(v, '')) FROM (SELECT x'AB' AS v UNION ALL SELECT 'text');
+}
+expect {
+    text
+}
 
