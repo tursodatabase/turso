@@ -2733,10 +2733,21 @@ impl HashTable {
 
     /// Initialize grace hash join processing.
     /// Returns the first match, or None if no spilled partitions need processing.
+    ///
+    /// Re-entrant: if grace_state already exists (from a previous call that
+    /// returned IOResult::IO via grace_next), we skip initialization and
+    /// continue from where we left off.
     pub fn grace_init(
         &mut self,
         metrics: Option<&mut HashJoinMetrics>,
     ) -> Result<IOResult<Option<GraceMatch>>> {
+        // Re-entry guard: if we already started grace processing (a prior call
+        // initialized grace_state then returned IO from grace_next), just
+        // continue advancing instead of re-initializing.
+        if self.grace_state.is_some() {
+            return self.grace_next(metrics);
+        }
+
         if self.probe_spill_state.is_none() || self.spill_state.is_none() {
             return Ok(IOResult::Done(None));
         }
