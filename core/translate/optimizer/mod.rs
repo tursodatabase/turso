@@ -447,10 +447,40 @@ pub fn optimize_plan(
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 /// Transform MATCH expressions to fts_match() function calls.
-fn transform_match_to_fts_match(where_clause: &mut [WhereTerm]) {
-    use super::ast::{FunctionTail, LikeOperator, Name};
+fn transform_match_to_fts_match(
+    where_clause: &mut [WhereTerm],
+    schema: &Schema,
+    table_references: &TableReferences,
+) -> Result<()> {
+    use super::ast::{FunctionTail, LikeOperator, Name, TableInternalId};
     use super::expr::{walk_expr_mut, WalkControl};
 
+    // Helper to extract table ID from a column expression
+    fn get_table_id_from_expr(expr: &Expr) -> Option<TableInternalId> {
+        match expr {
+            Expr::Column { table, .. } => Some(*table),
+            Expr::Parenthesized(exprs) if !exprs.is_empty() => get_table_id_from_expr(&exprs[0]),
+            _ => None,
+        }
+    }
+
+    // Helper to check if a table has an FTS index by its internal ID
+    let table_has_fts_index = |table_id: TableInternalId| -> bool {
+        table_references
+            .joined_tables()
+            .iter()
+            .find(|t| t.internal_id == table_id)
+            .and_then(|t| {
+                if let Table::BTree(btree) = &t.table {
+                    Some(schema.has_fts_index(&btree.name))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(false)
+    };
+
+    let mut match_without_fts = false;
     for term in where_clause.iter_mut() {
         let _ = walk_expr_mut(&mut term.expr, &mut |e: &mut Expr| -> Result<WalkControl> {
             match e {
@@ -461,6 +491,17 @@ fn transform_match_to_fts_match(where_clause: &mut [WhereTerm]) {
                     rhs,
                     escape: _,
                 } => {
+                    // Check if the specific table referenced by this MATCH has an FTS index
+                    let has_fts = get_table_id_from_expr(lhs)
+                        .map(table_has_fts_index)
+                        .unwrap_or(false);
+
+                    if !has_fts {
+                        match_without_fts = true;
+                        // Don't transform, we'll error after the walk
+                        return Ok(WalkControl::Continue);
+                    }
+
                     // Transform MATCH to fts_match():
                     // - `col MATCH 'query'` -> `fts_match(col, 'query')`
                     // - `(col1, col2) MATCH 'query'` -> `fts_match(col1, col2, 'query')`
@@ -492,6 +533,14 @@ fn transform_match_to_fts_match(where_clause: &mut [WhereTerm]) {
             }
         });
     }
+
+    if match_without_fts {
+        return Err(LimboError::ParseError(
+            "unable to use function MATCH in the requested context".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 /// Detect whether this plan qualifies for the simple-aggregate fast path.
@@ -573,7 +622,7 @@ struct OptimizeTableAccessResult {
 pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
     // Transform MATCH expressions to fts_match() for FTS optimizer recognition
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-    transform_match_to_fts_match(&mut plan.where_clause);
+    transform_match_to_fts_match(&mut plan.where_clause, schema, &plan.table_references)?;
 
     unnest::unnest_exists_subqueries(plan)?;
     // EXISTS only needs 1 row. Add LIMIT 1 to surviving (non-unnested) EXISTS
@@ -662,7 +711,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
 
 fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-    transform_match_to_fts_match(&mut plan.where_clause);
+    transform_match_to_fts_match(&mut plan.where_clause, schema, &plan.table_references)?;
 
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
@@ -701,7 +750,7 @@ fn optimize_update_plan(
 ) -> Result<()> {
     let schema = resolver.schema();
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-    transform_match_to_fts_match(&mut plan.where_clause);
+    transform_match_to_fts_match(&mut plan.where_clause, schema, &plan.table_references)?;
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?

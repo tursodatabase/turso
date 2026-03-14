@@ -873,3 +873,90 @@ expect {
     leave me|2
     change me|99
 }
+
+# -------------------------------------------------------------------
+# MATCH operator error tests - MATCH on non-FTS tables should error
+# -------------------------------------------------------------------
+
+@backend cli
+test match-operator-non-fts-table-select-error {
+    CREATE TABLE t (a TEXT, b TEXT, c TEXT);
+    INSERT INTO t VALUES ('hello', 'world', 'test');
+    SELECT * FROM t WHERE a MATCH 'hello';
+}
+expect error {
+    Parse error: unable to use function MATCH in the requested context
+}
+
+@backend cli
+test match-operator-non-fts-table-delete-error {
+    CREATE TABLE t (a TEXT, b TEXT);
+    INSERT INTO t VALUES ('hello', 'world');
+    DELETE FROM t WHERE a MATCH 'hello';
+}
+expect error {
+    Parse error: unable to use function MATCH in the requested context
+}
+
+@backend cli
+test match-operator-non-fts-table-update-error {
+    CREATE TABLE t (a TEXT, b TEXT);
+    INSERT INTO t VALUES ('hello', 'world');
+    UPDATE t SET b = 'updated' WHERE a MATCH 'hello';
+}
+expect error {
+    Parse error: unable to use function MATCH in the requested context
+}
+
+@backend cli
+test match-operator-with-fts-index-works {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'hello world');
+    INSERT INTO t VALUES (2, 'goodbye world');
+    SELECT id, x FROM t WHERE x MATCH 'hello';
+}
+expect {
+    1|hello world
+}
+
+@backend cli
+test not-match-operator-non-fts-table-error {
+    CREATE TABLE t (a TEXT, b TEXT);
+    INSERT INTO t VALUES ('hello', 'world');
+    SELECT * FROM t WHERE a NOT MATCH 'hello';
+}
+expect error {
+    Parse error: unable to use function MATCH in the requested context
+}
+
+@backend cli
+test match-operator-multi-table-join-wrong-table-error {
+    -- documents has FTS, users does not
+    CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE documents (id INTEGER PRIMARY KEY, content TEXT);
+    CREATE INDEX docs_fts ON documents USING fts (content);
+    INSERT INTO users VALUES (1, 'alice');
+    INSERT INTO documents VALUES (1, 'hello world');
+    -- MATCH on users.name should error even though documents has FTS
+    SELECT * FROM users, documents WHERE users.name MATCH 'alice';
+}
+expect error {
+    Parse error: unable to use function MATCH in the requested context
+}
+
+@backend cli
+test match-operator-multi-table-join-correct-table-works {
+    -- documents has FTS, users does not
+    CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE documents (id INTEGER PRIMARY KEY, content TEXT);
+    CREATE INDEX docs_fts ON documents USING fts (content);
+    INSERT INTO users VALUES (1, 'alice');
+    INSERT INTO documents VALUES (1, 'hello world');
+    -- MATCH on documents.content should work
+    SELECT users.name, documents.content FROM users, documents WHERE documents.content MATCH 'hello';
+}
+expect {
+    alice|hello world
+}
+
