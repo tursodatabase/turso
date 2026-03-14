@@ -1887,12 +1887,17 @@ impl FtsCursor {
                 Index::open(hybrid_dir.clone())
                     .map_err(|e| LimboError::InternalError(e.to_string()))?
             } else {
-                Index::create(
-                    hybrid_dir.clone(),
-                    self.schema.clone(),
-                    IndexSettings::default(),
-                )
-                .map_err(|e| LimboError::InternalError(e.to_string()))?
+                // On WASM, disable the dedicated compression thread to avoid Atomics.wait errors
+                #[cfg(target_family = "wasm")]
+                let settings = IndexSettings {
+                    docstore_compress_dedicated_thread: false,
+                    ..IndexSettings::default()
+                };
+                #[cfg(not(target_family = "wasm"))]
+                let settings = IndexSettings::default();
+
+                Index::create(hybrid_dir.clone(), self.schema.clone(), settings)
+                    .map_err(|e| LimboError::InternalError(e.to_string()))?
             };
 
             // Register custom tokenizers

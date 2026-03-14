@@ -27,3 +27,4 @@ napi-build = "2.2.3"
 
 [features]
 browser = ["turso_node/browser"]
+wasm-fts = ["turso_core/wasm-fts", "turso_node/wasm-fts"]
