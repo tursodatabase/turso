@@ -484,8 +484,7 @@ pub(super) fn emit_multi_index_scan_loop(
     };
     t_ctx
         .resolver
-        .expr_to_reg_cache
-        .push((Cow::Owned(rowid_expr), rowid_reg, false));
+        .cache_expr_reg(Cow::Owned(rowid_expr), rowid_reg, false, None);
 
     program.preassign_label_to_next_insn(skip_label);
     Ok(())

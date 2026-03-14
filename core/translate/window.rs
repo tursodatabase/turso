@@ -555,11 +555,12 @@ impl EmitWindow {
         let reg_acc_start = program.alloc_registers(window_function_count);
         let reg_acc_result_start = program.alloc_registers(window_function_count);
         for (i, func) in window.functions.iter().enumerate() {
-            t_ctx.resolver.expr_to_reg_cache.push((
+            t_ctx.resolver.cache_expr_reg(
                 std::borrow::Cow::Borrowed(&func.original_expr),
                 reg_acc_result_start + i,
                 false,
-            ));
+                None,
+            );
         }
 
         // The same approach applies to expressions referencing the subquery (columns).
@@ -573,11 +574,12 @@ impl EmitWindow {
         )?;
         let reg_col_start = program.alloc_registers(expressions_referencing_subquery.len());
         for (i, (expr, _)) in expressions_referencing_subquery.iter().enumerate() {
-            t_ctx.resolver.expr_to_reg_cache.push((
+            t_ctx.resolver.cache_scalar_expr_reg(
                 std::borrow::Cow::Borrowed(expr),
                 reg_col_start + i,
                 false,
-            ));
+                &plan.table_references,
+            )?;
         }
 
         t_ctx.meta_window = Some(WindowMetadata {
