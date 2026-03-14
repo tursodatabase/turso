@@ -179,6 +179,36 @@ pub struct ReadArgs {
     pub path: String,
 }
 
+#[derive(Debug, Clone, Args)]
+pub struct ParameterArgs {
+    #[command(subcommand)]
+    pub command: ParameterCommand,
+}
+
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum ParameterCommand {
+    /// Set a parameter value
+    Set(ParameterSetArgs),
+    /// List all stored parameters
+    List,
+    /// Clear one parameter or all parameters
+    Clear(ParameterClearArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ParameterSetArgs {
+    /// Parameter name like :name, @name, $name, ?1
+    pub name: String,
+    /// Parameter value
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ParameterClearArgs {
+    /// Parameter name to clear. If omitted, clears all.
+    pub name: Option<String>,
+}
+
 #[derive(ValueEnum, Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HeadersMode {
     On,
