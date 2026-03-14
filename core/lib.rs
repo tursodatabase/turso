@@ -1255,13 +1255,13 @@ impl Database {
         pager.set_schema_cookie(None);
 
         if open_mv_store {
-            // todo(v): pass required encryption ctx to enable encryption with mvcc
+            let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
             let mv_store = journal_mode::open_mv_store(
                 self.io.clone(),
                 &self.path,
                 self.open_flags,
                 self.durable_storage.clone(),
-                None,
+                enc_ctx,
             )?;
             self.mv_store.store(Some(mv_store));
         }

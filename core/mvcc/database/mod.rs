@@ -2217,41 +2217,38 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 None => {
                     let log_size = self.get_logical_log_file().size()?;
                     let pager = bootstrap_conn.pager.load().clone();
-                    if !pager.is_encryption_enabled() {
-                        if bootstrap_conn.db.is_readonly() {
-                            return Err(LimboError::Corrupt(
-                                "Missing MVCC metadata table in read-only mode".to_string(),
-                            ));
-                        }
-                        if log_size > LOG_HDR_SIZE as u64 {
-                            return Err(LimboError::Corrupt(
-                                "Missing MVCC metadata table while logical log state exists"
-                                    .to_string(),
-                            ));
-                        }
-                        // First-time MVCC bootstrap: ensure a durable logical-log header exists
-                        // before any metadata-table writes can commit into WAL.
-                        // If a previous crash left a torn header tail (0 < size < LOG_HDR_SIZE),
-                        // clear it before rewriting the header.
-                        if log_size > 0 && log_size < LOG_HDR_SIZE as u64 {
-                            let log_file = self.get_logical_log_file();
-                            let c = log_file.truncate(0, Completion::new_trunc(|_| {}))?;
-                            bootstrap_conn.db.io.wait_for_completion(c)?;
-                        }
-                        if log_size <= LOG_HDR_SIZE as u64 {
-                            let pager = bootstrap_conn.pager.load().clone();
-                            let c = self.storage.update_header()?;
-                            pager.io.wait_for_completion(c)?;
-                            if bootstrap_conn.get_sync_mode() != SyncMode::Off {
-                                let c = self.storage.sync(pager.get_sync_type())?;
-                                pager.io.wait_for_completion(c)?;
-                            }
-                        }
-                        self.initialize_mvcc_metadata_table(&bootstrap_conn)?;
-                        // Metadata bootstrap writes land in SQLite WAL first; reconcile immediately so
-                        // subsequent opens (including read-only opens) do not depend on WAL replay.
-                        self.maybe_complete_interrupted_checkpoint(&bootstrap_conn)?;
+                    if bootstrap_conn.db.is_readonly() {
+                        return Err(LimboError::Corrupt(
+                            "Missing MVCC metadata table in read-only mode".to_string(),
+                        ));
                     }
+                    if log_size > LOG_HDR_SIZE as u64 {
+                        return Err(LimboError::Corrupt(
+                            "Missing MVCC metadata table while logical log state exists"
+                                .to_string(),
+                        ));
+                    }
+                    // First-time MVCC bootstrap: ensure a durable logical-log header exists
+                    // before any metadata-table writes can commit into WAL.
+                    // If a previous crash left a torn header tail (0 < size < LOG_HDR_SIZE),
+                    // clear it before rewriting the header.
+                    if log_size > 0 && log_size < LOG_HDR_SIZE as u64 {
+                        let log_file = self.get_logical_log_file();
+                        let c = log_file.truncate(0, Completion::new_trunc(|_| {}))?;
+                        bootstrap_conn.db.io.wait_for_completion(c)?;
+                    }
+                    if log_size <= LOG_HDR_SIZE as u64 {
+                        let c = self.storage.update_header()?;
+                        pager.io.wait_for_completion(c)?;
+                        if bootstrap_conn.get_sync_mode() != SyncMode::Off {
+                            let c = self.storage.sync(pager.get_sync_type())?;
+                            pager.io.wait_for_completion(c)?;
+                        }
+                    }
+                    self.initialize_mvcc_metadata_table(&bootstrap_conn)?;
+                    // Metadata bootstrap writes land in SQLite WAL first; reconcile immediately so
+                    // subsequent opens (including read-only opens) do not depend on WAL replay.
+                    self.maybe_complete_interrupted_checkpoint(&bootstrap_conn)?;
                 }
             }
         }
@@ -4076,6 +4073,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     fn logical_log_header_crc_valid(&self, pager: &Arc<Pager>) -> Result<bool> {
         let file = self.get_logical_log_file();
+        // Header is never encrypted; no need to clone EncryptionContext here.
         let mut reader = StreamingLogicalLogReader::new(file, None);
         match reader.try_read_header(&pager.io)? {
             HeaderReadResult::Valid(_) => Ok(true),
@@ -4102,6 +4100,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         let wal_max_frame = wal.get_max_frame_in_wal();
         let file = self.get_logical_log_file();
+        // This method only reads the header (never encrypted); skip cloning EncryptionContext.
         let mut reader = StreamingLogicalLogReader::new(file, None);
         let header_result = reader.try_read_header(&pager.io)?;
 
@@ -4205,7 +4204,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn maybe_recover_logical_log(&self, connection: Arc<Connection>) -> Result<bool> {
         let pager = connection.pager.load().clone();
         let file = self.get_logical_log_file();
-        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
+        let enc_ctx = self.storage.encryption_ctx();
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), enc_ctx);
         let preserved_table_valued_functions =
             Self::capture_table_valued_functions(&connection.schema.read());
 
@@ -4225,7 +4225,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let persistent_tx_ts_max = if self.uses_durable_mvcc_metadata(&connection) {
             match self.try_read_persistent_tx_ts_max(&connection)? {
                 Some(ts) => ts,
-                None if pager.is_encryption_enabled() => 0,
                 None if header.is_none() => 0,
                 None => {
                     return Err(LimboError::Corrupt(

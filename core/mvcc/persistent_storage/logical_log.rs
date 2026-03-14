@@ -15,6 +15,49 @@
 //! - one fixed-size header (`LOG_HDR_SIZE = 56` bytes), then
 //! - zero or more transaction frames.
 //!
+//! ```text
+//!     ┌─────────────────────────────────────────┐
+//!     │         Log Header (56 bytes)           │
+//!     │  magic(4) | ver(1) | flags(1) | len(2)  │
+//!     │  salt(8) | reserved(36) | crc32c(4)     │
+//!     ├─────────────────────────────────────────┤
+//!     │         TX Frame 0                      │
+//!     ├─────────────────────────────────────────┤
+//!     │         TX Frame 1                      │
+//!     ├─────────────────────────────────────────┤
+//!     │         ...                             │
+//!     └─────────────────────────────────────────┘
+//! ```
+//!
+//! ### Transaction frame (TX Frame)
+//!
+//! ```text
+//!     ┌─────────────────────────────────────────┐
+//!     │       TX Header (24 bytes)              │
+//!     │  frame_magic(4) | payload_size(8)       │
+//!     │  op_count(4) | commit_ts(8)             │
+//!     ├─────────────────────────────────────────┤
+//!     │       Payload (variable)                │
+//!     │                                         │
+//!     │  Unencrypted:                           │
+//!     │    op entries serialized directly       │
+//!     │                                         │
+//!     │  Encrypted:                             │
+//!     │    ciphertext(plain_len + tag_size)     │
+//!     │    nonce(nonce_size)                    │
+//!     ├─────────────────────────────────────────┤
+//!     │       TX Trailer (8 bytes)              │
+//!     │  crc32c(4) | end_magic(4)               │
+//!     └─────────────────────────────────────────┘
+//! ```
+//!
+//! When encryption is enabled, only the payload is encrypted. The log header,
+//! TX header, and TX trailer are always written in plaintext. The log header's salt and TX header
+//! fields (payload_size, op_count, commit_ts) are bound to the ciphertext
+//! as AEAD additional data, so tampering with them will cause decryption to fail.
+//! The CRC in the trailer covers the TX header and the payload as written on disk
+//! (i.e. the ciphertext when encrypted).
+//!
 //! ### Header fields (56 bytes, little-endian)
 //! - `magic: u32` (`LOG_MAGIC`)
 //! - `version: u8` (`LOG_VERSION`)
@@ -24,23 +67,23 @@
 //! - `reserved: [u8; 36]` (must be zero for current format)
 //! - `hdr_crc32c: u32` (CRC32C of the header with this field zeroed)
 //!
-//! ### Transaction frame (LOG_VERSION = 2)
-//!
-//! Header (`TX_HEADER_SIZE = 24`):
+//! ### TX Header (`TX_HEADER_SIZE = 24`)
 //! - `frame_magic: u32` (`FRAME_MAGIC`)
-//! - `payload_size: u64` (total bytes of all op entries)
+//! - `payload_size: u64` (total bytes of all op entries, pre-encryption)
 //! - `op_count: u32`
 //! - `commit_ts: u64`
 //!
-//! Payload:
-//! - `op_count` operation entries:
+//! ### Payload
+//! - When **unencrypted**: `op_count` operation entries serialized directly:
 //!   - `tag: u8` (`OP_*`)
 //!   - `flags: u8` (`OP_FLAG_BTREE_RESIDENT` currently defined)
 //!   - `table_id: i32` (must be negative)
 //!   - `payload_len: sqlite varint`
 //!   - `payload: [u8; payload_len]`
+//! - When **encrypted**: `ciphertext(payload_size + tag_size) | nonce(nonce_size)`
+//!   - AEAD additional data: `salt(8) || payload_size(8) || op_count(4) || commit_ts(8)`
 //!
-//! Trailer (`TX_TRAILER_SIZE = 8`):
+//! ### TX Trailer (`TX_TRAILER_SIZE = 8`)
 //! - `crc32c: u32` (chained CRC32C: `crc32c_append(prev_frame_crc, tx_header || payload)`;
 //!   the first frame uses `crc32c(salt.to_le_bytes())` as its seed)
 //! - `end_magic: u32` (`END_MAGIC`)
@@ -285,7 +328,7 @@ pub struct LogicalLog {
     /// `advance_offset_after_success` so that an abandoned write
     /// doesn't corrupt the chain.
     pending_running_crc: Option<u32>,
-    encryption_ctx: Option<EncryptionContext>,
+    pub(crate) encryption_ctx: Option<EncryptionContext>,
     /// Reusable scratch buffer for ops serialization on the encrypted write path.
     encryption_scratch_buffer: Vec<u8>,
 }
