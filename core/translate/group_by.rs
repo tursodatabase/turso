@@ -695,11 +695,12 @@ pub fn group_by_process_single_group(
             {
                 if *expr_appears_in_result_columns {
                     program.emit_column_or_rowid(*pseudo_cursor, sorter_column_index, next_reg);
-                    t_ctx.resolver.expr_to_reg_cache.push((
+                    t_ctx.resolver.cache_scalar_expr_reg(
                         std::borrow::Cow::Borrowed(expr),
                         next_reg,
                         false,
-                    ));
+                        &plan.table_references,
+                    )?;
                     next_reg += 1;
                 }
             }
@@ -722,11 +723,12 @@ pub fn group_by_process_single_group(
                     dest_reg,
                     &t_ctx.resolver,
                 )?;
-                t_ctx.resolver.expr_to_reg_cache.push((
+                t_ctx.resolver.cache_scalar_expr_reg(
                     std::borrow::Cow::Borrowed(expr),
                     dest_reg,
                     false,
-                ));
+                    &plan.table_references,
+                )?;
             }
         }
     }
@@ -850,11 +852,12 @@ pub fn group_by_emit_row_phase<'a>(
             register: agg_result_reg,
             func: agg.func.clone(),
         });
-        t_ctx.resolver.expr_to_reg_cache.push((
+        t_ctx.resolver.cache_expr_reg(
             std::borrow::Cow::Owned(agg.original_expr.clone()),
             agg_result_reg,
             false,
-        ));
+            None,
+        );
     }
 
     t_ctx.resolver.enable_expr_to_reg_cache();

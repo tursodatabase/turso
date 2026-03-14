@@ -42,11 +42,12 @@ pub fn emit_ungrouped_aggregation<'a>(
     // we need to call translate_expr on each result column, but replace the expr with a register copy in case any part of the
     // result column expression matches a) a group by column or b) an aggregation result.
     for (i, agg) in plan.aggregates.iter().enumerate() {
-        t_ctx.resolver.expr_to_reg_cache.push((
+        t_ctx.resolver.cache_expr_reg(
             std::borrow::Cow::Borrowed(&agg.original_expr),
             agg_start_reg + i,
             false,
-        ));
+            None,
+        );
     }
     t_ctx.resolver.enable_expr_to_reg_cache();
 
@@ -632,6 +633,10 @@ pub fn translate_aggregation_step(
             target_register
         }
     };
+    // Aggregate arguments can carry column or explicit COLLATE metadata for the
+    // aggregate's internal comparator, but that state must not leak to the
+    // surrounding expression that consumes the aggregate result.
+    program.reset_collation();
     Ok(dest)
 }
 

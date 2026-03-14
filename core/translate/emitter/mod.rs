@@ -1,3 +1,4 @@
+use crate::translate::collate::{get_expr_collation_ctx, CollationSeq};
 use crate::translate::emitter::delete::emit_program_for_delete;
 use crate::translate::emitter::select::emit_program_for_select;
 use crate::translate::emitter::update::emit_program_for_update;
@@ -83,16 +84,27 @@ fn init_exists_result_regs(
 // Would make more sense to not have RwLock for the attached databases and get all the schemas on prepare,
 // because there could be some data race where at 1 point you check the attached db, it has a table,
 // but after some write it could not be there anymore. However, leaving it as it is to avoid more complicated logic on something that is experimental
+#[derive(Debug, Clone)]
+pub struct CachedExprReg<'a> {
+    pub expr: Cow<'a, ast::Expr>,
+    pub reg: usize,
+    pub needs_decode: bool,
+    pub collation: CachedExprCollation,
+}
+
+pub type CachedExprCollation = Option<(CollationSeq, bool)>;
+pub type CachedExprRegHit = (usize, bool, CachedExprCollation);
+
 pub struct Resolver<'a> {
     schema: &'a Schema,
     database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
     attached_databases: &'a RwLock<DatabaseCatalog>,
     pub symbol_table: &'a SymbolTable,
     pub expr_to_reg_cache_enabled: bool,
-    /// Cache entries: (expression, register, needs_custom_type_decode).
+    /// Cache entries for previously translated expressions.
     /// The `needs_custom_type_decode` flag is true for hash-join payload registers
     /// that contain raw encoded values and need DECODE applied when read.
-    pub expr_to_reg_cache: Vec<(Cow<'a, ast::Expr>, usize, bool)>,
+    pub expr_to_reg_cache: Vec<CachedExprReg<'a>>,
     /// Maps register indices to column affinities for expression index evaluation.
     /// Populated temporarily during UPDATE new-image expression index key computation,
     /// where column references have been rewritten to Expr::Register and comparison
@@ -201,18 +213,47 @@ impl<'a> Resolver<'a> {
         self.expr_to_reg_cache_enabled = true;
     }
 
-    /// Returns the register and decode flag for a previously translated expression.
+    pub fn cache_expr_reg(
+        &mut self,
+        expr: Cow<'a, ast::Expr>,
+        reg: usize,
+        needs_decode: bool,
+        collation: CachedExprCollation,
+    ) {
+        self.expr_to_reg_cache.push(CachedExprReg {
+            expr,
+            reg,
+            needs_decode,
+            collation,
+        });
+    }
+
+    /// Cache a scalar expression result together with the collation metadata that
+    /// standalone expression translation would have propagated to a parent comparison.
+    pub fn cache_scalar_expr_reg(
+        &mut self,
+        expr: Cow<'a, ast::Expr>,
+        reg: usize,
+        needs_decode: bool,
+        referenced_tables: &TableReferences,
+    ) -> Result<()> {
+        let collation = get_expr_collation_ctx(expr.as_ref(), referenced_tables)?;
+        self.cache_expr_reg(expr, reg, needs_decode, collation);
+        Ok(())
+    }
+
+    /// Returns the register, decode flag, and collation metadata for a previously translated expression.
     ///
     /// We scan from newest to oldest so later translations win when equivalent
     /// expressions are seen multiple times in the same translation pass.
-    /// Returns `(register, needs_custom_type_decode)`.
-    pub fn resolve_cached_expr_reg(&self, expr: &ast::Expr) -> Option<(usize, bool)> {
+    /// Returns `(register, needs_custom_type_decode, collation_ctx)`.
+    pub fn resolve_cached_expr_reg(&self, expr: &ast::Expr) -> Option<CachedExprRegHit> {
         if self.expr_to_reg_cache_enabled {
             self.expr_to_reg_cache
                 .iter()
                 .rev()
-                .find(|(e, _, _)| exprs_are_equivalent(expr, e))
-                .map(|(_, reg, needs_decode)| (*reg, *needs_decode))
+                .find(|entry| exprs_are_equivalent(expr, &entry.expr))
+                .map(|entry| (entry.reg, entry.needs_decode, entry.collation))
         } else {
             None
         }
@@ -1465,49 +1506,51 @@ pub(crate) fn emit_check_constraints<'a>(
 
     let column_mappings: Vec<(&str, usize)> = column_mappings.collect();
     let initial_cache_size = resolver.expr_to_reg_cache.len();
+    let joined_table = referenced_tables.and_then(|tables| tables.joined_tables().first());
 
     // Map rowid aliases to the actual rowid register.
     // We cache both unqualified (Expr::Id) and qualified (Expr::Qualified) forms
     // so that CHECK expressions like `CHECK(rowid > 0)` and `CHECK(t.rowid > 0)` both resolve.
     for rowid_name in ROWID_STRS {
         let rowid_expr = ast::Expr::Id(ast::Name::exact(rowid_name.to_string()));
-        resolver
-            .expr_to_reg_cache
-            .push((Cow::Owned(rowid_expr), rowid_reg, false));
+        resolver.cache_expr_reg(Cow::Owned(rowid_expr), rowid_reg, false, None);
         let qualified_expr = ast::Expr::Qualified(
             ast::Name::exact(table_name.to_string()),
             ast::Name::exact(rowid_name.to_string()),
         );
-        resolver
-            .expr_to_reg_cache
-            .push((Cow::Owned(qualified_expr), rowid_reg, false));
+        resolver.cache_expr_reg(Cow::Owned(qualified_expr), rowid_reg, false, None);
     }
 
     // Map each column to its register (both unqualified and qualified forms).
     for (col_name, register) in column_mappings.iter().copied() {
+        let collation = joined_table
+            .and_then(|table| {
+                table.columns().iter().find(|col| {
+                    col.name
+                        .as_ref()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(col_name))
+                })
+            })
+            .map(|col| (col.collation(), false));
         let column_expr = ast::Expr::Id(ast::Name::exact(col_name.to_string()));
-        resolver
-            .expr_to_reg_cache
-            .push((Cow::Owned(column_expr), register, false));
+        resolver.cache_expr_reg(Cow::Owned(column_expr), register, false, collation);
         let qualified_expr = ast::Expr::Qualified(
             ast::Name::exact(table_name.to_string()),
             ast::Name::exact(col_name.to_string()),
         );
-        resolver
-            .expr_to_reg_cache
-            .push((Cow::Owned(qualified_expr), register, false));
+        resolver.cache_expr_reg(Cow::Owned(qualified_expr), register, false, collation);
     }
 
-    if let Some(joined_table) = referenced_tables.and_then(|tables| tables.joined_tables().first())
-    {
-        resolver.expr_to_reg_cache.push((
+    if let Some(joined_table) = joined_table {
+        resolver.cache_expr_reg(
             Cow::Owned(ast::Expr::RowId {
                 database: None,
                 table: joined_table.internal_id,
             }),
             rowid_reg,
             false,
-        ));
+            None,
+        );
 
         for (col_name, register) in column_mappings.iter().copied() {
             if let Some((idx, col)) = joined_table.columns().iter().enumerate().find(|(_, c)| {
@@ -1515,7 +1558,7 @@ pub(crate) fn emit_check_constraints<'a>(
                     .as_ref()
                     .is_some_and(|n| n.eq_ignore_ascii_case(col_name))
             }) {
-                resolver.expr_to_reg_cache.push((
+                resolver.cache_expr_reg(
                     Cow::Owned(ast::Expr::Column {
                         database: None,
                         table: joined_table.internal_id,
@@ -1524,7 +1567,8 @@ pub(crate) fn emit_check_constraints<'a>(
                     }),
                     register,
                     false,
-                ));
+                    Some((col.collation(), false)),
+                );
             }
         }
     }
