@@ -422,6 +422,8 @@ pub struct HashCtx {
     pub inner_loop_gosub_label: Option<BranchOffset>,
     /// Label that skips past the subroutine body (resolved after Return).
     pub inner_loop_skip_label: Option<BranchOffset>,
+    /// Probe-side rowid register for grace hash join (from RowId before HashProbe).
+    pub probe_rowid_reg: Option<usize>,
 }
 
 /// The TranslateCtx struct holds various information and labels used during bytecode generation.

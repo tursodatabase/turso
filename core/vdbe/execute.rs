@@ -12393,6 +12393,7 @@ pub fn op_hash_probe(
             target_pc,
             payload_dest_reg,
             num_payload,
+            probe_rowid_reg,
         },
         insn
     );
@@ -12402,6 +12403,7 @@ pub fn op_hash_probe(
     let dest_reg = *dest_reg as usize;
     let payload_dest_reg = payload_dest_reg.map(|r| r as usize);
     let num_payload = *num_payload as usize;
+    let probe_rowid_reg = probe_rowid_reg.map(|r| r as usize);
     let (probe_keys, partition_idx) = if let Some(op_state) = state.op_hash_probe_state.take() {
         if op_state.hash_table_id == hash_table_id {
             (op_state.probe_keys, Some(op_state.partition_idx))
@@ -12431,26 +12433,64 @@ pub fn op_hash_probe(
         return Ok(InsnFunctionStepResult::Step);
     };
 
-    // For spilled hash tables, load the appropriate partition on demand
+    // For spilled hash tables, decide between grace buffering and LRU loading
     if hash_table.has_spilled() {
         let partition_idx =
             partition_idx.unwrap_or_else(|| hash_table.partition_for_keys(&probe_keys));
 
-        // Load partition if not already loaded (may require multiple re-entries for multi-chunk partitions)
-        if !hash_table.is_partition_loaded(partition_idx) {
-            match hash_table
-                .load_spilled_partition(partition_idx, Some(&mut state.metrics.hash_join))?
-            {
-                IOResult::Done(()) => {
-                    // Partition loaded or nothing to load
+        // Grace hash join path: buffer probe rows targeting spilled partitions
+        if let Some(rowid_reg) = probe_rowid_reg {
+            if !hash_table.is_partition_loaded(partition_idx) {
+                // Partition is on disk -- buffer this probe row for grace processing
+                let probe_rowid = match state.registers[rowid_reg].get_value() {
+                    Value::Numeric(Numeric::Integer(i)) => *i,
+                    _ => 0,
+                };
+                match hash_table.buffer_probe_row(
+                    probe_keys,
+                    probe_rowid,
+                    Some(&mut state.metrics.hash_join),
+                )? {
+                    IOResult::Done(()) => {}
+                    IOResult::IO(io) => {
+                        state.op_hash_probe_state = Some(OpHashProbeState {
+                            probe_keys: Vec::new(), // keys consumed
+                            hash_table_id,
+                            partition_idx,
+                        });
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
                 }
-                IOResult::IO(io) => {
-                    state.op_hash_probe_state = Some(OpHashProbeState {
-                        probe_keys,
-                        hash_table_id,
-                        partition_idx,
-                    });
-                    return Ok(InsnFunctionStepResult::IO(io));
+                state.metrics.hash_join.grace_probe_rows_streamed = state
+                    .metrics
+                    .hash_join
+                    .grace_probe_rows_streamed
+                    .saturating_sub(0); // not streamed
+                                        // Jump to target_pc -- this row is deferred to grace processing
+                state.pc = target_pc.as_offset_int();
+                return Ok(InsnFunctionStepResult::Step);
+            }
+            // Partition is in memory -- probe immediately (fast path)
+            state.metrics.hash_join.grace_probe_rows_streamed = state
+                .metrics
+                .hash_join
+                .grace_probe_rows_streamed
+                .saturating_add(1);
+        } else {
+            // LRU fallback: load partition if not already loaded
+            if !hash_table.is_partition_loaded(partition_idx) {
+                match hash_table
+                    .load_spilled_partition(partition_idx, Some(&mut state.metrics.hash_join))?
+                {
+                    IOResult::Done(()) => {}
+                    IOResult::IO(io) => {
+                        state.op_hash_probe_state = Some(OpHashProbeState {
+                            probe_keys,
+                            hash_table_id,
+                            partition_idx,
+                        });
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
                 }
             }
         }
@@ -12698,6 +12738,132 @@ fn advance_unmatched_scan(
                 *pc = target_pc;
                 return Ok(InsnFunctionStepResult::Step);
             }
+        }
+    }
+}
+
+pub fn op_hash_grace_init(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        HashGraceInit {
+            hash_table_id,
+            dest_reg,
+            probe_rowid_dest,
+            payload_dest_reg,
+            num_payload,
+            target_pc,
+        },
+        insn
+    );
+    let hash_table_id = *hash_table_id as usize;
+    let dest_reg = *dest_reg as usize;
+    let probe_rowid_dest = *probe_rowid_dest as usize;
+    let payload_dest_reg = payload_dest_reg.map(|r| r as usize);
+    let num_payload = *num_payload as usize;
+
+    let Some(hash_table) = state.hash_tables.get_mut(&hash_table_id) else {
+        state.pc = target_pc.as_offset_int();
+        return Ok(InsnFunctionStepResult::Step);
+    };
+
+    // If no spilling occurred, skip grace processing
+    if !hash_table.has_grace_partitions() {
+        state.pc = target_pc.as_offset_int();
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
+    // Finalize probe spill
+    match hash_table.finalize_probe_spill(Some(&mut state.metrics.hash_join))? {
+        IOResult::Done(()) => {}
+        IOResult::IO(io) => {
+            return Ok(InsnFunctionStepResult::IO(io));
+        }
+    }
+
+    // Initialize grace processing
+    match hash_table.grace_init(Some(&mut state.metrics.hash_join))? {
+        IOResult::Done(Some(m)) => {
+            state.registers[dest_reg].set_int(m.build_rowid);
+            state.registers[probe_rowid_dest].set_int(m.probe_rowid);
+            write_grace_payload_to_registers(
+                &mut state.registers,
+                &m.build_payload,
+                payload_dest_reg,
+                num_payload,
+            );
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        IOResult::Done(None) => {
+            state.pc = target_pc.as_offset_int();
+            Ok(InsnFunctionStepResult::Step)
+        }
+        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
+    }
+}
+
+pub fn op_hash_grace_next(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        HashGraceNext {
+            hash_table_id,
+            dest_reg,
+            probe_rowid_dest,
+            payload_dest_reg,
+            num_payload,
+            target_pc,
+        },
+        insn
+    );
+    let hash_table_id = *hash_table_id as usize;
+    let dest_reg = *dest_reg as usize;
+    let probe_rowid_dest = *probe_rowid_dest as usize;
+    let payload_dest_reg = payload_dest_reg.map(|r| r as usize);
+    let num_payload = *num_payload as usize;
+
+    let hash_table = state.hash_tables.get_mut(&hash_table_id).ok_or_else(|| {
+        LimboError::InternalError(format!("Hash table not found with ID: {hash_table_id}"))
+    })?;
+
+    match hash_table.grace_next(Some(&mut state.metrics.hash_join))? {
+        IOResult::Done(Some(m)) => {
+            state.registers[dest_reg].set_int(m.build_rowid);
+            state.registers[probe_rowid_dest].set_int(m.probe_rowid);
+            write_grace_payload_to_registers(
+                &mut state.registers,
+                &m.build_payload,
+                payload_dest_reg,
+                num_payload,
+            );
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        IOResult::Done(None) => {
+            state.pc = target_pc.as_offset_int();
+            Ok(InsnFunctionStepResult::Step)
+        }
+        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
+    }
+}
+
+/// Write payload values from a grace match to registers.
+fn write_grace_payload_to_registers(
+    registers: &mut [Register],
+    build_payload: &[Value],
+    payload_dest_reg: Option<usize>,
+    num_payload: usize,
+) {
+    if let Some(dest_reg) = payload_dest_reg {
+        for (i, value) in build_payload.iter().take(num_payload).enumerate() {
+            registers[dest_reg + i].set_value(value.clone());
         }
     }
 }

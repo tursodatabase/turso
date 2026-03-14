@@ -2192,7 +2192,7 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        Insn::HashProbe{hash_table_id: hash_table_reg, key_start_reg, num_keys, dest_reg, target_pc, payload_dest_reg, num_payload} => {
+        Insn::HashProbe{hash_table_id: hash_table_reg, key_start_reg, num_keys, dest_reg, target_pc, payload_dest_reg, num_payload, probe_rowid_reg: _} => {
             let payload_info = if let Some(p_reg) = payload_dest_reg {
                 format!(" payload=r[{}]..r[{}]", p_reg, p_reg + num_payload - 1)
             } else {
@@ -2290,6 +2290,38 @@ pub fn insn_to_row(
                 Value::build_text(""),
                 0,
                 format!("hash_table_id={hash_table_id}{payload_info}"),
+            )
+        },
+        Insn::HashGraceInit { hash_table_id, dest_reg, probe_rowid_dest, target_pc, payload_dest_reg, num_payload } => {
+            let payload_info = if let Some(p_reg) = payload_dest_reg {
+                format!(" payload=r[{}]..r[{}]", p_reg, p_reg + num_payload - 1)
+            } else {
+                String::new()
+            };
+            (
+                "HashGraceInit",
+                *hash_table_id as i64,
+                *dest_reg as i64,
+                target_pc.as_debug_int() as i64,
+                Value::build_text(""),
+                0,
+                format!("hash_table_id={hash_table_id} probe_rowid_dest=r[{probe_rowid_dest}]{payload_info}"),
+            )
+        },
+        Insn::HashGraceNext { hash_table_id, dest_reg, probe_rowid_dest, target_pc, payload_dest_reg, num_payload } => {
+            let payload_info = if let Some(p_reg) = payload_dest_reg {
+                format!(" payload=r[{}]..r[{}]", p_reg, p_reg + num_payload - 1)
+            } else {
+                String::new()
+            };
+            (
+                "HashGraceNext",
+                *hash_table_id as i64,
+                *dest_reg as i64,
+                target_pc.as_debug_int() as i64,
+                Value::build_text(""),
+                0,
+                format!("hash_table_id={hash_table_id} probe_rowid_dest=r[{probe_rowid_dest}]{payload_info}"),
             )
         },
         Insn::VacuumInto { dest_path } => (

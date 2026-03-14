@@ -1234,6 +1234,8 @@ impl ProgramBuilder {
                 Insn::HashNextUnmatched { target_pc, .. } => {
                     resolve(target_pc, "HashNextUnmatched")?
                 }
+                Insn::HashGraceInit { target_pc, .. } => resolve(target_pc, "HashGraceInit")?,
+                Insn::HashGraceNext { target_pc, .. } => resolve(target_pc, "HashGraceNext")?,
                 Insn::Program {
                     ignore_jump_target, ..
                 } => resolve(ignore_jump_target, "Program")?,

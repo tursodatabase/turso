@@ -507,6 +507,7 @@ struct ProbeSetupState {
     hash_probe_miss_label: BranchOffset,
     match_found_label: BranchOffset,
     hash_next_label: BranchOffset,
+    probe_rowid_reg: Option<usize>,
 }
 
 /// Hash-join probe setup in `open_loop`.
@@ -681,6 +682,26 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
             self.next
         };
 
+        // For grace hash join: emit RowId for the probe cursor so we can
+        // buffer probe rows when their target partition is on disk.
+        // Only for INNER and LEFT OUTER joins (FULL OUTER deferred to v2).
+        // Disabled for aggregate queries because the grace loop can't replay
+        // the aggregation -- those fall back to LRU-based partition loading.
+        let grace_eligible = matches!(
+            self.hash_join_op.join_type,
+            HashJoinType::Inner | HashJoinType::LeftOuter
+        ) && self.t_ctx.reg_agg_start.is_none();
+        let probe_rowid_reg = if grace_eligible {
+            let reg = self.program.alloc_register();
+            self.program.emit_insn(Insn::RowId {
+                cursor_id: self.probe_cursor_id,
+                dest: reg,
+            });
+            Some(reg)
+        } else {
+            None
+        };
+
         let match_reg = self.program.alloc_register();
         self.program.emit_insn(Insn::HashProbe {
             hash_table_id: to_u16(hash_table_id),
@@ -690,6 +711,7 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
             target_pc: hash_probe_miss_label,
             payload_dest_reg: payload_dest_reg.map(to_u16),
             num_payload: to_u16(num_payload),
+            probe_rowid_reg: probe_rowid_reg.map(to_u16),
         });
 
         let match_found_label = self.program.allocate_label();
@@ -704,6 +726,7 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
             hash_probe_miss_label,
             match_found_label,
             hash_next_label,
+            probe_rowid_reg,
         })
     }
 
@@ -717,6 +740,7 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
             hash_probe_miss_label,
             match_found_label,
             hash_next_label,
+            probe_rowid_reg,
         } = state;
         let build_table = &self.table_references.joined_tables()[self.hash_join_op.build_table_idx];
         let hash_table_id: usize = build_table.internal_id.into();
@@ -745,6 +769,7 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
                 inner_loop_gosub_reg: None,
                 inner_loop_gosub_label: None,
                 inner_loop_skip_label: None,
+                probe_rowid_reg,
             },
         );
 

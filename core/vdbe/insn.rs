@@ -1542,6 +1542,11 @@ pub enum Insn {
         payload_dest_reg: Option<u16>,
         /// Number of payload columns expected
         num_payload: u16,
+        /// Register containing probe-side rowid for grace hash join buffering.
+        /// When Some and target partition is on disk, buffer the probe row
+        /// instead of loading the partition on demand.
+        /// When None, fall back to LRU-based on-demand partition loading.
+        probe_rowid_reg: Option<u16>,
     },
 
     /// Advance to next matching row in hash table bucket.
@@ -1594,6 +1599,34 @@ pub enum Insn {
         target_pc: BranchOffset,
         payload_dest_reg: Option<usize>,
         num_payload: usize,
+    },
+
+    /// Initialize grace hash join processing after the probe cursor is exhausted.
+    /// Finalizes probe-side spills, then loads the first spilled partition pair and
+    /// returns the first match. Writes build rowid to dest_reg, probe rowid to
+    /// probe_rowid_dest, and build payload to payload_dest_reg.
+    /// Jumps to target_pc if no spilling occurred or no matches found.
+    HashGraceInit {
+        hash_table_id: u16,
+        dest_reg: u16,
+        probe_rowid_dest: u16,
+        payload_dest_reg: Option<u16>,
+        num_payload: u16,
+        target_pc: BranchOffset,
+    },
+
+    /// Advance to the next grace hash join match.
+    /// Returns the next match from the current partition pair, or loads the next
+    /// partition pair. Writes build rowid to dest_reg, probe rowid to probe_rowid_dest,
+    /// and build payload to payload_dest_reg.
+    /// Jumps to target_pc when all partitions are processed.
+    HashGraceNext {
+        hash_table_id: u16,
+        dest_reg: u16,
+        probe_rowid_dest: u16,
+        payload_dest_reg: Option<u16>,
+        num_payload: u16,
+        target_pc: BranchOffset,
     },
 
     /// VACUUM INTO - create a compacted copy of the database at the specified path.
@@ -1827,6 +1860,8 @@ impl InsnVariants {
             InsnVariants::HashMarkMatched => execute::op_hash_mark_matched,
             InsnVariants::HashScanUnmatched => execute::op_hash_scan_unmatched,
             InsnVariants::HashNextUnmatched => execute::op_hash_next_unmatched,
+            InsnVariants::HashGraceInit => execute::op_hash_grace_init,
+            InsnVariants::HashGraceNext => execute::op_hash_grace_next,
             InsnVariants::VacuumInto => execute::op_vacuum_into,
             InsnVariants::InitCdcVersion => execute::op_init_cdc_version,
         }

@@ -281,6 +281,24 @@ impl CloseLoop {
                             )?;
                         }
                     }
+
+                    // Grace hash join processing: process spilled partition pairs.
+                    // At runtime, this is a no-op if the build side didn't spill.
+                    if let Some(hash_ctx) = t_ctx
+                        .hash_table_contexts
+                        .get(&hash_join_op.build_table_idx)
+                        .cloned()
+                    {
+                        emit_grace_hash_join_loop(
+                            program,
+                            t_ctx,
+                            hash_join_op,
+                            &hash_ctx,
+                            select_plan,
+                            table_index,
+                            probe_cursor_id,
+                        )?;
+                    }
                 }
                 Operation::MultiIndexScan(_) => {
                     // MultiIndexScan uses RowSetRead for iteration - the next is handled
@@ -416,6 +434,136 @@ impl CloseLoop {
 
 pub(super) struct AutoIndexResult {
     pub(super) use_bloom_filter: bool,
+}
+
+/// Emit the grace hash join processing loop after the probe cursor is exhausted.
+/// At runtime, HashGraceInit/Next are no-ops if the build side didn't spill.
+#[allow(clippy::too_many_arguments)]
+fn emit_grace_hash_join_loop<'a>(
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx<'a>,
+    hash_join_op: &HashJoinOp,
+    hash_ctx: &HashCtx,
+    select_plan: Option<&'a SelectPlan>,
+    _table_index: usize,
+    probe_cursor_id: CursorID,
+) -> Result<()> {
+    // Only emit grace loop for INNER and LEFT OUTER (v1 scope)
+    if !matches!(
+        hash_join_op.join_type,
+        HashJoinType::Inner | HashJoinType::LeftOuter
+    ) {
+        return Ok(());
+    }
+
+    // Need probe_rowid_reg for grace processing
+    let Some(probe_rowid_reg) = hash_ctx.probe_rowid_reg else {
+        return Ok(());
+    };
+
+    // Don't emit grace loop for aggregate queries -- the aggregation happens
+    // in the main loop body and can't be replayed in the grace loop.
+    // These queries fall back to LRU-based partition loading.
+    if let Some(plan) = select_plan {
+        if !plan.aggregates.is_empty() {
+            return Ok(());
+        }
+    }
+
+    let hash_table_reg = hash_ctx.hash_table_reg;
+    let match_reg = hash_ctx.match_reg;
+    let payload_dest_reg = hash_ctx.payload_start_reg;
+    let num_payload = hash_ctx.payload_columns.len();
+
+    let grace_done = program.allocate_label();
+    let grace_next_label = program.allocate_label();
+    let grace_loop = program.allocate_label();
+
+    // HashGraceInit: finalize probe spill + load first partition + return first match
+    program.emit_insn(Insn::HashGraceInit {
+        hash_table_id: to_u16(hash_table_reg),
+        dest_reg: to_u16(match_reg),
+        probe_rowid_dest: to_u16(probe_rowid_reg),
+        payload_dest_reg: payload_dest_reg.map(to_u16),
+        num_payload: to_u16(num_payload),
+        target_pc: grace_done,
+    });
+
+    program.preassign_label_to_next_insn(grace_loop);
+
+    // Re-position probe cursor for this probe row
+    program.emit_insn(Insn::SeekRowid {
+        cursor_id: probe_cursor_id,
+        src_reg: probe_rowid_reg,
+        target_pc: grace_next_label,
+    });
+
+    // Re-position build cursor if needed (when payload doesn't cover all columns)
+    if let Some(build_cursor_id) = hash_ctx.build_cursor_id {
+        program.emit_insn(Insn::SeekRowid {
+            cursor_id: build_cursor_id,
+            src_reg: match_reg,
+            target_pc: grace_next_label,
+        });
+    }
+
+    // Emit result row using the inner-loop Gosub subroutine if available.
+    if let Some(plan) = select_plan {
+        if let Some(gosub_reg) = hash_ctx.inner_loop_gosub_reg {
+            if let Some(gosub_label) = hash_ctx.inner_loop_gosub_label {
+                program.emit_insn(Insn::Gosub {
+                    return_reg: gosub_reg,
+                    target_pc: gosub_label,
+                });
+            }
+        } else if let Some(reg_result_cols_start) = t_ctx.reg_result_cols_start {
+            // For simple joins without a Gosub, emit result columns and ResultRow
+            // directly. The cursors are positioned by SeekRowid and payload
+            // registers are filled by HashGraceInit/Next.
+            // Skip if the query uses aggregates (they can't be re-evaluated here).
+            let has_aggregates = plan.result_columns.iter().any(|rc| rc.contains_aggregates);
+            if !has_aggregates {
+                let num_result_cols = plan.result_columns.len();
+                for (i, rc) in plan.result_columns.iter().enumerate() {
+                    translate_expr(
+                        program,
+                        Some(&plan.table_references),
+                        &rc.expr,
+                        reg_result_cols_start + i,
+                        &t_ctx.resolver,
+                    )?;
+                }
+                program.emit_insn(Insn::ResultRow {
+                    start_reg: reg_result_cols_start,
+                    count: num_result_cols,
+                });
+                // Respect LIMIT: decrement limit counter and jump to grace_done if exhausted
+                if let Some(limit_ctx) = t_ctx.limit_ctx {
+                    program.emit_insn(Insn::DecrJumpZero {
+                        reg: limit_ctx.reg_limit,
+                        target_pc: grace_done,
+                    });
+                }
+            }
+        }
+    }
+
+    // HashGraceNext: advance to next grace match
+    program.resolve_label(grace_next_label, program.offset());
+    program.emit_insn(Insn::HashGraceNext {
+        hash_table_id: to_u16(hash_table_reg),
+        dest_reg: to_u16(match_reg),
+        probe_rowid_dest: to_u16(probe_rowid_reg),
+        payload_dest_reg: payload_dest_reg.map(to_u16),
+        num_payload: to_u16(num_payload),
+        target_pc: grace_done,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: grace_loop,
+    });
+
+    program.preassign_label_to_next_insn(grace_done);
+    Ok(())
 }
 
 pub(super) struct AutoIndexBuild<'a> {
