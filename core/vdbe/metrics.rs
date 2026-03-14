@@ -18,6 +18,14 @@ pub struct HashJoinMetrics {
     // Probe metrics
     pub probe_calls: u64,
     pub probe_partition_switches: u64,
+
+    // Grace hash join metrics
+    pub probe_spill_bytes_written: u64,
+    pub probe_spill_chunks: u64,
+    pub grace_partitions_processed: u64,
+    pub grace_probe_rows_streamed: u64,
+    pub grace_probe_rows_buffered: u64,
+    pub grace_matches: u64,
 }
 
 impl HashJoinMetrics {
@@ -44,6 +52,22 @@ impl HashJoinMetrics {
         self.probe_partition_switches = self
             .probe_partition_switches
             .saturating_add(other.probe_partition_switches);
+        self.probe_spill_bytes_written = self
+            .probe_spill_bytes_written
+            .saturating_add(other.probe_spill_bytes_written);
+        self.probe_spill_chunks = self
+            .probe_spill_chunks
+            .saturating_add(other.probe_spill_chunks);
+        self.grace_partitions_processed = self
+            .grace_partitions_processed
+            .saturating_add(other.grace_partitions_processed);
+        self.grace_probe_rows_streamed = self
+            .grace_probe_rows_streamed
+            .saturating_add(other.grace_probe_rows_streamed);
+        self.grace_probe_rows_buffered = self
+            .grace_probe_rows_buffered
+            .saturating_add(other.grace_probe_rows_buffered);
+        self.grace_matches = self.grace_matches.saturating_add(other.grace_matches);
     }
 
     pub fn reset(&mut self) {
@@ -179,6 +203,32 @@ impl fmt::Display for StatementMetrics {
             "    Partition switches: {}",
             self.hash_join.probe_partition_switches
         )?;
+        writeln!(
+            f,
+            "    Probe spill bytes: {}",
+            self.hash_join.probe_spill_bytes_written
+        )?;
+        writeln!(
+            f,
+            "    Probe spill chunks: {}",
+            self.hash_join.probe_spill_chunks
+        )?;
+        writeln!(
+            f,
+            "    Grace partitions:  {}",
+            self.hash_join.grace_partitions_processed
+        )?;
+        writeln!(
+            f,
+            "    Grace streamed:    {}",
+            self.hash_join.grace_probe_rows_streamed
+        )?;
+        writeln!(
+            f,
+            "    Grace buffered:    {}",
+            self.hash_join.grace_probe_rows_buffered
+        )?;
+        writeln!(f, "    Grace matches:     {}", self.hash_join.grace_matches)?;
         Ok(())
     }
 }
