@@ -1661,7 +1661,6 @@ fn test_vacuum_into_with_strict_table(tmp_db: TempDatabase) -> anyhow::Result<()
         assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
     }
 
-
     let rows: Vec<(i64, String, String, i64)> =
         dest_conn.exec_rows("SELECT id, email, username, score FROM users ORDER BY id");
     assert_eq!(
@@ -1843,4 +1842,3 @@ fn test_vacuum_into_with_multiple_strict_tables(tmp_db: TempDatabase) -> anyhow:
 
     Ok(())
 }
-
