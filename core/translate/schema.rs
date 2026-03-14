@@ -727,7 +727,7 @@ fn validate(body: &ast::CreateTableBody, table_name: &str, resolver: &Resolver) 
                         validate_check_expr(expr, table_name, &column_names, resolver)?;
                     }
                     ast::ColumnConstraint::Generated { .. } => {
-                        bail_parse_error!("GENERATED columns are not supported yet");
+                        // Generated columns are supported - validation is done in core/schema.rs
                     }
                     ast::ColumnConstraint::Default(expr) => {
                         let expr =
@@ -1027,7 +1027,7 @@ pub fn translate_create_table(
     // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L2856-L2871
     // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L1334C5-L1336C65
 
-    let index_regs = collect_autoindexes(&body, program, &normalized_tbl_name)?;
+    let index_regs = collect_autoindexes(&body, program, &normalized_tbl_name, resolver)?;
     if let Some(index_regs) = index_regs.as_ref() {
         for index_reg in index_regs.iter() {
             program.emit_insn(Insn::CreateBtree {
@@ -1224,8 +1224,9 @@ fn collect_autoindexes(
     body: &ast::CreateTableBody,
     program: &mut ProgramBuilder,
     tbl_name: &str,
+    resolver: &Resolver,
 ) -> Result<Option<Vec<usize>>> {
-    let table = create_table(tbl_name, body, 0)?;
+    let table = create_table(tbl_name, body, 0, Some(resolver))?;
 
     let mut regs: Vec<usize> = Vec::new();
 

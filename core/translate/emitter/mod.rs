@@ -654,6 +654,55 @@ pub fn emit_cdc_patch_record(
     }
 }
 
+/// Emit a MakeRecord instruction that excludes VIRTUAL generated columns.
+///
+/// VIRTUAL columns are computed on-the-fly during reads and should not be stored.
+/// When the table has VIRTUAL columns, this function copies the storable (non-VIRTUAL)
+/// columns into contiguous registers before emitting MakeRecord.
+///
+/// Returns the register containing the record.
+pub(super) fn emit_make_record_without_virtual(
+    program: &mut ProgramBuilder,
+    columns: &[Column],
+    source_start: usize,
+    dest_reg: usize,
+    is_strict: bool,
+) {
+    let storable: Vec<(usize, &Column)> = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !c.is_virtual_generated())
+        .collect();
+    let storable_count = storable.len();
+
+    let (record_start, record_count) = if storable_count < columns.len() {
+        let record_start = program.alloc_registers(storable_count);
+        for (compact_idx, &(orig_idx, _)) in storable.iter().enumerate() {
+            program.emit_insn(Insn::Copy {
+                src_reg: source_start + orig_idx,
+                dst_reg: record_start + compact_idx,
+                extra_amount: 0,
+            });
+        }
+        (record_start, storable_count)
+    } else {
+        (source_start, columns.len())
+    };
+
+    let affinity_str: String = storable
+        .iter()
+        .map(|(_, c)| c.affinity_with_strict(is_strict).aff_mask())
+        .collect();
+
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u16(record_start),
+        count: to_u16(record_count),
+        dest_reg: to_u16(dest_reg),
+        index_name: None,
+        affinity_str: Some(affinity_str),
+    });
+}
+
 pub fn emit_cdc_full_record(
     program: &mut ProgramBuilder,
     columns: &[Column],
@@ -663,7 +712,9 @@ pub fn emit_cdc_full_record(
 ) -> usize {
     let columns_reg = program.alloc_registers(columns.len() + 1);
     for (i, column) in columns.iter().enumerate() {
-        if column.is_rowid_alias() {
+        if column.is_virtual_generated() {
+            program.emit_null(columns_reg + 1 + i, None);
+        } else if column.is_rowid_alias() {
             program.emit_insn(Insn::Copy {
                 src_reg: rowid_reg,
                 dst_reg: columns_reg + 1 + i,
@@ -1339,16 +1390,36 @@ fn emit_index_column_value_new_image(
         let col_in_table = columns
             .get(idx_col.pos_in_table)
             .expect("column index out of bounds");
-        let src_reg = if col_in_table.is_rowid_alias() {
-            rowid_reg
+        if col_in_table.is_virtual_generated() {
+            // VIRTUAL columns are not stored in registers during UPDATE (they hold NULL).
+            // Evaluate the generated expression using the NEW values from registers.
+            let column_lookup = crate::schema::build_column_name_lookup(columns);
+            update::emit_generated_expr_from_registers(
+                program,
+                col_in_table
+                    .generated
+                    .as_ref()
+                    .expect("virtual generated column must have expression"),
+                dest_reg,
+                columns_start_reg,
+                &column_lookup,
+                columns,
+                resolver,
+                Some(rowid_reg),
+            )?;
+            program.emit_column_affinity(dest_reg, col_in_table.affinity());
         } else {
-            columns_start_reg + idx_col.pos_in_table
-        };
-        program.emit_insn(Insn::Copy {
-            src_reg,
-            dst_reg: dest_reg,
-            extra_amount: 0,
-        });
+            let src_reg = if col_in_table.is_rowid_alias() {
+                rowid_reg
+            } else {
+                columns_start_reg + idx_col.pos_in_table
+            };
+            program.emit_insn(Insn::Copy {
+                src_reg,
+                dst_reg: dest_reg,
+                extra_amount: 0,
+            });
+        }
     }
     Ok(())
 }

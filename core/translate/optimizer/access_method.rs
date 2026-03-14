@@ -1564,6 +1564,7 @@ fn materialized_subquery_ephemeral_index(
             collation: column.collation_opt(),
             default: column.default.clone(),
             expr: None,
+            affinity: None,
         });
     }
 
@@ -1578,6 +1579,7 @@ fn materialized_subquery_ephemeral_index(
             collation: column.collation_opt(),
             default: column.default.clone(),
             expr: None,
+            affinity: None,
         });
     }
 

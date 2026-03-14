@@ -59,6 +59,7 @@ use super::{
         WhereTerm,
     },
     planner::TableMask,
+    update::column_depends_on_updated,
 };
 
 pub(crate) mod access_method;
@@ -806,6 +807,7 @@ fn first_update_safety_reason(
             break 'requires None;
         };
 
+        // Check expression index columns against updated columns
         for (set_clause_col_idx, _) in plan.set_clauses.iter() {
             for c in index.columns.iter() {
                 if let Some(ref expr) = c.expr {
@@ -814,10 +816,38 @@ fn first_update_safety_reason(
                     if expr_idx_cols_mask.get(*set_clause_col_idx) {
                         break 'requires Some(DmlSafetyReason::KeyMutation);
                     }
-                } else if c.pos_in_table == *set_clause_col_idx {
-                    break 'requires Some(DmlSafetyReason::KeyMutation);
                 }
             }
+        }
+
+        // Build column lookup for column_depends_on_updated
+        let column_lookup: HashMap<String, usize> = btree_table
+            .columns
+            .iter()
+            .enumerate()
+            .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
+            .collect();
+
+        // Check if any index column is directly updated or transitively depends on updated columns
+        if index.columns.iter().any(|c| {
+            // Direct update of index column
+            if updated_cols.contains(&c.pos_in_table) {
+                return true;
+            }
+            // Check if this is a generated column that depends on any updated column
+            if btree_table.columns[c.pos_in_table].generated.is_some() {
+                let mut visited = HashSet::default();
+                return column_depends_on_updated(
+                    c.pos_in_table,
+                    &btree_table.columns,
+                    &column_lookup,
+                    &updated_cols,
+                    &mut visited,
+                );
+            }
+            false
+        }) {
+            break 'requires Some(DmlSafetyReason::KeyMutation);
         }
         break 'requires None;
     };
@@ -2754,13 +2784,21 @@ fn ephemeral_index_build(
         .columns()
         .iter()
         .enumerate()
-        .map(|(i, c)| IndexColumn {
-            name: c.name.clone().unwrap(),
-            order: SortOrder::Asc,
-            pos_in_table: i,
-            collation: c.collation_opt(),
-            default: c.default.clone(),
-            expr: None,
+        .map(|(i, c)| {
+            let (expr, affinity) = if c.is_virtual_generated() {
+                (c.generated.clone().map(|e| *e), Some(c.affinity()))
+            } else {
+                (None, None)
+            };
+            IndexColumn {
+                name: c.name.clone().unwrap(),
+                order: SortOrder::Asc,
+                pos_in_table: i,
+                collation: c.collation_opt(),
+                default: c.default.clone(),
+                expr: expr.map(Box::new),
+                affinity,
+            }
         })
         // only include columns that are used in the query
         .filter(|c| table_reference.column_is_used(c.pos_in_table))

@@ -12,7 +12,6 @@ use crate::{
         emitter::{MaterializedColumnRef, TransactionMode},
         plan::{ResultSetColumn, TableReferences},
     },
-    vdbe::affinity::Affinity,
     Arc, CaptureDataChangesInfo, Connection, VirtualTable,
 };
 
@@ -39,9 +38,11 @@ impl TableRefIdCounter {
     }
 }
 
+use std::num::NonZeroUsize;
+
 use super::{
-    BranchOffset, CursorID, Insn, InsnReference, JumpTarget, PrepareContext, PreparedProgram,
-    Program,
+    affinity::Affinity, BranchOffset, CursorID, Insn, InsnReference, JumpTarget, PrepareContext,
+    PreparedProgram, Program,
 };
 
 /// A key that uniquely identifies a cursor.
@@ -1566,13 +1567,50 @@ impl ProgramBuilder {
         }
     }
 
+    /// Emit an Affinity instruction for a single register with the given column affinity.
+    pub fn emit_column_affinity(&mut self, register: usize, affinity: Affinity) {
+        self.emit_insn(Insn::Affinity {
+            start_reg: register,
+            count: NonZeroUsize::MIN,
+            affinities: affinity.aff_mask().to_string(),
+        });
+    }
+
     fn emit_column(&mut self, cursor_id: CursorID, column: usize, out: usize) {
         let (_, cursor_type) = self.cursor_ref.get(cursor_id).expect("cursor_id is valid");
+
+        match cursor_type {
+            CursorType::BTreeTable(btree) | CursorType::MaterializedView(btree, _) => {
+                let column_def = btree
+                    .columns
+                    .get(column)
+                    .expect("column index out of bounds");
+                turso_assert!(
+                    !column_def.is_virtual_generated(),
+                    "emit_column called with virtual generated column index {column}"
+                );
+            }
+            _ => {}
+        }
+
+        // Compute physical column index by skipping VIRTUAL generated columns
+        // (since they are not stored in the record)
+        let physical_column = match cursor_type {
+            CursorType::BTreeTable(btree) => btree.logical_to_physical_column(column),
+            CursorType::MaterializedView(btree, _) => btree.logical_to_physical_column(column),
+            _ => column, // For indexes and other cursor types, use logical column
+        };
 
         let default = 'value: {
             let default = match cursor_type {
                 CursorType::BTreeTable(btree) => &btree.columns[column].default,
-                CursorType::BTreeIndex(index) => &index.columns[column].default,
+                CursorType::BTreeIndex(index) => {
+                    // Find the IndexColumn with matching pos_in_table, or break with None
+                    match index.columns.iter().find(|ic| ic.pos_in_table == column) {
+                        Some(ic) => &ic.default,
+                        None => break 'value None,
+                    }
+                }
                 CursorType::MaterializedView(btree, _) => &btree.columns[column].default,
                 _ => break 'value None,
             };
@@ -1621,7 +1659,7 @@ impl ProgramBuilder {
 
         self.emit_insn(Insn::Column {
             cursor_id,
-            column,
+            column: physical_column,
             dest: out,
             default,
         });

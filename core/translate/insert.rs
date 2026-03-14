@@ -15,7 +15,8 @@ use crate::{
             bind_and_rewrite_expr, emit_returning_results, emit_returning_scan_back,
             process_returning_clause, restore_returning_row_image_in_cache, rewrite_between_expr,
             seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
-            walk_expr_mut, BindingBehavior, NoConstantOptReason, ReturningBufferCtx, WalkControl,
+            translate_expr_with_context, walk_expr_mut, BindingBehavior, ExprContext,
+            NoConstantOptReason, ReturningBufferCtx, WalkControl,
         },
         fkeys::{
             build_index_affinity_string, emit_fk_restrict_halt, emit_fk_violation,
@@ -465,6 +466,15 @@ pub fn translate_insert(
 
     let has_before_triggers = !relevant_before_triggers.is_empty();
     if has_before_triggers {
+        // Compute VIRTUAL column values for trigger access
+        // VIRTUAL columns are normally NULL (computed on read), but triggers need actual values
+        compute_virtual_columns_for_triggers(
+            program,
+            &insertion.col_mappings,
+            insertion.rowid_alias_mapping(),
+            resolver,
+        )?;
+
         // In SQLite, NEW.<rowid_alias> returns -1 in BEFORE INSERT triggers when the rowid
         // hasn't been assigned yet (i.e., it's NULL). We need to temporarily set the key
         // register to -1 so the trigger sees the correct value.
@@ -769,6 +779,19 @@ pub fn translate_insert(
         connection,
         table_references: &mut table_references,
     };
+    // Compute VIRTUAL column values before NOT NULL constraint checking.
+    // VIRTUAL columns normally store NULL (computed on read), but NOT NULL checks
+    // need the actual computed values to correctly validate constraints like:
+    //   b AS (COALESCE(a, 0)) NOT NULL  -- should pass even when a is NULL
+    if insertion.has_virtual_columns() {
+        compute_virtual_columns_for_triggers(
+            program,
+            &insertion.col_mappings,
+            insertion.rowid_alias_mapping(),
+            resolver,
+        )?;
+    }
+
     // NOT NULL default substitution must happen before index key registers are
     // copied in preflight constraint checks. Otherwise the index entry gets NULL
     // while the table row gets the default value, causing integrity_check failures.
@@ -784,20 +807,47 @@ pub fn translate_insert(
     )?;
 
     // Create and insert the record
-    let affinity_str = insertion
-        .col_mappings
-        .iter()
-        .map(|col_mapping| {
-            col_mapping
-                .column
-                .affinity_with_strict(ctx.table.is_strict)
-                .aff_mask()
-        })
-        .collect::<String>();
+    // VIRTUAL generated columns are not stored, so we need to exclude them from the record.
+    let (record_start_reg, record_col_count, affinity_str) = if insertion.has_virtual_columns() {
+        // Allocate contiguous registers for storable columns and copy values
+        let storable_count = insertion.storable_count();
+        let start_reg = program.alloc_registers(storable_count);
+        let mut affinity = String::with_capacity(storable_count);
+        for (i, col_mapping) in insertion.storable_columns().enumerate() {
+            program.emit_insn(Insn::Copy {
+                src_reg: col_mapping.register,
+                dst_reg: start_reg + i,
+                extra_amount: 0,
+            });
+            affinity.push(
+                col_mapping
+                    .column
+                    .affinity_with_strict(ctx.table.is_strict)
+                    .aff_mask(),
+            );
+        }
+        (start_reg, storable_count, affinity)
+    } else {
+        let affinity_str = insertion
+            .col_mappings
+            .iter()
+            .map(|col_mapping| {
+                col_mapping
+                    .column
+                    .affinity_with_strict(ctx.table.is_strict)
+                    .aff_mask()
+            })
+            .collect::<String>();
+        (
+            insertion.first_col_register(),
+            insertion.col_mappings.len(),
+            affinity_str,
+        )
+    };
 
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(insertion.first_col_register()),
-        count: to_u16(insertion.col_mappings.len()),
+        start_reg: to_u16(record_start_reg),
+        count: to_u16(record_col_count),
         dest_reg: to_u16(insertion.record_register()),
         index_name: None,
         affinity_str: Some(affinity_str),
@@ -854,6 +904,15 @@ pub fn translate_insert(
     });
     let has_after_triggers = !relevant_after_triggers.is_empty();
     if has_after_triggers {
+        // Compute VIRTUAL column values for trigger access
+        // VIRTUAL columns are normally NULL (computed on read), but triggers need actual values
+        compute_virtual_columns_for_triggers(
+            program,
+            &insertion.col_mappings,
+            insertion.rowid_alias_mapping(),
+            resolver,
+        )?;
+
         // Build raw NEW registers for AFTER triggers. Values are encoded at this point;
         // fire_trigger will decode them via decode_trigger_registers.
         let key_reg = insertion.key_register();
@@ -1658,11 +1717,12 @@ fn bind_insert(
         InsertBody::DefaultValues => {
             // Generate default values for the table.
             // Check column-level default first, then type-level default.
+            // Generated columns are excluded - they are computed from their expressions
             let is_strict = table.is_strict();
             values = table
                 .columns()
                 .iter()
-                .filter(|c| !c.hidden())
+                .filter(|c| !c.hidden() && !c.is_generated())
                 .map(|c| {
                     c.default.clone().unwrap_or_else(|| {
                         if let Some(type_def) = resolver.schema().get_type_def(&c.ty_str, is_strict)
@@ -1813,7 +1873,9 @@ fn init_source_emission<'a>(
     database_id: usize,
 ) -> Result<()> {
     let required_column_count = if columns.is_empty() {
-        table.columns().len()
+        // When no column list is specified, count only insertable columns
+        // (excludes generated columns which are computed, not inserted)
+        table.columns().iter().filter(|c| !c.is_generated()).count()
     } else {
         columns.len()
     };
@@ -2003,9 +2065,16 @@ fn init_source_emission<'a>(
             }
         }
         InsertBody::DefaultValues => {
-            let num_values = table.columns().len();
+            // Only count and process non-generated columns
+            // Generated columns are computed from their expressions, not default values
+            let insertable_columns: Vec<_> = table
+                .columns()
+                .iter()
+                .filter(|c| !c.is_generated())
+                .collect();
+            let num_values = insertable_columns.len();
             let is_strict = table.is_strict();
-            values.extend(table.columns().iter().map(|c| {
+            values.extend(insertable_columns.iter().map(|c| {
                 c.default.clone().unwrap_or_else(|| {
                     if let Some(type_def) = resolver.schema().get_type_def(&c.ty_str, is_strict) {
                         if let Some(ref default_expr) = type_def.default {
@@ -2088,6 +2157,28 @@ impl<'a> Insertion<'a> {
         self.record_reg
     }
 
+    /// Returns true if any column is a VIRTUAL generated column.
+    pub fn has_virtual_columns(&self) -> bool {
+        self.col_mappings
+            .iter()
+            .any(|m| m.column.is_virtual_generated())
+    }
+
+    /// Returns an iterator over storable (non-virtual) column mappings.
+    pub fn storable_columns(&self) -> impl Iterator<Item = &ColMapping<'a>> {
+        self.col_mappings
+            .iter()
+            .filter(|m| !m.column.is_virtual_generated())
+    }
+
+    /// Returns the count of storable (non-virtual) columns.
+    pub fn storable_count(&self) -> usize {
+        self.col_mappings
+            .iter()
+            .filter(|m| !m.column.is_virtual_generated())
+            .count()
+    }
+
     /// Returns the column mapping for a given column name.
     pub fn get_col_mapping_by_name(&self, name: &str) -> Option<&ColMapping<'a>> {
         if let InsertionKey::RowidAlias(mapping) = &self.key {
@@ -2109,6 +2200,16 @@ impl<'a> Insertion<'a> {
                 .as_ref()
                 .is_some_and(|n| n.eq_ignore_ascii_case(name))
         })
+    }
+
+    /// Returns the rowid alias column mapping if the key is a RowidAlias.
+    /// Used by generated column expression translation to resolve references
+    /// to INTEGER PRIMARY KEY columns.
+    pub fn rowid_alias_mapping(&self) -> Option<&ColMapping<'a>> {
+        match &self.key {
+            InsertionKey::RowidAlias(mapping) => Some(mapping),
+            _ => None,
+        }
     }
 }
 
@@ -2194,18 +2295,23 @@ fn build_insertion<'a>(
 
     if columns.is_empty() {
         // Case 1: No columns specified - map values to columns in order
-        if num_values != table_columns.iter().filter(|c| !c.hidden()).count() {
+        // Generated and hidden columns are not taken into account for value count
+        let insertable_count = table_columns
+            .iter()
+            .filter(|c| !c.hidden() && !c.is_generated())
+            .count();
+        if num_values != insertable_count {
             crate::bail_parse_error!(
                 "table {} has {} columns but {} values were supplied",
                 &table.get_name(),
-                table_columns.len(),
+                insertable_count,
                 num_values
             );
         }
         let mut value_idx = 0;
         for (i, col) in table_columns.iter().enumerate() {
-            if col.hidden() {
-                // Hidden columns are not taken into account.
+            if col.hidden() || col.is_generated() {
+                // Hidden and generated columns are not taken into account.
                 continue;
             }
             if col.is_rowid_alias() {
@@ -2225,6 +2331,8 @@ fn build_insertion<'a>(
         for (value_index, column_name) in columns.iter().enumerate() {
             let column_name = normalize_ident(column_name.as_str());
             if let Some((idx_in_table, col_in_table)) = table.get_column_by_name(&column_name) {
+                // Generated columns cannot be written to directly
+                col_in_table.ensure_not_generated("INSERT into", &column_name)?;
                 // Named column
                 if col_in_table.is_rowid_alias() {
                     insertion_key = InsertionKey::RowidAlias(ColMapping {
@@ -2351,7 +2459,12 @@ fn translate_rows_base<'short, 'long: 'short>(
         &mut translate_value_fn,
         resolver,
         is_strict,
+        &insertion.col_mappings,
     )?;
+
+    // Get the rowid alias mapping if one exists, for generated column expression translation
+    let rowid_alias = insertion.rowid_alias_mapping();
+
     for col in insertion.col_mappings.iter() {
         translate_column(
             program,
@@ -2361,6 +2474,8 @@ fn translate_rows_base<'short, 'long: 'short>(
             &mut translate_value_fn,
             resolver,
             is_strict,
+            &insertion.col_mappings,
+            rowid_alias,
         )?;
     }
 
@@ -2368,12 +2483,13 @@ fn translate_rows_base<'short, 'long: 'short>(
 }
 
 /// Translate the [InsertionKey].
-fn translate_key(
+fn translate_key<'a>(
     program: &mut ProgramBuilder,
     insertion: &Insertion,
     mut translate_value_fn: impl FnMut(&mut ProgramBuilder, usize, usize) -> Result<()>,
     resolver: &Resolver,
     is_strict: bool,
+    col_mappings: &[ColMapping<'a>],
 ) -> Result<()> {
     match &insertion.key {
         InsertionKey::RowidAlias(rowid_alias_column) => translate_column(
@@ -2384,6 +2500,8 @@ fn translate_key(
             &mut translate_value_fn,
             resolver,
             is_strict,
+            col_mappings,
+            None, // Key translation doesn't need rowid alias resolution
         ),
         InsertionKey::LiteralRowid {
             value_index,
@@ -2396,12 +2514,15 @@ fn translate_key(
             &mut translate_value_fn,
             resolver,
             is_strict,
+            col_mappings,
+            None, // Key translation doesn't need rowid alias resolution
         ),
         InsertionKey::Autogenerated { .. } => Ok(()), // will be populated later
     }
 }
 
-fn translate_column(
+#[allow(clippy::too_many_arguments)]
+fn translate_column<'a>(
     program: &mut ProgramBuilder,
     column: &Column,
     column_register: usize,
@@ -2409,6 +2530,8 @@ fn translate_column(
     translate_value_fn: &mut impl FnMut(&mut ProgramBuilder, usize, usize) -> Result<()>,
     resolver: &Resolver,
     is_strict: bool,
+    _col_mappings: &[ColMapping<'a>],
+    _rowid_alias: Option<&ColMapping<'a>>,
 ) -> Result<()> {
     if let Some(value_index) = value_index {
         translate_value_fn(program, value_index, column_register)?;
@@ -2420,6 +2543,13 @@ fn translate_column(
         });
     } else if column.hidden() {
         // Emit NULL for not-explicitly-mentioned hidden columns, even ignoring DEFAULT.
+        program.emit_insn(Insn::Null {
+            dest: column_register,
+            dest_end: None,
+        });
+    } else if column.is_virtual_generated() {
+        // VIRTUAL generated columns are computed on read, not stored.
+        // Emit NULL as a placeholder - this register will be excluded from MakeRecord.
         program.emit_insn(Insn::Null {
             dest: column_register,
             dest_end: None,
@@ -2452,6 +2582,58 @@ fn translate_column(
             dest_end: None,
         });
     }
+    Ok(())
+}
+
+/// Compute VIRTUAL generated column values into their registers for trigger access.
+/// This is needed because VIRTUAL columns normally store NULL (computed on read),
+/// but triggers need the actual computed values in NEW/OLD contexts.
+///
+/// This function iterates through column mappings, finds VIRTUAL generated columns,
+/// evaluates their expressions, and applies column affinity for consistency.
+pub fn compute_virtual_columns_for_triggers<'a>(
+    program: &mut ProgramBuilder,
+    col_mappings: &[ColMapping<'a>],
+    rowid_alias: Option<&ColMapping<'a>>,
+    resolver: &Resolver,
+) -> Result<()> {
+    for col_mapping in col_mappings {
+        if col_mapping.column.is_virtual_generated() {
+            if let Some(gen_expr) = &col_mapping.column.generated {
+                translate_generated_expr(
+                    program,
+                    gen_expr,
+                    col_mapping.register,
+                    col_mappings,
+                    rowid_alias,
+                    resolver,
+                )?;
+                // Apply affinity for consistency
+                program.emit_column_affinity(col_mapping.register, col_mapping.column.affinity());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Translate a generated column expression during INSERT.
+/// Handles Expr::Id column references by looking up their registers in col_mappings.
+fn translate_generated_expr<'a>(
+    program: &mut ProgramBuilder,
+    expr: &ast::Expr,
+    target_register: usize,
+    col_mappings: &[ColMapping<'a>],
+    rowid_alias: Option<&ColMapping<'a>>,
+    resolver: &Resolver,
+) -> Result<()> {
+    use super::expr::{translate_expr_with_context, ExprContext};
+
+    // Use the unified evaluator with InsertGenerated context
+    let context = ExprContext::InsertGenerated {
+        col_mappings,
+        rowid_alias,
+    };
+    translate_expr_with_context(program, &context, expr, target_register, resolver)?;
     Ok(())
 }
 
@@ -3108,91 +3290,29 @@ pub fn rewrite_partial_index_where(
     )
 }
 
-/// For an index expression, rewrite column references to use the insertion registers.
-fn rewrite_index_expr_for_insertion(expr: &mut ast::Expr, insertion: &Insertion) -> Result<()> {
-    let mut missing_column = None;
-    let col_reg = |name: &str| -> Option<usize> {
-        if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name)) {
-            Some(insertion.key_register())
-        } else if let Some(c) = insertion.get_col_mapping_by_name(name) {
-            if c.column.is_rowid_alias() {
-                Some(insertion.key_register())
-            } else {
-                Some(c.register)
-            }
-        } else {
-            None
-        }
-    };
-    walk_expr_mut(
-        expr,
-        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
-            match e {
-                Expr::Id(name) | Expr::Name(name) => {
-                    let normalized = normalize_ident(name.as_str());
-                    if let Some(reg) = col_reg(&normalized) {
-                        *e = Expr::Register(reg);
-                    } else {
-                        missing_column = Some(normalized);
-                    }
-                }
-                Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
-                    let normalized = normalize_ident(col.as_str());
-                    if let Some(reg) = col_reg(&normalized) {
-                        *e = Expr::Register(reg);
-                    } else {
-                        missing_column = Some(normalized);
-                    }
-                }
-                _ => {}
-            }
-            Ok(if missing_column.is_some() {
-                WalkControl::SkipChildren
-            } else {
-                WalkControl::Continue
-            })
-        },
-    )?;
-
-    if let Some(col) = missing_column {
-        return Err(LimboError::PlanningError(format!(
-            "Column not found in INSERT: {col}"
-        )));
-    }
-    Ok(())
-}
-
 fn emit_index_column_value_for_insert(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     insertion: &Insertion,
-    table: &BTreeTable,
+    _table: &BTreeTable,
     idx_col: &IndexColumn,
     dest_reg: usize,
 ) -> Result<()> {
     if let Some(expr) = &idx_col.expr {
-        let mut expr = expr.as_ref().clone();
-        rewrite_index_expr_for_insertion(&mut expr, insertion)?;
-        // After rewrite, Expr::Register nodes reference encoded column registers.
-        // Decode custom type registers so the expression evaluates on user-facing
-        // values, matching what SELECT / CREATE INDEX see.
-        crate::translate::expr::decode_custom_type_registers_in_expr(
-            program,
-            resolver,
-            &mut expr,
-            &table.columns,
-            insertion.first_col_register(),
-            Some(insertion.key_register()),
-            table.is_strict,
-        )?;
-        translate_expr_no_constant_opt(
-            program,
-            Some(&TableReferences::new_empty()),
-            &expr,
-            dest_reg,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        )?;
+        // Use InsertGenerated context which handles VIRTUAL column recursion.
+        // This properly evaluates VIRTUAL column expressions instead of just
+        // reading from registers (which would have NULL for VIRTUAL columns).
+        let rowid_alias = insertion.rowid_alias_mapping();
+        let context = ExprContext::InsertGenerated {
+            col_mappings: &insertion.col_mappings,
+            rowid_alias,
+        };
+        translate_expr_with_context(program, &context, expr.as_ref(), dest_reg, resolver)?;
+        // Apply column affinity for VIRTUAL columns. This ensures INTEGER->REAL
+        // conversions (and other affinity rules) happen per SQLite's documentation.
+        if let Some(affinity) = &idx_col.affinity {
+            program.emit_column_affinity(dest_reg, *affinity);
+        }
     } else {
         let Some(cm) = insertion.get_col_mapping_by_name(&idx_col.name) else {
             return Err(LimboError::PlanningError(
