@@ -666,6 +666,7 @@ pub(super) fn emit_make_record_without_virtual(
     columns: &[Column],
     source_start: usize,
     dest_reg: usize,
+    is_strict: bool,
 ) {
     let storable: Vec<(usize, &Column)> = columns
         .iter()
@@ -690,7 +691,7 @@ pub(super) fn emit_make_record_without_virtual(
 
     let affinity_str: String = storable
         .iter()
-        .map(|(_, c)| c.affinity().aff_mask())
+        .map(|(_, c)| c.affinity_with_strict(is_strict).aff_mask())
         .collect();
 
     program.emit_insn(Insn::MakeRecord {

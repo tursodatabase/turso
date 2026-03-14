@@ -2228,7 +2228,7 @@ fn emit_update_insns<'a>(
         }
 
         let record_reg = program.alloc_register();
-        emit_make_record_without_virtual(program, target_table.table.columns(), start, record_reg);
+        emit_make_record_without_virtual(program, target_table.table.columns(), start, record_reg, target_table.table.btree().is_some_and(|bt| bt.is_strict));
 
         if not_exists_check_required {
             program.emit_insn(Insn::NotExists {

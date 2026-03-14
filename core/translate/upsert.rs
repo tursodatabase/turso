@@ -1018,7 +1018,7 @@ pub fn emit_upsert(
 
     // Build NEW table payload (excluding VIRTUAL columns)
     let rec = program.alloc_register();
-    emit_make_record_without_virtual(program, table.columns(), new_start, rec);
+    emit_make_record_without_virtual(program, table.columns(), new_start, rec, table.btree().is_some_and(|bt| bt.is_strict));
 
     // If rowid changed, first ensure no other row owns it, then delete+insert
     if let Some(rnew) = new_rowid_reg {
