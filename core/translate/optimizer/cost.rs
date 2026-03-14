@@ -149,8 +149,14 @@ pub fn estimate_index_cost(
         // Point lookup: the leaf page is the last page of the B-tree traversal,
         // already counted in seek_cost.
         0.0
+    } else if input_cardinality <= 1.0 {
+        index_leaf_pages_count
     } else {
-        input_cardinality * index_leaf_pages_count
+        // Range scan in a nested-loop join: after the first iteration the inner
+        // table's pages are largely in the buffer pool.  Apply the same caching
+        // discount as full scans.
+        index_leaf_pages_count
+            + (input_cardinality - 1.0) * index_leaf_pages_count * params.cache_reuse_factor
     };
 
     // For non-covering indexes, we need to fetch from the table for each row.
