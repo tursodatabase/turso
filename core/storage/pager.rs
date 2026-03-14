@@ -2435,15 +2435,32 @@ impl Pager {
     /// Set the initial page size for the database. Should only be called before the database is initialized
     pub fn set_initial_page_size(&self, size: PageSize) -> Result<()> {
         turso_assert!(!self.db_initialized());
-        let IOResult::Done(_) = self.with_header_mut(|header| {
-            header.page_size = size;
-        })?
-        else {
+        let IOResult::Done(mut header) = self.with_header(|header| *header)? else {
             panic!("DB should not be initialized and should not do any IO");
         };
+        header.page_size = size;
+
+        let page = Arc::new(Page::new(DatabaseHeader::PAGE_ID as i64));
+        {
+            let inner = page.get();
+            inner.buffer = Some(Arc::new(Buffer::new_temporary(size.get() as usize)));
+        }
+
+        page.get_contents().write_database_header(&header);
+        page.set_loaded();
+        page.clear_wal_tag();
+
+        btree_init_page(
+            &page,
+            PageType::TableLeaf,
+            DatabaseHeader::SIZE,
+            (size.get() - header.reserved_space as u32) as usize,
+        );
+
+        self.init_page_1.store(Some(page));
         self.page_size.store(size.get(), Ordering::SeqCst);
         // Clear dirty pages since this is pre-initialization setup, not a real write transaction.
-        // with_header_mut marks page 1 dirty as a side effect, but no transaction is active.
+        // Rebuilding init_page_1 must not leak any stale 4 KiB page-1 image into the first write.
         self.dirty_pages.write().clear();
         Ok(())
     }

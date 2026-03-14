@@ -140,8 +140,8 @@ fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[turso_macros::test(mvcc)]
-fn test_non_4k_page_size_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
+#[turso_macros::test]
+fn test_non_4k_page_size_encryption_mvcc(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let db_path = tmp_db.path.clone();
 
@@ -155,6 +155,7 @@ fn test_non_4k_page_size_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> 
             "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';",
         )?;
         run_query(&tmp_db, &conn, "PRAGMA cipher = 'aegis256';")?;
+        run_query(&tmp_db, &conn, "PRAGMA journal_mode = 'mvcc';")?;
         run_query(
             &tmp_db,
             &conn,
@@ -260,8 +261,8 @@ fn test_corruption_turso_magic_bytes(tmp_db: TempDatabase) -> anyhow::Result<()>
     Ok(())
 }
 
-#[turso_macros::test(mvcc)]
-fn test_corruption_associated_data_bytes(tmp_db: TempDatabase) -> anyhow::Result<()> {
+#[turso_macros::test]
+fn test_corruption_associated_data_bytes_mvcc(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let db_path = tmp_db.path.clone();
 
@@ -273,6 +274,7 @@ fn test_corruption_associated_data_bytes(tmp_db: TempDatabase) -> anyhow::Result
             "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';",
         )?;
         run_query(&tmp_db, &conn, "PRAGMA cipher = 'aegis256';")?;
+        run_query(&tmp_db, &conn, "PRAGMA journal_mode = 'mvcc';")?;
         run_query(
             &tmp_db,
             &conn,
