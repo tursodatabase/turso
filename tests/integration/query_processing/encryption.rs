@@ -1,4 +1,4 @@
-use crate::common::{do_flush, run_query, run_query_on_row, TempDatabase};
+use crate::common::{do_flush, run_query, run_query_on_row, ExecRows, TempDatabase};
 use rand::{rng, RngCore};
 use std::sync::Arc;
 use turso_core::{
@@ -986,6 +986,84 @@ fn test_attach_encrypted_database(_tmp_db: TempDatabase) -> anyhow::Result<()> {
         )?;
         assert_eq!(val_a, "data from A");
         assert_eq!(val_b, "data from B");
+    }
+
+    Ok(())
+}
+
+/// Test that VACUUM INTO on an encrypted database results in a clean, unencrypted
+/// database that can be read without any encryption keys.
+#[turso_macros::test]
+fn test_vacuum_into_unencrypts(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    use tempfile::TempDir;
+
+    let _ = env_logger::try_init();
+    let hexkey = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+    let cipher = "aegis256";
+
+    // 1. Create an encrypted source database and insert data
+    {
+        let conn = tmp_db.connect_limbo();
+        conn.execute(format!("PRAGMA hexkey = '{hexkey}'"))?;
+        conn.execute(format!("PRAGMA cipher = '{cipher}'"))?;
+
+        conn.execute("CREATE TABLE secret_data (id INTEGER PRIMARY KEY, content TEXT)")?;
+        conn.execute("INSERT INTO secret_data (content) VALUES ('this was encrypted')")?;
+        do_flush(&conn, &tmp_db)?;
+    }
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("exported.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    // 2. Demonstrate that the encrypted source CANNOT be read or vacuumed without keys
+    {
+        let unauthorized_db = TempDatabase::new_with_existent(&tmp_db.path);
+        let unauthorized_conn = unauthorized_db.connect_limbo();
+
+        // Reading should fail
+        let result = unauthorized_conn.execute("SELECT * FROM secret_data");
+        assert!(
+            result.is_err(),
+            "Encrypted source should not be readable as plaintext"
+        );
+        let err_msg = result.err().unwrap().to_string();
+        assert!(
+            err_msg.contains("Corrupt database"),
+            "Error message should indicate that the encrypted database cannot be read: '{err_msg}'"
+        );
+
+        // VACUUM INTO should also fail because it cannot read the source schema/data
+        let fail_path = dest_dir.path().join("should_fail.db");
+        let fail_path_str = fail_path.to_str().unwrap();
+        let result = unauthorized_conn.execute(format!("VACUUM INTO '{fail_path_str}'"));
+        assert!(
+            result.is_err(),
+            "VACUUM INTO should fail on encrypted database when no keys are provided"
+        );
+        let err_msg = result.err().unwrap().to_string();
+        assert!(
+            err_msg.contains("Corrupt database"),
+            "Error message should indicate that the encrypted database cannot be read: '{err_msg}'"
+        );
+    }
+
+    // 3. Execute VACUUM INTO using an authorized connection
+    {
+        let conn = tmp_db.connect_limbo();
+        conn.execute(format!("PRAGMA hexkey = '{hexkey}'"))?;
+        conn.execute(format!("PRAGMA cipher = '{cipher}'"))?;
+        conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+    }
+
+    // 4. Prove the destination IS readable without keys (it was unencrypted)
+    {
+        let dest_db = TempDatabase::new_with_existent(&dest_path);
+        let dest_conn = dest_db.connect_limbo();
+
+        let rows: Vec<(i64, String)> = dest_conn.exec_rows("SELECT id, content FROM secret_data");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "this was encrypted");
     }
 
     Ok(())
