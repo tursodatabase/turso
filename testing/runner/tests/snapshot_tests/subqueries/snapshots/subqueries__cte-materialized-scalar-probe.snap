@@ -72,8 +72,7 @@ QUERY PLAN
 |  |  `--SCAN ordered_points AS p2
 |  |--SCAN previous_points
 |  |--SCAN window_subquery_0
-|  |  |--SCAN run_markers
-|  |  `--USE SORTER FOR ORDER BY
+|  |  `--SCAN run_markers
 |  `--SEARCH run_ids USING INDEX ephemeral_subquery_t63 (point_key=?)
 `--SCAN run_lengths
    |--SCAN run_ids

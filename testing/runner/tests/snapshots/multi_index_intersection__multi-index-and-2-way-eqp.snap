@@ -10,4 +10,4 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-`--MULTI-INDEX AND t (idx_a, idx_b)
+`--SEARCH t USING INDEX idx_b (b=?)

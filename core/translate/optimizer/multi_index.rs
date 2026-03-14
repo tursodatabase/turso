@@ -18,12 +18,13 @@ use crate::translate::optimizer::constraints::{
     TableConstraints,
 };
 use crate::translate::optimizer::cost::{
-    estimate_cost_for_scan_or_seek, estimate_rows_per_seek, AnalyzeCtx, Cost, IndexInfo,
-    RowCountEstimate,
+    estimate_cost_for_scan_or_seek, estimate_rows_per_seek, rows_per_leaf_page_for_index,
+    AnalyzeCtx, Cost, IndexInfo, RowCountEstimate,
 };
 use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::plan::{
-    InSeekSource, JoinedTable, NonFromClauseSubquery, SetOperation, TableReferences, WhereTerm,
+    InSeekSource, JoinedTable, NonFromClauseSubquery, SetOperation, TableReferences,
+    UnionBranchPrePostFilters, WhereTerm,
 };
 use crate::translate::planner::{table_mask_from_expr, TableMask};
 use rustc_hash::FxHashMap as HashMap;
@@ -40,10 +41,8 @@ pub struct MultiIndexBranchParams {
     pub access: MultiIndexBranchAccessParams,
     /// Estimated number of rows from this branch.
     pub estimated_rows: f64,
-    /// Residual filter expressions for compound AND disjuncts.
-    pub residual_exprs: Vec<ast::Expr>,
-    /// Whether residual evaluation needs the scanned table cursor positioned.
-    pub requires_table_cursor: bool,
+    /// Residual filters for union (OR) branches. `None` for intersection branches.
+    pub residuals: Option<UnionBranchPrePostFilters>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,8 +78,7 @@ struct MultiIdxBranch {
     access: MultiIdxBranchAccess,
     cost: Cost,
     estimated_rows: f64,
-    residual_exprs: Vec<ast::Expr>,
-    requires_table_cursor: bool,
+    union_prepost_filters: Option<UnionBranchPrePostFilters>,
 }
 
 enum MultiIdxBranchAccess {
@@ -216,7 +214,7 @@ fn estimate_multi_index_scan_cost(
 
     // Table fetch cost mirrors single-index lookup costing, assuming some
     // locality benefit from rowid-ordered access after RowSet deduplication.
-    let table_pages = (base_row_count / params.rows_per_page).max(1.0);
+    let table_pages = (base_row_count / params.rows_per_table_page).max(1.0);
     let selectivity = estimated_unique_rows / base_row_count.max(1.0);
     let table_fetch_cost = selectivity * table_pages;
     let total_cost = (branch_scan_cost + rowset_ops_cost + table_fetch_cost) * input_cardinality;
@@ -259,7 +257,7 @@ fn estimate_multi_index_intersection_cost(
 
     // Table fetch cost mirrors single-index lookup costing, assuming some
     // locality benefit from rowid-ordered access after intersection.
-    let table_pages = (base_row_count / params.rows_per_page).max(1.0);
+    let table_pages = (base_row_count / params.rows_per_table_page).max(1.0);
     let selectivity = estimated_intersection_rows / base_row_count.max(1.0);
     let table_fetch_cost = selectivity * table_pages;
     let total_cost = (branch_scan_cost + rowset_ops_cost + table_fetch_cost) * input_cardinality;
@@ -275,18 +273,25 @@ fn index_info_for_branch(
     index: Option<&Index>,
     rhs_table: &JoinedTable,
     read_mode: BranchReadMode,
+    rows_per_table_page: f64,
 ) -> Option<IndexInfo> {
+    let rowid_only = matches!(read_mode, BranchReadMode::RowIdOnly);
     match index {
         Some(index) => Some(IndexInfo {
             unique: index.unique,
-            covering: matches!(read_mode, BranchReadMode::RowIdOnly)
-                || rhs_table.index_is_covering(index),
+            covering: rowid_only || rhs_table.index_is_covering(index),
             column_count: index.columns.len(),
+            rows_per_leaf_page: rows_per_leaf_page_for_index(
+                index.columns.len(),
+                rhs_table,
+                rows_per_table_page,
+            ),
         }),
         None => Some(IndexInfo {
             unique: true,
             covering: true,
             column_count: 1,
+            rows_per_leaf_page: rows_per_table_page,
         }),
     }
 }
@@ -343,6 +348,7 @@ fn choose_multi_index_branch_access(
                 chosen.index.as_deref(),
                 rhs_table,
                 BranchReadMode::RowIdOnly,
+                params.rows_per_table_page,
             )
             .expect("multi-index branches always have costable access");
             let analyze_ctx = AnalyzeCtx {
@@ -374,8 +380,7 @@ fn choose_multi_index_branch_access(
                     base_row_count,
                     Some(&analyze_ctx),
                 ),
-                residual_exprs: vec![],
-                requires_table_cursor: false,
+                union_prepost_filters: None,
             }
         });
 
@@ -407,45 +412,33 @@ fn choose_multi_index_branch_access(
             },
             cost: chosen_in_seek.cost,
             estimated_rows: chosen_in_seek.estimated_rows_per_outer_row,
-            residual_exprs: vec![],
-            requires_table_cursor: false,
+            union_prepost_filters: None,
         });
     }
 
     Ok(best_branch)
 }
 
-/// Compute the table-reference mask for residual expressions that remain after
-/// branch seek terms are consumed.
-///
-/// Residuals containing subqueries are rejected here because correlated subquery
-/// translation is loop-position-sensitive and we do not yet duplicate that
-/// machinery safely for each branch.
-fn residual_tables_mask(
-    residual_exprs: &[ast::Expr],
-    table_references: &TableReferences,
-    subqueries: &[NonFromClauseSubquery],
-) -> Option<TableMask> {
-    residual_exprs
-        .iter()
-        .try_fold(TableMask::new(), |mut mask, expr| {
-            if expr_references_any_subquery(expr) {
-                return None;
-            }
-            mask |= table_mask_from_expr(expr, table_references, subqueries).ok()?;
-            Some(mask)
-        })
+/// Residual output from [`partition_residual_multi_or_exprs`].
+struct MultiOrResidualPrePostFilters {
+    pre_filter_exprs: Vec<ast::Expr>,
+    post_filter_exprs: Vec<ast::Expr>,
+    /// Combined table mask for `post_filter_exprs`.
+    post_mask: TableMask,
 }
 
-/// Return the branch-local conjuncts that were not consumed by the chosen seek
-/// constraints and therefore must remain as residual filters.
-fn residual_exprs_for_branch(
+/// Classify unconsumed branch conjuncts into pre-filters (outer-table-only,
+/// evaluated before the index seek) and post-filters (evaluated after the seek).
+///
+/// Returns `None` if any residual contains a subquery or has an unresolvable
+/// table mask—matching the old `residual_tables_mask` rejection.
+fn partition_residual_multi_or_exprs(
     branch_terms: &[WhereTerm],
     access: &MultiIdxBranchAccess,
-) -> Vec<ast::Expr> {
-    // These residuals stop being planner-managed `WhereTerm`s here. Downstream
-    // they are evaluated directly inside the branch loop, so metadata like
-    // `from_outer_join` no longer participates in scheduling or ownership.
+    lhs_mask: &TableMask,
+    table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
+) -> Option<MultiOrResidualPrePostFilters> {
     let mut consumed = vec![false; branch_terms.len()];
     match access {
         MultiIdxBranchAccess::Seek {
@@ -467,12 +460,33 @@ fn residual_exprs_for_branch(
         }
         MultiIdxBranchAccess::InSeek { constraint_idx, .. } => consumed[*constraint_idx] = true,
     }
-    branch_terms
-        .iter()
-        .enumerate()
-        .filter(|(idx, _)| !consumed[*idx])
-        .map(|(_, term)| term.expr.clone())
-        .collect()
+
+    let mut pre_filter_exprs = Vec::new();
+    let mut post_filter_exprs = Vec::new();
+    let mut post_mask = TableMask::new();
+
+    for (idx, term) in branch_terms.iter().enumerate() {
+        if consumed[idx] {
+            continue;
+        }
+        let expr = &term.expr;
+        if expr_references_any_subquery(expr) {
+            return None;
+        }
+        let mask = table_mask_from_expr(expr, table_references, subqueries).ok()?;
+        if lhs_mask.contains_all(&mask) {
+            pre_filter_exprs.push(expr.clone());
+        } else {
+            post_mask |= mask;
+            post_filter_exprs.push(expr.clone());
+        }
+    }
+
+    Some(MultiOrResidualPrePostFilters {
+        pre_filter_exprs,
+        post_filter_exprs,
+        post_mask,
+    })
 }
 
 /// Estimate selectivity for a residual predicate that remains after a branch
@@ -577,7 +591,7 @@ fn estimate_residual_expr_selectivity(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn estimate_residual_selectivity(
+fn estimate_multi_or_residual_selectivity(
     residual_exprs: &[ast::Expr],
     rhs_table: &JoinedTable,
     table_references: &TableReferences,
@@ -610,7 +624,6 @@ fn evaluate_multi_index_branches(
     branches: Vec<MultiIdxBranch>,
     set_op: SetOperation,
     where_term_idx: usize,
-    additional_consumed_terms: Vec<usize>,
     rhs_table: &JoinedTable,
     table_references: &TableReferences,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
@@ -626,7 +639,26 @@ fn evaluate_multi_index_branches(
     let mut branch_params = Vec::with_capacity(branches.len());
 
     for branch in branches {
-        let mut params_for_branch = MultiIndexBranchParams {
+        let post_filter_exprs = branch
+            .union_prepost_filters
+            .as_ref()
+            .map(|r| &r.post_filter_exprs);
+        let selectivity = if let Some(post_filter_exprs) = post_filter_exprs {
+            estimate_multi_or_residual_selectivity(
+                post_filter_exprs,
+                rhs_table,
+                table_references,
+                available_indexes,
+                subqueries,
+                schema,
+                params,
+            )
+        } else {
+            1.0
+        };
+        let estimated_rows = branch.estimated_rows * selectivity;
+
+        let params_for_branch = MultiIndexBranchParams {
             index: branch.index.clone(),
             access: match branch.access {
                 MultiIdxBranchAccess::Seek {
@@ -640,28 +672,16 @@ fn evaluate_multi_index_branches(
                     MultiIndexBranchAccessParams::InSeek { source }
                 }
             },
-            estimated_rows: branch.estimated_rows,
-            residual_exprs: vec![],
-            requires_table_cursor: false,
+            estimated_rows,
+            residuals: branch.union_prepost_filters,
         };
-        params_for_branch.residual_exprs = branch.residual_exprs;
-        params_for_branch.requires_table_cursor = branch.requires_table_cursor;
-        params_for_branch.estimated_rows *= estimate_residual_selectivity(
-            &params_for_branch.residual_exprs,
-            rhs_table,
-            table_references,
-            available_indexes,
-            subqueries,
-            schema,
-            params,
-        );
 
         branch_costs.push(branch.cost);
         branch_rows.push(params_for_branch.estimated_rows);
         branch_params.push(params_for_branch);
     }
 
-    let (multi_index_cost, estimated_rows) = match set_op {
+    let (multi_index_cost, estimated_rows) = match &set_op {
         SetOperation::Union => estimate_multi_index_scan_cost(
             &branch_costs,
             &branch_rows,
@@ -669,7 +689,7 @@ fn evaluate_multi_index_branches(
             input_cardinality,
             params,
         ),
-        SetOperation::Intersection => estimate_multi_index_intersection_cost(
+        SetOperation::Intersection { .. } => estimate_multi_index_intersection_cost(
             &branch_costs,
             &branch_rows,
             base_row_count,
@@ -681,9 +701,14 @@ fn evaluate_multi_index_branches(
     if multi_index_cost < best_cost {
         let mut consumed_where_terms = SmallVec::<[usize; 4]>::new();
         consumed_where_terms.push(where_term_idx);
-        for term_idx in additional_consumed_terms.iter().copied() {
-            if !consumed_where_terms.contains(&term_idx) {
-                consumed_where_terms.push(term_idx);
+        if let SetOperation::Intersection {
+            additional_consumed_terms,
+        } = &set_op
+        {
+            for term_idx in additional_consumed_terms.iter().copied() {
+                if !consumed_where_terms.contains(&term_idx) {
+                    consumed_where_terms.push(term_idx);
+                }
             }
         }
         for branch in &branch_params {
@@ -705,7 +730,6 @@ fn evaluate_multi_index_branches(
                 branches: branch_params,
                 where_term_idx,
                 set_op,
-                additional_consumed_terms,
             },
         })
     } else {
@@ -921,19 +945,25 @@ pub fn consider_multi_index_union(
                     params,
                 )
                 .ok()??;
-                // Residuals are kept as raw expressions because the multi-index
-                // executor runs them directly inside the branch loop rather
-                // than feeding them back through normal `WhereTerm`
-                // evaluation/scheduling.
-                let residual_exprs =
-                    residual_exprs_for_branch(&synthetic_where_terms, &chosen.access);
-                let residual_mask =
-                    residual_tables_mask(&residual_exprs, table_references, subqueries)?;
-                if !allowed_mask.contains_all(&residual_mask) {
+                // Partition residuals in a single pass: pre-filters reference
+                // only outer (lhs) tables and can short-circuit the branch
+                // before the index seek; post-filters reference the target
+                // table and are evaluated after the seek.
+                let partitioned_pre_post = partition_residual_multi_or_exprs(
+                    &synthetic_where_terms,
+                    &chosen.access,
+                    lhs_mask,
+                    table_references,
+                    subqueries,
+                )?;
+                if !allowed_mask.contains_all(&partitioned_pre_post.post_mask) {
                     return None;
                 }
-                chosen.residual_exprs = residual_exprs;
-                chosen.requires_table_cursor = residual_mask.contains_table(rhs_idx);
+                chosen.union_prepost_filters = Some(UnionBranchPrePostFilters {
+                    requires_table_cursor: partitioned_pre_post.post_mask.contains_table(rhs_idx),
+                    pre_filter_exprs: partitioned_pre_post.pre_filter_exprs,
+                    post_filter_exprs: partitioned_pre_post.post_filter_exprs,
+                });
                 Some(chosen)
             })
             .collect();
@@ -946,7 +976,6 @@ pub fn consider_multi_index_union(
             branches,
             SetOperation::Union,
             where_term_idx,
-            vec![],
             rhs_table,
             table_references,
             available_indexes,
@@ -1011,9 +1040,13 @@ pub fn consider_multi_index_intersection(
         .iter()
         .map(|b| {
             let constraints = vec![b.constraint.clone()];
-            let index_info =
-                index_info_for_branch(b.index.as_deref(), rhs_table, BranchReadMode::RowIdOnly)
-                    .expect("intersection branches always have costable access");
+            let index_info = index_info_for_branch(
+                b.index.as_deref(),
+                rhs_table,
+                BranchReadMode::RowIdOnly,
+                params.rows_per_table_page,
+            )
+            .expect("intersection branches always have costable access");
             let analyze_ctx = AnalyzeCtx {
                 rhs_table,
                 index: b.index.as_ref(),
@@ -1042,8 +1075,7 @@ pub fn consider_multi_index_intersection(
                     base_row_count,
                     Some(&analyze_ctx),
                 ),
-                residual_exprs: vec![],
-                requires_table_cursor: false,
+                union_prepost_filters: None,
             }
         })
         .collect();
@@ -1054,9 +1086,10 @@ pub fn consider_multi_index_intersection(
 
     evaluate_multi_index_branches(
         branches,
-        SetOperation::Intersection,
+        SetOperation::Intersection {
+            additional_consumed_terms,
+        },
         where_term_idx,
-        additional_consumed_terms,
         rhs_table,
         table_references,
         available_indexes,

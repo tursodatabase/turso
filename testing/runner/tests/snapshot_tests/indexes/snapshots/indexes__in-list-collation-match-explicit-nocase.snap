@@ -10,4 +10,4 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-`--SCAN collated_values USING COVERING INDEX idx_collated_values_nocase
+`--SCAN collated_values

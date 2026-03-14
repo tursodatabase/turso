@@ -1,0 +1,25 @@
+---
+source: subquery-sort-elision.sqltest
+expression: |-
+  WITH step1 AS (
+          SELECT x, y FROM t1 ORDER BY x
+      ),
+      step2 AS (
+          SELECT x, y FROM step1
+      )
+      SELECT * FROM step2 ORDER BY x;
+info:
+  statement_type: WITH (CTE)
+  tables:
+  - step1
+  - step2
+  - t1
+  setup_blocks:
+  - elision_schema
+  database: ':memory:'
+---
+QUERY PLAN
+`--SCAN step2
+   `--SCAN step1
+      |--SCAN t1
+      `--USE SORTER FOR ORDER BY

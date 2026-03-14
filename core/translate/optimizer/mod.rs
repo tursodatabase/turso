@@ -55,7 +55,8 @@ use super::{
     plan::{
         DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinOrderMember, JoinType,
         JoinedTable, MinMaxDef, MultiIndexBranch, MultiIndexScanOp, Operation, Plan, Search,
-        SeekDef, SeekKey, SelectPlan, SimpleAggregate, TableReferences, UpdatePlan, WhereTerm,
+        SeekDef, SeekKey, SelectPlan, SetOperation, SimpleAggregate, TableReferences, UpdatePlan,
+        WhereTerm,
     },
     planner::TableMask,
 };
@@ -2101,18 +2102,21 @@ fn optimize_table_access(
                 branches,
                 where_term_idx,
                 set_op,
-                additional_consumed_terms,
             } => {
                 // Mark the primary WHERE clause term as consumed
                 where_clause[*where_term_idx].consumed = true;
                 // For intersection, also mark additional consumed terms
-                for term_idx in additional_consumed_terms.iter() {
-                    where_clause[*term_idx].consumed = true;
+                if let SetOperation::Intersection {
+                    additional_consumed_terms,
+                } = set_op
+                {
+                    for term_idx in additional_consumed_terms.iter() {
+                        where_clause[*term_idx].consumed = true;
+                    }
                 }
 
                 let w_idx = *where_term_idx;
-                let s_op = *set_op;
-                let add_consumed = std::mem::take(additional_consumed_terms);
+                let s_op = set_op.clone();
                 // Build the MultiIndexScanOp from the branch parameters
                 let mut multi_idx_branches = Vec::with_capacity(branches.len());
                 for branch in std::mem::take(branches) {
@@ -2137,8 +2141,7 @@ fn optimize_table_access(
                         index: branch.index,
                         access,
                         estimated_rows: branch.estimated_rows,
-                        residual_exprs: branch.residual_exprs,
-                        requires_table_cursor: branch.requires_table_cursor,
+                        union_residuals: branch.residuals,
                     });
                 }
 
@@ -2147,7 +2150,6 @@ fn optimize_table_access(
                         branches: multi_idx_branches,
                         where_term_idx: w_idx,
                         set_op: s_op,
-                        additional_consumed_terms: add_consumed,
                     });
             }
             AccessMethodParams::InSeek {
