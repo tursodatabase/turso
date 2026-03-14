@@ -5,7 +5,7 @@ use crate::{
     schema::Table,
     translate::collate::CollationSeq,
     vdbe::{
-        builder::ProgramBuilder,
+        builder::{CursorKey, ProgramBuilder},
         insn::{HashDistinctData, Insn},
     },
     LimboError, Result,
@@ -94,10 +94,9 @@ pub fn emit_ungrouped_aggregation<'a>(
     // is not on a valid row). The once-flag mechanism normally evaluates non-agg columns on first
     // iteration, but if there were no iterations, we must do it here.
     //
-    // For direct table access, Column on an invalid cursor returns NULL naturally. But for
-    // coroutine-based sources (CTEs, FROM-clause subqueries), the output registers still hold
-    // the last yielded row's values. We null those registers first so that expressions
-    // referencing coroutine columns evaluate to NULL instead of leaking stale values.
+    // We must NullRow all btree cursors first so that Column/IdxRowId reads return NULL
+    // instead of stale values from the last scanned index entry. For coroutine-based sources
+    // (CTEs, FROM-clause subqueries), we null their output registers instead.
     if let Some(once_flag) = t_ctx.reg_nonagg_emit_once_flag {
         let skip_nonagg_eval = program.allocate_label();
         // If once-flag is non-zero (loop ran at least once), skip evaluation
@@ -106,23 +105,44 @@ pub fn emit_ungrouped_aggregation<'a>(
             target_pc: skip_nonagg_eval,
             jump_if_null: false,
         });
-        // Null out coroutine output registers so column references from CTEs/subqueries
-        // don't leak stale values from the last yielded row.
+        // NullRow all btree cursors so that Column/IdxRowId reads return NULL
+        // instead of leaking stale values from the last scanned row.
+        // Also null out coroutine output registers for CTE/subquery sources.
         for table_ref in plan.table_references.joined_tables() {
-            if let Table::FromClauseSubquery(subquery) = &table_ref.table {
-                if let Some(start_reg) = subquery.result_columns_start_reg {
-                    let num_cols = subquery.columns.len();
-                    if num_cols > 0 {
-                        program.emit_insn(Insn::Null {
-                            dest: start_reg,
-                            dest_end: if num_cols > 1 {
-                                Some(start_reg + num_cols - 1)
-                            } else {
-                                None
-                            },
-                        });
+            match &table_ref.table {
+                Table::BTree(_) => {
+                    // NullRow both the table cursor and index cursor (if any).
+                    // resolve_cursor_id_safe returns None if the cursor was never allocated
+                    // (e.g. covering index eliminates the table cursor).
+                    if let Some(cursor_id) =
+                        program.resolve_cursor_id_safe(&CursorKey::table(table_ref.internal_id))
+                    {
+                        program.emit_insn(Insn::NullRow { cursor_id });
+                    }
+                    if let Some(index) = table_ref.op.index() {
+                        let cursor_id = program.resolve_cursor_id(&CursorKey::index(
+                            table_ref.internal_id,
+                            index.clone(),
+                        ));
+                        program.emit_insn(Insn::NullRow { cursor_id });
                     }
                 }
+                Table::FromClauseSubquery(subquery) => {
+                    if let Some(start_reg) = subquery.result_columns_start_reg {
+                        let num_cols = subquery.columns.len();
+                        if num_cols > 0 {
+                            program.emit_insn(Insn::Null {
+                                dest: start_reg,
+                                dest_end: if num_cols > 1 {
+                                    Some(start_reg + num_cols - 1)
+                                } else {
+                                    None
+                                },
+                            });
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         // Evaluate non-aggregate columns now (with cursor in invalid state, columns return NULL)
