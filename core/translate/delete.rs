@@ -214,6 +214,22 @@ fn bind_prepare_delete_plan(
 
     let mut table_references = bound.into_table_references(&mut planned_ctes)?;
 
+    // Add planned CTEs as outer query refs so they're available for subquery resolution
+    for (name, jt) in &planned_ctes {
+        use super::plan::{ColumnUsedMask, OuterQueryReference};
+        table_references.add_outer_query_reference(OuterQueryReference {
+            identifier: name.clone(),
+            internal_id: jt.internal_id,
+            table: jt.table.clone(),
+            col_used_mask: ColumnUsedMask::default(),
+            cte_select: None,
+            cte_explicit_columns: vec![],
+            cte_id: None,
+            cte_definition_only: true,
+            rowid_referenced: false,
+        });
+    }
+
     // Set the database_id on the target table reference
     if let Some(target) = table_references.joined_tables_mut().first_mut() {
         target.database_id = database_id;

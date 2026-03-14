@@ -619,6 +619,32 @@ fn get_subquery_parser<'a>(
                     connection,
                 )?;
 
+                // Make outer CTEs available for inner CTE/scope resolution.
+                // Outer CTEs are in referenced_tables' outer_query_refs with
+                // cte_definition_only = true. They were planned at the DML
+                // statement level and need to be visible here for
+                // into_table_references to find them.
+                for oqr in referenced_tables.outer_query_refs() {
+                    if oqr.cte_definition_only && !planned_ctes.contains_key(&oqr.identifier) {
+                        // Create a JoinedTable from the outer query ref so
+                        // scope_to_table_references can find it by name.
+                        planned_ctes.insert(
+                            oqr.identifier.clone(),
+                            super::plan::JoinedTable {
+                                table: oqr.table.clone(),
+                                identifier: oqr.identifier.clone(),
+                                internal_id: oqr.internal_id,
+                                op: super::plan::Operation::default_scan_for(&oqr.table),
+                                join_info: None,
+                                col_used_mask: super::plan::ColumnUsedMask::default(),
+                                column_use_counts: Vec::new(),
+                                expression_index_usages: Vec::new(),
+                                database_id: 0,
+                            },
+                        );
+                    }
+                }
+
                 // Plan any nested derived tables.
                 let mut planned_derived = super::planner::plan_derived_tables(
                     inner_derived_bindings,

@@ -279,6 +279,23 @@ fn bind_prepare_update_plan(
 
     let mut table_references = bound.into_table_references(&mut planned_ctes)?;
 
+    // Add planned CTEs as outer query refs so they're available for subquery resolution
+    // (e.g. WITH c AS (...) UPDATE t SET b = 99 WHERE a IN (SELECT v FROM c))
+    for (name, jt) in &planned_ctes {
+        use super::plan::{ColumnUsedMask, OuterQueryReference};
+        table_references.add_outer_query_reference(OuterQueryReference {
+            identifier: name.clone(),
+            internal_id: jt.internal_id,
+            table: jt.table.clone(),
+            col_used_mask: ColumnUsedMask::default(),
+            cte_select: None,
+            cte_explicit_columns: vec![],
+            cte_id: None,
+            cte_definition_only: true,
+            rowid_referenced: false,
+        });
+    }
+
     // Convert bound result columns to ResultSetColumn for the plan
     let result_columns: Vec<ResultSetColumn> = bound_result_columns
         .into_iter()
