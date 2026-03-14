@@ -851,6 +851,7 @@ pub fn translate_expr_no_constant_opt(
 /// is allocated and the expression is translated into it.
 ///
 /// Callers MUST use the returned register — they cannot assume a specific destination.
+#[must_use = "the returned register must be used, because that is where the expression value is stored"]
 pub fn resolve_expr(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&TableReferences>,
