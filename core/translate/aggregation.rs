@@ -353,7 +353,7 @@ pub fn translate_aggregation_step(
                 col: expr_reg,
                 delimiter: 0,
                 func: AggFunc::Avg,
-                comparator_func_name: None,
+                comparator: None,
             });
             target_register
         }
@@ -366,7 +366,7 @@ pub fn translate_aggregation_step(
                 col: expr_reg,
                 delimiter: 0,
                 func: AggFunc::Count0,
-                comparator_func_name: None,
+                comparator: None,
             });
             target_register
         }
@@ -381,7 +381,7 @@ pub fn translate_aggregation_step(
                 col: expr_reg,
                 delimiter: 0,
                 func: AggFunc::Count,
-                comparator_func_name: None,
+                comparator: None,
             });
             target_register
         }
@@ -406,7 +406,7 @@ pub fn translate_aggregation_step(
                 col: expr_reg,
                 delimiter: delimiter_reg,
                 func: AggFunc::GroupConcat,
-                comparator_func_name: None,
+                comparator: None,
             });
 
             target_register
@@ -419,14 +419,14 @@ pub fn translate_aggregation_step(
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             let expr = &agg_arg_source.arg_at(0);
             emit_collseq_if_needed(program, referenced_tables, expr);
-            let comparator_func_name =
-                super::order_by::custom_type_lt_func(expr, referenced_tables, resolver.schema());
+            let comparator =
+                super::order_by::custom_type_comparator(expr, referenced_tables, resolver.schema());
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: 0,
                 func: AggFunc::Max,
-                comparator_func_name,
+                comparator,
             });
             target_register
         }
@@ -438,14 +438,14 @@ pub fn translate_aggregation_step(
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             let expr = &agg_arg_source.arg_at(0);
             emit_collseq_if_needed(program, referenced_tables, expr);
-            let comparator_func_name =
-                super::order_by::custom_type_lt_func(expr, referenced_tables, resolver.schema());
+            let comparator =
+                super::order_by::custom_type_comparator(expr, referenced_tables, resolver.schema());
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: 0,
                 func: AggFunc::Min,
-                comparator_func_name,
+                comparator,
             });
             target_register
         }
@@ -463,7 +463,7 @@ pub fn translate_aggregation_step(
                 col: expr_reg,
                 delimiter: value_reg,
                 func: AggFunc::JsonGroupObject,
-                comparator_func_name: None,
+                comparator: None,
             });
             target_register
         }
@@ -479,7 +479,7 @@ pub fn translate_aggregation_step(
                 col: expr_reg,
                 delimiter: 0,
                 func: AggFunc::JsonGroupArray,
-                comparator_func_name: None,
+                comparator: None,
             });
             target_register
         }
@@ -497,7 +497,7 @@ pub fn translate_aggregation_step(
                 col: expr_reg,
                 delimiter: delimiter_reg,
                 func: AggFunc::StringAgg,
-                comparator_func_name: None,
+                comparator: None,
             });
 
             target_register
@@ -513,7 +513,7 @@ pub fn translate_aggregation_step(
                 col: expr_reg,
                 delimiter: 0,
                 func: AggFunc::Sum,
-                comparator_func_name: None,
+                comparator: None,
             });
             target_register
         }
@@ -528,7 +528,7 @@ pub fn translate_aggregation_step(
                 col: expr_reg,
                 delimiter: 0,
                 func: AggFunc::Total,
-                comparator_func_name: None,
+                comparator: None,
             });
             target_register
         }
@@ -544,7 +544,7 @@ pub fn translate_aggregation_step(
                 col: expr_reg,
                 delimiter: 0,
                 func: AggFunc::ArrayAgg,
-                comparator_func_name: None,
+                comparator: None,
             });
             target_register
         }
@@ -574,7 +574,7 @@ pub fn translate_aggregation_step(
                 col: expr_reg,
                 delimiter: 0,
                 func: AggFunc::External(func.clone()),
-                comparator_func_name: None,
+                comparator: None,
             });
             target_register
         }
