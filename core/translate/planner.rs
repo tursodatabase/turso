@@ -1783,7 +1783,7 @@ fn parse_join(
             }
         }
         if distinct_names.is_empty() {
-            crate::bail_parse_error!("No columns found to NATURAL join on");
+            None // No common columns = cross join
         } else {
             Some(ast::JoinConstraint::Using(distinct_names))
         }
