@@ -3246,16 +3246,6 @@ fn build_seek_def(
     })
 }
 
-pub trait TakeOwnership {
-    fn take_ownership(&mut self) -> Self;
-}
-
-impl TakeOwnership for ast::Expr {
-    fn take_ownership(&mut self) -> Self {
-        std::mem::replace(self, ast::Expr::Literal(ast::Literal::Null))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{where_term_is_null_rejecting_for_table, Optimizable};
