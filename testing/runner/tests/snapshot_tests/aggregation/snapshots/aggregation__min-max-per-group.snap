@@ -20,7 +20,7 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-`--SCAN sales USING INDEX idx_sales_category
+`--SCAN sales USING INDEX idx_sales_category_region
 
 BYTECODE
 addr  opcode                  p1  p2  p3  p4                  p5  comment
@@ -30,8 +30,8 @@ addr  opcode                  p1  p2  p3  p4                  p5  comment
    3          Null             0   7   0                       0  r[7]=NULL; initialize group by comparison registers to NULL
    4          Gosub           15  39   0                       0  ; go to clear accumulator subroutine
    5          OpenRead         0   2   0  k(7,B,B,B,B,B,B,B)   0  table=sales, root=2, iDb=0
-   6          OpenRead         1   4   0  k(2,B)               0  index=idx_sales_category, root=4, iDb=0
-   7          Rewind           1  26   0                       0  Rewind index idx_sales_category
+   6          OpenRead         1   5   0  k(3,B,B)             0  index=idx_sales_category_region, root=5, iDb=0
+   7          Rewind           1  26   0                       0  Rewind index idx_sales_category_region
    8            DeferredSeek   1   0   0                       0
    9            Column         0   1  12                       0  r[12]=sales.category
   10            Column         0   4  13                       0  r[13]=sales.amount
