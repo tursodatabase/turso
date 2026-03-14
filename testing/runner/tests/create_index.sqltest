@@ -197,6 +197,32 @@ expect {
     idx15
 }
 
+@cross-check-integrity
+test create-index-strftime-with-column {
+    CREATE TABLE logs("created" TEXT NOT NULL);
+    INSERT INTO logs VALUES
+        ('2024-01-01 12:34:56'),
+        ('2024-01-01 12:59:59');
+    CREATE INDEX idx_logs_created_hour
+        ON logs(strftime('%Y-%m-%d %H:00:00', "created"));
+    INSERT INTO logs VALUES ('2024-01-01 13:00:00');
+    SELECT name
+    FROM sqlite_schema
+    WHERE type = 'index' AND name = 'idx_logs_created_hour';
+}
+expect {
+    idx_logs_created_hour
+}
+
+test create-index-strftime-now-remains-rejected {
+    CREATE TABLE logs("created" TEXT NOT NULL);
+    CREATE INDEX idx_logs_created_hour
+        ON logs(strftime('%Y-%m-%d %H:00:00', 'now'));
+    INSERT INTO logs VALUES ('2024-01-01 12:34:56');
+}
+expect error {
+}
+
 # Multiple columns where one is a string literal not matching any column should fail.
 # SQLite error: "no such column: literal"
 @cross-check-integrity
