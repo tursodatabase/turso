@@ -61,7 +61,7 @@ addr  opcode                     p1  p2  p3  p4                  p5  comment
   31      AggFinal                0  10   0  sum                  0  accum=r[10]
   32      AggFinal                0  11   0  avg                  0  accum=r[11]
   33      Copy                   10  18   0                       0  r[18]=r[10]
-  34      Le                     18  19  30  Binary               0  if r[18]<=r[19] goto 30
+  34      Le                     18  19  30                       0  if r[18]<=r[19] goto 30
   35      Copy                   10  20   0                       0  r[20]=r[10]
   36      Copy                    9  21   0                       0  r[21]=r[9]
   37      Copy                   11  22   0                       0  r[22]=r[11]

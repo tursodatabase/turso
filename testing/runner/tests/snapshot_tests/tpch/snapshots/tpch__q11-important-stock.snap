@@ -116,7 +116,7 @@ addr  opcode                    p1  p2  p3  p4                  p5  comment
   65      Return                22   0   1                       0
   66      Copy                  10  37   0                       0  r[37]=r[10]
   67      Copy                   1  38   0                       0  r[38]=r[1]
-  68      Le                    37  38  38  Binary               0  if r[37]<=r[38] goto 38
+  68      Le                    37  38  38                       0  if r[37]<=r[38] goto 38
   69      Copy                  10  39   0                       0  r[39]=r[10]
   70      Copy                   9  40   0                       0  r[40]=r[9]
   71      MakeRecord            39   2   4                       0  r[4]=mkrec(r[39..40])
