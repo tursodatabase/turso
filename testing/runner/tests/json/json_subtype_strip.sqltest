@@ -1,0 +1,315 @@
+@database :memory:
+
+test json_group_object_value-issue-5754-reproducer {
+    CREATE TABLE t(grp TEXT, val INT);
+    INSERT INTO t VALUES ('A', 1), ('A', 2), ('B', 3), ('B', 4);
+    SELECT json_group_object(grp, vals) FROM (
+        SELECT grp, json_group_array(val) AS vals FROM t GROUP BY grp
+    );
+}
+expect {
+    {"A":"[1,2]","B":"[3,4]"}
+}
+
+test json_group_object_with_direct_json_object_value {
+    CREATE TABLE t(grp TEXT, val INT);
+    INSERT INTO t VALUES ('alice', 95), ('bob', 87);
+    SELECT json_group_object(k, json_object('score', v)) FROM (
+        SELECT grp AS k, val AS v FROM t
+    );
+}
+expect {
+    {"alice":{"score":95},"bob":{"score":87}}
+}
+
+test json_group_object_with_indirect_json_object_value {
+    CREATE TABLE t(grp TEXT, val INT);
+    INSERT INTO t VALUES ('alice', 95), ('bob', 87);
+    SELECT json_group_object(k, v) FROM (
+        SELECT grp AS k, json_object('score', val) as v FROM t
+    );
+}
+expect {
+    {"alice":"{\"score\":95}","bob":"{\"score\":87}"}
+}
+
+test json_group_array_with_direct_json_object_value {
+    CREATE TABLE t(grp TEXT, val INT);
+    INSERT INTO t VALUES ('alice', 95), ('bob', 87);
+    SELECT json_group_array(json_object('score', v)) FROM (
+        SELECT grp AS k, val AS v FROM t
+    );
+}
+expect {
+    [{"score":95},{"score":87}]
+}
+
+test json_group_array_with_indirect_json_object_value {
+    CREATE TABLE t(grp TEXT, val INT);
+    INSERT INTO t VALUES ('alice', 95), ('bob', 87);
+    SELECT json_group_array(v) FROM (
+        SELECT grp AS k, json_object('score', val) AS v FROM t
+    );
+}
+expect {
+    ["{\"score\":95}","{\"score\":87}"]
+}
+
+test json_group_object_with_nested_agg_value {
+    CREATE TABLE t(grp TEXT, inner_key TEXT, val INT);
+    INSERT INTO t VALUES ('A', 'x', 1), ('A', 'y', 2), ('B', 'z', 3);
+    SELECT json_group_object(grp, inner_obj) FROM (
+        SELECT grp, json_group_object(inner_key, val) AS inner_obj
+        FROM t GROUP BY grp
+    );
+}
+expect {
+    {"A":"{\"x\":1,\"y\":2}","B":"{\"z\":3}"}
+}
+
+test json_subtype_strip_function_roundtrip {
+    SELECT json(v) FROM (SELECT json_object('a', 1) AS v);
+}
+expect {
+    {"a":1}
+}
+
+test json_subtype_strip_extract_through_subquery {
+    SELECT json_extract(v, '$.a') FROM (SELECT json_object('a', 42) AS v);
+}
+expect {
+    42
+}
+
+test json_subtype_strip_array_direct_value {
+    SELECT json_array(json_object('a', 1), 2);
+}
+expect {
+    [{"a":1},2]
+}
+
+test json_subtype_strip_array_subquery_value {
+    SELECT json_array(v) FROM (SELECT json_object('a', 1) AS v);
+}
+expect {
+    ["{\"a\":1}"]
+}
+
+test json_subtype_strip_insert_direct_value {
+    SELECT json_insert('{}', '$.k', json_object('a', 1));
+}
+expect {
+    {"k":{"a":1}}
+}
+
+test json_subtype_strip_insert_subquery_value {
+    SELECT json_insert('{}', '$.k', v) FROM (SELECT json_object('a', 1) AS v);
+}
+expect {
+    {"k":"{\"a\":1}"}
+}
+
+test json_subtype_strip_double_nested_subquery {
+    SELECT json_array(v) FROM (SELECT v FROM (SELECT json_object('a', 1) AS v));
+}
+expect {
+    ["{\"a\":1}"]
+}
+
+test json_subtype_strip_valid_through_subquery {
+    SELECT json_valid(v) FROM (SELECT json_object('a', 1) AS v);
+}
+expect {
+    1
+}
+
+test json_subtype_strip_patch_subquery_patch {
+    SELECT json_patch('{"a":1}', v) FROM (SELECT json_object('b', 2) AS v);
+}
+expect {
+    {"a":1,"b":2}
+}
+
+test json_subtype_strip_patch_subquery_doc {
+    SELECT json_patch(d, '{"b":2}') FROM (SELECT json_object('a', 1) AS d);
+}
+expect {
+    {"a":1,"b":2}
+}
+
+# Subtype boundary rules for json() values:
+# Direct function call: subtype preserved, value embedded as raw JSON.
+test json_subtype_strip_direct_call {
+    SELECT json_array(json('[1,2,3]'));
+}
+expect {
+    [[1,2,3]]
+}
+
+# FROM-clause subquery (co-routine): subtype lost, value double-quoted.
+test json_subtype_strip_from_subquery {
+    SELECT json_array(x) FROM (SELECT json('[1,2,3]') AS x);
+}
+expect {
+    ["[1,2,3]"]
+}
+
+# CTE: same co-routine path, subtype lost.
+test json_subtype_strip_cte {
+    WITH t AS (SELECT json('[1,2,3]') AS x) SELECT json_array(x) FROM t;
+}
+expect {
+    ["[1,2,3]"]
+}
+
+# UNION ALL: each branch goes through the co-routine, subtype lost.
+test json_subtype_strip_union_all {
+    SELECT json_array(j) FROM (
+        SELECT json('[1,2,3]') AS j
+        UNION ALL
+        SELECT json('{"a":1}')
+    );
+}
+expect {
+    ["[1,2,3]"]
+    ["{\"a\":1}"]
+}
+
+# Scalar subquery: not a co-routine, subtype survives.
+test json_subtype_strip_scalar_subquery {
+    SELECT json_array((SELECT json('[1,2,3]')));
+}
+expect {
+    [[1,2,3]]
+}
+
+# json_quote behavior depends on whether the argument carries a JSON subtype.
+# Direct call: subtype preserved → json_quote returns the value as-is (number).
+test json_quote_json_typed_arg {
+    SELECT json_quote(json(1));
+}
+expect {
+    1
+}
+
+# Plain string: no subtype → json_quote wraps it in double quotes.
+test json_quote_plain_string_arg {
+    SELECT json_quote('1');
+}
+expect {
+    "1"
+}
+
+# SELECT and WHERE must agree — the original SQLite bug was that the optimizer
+# fed a subtype-carrying value to the WHERE predicate while the SELECT list
+# saw the stripped version, causing NOT json_quote() to flip sign.
+test json_quote_view_boundary_consistency {
+    CREATE TABLE t1 (c0);
+    CREATE VIEW v0(c0) AS SELECT json(TRUE);
+    INSERT INTO t1 VALUES ('x');
+    SELECT NOT json_quote(v0.c0) FROM v0, t1;
+}
+expect {
+    1
+}
+
+test json_quote_view_boundary_where_consistent_with_select {
+    CREATE TABLE t1 (c0);
+    CREATE VIEW v0(c0) AS SELECT json(TRUE);
+    INSERT INTO t1 VALUES ('x');
+    SELECT * FROM v0, t1 WHERE NOT json_quote(v0.c0);
+}
+expect {
+    1|x
+}
+
+# subtype1-310 (SQLite test/subtype1.test): unary + on a JSON value inside a
+# subquery buries the subtype one expression level deeper, but the co-routine
+# boundary still strips it (SQLite commit fe373482).
+test json_subtype_strip_unary_plus_in_subquery {
+    SELECT *, json_quote(y) FROM (SELECT +json('1') AS y);
+}
+expect {
+    1|"1"
+}
+
+# subtype1-230: MATERIALIZED CTE goes through a coroutine, subtype is lost at
+# the boundary. SQLite verifies via subtype(a)=0; we verify via json_quote.
+test json_subtype_strip_materialized_cte {
+    WITH t(a) AS MATERIALIZED (SELECT json(1)) SELECT json_quote(a) FROM t;
+}
+expect {
+    "1"
+}
+
+# subtype1-231: NOT MATERIALIZED CTE is expanded inline but still loses the
+# subtype at the boundary. SQLite verifies via subtype(a)=0; we verify via json_quote.
+test json_subtype_strip_not_materialized_cte {
+    WITH t(a) AS NOT MATERIALIZED (SELECT json(1)) SELECT json_quote(a) FROM t;
+}
+expect {
+    "1"
+}
+
+# subtype1-210 (SQLite test/subtype1.test): value stored in a plain table has no
+# subtype (subtypes are not persisted), so json_quote double-quotes it and NOT
+# evaluates to true.
+test json_subtype_plain_table_no_subtype {
+    CREATE TABLE t1(a);
+    INSERT INTO t1 VALUES ('x');
+    CREATE TABLE t3(b);
+    INSERT INTO t3 VALUES(json(TRUE));
+    SELECT * FROM t3, t1 WHERE NOT json_quote(b);
+}
+expect {
+    1|x
+}
+
+# subtype1-220: same as 210 but with a view instead of a plain table. The view
+# introduces a coroutine boundary, stripping the JSON subtype so json_quote
+# double-quotes the value and NOT evaluates to true.
+test json_subtype_view_where_clause_strips_subtype {
+    CREATE TABLE t1(a);
+    INSERT INTO t1 VALUES ('x');
+    CREATE VIEW t2(b) AS SELECT json(TRUE);
+    SELECT * FROM t2, t1 WHERE NOT json_quote(b);
+}
+expect {
+    1|x
+}
+
+# subtype1-300: CASE WHEN expression containing json_patch() inside a view that
+# uses GROUP BY. The subtype must be stripped at the view boundary so that
+# json_quote wraps it in quotes and the inequality holds.
+test json_subtype_case_when_json_patch_view {
+    CREATE TABLE t0(c0);
+    INSERT INTO t0 VALUES ('1');
+    CREATE VIEW v0(c0) AS
+        SELECT CASE WHEN 1 THEN json_patch('1', '1') END
+        FROM t0 GROUP BY t0.c0;
+    SELECT * FROM v0 WHERE json_quote(v0.c0) != '1';
+}
+expect {
+    1
+}
+
+# subtype1-320: WHERE clause and SELECT list must agree when unary + is used
+# inside the subquery — both see the stripped (plain-string) value.
+test json_subtype_unary_plus_where_consistent {
+    SELECT *, json_quote(y) FROM (SELECT +json('1') AS y)
+    WHERE json_quote(y) = '"1"';
+}
+expect {
+    1|"1"
+}
+
+# subtype1-400 variant: iif() propagates the subtype of whichever branch it
+# returns, so a JSON value from iif() in a direct call (no subquery boundary)
+# keeps its subtype and is embedded as raw JSON by json_array().
+# (SQLite's original uses subtype() to assert eSubtype=74; we assert via embedding.)
+test json_subtype_iif_preserves_subtype {
+    SELECT json_array(iif(json_valid('{"a":1}'), json('{"a":1}'), NULL));
+}
+expect {
+    [{"a":1}]
+}

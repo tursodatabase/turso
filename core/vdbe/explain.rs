@@ -1352,6 +1352,7 @@ pub fn insn_to_row(
             Insn::Yield {
                 yield_reg,
                 end_offset,
+                ..
             } => (
                 "Yield",
                 *yield_reg as i64,
