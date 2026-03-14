@@ -1,4 +1,5 @@
 use crate::common::{compute_dbhash, ExecRows, TempDatabase};
+use rusqlite::Connection as SqliteConnection;
 use std::sync::Arc;
 use tempfile::TempDir;
 use turso_core::{Connection, Value};
@@ -21,6 +22,10 @@ fn run_integrity_check(conn: &Arc<Connection>) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn escape_sqlite_string_literal(text: &str) -> String {
+    text.replace('\'', "''")
 }
 
 #[cfg_attr(feature = "checksum", ignore)]
@@ -635,6 +640,275 @@ fn test_vacuum_into_preserves_autoincrement(tmp_db: TempDatabase) -> anyhow::Res
     // verify integrity since we modified the db
     let integrity_result = run_integrity_check(&dest_conn);
     assert_eq!(integrity_result, "ok");
+
+    Ok(())
+}
+
+/// Test VACUUM INTO preserves hidden rowid values for ordinary rowid tables.
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_preserves_rowid_for_rowid_tables(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (a TEXT)")?;
+    conn.execute("INSERT INTO t(rowid, a) VALUES(5, 'x')")?;
+    conn.execute("INSERT INTO t(rowid, a) VALUES(42, 'y')")?;
+
+    let source_rows: Vec<(i64, String)> = conn.exec_rows("SELECT rowid, a FROM t ORDER BY rowid");
+    assert_eq!(
+        source_rows,
+        vec![(5, "x".to_string()), (42, "y".to_string())]
+    );
+
+    let source_hash = compute_dbhash(&tmp_db);
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed_rowid.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    if !tmp_db.enable_mvcc {
+        assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+    }
+
+    let dest_rows: Vec<(i64, String)> =
+        dest_conn.exec_rows("SELECT rowid, a FROM t ORDER BY rowid");
+    assert_eq!(dest_rows, vec![(5, "x".to_string()), (42, "y".to_string())]);
+
+    Ok(())
+}
+
+/// Compare VACUUM INTO rowid behavior with SQLite reference output.
+/// This captures the compatibility expectation that explicit rowids are preserved.
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_rowid_compat_with_sqlite_reference(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (a TEXT)")?;
+    conn.execute("INSERT INTO t(rowid, a) VALUES(5, 'x')")?;
+    conn.execute("INSERT INTO t(rowid, a) VALUES(42, 'y')")?;
+
+    let dest_dir = TempDir::new()?;
+    let turso_dest = dest_dir.path().join("turso_rowid_vacuum.db");
+    conn.execute(format!("VACUUM INTO '{}'", turso_dest.to_str().unwrap()))?;
+    let turso_dest_db = TempDatabase::new_with_existent(&turso_dest);
+    let turso_dest_conn = turso_dest_db.connect_limbo();
+    let turso_rows: Vec<(i64, String)> =
+        turso_dest_conn.exec_rows("SELECT rowid, a FROM t ORDER BY rowid");
+
+    let sqlite_src = dest_dir.path().join("sqlite_rowid_src.db");
+    let sqlite_dest = dest_dir.path().join("sqlite_rowid_vacuum.db");
+    let sqlite_conn = SqliteConnection::open(&sqlite_src)?;
+    sqlite_conn.execute_batch(
+        "CREATE TABLE t (a TEXT);
+         INSERT INTO t(rowid, a) VALUES(5, 'x');
+         INSERT INTO t(rowid, a) VALUES(42, 'y');",
+    )?;
+    let sqlite_dest_escaped = escape_sqlite_string_literal(sqlite_dest.to_str().unwrap());
+    sqlite_conn.execute(&format!("VACUUM INTO '{sqlite_dest_escaped}'"), [])?;
+    drop(sqlite_conn);
+
+    let sqlite_dest_conn = SqliteConnection::open(&sqlite_dest)?;
+    let mut sqlite_stmt = sqlite_dest_conn.prepare("SELECT rowid, a FROM t ORDER BY rowid")?;
+    let sqlite_rows = sqlite_stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    assert_eq!(turso_rows, sqlite_rows);
+    assert_eq!(
+        turso_rows,
+        vec![(5, "x".to_string()), (42, "y".to_string())]
+    );
+
+    Ok(())
+}
+
+/// Compare VACUUM INTO compatibility for explicit INTEGER PRIMARY KEY and indexed tables.
+/// Includes normal, unique, and partial indexes to cover index-heavy table rewrites.
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_integer_pk_and_indexes_compat_with_sqlite(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute(
+        "CREATE TABLE t_idx (id INTEGER PRIMARY KEY, a TEXT NOT NULL, b INTEGER NOT NULL)",
+    )?;
+    conn.execute("CREATE INDEX idx_t_idx_b ON t_idx(b)")?;
+    conn.execute("CREATE UNIQUE INDEX idx_t_idx_a_unique ON t_idx(a)")?;
+    conn.execute("CREATE INDEX idx_t_idx_partial ON t_idx(a) WHERE b >= 100")?;
+    conn.execute("INSERT INTO t_idx(id, a, b) VALUES (10, 'alpha', 50)")?;
+    conn.execute("INSERT INTO t_idx(id, a, b) VALUES (25, 'beta', 150)")?;
+    conn.execute("INSERT INTO t_idx(id, a, b) VALUES (50, 'gamma', 200)")?;
+
+    let dest_dir = TempDir::new()?;
+    let turso_dest = dest_dir.path().join("turso_index_vacuum.db");
+    conn.execute(format!("VACUUM INTO '{}'", turso_dest.to_str().unwrap()))?;
+    let turso_dest_db = TempDatabase::new_with_existent(&turso_dest);
+    let turso_dest_conn = turso_dest_db.connect_limbo();
+    let turso_rows: Vec<(i64, i64, String, i64)> =
+        turso_dest_conn.exec_rows("SELECT rowid, id, a, b FROM t_idx ORDER BY id");
+    let turso_index_names_rows: Vec<(String,)> = turso_dest_conn.exec_rows(
+        "SELECT name FROM sqlite_schema WHERE type = 'index' AND tbl_name = 't_idx' ORDER BY name",
+    );
+    let turso_index_names: Vec<String> = turso_index_names_rows
+        .into_iter()
+        .map(|(name,)| name)
+        .collect();
+
+    let sqlite_src = dest_dir.path().join("sqlite_index_src.db");
+    let sqlite_dest = dest_dir.path().join("sqlite_index_vacuum.db");
+    let sqlite_conn = SqliteConnection::open(&sqlite_src)?;
+    sqlite_conn.execute_batch(
+        "CREATE TABLE t_idx (id INTEGER PRIMARY KEY, a TEXT NOT NULL, b INTEGER NOT NULL);
+         CREATE INDEX idx_t_idx_b ON t_idx(b);
+         CREATE UNIQUE INDEX idx_t_idx_a_unique ON t_idx(a);
+         CREATE INDEX idx_t_idx_partial ON t_idx(a) WHERE b >= 100;
+         INSERT INTO t_idx(id, a, b) VALUES (10, 'alpha', 50);
+         INSERT INTO t_idx(id, a, b) VALUES (25, 'beta', 150);
+         INSERT INTO t_idx(id, a, b) VALUES (50, 'gamma', 200);",
+    )?;
+    let sqlite_dest_escaped = escape_sqlite_string_literal(sqlite_dest.to_str().unwrap());
+    sqlite_conn.execute(&format!("VACUUM INTO '{sqlite_dest_escaped}'"), [])?;
+    drop(sqlite_conn);
+
+    let sqlite_dest_conn = SqliteConnection::open(&sqlite_dest)?;
+    let mut sqlite_rows_stmt =
+        sqlite_dest_conn.prepare("SELECT rowid, id, a, b FROM t_idx ORDER BY id")?;
+    let sqlite_rows = sqlite_rows_stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut sqlite_index_stmt = sqlite_dest_conn.prepare(
+        "SELECT name FROM sqlite_schema WHERE type = 'index' AND tbl_name = 't_idx' ORDER BY name",
+    )?;
+    let sqlite_index_names = sqlite_index_stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    assert_eq!(turso_rows, sqlite_rows);
+    assert_eq!(
+        turso_rows,
+        vec![
+            (10, 10, "alpha".to_string(), 50),
+            (25, 25, "beta".to_string(), 150),
+            (50, 50, "gamma".to_string(), 200),
+        ]
+    );
+    assert_eq!(turso_index_names, sqlite_index_names);
+    assert_eq!(
+        turso_index_names,
+        vec![
+            "idx_t_idx_a_unique".to_string(),
+            "idx_t_idx_b".to_string(),
+            "idx_t_idx_partial".to_string(),
+        ]
+    );
+
+    Ok(())
+}
+
+/// Test VACUUM INTO preserves hidden rowid values when "rowid" column name is shadowed.
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_preserves_rowid_when_rowid_alias_is_shadowed(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (rowid TEXT, a TEXT)")?;
+    conn.execute("INSERT INTO t(_rowid_, rowid, a) VALUES(77, 'visible', 'x')")?;
+
+    let source_rows: Vec<(i64, String, String)> =
+        conn.exec_rows("SELECT _rowid_, rowid, a FROM t ORDER BY _rowid_");
+    assert_eq!(
+        source_rows,
+        vec![(77, "visible".to_string(), "x".to_string())]
+    );
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed_rowid_shadowed.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+
+    let dest_rows: Vec<(i64, String, String)> =
+        dest_conn.exec_rows("SELECT _rowid_, rowid, a FROM t ORDER BY _rowid_");
+    assert_eq!(
+        dest_rows,
+        vec![(77, "visible".to_string(), "x".to_string())]
+    );
+
+    Ok(())
+}
+
+/// Test VACUUM INTO succeeds when all hidden rowid aliases are shadowed by real columns.
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_when_all_rowid_aliases_are_shadowed(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (rowid TEXT, _rowid_ TEXT, oid TEXT, a TEXT)")?;
+    conn.execute("INSERT INTO t(rowid, _rowid_, oid, a) VALUES('r1', 'u1', 'o1', 'x')")?;
+    conn.execute("INSERT INTO t(rowid, _rowid_, oid, a) VALUES('r2', 'u2', 'o2', 'y')")?;
+
+    let source_rows: Vec<(String, String, String, String)> =
+        conn.exec_rows("SELECT rowid, _rowid_, oid, a FROM t ORDER BY a");
+    assert_eq!(
+        source_rows,
+        vec![
+            (
+                "r1".to_string(),
+                "u1".to_string(),
+                "o1".to_string(),
+                "x".to_string()
+            ),
+            (
+                "r2".to_string(),
+                "u2".to_string(),
+                "o2".to_string(),
+                "y".to_string()
+            ),
+        ]
+    );
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed_all_aliases_shadowed.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+
+    let dest_rows: Vec<(String, String, String, String)> =
+        dest_conn.exec_rows("SELECT rowid, _rowid_, oid, a FROM t ORDER BY a");
+    assert_eq!(
+        dest_rows,
+        vec![
+            (
+                "r1".to_string(),
+                "u1".to_string(),
+                "o1".to_string(),
+                "x".to_string()
+            ),
+            (
+                "r2".to_string(),
+                "u2".to_string(),
+                "o2".to_string(),
+                "y".to_string()
+            ),
+        ]
+    );
 
     Ok(())
 }
