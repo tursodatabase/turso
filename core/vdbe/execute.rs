@@ -196,8 +196,8 @@ fn make_sort_comparator(
     use crate::vdbe::insn::SortComparatorType;
     use std::cmp::Ordering;
     match cmp_type {
-        SortComparatorType::NumericLt => std::sync::Arc::new(
-            |a: &ValueRef, b: &ValueRef| -> Ordering {
+        SortComparatorType::NumericLt => {
+            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Ordering {
                 match (a, b) {
                     (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
                     (ValueRef::Null, _) => Ordering::Less,
@@ -212,10 +212,10 @@ fn make_sort_comparator(
                         }
                     }
                 }
-            },
-        ),
-        SortComparatorType::StringReverse => std::sync::Arc::new(
-            |a: &ValueRef, b: &ValueRef| -> Ordering {
+            })
+        }
+        SortComparatorType::StringReverse => {
+            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Ordering {
                 fn reverse_str(v: &ValueRef) -> String {
                     match v {
                         ValueRef::Text(t) => t.to_string().chars().rev().collect(),
@@ -228,10 +228,10 @@ fn make_sort_comparator(
                     (_, ValueRef::Null) => Ordering::Greater,
                     _ => reverse_str(a).cmp(&reverse_str(b)),
                 }
-            },
-        ),
-        SortComparatorType::TestUintLt => std::sync::Arc::new(
-            |a: &ValueRef, b: &ValueRef| -> Ordering {
+            })
+        }
+        SortComparatorType::TestUintLt => {
+            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Ordering {
                 fn to_u64(v: &ValueRef) -> Option<u64> {
                     match v {
                         ValueRef::Null => None,
@@ -255,10 +255,10 @@ fn make_sort_comparator(
                         _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
                     },
                 }
-            },
-        ),
-        SortComparatorType::ArrayLt => std::sync::Arc::new(
-            |a: &ValueRef, b: &ValueRef| -> Ordering {
+            })
+        }
+        SortComparatorType::ArrayLt => {
+            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Ordering {
                 match (a, b) {
                     (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
                     (ValueRef::Null, _) => Ordering::Less,
@@ -286,8 +286,8 @@ fn make_sort_comparator(
                     }
                     _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
                 }
-            },
-        ),
+            })
+        }
     }
 }
 
