@@ -3,7 +3,7 @@ use crate::{turso_assert, turso_assert_greater_than_or_equal, turso_assert_less_
 use std::cmp::PartialEq;
 
 use super::{
-    expr::walk_expr,
+    expr::{walk_expr, walk_expr_mut},
     plan::{
         Aggregate, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
         JoinOrderMember, JoinType as PlanJoinType, JoinedTable, Operation, OuterQueryReference,
@@ -1366,8 +1366,54 @@ pub fn parse_where(
                 resolver,
                 BindingBehavior::TryCanonicalColumnsFirst,
             )?;
+            let _ = walk_expr_mut(&mut expr.expr, &mut |e: &mut Expr| -> Result<WalkControl> {
+                if let Expr::Between {
+                    lhs,
+                    not,
+                    start,
+                    end,
+                } = e
+                {
+                    let lhs_expr = std::mem::replace(lhs.as_mut(), Expr::Literal(Null));
+                    let start_expr = std::mem::replace(start.as_mut(), Expr::Literal(Null));
+                    let end_expr = std::mem::replace(end.as_mut(), Expr::Literal(Null));
+
+                    let (lower, upper, combine_op) = if *not {
+                        (
+                            Expr::Binary(
+                                Box::new(start_expr),
+                                ast::Operator::Greater,
+                                Box::new(lhs_expr.clone()),
+                            ),
+                            Expr::Binary(
+                                Box::new(lhs_expr),
+                                ast::Operator::Greater,
+                                Box::new(end_expr),
+                            ),
+                            ast::Operator::Or,
+                        )
+                    } else {
+                        (
+                            Expr::Binary(
+                                Box::new(start_expr),
+                                ast::Operator::LessEquals,
+                                Box::new(lhs_expr.clone()),
+                            ),
+                            Expr::Binary(
+                                Box::new(lhs_expr),
+                                ast::Operator::LessEquals,
+                                Box::new(end_expr),
+                            ),
+                            ast::Operator::And,
+                        )
+                    };
+                    *e = Expr::Binary(Box::new(lower), combine_op, Box::new(upper));
+                }
+                Ok(WalkControl::Continue)
+            });
         }
-        // BETWEEN is rewritten to (lhs >= start) AND (lhs <= end) by bind_and_rewrite_expr.
+        // BETWEEN in WHERE is rewritten to binary terms here so each side can be
+        // considered independently by constraint extraction and range planning.
         // Re-break any ANDs that were created so they become separate WhereTerms for
         // constraint extraction.
         let mut i = start_idx;
