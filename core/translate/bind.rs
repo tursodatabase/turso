@@ -190,6 +190,8 @@ pub struct ScopeTable {
     pub table: Arc<dyn BindTable>,
     /// Join constraint info (USING clause for dedup during unqualified lookup).
     pub join_info: Option<JoinInfo>,
+    /// Database ID for attached database support (0 = main).
+    pub database_id: usize,
 }
 
 #[derive(Clone)]
@@ -491,7 +493,7 @@ impl BoundSelect {
                     join_info: scope_table.join_info,
                     col_used_mask: Default::default(),
                     expression_index_usages: Vec::new(),
-                    database_id: 0,
+                    database_id: scope_table.database_id,
                 }),
                 ScopeTableSource::Cte { name, .. } => {
                     // Clone rather than remove: the same CTE may be referenced
@@ -1336,6 +1338,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         },
                         table: cte_table,
                         join_info: None,
+                        database_id: 0,
                     });
                 }
 
@@ -1405,6 +1408,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         },
                         table: subquery_table,
                         join_info: None,
+                        database_id: 0,
                     });
                 }
 
@@ -1423,6 +1427,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     source: ScopeTableSource::Table(schema_table.clone()),
                     table: schema_table,
                     join_info: None,
+                    database_id,
                 })
             }
             // Inline subquery in FROM: SELECT ... FROM (SELECT ...)
@@ -1467,6 +1472,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     },
                     table: subquery_table,
                     join_info: None,
+                    database_id: 0,
                 })
             }
             // Virtual table function call: SELECT ... FROM table_func(args)
@@ -1501,6 +1507,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     source: ScopeTableSource::Table(schema_table.clone()),
                     table: schema_table,
                     join_info: None,
+                    database_id: 0, // Virtual tables are always in main schema
                 })
             }
             // Parenthesized FROM subclause: SELECT ... FROM (t1 JOIN t2 ON ...)
@@ -1539,6 +1546,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     },
                     table: sub_table,
                     join_info: None,
+                    database_id: 0,
                 })
             }
         }
@@ -2221,6 +2229,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     },
                     table: cte_table,
                     join_info: None,
+                    database_id: 0,
                 }],
                 right_join_swapped: false,
             });
@@ -2241,6 +2250,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 source: ScopeTableSource::Table(schema_table.clone()),
                 table: schema_table,
                 join_info: None,
+                database_id,
             }],
             right_join_swapped: false,
         })
