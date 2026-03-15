@@ -4,6 +4,7 @@ use turso_parser::ast::{self, ResolveType, SortOrder};
 
 use super::{Insn, InsnReference, PreparedProgram, Value};
 use crate::function::{Func, ScalarFunc};
+use crate::translate::collate::CollationSeq;
 use crate::types::default_nulls_order;
 
 pub const EXPLAIN_COLUMNS: [&str; 8] = ["addr", "opcode", "p1", "p2", "p3", "p4", "p5", "comment"];
@@ -12,6 +13,14 @@ pub const EXPLAIN_COLUMNS_TYPE: [&str; 8] = [
 ];
 pub const EXPLAIN_QUERY_PLAN_COLUMNS: [&str; 4] = ["id", "parent", "notused", "detail"];
 pub const EXPLAIN_QUERY_PLAN_COLUMNS_TYPE: [&str; 4] = ["INTEGER", "INTEGER", "INTEGER", "TEXT"];
+
+fn sorter_collation_name(collation: CollationSeq) -> &'static str {
+    match collation {
+        CollationSeq::Unset | CollationSeq::Binary => "B",
+        CollationSeq::NoCase => "N",
+        CollationSeq::Rtrim => "R",
+    }
+}
 
 pub fn insn_to_row(
     program: &PreparedProgram,
@@ -1186,7 +1195,7 @@ pub fn insn_to_row(
                                 ast::NullsOrder::Last => "L.",
                             }
                         };
-                        format!("{sign}{nulls}{}", key_info.collation)
+                        format!("{sign}{nulls}{}", sorter_collation_name(key_info.collation))
                     })
                     .collect();
                 (

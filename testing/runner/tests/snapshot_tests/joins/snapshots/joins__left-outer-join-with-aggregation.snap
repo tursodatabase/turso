@@ -32,7 +32,7 @@ QUERY PLAN
 BYTECODE
 addr  opcode                    p1  p2  p3  p4                    p5  comment
    0          Init               0  80   0                         0  Start at 80
-   1          SorterOpen         0   2   0  k(2,-B,Binary)         0  cursor=0
+   1          SorterOpen         0   2   0  k(2,-B,B)              0  cursor=0
    2          Null               0  13  14                         0  r[13..14]=NULL
    3          SorterOpen         1   4   0  k(2,B,B)               0  cursor=1
    4          Integer            0   8   0                         0  r[8]=0; clear group by abort flag
