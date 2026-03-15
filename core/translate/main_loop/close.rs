@@ -1,4 +1,5 @@
 use super::*;
+use crate::translate::main_loop::body::emit_unmatched_row_conditions_and_loop;
 use crate::translate::main_loop::hash::{
     emit_hash_join_unmatched_build_rows, HashProbeCloseEmitter,
 };
@@ -295,6 +296,7 @@ impl CloseLoop {
                             hash_join_op,
                             &hash_ctx,
                             select_plan,
+                            table_index,
                             probe_cursor_id,
                         )?;
                     }
@@ -441,22 +443,15 @@ pub(super) struct AutoIndexResult {
 /// dispatch so that aggregates, LIMIT, ORDER BY, etc. all work naturally.
 /// At runtime, HashGraceInit is a no-op if the build side didn't spill.
 #[allow(clippy::too_many_arguments)]
-fn emit_grace_hash_join_loop(
+fn emit_grace_hash_join_loop<'a>(
     program: &mut ProgramBuilder,
-    _t_ctx: &mut TranslateCtx<'_>,
+    t_ctx: &mut TranslateCtx<'a>,
     hash_join_op: &HashJoinOp,
     hash_ctx: &HashCtx,
-    _select_plan: Option<&SelectPlan>,
+    select_plan: Option<&'a SelectPlan>,
+    table_index: usize,
     probe_cursor_id: CursorID,
 ) -> Result<()> {
-    // Only emit grace loop for INNER and LEFT OUTER (v1 scope)
-    if !matches!(
-        hash_join_op.join_type,
-        HashJoinType::Inner | HashJoinType::LeftOuter
-    ) {
-        return Ok(());
-    }
-
     // Need grace_flag_reg + probe_rowid_reg for grace processing
     let Some(probe_rowid_reg) = hash_ctx.probe_rowid_reg else {
         return Ok(());
@@ -470,6 +465,7 @@ fn emit_grace_hash_join_loop(
     let match_found_label = hash_ctx.match_found_label;
     let payload_dest_reg = hash_ctx.payload_start_reg;
     let num_payload = hash_ctx.payload_columns.len();
+    let is_full_outer = hash_join_op.join_type == HashJoinType::FullOuter;
 
     let grace_done = program.allocate_label();
     let grace_partition_top = program.allocate_label();
@@ -498,6 +494,18 @@ fn emit_grace_hash_join_loop(
 
     // grace_probe_top: get next probe entry (writes keys + rowid to registers)
     program.preassign_label_to_next_insn(grace_probe_top);
+
+    // FULL OUTER: reset match flag before each probe entry so we can detect misses
+    if is_full_outer {
+        let probe_table_idx = hash_join_op.probe_table_idx;
+        if let Some(lj_meta) = t_ctx.meta_left_joins[probe_table_idx].as_ref() {
+            program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: lj_meta.reg_match_flag,
+            });
+        }
+    }
+
     program.emit_insn(Insn::HashGraceNextProbe {
         hash_table_id: to_u16(hash_table_reg),
         key_start_reg: to_u16(hash_ctx.key_start_reg),
@@ -513,13 +521,22 @@ fn emit_grace_hash_join_loop(
         target_pc: grace_probe_top,
     });
 
+    // For FULL OUTER, HashProbe miss needs to go to the outer-check path
+    // (emit unmatched probe row with NULL build columns).
+    // For INNER/LEFT OUTER, miss just advances to next probe entry.
+    let grace_outer_check = if is_full_outer {
+        program.allocate_label()
+    } else {
+        grace_probe_top
+    };
+
     // HashProbe the loaded build partition with the probe keys
     program.emit_insn(Insn::HashProbe {
         hash_table_id: to_u16(hash_table_reg),
         key_start_reg: to_u16(hash_ctx.key_start_reg),
         num_keys: to_u16(hash_ctx.num_keys),
         dest_reg: to_u16(match_reg),
-        target_pc: grace_probe_top, // no match → next probe entry
+        target_pc: grace_outer_check,
         payload_dest_reg: payload_dest_reg.map(to_u16),
         num_payload: to_u16(num_payload),
         probe_rowid_reg: None, // no buffering during grace processing
@@ -532,14 +549,17 @@ fn emit_grace_hash_join_loop(
     });
 
     // grace_hash_next: the grace loop's own HashNext, reached via IfPos dispatch
-    // from the shared body. On miss, advance to next probe entry.
+    // from the shared body.
     if let Some(grace_hash_next_label) = hash_ctx.grace_hash_next_label {
         program.resolve_label(grace_hash_next_label, program.offset());
     }
+
+    // For FULL OUTER, HashNext miss goes to outer check (unmatched probe row).
+    // For INNER/LEFT OUTER, miss advances to next probe entry.
     program.emit_insn(Insn::HashNext {
         hash_table_id: hash_table_reg,
         dest_reg: match_reg,
-        target_pc: grace_probe_top, // miss → next probe entry
+        target_pc: grace_outer_check,
         payload_dest_reg,
         num_payload,
     });
@@ -548,8 +568,65 @@ fn emit_grace_hash_join_loop(
         target_pc: match_found_label,
     });
 
-    // grace_advance: evict current partition, advance to next
+    // FULL OUTER: unmatched probe row path.
+    // If match_flag is still 0, emit the probe row with NULL build columns.
+    if is_full_outer {
+        program.resolve_label(grace_outer_check, program.offset());
+
+        let probe_table_idx = hash_join_op.probe_table_idx;
+        if let Some(lj_meta) = t_ctx.meta_left_joins[probe_table_idx].as_ref() {
+            // If match_flag > 0, a match was found, skip to next probe entry
+            program.emit_insn(Insn::IfPos {
+                reg: lj_meta.reg_match_flag,
+                target_pc: grace_probe_top,
+                decrement_by: 0,
+            });
+        }
+
+        // Set build cursor to NULL row
+        if let Some(cursor_id) = hash_ctx.build_cursor_id {
+            program.emit_insn(Insn::NullRow { cursor_id });
+        }
+
+        // NULL out payload registers
+        if let Some(payload_reg) = hash_ctx.payload_start_reg {
+            if num_payload > 0 {
+                program.emit_insn(Insn::Null {
+                    dest: payload_reg,
+                    dest_end: Some(payload_reg + num_payload - 1),
+                });
+            }
+        }
+
+        // Emit the unmatched row through the shared body
+        if let Some(plan) = select_plan {
+            emit_unmatched_row_conditions_and_loop(
+                program,
+                t_ctx,
+                plan,
+                hash_join_op.build_table_idx,
+                table_index,
+                grace_probe_top,
+                hash_ctx
+                    .inner_loop_gosub_reg
+                    .zip(hash_ctx.inner_loop_gosub_label),
+            )?;
+        }
+
+        // Advance to next probe entry
+        program.emit_insn(Insn::Goto {
+            target_pc: grace_probe_top,
+        });
+    }
+
+    // grace_advance: probe entries exhausted for this partition.
     program.resolve_label(grace_advance, program.offset());
+
+    // Note: unmatched build rows (LEFT/FULL OUTER) are already handled by
+    // emit_hash_join_unmatched_build_rows which runs BEFORE the grace loop
+    // and scans ALL partitions. We don't duplicate that here.
+
+    // Evict current partition, advance to next
     program.emit_insn(Insn::HashGraceAdvancePartition {
         hash_table_id: to_u16(hash_table_reg),
         target_pc: grace_cleanup,

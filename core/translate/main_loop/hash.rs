@@ -696,14 +696,7 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
             self.next
         };
 
-        // For grace hash join: emit RowId for the probe cursor so we can
-        // buffer probe rows when their target partition is on disk.
-        // Only for INNER and LEFT OUTER joins (FULL OUTER deferred to v2).
-        let grace_eligible = matches!(
-            self.hash_join_op.join_type,
-            HashJoinType::Inner | HashJoinType::LeftOuter
-        );
-        let (probe_rowid_reg, grace_flag_reg) = if grace_eligible {
+        let (probe_rowid_reg, grace_flag_reg) = {
             let rowid_reg = self.program.alloc_register();
             self.program.emit_insn(Insn::RowId {
                 cursor_id: self.probe_cursor_id,
@@ -716,8 +709,6 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
                 dest: flag_reg,
             });
             (Some(rowid_reg), Some(flag_reg))
-        } else {
-            (None, None)
         };
 
         let match_reg = self.program.alloc_register();
