@@ -2845,7 +2845,7 @@ mod tests {
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
     }
-  
+
     /// Test: sqlite3_initialize must not panic when a global tracing subscriber
     /// is already installed.
     #[test]
