@@ -713,17 +713,23 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 }
                 self.lock_states.blocking_checkpoint_lock_held = true;
 
-                self.collect_committed_table_row_versions();
-                tracing::debug!("Collected {} committed versions", self.write_set.len());
-
-                self.collect_committed_index_row_versions();
-                tracing::debug!("Collected {} index row changes", self.index_write_set.len());
                 // Checkpoint boundary is derived from a stable snapshot under the blocking lock:
                 // old durable boundary plus the latest committed tx watermark. This covers both
                 // row/index commits and header-only commits.
                 let durable_old = self.durable_txid_max_old.map(u64::from).unwrap_or_default();
                 let committed_max = self.mvstore.last_committed_tx_ts.load(Ordering::Acquire);
                 self.durable_txid_max_new = durable_old.max(committed_max);
+
+                // Rebuild sqlite_sequence BEFORE collecting write set so the rebuilt entries
+                // are included in the checkpoint and persisted properly
+                self.rebuild_sqlite_sequence()?;
+
+                self.collect_committed_table_row_versions();
+                tracing::debug!("Collected {} committed versions", self.write_set.len());
+
+                self.collect_committed_index_row_versions();
+                tracing::debug!("Collected {} index row changes", self.index_write_set.len());
+
                 self.maybe_stage_mvcc_metadata_write()?;
 
                 self.mvstore
@@ -1509,6 +1515,302 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 ))
             }
         }
+    }
+
+    /// Rebuild the sqlite_sequence table for AUTOINCREMENT support in MVCC mode.
+    fn rebuild_sqlite_sequence(&mut self) -> Result<()> {
+        use crate::schema::SQLITE_SEQUENCE_TABLE_NAME;
+
+        let schema = self.connection.db.clone_schema();
+
+        let autoincrement_tables: Vec<(String, MVTableId)> = schema
+            .tables
+            .iter()
+            .filter_map(|(table_name, table)| {
+                let btree_table = table.btree()?;
+                if btree_table.has_autoincrement {
+                    let table_id = self
+                        .mvstore
+                        .get_table_id_from_root_page(btree_table.root_page);
+                    Some((table_name.clone(), table_id))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if autoincrement_tables.is_empty() {
+            return Ok(());
+        }
+
+        let seq_table_id = schema
+            .tables
+            .get(SQLITE_SEQUENCE_TABLE_NAME)
+            .and_then(|table| table.btree())
+            .map(|btree_table| {
+                self.mvstore
+                    .get_table_id_from_root_page(btree_table.root_page)
+            });
+
+        let Some(seq_table_id) = seq_table_id else {
+            tracing::warn!(
+                "No sqlite_sequence table found - this should not happen with AUTOINCREMENT tables"
+            );
+            return Ok(());
+        };
+
+        for (table_name, table_id) in autoincrement_tables {
+            let max_rowid_from_store = self.find_max_rowid_for_table(table_id);
+            let existing_seq =
+                self.read_existing_sqlite_sequence_value(seq_table_id, &table_name)?;
+
+            let effective_max = match (max_rowid_from_store, existing_seq) {
+                (Some(store), Some(existing)) => Some(store.max(existing)),
+                (Some(store), None) => Some(store),
+                (None, Some(existing)) => Some(existing),
+                (None, None) => None,
+            };
+
+            if let Some(max_rowid) = effective_max {
+                self.update_sqlite_sequence_entry(seq_table_id, table_name.clone(), max_rowid)?;
+
+                // Critical: Reset the RowidAllocator to match the rebuilt sqlite_sequence value
+                // This prevents the allocator from caching stale values from rolled-back transactions
+                let allocator = self.mvstore.get_rowid_allocator(&table_id);
+                allocator.initialize(Some(max_rowid));
+                tracing::debug!(
+                    "Reset RowidAllocator for table {} to max_rowid {}",
+                    table_name,
+                    max_rowid
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn find_max_rowid_for_table(&self, table_id: MVTableId) -> Option<i64> {
+        let mut max_rowid = 0i64;
+        let mut found_any = false;
+
+        // Use the same pattern as collect_committed_table_row_versions:
+        // Only consider rows that are actually being checkpointed (committed and within boundaries)
+        for entry in self.mvstore.rows.iter() {
+            let row_id = entry.key();
+            if row_id.table_id != table_id {
+                continue;
+            }
+
+            // Skip destroyed tables (following same pattern as checkpoint collection)
+            if self.destroyed_tables.contains(&row_id.table_id) {
+                continue;
+            }
+
+            let row_versions = entry.value().read();
+
+            // Critical: Only consider rows that would be checkpointed (committed and within boundaries)
+            if let Some(version) =
+                self.maybe_get_checkpointable_version(&row_versions, row_id.table_id)
+            {
+                // Only process non-delete versions (we want actual data, not tombstones)
+                if version.end.is_none() {
+                    if let RowKey::Int(rowid) = row_id.row_id {
+                        if rowid > max_rowid {
+                            max_rowid = rowid;
+                            found_any = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if found_any {
+            Some(max_rowid)
+        } else {
+            None
+        }
+    }
+
+    fn update_sqlite_sequence_entry(
+        &mut self,
+        seq_table_id: MVTableId,
+        table_name: String,
+        max_rowid: i64,
+    ) -> Result<()> {
+        use crate::types::{ImmutableRecord, Value};
+
+        tracing::debug!("Updating sqlite_sequence: {} -> {}", table_name, max_rowid);
+
+        let record = ImmutableRecord::from_values(
+            &[
+                Value::build_text(table_name.clone()),
+                Value::from_i64(max_rowid),
+            ],
+            2,
+        );
+        let row_data = record.get_payload().to_vec();
+
+        let existing_row_id = self.find_sqlite_sequence_row(seq_table_id, &table_name)?;
+
+        match existing_row_id {
+            Some(row_id) => self.update_existing_sqlite_sequence_row(row_id, row_data)?,
+            None => self.insert_new_sqlite_sequence_row(seq_table_id, &table_name, row_data)?,
+        }
+
+        Ok(())
+    }
+
+    fn find_sqlite_sequence_row(
+        &self,
+        seq_table_id: MVTableId,
+        table_name: &str,
+    ) -> Result<Option<RowID>> {
+        for entry in self.mvstore.rows.iter() {
+            let row_id = entry.key();
+            if row_id.table_id != seq_table_id {
+                continue;
+            }
+            let row_versions = entry.value().read();
+            if let Some(latest_version) = row_versions.iter().find(|v| v.end.is_none()) {
+                if let Some(ref row_data) = latest_version.row.data {
+                    if self.row_matches_table_name(row_data, table_name)? {
+                        return Ok(Some(row_id.clone()));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn row_matches_table_name(&self, row_data: &[u8], table_name: &str) -> Result<bool> {
+        use crate::types::{ValueIterator, ValueRef};
+
+        let mut value_iter = ValueIterator::new(row_data)?;
+        if let Some(Ok(ValueRef::Text(text_ref))) = value_iter.next() {
+            return Ok(text_ref.as_str() == table_name);
+        }
+        Ok(false)
+    }
+
+    fn read_existing_sqlite_sequence_value(
+        &self,
+        seq_table_id: MVTableId,
+        table_name: &str,
+    ) -> Result<Option<i64>> {
+        use crate::numeric::Numeric;
+        use crate::types::{ValueIterator, ValueRef};
+
+        for entry in self.mvstore.rows.iter() {
+            let row_id = entry.key();
+            if row_id.table_id != seq_table_id {
+                continue;
+            }
+            let row_versions = entry.value().read();
+            if let Some(latest_version) = row_versions.iter().find(|v| v.end.is_none()) {
+                if let Some(ref row_data) = latest_version.row.data {
+                    if !self.row_matches_table_name(row_data, table_name)? {
+                        continue;
+                    }
+                    let mut value_iter = ValueIterator::new(row_data)?;
+                    let _name = value_iter.next();
+                    if let Some(Ok(ValueRef::Numeric(Numeric::Integer(seq)))) = value_iter.next() {
+                        return Ok(Some(seq));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn update_existing_sqlite_sequence_row(
+        &mut self,
+        row_id: RowID,
+        new_row_data: Vec<u8>,
+    ) -> Result<()> {
+        use crate::mvcc::database::{Row, RowVersion, TxTimestampOrID};
+
+        let row_entry = self
+            .mvstore
+            .rows
+            .get(&row_id)
+            .ok_or_else(|| LimboError::InternalError("sqlite_sequence row not found".into()))?;
+
+        let mut row_versions = row_entry.value().write();
+
+        let checkpoint_timestamp = self.durable_txid_max_new;
+
+        if let Some(current_version) = row_versions.iter_mut().find(|v| v.end.is_none()) {
+            current_version.end = Some(TxTimestampOrID::Timestamp(checkpoint_timestamp));
+        }
+
+        let new_version = RowVersion {
+            id: self
+                .mvstore
+                .version_id_counter
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            begin: Some(TxTimestampOrID::Timestamp(checkpoint_timestamp)),
+            end: None,
+            row: Row::new_table_row(row_id.clone(), new_row_data, 2),
+            btree_resident: false,
+        };
+
+        self.mvstore
+            .insert_version_raw(&mut row_versions, new_version);
+
+        Ok(())
+    }
+
+    fn insert_new_sqlite_sequence_row(
+        &mut self,
+        seq_table_id: MVTableId,
+        table_name: &str,
+        row_data: Vec<u8>,
+    ) -> Result<()> {
+        use crate::mvcc::database::{Row, RowID, RowKey, RowVersion, TxTimestampOrID};
+
+        let new_rowid = self.generate_new_rowid_for_table(seq_table_id)?;
+
+        let row_id = RowID {
+            table_id: seq_table_id,
+            row_id: RowKey::Int(new_rowid),
+        };
+
+        let checkpoint_timestamp = self.durable_txid_max_new;
+
+        let row_version = RowVersion {
+            id: self
+                .mvstore
+                .version_id_counter
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            begin: Some(TxTimestampOrID::Timestamp(checkpoint_timestamp)),
+            end: None,
+            row: Row::new_table_row(row_id.clone(), row_data, 2),
+            btree_resident: false,
+        };
+
+        self.mvstore.insert_version(row_id, row_version);
+
+        tracing::debug!(
+            "Inserted new sqlite_sequence row: {} -> rowid {}",
+            table_name,
+            new_rowid
+        );
+        Ok(())
+    }
+
+    fn generate_new_rowid_for_table(&self, table_id: MVTableId) -> Result<i64> {
+        let mut max_rowid = 0i64;
+        for entry in self.mvstore.rows.iter() {
+            let row_id = entry.key();
+            if row_id.table_id == table_id {
+                if let RowKey::Int(rowid) = row_id.row_id {
+                    if rowid > max_rowid {
+                        max_rowid = rowid;
+                    }
+                }
+            }
+        }
+        Ok(max_rowid + 1)
     }
 }
 

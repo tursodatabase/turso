@@ -1,0 +1,93 @@
+@database :temp:
+@skip-file-if sqlite "MVCC is not supported in SQLite"
+
+test mvcc-autoincrement-basic {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT);
+    PRAGMA journal_mode='MVCC';
+    INSERT INTO t1(value) VALUES ('first');
+    INSERT INTO t1(value) VALUES ('second');
+    INSERT INTO t1(value) VALUES ('third');
+    SELECT id, value FROM t1 ORDER BY id;
+}
+expect {
+    mvcc
+    1|first
+    2|second
+    3|third
+}
+
+test mvcc-autoincrement-explicit-rowid {
+    CREATE TABLE t2(id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT);
+    PRAGMA journal_mode='MVCC';
+    INSERT INTO t2(id, value) VALUES (100, 'explicit');
+    INSERT INTO t2(value) VALUES ('auto');
+    SELECT id, value FROM t2 ORDER BY id;
+}
+expect {
+    mvcc
+    100|explicit
+    101|auto
+}
+
+test mvcc-autoincrement-checkpoint-rebuilds-sequence {
+    CREATE TABLE t3(id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT);
+    PRAGMA journal_mode='MVCC';
+    INSERT INTO t3(value) VALUES ('a');
+    INSERT INTO t3(value) VALUES ('b');
+    INSERT INTO t3(value) VALUES ('c');
+    PRAGMA wal_checkpoint(TRUNCATE);
+    SELECT name, seq FROM sqlite_sequence WHERE name='t3';
+}
+expect {
+    mvcc
+    0|0|0
+    t3|3
+}
+
+test mvcc-autoincrement-delete-preserves-sequence {
+    CREATE TABLE t4(id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT);
+    PRAGMA journal_mode='MVCC';
+    INSERT INTO t4(value) VALUES ('keep');
+    INSERT INTO t4(value) VALUES ('keep');
+    INSERT INTO t4(value) VALUES ('will-delete');
+    DELETE FROM t4 WHERE id = 3;
+    PRAGMA wal_checkpoint(TRUNCATE);
+    SELECT name, seq FROM sqlite_sequence WHERE name='t4';
+}
+expect {
+    mvcc
+    0|0|0
+    t4|3
+}
+
+test mvcc-autoincrement-multiple-tables {
+    CREATE TABLE m1(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE TABLE m2(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    PRAGMA journal_mode='MVCC';
+    INSERT INTO m1(v) VALUES ('a');
+    INSERT INTO m1(v) VALUES ('b');
+    INSERT INTO m2(v) VALUES ('x');
+    INSERT INTO m2(v) VALUES ('y');
+    INSERT INTO m2(v) VALUES ('z');
+    PRAGMA wal_checkpoint(TRUNCATE);
+    SELECT name, seq FROM sqlite_sequence ORDER BY name;
+}
+expect {
+    mvcc
+    0|0|0
+    m1|2
+    m2|3
+}
+
+test mvcc-autoincrement-multi-row-insert {
+    CREATE TABLE t5(id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT);
+    PRAGMA journal_mode='MVCC';
+    INSERT INTO t5(value) VALUES ('one'), ('two'), ('three');
+    SELECT id, value FROM t5 ORDER BY id;
+}
+expect {
+    mvcc
+    1|one
+    2|two
+    3|three
+}

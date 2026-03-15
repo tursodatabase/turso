@@ -94,11 +94,6 @@ fn validate(
     if table.btree().is_some_and(|t| !t.has_rowid) {
         crate::bail_parse_error!("INSERT into WITHOUT ROWID table is not supported");
     }
-    if table.btree().is_some_and(|t| t.has_autoincrement) && conn.mvcc_enabled() {
-        crate::bail_parse_error!(
-            "AUTOINCREMENT is not supported in MVCC mode (journal_mode=experimental_mvcc)"
-        );
-    }
 
     Ok(())
 }
@@ -317,7 +312,7 @@ pub fn translate_insert(
         database_id,
     )?;
 
-    if inserting_multiple_rows && btree_table.has_autoincrement {
+    if inserting_multiple_rows && btree_table.has_autoincrement && !connection.mvcc_enabled() {
         ensure_sequence_initialized(program, resolver, &btree_table, database_id)?;
     }
 
