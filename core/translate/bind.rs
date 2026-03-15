@@ -1520,12 +1520,17 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
                 // 2. Bind argument expressions. Use lateral scope if available so that
                 // table function args can reference previously-joined tables
-                // (e.g. SELECT * FROM generate_series(0,2) s JOIN json_tree(..., s.value))
+                // (e.g. SELECT * FROM generate_series(0,2) s JOIN json_tree(..., s.value)).
+                // Use allow_unbound so that forward references to later FROM tables
+                // (e.g. FROM func(s.col), s) are left unresolved for the emitter.
                 let empty_scope = BindScope::empty();
                 let arg_scope = lateral_scope.unwrap_or(&empty_scope);
+                let saved_allow_unbound = self.allow_unbound;
+                self.allow_unbound = true;
                 for arg in args.iter_mut() {
                     self.bind_expr(arg, arg_scope)?;
                 }
+                self.allow_unbound = saved_allow_unbound;
 
                 // 3. Build ScopeTable from the virtual table's columns
                 Ok(ScopeTable {
@@ -2211,6 +2216,22 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     }
                 }
                 None => {}
+            }
+        }
+
+        // Second pass: re-bind table function args that may have been left
+        // unresolved due to forward references (e.g. FROM func(s.col), s).
+        // Now that all tables are in scope, resolve any remaining Expr::Qualified/Id.
+        if let ast::SelectTable::TableCall(_, args, _) = from.select.as_mut() {
+            for arg in args.iter_mut() {
+                self.bind_expr(arg, &scope)?;
+            }
+        }
+        for join in &mut from.joins {
+            if let ast::SelectTable::TableCall(_, args, _) = join.table.as_mut() {
+                for arg in args.iter_mut() {
+                    self.bind_expr(arg, &scope)?;
+                }
             }
         }
 
