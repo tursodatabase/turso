@@ -1,0 +1,22 @@
+---
+source: subquery-sort-elision.sqltest
+expression: |-
+  WITH unordered AS (
+          SELECT x, y FROM t1
+      )
+      SELECT x, SUM(y) OVER (ORDER BY x) AS running
+      FROM unordered;
+info:
+  statement_type: WITH (CTE)
+  tables:
+  - t1
+  - unordered
+  setup_blocks:
+  - elision_schema
+  database: ':memory:'
+---
+QUERY PLAN
+`--SCAN window_subquery_0
+   |--SCAN unordered
+   |  `--SCAN t1
+   `--USE SORTER FOR ORDER BY

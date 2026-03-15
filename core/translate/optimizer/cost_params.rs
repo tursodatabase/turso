@@ -17,8 +17,8 @@ pub struct CostModelParams {
     /// Assumed rows per table when statistics unavailable.
     pub rows_per_table_fallback: f64,
 
-    /// Estimated rows per B-tree page (affects IO cost calculations).
-    pub rows_per_page: f64,
+    /// Estimated rows per table B-tree page.
+    pub rows_per_table_page: f64,
 
     // === Selectivity Fallbacks ===
     /// Selectivity for equality predicate on unindexed column (e.g., `x = 5`).
@@ -64,10 +64,6 @@ pub struct CostModelParams {
     /// Bonus subtracted from cost when using an index (encourages index usage).
     pub index_bonus: f64,
 
-    /// Density multiplier for covering indexes (more rows fit per page
-    /// because only indexed columns are stored).
-    pub covering_index_density: f64,
-
     // === Sort Cost ===
     /// CPU cost per row for sorting (used in O(n log n) estimate).
     /// This is used when estimating the cost saved by using an ordered index.
@@ -97,12 +93,6 @@ pub struct CostModelParams {
     /// Selectivity heuristic factor for closed ranges (e.g., `x > 5 AND x < 10`).
     /// Applied when both lower and upper bounds exist on an index column.
     pub closed_range_selectivity_factor: f64,
-    /// Fanout (how many rows are produced per lookup) for index seeks with unique index.
-    pub fanout_index_seek_unique: f64,
-    /// Fanout for index seeks with non-unique index.
-    pub fanout_index_seek_non_unique: f64,
-    /// Fanout for index seeks with unmatched columns.
-    pub fanout_index_seek_per_unmatched_column: f64,
 }
 
 impl CostModelParams {
@@ -111,11 +101,11 @@ impl CostModelParams {
         Self {
             // Cardinality fallbacks
             rows_per_table_fallback: 1_000_000.0,
-            rows_per_page: 50.0,
+            rows_per_table_page: 50.0,
 
             // Selectivity fallbacks
             sel_eq_unindexed: 0.1,
-            sel_eq_indexed: 0.01,
+            sel_eq_indexed: 0.001,
             sel_range: 0.4,
             sel_is_null: 0.1,
             sel_is_not_null: 0.9,
@@ -126,10 +116,9 @@ impl CostModelParams {
 
             // Scan/Seek costs
             cache_reuse_factor: 0.2,
-            cpu_cost_per_row: 0.001,
+            cpu_cost_per_row: 0.003,
             cpu_cost_per_seek: 0.01,
             index_bonus: 0.5,
-            covering_index_density: 2.0,
 
             // Sort costs
             sort_cpu_per_row: 0.002,
@@ -144,9 +133,6 @@ impl CostModelParams {
 
             // Join optimization
             closed_range_selectivity_factor: 0.2,
-            fanout_index_seek_unique: 1.0,
-            fanout_index_seek_non_unique: 2.0,
-            fanout_index_seek_per_unmatched_column: 4.0,
         }
     }
 }
@@ -246,8 +232,8 @@ impl CostModelParams {
         if self.rows_per_table_fallback <= 0.0 {
             return Err("rows_per_table_fallback must be positive".into());
         }
-        if self.rows_per_page <= 0.0 {
-            return Err("rows_per_page must be positive".into());
+        if self.rows_per_table_page <= 0.0 {
+            return Err("rows_per_table_page must be positive".into());
         }
         if self.in_subquery_rows <= 0.0 {
             return Err("in_subquery_rows must be positive".into());
@@ -275,14 +261,6 @@ impl CostModelParams {
             if val < 0.0 {
                 return Err(format!("{name} must be non-negative, got {val}"));
             }
-        }
-
-        // Covering index density must be >= 1.0
-        if self.covering_index_density < 1.0 {
-            return Err(format!(
-                "covering_index_density must be >= 1.0, got {}",
-                self.covering_index_density
-            ));
         }
 
         Ok(())
@@ -388,7 +366,7 @@ mod tests {
 
         // Unspecified values should be defaults
         assert!((params.sel_range - defaults.sel_range).abs() < f64::EPSILON);
-        assert!((params.rows_per_page - defaults.rows_per_page).abs() < f64::EPSILON);
+        assert!((params.rows_per_table_page - defaults.rows_per_table_page).abs() < f64::EPSILON);
 
         std::fs::remove_file(&path).ok();
     }

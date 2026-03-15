@@ -101,8 +101,7 @@ QUERY PLAN
 |  |  `--SCAN signal_days AS d2
 |  |--SCAN prior_days
 |  |--SCAN window_subquery_0
-|  |  |--SCAN run_boundaries
-|  |  `--USE SORTER FOR ORDER BY
+|  |  `--SCAN run_boundaries
 |  `--SEARCH run_ids USING INDEX ephemeral_subquery_t111 (signal_day=?)
 `--SCAN run_lengths
    |--SCAN run_ids

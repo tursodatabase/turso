@@ -1186,7 +1186,7 @@ pub fn emit_from_clause_subqueries(
                         "MULTI-INDEX {} {} ({})",
                         match multi_idx.set_op {
                             SetOperation::Union => "OR",
-                            SetOperation::Intersection => "AND",
+                            SetOperation::Intersection { .. } => "AND",
                         },
                         table_reference.identifier,
                         index_names.join(", ")
@@ -1370,6 +1370,7 @@ pub fn emit_from_clause_subquery(
                 reg_limit_offset_sum: None,
                 resolver: t_ctx.resolver.fork(),
                 non_aggregate_expressions: Vec::new(),
+                agg_leaf_columns: Vec::new(),
                 cdc_cursor_id: None,
                 meta_window: None,
                 meta_in_seeks: (0..select_plan.joined_tables().len())
@@ -1455,6 +1456,7 @@ fn emit_indexed_materialized_subquery(
                 reg_limit_offset_sum: None,
                 resolver: t_ctx.resolver.fork(),
                 non_aggregate_expressions: Vec::new(),
+                agg_leaf_columns: Vec::new(),
                 cdc_cursor_id: None,
                 meta_window: None,
                 meta_in_seeks: (0..select_plan.joined_tables().len())
@@ -1549,6 +1551,7 @@ fn emit_materialized_subquery_table(
                 reg_limit_offset_sum: None,
                 resolver: t_ctx.resolver.fork(),
                 non_aggregate_expressions: Vec::new(),
+                agg_leaf_columns: Vec::new(),
                 cdc_cursor_id: None,
                 meta_window: None,
                 meta_in_seeks: (0..select_plan.joined_tables().len())

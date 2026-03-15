@@ -1476,12 +1476,15 @@ pub struct HashJoinOp {
 }
 
 /// Distinguishes union (OR) from intersection (AND) operations for multi-index scans.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SetOperation {
     /// Union: rowid appears in result if it's in ANY branch (OR)
     Union,
-    /// Intersection: rowid appears in result only if it's in ALL branches (AND)
-    Intersection,
+    /// Intersection: rowid appears in result only if it's in ALL branches (AND).
+    /// Carries the indices of additional WHERE terms consumed beyond the primary one.
+    Intersection {
+        additional_consumed_terms: Vec<usize>,
+    },
 }
 
 /// Multi-index scan operation metadata for OR-by-union or AND-by-intersection optimization.
@@ -1503,8 +1506,24 @@ pub struct MultiIndexScanOp {
     pub where_term_idx: usize,
     /// The set operation to perform when combining branches
     pub set_op: SetOperation,
-    /// For Intersection: indices of additional WHERE terms consumed (besides where_term_idx)
-    pub additional_consumed_terms: Vec<usize>,
+}
+
+/// Residual filters that apply only to union (OR) branches.
+///
+/// Each OR disjunct may be a compound expression (e.g. `a = 1 AND c > 5`), so
+/// after the index seek satisfies the indexable part, these residuals filter
+/// the remaining conditions.
+#[derive(Debug, Clone)]
+pub struct UnionBranchPrePostFilters {
+    /// Outer-table-only residuals evaluated before the branch's index seek.
+    /// These reference only tables from earlier (outer) loops, so they can
+    /// short-circuit the entire branch without touching the index.
+    pub pre_filter_exprs: Vec<ast::Expr>,
+    /// Residual filter expressions that could not be satisfied by the index seek.
+    /// Applied within the branch loop after positioning on the table row.
+    pub post_filter_exprs: Vec<ast::Expr>,
+    /// Whether residual evaluation needs the scanned table cursor positioned.
+    pub requires_table_cursor: bool,
 }
 
 /// A single branch of a multi-index scan, representing one disjunct of an OR expression.
@@ -1516,11 +1535,8 @@ pub struct MultiIndexBranch {
     pub access: MultiIndexBranchAccess,
     /// Estimated number of rows from this branch
     pub estimated_rows: f64,
-    /// Residual filter expressions for compound AND disjuncts.
-    /// Applied within the branch loop after positioning on the table row.
-    pub residual_exprs: Vec<ast::Expr>,
-    /// Whether residual evaluation needs the scanned table cursor positioned.
-    pub requires_table_cursor: bool,
+    /// Residual filters for union (OR) branches. `None` for intersection branches.
+    pub union_residuals: Option<UnionBranchPrePostFilters>,
 }
 
 /// Access shape for a single multi-index branch.

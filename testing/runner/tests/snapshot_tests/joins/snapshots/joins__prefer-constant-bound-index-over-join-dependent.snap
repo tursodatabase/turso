@@ -12,5 +12,5 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN t1 USING COVERING INDEX sqlite_autoindex_t1_1
-`--SEARCH t2 USING INDEX idx_t2_b (b=?) LEFT-JOIN
+|--SCAN t1
+`--SEARCH t2 USING INDEX idx_t2_a (a=?) LEFT-JOIN

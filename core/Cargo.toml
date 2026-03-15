@@ -197,3 +197,7 @@ harness = false
 name = "fts_benchmark"
 harness = false
 required-features = ["fts"]
+
+[[bench]]
+name = "graph_queries_benchmark"
+harness = false

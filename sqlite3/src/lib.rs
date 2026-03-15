@@ -284,7 +284,11 @@ static INIT_DONE: std::sync::Once = std::sync::Once::new();
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_initialize() -> ffi::c_int {
     INIT_DONE.call_once(|| {
-        tracing_subscriber::fmt::init();
+        // Use try_init() instead of init() to avoid panicking if a global
+        // subscriber is already installed (e.g., by the embedding application
+        // or test harness). A panic here poisons the Once, causing all
+        // subsequent sqlite3_initialize calls to abort (panic in extern "C").
+        let _ = tracing_subscriber::fmt::try_init();
     });
     SQLITE_OK
 }

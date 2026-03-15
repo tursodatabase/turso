@@ -62,7 +62,7 @@ use crate::{
 };
 use crate::{
     get_cursor, CaptureDataChangesInfo, CheckpointMode, Completion, Connection, DatabaseStorage,
-    IOExt, MvCursor, QueryMode,
+    IOExt, MvCursor, NonNan, QueryMode,
 };
 use crate::{CdcVersion, Statement};
 use branches::{mark_unlikely, unlikely};
@@ -346,7 +346,7 @@ pub fn op_add(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Add { lhs, rhs, dest }, insn);
-    state.registers[*dest] = Register::Value(
+    state.registers[*dest].set_value(
         state.registers[*lhs]
             .get_value()
             .exec_add(state.registers[*rhs].get_value()),
@@ -362,7 +362,7 @@ pub fn op_subtract(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Subtract { lhs, rhs, dest }, insn);
-    state.registers[*dest] = Register::Value(
+    state.registers[*dest].set_value(
         state.registers[*lhs]
             .get_value()
             .exec_subtract(state.registers[*rhs].get_value()),
@@ -378,7 +378,7 @@ pub fn op_multiply(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Multiply { lhs, rhs, dest }, insn);
-    state.registers[*dest] = Register::Value(
+    state.registers[*dest].set_value(
         state.registers[*lhs]
             .get_value()
             .exec_multiply(state.registers[*rhs].get_value()),
@@ -394,7 +394,7 @@ pub fn op_divide(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Divide { lhs, rhs, dest }, insn);
-    state.registers[*dest] = Register::Value(
+    state.registers[*dest].set_value(
         state.registers[*lhs]
             .get_value()
             .exec_divide(state.registers[*rhs].get_value()),
@@ -432,7 +432,7 @@ pub fn op_remainder(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Remainder { lhs, rhs, dest }, insn);
-    state.registers[*dest] = Register::Value(
+    state.registers[*dest].set_value(
         state.registers[*lhs]
             .get_value()
             .exec_remainder(state.registers[*rhs].get_value()),
@@ -448,7 +448,7 @@ pub fn op_bit_and(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(BitAnd { lhs, rhs, dest }, insn);
-    state.registers[*dest] = Register::Value(
+    state.registers[*dest].set_value(
         state.registers[*lhs]
             .get_value()
             .exec_bit_and(state.registers[*rhs].get_value()),
@@ -464,7 +464,7 @@ pub fn op_bit_or(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(BitOr { lhs, rhs, dest }, insn);
-    state.registers[*dest] = Register::Value(
+    state.registers[*dest].set_value(
         state.registers[*lhs]
             .get_value()
             .exec_bit_or(state.registers[*rhs].get_value()),
@@ -480,7 +480,7 @@ pub fn op_bit_not(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(BitNot { reg, dest }, insn);
-    state.registers[*dest] = Register::Value(state.registers[*reg].get_value().exec_bit_not());
+    state.registers[*dest].set_value(state.registers[*reg].get_value().exec_bit_not());
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -554,11 +554,11 @@ pub fn op_checkpoint(
         };
         // https://sqlite.org/pragma.html#pragma_wal_checkpoint
         // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
-        state.registers[*dest] = Register::Value(Value::from_i64(0));
+        state.registers[*dest].set_int(0);
         // 2nd col: # modified pages written to wal file
-        state.registers[*dest + 1] = Register::Value(Value::from_i64(wal_max_frame as i64));
+        state.registers[*dest + 1].set_int(wal_max_frame as i64);
         // 3rd col: # pages moved to db after checkpoint
-        state.registers[*dest + 2] = Register::Value(Value::from_i64(wal_total_backfilled as i64));
+        state.registers[*dest + 2].set_int(wal_total_backfilled as i64);
 
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
@@ -572,12 +572,11 @@ pub fn op_checkpoint(
         })) => {
             // https://sqlite.org/pragma.html#pragma_wal_checkpoint
             // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
-            state.registers[*dest] = Register::Value(Value::from_i64(0));
+            state.registers[*dest].set_int(0);
             // 2nd col: # modified pages written to wal file
-            state.registers[*dest + 1] = Register::Value(Value::from_i64(wal_max_frame as i64));
+            state.registers[*dest + 1].set_int(wal_max_frame as i64);
             // 3rd col: # pages moved to db after checkpoint
-            state.registers[*dest + 2] =
-                Register::Value(Value::from_i64(wal_total_backfilled as i64));
+            state.registers[*dest + 2].set_int(wal_total_backfilled as i64);
 
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
@@ -586,7 +585,7 @@ pub fn op_checkpoint(
         Err(err) => {
             tracing::debug!("PRAGMA wal_checkpoint failed: {err:?}");
             pager.clear_checkpoint_state();
-            state.registers[*dest] = Register::Value(Value::from_i64(1));
+            state.registers[*dest].set_int(1);
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
@@ -603,7 +602,7 @@ pub fn op_null(
         Insn::Null { dest, dest_end } | Insn::BeginSubrtn { dest, dest_end } => {
             if let Some(dest_end) = dest_end {
                 for i in *dest..=*dest_end {
-                    state.registers[i] = Register::Value(Value::Null);
+                    state.registers[i].set_null();
                     // Clear any associated RowSet so it can be reused in a fresh
                     // state.  In SQLite the RowSet lives inside the register and
                     // is destroyed by OP_Null; we keep RowSets in a side map, so
@@ -611,7 +610,7 @@ pub fn op_null(
                     state.rowsets.remove(&i);
                 }
             } else {
-                state.registers[*dest] = Register::Value(Value::Null);
+                state.registers[*dest].set_null();
                 state.rowsets.remove(dest);
             }
         }
@@ -755,7 +754,7 @@ pub fn op_if_pos(
     match state.registers[reg].get_value() {
         Value::Numeric(Numeric::Integer(n)) if *n > 0 => {
             state.pc = target_pc.as_offset_int();
-            state.registers[reg] = Register::Value(Value::from_i64(*n - *decrement_by as i64));
+            state.registers[reg].set_int(*n - *decrement_by as i64);
         }
         Value::Numeric(Numeric::Integer(_)) => {
             state.pc += 1;
@@ -964,18 +963,18 @@ pub fn op_comparison(
 
     match (new_lhs, new_rhs) {
         (Some(new_lhs), None) => {
-            state.registers[lhs] = Register::Value(new_lhs.as_value_ref().to_owned());
+            state.registers[lhs].set_value(new_lhs.as_value_ref().to_owned());
         }
         (None, Some(new_rhs)) => {
-            state.registers[rhs] = Register::Value(new_rhs.as_value_ref().to_owned());
+            state.registers[rhs].set_value(new_rhs.as_value_ref().to_owned());
         }
         (Some(new_lhs), Some(new_rhs)) => {
             let (new_lhs, new_rhs) = (
                 new_lhs.as_value_ref().to_owned(),
                 new_rhs.as_value_ref().to_owned(),
             );
-            state.registers[lhs] = Register::Value(new_lhs);
-            state.registers[rhs] = Register::Value(new_rhs);
+            state.registers[lhs].set_value(new_lhs);
+            state.registers[rhs].set_value(new_rhs);
         }
         (None, None) => {}
     }
@@ -1320,7 +1319,7 @@ pub fn op_vcolumn(
         let cursor = cursor.as_virtual_mut();
         cursor.column(*column)?
     };
-    state.registers[*dest] = Register::Value(value);
+    state.registers[*dest].set_value(value);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -1675,7 +1674,7 @@ pub fn op_column(
                         _ => panic!("unexpected cursor type"),
                     }
                 }) else {
-                    state.registers[*dest] = Register::Value(Value::Null);
+                    state.registers[*dest].set_null();
                     break 'outer;
                 };
                 state.op_column_state = OpColumnState::Seek {
@@ -1715,7 +1714,7 @@ pub fn op_column(
                     if let Cursor::MaterializedView(mv_cursor) = cursor {
                         // Handle materialized view column access
                         let value = return_if_io!(mv_cursor.column(active_column));
-                        state.registers[*dest] = Register::Value(value);
+                        state.registers[*dest].set_value(value);
                         break 'outer;
                     }
                     // Fall back to normal handling
@@ -1740,7 +1739,7 @@ pub fn op_column(
 
                             if cursor.get_null_flag() {
                                 tracing::trace!("op_column(null_flag)");
-                                state.registers[*dest] = Register::Value(Value::Null);
+                                state.registers[*dest].set_null();
                                 break 'outer;
                             }
 
@@ -1750,7 +1749,7 @@ pub fn op_column(
                                 // Return NULL, not the column's default value.
                                 // DEFAULT handling below is for when record exists
                                 // but has fewer columns than expected.
-                                state.registers[*dest] = Register::Value(Value::Null);
+                                state.registers[*dest].set_null();
                                 break 'outer;
                             };
 
@@ -1778,7 +1777,7 @@ pub fn op_column(
 
                         // DEFAULT handling
                         let Some(ref default) = default else {
-                            state.registers[*dest] = Register::Value(Value::Null);
+                            state.registers[*dest].set_null();
                             break;
                         };
                         match (default, &mut state.registers[*dest]) {
@@ -1795,7 +1794,7 @@ pub fn op_column(
                                 existing_blob.do_extend(new_blob);
                             }
                             _ => {
-                                state.registers[*dest] = Register::Value(default.clone());
+                                state.registers[*dest].set_value(default.clone());
                             }
                         }
                         break;
@@ -1807,13 +1806,12 @@ pub fn op_column(
                             cursor.record().cloned()
                         };
                         if let Some(record) = record {
-                            state.registers[*dest] =
-                                Register::Value(match record.get_value_opt(*column) {
-                                    Some(val) => val.to_owned(),
-                                    None => default.clone().unwrap_or(Value::Null),
-                                });
+                            state.registers[*dest].set_value(match record.get_value_opt(*column) {
+                                Some(val) => val.to_owned(),
+                                None => default.clone().unwrap_or(Value::Null),
+                            });
                         } else {
-                            state.registers[*dest] = Register::Value(Value::Null);
+                            state.registers[*dest].set_null();
                         }
                     }
                     CursorType::Pseudo(_) => {
@@ -1822,7 +1820,7 @@ pub fn op_column(
                             let cursor = cursor.as_pseudo_mut();
                             cursor.get_value(*column)?
                         };
-                        state.registers[*dest] = Register::Value(value);
+                        state.registers[*dest].set_value(value);
                     }
                     CursorType::IndexMethod(..) => {
                         let cursor = state.cursors[*cursor_id]
@@ -1830,7 +1828,7 @@ pub fn op_column(
                             .expect("cursor should exist");
                         let cursor = cursor.as_index_method_mut();
                         let value = return_if_io!(cursor.query_column(*column));
-                        state.registers[*dest] = Register::Value(value);
+                        state.registers[*dest].set_value(value);
                     }
                     CursorType::VirtualTable(_) => {
                         panic!("Insn:Column on virtual table cursor, use Insn:VColumn instead");
@@ -2035,7 +2033,7 @@ pub fn op_array_encode(
 
     // Serialize coerced elements as a native record-format BLOB
     let record = ImmutableRecord::from_values(&coerced_elements, coerced_elements.len());
-    state.registers[*reg] = Register::Value(Value::Blob(record.into_payload()));
+    state.registers[*reg].set_blob(record.into_payload());
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -2065,7 +2063,7 @@ pub fn op_array_decode(
             return Ok(InsnFunctionStepResult::Step);
         }
     };
-    state.registers[*reg] = Register::Value(Value::build_text(text));
+    state.registers[*reg].set_text(Text::new(text));
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -2089,7 +2087,7 @@ pub fn op_array_element(
 
     let arr_val = state.registers[*array_reg].get_value();
     if matches!(arr_val, Value::Null) {
-        state.registers[*dest] = Register::Value(Value::Null);
+        state.registers[*dest].set_null();
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -2098,7 +2096,7 @@ pub fn op_array_element(
         Value::Numeric(Numeric::Integer(i)) if *i >= 1 => (*i - 1) as usize,
         _ => {
             // Non-positive, non-integer, or NULL index → NULL result (PG convention: 1-based)
-            state.registers[*dest] = Register::Value(Value::Null);
+            state.registers[*dest].set_null();
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
         }
@@ -2128,7 +2126,7 @@ pub fn op_array_element(
         _ => Value::Null,
     };
 
-    state.registers[*dest] = Register::Value(result);
+    state.registers[*dest].set_value(result);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -2143,11 +2141,10 @@ pub fn op_array_length(
     load_insn!(ArrayLength { reg, dest }, insn);
 
     let val = state.registers[*reg].get_value();
-    let result = match compute_array_length(val) {
-        Some(count) => Value::from_i64(count),
-        None => Value::Null,
+    match compute_array_length(val) {
+        Some(count) => state.registers[*dest].set_int(count),
+        None => state.registers[*dest].set_null(),
     };
-    state.registers[*dest] = Register::Value(result);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -2179,7 +2176,7 @@ pub fn op_make_array(
             state.registers.len()
         )));
     }
-    state.registers[*dest] = Register::Value(make_array_from_registers(
+    state.registers[*dest].set_value(make_array_from_registers(
         &state.registers,
         *start_reg,
         *count,
@@ -2222,7 +2219,7 @@ pub fn op_make_array_dynamic(
         )));
     }
 
-    state.registers[*dest] = Register::Value(make_array_from_registers(
+    state.registers[*dest].set_value(make_array_from_registers(
         &state.registers,
         *start_reg,
         count,
@@ -2282,17 +2279,17 @@ pub fn op_array_concat(
     // PG-compatible NULL handling for arrays:
     // array || NULL = array, NULL || array = array, NULL || NULL = NULL
     if matches!(lhs_ref, Value::Null) && matches!(rhs_ref, Value::Null) {
-        state.registers[*dest] = Register::Value(Value::Null);
+        state.registers[*dest].set_null();
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
     if matches!(lhs_ref, Value::Null) {
-        state.registers[*dest] = Register::Value(rhs_ref.clone());
+        state.registers[*dest].set_value(rhs_ref.clone());
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
     if matches!(rhs_ref, Value::Null) {
-        state.registers[*dest] = Register::Value(lhs_ref.clone());
+        state.registers[*dest].set_value(lhs_ref.clone());
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -2320,7 +2317,7 @@ pub fn op_array_concat(
         }
     };
 
-    state.registers[*dest] = Register::Value(result);
+    state.registers[*dest].set_value(result);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -2344,7 +2341,7 @@ pub fn op_array_set_element(
 
     let arr_val = state.registers[*array_reg].get_value();
     if matches!(arr_val, Value::Null) {
-        state.registers[*dest] = Register::Value(Value::Null);
+        state.registers[*dest].set_null();
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -2353,7 +2350,7 @@ pub fn op_array_set_element(
         Value::Numeric(Numeric::Integer(i)) if *i >= 1 => (*i - 1) as usize,
         _ => {
             // Invalid index (non-positive, non-integer): preserve original array (PG: 1-based)
-            state.registers[*dest] = Register::Value(arr_val.clone());
+            state.registers[*dest].set_value(arr_val.clone());
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
         }
@@ -2369,10 +2366,10 @@ pub fn op_array_set_element(
     let mut elements = array_values_from_blob(blob)?;
     if idx >= elements.len() {
         // Out-of-bounds: preserve original array unchanged
-        state.registers[*dest] = Register::Value(Value::Blob(blob.clone()));
+        state.registers[*dest].set_blob(blob.clone());
     } else {
         elements[idx] = new_val;
-        state.registers[*dest] = Register::Value(values_to_record_blob(&elements));
+        state.registers[*dest].set_value(values_to_record_blob(&elements));
     }
 
     state.pc += 1;
@@ -2401,7 +2398,7 @@ pub fn op_array_slice(
     let end_val = state.registers[*end_reg].get_value().clone();
 
     let result = exec_array_slice(&arr_val, &start_val, &end_val);
-    state.registers[*dest] = Register::Value(result);
+    state.registers[*dest].set_value(result);
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -2464,7 +2461,7 @@ pub fn op_mem_max(
     let src_int = extract_int_value(src_val);
 
     if dest_int < src_int {
-        state.registers[*dest_reg] = Register::Value(Value::from_i64(src_int));
+        state.registers[*dest_reg].set_int(src_int);
     }
 
     state.pc += 1;
@@ -3689,7 +3686,7 @@ pub fn op_gosub(
     if !target_pc.is_offset() {
         crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
     }
-    state.registers[*return_reg] = Register::Value(Value::from_i64((state.pc + 1) as i64));
+    state.registers[*return_reg].set_int((state.pc + 1) as i64);
     state.pc = target_pc.as_offset_int();
     Ok(InsnFunctionStepResult::Step)
 }
@@ -3730,7 +3727,7 @@ pub fn op_integer(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Integer { value, dest }, insn);
-    state.registers[*dest] = Register::Value(Value::from_i64(*value));
+    state.registers[*dest].set_int(*value);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -3878,7 +3875,8 @@ pub fn op_real(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Real { value, dest }, insn);
-    state.registers[*dest] = Register::Value(Value::from_f64(*value));
+    state.registers[*dest]
+        .set_float(NonNan::new(*value).expect("f64 passed to op_real should be a valid NonNan"));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -3891,7 +3889,10 @@ pub fn op_real_affinity(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(RealAffinity { register }, insn);
     if let Value::Numeric(Numeric::Integer(i)) = &state.registers[*register].get_value() {
-        state.registers[*register] = Register::Value(Value::from_f64(*i as f64));
+        state.registers[*register].set_float(
+            NonNan::new(*i as f64)
+                .expect("i64 passed to op_real_affinity should be a valid NonNan"),
+        );
     };
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -3904,7 +3905,7 @@ pub fn op_string8(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(String8 { value, dest }, insn);
-    state.registers[*dest] = Register::Value(Value::build_text(value.clone()));
+    state.registers[*dest].set_text(Text::new(value.clone()));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -3916,7 +3917,7 @@ pub fn op_blob(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Blob { value, dest }, insn);
-    state.registers[*dest] = Register::Value(Value::Blob(value.clone()));
+    state.registers[*dest].set_blob(value.clone());
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -4033,13 +4034,13 @@ pub fn op_row_id(
                     .expect("cursor_id should be valid")
                 {
                     if btree_cursor.get_null_flag() {
-                        state.registers[*dest] = Register::Value(Value::Null);
+                        state.registers[*dest].set_null();
                         break;
                     }
                     if let Some(ref rowid) = return_if_io!(btree_cursor.rowid()) {
                         state.registers[*dest].set_int(*rowid);
                     } else {
-                        state.registers[*dest] = Register::Value(Value::Null);
+                        state.registers[*dest].set_null();
                     }
                 } else if let Some(Cursor::Virtual(virtual_cursor)) = cursors
                     .get_mut(*cursor_id)
@@ -4049,7 +4050,7 @@ pub fn op_row_id(
                     if rowid != 0 {
                         state.registers[*dest].set_int(rowid);
                     } else {
-                        state.registers[*dest] = Register::Value(Value::Null);
+                        state.registers[*dest].set_null();
                     }
                 } else if let Some(Cursor::MaterializedView(mv_cursor)) = cursors
                     .get_mut(*cursor_id)
@@ -4058,7 +4059,7 @@ pub fn op_row_id(
                     if let Some(rowid) = return_if_io!(mv_cursor.rowid()) {
                         state.registers[*dest].set_int(rowid);
                     } else {
-                        state.registers[*dest] = Register::Value(Value::Null);
+                        state.registers[*dest].set_null();
                     }
                 } else if let Some(Cursor::IndexMethod(cursor)) = cursors
                     .get_mut(*cursor_id)
@@ -4067,7 +4068,7 @@ pub fn op_row_id(
                     if let Some(rowid) = return_if_io!(cursor.query_rowid()) {
                         state.registers[*dest].set_int(rowid);
                     } else {
-                        state.registers[*dest] = Register::Value(Value::Null);
+                        state.registers[*dest].set_null();
                     }
                 } else {
                     mark_unlikely();
@@ -4105,9 +4106,9 @@ pub fn op_idx_row_id(
         Cursor::IndexMethod(cursor) => return_if_io!(cursor.query_rowid()),
         _ => panic!("unexpected cursor type"),
     };
-    state.registers[*dest] = match rowid {
-        Some(rowid) => Register::Value(Value::from_i64(rowid)),
-        None => Register::Value(Value::Null),
+    match rowid {
+        Some(rowid) => state.registers[*dest].set_int(rowid),
+        None => state.registers[*dest].set_null(),
     };
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -5568,37 +5569,35 @@ pub fn op_agg_final(
                     finalize_agg_payload(func, payload)?
                 }
             };
-            state.registers[dest_reg] = Register::Value(value);
+            state.registers[dest_reg].set_value(value);
         }
         Register::Value(Value::Null) => {
             // When the set is empty, return appropriate default
             match func {
                 AggFunc::Total => {
-                    state.registers[dest_reg] = Register::Value(Value::from_f64(0.0));
+                    state.registers[dest_reg]
+                        .set_float(NonNan::new(0.0).expect("0.0 is a valid NonNan"));
                 }
                 AggFunc::Count | AggFunc::Count0 => {
-                    state.registers[dest_reg] = Register::Value(Value::from_i64(0));
+                    state.registers[dest_reg].set_int(0);
                 }
                 #[cfg(feature = "json")]
                 AggFunc::JsonGroupArray => {
-                    state.registers[dest_reg] =
-                        Register::Value(Value::Text(Text::json("[]".to_string())));
+                    state.registers[dest_reg].set_text(Text::json("[]".to_string()));
                 }
                 #[cfg(feature = "json")]
                 AggFunc::JsonbGroupArray => {
-                    state.registers[dest_reg] = Register::Value(Value::Blob(
-                        json::jsonb::Jsonb::make_empty_array(1).data(),
-                    ));
+                    state.registers[dest_reg]
+                        .set_blob(json::jsonb::Jsonb::make_empty_array(1).data());
                 }
                 #[cfg(feature = "json")]
                 AggFunc::JsonGroupObject => {
-                    state.registers[dest_reg] =
-                        Register::Value(Value::Text(Text::json("{}".to_string())));
+                    state.registers[dest_reg].set_text(Text::json("{}".to_string()));
                 }
                 #[cfg(feature = "json")]
                 AggFunc::JsonbGroupObject => {
-                    state.registers[dest_reg] =
-                        Register::Value(Value::Blob(json::jsonb::Jsonb::make_empty_obj(1).data()));
+                    state.registers[dest_reg]
+                        .set_blob(json::jsonb::Jsonb::make_empty_obj(1).data());
                 }
                 _ => {}
             }
@@ -5915,7 +5914,7 @@ pub fn op_rowset_read(
             if rowset.is_empty() {
                 state.pc = pc_if_empty.as_offset_int();
             } else if let Some(smallest) = rowset.smallest() {
-                state.registers[*dest_reg] = Register::Value(Value::from_i64(smallest));
+                state.registers[*dest_reg].set_int(smallest);
                 state.pc += 1;
             } else {
                 state.pc = pc_if_empty.as_offset_int();
@@ -6018,7 +6017,7 @@ pub fn op_function(
                 let json_value = &state.registers[*start_reg];
                 let json_str = get_json(json_value.get_value(), None);
                 match json_str {
-                    Ok(json) => state.registers[*dest] = Register::Value(json),
+                    Ok(json) => state.registers[*dest].set_value(json),
                     Err(e) => return Err(e),
                 }
             }
@@ -6027,7 +6026,7 @@ pub fn op_function(
                 let json_value = &state.registers[*start_reg];
                 let json_blob = jsonb(json_value.get_value(), &state.json_cache);
                 match json_blob {
-                    Ok(json) => state.registers[*dest] = Register::Value(json),
+                    Ok(json) => state.registers[*dest].set_value(json),
                     Err(e) => return Err(e),
                 }
             }
@@ -6049,7 +6048,7 @@ pub fn op_function(
                 let json_result = json_func(reg_values);
 
                 match json_result {
-                    Ok(json) => state.registers[*dest] = Register::Value(json),
+                    Ok(json) => state.registers[*dest].set_value(json),
                     Err(e) => return Err(e),
                 }
             }
@@ -6067,7 +6066,7 @@ pub fn op_function(
                 };
 
                 match result {
-                    Ok(json) => state.registers[*dest] = Register::Value(json),
+                    Ok(json) => state.registers[*dest].set_value(json),
                     Err(e) => return Err(e),
                 }
             }
@@ -6085,7 +6084,7 @@ pub fn op_function(
                 };
 
                 match result {
-                    Ok(json) => state.registers[*dest] = Register::Value(json),
+                    Ok(json) => state.registers[*dest].set_value(json),
                     Err(e) => return Err(e),
                 }
             }
@@ -6101,7 +6100,7 @@ pub fn op_function(
                 };
                 let json_str = json_func(json.get_value(), path.get_value(), &state.json_cache);
                 match json_str {
-                    Ok(json) => state.registers[*dest] = Register::Value(json),
+                    Ok(json) => state.registers[*dest].set_value(json),
                     Err(e) => return Err(e),
                 }
             }
@@ -6125,27 +6124,27 @@ pub fn op_function(
                 };
 
                 match func_result {
-                    Ok(result) => state.registers[*dest] = Register::Value(result),
+                    Ok(result) => state.registers[*dest].set_value(result),
                     Err(e) => return Err(e),
                 }
             }
             JsonFunc::JsonErrorPosition => {
                 let json_value = &state.registers[*start_reg];
                 match json_error_position(json_value.get_value()) {
-                    Ok(pos) => state.registers[*dest] = Register::Value(pos),
+                    Ok(pos) => state.registers[*dest].set_value(pos),
                     Err(e) => return Err(e),
                 }
             }
             JsonFunc::JsonValid => {
                 let json_value = &state.registers[*start_reg];
-                state.registers[*dest] = Register::Value(is_json_valid(json_value.get_value()));
+                state.registers[*dest].set_value(is_json_valid(json_value.get_value()));
             }
             JsonFunc::JsonPatch => {
                 assert_eq!(arg_count, 2);
                 assert!(*start_reg + 1 < state.registers.len());
                 let target = &state.registers[*start_reg];
                 let patch = &state.registers[*start_reg + 1];
-                state.registers[*dest] = Register::Value(json_patch(
+                state.registers[*dest].set_value(json_patch(
                     target.get_value(),
                     patch.get_value(),
                     &state.json_cache,
@@ -6156,7 +6155,7 @@ pub fn op_function(
                 assert!(*start_reg + 1 < state.registers.len());
                 let target = &state.registers[*start_reg];
                 let patch = &state.registers[*start_reg + 1];
-                state.registers[*dest] = Register::Value(jsonb_patch(
+                state.registers[*dest].set_value(jsonb_patch(
                     target.get_value(),
                     patch.get_value(),
                     &state.json_cache,
@@ -6167,9 +6166,9 @@ pub fn op_function(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
                 ) {
-                    state.registers[*dest] = Register::Value(json);
+                    state.registers[*dest].set_value(json);
                 } else {
-                    state.registers[*dest] = Register::Value(Value::Null);
+                    state.registers[*dest].set_null();
                 }
             }
             JsonFunc::JsonbRemove => {
@@ -6177,9 +6176,9 @@ pub fn op_function(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
                 ) {
-                    state.registers[*dest] = Register::Value(json);
+                    state.registers[*dest].set_value(json);
                 } else {
-                    state.registers[*dest] = Register::Value(Value::Null);
+                    state.registers[*dest].set_null();
                 }
             }
             JsonFunc::JsonReplace => {
@@ -6187,9 +6186,9 @@ pub fn op_function(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
                 ) {
-                    state.registers[*dest] = Register::Value(json);
+                    state.registers[*dest].set_value(json);
                 } else {
-                    state.registers[*dest] = Register::Value(Value::Null);
+                    state.registers[*dest].set_null();
                 }
             }
             JsonFunc::JsonbReplace => {
@@ -6197,9 +6196,9 @@ pub fn op_function(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
                 ) {
-                    state.registers[*dest] = Register::Value(json);
+                    state.registers[*dest].set_value(json);
                 } else {
-                    state.registers[*dest] = Register::Value(Value::Null);
+                    state.registers[*dest].set_null();
                 }
             }
             JsonFunc::JsonInsert => {
@@ -6207,9 +6206,9 @@ pub fn op_function(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
                 ) {
-                    state.registers[*dest] = Register::Value(json);
+                    state.registers[*dest].set_value(json);
                 } else {
-                    state.registers[*dest] = Register::Value(Value::Null);
+                    state.registers[*dest].set_null();
                 }
             }
             JsonFunc::JsonbInsert => {
@@ -6217,9 +6216,9 @@ pub fn op_function(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
                 ) {
-                    state.registers[*dest] = Register::Value(json);
+                    state.registers[*dest].set_value(json);
                 } else {
-                    state.registers[*dest] = Register::Value(Value::Null);
+                    state.registers[*dest].set_null();
                 }
             }
             JsonFunc::JsonPretty => {
@@ -6247,7 +6246,7 @@ pub fn op_function(
                 };
 
                 let json_str = get_json(json_value.get_value(), Some(indent))?;
-                state.registers[*dest] = Register::Value(json_str);
+                state.registers[*dest].set_value(json_str);
             }
             JsonFunc::JsonSet => {
                 if arg_count % 2 == 0 {
@@ -6259,7 +6258,7 @@ pub fn op_function(
                 let json_result = json_set(reg_values, &state.json_cache);
 
                 match json_result {
-                    Ok(json) => state.registers[*dest] = Register::Value(json),
+                    Ok(json) => state.registers[*dest].set_value(json),
                     Err(e) => return Err(e),
                 }
             }
@@ -6273,7 +6272,7 @@ pub fn op_function(
                 let json_result = jsonb_set(reg_values, &state.json_cache);
 
                 match json_result {
-                    Ok(json) => state.registers[*dest] = Register::Value(json),
+                    Ok(json) => state.registers[*dest].set_value(json),
                     Err(e) => return Err(e),
                 }
             }
@@ -6281,7 +6280,7 @@ pub fn op_function(
                 let json_value = &state.registers[*start_reg];
 
                 match json_quote(json_value.get_value()) {
-                    Ok(result) => state.registers[*dest] = Register::Value(result),
+                    Ok(result) => state.registers[*dest].set_value(result),
                     Err(e) => return Err(e),
                 }
             }
@@ -6302,16 +6301,16 @@ pub fn op_function(
                 let result = reg_value_argument
                     .get_value()
                     .exec_cast(reg_value_type.as_str());
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::Changes => {
                 let res = &program.connection.last_change;
                 let changes = res.load(Ordering::SeqCst);
-                state.registers[*dest] = Register::Value(Value::from_i64(changes));
+                state.registers[*dest].set_int(changes);
             }
             ScalarFunc::Char => {
                 let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-                state.registers[*dest] = Register::Value(Value::exec_char(
+                state.registers[*dest].set_value(Value::exec_char(
                     reg_values.iter().map(|reg| reg.get_value()),
                 ));
             }
@@ -6320,12 +6319,12 @@ pub fn op_function(
                 let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
                 let result =
                     Value::exec_concat_strings(reg_values.iter().map(|reg| reg.get_value()));
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::ConcatWs => {
                 let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
                 let result = Value::exec_concat_ws(reg_values.iter().map(|reg| reg.get_value()));
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::Glob => {
                 if arg_count != 2 {
@@ -6341,7 +6340,7 @@ pub fn op_function(
                 let match_value = match_reg.get_value();
 
                 if pattern_value == &Value::Null || match_value == &Value::Null {
-                    state.registers[*dest] = Register::Value(Value::Null);
+                    state.registers[*dest].set_null();
                 } else {
                     let pattern_cow = match pattern_value {
                         Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
@@ -6360,7 +6359,7 @@ pub fn op_function(
                     };
 
                     let matches = Value::exec_glob(&pattern_cow, &match_cow)?;
-                    state.registers[*dest] = Register::Value(Value::from_i64(matches as i64));
+                    state.registers[*dest].set_int(matches as i64);
                 }
             }
             ScalarFunc::IfNull => {}
@@ -6368,12 +6367,13 @@ pub fn op_function(
             ScalarFunc::Instr => {
                 let reg_value = &state.registers[*start_reg];
                 let pattern_value = &state.registers[*start_reg + 1];
-                let result = reg_value.get_value().exec_instr(pattern_value.get_value());
-                state.registers[*dest] = Register::Value(result);
+                match reg_value.get_value().exec_instr(pattern_value.get_value()) {
+                    Value::Numeric(Numeric::Integer(i)) => state.registers[*dest].set_int(i),
+                    _ => state.registers[*dest].set_null(),
+                };
             }
             ScalarFunc::LastInsertRowid => {
-                state.registers[*dest] =
-                    Register::Value(Value::from_i64(program.connection.last_insert_rowid()));
+                state.registers[*dest].set_int(program.connection.last_insert_rowid());
             }
             ScalarFunc::Like => {
                 let pattern_reg = &state.registers[*start_reg];
@@ -6384,7 +6384,7 @@ pub fn op_function(
 
                 // 1. Check for NULL inputs
                 if pattern_value == &Value::Null || match_value == &Value::Null {
-                    state.registers[*dest] = Register::Value(Value::Null);
+                    state.registers[*dest].set_null();
                 } else {
                     // 2. Resolve Escape Character (if 3rd arg exists)
                     let mut escape_char = None;
@@ -6418,7 +6418,7 @@ pub fn op_function(
                     }
 
                     if is_null_result {
-                        state.registers[*dest] = Register::Value(Value::Null);
+                        state.registers[*dest].set_null();
                     } else {
                         // 3. Prepare Pattern and Text
                         let pattern_cow = match pattern_value {
@@ -6439,7 +6439,7 @@ pub fn op_function(
 
                         // 4. Execute Like
                         let matches = Value::exec_like(&pattern_cow, &match_cow, escape_char)?;
-                        state.registers[*dest] = Register::Value(Value::from_i64(matches as i64));
+                        state.registers[*dest].set_int(matches as i64);
                     }
                 }
             }
@@ -6473,12 +6473,12 @@ pub fn op_function(
                     ScalarFunc::Soundex => Some(reg_value.exec_soundex()),
                     _ => unreachable!(),
                 };
-                state.registers[*dest] = Register::Value(result.unwrap_or(Value::Null));
+                state.registers[*dest].set_value(result.unwrap_or(Value::Null));
             }
             ScalarFunc::Hex => {
                 let reg_value = state.registers[*start_reg].borrow_mut();
                 let result = reg_value.get_value().exec_hex();
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::Unhex => {
                 let reg_value = &state.registers[*start_reg];
@@ -6490,11 +6490,10 @@ pub fn op_function(
                 let result = reg_value
                     .get_value()
                     .exec_unhex(ignored_chars.map(|x| x.get_value()));
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::Random => {
-                state.registers[*dest] =
-                    Register::Value(Value::exec_random(|| pager.io.generate_random_number()));
+                state.registers[*dest].set_int(pager.io.generate_random_number());
             }
             ScalarFunc::Trim => {
                 let reg_value = &state.registers[*start_reg];
@@ -6506,7 +6505,7 @@ pub fn op_function(
                 let result = reg_value
                     .get_value()
                     .exec_trim(pattern_value.map(|x| x.get_value()));
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::LTrim => {
                 let reg_value = &state.registers[*start_reg];
@@ -6518,7 +6517,7 @@ pub fn op_function(
                 let result = reg_value
                     .get_value()
                     .exec_ltrim(pattern_value.map(|x| x.get_value()));
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::RTrim => {
                 let reg_value = &state.registers[*start_reg];
@@ -6530,7 +6529,7 @@ pub fn op_function(
                 let result = reg_value
                     .get_value()
                     .exec_rtrim(pattern_value.map(|x| x.get_value()));
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::Round => {
                 let reg_value = &state.registers[*start_reg];
@@ -6543,22 +6542,22 @@ pub fn op_function(
                 let result = reg_value
                     .get_value()
                     .exec_round(precision_value.map(|x| x.get_value()));
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::Min => {
                 let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-                state.registers[*dest] =
-                    Register::Value(Value::exec_min(reg_values.iter().map(|v| v.get_value())));
+                state.registers[*dest]
+                    .set_value(Value::exec_min(reg_values.iter().map(|v| v.get_value())));
             }
             ScalarFunc::Max => {
                 let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-                state.registers[*dest] =
-                    Register::Value(Value::exec_max(reg_values.iter().map(|v| v.get_value())));
+                state.registers[*dest]
+                    .set_value(Value::exec_max(reg_values.iter().map(|v| v.get_value())));
             }
             ScalarFunc::Nullif => {
                 let first_value = &state.registers[*start_reg];
                 let second_value = &state.registers[*start_reg + 1];
-                state.registers[*dest] = Register::Value(Value::exec_nullif(
+                state.registers[*dest].set_value(Value::exec_nullif(
                     first_value.get_value(),
                     second_value.get_value(),
                 ));
@@ -6576,70 +6575,69 @@ pub fn op_function(
                     start_value.get_value(),
                     length_value.map(|x| x.get_value()),
                 );
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::Date => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
                 let result = exec_date(values);
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::Time => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
                 let result = exec_time(values);
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::TimeDiff => {
                 if arg_count != 2 {
-                    state.registers[*dest] = Register::Value(Value::Null);
+                    state.registers[*dest].set_null();
                 } else {
                     let start = state.registers[*start_reg].get_value();
                     let end = state.registers[*start_reg + 1].get_value();
 
                     let result = crate::functions::datetime::exec_timediff([start, end]);
 
-                    state.registers[*dest] = Register::Value(result);
+                    state.registers[*dest].set_value(result);
                 }
             }
             ScalarFunc::TotalChanges => {
                 let res = &program.connection.total_changes;
                 let total_changes = res.load(Ordering::SeqCst);
-                state.registers[*dest] = Register::Value(Value::from_i64(total_changes));
+                state.registers[*dest].set_int(total_changes);
             }
             ScalarFunc::DateTime => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
                 let result = exec_datetime_full(values);
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::JulianDay => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
                 let result = exec_julianday(values);
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::UnixEpoch => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
                 let result = exec_unixepoch(values);
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::TursoVersion => {
                 if !program.connection.is_db_initialized() {
-                    state.registers[*dest] =
-                        Register::Value(Value::build_text(info::build::PKG_VERSION));
+                    state.registers[*dest].set_text(Text::new(info::build::PKG_VERSION));
                 } else {
                     let version_integer =
                         return_if_io!(pager.with_header(|header| header.version_number)).get()
                             as i64;
                     let version = execute_turso_version(version_integer);
-                    state.registers[*dest] = Register::Value(Value::build_text(version));
+                    state.registers[*dest].set_text(Text::new(version));
                 }
             }
             ScalarFunc::SqliteVersion => {
                 let version = execute_sqlite_version();
-                state.registers[*dest] = Register::Value(Value::build_text(version));
+                state.registers[*dest].set_text(Text::new(version));
             }
             ScalarFunc::SqliteSourceId => {
                 let src_id = format!(
@@ -6647,14 +6645,14 @@ pub fn op_function(
                     info::build::BUILT_TIME_SQLITE,
                     info::build::GIT_COMMIT_HASH.unwrap_or("unknown")
                 );
-                state.registers[*dest] = Register::Value(Value::build_text(src_id));
+                state.registers[*dest].set_text(Text::new(src_id));
             }
             ScalarFunc::Replace => {
                 assert_eq!(arg_count, 3);
                 let source = &state.registers[*start_reg];
                 let pattern = &state.registers[*start_reg + 1];
                 let replacement = &state.registers[*start_reg + 2];
-                state.registers[*dest] = Register::Value(Value::exec_replace(
+                state.registers[*dest].set_value(Value::exec_replace(
                     source.get_value(),
                     pattern.get_value(),
                     replacement.get_value(),
@@ -6674,11 +6672,11 @@ pub fn op_function(
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
                 let result = exec_strftime(values);
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::Printf => {
                 let result = exec_printf(&state.registers[*start_reg..*start_reg + arg_count])?;
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::TableColumnsJsonArray => {
                 assert_eq!(arg_count, 1);
@@ -6724,7 +6722,7 @@ pub fn op_function(
                         json.append_jsonb_to_end(name_json.data());
                     }
                     json.finalize_unsafe(json::jsonb::ElementType::ARRAY)?;
-                    state.registers[*dest] = Register::Value(json::json_string_to_db_type(
+                    state.registers[*dest].set_value(json::json_string_to_db_type(
                         json,
                         json::jsonb::ElementType::ARRAY,
                         json::OutputVariant::String,
@@ -6754,7 +6752,7 @@ pub fn op_function(
                     };
 
                     if let Value::Null = bin_record {
-                        state.registers[*dest] = Register::Value(Value::Null);
+                        state.registers[*dest].set_null();
                         break 'outer;
                     }
 
@@ -6804,7 +6802,7 @@ pub fn op_function(
                     }
                     json.finalize_unsafe(json::jsonb::ElementType::OBJECT)?;
 
-                    state.registers[*dest] = Register::Value(json::json_string_to_db_type(
+                    state.registers[*dest].set_value(json::json_string_to_db_type(
                         json,
                         json::jsonb::ElementType::OBJECT,
                         json::OutputVariant::String,
@@ -6833,7 +6831,7 @@ pub fn op_function(
                     .connection
                     .attach_database(filename_str.as_str(), dbname_str.as_str())?;
 
-                state.registers[*dest] = Register::Value(Value::Null);
+                state.registers[*dest].set_null();
             }
             ScalarFunc::Detach => {
                 assert_eq!(arg_count, 1);
@@ -6849,7 +6847,7 @@ pub fn op_function(
                 program.connection.detach_database(dbname_str.as_str())?;
 
                 // Set result to NULL (detach doesn't return a value)
-                state.registers[*dest] = Register::Value(Value::Null);
+                state.registers[*dest].set_null();
             }
             ScalarFunc::Unlikely | ScalarFunc::Likely | ScalarFunc::Likelihood => {
                 panic!(
@@ -6865,7 +6863,7 @@ pub fn op_function(
                     _ => 0,
                 };
                 let accum = StatAccum::new(n_col);
-                state.registers[*dest] = Register::Value(Value::Blob(accum.to_bytes()));
+                state.registers[*dest].set_blob(accum.to_bytes());
             }
             ScalarFunc::StatPush => {
                 // stat_push(accum_blob, i_chng): Push a row into the accumulator
@@ -6888,7 +6886,7 @@ pub fn op_function(
                     }
                     _ => Value::Null,
                 };
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::StatGet => {
                 // stat_get(accum_blob): Get the stat1 string from the accumulator
@@ -6910,7 +6908,7 @@ pub fn op_function(
                     }
                     _ => Value::Null,
                 };
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::ConnTxnId => {
                 // conn_txn_id(candidate): get-or-set semantics for CDC transaction ID.
@@ -6924,16 +6922,15 @@ pub fn op_function(
                 let current = program.connection.get_cdc_transaction_id();
                 if current == -1 {
                     program.connection.set_cdc_transaction_id(candidate);
-                    state.registers[*dest] = Register::Value(Value::from_i64(candidate));
+                    state.registers[*dest].set_int(candidate);
                 } else {
-                    state.registers[*dest] = Register::Value(Value::from_i64(current));
+                    state.registers[*dest].set_int(current);
                 }
             }
             ScalarFunc::IsAutocommit => {
                 // is_autocommit(): returns 1 if autocommit, 0 otherwise.
                 let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
-                state.registers[*dest] =
-                    Register::Value(Value::from_i64(if auto_commit { 1 } else { 0 }));
+                state.registers[*dest].set_int(if auto_commit { 1 } else { 0 });
             }
             ScalarFunc::TestUintEncode => {
                 check_arg_count!(arg_count, 1);
@@ -6971,7 +6968,7 @@ pub fn op_function(
                         ));
                     }
                 };
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::TestUintDecode => {
                 check_arg_count!(arg_count, 1);
@@ -6980,7 +6977,7 @@ pub fn op_function(
                     Value::Null => Value::Null,
                     other => other.clone(),
                 };
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::TestUintAdd
             | ScalarFunc::TestUintSub
@@ -7015,7 +7012,7 @@ pub fn op_function(
                     }
                     _ => Value::Null,
                 };
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::TestUintLt | ScalarFunc::TestUintEq => {
                 check_arg_count!(arg_count, 2);
@@ -7032,7 +7029,7 @@ pub fn op_function(
                     }
                     _ => Value::Null,
                 };
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::StringReverse => {
                 check_arg_count!(arg_count, 1);
@@ -7049,7 +7046,7 @@ pub fn op_function(
                         Value::build_text(reversed)
                     }
                 };
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::BooleanToInt => {
                 check_arg_count!(arg_count, 1);
@@ -7083,7 +7080,7 @@ pub fn op_function(
                         )));
                     }
                 };
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::IntToBoolean => {
                 check_arg_count!(arg_count, 1);
@@ -7093,7 +7090,7 @@ pub fn op_function(
                     Value::Numeric(Numeric::Integer(0)) => Value::build_text("false".to_string()),
                     _ => Value::build_text("true".to_string()),
                 };
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::ValidateIpAddr => {
                 check_arg_count!(arg_count, 1);
@@ -7113,7 +7110,7 @@ pub fn op_function(
                         )));
                     }
                 };
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::NumericEncode => {
                 check_arg_count!(arg_count, 3);
@@ -7164,7 +7161,7 @@ pub fn op_function(
                         Value::from_blob(bigdecimal_to_blob(&validated))
                     }
                 };
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::NumericDecode => {
                 check_arg_count!(arg_count, 1);
@@ -7181,7 +7178,7 @@ pub fn op_function(
                         )));
                     }
                 };
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::NumericAdd
             | ScalarFunc::NumericSub
@@ -7213,14 +7210,14 @@ pub fn op_function(
                         Value::build_text(crate::numeric::decimal::format_numeric(&res))
                     }
                 };
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::NumericLt | ScalarFunc::NumericEq => {
                 check_arg_count!(arg_count, 2);
                 let lhs_val = state.registers[*start_reg].get_value().clone();
                 let rhs_val = state.registers[*start_reg + 1].get_value().clone();
-                let result = match (&lhs_val, &rhs_val) {
-                    (Value::Null, _) | (_, Value::Null) => Value::Null,
+                match (&lhs_val, &rhs_val) {
+                    (Value::Null, _) | (_, Value::Null) => state.registers[*dest].set_null(),
                     _ => {
                         let a = value_to_bigdecimal(&lhs_val)?;
                         let b = value_to_bigdecimal(&rhs_val)?;
@@ -7229,55 +7226,53 @@ pub fn op_function(
                             ScalarFunc::NumericEq => a == b,
                             _ => unreachable!(),
                         };
-                        Value::from_i64(cmp_result as i64)
+                        state.registers[*dest].set_int(cmp_result as i64)
                     }
                 };
-                state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::ArrayAppend => {
                 check_arg_count!(arg_count, 2);
                 let arr_val = state.registers[*start_reg].get_value().clone();
                 let elem_val = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest] = Register::Value(exec_array_append(&arr_val, &elem_val));
+                state.registers[*dest].set_value(exec_array_append(&arr_val, &elem_val));
             }
             ScalarFunc::ArrayPrepend => {
                 check_arg_count!(arg_count, 2);
                 let elem_val = state.registers[*start_reg].get_value().clone();
                 let arr_val = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest] = Register::Value(exec_array_prepend(&arr_val, &elem_val));
+                state.registers[*dest].set_value(exec_array_prepend(&arr_val, &elem_val));
             }
             ScalarFunc::ArrayCat => {
                 check_arg_count!(arg_count, 2);
                 let a_val = state.registers[*start_reg].get_value().clone();
                 let b_val = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest] = Register::Value(exec_array_cat(&a_val, &b_val));
+                state.registers[*dest].set_value(exec_array_cat(&a_val, &b_val));
             }
             ScalarFunc::ArrayRemove => {
                 check_arg_count!(arg_count, 2);
                 let arr_val = state.registers[*start_reg].get_value().clone();
                 let target = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest] = Register::Value(exec_array_remove(&arr_val, &target));
+                state.registers[*dest].set_value(exec_array_remove(&arr_val, &target));
             }
             ScalarFunc::ArrayContains => {
                 check_arg_count!(arg_count, 2);
                 let arr_val = state.registers[*start_reg].get_value().clone();
                 let target = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest] = Register::Value(exec_array_contains(&arr_val, &target));
+                state.registers[*dest].set_value(exec_array_contains(&arr_val, &target));
             }
             ScalarFunc::ArrayPosition => {
                 check_arg_count!(arg_count, 2);
                 let arr_val = state.registers[*start_reg].get_value().clone();
                 let target = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest] = Register::Value(exec_array_position(&arr_val, &target));
+                state.registers[*dest].set_value(exec_array_position(&arr_val, &target));
             }
             ScalarFunc::ArrayLength => {
                 // Accept 1 or 2 args; dimension arg (PG compat) ignored for 1D arrays
                 let arr_val = state.registers[*start_reg].get_value();
-                let result = match compute_array_length(arr_val) {
-                    Some(count) => Value::from_i64(count),
-                    None => Value::Null,
+                match compute_array_length(arr_val) {
+                    Some(count) => state.registers[*dest].set_int(count),
+                    None => state.registers[*dest].set_null(),
                 };
-                state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::ArraySlice => {
                 check_arg_count!(arg_count, 3);
@@ -7285,7 +7280,7 @@ pub fn op_function(
                 let start_idx = state.registers[*start_reg + 1].get_value().clone();
                 let end_idx = state.registers[*start_reg + 2].get_value().clone();
                 let result = exec_array_slice(&arr_val, &start_idx, &end_idx);
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::StringToArray => {
                 let text = state.registers[*start_reg].get_value().clone();
@@ -7295,8 +7290,11 @@ pub fn op_function(
                 } else {
                     None
                 };
-                state.registers[*dest] =
-                    Register::Value(exec_string_to_array(&text, &delimiter, null_str.as_ref()));
+                state.registers[*dest].set_value(exec_string_to_array(
+                    &text,
+                    &delimiter,
+                    null_str.as_ref(),
+                ));
             }
             ScalarFunc::ArrayToString => {
                 let arr_val = state.registers[*start_reg].get_value().clone();
@@ -7306,7 +7304,7 @@ pub fn op_function(
                 } else {
                     None
                 };
-                state.registers[*dest] = Register::Value(exec_array_to_string(
+                state.registers[*dest].set_value(exec_array_to_string(
                     &arr_val,
                     &delimiter,
                     null_str.as_ref(),
@@ -7316,13 +7314,13 @@ pub fn op_function(
                 check_arg_count!(arg_count, 2);
                 let a_val = state.registers[*start_reg].get_value().clone();
                 let b_val = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest] = Register::Value(exec_array_overlap(&a_val, &b_val));
+                state.registers[*dest].set_value(exec_array_overlap(&a_val, &b_val));
             }
             ScalarFunc::ArrayContainsAll => {
                 check_arg_count!(arg_count, 2);
                 let a_val = state.registers[*start_reg].get_value().clone();
                 let b_val = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest] = Register::Value(exec_array_contains_all(&a_val, &b_val));
+                state.registers[*dest].set_value(exec_array_contains_all(&a_val, &b_val));
             }
         },
         crate::function::Func::Vector(vector_func) => {
@@ -7330,55 +7328,55 @@ pub fn op_function(
             match vector_func {
                 VectorFunc::Vector => {
                     let result = vector32(args)?;
-                    state.registers[*dest] = Register::Value(result);
+                    state.registers[*dest].set_value(result);
                 }
                 VectorFunc::Vector32 => {
                     let result = vector32(args)?;
-                    state.registers[*dest] = Register::Value(result);
+                    state.registers[*dest].set_value(result);
                 }
                 VectorFunc::Vector32Sparse => {
                     let result = vector32_sparse(args)?;
-                    state.registers[*dest] = Register::Value(result);
+                    state.registers[*dest].set_value(result);
                 }
                 VectorFunc::Vector64 => {
                     let result = vector64(args)?;
-                    state.registers[*dest] = Register::Value(result);
+                    state.registers[*dest].set_value(result);
                 }
                 VectorFunc::Vector8 => {
                     let result = vector8(args)?;
-                    state.registers[*dest] = Register::Value(result);
+                    state.registers[*dest].set_value(result);
                 }
                 VectorFunc::Vector1Bit => {
                     let result = vector1bit(args)?;
-                    state.registers[*dest] = Register::Value(result);
+                    state.registers[*dest].set_value(result);
                 }
                 VectorFunc::VectorExtract => {
                     let result = vector_extract(args)?;
-                    state.registers[*dest] = Register::Value(result);
+                    state.registers[*dest].set_value(result);
                 }
                 VectorFunc::VectorDistanceCos => {
                     let result = vector_distance_cos(args)?;
-                    state.registers[*dest] = Register::Value(result);
+                    state.registers[*dest].set_value(result);
                 }
                 VectorFunc::VectorDistanceDot => {
                     let result = vector_distance_dot(args)?;
-                    state.registers[*dest] = Register::Value(result);
+                    state.registers[*dest].set_value(result);
                 }
                 VectorFunc::VectorDistanceL2 => {
                     let result = vector_distance_l2(args)?;
-                    state.registers[*dest] = Register::Value(result);
+                    state.registers[*dest].set_value(result);
                 }
                 VectorFunc::VectorDistanceJaccard => {
                     let result = vector_distance_jaccard(args)?;
-                    state.registers[*dest] = Register::Value(result);
+                    state.registers[*dest].set_value(result);
                 }
                 VectorFunc::VectorConcat => {
                     let result = vector_concat(args)?;
-                    state.registers[*dest] = Register::Value(result);
+                    state.registers[*dest].set_value(result);
                 }
                 VectorFunc::VectorSlice => {
                     let result = vector_slice(args)?;
-                    state.registers[*dest] = Register::Value(result)
+                    state.registers[*dest].set_value(result)
                 }
             }
         }
@@ -7388,7 +7386,7 @@ pub fn op_function(
                     let result_c_value: ExtValue = unsafe { (f)(0, std::ptr::null()) };
                     match Value::from_ffi(result_c_value) {
                         Ok(result_ov) => {
-                            state.registers[*dest] = Register::Value(result_ov);
+                            state.registers[*dest].set_value(result_ov);
                         }
                         Err(e) => {
                             return Err(e);
@@ -7405,7 +7403,7 @@ pub fn op_function(
                     let result_c_value: ExtValue = unsafe { (f)(arg_count as i32, argv_ptr) };
                     match Value::from_ffi(result_c_value) {
                         Ok(result_ov) => {
-                            state.registers[*dest] = Register::Value(result_ov);
+                            state.registers[*dest].set_value(result_ov);
                         }
                         Err(e) => {
                             return Err(e);
@@ -7418,7 +7416,9 @@ pub fn op_function(
         crate::function::Func::Math(math_func) => match math_func.arity() {
             MathFuncArity::Nullary => match math_func {
                 MathFunc::Pi => {
-                    state.registers[*dest] = Register::Value(Value::from_f64(std::f64::consts::PI));
+                    state.registers[*dest].set_float(
+                        NonNan::new(std::f64::consts::PI).expect("PI is a valid NonNan"),
+                    );
                 }
                 _ => {
                     unreachable!("Unexpected mathematical Nullary function {:?}", math_func);
@@ -7428,14 +7428,14 @@ pub fn op_function(
             MathFuncArity::Unary => {
                 let reg_value = &state.registers[*start_reg];
                 let result = reg_value.get_value().exec_math_unary(math_func);
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
 
             MathFuncArity::Binary => {
                 let lhs = &state.registers[*start_reg];
                 let rhs = &state.registers[*start_reg + 1];
                 let result = lhs.get_value().exec_math_binary(rhs.get_value(), math_func);
-                state.registers[*dest] = Register::Value(result);
+                state.registers[*dest].set_value(result);
             }
 
             MathFuncArity::UnaryOrBinary => match math_func {
@@ -7455,7 +7455,7 @@ pub fn op_function(
                             math_func
                         ),
                     };
-                    state.registers[*dest] = Register::Value(result);
+                    state.registers[*dest].set_value(result);
                 }
                 _ => unreachable!(
                     "Unexpected mathematical UnaryOrBinary function {:?}",
@@ -8046,15 +8046,15 @@ pub fn op_function(
                 }
             };
 
-            state.registers[*dest] = Register::Value(r#type.clone());
-            state.registers[*dest + 1] = Register::Value(Value::Text(Text::from(new_name)));
-            state.registers[*dest + 2] = Register::Value(Value::Text(Text::from(new_tbl_name)));
-            state.registers[*dest + 3] = Register::Value(Value::from_i64(*root_page));
+            state.registers[*dest].set_value(r#type.clone());
+            state.registers[*dest + 1].set_text(Text::from(new_name));
+            state.registers[*dest + 2].set_text(Text::from(new_tbl_name));
+            state.registers[*dest + 3].set_int(*root_page);
 
             if let Some(new_sql) = new_sql {
-                state.registers[*dest + 4] = Register::Value(Value::Text(Text::from(new_sql)));
+                state.registers[*dest + 4].set_text(Text::from(new_sql));
             } else {
-                state.registers[*dest + 4] = Register::Value(sql.clone());
+                state.registers[*dest + 4].set_value(sql.clone());
             }
         }
         #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -8065,7 +8065,8 @@ pub fn op_function(
             match fts_func {
                 FtsFunc::Score => {
                     // Without an FTS index match, return 0.0 as a default score
-                    state.registers[*dest] = Register::Value(Value::from_f64(0.0));
+                    state.registers[*dest]
+                        .set_float(NonNan::new(0.0).expect("0.0 is a valid NonNan"));
                 }
                 FtsFunc::Match => {
                     // fts_match(col1, col2, ..., query): returns 1 if any column matches query
@@ -8081,7 +8082,7 @@ pub fn op_function(
                     let query = state.registers[*start_reg + num_text_cols].get_value();
 
                     if matches!(query, Value::Null) {
-                        state.registers[*dest] = Register::Value(Value::from_i64(0));
+                        state.registers[*dest].set_int(0);
                     } else {
                         let query_str = query.to_string();
 
@@ -8100,7 +8101,7 @@ pub fn op_function(
 
                         let matches =
                             crate::index_method::fts::fts_match(&combined_text, &query_str);
-                        state.registers[*dest] = Register::Value(Value::from_i64(matches.into()));
+                        state.registers[*dest].set_int(matches.into());
                     }
                 }
                 FtsFunc::Highlight => {
@@ -8126,7 +8127,7 @@ pub fn op_function(
                         || matches!(before_tag, Value::Null)
                         || matches!(after_tag, Value::Null)
                     {
-                        state.registers[*dest] = Register::Value(Value::Null);
+                        state.registers[*dest].set_null();
                     } else {
                         let query_str = query.to_string();
                         let before_str = before_tag.to_string();
@@ -8150,7 +8151,7 @@ pub fn op_function(
                             &before_str,
                             &after_str,
                         );
-                        state.registers[*dest] = Register::Value(Value::build_text(highlighted));
+                        state.registers[*dest].set_text(Text::new(highlighted));
                     }
                 }
             }
@@ -8182,7 +8183,7 @@ pub fn op_sequence(
         .expect("cursor_id should be valid");
     let seq_num = *cursor_seq;
     *cursor_seq += 1;
-    state.registers[*target_reg] = Register::Value(Value::from_i64(seq_num));
+    state.registers[*target_reg].set_int(seq_num);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -8231,7 +8232,7 @@ pub fn op_init_coroutine(
     );
     assert!(jump_on_definition.is_offset());
     let start_offset = start_offset.as_offset_int();
-    state.registers[*yield_reg] = Register::Value(Value::from_i64(start_offset as i64));
+    state.registers[*yield_reg].set_int(start_offset as i64);
     state.ended_coroutine.retain(|n| *n != *yield_reg as u32);
     let jump_on_definition = jump_on_definition.as_offset_int();
     state.pc = if jump_on_definition == 0 {
@@ -8284,8 +8285,8 @@ pub fn op_yield(
                 .unwrap_or_else(|_| panic!("Yield: pc overflow: {pc}"));
             // swap the program counter with the value in the yield register
             // this is the mechanism that allows jumping back and forth between the coroutine and the caller
-            (state.pc, state.registers[*yield_reg]) =
-                (pc, Register::Value(Value::from_i64((state.pc + 1) as i64)));
+            state.registers[*yield_reg].set_int((state.pc + 1) as i64);
+            state.pc = pc;
         }
     } else {
         unreachable!(
@@ -8639,7 +8640,7 @@ pub fn op_int_64(
         },
         insn
     );
-    state.registers[*out_reg] = Register::Value(Value::from_i64(*value));
+    state.registers[*out_reg].set_int(*value);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -9117,11 +9118,10 @@ fn new_rowid_inner(
                             } => {
                                 // Allocator already initialized — release lock immediately
                                 mvcc_cursor.end_new_rowid();
-                                state.registers[*rowid_reg] =
-                                    Register::Value(Value::from_i64(new_rowid));
+                                state.registers[*rowid_reg].set_int(new_rowid);
                                 if *prev_largest_reg > 0 {
-                                    state.registers[*prev_largest_reg] =
-                                        Register::Value(Value::from_i64(prev_rowid.unwrap_or(0)));
+                                    state.registers[*prev_largest_reg]
+                                        .set_int(prev_rowid.unwrap_or(0));
                                 }
                                 state.op_new_rowid_state = OpNewRowidState::SeekingToLast {
                                     mvcc_already_initialized: true,
@@ -9189,11 +9189,10 @@ fn new_rowid_inner(
                         // Allocate the first rowid from the freshly initialized counter.
                         match mvcc_cursor.allocate_next_rowid() {
                             Some((new_rowid, prev_rowid)) => {
-                                state.registers[*rowid_reg] =
-                                    Register::Value(Value::from_i64(new_rowid));
+                                state.registers[*rowid_reg].set_int(new_rowid);
                                 if *prev_largest_reg > 0 {
-                                    state.registers[*prev_largest_reg] =
-                                        Register::Value(Value::from_i64(prev_rowid.unwrap_or(0)));
+                                    state.registers[*prev_largest_reg]
+                                        .set_int(prev_rowid.unwrap_or(0));
                                 }
                                 tracing::trace!("new_rowid={}", new_rowid);
                                 state.op_new_rowid_state = OpNewRowidState::GoNext;
@@ -9211,12 +9210,11 @@ fn new_rowid_inner(
 
                 // Non-MVCC path (or ephemeral cursor in MVCC mode)
                 if *prev_largest_reg > 0 {
-                    state.registers[*prev_largest_reg] =
-                        Register::Value(Value::from_i64(current_max.unwrap_or(0)));
+                    state.registers[*prev_largest_reg].set_int(current_max.unwrap_or(0));
                 }
                 match current_max {
                     Some(rowid) if rowid < MAX_ROWID => {
-                        state.registers[*rowid_reg] = Register::Value(Value::from_i64(rowid + 1));
+                        state.registers[*rowid_reg].set_int(rowid + 1);
                         tracing::trace!("new_rowid={}", rowid + 1);
                         state.op_new_rowid_state = OpNewRowidState::GoNext;
                         continue;
@@ -9227,7 +9225,7 @@ fn new_rowid_inner(
                     }
                     None => {
                         tracing::trace!("new_rowid=1");
-                        state.registers[*rowid_reg] = Register::Value(Value::from_i64(1));
+                        state.registers[*rowid_reg].set_int(1);
                         state.op_new_rowid_state = OpNewRowidState::GoNext;
                         continue;
                     }
@@ -9267,7 +9265,7 @@ fn new_rowid_inner(
 
                 if !exists {
                     // Found unused rowid!
-                    state.registers[*rowid_reg] = Register::Value(Value::from_i64(candidate));
+                    state.registers[*rowid_reg].set_int(candidate);
                     state.op_new_rowid_state = OpNewRowidState::Start;
                     state.pc += 1;
 
@@ -9320,15 +9318,13 @@ pub fn op_must_be_int(
     match &state.registers[*reg].get_value() {
         Value::Numeric(Numeric::Integer(_)) => {}
         Value::Numeric(Numeric::Float(f)) => match cast_real_to_integer(f64::from(*f)) {
-            Ok(i) => state.registers[*reg] = Register::Value(Value::from_i64(i)),
+            Ok(i) => state.registers[*reg].set_int(i),
             Err(_) => bail_constraint_error!("datatype mismatch"),
         },
         Value::Text(text) => match checked_cast_text_to_numeric(text.as_str(), true) {
-            Ok(Value::Numeric(Numeric::Integer(i))) => {
-                state.registers[*reg] = Register::Value(Value::from_i64(i))
-            }
+            Ok(Value::Numeric(Numeric::Integer(i))) => state.registers[*reg].set_int(i),
             Ok(Value::Numeric(Numeric::Float(f))) => match cast_real_to_integer(f64::from(f)) {
-                Ok(i) => state.registers[*reg] = Register::Value(Value::from_i64(i)),
+                Ok(i) => state.registers[*reg].set_int(i),
                 Err(_) => bail_constraint_error!("datatype mismatch"),
             },
             _ => bail_constraint_error!("datatype mismatch"),
@@ -9348,7 +9344,7 @@ pub fn op_soft_null(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(SoftNull { reg }, insn);
-    state.registers[*reg] = Register::Value(Value::Null);
+    state.registers[*reg].set_null();
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -9507,9 +9503,9 @@ pub fn op_offset_limit(
 
     let offset_limit_sum = limit_val.overflowing_add(offset_val);
     if *limit_val <= 0 || offset_limit_sum.1 {
-        state.registers[*combined_reg] = Register::Value(Value::from_i64(-1));
+        state.registers[*combined_reg].set_int(-1);
     } else {
-        state.registers[*combined_reg] = Register::Value(Value::from_i64(offset_limit_sum.0));
+        state.registers[*combined_reg].set_int(offset_limit_sum.0);
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -9697,14 +9693,14 @@ pub fn op_create_btree(
 
     if let Some(mv_store) = mv_store.as_ref() {
         let root_page = mv_store.get_next_table_id();
-        state.registers[*root] = Register::Value(Value::from_i64(root_page));
+        state.registers[*root].set_int(root_page);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
     let pager = program.get_pager_from_database_index(db);
     // FIXME: handle page cache is full
     let root_page = return_if_io!(pager.btree_create(flags));
-    state.registers[*root] = Register::Value(Value::from_i64(root_page as i64));
+    state.registers[*root].set_int(root_page as i64);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -9883,8 +9879,8 @@ pub fn op_destroy(
             }
             OpDestroyState::DestroyBtree(ref mut cursor) => {
                 let maybe_former_root_page = return_if_io!(cursor.write().btree_destroy());
-                state.registers[*former_root_reg] =
-                    Register::Value(Value::from_i64(maybe_former_root_page.unwrap_or(0) as i64));
+                state.registers[*former_root_reg]
+                    .set_int(maybe_former_root_page.unwrap_or(0) as i64);
                 state.op_destroy_state = OpDestroyState::CreateCursor;
                 state.pc += 1;
                 return Ok(InsnFunctionStepResult::Step);
@@ -10107,7 +10103,7 @@ pub fn op_coll_seq(
 
     // If P1 is not zero, initialize that register to 0
     if let Some(reg_idx) = reg {
-        state.registers[*reg_idx] = Register::Value(Value::from_i64(0));
+        state.registers[*reg_idx].set_int(0);
     }
 
     state.pc += 1;
@@ -10130,7 +10126,7 @@ pub fn op_page_count(
         Ok(IOResult::Done(v)) => v.into(),
         Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
     };
-    state.registers[*dest] = Register::Value(Value::from_i64(count));
+    state.registers[*dest].set_int(count);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -10477,7 +10473,7 @@ pub fn op_read_cookie(
             Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
         };
 
-    state.registers[*dest] = Register::Value(Value::from_i64(cookie_value));
+    state.registers[*dest].set_int(cookie_value);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -10563,7 +10559,7 @@ pub fn op_shift_right(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(ShiftRight { lhs, rhs, dest }, insn);
-    state.registers[*dest] = Register::Value(
+    state.registers[*dest].set_value(
         state.registers[*lhs]
             .get_value()
             .exec_shift_right(state.registers[*rhs].get_value()),
@@ -10579,7 +10575,7 @@ pub fn op_shift_left(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(ShiftLeft { lhs, rhs, dest }, insn);
-    state.registers[*dest] = Register::Value(
+    state.registers[*dest].set_value(
         state.registers[*lhs]
             .get_value()
             .exec_shift_left(state.registers[*rhs].get_value()),
@@ -10611,7 +10607,7 @@ pub fn op_add_imm(
         Value::Null => *value,    // NULL becomes the added value
     };
 
-    state.registers[*register] = Register::Value(Value::from_i64(int_val));
+    state.registers[*register].set_int(int_val);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -10623,7 +10619,7 @@ pub fn op_variable(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Variable { index, dest }, insn);
-    state.registers[*dest] = Register::Value(state.get_parameter(*index));
+    state.registers[*dest].set_value(state.get_parameter(*index));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -10636,9 +10632,9 @@ pub fn op_zero_or_null(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(ZeroOrNull { rg1, rg2, dest }, insn);
     if state.registers[*rg1].is_null() || state.registers[*rg2].is_null() {
-        state.registers[*dest] = Register::Value(Value::Null)
+        state.registers[*dest].set_null()
     } else {
-        state.registers[*dest] = Register::Value(Value::from_i64(0));
+        state.registers[*dest].set_int(0);
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -10651,7 +10647,10 @@ pub fn op_not(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Not { reg, dest }, insn);
-    state.registers[*dest] = Register::Value(state.registers[*reg].get_value().exec_boolean_not());
+    match state.registers[*reg].get_value().exec_boolean_not() {
+        Value::Numeric(Numeric::Integer(i)) => state.registers[*dest].set_int(i),
+        _ => state.registers[*dest].set_null(),
+    };
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -10696,7 +10695,7 @@ pub fn op_is_true(
             }
         }
     };
-    state.registers[*dest] = Register::Value(Value::from_i64(final_result));
+    state.registers[*dest].set_int(final_result);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -10708,7 +10707,7 @@ pub fn op_concat(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Concat { lhs, rhs, dest }, insn);
-    state.registers[*dest] = Register::Value(
+    state.registers[*dest].set_value(
         state.registers[*lhs]
             .get_value()
             .exec_concat(state.registers[*rhs].get_value()),
@@ -10724,7 +10723,7 @@ pub fn op_and(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(And { lhs, rhs, dest }, insn);
-    state.registers[*dest] = Register::Value(
+    state.registers[*dest].set_value(
         state.registers[*lhs]
             .get_value()
             .exec_and(state.registers[*rhs].get_value()),
@@ -10740,7 +10739,7 @@ pub fn op_or(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Or { lhs, rhs, dest }, insn);
-    state.registers[*dest] = Register::Value(
+    state.registers[*dest].set_value(
         state.registers[*lhs]
             .get_value()
             .exec_or(state.registers[*rhs].get_value()),
@@ -11222,7 +11221,7 @@ pub fn op_count(
         return_if_io!(cursor.count())
     };
 
-    state.registers[*target_reg] = Register::Value(Value::from_i64(count as i64));
+    state.registers[*target_reg].set_int(count as i64);
 
     // For optimized COUNT(*) queries, the count represents rows that would be read
     // SQLite tracks this differently (as pages read), but for consistency we track as rows
@@ -11349,9 +11348,9 @@ pub fn op_integrity_check(
             if errors.len() >= *max_errors {
                 errors.truncate(*max_errors);
                 let message = format_integrity_check_result(errors);
-                state.registers[*message_register] = match message {
-                    Some(msg) => Register::Value(Value::build_text(msg)),
-                    None => Register::Value(Value::Null),
+                match message {
+                    Some(msg) => state.registers[*message_register].set_text(Text::new(msg)),
+                    None => state.registers[*message_register].set_null(),
                 };
                 state.op_integrity_check_state = OpIntegrityCheckState::Start;
                 state.pc += 1;
@@ -11407,9 +11406,9 @@ pub fn op_integrity_check(
 
             errors.truncate(*max_errors);
             let message = format_integrity_check_result(errors);
-            state.registers[*message_register] = match message {
-                Some(msg) => Register::Value(Value::build_text(msg)),
-                None => Register::Value(Value::Null),
+            match message {
+                Some(msg) => state.registers[*message_register].set_text(Text::new(msg)),
+                None => state.registers[*message_register].set_null(),
             };
             state.op_integrity_check_state = OpIntegrityCheckState::Start;
             state.pc += 1;
@@ -11435,7 +11434,7 @@ pub fn op_cast(
         Affinity::Real => value.exec_cast("REAL"),
     };
 
-    state.registers[*reg] = Register::Value(result);
+    state.registers[*reg].set_value(result);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -12374,7 +12373,7 @@ fn write_hash_payload_to_registers(
 ) {
     if let Some(dest_reg) = payload_dest_reg {
         for (i, value) in entry.payload_values.iter().take(num_payload).enumerate() {
-            registers[dest_reg + i] = Register::Value(value.clone());
+            registers[dest_reg + i].set_value(value.clone());
         }
     }
 }
@@ -12463,7 +12462,7 @@ pub fn op_hash_probe(
             Some(&mut state.metrics.hash_join),
         ) {
             Some(entry) => {
-                state.registers[dest_reg] = Register::Value(Value::from_i64(entry.rowid));
+                state.registers[dest_reg].set_int(entry.rowid);
                 write_hash_payload_to_registers(
                     &mut state.registers,
                     entry,
@@ -12482,7 +12481,7 @@ pub fn op_hash_probe(
         // Non-spilled hash table, use normal probe
         match hash_table.probe(probe_keys, Some(&mut state.metrics.hash_join)) {
             Some(entry) => {
-                state.registers[dest_reg] = Register::Value(Value::from_i64(entry.rowid));
+                state.registers[dest_reg].set_int(entry.rowid);
                 write_hash_payload_to_registers(
                     &mut state.registers,
                     entry,
@@ -12522,7 +12521,7 @@ pub fn op_hash_next(
     })?;
     match hash_table.next_match() {
         Some(entry) => {
-            state.registers[*dest_reg] = Register::Value(Value::from_i64(entry.rowid));
+            state.registers[*dest_reg].set_int(entry.rowid);
             write_hash_payload_to_registers(
                 &mut state.registers,
                 entry,
@@ -12678,8 +12677,7 @@ fn advance_unmatched_scan(
     loop {
         match hash_table.next_unmatched() {
             Some(entry) => {
-                registers[dest_reg] =
-                    Register::Value(Value::Numeric(Numeric::Integer(entry.rowid)));
+                registers[dest_reg].set_int(entry.rowid);
                 write_hash_payload_to_registers(registers, entry, payload_dest_reg, num_payload);
                 *pc += 1;
                 return Ok(InsnFunctionStepResult::Step);
@@ -12922,7 +12920,7 @@ pub fn op_max_pgcnt(
         return_if_io!(pager.set_max_page_count(*new_max as u32))
     };
 
-    state.registers[*dest] = Register::Value(Value::from_i64(result_value.into()));
+    state.registers[*dest].set_int(result_value.into());
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -13012,7 +13010,7 @@ fn op_journal_mode_inner(
                 // If no new mode specified, just return current mode
                 let Some(mode_str) = new_mode else {
                     let ret: &'static str = prev_mode.into();
-                    state.registers[*dest] = Register::Value(Value::build_text(ret));
+                    state.registers[*dest].set_text(Text::new(ret));
                     state.pc += 1;
                     return Ok(InsnFunctionStepResult::Step);
                 };
@@ -13023,7 +13021,7 @@ fn op_journal_mode_inner(
                     Ok(mode) if mode.supported() => mode,
                     _ => {
                         let ret: &'static str = prev_mode.into();
-                        state.registers[*dest] = Register::Value(Value::build_text(ret));
+                        state.registers[*dest].set_text(Text::new(ret));
                         state.pc += 1;
                         return Ok(InsnFunctionStepResult::Step);
                     }
@@ -13032,7 +13030,7 @@ fn op_journal_mode_inner(
                 // If same mode, just return
                 if prev_mode == new_mode {
                     let ret: &'static str = new_mode.into();
-                    state.registers[*dest] = Register::Value(Value::build_text(ret));
+                    state.registers[*dest].set_text(Text::new(ret));
                     state.pc += 1;
                     return Ok(InsnFunctionStepResult::Step);
                 }
@@ -13158,7 +13156,7 @@ fn op_journal_mode_inner(
 
                 // Return result
                 let ret: &'static str = new_mode.into();
-                state.registers[*dest] = Register::Value(Value::build_text(ret));
+                state.registers[*dest].set_text(Text::new(ret));
                 state.pc += 1;
 
                 return Ok(InsnFunctionStepResult::Step);

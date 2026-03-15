@@ -171,10 +171,29 @@ setup collated-composite-mismatch {
         ON collated_values_composite(val COLLATE NOCASE, other);
 }
 
-# Composite indexes should respect the first-key collation too
+setup collated-composite-mismatch-larger-table {
+    CREATE TABLE collated_values_composite_larger_table (
+        id INTEGER PRIMARY KEY,
+        val TEXT,
+        other INTEGER,
+        other2 INTEGER,
+        other3 INTEGER
+    );
+
+    CREATE INDEX idx_collated_values_composite_nocase
+        ON collated_values_composite_larger_table(val COLLATE NOCASE, other);
+}
+
+# Composite indexes should respect the first-key collation too.
 @setup collated-composite-mismatch
 snapshot-eqp in-composite-collation-mismatch {
     SELECT id FROM collated_values_composite WHERE val IN ('hello');
+}
+
+# The composite index as a covering scan access method is only preferred when the table is large enough that an index scan results in less IO than a table scan.
+@setup collated-composite-mismatch-larger-table
+snapshot-eqp in-composite-collation-mismatch-larger-table {
+    SELECT id FROM collated_values_composite_larger_table WHERE val IN ('hello');
 }
 
 # =============================================================================

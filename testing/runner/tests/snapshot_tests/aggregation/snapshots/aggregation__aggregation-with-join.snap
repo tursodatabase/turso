@@ -71,10 +71,10 @@ addr  opcode                    p1  p2  p3  p4                p5  comment
   37            IfPos            8  68   0                     0  r[8]>0 -> r[8]-=0, goto 68; check abort flag
   38            Gosub           19  65   0                     0  ; goto clear accumulator subroutine
   39            Column           2   1  23                     0  r[23]=pseudo.column 1
-  40            AggStep          0  23  11  count              0  accum=r[11] step(r[23])
-  41            Column           2   2  24                     0  r[24]=pseudo.column 2
-  42            AggStep          0  24  12  sum                0  accum=r[12] step(r[24])
-  43            Column           2   3  25                     0  r[25]=pseudo.column 3
+  40            Column           2   2  24                     0  r[24]=pseudo.column 2
+  41            Column           2   3  25                     0  r[25]=pseudo.column 3
+  42            AggStep          0  23  11  count              0  accum=r[11] step(r[23])
+  43            AggStep          0  24  12  sum                0  accum=r[12] step(r[24])
   44            AggStep          0  25  13  avg                0  accum=r[13] step(r[25])
   45            If               7  47   0                     0  if r[7] goto 47; don't emit group columns if continuing existing group
   46            Column           2   0  10                     0  r[10]=pseudo.column 0

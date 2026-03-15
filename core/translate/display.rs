@@ -95,7 +95,7 @@ pub(crate) fn format_eqp_detail(table: &JoinedTable) -> String {
                 "MULTI-INDEX {} {} ({})",
                 match multi_idx.set_op {
                     SetOperation::Union => "OR",
-                    SetOperation::Intersection => "AND",
+                    SetOperation::Intersection { .. } => "AND",
                 },
                 table.identifier,
                 index_names.join(", ")
@@ -339,7 +339,7 @@ impl Display for SelectPlan {
                         .collect();
                     let op_name = match multi_idx.set_op {
                         SetOperation::Union => "MULTI-INDEX OR",
-                        SetOperation::Intersection => "MULTI-INDEX AND",
+                        SetOperation::Intersection { .. } => "MULTI-INDEX AND",
                     };
                     writeln!(
                         f,
@@ -457,7 +457,7 @@ impl Display for DeletePlan {
                         .collect();
                     let op_name = match multi_idx.set_op {
                         SetOperation::Union => "MULTI-INDEX OR",
-                        SetOperation::Intersection => "MULTI-INDEX AND",
+                        SetOperation::Intersection { .. } => "MULTI-INDEX AND",
                     };
                     writeln!(
                         f,

@@ -775,3 +775,39 @@ setup prereq_schema {
 snapshot-eqp prefer-constant-bound-index-over-join-dependent {
     SELECT t1.id FROM t1 LEFT JOIN t2 ON t1.id = t2.a AND t2.b = 'x' WHERE t2.a IS NULL;
 }
+
+# Self-join on a non-unique indexed column where the join-dependent index
+# (equality on the shared key) must beat a constant-bound index (equality on
+# a label/category column). Without proper selectivity-based cost estimation,
+# all single-column non-unique indexes get identical cost and the wrong
+# tiebreaker picks the label index — causing a full scan of all matching
+# labels instead of a narrow seek on the shared key.
+setup catalog_schema {
+    CREATE TABLE product (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL DEFAULT '', category TEXT DEFAULT 'general');
+    CREATE TABLE bundle (id TEXT PRIMARY KEY NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL DEFAULT '');
+    CREATE INDEX idx_bundle_kind   ON bundle (kind);
+    CREATE INDEX idx_bundle_target ON bundle (target);
+    CREATE INDEX idx_bundle_source ON bundle (source);
+}
+
+@setup catalog_schema
+snapshot-eqp self-join-prefer-join-dependent-index {
+    SELECT DISTINCT
+        p1.name, p2.name
+    FROM bundle b1
+    JOIN bundle b2 ON b1.source = b2.source
+    JOIN product p1 ON b1.target = p1.id
+    JOIN product p2 ON b2.target = p2.id
+    JOIN product container ON b1.source = container.id
+    LEFT JOIN bundle x1 ON p1.id = x1.target AND x1.kind = 'variant'
+    LEFT JOIN bundle x2 ON p2.id = x2.target AND x2.kind = 'variant'
+    WHERE b1.kind = 'contains'
+      AND b2.kind = 'contains'
+      AND b1.target <> b2.target
+      AND b1.target < b2.target
+      AND container.category = 'kit'
+      AND p1.category NOT IN ('shipping', 'meta', 'kit')
+      AND p2.category NOT IN ('shipping', 'meta', 'kit')
+      AND x1.id IS NULL
+      AND x2.id IS NULL;
+}

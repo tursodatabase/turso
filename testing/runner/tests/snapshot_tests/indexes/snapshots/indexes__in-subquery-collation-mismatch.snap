@@ -13,4 +13,4 @@ info:
 QUERY PLAN
 |--LIST SUBQUERY 1
 |  `--SCAN rhs_values
-`--SCAN collated_values_subquery USING COVERING INDEX idx_collated_values_subquery_nocase
+`--SCAN collated_values_subquery
