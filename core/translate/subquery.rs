@@ -19,9 +19,8 @@ use crate::{
         plan::{
             plan_has_outer_scope_dependency, plan_is_correlated, ColumnUsedMask, EvalAt,
             JoinOrderMember, NonFromClauseSubquery, OuterQueryReference, Plan, ResultSetColumn,
-            SetOperation,
-            SubqueryEvalPhase, SubqueryOrigin, SubqueryPosition, SubqueryState, TableReferences,
-            WhereTerm,
+            SetOperation, SubqueryEvalPhase, SubqueryOrigin, SubqueryPosition, SubqueryState,
+            TableReferences, WhereTerm,
         },
         select::bind_prepare_select_plan,
     },
@@ -531,12 +530,8 @@ fn get_subquery_parser<'a>(
                 let inner_derived_bindings = std::mem::take(&mut inner_bound.derived_bindings);
 
                 // Plan any inner CTEs.
-                let mut planned_ctes = super::planner::plan_bound_ctes(
-                    inner_cte_defs,
-                    resolver,
-                    program,
-                    connection,
-                )?;
+                let mut planned_ctes =
+                    super::planner::plan_bound_ctes(inner_cte_defs, resolver, program, connection)?;
 
                 // Make outer CTEs available for inner CTE/scope resolution.
                 // Outer CTEs are in referenced_tables' outer_query_refs with
@@ -657,18 +652,15 @@ fn get_subquery_parser<'a>(
                         // Only inject LIMIT 1 if there's no existing limit, or the existing limit is > 1.
                         let needs_limit = match &plan.limit {
                             Some(expr) => match parse_signed_number(expr) {
-                                Ok(Value::Numeric(Numeric::Integer(v))) => {
-                                    !(0..=1).contains(&v)
-                                }
+                                Ok(Value::Numeric(Numeric::Integer(v))) => !(0..=1).contains(&v),
                                 _ => true,
                             },
                             None => true,
                         };
                         if needs_limit {
-                            plan.limit =
-                                Some(Box::new(ast::Expr::Literal(ast::Literal::Numeric(
-                                    "1".to_string(),
-                                ))));
+                            plan.limit = Some(Box::new(ast::Expr::Literal(ast::Literal::Numeric(
+                                "1".to_string(),
+                            ))));
                         }
                         let correlated = plan.is_correlated();
                         handle_unsupported_correlation(correlated, position, allow_correlated)?;
@@ -687,9 +679,7 @@ fn get_subquery_parser<'a>(
                         });
                     }
                     SubqueryType::In { .. } => {
-                        let lhs_box = lhs
-                            .take()
-                            .expect("IN subquery should have lhs from binder");
+                        let lhs_box = lhs.take().expect("IN subquery should have lhs from binder");
                         let lhs_columns = match unwrap_parens(lhs_box.as_ref())? {
                             ast::Expr::Parenthesized(exprs) => {
                                 either::Left(exprs.iter().map(|e| e.as_ref()))
@@ -706,11 +696,8 @@ fn get_subquery_parser<'a>(
                         let mut affinity_chars = String::with_capacity(lhs_column_count);
                         let mut lhs_collations = Vec::with_capacity(lhs_column_count);
                         for (i, lhs_expr) in lhs_columns.enumerate() {
-                            let lhs_affinity = get_expr_affinity_info(
-                                lhs_expr,
-                                Some(referenced_tables),
-                                None,
-                            );
+                            let lhs_affinity =
+                                get_expr_affinity_info(lhs_expr, Some(referenced_tables), None);
                             affinity_chars.push(
                                 compare_affinity(
                                     &plan.result_columns[i].expr,
@@ -729,15 +716,10 @@ fn get_subquery_parser<'a>(
                             .iter()
                             .enumerate()
                             .map(|(i, c)| {
-                                let rhs_collation = get_collseq_from_expr(
-                                    &c.expr,
-                                    &plan.table_references,
-                                )?;
+                                let rhs_collation =
+                                    get_collseq_from_expr(&c.expr, &plan.table_references)?;
                                 Ok(IndexColumn {
-                                    name: c
-                                        .name(&plan.table_references)
-                                        .unwrap_or("")
-                                        .to_string(),
+                                    name: c.name(&plan.table_references).unwrap_or("").to_string(),
                                     order: SortOrder::Asc,
                                     pos_in_table: i,
                                     collation: lhs_collations[i].or(rhs_collation),

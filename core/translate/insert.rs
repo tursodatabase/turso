@@ -22,23 +22,15 @@ use crate::{
             emit_guarded_fk_decrement, index_probe, open_read_index, open_read_table,
             ForeignKeyActions,
         },
-        plan::{
-            EvalAt, QueryDestination, ResultSetColumn,
-            TableReferences,
-        },
+        plan::{EvalAt, QueryDestination, ResultSetColumn, TableReferences},
         planner::ROWID_STRS,
         select::translate_select,
-        subquery::{
-            emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery,
-        },
+        subquery::{emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery},
         trigger_exec::{
             fire_trigger, get_relevant_triggers_type_and_time, has_relevant_triggers_type_only,
             TriggerContext,
         },
-        upsert::{
-            collect_set_clauses_for_upsert, emit_upsert,
-            ResolvedUpsertTarget,
-        },
+        upsert::{collect_set_clauses_for_upsert, emit_upsert, ResolvedUpsertTarget},
     },
     util::normalize_ident,
     vdbe::{

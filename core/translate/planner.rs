@@ -1,23 +1,20 @@
-use crate::sync::Arc;
-use crate::turso_assert_less_than;
-use rustc_hash::FxHashMap;
-use std::cmp::PartialEq;
 use super::{
     bind::CteEntry,
     expr::walk_expr,
     plan::{
-        Aggregate, ColumnUsedMask, Distinctness, EvalAt,
-        JoinOrderMember, JoinedTable, Operation, OuterQueryReference,
-        Plan, QueryDestination, TableReferences, WhereTerm,
+        Aggregate, ColumnUsedMask, Distinctness, EvalAt, JoinOrderMember, JoinedTable, Operation,
+        OuterQueryReference, Plan, QueryDestination, TableReferences, WhereTerm,
     },
     select::bind_prepare_select_plan,
 };
 use crate::function::{AggFunc, ExtFunc};
+use crate::sync::Arc;
 use crate::translate::{
     emitter::Resolver,
     expr::{expr_vector_size, unwrap_parens, WalkControl},
     plan::{NonFromClauseSubquery, SubqueryState},
 };
+use crate::turso_assert_less_than;
 use crate::{
     function::Func,
     schema::Table,
@@ -28,12 +25,10 @@ use crate::{
     translate::plan::{Window, WindowFunction},
     vdbe::builder::ProgramBuilder,
 };
+use rustc_hash::FxHashMap;
+use std::cmp::PartialEq;
 use turso_parser::ast::Literal::Null;
-use turso_parser::ast::{
-    self, Expr, Materialized, Over, Select,
-    TableInternalId, With,
-};
-
+use turso_parser::ast::{self, Expr, Materialized, Over, Select, TableInternalId, With};
 
 /// Collect all table names referenced in a SELECT's FROM clause.
 /// Used to determine which earlier CTEs a CTE directly depends on.
@@ -463,7 +458,8 @@ pub fn plan_derived_tables_with_outer_refs(
         let inner_derived_bindings = std::mem::take(&mut inner_bound.derived_bindings);
 
         // Plan any inner CTEs.
-        let mut inner_planned_ctes = plan_bound_ctes(inner_cte_defs, resolver, program, connection)?;
+        let mut inner_planned_ctes =
+            plan_bound_ctes(inner_cte_defs, resolver, program, connection)?;
 
         // Make parent CTEs available for inner references.
         for (name, jt) in planned_ctes.iter() {
@@ -510,11 +506,11 @@ pub fn plan_derived_tables_with_outer_refs(
         let jt = JoinedTable::new_subquery_from_plan(
             String::new(), // identifier set later by scope_to_table_references
             subplan,
-            None,   // join_info set later
+            None, // join_info set later
             internal_id,
-            None,   // no explicit columns
-            None,   // not a CTE
-            false,  // no materialize hint
+            None,  // no explicit columns
+            None,  // not a CTE
+            false, // no materialize hint
         )?;
         planned.insert(internal_id, jt);
     }
@@ -596,7 +592,10 @@ fn plan_one_bound_cte(
 
     // Count CTE references in scope tables for materialization decisions.
     for scope_table in inner_bound.main_scope.tables.iter().chain(
-        inner_bound.compound_scopes.iter().flat_map(|s| s.tables.iter()),
+        inner_bound
+            .compound_scopes
+            .iter()
+            .flat_map(|s| s.tables.iter()),
     ) {
         if let super::bind::ScopeTableSource::Cte { cte_id, .. } = &scope_table.source {
             program.increment_cte_reference(*cte_id);
@@ -611,7 +610,11 @@ fn plan_one_bound_cte(
     // ordered_points via a scalar subquery).
     for tr in &mut all_table_refs {
         for (ref_name, ref_table) in planned.iter() {
-            if !tr.outer_query_refs().iter().any(|r| r.identifier == *ref_name) {
+            if !tr
+                .outer_query_refs()
+                .iter()
+                .any(|r| r.identifier == *ref_name)
+            {
                 tr.add_outer_query_reference(OuterQueryReference {
                     identifier: ref_name.clone(),
                     internal_id: ref_table.internal_id,
@@ -784,8 +787,6 @@ pub fn plan_ctes_as_outer_refs(
     Ok(())
 }
 
-
-
 fn transform_args_into_where_terms(
     args: &[Box<Expr>],
     internal_id: TableInternalId,
@@ -877,8 +878,6 @@ fn collect_vtab_predicates_for_table(
     }
     Ok(())
 }
-
-
 
 pub fn parse_where(
     where_clause: Option<&Expr>,

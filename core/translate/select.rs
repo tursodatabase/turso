@@ -1,8 +1,8 @@
 use super::bind::BindContext;
 use super::emitter::{emit_program, TranslateCtx};
 use super::plan::{
-    Distinctness, InSeekSource, JoinOrderMember, Operation, OuterQueryReference,
-    QueryDestination, Search, TableReferences, WhereTerm, Window,
+    Distinctness, InSeekSource, JoinOrderMember, Operation, OuterQueryReference, QueryDestination,
+    Search, TableReferences, WhereTerm, Window,
 };
 use crate::schema::Table;
 use crate::sync::Arc;
@@ -12,8 +12,8 @@ use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan, SubqueryState};
 use crate::translate::planner::{
-    break_predicate_at_and_boundaries, collect_vtab_predicates, fold_join_constraints,
-    parse_where, plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
+    break_predicate_at_and_boundaries, collect_vtab_predicates, fold_join_constraints, parse_where,
+    plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
 };
 use crate::translate::result_row::emit_select_result;
 use crate::translate::subquery::{plan_subqueries_from_select_plan, plan_subqueries_from_values};
@@ -50,17 +50,25 @@ pub fn bind_prepare_select_plan(
 
     // Plan derived tables (FROM subqueries) using pre-bound data.
     let derived_bindings = std::mem::take(&mut bound.derived_bindings);
-    let mut planned_derived =
-        plan_derived_tables(derived_bindings, &mut planned_ctes, resolver, program, connection)?;
+    let mut planned_derived = plan_derived_tables(
+        derived_bindings,
+        &mut planned_ctes,
+        resolver,
+        program,
+        connection,
+    )?;
 
     // Extract pre-bound subqueries for inline planning in the walker.
     let subquery_bindings = std::mem::take(&mut bound.subquery_bindings);
 
     // Count CTE references in scope tables for materialization decisions.
     // This must happen before into_table_references consumes the scopes.
-    for scope_table in bound.main_scope.tables.iter().chain(
-        bound.compound_scopes.iter().flat_map(|s| s.tables.iter()),
-    ) {
+    for scope_table in bound
+        .main_scope
+        .tables
+        .iter()
+        .chain(bound.compound_scopes.iter().flat_map(|s| s.tables.iter()))
+    {
         if let super::bind::ScopeTableSource::Cte { cte_id, .. } = &scope_table.source {
             program.increment_cte_reference(*cte_id);
         }
@@ -100,7 +108,6 @@ pub fn bind_prepare_select_plan(
         subquery_bindings,
     )
 }
-
 
 pub fn translate_select(
     select: ast::Select,
@@ -567,7 +574,13 @@ fn prepare_one_select_plan(
                 )?;
             }
 
-            plan_subqueries_from_select_plan(program, &mut plan, resolver, connection, bound_subqueries)?;
+            plan_subqueries_from_select_plan(
+                program,
+                &mut plan,
+                resolver,
+                connection,
+                bound_subqueries,
+            )?;
 
             validate_expr_correct_column_counts(&plan)?;
 

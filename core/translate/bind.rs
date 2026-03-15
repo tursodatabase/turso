@@ -195,10 +195,7 @@ pub struct ScopeTable {
 #[derive(Clone)]
 pub enum ScopeTableSource {
     Table(Arc<Table>),
-    Cte {
-        name: String,
-        cte_id: usize,
-    },
+    Cte { name: String, cte_id: usize },
     Derived {},
 }
 
@@ -1112,7 +1109,12 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                                 // Only inline if the name doesn't match any source column.
                                 // If a source column exists, the subquery should
                                 // resolve it as a correlated column reference, not an alias.
-                                if scope.find_column_unqualified(name.as_str()).ok().flatten().is_none() {
+                                if scope
+                                    .find_column_unqualified(name.as_str())
+                                    .ok()
+                                    .flatten()
+                                    .is_none()
+                                {
                                     if let Some(alias_expr) = self.resolve_alias(name.as_str()) {
                                         *expr = alias_expr;
                                         return;
@@ -1392,16 +1394,11 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         ref mut columns, ..
                     } = view_select.body.select
                     {
-                        for (col, result_col) in
-                            view_columns.iter().zip(columns.iter_mut())
-                        {
-                            if let (
-                                Some(name_str),
-                                ast::ResultColumn::Expr(_, ref mut col_alias),
-                            ) = (&col.name, result_col)
+                        for (col, result_col) in view_columns.iter().zip(columns.iter_mut()) {
+                            if let (Some(name_str), ast::ResultColumn::Expr(_, ref mut col_alias)) =
+                                (&col.name, result_col)
                             {
-                                *col_alias =
-                                    Some(ast::As::As(ast::Name::exact(name_str.clone())));
+                                *col_alias = Some(ast::As::As(ast::Name::exact(name_str.clone())));
                             }
                         }
                     }
@@ -1702,16 +1699,15 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             Err(_) => {
                 // Table found but column not found — try rowid pseudo-column
                 if let Some(st) = scope.find_table_by_identifier(table_name) {
-                    if let Some(row_id_expr) =
-                        parse_row_id(col_name, st.internal_id, || false)?
-                    {
+                    if let Some(row_id_expr) = parse_row_id(col_name, st.internal_id, || false)? {
                         self.tracking.record_rowid(st.internal_id);
                         return Ok(Some(row_id_expr));
                     }
                 }
                 // Not a rowid either — re-raise the original error
                 return Err(crate::LimboError::ParseError(format!(
-                    "no such column: {}.{}", table_name, col_name
+                    "no such column: {}.{}",
+                    table_name, col_name
                 )));
             }
         }
@@ -1740,16 +1736,15 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     }
                 }
                 if let Some(st) = outer_scope.find_table_by_identifier(table_name) {
-                    if let Some(row_id_expr) =
-                        parse_row_id(col_name, st.internal_id, || false)?
-                    {
+                    if let Some(row_id_expr) = parse_row_id(col_name, st.internal_id, || false)? {
                         result = Some(Ok(row_id_expr));
                         break;
                     }
                 }
                 // Column name not found in this scope as real column or rowid
                 result = Some(Err(crate::LimboError::ParseError(format!(
-                    "no such column: {}.{}", table_name, col_name
+                    "no such column: {}.{}",
+                    table_name, col_name
                 ))));
                 break;
             }
@@ -1765,7 +1760,9 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 } => {
                     self.tracking.record_outer_ref(*table_id, *col_idx);
                 }
-                ast::Expr::RowId { table: table_id, .. } => {
+                ast::Expr::RowId {
+                    table: table_id, ..
+                } => {
                     self.tracking.record_rowid(*table_id);
                 }
                 _ => {}
@@ -1824,9 +1821,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     // Also check CTEs and outer scopes — a CTE name that isn't
                     // in FROM still counts as a "known table" for error messages.
                     let tbl_normalized = normalize_ident(tbl.as_str());
-                    let table_exists = scope
-                        .find_table_by_identifier(tbl.as_str())
-                        .is_some()
+                    let table_exists = scope.find_table_by_identifier(tbl.as_str()).is_some()
                         || self.ctes.contains_key(&tbl_normalized)
                         || self
                             .outer_scopes_iter()
@@ -2106,13 +2101,10 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             // synthetic identifiers like "subquery".
             if matches!(st.source, ScopeTableSource::Table(_))
                 && tables.iter().any(|t| {
-                    matches!(t.source, ScopeTableSource::Table(_))
-                        && t.identifier == st.identifier
+                    matches!(t.source, ScopeTableSource::Table(_)) && t.identifier == st.identifier
                 })
             {
-                crate::bail_parse_error!(
-                    "ambiguous table reference: {}", st.identifier
-                );
+                crate::bail_parse_error!("ambiguous table reference: {}", st.identifier);
             }
 
             let (is_outer, is_full_outer, is_right, is_cross, is_natural) = match &join.operator {
@@ -2270,7 +2262,11 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
     // ── UPDATE binding ──────────────────────────────────────────────────
 
     /// Bind an UPDATE statement, resolving all name references in-place.
-    pub fn bind_update(&mut self, update: &mut ast::Update, database_id: usize) -> Result<BoundUpdate> {
+    pub fn bind_update(
+        &mut self,
+        update: &mut ast::Update,
+        database_id: usize,
+    ) -> Result<BoundUpdate> {
         self.with_query(|ctx| {
             // 1. Bind CTEs from WITH clause
             if let Some(with) = &mut update.with {
@@ -2450,10 +2446,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                                 idx
                             } else {
                                 // No rowid alias, use sentinel value for actual rowid
-                                match set_clauses
-                                    .iter_mut()
-                                    .find(|(i, _)| *i == ROWID_SENTINEL)
-                                {
+                                match set_clauses.iter_mut().find(|(i, _)| *i == ROWID_SENTINEL) {
                                     Some((_, existing_expr)) => existing_expr.clone_from(expr),
                                     None => set_clauses.push((ROWID_SENTINEL, expr.clone())),
                                 }
@@ -2461,11 +2454,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                             }
                         } else {
                             let table_name = &table.identifier;
-                            crate::bail_parse_error!(
-                                "no such column: {}.{}",
-                                table_name,
-                                col_name
-                            );
+                            crate::bail_parse_error!("no such column: {}.{}", table_name, col_name);
                         }
                     }
                 };
@@ -2683,9 +2672,8 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                             // Check if any VALUES expression contains a subquery.
                             // If so, route through multi-row path which handles subqueries.
                             let has_subquery = values_expr.iter().any(|row| {
-                                row.iter().any(|expr| {
-                                    Self::expr_contains_subquery_or_bound(expr)
-                                })
+                                row.iter()
+                                    .any(|expr| Self::expr_contains_subquery_or_bound(expr))
                             });
                             if has_subquery {
                                 return Ok((vec![], true));
@@ -2704,9 +2692,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                                             .into();
                                             continue;
                                         } else {
-                                            crate::bail_parse_error!(
-                                                "no such column: {name}"
-                                            );
+                                            crate::bail_parse_error!("no such column: {name}");
                                         }
                                     }
                                     ast::Expr::Qualified(first_name, second_name) => {

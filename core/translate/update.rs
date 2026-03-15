@@ -16,9 +16,7 @@ use turso_parser::ast::{self, Indexed, SortOrder};
 
 use super::emitter::emit_program;
 use super::optimizer::optimize_plan;
-use super::plan::{
-    DmlSafety, IterationDirection, Plan, ResultSetColumn, UpdatePlan,
-};
+use super::plan::{DmlSafety, IterationDirection, Plan, ResultSetColumn, UpdatePlan};
 use super::planner::{parse_where, plan_bound_ctes};
 use super::subquery::{
     plan_subqueries_from_returning_with_bound, plan_subqueries_from_select_plan,
@@ -59,12 +57,19 @@ pub fn translate_update(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> crate::Result<()> {
-    let (mut plan, mut bound_subqueries) = bind_prepare_update_plan(program, resolver, body, connection, false)?;
+    let (mut plan, mut bound_subqueries) =
+        bind_prepare_update_plan(program, resolver, body, connection, false)?;
 
     // Plan subqueries in the WHERE, SET, and RETURNING clauses
     if let Plan::Update(ref mut update_plan) = plan {
         if let Some(ref mut ephemeral_plan) = update_plan.ephemeral_plan {
-            plan_subqueries_from_select_plan(program, ephemeral_plan, resolver, connection, Default::default())?;
+            plan_subqueries_from_select_plan(
+                program,
+                ephemeral_plan,
+                resolver,
+                connection,
+                Default::default(),
+            )?;
         } else {
             plan_subqueries_from_where_clause_with_bound(
                 program,
@@ -127,7 +132,8 @@ pub fn translate_update_for_schema_change(
     ddl_query: &str,
     after: impl FnOnce(&mut ProgramBuilder),
 ) -> crate::Result<()> {
-    let (mut plan, mut bound_subqueries) = bind_prepare_update_plan(program, resolver, body, connection, true)?;
+    let (mut plan, mut bound_subqueries) =
+        bind_prepare_update_plan(program, resolver, body, connection, true)?;
 
     if let Plan::Update(update_plan) = &mut plan {
         if program.capture_data_changes_info().has_updates() {
@@ -136,7 +142,13 @@ pub fn translate_update_for_schema_change(
 
         // Plan subqueries in the WHERE clause
         if let Some(ref mut ephemeral_plan) = update_plan.ephemeral_plan {
-            plan_subqueries_from_select_plan(program, ephemeral_plan, resolver, connection, Default::default())?;
+            plan_subqueries_from_select_plan(
+                program,
+                ephemeral_plan,
+                resolver,
+                connection,
+                Default::default(),
+            )?;
         } else {
             plan_subqueries_from_where_clause_with_bound(
                 program,
@@ -238,7 +250,10 @@ fn bind_prepare_update_plan(
     mut body: ast::Update,
     connection: &Arc<crate::Connection>,
     is_internal_schema_change: bool,
-) -> crate::Result<(Plan, rustc_hash::FxHashMap<ast::TableInternalId, super::bind::BoundSubquery>)> {
+) -> crate::Result<(
+    Plan,
+    rustc_hash::FxHashMap<ast::TableInternalId, super::bind::BoundSubquery>,
+)> {
     let database_id = resolver.resolve_database_id(&body.tbl_name)?;
     let schema = resolver.schema();
     let table_name = &body.tbl_name.name;
@@ -404,26 +419,29 @@ fn bind_prepare_update_plan(
         indexes_to_update
     };
 
-    Ok((Plan::Update(UpdatePlan {
-        table_references,
-        or_conflict,
-        set_clauses,
-        where_clause,
-        returning: if result_columns.is_empty() {
-            None
-        } else {
-            Some(result_columns)
-        },
-        order_by,
-        limit,
-        offset,
-        contains_constant_false_condition: false,
-        indexes_to_update,
-        ephemeral_plan: None,
-        cdc_update_alter_statement: None,
-        non_from_clause_subqueries: vec![],
-        safety: DmlSafety::default(),
-    }), subquery_bindings))
+    Ok((
+        Plan::Update(UpdatePlan {
+            table_references,
+            or_conflict,
+            set_clauses,
+            where_clause,
+            returning: if result_columns.is_empty() {
+                None
+            } else {
+                Some(result_columns)
+            },
+            order_by,
+            limit,
+            offset,
+            contains_constant_false_condition: false,
+            indexes_to_update,
+            ephemeral_plan: None,
+            cdc_update_alter_statement: None,
+            non_from_clause_subqueries: vec![],
+            safety: DmlSafety::default(),
+        }),
+        subquery_bindings,
+    ))
 }
 
 fn build_scan_op(table: &Table, iter_dir: IterationDirection) -> Operation {
