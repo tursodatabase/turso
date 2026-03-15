@@ -1781,6 +1781,10 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         .or_else(|| self.resolve_outer_alias(id.as_str())),
                     BindPhase::AliasFirst => {
                         if let Some(alias) = self.resolve_alias(id.as_str()) {
+                            // Even though the alias matched, check if the name is
+                            // ambiguous as a table column. SQLite errors on
+                            // ORDER BY value when multiple tables have 'value'.
+                            scope.find_column_unqualified(id.as_str())?;
                             Some(alias)
                         } else {
                             self.resolve_unqualified_column(id.as_str(), scope)?
@@ -2061,6 +2065,21 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 right_join_swapped: false,
             };
             let mut st = self.resolve_select_table(&mut join.table, Some(&lateral_scope))?;
+
+            // Detect duplicate table identifiers (e.g. SELECT * FROM t JOIN t).
+            // SQLite requires aliases to disambiguate self-joins.
+            // Only check real tables — derived tables / subqueries may share
+            // synthetic identifiers like "subquery".
+            if matches!(st.source, ScopeTableSource::Table(_))
+                && tables.iter().any(|t| {
+                    matches!(t.source, ScopeTableSource::Table(_))
+                        && t.identifier == st.identifier
+                })
+            {
+                crate::bail_parse_error!(
+                    "ambiguous table reference: {}", st.identifier
+                );
+            }
 
             let (is_outer, is_full_outer, is_right, is_cross, is_natural) = match &join.operator {
                 ast::JoinOperator::TypedJoin(Some(jt)) => {
