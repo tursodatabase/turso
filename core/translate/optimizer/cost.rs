@@ -132,8 +132,15 @@ pub fn estimate_index_cost(
         } else {
             tree_depth + (input_cardinality - 1.0) * tree_depth * params.cache_reuse_factor
         }
-    } else {
+    } else if input_cardinality <= 1.0 {
         input_cardinality * tree_depth
+    } else {
+        // Repeated seeks on the same B-tree: the root page (and often upper
+        // internal pages) stay in the buffer pool after the first traversal.
+        // Subsequent seeks only need to read from the first uncached level,
+        // giving an effective depth of (tree_depth - 1), minimum 1 page.
+        let subsequent_seek_depth = (tree_depth - 1.0).max(1.0);
+        tree_depth + (input_cardinality - 1.0) * subsequent_seek_depth
     };
 
     let index_leaf_pages_count = (rows_per_seek / index_info.rows_per_leaf_page).max(1.0);
