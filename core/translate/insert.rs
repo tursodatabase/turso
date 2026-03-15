@@ -94,12 +94,6 @@ fn validate(
     if table.btree().is_some_and(|t| !t.has_rowid) {
         crate::bail_parse_error!("INSERT into WITHOUT ROWID table is not supported");
     }
-    if table.btree().is_some_and(|t| t.has_autoincrement) && conn.mvcc_enabled() {
-        crate::bail_parse_error!(
-            "AUTOINCREMENT is not supported in MVCC mode (journal_mode=experimental_mvcc)"
-        );
-    }
-
     Ok(())
 }
 
@@ -184,7 +178,6 @@ impl<'a> InsertEmitCtx<'a> {
         num_values: usize,
         temp_table_ctx: Option<TempTableCtx>,
         database_id: usize,
-        _connection: &Arc<crate::Connection>,
     ) -> Result<Self> {
         // allocate cursor id's for each btree index cursor we'll need to populate the indexes
         let indices: Vec<_> = resolver.with_schema(database_id, |s| {
@@ -247,6 +240,7 @@ pub fn translate_insert(
         approx_num_labels: 5,
     };
     program.extend(&opts);
+    let mvcc_enabled = connection.mvcc_enabled();
 
     // Merge INSERT's WITH clause into the SELECT source's WITH clause.
     // For VALUES/DEFAULT VALUES with subqueries, we route through the multi-row
@@ -317,7 +311,7 @@ pub fn translate_insert(
         database_id,
     )?;
 
-    if inserting_multiple_rows && btree_table.has_autoincrement {
+    if inserting_multiple_rows && btree_table.has_autoincrement && !mvcc_enabled {
         ensure_sequence_initialized(program, resolver, &btree_table, database_id)?;
     }
 
@@ -386,7 +380,6 @@ pub fn translate_insert(
         values.len(),
         None,
         database_id,
-        connection,
     )?;
     program.has_statement_conflict = on_conflict.is_some();
 
@@ -446,7 +439,7 @@ pub fn translate_insert(
 
     let has_user_provided_rowid = insertion.key.is_provided_by_user();
 
-    if ctx.table.has_autoincrement {
+    if ctx.table.has_autoincrement && !mvcc_enabled {
         init_autoincrement(program, &mut ctx, resolver)?;
     }
 
@@ -640,10 +633,7 @@ pub fn translate_insert(
     // INSERT OR IGNORE skips the row due to a CHECK failure.
     if has_user_provided_rowid {
         if let Some(AutoincMeta {
-            seq_cursor_id,
-            r_seq,
-            r_seq_rowid,
-            table_name_reg,
+            r_seq, r_seq_rowid, ..
         }) = ctx.autoincrement_meta
         {
             turso_assert!(ctx.table.has_autoincrement);
@@ -664,15 +654,7 @@ pub fn translate_insert(
                 collation: None,
             });
 
-            emit_update_sqlite_sequence(
-                program,
-                resolver,
-                ctx.database_id,
-                seq_cursor_id,
-                r_seq_rowid,
-                table_name_reg,
-                insertion.key_register(),
-            )?;
+            emit_update_autoincrement_metadata(program, resolver, &ctx, insertion.key_register())?;
             program.emit_insn(Insn::Goto {
                 target_pc: explicit_done_label,
             });
@@ -691,15 +673,7 @@ pub fn translate_insert(
                 dest_reg: seq_to_write_reg,
                 src_reg: insertion.key_register(),
             });
-            emit_update_sqlite_sequence(
-                program,
-                resolver,
-                ctx.database_id,
-                seq_cursor_id,
-                r_seq_rowid,
-                table_name_reg,
-                seq_to_write_reg,
-            )?;
+            emit_update_autoincrement_metadata(program, resolver, &ctx, seq_to_write_reg)?;
             program.preassign_label_to_next_insn(explicit_done_label);
         }
     }
@@ -922,8 +896,7 @@ pub fn translate_insert(
     if let Some(AutoincMeta {
         seq_cursor_id,
         r_seq,
-        r_seq_rowid,
-        table_name_reg,
+        ..
     }) = ctx.autoincrement_meta
     {
         let no_update_needed_label = program.allocate_label();
@@ -935,15 +908,7 @@ pub fn translate_insert(
             collation: None,
         });
 
-        emit_update_sqlite_sequence(
-            program,
-            resolver,
-            ctx.database_id,
-            seq_cursor_id,
-            r_seq_rowid,
-            table_name_reg,
-            insertion.key_register(),
-        )?;
+        emit_update_autoincrement_metadata(program, resolver, &ctx, insertion.key_register())?;
 
         program.preassign_label_to_next_insn(no_update_needed_label);
         program.emit_insn(Insn::Close {
@@ -1053,6 +1018,7 @@ pub fn translate_insert(
             is_replace: matches!(ctx.on_conflict, ResolveType::Replace),
             has_upsert,
             has_autoincrement: btree_table.has_autoincrement,
+            mvcc_enabled,
             has_abort_resolution: matches!(ctx.on_conflict, ResolveType::Abort),
             notnull_col_exists: insertion
                 .col_mappings
@@ -1274,14 +1240,7 @@ fn emit_rowid_generation(
     insertion: &Insertion,
     resolver: &Resolver,
 ) -> Result<()> {
-    if let Some(AutoincMeta {
-        r_seq,
-        seq_cursor_id,
-        r_seq_rowid,
-        table_name_reg,
-        ..
-    }) = ctx.autoincrement_meta
-    {
+    if let Some(AutoincMeta { r_seq, .. }) = ctx.autoincrement_meta {
         let r_max = program.alloc_register();
 
         let dummy_reg = program.alloc_register();
@@ -1330,15 +1289,7 @@ fn emit_rowid_generation(
             value: 1,
         });
 
-        emit_update_sqlite_sequence(
-            program,
-            resolver,
-            ctx.database_id,
-            seq_cursor_id,
-            r_seq_rowid,
-            table_name_reg,
-            insertion.key_register(),
-        )?;
+        emit_update_autoincrement_metadata(program, resolver, ctx, insertion.key_register())?;
     } else {
         program.emit_insn(Insn::NewRowid {
             cursor: ctx.cursor_id,
@@ -1495,6 +1446,33 @@ fn init_autoincrement(
     });
     program.preassign_label_to_next_insn(loop_end_label);
     Ok(())
+}
+
+fn emit_update_autoincrement_metadata(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    ctx: &InsertEmitCtx,
+    new_key_reg: usize,
+) -> Result<()> {
+    let Some(AutoincMeta {
+        seq_cursor_id,
+        r_seq_rowid,
+        table_name_reg,
+        ..
+    }) = ctx.autoincrement_meta
+    else {
+        return Ok(());
+    };
+
+    emit_update_sqlite_sequence(
+        program,
+        resolver,
+        ctx.database_id,
+        seq_cursor_id,
+        r_seq_rowid,
+        table_name_reg,
+        new_key_reg,
+    )
 }
 
 fn emit_notnulls(

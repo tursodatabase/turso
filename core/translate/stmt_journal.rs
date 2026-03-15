@@ -69,6 +69,7 @@ pub(crate) struct InsertJournalCtx {
     pub is_replace: bool,
     pub has_upsert: bool,
     pub has_autoincrement: bool,
+    pub mvcc_enabled: bool,
     pub has_abort_resolution: bool,
     pub notnull_col_exists: bool,
     pub has_check: bool,
@@ -83,7 +84,7 @@ pub(crate) fn set_insert_stmt_journal_flags(program: &mut ProgramBuilder, ctx: &
         && !ctx.has_triggers
         && !ctx.is_replace
         && !ctx.has_upsert
-        && !ctx.has_autoincrement
+        && (!ctx.has_autoincrement || ctx.mvcc_enabled)
     {
         program.set_multi_write(false);
     }
