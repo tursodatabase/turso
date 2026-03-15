@@ -262,6 +262,10 @@ impl CloseLoop {
                     program.preassign_label_to_next_insn(loop_labels.loop_end);
 
                     // Outer joins: emit unmatched build rows with NULLs for the probe side.
+                    // This runs BEFORE grace so that in-memory partitions (with valid
+                    // matched_bits from the main probe) are scanned while still available.
+                    // At runtime, the scan skips spilled partitions — those are handled
+                    // per-partition inside the grace loop where matched_bits are still live.
                     if matches!(
                         hash_join_op.join_type,
                         HashJoinType::LeftOuter | HashJoinType::FullOuter
@@ -285,6 +289,8 @@ impl CloseLoop {
 
                     // Grace hash join processing: process spilled partition pairs.
                     // At runtime, this is a no-op if the build side didn't spill.
+                    // For LEFT/FULL OUTER, each grace partition gets its own unmatched
+                    // scan before eviction (so matched_bits are still live).
                     if let Some(hash_ctx) = t_ctx
                         .hash_table_contexts
                         .get(&hash_join_op.build_table_idx)
@@ -622,9 +628,67 @@ fn emit_grace_hash_join_loop<'a>(
     // grace_advance: probe entries exhausted for this partition.
     program.resolve_label(grace_advance, program.offset());
 
-    // Note: unmatched build rows (LEFT/FULL OUTER) are already handled by
-    // emit_hash_join_unmatched_build_rows which runs BEFORE the grace loop
-    // and scans ALL partitions. We don't duplicate that here.
+    // LEFT/FULL OUTER: emit unmatched build rows for this partition BEFORE evicting.
+    // After eviction, matched_bits are lost, so the global unmatched scan can't
+    // see which build rows were matched during grace probing.
+    if matches!(
+        hash_join_op.join_type,
+        HashJoinType::LeftOuter | HashJoinType::FullOuter
+    ) {
+        if let Some(plan) = select_plan {
+            let done_grace_unmatched = program.allocate_label();
+            let grace_unmatched_loop = program.allocate_label();
+            let grace_next_unmatched = program.allocate_label();
+
+            // Set probe cursor to NULL row (unmatched build rows have no probe match)
+            program.emit_insn(Insn::NullRow {
+                cursor_id: probe_cursor_id,
+            });
+
+            program.emit_insn(Insn::HashScanUnmatched {
+                hash_table_id: hash_table_reg,
+                dest_reg: match_reg,
+                target_pc: done_grace_unmatched,
+                payload_dest_reg,
+                num_payload,
+            });
+
+            program.preassign_label_to_next_insn(grace_unmatched_loop);
+
+            if let Some(cursor_id) = hash_ctx.build_cursor_id {
+                program.emit_insn(Insn::SeekRowid {
+                    cursor_id,
+                    src_reg: match_reg,
+                    target_pc: done_grace_unmatched,
+                });
+            }
+
+            emit_unmatched_row_conditions_and_loop(
+                program,
+                t_ctx,
+                plan,
+                hash_join_op.build_table_idx,
+                table_index,
+                grace_next_unmatched,
+                hash_ctx
+                    .inner_loop_gosub_reg
+                    .zip(hash_ctx.inner_loop_gosub_label),
+            )?;
+
+            program.resolve_label(grace_next_unmatched, program.offset());
+            program.emit_insn(Insn::HashNextUnmatched {
+                hash_table_id: hash_table_reg,
+                dest_reg: match_reg,
+                target_pc: done_grace_unmatched,
+                payload_dest_reg,
+                num_payload,
+            });
+            program.emit_insn(Insn::Goto {
+                target_pc: grace_unmatched_loop,
+            });
+            program.preassign_label_to_next_insn(done_grace_unmatched);
+        }
+    }
 
     // Evict current partition, advance to next
     program.emit_insn(Insn::HashGraceAdvancePartition {
