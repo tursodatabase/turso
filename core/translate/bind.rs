@@ -1901,18 +1901,46 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 }
             }
             ast::Expr::DoublyQualified(db_name, tbl_name, col_name) => {
-                let database_id = self.resolver.resolve_database_id(&ast::QualifiedName {
+                let qname = ast::QualifiedName {
                     db_name: Some(db_name.clone()),
                     name: tbl_name.clone(),
                     alias: None,
-                })?;
+                };
+                // In trigger context, cross-database DoublyQualified references
+                // (e.g. aux.ref_t.v) should not be resolved at compile time.
+                // SQLite defers this to runtime with "no such column".
+                // We check the db name directly because resolve_database_id
+                // would error with "trigger cannot reference objects in database X".
+                if let Some(ref ctx) = self.resolver.trigger_context {
+                    let db_name_normalized = normalize_ident(db_name.as_str());
+                    let trigger_db_name = if ctx.database_id == crate::MAIN_DB_ID {
+                        "main".to_string()
+                    } else {
+                        self.resolver
+                            .get_database_name_by_index(ctx.database_id)
+                            .unwrap_or_else(|| "main".to_string())
+                            .to_lowercase()
+                    };
+                    if !db_name_normalized.eq_ignore_ascii_case(&trigger_db_name) {
+                        // Cross-database ref in trigger — error at runtime with
+                        // "no such column" matching SQLite behavior.
+                        crate::bail_parse_error!(
+                            "no such column: {}.{}.{}",
+                            db_name.as_str(),
+                            tbl_name.as_str(),
+                            col_name.as_str()
+                        );
+                    }
+                }
+                if self.allow_unbound {
+                    return Ok(());
+                }
+
+                let database_id = self.resolver.resolve_database_id(&qname)?;
 
                 let Some(resolved) =
                     self.resolve_qualified_column(tbl_name.as_str(), col_name.as_str(), scope)?
                 else {
-                    if self.allow_unbound {
-                        return Ok(());
-                    }
                     crate::bail_parse_error!(
                         "no such column: {}.{}.{}",
                         db_name.as_str(),

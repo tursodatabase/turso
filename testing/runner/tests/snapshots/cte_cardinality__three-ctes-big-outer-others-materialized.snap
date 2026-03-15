@@ -30,7 +30,7 @@ info:
 QUERY PLAN
 |--SCAN tiny AS t
 |  `--SCAN items
-|--SEARCH m USING INDEX ephemeral_subquery_t4 (id=?)
+|--SEARCH m USING INDEX ephemeral_subquery_t5 (id=?)
 |  `--SCAN items
 `--SEARCH b USING INDEX ephemeral_subquery_t6 (id=?)
    `--SCAN items

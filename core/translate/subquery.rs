@@ -454,12 +454,6 @@ pub fn plan_subqueries_from_returning_with_bound(
         bound_subqueries,
     )?;
 
-    // Mark newly added subqueries as RETURNING so the UPDATE emitter can
-    // defer their evaluation until after the Insert instruction.
-    for subquery in &mut non_from_clause_subqueries[count_before..] {
-        subquery.is_returning = true;
-    }
-
     update_column_used_masks(table_references, non_from_clause_subqueries);
     Ok(())
 }
@@ -723,7 +717,8 @@ fn get_subquery_parser<'a>(
                                 plan: Some(Box::new(plan)),
                             },
                             correlated,
-                            is_returning: false,
+                            origin,
+                            eval_phase: origin.phase_floor(),
                         });
                     }
                     SubqueryType::RowValue {
@@ -766,7 +761,8 @@ fn get_subquery_parser<'a>(
                                 plan: Some(Box::new(plan)),
                             },
                             correlated,
-                            is_returning: false,
+                            origin,
+                            eval_phase: origin.phase_floor(),
                         });
                     }
                     SubqueryType::In { .. } => {
@@ -868,7 +864,8 @@ fn get_subquery_parser<'a>(
                                 plan: Some(Box::new(plan)),
                             },
                             correlated,
-                            is_returning: false,
+                            origin,
+                            eval_phase: origin.phase_floor(),
                         });
                     }
                 }

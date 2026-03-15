@@ -111,7 +111,7 @@ pub struct Resolver<'a> {
 #[derive(Debug, Clone)]
 pub(crate) struct TriggerDatabaseContext {
     /// The database ID the trigger belongs to.
-    database_id: usize,
+    pub(crate) database_id: usize,
     /// The trigger name (for error messages).
     trigger_name: String,
 }
