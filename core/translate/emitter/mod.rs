@@ -424,6 +424,15 @@ pub struct HashCtx {
     pub inner_loop_skip_label: Option<BranchOffset>,
     /// Probe-side rowid register for grace hash join (from RowId before HashProbe).
     pub probe_rowid_reg: Option<usize>,
+    /// Starting register for probe key values.
+    pub key_start_reg: usize,
+    /// Number of join keys.
+    pub num_keys: usize,
+    /// Register: 0 during main probe loop, 1 during grace loop.
+    /// Used by IfPos dispatch before HashNext to route to the grace loop's HashNext.
+    pub grace_flag_reg: Option<usize>,
+    /// Label for the grace loop's own HashNext (resolved during grace loop emission).
+    pub grace_hash_next_label: Option<BranchOffset>,
 }
 
 /// The TranslateCtx struct holds various information and labels used during bytecode generation.

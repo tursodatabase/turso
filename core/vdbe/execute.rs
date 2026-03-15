@@ -12765,19 +12765,11 @@ pub fn op_hash_grace_init(
     load_insn!(
         HashGraceInit {
             hash_table_id,
-            dest_reg,
-            probe_rowid_dest,
-            payload_dest_reg,
-            num_payload,
             target_pc,
         },
         insn
     );
     let hash_table_id = *hash_table_id as usize;
-    let dest_reg = *dest_reg as usize;
-    let probe_rowid_dest = *probe_rowid_dest as usize;
-    let payload_dest_reg = payload_dest_reg.map(|r| r as usize);
-    let num_payload = *num_payload as usize;
 
     let Some(hash_table) = state.hash_tables.get_mut(&hash_table_id) else {
         state.pc = target_pc.as_offset_int();
@@ -12799,68 +12791,40 @@ pub fn op_hash_grace_init(
     }
 
     // Initialize grace processing
-    match hash_table.grace_init(Some(&mut state.metrics.hash_join))? {
-        IOResult::Done(Some(m)) => {
-            state.registers[dest_reg].set_int(m.build_rowid);
-            state.registers[probe_rowid_dest].set_int(m.probe_rowid);
-            write_grace_payload_to_registers(
-                &mut state.registers,
-                &m.build_payload,
-                payload_dest_reg,
-                num_payload,
-            );
-            state.pc += 1;
-            Ok(InsnFunctionStepResult::Step)
-        }
-        IOResult::Done(None) => {
-            state.pc = target_pc.as_offset_int();
-            Ok(InsnFunctionStepResult::Step)
-        }
-        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
+    if !hash_table.grace_begin() {
+        state.pc = target_pc.as_offset_int();
+        return Ok(InsnFunctionStepResult::Step);
     }
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
 }
 
-pub fn op_hash_grace_next(
+pub fn op_hash_grace_load_partition(
     _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
-        HashGraceNext {
+        HashGraceLoadPartition {
             hash_table_id,
-            dest_reg,
-            probe_rowid_dest,
-            payload_dest_reg,
-            num_payload,
             target_pc,
         },
         insn
     );
     let hash_table_id = *hash_table_id as usize;
-    let dest_reg = *dest_reg as usize;
-    let probe_rowid_dest = *probe_rowid_dest as usize;
-    let payload_dest_reg = payload_dest_reg.map(|r| r as usize);
-    let num_payload = *num_payload as usize;
 
     let hash_table = state.hash_tables.get_mut(&hash_table_id).ok_or_else(|| {
         LimboError::InternalError(format!("Hash table not found with ID: {hash_table_id}"))
     })?;
 
-    match hash_table.grace_next(Some(&mut state.metrics.hash_join))? {
-        IOResult::Done(Some(m)) => {
-            state.registers[dest_reg].set_int(m.build_rowid);
-            state.registers[probe_rowid_dest].set_int(m.probe_rowid);
-            write_grace_payload_to_registers(
-                &mut state.registers,
-                &m.build_payload,
-                payload_dest_reg,
-                num_payload,
-            );
+    match hash_table.grace_load_current_partition(Some(&mut state.metrics.hash_join))? {
+        IOResult::Done(true) => {
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
-        IOResult::Done(None) => {
+        IOResult::Done(false) => {
             state.pc = target_pc.as_offset_int();
             Ok(InsnFunctionStepResult::Step)
         }
@@ -12868,18 +12832,76 @@ pub fn op_hash_grace_next(
     }
 }
 
-/// Write payload values from a grace match to registers.
-fn write_grace_payload_to_registers(
-    registers: &mut [Register],
-    build_payload: &[Value],
-    payload_dest_reg: Option<usize>,
-    num_payload: usize,
-) {
-    if let Some(dest_reg) = payload_dest_reg {
-        for (i, value) in build_payload.iter().take(num_payload).enumerate() {
-            registers[dest_reg + i].set_value(value.clone());
+pub fn op_hash_grace_next_probe(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        HashGraceNextProbe {
+            hash_table_id,
+            key_start_reg,
+            num_keys,
+            probe_rowid_dest,
+            target_pc,
+        },
+        insn
+    );
+    let hash_table_id = *hash_table_id as usize;
+    let key_start_reg = *key_start_reg as usize;
+    let num_keys = *num_keys as usize;
+    let probe_rowid_dest = *probe_rowid_dest as usize;
+
+    let hash_table = state.hash_tables.get_mut(&hash_table_id).ok_or_else(|| {
+        LimboError::InternalError(format!("Hash table not found with ID: {hash_table_id}"))
+    })?;
+
+    match hash_table.grace_next_probe_entry()? {
+        Some(entry) => {
+            // Write probe keys to registers
+            for (i, value) in entry.key_values.into_iter().enumerate() {
+                if i < num_keys {
+                    state.registers[key_start_reg + i].set_value(value);
+                }
+            }
+            // Write probe rowid
+            state.registers[probe_rowid_dest].set_int(entry.probe_rowid);
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        None => {
+            state.pc = target_pc.as_offset_int();
+            Ok(InsnFunctionStepResult::Step)
         }
     }
+}
+
+pub fn op_hash_grace_advance_partition(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        HashGraceAdvancePartition {
+            hash_table_id,
+            target_pc,
+        },
+        insn
+    );
+    let hash_table_id = *hash_table_id as usize;
+
+    let hash_table = state.hash_tables.get_mut(&hash_table_id).ok_or_else(|| {
+        LimboError::InternalError(format!("Hash table not found with ID: {hash_table_id}"))
+    })?;
+
+    if hash_table.grace_advance_partition() {
+        state.pc += 1;
+    } else {
+        state.pc = target_pc.as_offset_int();
+    }
+    Ok(InsnFunctionStepResult::Step)
 }
 
 fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {

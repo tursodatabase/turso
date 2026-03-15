@@ -1609,30 +1609,35 @@ pub enum Insn {
     },
 
     /// Initialize grace hash join processing after the probe cursor is exhausted.
-    /// Finalizes probe-side spills, then loads the first spilled partition pair and
-    /// returns the first match. Writes build rowid to dest_reg, probe rowid to
-    /// probe_rowid_dest, and build payload to payload_dest_reg.
-    /// Jumps to target_pc if no spilling occurred or no matches found.
+    /// Finalizes probe-side spills and calls grace_begin.
+    /// Jumps to target_pc if no spilling occurred or no partitions to process.
     HashGraceInit {
         hash_table_id: u16,
-        dest_reg: u16,
-        probe_rowid_dest: u16,
-        payload_dest_reg: Option<u16>,
-        num_payload: u16,
         target_pc: BranchOffset,
     },
 
-    /// Advance to the next grace hash join match.
-    /// Returns the next match from the current partition pair, or loads the next
-    /// partition pair. Writes build rowid to dest_reg, probe rowid to probe_rowid_dest,
-    /// and build payload to payload_dest_reg.
-    /// Jumps to target_pc when all partitions are processed.
-    HashGraceNext {
+    /// Load the current grace partition's build side from disk.
+    /// Also loads the first probe chunk. Jumps to target_pc when all partitions done.
+    HashGraceLoadPartition {
         hash_table_id: u16,
-        dest_reg: u16,
+        target_pc: BranchOffset,
+    },
+
+    /// Advance to next probe entry in the current grace partition.
+    /// Writes probe keys to key_start_reg..key_start_reg+num_keys-1 and probe rowid to probe_rowid_dest.
+    /// Jumps to target_pc when probe entries exhausted.
+    HashGraceNextProbe {
+        hash_table_id: u16,
+        key_start_reg: u16,
+        num_keys: u16,
         probe_rowid_dest: u16,
-        payload_dest_reg: Option<u16>,
-        num_payload: u16,
+        target_pc: BranchOffset,
+    },
+
+    /// Evict current grace partition and advance to the next one.
+    /// Jumps to target_pc when all partitions are processed.
+    HashGraceAdvancePartition {
+        hash_table_id: u16,
         target_pc: BranchOffset,
     },
 
@@ -1869,7 +1874,9 @@ impl InsnVariants {
             InsnVariants::HashScanUnmatched => execute::op_hash_scan_unmatched,
             InsnVariants::HashNextUnmatched => execute::op_hash_next_unmatched,
             InsnVariants::HashGraceInit => execute::op_hash_grace_init,
-            InsnVariants::HashGraceNext => execute::op_hash_grace_next,
+            InsnVariants::HashGraceLoadPartition => execute::op_hash_grace_load_partition,
+            InsnVariants::HashGraceNextProbe => execute::op_hash_grace_next_probe,
+            InsnVariants::HashGraceAdvancePartition => execute::op_hash_grace_advance_partition,
             InsnVariants::VacuumInto => execute::op_vacuum_into,
             InsnVariants::InitCdcVersion => execute::op_init_cdc_version,
         }

@@ -508,6 +508,9 @@ struct ProbeSetupState {
     match_found_label: BranchOffset,
     hash_next_label: BranchOffset,
     probe_rowid_reg: Option<usize>,
+    key_start_reg: usize,
+    num_keys: usize,
+    grace_flag_reg: Option<usize>,
 }
 
 /// Hash-join probe setup in `open_loop`.
@@ -696,21 +699,25 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
         // For grace hash join: emit RowId for the probe cursor so we can
         // buffer probe rows when their target partition is on disk.
         // Only for INNER and LEFT OUTER joins (FULL OUTER deferred to v2).
-        // Disabled for aggregate queries because the grace loop can't replay
-        // the aggregation -- those fall back to LRU-based partition loading.
         let grace_eligible = matches!(
             self.hash_join_op.join_type,
             HashJoinType::Inner | HashJoinType::LeftOuter
-        ) && self.t_ctx.reg_agg_start.is_none();
-        let probe_rowid_reg = if grace_eligible {
-            let reg = self.program.alloc_register();
+        );
+        let (probe_rowid_reg, grace_flag_reg) = if grace_eligible {
+            let rowid_reg = self.program.alloc_register();
             self.program.emit_insn(Insn::RowId {
                 cursor_id: self.probe_cursor_id,
-                dest: reg,
+                dest: rowid_reg,
             });
-            Some(reg)
+            // grace_flag_reg: 0 during main probe loop, 1 during grace loop
+            let flag_reg = self.program.alloc_register();
+            self.program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: flag_reg,
+            });
+            (Some(rowid_reg), Some(flag_reg))
         } else {
-            None
+            (None, None)
         };
 
         let match_reg = self.program.alloc_register();
@@ -738,6 +745,9 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
             match_found_label,
             hash_next_label,
             probe_rowid_reg,
+            key_start_reg: probe_key_start_reg,
+            num_keys,
+            grace_flag_reg,
         })
     }
 
@@ -752,6 +762,9 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
             match_found_label,
             hash_next_label,
             probe_rowid_reg,
+            key_start_reg,
+            num_keys,
+            grace_flag_reg,
         } = state;
         let build_table = &self.table_references.joined_tables()[self.hash_join_op.build_table_idx];
         let hash_table_id: usize = build_table.internal_id.into();
@@ -781,6 +794,10 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
                 inner_loop_gosub_label: None,
                 inner_loop_skip_label: None,
                 probe_rowid_reg,
+                key_start_reg,
+                num_keys,
+                grace_flag_reg,
+                grace_hash_next_label: None, // resolved during grace loop emission
             },
         );
 
@@ -935,6 +952,25 @@ impl<'a, 'plan> HashProbeCloseEmitter<'a, 'plan> {
         }
         self.program
             .resolve_label(hash_next_label, self.program.offset());
+
+        // Grace dispatch: if grace_flag_reg > 0, jump to the grace loop's own
+        // HashNext (which has a different miss target). This lets the inner body
+        // be shared between the main probe loop and the grace loop.
+        if let Some(grace_flag_reg) = self.hash_ctx.grace_flag_reg {
+            let grace_hash_next_label = self.program.allocate_label();
+            // Store in hash_ctx for the grace loop emitter to resolve later.
+            // We need mutable access but hash_ctx is moved into self -- update
+            // the label in the t_ctx hash_table_contexts map directly.
+            let build_table_idx = self.hash_join_op.build_table_idx;
+            if let Some(ctx) = self.t_ctx.hash_table_contexts.get_mut(&build_table_idx) {
+                ctx.grace_hash_next_label = Some(grace_hash_next_label);
+            }
+            self.program.emit_insn(Insn::IfPos {
+                reg: grace_flag_reg,
+                target_pc: grace_hash_next_label,
+                decrement_by: 0,
+            });
+        }
 
         self.program.emit_insn(Insn::HashNext {
             hash_table_id: hash_table_reg,

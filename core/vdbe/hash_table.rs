@@ -188,12 +188,10 @@ pub enum HashTableState {
     Closed,
 }
 
-/// Result of a grace hash join match: contains both build and probe rowids
-/// plus the build payload, so the VDBE can SeekRowid both cursors.
-#[derive(Debug)]
-pub struct GraceMatch {
-    pub build_rowid: i64,
-    pub build_payload: Vec<Value>,
+/// A probe entry returned by `grace_next_probe_entry()`.
+/// The VDBE writes these to registers for HashProbe to use.
+pub struct GraceProbeEntry {
+    pub key_values: Vec<Value>,
     pub probe_rowid: i64,
 }
 
@@ -878,6 +876,7 @@ impl ProbeSpillState {
 }
 
 /// State for grace hash join partition-by-partition processing.
+/// The VDBE drives the loop; this tracks partition iteration and probe chunk loading.
 struct GraceState {
     /// Current probe entries loaded from disk (one chunk at a time).
     probe_entries: Vec<HashEntry>,
@@ -885,24 +884,20 @@ struct GraceState {
     probe_entry_cursor: usize,
     /// Which probe spill chunk we're reading next.
     probe_chunk_idx: usize,
-    /// Build-side match iteration state for current probe entry.
-    build_bucket_idx: usize,
-    build_entry_idx: usize,
-    current_probe_hash: u64,
     /// Ordered list of partition indices to process (only spilled ones).
     partitions_to_process: Vec<usize>,
     /// Index into partitions_to_process.
     partition_list_idx: usize,
-    /// Whether grace processing is complete.
-    finished: bool,
-    /// Whether we're scanning unmatched build entries for the current partition.
-    scanning_unmatched: bool,
-    /// Bucket index for unmatched scan within current partition.
-    unmatched_bucket_idx: usize,
-    /// Entry index for unmatched scan within current bucket.
-    unmatched_entry_idx: usize,
     /// Whether the current partition's build side has been loaded.
     build_loaded: bool,
+}
+
+impl GraceState {
+    fn current_partition_idx(&self) -> Option<usize> {
+        self.partitions_to_process
+            .get(self.partition_list_idx)
+            .copied()
+    }
 }
 
 /// HashTable is the build-side data structure used for hash joins and DISTINCT. It behaves like a
@@ -1915,7 +1910,7 @@ impl HashTable {
     /// Get the next matching entry for the current probe keys.
     pub fn next_match(&mut self) -> Option<&HashEntry> {
         turso_assert!(
-            self.state == HashTableState::Probing,
+            self.state == HashTableState::Probing || self.state == HashTableState::GraceProcessing,
             "Cannot get next match in unexpected state",
             { "state": format!("{:?}", self.state) }
         );
@@ -2731,25 +2726,11 @@ impl HashTable {
         Ok(IOResult::Done(()))
     }
 
-    /// Initialize grace hash join processing.
-    /// Returns the first match, or None if no spilled partitions need processing.
-    ///
-    /// Re-entrant: if grace_state already exists (from a previous call that
-    /// returned IOResult::IO via grace_next), we skip initialization and
-    /// continue from where we left off.
-    pub fn grace_init(
-        &mut self,
-        metrics: Option<&mut HashJoinMetrics>,
-    ) -> Result<IOResult<Option<GraceMatch>>> {
-        // Re-entry guard: if we already started grace processing (a prior call
-        // initialized grace_state then returned IO from grace_next), just
-        // continue advancing instead of re-initializing.
-        if self.grace_state.is_some() {
-            return self.grace_next(metrics);
-        }
-
+    /// Initialize grace processing. Builds partition list, frees in-memory build partitions.
+    /// Returns true if there are partitions to process. No IO.
+    pub fn grace_begin(&mut self) -> bool {
         if self.probe_spill_state.is_none() || self.spill_state.is_none() {
-            return Ok(IOResult::Done(None));
+            return false;
         }
 
         // Build list of partitions that were spilled on the build side
@@ -2764,7 +2745,7 @@ impl HashTable {
         };
 
         if partitions_to_process.is_empty() {
-            return Ok(IOResult::Done(None));
+            return false;
         }
 
         // Free in-memory build partitions -- initial probe is done with them
@@ -2774,95 +2755,110 @@ impl HashTable {
             probe_entries: Vec::new(),
             probe_entry_cursor: 0,
             probe_chunk_idx: 0,
-            build_bucket_idx: 0,
-            build_entry_idx: 0,
-            current_probe_hash: 0,
             partitions_to_process,
             partition_list_idx: 0,
-            finished: false,
-            scanning_unmatched: false,
-            unmatched_bucket_idx: 0,
-            unmatched_entry_idx: 0,
             build_loaded: false,
         });
 
         self.state = HashTableState::GraceProcessing;
-        self.grace_next(metrics)
+        true
     }
 
-    /// Get the next grace hash join match.
-    /// Returns None when all partitions have been processed.
-    pub fn grace_next(
+    /// Load build partition at current index + first probe chunk. IO-blocking.
+    /// Returns true if loaded, false if partition list exhausted.
+    pub fn grace_load_current_partition(
         &mut self,
         mut metrics: Option<&mut HashJoinMetrics>,
-    ) -> Result<IOResult<Option<GraceMatch>>> {
+    ) -> Result<IOResult<bool>> {
+        let grace = self.grace_state.as_ref().expect("grace state must exist");
+        if grace.partition_list_idx >= grace.partitions_to_process.len() {
+            return Ok(IOResult::Done(false));
+        }
+
+        let partition_idx = grace.partitions_to_process[grace.partition_list_idx];
+
+        if !grace.build_loaded {
+            // Evict any previously loaded build partition
+            self.evict_all_loaded_partitions();
+
+            // Load this build partition
+            return_if_io!(self.load_spilled_partition(partition_idx, metrics.as_deref_mut()));
+
+            let grace = self.grace_state.as_mut().expect("grace state");
+            grace.build_loaded = true;
+            grace.probe_entries.clear();
+            grace.probe_entry_cursor = 0;
+            grace.probe_chunk_idx = 0;
+
+            // Load first batch of probe entries
+            self.grace_load_probe_entries(partition_idx)?;
+
+            if let Some(m) = metrics.as_mut() {
+                m.grace_partitions_processed = m.grace_partitions_processed.saturating_add(1);
+            }
+        }
+
+        Ok(IOResult::Done(true))
+    }
+
+    /// Advance to next probe entry. Returns keys+rowid or None when exhausted. No IO.
+    pub fn grace_next_probe_entry(&mut self) -> Result<Option<GraceProbeEntry>> {
         loop {
             let grace = self.grace_state.as_ref().expect("grace state must exist");
-            if grace.finished {
-                return Ok(IOResult::Done(None));
-            }
-
-            let partition_list_idx = grace.partition_list_idx;
-            if partition_list_idx >= grace.partitions_to_process.len() {
-                self.grace_state.as_mut().expect("grace state").finished = true;
-                return Ok(IOResult::Done(None));
-            }
-
-            let partition_idx = grace.partitions_to_process[partition_list_idx];
-
-            // Load build partition if not yet loaded for this grace round
-            if !grace.build_loaded {
-                // Evict any previously loaded build partition
-                self.evict_all_loaded_partitions();
-
-                // Load this build partition
-                return_if_io!(self.load_spilled_partition(partition_idx, metrics.as_deref_mut()));
-
+            if grace.probe_entry_cursor < grace.probe_entries.len() {
+                let entry = &grace.probe_entries[grace.probe_entry_cursor];
+                let result = GraceProbeEntry {
+                    key_values: entry.key_values.clone(),
+                    probe_rowid: entry.rowid,
+                };
                 let grace = self.grace_state.as_mut().expect("grace state");
-                grace.build_loaded = true;
-                grace.probe_entries.clear();
-                grace.probe_entry_cursor = 0;
-                grace.probe_chunk_idx = 0;
-                grace.scanning_unmatched = false;
-                grace.unmatched_bucket_idx = 0;
-                grace.unmatched_entry_idx = 0;
-
-                // Load first batch of probe entries
-                self.grace_load_probe_entries(partition_idx)?;
-
-                if let Some(metrics) = metrics.as_deref_mut() {
-                    metrics.grace_partitions_processed =
-                        metrics.grace_partitions_processed.saturating_add(1);
-                }
+                grace.probe_entry_cursor += 1;
+                return Ok(Some(result));
             }
 
-            // Try to find a match in the current probe entries
-            if let Some(m) = self.grace_probe_next_match(partition_idx) {
-                if let Some(metrics) = metrics.as_deref_mut() {
-                    metrics.grace_matches = metrics.grace_matches.saturating_add(1);
-                }
-                return Ok(IOResult::Done(Some(m)));
+            // Current probe entries exhausted, try loading more
+            let grace = self.grace_state.as_ref().expect("grace state");
+            let partition_idx = match grace.current_partition_idx() {
+                Some(idx) => idx,
+                None => return Ok(None),
+            };
+            if !self.grace_try_load_next_probe_chunk(partition_idx)? {
+                return Ok(None);
             }
-
-            // Probe entries exhausted -- try loading more probe chunks
-            let has_more_probe = self.grace_advance_probe_entries(partition_idx)?;
-            if has_more_probe {
-                continue;
-            }
-
-            // All probe entries for this partition exhausted.
-            // For LEFT OUTER: scan unmatched build entries.
-            if self.track_matched {
-                if let Some(m) = self.grace_next_unmatched_build(partition_idx) {
-                    return Ok(IOResult::Done(Some(m)));
-                }
-            }
-
-            // Advance to next partition
-            let grace = self.grace_state.as_mut().expect("grace state");
-            grace.partition_list_idx += 1;
-            grace.build_loaded = false;
         }
+    }
+
+    /// Try to load the next probe chunk for the given partition.
+    /// Returns true if more probe entries were loaded, false if exhausted.
+    fn grace_try_load_next_probe_chunk(&mut self, partition_idx: usize) -> Result<bool> {
+        let grace = self.grace_state.as_ref().expect("grace state");
+        let chunk_idx = grace.probe_chunk_idx;
+
+        let probe_state = self.probe_spill_state.as_ref();
+        let Some(probe_state) = probe_state else {
+            return Ok(false);
+        };
+
+        let Some(spilled) = probe_state.find_partition(partition_idx) else {
+            return Ok(false);
+        };
+
+        if chunk_idx >= spilled.chunks.len() {
+            return Ok(false);
+        }
+
+        self.grace_load_next_probe_chunk(partition_idx)?;
+        let grace = self.grace_state.as_ref().expect("grace state");
+        Ok(!grace.probe_entries.is_empty())
+    }
+
+    /// Evict current partition, advance to next. Returns true if more partitions. No IO.
+    pub fn grace_advance_partition(&mut self) -> bool {
+        self.evict_all_loaded_partitions();
+        let grace = self.grace_state.as_mut().expect("grace state must exist");
+        grace.partition_list_idx += 1;
+        grace.build_loaded = false;
+        grace.partition_list_idx < grace.partitions_to_process.len()
     }
 
     /// Free all in-memory build partitions (InMemory state).
@@ -3012,141 +3008,6 @@ impl HashTable {
         grace.probe_chunk_idx += 1;
 
         Ok(())
-    }
-
-    /// Try to find the next match for the current batch of probe entries.
-    fn grace_probe_next_match(&mut self, partition_idx: usize) -> Option<GraceMatch> {
-        loop {
-            let grace = self.grace_state.as_ref().expect("grace state");
-            if grace.probe_entry_cursor >= grace.probe_entries.len() {
-                return None;
-            }
-
-            let probe_hash = grace.probe_entries[grace.probe_entry_cursor].hash;
-            let probe_rowid = grace.probe_entries[grace.probe_entry_cursor].rowid;
-            let is_null = has_null_key(&grace.probe_entries[grace.probe_entry_cursor].key_values);
-
-            if is_null {
-                let grace = self.grace_state.as_mut().expect("grace state");
-                grace.probe_entry_cursor += 1;
-                grace.build_entry_idx = 0;
-                continue;
-            }
-
-            let spill_state = self.spill_state.as_ref().expect("spill state");
-            let partition = spill_state.find_partition(partition_idx)?;
-            if partition.buckets.is_empty() {
-                let grace = self.grace_state.as_mut().expect("grace state");
-                grace.probe_entry_cursor += 1;
-                grace.build_entry_idx = 0;
-                continue;
-            }
-
-            let bucket_idx = (probe_hash as usize) % partition.buckets.len();
-            let bucket = &partition.buckets[bucket_idx];
-            let start_idx = grace.build_entry_idx;
-
-            // Collect match result to avoid holding borrows across mutation
-            let mut match_result: Option<(i64, Vec<Value>, usize)> = None;
-            for idx in start_idx..bucket.entries.len() {
-                let build_entry = &bucket.entries[idx];
-                if build_entry.hash == probe_hash {
-                    let grace = self.grace_state.as_ref().expect("grace state");
-                    let probe_key_refs: Vec<ValueRef> = grace.probe_entries
-                        [grace.probe_entry_cursor]
-                        .key_values
-                        .iter()
-                        .map(|v| v.as_ref())
-                        .collect();
-                    if keys_equal(&build_entry.key_values, &probe_key_refs, &self.collations) {
-                        match_result =
-                            Some((build_entry.rowid, build_entry.payload_values.clone(), idx));
-                        break;
-                    }
-                }
-            }
-
-            if let Some((build_rowid, build_payload, idx)) = match_result {
-                // Mark build entry as matched for outer join
-                if self.track_matched {
-                    let spill_state = self.spill_state.as_mut().expect("spill state");
-                    let partition = spill_state
-                        .find_partition_mut(partition_idx)
-                        .expect("partition");
-                    partition.matched_bits[bucket_idx][idx] = true;
-                }
-
-                let grace = self.grace_state.as_mut().expect("grace state");
-                grace.build_entry_idx = idx + 1;
-                return Some(GraceMatch {
-                    build_rowid,
-                    build_payload,
-                    probe_rowid,
-                });
-            }
-
-            // No more matches for this probe entry, advance to next
-            let grace = self.grace_state.as_mut().expect("grace state");
-            grace.probe_entry_cursor += 1;
-            grace.build_entry_idx = 0;
-        }
-    }
-
-    /// Try to advance to the next batch of probe entries.
-    /// Returns true if more entries were loaded.
-    fn grace_advance_probe_entries(&mut self, partition_idx: usize) -> Result<bool> {
-        let probe_state = self.probe_spill_state.as_ref();
-        let Some(probe_state) = probe_state else {
-            return Ok(false);
-        };
-
-        let grace = self.grace_state.as_ref().expect("grace state");
-        let chunk_idx = grace.probe_chunk_idx;
-
-        let Some(spilled) = probe_state.find_partition(partition_idx) else {
-            return Ok(false);
-        };
-
-        if chunk_idx >= spilled.chunks.len() {
-            return Ok(false);
-        }
-
-        self.grace_load_next_probe_chunk(partition_idx)?;
-        let grace = self.grace_state.as_ref().expect("grace state");
-        Ok(!grace.probe_entries.is_empty())
-    }
-
-    /// Scan unmatched build entries for the current partition (LEFT OUTER).
-    fn grace_next_unmatched_build(&mut self, partition_idx: usize) -> Option<GraceMatch> {
-        let grace = self.grace_state.as_mut().expect("grace state");
-        if !grace.scanning_unmatched {
-            grace.scanning_unmatched = true;
-            grace.unmatched_bucket_idx = 0;
-            grace.unmatched_entry_idx = 0;
-        }
-
-        let spill_state = self.spill_state.as_ref()?;
-        let partition = spill_state.find_partition(partition_idx)?;
-
-        while grace.unmatched_bucket_idx < partition.buckets.len() {
-            let bucket = &partition.buckets[grace.unmatched_bucket_idx];
-            let matched = &partition.matched_bits[grace.unmatched_bucket_idx];
-            while grace.unmatched_entry_idx < bucket.entries.len() {
-                let idx = grace.unmatched_entry_idx;
-                grace.unmatched_entry_idx += 1;
-                if !matched[idx] {
-                    let entry = &bucket.entries[idx];
-                    return Some(GraceMatch {
-                        build_rowid: entry.rowid,
-                        build_payload: entry.payload_values.clone(),
-                        probe_rowid: 0, // no probe row for unmatched build entries
-                    });
-                }
-            }
-            grace.unmatched_bucket_idx += 1;
-            grace.unmatched_entry_idx = 0;
-        }
-        None
     }
 
     /// Returns true if grace processing has any spilled partitions to process.
@@ -4290,6 +4151,60 @@ mod hashtests {
         ht
     }
 
+    /// Helper: run grace processing with the new fine-grained API.
+    /// Returns (build_rowid, probe_rowid) pairs for all matches found.
+    fn run_grace_processing(ht: &mut HashTable) -> Vec<(i64, i64)> {
+        let _ = ht.finalize_probe_spill(None).unwrap();
+        let mut matches = Vec::new();
+
+        if !ht.grace_begin() {
+            return matches;
+        }
+
+        // Partition loop
+        loop {
+            match ht.grace_load_current_partition(None).unwrap() {
+                IOResult::Done(true) => {}
+                IOResult::Done(false) => break,
+                _ => panic!("unexpected IO"),
+            }
+
+            // Probe entry loop
+            loop {
+                let entry = ht.grace_next_probe_entry().unwrap();
+                let Some(entry) = entry else {
+                    break;
+                };
+
+                // Use probe_partition + next_match to find build matches
+                let key_values = entry.key_values;
+                let probe_rowid = entry.probe_rowid;
+                let partition_idx = ht.partition_for_keys(&key_values);
+
+                if ht
+                    .probe_partition(partition_idx, &key_values, None)
+                    .is_some()
+                {
+                    // First match from probe_partition
+                    let build_entry = ht.probe_partition(partition_idx, &key_values, None);
+                    // Re-probe to get entry again
+                    if let Some(build_entry) = build_entry {
+                        matches.push((build_entry.rowid, probe_rowid));
+                    }
+                    // Get additional matches via next_match
+                    while let Some(build_entry) = ht.next_match() {
+                        matches.push((build_entry.rowid, probe_rowid));
+                    }
+                }
+            }
+
+            if !ht.grace_advance_partition() {
+                break;
+            }
+        }
+        matches
+    }
+
     #[test]
     fn test_grace_basic() {
         let io = Arc::new(MemoryIO::new());
@@ -4310,21 +4225,7 @@ mod hashtests {
         }
         assert!(buffered > 0, "should have buffered some probe rows");
 
-        // Finalize and run grace processing
-        let _ = ht.finalize_probe_spill(None).unwrap();
-        let mut matches = Vec::new();
-        match ht.grace_init(None).unwrap() {
-            IOResult::Done(Some(m)) => matches.push((m.build_rowid, m.probe_rowid)),
-            IOResult::Done(None) => {}
-            _ => panic!("unexpected IO"),
-        }
-        loop {
-            match ht.grace_next(None).unwrap() {
-                IOResult::Done(Some(m)) => matches.push((m.build_rowid, m.probe_rowid)),
-                IOResult::Done(None) => break,
-                _ => panic!("unexpected IO"),
-            }
-        }
+        let matches = run_grace_processing(&mut ht);
 
         // Every buffered probe row should have found a match
         assert_eq!(
@@ -4362,11 +4263,11 @@ mod hashtests {
         let _ = ht.finalize_build(None).unwrap();
         assert!(!ht.has_spilled(), "should NOT have spilled");
 
-        // grace_init should return None since nothing was spilled
-        match ht.grace_init(None).unwrap() {
-            IOResult::Done(None) => {} // expected
-            other => panic!("expected None, got {other:?}"),
-        }
+        // grace_begin should return false since nothing was spilled
+        assert!(
+            !ht.grace_begin(),
+            "grace_begin should return false when nothing spilled"
+        );
     }
 
     #[test]
@@ -4394,20 +4295,7 @@ mod hashtests {
             }
         }
 
-        let _ = ht.finalize_probe_spill(None).unwrap();
-        let mut matches = Vec::new();
-        match ht.grace_init(None).unwrap() {
-            IOResult::Done(Some(m)) => matches.push(m),
-            IOResult::Done(None) => {}
-            _ => panic!("unexpected IO"),
-        }
-        loop {
-            match ht.grace_next(None).unwrap() {
-                IOResult::Done(Some(m)) => matches.push(m),
-                IOResult::Done(None) => break,
-                _ => panic!("unexpected IO"),
-            }
-        }
+        let matches = run_grace_processing(&mut ht);
 
         // Each buffered probe key should match 3 build rows
         assert_eq!(
@@ -4435,22 +4323,12 @@ mod hashtests {
             }
         }
 
-        let _ = ht.finalize_probe_spill(None).unwrap();
-        let mut matches = 0;
-        match ht.grace_init(None).unwrap() {
-            IOResult::Done(Some(_)) => matches += 1,
-            IOResult::Done(None) => {}
-            _ => panic!("unexpected IO"),
-        }
-        loop {
-            match ht.grace_next(None).unwrap() {
-                IOResult::Done(Some(_)) => matches += 1,
-                IOResult::Done(None) => break,
-                _ => panic!("unexpected IO"),
-            }
-        }
-
-        assert_eq!(matches, 0, "non-matching keys should produce no matches");
+        let matches = run_grace_processing(&mut ht);
+        assert_eq!(
+            matches.len(),
+            0,
+            "non-matching keys should produce no matches"
+        );
     }
 
     #[test]
@@ -4475,16 +4353,24 @@ mod hashtests {
         let _ = ht.buffer_probe_row(null_key, 888, None).unwrap();
 
         let _ = ht.finalize_probe_spill(None).unwrap();
-        // Should not crash; NULL key entries should be skipped in grace processing
-        match ht.grace_init(None).unwrap() {
-            IOResult::Done(_) => {} // OK
-            _ => panic!("unexpected IO"),
-        }
+        // Should not crash; NULL key entries should return from grace_next_probe_entry
+        assert!(ht.grace_begin(), "should have partitions to process");
         loop {
-            match ht.grace_next(None).unwrap() {
-                IOResult::Done(None) => break,
-                IOResult::Done(Some(_)) => {} // OK
+            match ht.grace_load_current_partition(None).unwrap() {
+                IOResult::Done(true) => {}
+                IOResult::Done(false) => break,
                 _ => panic!("unexpected IO"),
+            }
+            loop {
+                let entry = ht.grace_next_probe_entry().unwrap();
+                if entry.is_none() {
+                    break;
+                }
+                // NULL key probe entries are still returned; the VDBE's HashProbe
+                // handles NULL skip. Just verify no crash.
+            }
+            if !ht.grace_advance_partition() {
+                break;
             }
         }
     }
@@ -4509,29 +4395,37 @@ mod hashtests {
         }
 
         let _ = ht.finalize_probe_spill(None).unwrap();
-        let mut matches = Vec::new();
-        match ht.grace_init(None).unwrap() {
-            IOResult::Done(Some(m)) => matches.push(m),
-            IOResult::Done(None) => {}
-            _ => panic!("unexpected IO"),
-        }
+        assert!(ht.grace_begin(), "should have partitions to process");
+
+        let mut match_count = 0;
         loop {
-            match ht.grace_next(None).unwrap() {
-                IOResult::Done(Some(m)) => matches.push(m),
-                IOResult::Done(None) => break,
+            match ht.grace_load_current_partition(None).unwrap() {
+                IOResult::Done(true) => {}
+                IOResult::Done(false) => break,
                 _ => panic!("unexpected IO"),
             }
-        }
-
-        assert_eq!(matches.len(), buffered);
-        // Check that payload was correctly round-tripped
-        for m in &matches {
-            let expected_payload = format!("payload_{}", m.build_rowid);
-            assert_eq!(m.build_payload.len(), 1);
-            match &m.build_payload[0] {
-                Value::Text(t) => assert_eq!(t.as_str(), expected_payload.as_str()),
-                other => panic!("expected text payload, got {other:?}"),
+            loop {
+                let entry = ht.grace_next_probe_entry().unwrap();
+                let Some(entry) = entry else {
+                    break;
+                };
+                let key_values = entry.key_values;
+                let partition_idx = ht.partition_for_keys(&key_values);
+                if let Some(build_entry) = ht.probe_partition(partition_idx, &key_values, None) {
+                    // Check payload was correctly round-tripped
+                    let expected_payload = format!("payload_{}", build_entry.rowid);
+                    assert_eq!(build_entry.payload_values.len(), 1);
+                    match &build_entry.payload_values[0] {
+                        Value::Text(t) => assert_eq!(t.as_str(), expected_payload.as_str()),
+                        other => panic!("expected text payload, got {other:?}"),
+                    }
+                    match_count += 1;
+                }
+            }
+            if !ht.grace_advance_partition() {
+                break;
             }
         }
+        assert_eq!(match_count, buffered);
     }
 }

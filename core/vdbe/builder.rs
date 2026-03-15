@@ -1235,7 +1235,15 @@ impl ProgramBuilder {
                     resolve(target_pc, "HashNextUnmatched")?
                 }
                 Insn::HashGraceInit { target_pc, .. } => resolve(target_pc, "HashGraceInit")?,
-                Insn::HashGraceNext { target_pc, .. } => resolve(target_pc, "HashGraceNext")?,
+                Insn::HashGraceLoadPartition { target_pc, .. } => {
+                    resolve(target_pc, "HashGraceLoadPartition")?
+                }
+                Insn::HashGraceNextProbe { target_pc, .. } => {
+                    resolve(target_pc, "HashGraceNextProbe")?
+                }
+                Insn::HashGraceAdvancePartition { target_pc, .. } => {
+                    resolve(target_pc, "HashGraceAdvancePartition")?
+                }
                 Insn::Program {
                     ignore_jump_target, ..
                 } => resolve(ignore_jump_target, "Program")?,
