@@ -34,11 +34,11 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SEARCH b1 USING INDEX idx_bundle_kind (kind=?)
+|--SEARCH b2 USING INDEX idx_bundle_kind (kind=?)
 |--SEARCH container USING INDEX sqlite_autoindex_product_1 (id=?)
-|--SEARCH p1 USING INDEX sqlite_autoindex_product_1 (id=?)
-|--SEARCH b2 USING INDEX idx_bundle_source (source=?)
 |--SEARCH p2 USING INDEX sqlite_autoindex_product_1 (id=?)
+|--SEARCH b1 USING INDEX idx_bundle_source (source=?)
+|--SEARCH p1 USING INDEX sqlite_autoindex_product_1 (id=?)
 |--SEARCH x1 USING INDEX idx_bundle_target (target=?) LEFT-JOIN
 |--SEARCH x2 USING INDEX idx_bundle_target (target=?) LEFT-JOIN
 `--USE HASH TABLE FOR DISTINCT

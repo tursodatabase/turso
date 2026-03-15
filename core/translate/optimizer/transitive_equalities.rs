@@ -1,0 +1,323 @@
+use smallvec::SmallVec;
+use turso_parser::ast::{self, Expr, TableInternalId};
+
+use crate::translate::plan::{JoinType, TableReferences, WhereTerm};
+
+/// Lightweight Copy handle for an Expr::Column, used to avoid cloning full
+/// Expr trees during equivalence class construction.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+struct ColRef {
+    database: Option<usize>,
+    table: TableInternalId,
+    column: usize,
+    is_rowid_alias: bool,
+}
+
+impl ColRef {
+    fn extract(expr: &Expr) -> Option<Self> {
+        match expr {
+            Expr::Column {
+                database,
+                table,
+                column,
+                is_rowid_alias,
+            } => Some(Self {
+                database: *database,
+                table: *table,
+                column: *column,
+                is_rowid_alias: *is_rowid_alias,
+            }),
+            _ => None,
+        }
+    }
+
+    fn to_expr(self) -> Expr {
+        Expr::Column {
+            database: self.database,
+            table: self.table,
+            column: self.column,
+            is_rowid_alias: self.is_rowid_alias,
+        }
+    }
+}
+
+/// Derive transitive equalities from column-to-column equality predicates.
+///
+/// Given `A.x = B.y AND B.y = C.z`, derives `A.x = C.z` (if not already present).
+/// Only considers inner-join predicates: skips outer-join ON-clause terms and
+/// predicates involving anti-join or semi-join tables (from EXISTS unnesting).
+///
+/// Returns the number of new WhereTerms added.
+pub(crate) fn add_transitive_equalities(
+    where_clause: &mut Vec<WhereTerm>,
+    table_references: &TableReferences,
+) -> usize {
+    // Tables joined via Anti or Semi should not participate in transitive closure.
+    // Their join predicates have different semantics (exclusion/existence checks).
+    let is_eligible = |id: &TableInternalId| -> bool {
+        table_references
+            .find_joined_table_by_internal_id(*id)
+            .is_some_and(|t| {
+                t.join_info
+                    .as_ref()
+                    .map_or(true, |ji| ji.join_type == JoinType::Inner)
+            })
+    };
+    add_transitive_equalities_impl(where_clause, &is_eligible)
+}
+
+/// Core implementation that accepts a predicate for table eligibility,
+/// allowing tests to bypass TableReferences construction.
+fn add_transitive_equalities_impl(
+    where_clause: &mut Vec<WhereTerm>,
+    is_eligible_table: &dyn Fn(&TableInternalId) -> bool,
+) -> usize {
+    // Step 1: Collect cross-table column=column equalities from eligible terms.
+    let mut equalities: Vec<(ColRef, ColRef)> = Vec::new();
+    for term in where_clause.iter() {
+        if term.from_outer_join.is_some() || term.consumed {
+            continue;
+        }
+        if let Expr::Binary(lhs, ast::Operator::Equals, rhs) = &term.expr {
+            if let (Some(a), Some(b)) = (ColRef::extract(lhs), ColRef::extract(rhs)) {
+                if a.table != b.table && is_eligible_table(&a.table) && is_eligible_table(&b.table)
+                {
+                    equalities.push((a, b));
+                }
+            }
+        }
+    }
+
+    if equalities.is_empty() {
+        return 0;
+    }
+
+    // Step 2: Build equivalence classes.
+    // Each class is a set of column refs known to be equal.
+    let mut classes: Vec<SmallVec<[ColRef; 4]>> = Vec::new();
+    for &(a, b) in &equalities {
+        let class_a = classes.iter().position(|c| c.contains(&a));
+        let class_b = classes.iter().position(|c| c.contains(&b));
+        match (class_a, class_b) {
+            (Some(ia), Some(ib)) if ia != ib => {
+                // Merge the two classes. Remove the higher index first to avoid shifting.
+                let hi = ia.max(ib);
+                let lo = ia.min(ib);
+                let removed = classes.remove(hi);
+                classes[lo].extend(removed);
+            }
+            (Some(ia), None) => {
+                classes[ia].push(b);
+            }
+            (None, Some(ib)) => {
+                classes[ib].push(a);
+            }
+            (None, None) => {
+                classes.push(SmallVec::from_slice(&[a, b]));
+            }
+            _ => {
+                // Same class already — nothing to do.
+            }
+        }
+    }
+
+    // Helper to check if a where term is a column=column equality matching two ColRefs.
+    let term_matches_pair = |term: &WhereTerm, a: ColRef, b: ColRef| -> bool {
+        if let Expr::Binary(lhs, ast::Operator::Equals, rhs) = &term.expr {
+            if let (Some(l), Some(r)) = (ColRef::extract(lhs), ColRef::extract(rhs)) {
+                return (l == a && r == b) || (l == b && r == a);
+            }
+        }
+        false
+    };
+
+    // Step 3: For each class with 3+ members, generate pairwise equalities
+    // that don't already exist.
+    let mut derived_count = 0;
+    for class in &classes {
+        if class.len() < 3 {
+            continue;
+        }
+        for i in 0..class.len() {
+            for j in (i + 1)..class.len() {
+                let a = class[i];
+                let b = class[j];
+                let already_exists = where_clause
+                    .iter()
+                    .any(|term| term_matches_pair(term, a, b));
+                if !already_exists {
+                    where_clause.push(WhereTerm {
+                        expr: Expr::Binary(
+                            Box::new(a.to_expr()),
+                            ast::Operator::Equals,
+                            Box::new(b.to_expr()),
+                        ),
+                        from_outer_join: None,
+                        consumed: false,
+                    });
+                    derived_count += 1;
+                }
+            }
+        }
+    }
+
+    derived_count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use turso_parser::ast::Operator;
+
+    /// All tables eligible (simulates all-inner-join query).
+    fn all_eligible(_: &TableInternalId) -> bool {
+        true
+    }
+
+    fn col(table: usize, column: usize) -> Expr {
+        Expr::Column {
+            database: None,
+            table: TableInternalId::from(table),
+            column,
+            is_rowid_alias: false,
+        }
+    }
+
+    fn eq_term(lhs: Expr, rhs: Expr) -> WhereTerm {
+        WhereTerm {
+            expr: Expr::Binary(Box::new(lhs), Operator::Equals, Box::new(rhs)),
+            from_outer_join: None,
+            consumed: false,
+        }
+    }
+
+    fn is_col_eq(term: &WhereTerm, t1: usize, c1: usize, t2: usize, c2: usize) -> bool {
+        if let Expr::Binary(lhs, Operator::Equals, rhs) = &term.expr {
+            if let (Some(l), Some(r)) = (ColRef::extract(lhs), ColRef::extract(rhs)) {
+                return (l.table == TableInternalId::from(t1)
+                    && l.column == c1
+                    && r.table == TableInternalId::from(t2)
+                    && r.column == c2)
+                    || (l.table == TableInternalId::from(t2)
+                        && l.column == c2
+                        && r.table == TableInternalId::from(t1)
+                        && r.column == c1);
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn no_equalities_no_derivations() {
+        let mut wc = vec![WhereTerm {
+            expr: Expr::Binary(
+                Box::new(col(1, 0)),
+                Operator::GreaterEquals,
+                Box::new(Expr::Literal(ast::Literal::Numeric("5".to_string()))),
+            ),
+            from_outer_join: None,
+            consumed: false,
+        }];
+        assert_eq!(add_transitive_equalities_impl(&mut wc, &all_eligible), 0);
+        assert_eq!(wc.len(), 1);
+    }
+
+    #[test]
+    fn two_tables_no_transitive() {
+        // A.0 = B.0 — only two columns, no transitive derivation possible
+        let mut wc = vec![eq_term(col(1, 0), col(2, 0))];
+        assert_eq!(add_transitive_equalities_impl(&mut wc, &all_eligible), 0);
+        assert_eq!(wc.len(), 1);
+    }
+
+    #[test]
+    fn three_tables_derives_one() {
+        // A.0 = B.0, B.0 = C.0 → derives A.0 = C.0
+        let mut wc = vec![eq_term(col(1, 0), col(2, 0)), eq_term(col(2, 0), col(3, 0))];
+        assert_eq!(add_transitive_equalities_impl(&mut wc, &all_eligible), 1);
+        assert_eq!(wc.len(), 3);
+        assert!(is_col_eq(&wc[2], 1, 0, 3, 0));
+    }
+
+    #[test]
+    fn already_exists_no_duplicate() {
+        // A.0 = B.0, B.0 = C.0, A.0 = C.0 — all pairs present, nothing to derive
+        let mut wc = vec![
+            eq_term(col(1, 0), col(2, 0)),
+            eq_term(col(2, 0), col(3, 0)),
+            eq_term(col(1, 0), col(3, 0)),
+        ];
+        assert_eq!(add_transitive_equalities_impl(&mut wc, &all_eligible), 0);
+        assert_eq!(wc.len(), 3);
+    }
+
+    #[test]
+    fn four_tables_chain() {
+        // A=B, B=C, C=D → derives A=C, A=D, B=D (3 new terms)
+        let mut wc = vec![
+            eq_term(col(1, 0), col(2, 0)),
+            eq_term(col(2, 0), col(3, 0)),
+            eq_term(col(3, 0), col(4, 0)),
+        ];
+        assert_eq!(add_transitive_equalities_impl(&mut wc, &all_eligible), 3);
+        assert_eq!(wc.len(), 6);
+    }
+
+    #[test]
+    fn consumed_terms_skipped() {
+        let mut wc = vec![
+            eq_term(col(1, 0), col(2, 0)),
+            WhereTerm {
+                expr: Expr::Binary(Box::new(col(2, 0)), Operator::Equals, Box::new(col(3, 0))),
+                from_outer_join: None,
+                consumed: true,
+            },
+        ];
+        assert_eq!(add_transitive_equalities_impl(&mut wc, &all_eligible), 0);
+        assert_eq!(wc.len(), 2);
+    }
+
+    #[test]
+    fn outer_join_terms_skipped() {
+        let mut wc = vec![
+            eq_term(col(1, 0), col(2, 0)),
+            WhereTerm {
+                expr: Expr::Binary(Box::new(col(2, 0)), Operator::Equals, Box::new(col(3, 0))),
+                from_outer_join: Some(TableInternalId::from(3)),
+                consumed: false,
+            },
+        ];
+        assert_eq!(add_transitive_equalities_impl(&mut wc, &all_eligible), 0);
+        assert_eq!(wc.len(), 2);
+    }
+
+    #[test]
+    fn different_columns_separate_classes() {
+        // A.0 = B.0, B.1 = C.1 — different columns, no transitive link
+        let mut wc = vec![eq_term(col(1, 0), col(2, 0)), eq_term(col(2, 1), col(3, 1))];
+        assert_eq!(add_transitive_equalities_impl(&mut wc, &all_eligible), 0);
+        assert_eq!(wc.len(), 2);
+    }
+
+    #[test]
+    fn ineligible_table_excluded() {
+        // A.0 = B.0, B.0 = C.0, but table 3 (C) is ineligible (e.g. semi-join)
+        let mut wc = vec![eq_term(col(1, 0), col(2, 0)), eq_term(col(2, 0), col(3, 0))];
+        let not_table_3 = |id: &TableInternalId| *id != TableInternalId::from(3);
+        assert_eq!(add_transitive_equalities_impl(&mut wc, &not_table_3), 0);
+        assert_eq!(wc.len(), 2);
+    }
+
+    #[test]
+    fn same_table_equality_ignored() {
+        // A.0 = A.1 — same table, should not be collected
+        let mut wc = vec![
+            eq_term(col(1, 0), col(1, 1)),
+            eq_term(col(1, 0), col(2, 0)),
+            eq_term(col(2, 0), col(3, 0)),
+        ];
+        assert_eq!(add_transitive_equalities_impl(&mut wc, &all_eligible), 1);
+        assert_eq!(wc.len(), 4);
+        assert!(is_col_eq(&wc[3], 1, 0, 3, 0));
+    }
+}

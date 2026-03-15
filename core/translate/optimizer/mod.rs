@@ -72,6 +72,7 @@ pub(crate) mod lift_common_subexpressions;
 pub(crate) mod multi_index;
 pub(crate) mod order;
 mod selectivity;
+mod transitive_equalities;
 pub(crate) mod unnest;
 
 /// A candidate index method that could be used for table access in a join query.
@@ -1560,7 +1561,7 @@ fn optimize_table_access(
     result_columns: &mut [ResultSetColumn],
     table_references: &mut TableReferences,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
-    where_clause: &mut [WhereTerm],
+    where_clause: &mut Vec<WhereTerm>,
     order_by: &mut Vec<(Box<ast::Expr>, SortOrder)>,
     group_by: &mut Option<GroupBy>,
     simple_aggregate: Option<&SimpleAggregate>,
@@ -1744,6 +1745,20 @@ fn optimize_table_access(
             table_references,
             available_indexes,
             &mut constraints_per_table,
+        )?;
+    }
+
+    let transitive_synthetic_whereterms_start = where_clause.len();
+    let transitive_synthetic_whereterm_count =
+        transitive_equalities::add_transitive_equalities(where_clause, table_references);
+    if transitive_synthetic_whereterm_count > 0 {
+        constraints_per_table = constraints_from_where_clause(
+            where_clause,
+            table_references,
+            available_indexes,
+            subqueries,
+            schema,
+            params,
         )?;
     }
 
@@ -2367,6 +2382,14 @@ fn optimize_table_access(
         if !has_prior_constraints {
             hash_join_op.materialize_build_input = false;
         }
+    }
+
+    // Mark synthetic transitive-equality terms as consumed so the emitter
+    // never evaluates them at runtime. They only existed to give the optimizer
+    // more index seek opportunities. We can't truncate because Constraint
+    // objects hold where_clause_pos indices into these entries.
+    for term in where_clause[transitive_synthetic_whereterms_start..].iter_mut() {
+        term.consumed = true;
     }
 
     Ok(Some(OptimizeTableAccessResult {
