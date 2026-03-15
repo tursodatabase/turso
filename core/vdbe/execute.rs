@@ -12877,7 +12877,7 @@ pub fn op_hash_grace_next_probe(
     })?;
 
     match hash_table.grace_next_probe_entry()? {
-        Some(entry) => {
+        IOResult::Done(Some(entry)) => {
             // Write probe keys to registers
             for (i, value) in entry.key_values.into_iter().enumerate() {
                 if i < num_keys {
@@ -12889,10 +12889,11 @@ pub fn op_hash_grace_next_probe(
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
-        None => {
+        IOResult::Done(None) => {
             state.pc = target_pc.as_offset_int();
             Ok(InsnFunctionStepResult::Step)
         }
+        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
     }
 }
 
