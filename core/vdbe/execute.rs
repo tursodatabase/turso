@@ -31,7 +31,9 @@ use crate::util::{
 use crate::vdbe::affinity::{
     apply_numeric_affinity, try_for_float, Affinity, NumericParseResult, ParsedNumber,
 };
-use crate::vdbe::hash_table::{HashEntry, HashTable, HashTableConfig, DEFAULT_MEM_BUDGET};
+use crate::vdbe::hash_table::{
+    HashEntry, HashInsertResult, HashTable, HashTableConfig, PendingHashInsert, DEFAULT_MEM_BUDGET,
+};
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::metrics::HashJoinMetrics;
 use crate::vdbe::value::ComparisonOp;
@@ -3822,9 +3824,10 @@ pub fn op_program(
                         Ok(step_result) => match step_result {
                             StepResult::Done => break,
                             StepResult::IO => {
-                                return Ok(InsnFunctionStepResult::IO(IOCompletions::Single(
-                                    Completion::new_yield(),
-                                )));
+                                let io = statement.take_io_completions().unwrap_or_else(|| {
+                                    IOCompletions::Single(Completion::new_yield())
+                                });
+                                return Ok(InsnFunctionStepResult::IO(io));
                             }
                             StepResult::Row => continue,
                             StepResult::Interrupt | StepResult::Busy => {
@@ -12258,26 +12261,18 @@ pub fn op_hash_build(
     // Insert the rowid into the hash table
     if let Some(ht) = state.hash_tables.get_mut(&data.hash_table_id) {
         let rowid = op_state.rowid.expect("rowid set");
-        let key_values = std::mem::take(&mut op_state.key_values);
-        let payload_values = std::mem::take(&mut op_state.payload_values);
-        match ht.insert(
-            key_values.clone(),
+        let pending = PendingHashInsert {
+            key_values: std::mem::take(&mut op_state.key_values),
             rowid,
-            payload_values.clone(),
-            Some(&mut state.metrics.hash_join),
-        ) {
-            Ok(IOResult::Done(())) => {}
-            Ok(IOResult::IO(io)) => {
-                op_state.key_values = key_values;
-                op_state.payload_values = payload_values;
+            payload_values: std::mem::take(&mut op_state.payload_values),
+        };
+        match ht.insert_pending(pending, Some(&mut state.metrics.hash_join))? {
+            HashInsertResult::Done => {}
+            HashInsertResult::IO { io, pending } => {
+                op_state.key_values = pending.key_values;
+                op_state.payload_values = pending.payload_values;
                 state.op_hash_build_state = Some(op_state);
                 return Ok(InsnFunctionStepResult::IO(io));
-            }
-            Err(e) => {
-                op_state.key_values = key_values;
-                op_state.payload_values = payload_values;
-                state.op_hash_build_state = Some(op_state);
-                return Err(e);
             }
         }
     }
@@ -12404,27 +12399,32 @@ pub fn op_hash_probe(
     let payload_dest_reg = payload_dest_reg.map(|r| r as usize);
     let num_payload = *num_payload as usize;
     let probe_rowid_reg = probe_rowid_reg.map(|r| r as usize);
-    let (probe_keys, partition_idx) = if let Some(op_state) = state.op_hash_probe_state.take() {
-        if op_state.hash_table_id == hash_table_id {
-            (op_state.probe_keys, Some(op_state.partition_idx))
+    let (probe_keys, partition_idx, probe_buffered) =
+        if let Some(op_state) = state.op_hash_probe_state.take() {
+            if op_state.hash_table_id == hash_table_id {
+                (
+                    op_state.probe_keys,
+                    Some(op_state.partition_idx),
+                    op_state.probe_buffered,
+                )
+            } else {
+                // Different hash table, read fresh keys
+                let mut keys = Vec::with_capacity(num_keys);
+                for i in 0..num_keys {
+                    let reg = &state.registers[key_start_reg + i];
+                    keys.push(reg.get_value().clone());
+                }
+                (keys, None, false)
+            }
         } else {
-            // Different hash table, read fresh keys
+            // First entry, read probe keys from registers
             let mut keys = Vec::with_capacity(num_keys);
             for i in 0..num_keys {
                 let reg = &state.registers[key_start_reg + i];
                 keys.push(reg.get_value().clone());
             }
-            (keys, None)
-        }
-    } else {
-        // First entry, read probe keys from registers
-        let mut keys = Vec::with_capacity(num_keys);
-        for i in 0..num_keys {
-            let reg = &state.registers[key_start_reg + i];
-            keys.push(reg.get_value().clone());
-        }
-        (keys, None)
-    };
+            (keys, None, false)
+        };
 
     let Some(hash_table) = state.hash_tables.get_mut(&hash_table_id) else {
         // Empty build side: treat as no match and jump to target.
@@ -12440,6 +12440,10 @@ pub fn op_hash_probe(
 
         // Grace hash join path: buffer probe rows targeting spilled partitions
         if let Some(rowid_reg) = probe_rowid_reg {
+            if probe_buffered {
+                state.pc = target_pc.as_offset_int();
+                return Ok(InsnFunctionStepResult::Step);
+            }
             if !hash_table.is_partition_loaded(partition_idx) {
                 // Partition is on disk -- buffer this probe row for grace processing
                 let probe_rowid = match state.registers[rowid_reg].get_value() {
@@ -12457,6 +12461,7 @@ pub fn op_hash_probe(
                             probe_keys: Vec::new(), // keys consumed
                             hash_table_id,
                             partition_idx,
+                            probe_buffered: true,
                         });
                         return Ok(InsnFunctionStepResult::IO(io));
                     }
@@ -12488,6 +12493,7 @@ pub fn op_hash_probe(
                             probe_keys,
                             hash_table_id,
                             partition_idx,
+                            probe_buffered: false,
                         });
                         return Ok(InsnFunctionStepResult::IO(io));
                     }

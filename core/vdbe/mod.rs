@@ -411,6 +411,8 @@ pub struct OpHashProbeState {
     pub hash_table_id: usize,
     /// Partition index being loaded (if any)
     pub partition_idx: usize,
+    /// Whether the probe row was already buffered for grace processing.
+    pub probe_buffered: bool,
 }
 
 #[derive(Debug, Clone)]
