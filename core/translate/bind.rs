@@ -1117,7 +1117,6 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                                 {
                                     if let Some(alias_expr) = self.resolve_alias(name.as_str()) {
                                         *expr = alias_expr;
-                                        return;
                                     }
                                 }
                             }
@@ -1419,7 +1418,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         .map(|bc| bc.name.clone())
                         .collect();
                     let subquery_table = Arc::new(DerivedTable {
-                        columns: subquery_columns.clone(),
+                        columns: subquery_columns,
                     });
 
                     let internal_id = self.id_gen.next_table_id();
@@ -1447,7 +1446,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     .resolver
                     .with_schema(database_id, |s| s.get_table(&table_name))
                     .ok_or_else(|| {
-                        crate::LimboError::ParseError(format!("no such table: {}", table_name))
+                        crate::LimboError::ParseError(format!("no such table: {table_name}"))
                     })?;
 
                 // 4. Generate internal_id via self.id_gen.next_table_id()
@@ -1478,7 +1477,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     .map(|bc| bc.name.clone())
                     .collect();
                 let subquery_table = Arc::new(DerivedTable {
-                    columns: subquery_columns.clone(),
+                    columns: subquery_columns,
                 });
 
                 let internal_id = self.id_gen.next_table_id();
@@ -1510,7 +1509,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         .schema()
                         .get_table(&table_name)
                         .ok_or_else(|| {
-                            crate::LimboError::ParseError(format!("no such table: {}", table_name))
+                            crate::LimboError::ParseError(format!("no such table: {table_name}"))
                         })?;
 
                 let identifier = alias
@@ -1706,8 +1705,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 }
                 // Not a rowid either — re-raise the original error
                 return Err(crate::LimboError::ParseError(format!(
-                    "no such column: {}.{}",
-                    table_name, col_name
+                    "no such column: {table_name}.{col_name}"
                 )));
             }
         }
@@ -1743,8 +1741,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 }
                 // Column name not found in this scope as real column or rowid
                 result = Some(Err(crate::LimboError::ParseError(format!(
-                    "no such column: {}.{}",
-                    table_name, col_name
+                    "no such column: {table_name}.{col_name}"
                 ))));
                 break;
             }
@@ -1914,6 +1911,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         select: &mut ast::Select,
         scope: &BindScope,
     ) -> Result<BoundSelect> {
+        #[expect(clippy::arc_with_non_send_sync)]
         self.append_outer_query_scope(Arc::new(scope.clone()), self.aliases.clone());
         let result = self.bind_select(select);
         self.pop_outer_query_scope();
@@ -2167,7 +2165,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
             // Determine USING columns from (possibly rewritten) constraint
             let using_cols = match &join.constraint {
-                Some(JoinConstraint::Using(cols)) => cols.iter().cloned().collect::<Vec<_>>(),
+                Some(JoinConstraint::Using(cols)) => cols.to_vec(),
                 _ => vec![],
             };
 
@@ -2371,9 +2369,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         let schema_table = self
             .resolver
             .with_schema(database_id, |s| s.get_table(&normalized))
-            .ok_or_else(|| {
-                crate::LimboError::ParseError(format!("no such table: {}", normalized))
-            })?;
+            .ok_or_else(|| crate::LimboError::ParseError(format!("no such table: {normalized}")))?;
 
         Ok(BindScope {
             tables: vec![ScopeTable {
@@ -2400,7 +2396,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         // Build column name → index lookup
         let column_lookup: HashMap<String, usize> = bt
             .columns()
-            .filter_map(|col| Some((col.name.to_lowercase(), col.idx)))
+            .map(|col| (col.name.to_lowercase(), col.idx))
             .collect();
 
         let mut set_clauses: Vec<(usize, Box<ast::Expr>)> = Vec::with_capacity(sets.len());
@@ -2652,6 +2648,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         })
     }
 
+    #[expect(clippy::vec_box)]
     /// Bind single-row VALUES expressions. Returns `(values, inserting_multiple_rows)`.
     /// Multi-row VALUES and SELECT sources are left unbound (delegated to `translate_select`).
     fn bind_insert_values(
@@ -3755,6 +3752,7 @@ mod tests {
         });
     }
 
+    #[expect(clippy::vec_box)]
     fn values_exprs(select: &ast::Select) -> &[Vec<Box<ast::Expr>>] {
         match &select.body.select {
             ast::OneSelect::Values(rows) => rows,
@@ -3907,7 +3905,7 @@ mod tests {
     #[test]
     fn expand_star_no_tables_errors() {
         with_bind_context(&[], |ctx| {
-            let mut select = parse_select("SELECT *");
+            let select = parse_select("SELECT *");
             let cols = select_columns(&select);
             // No FROM → no tables in scope → star expands to nothing
             assert_eq!(cols.len(), 1); // still Star before binding

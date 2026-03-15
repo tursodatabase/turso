@@ -683,7 +683,7 @@ fn plan_one_bound_cte(
         }
     };
 
-    planned.insert(name.clone(), cte_table.clone());
+    planned.insert(name, cte_table.clone());
     Ok(cte_table)
 }
 
