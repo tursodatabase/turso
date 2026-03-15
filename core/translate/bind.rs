@@ -317,6 +317,8 @@ pub struct BoundColumn {
     pub name: String,
     /// The original expression (before binding), cloned into alias references.
     pub expr: ast::Expr,
+    /// True if the name comes from an explicit AS alias (not inferred from expr).
+    pub is_explicit_alias: bool,
 }
 
 /// A subquery expression that was bound during binding.
@@ -871,11 +873,13 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                             _ => String::new(),
                         }
                     };
+                    let is_explicit_alias = alias.is_some();
                     // Resolve the expression
                     self.bind_expr(expr, scope)?;
                     result.push(BoundColumn {
                         name,
                         expr: *expr.clone(),
+                        is_explicit_alias,
                     });
                 }
                 ast::ResultColumn::Star => {
@@ -890,6 +894,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                                     column: col_ref.idx,
                                     is_rowid_alias: col_ref.is_rowid_alias,
                                 },
+                                is_explicit_alias: false,
                             });
                         }
                     }
@@ -907,6 +912,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                                 column: col_ref.idx,
                                 is_rowid_alias: col_ref.is_rowid_alias,
                             },
+                            is_explicit_alias: false,
                         });
                     }
                 }
@@ -1058,6 +1064,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         .map(|i| BoundColumn {
                             name: format!("column{}", i + 1),
                             expr: ast::Expr::Literal(ast::Literal::Numeric(i.to_string())),
+                            is_explicit_alias: false,
                         })
                         .collect();
                     for row in rows.iter_mut() {
@@ -1305,7 +1312,11 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         Ok(())
     }
 
-    fn resolve_select_table(&mut self, table: &mut ast::SelectTable) -> Result<ScopeTable> {
+    fn resolve_select_table(
+        &mut self,
+        table: &mut ast::SelectTable,
+        lateral_scope: Option<&BindScope>,
+    ) -> Result<ScopeTable> {
         match table {
             // Named table: CTE lookup first, then schema lookup
             ast::SelectTable::Table(name, alias, _indexed) => {
@@ -1494,10 +1505,13 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     })
                     .unwrap_or_else(|| table_name.clone());
 
-                // 2. Bind argument expressions (typically literals, no FROM scope yet)
+                // 2. Bind argument expressions. Use lateral scope if available so that
+                // table function args can reference previously-joined tables
+                // (e.g. SELECT * FROM generate_series(0,2) s JOIN json_tree(..., s.value))
                 let empty_scope = BindScope::empty();
+                let arg_scope = lateral_scope.unwrap_or(&empty_scope);
                 for arg in args.iter_mut() {
-                    self.bind_expr(arg, &empty_scope)?;
+                    self.bind_expr(arg, arg_scope)?;
                 }
 
                 // 3. Build ScopeTable from the virtual table's columns
@@ -1554,13 +1568,24 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
     fn resolve_alias(&self, name: &str) -> Option<ast::Expr> {
         let normalized = normalize_ident(name);
-        // Search from the end: later aliases shadow earlier ones (SQLite behavior).
-        // e.g. SELECT a, -b AS a FROM t ORDER BY a → ORDER BY resolves to -b
-        self.aliases()
+        let aliases = self.aliases();
+        // Prefer explicit AS aliases over inferred column names.
+        // Among explicit aliases, later ones shadow earlier (SQLite behavior).
+        // e.g. SELECT -a AS b, a, t.b ORDER BY b → resolves to -a (explicit AS b)
+        // e.g. SELECT a, -b AS a ORDER BY a → resolves to -b (explicit AS a)
+        if let Some(alias) = aliases
             .iter()
             .rev()
-            .find(|alias| alias.name.eq_ignore_ascii_case(&normalized))
-            .map(|alias| alias.expr.clone())
+            .find(|a| a.is_explicit_alias && a.name.eq_ignore_ascii_case(&normalized))
+        {
+            return Some(alias.expr.clone());
+        }
+        // Fallback: inferred names (last match wins)
+        aliases
+            .iter()
+            .rev()
+            .find(|a| a.name.eq_ignore_ascii_case(&normalized))
+            .map(|a| a.expr.clone())
     }
 
     fn resolve_outer_alias(&mut self, name: &str) -> Option<ast::Expr> {
@@ -2014,9 +2039,15 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         let mut tables: Vec<ScopeTable> = Vec::new();
         let mut right_join_swapped = false;
 
-        tables.push(self.resolve_select_table(&mut from.select)?);
+        tables.push(self.resolve_select_table(&mut from.select, None)?);
         for join in &mut from.joins {
-            let mut st = self.resolve_select_table(&mut join.table)?;
+            // Build a temporary scope from tables accumulated so far, so that
+            // table function arguments can reference previously-joined tables.
+            let lateral_scope = BindScope {
+                tables: tables.clone(),
+                right_join_swapped: false,
+            };
+            let mut st = self.resolve_select_table(&mut join.table, Some(&lateral_scope))?;
 
             let (is_outer, is_full_outer, is_right, is_cross, is_natural) = match &join.operator {
                 ast::JoinOperator::TypedJoin(Some(jt)) => {
@@ -2425,6 +2456,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     result.push(BoundColumn {
                         name,
                         expr: *expr.clone(),
+                        is_explicit_alias: alias.is_some(),
                     });
                 }
                 ast::ResultColumn::Star | ast::ResultColumn::TableStar(_) => {
