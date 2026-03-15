@@ -4,8 +4,11 @@ use crate::sync::Arc;
 use crate::translate::optimizer::constraints::RangeConstraintRef;
 use crate::translate::plan::JoinedTable;
 
+use smallvec::SmallVec;
+
 use super::constraints::Constraint;
 use super::cost_params::CostModelParams;
+use super::selectivity::{closed_range_selectivity, dampened_product};
 
 /// A simple newtype wrapper over a f64 that represents the cost of an operation.
 ///
@@ -235,6 +238,7 @@ pub(crate) fn estimate_rows_per_seek(
     usable_constraint_refs: &[RangeConstraintRef],
     base_row_count: RowCountEstimate,
     analyze_ctx: Option<&AnalyzeCtx>,
+    params: &CostModelParams,
 ) -> f64 {
     if is_unique_point_lookup(index_info, usable_constraint_refs) {
         return 1.0;
@@ -252,40 +256,37 @@ pub(crate) fn estimate_rows_per_seek(
                     .iter()
                     .take_while(|cref| cref.eq.is_some())
                     .count();
-                let range_selectivity: f64 = usable_constraint_refs[eq_prefix_len..]
+                let mut range_sels: SmallVec<[f64; 4]> = usable_constraint_refs[eq_prefix_len..]
                     .iter()
-                    .map(|cref| {
-                        let mut sel = 1.0;
-                        if let Some(lb) = cref.lower_bound {
-                            sel *= constraints[lb].selectivity;
-                        }
-                        if let Some(ub) = cref.upper_bound {
-                            sel *= constraints[ub].selectivity;
-                        }
-                        sel
+                    .filter_map(|cref| {
+                        closed_range_selectivity(
+                            cref.lower_bound.map(|i| constraints[i].selectivity),
+                            cref.upper_bound.map(|i| constraints[i].selectivity),
+                            params.closed_range_selectivity_factor,
+                        )
                     })
-                    .product();
+                    .collect();
+                let range_selectivity = dampened_product(&mut range_sels);
                 return (eq_prefix_rows * range_selectivity).max(1.0);
             }
         }
     }
 
-    let selectivity_multiplier: f64 = usable_constraint_refs
+    let mut sels: SmallVec<[f64; 4]> = usable_constraint_refs
         .iter()
         .map(|cref| {
             if let Some(ref eq) = cref.eq {
                 return constraints[eq.constraint_pos].selectivity;
             }
-            let mut selectivity = 1.0;
-            if let Some(lower_bound) = cref.lower_bound {
-                selectivity *= constraints[lower_bound].selectivity;
-            }
-            if let Some(upper_bound) = cref.upper_bound {
-                selectivity *= constraints[upper_bound].selectivity;
-            }
-            selectivity
+            closed_range_selectivity(
+                cref.lower_bound.map(|i| constraints[i].selectivity),
+                cref.upper_bound.map(|i| constraints[i].selectivity),
+                params.closed_range_selectivity_factor,
+            )
+            .unwrap_or(1.0)
         })
-        .product();
+        .collect();
+    let selectivity_multiplier = dampened_product(&mut sels);
 
     (selectivity_multiplier * *base_row_count).max(1.0)
 }
@@ -373,6 +374,7 @@ pub fn estimate_cost_for_scan_or_seek(
         usable_constraint_refs,
         RowCountEstimate::AnalyzeStats(base_row_count),
         analyze_ctx,
+        params,
     );
 
     let base_cost = estimate_index_cost(

@@ -384,9 +384,9 @@ pub(super) fn choose_best_btree_candidate(
             })
             .collect();
 
-        // Multiply selectivities of residual constraints whose prerequisites
+        // Combine selectivities of residual constraints whose prerequisites
         // are within the allowed mask (i.e. already satisfied by this loop).
-        let residual_selectivity: f64 = rhs_constraints
+        let mut residual_sels: smallvec::SmallVec<[f64; 4]> = rhs_constraints
             .constraints
             .iter()
             .enumerate()
@@ -404,7 +404,8 @@ pub(super) fn choose_best_btree_candidate(
                     )
             })
             .map(|(_, c)| c.selectivity)
-            .product();
+            .collect();
+        let residual_selectivity = super::selectivity::dampened_product(&mut residual_sels);
 
         // Adjusted output: lower means the loop delivers fewer rows downstream.
         let adjusted_output = residual_selectivity;
@@ -755,6 +756,7 @@ fn find_best_access_method_for_btree(
             &best.constraint_refs,
             base_row_count,
             Some(&analyze_ctx),
+            params,
         )
     };
     let mut best_access_method = AccessMethod {
@@ -1496,6 +1498,7 @@ fn find_best_access_method_for_subquery(
         &usable_constraint_refs,
         base_row_count,
         None,
+        params,
     );
     let one_pass_scan_cost =
         estimate_cost_for_scan_or_seek(None, &[], &[], 1.0, base_row_count, false, params, None);

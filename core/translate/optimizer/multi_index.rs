@@ -379,6 +379,7 @@ fn choose_multi_index_branch_access(
                     &chosen.constraint_refs,
                     base_row_count,
                     Some(&analyze_ctx),
+                    params,
                 ),
                 union_prepost_filters: None,
             }
@@ -1074,6 +1075,7 @@ pub fn consider_multi_index_intersection(
                     &b.constraint_refs,
                     base_row_count,
                     Some(&analyze_ctx),
+                    params,
                 ),
                 union_prepost_filters: None,
             }

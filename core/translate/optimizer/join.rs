@@ -83,29 +83,15 @@ fn constraint_output_multipliers(
     params: &CostModelParams,
     join_type: Option<JoinType>,
 ) -> ResidualInfo {
-    let mut on_clause_residual = 1.0;
-    let mut where_clause_residual = 1.0;
+    let mut on_sels: SmallVec<[f64; 4]> = SmallVec::new();
+    let mut where_sels: SmallVec<[f64; 4]> = SmallVec::new();
     let mut has_where_is_null = false;
 
-    // Track range bounds per column, with which bucket (on/where) they belong to.
-    // (col_pos, has_lower, has_upper, is_on_clause)
-    let mut bounds: SmallVec<[(Option<usize>, bool, bool, bool); 4]> = SmallVec::new();
-
-    let record_bound = |bounds: &mut SmallVec<[(Option<usize>, bool, bool, bool); 4]>,
-                        dominated_col: Option<usize>,
-                        is_lower: bool,
-                        is_upper: bool,
-                        is_on_clause: bool| {
-        if !(is_lower || is_upper) {
-            return;
-        }
-        if let Some(entry) = bounds.iter_mut().find(|(col, _, _, _)| *col == dominated_col) {
-            entry.1 |= is_lower;
-            entry.2 |= is_upper;
-        } else {
-            bounds.push((dominated_col, is_lower, is_upper, is_on_clause));
-        }
-    };
+    // Track range bounds per column so they can be combined into a single
+    // effective selectivity rather than being dampened as independent predicates.
+    // (col_pos, lower_sel, upper_sel, is_on_clause)
+    let mut range_bounds: SmallVec<[(Option<usize>, Option<f64>, Option<f64>, bool); 4]> =
+        SmallVec::new();
 
     for constraint in rhs_constraints.constraints.iter().filter(|constraint| {
         (lhs_mask.contains_all(&constraint.lhs_mask)
@@ -113,26 +99,10 @@ fn constraint_output_multipliers(
             || constraint.lhs_mask.is_empty())
             && !consumed_where_terms.contains(&constraint.where_clause_pos.0)
     }) {
-        let is_isnull = matches!(
+        let is_is_null = matches!(
             constraint.operator,
             super::constraints::ConstraintOperator::AstNativeOperator(Operator::Is)
         );
-
-        if constraint.from_outer_join {
-            // ON-clause constraint
-            on_clause_residual *= constraint.selectivity;
-        } else if is_isnull
-            && matches!(join_type, Some(JoinType::LeftOuter))
-        {
-            // WHERE-clause IS NULL on a LEFT JOIN's RHS table → anti-join pattern.
-            // Don't multiply into residual; the anti-join formula accounts for it.
-            has_where_is_null = true;
-        } else {
-            // WHERE-clause constraint (or non-outer-join)
-            where_clause_residual *= constraint.selectivity;
-        }
-
-        let dominated_col = constraint.table_col_pos;
         let is_lower = matches!(
             constraint.operator.as_ast_operator(),
             Some(Operator::Greater | Operator::GreaterEquals)
@@ -141,28 +111,55 @@ fn constraint_output_multipliers(
             constraint.operator.as_ast_operator(),
             Some(Operator::Less | Operator::LessEquals)
         );
-        record_bound(
-            &mut bounds,
-            dominated_col,
-            is_lower,
-            is_upper,
-            constraint.from_outer_join,
-        );
+
+        if is_lower || is_upper {
+            // Defer range bounds — they'll be combined per-column after the loop.
+            let col = constraint.table_col_pos;
+            let is_on = constraint.from_outer_join;
+            if let Some(entry) = range_bounds.iter_mut().find(|(c, _, _, _)| *c == col) {
+                if is_lower {
+                    entry.1 = Some(constraint.selectivity);
+                } else {
+                    entry.2 = Some(constraint.selectivity);
+                }
+            } else {
+                let (lo, hi) = if is_lower {
+                    (Some(constraint.selectivity), None)
+                } else {
+                    (None, Some(constraint.selectivity))
+                };
+                range_bounds.push((col, lo, hi, is_on));
+            }
+        } else if constraint.from_outer_join {
+            on_sels.push(constraint.selectivity);
+        } else if is_is_null && matches!(join_type, Some(JoinType::LeftOuter)) {
+            // WHERE-clause IS NULL on a LEFT JOIN's RHS table → anti-join pattern.
+            // Don't multiply into residual; the anti-join formula accounts for it.
+            has_where_is_null = true;
+        } else {
+            where_sels.push(constraint.selectivity);
+        }
     }
 
-    for (_, has_lower, has_upper, is_on_clause) in &bounds {
-        if *has_lower && *has_upper {
-            if *is_on_clause {
-                on_clause_residual *= params.closed_range_selectivity_factor;
+    // Combine range bounds: two bounds on the same column become one entry
+    // for dampening purposes, corrected by closed_range_factor.
+    for &(_, lower_sel, upper_sel, is_on_clause) in &range_bounds {
+        if let Some(combined) = super::selectivity::closed_range_selectivity(
+            lower_sel,
+            upper_sel,
+            params.closed_range_selectivity_factor,
+        ) {
+            if is_on_clause {
+                on_sels.push(combined);
             } else {
-                where_clause_residual *= params.closed_range_selectivity_factor;
+                where_sels.push(combined);
             }
         }
     }
 
     ResidualInfo {
-        on_clause_residual,
-        where_clause_residual,
+        on_clause_residual: super::selectivity::dampened_product(&mut on_sels),
+        where_clause_residual: super::selectivity::dampened_product(&mut where_sels),
         is_anti_join_pattern: has_where_is_null,
     }
 }
@@ -902,8 +899,7 @@ fn build_prior_constraint_selectivity(
     build_constraints: &TableConstraints,
     prior_mask: &TableMask,
 ) -> f64 {
-    let mut selectivity = 1.0;
-    let mut saw_constraint = false;
+    let mut sels: SmallVec<[f64; 4]> = SmallVec::new();
     for constraint in build_constraints.constraints.iter() {
         if constraint.operator == Operator::Equals.into()
             && constraint.lhs_mask.intersects(prior_mask)
@@ -915,14 +911,10 @@ fn build_prior_constraint_selectivity(
                 selectivity = constraint.selectivity,
                 "prior constraint selectivity contributor"
             );
-            selectivity *= constraint.selectivity;
-            saw_constraint = true;
+            sels.push(constraint.selectivity);
         }
     }
-    if !saw_constraint {
-        return 1.0;
-    }
-    selectivity.clamp(0.0, 1.0)
+    super::selectivity::dampened_product(&mut sels).clamp(0.0, 1.0)
 }
 
 /// Estimates selectivity from build-side constraints that reference only the build table.
@@ -931,19 +923,14 @@ fn build_self_constraint_selectivity(
     build_table_idx: usize,
 ) -> f64 {
     let build_only_mask = TableMask::from_table_number_iter([build_table_idx].into_iter());
-    let mut selectivity = 1.0;
-    let mut saw_constraint = false;
+    let mut sels: SmallVec<[f64; 4]> = SmallVec::new();
     for constraint in build_constraints.constraints.iter() {
         if !build_only_mask.contains_all(&constraint.lhs_mask) {
             continue;
         }
-        selectivity *= constraint.selectivity;
-        saw_constraint = true;
+        sels.push(constraint.selectivity);
     }
-    if !saw_constraint {
-        return 1.0;
-    }
-    selectivity.clamp(0.0, 1.0)
+    super::selectivity::dampened_product(&mut sels).clamp(0.0, 1.0)
 }
 
 /// Returns true if any prior constraints can be turned into an index lookup.
@@ -1679,12 +1666,13 @@ fn find_best_starting_table(
         };
 
         // Include literal constraints (lhs_mask empty) and self-constraints in selectivity
-        let selectivity: f64 = constraints[t]
+        let mut sels: SmallVec<[f64; 4]> = constraints[t]
             .constraints
             .iter()
             .filter(|c| c.lhs_mask.is_empty() || c.lhs_mask == self_mask)
             .map(|c| c.selectivity)
-            .product();
+            .collect();
+        let selectivity = super::selectivity::dampened_product(&mut sels);
 
         let score = base_rows * selectivity / (1.0 + hub_score[t] as f64);
 

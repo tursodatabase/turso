@@ -71,6 +71,7 @@ pub(crate) mod join;
 pub(crate) mod lift_common_subexpressions;
 pub(crate) mod multi_index;
 pub(crate) mod order;
+mod selectivity;
 pub(crate) mod unnest;
 
 /// A candidate index method that could be used for table access in a join query.
