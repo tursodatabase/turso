@@ -69,6 +69,7 @@ pub(crate) mod join;
 pub(crate) mod lift_common_subexpressions;
 pub(crate) mod multi_index;
 pub(crate) mod order;
+mod rewrite_rules;
 pub(crate) mod unnest;
 
 /// A candidate index method that could be used for table access in a join query.
@@ -592,6 +593,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
         }
     }
     optimize_subqueries(plan, schema)?;
+    rewrite_rules::rewrite_like_prefix_to_range(&mut plan.where_clause, &plan.table_references);
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
@@ -665,6 +667,7 @@ fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause);
 
+    rewrite_rules::rewrite_like_prefix_to_range(&mut plan.where_clause, &plan.table_references);
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
@@ -703,6 +706,7 @@ fn optimize_update_plan(
     let schema = resolver.schema();
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause);
+    rewrite_rules::rewrite_like_prefix_to_range(&mut plan.where_clause, &plan.table_references);
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?

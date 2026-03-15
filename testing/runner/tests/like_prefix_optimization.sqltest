@@ -1,0 +1,629 @@
+@database :memory:
+
+setup like_prefix_schema {
+    CREATE TABLE t (
+        id INTEGER PRIMARY KEY,
+        name TEXT
+    );
+    CREATE INDEX idx_name ON t(name);
+
+    INSERT INTO t VALUES (1, 'alice');
+    INSERT INTO t VALUES (2, 'bob');
+    INSERT INTO t VALUES (3, 'abcdef');
+    INSERT INTO t VALUES (4, 'ABCDEF');
+    INSERT INTO t VALUES (5, 'ABCxyz');
+    INSERT INTO t VALUES (6, 'abd');
+    INSERT INTO t VALUES (7, 'abb');
+    INSERT INTO t VALUES (8, 'ABC');
+    INSERT INTO t VALUES (9, 'abc');
+}
+
+setup like_prefix_nocase_schema {
+    CREATE TABLE t_nocase (
+        id INTEGER PRIMARY KEY,
+        name TEXT COLLATE NOCASE
+    );
+    CREATE INDEX idx_name_nocase ON t_nocase(name);
+
+    INSERT INTO t_nocase VALUES (1, 'alice');
+    INSERT INTO t_nocase VALUES (2, 'abcdef');
+    INSERT INTO t_nocase VALUES (3, 'ABCDEF');
+    INSERT INTO t_nocase VALUES (4, 'ABCxyz');
+    INSERT INTO t_nocase VALUES (5, 'abd');
+    INSERT INTO t_nocase VALUES (6, 'abc');
+}
+
+# --- Snapshot tests: verify index is used ---
+
+@setup like_prefix_schema
+snapshot-eqp like-prefix-uses-index {
+    SELECT * FROM t WHERE name LIKE 'abc%';
+}
+
+@setup like_prefix_schema
+snapshot-eqp like-prefix-single-char-uses-index {
+    SELECT * FROM t WHERE name LIKE 'a%';
+}
+
+# NOT LIKE should not use the prefix optimization seek
+@setup like_prefix_schema
+snapshot-eqp not-like-no-index-seek {
+    SELECT * FROM t WHERE name NOT LIKE 'abc%';
+}
+
+# Leading wildcard should not use the prefix optimization seek
+@setup like_prefix_schema
+snapshot-eqp leading-wildcard-no-index-seek {
+    SELECT * FROM t WHERE name LIKE '%abc';
+}
+
+# NOCASE column uses index for LIKE prefix
+@setup like_prefix_nocase_schema
+snapshot-eqp like-prefix-nocase-uses-index {
+    SELECT * FROM t_nocase WHERE name LIKE 'abc%';
+}
+
+# --- Correctness tests ---
+
+@setup like_prefix_schema
+test like-prefix-with-index {
+    SELECT id FROM t WHERE name LIKE 'abc%' ORDER BY id;
+}
+expect {
+    3
+    4
+    5
+    8
+    9
+}
+
+@setup like_prefix_schema
+test like-prefix-single-char {
+    SELECT id FROM t WHERE name LIKE 'a%' ORDER BY id;
+}
+expect {
+    1
+    3
+    4
+    5
+    6
+    7
+    8
+    9
+}
+
+@setup like_prefix_schema
+test like-prefix-exact-match {
+    SELECT id FROM t WHERE name LIKE 'abc' ORDER BY id;
+}
+expect {
+    8
+    9
+}
+
+@setup like_prefix_schema
+test like-prefix-case-insensitive {
+    SELECT id FROM t WHERE name LIKE 'ABC%' ORDER BY id;
+}
+expect {
+    3
+    4
+    5
+    8
+    9
+}
+
+@setup like_prefix_schema
+test like-prefix-no-match {
+    SELECT id FROM t WHERE name LIKE 'xyz%' ORDER BY id;
+}
+expect {
+}
+
+@setup like_prefix_schema
+test like-prefix-with-underscore {
+    SELECT id FROM t WHERE name LIKE 'ab_%' ORDER BY id;
+}
+expect {
+    3
+    4
+    5
+    6
+    7
+    8
+    9
+}
+
+@setup like_prefix_schema
+test like-not-prefix-leading-wildcard {
+    SELECT id FROM t WHERE name LIKE '%def' ORDER BY id;
+}
+expect {
+    3
+    4
+}
+
+@setup like_prefix_schema
+test like-prefix-and-other-conditions {
+    SELECT id FROM t WHERE name LIKE 'abc%' AND id > 4 ORDER BY id;
+}
+expect {
+    5
+    8
+    9
+}
+
+# NOCASE collation correctness
+@setup like_prefix_nocase_schema
+test like-prefix-nocase-correctness {
+    SELECT id FROM t_nocase WHERE name LIKE 'abc%' ORDER BY id;
+}
+expect {
+    2
+    3
+    4
+    6
+}
+
+# Verify digits-only prefix works
+@setup like_prefix_schema
+test like-prefix-digits {
+    CREATE TABLE t_nums (id INTEGER PRIMARY KEY, code TEXT);
+    CREATE INDEX idx_code ON t_nums(code);
+    INSERT INTO t_nums VALUES (1, '12345');
+    INSERT INTO t_nums VALUES (2, '12999');
+    INSERT INTO t_nums VALUES (3, '13000');
+    INSERT INTO t_nums VALUES (4, '11999');
+    SELECT id FROM t_nums WHERE code LIKE '12%' ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+# Verify ESCAPE clause prevents optimization (correctness)
+@setup like_prefix_schema
+test like-with-escape-no-optimization {
+    CREATE TABLE t_esc (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t_esc VALUES (1, 'abc%def');
+    INSERT INTO t_esc VALUES (2, 'abcXdef');
+    INSERT INTO t_esc VALUES (3, 'abcdef');
+    SELECT id FROM t_esc WHERE val LIKE 'abc!%%' ESCAPE '!' ORDER BY id;
+}
+expect {
+    1
+}
+
+# --- Edge case tests ---
+
+# Prefix 'z' — upper bound becomes '{' (0x7B), the char after 'z'.
+# Verify values starting with z/Z are found and 'za...' through 'zz...' all match.
+@setup like_prefix_schema
+test like-prefix-z-boundary {
+    CREATE TABLE t_z (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE INDEX idx_z ON t_z(name);
+    INSERT INTO t_z VALUES (1, 'zebra');
+    INSERT INTO t_z VALUES (2, 'ZEBRA');
+    INSERT INTO t_z VALUES (3, 'zoo');
+    INSERT INTO t_z VALUES (4, 'zzz');
+    INSERT INTO t_z VALUES (5, 'yak');
+    INSERT INTO t_z VALUES (6, 'Zap');
+    INSERT INTO t_z VALUES (7, 'z');
+    INSERT INTO t_z VALUES (8, 'Z');
+    SELECT id FROM t_z WHERE name LIKE 'z%' ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    4
+    6
+    7
+    8
+}
+
+# Prefix 'Z' — same boundary, just different case in pattern
+@setup like_prefix_schema
+test like-prefix-Z-boundary {
+    CREATE TABLE t_z2 (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE INDEX idx_z2 ON t_z2(name);
+    INSERT INTO t_z2 VALUES (1, 'zebra');
+    INSERT INTO t_z2 VALUES (2, 'ZEBRA');
+    INSERT INTO t_z2 VALUES (3, 'zzz');
+    INSERT INTO t_z2 VALUES (4, 'ZZZ');
+    INSERT INTO t_z2 VALUES (5, 'yak');
+    SELECT id FROM t_z2 WHERE name LIKE 'Z%' ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+# Values exactly at the range bounds.
+# For prefix 'abc': lower bound = 'ABC', upper bound = 'abd'.
+# 'ABC' should match, 'abd' should NOT match.
+@setup like_prefix_schema
+test like-prefix-exact-bounds {
+    CREATE TABLE t_bounds (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE INDEX idx_bounds ON t_bounds(name);
+    INSERT INTO t_bounds VALUES (1, 'ABC');
+    INSERT INTO t_bounds VALUES (2, 'abd');
+    INSERT INTO t_bounds VALUES (3, 'ABD');
+    INSERT INTO t_bounds VALUES (4, 'abc');
+    INSERT INTO t_bounds VALUES (5, 'abczzz');
+    INSERT INTO t_bounds VALUES (6, 'ABCzzz');
+    INSERT INTO t_bounds VALUES (7, 'abb');
+    INSERT INTO t_bounds VALUES (8, 'ABB');
+    SELECT id FROM t_bounds WHERE name LIKE 'abc%' ORDER BY id;
+}
+expect {
+    1
+    4
+    5
+    6
+}
+
+# NULL values must not appear in results
+@setup like_prefix_schema
+test like-prefix-null-values {
+    CREATE TABLE t_null (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE INDEX idx_null ON t_null(name);
+    INSERT INTO t_null VALUES (1, NULL);
+    INSERT INTO t_null VALUES (2, 'abc');
+    INSERT INTO t_null VALUES (3, NULL);
+    INSERT INTO t_null VALUES (4, 'abcdef');
+    SELECT id FROM t_null WHERE name LIKE 'abc%' ORDER BY id;
+}
+expect {
+    2
+    4
+}
+
+# Embedded single quote in prefix — optimization is skipped (no allocation
+# for the rare escaped-quote case), but LIKE still produces correct results.
+@setup like_prefix_schema
+test like-prefix-embedded-quote {
+    CREATE TABLE t_quote (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE INDEX idx_quote ON t_quote(name);
+    INSERT INTO t_quote VALUES (1, 'it''s fine');
+    INSERT INTO t_quote VALUES (2, 'it''s broken');
+    INSERT INTO t_quote VALUES (3, 'item');
+    INSERT INTO t_quote VALUES (4, 'IT''S FINE');
+    SELECT id FROM t_quote WHERE name LIKE 'it''s%' ORDER BY id;
+}
+expect {
+    1
+    2
+    4
+}
+
+# Multiple LIKE conditions in the same WHERE clause
+@setup like_prefix_schema
+test like-prefix-multiple-likes {
+    CREATE TABLE t_multi (id INTEGER PRIMARY KEY, name TEXT, city TEXT);
+    CREATE INDEX idx_multi_name ON t_multi(name);
+    CREATE INDEX idx_multi_city ON t_multi(city);
+    INSERT INTO t_multi VALUES (1, 'alice', 'amsterdam');
+    INSERT INTO t_multi VALUES (2, 'alice', 'berlin');
+    INSERT INTO t_multi VALUES (3, 'bob', 'amsterdam');
+    INSERT INTO t_multi VALUES (4, 'alice', 'athens');
+    SELECT id FROM t_multi WHERE name LIKE 'ali%' AND city LIKE 'a%' ORDER BY id;
+}
+expect {
+    1
+    4
+}
+
+# Non-indexed column — range terms added but no index seek; must still be correct
+@setup like_prefix_schema
+test like-prefix-no-index {
+    CREATE TABLE t_noidx (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO t_noidx VALUES (1, 'abc');
+    INSERT INTO t_noidx VALUES (2, 'abcdef');
+    INSERT INTO t_noidx VALUES (3, 'xyz');
+    INSERT INTO t_noidx VALUES (4, 'ABC');
+    SELECT id FROM t_noidx WHERE name LIKE 'abc%' ORDER BY id;
+}
+expect {
+    1
+    2
+    4
+}
+
+# Special ASCII prefix (non-letter, non-digit) — case folding is identity
+@setup like_prefix_schema
+test like-prefix-special-ascii {
+    CREATE TABLE t_special (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE INDEX idx_special ON t_special(name);
+    INSERT INTO t_special VALUES (1, '#hashtag');
+    INSERT INTO t_special VALUES (2, '#help');
+    INSERT INTO t_special VALUES (3, '@mention');
+    INSERT INTO t_special VALUES (4, '#100');
+    SELECT id FROM t_special WHERE name LIKE '#h%' ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+# Empty table should return nothing
+@setup like_prefix_schema
+test like-prefix-empty-table {
+    CREATE TABLE t_empty (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE INDEX idx_empty ON t_empty(name);
+    SELECT id FROM t_empty WHERE name LIKE 'abc%' ORDER BY id;
+}
+expect {
+}
+
+# Mixed types in column — integers stored in a TEXT column via implicit conversion.
+# LIKE converts values to text, but range comparison uses native type ordering
+# (integers sort before text in SQLite). Verify correctness.
+@setup like_prefix_schema
+test like-prefix-mixed-types {
+    CREATE TABLE t_mixed (id INTEGER PRIMARY KEY, val);
+    CREATE INDEX idx_mixed ON t_mixed(val);
+    INSERT INTO t_mixed VALUES (1, '100abc');
+    INSERT INTO t_mixed VALUES (2, '100xyz');
+    INSERT INTO t_mixed VALUES (3, '200abc');
+    INSERT INTO t_mixed VALUES (4, 100);
+    INSERT INTO t_mixed VALUES (5, '100');
+    SELECT id FROM t_mixed WHERE val LIKE '100%' ORDER BY id;
+}
+expect {
+    1
+    2
+    4
+    5
+}
+
+# --- Residual LIKE consumption tests ---
+# When bounds are provably exact, the LIKE filter should be consumed
+# (no Function/like opcode in bytecode). When bounds may have false
+# positives, the LIKE filter must remain as a residual.
+
+# NOCASE column + prefix%: LIKE consumed (no Function/like in bytecode)
+@setup like_prefix_nocase_schema
+snapshot like-prefix-nocase-consumed {
+    SELECT * FROM t_nocase WHERE name LIKE 'abc%';
+}
+
+# BINARY column + letters + prefix%: LIKE NOT consumed (Function/like present)
+@setup like_prefix_schema
+snapshot like-prefix-binary-letters-residual {
+    SELECT * FROM t WHERE name LIKE 'abc%';
+}
+
+# Digits-only prefix on BINARY column: LIKE consumed (UPPER==LOWER for digits)
+setup like_prefix_digits_schema {
+    CREATE TABLE t_digits (id INTEGER PRIMARY KEY, code TEXT);
+    CREATE INDEX idx_digits ON t_digits(code);
+    INSERT INTO t_digits VALUES (1, '12345');
+    INSERT INTO t_digits VALUES (2, '12999');
+    INSERT INTO t_digits VALUES (3, '13000');
+}
+
+@setup like_prefix_digits_schema
+snapshot like-prefix-digits-consumed {
+    SELECT * FROM t_digits WHERE code LIKE '12%';
+}
+
+# Underscore in suffix: LIKE NOT consumed even on NOCASE
+@setup like_prefix_nocase_schema
+snapshot like-prefix-nocase-underscore-residual {
+    SELECT * FROM t_nocase WHERE name LIKE 'abc_%';
+}
+
+# --- Correctness tests for consumed LIKE ---
+
+# NOCASE consumed correctness — verify results match even without residual
+@setup like_prefix_nocase_schema
+test like-prefix-nocase-consumed-correctness {
+    SELECT id FROM t_nocase WHERE name LIKE 'ABC%' ORDER BY id;
+}
+expect {
+    2
+    3
+    4
+    6
+}
+
+# Digits consumed correctness
+@setup like_prefix_digits_schema
+test like-prefix-digits-consumed-correctness {
+    SELECT id FROM t_digits WHERE code LIKE '12%' ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+# BINARY with letters keeps residual — correctness
+@setup like_prefix_schema
+test like-prefix-binary-with-letters-correctness {
+    SELECT id FROM t WHERE name LIKE 'ABC%' ORDER BY id;
+}
+expect {
+    3
+    4
+    5
+    8
+    9
+}
+
+# Mixed: underscore pattern on NOCASE keeps residual — correctness
+@setup like_prefix_nocase_schema
+test like-prefix-nocase-underscore-correctness {
+    SELECT id FROM t_nocase WHERE name LIKE 'abc_%' ORDER BY id;
+}
+expect {
+    2
+    3
+    4
+}
+
+# Special chars (non-letter, non-digit) prefix on BINARY — consumed
+@setup like_prefix_schema
+test like-prefix-special-chars-consumed {
+    CREATE TABLE t_sp (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE INDEX idx_sp ON t_sp(val);
+    INSERT INTO t_sp VALUES (1, '#hello');
+    INSERT INTO t_sp VALUES (2, '#help');
+    INSERT INTO t_sp VALUES (3, '#world');
+    INSERT INTO t_sp VALUES (4, '@hello');
+    SELECT id FROM t_sp WHERE val LIKE '#he%' ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+# --- Regression tests ---
+
+# Regression: LIKE '@%' on NOCASE must NOT match '[' (ASCII 91).
+# The upper bound increment('@') = 'A', but in NOCASE 'A' folds to 'a' (97),
+# widening the range to include '[' (91) through '`' (96). The residual LIKE
+# must be kept for this case.
+@setup like_prefix_schema
+test like-prefix-nocase-at-sign-regression {
+    CREATE TABLE t_at (id INTEGER PRIMARY KEY, val TEXT COLLATE NOCASE);
+    CREATE INDEX idx_at ON t_at(val);
+    INSERT INTO t_at VALUES (1, '@abc');
+    INSERT INTO t_at VALUES (2, '@def');
+    INSERT INTO t_at VALUES (3, '[');
+    INSERT INTO t_at VALUES (4, '\');
+    INSERT INTO t_at VALUES (5, ']');
+    INSERT INTO t_at VALUES (6, '^');
+    INSERT INTO t_at VALUES (7, '_');
+    INSERT INTO t_at VALUES (8, '`');
+    INSERT INTO t_at VALUES (9, 'Abc');
+    INSERT INTO t_at VALUES (10, 'abc');
+    SELECT id FROM t_at WHERE val LIKE '@%' ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+# RTRIM collation: LIKE prefix must work correctly.
+# RTRIM trims trailing spaces for comparison but LIKE still matches them.
+@setup like_prefix_schema
+test like-prefix-rtrim-collation {
+    CREATE TABLE t_rtrim (id INTEGER PRIMARY KEY, val TEXT COLLATE RTRIM);
+    CREATE INDEX idx_rtrim ON t_rtrim(val);
+    INSERT INTO t_rtrim VALUES (1, 'abc');
+    INSERT INTO t_rtrim VALUES (2, 'abc   ');
+    INSERT INTO t_rtrim VALUES (3, 'abcdef');
+    INSERT INTO t_rtrim VALUES (4, 'ABC');
+    INSERT INTO t_rtrim VALUES (5, 'ABC   ');
+    INSERT INTO t_rtrim VALUES (6, 'abd');
+    INSERT INTO t_rtrim VALUES (7, 'abb');
+    SELECT id FROM t_rtrim WHERE val LIKE 'abc%' ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+}
+
+# Index collation differs from table column collation (BINARY table + NOCASE index).
+# The LIKE rewrite uses the table column's collation for consumption decisions.
+# The constraint system should reject the mismatched index for seeks, falling
+# back to a scan where the residual LIKE ensures correctness.
+@setup like_prefix_schema
+test like-prefix-collation-mismatch-binary-nocase {
+    CREATE TABLE t_mismatch (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE INDEX idx_mismatch ON t_mismatch(val COLLATE NOCASE);
+    INSERT INTO t_mismatch VALUES (1, 'abc');
+    INSERT INTO t_mismatch VALUES (2, 'ABC');
+    INSERT INTO t_mismatch VALUES (3, 'Abc');
+    INSERT INTO t_mismatch VALUES (4, 'abd');
+    INSERT INTO t_mismatch VALUES (5, 'ABD');
+    INSERT INTO t_mismatch VALUES (6, 'abb');
+    INSERT INTO t_mismatch VALUES (7, '[');
+    INSERT INTO t_mismatch VALUES (8, '@abc');
+    SELECT id FROM t_mismatch WHERE val LIKE 'abc%' ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+}
+
+# Reverse mismatch: NOCASE table + BINARY index.
+@setup like_prefix_schema
+test like-prefix-collation-mismatch-nocase-binary {
+    CREATE TABLE t_mismatch2 (id INTEGER PRIMARY KEY, val TEXT COLLATE NOCASE);
+    CREATE INDEX idx_mismatch2 ON t_mismatch2(val COLLATE BINARY);
+    INSERT INTO t_mismatch2 VALUES (1, 'abc');
+    INSERT INTO t_mismatch2 VALUES (2, 'ABC');
+    INSERT INTO t_mismatch2 VALUES (3, 'Abc');
+    INSERT INTO t_mismatch2 VALUES (4, 'abd');
+    INSERT INTO t_mismatch2 VALUES (5, '@abc');
+    INSERT INTO t_mismatch2 VALUES (6, '[');
+    SELECT id FROM t_mismatch2 WHERE val LIKE 'abc%' ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+}
+
+# Tilde (~, 0x7E) prefix: increment produces DEL (0x7F).
+# DEL is a valid ASCII byte but not printable. The upper bound 0x7F is
+# higher than all printable ASCII, so the range is correct.
+@setup like_prefix_schema
+test like-prefix-tilde-boundary {
+    CREATE TABLE t_tilde (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE INDEX idx_tilde ON t_tilde(val);
+    INSERT INTO t_tilde VALUES (1, '~hello');
+    INSERT INTO t_tilde VALUES (2, '~');
+    INSERT INTO t_tilde VALUES (3, 'abc');
+    INSERT INTO t_tilde VALUES (4, '~world');
+    SELECT id FROM t_tilde WHERE val LIKE '~%' ORDER BY id;
+}
+expect {
+    1
+    2
+    4
+}
+
+# Digits-only prefix on RTRIM column: consumed (no letters, RTRIM is like BINARY for case)
+@setup like_prefix_schema
+test like-prefix-rtrim-digits {
+    CREATE TABLE t_rtrim_d (id INTEGER PRIMARY KEY, code TEXT COLLATE RTRIM);
+    CREATE INDEX idx_rtrim_d ON t_rtrim_d(code);
+    INSERT INTO t_rtrim_d VALUES (1, '12345');
+    INSERT INTO t_rtrim_d VALUES (2, '12   ');
+    INSERT INTO t_rtrim_d VALUES (3, '13000');
+    SELECT id FROM t_rtrim_d WHERE code LIKE '12%' ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+# Regression: LIKE ' %' on RTRIM must NOT match empty strings.
+# Under RTRIM, ' ' (space) compares equal to '' (empty) because trailing
+# spaces are trimmed. So `col >= ' '` under RTRIM includes '', but
+# LIKE ' %' requires the value to actually start with a space.
+@setup like_prefix_schema
+test like-prefix-rtrim-space-regression {
+    CREATE TABLE t_rtrim_sp (id INTEGER PRIMARY KEY, val TEXT COLLATE RTRIM);
+    CREATE INDEX idx_rtrim_sp ON t_rtrim_sp(val);
+    INSERT INTO t_rtrim_sp VALUES (1, '');
+    INSERT INTO t_rtrim_sp VALUES (2, ' hello');
+    INSERT INTO t_rtrim_sp VALUES (3, ' ');
+    INSERT INTO t_rtrim_sp VALUES (4, '  ');
+    INSERT INTO t_rtrim_sp VALUES (5, 'hello');
+    SELECT id FROM t_rtrim_sp WHERE val LIKE ' %' ORDER BY id;
+}
+expect {
+    2
+    3
+    4
+}

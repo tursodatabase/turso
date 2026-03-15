@@ -1,0 +1,13 @@
+---
+source: like_prefix_optimization.sqltest
+expression: SELECT * FROM t_nocase WHERE name LIKE 'abc%';
+info:
+  statement_type: SELECT
+  tables:
+  - t_nocase
+  setup_blocks:
+  - like_prefix_nocase_schema
+  database: ':memory:'
+---
+QUERY PLAN
+`--SEARCH t_nocase USING INDEX idx_name_nocase (name>=? AND name<?)
