@@ -56,8 +56,30 @@ pub fn bind_prepare_select_plan(
     // Extract pre-bound subqueries for inline planning in the walker.
     let subquery_bindings = std::mem::take(&mut bound.subquery_bindings);
 
-    let all_table_refs =
+    let mut all_table_refs =
         bound.into_table_references(&mut planned_ctes, &mut planned_derived)?;
+
+    // Add planned CTEs as outer query refs on each TableReferences so they're
+    // available when subqueries reference CTEs from the outer WITH clause
+    // (e.g. WITH t AS (...) SELECT (SELECT x FROM t)).
+    if !planned_ctes.is_empty() {
+        for tr in &mut all_table_refs {
+            for (name, jt) in &planned_ctes {
+                tr.add_outer_query_reference(super::plan::OuterQueryReference {
+                    identifier: name.clone(),
+                    internal_id: jt.internal_id,
+                    table: jt.table.clone(),
+                    col_used_mask: super::plan::ColumnUsedMask::default(),
+                    cte_select: None,
+                    cte_explicit_columns: vec![],
+                    cte_id: None,
+                    cte_definition_only: true,
+                    rowid_referenced: false,
+                });
+            }
+        }
+    }
+
     prepare_select_plan(
         select,
         resolver,
