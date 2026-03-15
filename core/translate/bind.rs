@@ -287,7 +287,7 @@ impl BindScope {
             .position(|col| col.name.eq_ignore_ascii_case(&normalized_col));
 
         let Some(idx) = col_idx else {
-            crate::bail_parse_error!("no such column: {}", col_name);
+            crate::bail_parse_error!("no such column: {}.{}", table_name, col_name);
         };
 
         Ok(Some((

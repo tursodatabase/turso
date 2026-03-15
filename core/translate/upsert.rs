@@ -1447,6 +1447,22 @@ fn rewrite_expr_to_registers(
                         *expr = Expr::Register(r);
                     }
                 }
+                // After binding, target table columns become Expr::Column.
+                // Map them to the row image registers.
+                Expr::Column { column, .. } => {
+                    let col = &table.columns()[*column];
+                    if col.is_rowid_alias() {
+                        *expr = Expr::Register(rowid_reg);
+                    } else {
+                        *expr = Expr::Register(base_start + *column);
+                    }
+                    return Ok(WalkControl::SkipChildren);
+                }
+                // After binding, rowid references become Expr::RowId.
+                Expr::RowId { .. } => {
+                    *expr = Expr::Register(rowid_reg);
+                    return Ok(WalkControl::SkipChildren);
+                }
                 _ => {}
             }
             Ok(WalkControl::Continue)
