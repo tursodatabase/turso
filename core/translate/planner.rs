@@ -716,13 +716,12 @@ fn plan_one_bound_cte(
     // Plan any nested CTEs from inner WITH clauses.
     let mut inner_planned = plan_bound_ctes(inner_cte_defs, resolver, program, connection)?;
 
-    // Make already-planned sibling CTEs available for FROM references.
-    for &ref_idx in &referenced_indices {
-        let ref_name = &cte_definitions[ref_idx].0;
+    // Make all already-planned sibling CTEs available. CTEs can be
+    // referenced not only from the FROM clause (tracked by referenced_indices)
+    // but also from correlated subqueries within the CTE body.
+    for (ref_name, ref_table) in planned.iter() {
         if !inner_planned.contains_key(ref_name) {
-            if let Some(ref_table) = planned.get(ref_name) {
-                inner_planned.insert(ref_name.clone(), ref_table.clone());
-            }
+            inner_planned.insert(ref_name.clone(), ref_table.clone());
         }
     }
 
@@ -735,8 +734,29 @@ fn plan_one_bound_cte(
         connection,
     )?;
 
-    let all_table_refs =
+    let mut all_table_refs =
         inner_bound.into_table_references(&mut inner_planned, &mut inner_planned_derived)?;
+
+    // Add sibling CTEs as outer query refs so correlated subqueries within
+    // this CTE body can reference them (e.g. previous_points referencing
+    // ordered_points via a scalar subquery).
+    for tr in &mut all_table_refs {
+        for (ref_name, ref_table) in planned.iter() {
+            if !tr.outer_query_refs().iter().any(|r| r.identifier == *ref_name) {
+                tr.add_outer_query_reference(OuterQueryReference {
+                    identifier: ref_name.clone(),
+                    internal_id: ref_table.internal_id,
+                    table: ref_table.table.clone(),
+                    col_used_mask: ColumnUsedMask::default(),
+                    cte_select: None,
+                    cte_explicit_columns: vec![],
+                    cte_id: None,
+                    cte_definition_only: true,
+                    rowid_referenced: false,
+                });
+            }
+        }
+    }
 
     let cte_plan = super::select::prepare_select_plan(
         cte_select,
