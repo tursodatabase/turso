@@ -1749,37 +1749,51 @@ async fn test_ghost_commits() {
     }
 }
 
-/// AUTOINCREMENT is not supported in MVCC mode. Verify that CREATE TABLE
-/// with AUTOINCREMENT fails with a clear error message.
+/// AUTOINCREMENT works in MVCC and only materializes sqlite_sequence at
+/// checkpoint time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_autoincrement_blocked_in_mvcc() {
+async fn test_autoincrement_allowed_in_mvcc() {
     let (db, _dir) = setup_mvcc_db("").await;
     let conn = db.connect().unwrap();
 
-    // CREATE TABLE with AUTOINCREMENT should fail
-    let result = conn
-        .execute(
-            "CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)",
-            (),
-        )
-        .await;
-    assert!(
-        result.is_err(),
-        "CREATE TABLE with AUTOINCREMENT should fail in MVCC mode"
-    );
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("AUTOINCREMENT is not supported in MVCC mode"),
-        "unexpected error: {err}"
-    );
+    conn.execute(
+        "CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)",
+        (),
+    )
+    .await
+    .unwrap();
 
-    // Regular tables without AUTOINCREMENT should still work
-    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)", ())
+    conn.execute("INSERT INTO t(b) VALUES ('hello')", ())
         .await
         .unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 'hello')", ())
+
+    let mut rows = conn
+        .query("SELECT a, b FROM t ORDER BY a", ())
         .await
         .unwrap();
-    let count = query_i64(&conn, "SELECT COUNT(*) FROM t").await;
-    assert_eq!(count, 1);
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 1);
+    assert_eq!(row.get::<String>(1).unwrap(), "hello");
+    assert!(rows.next().await.unwrap().is_none());
+
+    let mut rows = conn
+        .query("SELECT name, seq FROM sqlite_sequence", ())
+        .await
+        .unwrap();
+    assert!(rows.next().await.unwrap().is_none());
+
+    let mut rows = conn
+        .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+        .await
+        .unwrap();
+    while rows.next().await.unwrap().is_some() {}
+
+    let mut rows = conn
+        .query("SELECT name, seq FROM sqlite_sequence", ())
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<String>(0).unwrap(), "t");
+    assert_eq!(row.get::<i64>(1).unwrap(), 1);
+    assert!(rows.next().await.unwrap().is_none());
 }

@@ -389,6 +389,9 @@ pub struct Savepoint {
     /// RowIDs that were NEWLY added to write_set by this savepoint.
     /// On rollback: only these should be removed from write_set.
     newly_added_to_write_set: Vec<RowID>,
+    /// Previous AUTOINCREMENT sequence values before this savepoint first advanced them.
+    /// On rollback: restore the previous value (or remove the pending override).
+    previous_autoincrement_sequences: Vec<(MVTableId, Option<i64>)>,
 }
 
 impl Savepoint {
@@ -423,6 +426,17 @@ impl Savepoint {
             .append(&mut other.deleted_index_versions);
         self.newly_added_to_write_set
             .append(&mut other.newly_added_to_write_set);
+        for (table_id, previous_value) in other.previous_autoincrement_sequences.drain(..) {
+            if self
+                .previous_autoincrement_sequences
+                .iter()
+                .any(|(existing_table_id, _)| *existing_table_id == table_id)
+            {
+                continue;
+            }
+            self.previous_autoincrement_sequences
+                .push((table_id, previous_value));
+        }
     }
 }
 
@@ -467,6 +481,9 @@ pub struct Transaction {
     /// Hekaton Section 2.7: "CommitDepSet, that stores transaction IDs of the
     /// transactions that depend on T."
     commit_dep_set: Mutex<HashSet<TxID>>,
+    /// Pending AUTOINCREMENT sequence bumps staged by this transaction.
+    /// Merged into the global committed map only after commit succeeds.
+    autoincrement_sequences: RwLock<HashMap<MVTableId, i64>>,
 }
 
 impl Transaction {
@@ -484,6 +501,7 @@ impl Transaction {
             commit_dep_counter: AtomicU64::new(0),
             abort_now: AtomicBool::new(false),
             commit_dep_set: Mutex::new(HashSet::default()),
+            autoincrement_sequences: RwLock::new(HashMap::default()),
         }
     }
 
@@ -501,6 +519,35 @@ impl Transaction {
                 savepoint.newly_added_to_write_set.push(id);
             }
         }
+    }
+
+    fn autoincrement_sequence(&self, table_id: MVTableId) -> Option<i64> {
+        self.autoincrement_sequences.read().get(&table_id).copied()
+    }
+
+    fn bump_autoincrement_sequence(&self, table_id: MVTableId, seq: i64) {
+        if seq <= 0 {
+            return;
+        }
+
+        let previous = self.autoincrement_sequences.read().get(&table_id).copied();
+        if seq <= previous.unwrap_or(0) {
+            return;
+        }
+
+        if let Some(savepoint) = self.savepoint_stack.write().last_mut() {
+            if !savepoint
+                .previous_autoincrement_sequences
+                .iter()
+                .any(|(saved_table_id, _)| *saved_table_id == table_id)
+            {
+                savepoint
+                    .previous_autoincrement_sequences
+                    .push((table_id, previous));
+            }
+        }
+
+        self.autoincrement_sequences.write().insert(table_id, seq);
     }
 
     /// Begin a new savepoint for statement-level tracking.
@@ -1674,6 +1721,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         .last_committed_schema_change_ts
                         .store(*end_ts, Ordering::Release);
                 }
+                mvcc_store.merge_committed_autoincrement_sequences(tx_unlocked);
 
                 // We have now updated all the versions with a reference to the
                 // transaction ID to a timestamp and can, therefore, remove the
@@ -1866,7 +1914,8 @@ impl StateTransition for DeleteRowStateMachine {
                             }
                             SeekResult::NotFound => {
                                 crate::bail_corrupt_error!(
-                                    "MVCC delete: rowid {} not found",
+                                    "MVCC delete: table_id {} rowid {} not found",
+                                    self.rowid.table_id,
                                     self.rowid.row_id
                                 );
                             }
@@ -1884,7 +1933,8 @@ impl StateTransition for DeleteRowStateMachine {
                     IOResult::Done(()) => {
                         if !self.cursor.read().has_record() {
                             crate::bail_corrupt_error!(
-                                "MVCC delete: rowid {} not found after advance",
+                                "MVCC delete: table_id {} rowid {} not found after advance",
+                                self.rowid.table_id,
                                 self.rowid.row_id
                             );
                         }
@@ -2027,6 +2077,8 @@ pub struct MvStore<Clock: LogicalClock> {
     /// to exclusive, it will abort if another transaction committed after its begin timestamp.
     last_committed_tx_ts: AtomicU64,
     table_id_to_last_rowid: RwLock<HashMap<MVTableId, Arc<RowidAllocator>>>,
+    committed_autoincrement_sequences: RwLock<HashMap<MVTableId, i64>>,
+    autoincrement_needs_checkpoint: AtomicBool,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -2101,6 +2153,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             last_committed_schema_change_ts: AtomicU64::new(0),
             last_committed_tx_ts: AtomicU64::new(0),
             table_id_to_last_rowid: RwLock::new(HashMap::default()),
+            committed_autoincrement_sequences: RwLock::new(HashMap::default()),
+            autoincrement_needs_checkpoint: AtomicBool::new(false),
         }
     }
 
@@ -2194,6 +2248,45 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         Ok(Some(value as u64))
     }
 
+    fn load_persisted_autoincrement_sequences(&self, connection: &Arc<Connection>) -> Result<()> {
+        let query_result =
+            connection.query("SELECT name, seq FROM sqlite_sequence WHERE seq IS NOT NULL");
+        let maybe_stmt = match query_result {
+            Ok(stmt) => stmt,
+            Err(LimboError::ParseError(msg)) if msg.contains("no such table") => return Ok(()),
+            Err(err) => {
+                return Err(LimboError::Corrupt(format!(
+                    "Failed to read sqlite_sequence during MVCC bootstrap: {err}"
+                )))
+            }
+        };
+
+        let Some(mut stmt) = maybe_stmt else {
+            return Ok(());
+        };
+
+        let schema = connection.schema.read();
+        let mut persisted = HashMap::default();
+        stmt.run_with_row_callback(|row| {
+            let table_name = row.get::<String>(0)?;
+            let seq = row.get::<i64>(1)?;
+            let Some(table) = schema.get_btree_table(&table_name) else {
+                return Ok(());
+            };
+            if !table.has_autoincrement {
+                return Ok(());
+            }
+            let table_id = self.get_table_id_from_root_page(table.root_page);
+            persisted.insert(table_id, seq);
+            Ok(())
+        })?;
+
+        *self.committed_autoincrement_sequences.write() = persisted;
+        self.autoincrement_needs_checkpoint
+            .store(false, Ordering::Release);
+        Ok(())
+    }
+
     /// Bootstrap the MV store from the SQLite schema table and logical log.
     /// 1. Get all root pages from the already parsed schema object
     /// 2. Assign table IDs to the root pages (table_id = -1 * root_page)
@@ -2284,6 +2377,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 self.insert_table_id_to_rootpage(root_page_as_table_id, Some(root_page as u64));
             }
         }
+        self.load_persisted_autoincrement_sequences(&bootstrap_conn)?;
 
         // Recover logical log while bootstrap connection still reads from pager-backed schema.
         // This lets recovery merge checkpointed sqlite_schema rows with non-checkpointed rows from log replay.
@@ -3498,6 +3592,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             deleted_table_versions,
             deleted_index_versions,
             newly_added_to_write_set,
+            previous_autoincrement_sequences,
             ..
         } = savepoint;
 
@@ -3580,6 +3675,21 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         touched_rowids.extend(newly_added_to_write_set);
         self.remove_rolled_back_rows_from_write_set(tx_id, touched_rowids.clone());
+
+        if let Some(tx) = self.txs.get(&tx_id) {
+            let tx = tx.value();
+            let mut pending = tx.autoincrement_sequences.write();
+            for (table_id, previous_value) in previous_autoincrement_sequences {
+                match previous_value {
+                    Some(previous_value) => {
+                        pending.insert(table_id, previous_value);
+                    }
+                    None => {
+                        pending.remove(&table_id);
+                    }
+                }
+            }
+        }
     }
 
     fn row_has_uncommitted_version_for_tx(&self, rowid: &RowID, tx_id: TxID) -> bool {
@@ -4744,6 +4854,68 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let maybe_root_page = self.table_id_to_rootpage.get(table_id);
         maybe_root_page.is_some_and(|entry| entry.value().is_some())
     }
+
+    pub fn get_committed_autoincrement_sequence(&self, table_id: &MVTableId) -> i64 {
+        self.committed_autoincrement_sequences
+            .read()
+            .get(table_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn get_autoincrement_sequence_for_tx(&self, tx_id: TxID, table_id: &MVTableId) -> i64 {
+        let committed = self.get_committed_autoincrement_sequence(table_id);
+        let pending = self
+            .txs
+            .get(&tx_id)
+            .and_then(|tx| tx.value().autoincrement_sequence(*table_id))
+            .unwrap_or(0);
+        committed.max(pending)
+    }
+
+    pub fn bump_autoincrement_sequence_for_tx(
+        &self,
+        tx_id: TxID,
+        table_id: MVTableId,
+        seq: i64,
+    ) -> Result<()> {
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+        tx.value().bump_autoincrement_sequence(table_id, seq);
+        Ok(())
+    }
+
+    fn merge_committed_autoincrement_sequences(&self, tx: &Transaction) {
+        let pending = tx.autoincrement_sequences.read();
+        if pending.is_empty() {
+            return;
+        }
+
+        let mut committed = self.committed_autoincrement_sequences.write();
+        let mut changed = false;
+        for (&table_id, &seq) in pending.iter() {
+            let entry = committed.entry(table_id).or_insert(0);
+            if seq > *entry {
+                *entry = seq;
+                changed = true;
+            }
+        }
+        if changed {
+            self.autoincrement_needs_checkpoint
+                .store(true, Ordering::Release);
+        }
+    }
+
+    pub fn autoincrement_checkpoint_needed(&self) -> bool {
+        self.autoincrement_needs_checkpoint.load(Ordering::Acquire)
+    }
+
+    pub fn clear_autoincrement_checkpoint_needed(&self) {
+        self.autoincrement_needs_checkpoint
+            .store(false, Ordering::Release);
+    }
 }
 
 fn rollback_row_version(tx_id: u64, rv: &mut RowVersion) {
@@ -4779,6 +4951,28 @@ impl RowidAllocator {
             {
                 let prev = if cur == 0 { None } else { Some(cur) };
                 tracing::trace!("get_next_rowid({next})");
+                return Some((next, prev));
+            }
+        }
+    }
+
+    /// Lock-free rowid allocation with a lower bound sourced from AUTOINCREMENT state.
+    pub fn get_next_rowid_with_min(&self, minimum_rowid: i64) -> Option<(i64, Option<i64>)> {
+        loop {
+            let cur = self.max_rowid.load(Ordering::SeqCst);
+            let floor = cur.max(minimum_rowid);
+            if floor == i64::MAX {
+                tracing::trace!("get_next_rowid_with_min(max)");
+                return None;
+            }
+            let next = floor + 1;
+            if self
+                .max_rowid
+                .compare_exchange(cur, next, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                let prev = if floor == 0 { None } else { Some(floor) };
+                tracing::trace!("get_next_rowid_with_min({next})");
                 return Some((next, prev));
             }
         }

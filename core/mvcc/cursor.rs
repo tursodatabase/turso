@@ -378,7 +378,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         Ok(())
     }
 
-    pub fn start_new_rowid(&mut self) -> Result<IOResult<NextRowidResult>> {
+    pub fn start_new_rowid(&mut self, minimum_rowid: i64) -> Result<IOResult<NextRowidResult>> {
         tracing::trace!("start_new_rowid");
 
         let allocator = self.db.get_rowid_allocator(&self.table_id);
@@ -391,7 +391,9 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         self.creating_new_rowid = true;
         let res = if allocator.is_uninitialized() {
             NextRowidResult::Uninitialized
-        } else if let Some((next_rowid, prev_max_rowid)) = allocator.get_next_rowid() {
+        } else if let Some((next_rowid, prev_max_rowid)) =
+            allocator.get_next_rowid_with_min(minimum_rowid)
+        {
             NextRowidResult::Next {
                 new_rowid: next_rowid,
                 prev_rowid: prev_max_rowid,
@@ -414,9 +416,19 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
 
     /// Allocate the next rowid from the (already initialized) allocator.
     /// Must be called while holding the allocator lock.
-    pub fn allocate_next_rowid(&self) -> Option<(i64, Option<i64>)> {
+    pub fn allocate_next_rowid(&self, minimum_rowid: i64) -> Option<(i64, Option<i64>)> {
         let allocator = self.db.get_rowid_allocator(&self.table_id);
-        allocator.get_next_rowid()
+        allocator.get_next_rowid_with_min(minimum_rowid)
+    }
+
+    pub fn autoincrement_sequence(&self) -> i64 {
+        self.db
+            .get_autoincrement_sequence_for_tx(self.tx_id, &self.table_id)
+    }
+
+    pub fn bump_autoincrement_sequence(&self, seq: i64) -> Result<()> {
+        self.db
+            .bump_autoincrement_sequence_for_tx(self.tx_id, self.table_id, seq)
     }
 
     pub fn end_new_rowid(&mut self) {
