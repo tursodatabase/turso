@@ -615,6 +615,9 @@ impl Value {
             Value::Text(_) | Value::Numeric(_) | Value::Blob(_) => {
                 let text = self.to_string();
                 if let Some(first_char) = text.chars().next() {
+                    if first_char == '\0' {
+                        return Value::Null;
+                    }
                     Value::from_i64(first_char as u32 as i64)
                 } else {
                     Value::Null
@@ -1883,6 +1886,7 @@ mod tests {
             Value::from_i64(128522)
         );
         assert_eq!(Value::build_text("").exec_unicode(), Value::Null);
+        assert_eq!(Value::build_text("\0").exec_unicode(), Value::Null);
         assert_eq!(Value::from_i64(23).exec_unicode(), Value::from_i64(50));
         assert_eq!(Value::from_i64(0).exec_unicode(), Value::from_i64(48));
         assert_eq!(Value::from_f64(0.0).exec_unicode(), Value::from_i64(48));
