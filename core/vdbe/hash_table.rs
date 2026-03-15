@@ -213,6 +213,22 @@ pub struct HashEntry {
     pub payload_values: Vec<Value>,
 }
 
+#[derive(Debug)]
+pub(crate) struct PendingHashInsert {
+    pub(crate) key_values: Vec<Value>,
+    pub(crate) rowid: i64,
+    pub(crate) payload_values: Vec<Value>,
+}
+
+#[derive(Debug)]
+pub(crate) enum HashInsertResult {
+    Done,
+    IO {
+        io: IOCompletions,
+        pending: PendingHashInsert,
+    },
+}
+
 impl HashEntry {
     fn new(hash: u64, key_values: Vec<Value>, rowid: i64) -> Self {
         Self {
@@ -1115,8 +1131,24 @@ impl HashTable {
         payload_values: Vec<Value>,
         metrics: Option<&mut HashJoinMetrics>,
     ) -> Result<IOResult<()>> {
+        let pending = PendingHashInsert {
+            key_values,
+            rowid,
+            payload_values,
+        };
+        match self.insert_pending(pending, metrics)? {
+            HashInsertResult::Done => Ok(IOResult::Done(())),
+            HashInsertResult::IO { io, .. } => Ok(IOResult::IO(io)),
+        }
+    }
+
+    pub(crate) fn insert_pending(
+        &mut self,
+        pending: PendingHashInsert,
+        metrics: Option<&mut HashJoinMetrics>,
+    ) -> Result<HashInsertResult> {
         turso_assert!(
-            self.state == HashTableState::Building || self.state == HashTableState::Spilled,
+            matches!(self.state,  HashTableState::Building | HashTableState::Spilled),
             "Cannot insert into hash table in unexpected state",
             { "state": format!("{:?}", self.state) }
         );
@@ -1124,20 +1156,14 @@ impl HashTable {
         // Skip rows with NULL join keys - they can never match anything since NULL != NULL in SQL.
         // However, when track_matched is enabled (outer joins), we must keep NULL-key entries
         // so they appear as unmatched in the unmatched scan.
-        if has_null_key(&key_values) && !self.track_matched {
-            return Ok(IOResult::Done(()));
+        if has_null_key(&pending.key_values) && !self.track_matched {
+            return Ok(HashInsertResult::Done);
         }
 
         // Compute hash of the join keys using collations
-        let key_refs: Vec<ValueRef> = key_values.iter().map(|v| v.as_ref()).collect();
+        let key_refs: Vec<ValueRef> = pending.key_values.iter().map(|v| v.as_ref()).collect();
         let hash = hash_join_key(&key_refs, &self.collations);
-
-        let entry = if payload_values.is_empty() {
-            HashEntry::new(hash, key_values, rowid)
-        } else {
-            HashEntry::new_with_payload(hash, key_values, rowid, payload_values)
-        };
-        let entry_size = entry.size_bytes();
+        let entry_size = HashEntry::size_from_values(&pending.key_values, &pending.payload_values);
 
         // Check if we would exceed memory budget
         if self.mem_used + entry_size > self.mem_budget {
@@ -1160,10 +1186,24 @@ impl HashTable {
             if let Some(c) = self.spill_partitions_for_entry(entry_size, metrics)? {
                 // I/O pending, caller will re-enter after completion and retry the insert.
                 if !c.finished() {
-                    return Ok(IOResult::IO(IOCompletions::Single(c)));
+                    return Ok(HashInsertResult::IO {
+                        io: IOCompletions::Single(c),
+                        pending,
+                    });
                 }
             }
         }
+
+        let PendingHashInsert {
+            key_values,
+            rowid,
+            payload_values,
+        } = pending;
+        let entry = if payload_values.is_empty() {
+            HashEntry::new(hash, key_values, rowid)
+        } else {
+            HashEntry::new_with_payload(hash, key_values, rowid, payload_values)
+        };
 
         if self.spill_state.is_some() {
             let partition_idx = {
@@ -1188,7 +1228,7 @@ impl HashTable {
         self.num_entries += 1;
         self.mem_used += entry_size;
 
-        Ok(IOResult::Done(()))
+        Ok(HashInsertResult::Done)
     }
 
     /// Insert keys into the hash table if not already present.
@@ -3127,6 +3167,7 @@ impl HashTable {
 #[cfg(test)]
 mod hashtests {
     use super::*;
+    use crate::io::Buffer;
     use crate::MemoryIO;
 
     #[test]
