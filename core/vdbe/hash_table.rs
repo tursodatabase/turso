@@ -2012,9 +2012,27 @@ impl HashTable {
     /// Returns the entry if found, or None when the scan is complete
     /// (or a spilled partition needs loading).
     pub fn next_unmatched(&mut self) -> Option<&HashEntry> {
-        if self.spill_state.is_some() {
+        let has_spill_state = self.spill_state.is_some();
+        let in_grace = self.grace_state.is_some();
+        let has_pending_grace = !in_grace && self.has_grace_partitions();
+
+        if has_spill_state {
+            if in_grace {
+                // During grace: scan only the partition currently owned by grace.
+                return self.next_unmatched_current_grace_partition();
+            }
+            if has_pending_grace {
+                // Before grace starts, emit unmatched rows from never-spilled in-memory
+                // partitions here. Grace will handle only partitions that actually have
+                // disk chunks, so skipping these would lose unmatched build rows.
+                return self.next_unmatched_spilled_in_memory_only();
+            }
             return self.next_unmatched_spilled();
         }
+        self.next_unmatched_main_buckets()
+    }
+
+    fn next_unmatched_main_buckets(&mut self) -> Option<&HashEntry> {
         while self.unmatched_scan_bucket < self.buckets.len() {
             let bucket = &self.buckets[self.unmatched_scan_bucket];
             let matched = &self.matched_bits[self.unmatched_scan_bucket];
@@ -2062,8 +2080,84 @@ impl HashTable {
         None
     }
 
+    /// Scan unmatched rows from partitions that stayed resident in memory after spilling.
+    /// These partitions have no disk chunks, so grace never revisits them.
+    fn next_unmatched_spilled_in_memory_only(&mut self) -> Option<&HashEntry> {
+        let spill_state = self.spill_state.as_ref()?;
+        while self.unmatched_scan_partition < spill_state.partitions.len() {
+            let partition = &spill_state.partitions[self.unmatched_scan_partition];
+            if !partition.chunks.is_empty() {
+                self.unmatched_scan_partition += 1;
+                self.unmatched_scan_bucket = 0;
+                self.unmatched_scan_entry = 0;
+                continue;
+            }
+
+            turso_assert!(
+                partition.is_loaded(),
+                "in-memory partition unexpectedly unavailable during unmatched scan",
+                { "partition_idx": partition.partition_idx }
+            );
+
+            while self.unmatched_scan_bucket < partition.buckets.len() {
+                let bucket = &partition.buckets[self.unmatched_scan_bucket];
+                let matched = &partition.matched_bits[self.unmatched_scan_bucket];
+                while self.unmatched_scan_entry < bucket.entries.len() {
+                    let idx = self.unmatched_scan_entry;
+                    self.unmatched_scan_entry += 1;
+                    if !matched[idx] {
+                        return Some(&bucket.entries[idx]);
+                    }
+                }
+                self.unmatched_scan_bucket += 1;
+                self.unmatched_scan_entry = 0;
+            }
+
+            self.unmatched_scan_partition += 1;
+            self.unmatched_scan_bucket = 0;
+            self.unmatched_scan_entry = 0;
+        }
+        None
+    }
+
+    /// Scan unmatched entries only for the active grace partition.
+    /// Grace unmatched emission happens partition-by-partition before eviction, so
+    /// scanning any other loaded partition can duplicate or suppress rows.
+    fn next_unmatched_current_grace_partition(&mut self) -> Option<&HashEntry> {
+        let partition_idx = self.grace_state.as_ref()?.current_partition_idx()?;
+        let spill_state = self.spill_state.as_ref()?;
+        let partition = spill_state
+            .find_partition(partition_idx)
+            .expect("current grace partition missing from spill state");
+
+        if !partition.is_loaded() {
+            return None;
+        }
+
+        while self.unmatched_scan_bucket < partition.buckets.len() {
+            let bucket = &partition.buckets[self.unmatched_scan_bucket];
+            let matched = &partition.matched_bits[self.unmatched_scan_bucket];
+            while self.unmatched_scan_entry < bucket.entries.len() {
+                let idx = self.unmatched_scan_entry;
+                self.unmatched_scan_entry += 1;
+                if !matched[idx] {
+                    return Some(&bucket.entries[idx]);
+                }
+            }
+            self.unmatched_scan_bucket += 1;
+            self.unmatched_scan_entry = 0;
+        }
+        None
+    }
+
     /// Get the current partition index for unmatched scan (for spilled partition loading).
     pub fn unmatched_scan_current_partition(&self) -> Option<usize> {
+        if let Some(grace_state) = self.grace_state.as_ref() {
+            return grace_state.current_partition_idx();
+        }
+        if self.has_grace_partitions() {
+            return None;
+        }
         let spill_state = self.spill_state.as_ref()?;
         if self.unmatched_scan_partition < spill_state.partitions.len() {
             Some(spill_state.partitions[self.unmatched_scan_partition].partition_idx)
@@ -4427,5 +4521,267 @@ mod hashtests {
             }
         }
         assert_eq!(match_count, buffered);
+    }
+
+    #[test]
+    fn test_grace_unmatched_scan_uses_current_partition() {
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 4096,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
+            track_matched: true,
+            partition_count: Some(4),
+        };
+        let mut ht = HashTable::new(config, io);
+
+        for i in 0..400 {
+            let key = vec![Value::from_i64(i)];
+            let _ = ht.insert(key, i, vec![], None);
+        }
+        let _ = ht.finalize_build(None).unwrap();
+        assert!(ht.has_spilled(), "should have spilled");
+
+        let mut keys_by_partition = std::collections::BTreeMap::<usize, Vec<i64>>::new();
+        for i in 0..400 {
+            let partition_idx = ht.partition_for_keys(&[Value::from_i64(i)]);
+            keys_by_partition.entry(partition_idx).or_default().push(i);
+        }
+
+        let partitions_to_process: Vec<usize> = ht
+            .spill_state
+            .as_ref()
+            .expect("spill state")
+            .partitions
+            .iter()
+            .filter(|partition| !partition.chunks.is_empty())
+            .map(|partition| partition.partition_idx)
+            .collect();
+        assert!(
+            partitions_to_process.len() >= 2,
+            "test requires at least two spilled partitions"
+        );
+
+        let first_partition = partitions_to_process[0];
+        let second_partition = partitions_to_process[1];
+        let first_keys = keys_by_partition
+            .get(&first_partition)
+            .cloned()
+            .expect("first partition keys");
+        let second_keys = keys_by_partition
+            .get(&second_partition)
+            .cloned()
+            .expect("second partition keys");
+
+        for key in &first_keys {
+            let _ = ht
+                .buffer_probe_row(vec![Value::from_i64(*key)], key + 10_000, None)
+                .unwrap();
+        }
+        let _ = ht.finalize_probe_spill(None).unwrap();
+        assert!(ht.grace_begin(), "should enter grace");
+
+        match ht.grace_load_current_partition(None).unwrap() {
+            IOResult::Done(true) => {}
+            other => panic!("unexpected grace load result: {other:?}"),
+        }
+        assert_eq!(
+            ht.grace_state
+                .as_ref()
+                .expect("grace state")
+                .current_partition_idx(),
+            Some(first_partition)
+        );
+
+        loop {
+            let Some(entry) = ht.grace_next_probe_entry().unwrap() else {
+                break;
+            };
+            let partition_idx = ht.partition_for_keys(&entry.key_values);
+            if ht
+                .probe_partition(partition_idx, &entry.key_values, None)
+                .is_some()
+            {
+                ht.mark_current_matched();
+                while ht.next_match().is_some() {
+                    ht.mark_current_matched();
+                }
+            }
+        }
+
+        ht.begin_unmatched_scan();
+        assert!(
+            ht.next_unmatched().is_none(),
+            "all rows in the first partition were matched"
+        );
+
+        assert!(
+            ht.grace_advance_partition(),
+            "should have another partition"
+        );
+        match ht.grace_load_current_partition(None).unwrap() {
+            IOResult::Done(true) => {}
+            other => panic!("unexpected grace load result: {other:?}"),
+        }
+        assert_eq!(
+            ht.grace_state
+                .as_ref()
+                .expect("grace state")
+                .current_partition_idx(),
+            Some(second_partition)
+        );
+
+        match ht.load_spilled_partition(first_partition, None).unwrap() {
+            IOResult::Done(()) => {}
+            other => panic!("unexpected spill load result: {other:?}"),
+        }
+
+        ht.begin_unmatched_scan();
+        assert_eq!(
+            ht.unmatched_scan_current_partition(),
+            Some(second_partition),
+            "grace unmatched scan must target the active grace partition"
+        );
+        match ht.load_spilled_partition(second_partition, None).unwrap() {
+            IOResult::Done(()) => {}
+            other => panic!("unexpected spill load result: {other:?}"),
+        }
+
+        let mut unmatched_rowids = Vec::new();
+        while let Some(entry) = ht.next_unmatched() {
+            unmatched_rowids.push(entry.rowid);
+        }
+        unmatched_rowids.sort_unstable();
+
+        let mut expected = second_keys;
+        expected.sort_unstable();
+        assert_eq!(unmatched_rowids, expected);
+    }
+
+    #[test]
+    fn test_unmatched_scan_preserves_in_memory_partitions_before_grace() {
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 1024,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
+            track_matched: true,
+            partition_count: Some(16),
+        };
+        let mut ht = HashTable::new(config, io);
+
+        let mut next_rowid = 0i64;
+        while !ht.has_spilled() {
+            let _ = ht
+                .insert(vec![Value::from_i64(next_rowid)], next_rowid, vec![], None)
+                .unwrap();
+            next_rowid += 1;
+        }
+
+        let partition_keys: std::collections::BTreeMap<usize, Vec<i64>> = (0..4096)
+            .map(|i| (ht.partition_for_keys(&[Value::from_i64(i)]), i))
+            .fold(
+                std::collections::BTreeMap::new(),
+                |mut acc, (partition, key)| {
+                    acc.entry(partition).or_default().push(key);
+                    acc
+                },
+            );
+
+        let hot_partition = ht
+            .spill_state
+            .as_ref()
+            .expect("spill state")
+            .partitions
+            .first()
+            .map(|partition| partition.partition_idx)
+            .expect("expected at least one spilled partition");
+        let cold_partition = partition_keys
+            .keys()
+            .copied()
+            .find(|partition_idx| {
+                ht.spill_state
+                    .as_ref()
+                    .expect("spill state")
+                    .find_partition(*partition_idx)
+                    .is_none()
+            })
+            .expect("expected at least one partition without spill chunks yet");
+        let hot_key = partition_keys
+            .get(&hot_partition)
+            .and_then(|keys| keys.first())
+            .copied()
+            .expect("hot partition key");
+        let cold_key = partition_keys
+            .get(&cold_partition)
+            .and_then(|keys| keys.first())
+            .copied()
+            .expect("cold partition key");
+
+        for _ in 0..160 {
+            let _ = ht
+                .insert(vec![Value::from_i64(hot_key)], next_rowid, vec![], None)
+                .unwrap();
+            next_rowid += 1;
+        }
+        for _ in 0..6 {
+            let _ = ht
+                .insert(vec![Value::from_i64(cold_key)], next_rowid, vec![], None)
+                .unwrap();
+            next_rowid += 1;
+        }
+
+        let _ = ht.finalize_build(None).unwrap();
+        assert!(ht.has_spilled(), "should have spilled");
+
+        let (spilled_partition, mut expected_unmatched) = {
+            let spill_state = ht.spill_state.as_ref().expect("spill state");
+            let spilled_partition = spill_state
+                .partitions
+                .iter()
+                .find(|partition| !partition.chunks.is_empty())
+                .map(|partition| partition.partition_idx)
+                .expect("expected at least one spilled partition");
+            let expected_unmatched: Vec<i64> = spill_state
+                .partitions
+                .iter()
+                .filter(|partition| partition.chunks.is_empty())
+                .flat_map(|partition| {
+                    partition
+                        .buckets
+                        .iter()
+                        .flat_map(|bucket| bucket.entries.iter().map(|entry| entry.rowid))
+                })
+                .collect();
+            (spilled_partition, expected_unmatched)
+        };
+        assert!(
+            !expected_unmatched.is_empty(),
+            "expected at least one resident in-memory partition"
+        );
+
+        let probe_key = (0..400)
+            .map(|i| vec![Value::from_i64(i)])
+            .find(|key| ht.partition_for_keys(key) == spilled_partition)
+            .expect("spilled partition should have at least one key");
+        let _ = ht.buffer_probe_row(probe_key, 10_000, None).unwrap();
+        assert!(
+            ht.has_grace_partitions(),
+            "probe buffering should enable grace"
+        );
+
+        ht.begin_unmatched_scan();
+        let mut actual_unmatched = Vec::new();
+        while let Some(entry) = ht.next_unmatched() {
+            actual_unmatched.push(entry.rowid);
+        }
+
+        expected_unmatched.sort_unstable();
+        actual_unmatched.sort_unstable();
+        assert_eq!(actual_unmatched, expected_unmatched);
     }
 }
