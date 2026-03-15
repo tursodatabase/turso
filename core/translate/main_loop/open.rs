@@ -553,7 +553,7 @@ impl OpenLoop {
                 t_ctx
                     .hash_table_contexts
                     .get(&hj.build_table_idx)
-                    .map(|ctx| ctx.hash_next_label)
+                    .map(|ctx| ctx.labels.next)
                     .expect("should have hash context for build table")
             } else {
                 next
@@ -668,8 +668,8 @@ impl OpenLoop {
 
                     if let Some(hash_ctx) = t_ctx.hash_table_contexts.get_mut(&hj.build_table_idx) {
                         hash_ctx.inner_loop_gosub_reg = Some(return_reg);
-                        hash_ctx.inner_loop_gosub_label = Some(gosub_label);
-                        hash_ctx.inner_loop_skip_label = Some(skip_label);
+                        hash_ctx.labels.inner_loop_gosub = Some(gosub_label);
+                        hash_ctx.labels.inner_loop_skip = Some(skip_label);
                     }
                 }
             }

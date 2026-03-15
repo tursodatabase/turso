@@ -12444,7 +12444,7 @@ pub fn op_hash_probe(
                 return Ok(InsnFunctionStepResult::Step);
             }
             if !hash_table.is_partition_loaded(partition_idx) {
-                // Partition is on disk -- buffer this probe row for grace processing
+                // Partition is on disk: buffer this probe row for grace processing
                 let probe_rowid = match state.registers[rowid_reg].get_value() {
                     Value::Numeric(Numeric::Integer(i)) => *i,
                     _ => 0,
@@ -12465,17 +12465,17 @@ pub fn op_hash_probe(
                         return Ok(InsnFunctionStepResult::IO(io));
                     }
                 }
-                // Jump to target_pc -- this row is deferred to grace processing.
+                // Jump to target_pc: this row is deferred to grace processing.
                 state.pc = target_pc.as_offset_int();
                 return Ok(InsnFunctionStepResult::Step);
             }
-            // Partition is in memory -- probe immediately (fast path)
+            // Partition is in memory: probe immediately (fast path)
             state.metrics.hash_join.grace_probe_rows_streamed = state
                 .metrics
                 .hash_join
                 .grace_probe_rows_streamed
                 .saturating_add(1);
-        } else if !hash_table.is_partition_loaded(partition_idx) {
+        } else if unlikely(!hash_table.is_partition_loaded(partition_idx)) {
             return Err(LimboError::InternalError(format!(
                 "HashProbe reached spilled partition {partition_idx} without a preloaded build partition; probe_rowid_reg=None is grace-only"
             )));
@@ -12840,6 +12840,7 @@ pub fn op_hash_grace_next_probe(
     let probe_rowid_dest = *probe_rowid_dest as usize;
 
     let hash_table = state.hash_tables.get_mut(&hash_table_id).ok_or_else(|| {
+        mark_unlikely();
         LimboError::InternalError(format!("Hash table not found with ID: {hash_table_id}"))
     })?;
 
@@ -12879,6 +12880,7 @@ pub fn op_hash_grace_advance_partition(
     let hash_table_id = *hash_table_id as usize;
 
     let hash_table = state.hash_tables.get_mut(&hash_table_id).ok_or_else(|| {
+        mark_unlikely();
         LimboError::InternalError(format!("Hash table not found with ID: {hash_table_id}"))
     })?;
 

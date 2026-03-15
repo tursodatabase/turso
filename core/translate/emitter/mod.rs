@@ -391,17 +391,44 @@ impl LimitCtx {
         }
     }
 }
+
+#[derive(Clone, Debug)]
+pub(crate) struct HashLabels {
+    /// Label for hash join match processing (points to just after HashProbe instruction)
+    /// Used by HashNext to jump back to process additional matches without re-probing
+    pub match_found: BranchOffset,
+    /// Label for advancing to the next hash match (points to HashNext instruction).
+    /// When conditions fail within a hash join, they should jump here to try the next
+    /// hash match, rather than jumping to the outer loop's next label.
+    pub next: BranchOffset,
+    /// Jump target for unmatched probe rows (outer joins only).
+    pub check_outer: Option<BranchOffset>,
+    /// Entry label for the inner-loop subroutine.
+    pub inner_loop_gosub: Option<BranchOffset>,
+    /// Label that skips past the subroutine body (resolved after Return).
+    pub inner_loop_skip: Option<BranchOffset>,
+    /// Label for the grace loop's own HashNext (resolved during grace loop emission).
+    pub grace_hash_next: Option<BranchOffset>,
+}
+
+impl HashLabels {
+    pub fn new(match_found: BranchOffset, next: BranchOffset) -> Self {
+        Self {
+            match_found,
+            next,
+            check_outer: None,
+            inner_loop_gosub: None,
+            inner_loop_skip: None,
+            grace_hash_next: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HashCtx {
     pub match_reg: usize,
     pub hash_table_reg: usize,
-    /// Label for hash join match processing (points to just after HashProbe instruction)
-    /// Used by HashNext to jump back to process additional matches without re-probing
-    pub match_found_label: BranchOffset,
-    /// Label for advancing to the next hash match (points to HashNext instruction).
-    /// When conditions fail within a hash join, they should jump here to try the next
-    /// hash match, rather than jumping to the outer loop's next label.
-    pub hash_next_label: BranchOffset,
+    pub labels: HashLabels,
     /// Starting register where payload columns are stored after HashProbe/HashNext.
     /// None if payload optimization is not used for this hash join.
     pub payload_start_reg: Option<usize>,
@@ -410,18 +437,12 @@ pub struct HashCtx {
     /// These references may point at multiple tables when a build input was
     /// materialized from a join prefix.
     pub payload_columns: Vec<MaterializedColumnRef>,
-    /// Jump target for unmatched probe rows (outer joins only).
-    pub check_outer_label: Option<BranchOffset>,
     /// Build table cursor (for NullRow in outer joins).
     pub build_cursor_id: Option<CursorID>,
     pub join_type: HashJoinType,
     /// Gosub register for the inner-loop subroutine wrapping subsequent tables.
     /// Outer hash joins wrap inner loops so unmatched-row paths can re-enter via Gosub.
     pub inner_loop_gosub_reg: Option<usize>,
-    /// Entry label for the inner-loop subroutine.
-    pub inner_loop_gosub_label: Option<BranchOffset>,
-    /// Label that skips past the subroutine body (resolved after Return).
-    pub inner_loop_skip_label: Option<BranchOffset>,
     /// Probe-side rowid register for grace hash join (from RowId before HashProbe).
     pub probe_rowid_reg: Option<usize>,
     /// Starting register for probe key values.
@@ -431,8 +452,6 @@ pub struct HashCtx {
     /// Register: 0 during main probe loop, 1 during grace loop.
     /// Used by IfPos dispatch before HashNext to route to the grace loop's HashNext.
     pub grace_flag_reg: Option<usize>,
-    /// Label for the grace loop's own HashNext (resolved during grace loop emission).
-    pub grace_hash_next_label: Option<BranchOffset>,
 }
 
 /// The TranslateCtx struct holds various information and labels used during bytecode generation.
