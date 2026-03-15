@@ -1561,8 +1561,16 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
         for (table_name, table_id) in autoincrement_tables {
             let max_rowid_from_store = self.find_max_rowid_for_table(table_id);
-            let existing_seq =
-                self.read_existing_sqlite_sequence_value(seq_table_id, &table_name)?;
+            let all_seq_row_ids = self.find_all_sqlite_sequence_rows(seq_table_id, &table_name)?;
+            let mut existing_seq: Option<i64> = None;
+            for row_id in &all_seq_row_ids {
+                if let Some(seq_value) = self.extract_seq_value_from_row(row_id)? {
+                    existing_seq = Some(match existing_seq {
+                        Some(cur) => cur.max(seq_value),
+                        None => seq_value,
+                    });
+                }
+            }
 
             let effective_max = match (max_rowid_from_store, existing_seq) {
                 (Some(store), Some(existing)) => Some(store.max(existing)),
@@ -1574,15 +1582,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             if let Some(max_rowid) = effective_max {
                 self.update_sqlite_sequence_entry(seq_table_id, table_name.clone(), max_rowid)?;
 
-                // Reset the RowidAllocator to match the rebuilt sqlite_sequence value. This
-                // prevents the allocator from caching stale values from rolled-back transactions
+                // Reset the RowidAllocator to match rebuilt sqlite_sequence.
                 let allocator = self.mvstore.get_rowid_allocator(&table_id);
                 allocator.initialize(Some(max_rowid));
-                tracing::debug!(
-                    "Reset RowidAllocator for table {} to max_rowid {}",
-                    table_name,
-                    max_rowid
-                );
             }
         }
 
@@ -1639,8 +1641,6 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     ) -> Result<()> {
         use crate::types::{ImmutableRecord, Value};
 
-        tracing::debug!("Updating sqlite_sequence: {} -> {}", table_name, max_rowid);
-
         let record = ImmutableRecord::from_values(
             &[
                 Value::build_text(table_name.clone()),
@@ -1650,21 +1650,33 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         );
         let row_data = record.get_payload().to_vec();
 
-        let existing_row_id = self.find_sqlite_sequence_row(seq_table_id, &table_name)?;
+        let existing_row_ids = self.find_all_sqlite_sequence_rows(seq_table_id, &table_name)?;
 
-        match existing_row_id {
-            Some(row_id) => self.update_existing_sqlite_sequence_row(row_id, row_data)?,
-            None => self.insert_new_sqlite_sequence_row(seq_table_id, &table_name, row_data)?,
+        match existing_row_ids.len() {
+            0 => {
+                self.insert_new_sqlite_sequence_row(seq_table_id, row_data)?;
+            }
+            1 => {
+                self.update_existing_sqlite_sequence_row(existing_row_ids[0].clone(), row_data)?;
+            }
+            _ => {
+                for row_id in existing_row_ids {
+                    self.delete_sqlite_sequence_row(row_id)?;
+                }
+                self.insert_new_sqlite_sequence_row(seq_table_id, row_data)?;
+            }
         }
 
         Ok(())
     }
 
-    fn find_sqlite_sequence_row(
+    fn find_all_sqlite_sequence_rows(
         &self,
         seq_table_id: MVTableId,
         table_name: &str,
-    ) -> Result<Option<RowID>> {
+    ) -> Result<Vec<RowID>> {
+        let mut matching_rows = Vec::new();
+
         for entry in self.mvstore.rows.iter() {
             let row_id = entry.key();
             if row_id.table_id != seq_table_id {
@@ -1674,12 +1686,12 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             if let Some(latest_version) = row_versions.iter().find(|v| v.end.is_none()) {
                 if let Some(ref row_data) = latest_version.row.data {
                     if self.row_matches_table_name(row_data, table_name)? {
-                        return Ok(Some(row_id.clone()));
+                        matching_rows.push(row_id.clone());
                     }
                 }
             }
         }
-        Ok(None)
+        Ok(matching_rows)
     }
 
     fn row_matches_table_name(&self, row_data: &[u8], table_name: &str) -> Result<bool> {
@@ -1692,29 +1704,20 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         Ok(false)
     }
 
-    fn read_existing_sqlite_sequence_value(
-        &self,
-        seq_table_id: MVTableId,
-        table_name: &str,
-    ) -> Result<Option<i64>> {
+    fn extract_seq_value_from_row(&self, row_id: &RowID) -> Result<Option<i64>> {
         use crate::numeric::Numeric;
         use crate::types::{ValueIterator, ValueRef};
 
-        for entry in self.mvstore.rows.iter() {
-            let row_id = entry.key();
-            if row_id.table_id != seq_table_id {
-                continue;
-            }
-            let row_versions = entry.value().read();
+        if let Some(row_entry) = self.mvstore.rows.get(row_id) {
+            let row_versions = row_entry.value().read();
             if let Some(latest_version) = row_versions.iter().find(|v| v.end.is_none()) {
                 if let Some(ref row_data) = latest_version.row.data {
-                    if !self.row_matches_table_name(row_data, table_name)? {
-                        continue;
-                    }
                     let mut value_iter = ValueIterator::new(row_data)?;
-                    let _name = value_iter.next();
-                    if let Some(Ok(ValueRef::Numeric(Numeric::Integer(seq)))) = value_iter.next() {
-                        return Ok(Some(seq));
+                    let _name = value_iter.next(); // Skip table name
+                    if let Some(Ok(ValueRef::Numeric(Numeric::Integer(int_val)))) =
+                        value_iter.next()
+                    {
+                        return Ok(Some(int_val));
                     }
                 }
             }
@@ -1763,7 +1766,6 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     fn insert_new_sqlite_sequence_row(
         &mut self,
         seq_table_id: MVTableId,
-        table_name: &str,
         row_data: Vec<u8>,
     ) -> Result<()> {
         use crate::mvcc::database::{Row, RowID, RowKey, RowVersion, TxTimestampOrID};
@@ -1790,11 +1792,41 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
         self.mvstore.insert_version(row_id, row_version);
 
-        tracing::debug!(
-            "Inserted new sqlite_sequence row: {} -> rowid {}",
-            table_name,
-            new_rowid
-        );
+        Ok(())
+    }
+
+    fn delete_sqlite_sequence_row(&mut self, row_id: RowID) -> Result<()> {
+        use crate::mvcc::database::TxTimestampOrID;
+
+        let row_entry = self
+            .mvstore
+            .rows
+            .get(&row_id)
+            .ok_or_else(|| LimboError::InternalError("sqlite_sequence row not found".into()))?;
+
+        let mut row_versions = row_entry.value().write();
+
+        let checkpoint_timestamp = self.durable_txid_max_new;
+
+        if let Some(current_version) = row_versions.iter_mut().find(|v| v.end.is_none()) {
+            let mut exists_in_db_file = current_version.btree_resident;
+            if !exists_in_db_file {
+                if let Some(TxTimestampOrID::Timestamp(begin)) = current_version.begin {
+                    if self
+                        .durable_txid_max_old
+                        .is_some_and(|txid_max_old| begin <= u64::from(txid_max_old))
+                    {
+                        exists_in_db_file = true;
+                    }
+                }
+            }
+
+            current_version.end = Some(TxTimestampOrID::Timestamp(checkpoint_timestamp));
+            if exists_in_db_file {
+                current_version.btree_resident = true;
+            }
+        }
+
         Ok(())
     }
 

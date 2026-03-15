@@ -7105,9 +7105,18 @@ fn test_autoincrement_works_in_mvcc() {
 
     let rows = get_rows(&conn, "SELECT a, b FROM t ORDER BY a");
     assert_eq!(rows.len(), 3);
-    assert_eq!(rows[0], vec![Value::from_i64(1), Value::build_text("first")]);
-    assert_eq!(rows[1], vec![Value::from_i64(2), Value::build_text("second")]);
-    assert_eq!(rows[2], vec![Value::from_i64(3), Value::build_text("third")]);
+    assert_eq!(
+        rows[0],
+        vec![Value::from_i64(1), Value::build_text("first")]
+    );
+    assert_eq!(
+        rows[1],
+        vec![Value::from_i64(2), Value::build_text("second")]
+    );
+    assert_eq!(
+        rows[2],
+        vec![Value::from_i64(3), Value::build_text("third")]
+    );
 }
 
 /// Test that a table with AUTOINCREMENT created before MVCC was enabled
@@ -7161,7 +7170,10 @@ fn test_autoincrement_works_for_preexisting_table() {
 
         conn.execute("INSERT INTO t(b) VALUES ('in_mvcc')").unwrap();
         let rows = get_rows(&conn, "SELECT a, b FROM t ORDER BY a");
-        assert_eq!(rows[1], vec![Value::from_i64(2), Value::build_text("in_mvcc")]);
+        assert_eq!(
+            rows[1],
+            vec![Value::from_i64(2), Value::build_text("in_mvcc")]
+        );
     }
 }
 

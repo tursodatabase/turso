@@ -1775,11 +1775,11 @@ async fn test_autoincrement_works_in_mvcc() {
 
     let count = query_i64(&conn, "SELECT COUNT(*) FROM t").await;
     assert_eq!(count, 3);
-    
+
     let first_id = query_i64(&conn, "SELECT a FROM t WHERE b = 'first'").await;
     let second_id = query_i64(&conn, "SELECT a FROM t WHERE b = 'second'").await;
     let third_id = query_i64(&conn, "SELECT a FROM t WHERE b = 'third'").await;
-    
+
     assert_eq!(first_id, 1);
     assert_eq!(second_id, 2);
     assert_eq!(third_id, 3);
