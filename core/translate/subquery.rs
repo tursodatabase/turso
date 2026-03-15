@@ -266,29 +266,6 @@ pub fn plan_subqueries_from_select_plan(
     Ok(())
 }
 
-/// Compute query plans for subqueries in a DML statement's WHERE clause.
-/// This is used by DELETE and UPDATE statements which only have subqueries in the WHERE clause.
-/// Similar to [plan_subqueries_from_select_plan] but only handles the WHERE clause
-/// since these statements don't have GROUP BY, ORDER BY, or result column subqueries.
-pub fn plan_subqueries_from_where_clause(
-    program: &mut ProgramBuilder,
-    non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
-    table_references: &mut TableReferences,
-    where_clause: &mut [WhereTerm],
-    resolver: &Resolver,
-    connection: &Arc<Connection>,
-) -> Result<()> {
-    plan_subqueries_from_where_clause_with_bound(
-        program,
-        non_from_clause_subqueries,
-        table_references,
-        where_clause,
-        resolver,
-        connection,
-        &mut Default::default(),
-    )
-}
-
 pub fn plan_subqueries_from_where_clause_with_bound(
     program: &mut ProgramBuilder,
     non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
@@ -348,28 +325,6 @@ pub fn plan_subqueries_from_values(
     Ok(())
 }
 
-/// Compute query plans for subqueries in UPDATE SET clause expressions.
-/// This is used by UPDATE statements where SET clause values contain scalar subqueries.
-/// e.g. `UPDATE t SET col = (SELECT max(id) FROM t2)`
-pub fn plan_subqueries_from_set_clauses(
-    program: &mut ProgramBuilder,
-    non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
-    table_references: &mut TableReferences,
-    set_clauses: &mut [(usize, Box<ast::Expr>)],
-    resolver: &Resolver,
-    connection: &Arc<Connection>,
-) -> Result<()> {
-    plan_subqueries_from_set_clauses_with_bound(
-        program,
-        non_from_clause_subqueries,
-        table_references,
-        set_clauses,
-        resolver,
-        connection,
-        &mut Default::default(),
-    )
-}
-
 pub fn plan_subqueries_from_set_clauses_with_bound(
     program: &mut ProgramBuilder,
     non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
@@ -396,40 +351,6 @@ pub fn plan_subqueries_from_set_clauses_with_bound(
     Ok(())
 }
 
-/// Compute query plans for subqueries in RETURNING expressions.
-/// This is used by INSERT, UPDATE, and DELETE statements with RETURNING clauses.
-/// RETURNING expressions may contain scalar subqueries that need to be planned.
-pub fn plan_subqueries_from_returning(
-    program: &mut ProgramBuilder,
-    non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
-    table_references: &mut TableReferences,
-    returning: &mut [ast::ResultColumn],
-    resolver: &Resolver,
-    connection: &Arc<Connection>,
-) -> Result<()> {
-    // Extract mutable references to expressions from ResultColumn::Expr variants
-    let exprs = returning.iter_mut().filter_map(|rc| match rc {
-        ast::ResultColumn::Expr(expr, _) => Some(expr.as_mut()),
-        ast::ResultColumn::Star | ast::ResultColumn::TableStar(_) => None,
-    });
-
-    plan_subqueries_with_outer_query_access(
-        program,
-        non_from_clause_subqueries,
-        table_references,
-        resolver,
-        exprs,
-        connection,
-        SubqueryPosition::ResultColumn,
-        SubqueryOrigin::DmlReturning,
-        SubqueryPosition::ResultColumn.allow_correlated(),
-        &mut Default::default(),
-    )?;
-
-    update_column_used_masks(table_references, non_from_clause_subqueries);
-    Ok(())
-}
-
 pub fn plan_subqueries_from_returning_with_bound(
     program: &mut ProgramBuilder,
     non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
@@ -439,7 +360,7 @@ pub fn plan_subqueries_from_returning_with_bound(
     connection: &Arc<Connection>,
     bound_subqueries: &mut HashMap<ast::TableInternalId, super::bind::BoundSubquery>,
 ) -> Result<()> {
-    let count_before = non_from_clause_subqueries.len();
+    let _count_before = non_from_clause_subqueries.len();
 
     plan_subqueries_with_outer_query_access(
         program,
@@ -694,7 +615,7 @@ fn get_subquery_parser<'a>(
                 let ast::Expr::SubqueryResult {
                     subquery_id,
                     lhs,
-                    not_in,
+                    not_in: _not_in,
                     query_type,
                 } = expr
                 else {

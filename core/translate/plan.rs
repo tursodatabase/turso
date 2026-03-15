@@ -740,60 +740,6 @@ pub enum IterationDirection {
     Backwards,
 }
 
-pub fn select_star(
-    tables: &[JoinedTable],
-    out_columns: &mut Vec<ResultSetColumn>,
-    right_join_swapped: bool,
-) {
-    // RIGHT JOIN swapped tables; iterate in reverse to restore original column order.
-    let table_iter: Vec<&JoinedTable> = if right_join_swapped {
-        tables.iter().rev().collect()
-    } else {
-        tables.iter().collect()
-    };
-    for table in table_iter {
-        // Semi/anti-join tables are internal (from EXISTS/NOT EXISTS unnesting)
-        // and should not contribute columns to SELECT *.
-        if table
-            .join_info
-            .as_ref()
-            .is_some_and(|ji| ji.is_semi_or_anti())
-        {
-            continue;
-        }
-        out_columns.extend(
-            table
-                .columns()
-                .iter()
-                .enumerate()
-                .filter(|(_, col)| !col.hidden())
-                .filter(|(_, col)| {
-                    // If we are joining with USING, we need to deduplicate the columns from the right table
-                    // that are also present in the USING clause.
-                    if let Some(join_info) = &table.join_info {
-                        !join_info.using.iter().any(|using_col| {
-                            col.name
-                                .as_ref()
-                                .is_some_and(|name| name.eq_ignore_ascii_case(using_col.as_str()))
-                        })
-                    } else {
-                        true
-                    }
-                })
-                .map(|(i, col)| ResultSetColumn {
-                    alias: None,
-                    expr: ast::Expr::Column {
-                        database: None,
-                        table: table.internal_id,
-                        column: i,
-                        is_rowid_alias: col.is_rowid_alias(),
-                    },
-                    contains_aggregates: false,
-                }),
-        );
-    }
-}
-
 /// The type of join between two tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinType {

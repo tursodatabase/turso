@@ -108,7 +108,6 @@ impl BindTable for Table {
 
 /// Lightweight table for CTEs — just column names, no schema object.
 pub struct CteTable {
-    pub name: String,
     pub columns: Vec<String>,
 }
 
@@ -132,7 +131,6 @@ impl BindTable for CteTable {
 
 #[derive(Clone)]
 pub struct DerivedTable {
-    pub name: String,
     pub columns: Vec<String>,
 }
 
@@ -199,14 +197,9 @@ pub enum ScopeTableSource {
     Table(Arc<Table>),
     Cte {
         name: String,
-        columns: Vec<String>,
         cte_id: usize,
-        select: ast::Select,
     },
-    Derived {
-        name: String,
-        columns: Vec<String>,
-    },
+    Derived {},
 }
 
 // ── BindScope ────────────────────────────────────────────────────────────
@@ -715,54 +708,18 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         self.outer_query_frames.iter().rev()
     }
 
-    /// The immediately enclosing query's scope (if any).
-    fn latest_outer_scope(&self) -> Option<&BindScopeRef> {
-        self.outer_query_frames.last().map(|frame| &frame.scope)
-    }
-
-    // ── Outer FROM (LATERAL support) ─────────────────────────────────
-
-    fn outer_from_scope(&self) -> Option<&BindScopeRef> {
-        self.outer_from_scope.as_ref()
-    }
-
-    /// Set the outer FROM scope, returning the previous value.
-    fn set_outer_from_scope(&mut self, scope: Option<BindScopeRef>) -> Option<BindScopeRef> {
-        std::mem::replace(&mut self.outer_from_scope, scope)
-    }
-
-    /// Extend the outer FROM scope by merging tables from another scope.
-    /// Used during LATERAL join planning: each left-side table's scope
-    /// is accumulated so the right side can reference it.
-    fn extend_outer_from_scope(&mut self, scope: &BindScopeRef) {
-        match self.outer_from_scope.as_mut() {
-            Some(existing) => {
-                let merged = Arc::make_mut(existing);
-                merged.tables.extend(scope.tables.iter().cloned());
-            }
-            None => self.outer_from_scope = Some(Arc::clone(scope)),
-        }
-    }
-
     // ── CTEs ─────────────────────────────────────────────────────────
 
     pub fn insert_cte(&mut self, name: String, entry: CteEntry) {
         self.ctes.insert(name, entry);
     }
 
-    pub fn has_cte(&self, name: &str) -> bool {
-        self.ctes.contains_key(name)
-    }
-
+    #[cfg(test)]
     fn get_cte(&self, name: &str) -> Option<&CteEntry> {
         self.ctes.get(name)
     }
 
     // ── Phase and aliases ────────────────────────────────────────────
-
-    fn set_phase(&mut self, phase: BindPhase) {
-        self.phase = phase;
-    }
 
     fn phase(&self) -> BindPhase {
         self.phase
@@ -1399,7 +1356,6 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     //    - resolved_columns was populated by bind_cte pass 2
                     //    - Build Arc<CteTable> as the BindTable
                     let cte_table = Arc::new(CteTable {
-                        name: table_name.clone(),
                         columns: cte.resolved_columns.clone(),
                     });
                     // 4. Generate internal_id via self.id_gen.next_table_id()
@@ -1408,9 +1364,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         internal_id: self.id_gen.next_table_id(),
                         source: ScopeTableSource::Cte {
                             name: table_name,
-                            columns: cte.resolved_columns.clone(),
                             cte_id: cte.cte_id,
-                            select: cte.select.clone(),
                         },
                         table: cte_table,
                         join_info: None,
@@ -1468,7 +1422,6 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         .map(|bc| bc.name.clone())
                         .collect();
                     let subquery_table = Arc::new(DerivedTable {
-                        name: identifier.clone(),
                         columns: subquery_columns.clone(),
                     });
 
@@ -1485,10 +1438,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     return Ok(ScopeTable {
                         identifier,
                         internal_id,
-                        source: ScopeTableSource::Derived {
-                            name: subquery_table.name.clone(),
-                            columns: subquery_columns,
-                        },
+                        source: ScopeTableSource::Derived {},
                         table: subquery_table,
                         join_info: None,
                         database_id: 0,
@@ -1531,7 +1481,6 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     .map(|bc| bc.name.clone())
                     .collect();
                 let subquery_table = Arc::new(DerivedTable {
-                    name: identifier.clone(),
                     columns: subquery_columns.clone(),
                 });
 
@@ -1549,10 +1498,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 Ok(ScopeTable {
                     identifier,
                     internal_id,
-                    source: ScopeTableSource::Derived {
-                        name: subquery_table.name.clone(),
-                        columns: subquery_columns,
-                    },
+                    source: ScopeTableSource::Derived {},
                     table: subquery_table,
                     join_info: None,
                     database_id: 0,
@@ -1624,17 +1570,13 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 // If alias is present, wrap all columns under that alias
                 // If no alias, flatten tables into parent scope
                 let sub_table = Arc::new(DerivedTable {
-                    name: identifier.clone(),
                     columns: all_columns,
                 });
 
                 Ok(ScopeTable {
                     identifier,
                     internal_id: self.id_gen.next_table_id(),
-                    source: ScopeTableSource::Derived {
-                        name: sub_table.name.clone(),
-                        columns: sub_table.columns.clone(),
-                    },
+                    source: ScopeTableSource::Derived {},
                     table: sub_table,
                     join_info: None,
                     database_id: 0,
@@ -2411,7 +2353,6 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         // Check CTEs first
         if let Some(cte) = self.ctes.get(&normalized) {
             let cte_table = Arc::new(CteTable {
-                name: normalized.clone(),
                 columns: cte.resolved_columns.clone(),
             });
             return Ok(BindScope {
@@ -2420,9 +2361,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     internal_id: self.id_gen.next_table_id(),
                     source: ScopeTableSource::Cte {
                         name: normalized,
-                        columns: cte.resolved_columns.clone(),
                         cte_id: cte.cte_id,
-                        select: cte.select.clone(),
                     },
                     table: cte_table,
                     join_info: None,

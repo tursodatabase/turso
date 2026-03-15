@@ -23,7 +23,7 @@ use crate::{
             ForeignKeyActions,
         },
         plan::{
-            ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
+            EvalAt, QueryDestination, ResultSetColumn,
             TableReferences,
         },
         planner::ROWID_STRS,
@@ -36,7 +36,7 @@ use crate::{
             TriggerContext,
         },
         upsert::{
-            collect_set_clauses_for_upsert, emit_upsert, resolve_upsert_target,
+            collect_set_clauses_for_upsert, emit_upsert,
             ResolvedUpsertTarget,
         },
     },
