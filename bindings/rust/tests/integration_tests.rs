@@ -1749,37 +1749,38 @@ async fn test_ghost_commits() {
     }
 }
 
-/// AUTOINCREMENT is not supported in MVCC mode. Verify that CREATE TABLE
-/// with AUTOINCREMENT fails with a clear error message.
+/// Test that AUTOINCREMENT works correctly in MVCC mode.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_autoincrement_blocked_in_mvcc() {
+async fn test_autoincrement_works_in_mvcc() {
     let (db, _dir) = setup_mvcc_db("").await;
     let conn = db.connect().unwrap();
 
-    // CREATE TABLE with AUTOINCREMENT should fail
-    let result = conn
-        .execute(
-            "CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)",
-            (),
-        )
-        .await;
-    assert!(
-        result.is_err(),
-        "CREATE TABLE with AUTOINCREMENT should fail in MVCC mode"
-    );
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("AUTOINCREMENT is not supported in MVCC mode"),
-        "unexpected error: {err}"
-    );
+    // CREATE TABLE with AUTOINCREMENT should work
+    conn.execute(
+        "CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)",
+        (),
+    )
+    .await
+    .unwrap();
 
-    // Regular tables without AUTOINCREMENT should still work
-    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)", ())
+    conn.execute("INSERT INTO t(b) VALUES ('first')", ())
         .await
         .unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 'hello')", ())
+    conn.execute("INSERT INTO t(b) VALUES ('second')", ())
         .await
         .unwrap();
+    conn.execute("INSERT INTO t(b) VALUES ('third')", ())
+        .await
+        .unwrap();
+
     let count = query_i64(&conn, "SELECT COUNT(*) FROM t").await;
-    assert_eq!(count, 1);
+    assert_eq!(count, 3);
+    
+    let first_id = query_i64(&conn, "SELECT a FROM t WHERE b = 'first'").await;
+    let second_id = query_i64(&conn, "SELECT a FROM t WHERE b = 'second'").await;
+    let third_id = query_i64(&conn, "SELECT a FROM t WHERE b = 'third'").await;
+    
+    assert_eq!(first_id, 1);
+    assert_eq!(second_id, 2);
+    assert_eq!(third_id, 3);
 }

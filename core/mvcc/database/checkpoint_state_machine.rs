@@ -1574,8 +1574,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             if let Some(max_rowid) = effective_max {
                 self.update_sqlite_sequence_entry(seq_table_id, table_name.clone(), max_rowid)?;
 
-                // Critical: Reset the RowidAllocator to match the rebuilt sqlite_sequence value
-                // This prevents the allocator from caching stale values from rolled-back transactions
+                // Reset the RowidAllocator to match the rebuilt sqlite_sequence value. This
+                // prevents the allocator from caching stale values from rolled-back transactions
                 let allocator = self.mvstore.get_rowid_allocator(&table_id);
                 allocator.initialize(Some(max_rowid));
                 tracing::debug!(
@@ -1594,7 +1594,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         let mut found_any = false;
 
         // Use the same pattern as collect_committed_table_row_versions:
-        // Only consider rows that are actually being checkpointed (committed and within boundaries)
+        // Only consider rows that are actually being checkpointed
         for entry in self.mvstore.rows.iter() {
             let row_id = entry.key();
             if row_id.table_id != table_id {
@@ -1608,11 +1608,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
             let row_versions = entry.value().read();
 
-            // Critical: Only consider rows that would be checkpointed (committed and within boundaries)
+            // Only consider rows that would be checkpointed
             if let Some(version) =
                 self.maybe_get_checkpointable_version(&row_versions, row_id.table_id)
             {
-                // Only process non-delete versions (we want actual data, not tombstones)
+                // Only process non-delete versions
                 if version.end.is_none() {
                     if let RowKey::Int(rowid) = row_id.row_id {
                         if rowid > max_rowid {

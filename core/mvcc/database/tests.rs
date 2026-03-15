@@ -4842,7 +4842,6 @@ fn test_cursor_with_btree_and_mvcc_delete_after_checkpoint() {
 
 /// Core MVCC read/write semantics for AUTOINCREMENT with rowid update.
 #[test]
-#[ignore = "AUTOINCREMENT not yet supported in MVCC mode"]
 fn test_skips_updated_rowid() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
@@ -7090,38 +7089,31 @@ fn test_double_delete_btree_resident_row_with_unique_index() {
     );
 }
 
-/// AUTOINCREMENT is not supported in MVCC mode due to sqlite_sequence
-/// corruption with concurrent transactions. Verify that CREATE TABLE
-/// with AUTOINCREMENT and INSERT into AUTOINCREMENT tables are blocked.
+/// Test that AUTOINCREMENT works correctly in MVCC mode.
 #[test]
-fn test_autoincrement_blocked_in_mvcc() {
+fn test_autoincrement_works_in_mvcc() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
-    // CREATE TABLE with AUTOINCREMENT should fail in MVCC mode
-    let result = conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)");
-    assert!(
-        result.is_err(),
-        "CREATE TABLE with AUTOINCREMENT should fail in MVCC mode"
-    );
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("AUTOINCREMENT is not supported in MVCC mode"),
-        "unexpected error: {err}"
-    );
-
-    // Regular tables without AUTOINCREMENT should still work
-    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)")
+    // CREATE TABLE with AUTOINCREMENT should work in MVCC mode
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)")
         .unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
-    let rows = get_rows(&conn, "SELECT * FROM t");
-    assert_eq!(rows.len(), 1);
+
+    conn.execute("INSERT INTO t(b) VALUES ('first')").unwrap();
+    conn.execute("INSERT INTO t(b) VALUES ('second')").unwrap();
+    conn.execute("INSERT INTO t(b) VALUES ('third')").unwrap();
+
+    let rows = get_rows(&conn, "SELECT a, b FROM t ORDER BY a");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0], vec![Value::from_i64(1), Value::build_text("first")]);
+    assert_eq!(rows[1], vec![Value::from_i64(2), Value::build_text("second")]);
+    assert_eq!(rows[2], vec![Value::from_i64(3), Value::build_text("third")]);
 }
 
-/// If a table with AUTOINCREMENT was created before MVCC was enabled,
-/// INSERT into that table should still be blocked in MVCC mode.
+/// Test that a table with AUTOINCREMENT created before MVCC was enabled
+/// continues to work correctly after switching to MVCC mode.
 #[test]
-fn test_autoincrement_insert_blocked_for_preexisting_table() {
+fn test_autoincrement_works_for_preexisting_table() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let path = temp_dir
         .path()
@@ -7153,7 +7145,7 @@ fn test_autoincrement_insert_blocked_for_preexisting_table() {
         manager.clear();
     }
 
-    // Phase 2: Reopen in MVCC mode — INSERT should be blocked
+    // Phase 2: Reopen in MVCC mode — INSERT should work
     {
         let db = crate::Database::open_file_with_flags(
             io,
@@ -7167,16 +7159,9 @@ fn test_autoincrement_insert_blocked_for_preexisting_table() {
         conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
             .unwrap();
 
-        let result = conn.execute("INSERT INTO t(b) VALUES ('in_mvcc')");
-        assert!(
-            result.is_err(),
-            "INSERT into AUTOINCREMENT table should fail in MVCC mode"
-        );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("AUTOINCREMENT is not supported in MVCC mode"),
-            "unexpected error: {err}"
-        );
+        conn.execute("INSERT INTO t(b) VALUES ('in_mvcc')").unwrap();
+        let rows = get_rows(&conn, "SELECT a, b FROM t ORDER BY a");
+        assert_eq!(rows[1], vec![Value::from_i64(2), Value::build_text("in_mvcc")]);
     }
 }
 
@@ -7184,7 +7169,6 @@ fn test_autoincrement_insert_blocked_for_preexisting_table() {
 /// both succeed. Before the fix, the second transaction would fail with a
 /// WriteWriteConflict on the sqlite_sequence metadata table.
 #[test]
-#[ignore = "AUTOINCREMENT not yet supported in MVCC mode"]
 fn test_concurrent_autoincrement_inserts() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn1 = db.connect();
@@ -7223,7 +7207,6 @@ fn test_concurrent_autoincrement_inserts() {
 /// After concurrent autoincrement inserts and a checkpoint, sqlite_sequence
 /// must reflect the true maximum rowid.
 #[test]
-#[ignore = "AUTOINCREMENT not yet supported in MVCC mode"]
 fn test_autoincrement_sqlite_sequence_after_checkpoint() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn1 = db.connect();
@@ -7260,7 +7243,6 @@ fn test_autoincrement_sqlite_sequence_after_checkpoint() {
 /// Three concurrent transactions all inserting into the same AUTOINCREMENT table
 /// must all succeed and produce unique, increasing rowids.
 #[test]
-#[ignore = "AUTOINCREMENT not yet supported in MVCC mode"]
 fn test_three_concurrent_autoincrement_inserts() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
@@ -7309,7 +7291,6 @@ fn test_three_concurrent_autoincrement_inserts() {
 ///
 /// This violates AUTOINCREMENT's contract that rowids must never decrease.
 #[test]
-#[ignore = "AUTOINCREMENT not yet supported in MVCC mode"]
 fn test_autoincrement_no_reuse_after_delete_and_restart() {
     let _ = tracing_subscriber::fmt().try_init();
     let mut db = MvccTestDbNoConn::new_with_random_db();
