@@ -1554,8 +1554,11 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
     fn resolve_alias(&self, name: &str) -> Option<ast::Expr> {
         let normalized = normalize_ident(name);
+        // Search from the end: later aliases shadow earlier ones (SQLite behavior).
+        // e.g. SELECT a, -b AS a FROM t ORDER BY a → ORDER BY resolves to -b
         self.aliases()
             .iter()
+            .rev()
             .find(|alias| alias.name.eq_ignore_ascii_case(&normalized))
             .map(|alias| alias.expr.clone())
     }
@@ -1635,34 +1638,63 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         col_name: &str,
         scope: &BindScope,
     ) -> Result<Option<ast::Expr>> {
-        // Check for rowid pseudo-column first (before find_column_qualified
-        // which would error with "no such column" for rowid on a found table).
-        if let Some(st) = scope.find_table_by_identifier(table_name) {
-            if let Some(row_id_expr) =
-                parse_row_id(col_name, st.internal_id, || false)?
-            {
-                self.tracking.record_rowid(st.internal_id);
-                return Ok(Some(row_id_expr));
+        // Try real columns first. A user-defined column named "oid", "rowid",
+        // or "_rowid_" takes priority over the rowid pseudo-column.
+        // find_column_qualified returns Err only when the table IS found but
+        // the column is NOT — we intercept that case to try rowid fallback.
+        match scope.find_column_qualified(table_name, col_name) {
+            Ok(Some((table_id, col_idx, is_rowid_alias))) => {
+                self.tracking.record_column(table_id, col_idx);
+                return Ok(Some(ast::Expr::Column {
+                    database: None,
+                    table: table_id,
+                    column: col_idx,
+                    is_rowid_alias,
+                }));
+            }
+            Ok(None) => {
+                // Table not found — continue to outer scope / rowid checks
+            }
+            Err(_) => {
+                // Table found but column not found — try rowid pseudo-column
+                if let Some(st) = scope.find_table_by_identifier(table_name) {
+                    if let Some(row_id_expr) =
+                        parse_row_id(col_name, st.internal_id, || false)?
+                    {
+                        self.tracking.record_rowid(st.internal_id);
+                        return Ok(Some(row_id_expr));
+                    }
+                }
+                // Not a rowid either — re-raise the original error
+                return Err(crate::LimboError::ParseError(format!(
+                    "no such column: {}.{}", table_name, col_name
+                )));
             }
         }
 
-        if let Some((table_id, col_idx, is_rowid_alias)) =
-            scope.find_column_qualified(table_name, col_name)?
-        {
-            self.tracking.record_column(table_id, col_idx);
-            return Ok(Some(ast::Expr::Column {
-                database: None,
-                table: table_id,
-                column: col_idx,
-                is_rowid_alias,
-            }));
-        }
-
-        // Check outer scopes for rowid and columns
+        // Check outer scopes for columns and rowid
         let outer_match: Option<Result<ast::Expr>> = {
             let mut result = None;
             for outer_scope in self.outer_scopes_iter() {
-                // Check rowid first (before find_column_qualified errors)
+                // Check real columns first, rowid as fallback
+                match outer_scope.find_column_qualified(table_name, col_name) {
+                    Ok(Some((table_id, col_idx, is_rowid_alias))) => {
+                        result = Some(Ok(ast::Expr::Column {
+                            database: None,
+                            table: table_id,
+                            column: col_idx,
+                            is_rowid_alias,
+                        }));
+                        break;
+                    }
+                    Ok(None) => {
+                        // Table not found in this scope, continue to next
+                        continue;
+                    }
+                    Err(_) => {
+                        // Table found but column not — try rowid pseudo-column
+                    }
+                }
                 if let Some(st) = outer_scope.find_table_by_identifier(table_name) {
                     if let Some(row_id_expr) =
                         parse_row_id(col_name, st.internal_id, || false)?
@@ -1671,17 +1703,11 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         break;
                     }
                 }
-                if let Some((table_id, col_idx, is_rowid_alias)) =
-                    outer_scope.find_column_qualified(table_name, col_name)?
-                {
-                    result = Some(Ok(ast::Expr::Column {
-                        database: None,
-                        table: table_id,
-                        column: col_idx,
-                        is_rowid_alias,
-                    }));
-                    break;
-                }
+                // Column name not found in this scope as real column or rowid
+                result = Some(Err(crate::LimboError::ParseError(format!(
+                    "no such column: {}.{}", table_name, col_name
+                ))));
+                break;
             }
             result
         };
