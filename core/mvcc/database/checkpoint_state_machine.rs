@@ -4,7 +4,7 @@ use crate::mvcc::database::{
     WriteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX, MVCC_META_TABLE_NAME,
     SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
-use crate::schema::Index;
+use crate::schema::{Index, Table, SQLITE_SEQUENCE_TABLE_NAME};
 use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::pager::CreateBTreeFlags;
@@ -502,16 +502,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 }
             }
         }
-        // Writing in ascending order of rowid gives us a better chance of using balance-quick algorithm
-        // in case of an insert-heavy checkpoint.
-        self.write_set.sort_by_key(|version| {
-            (
-                // Sort by table_id descending (schema changes first)
-                std::cmp::Reverse(version.0.row.id.table_id),
-                // Then by row_id ascending
-                version.0.row.id.row_id.clone(),
-            )
-        });
+        self.sort_write_set();
     }
 
     /// Collect all committed index row versions that need to be written to the B-tree.
@@ -576,6 +567,195 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         self.mvstore.storage.truncate()
     }
 
+    fn run_to_completion<T>(&self, mut action: impl FnMut() -> Result<IOResult<T>>) -> Result<T> {
+        loop {
+            match action()? {
+                IOResult::Done(result) => return Ok(result),
+                IOResult::IO(io) => io.wait(self.pager.io.as_ref())?,
+            }
+        }
+    }
+
+    fn sort_write_set(&mut self) {
+        // Writing in ascending order of rowid gives us a better chance of using
+        // balance-quick algorithm in insert-heavy checkpoints.
+        self.write_set.sort_by_key(|version| {
+            (
+                // Sort by table_id descending (schema changes first)
+                std::cmp::Reverse(version.0.row.id.table_id),
+                // Then by row_id ascending
+                version.0.row.id.row_id.clone(),
+            )
+        });
+    }
+
+    fn should_rebuild_sqlite_sequence(&self) -> bool {
+        self.mvstore.autoincrement_checkpoint_needed()
+            || self
+                .write_set
+                .iter()
+                .any(|(row_version, _)| row_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID)
+    }
+
+    fn read_existing_sqlite_sequence_rows(
+        &self,
+        seq_table: &crate::schema::BTreeTable,
+        seq_table_created_in_checkpoint: bool,
+    ) -> Result<HashMap<String, i64>> {
+        if seq_table_created_in_checkpoint {
+            return Ok(HashMap::default());
+        }
+
+        let root_page = self
+            .mvstore
+            .table_id_to_rootpage
+            .get(
+                &self
+                    .mvstore
+                    .get_table_id_from_root_page(seq_table.root_page),
+            )
+            .and_then(|entry| entry.value().map(|root_page| root_page as i64))
+            .ok_or_else(|| {
+                LimboError::Corrupt(
+                    "sqlite_sequence is missing a physical root page during MVCC checkpoint"
+                        .to_string(),
+                )
+            })?;
+        let mut cursor =
+            BTreeCursor::new_table(self.pager.clone(), root_page, seq_table.columns.len());
+        let mut rows = HashMap::default();
+        self.run_to_completion(|| cursor.rewind())?;
+        while cursor.has_record() {
+            let rowid = self.run_to_completion(|| cursor.rowid())?.ok_or_else(|| {
+                LimboError::Corrupt(
+                    "sqlite_sequence cursor lost rowid during MVCC checkpoint".to_string(),
+                )
+            })?;
+            let record = loop {
+                match cursor.record()? {
+                    IOResult::Done(Some(record)) => break record,
+                    IOResult::Done(None) => {
+                        return Err(LimboError::Corrupt(
+                            "sqlite_sequence cursor lost record during MVCC checkpoint".to_string(),
+                        ));
+                    }
+                    IOResult::IO(io) => io.wait(self.pager.io.as_ref())?,
+                }
+            };
+            let (name, _seq) = record.get_two_values(0, 1)?;
+            let ValueRef::Text(name) = name else {
+                crate::bail_corrupt_error!("malformed sqlite_sequence name during checkpoint");
+            };
+            let ValueRef::Numeric(Numeric::Integer(_)) = _seq else {
+                crate::bail_corrupt_error!("malformed sqlite_sequence seq during checkpoint");
+            };
+            rows.insert(name.to_string(), rowid);
+            self.run_to_completion(|| cursor.next())?;
+        }
+        Ok(rows)
+    }
+
+    fn stage_sqlite_sequence_rebuild(&mut self) -> Result<()> {
+        let schema = self.connection.db.clone_schema();
+        let has_autoincrement_tables = schema
+            .tables
+            .values()
+            .any(|table| matches!(table.as_ref(), Table::BTree(table) if table.has_autoincrement));
+        let Some(seq_table) = schema.get_btree_table(SQLITE_SEQUENCE_TABLE_NAME) else {
+            if has_autoincrement_tables {
+                crate::bail_corrupt_error!("missing sqlite_sequence table during MVCC checkpoint");
+            }
+            return Ok(());
+        };
+        let seq_table_id = self
+            .mvstore
+            .get_table_id_from_root_page(seq_table.root_page);
+        let seq_table_created_in_checkpoint = self.write_set.iter().any(|(_, special_write)| {
+            matches!(
+                special_write,
+                Some(SpecialWrite::BTreeCreate { table_id, .. }) if *table_id == seq_table_id
+            )
+        });
+        let existing_rows = self.read_existing_sqlite_sequence_rows(
+            seq_table.as_ref(),
+            seq_table_created_in_checkpoint,
+        )?;
+        let mut desired_rows = Vec::new();
+
+        for table in schema.tables.values() {
+            let Table::BTree(table) = table.as_ref() else {
+                continue;
+            };
+            if !table.has_autoincrement {
+                continue;
+            }
+
+            let table_id = self.mvstore.get_table_id_from_root_page(table.root_page);
+            let committed_seq = self.mvstore.get_committed_autoincrement_sequence(&table_id);
+            // Checkpoint runs under the blocking lock, so it is the safe point to
+            // resynchronize the shared rowid allocator with committed AUTOINCREMENT
+            // state and discard stale reservations left behind by rolled-back txns.
+            self.mvstore
+                .get_rowid_allocator(&table_id)
+                .initialize(Some(committed_seq));
+            if committed_seq <= 0 {
+                continue;
+            }
+
+            desired_rows.push((table.name.clone(), committed_seq));
+        }
+
+        desired_rows.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+        let mut existing_by_name = existing_rows;
+        let mut next_rowid = existing_by_name.values().copied().max().unwrap_or(0) + 1;
+
+        for (table_name, seq) in desired_rows.into_iter() {
+            let rowid = if let Some(existing_rowid) = existing_by_name.remove(&table_name) {
+                existing_rowid
+            } else {
+                let rowid = next_rowid;
+                next_rowid += 1;
+                rowid
+            };
+            let record = ImmutableRecord::from_values(
+                &[Value::build_text(table_name), Value::from_i64(seq)],
+                seq_table.columns.len(),
+            );
+            let row = Row::new_table_row(
+                RowID::new(seq_table_id, RowKey::Int(rowid)),
+                record.get_payload().to_owned(),
+                seq_table.columns.len(),
+            );
+            let row_version = RowVersion {
+                // Synthetic checkpoint-only row version; it has no MV store backing chain.
+                id: 0,
+                begin: Some(TxTimestampOrID::Timestamp(self.durable_txid_max_new)),
+                end: None,
+                row,
+                btree_resident: true,
+            };
+            self.write_set.push((row_version, None));
+        }
+
+        for (_table_name, rowid) in existing_by_name {
+            self.write_set.push((
+                RowVersion {
+                    id: 0,
+                    begin: Some(TxTimestampOrID::Timestamp(self.durable_txid_max_new)),
+                    end: Some(TxTimestampOrID::Timestamp(self.durable_txid_max_new)),
+                    row: Row {
+                        id: RowID::new(seq_table_id, RowKey::Int(rowid)),
+                        data: None,
+                        column_count: seq_table.columns.len(),
+                    },
+                    btree_resident: true,
+                },
+                None,
+            ));
+        }
+        Ok(())
+    }
+
     /// Perform a TRUNCATE checkpoint on the WAL
     fn checkpoint_wal(&self) -> Result<IOResult<CheckpointResult>> {
         let Some(wal) = &self.pager.wal else {
@@ -609,17 +789,15 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         let ckpt_max = self.durable_txid_max_new;
 
         for (row_version, _special_write) in &self.write_set {
+            if row_version.id == 0 {
+                continue;
+            }
             let row_id = &row_version.row.id;
             let Some(entry) = self.mvstore.rows.get(row_id) else {
-                // The MVCC metadata table row (persistent_tx_ts_max) is staged
-                // directly into the write set by maybe_stage_mvcc_metadata_write() and do not
-                // have a backing in-memory MVCC version chain. Skip GC for these.
-                assert!(
-                    self.mvcc_meta_table
-                        .is_some_and(|(tid, _)| tid == row_id.table_id),
-                    "row {row_id:?} missing from MVCC store but is not an MVCC metadata table row"
+                panic!(
+                    "checkpoint write_set row missing MVCC version chain: table_id={} row_id={}",
+                    row_id.table_id, row_id.row_id
                 );
-                continue;
             };
             let is_now_empty = {
                 let mut versions = entry.value().write();
@@ -724,8 +902,13 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 let durable_old = self.durable_txid_max_old.map(u64::from).unwrap_or_default();
                 let committed_max = self.mvstore.last_committed_tx_ts.load(Ordering::Acquire);
                 self.durable_txid_max_new = durable_old.max(committed_max);
-                self.maybe_stage_mvcc_metadata_write()?;
 
+                if self.should_rebuild_sqlite_sequence() {
+                    self.stage_sqlite_sequence_rebuild()?;
+                    self.sort_write_set();
+                }
+
+                self.maybe_stage_mvcc_metadata_write()?;
                 self.mvstore
                     .storage
                     .on_checkpoint_start(self.durable_txid_max_new);
@@ -775,7 +958,6 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 if !self.has_more_rows(write_set_index) {
                     // Done writing all table rows, now process index rows
                     if self.index_write_set.is_empty() {
-                        // No index rows to write, skip to commit
                         self.state = CheckpointState::CommitPagerTxn;
                     } else {
                         // Start writing index rows
@@ -1116,7 +1298,6 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 let requires_seek = *requires_seek;
 
                 if index_write_set_index >= self.index_write_set.len() {
-                    // Done writing all index rows
                     self.state = CheckpointState::CommitPagerTxn;
                     return Ok(TransitionResult::Continue);
                 }
@@ -1497,6 +1678,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     .store(self.durable_txid_max_new, Ordering::SeqCst);
                 self.gc_checkpointed_versions();
                 self.mvstore.drop_unused_row_versions();
+                if self.mvstore.autoincrement_checkpoint_needed() {
+                    self.mvstore.clear_autoincrement_checkpoint_needed();
+                }
                 self.mvstore
                     .storage
                     .on_checkpoint_end(self.durable_txid_max_new);
