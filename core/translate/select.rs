@@ -603,6 +603,7 @@ fn prepare_one_select_plan(
 
             // Plan subqueries in VALUES expressions
             let mut non_from_clause_subqueries = vec![];
+            let mut bound_subqueries = bound_subqueries;
             plan_subqueries_from_values(
                 program,
                 &mut non_from_clause_subqueries,
@@ -610,6 +611,7 @@ fn prepare_one_select_plan(
                 &mut values,
                 resolver,
                 connection,
+                &mut bound_subqueries,
             )?;
 
             let plan = SelectPlan {

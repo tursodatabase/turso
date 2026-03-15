@@ -326,6 +326,10 @@ pub fn plan_subqueries_from_values(
     values: &mut [Vec<Box<ast::Expr>>],
     resolver: &Resolver,
     connection: &Arc<Connection>,
+    bound_subqueries: &mut rustc_hash::FxHashMap<
+        turso_parser::ast::TableInternalId,
+        super::bind::BoundSubquery,
+    >,
 ) -> Result<()> {
     plan_subqueries_with_outer_query_access(
         program,
@@ -337,7 +341,7 @@ pub fn plan_subqueries_from_values(
         SubqueryPosition::ResultColumn, // VALUES are similar to result columns in terms of subquery handling
         SubqueryOrigin::SelectList,
         SubqueryPosition::ResultColumn.allow_correlated(),
-        &mut Default::default(),
+        bound_subqueries,
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries);
