@@ -266,7 +266,7 @@ fn bind_prepare_update_plan(
 
     // Bind phase
     let mut binder = BindContext::new(resolver, program);
-    let mut bound = binder.bind_update(&mut body)?;
+    let mut bound = binder.bind_update(&mut body, database_id)?;
 
     // Extract bound data before consuming `bound` for table references.
     let cte_definitions = std::mem::take(&mut bound.cte_definitions);

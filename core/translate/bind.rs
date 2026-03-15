@@ -1339,14 +1339,76 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 }
 
                 // 3. Otherwise, schema lookup via resolver
-                //    - Build Arc<Table> as the BindTable (Table already implements BindTable)
-                let schema_table =
-                    self.resolver
-                        .schema()
-                        .get_table(&table_name)
-                        .ok_or_else(|| {
-                            crate::LimboError::ParseError(format!("no such table: {}", table_name))
-                        })?;
+                //    - Handle cross-database references (e.g. aux.t1)
+                let database_id = self.resolver.resolve_database_id(name)?;
+
+                // 3a. Check for views — expand them as derived tables (subqueries)
+                if let Some(view) = self
+                    .resolver
+                    .with_schema(database_id, |s| s.get_view(&table_name))
+                {
+                    view.process()?;
+                    let mut view_select = view.select_stmt.clone();
+                    // Apply view column aliases to the SELECT result columns
+                    if let ast::OneSelect::Select {
+                        ref mut columns, ..
+                    } = view_select.body.select
+                    {
+                        for (col, result_col) in
+                            view.columns.iter().zip(columns.iter_mut())
+                        {
+                            if let (
+                                Some(name_str),
+                                ast::ResultColumn::Expr(_, ref mut col_alias),
+                            ) = (&col.name, result_col)
+                            {
+                                *col_alias =
+                                    Some(ast::As::As(ast::Name::exact(name_str.clone())));
+                            }
+                        }
+                    }
+
+                    // Bind the view's SELECT as a derived table (subquery)
+                    let bound_select = self.bind_select(&mut view_select)?;
+                    let subquery_columns: Vec<String> = bound_select
+                        .result_columns
+                        .iter()
+                        .map(|bc| bc.name.clone())
+                        .collect();
+                    let subquery_table = Arc::new(DerivedTable {
+                        name: identifier.clone(),
+                        columns: subquery_columns.clone(),
+                    });
+
+                    let internal_id = self.id_gen.next_table_id();
+
+                    self.derived_bindings.insert(
+                        internal_id,
+                        BoundSubquery {
+                            select: view_select,
+                            inner_bound: bound_select,
+                        },
+                    );
+
+                    return Ok(ScopeTable {
+                        identifier,
+                        internal_id,
+                        source: ScopeTableSource::Derived {
+                            name: subquery_table.name.clone(),
+                            columns: subquery_columns,
+                        },
+                        table: subquery_table,
+                        join_info: None,
+                    });
+                }
+
+                // 3b. Regular table lookup
+                let schema_table = self
+                    .resolver
+                    .with_schema(database_id, |s| s.get_table(&table_name))
+                    .ok_or_else(|| {
+                        crate::LimboError::ParseError(format!("no such table: {}", table_name))
+                    })?;
 
                 // 4. Generate internal_id via self.id_gen.next_table_id()
                 Ok(ScopeTable {
@@ -2036,7 +2098,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
     // ── UPDATE binding ──────────────────────────────────────────────────
 
     /// Bind an UPDATE statement, resolving all name references in-place.
-    pub fn bind_update(&mut self, update: &mut ast::Update) -> Result<BoundUpdate> {
+    pub fn bind_update(&mut self, update: &mut ast::Update, database_id: usize) -> Result<BoundUpdate> {
         self.with_query(|ctx| {
             // 1. Bind CTEs from WITH clause
             if let Some(with) = &mut update.with {
@@ -2047,6 +2109,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             let scope = ctx.build_table_scope(
                 &update.tbl_name.name,
                 update.tbl_name.alias.as_ref(),
+                database_id,
             )?;
 
             // 3. Bind SET expressions + resolve column names to indices
@@ -2103,10 +2166,12 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
     }
 
     /// Build a single-table scope for DML statements (UPDATE, DELETE).
+    /// `database_id` specifies which attached database to search (0 = main).
     fn build_table_scope(
         &mut self,
         table_name: &ast::Name,
         alias: Option<&ast::Name>,
+        database_id: usize,
     ) -> Result<BindScope> {
         let normalized = normalize_ident(table_name.as_str());
         let identifier = alias
@@ -2136,11 +2201,10 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             });
         }
 
-        // Schema lookup
+        // Schema lookup (uses the specified database for attached DB support)
         let schema_table = self
             .resolver
-            .schema()
-            .get_table(&normalized)
+            .with_schema(database_id, |s| s.get_table(&normalized))
             .ok_or_else(|| {
                 crate::LimboError::ParseError(format!("no such table: {}", normalized))
             })?;
@@ -2320,6 +2384,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         where_clause: &mut Option<Box<ast::Expr>>,
         returning: &mut Vec<ast::ResultColumn>,
         with: &mut Option<ast::With>,
+        database_id: usize,
     ) -> Result<BoundDelete> {
         self.with_query(|ctx| {
             // 1. Bind CTEs from WITH clause
@@ -2328,7 +2393,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             }
 
             // 2. Build scope with target table
-            let scope = ctx.build_table_scope(tbl_name, None)?;
+            let scope = ctx.build_table_scope(tbl_name, None, database_id)?;
 
             // 3. Bind WHERE clause
             if let Some(where_expr) = where_clause.as_mut() {
@@ -2388,7 +2453,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             }
 
             // 2. Build scope with target table (for RETURNING)
-            let scope = ctx.build_table_scope(tbl_name, None)?;
+            let scope = ctx.build_table_scope(tbl_name, None, database_id)?;
 
             // 3. Bind VALUES / detect multi-row path
             let (values, inserting_multiple_rows) = ctx.bind_insert_values(body, &scope)?;

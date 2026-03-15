@@ -202,7 +202,7 @@ fn bind_prepare_delete_plan(
 
     // Bind phase
     let mut binder = BindContext::new(resolver, program);
-    let mut bound = binder.bind_delete(tbl_name_ast, where_clause, returning, with)?;
+    let mut bound = binder.bind_delete(tbl_name_ast, where_clause, returning, with, database_id)?;
 
     // Extract bound data before consuming `bound` for table references.
     let cte_definitions = std::mem::take(&mut bound.cte_definitions);
