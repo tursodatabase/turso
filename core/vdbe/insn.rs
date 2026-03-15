@@ -1545,7 +1545,8 @@ pub enum Insn {
         /// Register containing probe-side rowid for grace hash join buffering.
         /// When Some and target partition is on disk, buffer the probe row
         /// instead of loading the partition on demand.
-        /// When None, fall back to LRU-based on-demand partition loading.
+        /// When None, this instruction is running inside grace processing and
+        /// the build partition must already be loaded.
         probe_rowid_reg: Option<u16>,
     },
 

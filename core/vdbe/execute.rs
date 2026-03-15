@@ -12346,9 +12346,7 @@ pub fn op_hash_build_finalize(
     if let Some(ht) = state.hash_tables.get_mut(hash_table_id) {
         // Finalize the build phase, may flush remaining partitions to disk if spilled
         match ht.finalize_build(Some(&mut state.metrics.hash_join))? {
-            crate::types::IOResult::Done(()) => {
-                // Partitions will be loaded on-demand during probing
-            }
+            crate::types::IOResult::Done(()) => {}
             crate::types::IOResult::IO(io) => {
                 return Ok(InsnFunctionStepResult::IO(io));
             }
@@ -12433,12 +12431,13 @@ pub fn op_hash_probe(
         return Ok(InsnFunctionStepResult::Step);
     };
 
-    // For spilled hash tables, decide between grace buffering and LRU loading
+    // For spilled hash tables, either buffer main-loop probe rows for grace
+    // processing or probe a partition that grace logic already loaded.
     if hash_table.has_spilled() {
         let partition_idx =
             partition_idx.unwrap_or_else(|| hash_table.partition_for_keys(&probe_keys));
 
-        // Grace hash join path: buffer probe rows targeting spilled partitions
+        // Main probe loop: buffer probe rows targeting spilled build partitions.
         if let Some(rowid_reg) = probe_rowid_reg {
             if probe_buffered {
                 state.pc = target_pc.as_offset_int();
@@ -12466,12 +12465,7 @@ pub fn op_hash_probe(
                         return Ok(InsnFunctionStepResult::IO(io));
                     }
                 }
-                state.metrics.hash_join.grace_probe_rows_streamed = state
-                    .metrics
-                    .hash_join
-                    .grace_probe_rows_streamed
-                    .saturating_sub(0); // not streamed
-                                        // Jump to target_pc -- this row is deferred to grace processing
+                // Jump to target_pc -- this row is deferred to grace processing.
                 state.pc = target_pc.as_offset_int();
                 return Ok(InsnFunctionStepResult::Step);
             }
@@ -12481,24 +12475,10 @@ pub fn op_hash_probe(
                 .hash_join
                 .grace_probe_rows_streamed
                 .saturating_add(1);
-        } else {
-            // LRU fallback: load partition if not already loaded
-            if !hash_table.is_partition_loaded(partition_idx) {
-                match hash_table
-                    .load_spilled_partition(partition_idx, Some(&mut state.metrics.hash_join))?
-                {
-                    IOResult::Done(()) => {}
-                    IOResult::IO(io) => {
-                        state.op_hash_probe_state = Some(OpHashProbeState {
-                            probe_keys,
-                            hash_table_id,
-                            partition_idx,
-                            probe_buffered: false,
-                        });
-                        return Ok(InsnFunctionStepResult::IO(io));
-                    }
-                }
-            }
+        } else if !hash_table.is_partition_loaded(partition_idx) {
+            return Err(LimboError::InternalError(format!(
+                "HashProbe reached spilled partition {partition_idx} without a preloaded build partition; probe_rowid_reg=None is grace-only"
+            )));
         }
 
         // Probe the loaded partition
@@ -14285,10 +14265,11 @@ fn maybe_transform_root_page_to_positive(mvcc_store: Option<&Arc<MvStore>>, root
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::translate::collate::CollationSeq;
+    use crate::vdbe::BranchOffset;
     use crate::{Database, DatabaseOpts, MemoryIO, IO};
 
-    #[test]
-    fn test_decr_jump_zero_non_integer_register_returns_error() {
+    fn prepare_test_statement() -> Statement {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file_with_flags(
             io,
@@ -14299,7 +14280,138 @@ mod tests {
         )
         .unwrap();
         let conn = db.connect().unwrap();
-        let stmt = conn.prepare("SELECT 1;").unwrap();
+        conn.prepare("SELECT 1;").unwrap()
+    }
+
+    fn make_spilled_hash_table() -> (HashTable, Vec<Value>, usize) {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 1024,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
+            track_matched: false,
+            ..Default::default()
+        };
+        let mut ht = HashTable::new(config, io);
+
+        for i in 0..1024 {
+            match ht
+                .insert(vec![Value::from_i64(i)], i, vec![], None)
+                .unwrap()
+            {
+                IOResult::Done(()) => {}
+                IOResult::IO(_) => panic!("memory IO should complete synchronously"),
+            }
+        }
+
+        match ht.finalize_build(None).unwrap() {
+            IOResult::Done(()) => {}
+            IOResult::IO(_) => panic!("memory IO should complete synchronously"),
+        }
+        assert!(ht.has_spilled(), "test requires spilled hash table");
+
+        let probe_key = (0..1024)
+            .map(|i| vec![Value::from_i64(i)])
+            .find(|key| {
+                let partition_idx = ht.partition_for_keys(key);
+                !ht.is_partition_loaded(partition_idx)
+            })
+            .expect("expected an unloaded spilled partition");
+        let partition_idx = ht.partition_for_keys(&probe_key);
+
+        (ht, probe_key, partition_idx)
+    }
+
+    #[test]
+    fn test_hash_probe_rejects_unloaded_spilled_partition_without_probe_rowid() {
+        let stmt = prepare_test_statement();
+        let (ht, probe_key, _) = make_spilled_hash_table();
+
+        let mut state = ProgramState::new(2, 0);
+        state.hash_tables.insert(7, ht);
+        state.set_register(0, Register::Value(probe_key[0].clone()));
+
+        let insn = Insn::HashProbe {
+            hash_table_id: 7,
+            key_start_reg: 0,
+            num_keys: 1,
+            dest_reg: 1,
+            target_pc: BranchOffset::Offset(99),
+            payload_dest_reg: None,
+            num_payload: 0,
+            probe_rowid_reg: None,
+        };
+
+        let err = match op_hash_probe(stmt.get_program(), &mut state, &insn, stmt.get_pager()) {
+            Ok(_) => {
+                panic!("HashProbe should reject grace-only probing without a loaded partition")
+            }
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, LimboError::InternalError(ref message) if message.contains("probe_rowid_reg=None is grace-only")),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(state.pc, 0, "pc should not advance on invariant violation");
+        assert!(
+            state.op_hash_probe_state.is_none(),
+            "HashProbe should not stash resumable state for the removed fallback path"
+        );
+    }
+
+    #[test]
+    fn test_hash_probe_allows_grace_style_probe_after_partition_preload() {
+        let stmt = prepare_test_statement();
+        let (mut ht, probe_key, partition_idx) = make_spilled_hash_table();
+
+        loop {
+            match ht.load_spilled_partition(partition_idx, None).unwrap() {
+                IOResult::Done(()) => break,
+                IOResult::IO(_) => continue,
+            }
+        }
+        assert!(
+            ht.is_partition_loaded(partition_idx),
+            "grace-style probe requires the build partition to be resident"
+        );
+
+        let expected_rowid = match &probe_key[0] {
+            Value::Numeric(Numeric::Integer(i)) => *i,
+            ref other => panic!("expected integer probe key, got {other:?}"),
+        };
+
+        let mut state = ProgramState::new(2, 0);
+        state.hash_tables.insert(7, ht);
+        state.set_register(0, Register::Value(probe_key[0].clone()));
+
+        let insn = Insn::HashProbe {
+            hash_table_id: 7,
+            key_start_reg: 0,
+            num_keys: 1,
+            dest_reg: 1,
+            target_pc: BranchOffset::Offset(99),
+            payload_dest_reg: None,
+            num_payload: 0,
+            probe_rowid_reg: None,
+        };
+
+        let step = op_hash_probe(stmt.get_program(), &mut state, &insn, stmt.get_pager())
+            .expect("preloaded grace probe should succeed");
+        assert!(matches!(step, InsnFunctionStepResult::Step));
+        assert_eq!(state.pc, 1, "matching probe should fall through");
+        assert_eq!(
+            state.get_register(1).get_value(),
+            &Value::from_i64(expected_rowid),
+            "HashProbe should return the matching build rowid"
+        );
+    }
+
+    #[test]
+    fn test_decr_jump_zero_non_integer_register_returns_error() {
+        let stmt = prepare_test_statement();
 
         let mut state = ProgramState::new(1, 0);
         state.set_register(0, Register::Value(Value::Text("not-an-int".into())));
