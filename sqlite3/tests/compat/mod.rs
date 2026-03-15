@@ -144,6 +144,17 @@ extern "C" {
         final_: Option<unsafe extern "C" fn()>,
         destroy: Option<unsafe extern "C" fn(*mut libc::c_void)>,
     ) -> i32;
+    fn sqlite3_prepare_v3(
+        db: *mut sqlite3,
+        sql: *const libc::c_char,
+        n_bytes: i32,
+        prep_flags: u32,
+        stmt: *mut *mut sqlite3_stmt,
+        tail: *mut *const libc::c_char,
+    ) -> i32;
+    fn sqlite3_db_handle(stmt: *mut sqlite3_stmt) -> *mut sqlite3;
+    fn sqlite3_value_int(value: *mut libc::c_void) -> i32;
+    fn sqlite3_result_int(context: *mut libc::c_void, val: i32);
     fn sqlite3_initialize() -> i32;
 }
 
@@ -153,6 +164,7 @@ const SQLITE_MISUSE: i32 = 21;
 const SQLITE_CANTOPEN: i32 = 14;
 const SQLITE_ROW: i32 = 100;
 const SQLITE_DONE: i32 = 101;
+const SQLITE_PREPARE_PERSISTENT: u32 = 0x01;
 
 const SQLITE_CHECKPOINT_PASSIVE: i32 = 0;
 const SQLITE_CHECKPOINT_FULL: i32 = 1;
@@ -2767,6 +2779,73 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_sqlite3_prepare_v3() {
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("test.db");
+            let path_cstr = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(path_cstr.as_ptr(), &mut db), SQLITE_OK);
+
+            let mut errmsg: *mut libc::c_char = ptr::null_mut();
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg,
+                ),
+                SQLITE_OK
+            );
+
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v3(
+                    db,
+                    c"INSERT INTO t1 VALUES (?1, ?2)".as_ptr(),
+                    -1,
+                    SQLITE_PREPARE_PERSISTENT,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert!(!stmt.is_null());
+
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_db_handle() {
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("test.db");
+            let path_cstr = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(path_cstr.as_ptr(), &mut db), SQLITE_OK);
+
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(db, c"SELECT 1".as_ptr(), -1, &mut stmt, ptr::null_mut()),
+                SQLITE_OK
+            );
+            assert!(!stmt.is_null());
+
+            let returned_db = sqlite3_db_handle(stmt);
+            assert_eq!(returned_db, db);
+
+            let null_db = sqlite3_db_handle(ptr::null_mut());
+            assert!(null_db.is_null());
+
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+  
     /// Test: sqlite3_initialize must not panic when a global tracing subscriber
     /// is already installed.
     #[test]

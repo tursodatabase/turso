@@ -559,6 +559,22 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
     SQLITE_OK
 }
 
+/// sqlite3_prepare_v3 is identical to sqlite3_prepare_v2 but accepts a
+/// `prep_flags` parameter (e.g. SQLITE_PREPARE_PERSISTENT) which is a hint
+/// to the query planner. Turso does not use these hints yet, so we delegate
+/// directly to sqlite3_prepare_v2.
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_prepare_v3(
+    db: *mut sqlite3,
+    sql: *const ffi::c_char,
+    n_byte: ffi::c_int,
+    _prep_flags: ffi::c_uint,
+    out_stmt: *mut *mut sqlite3_stmt,
+    tail: *mut *const ffi::c_char,
+) -> ffi::c_int {
+    sqlite3_prepare_v2(db, sql, n_byte, out_stmt, tail)
+}
+
 unsafe fn stmt_run_to_completion(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     let stmt_ref = &mut *stmt;
     while stmt_ref.stmt.execution_state().is_running() {
@@ -1031,8 +1047,11 @@ pub unsafe extern "C" fn sqlite3_db_config(_db: *mut sqlite3, _op: ffi::c_int) -
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_db_handle(_stmt: *mut sqlite3_stmt) -> *mut sqlite3 {
-    stub!();
+pub unsafe extern "C" fn sqlite3_db_handle(stmt: *mut sqlite3_stmt) -> *mut sqlite3 {
+    if stmt.is_null() {
+        return std::ptr::null_mut();
+    }
+    (*stmt).db
 }
 
 #[no_mangle]
@@ -1470,8 +1489,11 @@ pub unsafe extern "C" fn sqlite3_column_int64(stmt: *mut sqlite3_stmt, idx: ffi:
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_column_int(stmt: *mut sqlite3_stmt, idx: ffi::c_int) -> i64 {
-    sqlite3_column_int64(stmt, idx)
+pub unsafe extern "C" fn sqlite3_column_int(
+    stmt: *mut sqlite3_stmt,
+    idx: ffi::c_int,
+) -> ffi::c_int {
+    sqlite3_column_int64(stmt, idx) as ffi::c_int
 }
 
 #[no_mangle]
@@ -1545,6 +1567,11 @@ pub unsafe extern "C" fn sqlite3_value_int64(value: *mut ffi::c_void) -> i64 {
     }
     let v = &*(value as *const ExtValue);
     v.to_integer().unwrap_or(0)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_value_int(value: *mut ffi::c_void) -> ffi::c_int {
+    sqlite3_value_int64(value) as ffi::c_int
 }
 
 #[no_mangle]
@@ -1803,6 +1830,11 @@ pub unsafe extern "C" fn sqlite3_result_int64(context: *mut ffi::c_void, val: i6
     }
     let ctx = &mut *(context as *mut SqliteContext);
     ctx.result = ExtValue::from_integer(val);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_result_int(context: *mut ffi::c_void, val: ffi::c_int) {
+    sqlite3_result_int64(context, val as i64);
 }
 
 #[no_mangle]
