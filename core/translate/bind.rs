@@ -508,6 +508,9 @@ impl BoundSelect {
                     cte_table.identifier = scope_table.identifier;
                     cte_table.internal_id = scope_table.internal_id;
                     cte_table.join_info = scope_table.join_info;
+                    // CTE's FromClauseSubquery.name is already set to the CTE
+                    // definition name during plan_bound_ctes — don't overwrite
+                    // with the alias.
                     Ok(cte_table)
                 }
                 ScopeTableSource::Derived { .. } => {
@@ -519,9 +522,14 @@ impl BoundSelect {
                                 scope_table.identifier
                             ))
                         })?;
-                    derived_table.identifier = scope_table.identifier;
+                    derived_table.identifier = scope_table.identifier.clone();
                     derived_table.internal_id = scope_table.internal_id;
                     derived_table.join_info = scope_table.join_info;
+                    // Also update the inner FromClauseSubquery name so that
+                    // index_seek_affinities can match the table by name.
+                    if let Table::FromClauseSubquery(subq) = &mut derived_table.table {
+                        Arc::make_mut(subq).name = scope_table.identifier;
+                    }
                     Ok(derived_table)
                 }
             })
