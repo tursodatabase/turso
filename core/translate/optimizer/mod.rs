@@ -446,7 +446,10 @@ pub fn optimize_plan(
     Ok(())
 }
 
-#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[cfg(any(
+    all(feature = "fts", not(target_family = "wasm")),
+    feature = "wasm-fts"
+))]
 /// Transform MATCH expressions to fts_match() function calls.
 fn transform_match_to_fts_match(where_clause: &mut [WhereTerm]) {
     use super::ast::{FunctionTail, LikeOperator, Name};
@@ -573,7 +576,10 @@ struct OptimizeTableAccessResult {
  */
 pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
     // Transform MATCH expressions to fts_match() for FTS optimizer recognition
-    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    #[cfg(any(
+        all(feature = "fts", not(target_family = "wasm")),
+        feature = "wasm-fts"
+    ))]
     transform_match_to_fts_match(&mut plan.where_clause);
 
     unnest::unnest_exists_subqueries(plan)?;
@@ -662,7 +668,10 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
 }
 
 fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
-    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    #[cfg(any(
+        all(feature = "fts", not(target_family = "wasm")),
+        feature = "wasm-fts"
+    ))]
     transform_match_to_fts_match(&mut plan.where_clause);
 
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
@@ -701,7 +710,10 @@ fn optimize_update_plan(
     resolver: &Resolver,
 ) -> Result<()> {
     let schema = resolver.schema();
-    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    #[cfg(any(
+        all(feature = "fts", not(target_family = "wasm")),
+        feature = "wasm-fts"
+    ))]
     transform_match_to_fts_match(&mut plan.where_clause);
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =

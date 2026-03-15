@@ -39,10 +39,13 @@
   },
   "scripts": {
     "napi-build": "napi build --features browser --profile release-official --platform --target wasm32-wasip1-threads --no-js --manifest-path ../../Cargo.toml --output-dir . && rm index.d.ts turso.wasi* wasi* browser.js",
+    "napi-build-fts": "napi build --features browser,wasm-fts --profile release-official --platform --target wasm32-wasip1-threads --no-js --manifest-path ../../Cargo.toml --output-dir . && rm index.d.ts turso.wasi* wasi* browser.js",
     "tsc-build": "npm exec tsc && cp turso.wasm32-wasi.wasm ./dist/turso.wasm32-wasi.wasm && WASM_FILE=turso.wasm32-wasi.wasm JS_FILE=./dist/wasm-inline.js node ../../scripts/inline-wasm-base64.js && npm run bundle",
     "bundle": "vite build",
     "build": "npm run napi-build && npm run tsc-build",
-    "test": "CI=1 vitest --browser=chromium --run && CI=1 vitest --browser=firefox --run"
+    "build-fts": "npm run napi-build-fts && npm run tsc-build",
+    "test": "CI=1 vitest --browser=chromium --run && CI=1 vitest --browser=firefox --run",
+    "test-fts": "CI=1 vitest --browser=chromium --run fts.test.ts && CI=1 vitest --browser=firefox --run fts.test.ts"
   },
   "napi": {
     "binaryName": "turso",
