@@ -649,13 +649,16 @@ fn get_subquery_parser<'a>(
                     }
                 }
 
-                // Plan any nested derived tables.
-                let mut planned_derived = super::planner::plan_derived_tables(
+                // Plan any nested derived tables, propagating outer refs
+                // so correlated references (e.g. t2.id inside a derived table)
+                // are visible.
+                let mut planned_derived = super::planner::plan_derived_tables_with_outer_refs(
                     inner_derived_bindings,
                     &mut planned_ctes,
                     resolver,
                     program,
                     connection,
+                    outer_query_refs.clone(),
                 )?;
 
                 let table_refs_vec = inner_bound.into_table_references_with_outer_refs(

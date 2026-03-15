@@ -1263,6 +1263,12 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             // Determine which preceding CTEs this one directly references.
             let mut referenced_tables = Vec::new();
             super::planner::collect_from_clause_table_refs(&cte.select, &mut referenced_tables);
+
+            // Detect self-referencing CTEs (circular reference).
+            if referenced_tables.contains(&cte_name) {
+                crate::bail_parse_error!("circular reference: {}", cte.tbl_name.as_str());
+            }
+
             let idx = cte_names.len();
             let referenced_cte_indices: SmallVec<[usize; 2]> = (0..idx)
                 .filter(|&i| referenced_tables.contains(&cte_names[i]))

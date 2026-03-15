@@ -594,6 +594,24 @@ pub fn plan_derived_tables(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<FxHashMap<TableInternalId, JoinedTable>> {
+    plan_derived_tables_with_outer_refs(
+        derived_bindings,
+        planned_ctes,
+        resolver,
+        program,
+        connection,
+        Vec::new(),
+    )
+}
+
+pub fn plan_derived_tables_with_outer_refs(
+    derived_bindings: FxHashMap<TableInternalId, super::bind::BoundSubquery>,
+    planned_ctes: &mut FxHashMap<String, JoinedTable>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+    outer_query_refs: Vec<super::plan::OuterQueryReference>,
+) -> Result<FxHashMap<TableInternalId, JoinedTable>> {
     let mut planned: FxHashMap<TableInternalId, JoinedTable> = FxHashMap::default();
 
     for (internal_id, bound_sq) in derived_bindings {
@@ -615,17 +633,19 @@ pub fn plan_derived_tables(
         }
 
         // Plan any nested derived tables.
-        let mut inner_planned_derived = plan_derived_tables(
+        let mut inner_planned_derived = plan_derived_tables_with_outer_refs(
             inner_derived_bindings,
             &mut inner_planned_ctes,
             resolver,
             program,
             connection,
+            outer_query_refs.clone(),
         )?;
 
-        let all_table_refs = inner_bound.into_table_references(
+        let all_table_refs = inner_bound.into_table_references_with_outer_refs(
             &mut inner_planned_ctes,
             &mut inner_planned_derived,
+            outer_query_refs.clone(),
         )?;
 
         let subplan = super::select::prepare_select_plan(
