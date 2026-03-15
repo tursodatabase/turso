@@ -754,6 +754,15 @@ fn plan_one_bound_cte(
         connection,
     )?;
 
+    // Count CTE references in scope tables for materialization decisions.
+    for scope_table in inner_bound.main_scope.tables.iter().chain(
+        inner_bound.compound_scopes.iter().flat_map(|s| s.tables.iter()),
+    ) {
+        if let super::bind::ScopeTableSource::Cte { cte_id, .. } = &scope_table.source {
+            program.increment_cte_reference(*cte_id);
+        }
+    }
+
     let mut all_table_refs =
         inner_bound.into_table_references(&mut inner_planned, &mut inner_planned_derived)?;
 

@@ -667,6 +667,18 @@ fn get_subquery_parser<'a>(
                     outer_query_refs,
                 )?;
 
+                // Count CTE references from within this subquery so that the
+                // outer query knows the CTE needs shared materialization.
+                for tr in &table_refs_vec {
+                    for jt in tr.joined_tables() {
+                        if let Table::FromClauseSubquery(subq) = &jt.table {
+                            if let Some(cte_id) = subq.cte_id() {
+                                program.increment_cte_reference(cte_id);
+                            }
+                        }
+                    }
+                }
+
                 let plan = super::select::prepare_select_plan(
                     bound_sq.select,
                     resolver,

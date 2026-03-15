@@ -56,6 +56,16 @@ pub fn bind_prepare_select_plan(
     // Extract pre-bound subqueries for inline planning in the walker.
     let subquery_bindings = std::mem::take(&mut bound.subquery_bindings);
 
+    // Count CTE references in scope tables for materialization decisions.
+    // This must happen before into_table_references consumes the scopes.
+    for scope_table in bound.main_scope.tables.iter().chain(
+        bound.compound_scopes.iter().flat_map(|s| s.tables.iter()),
+    ) {
+        if let super::bind::ScopeTableSource::Cte { cte_id, .. } = &scope_table.source {
+            program.increment_cte_reference(*cte_id);
+        }
+    }
+
     let mut all_table_refs =
         bound.into_table_references(&mut planned_ctes, &mut planned_derived)?;
 
