@@ -3411,6 +3411,9 @@ pub fn op_auto_commit(
             conn.set_tx_state(TransactionState::None);
             conn.auto_commit.store(true, Ordering::SeqCst);
             conn.set_cdc_transaction_id(-1);
+            // ROLLBACK undoes all changes, so all deferred FK violations are moot.
+            // Matches SQLite's OP_AutoCommit which clears nDeferredCons on rollback.
+            conn.clear_deferred_foreign_key_violations();
         } else {
             // BEGIN (true->false) or COMMIT (false->true)
             if is_commit_req {

@@ -577,17 +577,24 @@ fn emit_fk_parent_key_probe(
                 }
             }
 
-            // NEW key referenced by a child (cancel one deferred violation)
-            // Note: for RESTRICT, we already halted on OLD pass if child exists,
-            // so this branch only applies to NO ACTION deferred FKs
-            (true, ParentProbePass::New) => {
-                // Guard to avoid underflow if OLD pass didn't increment.
-                let skip = p.allocate_label();
-                emit_guarded_fk_decrement(p, skip, fk_ref.fk.deferred);
-                p.preassign_label_to_next_insn(skip);
+            // NEW key referenced by a child: cancel one violation from the OLD pass
+            // or from a REPLACE delete that removed the previous row with this key.
+            // For RESTRICT, we already halted on OLD pass if child exists,
+            // so this only applies to NO ACTION FKs.
+            //
+            // We emit the decrement WITHOUT the FkIfZero guard because ON CONFLICT
+            // REPLACE may fire AFTER this point, adding violations that this
+            // decrement must cancel. With a guard the counter would be zero here
+            // and the decrement would be skipped, leaving REPLACE violations
+            // unresolved. Allowing the counter to go temporarily negative is safe:
+            // the REPLACE increment restores it, matching SQLite's behaviour where
+            // the REPLACE fires first and the resolution fires second.
+            (_, ParentProbePass::New) => {
+                p.emit_insn(Insn::FkCounter {
+                    increment_value: -1,
+                    deferred: is_deferred,
+                });
             }
-            // Immediate FK on NEW pass: nothing to cancel; do nothing.
-            (false, ParentProbePass::New) => {}
         }
         Ok(())
     };
