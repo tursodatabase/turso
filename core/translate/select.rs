@@ -306,7 +306,7 @@ fn prepare_one_select_plan(
     program: &mut ProgramBuilder,
     limit: Option<ast::Limit>,
     order_by: Vec<ast::SortedColumn>,
-    with: Option<ast::With>,
+    mut with: Option<ast::With>,
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
     table_references: TableReferences,
@@ -587,7 +587,18 @@ fn prepare_one_select_plan(
 
             let mut table_references = table_references;
 
-            // Plan CTEs from WITH clause so they're available for subqueries in VALUES
+            // Plan CTEs from WITH clause so they're available for subqueries in VALUES.
+            // Skip CTEs that were already added as outer query refs by the binder
+            // (to avoid "duplicate WITH table name" errors).
+            if let Some(ref mut with_clause) = with {
+                with_clause.ctes.retain(|cte| {
+                    let name = crate::util::normalize_ident(cte.tbl_name.as_str());
+                    !table_references
+                        .outer_query_refs()
+                        .iter()
+                        .any(|r| r.cte_definition_only && r.identifier == name)
+                });
+            }
             plan_ctes_as_outer_refs(with, resolver, program, &mut table_references, connection)?;
 
             // Plan subqueries in VALUES expressions
