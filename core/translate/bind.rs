@@ -1793,6 +1793,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         unreachable!();
                     };
                     let inner_bound = self.bind_subquery_expr(&mut select, scope)?;
+                    let num_result_cols = inner_bound.result_columns.len();
                     self.subquery_bindings.insert(
                         subquery_id,
                         BoundSubquery {
@@ -1806,7 +1807,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         not_in: false,
                         query_type: ast::SubqueryType::RowValue {
                             result_reg_start: 0,
-                            num_regs: 0,
+                            num_regs: num_result_cols,
                         },
                     };
                     return Ok(WalkControl::SkipChildren);

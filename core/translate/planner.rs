@@ -564,13 +564,17 @@ pub fn plan_bound_ctes(
     let mut planned: FxHashMap<String, JoinedTable> = FxHashMap::default();
     for idx in 0..cte_definitions.len() {
         if !planned.contains_key(&cte_definitions[idx].0) {
+            // count_reference = false: validation of explicit column count is
+            // deferred until the CTE is actually referenced (matching SQLite
+            // behavior where unreferenced CTEs with mismatched column counts
+            // don't error).
             plan_one_bound_cte(
                 idx,
                 &mut cte_definitions,
                 resolver,
                 program,
                 connection,
-                true,
+                false,
                 &mut planned,
             )?;
         }

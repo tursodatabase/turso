@@ -249,8 +249,7 @@ pub fn translate_insert(
 
     // Merge INSERT's WITH clause into the SELECT source's WITH clause.
     // For multi-row VALUES/SELECT, CTEs are handled by translate_select.
-    // We keep a separate copy for RETURNING clause binding only when the
-    // WITH is NOT merged (i.e. DEFAULT VALUES without a SELECT body).
+    // We also keep a copy for RETURNING clause binding via bind_insert.
     let mut with_for_returning = with.clone();
     if let Some(insert_with) = with {
         if let InsertBody::Select(select, _) = &mut body {
@@ -264,9 +263,6 @@ pub fn translate_insert(
                 }
                 None => select.with = Some(insert_with),
             }
-            // WITH was merged into the SELECT body — clear with_for_returning
-            // to avoid double-binding when bind_insert also sees the CTEs.
-            with_for_returning = None;
         }
         // For DEFAULT VALUES without SELECT body, CTEs are still needed
         // for RETURNING clause subqueries - handled via with_for_returning.
