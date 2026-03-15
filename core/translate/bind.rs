@@ -1037,9 +1037,10 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         })?;
                     }
 
-                    // 9. Bind GROUP BY and HAVING (table columns win in GROUP BY)
+                    // 9. Bind GROUP BY and HAVING (aliases take priority in GROUP BY,
+                    //    matching SQLite behavior where SELECT alias shadows column name)
                     if let Some(group_by) = group_by {
-                        ctx.with_phase(BindPhase::TableFirst, |ctx| {
+                        ctx.with_phase(BindPhase::AliasFirst, |ctx| {
                             ctx.bind_group_by(group_by, &scope)
                         })?;
                     }
@@ -1368,8 +1369,13 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         }
                     }
 
-                    // Bind the view's SELECT as a derived table (subquery)
-                    let bound_select = self.bind_select(&mut view_select)?;
+                    // Bind the view's SELECT as a derived table (subquery).
+                    // Views resolve against the schema only — CTEs from the
+                    // calling query must not leak into the view body.
+                    let saved_ctes = std::mem::take(&mut self.ctes);
+                    let bound_select = self.bind_select(&mut view_select);
+                    self.ctes = saved_ctes;
+                    let bound_select = bound_select?;
                     let subquery_columns: Vec<String> = bound_select
                         .result_columns
                         .iter()
@@ -1732,7 +1738,26 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 } else if self.allow_unbound {
                     // Leave as-is (e.g. EXCLUDED.col in UPSERT)
                 } else {
-                    crate::bail_parse_error!("no such column: {}.{}", tbl.as_str(), col.as_str());
+                    // Check whether the table itself exists to give a better error.
+                    // Also check CTEs and outer scopes — a CTE name that isn't
+                    // in FROM still counts as a "known table" for error messages.
+                    let tbl_normalized = normalize_ident(tbl.as_str());
+                    let table_exists = scope
+                        .find_table_by_identifier(tbl.as_str())
+                        .is_some()
+                        || self.ctes.contains_key(&tbl_normalized)
+                        || self
+                            .outer_scopes_iter()
+                            .any(|s| s.find_table_by_identifier(tbl.as_str()).is_some());
+                    if table_exists {
+                        crate::bail_parse_error!(
+                            "no such column: {}.{}",
+                            tbl.as_str(),
+                            col.as_str()
+                        );
+                    } else {
+                        crate::bail_parse_error!("no such table: {}", tbl.as_str());
+                    }
                 }
             }
             ast::Expr::DoublyQualified(db_name, tbl_name, col_name) => {
@@ -2023,28 +2048,28 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 _ => vec![],
             };
 
-            // RIGHT JOIN: swap tables
+            // RIGHT JOIN: rewrite as LEFT JOIN by swapping tables.
+            // Push the right table first, then swap it to the front so it
+            // becomes the driving table. The originally-left table gets the
+            // LeftOuter join info.
             if is_right {
-                let len = tables.len();
-                if len > 1 {
+                if tables.len() > 1 {
                     crate::bail_parse_error!(
                         "RIGHT JOIN following another join is not yet supported. \
                          Try rewriting as LEFT JOIN or using a subquery."
                     );
                 }
-                tables.swap(0, len - 1);
-                // The originally-left table (now at end position after push) gets the outer flag
-                // But we haven't pushed yet, so mark the existing table as outer
-                if let Some(first) = tables.first_mut() {
-                    first.join_info = Some(JoinInfo {
-                        join_type: PlanJoinType::LeftOuter,
-                        using: using_cols.clone(),
-                        no_reorder: false,
-                    });
-                }
-                right_join_swapped = true;
-                // The right-side table (being pushed) has no join_info (it's now the "left" side)
+                // Push right table, then swap so it's first
                 tables.push(st);
+                let last = tables.len() - 1;
+                tables.swap(0, last);
+                // The originally-left table (now at last position) gets the outer flag
+                tables[last].join_info = Some(JoinInfo {
+                    join_type: PlanJoinType::LeftOuter,
+                    using: using_cols.clone(),
+                    no_reorder: false,
+                });
+                right_join_swapped = true;
             } else {
                 let plan_join_type = if is_full_outer {
                     PlanJoinType::FullOuter
