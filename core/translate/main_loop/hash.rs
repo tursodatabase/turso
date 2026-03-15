@@ -720,6 +720,8 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
             target_pc: hash_probe_miss_label,
             payload_dest_reg: payload_dest_reg.map(to_u16),
             num_payload: to_u16(num_payload),
+            // Main probe loop always carries the probe rowid so spilled build
+            // partitions are deferred to grace processing instead of loaded here.
             probe_rowid_reg: probe_rowid_reg.map(to_u16),
         });
 

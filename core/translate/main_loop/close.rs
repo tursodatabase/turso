@@ -545,7 +545,7 @@ fn emit_grace_hash_join_loop<'a>(
         target_pc: grace_outer_check,
         payload_dest_reg: payload_dest_reg.map(to_u16),
         num_payload: to_u16(num_payload),
-        probe_rowid_reg: None, // no buffering during grace processing
+        probe_rowid_reg: None, // grace-only: HashGraceLoadPartition already loaded this partition
     });
 
     // Jump INTO the shared inner body (conditions, result columns, aggregation).

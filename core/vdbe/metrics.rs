@@ -11,13 +11,9 @@ pub struct HashJoinMetrics {
 
     // Load metrics
     pub load_bytes_read: u64,
-    pub partition_loads: u64,
-    pub partition_evictions: u64,
-    pub max_loaded_partitions_mem: u64,
 
     // Probe metrics
     pub probe_calls: u64,
-    pub probe_partition_switches: u64,
 
     // Grace hash join metrics
     pub probe_spill_bytes_written: u64,
@@ -41,17 +37,7 @@ impl HashJoinMetrics {
             .spill_max_partition_bytes
             .max(other.spill_max_partition_bytes);
         self.load_bytes_read = self.load_bytes_read.saturating_add(other.load_bytes_read);
-        self.partition_loads = self.partition_loads.saturating_add(other.partition_loads);
-        self.partition_evictions = self
-            .partition_evictions
-            .saturating_add(other.partition_evictions);
-        self.max_loaded_partitions_mem = self
-            .max_loaded_partitions_mem
-            .max(other.max_loaded_partitions_mem);
         self.probe_calls = self.probe_calls.saturating_add(other.probe_calls);
-        self.probe_partition_switches = self
-            .probe_partition_switches
-            .saturating_add(other.probe_partition_switches);
         self.probe_spill_bytes_written = self
             .probe_spill_bytes_written
             .saturating_add(other.probe_spill_bytes_written);
@@ -182,27 +168,7 @@ impl fmt::Display for StatementMetrics {
             "    Load bytes:       {}",
             self.hash_join.load_bytes_read
         )?;
-        writeln!(
-            f,
-            "    Partition loads:  {}",
-            self.hash_join.partition_loads
-        )?;
-        writeln!(
-            f,
-            "    Evictions:        {}",
-            self.hash_join.partition_evictions
-        )?;
-        writeln!(
-            f,
-            "    Peak loaded mem:  {}",
-            self.hash_join.max_loaded_partitions_mem
-        )?;
         writeln!(f, "    Probes:           {}", self.hash_join.probe_calls)?;
-        writeln!(
-            f,
-            "    Partition switches: {}",
-            self.hash_join.probe_partition_switches
-        )?;
         writeln!(
             f,
             "    Probe spill bytes: {}",

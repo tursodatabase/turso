@@ -966,7 +966,8 @@ pub struct HashTable {
     current_spill_partition_idx: usize,
     /// Track non-empty buckets for fast clear in distinct/group-by usage.
     non_empty_buckets: Vec<usize>,
-    /// LRU of loaded partitions to cap probe-time memory
+    /// LRU of resident spilled partitions to cap memory for DISTINCT, grace,
+    /// and unmatched-scan partition loads.
     loaded_partitions_lru: RefCell<VecDeque<usize>>,
     /// Memory used by resident (loaded or in-memory) partitions
     loaded_partitions_mem: usize,
@@ -984,8 +985,6 @@ pub struct HashTable {
     unmatched_scan_partition: usize,
     /// Optional override for partition count selection
     partition_count_override: Option<usize>,
-    /// Track last probed partition for switch metrics
-    last_probe_partition: Option<usize>,
     /// Probe-side spill state for grace hash join.
     probe_spill_state: Option<ProbeSpillState>,
     /// Grace processing state machine.
@@ -1053,7 +1052,6 @@ impl HashTable {
             unmatched_scan_entry: 0,
             unmatched_scan_partition: 0,
             partition_count_override: config.partition_count,
-            last_probe_partition: None,
             probe_spill_state: None,
             grace_state: None,
         }
@@ -1095,28 +1093,9 @@ impl HashTable {
         spill_state.partitioning.index(hash)
     }
 
-    fn record_probe_partition(
-        &mut self,
-        partition_idx: usize,
-        metrics: Option<&mut HashJoinMetrics>,
-    ) {
+    fn record_probe_call(&mut self, metrics: Option<&mut HashJoinMetrics>) {
         if let Some(metrics) = metrics {
             metrics.probe_calls = metrics.probe_calls.saturating_add(1);
-            if let Some(prev) = self.last_probe_partition {
-                if prev != partition_idx {
-                    metrics.probe_partition_switches =
-                        metrics.probe_partition_switches.saturating_add(1);
-                }
-            }
-        }
-        self.last_probe_partition = Some(partition_idx);
-    }
-
-    fn update_max_loaded_mem(&mut self, metrics: Option<&mut HashJoinMetrics>) {
-        if let Some(metrics) = metrics {
-            metrics.max_loaded_partitions_mem = metrics
-                .max_loaded_partitions_mem
-                .max(self.loaded_partitions_mem as u64);
         }
     }
 
@@ -1353,7 +1332,6 @@ impl HashTable {
             self.probe_bucket_idx = 0;
             self.probe_entry_idx = 0;
             self.current_spill_partition_idx = 0;
-            self.last_probe_partition = None;
             self.loaded_partitions_lru.borrow_mut().clear();
             self.loaded_partitions_mem = 0;
             self.non_empty_buckets.clear();
@@ -1383,7 +1361,6 @@ impl HashTable {
         self.probe_bucket_idx = 0;
         self.probe_entry_idx = 0;
         self.current_spill_partition_idx = 0;
-        self.last_probe_partition = None;
         self.loaded_partitions_lru.borrow_mut().clear();
         self.loaded_partitions_mem = 0;
     }
@@ -1868,7 +1845,7 @@ impl HashTable {
                 spill_state.partitioning
             };
             let target_partition = partitioning.index(hash);
-            self.record_probe_partition(target_partition, metrics);
+            self.record_probe_call(metrics);
             self.touch_partition_lru(target_partition);
 
             let bucket_idx = {
@@ -2242,8 +2219,7 @@ impl HashTable {
                 };
                 let io_state = spilled.io_state.get();
 
-                if matches!(io_state, SpillIOState::Error) {
-                    mark_unlikely();
+                if unlikely(matches!(io_state, SpillIOState::Error)) {
                     return Err(LimboError::InternalError(
                         "hash join spill I/O failure".into(),
                     ));
@@ -2264,10 +2240,6 @@ impl HashTable {
                             let is_first_load = matches!(spilled.state, PartitionState::OnDisk)
                                 && spilled.current_chunk_idx == 0;
                             if is_first_load {
-                                if let Some(metrics) = metrics.as_deref_mut() {
-                                    metrics.partition_loads =
-                                        metrics.partition_loads.saturating_add(1);
-                                }
                                 let total_entries = spilled.total_num_entries();
                                 let bucket_count = total_entries.next_power_of_two().max(64);
                                 spilled.buckets =
@@ -2305,14 +2277,6 @@ impl HashTable {
                         }
                         None => {
                             // No chunks at all: partition is logically empty, mark as loaded.
-                            if matches!(spilled.state, PartitionState::OnDisk)
-                                && spilled.current_chunk_idx == 0
-                            {
-                                if let Some(metrics) = metrics.as_deref_mut() {
-                                    metrics.partition_loads =
-                                        metrics.partition_loads.saturating_add(1);
-                                }
-                            }
                             spilled.state = PartitionState::Loaded;
                             SpillAction::NoChunks
                         }
@@ -2326,9 +2290,8 @@ impl HashTable {
                     return Ok(IOResult::Done(()));
                 }
                 SpillAction::NoChunks => {
-                    self.evict_partitions_to_fit(0, partition_idx, metrics.as_deref_mut());
+                    self.evict_partitions_to_fit(0, partition_idx);
                     self.record_partition_resident(partition_idx, 0);
-                    self.update_max_loaded_mem(metrics.as_deref_mut());
                     return Ok(IOResult::Done(()));
                 }
                 SpillAction::NotFound => {
@@ -2338,13 +2301,8 @@ impl HashTable {
                     match self.parse_partition_chunk(partition_idx, metrics.as_deref_mut())? {
                         ParseChunkResult::MoreChunks => continue,
                         ParseChunkResult::Done { resident_mem } => {
-                            self.evict_partitions_to_fit(
-                                resident_mem,
-                                partition_idx,
-                                metrics.as_deref_mut(),
-                            );
+                            self.evict_partitions_to_fit(resident_mem, partition_idx);
                             self.record_partition_resident(partition_idx, resident_mem);
-                            self.update_max_loaded_mem(metrics.as_deref_mut());
                             return Ok(IOResult::Done(()));
                         }
                     }
@@ -2526,7 +2484,7 @@ impl HashTable {
         self.current_probe_keys = Some(probe_keys.to_vec());
         self.current_probe_hash = Some(hash);
 
-        self.record_probe_partition(partition_idx, metrics);
+        self.record_probe_call(metrics);
         self.touch_partition_lru(partition_idx);
         let spill_state = self.spill_state.as_ref()?;
         let partition = spill_state.find_partition(partition_idx)?;
@@ -2571,7 +2529,8 @@ impl HashTable {
         buckets.iter().map(|b| b.size_bytes()).sum()
     }
 
-    /// Touch a partition for LRU ordering without changing its accounted memory.
+    /// Touch a resident spilled partition for LRU ordering without changing its
+    /// accounted memory.
     fn touch_partition_lru(&self, partition_idx: usize) {
         let mut lru = self.loaded_partitions_lru.borrow_mut();
         if let Some(pos) = lru.iter().position(|p| *p == partition_idx) {
@@ -2580,7 +2539,8 @@ impl HashTable {
         lru.push_back(partition_idx);
     }
 
-    /// Record that a partition is resident with the given memory footprint and update LRU.
+    /// Record that a spilled partition is resident with the given memory
+    /// footprint and update LRU ordering.
     fn record_partition_resident(&mut self, partition_idx: usize, mem_used: usize) {
         if let Some(spill_state) = self.spill_state.as_mut() {
             if let Some(partition) = spill_state.find_partition_mut(partition_idx) {
@@ -2594,12 +2554,7 @@ impl HashTable {
         }
     }
 
-    fn evict_partitions_to_fit(
-        &mut self,
-        incoming_mem: usize,
-        protect_idx: usize,
-        mut metrics: Option<&mut HashJoinMetrics>,
-    ) {
+    fn evict_partitions_to_fit(&mut self, incoming_mem: usize, protect_idx: usize) {
         while self.mem_used + self.loaded_partitions_mem + incoming_mem > self.mem_budget {
             let Some(victim_idx) = self.next_evictable(protect_idx) else {
                 break;
@@ -2619,10 +2574,6 @@ impl HashTable {
                         victim.partial_entry.clear();
                         victim.parsed_entries = 0;
                         victim.io_state.set(SpillIOState::None);
-                        if let Some(metrics) = metrics.as_deref_mut() {
-                            metrics.partition_evictions =
-                                metrics.partition_evictions.saturating_add(1);
-                        }
                     }
                 }
             }
@@ -2631,7 +2582,8 @@ impl HashTable {
         }
     }
 
-    /// Find the next evictable partition (LRU) that is not protected and has backing spill data.
+    /// Find the next evictable resident spilled partition (LRU) that is not
+    /// protected and has backing spill data.
     fn next_evictable(&mut self, protect_idx: usize) -> Option<usize> {
         let spill_state = self.spill_state.as_ref()?;
 
@@ -3157,7 +3109,6 @@ impl HashTable {
         self.mem_used = 0;
         self.loaded_partitions_lru.borrow_mut().clear();
         self.loaded_partitions_mem = 0;
-        self.last_probe_partition = None;
         let _ = self.spill_state.take();
         self.probe_spill_state = None;
         self.grace_state = None;
