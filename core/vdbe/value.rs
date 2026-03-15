@@ -8,72 +8,77 @@ use crate::{
     LimboError, Result, Value, ValueRef,
 };
 
-// we use math functions from Rust stdlib in order to be as portable as possible for the production version of the tursodb
+// Use libm in production for portability (some targets like wasm32 lack C math symbols, see #4246).
+// Rust stdlib math can diverge from libm/C math on some platforms (see #5165), so we use libm
+// which closely matches the C math library SQLite uses, while remaining portable.
 #[cfg(not(test))]
 mod cmath {
     pub fn exp(x: f64) -> f64 {
-        x.exp()
+        libm::exp(x)
     }
     pub fn log(x: f64) -> f64 {
-        x.ln()
+        libm::log(x)
     }
     pub fn log10(x: f64) -> f64 {
-        x.log(10.)
+        libm::log10(x)
     }
     pub fn log2(x: f64) -> f64 {
-        x.log(2.)
+        libm::log2(x)
     }
     pub fn pow(x: f64, y: f64) -> f64 {
-        x.powf(y)
+        libm::pow(x, y)
     }
     pub fn sin(x: f64) -> f64 {
-        x.sin()
+        libm::sin(x)
     }
     pub fn sinh(x: f64) -> f64 {
-        x.sinh()
+        libm::sinh(x)
     }
     pub fn asin(x: f64) -> f64 {
-        x.asin()
+        libm::asin(x)
     }
     pub fn asinh(x: f64) -> f64 {
-        x.asinh()
+        libm::asinh(x)
     }
     pub fn cos(x: f64) -> f64 {
-        x.cos()
+        libm::cos(x)
     }
     pub fn cosh(x: f64) -> f64 {
-        x.cosh()
+        libm::cosh(x)
     }
     pub fn acos(x: f64) -> f64 {
-        x.acos()
+        libm::acos(x)
     }
     pub fn acosh(x: f64) -> f64 {
-        x.acosh()
+        libm::acosh(x)
     }
     pub fn tan(x: f64) -> f64 {
-        x.tan()
+        libm::tan(x)
     }
     pub fn tanh(x: f64) -> f64 {
-        x.tanh()
+        libm::tanh(x)
     }
     pub fn atan(x: f64) -> f64 {
-        x.atan()
+        libm::atan(x)
     }
     pub fn atanh(x: f64) -> f64 {
-        x.atanh()
+        libm::atanh(x)
     }
     pub fn atan2(x: f64, y: f64) -> f64 {
-        x.atan2(y)
+        libm::atan2(x, y)
     }
+    // Use the same M_PI constant and formula as SQLite (func.c)
+    #[allow(clippy::excessive_precision)]
+    const M_PI: f64 = 3.141592653589793238462643383279502884;
     pub fn degrees(x: f64) -> f64 {
-        x.to_degrees()
+        x * 180.0 / M_PI
     }
     pub fn radians(x: f64) -> f64 {
-        x.to_radians()
+        x * M_PI / 180.0
     }
 }
 
-// we use exactly same math function as SQLite in tests in order to avoid mismatch in the differential tests due to floating-point precision issues
+// In tests, use the platform C math library directly to match SQLite exactly for differential testing.
 #[cfg(test)]
 mod cmath {
     extern "C" {

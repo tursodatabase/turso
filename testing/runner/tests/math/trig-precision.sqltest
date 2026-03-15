@@ -1,0 +1,36 @@
+@database :memory:
+
+# Regression test for https://github.com/tursodatabase/turso/issues/5165
+# Fuzzer found that atanh(tanh(-2.0)) returned ~-1.999... instead of -2.0
+# due to Rust stdlib math functions diverging from the C math library on Linux.
+# trunc(-1.999...) = -1.0, causing the final result to be -3.0 instead of -4.0.
+
+test atanh-tanh-roundtrip {
+    SELECT (trunc(atanh((tanh(0.0 - 2.0) + mod(2.0, 2.0) * (-2.0 - 0.0))))) + -2.0
+}
+expect {
+    -4.0
+}
+expect @js {
+    -4
+}
+
+test atanh-tanh-inverse {
+    SELECT atanh(tanh(-2.0))
+}
+expect {
+    -2.0
+}
+expect @js {
+    -2
+}
+
+test trunc-atanh-tanh {
+    SELECT trunc(atanh(tanh(-2.0)))
+}
+expect {
+    -2.0
+}
+expect @js {
+    -2
+}
