@@ -7117,6 +7117,29 @@ fn test_autoincrement_allowed_in_mvcc() {
     assert_eq!(rows[0][1].as_int().unwrap(), 1);
 }
 
+/// Unrelated schema checkpoints must not require sqlite_sequence when the schema
+/// has no AUTOINCREMENT tables.
+#[test]
+fn test_schema_checkpoint_without_autoincrement_does_not_require_sqlite_sequence() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = get_rows(&conn, "SELECT COUNT(*) FROM sqlite_master WHERE name = 't'");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+
+    let rows = get_rows(
+        &conn,
+        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'sqlite_sequence'",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 0);
+}
+
 /// AUTOINCREMENT tables created in WAL mode continue to work after switching to MVCC.
 #[test]
 fn test_autoincrement_insert_allowed_for_preexisting_table() {

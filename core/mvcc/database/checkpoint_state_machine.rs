@@ -4,7 +4,7 @@ use crate::mvcc::database::{
     WriteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX, MVCC_META_TABLE_NAME,
     SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
-use crate::schema::{Index, Table, SQLITE_SEQUENCE_TABLE_NAME};
+use crate::schema::{BTreeTable, Index, Table, SQLITE_SEQUENCE_TABLE_NAME};
 use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::pager::CreateBTreeFlags;
@@ -589,12 +589,58 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         });
     }
 
-    fn should_rebuild_sqlite_sequence(&self) -> bool {
-        self.mvstore.autoincrement_checkpoint_needed()
-            || self
-                .write_set
-                .iter()
-                .any(|(row_version, _)| row_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID)
+    fn schema_change_requires_sqlite_sequence_rebuild(&self) -> Result<bool> {
+        for (row_version, _) in &self.write_set {
+            if row_version.row.id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
+                continue;
+            }
+
+            let record = ImmutableRecord::from_bin_record(row_version.row.payload().to_vec());
+            let row_type = match record.get_value(0)? {
+                ValueRef::Text(row_type) => row_type,
+                _ => crate::bail_corrupt_error!(
+                    "sqlite_schema.type must be TEXT during MVCC checkpoint"
+                ),
+            };
+            if !row_type.as_str().eq_ignore_ascii_case("table") {
+                continue;
+            }
+
+            let name = match record.get_value(1)? {
+                ValueRef::Text(name) => name,
+                _ => crate::bail_corrupt_error!(
+                    "sqlite_schema.name must be TEXT during MVCC checkpoint"
+                ),
+            };
+            if name
+                .as_str()
+                .eq_ignore_ascii_case(SQLITE_SEQUENCE_TABLE_NAME)
+            {
+                return Ok(true);
+            }
+
+            let ValueRef::Text(sql) = record.get_value(4)? else {
+                crate::bail_corrupt_error!("sqlite_schema.sql must be TEXT for table rows");
+            };
+            let table = BTreeTable::from_sql(sql.as_str(), 1).map_err(|err| {
+                LimboError::Corrupt(format!(
+                    "failed to parse sqlite_schema SQL during MVCC checkpoint: {err}"
+                ))
+            })?;
+            if table.has_autoincrement {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    fn should_rebuild_sqlite_sequence(&self) -> Result<bool> {
+        if self.mvstore.autoincrement_checkpoint_needed() {
+            return Ok(true);
+        }
+
+        self.schema_change_requires_sqlite_sequence_rebuild()
     }
 
     fn read_existing_sqlite_sequence_rows(
@@ -903,7 +949,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 let committed_max = self.mvstore.last_committed_tx_ts.load(Ordering::Acquire);
                 self.durable_txid_max_new = durable_old.max(committed_max);
 
-                if self.should_rebuild_sqlite_sequence() {
+                if self.should_rebuild_sqlite_sequence()? {
                     self.stage_sqlite_sequence_rebuild()?;
                     self.sort_write_set();
                 }
