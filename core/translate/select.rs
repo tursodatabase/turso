@@ -229,13 +229,6 @@ fn prepare_one_select_plan(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<SelectPlan> {
-    if order_by
-        .iter()
-        .filter_map(|o| o.nulls)
-        .any(|n| n == ast::NullsOrder::Last)
-    {
-        crate::bail_parse_error!("NULLS LAST is not supported yet in ORDER BY");
-    }
     match select {
         ast::OneSelect::Select {
             columns,
@@ -535,7 +528,7 @@ fn prepare_one_select_plan(
                     Some(&mut windows),
                 )?;
 
-                key.push((o.expr, o.order.unwrap_or(ast::SortOrder::Asc)));
+                key.push(o);
             }
             // Remove duplicate ORDER BY expressions, keeping the first occurrence.
             // Duplicates are semantically redundant.
@@ -543,7 +536,7 @@ fn prepare_one_select_plan(
             while i < key.len() {
                 if key[..i]
                     .iter()
-                    .any(|(prev, _)| exprs_are_equivalent(prev, &key[i].0))
+                    .any(|prev| exprs_are_equivalent(&prev.expr, &key[i].expr))
                 {
                     key.remove(i);
                 } else {
@@ -575,7 +568,7 @@ fn prepare_one_select_plan(
                     .btree()
                     .and_then(|t| t.get_rowid_alias_column().map(|(idx, _)| idx));
 
-                let first_is_rowid = match plan.order_by[0].0.as_ref() {
+                let first_is_rowid = match plan.order_by[0].expr.as_ref() {
                     ast::Expr::Column { table, column, .. } => {
                         *table == table_id && rowid_alias_col == Some(*column)
                     }
@@ -714,8 +707,8 @@ fn validate_expr_correct_column_counts(plan: &SelectPlan) -> Result<()> {
             crate::bail_parse_error!("result column must return 1 value, got {}", vec_size);
         }
     }
-    for (expr, _) in plan.order_by.iter() {
-        let vec_size = expr_vector_size(expr)?;
+    for sorted_column in plan.order_by.iter() {
+        let vec_size = expr_vector_size(&sorted_column.expr)?;
         if vec_size != 1 {
             crate::bail_parse_error!("order by expression must return 1 value, got {}", vec_size);
         }

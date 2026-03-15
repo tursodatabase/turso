@@ -53,10 +53,10 @@ use super::{
     collate::get_collseq_from_expr,
     emitter::Resolver,
     plan::{
-        DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinOrderMember, JoinType,
-        JoinedTable, MinMaxDef, MultiIndexBranch, MultiIndexScanOp, Operation, Plan, Search,
-        SeekDef, SeekKey, SelectPlan, SetOperation, SimpleAggregate, TableReferences, UpdatePlan,
-        WhereTerm,
+        sorted_column_nulls_order, sorted_column_order, DeletePlan, GroupBy, InSeekSource,
+        IterationDirection, JoinOrderMember, JoinType, JoinedTable, MinMaxDef, MultiIndexBranch,
+        MultiIndexScanOp, Operation, Plan, Search, SeekDef, SeekKey, SelectPlan, SetOperation,
+        SimpleAggregate, TableReferences, UpdatePlan, WhereTerm,
     },
     planner::TableMask,
 };
@@ -130,7 +130,7 @@ fn try_match_index_method_pattern(
     pattern: &ast::Select,
     table: &JoinedTable,
     query_where_terms: &[WhereTerm],
-    order_by: &[(Box<ast::Expr>, SortOrder)],
+    order_by: &[ast::SortedColumn],
     limit: &Option<Box<Expr>>,
     offset: &Option<Box<Expr>>,
     pattern_idx: usize,
@@ -215,21 +215,23 @@ fn try_match_index_method_pattern(
 
     // Match ORDER BY if pattern has it
     if pattern_has_order_by {
-        for (pattern_column, (query_column, query_order)) in
-            pattern.order_by.iter().zip(order_by.iter())
-        {
-            if *query_order != pattern_column.order.unwrap_or(SortOrder::Asc) {
+        for (pattern_column, query_column) in pattern.order_by.iter().zip(order_by.iter()) {
+            if sorted_column_order(query_column) != sorted_column_order(pattern_column) {
+                return None;
+            }
+            if sorted_column_nulls_order(query_column) != sorted_column_nulls_order(pattern_column)
+            {
                 return None;
             }
             let num_col_args = count_fts_column_args(&pattern_column.expr);
             let captured = if num_col_args > 0 {
                 try_capture_parameters_column_agnostic(
                     &pattern_column.expr,
-                    query_column,
+                    &query_column.expr,
                     num_col_args,
                 )
             } else {
-                try_capture_parameters(&pattern_column.expr, query_column)
+                try_capture_parameters(&pattern_column.expr, &query_column.expr)
             };
             parameters.extend(captured?);
         }
@@ -340,7 +342,7 @@ fn collect_index_method_candidates(
     table_references: &TableReferences,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
     where_clause: &[WhereTerm],
-    order_by: &[(Box<ast::Expr>, SortOrder)],
+    order_by: &[ast::SortedColumn],
     group_by: &Option<GroupBy>,
     limit: &Option<Box<Expr>>,
     offset: &Option<Box<Expr>>,
@@ -724,13 +726,22 @@ fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
         optimize_select_plan(rowset_plan, schema)?;
     }
 
+    let mut order_by: Vec<ast::SortedColumn> = plan
+        .order_by
+        .iter()
+        .map(|(expr, order)| ast::SortedColumn {
+            expr: expr.clone(),
+            order: Some(*order),
+            nulls: None,
+        })
+        .collect();
     let _ = optimize_table_access(
         schema,
         &mut plan.result_columns,
         &mut plan.table_references,
         &schema.indexes,
         &mut plan.where_clause,
-        &mut plan.order_by,
+        &mut order_by,
         &mut None,
         None,
         &plan.non_from_clause_subqueries,
@@ -738,6 +749,15 @@ fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
         &mut plan.offset,
         1.0,
     )?;
+    plan.order_by = order_by
+        .into_iter()
+        .map(|sorted_column| {
+            (
+                sorted_column.expr,
+                sorted_column.order.unwrap_or(SortOrder::Asc),
+            )
+        })
+        .collect();
 
     Ok(())
 }
@@ -757,13 +777,22 @@ fn optimize_update_plan(
         plan.contains_constant_false_condition = true;
         return Ok(());
     }
+    let mut order_by: Vec<ast::SortedColumn> = plan
+        .order_by
+        .iter()
+        .map(|(expr, order)| ast::SortedColumn {
+            expr: expr.clone(),
+            order: Some(*order),
+            nulls: None,
+        })
+        .collect();
     let _ = optimize_table_access(
         schema,
         &mut [],
         &mut plan.table_references,
         &schema.indexes,
         &mut plan.where_clause,
-        &mut plan.order_by,
+        &mut order_by,
         &mut None,
         None,
         &plan.non_from_clause_subqueries,
@@ -771,6 +800,15 @@ fn optimize_update_plan(
         &mut plan.offset,
         1.0,
     )?;
+    plan.order_by = order_by
+        .into_iter()
+        .map(|sorted_column| {
+            (
+                sorted_column.expr,
+                sorted_column.order.unwrap_or(SortOrder::Asc),
+            )
+        })
+        .collect();
 
     if let Some(reason) = first_update_safety_reason(plan, resolver)? {
         plan.safety.require(reason);
@@ -1166,7 +1204,7 @@ fn optimize_table_access_with_custom_modules(
     table_references: &mut TableReferences,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
     where_query: &mut [WhereTerm],
-    order_by: &mut Vec<(Box<ast::Expr>, SortOrder)>,
+    order_by: &mut Vec<ast::SortedColumn>,
     group_by: &mut Option<GroupBy>,
     limit: &mut Option<Box<Expr>>,
     offset: &mut Option<Box<Expr>>,
@@ -1287,15 +1325,15 @@ fn optimize_table_access_with_custom_modules(
 fn register_expression_index_usages_for_plan(
     table_references: &mut TableReferences,
     result_columns: &[ResultSetColumn],
-    order_by: &[(Box<ast::Expr>, SortOrder)],
+    order_by: &[ast::SortedColumn],
     group_by: Option<&GroupBy>,
 ) {
     table_references.reset_expression_index_usages();
     for rc in result_columns {
         table_references.register_expression_index_usage(&rc.expr);
     }
-    for (expr, _) in order_by {
-        table_references.register_expression_index_usage(expr);
+    for sorted_column in order_by {
+        table_references.register_expression_index_usage(&sorted_column.expr);
     }
     if let Some(group_by) = group_by {
         for expr in &group_by.exprs {
@@ -1503,7 +1541,7 @@ fn optimize_table_access(
     table_references: &mut TableReferences,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
     where_clause: &mut [WhereTerm],
-    order_by: &mut Vec<(Box<ast::Expr>, SortOrder)>,
+    order_by: &mut Vec<ast::SortedColumn>,
     group_by: &mut Option<GroupBy>,
     simple_aggregate: Option<&SimpleAggregate>,
     subqueries: &[NonFromClauseSubquery],

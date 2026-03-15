@@ -205,7 +205,9 @@ pub fn plan_subqueries_from_select_plan(
         &mut plan.non_from_clause_subqueries,
         &mut plan.table_references,
         resolver,
-        plan.order_by.iter_mut().map(|(expr, _)| &mut **expr),
+        plan.order_by
+            .iter_mut()
+            .map(|sorted_column| sorted_column.expr.as_mut()),
         connection,
         SubqueryPosition::OrderBy,
         SubqueryOrigin::SelectOrderBy,
@@ -794,8 +796,13 @@ fn recollect_aggregates(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()
     }
 
     // Collect from ORDER BY
-    for (expr, _) in &plan.order_by {
-        resolve_window_and_aggregate_functions(expr, resolver, &mut new_aggregates, None)?;
+    for sorted_column in &plan.order_by {
+        resolve_window_and_aggregate_functions(
+            &sorted_column.expr,
+            resolver,
+            &mut new_aggregates,
+            None,
+        )?;
     }
 
     plan.aggregates = new_aggregates;

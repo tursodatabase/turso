@@ -2,7 +2,7 @@ use crate::turso_debug_assert;
 use branches::{mark_unlikely, unlikely};
 use either::Either;
 use turso_ext::{AggCtx, FinalizeFunction, StepFunction};
-use turso_parser::ast::SortOrder;
+use turso_parser::ast::{NullsOrder, SortOrder};
 
 use crate::error::LimboError;
 use crate::ext::{ExtValue, ExtValueType};
@@ -1788,6 +1788,24 @@ impl<'a> Ord for ValueRef<'a> {
 pub struct KeyInfo {
     pub sort_order: SortOrder,
     pub collation: CollationSeq,
+    pub nulls_order: NullsOrder,
+}
+
+pub const fn default_nulls_order(sort_order: SortOrder) -> NullsOrder {
+    match sort_order {
+        SortOrder::Asc => NullsOrder::First,
+        SortOrder::Desc => NullsOrder::Last,
+    }
+}
+
+pub const fn normalize_nulls_order(
+    sort_order: SortOrder,
+    nulls_order: Option<NullsOrder>,
+) -> NullsOrder {
+    match nulls_order {
+        Some(nulls_order) => nulls_order,
+        None => default_nulls_order(sort_order),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1828,12 +1846,14 @@ impl IndexInfo {
                     .map(|c| KeyInfo {
                         sort_order: c.order,
                         collation: c.collation.unwrap_or_default(),
+                        nulls_order: default_nulls_order(c.order),
                     })
                     .collect();
                 if index.has_rowid {
                     key_info.push(KeyInfo {
                         sort_order: SortOrder::Asc,
                         collation: CollationSeq::Binary,
+                        nulls_order: NullsOrder::First,
                     });
                 }
                 key_info
@@ -1873,14 +1893,9 @@ where
     );
     let (l, r) = (l.take(column_info.len()), r.take(column_info.len()));
     for (i, (l, r)) in l.zip(r).enumerate() {
-        let column_order = column_info[i].sort_order;
-        let collation = column_info[i].collation;
-        let cmp = compare_immutable_single(l, r, collation);
+        let cmp = compare_with_key_info(l, r, column_info[i]);
         if !cmp.is_eq() {
-            return match column_order {
-                SortOrder::Asc => cmp,
-                SortOrder::Desc => cmp.reverse(),
-            };
+            return cmp;
         }
     }
     std::cmp::Ordering::Equal
@@ -1905,14 +1920,9 @@ where
             Some(v) => v,
             None => break,
         };
-        let column_order = col_info.sort_order;
-        let collation = col_info.collation;
-        let cmp = compare_immutable_single(l?, r?, collation);
+        let cmp = compare_with_key_info(l?, r?, *col_info);
         if !cmp.is_eq() {
-            return match column_order {
-                SortOrder::Asc => Ok(cmp),
-                SortOrder::Desc => Ok(cmp.reverse()),
-            };
+            return Ok(cmp);
         }
     }
     Ok(std::cmp::Ordering::Equal)
@@ -1928,6 +1938,33 @@ where
     match (l, r) {
         (ValueRef::Text(left), ValueRef::Text(right)) => collation.compare_strings(&left, &right),
         _ => l.cmp(&r),
+    }
+}
+
+fn compare_with_key_info<V1, V2>(l: V1, r: V2, key_info: KeyInfo) -> std::cmp::Ordering
+where
+    V1: AsValueRef,
+    V2: AsValueRef,
+{
+    let l = l.as_value_ref();
+    let r = r.as_value_ref();
+    match (l, r) {
+        (ValueRef::Null, ValueRef::Null) => std::cmp::Ordering::Equal,
+        (ValueRef::Null, _) => match key_info.nulls_order {
+            NullsOrder::First => std::cmp::Ordering::Less,
+            NullsOrder::Last => std::cmp::Ordering::Greater,
+        },
+        (_, ValueRef::Null) => match key_info.nulls_order {
+            NullsOrder::First => std::cmp::Ordering::Greater,
+            NullsOrder::Last => std::cmp::Ordering::Less,
+        },
+        _ => {
+            let cmp = compare_immutable_single(l, r, key_info.collation);
+            match key_info.sort_order {
+                SortOrder::Asc => cmp,
+                SortOrder::Desc => cmp.reverse(),
+            }
+        }
     }
 }
 
@@ -2314,18 +2351,8 @@ where
             }
         };
 
-        let comparison = match (&lhs_value, rhs_value) {
-            (ValueRef::Text(lhs_text), ValueRef::Text(rhs_text)) => index_info.key_info[field_idx]
-                .collation
-                .compare_strings(lhs_text, rhs_text),
-
-            _ => lhs_value.cmp(rhs_value),
-        };
-
-        let final_comparison = match index_info.key_info[field_idx].sort_order {
-            SortOrder::Asc => comparison,
-            SortOrder::Desc => comparison.reverse(),
-        };
+        let final_comparison =
+            compare_with_key_info(lhs_value, *rhs_value, index_info.key_info[field_idx]);
 
         if final_comparison != std::cmp::Ordering::Equal {
             return Ok(final_comparison);
@@ -3120,21 +3147,10 @@ mod tests {
         let min_len = l.len().min(r.len());
 
         for i in 0..min_len {
-            let column_order = index_key_info[i].sort_order;
-            let collation = index_key_info[i].collation;
-
-            let cmp = match (&l[i], &r[i]) {
-                (ValueRef::Text(left), ValueRef::Text(right)) => {
-                    collation.compare_strings(left, right)
-                }
-                _ => l[i].partial_cmp(&r[i]).unwrap_or(std::cmp::Ordering::Equal),
-            };
+            let cmp = compare_with_key_info(l[i], r[i], index_key_info[i]);
 
             if cmp != std::cmp::Ordering::Equal {
-                return match column_order {
-                    SortOrder::Asc => cmp,
-                    SortOrder::Desc => cmp.reverse(),
-                };
+                return cmp;
             }
         }
 
@@ -3158,6 +3174,7 @@ mod tests {
                 .map(|(sort_order, collation)| KeyInfo {
                     sort_order,
                     collation,
+                    nulls_order: default_nulls_order(sort_order),
                 })
                 .collect(),
             has_rowid: false,

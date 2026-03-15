@@ -857,14 +857,7 @@ impl ToTokens for SelectPlan {
             s.append(TokenType::TK_ORDER, None)?;
             s.append(TokenType::TK_BY, None)?;
 
-            s.comma(
-                self.order_by.iter().map(|(expr, order)| ast::SortedColumn {
-                    expr: expr.clone(),
-                    order: Some(*order),
-                    nulls: None,
-                }),
-                context,
-            )?;
+            s.comma(self.order_by.iter().cloned(), context)?;
         }
 
         if let Some(limit) = &self.limit {

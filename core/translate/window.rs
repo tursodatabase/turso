@@ -11,7 +11,7 @@ use crate::translate::plan::{
 };
 use crate::translate::planner::resolve_window_and_aggregate_functions;
 use crate::translate::result_row::emit_select_result;
-use crate::types::KeyInfo;
+use crate::types::{default_nulls_order, KeyInfo};
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::builder::{CursorType, ProgramBuilder, TableRefIdCounter};
 use crate::vdbe::insn::{
@@ -22,13 +22,13 @@ use crate::Result;
 use crate::{turso_assert, turso_assert_eq};
 use std::mem;
 use turso_parser::ast::Name;
-use turso_parser::ast::{Expr, FunctionTail, Literal, Over, SortOrder, TableInternalId};
+use turso_parser::ast::{self, Expr, FunctionTail, Literal, Over, SortOrder, TableInternalId};
 
 const SUBQUERY_DATABASE_ID: usize = 0;
 
 struct WindowSubqueryContext<'a> {
     resolver: &'a Resolver<'a>,
-    subquery_order_by: &'a mut Vec<(Box<Expr>, SortOrder)>,
+    subquery_order_by: &'a mut Vec<ast::SortedColumn>,
     subquery_result_columns: &'a mut Vec<ResultSetColumn>,
     subquery_id: &'a TableInternalId,
 }
@@ -169,10 +169,10 @@ fn prepare_window_subquery(
             &mut ctx,
         )?;
     }
-    for (expr, _) in outer_plan.order_by.iter_mut() {
+    for sorted_column in outer_plan.order_by.iter_mut() {
         rewrite_terminal_expr(
             &mut outer_plan.aggregates,
-            expr,
+            &mut sorted_column.expr,
             &mut current_window,
             &mut ctx,
         )?;
@@ -263,10 +263,13 @@ fn append_order_by(
     let already_exists = ctx
         .subquery_order_by
         .iter()
-        .any(|(existing, _)| exprs_are_equivalent(existing, expr));
+        .any(|existing| exprs_are_equivalent(&existing.expr, expr));
     if !already_exists {
-        ctx.subquery_order_by
-            .push((Box::new(expr.clone()), *sort_order));
+        ctx.subquery_order_by.push(ast::SortedColumn {
+            expr: Box::new(expr.clone()),
+            order: Some(*sort_order),
+            nulls: None,
+        });
     }
 
     let contains_aggregates =
@@ -490,7 +493,7 @@ impl EmitWindow {
         window: &'a Window,
         plan: &SelectPlan,
         result_columns: &'a [ResultSetColumn],
-        order_by: &'a [(Box<Expr>, SortOrder)],
+        order_by: &'a [ast::SortedColumn],
     ) -> crate::Result<()> {
         let joined_tables = &plan.joined_tables();
         turso_assert_eq!(joined_tables.len(), 1, "expected only one joined table");
@@ -671,16 +674,16 @@ fn alloc_optional_registers(program: &mut ProgramBuilder, count: usize) -> Optio
 
 fn collect_expressions_referencing_subquery<'a>(
     result_columns: &'a [ResultSetColumn],
-    order_by: &'a [(Box<Expr>, SortOrder)],
+    order_by: &'a [ast::SortedColumn],
     subquery_id: &TableInternalId,
 ) -> crate::Result<Vec<(&'a Expr, usize)>> {
     let mut expressions_referencing_subquery: Vec<(&'a Expr, usize)> = Vec::new();
 
-    for root_expr in result_columns
-        .iter()
-        .map(|col| &col.expr)
-        .chain(order_by.iter().map(|(e, _)| e.as_ref()))
-    {
+    for root_expr in result_columns.iter().map(|col| &col.expr).chain(
+        order_by
+            .iter()
+            .map(|sorted_column| sorted_column.expr.as_ref()),
+    ) {
         walk_expr(
             root_expr,
             &mut |expr: &Expr| -> crate::Result<WalkControl> {
@@ -739,6 +742,7 @@ fn emit_flush_buffer_if_new_partition(
             .map(|_| KeyInfo {
                 sort_order: SortOrder::Asc,
                 collation: CollationSeq::default(),
+                nulls_order: default_nulls_order(SortOrder::Asc),
             })
             .collect::<Vec<_>>();
         for (i, c) in compare_key_info
@@ -851,6 +855,7 @@ fn emit_flush_buffer_if_not_peer(
             .map(|_| KeyInfo {
                 sort_order: SortOrder::Asc,
                 collation: CollationSeq::default(),
+                nulls_order: default_nulls_order(SortOrder::Asc),
             })
             .collect::<Vec<_>>();
         for (i, c) in compare_key_info

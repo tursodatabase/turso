@@ -16,6 +16,7 @@ use crate::{
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
         planner::determine_where_to_eval_term,
     },
+    types::{default_nulls_order, normalize_nulls_order},
     vdbe::{
         affinity::{self, Affinity},
         builder::{CursorKey, CursorType, ProgramBuilder},
@@ -306,6 +307,26 @@ pub enum Plan {
     Update(UpdatePlan),
 }
 
+pub fn sorted_column_order(sorted_column: &ast::SortedColumn) -> SortOrder {
+    sorted_column.order.unwrap_or(SortOrder::Asc)
+}
+
+pub fn sorted_column_nulls_order(sorted_column: &ast::SortedColumn) -> ast::NullsOrder {
+    normalize_nulls_order(sorted_column_order(sorted_column), sorted_column.nulls)
+}
+
+fn sorted_column_has_nondefault_explicit_nulls(sorted_column: &ast::SortedColumn) -> bool {
+    sorted_column.nulls.is_some_and(|nulls_order| {
+        nulls_order != default_nulls_order(sorted_column_order(sorted_column))
+    })
+}
+
+pub fn order_by_has_nondefault_explicit_nulls(order_by: &[ast::SortedColumn]) -> bool {
+    order_by
+        .iter()
+        .any(sorted_column_has_nondefault_explicit_nulls)
+}
+
 impl Plan {
     /// Returns true if this SELECT plan contains a reference to the given table.
     /// For compound selects, checks all component selects.
@@ -563,7 +584,7 @@ pub struct SelectPlan {
     /// group by clause
     pub group_by: Option<GroupBy>,
     /// order by clause
-    pub order_by: Vec<(Box<ast::Expr>, SortOrder)>,
+    pub order_by: Vec<ast::SortedColumn>,
     /// all the aggregates collected from the result columns, order by, and (TODO) having clauses
     pub aggregates: Vec<Aggregate>,
     /// limit clause

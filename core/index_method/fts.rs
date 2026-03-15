@@ -1212,6 +1212,7 @@ fn key_info() -> KeyInfo {
     KeyInfo {
         sort_order: SortOrder::Asc,
         collation: CollationSeq::Binary,
+        nulls_order: crate::types::default_nulls_order(SortOrder::Asc),
     }
 }
 

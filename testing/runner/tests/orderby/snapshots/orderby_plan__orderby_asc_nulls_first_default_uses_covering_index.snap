@@ -1,0 +1,17 @@
+---
+source: orderby_plan.sqltest
+expression: |-
+  SELECT id, val
+      FROM t
+      ORDER BY val ASC NULLS FIRST
+      LIMIT 3;
+info:
+  statement_type: SELECT
+  tables:
+  - t
+  setup_blocks:
+  - orderby_plan_nulls
+  database: ':memory:'
+---
+QUERY PLAN
+`--SCAN t USING COVERING INDEX idx_t_val

@@ -198,6 +198,21 @@ expect {
 }
 
 @cross-check-integrity
+test create-index-on-populated-table {
+    CREATE TABLE t15b(a);
+    INSERT INTO t15b VALUES (2), (1), (3);
+    CREATE INDEX idx15b ON t15b(a);
+    INSERT INTO t15b VALUES (0);
+    SELECT a FROM t15b ORDER BY a;
+}
+expect {
+    0
+    1
+    2
+    3
+}
+
+@cross-check-integrity
 test create-index-strftime-with-column {
     CREATE TABLE logs("created" TEXT NOT NULL);
     INSERT INTO logs VALUES

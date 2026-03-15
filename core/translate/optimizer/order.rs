@@ -8,8 +8,9 @@ use crate::{
         optimizer::access_method::AccessMethodParams,
         optimizer::constraints::RangeConstraintRef,
         plan::{
-            GroupBy, HashJoinType, IterationDirection, JoinedTable, Operation, Plan, Scan,
-            SimpleAggregate, TableReferences,
+            order_by_has_nondefault_explicit_nulls, sorted_column_order, GroupBy, HashJoinType,
+            IterationDirection, JoinedTable, Operation, Plan, Scan, SimpleAggregate,
+            TableReferences,
         },
         planner::table_mask_from_expr,
     },
@@ -136,16 +137,24 @@ pub fn simple_aggregate_order_target(
 /// TODO: this does not currently handle the case where we definitely cannot eliminate
 /// the ORDER BY sorter, but we could still eliminate the GROUP BY sorter.
 pub fn compute_order_target(
-    order_by: &mut Vec<(Box<ast::Expr>, SortOrder)>,
+    order_by: &mut Vec<ast::SortedColumn>,
     group_by_opt: Option<&mut GroupBy>,
     tables: &TableReferences,
 ) -> Option<OrderTarget> {
+    if order_by_has_nondefault_explicit_nulls(order_by) {
+        return None;
+    }
     match (order_by.is_empty(), group_by_opt) {
         // No ordering demands - we don't care what order the joined result rows are in
         (true, None) => None,
         // Only ORDER BY - we would like the joined result rows to be in the order specified by the ORDER BY
         (false, None) => OrderTarget::maybe_from_iterator(
-            order_by.iter().map(|(expr, order)| (expr.as_ref(), *order)),
+            order_by.iter().map(|sorted_column| {
+                (
+                    sorted_column.expr.as_ref(),
+                    sorted_column_order(sorted_column),
+                )
+            }),
             tables,
             OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
         ),
@@ -166,11 +175,11 @@ pub fn compute_order_target(
         // however in this case we must take the ASC/DESC from ORDER BY into account.
         (false, Some(group_by)) => {
             // Does the group by contain all expressions in the order by?
-            let group_by_contains_all = order_by.iter().all(|(expr, _)| {
+            let group_by_contains_all = order_by.iter().all(|sorted_column| {
                 group_by
                     .exprs
                     .iter()
-                    .any(|group_by_expr| exprs_are_equivalent(expr, group_by_expr))
+                    .any(|group_by_expr| exprs_are_equivalent(&sorted_column.expr, group_by_expr))
             });
             // If not, let's try to target an ordering that matches the group by -- we don't care about ASC/DESC
             if !group_by_contains_all {
@@ -185,7 +194,7 @@ pub fn compute_order_target(
             group_by.exprs.sort_by_key(|expr| {
                 order_by
                     .iter()
-                    .position(|(order_by_expr, _)| exprs_are_equivalent(expr, order_by_expr))
+                    .position(|sorted_column| exprs_are_equivalent(expr, &sorted_column.expr))
                     .map_or(usize::MAX, |i| i)
             });
 
@@ -195,8 +204,8 @@ pub fn compute_order_target(
             // First, however, we need to make sure the GROUP BY sorter's column sort directions match the ORDER BY requirements.
             turso_assert_greater_than_or_equal!(group_by.exprs.len(), order_by.len());
             let sort_order = &mut group_by.sort_order;
-            for (i, (_, order_by_dir)) in order_by.iter().enumerate() {
-                sort_order[i] = *order_by_dir;
+            for (i, sorted_column) in order_by.iter().enumerate() {
+                sort_order[i] = sorted_column_order(sorted_column);
             }
             // The sort_by_key above reordered group_by.exprs but not sort_order,
             // so remaining positions may have stale values. GROUP BY columns not
@@ -440,13 +449,18 @@ pub fn subquery_intrinsic_order_consumed(
     };
     // Explicit ORDER BY takes priority.
     if !select_plan.order_by.is_empty() {
+        if order_by_has_nondefault_explicit_nulls(&select_plan.order_by) {
+            return 0;
+        }
         let intrinsic = build_intrinsic_order(
             table_id,
             select_plan,
-            select_plan
-                .order_by
-                .iter()
-                .map(|(expr, order)| (expr.as_ref(), *order)),
+            select_plan.order_by.iter().map(|sorted_column| {
+                (
+                    sorted_column.expr.as_ref(),
+                    sorted_column_order(sorted_column),
+                )
+            }),
         );
         return match_intrinsic_order(&intrinsic, iter_dir, target);
     }
