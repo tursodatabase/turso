@@ -10,6 +10,9 @@ mod opcodes_dictionary;
 mod read_state_machine;
 mod sync_server;
 
+#[cfg(feature = "mvcc_repl")]
+mod mvcc_repl;
+
 use config::CONFIG_DIR;
 use mcp_server::TursoMcpServer;
 use rustyline::{error::ReadlineError, Config, Editor};
@@ -54,6 +57,21 @@ fn run_sync_server(app: app::Limbo) -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(feature = "mvcc_repl")]
+    {
+        use clap::Parser as _;
+        let opts = app::Opts::parse();
+        if opts.mvcc {
+            let path = opts
+                .database
+                .as_ref()
+                .and_then(|p| p.to_str())
+                .unwrap_or(":memory:")
+                .to_owned();
+            return mvcc_repl::run(&path);
+        }
+    }
+
     let (mut app, _guard) = app::Limbo::new()?;
 
     if app.is_mcp_mode() {

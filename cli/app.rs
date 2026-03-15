@@ -90,6 +90,9 @@ pub struct Opts {
     pub experimental_autovacuum: bool,
     #[clap(long, help = "Enable experimental attach feature")]
     pub experimental_attach: bool,
+    #[cfg(feature = "mvcc_repl")]
+    #[clap(long, help = "Start MVCC concurrent transaction harness")]
+    pub mvcc: bool,
     #[clap(
         long,
         help = "Enable unsafe testing features (e.g. sqlite_dbpage writes)"
