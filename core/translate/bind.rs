@@ -954,6 +954,10 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             ctx.with_phase(BindPhase::AliasFirst, |ctx| {
                 for sort_col in &mut select.order_by {
                     ctx.replace_column_number(&mut sort_col.expr)?;
+                    // Optimize trivial subqueries like (SELECT alias) by inlining
+                    // the alias expression. This avoids creating a "correlated"
+                    // subquery that's really just an alias reference.
+                    ctx.try_inline_trivial_subquery(&mut sort_col.expr, &main_scope);
                     ctx.bind_expr(&mut sort_col.expr, &main_scope)?;
                 }
                 Ok(())
@@ -1121,6 +1125,50 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         Ok(())
     }
 
+    /// Inline trivial subqueries like `(SELECT alias_name)` by resolving
+    /// the inner expression against the current alias list. This avoids
+    /// creating correlated subqueries for ORDER BY / HAVING expressions
+    /// that are really just alias references wrapped in a subquery.
+    /// Inline trivial subqueries like `(SELECT alias_name)` by resolving
+    /// the inner expression against the current alias list. Only inlines if
+    /// the name ONLY matches an alias and NOT a source column (SQLite gives
+    /// source columns priority inside subquery context).
+    fn try_inline_trivial_subquery(&self, expr: &mut ast::Expr, scope: &BindScope) {
+        if let ast::Expr::Subquery(select) = expr {
+            // Only inline if there's no FROM, no WHERE, no compounds, no LIMIT
+            if select.with.is_none()
+                && select.body.compounds.is_empty()
+                && select.order_by.is_empty()
+                && select.limit.is_none()
+            {
+                if let ast::OneSelect::Select {
+                    columns,
+                    from: None,
+                    where_clause: None,
+                    group_by: None,
+                    ..
+                } = &select.body.select
+                {
+                    if columns.len() == 1 {
+                        if let ast::ResultColumn::Expr(inner_expr, None) = &columns[0] {
+                            if let ast::Expr::Id(name) = inner_expr.as_ref() {
+                                // Only inline if the name doesn't match any source column.
+                                // If a source column exists, the subquery should
+                                // resolve it as a correlated column reference, not an alias.
+                                if scope.find_column_unqualified(name.as_str()).ok().flatten().is_none() {
+                                    if let Some(alias_expr) = self.resolve_alias(name.as_str()) {
+                                        *expr = alias_expr;
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Replace a numeric literal (e.g. `1`, `2`) with the corresponding
     /// SELECT result column expression. Per SQLite semantics, only positive
     /// integer literals are treated as column references; floats and negative
@@ -1158,7 +1206,10 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         self.outer_query_frames = saved_outer_query_frames;
         group_result?;
         if let Some(having) = &mut group_by.having {
-            self.with_phase(BindPhase::AliasFirst, |ctx| ctx.bind_expr(having, scope))?;
+            self.with_phase(BindPhase::AliasFirst, |ctx| {
+                ctx.try_inline_trivial_subquery(having, scope);
+                ctx.bind_expr(having, scope)
+            })?;
         }
         Ok(())
     }
