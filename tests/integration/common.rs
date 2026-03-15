@@ -746,7 +746,7 @@ mod tests {
         expected.sort();
 
         // Query all values and verify they come back in sorted order
-        let ret: Vec<(i64,)> = conn.exec_rows(&format!("SELECT x FROM t WHERE x > {RANGE_MIN}"));
+        let ret: Vec<(i64,)> = conn.exec_rows(&format!("SELECT x FROM t WHERE x >= {RANGE_MIN}"));
         let actual: Vec<i64> = ret.into_iter().map(|row| row.0).collect();
 
         assert_eq!(actual, expected, "Values not returned in sorted order");
