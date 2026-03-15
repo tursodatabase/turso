@@ -1363,6 +1363,10 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     .with_schema(database_id, |s| s.get_view(&table_name))
                 {
                     view.process()?;
+                    // Clone what we need before releasing the view reference.
+                    // Keep Arc to original so we can call done() after binding.
+                    let view_ref = view.clone(); // Arc clone, not View clone
+                    let view_columns = view.columns.clone();
                     let mut view_select = view.select_stmt.clone();
                     // Apply view column aliases to the SELECT result columns
                     if let ast::OneSelect::Select {
@@ -1370,7 +1374,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     } = view_select.body.select
                     {
                         for (col, result_col) in
-                            view.columns.iter().zip(columns.iter_mut())
+                            view_columns.iter().zip(columns.iter_mut())
                         {
                             if let (
                                 Some(name_str),
@@ -1389,6 +1393,9 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     let saved_ctes = std::mem::take(&mut self.ctes);
                     let bound_select = self.bind_select(&mut view_select);
                     self.ctes = saved_ctes;
+                    // Reset view state so nested view-on-view chains don't
+                    // falsely detect circular definitions during ALTER TABLE.
+                    view_ref.done();
                     let bound_select = bound_select?;
                     let subquery_columns: Vec<String> = bound_select
                         .result_columns
