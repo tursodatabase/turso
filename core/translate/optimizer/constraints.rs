@@ -70,6 +70,10 @@ pub struct Constraint {
     /// Whether this constraint references the implicit rowid (tables without an INTEGER PRIMARY KEY alias).
     /// When true and `table_col_pos` is None, this constraint targets the rowid pseudo-column.
     pub is_rowid: bool,
+    /// Whether this constraint originates from an outer join's ON clause (as opposed to the WHERE clause).
+    /// Used by the cardinality estimator to separate ON-clause residuals from WHERE-clause residuals
+    /// for join-type-aware cardinality estimation (e.g. LEFT JOIN output floor, anti-join detection).
+    pub from_outer_join: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -425,6 +429,7 @@ pub fn constraints_from_where_clause(
                     continue;
                 }
             }
+            let is_from_outer_join = term.from_outer_join.is_some();
 
             // Try to extract as binary expression first
             if let Some((lhs, operator, rhs)) = as_binary_components(&term.expr)? {
@@ -452,6 +457,7 @@ pub fn constraints_from_where_clause(
                                 ),
                                 usable: true,
                                 is_rowid: false,
+                                from_outer_join: is_from_outer_join,
                             });
                         }
                     }
@@ -481,6 +487,7 @@ pub fn constraints_from_where_clause(
                                 ),
                                 usable: true,
                                 is_rowid: true,
+                                from_outer_join: is_from_outer_join,
                             });
                         }
                     }
@@ -519,6 +526,7 @@ pub fn constraints_from_where_clause(
                             selectivity,
                             usable: true,
                             is_rowid: false,
+                            from_outer_join: is_from_outer_join,
                         });
                     }
                     _ => {}
@@ -546,6 +554,7 @@ pub fn constraints_from_where_clause(
                                 ),
                                 usable: true,
                                 is_rowid: false,
+                                from_outer_join: is_from_outer_join,
                             });
                         }
                     }
@@ -575,6 +584,7 @@ pub fn constraints_from_where_clause(
                                 ),
                                 usable: true,
                                 is_rowid: true,
+                                from_outer_join: is_from_outer_join,
                             });
                         }
                     }
@@ -613,6 +623,7 @@ pub fn constraints_from_where_clause(
                             selectivity,
                             usable: true,
                             is_rowid: false,
+                            from_outer_join: is_from_outer_join,
                         });
                     }
                     _ => {}
@@ -658,6 +669,7 @@ pub fn constraints_from_where_clause(
                             selectivity,
                             usable: false, // IN uses a separate seek path, not the range-seek model
                             is_rowid,
+                            from_outer_join: is_from_outer_join,
                         });
                     }
                     ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
@@ -674,6 +686,7 @@ pub fn constraints_from_where_clause(
                             selectivity,
                             usable: false,
                             is_rowid: true,
+                            from_outer_join: is_from_outer_join,
                         });
                     }
                     _ => {}
@@ -723,6 +736,7 @@ pub fn constraints_from_where_clause(
                                 selectivity,
                                 usable: false, // IN uses a separate seek path (consider_in_list_seek)
                                 is_rowid,
+                                from_outer_join: is_from_outer_join,
                             });
                         }
                         ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
@@ -739,6 +753,7 @@ pub fn constraints_from_where_clause(
                                 selectivity,
                                 usable: false,
                                 is_rowid: true,
+                                from_outer_join: is_from_outer_join,
                             });
                         }
                         _ => {}
@@ -1386,6 +1401,7 @@ pub(crate) fn analyze_binary_term_for_index(
         selectivity,
         usable: true,
         is_rowid,
+        from_outer_join: false, // multi-index branches don't participate in outer join residual splitting
     };
 
     Some(AnalyzedTerm {

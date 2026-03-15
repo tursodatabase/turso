@@ -29,8 +29,8 @@ use crate::{
             order::plan_satisfies_order_target,
         },
         plan::{
-            HashJoinKey, HashJoinType, JoinOrderMember, JoinedTable, NonFromClauseSubquery,
-            TableReferences, WhereTerm,
+            HashJoinKey, HashJoinType, JoinOrderMember, JoinType, JoinedTable,
+            NonFromClauseSubquery, TableReferences, WhereTerm,
         },
         planner::TableMask,
     },
@@ -58,28 +58,52 @@ impl<'a> JoinPlanningContext<'a> {
 // This is a safety limit, not a cost tuning parameter.
 const MAX_MATERIALIZED_BUILD_ROWS: f64 = 200_000.0;
 
+/// Residual selectivity information split by constraint origin.
+///
+/// For outer joins (LEFT JOIN), ON-clause and WHERE-clause residuals must be
+/// handled differently: the ON-clause residual determines match rate (used for
+/// LEFT JOIN output floor and anti-join formulas), while WHERE-clause residuals
+/// are post-join filters applied after the join guarantee.
+struct ResidualInfo {
+    /// Product of unconsumed ON-clause (outer join) constraint selectivities.
+    on_clause_residual: f64,
+    /// Product of unconsumed WHERE-clause constraint selectivities,
+    /// excluding any IS NULL constraint identified as part of an anti-join pattern.
+    where_clause_residual: f64,
+    /// True when a WHERE-clause IS NULL was found on the outer-joined table,
+    /// indicating a `LEFT JOIN ... WHERE right.col IS NULL` anti-join pattern.
+    is_anti_join_pattern: bool,
+}
+
 fn constraint_output_multipliers(
     rhs_constraints: &TableConstraints,
     lhs_mask: &TableMask,
     rhs_self_mask: TableMask,
     consumed_where_terms: &[usize],
     params: &CostModelParams,
-) -> f64 {
-    let mut multiplier = 1.0;
-    let mut bounds: SmallVec<[(Option<usize>, bool, bool); 4]> = SmallVec::new();
+    join_type: Option<JoinType>,
+) -> ResidualInfo {
+    let mut on_clause_residual = 1.0;
+    let mut where_clause_residual = 1.0;
+    let mut has_where_is_null = false;
 
-    let record_bound = |bounds: &mut SmallVec<[(Option<usize>, bool, bool); 4]>,
+    // Track range bounds per column, with which bucket (on/where) they belong to.
+    // (col_pos, has_lower, has_upper, is_on_clause)
+    let mut bounds: SmallVec<[(Option<usize>, bool, bool, bool); 4]> = SmallVec::new();
+
+    let record_bound = |bounds: &mut SmallVec<[(Option<usize>, bool, bool, bool); 4]>,
                         dominated_col: Option<usize>,
                         is_lower: bool,
-                        is_upper: bool| {
+                        is_upper: bool,
+                        is_on_clause: bool| {
         if !(is_lower || is_upper) {
             return;
         }
-        if let Some(entry) = bounds.iter_mut().find(|(col, _, _)| *col == dominated_col) {
+        if let Some(entry) = bounds.iter_mut().find(|(col, _, _, _)| *col == dominated_col) {
             entry.1 |= is_lower;
             entry.2 |= is_upper;
         } else {
-            bounds.push((dominated_col, is_lower, is_upper));
+            bounds.push((dominated_col, is_lower, is_upper, is_on_clause));
         }
     };
 
@@ -89,7 +113,24 @@ fn constraint_output_multipliers(
             || constraint.lhs_mask.is_empty())
             && !consumed_where_terms.contains(&constraint.where_clause_pos.0)
     }) {
-        multiplier *= constraint.selectivity;
+        let is_isnull = matches!(
+            constraint.operator,
+            super::constraints::ConstraintOperator::AstNativeOperator(Operator::Is)
+        );
+
+        if constraint.from_outer_join {
+            // ON-clause constraint
+            on_clause_residual *= constraint.selectivity;
+        } else if is_isnull
+            && matches!(join_type, Some(JoinType::LeftOuter))
+        {
+            // WHERE-clause IS NULL on a LEFT JOIN's RHS table → anti-join pattern.
+            // Don't multiply into residual; the anti-join formula accounts for it.
+            has_where_is_null = true;
+        } else {
+            // WHERE-clause constraint (or non-outer-join)
+            where_clause_residual *= constraint.selectivity;
+        }
 
         let dominated_col = constraint.table_col_pos;
         let is_lower = matches!(
@@ -100,16 +141,30 @@ fn constraint_output_multipliers(
             constraint.operator.as_ast_operator(),
             Some(Operator::Less | Operator::LessEquals)
         );
-        record_bound(&mut bounds, dominated_col, is_lower, is_upper);
+        record_bound(
+            &mut bounds,
+            dominated_col,
+            is_lower,
+            is_upper,
+            constraint.from_outer_join,
+        );
     }
 
-    for (_, has_lower, has_upper) in &bounds {
+    for (_, has_lower, has_upper, is_on_clause) in &bounds {
         if *has_lower && *has_upper {
-            multiplier *= params.closed_range_selectivity_factor;
+            if *is_on_clause {
+                on_clause_residual *= params.closed_range_selectivity_factor;
+            } else {
+                where_clause_residual *= params.closed_range_selectivity_factor;
+            }
         }
     }
 
-    multiplier
+    ResidualInfo {
+        on_clause_residual,
+        where_clause_residual,
+        is_anti_join_pattern: has_where_is_null,
+    }
 }
 
 /// Represents an n-ary join, anywhere from 1 table to N tables.
@@ -732,31 +787,65 @@ pub fn join_lhs_and_rhs<'a>(
     // OUTPUT CARDINALITY CALCULATION
     // ============================================================================
     //
-    // Formula: output_rows = input_rows × rows_from_access_path × remaining_filter_selectivity.
+    // For INNER JOIN:
+    //   output = input × rows_per_outer × (on_residual × where_residual)
     //
-    // Each access method provides its own per-outer-row row estimate for:
-    // - full BTree scans and full index scans
-    // - rowid seeks
-    // - ordinary secondary-index seeks
-    // - multi-index OR/AND scans
-    // - index-method access such as FTS
+    // For LEFT OUTER JOIN:
+    //   The LEFT JOIN guarantee: every input row appears at least once.
+    //   inner_card = input × rows_per_outer × on_residual
+    //   clamped    = max(inner_card, input)
+    //   output     = clamped × where_residual
     //
-    // Join planning only applies the selectivity of WHERE terms that the chosen
-    // access path did not already consume.
+    // For LEFT OUTER + anti-join (WHERE right.col IS NULL):
+    //   match_rate = min(1, rows_per_outer × on_residual)
+    //   output     = input × (1 - match_rate) × other_where_residual
     //
-    let unconsumed_constraint_multiplier = constraint_output_multipliers(
+    let join_type = rhs_table_reference
+        .join_info
+        .as_ref()
+        .map(|ji| ji.join_type);
+    let residual_info = constraint_output_multipliers(
         rhs_constraints,
         &lhs_mask,
         rhs_self_mask,
         &best_access_method.consumed_where_terms,
         params,
+        join_type,
     );
-    let residual_multiplier = match best_access_method.residual_constraints {
-        ResidualConstraintMode::ApplyUnconsumed => unconsumed_constraint_multiplier,
-        ResidualConstraintMode::None => 1.0,
+    let rows_per_outer = best_access_method.estimated_rows_per_outer_row;
+    let output_cardinality = match best_access_method.residual_constraints {
+        ResidualConstraintMode::None => input_cardinality * rows_per_outer,
+        ResidualConstraintMode::ApplyUnconsumed => {
+            match join_type {
+                Some(JoinType::LeftOuter) if residual_info.is_anti_join_pattern => {
+                    // Anti-join pattern: LEFT JOIN ... WHERE right.col IS NULL
+                    // Unlike inner/left joins which ask "how many matches per
+                    // row", anti-join asks "does this row have any match at
+                    // all?" — a yes/no question. We convert the estimated match
+                    // count (λ) into a probability of zero matches via the
+                    // Poisson distribution: P(no match) = e^(-λ). This smoothly
+                    // approaches zero but never reaches it, so downstream joins
+                    // always see nonzero cardinality and pick sane plans.
+                    let lambda = rows_per_outer * residual_info.on_clause_residual;
+                    let survival_rate = (-lambda).exp();
+                    input_cardinality * survival_rate * residual_info.where_clause_residual
+                }
+                Some(JoinType::LeftOuter) => {
+                    // LEFT JOIN: every input row appears at least once
+                    let inner_card =
+                        input_cardinality * rows_per_outer * residual_info.on_clause_residual;
+                    inner_card.max(input_cardinality) * residual_info.where_clause_residual
+                }
+                _ => {
+                    // INNER JOIN and other join types: standard formula
+                    input_cardinality
+                        * rows_per_outer
+                        * residual_info.on_clause_residual
+                        * residual_info.where_clause_residual
+                }
+            }
+        }
     };
-    let output_cardinality =
-        input_cardinality * best_access_method.estimated_rows_per_outer_row * residual_multiplier;
 
     access_methods_arena.push(best_access_method);
 
