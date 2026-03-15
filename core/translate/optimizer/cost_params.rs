@@ -116,7 +116,7 @@ impl CostModelParams {
 
             // Scan/Seek costs
             cache_reuse_factor: 0.2,
-            cpu_cost_per_row: 0.003,
+            cpu_cost_per_row: 0.01,
             cpu_cost_per_seek: 0.01,
             index_bonus: 0.5,
 
