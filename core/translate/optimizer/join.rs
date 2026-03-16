@@ -3212,7 +3212,7 @@ mod tests {
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
-            pk_conflict_clause: None,
+            rowid_alias_conflict_clause: None,
         })
     }
 

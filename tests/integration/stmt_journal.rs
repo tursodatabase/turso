@@ -483,12 +483,13 @@ fn update_abort_partial_index_not_preflighted(tmp_db: TempDatabase) -> anyhow::R
     conn.execute("CREATE UNIQUE INDEX idx_b ON t(b)")?;
     conn.execute("INSERT INTO t VALUES(1, 10, 100)")?;
     conn.execute("INSERT INTO t VALUES(2, 20, 200)")?;
-    // Partial unique indexes can't be preflighted, so the stmt journal must be kept
-    // to protect against orphan index entries when the partial index check fails
-    // after a non-partial index has been mutated.
+    // With three-phase index updates, constraint checks (Phase 1) are fully
+    // separated from mutations (Phase 2+3), so partial unique indexes do not
+    // require the statement journal for single-row updates — Phase 1 handles
+    // the partial index constraint check before any IdxDelete/IdxInsert.
     assert!(
-        needs_stmt_journal(&conn, "UPDATE t SET b=40, c=200 WHERE a=1"),
-        "stmt journal required: partial unique index can't be preflighted"
+        !needs_stmt_journal(&conn, "UPDATE t SET b=40, c=200 WHERE a=1"),
+        "stmt journal not needed: three-phase update handles partial indexes"
     );
 
     conn.execute("BEGIN")?;
