@@ -17,7 +17,7 @@ use crate::{
         plan::{
             ColumnUsedMask, DmlSafetyReason, EphemeralRowidMode, HashJoinOp, IndexMethodQuery,
             NonFromClauseSubquery, OuterQueryReference, QueryDestination, ResultSetColumn, Scan,
-            SeekKeyComponent, SubqueryState,
+            SeekKeyComponent, SubqueryOrigin, SubqueryState,
         },
         trigger_exec::has_relevant_triggers_type_only,
     },
@@ -780,6 +780,10 @@ fn first_update_safety_reason(
             break 'requires Some(DmlSafetyReason::Trigger);
         }
 
+        if update_where_subquery_reads_target_table(plan, table_ref.database_id) {
+            break 'requires Some(DmlSafetyReason::SubqueryInWhere);
+        }
+
         // REPLACE mode requires ephemeral table because REPLACE deletes conflicting rows,
         // which can corrupt the iteration order when iterating via an index.
         if matches!(
@@ -823,6 +827,16 @@ fn first_update_safety_reason(
     };
 
     Ok(reason)
+}
+
+fn update_where_subquery_reads_target_table(plan: &UpdatePlan, database_id: usize) -> bool {
+    let Some(target_table) = plan.table_references.joined_tables().first() else {
+        return false;
+    };
+    let table_name = target_table.table.get_name();
+    plan.non_from_clause_subqueries.iter().any(|subquery| {
+        subquery.origin == SubqueryOrigin::DmlWhere && subquery.reads_table(database_id, table_name)
+    })
 }
 
 /// Collect SubqueryResult IDs referenced in SET clause and RETURNING expressions.
