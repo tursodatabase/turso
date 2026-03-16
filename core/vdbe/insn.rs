@@ -1559,6 +1559,12 @@ pub enum Insn {
         payload_dest_reg: Option<u16>,
         /// Number of payload columns expected
         num_payload: u16,
+        /// Register containing probe-side rowid for grace hash join buffering.
+        /// When Some and target partition is on disk, buffer the probe row
+        /// instead of loading the partition on demand.
+        /// When None, this instruction is running inside grace processing and
+        /// the build partition must already be loaded.
+        probe_rowid_reg: Option<u16>,
     },
 
     /// Advance to next matching row in hash table bucket.
@@ -1591,6 +1597,13 @@ pub enum Insn {
         hash_table_id: usize,
     },
 
+    /// Reset all matched_bits in a hash table to false.
+    /// Emitted at the start of each outer-loop iteration so that marks from
+    /// a previous probe pass don't suppress NULL-fill rows in the current one.
+    HashResetMatched {
+        hash_table_id: usize,
+    },
+
     /// Begin scanning unmatched entries in the hash table (for FULL OUTER JOIN).
     /// Writes the first unmatched entry's rowid to dest_reg and payload to payload_dest_reg.
     /// If no unmatched entries exist, jumps to target_pc.
@@ -1611,6 +1624,39 @@ pub enum Insn {
         target_pc: BranchOffset,
         payload_dest_reg: Option<usize>,
         num_payload: usize,
+    },
+
+    /// Initialize grace hash join processing after the probe cursor is exhausted.
+    /// Finalizes probe-side spills and calls grace_begin.
+    /// Jumps to target_pc if no spilling occurred or no partitions to process.
+    HashGraceInit {
+        hash_table_id: u16,
+        target_pc: BranchOffset,
+    },
+
+    /// Load the current grace partition's build side from disk.
+    /// Also loads the first probe chunk. Jumps to target_pc when all partitions done.
+    HashGraceLoadPartition {
+        hash_table_id: u16,
+        target_pc: BranchOffset,
+    },
+
+    /// Advance to next probe entry in the current grace partition.
+    /// Writes probe keys to key_start_reg..key_start_reg+num_keys-1 and probe rowid to probe_rowid_dest.
+    /// Jumps to target_pc when probe entries exhausted.
+    HashGraceNextProbe {
+        hash_table_id: u16,
+        key_start_reg: u16,
+        num_keys: u16,
+        probe_rowid_dest: u16,
+        target_pc: BranchOffset,
+    },
+
+    /// Evict current grace partition and advance to the next one.
+    /// Jumps to target_pc when all partitions are processed.
+    HashGraceAdvancePartition {
+        hash_table_id: u16,
+        target_pc: BranchOffset,
     },
 
     /// VACUUM INTO - create a compacted copy of the database at the specified path.
@@ -1842,8 +1888,13 @@ impl InsnVariants {
             InsnVariants::HashClose => execute::op_hash_close,
             InsnVariants::HashClear => execute::op_hash_clear,
             InsnVariants::HashMarkMatched => execute::op_hash_mark_matched,
+            InsnVariants::HashResetMatched => execute::op_hash_reset_matched,
             InsnVariants::HashScanUnmatched => execute::op_hash_scan_unmatched,
             InsnVariants::HashNextUnmatched => execute::op_hash_next_unmatched,
+            InsnVariants::HashGraceInit => execute::op_hash_grace_init,
+            InsnVariants::HashGraceLoadPartition => execute::op_hash_grace_load_partition,
+            InsnVariants::HashGraceNextProbe => execute::op_hash_grace_next_probe,
+            InsnVariants::HashGraceAdvancePartition => execute::op_hash_grace_advance_partition,
             InsnVariants::VacuumInto => execute::op_vacuum_into,
             InsnVariants::InitCdcVersion => execute::op_init_cdc_version,
         }

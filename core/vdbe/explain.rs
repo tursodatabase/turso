@@ -2193,7 +2193,7 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        Insn::HashProbe{hash_table_id: hash_table_reg, key_start_reg, num_keys, dest_reg, target_pc, payload_dest_reg, num_payload} => {
+        Insn::HashProbe{hash_table_id: hash_table_reg, key_start_reg, num_keys, dest_reg, target_pc, payload_dest_reg, num_payload, probe_rowid_reg: _} => {
             let payload_info = if let Some(p_reg) = payload_dest_reg {
                 format!(" payload=r[{}]..r[{}]", p_reg, p_reg + num_payload - 1)
             } else {
@@ -2261,6 +2261,15 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
+        Insn::HashResetMatched { hash_table_id } => (
+            "HashResetMatched",
+            *hash_table_id as i64,
+            0,
+            0,
+            Value::build_text(""),
+            0,
+            String::new(),
+        ),
         Insn::HashScanUnmatched { hash_table_id, dest_reg, target_pc, payload_dest_reg, num_payload } => {
             let payload_info = if let Some(p_reg) = payload_dest_reg {
                 format!(" payload=r[{}]..r[{}]", p_reg, p_reg + num_payload - 1)
@@ -2291,6 +2300,50 @@ pub fn insn_to_row(
                 Value::build_text(""),
                 0,
                 format!("hash_table_id={hash_table_id}{payload_info}"),
+            )
+        },
+        Insn::HashGraceInit { hash_table_id, target_pc } => {
+            (
+                "HashGraceInit",
+                *hash_table_id as i64,
+                0,
+                target_pc.as_debug_int() as i64,
+                Value::build_text(""),
+                0,
+                format!("hash_table_id={hash_table_id}"),
+            )
+        },
+        Insn::HashGraceLoadPartition { hash_table_id, target_pc } => {
+            (
+                "HashGraceLoadPart",
+                *hash_table_id as i64,
+                0,
+                target_pc.as_debug_int() as i64,
+                Value::build_text(""),
+                0,
+                format!("hash_table_id={hash_table_id}"),
+            )
+        },
+        Insn::HashGraceNextProbe { hash_table_id, key_start_reg, num_keys, probe_rowid_dest, target_pc } => {
+            (
+                "HashGraceNextProbe",
+                *hash_table_id as i64,
+                *key_start_reg as i64,
+                target_pc.as_debug_int() as i64,
+                Value::build_text(""),
+                0,
+                format!("hash_table_id={hash_table_id} keys=r[{}]..r[{}] probe_rowid_dest=r[{probe_rowid_dest}]", key_start_reg, *key_start_reg + *num_keys - 1),
+            )
+        },
+        Insn::HashGraceAdvancePartition { hash_table_id, target_pc } => {
+            (
+                "HashGraceAdvPart",
+                *hash_table_id as i64,
+                0,
+                target_pc.as_debug_int() as i64,
+                Value::build_text(""),
+                0,
+                format!("hash_table_id={hash_table_id}"),
             )
         },
         Insn::VacuumInto { dest_path } => (

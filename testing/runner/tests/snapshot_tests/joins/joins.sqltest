@@ -811,3 +811,92 @@ snapshot-eqp self-join-prefer-join-dependent-index {
       AND x1.id IS NULL
       AND x2.id IS NULL;
 }
+
+# =============================================================================
+# Hash Join Snapshot Tests
+# =============================================================================
+# These capture bytecode for hash joins (tables WITHOUT indexes on join columns)
+# to verify grace hash join opcode emission.
+
+setup hash_schema {
+    -- Tables deliberately have NO indexes on join columns to force hash join
+    CREATE TABLE h_orders (
+        order_id INTEGER PRIMARY KEY NOT NULL,
+        customer_name TEXT NOT NULL,
+        amount INTEGER NOT NULL
+    );
+
+    CREATE TABLE h_items (
+        item_id INTEGER PRIMARY KEY NOT NULL,
+        order_name TEXT NOT NULL,
+        product TEXT NOT NULL,
+        quantity INTEGER NOT NULL
+    );
+
+    CREATE TABLE h_returns (
+        return_id INTEGER PRIMARY KEY NOT NULL,
+        order_name TEXT NOT NULL,
+        reason TEXT NOT NULL
+    );
+}
+
+# Inner hash join - should show HashBuild, HashProbe, and Grace opcodes
+@setup hash_schema
+snapshot hash-join-inner-basic {
+    SELECT h.order_id, h.customer_name, i.product, i.quantity
+    FROM h_orders h
+    JOIN h_items i ON h.customer_name = i.order_name;
+}
+
+# LEFT OUTER hash join - includes HashScanUnmatched for unmatched build rows
+@setup hash_schema
+snapshot hash-join-left-outer {
+    SELECT h.order_id, h.customer_name, i.product
+    FROM h_orders h
+    LEFT JOIN h_items i ON h.customer_name = i.order_name;
+}
+
+# FULL OUTER hash join - both unmatched build and unmatched probe paths
+@setup hash_schema
+snapshot hash-join-full-outer {
+    SELECT h.order_id, h.customer_name, i.item_id, i.product
+    FROM h_orders h
+    FULL OUTER JOIN h_items i ON h.customer_name = i.order_name;
+}
+
+# Hash join with aggregation
+@setup hash_schema
+snapshot hash-join-with-aggregation {
+    SELECT h.customer_name, count(*) as item_count, sum(i.quantity) as total_qty
+    FROM h_orders h
+    JOIN h_items i ON h.customer_name = i.order_name
+    GROUP BY h.customer_name;
+}
+
+# Three-table hash join chain
+@setup hash_schema
+snapshot hash-join-three-table {
+    SELECT h.order_id, i.product, r.reason
+    FROM h_orders h
+    JOIN h_items i ON h.customer_name = i.order_name
+    JOIN h_returns r ON h.customer_name = r.order_name;
+}
+
+# Hash join with ORDER BY (sorter after hash join)
+@setup hash_schema
+snapshot hash-join-with-order-by {
+    SELECT h.order_id, h.customer_name, i.product
+    FROM h_orders h
+    JOIN h_items i ON h.customer_name = i.order_name
+    ORDER BY h.customer_name, i.product;
+}
+
+# LEFT OUTER hash join with aggregation (grace + unmatched + groupby)
+@setup hash_schema
+snapshot hash-join-left-outer-agg {
+    SELECT h.customer_name, count(i.item_id) as item_count
+    FROM h_orders h
+    LEFT JOIN h_items i ON h.customer_name = i.order_name
+    GROUP BY h.customer_name
+    ORDER BY h.customer_name;
+}

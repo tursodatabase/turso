@@ -1,6 +1,6 @@
 use super::*;
 use crate::translate::main_loop::hash::{
-    emit_hash_join_unmatched_build_rows, HashProbeCloseEmitter,
+    emit_hash_join_unmatched_build_rows, GraceHashLoop, HashProbeCloseEmitter,
 };
 
 /// Represents final step of Loop emission
@@ -261,6 +261,10 @@ impl CloseLoop {
                     program.preassign_label_to_next_insn(loop_labels.loop_end);
 
                     // Outer joins: emit unmatched build rows with NULLs for the probe side.
+                    // This runs BEFORE grace so that in-memory partitions (with valid
+                    // matched_bits from the main probe) are scanned while still available.
+                    // At runtime, the scan skips spilled partitions — those are handled
+                    // per-partition inside the grace loop where matched_bits are still live.
                     if matches!(
                         hash_join_op.join_type,
                         HashJoinType::LeftOuter | HashJoinType::FullOuter
@@ -280,6 +284,27 @@ impl CloseLoop {
                                 probe_cursor_id,
                             )?;
                         }
+                    }
+
+                    // Grace hash join processing: process spilled partition pairs.
+                    // At runtime, this is a no-op if the build side didn't spill.
+                    // For LEFT/FULL OUTER, each grace partition gets its own unmatched
+                    // scan before eviction (so matched_bits are still live).
+                    if let Some(hash_ctx) = t_ctx
+                        .hash_table_contexts
+                        .get(&hash_join_op.build_table_idx)
+                        .cloned()
+                    {
+                        // emit grace processing loop after the probe cursor is exhausted.
+                        GraceHashLoop::emit(
+                            program,
+                            t_ctx,
+                            hash_join_op,
+                            &hash_ctx,
+                            select_plan,
+                            table_index,
+                            probe_cursor_id,
+                        )?;
                     }
                 }
                 Operation::MultiIndexScan(_) => {

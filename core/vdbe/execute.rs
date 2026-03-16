@@ -31,7 +31,9 @@ use crate::util::{
 use crate::vdbe::affinity::{
     apply_numeric_affinity, try_for_float, Affinity, NumericParseResult, ParsedNumber,
 };
-use crate::vdbe::hash_table::{HashEntry, HashTable, HashTableConfig, DEFAULT_MEM_BUDGET};
+use crate::vdbe::hash_table::{
+    HashEntry, HashInsertResult, HashTable, HashTableConfig, PendingHashInsert, DEFAULT_MEM_BUDGET,
+};
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::metrics::HashJoinMetrics;
 use crate::vdbe::value::ComparisonOp;
@@ -3831,9 +3833,10 @@ pub fn op_program(
                         Ok(step_result) => match step_result {
                             StepResult::Done => break,
                             StepResult::IO => {
-                                return Ok(InsnFunctionStepResult::IO(IOCompletions::Single(
-                                    Completion::new_yield(),
-                                )));
+                                let io = statement.take_io_completions().unwrap_or_else(|| {
+                                    IOCompletions::Single(Completion::new_yield())
+                                });
+                                return Ok(InsnFunctionStepResult::IO(io));
                             }
                             StepResult::Row => continue,
                             StepResult::Interrupt | StepResult::Busy => {
@@ -12290,26 +12293,18 @@ pub fn op_hash_build(
     // Insert the rowid into the hash table
     if let Some(ht) = state.hash_tables.get_mut(&data.hash_table_id) {
         let rowid = op_state.rowid.expect("rowid set");
-        let key_values = std::mem::take(&mut op_state.key_values);
-        let payload_values = std::mem::take(&mut op_state.payload_values);
-        match ht.insert(
-            key_values.clone(),
+        let pending = PendingHashInsert {
+            key_values: std::mem::take(&mut op_state.key_values),
             rowid,
-            payload_values.clone(),
-            Some(&mut state.metrics.hash_join),
-        ) {
-            Ok(IOResult::Done(())) => {}
-            Ok(IOResult::IO(io)) => {
-                op_state.key_values = key_values;
-                op_state.payload_values = payload_values;
+            payload_values: std::mem::take(&mut op_state.payload_values),
+        };
+        match ht.insert_pending(pending, Some(&mut state.metrics.hash_join))? {
+            HashInsertResult::Done => {}
+            HashInsertResult::IO { io, pending } => {
+                op_state.key_values = pending.key_values;
+                op_state.payload_values = pending.payload_values;
                 state.op_hash_build_state = Some(op_state);
                 return Ok(InsnFunctionStepResult::IO(io));
-            }
-            Err(e) => {
-                op_state.key_values = key_values;
-                op_state.payload_values = payload_values;
-                state.op_hash_build_state = Some(op_state);
-                return Err(e);
             }
         }
     }
@@ -12383,9 +12378,7 @@ pub fn op_hash_build_finalize(
     if let Some(ht) = state.hash_tables.get_mut(hash_table_id) {
         // Finalize the build phase, may flush remaining partitions to disk if spilled
         match ht.finalize_build(Some(&mut state.metrics.hash_join))? {
-            crate::types::IOResult::Done(()) => {
-                // Partitions will be loaded on-demand during probing
-            }
+            crate::types::IOResult::Done(()) => {}
             crate::types::IOResult::IO(io) => {
                 return Ok(InsnFunctionStepResult::IO(io));
             }
@@ -12425,6 +12418,7 @@ pub fn op_hash_probe(
             target_pc,
             payload_dest_reg,
             num_payload,
+            probe_rowid_reg,
         },
         insn
     );
@@ -12434,27 +12428,33 @@ pub fn op_hash_probe(
     let dest_reg = *dest_reg as usize;
     let payload_dest_reg = payload_dest_reg.map(|r| r as usize);
     let num_payload = *num_payload as usize;
-    let (probe_keys, partition_idx) = if let Some(op_state) = state.op_hash_probe_state.take() {
-        if op_state.hash_table_id == hash_table_id {
-            (op_state.probe_keys, Some(op_state.partition_idx))
+    let probe_rowid_reg = probe_rowid_reg.map(|r| r as usize);
+    let (probe_keys, partition_idx, probe_buffered) =
+        if let Some(op_state) = state.op_hash_probe_state.take() {
+            if op_state.hash_table_id == hash_table_id {
+                (
+                    op_state.probe_keys,
+                    Some(op_state.partition_idx),
+                    op_state.probe_buffered,
+                )
+            } else {
+                // Different hash table, read fresh keys
+                let mut keys = Vec::with_capacity(num_keys);
+                for i in 0..num_keys {
+                    let reg = &state.registers[key_start_reg + i];
+                    keys.push(reg.get_value().clone());
+                }
+                (keys, None, false)
+            }
         } else {
-            // Different hash table, read fresh keys
+            // First entry, read probe keys from registers
             let mut keys = Vec::with_capacity(num_keys);
             for i in 0..num_keys {
                 let reg = &state.registers[key_start_reg + i];
                 keys.push(reg.get_value().clone());
             }
-            (keys, None)
-        }
-    } else {
-        // First entry, read probe keys from registers
-        let mut keys = Vec::with_capacity(num_keys);
-        for i in 0..num_keys {
-            let reg = &state.registers[key_start_reg + i];
-            keys.push(reg.get_value().clone());
-        }
-        (keys, None)
-    };
+            (keys, None, false)
+        };
 
     let Some(hash_table) = state.hash_tables.get_mut(&hash_table_id) else {
         // Empty build side: treat as no match and jump to target.
@@ -12463,28 +12463,54 @@ pub fn op_hash_probe(
         return Ok(InsnFunctionStepResult::Step);
     };
 
-    // For spilled hash tables, load the appropriate partition on demand
+    // For spilled hash tables, either buffer main-loop probe rows for grace
+    // processing or probe a partition that grace logic already loaded.
     if hash_table.has_spilled() {
         let partition_idx =
             partition_idx.unwrap_or_else(|| hash_table.partition_for_keys(&probe_keys));
 
-        // Load partition if not already loaded (may require multiple re-entries for multi-chunk partitions)
-        if !hash_table.is_partition_loaded(partition_idx) {
-            match hash_table
-                .load_spilled_partition(partition_idx, Some(&mut state.metrics.hash_join))?
-            {
-                IOResult::Done(()) => {
-                    // Partition loaded or nothing to load
-                }
-                IOResult::IO(io) => {
-                    state.op_hash_probe_state = Some(OpHashProbeState {
-                        probe_keys,
-                        hash_table_id,
-                        partition_idx,
-                    });
-                    return Ok(InsnFunctionStepResult::IO(io));
-                }
+        // Main probe loop: buffer probe rows targeting spilled build partitions.
+        if let Some(rowid_reg) = probe_rowid_reg {
+            if probe_buffered {
+                state.pc = target_pc.as_offset_int();
+                return Ok(InsnFunctionStepResult::Step);
             }
+            if !hash_table.is_partition_loaded(partition_idx) {
+                // Partition is on disk: buffer this probe row for grace processing
+                let probe_rowid = match state.registers[rowid_reg].get_value() {
+                    Value::Numeric(Numeric::Integer(i)) => *i,
+                    _ => 0,
+                };
+                match hash_table.buffer_probe_row(
+                    probe_keys,
+                    probe_rowid,
+                    Some(&mut state.metrics.hash_join),
+                )? {
+                    IOResult::Done(()) => {}
+                    IOResult::IO(io) => {
+                        state.op_hash_probe_state = Some(OpHashProbeState {
+                            probe_keys: Vec::new(), // keys consumed
+                            hash_table_id,
+                            partition_idx,
+                            probe_buffered: true,
+                        });
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                }
+                // Jump to target_pc: this row is deferred to grace processing.
+                state.pc = target_pc.as_offset_int();
+                return Ok(InsnFunctionStepResult::Step);
+            }
+            // Partition is in memory: probe immediately (fast path)
+            state.metrics.hash_join.grace_probe_rows_streamed = state
+                .metrics
+                .hash_join
+                .grace_probe_rows_streamed
+                .saturating_add(1);
+        } else if unlikely(!hash_table.is_partition_loaded(partition_idx)) {
+            return Err(LimboError::InternalError(format!(
+                "HashProbe reached spilled partition {partition_idx} without a preloaded build partition; probe_rowid_reg=None is grace-only"
+            )));
         }
 
         // Probe the loaded partition
@@ -12593,6 +12619,20 @@ pub fn op_hash_clear(
     load_insn!(HashClear { hash_table_id }, insn);
     if let Some(hash_table) = state.hash_tables.get_mut(hash_table_id) {
         hash_table.clear();
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_hash_reset_matched(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(HashResetMatched { hash_table_id }, insn);
+    if let Some(hash_table) = state.hash_tables.get_mut(hash_table_id) {
+        hash_table.reset_matched_bits();
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -12732,6 +12772,157 @@ fn advance_unmatched_scan(
             }
         }
     }
+}
+
+pub fn op_hash_grace_init(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        HashGraceInit {
+            hash_table_id,
+            target_pc,
+        },
+        insn
+    );
+    let hash_table_id = *hash_table_id as usize;
+
+    let Some(hash_table) = state.hash_tables.get_mut(&hash_table_id) else {
+        state.pc = target_pc.as_offset_int();
+        return Ok(InsnFunctionStepResult::Step);
+    };
+
+    // If no spilling occurred, skip grace processing
+    if !hash_table.has_grace_partitions() {
+        state.pc = target_pc.as_offset_int();
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
+    // Finalize probe spill
+    match hash_table.finalize_probe_spill(Some(&mut state.metrics.hash_join))? {
+        IOResult::Done(()) => {}
+        IOResult::IO(io) => {
+            return Ok(InsnFunctionStepResult::IO(io));
+        }
+    }
+
+    // Initialize grace processing
+    if !hash_table.grace_begin() {
+        state.pc = target_pc.as_offset_int();
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_hash_grace_load_partition(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        HashGraceLoadPartition {
+            hash_table_id,
+            target_pc,
+        },
+        insn
+    );
+    let hash_table_id = *hash_table_id as usize;
+
+    let hash_table = state.hash_tables.get_mut(&hash_table_id).ok_or_else(|| {
+        LimboError::InternalError(format!("Hash table not found with ID: {hash_table_id}"))
+    })?;
+
+    match hash_table.grace_load_current_partition(Some(&mut state.metrics.hash_join))? {
+        IOResult::Done(true) => {
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        IOResult::Done(false) => {
+            state.pc = target_pc.as_offset_int();
+            Ok(InsnFunctionStepResult::Step)
+        }
+        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
+    }
+}
+
+pub fn op_hash_grace_next_probe(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        HashGraceNextProbe {
+            hash_table_id,
+            key_start_reg,
+            num_keys,
+            probe_rowid_dest,
+            target_pc,
+        },
+        insn
+    );
+    let hash_table_id = *hash_table_id as usize;
+    let key_start_reg = *key_start_reg as usize;
+    let num_keys = *num_keys as usize;
+    let probe_rowid_dest = *probe_rowid_dest as usize;
+
+    let hash_table = state.hash_tables.get_mut(&hash_table_id).ok_or_else(|| {
+        mark_unlikely();
+        LimboError::InternalError(format!("Hash table not found with ID: {hash_table_id}"))
+    })?;
+
+    match hash_table.grace_next_probe_entry()? {
+        IOResult::Done(Some(entry)) => {
+            // Write probe keys to registers
+            for (i, value) in entry.key_values.into_iter().enumerate() {
+                if i < num_keys {
+                    state.registers[key_start_reg + i].set_value(value);
+                }
+            }
+            // Write probe rowid
+            state.registers[probe_rowid_dest].set_int(entry.probe_rowid);
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        IOResult::Done(None) => {
+            state.pc = target_pc.as_offset_int();
+            Ok(InsnFunctionStepResult::Step)
+        }
+        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
+    }
+}
+
+pub fn op_hash_grace_advance_partition(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        HashGraceAdvancePartition {
+            hash_table_id,
+            target_pc,
+        },
+        insn
+    );
+    let hash_table_id = *hash_table_id as usize;
+
+    let hash_table = state.hash_tables.get_mut(&hash_table_id).ok_or_else(|| {
+        mark_unlikely();
+        LimboError::InternalError(format!("Hash table not found with ID: {hash_table_id}"))
+    })?;
+
+    if hash_table.grace_advance_partition() {
+        state.pc += 1;
+    } else {
+        state.pc = target_pc.as_offset_int();
+    }
+    Ok(InsnFunctionStepResult::Step)
 }
 
 fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
@@ -14109,10 +14300,11 @@ fn maybe_transform_root_page_to_positive(mvcc_store: Option<&Arc<MvStore>>, root
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::translate::collate::CollationSeq;
+    use crate::vdbe::BranchOffset;
     use crate::{Database, DatabaseOpts, MemoryIO, IO};
 
-    #[test]
-    fn test_decr_jump_zero_non_integer_register_returns_error() {
+    fn prepare_test_statement() -> Statement {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file_with_flags(
             io,
@@ -14123,7 +14315,138 @@ mod tests {
         )
         .unwrap();
         let conn = db.connect().unwrap();
-        let stmt = conn.prepare("SELECT 1;").unwrap();
+        conn.prepare("SELECT 1;").unwrap()
+    }
+
+    fn make_spilled_hash_table() -> (HashTable, Vec<Value>, usize) {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 1024,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
+            track_matched: false,
+            ..Default::default()
+        };
+        let mut ht = HashTable::new(config, io);
+
+        for i in 0..1024 {
+            match ht
+                .insert(vec![Value::from_i64(i)], i, vec![], None)
+                .unwrap()
+            {
+                IOResult::Done(()) => {}
+                IOResult::IO(_) => panic!("memory IO should complete synchronously"),
+            }
+        }
+
+        match ht.finalize_build(None).unwrap() {
+            IOResult::Done(()) => {}
+            IOResult::IO(_) => panic!("memory IO should complete synchronously"),
+        }
+        assert!(ht.has_spilled(), "test requires spilled hash table");
+
+        let probe_key = (0..1024)
+            .map(|i| vec![Value::from_i64(i)])
+            .find(|key| {
+                let partition_idx = ht.partition_for_keys(key);
+                !ht.is_partition_loaded(partition_idx)
+            })
+            .expect("expected an unloaded spilled partition");
+        let partition_idx = ht.partition_for_keys(&probe_key);
+
+        (ht, probe_key, partition_idx)
+    }
+
+    #[test]
+    fn test_hash_probe_rejects_unloaded_spilled_partition_without_probe_rowid() {
+        let stmt = prepare_test_statement();
+        let (ht, probe_key, _) = make_spilled_hash_table();
+
+        let mut state = ProgramState::new(2, 0);
+        state.hash_tables.insert(7, ht);
+        state.set_register(0, Register::Value(probe_key[0].clone()));
+
+        let insn = Insn::HashProbe {
+            hash_table_id: 7,
+            key_start_reg: 0,
+            num_keys: 1,
+            dest_reg: 1,
+            target_pc: BranchOffset::Offset(99),
+            payload_dest_reg: None,
+            num_payload: 0,
+            probe_rowid_reg: None,
+        };
+
+        let err = match op_hash_probe(stmt.get_program(), &mut state, &insn, stmt.get_pager()) {
+            Ok(_) => {
+                panic!("HashProbe should reject grace-only probing without a loaded partition")
+            }
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, LimboError::InternalError(ref message) if message.contains("probe_rowid_reg=None is grace-only")),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(state.pc, 0, "pc should not advance on invariant violation");
+        assert!(
+            state.op_hash_probe_state.is_none(),
+            "HashProbe should not stash resumable state for the removed fallback path"
+        );
+    }
+
+    #[test]
+    fn test_hash_probe_allows_grace_style_probe_after_partition_preload() {
+        let stmt = prepare_test_statement();
+        let (mut ht, probe_key, partition_idx) = make_spilled_hash_table();
+
+        loop {
+            match ht.load_spilled_partition(partition_idx, None).unwrap() {
+                IOResult::Done(()) => break,
+                IOResult::IO(_) => continue,
+            }
+        }
+        assert!(
+            ht.is_partition_loaded(partition_idx),
+            "grace-style probe requires the build partition to be resident"
+        );
+
+        let expected_rowid = match &probe_key[0] {
+            Value::Numeric(Numeric::Integer(i)) => *i,
+            ref other => panic!("expected integer probe key, got {other:?}"),
+        };
+
+        let mut state = ProgramState::new(2, 0);
+        state.hash_tables.insert(7, ht);
+        state.set_register(0, Register::Value(probe_key[0].clone()));
+
+        let insn = Insn::HashProbe {
+            hash_table_id: 7,
+            key_start_reg: 0,
+            num_keys: 1,
+            dest_reg: 1,
+            target_pc: BranchOffset::Offset(99),
+            payload_dest_reg: None,
+            num_payload: 0,
+            probe_rowid_reg: None,
+        };
+
+        let step = op_hash_probe(stmt.get_program(), &mut state, &insn, stmt.get_pager())
+            .expect("preloaded grace probe should succeed");
+        assert!(matches!(step, InsnFunctionStepResult::Step));
+        assert_eq!(state.pc, 1, "matching probe should fall through");
+        assert_eq!(
+            state.get_register(1).get_value(),
+            &Value::from_i64(expected_rowid),
+            "HashProbe should return the matching build rowid"
+        );
+    }
+
+    #[test]
+    fn test_decr_jump_zero_non_integer_register_returns_error() {
+        let stmt = prepare_test_statement();
 
         let mut state = ProgramState::new(1, 0);
         state.set_register(0, Register::Value(Value::Text("not-an-int".into())));

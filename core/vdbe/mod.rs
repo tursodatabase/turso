@@ -402,7 +402,7 @@ pub struct OpHashBuildState {
 }
 
 /// Re-entrant state for [Insn::HashProbe].
-/// Allows HashProbe to resume cleanly after async I/O when loading spilled partitions.
+/// Allows HashProbe to resume cleanly after async probe-row buffering I/O.
 #[derive(Debug, Default)]
 pub struct OpHashProbeState {
     /// Cached probe key values to avoid re-reading from registers
@@ -411,6 +411,8 @@ pub struct OpHashProbeState {
     pub hash_table_id: usize,
     /// Partition index being loaded (if any)
     pub partition_idx: usize,
+    /// Whether the probe row was already buffered for grace processing.
+    pub probe_buffered: bool,
 }
 
 #[derive(Debug, Clone)]
