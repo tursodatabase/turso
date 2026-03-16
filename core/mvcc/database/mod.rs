@@ -4096,7 +4096,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         &self,
         index_id: MVTableId,
         index_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>>>,
+        tx_id: TxID,
     ) -> Option<RowKey> {
+        let tx = self.txs.get(&tx_id).expect("transaction should exist");
+        let tx = tx.value();
         let index = self.index_rows.get_or_insert_with(index_id, SkipMap::new);
         let index = index.value();
         let iter_box = Box::new(index.iter().rev());
@@ -4104,8 +4107,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let iter = index_iterator
             .as_mut()
             .expect("index_iterator was assigned above");
-        iter.next()
-            .map(|entry| RowKey::Record((**entry.key()).clone()))
+        loop {
+            let entry = iter.next()?;
+            if let Some(visible_row) = self.find_last_visible_index_version(tx, entry) {
+                return Some(visible_row.row_id);
+            }
+        }
     }
 
     pub fn get_logical_log_file(&self) -> Arc<dyn File> {
