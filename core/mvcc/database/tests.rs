@@ -7394,3 +7394,77 @@ fn test_autoincrement_no_reuse_after_delete_and_restart() {
          init_autoincrement picked the stale one (seq=1 instead of seq=2)."
     );
 }
+
+/// Regression test for: Secondary indexes show deleted rows with MVCC
+/// When scanning a secondary index using ORDER BY, deleted rows were incorrectly visible.
+/// The bug was in `get_last_index_rowid` which didn't check MVCC visibility.
+#[test]
+fn test_secondary_index_visibility_after_delete() {
+    let db = MvccTestDb::new();
+    let conn = &db.conn;
+
+    // Create table with a UNIQUE index (secondary index) on val column
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER UNIQUE)")
+        .unwrap();
+
+    // Insert a row
+    conn.execute("INSERT INTO t VALUES (42, 46)").unwrap();
+
+    // Verify row exists
+    let rows = get_rows(conn, "SELECT id, val FROM t ORDER BY val DESC");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 42);
+    assert_eq!(rows[0][1].as_int().unwrap(), 46);
+
+    // Delete the row
+    conn.execute("DELETE FROM t WHERE id = 42").unwrap();
+
+    // Query using the secondary index (ORDER BY val) - should return no rows
+    let rows = get_rows(conn, "SELECT id, val FROM t ORDER BY val DESC");
+    assert_eq!(
+        rows.len(),
+        0,
+        "Deleted row should not be visible when scanning secondary index"
+    );
+
+    // Also verify table scan returns no rows
+    let rows = get_rows(conn, "SELECT * FROM t");
+    assert_eq!(
+        rows.len(),
+        0,
+        "Deleted row should not be visible in table scan"
+    );
+}
+
+/// Test that multiple rows with deletes in the middle are correctly handled
+/// when scanning via secondary index.
+#[test]
+fn test_secondary_index_partial_delete() {
+    let db = MvccTestDb::new();
+    let conn = &db.conn;
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER UNIQUE)")
+        .unwrap();
+
+    // Insert multiple rows
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    conn.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+
+    // Delete the middle row
+    conn.execute("DELETE FROM t WHERE id = 2").unwrap();
+
+    // Query using secondary index - should show only rows 1 and 3
+    let rows = get_rows(conn, "SELECT id, val FROM t ORDER BY val DESC");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_int().unwrap(), 3);
+    assert_eq!(rows[0][1].as_int().unwrap(), 30);
+    assert_eq!(rows[1][0].as_int().unwrap(), 1);
+    assert_eq!(rows[1][1].as_int().unwrap(), 10);
+
+    // Query in ascending order too
+    let rows = get_rows(conn, "SELECT id, val FROM t ORDER BY val ASC");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[1][0].as_int().unwrap(), 3);
+}

@@ -2889,7 +2889,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     fn find_last_visible_index_version(
         &self,
         tx: &Transaction,
-        row: crossbeam_skiplist::map::Entry<'_, Arc<SortableIndexKey>, RwLock<Vec<RowVersion>>>,
+        row: &crossbeam_skiplist::map::Entry<'_, Arc<SortableIndexKey>, RwLock<Vec<RowVersion>>>,
     ) -> Option<RowID> {
         row.value()
             .read()
@@ -2911,7 +2911,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     {
         loop {
             let row = rows.next()?;
-            if let Some(visible_row) = self.find_last_visible_index_version(tx, row) {
+            if let Some(visible_row) = self.find_last_visible_index_version(tx, &row) {
                 return Some(visible_row);
             }
         }
@@ -4058,7 +4058,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         &self,
         index_id: MVTableId,
         index_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>>>,
+        tx_id: TxID,
     ) -> Option<RowKey> {
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .expect("transaction should exist in txs map");
+        let tx = tx.value();
         let index = self.index_rows.get_or_insert_with(index_id, SkipMap::new);
         let index = index.value();
         let iter_box = Box::new(index.iter().rev());
@@ -4066,8 +4072,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let iter = index_iterator
             .as_mut()
             .expect("index_iterator was assigned above");
-        iter.next()
-            .map(|entry| RowKey::Record((**entry.key()).clone()))
+        loop {
+            let entry = iter.next()?;
+            if self.find_last_visible_index_version(tx, &entry).is_some() {
+                return Some(RowKey::Record((**entry.key()).clone()));
+            }
+        }
     }
 
     pub fn get_logical_log_file(&self) -> Arc<dyn File> {
