@@ -13,7 +13,7 @@ use crate::{
         },
         expr::{
             bind_and_rewrite_expr, emit_returning_results, emit_returning_scan_back,
-            process_returning_clause, restore_returning_row_image_in_cache, rewrite_between_expr,
+            restore_returning_row_image_in_cache, rewrite_between_expr,
             seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
             walk_expr_mut, BindingBehavior, NoConstantOptReason, ReturningBufferCtx, WalkControl,
         },
@@ -22,24 +22,15 @@ use crate::{
             emit_guarded_fk_decrement, index_probe, open_read_index, open_read_table,
             ForeignKeyActions,
         },
-        plan::{
-            ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
-            TableReferences,
-        },
-        planner::{plan_ctes_as_outer_refs, ROWID_STRS},
+        plan::{EvalAt, QueryDestination, ResultSetColumn, TableReferences},
+        planner::ROWID_STRS,
         select::translate_select,
-        subquery::{
-            emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery,
-            plan_subqueries_from_returning,
-        },
+        subquery::{emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery},
         trigger_exec::{
             fire_trigger, get_relevant_triggers_type_and_time, has_relevant_triggers_type_only,
             TriggerContext,
         },
-        upsert::{
-            collect_set_clauses_for_upsert, emit_upsert, resolve_upsert_target,
-            ResolvedUpsertTarget,
-        },
+        upsert::{collect_set_clauses_for_upsert, emit_upsert, ResolvedUpsertTarget},
     },
     util::normalize_ident,
     vdbe::{
@@ -249,10 +240,9 @@ pub fn translate_insert(
     program.extend(&opts);
 
     // Merge INSERT's WITH clause into the SELECT source's WITH clause.
-    // For VALUES/DEFAULT VALUES with subqueries, we route through the multi-row
-    // path which goes through translate_select and handles CTEs properly.
-    // We also keep a copy for RETURNING clause subqueries.
-    let with_for_returning = with.clone();
+    // For multi-row VALUES/SELECT, CTEs are handled by translate_select.
+    // We also keep a copy for RETURNING clause binding via bind_insert.
+    let mut with_for_returning = with.clone();
     if let Some(insert_with) = with {
         if let InsertBody::Select(select, _) = &mut body {
             match &mut select.with {
@@ -265,21 +255,18 @@ pub fn translate_insert(
                 }
                 None => select.with = Some(insert_with),
             }
-        } else {
-            // WITH clause on INSERT with VALUES or DEFAULT VALUES is not useful
-            // e.g. WITH unused AS (SELECT c FROM a) INSERT INTO b VALUES (1, 2, 3)
-            // but: we can, and indeed must, just ignore it instead of erroring.
-            // leaving this empty else block here for documentation.
         }
-        // For DEFAULT VALUES/VALUES without SELECT body, CTEs are still needed
-        // for RETURNING clause subqueries - handled below via with_for_returning.
+        // For DEFAULT VALUES without SELECT body, CTEs are still needed
+        // for RETURNING clause subqueries - handled via with_for_returning.
     }
 
     let database_id = resolver.resolve_database_id(&tbl_name)?;
     let table_name = &tbl_name.name;
     let table = match resolver.with_schema(database_id, |s| s.get_table(table_name.as_str())) {
         Some(table) => table,
-        None => crate::bail_parse_error!("no such table: {}", table_name),
+        None => {
+            crate::bail_parse_error!("no such table: {}", table_name);
+        }
     };
     if program.trigger.is_some() && table.virtual_table().is_some() {
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name.name.as_str());
@@ -304,18 +291,95 @@ pub fn translate_insert(
         crate::bail_parse_error!("no such table: {}", table_name);
     };
 
-    let BoundInsertResult {
-        mut values,
-        mut upsert_actions,
-        inserting_multiple_rows,
-    } = bind_insert(
-        program,
-        resolver,
-        &table,
+    // Bind phase
+    use crate::translate::bind::BindContext;
+    let mut binder = BindContext::new(resolver, program);
+    let mut bound = binder.bind_insert(
+        table_name,
         &mut body,
         on_conflict.unwrap_or(ResolveType::Abort),
+        &mut returning,
+        &mut with_for_returning,
         database_id,
     )?;
+
+    let mut values = std::mem::take(&mut bound.values);
+    let inserting_multiple_rows = bound.inserting_multiple_rows;
+
+    // Allocate real labels for upsert actions (binder can't allocate labels)
+    let mut upsert_actions: Vec<(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)> = bound
+        .upsert_actions
+        .drain(..)
+        .map(|(target, upsert)| (target, program.allocate_label(), upsert))
+        .collect();
+
+    // Extract bound data before consuming `bound`
+    let cte_definitions = std::mem::take(&mut bound.cte_definitions);
+    let bound_result_columns = std::mem::take(&mut bound.result_columns);
+    let mut bound_subqueries = std::mem::take(&mut bound.subquery_bindings);
+
+    // Set the resolve type on the program (needed for OR IGNORE/REPLACE emission)
+    if on_conflict == Some(ResolveType::Ignore) {
+        program.set_resolve_type(ResolveType::Ignore);
+    } else if let Some(conflict) = on_conflict {
+        program.set_resolve_type(conflict);
+    }
+
+    // Plan CTEs using pre-bound data from the binder.
+    use crate::translate::planner::plan_bound_ctes;
+    let mut planned_ctes = plan_bound_ctes(cte_definitions, resolver, program, connection)?;
+
+    let mut table_references = bound.into_table_references(&mut planned_ctes)?;
+
+    // Add planned CTEs as outer query refs so they're available for RETURNING subquery resolution
+    for (name, jt) in &planned_ctes {
+        use crate::translate::plan::{ColumnUsedMask, OuterQueryReference};
+        table_references.add_outer_query_reference(OuterQueryReference {
+            identifier: name.clone(),
+            internal_id: jt.internal_id,
+            table: jt.table.clone(),
+            col_used_mask: ColumnUsedMask::default(),
+            cte_select: None,
+            cte_explicit_columns: vec![],
+            cte_id: None,
+            cte_definition_only: true,
+            rowid_referenced: false,
+        });
+    }
+
+    // Set the database_id on the target table reference
+    if let Some(target) = table_references.joined_tables_mut().first_mut() {
+        target.database_id = database_id;
+    }
+
+    // Convert bound result columns to ResultSetColumn
+    let mut result_columns: Vec<ResultSetColumn> = bound_result_columns
+        .into_iter()
+        .map(|bc| ResultSetColumn {
+            expr: bc.expr,
+            alias: if bc.name.is_empty() {
+                None
+            } else {
+                Some(bc.name)
+            },
+            contains_aggregates: false,
+        })
+        .collect();
+
+    // Plan subqueries in RETURNING expressions
+    let mut returning_subqueries = vec![];
+    if !result_columns.is_empty() {
+        use crate::translate::subquery::plan_subqueries_from_returning_with_bound;
+        plan_subqueries_from_returning_with_bound(
+            program,
+            &mut returning_subqueries,
+            &mut table_references,
+            &mut result_columns,
+            resolver,
+            connection,
+            &mut bound_subqueries,
+        )?;
+    }
 
     if inserting_multiple_rows && btree_table.has_autoincrement {
         ensure_sequence_initialized(program, resolver, &btree_table, database_id)?;
@@ -327,50 +391,6 @@ pub fn translate_insert(
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }
-
-    let mut table_references = TableReferences::new(
-        vec![JoinedTable {
-            table: Table::BTree(
-                table
-                    .btree()
-                    .expect("we shouldn't have got here without a BTree table"),
-            ),
-            identifier: table_name.to_string(),
-            internal_id: program.table_reference_counter.next(),
-            op: Operation::default_scan_for(&table),
-            join_info: None,
-            col_used_mask: ColumnUsedMask::default(),
-            column_use_counts: Vec::new(),
-            expression_index_usages: Vec::new(),
-            database_id,
-        }],
-        vec![],
-    );
-
-    // Plan CTEs and add them as outer query references for RETURNING subquery resolution
-    plan_ctes_as_outer_refs(
-        with_for_returning,
-        resolver,
-        program,
-        &mut table_references,
-        connection,
-    )?;
-
-    // Plan subqueries in RETURNING expressions before processing
-    // (so SubqueryResult nodes are cloned into result_columns)
-    let mut returning_subqueries = vec![];
-    plan_subqueries_from_returning(
-        program,
-        &mut returning_subqueries,
-        &mut table_references,
-        &mut returning,
-        resolver,
-        connection,
-    )?;
-
-    // Process RETURNING clause using shared module
-    let mut result_columns =
-        process_returning_clause(&mut returning, &mut table_references, resolver)?;
     let has_fks = fk_enabled
         && (resolver.with_schema(database_id, |s| s.has_child_fks(table_name.as_str()))
             || resolver.with_schema(database_id, |s| {
@@ -1614,175 +1634,6 @@ fn emit_notnulls(
         }
     }
     Ok(())
-}
-
-struct BoundInsertResult {
-    #[allow(clippy::vec_box)]
-    values: Vec<Box<Expr>>,
-    upsert_actions: Vec<(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)>,
-    inserting_multiple_rows: bool,
-}
-
-/// Check if an expression contains a subquery (Subquery, InSelect, or Exists).
-/// This is used to detect when single-row VALUES should be routed through the
-/// multi-row path which has proper subquery handling.
-fn expr_contains_subquery(expr: &Expr) -> bool {
-    use crate::translate::expr::{walk_expr, WalkControl};
-    let mut found_subquery = false;
-    let _ = walk_expr(expr, &mut |e| {
-        if matches!(
-            e,
-            Expr::Subquery(_) | Expr::InSelect { .. } | Expr::Exists(_)
-        ) {
-            found_subquery = true;
-            return Ok(WalkControl::SkipChildren);
-        }
-        Ok(WalkControl::Continue)
-    });
-    found_subquery
-}
-
-fn bind_insert(
-    program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    table: &Table,
-    body: &mut InsertBody,
-    on_conflict: ResolveType,
-    database_id: usize,
-) -> Result<BoundInsertResult> {
-    let mut values: Vec<Box<Expr>> = vec![];
-    let mut upsert: Option<Box<Upsert>> = None;
-    let mut upsert_actions: Vec<(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)> = Vec::new();
-    let mut inserting_multiple_rows = false;
-    match body {
-        InsertBody::DefaultValues => {
-            // Generate default values for the table.
-            // Check column-level default first, then type-level default.
-            let is_strict = table.is_strict();
-            values = table
-                .columns()
-                .iter()
-                .filter(|c| !c.hidden())
-                .map(|c| {
-                    c.default.clone().unwrap_or_else(|| {
-                        if let Some(type_def) = resolver.schema().get_type_def(&c.ty_str, is_strict)
-                        {
-                            if let Some(ref default_expr) = type_def.default {
-                                return default_expr.clone();
-                            }
-                        }
-                        Box::new(ast::Expr::Literal(ast::Literal::Null))
-                    })
-                })
-                .collect();
-        }
-        InsertBody::Select(select, upsert_opt) => {
-            if select.body.compounds.is_empty() {
-                match &mut select.body.select {
-                    // TODO see how to avoid clone
-                    OneSelect::Values(values_expr) if values_expr.len() <= 1 => {
-                        if values_expr.is_empty() {
-                            crate::bail_parse_error!("no values to insert");
-                        }
-                        // Check if any VALUES expression contains a subquery.
-                        // If so, route through multi-row path which handles subqueries.
-                        let has_subquery = values_expr
-                            .iter()
-                            .any(|row| row.iter().any(|expr| expr_contains_subquery(expr)));
-                        if has_subquery {
-                            inserting_multiple_rows = true;
-                        } else {
-                            for expr in values_expr.iter_mut().flat_map(|v| v.iter_mut()) {
-                                match expr.as_mut() {
-                                    Expr::Id(name) => {
-                                        if name.quoted_with('"') {
-                                            *expr = Expr::Literal(ast::Literal::String(
-                                                name.as_literal(),
-                                            ))
-                                            .into();
-                                        } else {
-                                            // an INSERT INTO ... VALUES (...) cannot reference columns
-                                            crate::bail_parse_error!("no such column: {name}");
-                                        }
-                                    }
-                                    Expr::Qualified(first_name, second_name) => {
-                                        // an INSERT INTO ... VALUES (...) cannot reference columns
-                                        crate::bail_parse_error!(
-                                            "no such column: {first_name}.{second_name}"
-                                        );
-                                    }
-                                    _ => {}
-                                }
-                                bind_and_rewrite_expr(
-                                    expr,
-                                    None,
-                                    None,
-                                    resolver,
-                                    BindingBehavior::ResultColumnsNotAllowed,
-                                )?;
-                            }
-                            values = values_expr.pop().unwrap_or_else(Vec::new);
-                        }
-                    }
-                    _ => inserting_multiple_rows = true,
-                }
-            } else {
-                inserting_multiple_rows = true;
-            }
-            upsert = upsert_opt.take();
-        }
-    }
-    if let ResolveType::Ignore = on_conflict {
-        program.set_resolve_type(ResolveType::Ignore);
-        upsert.replace(Box::new(ast::Upsert {
-            do_clause: UpsertDo::Nothing,
-            index: None,
-            next: None,
-        }));
-    } else {
-        program.set_resolve_type(on_conflict);
-    }
-    while let Some(mut upsert_opt) = upsert.take() {
-        if let UpsertDo::Set {
-            ref mut sets,
-            ref mut where_clause,
-        } = &mut upsert_opt.do_clause
-        {
-            for set in sets.iter_mut() {
-                bind_and_rewrite_expr(
-                    &mut set.expr,
-                    None,
-                    None,
-                    resolver,
-                    BindingBehavior::AllowUnboundIdentifiers,
-                )?;
-            }
-            if let Some(ref mut where_expr) = where_clause {
-                bind_and_rewrite_expr(
-                    where_expr,
-                    None,
-                    None,
-                    resolver,
-                    BindingBehavior::AllowUnboundIdentifiers,
-                )?;
-            }
-        }
-        let next = upsert_opt.next.take();
-        upsert_actions.push((
-            // resolve the constrained target for UPSERT in the chain
-            resolver.with_schema(database_id, |s| {
-                resolve_upsert_target(s, table, &upsert_opt)
-            })?,
-            program.allocate_label(),
-            upsert_opt,
-        ));
-        upsert = next;
-    }
-    Ok(BoundInsertResult {
-        values,
-        upsert_actions,
-        inserting_multiple_rows,
-    })
 }
 
 /// Depending on the InsertBody, we begin to initialize the source of the insert values
