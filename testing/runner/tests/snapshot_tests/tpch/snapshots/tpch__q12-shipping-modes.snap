@@ -87,7 +87,7 @@ addr  opcode                  p1  p2  p3  p4                                    
   40            Copy          32  37   0                                          0  r[37]=r[32]
   41            String8        0  38   0  1-URGENT                                0  r[38]='1-URGENT'
   42            Integer        1  35   0                                          0  r[35]=1
-  43            Eq            37  38  45  Binary                                  0  if r[37]==r[38] goto 45
+  43            Eq            37  38  45                                          0  if r[37]==r[38] goto 45
   44            ZeroOrNull    37  35  38                                          0  ((r[37]=NULL)|(r[38]=NULL)) ? r[35]=NULL : r[35]=0
   45            Copy          32  39   0                                          0  r[39]=r[32]
   46            String8        0  40   0  2-HIGH                                  0  r[40]='2-HIGH'
