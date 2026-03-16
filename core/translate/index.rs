@@ -367,7 +367,7 @@ pub fn translate_create_index(
             cursor_id: sorter_cursor_id,
             columns: columns.len(),
             order_and_collations,
-            comparator_func_names: vec![],
+            comparators: vec![],
         });
         let content_reg = program.alloc_register();
         program.emit_insn(Insn::OpenPseudo {

@@ -8,7 +8,7 @@ use super::{
 };
 use crate::translate::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
-    order_by::{custom_type_lt_func, EmitOrderBy},
+    order_by::{custom_type_comparator, EmitOrderBy},
     plan::{Aggregate, NonFromClauseSubquery},
     subquery::emit_non_from_clause_subqueries_for_phase,
 };
@@ -165,11 +165,11 @@ impl EmitGroupBy {
                 .collect::<Result<Vec<_>>>()?;
 
             // Resolve custom type comparators for GROUP BY columns (e.g. array_lt).
-            let comparator_func_names: Vec<Option<String>> = group_by
+            let comparators = group_by
                 .exprs
                 .iter()
                 .map(|expr| {
-                    custom_type_lt_func(expr, &plan.table_references, t_ctx.resolver.schema())
+                    custom_type_comparator(expr, &plan.table_references, t_ctx.resolver.schema())
                 })
                 .collect();
 
@@ -177,7 +177,7 @@ impl EmitGroupBy {
                 cursor_id: sort_cursor,
                 columns: column_count,
                 order_and_collations,
-                comparator_func_names,
+                comparators,
             });
             emit_explain!(program, false, "USE SORTER FOR GROUP BY".to_owned());
             let pseudo_cursor = group_by_create_pseudo_table(program, column_count);
