@@ -858,7 +858,7 @@ pub fn resolve_expr(
     expr: &ast::Expr,
     resolver: &Resolver,
 ) -> Result<usize> {
-    if let Some((reg, needs_decode)) = resolver.resolve_cached_expr_reg(expr) {
+    if let Some((reg, needs_decode, _collation)) = resolver.resolve_cached_expr_reg(expr) {
         if !needs_decode {
             return Ok(reg);
         }
@@ -886,7 +886,7 @@ pub fn translate_expr(
         None
     };
 
-    if let Some((reg, needs_decode)) = resolver.resolve_cached_expr_reg(expr) {
+    if let Some((reg, needs_decode, collation_ctx)) = resolver.resolve_cached_expr_reg(expr) {
         program.emit_insn(Insn::Copy {
             src_reg: reg,
             dst_reg: target_register,
@@ -933,6 +933,7 @@ pub fn translate_expr(
                 }
             }
         }
+        program.set_collation(collation_ctx);
         if let Some(span) = constant_span {
             program.constant_span_end(span);
         }
@@ -6408,14 +6409,15 @@ pub(crate) fn seed_returning_row_image_in_cache<'a>(
     let cache_len = resolver.expr_to_reg_cache.len();
     let cache_enabled = resolver.expr_to_reg_cache_enabled;
     resolver.enable_expr_to_reg_cache();
-    resolver.expr_to_reg_cache.push((
+    resolver.cache_expr_reg(
         std::borrow::Cow::Owned(Expr::RowId {
             database: None,
             table: table.internal_id,
         }),
         rowid_reg,
         false,
-    ));
+        None,
+    );
     for (i, column) in table.columns().iter().enumerate() {
         let raw_reg = if column.is_rowid_alias() {
             rowid_reg
@@ -6440,9 +6442,12 @@ pub(crate) fn seed_returning_row_image_in_cache<'a>(
             column: i,
             is_rowid_alias: column.is_rowid_alias(),
         };
-        resolver
-            .expr_to_reg_cache
-            .push((std::borrow::Cow::Owned(expr), decoded_reg, false));
+        resolver.cache_scalar_expr_reg(
+            std::borrow::Cow::Owned(expr),
+            decoded_reg,
+            false,
+            table_references,
+        )?;
     }
 
     Ok(ReturningRowImageCacheState {
