@@ -661,24 +661,18 @@ fn parse_from_clause_table(
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     match table {
-        ast::SelectTable::Table(qualified_name, maybe_alias, indexed) => {
-            if indexed.is_some() {
-                crate::bail_parse_error!(
-                    "INDEXED BY / NOT INDEXED clauses are not supported yet in FROM clause"
-                );
-            }
-            parse_table(
-                table_references,
-                resolver,
-                program,
-                cte_definitions,
-                vtab_predicates,
-                &qualified_name,
-                maybe_alias.as_ref(),
-                &[],
-                connection,
-            )
-        }
+        ast::SelectTable::Table(qualified_name, maybe_alias, indexed) => parse_table(
+            table_references,
+            resolver,
+            program,
+            cte_definitions,
+            vtab_predicates,
+            &qualified_name,
+            maybe_alias.as_ref(),
+            &[],
+            indexed,
+            connection,
+        ),
         ast::SelectTable::Select(subselect, maybe_alias) => {
             // For inline subqueries, we plan all CTEs once and pass them as outer_query_refs.
             // This allows the subquery to reference CTEs defined in the parent's WITH clause.
@@ -767,6 +761,7 @@ fn parse_from_clause_table(
             &qualified_name,
             maybe_alias.as_ref(),
             &args,
+            None, // table-valued functions don't support INDEXED BY
             connection,
         ),
         ast::SelectTable::Sub(..) => {
@@ -785,6 +780,7 @@ fn parse_table(
     qualified_name: &QualifiedName,
     maybe_alias: Option<&As>,
     args: &[Box<Expr>],
+    indexed: Option<ast::Indexed>,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     let normalized_qualified_name = normalize_ident(qualified_name.name.as_str());
@@ -924,6 +920,7 @@ fn parse_table(
                 column_use_counts: Vec::new(),
                 expression_index_usages: Vec::new(),
                 database_id,
+                indexed: None,
             });
         }
         return Ok(());
@@ -960,6 +957,7 @@ fn parse_table(
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id,
+            indexed,
         });
         return Ok(());
     };
@@ -1076,6 +1074,7 @@ fn parse_table(
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id,
+            indexed: None,
         });
         return Ok(());
     }
@@ -1101,6 +1100,7 @@ fn parse_table(
                 column_use_counts: Vec::new(),
                 expression_index_usages: Vec::new(),
                 database_id,
+                indexed: None,
             });
             return Ok(());
         }

@@ -891,6 +891,8 @@ pub struct JoinedTable {
     pub expression_index_usages: Vec<ExpressionIndexUsage>,
     /// The index of the database. "main" is always zero.
     pub database_id: usize,
+    /// INDEXED BY / NOT INDEXED hint from the SQL statement.
+    pub indexed: Option<ast::Indexed>,
 }
 
 #[derive(Debug, Clone)]
@@ -1714,6 +1716,7 @@ impl JoinedTable {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: 0,
+            indexed: None,
         })
     }
 
@@ -1814,6 +1817,7 @@ impl JoinedTable {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: 0,
+            indexed: None,
         })
     }
 

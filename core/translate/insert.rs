@@ -343,6 +343,7 @@ pub fn translate_insert(
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id,
+            indexed: None,
         }],
         vec![],
     );
