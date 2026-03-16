@@ -61,6 +61,8 @@ fn mvcc_autoincrement_restart_durability() {
         .unwrap();
         let conn = db.connect().unwrap();
 
+        conn.pragma_update("journal_mode", "'mvcc'").unwrap();
+
         let seq_rows: Vec<(String, i64)> =
             conn.exec_rows("SELECT name, seq FROM sqlite_sequence WHERE name='test_table'");
         assert_eq!(
@@ -184,6 +186,72 @@ fn mvcc_autoincrement_rollback_consistency() {
     drop(db);
 }
 
+/// Test that sqlite_sequence stays consistent in MVCC mode even without
+/// explicit checkpoints.
+#[test]
+fn mvcc_autoincrement_sqlite_sequence_consistent_without_checkpoint() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("consistent_seq.db");
+    let io = Arc::new(turso_core::PlatformIO::new().unwrap());
+
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path.to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.pragma_update("journal_mode", "'mvcc'").unwrap();
+
+    conn.execute("CREATE TABLE seq_test(id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO seq_test(value) VALUES ('a'), ('b'), ('c')")
+        .unwrap();
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let seq_rows: Vec<(String, i64)> =
+        conn.exec_rows("SELECT name, seq FROM sqlite_sequence WHERE name='seq_test'");
+    assert_eq!(seq_rows[0], ("seq_test".to_string(), 3));
+
+    // Insert two rows WITHOUT checkpointing
+    conn.execute("INSERT INTO seq_test(value) VALUES ('d')")
+        .unwrap();
+    conn.execute("INSERT INTO seq_test(value) VALUES ('e')")
+        .unwrap();
+
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, value FROM seq_test ORDER BY id");
+    assert_eq!(rows.len(), 5);
+    assert_eq!(rows[3], (4, "d".to_string()));
+    assert_eq!(rows[4], (5, "e".to_string()));
+
+    // sqlite_sequence reflects real-time state WITHOUT a checkpoint
+    let seq_rows: Vec<(String, i64)> =
+        conn.exec_rows("SELECT name, seq FROM sqlite_sequence WHERE name='seq_test'");
+    assert_eq!(
+        seq_rows[0],
+        ("seq_test".to_string(), 5),
+        "sqlite_sequence should reflect real-time max even before checkpoint"
+    );
+
+    conn.execute("INSERT INTO seq_test(value) VALUES ('f')")
+        .unwrap();
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, value FROM seq_test ORDER BY id");
+    assert_eq!(rows[5], (6, "f".to_string()), "IDs must keep increasing");
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let seq_rows: Vec<(String, i64)> =
+        conn.exec_rows("SELECT name, seq FROM sqlite_sequence WHERE name='seq_test'");
+    assert_eq!(
+        seq_rows[0],
+        ("seq_test".to_string(), 6),
+        "sqlite_sequence should reflect true max after checkpoint"
+    );
+}
+
 /// Test to verify that rebuilt sqlite_sequence entries are properly persisted
 #[test]
 fn mvcc_autoincrement_sequence_persistence() {
@@ -235,6 +303,8 @@ fn mvcc_autoincrement_sequence_persistence() {
         )
         .unwrap();
         let conn = db.connect().unwrap();
+
+        conn.pragma_update("journal_mode", "'mvcc'").unwrap();
 
         // Critical test: sqlite_sequence should have persisted across restart
         let seq_rows: Vec<(String, i64)> =
@@ -297,6 +367,8 @@ fn mvcc_autoincrement_uncommitted_transaction_handling() {
     )
     .unwrap();
     let conn2 = db2.connect().unwrap();
+
+    conn2.pragma_update("journal_mode", "'mvcc'").unwrap();
 
     conn1
         .execute("CREATE TABLE uncommitted_test(id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT)")
@@ -394,6 +466,8 @@ fn mvcc_autoincrement_allocator_consistency() {
         )
         .unwrap();
         let conn = db.connect().unwrap();
+
+        conn.pragma_update("journal_mode", "'mvcc'").unwrap();
 
         conn.execute("INSERT INTO allocator_test(value) VALUES ('after_restart')")
             .unwrap();
