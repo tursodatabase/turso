@@ -1,0 +1,66 @@
+---
+source: modifications.sqltest
+expression: |-
+  UPDATE products
+      SET quantity = quantity + 1
+      WHERE EXISTS (
+          SELECT 1
+          FROM products AS p2
+          WHERE p2.id = products.id - 1
+            AND p2.quantity < 5
+      );
+info:
+  statement_type: UPDATE
+  tables:
+  - products
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN products
+`--SEARCH p2 USING INTEGER PRIMARY KEY (rowid=?)
+
+BYTECODE
+addr  opcode           p1  p2  p3  p4                 p5  comment
+   0    Init            0  36   0                      0  Start at 36
+   1    OpenEphemeral   0   1   0                      0  cursor=0 is_table=true
+   2    OpenRead        1   2   0  k(5,B,B,B,B,B)      0  table=products, root=2, iDb=0
+   3    Rewind          1  19   0                      0  Rewind table products
+   4      BeginSubrtn   3   0   0                      0  r[3]=NULL
+   5      Integer       0   1   0                      0  r[1]=0
+   6      OpenRead      2   2   0  k(5,B,B,B,B,B)      0  table=products, root=2, iDb=0
+   7      RowId         1   6   0                      0  r[6]=products.rowid
+   8      Subtract      6   7   5                      0  r[5]=r[6]-r[7]
+   9      SeekRowid     2   5  13                      0  if (r[5]!=cursor 2 for table products.rowid) goto 13
+  10      Column        2   3   9  0                   0  r[9]=products.quantity
+  11      Ge            9  10  13  Binary              0  if r[9]>=r[10] goto 13
+  12      Integer       1   1   0                      0  r[1]=1
+  13    Return          3   0   1                      0
+  14    IfNot           1  18   1                      0  if !r[1] goto 18
+  15    RowId           1   2   0                      0  r[2]=products.rowid
+  16    MakeRecord      2   1  11                      0  r[11]=mkrec(r[2..2]); for ephemeral_scratch
+  17    Insert          0  11   2  ephemeral_scratch   6  intkey=r[2] data=r[11]
+  18  Next              1   4   0                      0
+  19  OpenWrite         1   2   0                      0  root=2; iDb=0
+  20  Rewind            0  35   0                      0  Rewind table ephemeral(ephemeral_scratch)
+  21    RowId           0  12   0                      0  r[12]=ephemeral(ephemeral_scratch).rowid
+  22    NotExists       1  34  12                      0
+  23    Null            0  13   0                      0  r[13]=NULL
+  24    Column          1   1  14                      0  r[14]=products.name
+  25    Column          1   2  15                      0  r[15]=products.price
+  26    Column          1   3  18  0                   0  r[18]=products.quantity
+  27    Add            18  19  16                      0  r[16]=r[18]+r[19]
+  28    Column          1   4  17                      0  r[17]=products.category
+  29    Affinity       13   5   0                      0  r[13..18] = D, B, E, D, B
+  30    MakeRecord     13   5  20                      0  r[20]=mkrec(r[13..17])
+  31    NotExists       1  34  12                      0
+  32    Delete          1   0   0  products            0
+  33    Insert          1  20  12  products           11  intkey=r[12] data=r[20]
+  34  Next              0  21   0                      0
+  35  Halt              0   0   0                      0
+  36  Transaction       0   2  10                      0  iDb=0 tx_mode=Write
+  37  Integer           1   7   0                      0  r[7]=1
+  38  Integer           5  10   0                      0  r[10]=5
+  39  Integer           1  19   0                      0  r[19]=1
+  40  Goto              0   1   0                      0

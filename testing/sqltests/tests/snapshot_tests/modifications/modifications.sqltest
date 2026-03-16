@@ -102,6 +102,33 @@ snapshot update-simple {
     WHERE category = 'Electronics';
 }
 
+# Any WHERE-clause subquery in UPDATE forces the optimizer to materialize
+# target rowids into an ephemeral table first, so the row-by-row predicate
+# evaluation cannot observe rows already modified by earlier iterations.
+# (See issue #5806.)
+@setup schema
+snapshot update-where-unrelated-subquery {
+    UPDATE products
+    SET quantity = quantity + 1
+    WHERE EXISTS (
+        SELECT 1
+        FROM users
+        WHERE users.id = products.id
+    );
+}
+
+@setup schema
+snapshot update-where-self-subquery {
+    UPDATE products
+    SET quantity = quantity + 1
+    WHERE EXISTS (
+        SELECT 1
+        FROM products AS p2
+        WHERE p2.id = products.id - 1
+          AND p2.quantity < 5
+    );
+}
+
 # TODO: Uncomment when subquery in UPDATE SET is supported
 # # UPDATE with subquery - computed update value
 # @setup schema
