@@ -9133,3 +9133,41 @@ fn test_integrity_check_ignores_dropped_root_that_is_live_after_recovery() {
     assert_eq!(rows.len(), 1);
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
+
+#[test]
+fn test_immediate_not_blocked_by_concurrent_speculative_write() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn0 = db.connect();
+    conn0
+        .execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn0
+        .execute("INSERT INTO t1 VALUES(1, 'original')")
+        .unwrap();
+    conn0.close().unwrap();
+
+    let conn1 = db.connect();
+    let conn2 = db.connect();
+
+    conn1.execute("BEGIN IMMEDIATE").unwrap();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2
+        .execute("UPDATE t1 SET val = 'concurrent_val' WHERE id = 1")
+        .unwrap();
+    // IMMEDIATE tx holds the exclusive lock — this should succeed
+    conn1
+        .execute("UPDATE t1 SET val = 'immediate_val' WHERE id = 1")
+        .unwrap();
+    conn1.execute("COMMIT").unwrap();
+
+    // CONCURRENT should fail with write-write conflict
+    let result = conn2.execute("COMMIT");
+    assert!(
+        matches!(&result, Err(LimboError::WriteWriteConflict)),
+        "CONCURRENT commit should fail: {result:?}",
+    );
+
+    let conn3 = db.connect();
+    let rows = get_rows(&conn3, "SELECT val FROM t1 WHERE id = 1");
+    assert_eq!(rows[0][0].to_string(), "immediate_val");
+}
