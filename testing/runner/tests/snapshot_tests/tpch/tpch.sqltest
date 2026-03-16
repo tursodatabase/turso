@@ -502,7 +502,7 @@ snapshot q12-shipping-modes {
 
 # Q13: Customer Distribution
 @setup schema
-snapshot-eqp q13-customer-distribution {
+snapshot q13-customer-distribution {
     select
         c_count,
         count(*) as custdist
