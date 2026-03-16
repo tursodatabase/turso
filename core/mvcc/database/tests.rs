@@ -6450,6 +6450,83 @@ fn test_checkpoint_root_page_mismatch_with_index() {
     println!("Test passed - row found correctly after checkpoint");
 }
 
+/// What this test checks: checkpoint does not rewrite committed sqlite_schema MVCC versions in place.
+/// Why this matters: Hekaton-style versions are immutable in the version chain; only Begin/End change.
+/// The physical root page must be projected from table_id_to_rootpage at read time instead.
+#[test]
+fn test_checkpoint_preserves_sqlite_schema_version_immutability() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let mvcc_store = db.get_mvcc_store();
+
+    let pinned_reader_tx_id = 1_000_000;
+    let header = *mvcc_store
+        .global_header
+        .read()
+        .as_ref()
+        .expect("global_header should be initialized");
+    mvcc_store.txs.insert(
+        pinned_reader_tx_id,
+        Transaction::new(pinned_reader_tx_id, 0, header),
+    );
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    let rows = get_rows(
+        &conn,
+        "SELECT rowid, rootpage FROM sqlite_schema WHERE type = 'table' AND name = 't'",
+    );
+    assert_eq!(rows.len(), 1);
+    let sqlite_schema_rowid = rows[0][0].as_int().unwrap();
+    let root_before_checkpoint = rows[0][1].as_int().unwrap();
+    assert!(
+        root_before_checkpoint < 0,
+        "new MVCC table should expose a negative rootpage before checkpoint"
+    );
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let visible_root_after_checkpoint = get_rows(
+        &conn,
+        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 't'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    assert!(
+        visible_root_after_checkpoint > 0,
+        "sqlite_schema reads should surface the physical rootpage after checkpoint"
+    );
+
+    let key = RowID::new(
+        SQLITE_SCHEMA_MVCC_TABLE_ID,
+        RowKey::Int(sqlite_schema_rowid),
+    );
+    let sqlite_schema_versions = mvcc_store
+        .rows
+        .get(&key)
+        .expect("sqlite_schema row should exist in MV store");
+    let sqlite_schema_versions = sqlite_schema_versions.value().read();
+    let current_version = sqlite_schema_versions
+        .iter()
+        .rev()
+        .find(|rv| rv.end.is_none())
+        .expect("sqlite_schema row should have a current version");
+    let record = ImmutableRecord::from_bin_record(current_version.row.payload().to_vec());
+    let Some(ValueRef::Numeric(Numeric::Integer(raw_root_after_checkpoint))) =
+        record.get_value_opt(3)
+    else {
+        panic!("sqlite_schema.rootpage should remain an INTEGER");
+    };
+
+    assert_eq!(
+        raw_root_after_checkpoint, root_before_checkpoint,
+        "checkpoint must not mutate the committed sqlite_schema row version in place"
+    );
+
+    mvcc_store.txs.remove(&pinned_reader_tx_id);
+}
+
 /// What this test checks: Checkpoint transitions preserve DB/WAL/log ordering and watermark updates for the tested edge case.
 /// Why this matters: Incorrect ordering breaks crash safety, replay boundaries, or durability guarantees.
 #[test]
