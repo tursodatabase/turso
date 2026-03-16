@@ -18,8 +18,25 @@ mod tests {
     const BYTE_POOL: &[u8] =
         b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#[{\\]^_`~ \x7F";
 
-    /// Generate a random ASCII string of length 0..=max_len from BYTE_POOL.
+    /// Unicode strings mixed in occasionally to ensure the optimization
+    /// correctly bails out for non-ASCII without panicking or corrupting.
+    const UNICODE_POOL: [&str; 8] = [
+        "café",
+        "über",
+        "日本語",
+        "中文",
+        "Ñoño",
+        "résumé",
+        "naïve",
+        "🦀",
+    ];
+
+    /// Generate a random string of length 0..=max_len. Mostly ASCII from
+    /// BYTE_POOL, but ~10% of the time picks a unicode string instead.
     fn random_string(rng: &mut impl Rng, max_len: usize) -> String {
+        if rng.random_bool(0.1) {
+            return UNICODE_POOL[rng.random_range(0..UNICODE_POOL.len())].to_string();
+        }
         let len = rng.random_range(0..=max_len);
         (0..len)
             .map(|_| BYTE_POOL[rng.random_range(0..BYTE_POOL.len())] as char)

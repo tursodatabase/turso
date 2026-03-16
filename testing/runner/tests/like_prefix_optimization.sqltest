@@ -631,3 +631,52 @@ expect {
     3
     4
 }
+
+# Non-ASCII (unicode) prefix: the optimization must be skipped entirely
+# (is_ascii check bails out), but LIKE must still produce correct results.
+@setup like_prefix_schema
+test like-prefix-unicode-no-optimization {
+    CREATE TABLE t_uni (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE INDEX idx_uni ON t_uni(val);
+    INSERT INTO t_uni VALUES (1, 'café');
+    INSERT INTO t_uni VALUES (2, 'caféine');
+    INSERT INTO t_uni VALUES (3, 'cat');
+    INSERT INTO t_uni VALUES (4, '日本語');
+    INSERT INTO t_uni VALUES (5, '日本語テスト');
+    INSERT INTO t_uni VALUES (6, 'über');
+    INSERT INTO t_uni VALUES (7, 'übermut');
+    SELECT id FROM t_uni WHERE val LIKE 'café%' ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+@setup like_prefix_schema
+test like-prefix-unicode-cjk {
+    CREATE TABLE t_cjk (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE INDEX idx_cjk ON t_cjk(val);
+    INSERT INTO t_cjk VALUES (1, '日本語');
+    INSERT INTO t_cjk VALUES (2, '日本語テスト');
+    INSERT INTO t_cjk VALUES (3, '日本');
+    INSERT INTO t_cjk VALUES (4, '中文');
+    SELECT id FROM t_cjk WHERE val LIKE '日本語%' ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+@setup like_prefix_schema
+test like-prefix-unicode-umlaut {
+    CREATE TABLE t_uml (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE INDEX idx_uml ON t_uml(val);
+    INSERT INTO t_uml VALUES (1, 'über');
+    INSERT INTO t_uml VALUES (2, 'übermut');
+    INSERT INTO t_uml VALUES (3, 'uber');
+    SELECT id FROM t_uml WHERE val LIKE 'über%' ORDER BY id;
+}
+expect {
+    1
+    2
+}
