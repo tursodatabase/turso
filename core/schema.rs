@@ -861,6 +861,16 @@ impl Schema {
             .filter(|i| !i.is_backing_btree_index())
     }
 
+    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    pub fn has_fts_index(&self, table_name: &str) -> bool {
+        use crate::index_method::fts::FTS_INDEX_METHOD_NAME;
+        self.get_indices(table_name).any(|idx| {
+            idx.index_method
+                .as_ref()
+                .is_some_and(|m| m.definition().method_name == FTS_INDEX_METHOD_NAME)
+        })
+    }
+
     pub fn get_index(&self, table_name: &str, index_name: &str) -> Option<&Arc<Index>> {
         let name = normalize_ident(table_name);
         self.indexes
