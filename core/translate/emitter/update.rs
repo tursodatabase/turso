@@ -21,8 +21,9 @@ use crate::{
             NoConstantOptReason, ReturningBufferCtx,
         },
         fkeys::{
-            emit_fk_child_update_counters, emit_fk_update_parent_actions, fire_fk_update_actions,
-            stabilize_new_row_for_fk, ForeignKeyActions,
+            emit_fk_child_update_counters, emit_fk_parent_new_key_reconcile,
+            emit_fk_update_parent_actions, fire_fk_update_actions, stabilize_new_row_for_fk,
+            ForeignKeyActions,
         },
         main_loop::{CloseLoop, InitLoop, OpenLoop},
         plan::{
@@ -2099,6 +2100,24 @@ fn emit_update_insns<'a>(
             },
             table_name: target_table.identifier.clone(),
         });
+
+        // Reconcile deferred FK violations after REPLACE.
+        // If Phase 1 REPLACE deleted a parent row referenced by deferred FK children,
+        // the counter was incremented. Now that the new row is inserted with the
+        // (potentially same) parent key, scan children and decrement.
+        if connection.foreign_keys_enabled() {
+            if let Some(table_btree) = target_table.table.btree() {
+                emit_fk_parent_new_key_reconcile(
+                    program,
+                    &table_btree,
+                    start,
+                    rowid_set_clause_reg.unwrap_or(beg),
+                    set_clauses,
+                    update_database_id,
+                    &t_ctx.resolver,
+                )?;
+            }
+        }
 
         // Fire FK CASCADE/SET NULL actions AFTER the parent row is updated
         // This ensures the new parent key exists when cascade actions update child rows

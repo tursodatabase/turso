@@ -4608,3 +4608,97 @@ fn test_autocommit_fail_update_check_constraint(tmp_db: TempDatabase) {
     let ic = sqlite_integrity_check(&limbo_db.path);
     assert_eq!(ic, "ok");
 }
+
+// ---------------------------------------------------------------------------
+// Deferred FK + REPLACE UPDATE regression
+// ---------------------------------------------------------------------------
+
+/// When UPDATE triggers REPLACE on a UNIQUE constraint, the deleted conflicting
+/// parent row increments FkCounter for deferred child FK references. After the
+/// new row is inserted with the same key, those child references are satisfied
+/// again, so FkCounter must be decremented. Without the fix, the counter stays
+/// nonzero and autocommit raises a spurious "deferred foreign key constraint failed".
+#[turso_macros::test]
+fn test_update_replace_deferred_fk_counter_reconcile(tmp_db: TempDatabase) {
+    drop(tmp_db);
+    run_fk_constraint_case(
+        "replace_deferred_fk_reconcile",
+        &[
+            "CREATE TABLE parent(id UNIQUE ON CONFLICT REPLACE, a INT)",
+            "CREATE TABLE child_deferred(id UNIQUE ON CONFLICT ROLLBACK, pid INT, \
+             FOREIGN KEY(pid) REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)",
+        ],
+        &[
+            "INSERT INTO parent VALUES (2, 10)",
+            "INSERT INTO parent VALUES (234, 20)",
+            "INSERT INTO child_deferred VALUES (1, 2)",
+        ],
+        // UPDATE changes parent id from 234 to 2; REPLACE deletes the old id=2 row.
+        // child_deferred row (1, 2) still references id=2 which is now the updated row.
+        "UPDATE parent SET id=2 WHERE id=234",
+        "SELECT * FROM parent ORDER BY id",
+    );
+}
+
+/// Same scenario but inside an explicit transaction with COMMIT.
+#[turso_macros::test]
+fn test_update_replace_deferred_fk_counter_reconcile_in_txn(tmp_db: TempDatabase) {
+    drop(tmp_db);
+    let limbo_db = TempDatabase::builder()
+        .with_db_name("replace_deferred_fk_txn.db")
+        .build();
+    let limbo_conn = limbo_db.connect_limbo();
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+    for s in [
+        "PRAGMA foreign_keys=ON",
+        "CREATE TABLE parent(id UNIQUE ON CONFLICT REPLACE, a INT)",
+        "CREATE TABLE child_deferred(id UNIQUE ON CONFLICT ROLLBACK, pid INT, \
+         FOREIGN KEY(pid) REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)",
+        "INSERT INTO parent VALUES (2, 10)",
+        "INSERT INTO parent VALUES (234, 20)",
+        "INSERT INTO child_deferred VALUES (1, 2)",
+    ] {
+        sqlite_try_exec(&sqlite_conn, s).unwrap();
+        limbo_try_exec(&limbo_conn, s).unwrap();
+    }
+    // Wrap in explicit transaction — COMMIT must succeed.
+    for s in ["BEGIN", "UPDATE parent SET id=2 WHERE id=234", "COMMIT"] {
+        let sqlite_r = sqlite_try_exec(&sqlite_conn, s);
+        let limbo_r = limbo_try_exec(&limbo_conn, s);
+        match (&sqlite_r, &limbo_r) {
+            (Ok(()), Err(e)) => panic!("SQLite succeeded on '{s}' but Limbo failed: {e}"),
+            (Err(e), Ok(())) => panic!("Limbo succeeded on '{s}' but SQLite failed: {e}"),
+            _ => {}
+        }
+    }
+    let diff = compare_tables(
+        "replace_deferred_fk_txn",
+        &sqlite_conn,
+        &limbo_conn,
+        "SELECT * FROM parent ORDER BY id",
+    );
+    assert!(diff.is_none(), "{diff:?}");
+}
+
+/// Multiple child rows referencing the same parent key that gets REPLACE'd.
+#[turso_macros::test]
+fn test_update_replace_deferred_fk_multiple_children(tmp_db: TempDatabase) {
+    drop(tmp_db);
+    run_fk_constraint_case(
+        "replace_deferred_fk_multi_child",
+        &[
+            "CREATE TABLE parent(id UNIQUE ON CONFLICT REPLACE, a INT)",
+            "CREATE TABLE child_deferred(id UNIQUE ON CONFLICT ROLLBACK, pid INT, \
+             FOREIGN KEY(pid) REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)",
+        ],
+        &[
+            "INSERT INTO parent VALUES (2, 10)",
+            "INSERT INTO parent VALUES (234, 20)",
+            "INSERT INTO child_deferred VALUES (1, 2)",
+            "INSERT INTO child_deferred VALUES (2, 2)",
+            "INSERT INTO child_deferred VALUES (3, 2)",
+        ],
+        "UPDATE parent SET id=2 WHERE id=234",
+        "SELECT * FROM parent ORDER BY id",
+    );
+}
