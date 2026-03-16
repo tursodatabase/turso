@@ -2845,7 +2845,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             continue;
                         }
                         if is_write_write_conflict(&self.txs, &self.finalized_tx_states, tx, rv)
-                            && !self.is_exclusive_tx(&tx.tx_id)
+                            && !self.can_exclusive_preempt_write_lock(tx, rv)
                         {
                             turso_assert_reachable!("write-write conflict on delete");
                             drop(row_versions);
@@ -2884,7 +2884,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             continue;
                         }
                         if is_write_write_conflict(&self.txs, &self.finalized_tx_states, tx, rv)
-                            && !self.is_exclusive_tx(&tx.tx_id)
+                            && !self.can_exclusive_preempt_write_lock(tx, rv)
                         {
                             turso_assert_reachable!("write-write conflict on delete");
                             drop(row_versions);
@@ -3886,6 +3886,30 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 continue;
             }
             tx.write_set.remove(&rowid);
+        }
+    }
+
+    fn can_exclusive_preempt_write_lock(&self, tx: &Transaction, rv: &RowVersion) -> bool {
+        if !self.is_exclusive_tx(&tx.tx_id) {
+            return false;
+        }
+
+        let Some(TxTimestampOrID::TxID(owner_tx_id)) = rv.end else {
+            return false;
+        };
+        if owner_tx_id == tx.tx_id {
+            return false;
+        }
+
+        let Some(owner_tx_entry) = self.txs.get(&owner_tx_id) else {
+            return false;
+        };
+        let owner_tx = owner_tx_entry.value();
+        match owner_tx.state.load() {
+            TransactionState::Active | TransactionState::Preparing(_) => {
+                tx.begin_ts < owner_tx.begin_ts
+            }
+            _ => false,
         }
     }
 
