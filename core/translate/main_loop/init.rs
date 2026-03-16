@@ -76,6 +76,10 @@ impl InitLoop {
                     label_on_conflict: program.allocate_label(),
                 }),
             };
+            // DISTINCT aggregate hash tables live in ProgramState, so a correlated
+            // subquery can re-enter with rows from the previous invocation still
+            // recorded unless we clear the seen-set here.
+            program.emit_insn(Insn::HashClear { hash_table_id });
             emit_explain!(
                 program,
                 false,

@@ -470,6 +470,26 @@ expect {
     2|Bob|Engineering
 }
 
+# Correlated DISTINCT aggregate subqueries must reset their seen-set per outer row.
+@cross-check-integrity
+test subquery-correlated-distinct-aggregate-reset {
+    create table t1(a integer, b text);
+    insert into t1 values (1, 'abc'), (2, 'def'), (3, 'abc'), (4, 'ghi'), (5, 'abc');
+    select a,
+           (select count(distinct t2.b) from t1 t2 where t2.rowid <= t1.rowid),
+           (select sum(distinct t2.a) from t1 t2 where t2.rowid <= t1.rowid),
+           (select group_concat(distinct t2.b) from t1 t2 where t2.rowid <= t1.rowid)
+    from t1
+    order by rowid;
+}
+expect {
+    1|1|1|abc
+    2|2|3|abc,def
+    3|2|6|abc,def
+    4|3|10|abc,def,ghi
+    5|3|15|abc,def,ghi
+}
+
 # Correlated subquery in result column with join
 @cross-check-integrity
 test subquery-correlated-in-result-column-with-join {
