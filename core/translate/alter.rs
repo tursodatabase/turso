@@ -2801,27 +2801,26 @@ fn validate_trigger_columns_after_drop(
     let trigger_table_norm = normalize_ident(&trigger.table_name);
 
     // Determine the trigger's owning table columns (post-drop if it's the altered table)
-    let owning_table_columns: Option<Vec<String>> =
-        if trigger_table_norm == *altered_table_norm {
-            Some(
-                post_drop_table
-                    .columns
-                    .iter()
-                    .filter_map(|c| c.name.as_deref().map(normalize_ident))
-                    .collect(),
-            )
-        } else {
-            resolver.with_schema(database_id, |s| {
-                s.get_table(&trigger_table_norm).and_then(|t| {
-                    t.btree().map(|bt| {
-                        bt.columns
-                            .iter()
-                            .filter_map(|c| c.name.as_deref().map(normalize_ident))
-                            .collect()
-                    })
+    let owning_table_columns: Option<Vec<String>> = if trigger_table_norm == *altered_table_norm {
+        Some(
+            post_drop_table
+                .columns
+                .iter()
+                .filter_map(|c| c.name.as_deref().map(normalize_ident))
+                .collect(),
+        )
+    } else {
+        resolver.with_schema(database_id, |s| {
+            s.get_table(&trigger_table_norm).and_then(|t| {
+                t.btree().map(|bt| {
+                    bt.columns
+                        .iter()
+                        .filter_map(|c| c.name.as_deref().map(normalize_ident))
+                        .collect()
                 })
             })
-        };
+        })
+    };
 
     // Helper: walk an expression (including subqueries) and find bad column refs
     let find_bad_in_expr = |expr: &ast::Expr,
@@ -2929,9 +2928,7 @@ fn validate_trigger_columns_after_drop(
             // INSERT ... VALUES and INSERT ... SELECT are checked.
             ast::TriggerCmd::Insert { select, .. } => {
                 let all_cols = merge_cols(&owning_table_columns, &None);
-                if let Some(bad) =
-                    find_bad_in_select(select, &all_cols, &owning_table_columns)?
-                {
+                if let Some(bad) = find_bad_in_select(select, &all_cols, &owning_table_columns)? {
                     return Ok(Some(bad));
                 }
             }
@@ -2959,9 +2956,7 @@ fn validate_trigger_columns_after_drop(
             }
             ast::TriggerCmd::Select(select) => {
                 let all_cols = merge_cols(&owning_table_columns, &None);
-                if let Some(bad) =
-                    find_bad_in_select(select, &all_cols, &owning_table_columns)?
-                {
+                if let Some(bad) = find_bad_in_select(select, &all_cols, &owning_table_columns)? {
                     return Ok(Some(bad));
                 }
             }
