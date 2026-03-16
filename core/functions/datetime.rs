@@ -1260,7 +1260,7 @@ where
     let mut res = String::new();
     let mut chars = fmt_str.chars().peekable();
 
-    let days_after_jan1 = |curr: &DateTime| -> Result<i64, ()> {
+    let days_after_jan1 = |curr: &DateTime| -> Option<i64> {
         let jan1 = DateTime {
             y: curr.y,
             m: 1,
@@ -1284,7 +1284,6 @@ where
         c1.i_jd
             .checked_sub(j1.i_jd)
             .and_then(|diff| diff.checked_div(JD_TO_MS))
-            .ok_or(())
     };
 
     let days_after_mon = |curr: &DateTime| -> i64 { ((curr.i_jd + 43200000) / JD_TO_MS) % 7 };
@@ -1327,8 +1326,8 @@ where
                 write!(res, "{h:02}").unwrap();
             }
             Some('j') => match days_after_jan1(&p) {
-                Ok(days) => write!(res, "{:03}", days + 1).unwrap(),
-                Err(_) => return Value::Null,
+                Some(days) => write!(res, "{:03}", days + 1).unwrap(),
+                None => return Value::Null,
             },
             Some('J') => {
                 let val = p.i_jd as f64 / 86400000.0;
@@ -1367,11 +1366,11 @@ where
                 write!(res, "{w}").unwrap();
             }
             Some('U') => match days_after_jan1(&p) {
-                Ok(days) => {
+                Some(days) => {
                     let w = (days - days_after_sun(&p) + 7) / 7;
                     write!(res, "{w:02}").unwrap();
                 }
-                Err(_) => return Value::Null,
+                None => return Value::Null,
             },
 
             Some('V') => {
@@ -1380,22 +1379,22 @@ where
                 temp.valid_ymd = false;
                 temp.compute_ymd();
                 match days_after_jan1(&temp) {
-                    Ok(days) => {
+                    Some(days) => {
                         let w = days / 7 + 1;
                         write!(res, "{w:02}").unwrap();
                     }
-                    Err(_) => return Value::Null,
+                    None => return Value::Null,
                 }
             }
             Some('w') => {
                 write!(res, "{}", days_after_sun(&p)).unwrap();
             }
             Some('W') => match days_after_jan1(&p) {
-                Ok(days) => {
+                Some(days) => {
                     let w = (days - days_after_mon(&p) + 7) / 7;
                     write!(res, "{w:02}").unwrap();
                 }
-                Err(_) => return Value::Null,
+                None => return Value::Null,
             },
             Some('Y') => write!(res, "{:04}", p.y).unwrap(),
             Some('%') => res.push('%'),
