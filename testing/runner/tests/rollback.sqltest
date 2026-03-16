@@ -154,7 +154,7 @@ expect {
 
 @cross-check-integrity
 test schema-alter-rollback {
-    create table t (x);
+    CREATE TABLE t (x);
     begin;
     alter table t add column y;
     rollback;
@@ -179,7 +179,7 @@ expect {
 
 @cross-check-integrity
 test schema-create-index-rollback {
-    create table t (x);
+    CREATE TABLE t (x);
     begin;
     create index i on t(x);
     rollback;
@@ -191,7 +191,7 @@ expect {
 
 @cross-check-integrity
 test schema-drop-table-rollback {
-    create table t (x);
+    CREATE TABLE t (x);
     begin;
     drop table t;
     rollback;

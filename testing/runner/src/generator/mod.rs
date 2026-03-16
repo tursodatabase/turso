@@ -1164,20 +1164,7 @@ async fn create_tables(conn: &Connection, no_rowid_alias: bool) -> Result<()> {
     };
 
     let users_sql = format!(
-        r#"
-        CREATE TABLE users (
-        id {pk_type},
-        first_name TEXT,
-        last_name TEXT,
-        email TEXT,
-        phone_number TEXT,
-        address TEXT,
-        city TEXT,
-        state TEXT,
-        zipcode TEXT,
-        age INTEGER
-    );
-        "#
+        "CREATE TABLE users (id {pk_type}, first_name TEXT, last_name TEXT, email TEXT, phone_number TEXT, address TEXT, city TEXT, state TEXT, zipcode TEXT, age INTEGER);"
     );
 
     conn.execute(&users_sql, ())
@@ -1193,13 +1180,7 @@ async fn create_tables(conn: &Connection, no_rowid_alias: bool) -> Result<()> {
     }
 
     let products_sql = format!(
-        r#"
-        CREATE TABLE IF NOT EXISTS products (
-            id {pk_type},
-            name TEXT,
-            price REAL
-        )
-        "#
+        "CREATE TABLE IF NOT EXISTS products (id {pk_type}, name TEXT, price REAL)"
     );
 
     conn.execute(&products_sql, ())

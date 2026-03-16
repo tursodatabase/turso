@@ -1,0 +1,47 @@
+@database :memory:
+
+# https://github.com/tursodatabase/turso/issues/3264
+# Tests that the original SQL is preserved in sqlite_schema.sql
+# rather than being reconstructed from the AST (which loses whitespace, etc.)
+
+test create_table_preserves_spaces_in_column_type {
+    CREATE TABLE t1 (a, name varchar ( 255));
+    SELECT sql FROM sqlite_schema WHERE name = 't1';
+}
+expect {
+    CREATE TABLE t1 (a, name varchar ( 255))
+}
+
+test create_table_preserves_no_space_before_paren_in_type {
+    CREATE TABLE t2 (a, name varchar( 255));
+    SELECT sql FROM sqlite_schema WHERE name = 't2';
+}
+expect {
+    CREATE TABLE t2 (a, name varchar( 255))
+}
+
+test create_table_preserves_multiple_spaces {
+    CREATE TABLE t3 (a  TEXT,  b   INTEGER);
+    SELECT sql FROM sqlite_schema WHERE name = 't3';
+}
+expect {
+    CREATE TABLE t3 (a  TEXT,  b   INTEGER)
+}
+
+test create_index_preserves_original_sql {
+    CREATE TABLE t4 (a, b);
+    CREATE INDEX idx1 ON t4 ( a, b );
+    SELECT sql FROM sqlite_schema WHERE name = 'idx1';
+}
+expect {
+    CREATE INDEX idx1 ON t4 ( a, b )
+}
+
+test create_view_preserves_original_sql {
+    CREATE TABLE t5 (a, b);
+    CREATE VIEW v1 AS SELECT  a,  b  FROM  t5;
+    SELECT sql FROM sqlite_schema WHERE name = 'v1';
+}
+expect {
+    CREATE VIEW v1 AS SELECT  a,  b  FROM  t5
+}

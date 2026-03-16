@@ -222,7 +222,7 @@ test alter-table-rename-column-view-attached-db-same-db {
     SELECT sql FROM aux.sqlite_schema WHERE type = 'view' AND name = 'v';
 }
 expect {
-    CREATE VIEW v AS SELECT c FROM t
+    CREATE VIEW aux.v AS SELECT c FROM t
 }
 
 # https://github.com/tursodatabase/turso/issues/5246
@@ -505,7 +505,7 @@ test alter-table-rename-to-quoted-identifier {
     ALTER TABLE "t t" RENAME COLUMN a TO "a a";
     SELECT sql FROM sqlite_schema;
     SELECT "a a" FROM "t t";
-    
+
     ALTER TABLE "t t" RENAME COLUMN "a a" TO "b b";
     SELECT sql FROM sqlite_schema;
     SELECT "b b" FROM "t t";
