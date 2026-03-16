@@ -150,7 +150,7 @@ mod tests {
                 let prefix: String = (0..prefix_len)
                     .map(|_| BOUNDARY_BYTES[rng.random_range(0..BOUNDARY_BYTES.len())] as char)
                     .collect();
-                let pattern = format!("{}%", prefix);
+                let pattern = format!("{prefix}%");
                 let query = format!(
                     "SELECT id, val FROM t WHERE val LIKE '{}' ORDER BY id",
                     pattern.replace('\'', "''")

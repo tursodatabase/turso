@@ -385,12 +385,14 @@ expect {
 # positives, the LIKE filter must remain as a residual.
 
 # NOCASE column + prefix%: LIKE consumed (no Function/like in bytecode)
+@skip-if mvcc "bytecode snapshot has OpenRead with rootpage that differs in MVCC"
 @setup like_prefix_nocase_schema
 snapshot like-prefix-nocase-consumed {
     SELECT * FROM t_nocase WHERE name LIKE 'abc%';
 }
 
 # BINARY column + letters + prefix%: LIKE NOT consumed (Function/like present)
+@skip-if mvcc "bytecode snapshot has OpenRead with rootpage that differs in MVCC"
 @setup like_prefix_schema
 snapshot like-prefix-binary-letters-residual {
     SELECT * FROM t WHERE name LIKE 'abc%';
@@ -405,12 +407,14 @@ setup like_prefix_digits_schema {
     INSERT INTO t_digits VALUES (3, '13000');
 }
 
+@skip-if mvcc "bytecode snapshot has OpenRead with rootpage that differs in MVCC"
 @setup like_prefix_digits_schema
 snapshot like-prefix-digits-consumed {
     SELECT * FROM t_digits WHERE code LIKE '12%';
 }
 
 # Underscore in suffix: LIKE NOT consumed even on NOCASE
+@skip-if mvcc "bytecode snapshot has OpenRead with rootpage that differs in MVCC"
 @setup like_prefix_nocase_schema
 snapshot like-prefix-nocase-underscore-residual {
     SELECT * FROM t_nocase WHERE name LIKE 'abc_%';
