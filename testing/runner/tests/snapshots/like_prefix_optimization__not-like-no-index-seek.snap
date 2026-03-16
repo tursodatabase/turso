@@ -1,0 +1,13 @@
+---
+source: like_prefix_optimization.sqltest
+expression: SELECT * FROM t WHERE name NOT LIKE 'abc%';
+info:
+  statement_type: SELECT
+  tables:
+  - t
+  setup_blocks:
+  - like_prefix_schema
+  database: ':memory:'
+---
+QUERY PLAN
+`--SCAN t

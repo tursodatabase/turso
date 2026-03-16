@@ -1,0 +1,33 @@
+---
+source: like_prefix_optimization.sqltest
+expression: SELECT * FROM t_nocase WHERE name LIKE 'abc_%';
+info:
+  statement_type: SELECT
+  tables:
+  - t_nocase
+  setup_blocks:
+  - like_prefix_nocase_schema
+  database: ':memory:'
+---
+QUERY PLAN
+`--SEARCH t_nocase USING INDEX idx_name_nocase (name>=? AND name<?)
+
+BYTECODE
+addr  opcode       p1  p2  p3  p4           p5  comment
+   0  Init          0  14   0                0  Start at 14
+   1  OpenRead      0   3   0  k(2,NoCase)   0  index=idx_name_nocase, root=3, iDb=0
+   2  String8       0   3   0  ABC           0  r[3]='ABC'
+   3  SeekGE        0  13   3                0  key=[3..3]
+   4  String8       0   3   0  abd           0  r[3]='abd'
+   5    IdxGE       0  13   3                0  key=[3..3]
+   6    Column      0   0   6                0  r[6]=idx_name_nocase.name
+   7    Function    1   5   4  like(2)       0  r[4]=func(r[5..6])
+   8    IfNot       4  12   1                0  if !r[4] goto 12
+   9    IdxRowId    0   1   0                0  r[1]=cursor 0 for index idx_name_nocase.rowid
+  10    Column      0   0   2                0  r[2]=idx_name_nocase.name
+  11    ResultRow   1   2   0                0  output=r[1..2]
+  12  Next          0   5   0                0
+  13  Halt          0   0   0                0
+  14  Transaction   0   1   2                0  iDb=0 tx_mode=Read
+  15  String8       0   5   0  abc_%         0  r[5]='abc_%'
+  16  Goto          0   1   0                0
