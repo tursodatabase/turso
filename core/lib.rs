@@ -516,6 +516,31 @@ impl Database {
         Self::open_file_with_flags(io, path, OpenFlags::default(), DatabaseOpts::new(), None)
     }
 
+    /// Open or retrieve a shared named in-memory database.
+    /// Multiple connections to the same `name` share a single `Database`,
+    /// matching SQLite's `file:name?mode=memory&cache=shared` semantics.
+    #[cfg(feature = "fs")]
+    pub fn open_shared_memory(name: &str) -> Result<Arc<Database>> {
+        let registry_key = format!(":memory:shared:{name}");
+
+        {
+            let registry = DATABASE_MANAGER.lock_arc();
+            if let Some(db) = registry.get(&registry_key).and_then(Weak::upgrade) {
+                return Ok(db);
+            }
+        }
+        // `:memory:` paths bypass DATABASE_MANAGER internally, so no deadlock.
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Self::open_file(io, ":memory:")?;
+
+        let mut registry = DATABASE_MANAGER.lock_arc();
+        if let Some(existing) = registry.get(&registry_key).and_then(Weak::upgrade) {
+            return Ok(existing);
+        }
+        registry.insert(registry_key, Arc::downgrade(&db));
+        Ok(db)
+    }
+
     /// Look up a database in the process-wide registry by path.
     /// Returns the cached Database if found, with encryption validation.
     /// This avoids opening a file (and acquiring a file lock) when the

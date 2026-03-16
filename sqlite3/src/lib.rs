@@ -385,7 +385,7 @@ fn percent_decode(input: &str) -> Option<String> {
 ///   file:path               -> real file at path
 ///   file:///path             -> real file at /path (authority form)
 ///   file://localhost/path    -> real file at /path
-fn parse_uri_filename(uri: &str) -> Result<(String, bool), ()> {
+fn parse_uri_filename(uri: &str) -> Result<(String, bool, bool), ()> {
     // Must start with "file:"
     let after_file = &uri[5..];
 
@@ -424,28 +424,36 @@ fn parse_uri_filename(uri: &str) -> Result<(String, bool), ()> {
 
     // Check for :memory: path
     if path == ":memory:" {
-        return Ok((":memory:".to_string(), true));
+        return Ok((":memory:".to_string(), true, false));
     }
 
     // Parse query parameters
     let mut is_memory = false;
+    let mut cache_shared = false;
     if let Some(query) = query {
         for param in query.split('&') {
             let (key, value) = match param.find('=') {
                 Some(pos) => (&param[..pos], &param[pos + 1..]),
                 None => (param, ""),
             };
-            if key == "mode" {
-                match value {
+            match key {
+                "mode" => match value {
                     "memory" => is_memory = true,
                     "ro" | "rw" | "rwc" => {} // valid modes, no-op (Turso doesn't enforce read-only yet)
                     _ => return Err(()),      // unknown mode -> SQLITE_CANTOPEN
+                },
+                "cache" => {
+                    if value == "shared" {
+                        cache_shared = true;
+                    }
+                    // "private" is also valid but is the default behavior
                 }
+                _ => {}
             }
         }
     }
 
-    Ok((path, is_memory))
+    Ok((path, is_memory, cache_shared))
 }
 
 #[no_mangle]
@@ -470,49 +478,66 @@ pub unsafe extern "C" fn sqlite3_open_v2(
     };
 
     // Determine the effective filename and whether to use in-memory IO
-    let (effective_filename, use_memory) =
+    let (effective_filename, use_memory, cache_shared) =
         if (flags & SQLITE_OPEN_URI) != 0 && filename_str.starts_with("file:") {
             match parse_uri_filename(filename_str) {
-                Ok((path, is_memory)) => (path, is_memory),
+                Ok(result) => result,
                 Err(()) => return SQLITE_CANTOPEN,
             }
         } else if (flags & SQLITE_OPEN_MEMORY) != 0 || filename_str == ":memory:" {
-            (":memory:".to_string(), true)
+            (":memory:".to_string(), true, false)
         } else {
-            (filename_str.to_string(), false)
+            (filename_str.to_string(), false, false)
         };
 
-    // TODO: Named memory URIs with cache=shared (e.g. file:name?mode=memory&cache=shared)
-    // should share the same MemoryIO across connections. This requires using core's
-    // existing database registry plumbing (similar to ATTACH ':memory:' AS aux).
-    // See: https://github.com/tursodatabase/turso/pull/5932#discussion_r2941454614
-    let io: Arc<dyn turso_core::IO> = if use_memory {
-        Arc::new(turso_core::MemoryIO::new())
+    let use_shared_memory = use_memory
+        && cache_shared
+        && effective_filename != ":memory:"
+        && !effective_filename.is_empty();
+
+    let (io, db) = if use_shared_memory {
+        match turso_core::Database::open_shared_memory(&effective_filename) {
+            Ok(db) => (db.io.clone(), db),
+            Err(e) => {
+                trace!("error opening shared memory database {effective_filename}: {e:?}");
+                return SQLITE_CANTOPEN;
+            }
+        }
+    } else if use_memory {
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
+        match turso_core::Database::open_file(io.clone(), ":memory:") {
+            Ok(db) => (io, db),
+            Err(e) => {
+                trace!("error opening memory database: {e:?}");
+                return SQLITE_CANTOPEN;
+            }
+        }
     } else {
-        match turso_core::PlatformIO::new() {
+        let io: Arc<dyn turso_core::IO> = match turso_core::PlatformIO::new() {
             Ok(io) => Arc::new(io),
             Err(_) => return SQLITE_CANTOPEN,
+        };
+        match turso_core::Database::open_file(io.clone(), &effective_filename) {
+            Ok(db) => (io, db),
+            Err(e) => {
+                trace!("error opening database {effective_filename}: {e:?}");
+                return SQLITE_CANTOPEN;
+            }
         }
     };
 
-    match turso_core::Database::open_file(io.clone(), &effective_filename) {
-        Ok(db) => match db.connect() {
-            Ok(conn) => {
-                let stored_filename = if use_memory {
-                    CString::new("".to_string()).unwrap()
-                } else {
-                    CString::new(effective_filename).unwrap()
-                };
-                *db_out = Box::leak(Box::new(sqlite3::new(io, db, conn, stored_filename)));
-                SQLITE_OK
-            }
-            Err(e) => {
-                trace!("error connecting to database: {:?}", e);
-                SQLITE_CANTOPEN
-            }
-        },
+    match db.connect() {
+        Ok(conn) => {
+            let stored_filename = if use_memory {
+                CString::new("".to_string()).unwrap()
+            } else {
+                CString::new(effective_filename).unwrap()
+            };
+            *db_out = Box::leak(Box::new(sqlite3::new(io, db, conn, stored_filename)));
+            SQLITE_OK
+        }
         Err(e) => {
-            trace!("error opening database {effective_filename}: {e:?}");
+            trace!("error connecting to database: {:?}", e);
             SQLITE_CANTOPEN
         }
     }
