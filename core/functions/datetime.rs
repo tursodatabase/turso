@@ -26,7 +26,6 @@ struct DateTime {
     valid_ymd: bool,
     valid_hms: bool,
     raw_s: bool, // Raw numeric value stored in s
-    is_error: bool,
     use_subsec: bool,
     is_utc: bool,
     is_local: bool,
@@ -48,7 +47,6 @@ impl Default for DateTime {
             valid_ymd: false,
             valid_hms: false,
             raw_s: false,
-            is_error: false,
             use_subsec: false,
             is_utc: false,
             is_local: false,
@@ -57,14 +55,9 @@ impl Default for DateTime {
 }
 
 impl DateTime {
-    fn set_error(&mut self) {
-        *self = DateTime::default();
-        self.is_error = true;
-    }
-
-    fn compute_jd(&mut self) {
+    fn compute_jd(&mut self) -> Option<()> {
         if self.valid_jd {
-            return;
+            return Some(());
         }
         let mut y: i32;
         let mut m: i32;
@@ -79,8 +72,7 @@ impl DateTime {
             d = 1;
         }
         if !(-4713..=9999).contains(&y) || self.raw_s {
-            self.set_error();
-            return;
+            return None;
         }
         if m <= 2 {
             y -= 1;
@@ -88,16 +80,27 @@ impl DateTime {
         }
         let a = (y + 4800) / 100;
         let b = 38 - a + (a / 4);
-        let x1 = 36525 * (y + 4716) / 100;
-        let x2 = 306001 * (m + 1) / 10000;
-        self.i_jd = (x1 as i64 + x2 as i64 + d as i64 + b as i64) * 86400000 - 131716800000;
+        let x1 = 36525_i64.checked_mul((y + 4716) as i64)? / 100;
+        let x2 = 306001_i64.checked_mul((m + 1) as i64)? / 10000;
+        self.i_jd = x1
+            .checked_add(x2)?
+            .checked_add(d as i64)?
+            .checked_add(b as i64)?
+            .checked_mul(86400000)?
+            .checked_sub(131716800000)?;
         self.valid_jd = true;
         if self.valid_hms {
-            self.i_jd += self.h as i64 * 3_600_000
-                + self.min as i64 * 60_000
-                + (self.s * 1000.0 + 0.5) as i64;
+            let h_ms = (self.h as i64).checked_mul(3_600_000)?;
+            let min_ms = (self.min as i64).checked_mul(60_000)?;
+            let s_ms = (self.s * 1000.0 + 0.5) as i64;
+            self.i_jd = self
+                .i_jd
+                .checked_add(h_ms)?
+                .checked_add(min_ms)?
+                .checked_add(s_ms)?;
             if self.tz != 0 {
-                self.i_jd -= self.tz as i64 * 60_000;
+                let tz_ms = (self.tz as i64).checked_mul(60_000)?;
+                self.i_jd = self.i_jd.checked_sub(tz_ms)?;
                 self.valid_ymd = false;
                 self.valid_hms = false;
                 self.tz = 0;
@@ -105,21 +108,21 @@ impl DateTime {
                 self.is_local = false;
             }
         }
+        Some(())
     }
 
-    fn compute_ymd(&mut self) {
+    fn compute_ymd(&mut self) -> Option<()> {
         if self.valid_ymd {
-            return;
+            return Some(());
         }
         if !self.valid_jd {
             self.y = 2000;
             self.m = 1;
             self.d = 1;
         } else if self.i_jd < 0 || self.i_jd > MAX_JD {
-            self.set_error();
-            return;
+            return None;
         } else {
-            let z = ((self.i_jd + 43200000) / JD_TO_MS) as i32;
+            let z = (self.i_jd.checked_add(43200000)? / JD_TO_MS) as i32;
             let alpha = ((z as f64 + 32044.75) / 36524.25) as i32 - 52;
             let a = z + 1 + alpha - ((alpha + 100) / 4) + 25;
             let b = a + 1524;
@@ -133,25 +136,27 @@ impl DateTime {
             self.y = if self.m > 2 { c - 4716 } else { c - 4715 };
         }
         self.valid_ymd = true;
+        Some(())
     }
 
-    fn compute_hms(&mut self) {
+    fn compute_hms(&mut self) -> Option<()> {
         if self.valid_hms {
-            return;
+            return Some(());
         }
-        self.compute_jd();
-        let day_ms = ((self.i_jd + 43200000) % 86400000) as i32;
+        self.compute_jd()?;
+        let day_ms = (self.i_jd.checked_add(43200000)?.checked_rem(86400000)?) as i32;
         self.s = (day_ms % 60000) as f64 / 1000.0;
         let day_min = day_ms / 60000;
         self.min = day_min % 60;
         self.h = day_min / 60;
         self.raw_s = false;
         self.valid_hms = true;
+        Some(())
     }
 
-    fn compute_ymd_hms(&mut self) {
-        self.compute_ymd();
-        self.compute_hms();
+    fn compute_ymd_hms(&mut self) -> Option<()> {
+        self.compute_ymd()?;
+        self.compute_hms()
     }
 
     fn clear_ymd_hms_tz(&mut self) {
@@ -160,10 +165,10 @@ impl DateTime {
         self.tz = 0;
     }
 
-    fn compute_floor(&mut self) {
-        assert!(self.valid_ymd || self.is_error);
-        assert!(self.d >= 0 && self.d <= 31);
-        assert!(self.m >= 0 && self.m <= 12);
+    fn compute_floor(&mut self) -> Option<()> {
+        if !self.valid_ymd || !(0..=31).contains(&self.d) || !(0..=12).contains(&self.m) {
+            return None;
+        }
         if self.d <= 28 || ((1 << self.m) & 0x15aa) != 0 {
             self.n_floor = 0;
         } else if self.m != 2 {
@@ -173,6 +178,7 @@ impl DateTime {
         } else {
             self.n_floor = self.d - 29;
         }
+        Some(())
     }
 }
 
@@ -302,10 +308,12 @@ fn parse_yyyy_mm_dd(mut z: &str, p: &mut DateTime) -> bool {
     p.m = m;
     p.d = d;
 
-    p.compute_floor();
+    if p.compute_floor().is_none() {
+        return false;
+    }
 
-    if p.tz != 0 {
-        p.compute_jd();
+    if p.tz != 0 && p.compute_jd().is_none() {
+        return false;
     }
     true
 }
@@ -489,15 +497,24 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
             Ok(())
         }
         'c' if z.eq_ignore_ascii_case("ceiling") => {
-            p.compute_jd();
+            p.compute_jd()
+                .ok_or_else(|| InvalidModifier(format!("date overflow: {z}")))?;
             p.clear_ymd_hms_tz();
             p.n_floor = 0;
             Ok(())
         }
         'f' if z.eq_ignore_ascii_case("floor") => {
-            p.compute_jd();
+            p.compute_jd()
+                .ok_or_else(|| InvalidModifier(format!("date overflow: {z}")))?;
             if p.n_floor != 0 {
-                p.i_jd -= p.n_floor as i64 * JD_TO_MS;
+                p.i_jd = p
+                    .i_jd
+                    .checked_sub(
+                        (p.n_floor as i64)
+                            .checked_mul(JD_TO_MS)
+                            .ok_or_else(|| InvalidModifier(format!("date overflow: {z}")))?,
+                    )
+                    .ok_or_else(|| InvalidModifier(format!("date overflow: {z}")))?;
                 p.n_floor = 0;
             }
             p.clear_ymd_hms_tz();
@@ -520,13 +537,17 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
         }
         'l' if z.eq_ignore_ascii_case("localtime") => {
             if !p.is_local {
-                p.compute_jd();
+                p.compute_jd()
+                    .ok_or_else(|| InvalidModifier(format!("date overflow: {z}")))?;
                 let timestamp = (p.i_jd - 210866760000000) / 1000;
                 let offset_sec = match Local.timestamp_opt(timestamp, 0) {
                     chrono::LocalResult::Single(dt) => dt.offset().fix().local_minus_utc(),
                     _ => 0,
                 };
-                p.i_jd += (offset_sec as i64) * 1000;
+                p.i_jd = p
+                    .i_jd
+                    .checked_add((offset_sec as i64) * 1000)
+                    .ok_or_else(|| InvalidModifier(format!("date overflow: {z}")))?;
                 p.clear_ymd_hms_tz();
                 p.is_local = true;
                 p.is_utc = false;
@@ -554,13 +575,17 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
         }
         'u' if z.eq_ignore_ascii_case("utc") => {
             if !p.is_utc {
-                p.compute_jd();
+                p.compute_jd()
+                    .ok_or_else(|| InvalidModifier(format!("date overflow: {z}")))?;
                 let timestamp = (p.i_jd - 210866760000000) / 1000;
                 let offset_sec = match Local.timestamp_opt(timestamp, 0) {
                     chrono::LocalResult::Single(dt) => dt.offset().fix().local_minus_utc(),
                     _ => 0,
                 };
-                p.i_jd -= (offset_sec as i64) * 1000;
+                p.i_jd = p
+                    .i_jd
+                    .checked_sub((offset_sec as i64) * 1000)
+                    .ok_or_else(|| InvalidModifier(format!("date overflow: {z}")))?;
                 p.clear_ymd_hms_tz();
                 p.is_utc = true;
                 p.is_local = false;
@@ -574,14 +599,23 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
             if let Ok(val) = z[8..].trim().parse::<f64>() {
                 if (0.0..7.0).contains(&val) && (val as i64 as f64) == val {
                     let n = val as i64;
-                    p.compute_ymd_hms();
+                    p.compute_ymd_hms()
+                        .ok_or_else(|| InvalidModifier(format!("date overflow: {z}")))?;
                     p.valid_jd = false;
-                    p.compute_jd();
-                    let mut z = ((p.i_jd + 129600000) / 86400000) % 7;
-                    if z > n {
-                        z -= 7;
+                    p.compute_jd()
+                        .ok_or_else(|| InvalidModifier(format!("date overflow: {z}")))?;
+                    let mut wd = ((p.i_jd + 129600000) / 86400000) % 7;
+                    if wd > n {
+                        wd -= 7;
                     }
-                    p.i_jd += (n - z) * 86400000;
+                    p.i_jd = p
+                        .i_jd
+                        .checked_add(
+                            (n - wd)
+                                .checked_mul(86400000)
+                                .ok_or_else(|| InvalidModifier(format!("date overflow: {z}")))?,
+                        )
+                        .ok_or_else(|| InvalidModifier(format!("date overflow: {z}")))?;
                     p.clear_ymd_hms_tz();
                     return Ok(());
                 }
@@ -599,7 +633,8 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
                 if !p.valid_jd && !p.valid_ymd && !p.valid_hms {
                     return Err(InvalidModifier(format!("Invalid start of: {z}")));
                 }
-                p.compute_ymd();
+                p.compute_ymd()
+                    .ok_or_else(|| InvalidModifier(format!("date overflow: {z}")))?;
                 p.valid_hms = true;
                 p.h = 0;
                 p.min = 0;
@@ -631,10 +666,14 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
     }
 }
 
+fn overflow_err(z: &str) -> crate::LimboError {
+    InvalidModifier(format!("date overflow: {z}"))
+}
+
 fn parse_arithmetic_modifier(p: &mut DateTime, z: &str) -> Result<()> {
     let z = z.trim();
     let is_neg = z.starts_with('-');
-    let sign = if is_neg { -1 } else { 1 };
+    let sign: i64 = if is_neg { -1 } else { 1 };
 
     let clean_z = if z.starts_with('+') || z.starts_with('-') {
         &z[1..]
@@ -670,19 +709,15 @@ fn parse_arithmetic_modifier(p: &mut DateTime, z: &str) -> Result<()> {
             }
 
             if valid_format {
-                p.compute_ymd_hms();
+                p.compute_ymd_hms().ok_or_else(|| overflow_err(z))?;
                 p.valid_jd = false;
 
-                let y_adj = y as i64;
-                let m_adj = m as i64;
-                let d_adj = d as i64;
-
                 if is_neg {
-                    p.y = p.y.wrapping_sub(y_adj as i32);
-                    p.m = p.m.wrapping_sub(m_adj as i32);
+                    p.y = p.y.checked_sub(y).ok_or_else(|| overflow_err(z))?;
+                    p.m = p.m.checked_sub(m).ok_or_else(|| overflow_err(z))?;
                 } else {
-                    p.y = p.y.wrapping_add(y_adj as i32);
-                    p.m = p.m.wrapping_add(m_adj as i32);
+                    p.y = p.y.checked_add(y).ok_or_else(|| overflow_err(z))?;
+                    p.m = p.m.checked_add(m).ok_or_else(|| overflow_err(z))?;
                 }
 
                 // Normalize months
@@ -692,27 +727,35 @@ fn parse_arithmetic_modifier(p: &mut DateTime, z: &str) -> Result<()> {
                 } else {
                     (m_current - 12) / 12
                 };
-                p.y = p.y.wrapping_add(x as i32);
+                p.y = p.y.checked_add(x as i32).ok_or_else(|| overflow_err(z))?;
                 p.m = (m_current - x * 12) as i32;
 
-                p.compute_floor();
-                p.compute_jd();
+                p.compute_floor().ok_or_else(|| overflow_err(z))?;
+                p.compute_jd().ok_or_else(|| overflow_err(z))?;
 
                 // Apply day offset
+                let d_adj = d as i64;
                 let day_diff = if is_neg { -d_adj } else { d_adj };
-                p.i_jd = p.i_jd.wrapping_add(day_diff.wrapping_mul(JD_TO_MS));
+                p.i_jd = day_diff
+                    .checked_mul(JD_TO_MS)
+                    .and_then(|v| p.i_jd.checked_add(v))
+                    .ok_or_else(|| overflow_err(z))?;
 
                 // Apply time offset if present
                 if let Some(t_val) = time_str {
                     let mut tx = DateTime::default();
                     if parse_hh_mm_ss(t_val, &mut tx) {
-                        tx.compute_jd();
-                        let ms = (tx.h as i64 * 3600000)
-                            + (tx.min as i64 * 60000)
-                            + (tx.s * 1000.0) as i64;
-                        p.i_jd = p.i_jd.wrapping_add((sign as i64).wrapping_mul(ms));
+                        tx.compute_jd().ok_or_else(|| overflow_err(z))?;
+                        let ms = (tx.h as i64)
+                            .checked_mul(3600000)
+                            .and_then(|v| v.checked_add((tx.min as i64).checked_mul(60000)?))
+                            .and_then(|v| v.checked_add((tx.s * 1000.0) as i64))
+                            .ok_or_else(|| overflow_err(z))?;
+                        p.i_jd = sign
+                            .checked_mul(ms)
+                            .and_then(|v| p.i_jd.checked_add(v))
+                            .ok_or_else(|| overflow_err(z))?;
                     } else {
-                        // If time parsing failed, the whole modifier is invalid
                         return Err(InvalidModifier(format!(
                             "Invalid time in arithmetic modifier: {z}"
                         )));
@@ -734,10 +777,17 @@ fn parse_arithmetic_modifier(p: &mut DateTime, z: &str) -> Result<()> {
             z
         };
         if parse_hh_mm_ss(time_str, &mut tx) {
-            tx.compute_jd();
-            let ms = (tx.h as i64 * 3600000) + (tx.min as i64 * 60000) + (tx.s * 1000.0) as i64;
-            p.compute_jd();
-            p.i_jd = p.i_jd.wrapping_add((sign as i64).wrapping_mul(ms));
+            tx.compute_jd().ok_or_else(|| overflow_err(z))?;
+            let ms = (tx.h as i64)
+                .checked_mul(3600000)
+                .and_then(|v| v.checked_add((tx.min as i64).checked_mul(60000)?))
+                .and_then(|v| v.checked_add((tx.s * 1000.0) as i64))
+                .ok_or_else(|| overflow_err(z))?;
+            p.compute_jd().ok_or_else(|| overflow_err(z))?;
+            p.i_jd = sign
+                .checked_mul(ms)
+                .and_then(|v| p.i_jd.checked_add(v))
+                .ok_or_else(|| overflow_err(z))?;
             p.clear_ymd_hms_tz();
             return Ok(());
         }
@@ -753,100 +803,121 @@ fn parse_arithmetic_modifier(p: &mut DateTime, z: &str) -> Result<()> {
                     if !limit_check(val, 5373485.0) {
                         return Err(InvalidModifier(format!("Modifier out of range: {z}")));
                     }
-                    p.compute_jd();
+                    p.compute_jd().ok_or_else(|| overflow_err(z))?;
                     let ms = val * 86400000.0;
                     let rounder = if ms < 0.0 { -0.5 } else { 0.5 };
-                    p.i_jd = p.i_jd.wrapping_add((ms + rounder) as i64);
+                    p.i_jd = p
+                        .i_jd
+                        .checked_add((ms + rounder) as i64)
+                        .ok_or_else(|| overflow_err(z))?;
                     p.n_floor = 0;
                     p.clear_ymd_hms_tz();
                     return Ok(());
-                } else if unit.eq_ignore_ascii_case("hour") || unit.eq_ignore_ascii_case("hours") {
+                }
+                if unit.eq_ignore_ascii_case("hour") || unit.eq_ignore_ascii_case("hours") {
                     if !limit_check(val, 1.2897e+11) {
                         return Err(InvalidModifier(format!("Modifier out of range: {z}")));
                     }
-                    p.compute_jd();
+                    p.compute_jd().ok_or_else(|| overflow_err(z))?;
                     let ms = val * 3600000.0;
                     let rounder = if ms < 0.0 { -0.5 } else { 0.5 };
-                    p.i_jd = p.i_jd.wrapping_add((ms + rounder) as i64);
+                    p.i_jd = p
+                        .i_jd
+                        .checked_add((ms + rounder) as i64)
+                        .ok_or_else(|| overflow_err(z))?;
                     p.n_floor = 0;
                     p.clear_ymd_hms_tz();
                     return Ok(());
-                } else if unit.eq_ignore_ascii_case("minute")
-                    || unit.eq_ignore_ascii_case("minutes")
-                {
+                }
+                if unit.eq_ignore_ascii_case("minute") || unit.eq_ignore_ascii_case("minutes") {
                     if !limit_check(val, 7.7379e+12) {
                         return Err(InvalidModifier(format!("Modifier out of range: {z}")));
                     }
-                    p.compute_jd();
+                    p.compute_jd().ok_or_else(|| overflow_err(z))?;
                     let ms = val * 60000.0;
                     let rounder = if ms < 0.0 { -0.5 } else { 0.5 };
-                    p.i_jd = p.i_jd.wrapping_add((ms + rounder) as i64);
+                    p.i_jd = p
+                        .i_jd
+                        .checked_add((ms + rounder) as i64)
+                        .ok_or_else(|| overflow_err(z))?;
                     p.n_floor = 0;
                     p.clear_ymd_hms_tz();
                     return Ok(());
-                } else if unit.eq_ignore_ascii_case("second")
-                    || unit.eq_ignore_ascii_case("seconds")
-                {
-                    if !limit_check(val, 4.6427e+14) {
-                        return Err(InvalidModifier(format!("Modifier out of range: {z}")));
-                    }
-                    p.compute_jd();
-                    let ms = val * 1000.0;
-                    let rounder = if ms < 0.0 { -0.5 } else { 0.5 };
-                    p.i_jd = p.i_jd.wrapping_add((ms + rounder) as i64);
-                    p.n_floor = 0;
-                    p.clear_ymd_hms_tz();
-                    return Ok(());
-                } else if unit.eq_ignore_ascii_case("month") || unit.eq_ignore_ascii_case("months")
-                {
-                    if !limit_check(val, 176546.0) {
-                        return Err(InvalidModifier(format!("Modifier out of range: {z}")));
-                    }
-                    p.compute_ymd_hms();
-                    let int_months = val as i64;
-                    let frac_months = val - int_months as f64;
-
-                    let total_months = (p.m as i64) + int_months;
-                    let x = if total_months > 0 {
-                        (total_months - 1) / 12
-                    } else {
-                        (total_months - 12) / 12
-                    };
-                    p.y = p.y.wrapping_add(x as i32);
-                    p.m = (total_months - x * 12) as i32;
-
-                    p.compute_floor();
-                    p.valid_jd = false;
-                    p.compute_jd();
-
-                    if frac_months.abs() > f64::EPSILON {
-                        let ms = frac_months * 30.0 * JD_TO_MS as f64;
+                } else {
+                    if unit.eq_ignore_ascii_case("second") || unit.eq_ignore_ascii_case("seconds") {
+                        if !limit_check(val, 4.6427e+14) {
+                            return Err(InvalidModifier(format!("Modifier out of range: {z}")));
+                        }
+                        p.compute_jd().ok_or_else(|| overflow_err(z))?;
+                        let ms = val * 1000.0;
                         let rounder = if ms < 0.0 { -0.5 } else { 0.5 };
-                        p.i_jd = p.i_jd.wrapping_add((ms + rounder) as i64);
+                        p.i_jd = p
+                            .i_jd
+                            .checked_add((ms + rounder) as i64)
+                            .ok_or_else(|| overflow_err(z))?;
+                        p.n_floor = 0;
+                        p.clear_ymd_hms_tz();
+                        return Ok(());
                     }
-                    p.clear_ymd_hms_tz();
-                    return Ok(());
-                } else if unit.eq_ignore_ascii_case("year") || unit.eq_ignore_ascii_case("years") {
-                    if !limit_check(val, 14713.0) {
-                        return Err(InvalidModifier(format!("Modifier out of range: {z}")));
+                    if unit.eq_ignore_ascii_case("month") || unit.eq_ignore_ascii_case("months") {
+                        if !limit_check(val, 176546.0) {
+                            return Err(InvalidModifier(format!("Modifier out of range: {z}")));
+                        }
+                        p.compute_ymd_hms().ok_or_else(|| overflow_err(z))?;
+                        let int_months = val as i64;
+                        let frac_months = val - int_months as f64;
+
+                        let total_months = (p.m as i64) + int_months;
+                        let x = if total_months > 0 {
+                            (total_months - 1) / 12
+                        } else {
+                            (total_months - 12) / 12
+                        };
+                        p.y = p.y.checked_add(x as i32).ok_or_else(|| overflow_err(z))?;
+                        p.m = (total_months - x * 12) as i32;
+
+                        p.compute_floor().ok_or_else(|| overflow_err(z))?;
+                        p.valid_jd = false;
+                        p.compute_jd().ok_or_else(|| overflow_err(z))?;
+
+                        if frac_months.abs() > f64::EPSILON {
+                            let ms = frac_months * 30.0 * JD_TO_MS as f64;
+                            let rounder = if ms < 0.0 { -0.5 } else { 0.5 };
+                            p.i_jd = p
+                                .i_jd
+                                .checked_add((ms + rounder) as i64)
+                                .ok_or_else(|| overflow_err(z))?;
+                        }
+                        p.clear_ymd_hms_tz();
+                        return Ok(());
                     }
-                    p.compute_ymd_hms();
-                    let int_years = val as i64;
-                    let frac_years = val - int_years as f64;
+                    if unit.eq_ignore_ascii_case("year") || unit.eq_ignore_ascii_case("years") {
+                        if !limit_check(val, 14713.0) {
+                            return Err(InvalidModifier(format!("Modifier out of range: {z}")));
+                        }
+                        p.compute_ymd_hms().ok_or_else(|| overflow_err(z))?;
+                        let int_years = val as i64;
+                        let frac_years = val - int_years as f64;
 
-                    p.y = p.y.wrapping_add(int_years as i32);
+                        p.y =
+                            p.y.checked_add(int_years as i32)
+                                .ok_or_else(|| overflow_err(z))?;
 
-                    p.compute_floor();
-                    p.valid_jd = false;
-                    p.compute_jd();
+                        p.compute_floor().ok_or_else(|| overflow_err(z))?;
+                        p.valid_jd = false;
+                        p.compute_jd().ok_or_else(|| overflow_err(z))?;
 
-                    if frac_years.abs() > f64::EPSILON {
-                        let ms = frac_years * 365.0 * JD_TO_MS as f64;
-                        let rounder = if ms < 0.0 { -0.5 } else { 0.5 };
-                        p.i_jd = p.i_jd.wrapping_add((ms + rounder) as i64);
+                        if frac_years.abs() > f64::EPSILON {
+                            let ms = frac_years * 365.0 * JD_TO_MS as f64;
+                            let rounder = if ms < 0.0 { -0.5 } else { 0.5 };
+                            p.i_jd = p
+                                .i_jd
+                                .checked_add((ms + rounder) as i64)
+                                .ok_or_else(|| overflow_err(z))?;
+                        }
+                        p.clear_ymd_hms_tz();
+                        return Ok(());
                     }
-                    p.clear_ymd_hms_tz();
-                    return Ok(());
                 }
             }
         }
@@ -855,7 +926,33 @@ fn parse_arithmetic_modifier(p: &mut DateTime, z: &str) -> Result<()> {
     Err(InvalidModifier(format!("Invalid arithmetic modifier: {z}")))
 }
 
-pub fn exec_datetime_general<I, E, V>(values: I, func_type: &str) -> Value
+fn parse_datetime_value(val: ValueRef<'_>, p: &mut DateTime) -> Option<()> {
+    match val {
+        ValueRef::Text(s) => {
+            parse_date_or_time(s.as_str(), p).ok()?;
+        }
+        ValueRef::Numeric(Numeric::Integer(i)) => {
+            p.s = i as f64;
+            p.raw_s = true;
+            if p.s >= 0.0 && p.s < 5373484.5 {
+                p.i_jd = (p.s * JD_TO_MS as f64 + 0.5) as i64;
+                p.valid_jd = true;
+            }
+        }
+        ValueRef::Numeric(Numeric::Float(f)) => {
+            p.s = f64::from(f);
+            p.raw_s = true;
+            if p.s >= 0.0 && p.s < 5373484.5 {
+                p.i_jd = (p.s * JD_TO_MS as f64 + 0.5) as i64;
+                p.valid_jd = true;
+            }
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+fn exec_datetime_general_inner<I, E, V>(values: I, func_type: &str) -> Option<Value>
 where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
@@ -868,47 +965,22 @@ where
     if values.len() == 0 {
         set_to_current(&mut p);
     } else {
-        let first = values.next().unwrap();
-        match first.as_value_ref() {
-            ValueRef::Text(s) => {
-                if parse_date_or_time(s.as_str(), &mut p).is_err() {
-                    return Value::Null;
-                }
-            }
-            ValueRef::Numeric(Numeric::Integer(i)) => {
-                p.s = i as f64;
-                p.raw_s = true;
-                if p.s >= 0.0 && p.s < 5373484.5 {
-                    p.i_jd = (p.s * JD_TO_MS as f64 + 0.5) as i64;
-                    p.valid_jd = true;
-                }
-            }
-            ValueRef::Numeric(Numeric::Float(f)) => {
-                p.s = f64::from(f);
-                p.raw_s = true;
-                if p.s >= 0.0 && p.s < 5373484.5 {
-                    p.i_jd = (p.s * JD_TO_MS as f64 + 0.5) as i64;
-                    p.valid_jd = true;
-                }
-            }
-            _ => return Value::Null,
-        }
+        let first = values.next()?;
+        parse_datetime_value(first.as_value_ref(), &mut p)?;
     }
 
     for (i, val) in values.enumerate() {
         has_modifier = true;
         if let ValueRef::Text(s) = val.as_value_ref() {
-            if parse_modifier(&mut p, s.as_str(), i).is_err() {
-                return Value::Null;
-            }
+            parse_modifier(&mut p, s.as_str(), i).ok()?;
         } else {
-            return Value::Null;
+            return None;
         }
     }
 
-    p.compute_jd();
-    if p.is_error || p.i_jd < 0 || p.i_jd > MAX_JD {
-        return Value::Null;
+    p.compute_jd()?;
+    if p.i_jd < 0 || p.i_jd > MAX_JD {
+        return None;
     }
 
     if !has_modifier && p.valid_ymd && p.d > 28 {
@@ -916,21 +988,18 @@ where
     }
 
     match func_type {
-        "julianday" => Value::from_f64(p.i_jd as f64 / 86400000.0),
+        "julianday" => Some(Value::from_f64(p.i_jd as f64 / 86400000.0)),
         "unixepoch" => {
             let unix = (p.i_jd - 210866760000000) / 1000;
             if p.use_subsec {
                 let ms = (p.i_jd - 210866760000000) as f64 / 1000.0;
-                Value::from_f64(ms)
+                Some(Value::from_f64(ms))
             } else {
-                Value::from_i64(unix)
+                Some(Value::from_i64(unix))
             }
         }
         _ => {
-            p.compute_ymd_hms();
-            if p.is_error {
-                return Value::Null;
-            }
+            p.compute_ymd_hms()?;
 
             let mut res = String::new();
             if func_type == "date" {
@@ -973,9 +1042,18 @@ where
                     write!(res, ":{:02}", p.s as i32).unwrap();
                 }
             }
-            Value::from_text(res)
+            Some(Value::from_text(res))
         }
     }
+}
+
+pub fn exec_datetime_general<I, E, V>(values: I, func_type: &str) -> Value
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
+    exec_datetime_general_inner(values, func_type).unwrap_or(Value::Null)
 }
 
 pub fn exec_date<I, E, V>(values: I) -> Value
@@ -1023,7 +1101,7 @@ where
     exec_datetime_general(values, "unixepoch")
 }
 
-pub fn exec_timediff<I, E, V>(values: I) -> Value
+fn exec_timediff_inner<I, E, V>(values: I) -> Option<Value>
 where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
@@ -1031,76 +1109,22 @@ where
 {
     let mut values = values.into_iter();
     if values.len() < 2 {
-        return Value::Null;
+        return None;
     }
 
     let mut d1 = DateTime::default();
     let mut d2 = DateTime::default();
 
-    // Parse first argument (d1)
-    let val1 = values.next().unwrap();
-    match val1.as_value_ref() {
-        ValueRef::Text(s) => {
-            if parse_date_or_time(s.as_str(), &mut d1).is_err() {
-                return Value::Null;
-            }
-        }
-        ValueRef::Numeric(Numeric::Integer(i)) => {
-            d1.s = i as f64;
-            d1.raw_s = true;
-            if d1.s >= 0.0 && d1.s < 5373484.5 {
-                d1.i_jd = (d1.s * JD_TO_MS as f64 + 0.5) as i64;
-                d1.valid_jd = true;
-            }
-        }
-        ValueRef::Numeric(Numeric::Float(f)) => {
-            d1.s = f64::from(f);
-            d1.raw_s = true;
-            if d1.s >= 0.0 && d1.s < 5373484.5 {
-                d1.i_jd = (d1.s * JD_TO_MS as f64 + 0.5) as i64;
-                d1.valid_jd = true;
-            }
-        }
-        _ => return Value::Null,
-    }
+    let val1 = values.next()?;
+    parse_datetime_value(val1.as_value_ref(), &mut d1)?;
 
-    // Parse second argument (d2)
-    let val2 = values.next().unwrap();
-    match val2.as_value_ref() {
-        ValueRef::Text(s) => {
-            if parse_date_or_time(s.as_str(), &mut d2).is_err() {
-                return Value::Null;
-            }
-        }
-        ValueRef::Numeric(Numeric::Integer(i)) => {
-            d2.s = i as f64;
-            d2.raw_s = true;
-            if d2.s >= 0.0 && d2.s < 5373484.5 {
-                d2.i_jd = (d2.s * JD_TO_MS as f64 + 0.5) as i64;
-                d2.valid_jd = true;
-            }
-        }
-        ValueRef::Numeric(Numeric::Float(f)) => {
-            d2.s = f64::from(f);
-            d2.raw_s = true;
-            if d2.s >= 0.0 && d2.s < 5373484.5 {
-                d2.i_jd = (d2.s * JD_TO_MS as f64 + 0.5) as i64;
-                d2.valid_jd = true;
-            }
-        }
-        _ => return Value::Null,
-    }
+    let val2 = values.next()?;
+    parse_datetime_value(val2.as_value_ref(), &mut d2)?;
 
-    d1.compute_jd();
-    d2.compute_jd();
-
-    // Validate inputs after computation
-    if d1.is_error || d2.is_error {
-        return Value::Null;
-    }
-
-    d1.compute_ymd_hms();
-    d2.compute_ymd_hms();
+    d1.compute_jd()?;
+    d2.compute_jd()?;
+    d1.compute_ymd_hms()?;
+    d2.compute_ymd_hms()?;
 
     let sign: char;
     if d1.i_jd >= d2.i_jd {
@@ -1133,7 +1157,7 @@ where
     }
 
     temp.valid_jd = false;
-    temp.compute_jd();
+    temp.compute_jd()?;
 
     // Adjust if the Y/M shift overshot d1
     while temp.i_jd > d1.i_jd {
@@ -1154,7 +1178,7 @@ where
             temp.y -= 1;
         }
         temp.valid_jd = false;
-        temp.compute_jd();
+        temp.compute_jd()?;
     }
 
     let diff_ms = d1.i_jd - temp.i_jd;
@@ -1173,10 +1197,19 @@ where
     )
     .unwrap();
 
-    Value::from_text(res)
+    Some(Value::from_text(res))
 }
 
-pub fn exec_strftime<I, E, V>(values: I) -> Value
+pub fn exec_timediff<I, E, V>(values: I) -> Value
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
+    exec_timediff_inner(values).unwrap_or(Value::Null)
+}
+
+fn exec_strftime_inner<I, E, V>(values: I) -> Option<Value>
 where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
@@ -1184,13 +1217,13 @@ where
 {
     let mut values = values.into_iter();
     if values.len() < 1 {
-        return Value::Null;
+        return None;
     }
 
-    let fmt_val = values.next().unwrap();
+    let fmt_val = values.next()?;
     let fmt_str = match fmt_val.as_value_ref() {
         ValueRef::Text(s) => Cow::Borrowed(s.as_str()),
-        ValueRef::Null => return Value::Null,
+        ValueRef::Null => return None,
         val => Cow::Owned(val.to_string()),
     };
 
@@ -1198,7 +1231,7 @@ where
     if values.len() == 0 {
         set_to_current(&mut p);
     } else {
-        let init_val = values.next().unwrap();
+        let init_val = values.next()?;
         match init_val.as_value_ref() {
             ValueRef::Text(s) => {
                 let s_str = s.as_str();
@@ -1213,11 +1246,8 @@ where
                     }
                 } else {
                     let mut temp_p = DateTime::default();
-                    if parse_date_or_time(s_str, &mut temp_p).is_ok() {
-                        p = temp_p;
-                    } else {
-                        return Value::Null;
-                    }
+                    parse_date_or_time(s_str, &mut temp_p).ok()?;
+                    p = temp_p;
                 }
             }
             ValueRef::Numeric(Numeric::Integer(i)) => {
@@ -1236,51 +1266,45 @@ where
                     p.valid_jd = true;
                 }
             }
-            _ => return Value::Null,
+            _ => return None,
         }
 
         for (i, val) in values.enumerate() {
             if let ValueRef::Text(s) = val.as_value_ref() {
-                if parse_modifier(&mut p, s.as_str(), i).is_err() {
-                    return Value::Null;
-                }
+                parse_modifier(&mut p, s.as_str(), i).ok()?;
             } else {
-                return Value::Null;
+                return None;
             }
         }
     }
 
-    p.compute_jd();
-    if p.is_error {
-        return Value::Null;
+    p.compute_jd()?;
+    if p.i_jd < 0 || p.i_jd > MAX_JD {
+        return None;
     }
 
-    p.compute_ymd_hms();
+    p.compute_ymd_hms()?;
 
     let mut res = String::new();
     let mut chars = fmt_str.chars().peekable();
 
     let days_after_jan1 = |curr: &DateTime| -> Option<i64> {
-        let jan1 = DateTime {
+        let mut j1 = DateTime {
             y: curr.y,
             m: 1,
             d: 1,
             valid_ymd: true,
             ..Default::default()
         };
-        let mut j1 = jan1;
-        j1.compute_jd();
-        let curr_norm = DateTime {
+        j1.compute_jd()?;
+        let mut c1 = DateTime {
             y: curr.y,
             m: curr.m,
             d: curr.d,
             valid_ymd: true,
             ..Default::default()
         };
-        let mut c1 = curr_norm;
-        c1.compute_jd();
-
-        // Check for potential overflow before subtraction
+        c1.compute_jd()?;
         c1.i_jd
             .checked_sub(j1.i_jd)
             .and_then(|diff| diff.checked_div(JD_TO_MS))
@@ -1310,14 +1334,14 @@ where
                 let mut y_iso = p;
                 y_iso.i_jd += (3 - days_after_mon(&p)) * 86400000;
                 y_iso.valid_ymd = false;
-                y_iso.compute_ymd();
+                y_iso.compute_ymd()?;
                 write!(res, "{:02}", y_iso.y % 100).unwrap();
             }
             Some('G') => {
                 let mut y_iso = p;
                 y_iso.i_jd += (3 - days_after_mon(&p)) * 86400000;
                 y_iso.valid_ymd = false;
-                y_iso.compute_ymd();
+                y_iso.compute_ymd()?;
                 write!(res, "{:04}", y_iso.y).unwrap();
             }
             Some('H') => write!(res, "{:02}", p.h).unwrap(),
@@ -1325,10 +1349,10 @@ where
                 let h = if p.h % 12 == 0 { 12 } else { p.h % 12 };
                 write!(res, "{h:02}").unwrap();
             }
-            Some('j') => match days_after_jan1(&p) {
-                Some(days) => write!(res, "{:03}", days + 1).unwrap(),
-                None => return Value::Null,
-            },
+            Some('j') => {
+                let days = days_after_jan1(&p)?;
+                write!(res, "{:03}", days + 1).unwrap();
+            }
             Some('J') => {
                 let val = p.i_jd as f64 / 86400000.0;
                 if val.abs() >= 1_000_000.0 && val.abs() < 10_000_000.0 {
@@ -1365,44 +1389,44 @@ where
                 }
                 write!(res, "{w}").unwrap();
             }
-            Some('U') => match days_after_jan1(&p) {
-                Some(days) => {
-                    let w = (days - days_after_sun(&p) + 7) / 7;
-                    write!(res, "{w:02}").unwrap();
-                }
-                None => return Value::Null,
-            },
-
+            Some('U') => {
+                let days = days_after_jan1(&p)?;
+                let w = (days - days_after_sun(&p) + 7) / 7;
+                write!(res, "{w:02}").unwrap();
+            }
             Some('V') => {
                 let mut temp = p;
                 temp.i_jd += (3 - days_after_mon(&p)) * 86400000;
                 temp.valid_ymd = false;
-                temp.compute_ymd();
-                match days_after_jan1(&temp) {
-                    Some(days) => {
-                        let w = days / 7 + 1;
-                        write!(res, "{w:02}").unwrap();
-                    }
-                    None => return Value::Null,
-                }
+                temp.compute_ymd()?;
+                let days = days_after_jan1(&temp)?;
+                let w = days / 7 + 1;
+                write!(res, "{w:02}").unwrap();
             }
             Some('w') => {
                 write!(res, "{}", days_after_sun(&p)).unwrap();
             }
-            Some('W') => match days_after_jan1(&p) {
-                Some(days) => {
-                    let w = (days - days_after_mon(&p) + 7) / 7;
-                    write!(res, "{w:02}").unwrap();
-                }
-                None => return Value::Null,
-            },
+            Some('W') => {
+                let days = days_after_jan1(&p)?;
+                let w = (days - days_after_mon(&p) + 7) / 7;
+                write!(res, "{w:02}").unwrap();
+            }
             Some('Y') => write!(res, "{:04}", p.y).unwrap(),
             Some('%') => res.push('%'),
-            _ => return Value::Null,
+            _ => return None,
         }
     }
 
-    Value::from_text(res)
+    Some(Value::from_text(res))
+}
+
+pub fn exec_strftime<I, E, V>(values: I) -> Value
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
+    exec_strftime_inner(values).unwrap_or(Value::Null)
 }
 
 #[cfg(test)]
@@ -1696,7 +1720,7 @@ mod tests {
     fn test_parse_days() {
         let get_days = |s: &str| -> f64 {
             let mut p = DateTime::default();
-            p.compute_jd();
+            p.compute_jd().expect("compute_jd failed");
             let start_jd = p.i_jd;
             parse_modifier(&mut p, s, 1).expect("Failed to parse modifier");
             (p.i_jd - start_jd) as f64 / 86_400_000.0
@@ -1717,7 +1741,7 @@ mod tests {
     fn test_parse_hours() {
         let get_hours = |s: &str| -> f64 {
             let mut p = DateTime::default();
-            p.compute_jd();
+            p.compute_jd().expect("compute_jd failed");
             let start_jd = p.i_jd;
             parse_modifier(&mut p, s, 1).expect("Failed to parse modifier");
             (p.i_jd - start_jd) as f64 / 3_600_000.0
@@ -1734,7 +1758,7 @@ mod tests {
     fn test_parse_minutes() {
         let get_minutes = |s: &str| -> f64 {
             let mut p = DateTime::default();
-            p.compute_jd();
+            p.compute_jd().expect("compute_jd failed");
             let start_jd = p.i_jd;
             parse_modifier(&mut p, s, 1).expect("Failed to parse modifier");
             (p.i_jd - start_jd) as f64 / 60_000.0
@@ -1749,7 +1773,7 @@ mod tests {
     fn test_parse_seconds() {
         let get_seconds = |s: &str| -> f64 {
             let mut p = DateTime::default();
-            p.compute_jd();
+            p.compute_jd().expect("compute_jd failed");
             let start_jd = p.i_jd;
             parse_modifier(&mut p, s, 1).expect("Failed to parse modifier");
             (p.i_jd - start_jd) as f64 / 1000.0
@@ -1793,7 +1817,7 @@ mod tests {
     fn test_parse_time_offset() {
         let get_ms_change = |s: &str| -> i64 {
             let mut p = DateTime::default();
-            p.compute_jd();
+            p.compute_jd().expect("compute_jd failed");
             let start_jd = p.i_jd;
             parse_modifier(&mut p, s, 1).expect("Failed to parse modifier");
             p.i_jd - start_jd
