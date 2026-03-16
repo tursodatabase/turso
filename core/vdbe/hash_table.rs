@@ -3224,7 +3224,7 @@ impl HashTable {
 #[cfg(test)]
 mod hashtests {
     use super::*;
-    use crate::io::{Buffer, File};
+    use crate::io::Buffer;
     use crate::MemoryIO;
 
     #[test]
