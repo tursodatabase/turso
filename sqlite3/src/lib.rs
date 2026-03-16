@@ -1,7 +1,6 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(non_camel_case_types)]
 
-use std::collections::HashMap;
 use std::ffi::{self, CStr, CString};
 use std::num::{NonZero, NonZeroUsize};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -9,21 +8,6 @@ use tracing::trace;
 use turso_core::{CheckpointMode, LimboError, Value};
 use turso_ext::ScalarFunction;
 use turso_ext::Value as ExtValue;
-
-/// Registry of named in-memory databases. When a URI like
-/// `file:name?mode=memory&cache=shared` is opened, the MemoryIO is stored here
-/// so subsequent opens of the same name share the same in-memory storage
-/// (matching SQLite's cache=shared behavior for in-memory databases).
-static MEMORY_DB_REGISTRY: OnceLock<Mutex<HashMap<String, Arc<dyn turso_core::IO>>>> =
-    OnceLock::new();
-
-fn get_or_create_memory_io(name: &str) -> Arc<dyn turso_core::IO> {
-    let registry = MEMORY_DB_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut map = registry.lock().unwrap();
-    map.entry(name.to_string())
-        .or_insert_with(|| Arc::new(turso_core::MemoryIO::new()))
-        .clone()
-}
 
 macro_rules! stub {
     () => {
@@ -498,15 +482,12 @@ pub unsafe extern "C" fn sqlite3_open_v2(
             (filename_str.to_string(), false)
         };
 
+    // TODO: Named memory URIs with cache=shared (e.g. file:name?mode=memory&cache=shared)
+    // should share the same MemoryIO across connections. This requires using core's
+    // existing database registry plumbing (similar to ATTACH ':memory:' AS aux).
+    // See: https://github.com/tursodatabase/turso/pull/5932#discussion_r2941454614
     let io: Arc<dyn turso_core::IO> = if use_memory {
-        if effective_filename == ":memory:" {
-            // Plain :memory: always gets a fresh, independent MemoryIO
-            Arc::new(turso_core::MemoryIO::new())
-        } else {
-            // Named memory URIs (e.g. file:name?mode=memory&cache=shared)
-            // share the same MemoryIO so multiple connections see the same data
-            get_or_create_memory_io(&effective_filename)
-        }
+        Arc::new(turso_core::MemoryIO::new())
     } else {
         match turso_core::PlatformIO::new() {
             Ok(io) => Arc::new(io),
