@@ -1001,13 +1001,14 @@ impl ToTokens for Expr {
                 op.to_tokens(s, context)?;
                 sub_expr.to_tokens(s, context)
             }
-            Self::Variable(var) => match var.chars().next() {
-                Some(c) if c == '$' || c == '@' || c == '#' || c == ':' => {
-                    s.append(TK_VARIABLE, Some(var))
+            Self::Variable(var) => {
+                if let Some(name) = var.name.as_deref() {
+                    return s.append(TK_VARIABLE, Some(name));
                 }
-                Some(_) => s.append(TK_VARIABLE, Some(&("?".to_owned() + var))),
-                None => s.append(TK_VARIABLE, Some("?")),
-            },
+
+                let indexed = format!("?{}", var.index.get());
+                s.append(TK_VARIABLE, Some(indexed.as_str()))
+            }
             Self::Array { elements } => {
                 s.append(TK_ID, Some("ARRAY"))?;
                 s.append(TK_LBRACKET, None)?;

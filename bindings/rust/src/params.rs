@@ -60,12 +60,15 @@ use sealed::Sealed;
 ///
 /// # Named parameters
 ///
+/// Named parameter keys must include the SQL prefix used in the statement,
+/// for example `:name`, `@name`, `$name`, or `?1`.
+///
 /// - For heterogeneous parameter lists of 16 or less items a tuple syntax is supported
-///   by doing `(("key1", 1), ("key2", "foo"))`.
-/// - For hetergeneous parameter lists of 16 or greater, the [`turso::params!`] is supported
-///   by doing `turso::named_params!["key1": 1, "key2": "foo"]`.
+///   by doing `((":key1", 1), (":key2", "foo"))`.
+/// - For heterogeneous parameter lists of 16 or greater, the [`turso::params!`] is supported
+///   by doing `turso::named_params![":key1": 1, ":key2": "foo"]`.
 /// - For homogeneous parameter types (where they are all the same type), const arrays are
-///   supported by doing `[("key1", 1), ("key2, 2), ("key3", 3)]`.
+///   supported by doing `[(":key1", 1), (":key2", 2), (":key3", 3)]`.
 ///
 /// # Example (named)
 ///
@@ -276,7 +279,7 @@ impl IntoValue for Result<Value> {
     }
 }
 
-/// Construct positional params from a hetergeneous set of params types.
+/// Construct positional params from a heterogeneous set of params types.
 #[macro_export]
 macro_rules! params {
     () => {
@@ -289,7 +292,7 @@ macro_rules! params {
     }};
 }
 
-/// Construct named params from a hetergeneous set of params types.
+/// Construct named params from a heterogeneous set of params types.
 #[macro_export]
 macro_rules! named_params {
     () => {
