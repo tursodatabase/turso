@@ -2633,7 +2633,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         if !rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states) {
                             continue;
                         }
-                        if is_write_write_conflict(&self.txs, &self.finalized_tx_states, tx, rv) {
+                        if is_write_write_conflict(&self.txs, &self.finalized_tx_states, tx, rv)
+                            && !self.is_exclusive_tx(&tx.tx_id)
+                        {
                             turso_assert_reachable!("write-write conflict on delete");
                             drop(row_versions);
                             drop(row_versions_opt);
@@ -2670,7 +2672,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         if !rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states) {
                             continue;
                         }
-                        if is_write_write_conflict(&self.txs, &self.finalized_tx_states, tx, rv) {
+                        if is_write_write_conflict(&self.txs, &self.finalized_tx_states, tx, rv)
+                            && !self.is_exclusive_tx(&tx.tx_id)
+                        {
                             turso_assert_reachable!("write-write conflict on delete");
                             drop(row_versions);
                             drop(row_versions_opt);
