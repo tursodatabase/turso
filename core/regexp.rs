@@ -9,6 +9,9 @@ pub fn register_extension(ext_api: &mut ExtensionApi) {
 
 #[scalar(name = "regexp")]
 fn regexp(args: &[Value]) -> Value {
+    if !(1..=2).contains(&args.len()) {
+        return Value::error_with_message("wrong number of arguments to function regexp()".into());
+    }
     let Some(pattern) = args[0].to_text_coerced() else {
         return Value::null();
     };
