@@ -858,7 +858,7 @@ pub fn resolve_expr(
     expr: &ast::Expr,
     resolver: &Resolver,
 ) -> Result<usize> {
-    if let Some((reg, needs_decode)) = resolver.resolve_cached_expr_reg(expr) {
+    if let Some((reg, needs_decode, _collation)) = resolver.resolve_cached_expr_reg(expr) {
         if !needs_decode {
             return Ok(reg);
         }
