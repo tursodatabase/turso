@@ -670,19 +670,6 @@ pub fn translate_alter_table(
 
             // References in VIEWs are checked in the VDBE layer op_drop_column instruction.
 
-            // Check if any trigger owned by this table references the column being dropped
-            let triggers_for_table: Vec<_> = resolver.with_schema(database_id, |s| {
-                s.get_triggers_for_table(table_name).cloned().collect()
-            });
-            for trigger in &triggers_for_table {
-                if trigger_references_column(trigger, &btree, column_name)? {
-                    return Err(LimboError::ParseError(format!(
-                        "cannot drop column \"{column_name}\": it is referenced in trigger {}",
-                        trigger.name
-                    )));
-                }
-            }
-
             // Like SQLite, re-validate ALL triggers after the drop. Any trigger whose
             // body references a nonexistent column (in the altered table or any other
             // table) causes the DROP to fail. This catches cross-table references to
@@ -1650,531 +1637,6 @@ fn translate_rename_virtual_table(
 Here are some helpers related to that: */
 
 /// Check if a trigger contains qualified references to a specific column in its owning table.
-/// This is used to detect cases like `t.x` in a trigger on table `t`, which SQLite fails on RENAME COLUMN.
-/// Only checks for qualified table references (e.g., t.x), not NEW.x, OLD.x, or unqualified x.
-/// Check if an expression references a specific column from a trigger's owning table.
-/// Checks for NEW.column, OLD.column, unqualified column references, and qualified
-/// references to the trigger table (e.g., t.x in a trigger on table t).
-/// Returns true if the column is found, false otherwise.
-fn expr_references_trigger_column(
-    expr: &ast::Expr,
-    table: &BTreeTable,
-    trigger_table_name: &str,
-    column_name_norm: &str,
-) -> Result<bool> {
-    use crate::translate::expr::walk_expr;
-    let trigger_table_name_norm = normalize_ident(trigger_table_name);
-    let mut found = false;
-    walk_expr(expr, &mut |e: &ast::Expr| -> Result<
-        crate::translate::expr::WalkControl,
-    > {
-        match e {
-            ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) => {
-                let ns_norm = normalize_ident(ns.as_str());
-                let col_norm = normalize_ident(col.as_str());
-
-                // Check NEW.column or OLD.column
-                if (ns_norm.eq_ignore_ascii_case("new") || ns_norm.eq_ignore_ascii_case("old"))
-                    && col_norm == *column_name_norm
-                {
-                    found = true;
-                    return Ok(crate::translate::expr::WalkControl::SkipChildren);
-                }
-                // Check qualified reference to trigger table (e.g., t.x)
-                if ns_norm == trigger_table_name_norm
-                    && col_norm == *column_name_norm
-                    && table.get_column(&col_norm).is_some()
-                {
-                    found = true;
-                    return Ok(crate::translate::expr::WalkControl::SkipChildren);
-                }
-            }
-            ast::Expr::Id(col) => {
-                // Unqualified column reference - check if it matches
-                let col_norm = normalize_ident(col.as_str());
-                if col_norm == *column_name_norm {
-                    // Verify this column exists in the trigger's owning table
-                    if table.get_column(&col_norm).is_some() {
-                        found = true;
-                        return Ok(crate::translate::expr::WalkControl::SkipChildren);
-                    }
-                }
-            }
-            _ => {}
-        }
-        Ok(crate::translate::expr::WalkControl::Continue)
-    })?;
-    Ok(found)
-}
-
-/// Check if a trigger references a specific column from its owning table.
-/// Returns true if the column is referenced as old.x, new.x, or unqualified x.
-fn trigger_references_column(
-    trigger: &crate::schema::Trigger,
-    table: &BTreeTable,
-    column_name: &str,
-) -> Result<bool> {
-    let column_name_norm = normalize_ident(column_name);
-    let mut found = false;
-
-    // Check when_clause
-    if let Some(ref when_expr) = trigger.when_clause {
-        // Get trigger table name for checking qualified references
-        let trigger_table_name = normalize_ident(&trigger.table_name);
-        found = expr_references_trigger_column(
-            when_expr,
-            table,
-            &trigger_table_name,
-            &column_name_norm,
-        )?;
-    }
-
-    if found {
-        return Ok(true);
-    }
-
-    // Check all trigger commands
-    // Note: We only check NEW.x, OLD.x, and unqualified x references in expressions.
-    // INSERT column lists and UPDATE SET column lists are NOT checked here because
-    // SQLite allows DROP COLUMN even when triggers reference columns in INSERT/UPDATE
-    // column lists targeting the owning table. The error only occurs when the trigger
-    // is actually executed.
-    for cmd in &trigger.commands {
-        match cmd {
-            ast::TriggerCmd::Update {
-                sets, where_clause, ..
-            } => {
-                // Check SET expressions (not column names in SET clause)
-                let trigger_table_name = normalize_ident(&trigger.table_name);
-                for set in sets {
-                    if expr_references_trigger_column(
-                        &set.expr,
-                        table,
-                        &trigger_table_name,
-                        &column_name_norm,
-                    )? {
-                        found = true;
-                        break;
-                    }
-                }
-                // Check WHERE clause
-                if !found {
-                    if let Some(ref where_expr) = where_clause {
-                        found = expr_references_trigger_column(
-                            where_expr,
-                            table,
-                            &trigger_table_name,
-                            &column_name_norm,
-                        )?;
-                    }
-                }
-            }
-            ast::TriggerCmd::Insert { select, .. } => {
-                // Check SELECT/VALUES expressions (not column names in INSERT clause)
-                let trigger_table_name = normalize_ident(&trigger.table_name);
-                walk_select_expressions(
-                    select,
-                    table,
-                    &trigger_table_name,
-                    &column_name_norm,
-                    &mut found,
-                )?;
-            }
-            ast::TriggerCmd::Delete { where_clause, .. } => {
-                if let Some(ref where_expr) = where_clause {
-                    let trigger_table_name = normalize_ident(&trigger.table_name);
-                    found = expr_references_trigger_column(
-                        where_expr,
-                        table,
-                        &trigger_table_name,
-                        &column_name_norm,
-                    )?;
-                }
-            }
-            ast::TriggerCmd::Select(select) => {
-                let trigger_table_name = normalize_ident(&trigger.table_name);
-                walk_select_expressions(
-                    select,
-                    table,
-                    &trigger_table_name,
-                    &column_name_norm,
-                    &mut found,
-                )?;
-            }
-        }
-        if found {
-            break;
-        }
-    }
-
-    Ok(found)
-}
-
-/// Helper to check if an expression references a column.
-/// Used as a callback within walk_expr, so it mutates a found flag.
-/// Also checks for qualified references to the trigger table (e.g., t.x).
-fn check_column_ref(
-    e: &ast::Expr,
-    table: &BTreeTable,
-    trigger_table_name: &str,
-    column_name_norm: &str,
-    found: &mut bool,
-) -> Result<()> {
-    let trigger_table_name_norm = normalize_ident(trigger_table_name);
-    match e {
-        ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) => {
-            let ns_norm = normalize_ident(ns.as_str());
-            let col_norm = normalize_ident(col.as_str());
-
-            let new_or_old = (ns_norm.eq_ignore_ascii_case("new")
-                || ns_norm.eq_ignore_ascii_case("old"))
-                && col_norm == *column_name_norm;
-            let qualified_ref = ns_norm == trigger_table_name_norm
-                && col_norm == *column_name_norm
-                && table.get_column(&col_norm).is_some();
-            if new_or_old || qualified_ref {
-                *found = true;
-            }
-        }
-        ast::Expr::Id(col) => {
-            // Unqualified column reference - check if it matches
-            let col_norm = normalize_ident(col.as_str());
-            if col_norm == *column_name_norm {
-                // Verify this column exists in the trigger's owning table
-                if table.get_column(&col_norm).is_some() {
-                    *found = true;
-                }
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-/// Walk through all expressions in a SELECT statement
-fn walk_select_expressions(
-    select: &ast::Select,
-    table: &BTreeTable,
-    trigger_table_name: &str,
-    column_name_norm: &str,
-    found: &mut bool,
-) -> Result<()> {
-    // Check WITH clause (CTEs)
-    if let Some(ref with_clause) = select.with {
-        for cte in &with_clause.ctes {
-            walk_select_expressions(
-                &cte.select,
-                table,
-                trigger_table_name,
-                column_name_norm,
-                found,
-            )?;
-            if *found {
-                return Ok(());
-            }
-        }
-    }
-
-    // Check main SELECT body
-    walk_one_select_expressions(
-        &select.body.select,
-        table,
-        trigger_table_name,
-        column_name_norm,
-        found,
-    )?;
-    if *found {
-        return Ok(());
-    }
-
-    // Check compound SELECTs (UNION, EXCEPT, INTERSECT)
-    for compound in &select.body.compounds {
-        walk_one_select_expressions(
-            &compound.select,
-            table,
-            trigger_table_name,
-            column_name_norm,
-            found,
-        )?;
-        if *found {
-            return Ok(());
-        }
-    }
-
-    // Check ORDER BY
-    for sorted_col in &select.order_by {
-        walk_expr(
-            &sorted_col.expr,
-            &mut |e: &ast::Expr| -> Result<WalkControl> {
-                check_column_ref(e, table, trigger_table_name, column_name_norm, found)?;
-                Ok(WalkControl::Continue)
-            },
-        )?;
-        if *found {
-            return Ok(());
-        }
-    }
-
-    // Check LIMIT
-    if let Some(ref limit) = select.limit {
-        walk_expr(&limit.expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
-            check_column_ref(e, table, trigger_table_name, column_name_norm, found)?;
-            Ok(WalkControl::Continue)
-        })?;
-        if *found {
-            return Ok(());
-        }
-        if let Some(ref offset) = limit.offset {
-            walk_expr(offset, &mut |e: &ast::Expr| -> Result<WalkControl> {
-                check_column_ref(e, table, trigger_table_name, column_name_norm, found)?;
-                Ok(WalkControl::Continue)
-            })?;
-            if *found {
-                return Ok(());
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Walk through all expressions in a OneSelect
-fn walk_one_select_expressions(
-    one_select: &ast::OneSelect,
-    table: &BTreeTable,
-    trigger_table_name: &str,
-    column_name_norm: &str,
-    found: &mut bool,
-) -> Result<()> {
-    match one_select {
-        ast::OneSelect::Select {
-            columns,
-            from,
-            where_clause,
-            group_by,
-            window_clause,
-            ..
-        } => {
-            // Check columns
-            for col in columns {
-                if let ast::ResultColumn::Expr(expr, _) = col {
-                    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
-                        check_column_ref(e, table, trigger_table_name, column_name_norm, found)?;
-                        Ok(WalkControl::Continue)
-                    })?;
-                    if *found {
-                        return Ok(());
-                    }
-                }
-            }
-
-            // Check FROM clause and JOIN conditions
-            if let Some(ref from_clause) = from {
-                walk_from_clause_expressions(
-                    from_clause,
-                    table,
-                    trigger_table_name,
-                    column_name_norm,
-                    found,
-                )?;
-                if *found {
-                    return Ok(());
-                }
-            }
-
-            // Check WHERE clause
-            if let Some(ref where_expr) = where_clause {
-                walk_expr(where_expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
-                    check_column_ref(e, table, trigger_table_name, column_name_norm, found)?;
-                    Ok(WalkControl::Continue)
-                })?;
-                if *found {
-                    return Ok(());
-                }
-            }
-
-            // Check GROUP BY and HAVING
-            if let Some(ref group_by) = group_by {
-                for expr in &group_by.exprs {
-                    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
-                        check_column_ref(e, table, trigger_table_name, column_name_norm, found)?;
-                        Ok(WalkControl::Continue)
-                    })?;
-                    if *found {
-                        return Ok(());
-                    }
-                }
-                if let Some(ref having_expr) = group_by.having {
-                    walk_expr(having_expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
-                        check_column_ref(e, table, trigger_table_name, column_name_norm, found)?;
-                        Ok(WalkControl::Continue)
-                    })?;
-                    if *found {
-                        return Ok(());
-                    }
-                }
-            }
-
-            // Check WINDOW clause
-            for window_def in window_clause {
-                walk_window_expressions(
-                    &window_def.window,
-                    table,
-                    trigger_table_name,
-                    column_name_norm,
-                    found,
-                )?;
-                if *found {
-                    return Ok(());
-                }
-            }
-        }
-        ast::OneSelect::Values(values) => {
-            for row in values {
-                for expr in row {
-                    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
-                        check_column_ref(e, table, trigger_table_name, column_name_norm, found)?;
-                        Ok(WalkControl::Continue)
-                    })?;
-                    if *found {
-                        return Ok(());
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Walk through expressions in a FROM clause (including JOIN conditions)
-fn walk_from_clause_expressions(
-    from_clause: &ast::FromClause,
-    table: &BTreeTable,
-    trigger_table_name: &str,
-    column_name_norm: &str,
-    found: &mut bool,
-) -> Result<()> {
-    // Check main table (could be a subquery)
-    walk_select_table_expressions(
-        &from_clause.select,
-        table,
-        trigger_table_name,
-        column_name_norm,
-        found,
-    )?;
-    if *found {
-        return Ok(());
-    }
-
-    // Check JOIN conditions
-    for join in &from_clause.joins {
-        walk_select_table_expressions(
-            &join.table,
-            table,
-            trigger_table_name,
-            column_name_norm,
-            found,
-        )?;
-        if *found {
-            return Ok(());
-        }
-        if let Some(ref constraint) = join.constraint {
-            match constraint {
-                ast::JoinConstraint::On(expr) => {
-                    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
-                        check_column_ref(e, table, trigger_table_name, column_name_norm, found)?;
-                        Ok(WalkControl::Continue)
-                    })?;
-                    if *found {
-                        return Ok(());
-                    }
-                }
-                ast::JoinConstraint::Using(_) => {
-                    // USING clause contains column names, not expressions
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Walk through expressions in a SelectTable (table, subquery, or table function)
-fn walk_select_table_expressions(
-    select_table: &ast::SelectTable,
-    table: &BTreeTable,
-    trigger_table_name: &str,
-    column_name_norm: &str,
-    found: &mut bool,
-) -> Result<()> {
-    match select_table {
-        ast::SelectTable::Select(select, _) => {
-            walk_select_expressions(select, table, trigger_table_name, column_name_norm, found)?;
-        }
-        ast::SelectTable::Sub(from_clause, _) => {
-            walk_from_clause_expressions(
-                from_clause,
-                table,
-                trigger_table_name,
-                column_name_norm,
-                found,
-            )?;
-        }
-        ast::SelectTable::TableCall(_, args, _) => {
-            for arg in args {
-                walk_expr(arg, &mut |e: &ast::Expr| -> Result<WalkControl> {
-                    check_column_ref(e, table, trigger_table_name, column_name_norm, found)?;
-                    Ok(WalkControl::Continue)
-                })?;
-                if *found {
-                    return Ok(());
-                }
-            }
-        }
-        ast::SelectTable::Table(_, _, _) => {
-            // Table reference, no expressions
-        }
-    }
-    Ok(())
-}
-
-/// Walk through expressions in a Window definition
-fn walk_window_expressions(
-    window: &ast::Window,
-    table: &BTreeTable,
-    trigger_table_name: &str,
-    column_name_norm: &str,
-    found: &mut bool,
-) -> Result<()> {
-    // Check PARTITION BY expressions
-    for expr in &window.partition_by {
-        walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
-            check_column_ref(e, table, trigger_table_name, column_name_norm, found)?;
-            Ok(WalkControl::Continue)
-        })?;
-        if *found {
-            return Ok(());
-        }
-    }
-
-    // Check ORDER BY expressions
-    for sorted_col in &window.order_by {
-        walk_expr(
-            &sorted_col.expr,
-            &mut |e: &ast::Expr| -> Result<WalkControl> {
-                check_column_ref(e, table, trigger_table_name, column_name_norm, found)?;
-                Ok(WalkControl::Continue)
-            },
-        )?;
-        if *found {
-            return Ok(());
-        }
-    }
-
-    // TODO: FrameClause can also contain expressions, but they're more complex
-    // For now, we'll skip them as they're less common in triggers
-    Ok(())
-}
-
 /// Rewrite trigger SQL to replace old column name with new column name.
 /// This handles old.x, new.x, and unqualified x references.
 fn rewrite_trigger_sql_for_column_rename(
@@ -3361,10 +2823,66 @@ fn validate_trigger_columns_after_drop(
             })
         };
 
+    // Helper: walk an expression (including subqueries) and find bad column refs
+    let find_bad_in_expr = |expr: &ast::Expr,
+                            valid_columns: &[String],
+                            owning_cols: &Option<Vec<String>>|
+     -> Result<Option<String>> {
+        let mut bad: Option<String> = None;
+        crate::util::walk_expr_with_subqueries(expr, &mut |e: &ast::Expr| {
+            if bad.is_some() {
+                return Ok(WalkControl::SkipChildren);
+            }
+            bad = check_column_ref_valid(
+                e,
+                valid_columns,
+                owning_cols,
+                altered_table_norm,
+                post_drop_table,
+                resolver,
+                database_id,
+            );
+            if bad.is_some() {
+                Ok(WalkControl::SkipChildren)
+            } else {
+                Ok(WalkControl::Continue)
+            }
+        })?;
+        Ok(bad)
+    };
+
+    // Helper: walk a SELECT (including subqueries) and find bad column refs
+    let find_bad_in_select = |select: &ast::Select,
+                              valid_columns: &[String],
+                              owning_cols: &Option<Vec<String>>|
+     -> Result<Option<String>> {
+        let mut bad: Option<String> = None;
+        crate::util::walk_select_expressions(select, &mut |e: &ast::Expr| {
+            if bad.is_some() {
+                return Ok(WalkControl::SkipChildren);
+            }
+            bad = check_column_ref_valid(
+                e,
+                valid_columns,
+                owning_cols,
+                altered_table_norm,
+                post_drop_table,
+                resolver,
+                database_id,
+            );
+            if bad.is_some() {
+                Ok(WalkControl::SkipChildren)
+            } else {
+                Ok(WalkControl::Continue)
+            }
+        })?;
+        Ok(bad)
+    };
+
     // Validate WHEN clause — NEW/OLD refs resolve against the trigger's owning table
     if let Some(ref when_expr) = trigger.when_clause {
         if let Some(ref cols) = owning_table_columns {
-            if let Some(bad) = find_bad_column_in_expr(when_expr, cols)? {
+            if let Some(bad) = find_bad_in_expr(when_expr, cols, &owning_table_columns)? {
                 return Ok(Some(bad));
             }
         }
@@ -3392,19 +2910,31 @@ fn validate_trigger_columns_after_drop(
                 // that validation to trigger execution time.
                 let all_cols = merge_cols(&cmd_table_cols, &owning_table_columns);
                 for set in sets {
-                    if let Some(bad) = find_bad_column_in_expr(&set.expr, &all_cols)? {
+                    if let Some(bad) =
+                        find_bad_in_expr(&set.expr, &all_cols, &owning_table_columns)?
+                    {
                         return Ok(Some(bad));
                     }
                 }
                 if let Some(ref where_expr) = where_clause {
-                    if let Some(bad) = find_bad_column_in_expr(where_expr, &all_cols)? {
+                    if let Some(bad) =
+                        find_bad_in_expr(where_expr, &all_cols, &owning_table_columns)?
+                    {
                         return Ok(Some(bad));
                     }
                 }
             }
             // Note: INSERT column lists are NOT checked — SQLite defers that
-            // validation to trigger execution time.
-            ast::TriggerCmd::Insert { .. } => {}
+            // validation to trigger execution time. But expressions in
+            // INSERT ... VALUES and INSERT ... SELECT are checked.
+            ast::TriggerCmd::Insert { select, .. } => {
+                let all_cols = merge_cols(&owning_table_columns, &None);
+                if let Some(bad) =
+                    find_bad_in_select(select, &all_cols, &owning_table_columns)?
+                {
+                    return Ok(Some(bad));
+                }
+            }
             ast::TriggerCmd::Delete {
                 tbl_name,
                 where_clause,
@@ -3420,16 +2950,74 @@ fn validate_trigger_columns_after_drop(
                 );
                 if let Some(ref where_expr) = where_clause {
                     let all_cols = merge_cols(&cmd_table_cols, &owning_table_columns);
-                    if let Some(bad) = find_bad_column_in_expr(where_expr, &all_cols)? {
+                    if let Some(bad) =
+                        find_bad_in_expr(where_expr, &all_cols, &owning_table_columns)?
+                    {
                         return Ok(Some(bad));
                     }
                 }
             }
-            ast::TriggerCmd::Select(_) => {}
+            ast::TriggerCmd::Select(select) => {
+                let all_cols = merge_cols(&owning_table_columns, &None);
+                if let Some(bad) =
+                    find_bad_in_select(select, &all_cols, &owning_table_columns)?
+                {
+                    return Ok(Some(bad));
+                }
+            }
         }
     }
 
     Ok(None)
+}
+
+/// Check a single expression node for invalid column references after a DROP COLUMN.
+/// Returns `Some(bad_column_description)` if invalid, `None` if OK.
+fn check_column_ref_valid(
+    e: &ast::Expr,
+    valid_columns: &[String],
+    owning_table_columns: &Option<Vec<String>>,
+    altered_table_norm: &str,
+    post_drop_table: &BTreeTable,
+    resolver: &Resolver,
+    database_id: usize,
+) -> Option<String> {
+    match e {
+        ast::Expr::Id(col) => {
+            let col_norm = normalize_ident(col.as_str());
+            if !valid_columns.contains(&col_norm) {
+                return Some(col.to_string());
+            }
+        }
+        ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) => {
+            let ns_norm = normalize_ident(ns.as_str());
+            let col_norm = normalize_ident(col.as_str());
+            if ns_norm.eq_ignore_ascii_case("new") || ns_norm.eq_ignore_ascii_case("old") {
+                // NEW.col / OLD.col — validate against owning table columns
+                if let Some(ref cols) = owning_table_columns {
+                    if !cols.contains(&col_norm) {
+                        return Some(format!("{ns}.{col}"));
+                    }
+                }
+            } else {
+                // table.col — validate against that table's columns
+                let table_cols = get_table_columns(
+                    &ns_norm,
+                    altered_table_norm,
+                    post_drop_table,
+                    resolver,
+                    database_id,
+                );
+                if let Some(cols) = table_cols {
+                    if !cols.contains(&col_norm) {
+                        return Some(format!("{ns}.{col}"));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    None
 }
 
 /// Get the column names for a table, using the post-drop schema if it's the altered table.
@@ -3476,25 +3064,4 @@ fn merge_cols(a: &Option<Vec<String>>, b: &Option<Vec<String>>) -> Vec<String> {
         }
     }
     result
-}
-
-/// Walk an expression and return the first unqualified column reference that doesn't
-/// exist in `valid_columns`. Qualified references (t.col, NEW.col, OLD.col) are skipped
-/// since they're validated separately or refer to the trigger's owning table.
-fn find_bad_column_in_expr(
-    expr: &ast::Expr,
-    valid_columns: &[String],
-) -> Result<Option<String>> {
-    let mut bad: Option<String> = None;
-    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
-        if let ast::Expr::Id(col) = e {
-            let col_norm = normalize_ident(col.as_str());
-            if !valid_columns.contains(&col_norm) {
-                bad = Some(col.to_string());
-                return Ok(WalkControl::SkipChildren);
-            }
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(bad)
 }

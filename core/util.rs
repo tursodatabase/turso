@@ -1605,7 +1605,7 @@ where
     }
 }
 
-fn walk_expr_with_subqueries<F>(expr: &ast::Expr, func: &mut F) -> Result<()>
+pub fn walk_expr_with_subqueries<F>(expr: &ast::Expr, func: &mut F) -> Result<()>
 where
     F: FnMut(&ast::Expr) -> Result<WalkControl>,
 {
