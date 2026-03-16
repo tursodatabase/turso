@@ -1396,12 +1396,7 @@ fn emit_update_insns<'a>(
                 target_table
                     .table
                     .btree()
-                    .and_then(|bt| {
-                        bt.unique_sets
-                            .iter()
-                            .find(|us| us.is_primary_key)
-                            .and_then(|us| us.conflict_clause)
-                    })
+                    .and_then(|bt| bt.pk_conflict_clause)
                     .unwrap_or(ResolveType::Abort)
             };
             match pk_conflict {
@@ -2112,12 +2107,7 @@ fn emit_update_insns<'a>(
                 target_table
                     .table
                     .btree()
-                    .and_then(|bt| {
-                        bt.unique_sets
-                            .iter()
-                            .find(|us| us.is_primary_key)
-                            .and_then(|us| us.conflict_clause)
-                    })
+                    .and_then(|bt| bt.pk_conflict_clause)
                     .unwrap_or(ResolveType::Abort)
             };
             match pk_conflict {

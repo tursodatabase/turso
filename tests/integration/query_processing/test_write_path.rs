@@ -1794,3 +1794,42 @@ fn test_attached_read_lock_released_after_main_write(tmp_db: TempDatabase) -> an
 
     Ok(())
 }
+
+#[turso_macros::test]
+fn test_update_on_conflict_rollback_rowid_alias(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY ON CONFLICT ROLLBACK, b TEXT);")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES(1, 'one');").unwrap();
+    conn.execute("INSERT INTO t VALUES(2, 'two');").unwrap();
+
+    // Start a transaction and insert a canary row
+    conn.execute("BEGIN;").unwrap();
+    conn.execute("INSERT INTO t VALUES(3, 'three');").unwrap();
+
+    // This UPDATE should fail and cause a ROLLBACK of the whole transaction
+    let res = conn.execute("UPDATE t SET a = 1 WHERE b = 'two';");
+    assert!(res.is_err());
+    assert!(res
+        .unwrap_err()
+        .to_string()
+        .contains("UNIQUE constraint failed"));
+
+    // If it correctly ROLLED BACK, the transaction should no longer be active.
+    // Committing should fail.
+    let res_commit = conn.execute("COMMIT;");
+    assert!(res_commit.is_err());
+    assert!(res_commit
+        .unwrap_err()
+        .to_string()
+        .contains("no transaction is active"));
+
+    // Verify the final state of the table: row 3 should be gone.
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT a FROM t ORDER BY a");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, 1);
+    assert_eq!(rows[1].0, 2);
+
+    Ok(())
+}
