@@ -1015,6 +1015,12 @@ expect {
     3
 }
 
+test json_array_length_NULL {
+    SELECT json_array_length(NULL);
+}
+expect {
+}
+
 test json_type_no_path {
     select json_type('{"a":[2,3.5,true,false,null,"x"]}')
 }
