@@ -1626,3 +1626,219 @@ fn test_vacuum_into_with_without_rowid(tmp_db: TempDatabase) -> anyhow::Result<(
 
     Ok(())
 }
+
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_with_strict_table(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute(
+        "CREATE TABLE users (
+            id INTEGER PRIMARY KEY,
+            email TEXT NOT NULL,
+            username TEXT NOT NULL,
+            score INTEGER
+        ) STRICT",
+    )?;
+    conn.execute("CREATE UNIQUE INDEX idx_users_email ON users (email)")?;
+    conn.execute("CREATE INDEX idx_users_username ON users (username)")?;
+    conn.execute("CREATE INDEX idx_users_score ON users (score)")?;
+
+    conn.execute("INSERT INTO users VALUES (1, 'alice@example.com', 'alice', 100)")?;
+    conn.execute("INSERT INTO users VALUES (2, 'bob@example.com', 'bob', 200)")?;
+    conn.execute("INSERT INTO users VALUES (3, 'charlie@example.com', 'charlie', 150)")?;
+
+    let source_hash = compute_dbhash(&tmp_db);
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed_strict.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    if !tmp_db.enable_mvcc {
+        assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+    }
+
+    let rows: Vec<(i64, String, String, i64)> =
+        dest_conn.exec_rows("SELECT id, email, username, score FROM users ORDER BY id");
+    assert_eq!(
+        rows,
+        vec![
+            (1, "alice@example.com".to_string(), "alice".to_string(), 100),
+            (2, "bob@example.com".to_string(), "bob".to_string(), 200),
+            (
+                3,
+                "charlie@example.com".to_string(),
+                "charlie".to_string(),
+                150
+            )
+        ]
+    );
+
+    let indexes: Vec<(String,)> = dest_conn.exec_rows(
+        "SELECT name FROM sqlite_schema WHERE type = 'index' AND tbl_name = 'users' ORDER BY name",
+    );
+    assert_eq!(indexes.len(), 3);
+    assert_eq!(indexes[0].0, "idx_users_email");
+    assert_eq!(indexes[1].0, "idx_users_score");
+    assert_eq!(indexes[2].0, "idx_users_username");
+
+    assert!(
+        dest_conn
+            .execute("INSERT INTO users VALUES (4, 'alice@example.com', 'alice2', 50)")
+            .is_err(),
+        "Unique index should reject duplicate email"
+    );
+
+    Ok(())
+}
+
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_with_strict_without_rowid(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    if conn
+        .execute(
+            "CREATE TABLE settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at INTEGER
+            ) STRICT, WITHOUT ROWID",
+        )
+        .is_err()
+    {
+        return Ok(());
+    }
+
+    conn.execute("INSERT INTO settings VALUES ('theme', 'dark', 1704067200)")?;
+    conn.execute("INSERT INTO settings VALUES ('language', 'en', 1704153600)")?;
+    conn.execute("INSERT INTO settings VALUES ('timezone', 'UTC', 1704240000)")?;
+
+    let source_hash = compute_dbhash(&tmp_db);
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed_strict_without_rowid.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    if !tmp_db.enable_mvcc {
+        assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+    }
+
+    let settings_sql: Vec<(String,)> =
+        dest_conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 'settings'");
+    assert!(
+        settings_sql[0].0.contains("STRICT"),
+        "STRICT should be preserved in schema"
+    );
+    assert!(
+        settings_sql[0].0.contains("WITHOUT ROWID"),
+        "WITHOUT ROWID should be preserved in schema"
+    );
+
+    let rows: Vec<(String, String, i64)> =
+        dest_conn.exec_rows("SELECT key, value, updated_at FROM settings ORDER BY key");
+    assert_eq!(
+        rows,
+        vec![
+            ("language".to_string(), "en".to_string(), 1704153600),
+            ("theme".to_string(), "dark".to_string(), 1704067200),
+            ("timezone".to_string(), "UTC".to_string(), 1704240000)
+        ]
+    );
+
+    assert!(
+        dest_conn
+            .execute("INSERT INTO settings VALUES ('test', 123, 'not_an_int')")
+            .is_err(),
+        "STRICT should reject wrong types"
+    );
+
+    Ok(())
+}
+
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_with_multiple_strict_tables(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute(
+        "CREATE TABLE orders (
+            id INTEGER PRIMARY KEY,
+            customer_id INTEGER NOT NULL,
+            total REAL NOT NULL
+        ) STRICT",
+    )?;
+
+    conn.execute(
+        "CREATE TABLE order_items (
+            id INTEGER PRIMARY KEY,
+            order_id INTEGER NOT NULL,
+            product_name TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            price REAL NOT NULL
+        ) STRICT",
+    )?;
+
+    conn.execute("CREATE TABLE logs (id INTEGER PRIMARY KEY, message TEXT)")?;
+
+    conn.execute("INSERT INTO orders VALUES (1, 100, 59.97)")?;
+    conn.execute("INSERT INTO orders VALUES (2, 101, 29.99)")?;
+
+    conn.execute("INSERT INTO order_items VALUES (1, 1, 'Widget', 2, 19.99)")?;
+    conn.execute("INSERT INTO order_items VALUES (2, 1, 'Gadget', 1, 19.99)")?;
+    conn.execute("INSERT INTO order_items VALUES (3, 2, 'Gizmo', 3, 9.99)")?;
+
+    conn.execute("INSERT INTO logs VALUES (1, 'Order 1 created')")?;
+
+    let source_hash = compute_dbhash(&tmp_db);
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed_multi_strict.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    if !tmp_db.enable_mvcc {
+        assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+    }
+
+    let orders_sql: Vec<(String,)> =
+        dest_conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 'orders'");
+    assert!(orders_sql[0].0.contains("STRICT"));
+
+    let items_sql: Vec<(String,)> =
+        dest_conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 'order_items'");
+    assert!(items_sql[0].0.contains("STRICT"));
+
+    let logs_sql: Vec<(String,)> =
+        dest_conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 'logs'");
+    assert!(!logs_sql[0].0.contains("STRICT"));
+
+    let orders: Vec<(i64, i64, f64)> =
+        dest_conn.exec_rows("SELECT id, customer_id, total FROM orders ORDER BY id");
+    assert_eq!(orders, vec![(1, 100, 59.97), (2, 101, 29.99)]);
+
+    let items: Vec<(i64, i64, String, i64, f64)> = dest_conn.exec_rows(
+        "SELECT id, order_id, product_name, quantity, price FROM order_items ORDER BY id",
+    );
+    assert_eq!(
+        items,
+        vec![
+            (1, 1, "Widget".to_string(), 2, 19.99),
+            (2, 1, "Gadget".to_string(), 1, 19.99),
+            (3, 2, "Gizmo".to_string(), 3, 9.99)
+        ]
+    );
+
+    let logs: Vec<(i64, String)> = dest_conn.exec_rows("SELECT id, message FROM logs");
+    assert_eq!(logs, vec![(1, "Order 1 created".to_string())]);
+
+    Ok(())
+}
