@@ -52,6 +52,69 @@ expect {
     3|700
 }
 
+# When alias is an expression (x+1 as x), GROUP BY x should still group by column x.
+@cross-check-integrity
+test group_by_expr_alias_shadows_column {
+    CREATE TABLE t(x INT, y INT);
+    INSERT INTO t VALUES (1,10),(1,20),(2,30),(2,40);
+    SELECT x+1 as x, SUM(y) FROM t GROUP BY x ORDER BY x;
+}
+expect {
+    2|30
+    3|70
+}
+
+# When the alias name doesn't match any column, GROUP BY falls back to the alias.
+@cross-check-integrity
+test group_by_nonconflicting_alias {
+    CREATE TABLE t(a INT, b INT);
+    INSERT INTO t VALUES (1,10),(1,20),(2,30),(2,40);
+    SELECT a as c, SUM(b) FROM t GROUP BY c ORDER BY c;
+}
+expect {
+    1|30
+    2|70
+}
+
+# When aliases swap column names (b as a, a as b), GROUP BY a,b still uses real columns.
+@cross-check-integrity
+test group_by_swapped_aliases {
+    CREATE TABLE t(a INT, b INT, c INT);
+    INSERT INTO t VALUES (1,10,100),(2,10,200),(1,20,300),(2,20,400);
+    SELECT b as a, a as b, SUM(c) FROM t GROUP BY a, b ORDER BY a, b;
+}
+expect {
+    10|1|100
+    10|2|200
+    20|1|300
+    20|2|400
+}
+
+# GROUP BY resolves to column y; HAVING references aggregate alias.
+@cross-check-integrity
+test group_by_column_having_alias {
+    CREATE TABLE t(x INT, y INT, z INT);
+    INSERT INTO t VALUES (1,10,100),(2,10,200),(3,20,300),(4,20,400);
+    SELECT x as y, SUM(z) as total FROM t GROUP BY y HAVING total > 500;
+}
+expect {
+    3|700
+}
+
+# GROUP BY 1 means first result column (alias y = column x), unlike GROUP BY y which uses column y.
+@cross-check-integrity
+test group_by_numeric_index_vs_alias {
+    CREATE TABLE t(x INT, y INT, z INT);
+    INSERT INTO t VALUES (1,10,100),(2,10,200),(3,20,300),(4,20,400);
+    SELECT x as y, SUM(z) FROM t GROUP BY 1 ORDER BY 1;
+}
+expect {
+    1|100
+    2|200
+    3|300
+    4|400
+}
+
 @cross-check-integrity
 test group_by_alias_precedence {
     CREATE TABLE t(x,y);
