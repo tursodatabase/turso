@@ -1390,18 +1390,15 @@ fn emit_update_insns<'a>(
 
             // Conflict found - handle based on conflict resolution mode.
             // Use per-constraint ON CONFLICT when no statement-level OR clause.
+            // Use pk_conflict_clause from BTreeTable, which is preserved
+            // even for rowid-alias PKs (whose UniqueSet is removed from unique_sets).
             let pk_conflict = if program.has_statement_conflict {
                 or_conflict
             } else {
                 target_table
                     .table
                     .btree()
-                    .and_then(|bt| {
-                        bt.unique_sets
-                            .iter()
-                            .find(|us| us.is_primary_key)
-                            .and_then(|us| us.conflict_clause)
-                    })
+                    .and_then(|bt| bt.pk_conflict_clause)
                     .unwrap_or(ResolveType::Abort)
             };
             match pk_conflict {
@@ -2105,19 +2102,15 @@ fn emit_update_insns<'a>(
             });
 
             // Handle conflict resolution for rowid/primary key conflict.
-            // Use per-constraint ON CONFLICT when no statement-level OR clause.
+            // Use pk_conflict_clause from BTreeTable, which is preserved
+            // even for rowid-alias PKs (whose UniqueSet is removed from unique_sets).
             let pk_conflict = if program.has_statement_conflict {
                 or_conflict
             } else {
                 target_table
                     .table
                     .btree()
-                    .and_then(|bt| {
-                        bt.unique_sets
-                            .iter()
-                            .find(|us| us.is_primary_key)
-                            .and_then(|us| us.conflict_clause)
-                    })
+                    .and_then(|bt| bt.pk_conflict_clause)
                     .unwrap_or(ResolveType::Abort)
             };
             match pk_conflict {
