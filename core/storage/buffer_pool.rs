@@ -365,8 +365,8 @@ const UNREGISTERED_START: u32 = 2;
 /// registered arena will always have id = 0..=1
 /// we purposely use std::sync::AtomicU32 instead of core::sync::AtomicU32 because
 /// this is a global static variable and can mess with shuttle tests
-static NEXT_ID: crate::sync::atomic::AtomicU32 =
-    crate::sync::atomic::AtomicU32::new(UNREGISTERED_START);
+static NEXT_ID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(UNREGISTERED_START);
 
 impl Arena {
     /// Create a new arena with the given size and page size.
