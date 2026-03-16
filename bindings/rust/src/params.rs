@@ -155,9 +155,6 @@ impl<T: IntoValue> IntoParams for Vec<T> {
     }
 }
 
-// Named parameters: Users provide (String, Value) pairs.
-// Internally we convert String to Cow::Owned for storage.
-// This keeps the public API simple - users never need to use Cow directly.
 impl<T: IntoValue> Sealed for Vec<(String, T)> {}
 impl<T: IntoValue> IntoParams for Vec<(String, T)> {
     fn into_params(self) -> Result<Params> {
@@ -177,9 +174,7 @@ impl<T: IntoValue, const N: usize> IntoParams for [T; N] {
     }
 }
 
-// Named parameters with static string keys: Users provide [(&str, Value); N] arrays.
-// Internally we convert &'static str to Cow::Borrowed - this is zero-cost!
-// This provides the performance benefit of Cow without exposing it in the API.
+// Named parameters with static string keys to avoid String allocations.
 impl<T: IntoValue, const N: usize> Sealed for [(&'static str, T); N] {}
 impl<T: IntoValue, const N: usize> IntoParams for [(&'static str, T); N] {
     fn into_params(self) -> Result<Params> {
@@ -214,9 +209,6 @@ macro_rules! tuple_into_params {
 
 macro_rules! named_tuple_into_params {
     ($count:literal : $(($field:tt $ftype:ident)),* $(,)?) => {
-        // Named parameters with static string keys in tuple form.
-        // Users provide ((&str, Value), ...) tuples.
-        // Internally we convert &'static str to Cow::Borrowed - zero-cost!
         impl<$($ftype,)*> Sealed for ($((&'static str, $ftype),)*) where $($ftype: IntoValue,)* {}
         impl<$($ftype,)*> IntoParams for ($((&'static str, $ftype),)*) where $($ftype: IntoValue,)* {
             fn into_params(self) -> Result<Params> {
