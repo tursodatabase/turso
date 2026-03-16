@@ -646,7 +646,7 @@ fn test_alter_table_drop_column_fails_when_trigger_references_new_column(db: Tem
 
     let error_msg = result.unwrap_err().to_string();
     assert!(
-        error_msg.contains("cannot drop column") && error_msg.contains("trigger"),
+        error_msg.contains("error in trigger") && error_msg.contains("after drop column"),
         "Error should mention column drop and trigger: {error_msg}",
     );
 }
@@ -676,7 +676,7 @@ fn test_alter_table_drop_column_fails_when_trigger_references_old_column(db: Tem
 
     let error_msg = result.unwrap_err().to_string();
     assert!(
-        error_msg.contains("cannot drop column") && error_msg.contains("trigger"),
+        error_msg.contains("error in trigger") && error_msg.contains("after drop column"),
         "Error should mention column drop and trigger: {error_msg}",
     );
 }
@@ -706,7 +706,7 @@ fn test_alter_table_drop_column_fails_when_trigger_references_unqualified_column
 
     let error_msg = result.unwrap_err().to_string();
     assert!(
-        error_msg.contains("cannot drop column") && error_msg.contains("trigger"),
+        error_msg.contains("error in trigger") && error_msg.contains("after drop column"),
         "Error should mention column drop and trigger: {error_msg}",
     );
 }

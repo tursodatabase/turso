@@ -1977,3 +1977,214 @@ test drop-column-owning-table-trigger-update-set-deferred {
 expect {
     y
 }
+
+# ──────────────────────────────────────────────────────────────────────
+# Adversarial DROP COLUMN + trigger tests
+# ──────────────────────────────────────────────────────────────────────
+
+# WHEN clause referencing dropped column via NEW qualifier
+@cross-check-integrity
+test fail-drop-column-when-clause-new-ref {
+    CREATE TABLE t (a, b, c);
+    CREATE TRIGGER tr AFTER INSERT ON t WHEN NEW.b > 0 BEGIN SELECT 1; END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
+# Trigger body UPDATE SET value via NEW.dropped_col
+@cross-check-integrity
+test fail-drop-column-new-qualified-ref-in-set {
+    CREATE TABLE t (a, b, c);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET c = NEW.b WHERE a = 1; END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
+# INSERT VALUES referencing dropped column via NEW qualifier
+@cross-check-integrity
+test fail-drop-column-insert-values-new-ref {
+    CREATE TABLE t (a, b);
+    CREATE TABLE u (x);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO u VALUES (NEW.b); END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
+# INSERT INTO ... SELECT referencing dropped column
+@cross-check-integrity
+test fail-drop-column-insert-select-ref {
+    CREATE TABLE t (a, b, c);
+    CREATE TABLE u (x);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO u SELECT b FROM t; END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
+# Subquery inside trigger DELETE WHERE references dropped column
+@cross-check-integrity
+test fail-drop-column-subquery-in-delete-where {
+    CREATE TABLE t (a, b);
+    CREATE TABLE u (x, y);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN DELETE FROM u WHERE x = (SELECT b FROM t LIMIT 1); END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
+# Table-qualified reference to dropped column (t.col)
+@cross-check-integrity
+test fail-drop-column-table-qualified-ref {
+    CREATE TABLE t (a, b, c);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET c = t.b; END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
+# RAISE in WHEN clause referencing dropped column via NEW
+@cross-check-integrity
+test fail-drop-column-raise-when-new-ref {
+    CREATE TABLE t (a, b);
+    CREATE TRIGGER tr BEFORE INSERT ON t WHEN NEW.b IS NULL BEGIN SELECT RAISE(ABORT, 'b is null'); END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
+# Multiple triggers, only second one references dropped column
+@cross-check-integrity
+test fail-drop-column-multiple-triggers-one-bad {
+    CREATE TABLE t (a, b, c);
+    CREATE TRIGGER tr1 AFTER INSERT ON t BEGIN SELECT 1; END;
+    CREATE TRIGGER tr2 AFTER INSERT ON t BEGIN UPDATE t SET c = b; END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr2 after drop column: no such column:
+}
+
+# EXISTS subquery referencing dropped column
+@cross-check-integrity
+test fail-drop-column-exists-subquery-ref {
+    CREATE TABLE t (a, b, c);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET c = 1 WHERE EXISTS (SELECT 1 FROM t WHERE b = 0); END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
+# Cross-table trigger with subquery in INSERT VALUES referencing dropped column
+@cross-check-integrity
+test fail-drop-column-cross-table-subquery-in-insert {
+    CREATE TABLE t (a, b);
+    CREATE TABLE u (x);
+    CREATE TRIGGER tr AFTER INSERT ON u BEGIN INSERT INTO u(x) VALUES ((SELECT b FROM t LIMIT 1)); END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
+# Aggregate in subquery referencing dropped column (cross-table)
+@cross-check-integrity
+test fail-drop-column-aggregate-subquery-cross-table {
+    CREATE TABLE t (a, b);
+    CREATE TABLE u (x);
+    CREATE TRIGGER tr AFTER INSERT ON u BEGIN INSERT INTO u(x) VALUES ((SELECT sum(b) FROM t)); END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
+# DROP non-referenced column should succeed even with complex triggers present
+@cross-check-integrity
+test drop-column-unreferenced-with-complex-trigger {
+    CREATE TABLE t (a, b, c, d);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET c = b WHERE a = 1; END;
+    ALTER TABLE t DROP COLUMN d;
+    SELECT name FROM pragma_table_info('t');
+}
+expect {
+    a
+    b
+    c
+}
+
+# Nested function call referencing dropped column
+@cross-check-integrity
+test fail-drop-column-nested-function-ref {
+    CREATE TABLE t (a, b, c);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET c = upper(substr(b, 1, 3)); END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
+# COALESCE referencing dropped column
+@cross-check-integrity
+test fail-drop-column-coalesce-ref {
+    CREATE TABLE t (a, b, c);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET c = coalesce(b, 0); END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
+# IN expression referencing dropped column
+@cross-check-integrity
+test fail-drop-column-in-expr-ref {
+    CREATE TABLE t (a, b, c);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET c = 1 WHERE a IN (b, c); END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
+# BETWEEN referencing dropped column
+@cross-check-integrity
+test fail-drop-column-between-ref {
+    CREATE TABLE t (a, b, c);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET c = 1 WHERE a BETWEEN b AND c; END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
+# Compound expression (||) referencing dropped column
+@cross-check-integrity
+test fail-drop-column-compound-expr-ref {
+    CREATE TABLE t (a, b, c);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET c = a || b; END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
+# CASE expression referencing dropped column
+@cross-check-integrity
+test fail-drop-column-case-expr-ref {
+    CREATE TABLE t (a, b, c);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET c = CASE WHEN b > 0 THEN 1 ELSE 0 END; END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
