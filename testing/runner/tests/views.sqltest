@@ -300,3 +300,10 @@ test view-mutual-circle-detection {
 expect error {
     view v is circularly defined
 }
+
+test view-reserved-prefix-sqlite {
+    CREATE VIEW sqlite_view AS SELECT 1;
+}
+expect error {
+    object name reserved for internal use: sqlite_view
+}

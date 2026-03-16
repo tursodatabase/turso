@@ -1,4 +1,4 @@
-use crate::schema::{SchemaObjectType, DBSP_TABLE_PREFIX};
+use crate::schema::{SchemaObjectType, DBSP_TABLE_PREFIX, RESERVED_TABLE_PREFIXES};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
@@ -8,7 +8,7 @@ use crate::util::{
 };
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral};
-use crate::{Connection, Result};
+use crate::{bail_parse_error, Connection, Result};
 use turso_parser::ast;
 
 pub fn translate_create_materialized_view(
@@ -38,6 +38,15 @@ pub fn translate_create_materialized_view(
     }
 
     let normalized_view_name = normalize_ident(view_name.name.as_str());
+    if RESERVED_TABLE_PREFIXES
+        .iter()
+        .any(|prefix| normalized_view_name.starts_with(prefix))
+    {
+        bail_parse_error!(
+            "Object name reserved for internal use: {}",
+            view_name.name.as_str()
+        );
+    }
 
     // Check if view already exists
     if resolver.with_schema(database_id, |s| {
@@ -268,6 +277,16 @@ pub fn translate_create_view(
         program.begin_write_on_database(database_id, schema_cookie);
     }
     let normalized_view_name = normalize_ident(view_name.name.as_str());
+
+    if RESERVED_TABLE_PREFIXES
+        .iter()
+        .any(|prefix| normalized_view_name.starts_with(prefix))
+    {
+        bail_parse_error!(
+            "Object name reserved for internal use: {}",
+            view_name.name.as_str()
+        );
+    }
 
     // Check for name conflicts with existing schema objects
     if let Some(object_type) =
