@@ -284,6 +284,10 @@ pub fn json_array_length(
     path: Option<&Value>,
     json_cache: &JsonCacheCell,
 ) -> crate::Result<Value> {
+    if let Value::Null = value {
+        return Ok(Value::Null);
+    }
+
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
     let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
 
@@ -1131,6 +1135,14 @@ mod tests {
         } else {
             panic!("Expected Value::Numeric(Numeric::Integer)");
         }
+    }
+
+    #[test]
+    fn test_json_array_length_null() {
+        let input = Value::Null;
+        let json_cache = JsonCacheCell::new();
+        let result = json_array_length(&input, None, &json_cache).unwrap();
+        assert_eq!(result, Value::Null);
     }
 
     #[test]
