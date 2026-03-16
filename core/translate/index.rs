@@ -40,8 +40,8 @@ pub fn translate_create_index(
     connection: &Arc<crate::Connection>,
     resolver: &Resolver,
     stmt: ast::Stmt,
+    sql: &str,
 ) -> crate::Result<()> {
-    let sql = stmt.to_string();
     let ast::Stmt::CreateIndex {
         unique,
         if_not_exists,
@@ -262,7 +262,7 @@ pub fn translate_create_index(
         &idx_name,
         &tbl_name,
         root_page_reg,
-        Some(sql),
+        Some(sql.to_string()),
     )?;
 
     if index_method

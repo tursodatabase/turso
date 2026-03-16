@@ -77,6 +77,16 @@ pub fn translate(
     query_mode: QueryMode,
     input: &str,
 ) -> Result<Program> {
+    let input = {
+        let mut chars = input.chars().rev();
+        // Remove the trailing comma
+        if chars.next() == Some(';') {
+            &input[..input.len() - 1]
+        } else {
+            input
+        }
+    };
+
     tracing::trace!("querying {}", input);
     let change_cnt_on = matches!(
         stmt,
@@ -134,7 +144,7 @@ pub fn translate_inner(
     resolver: &mut Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
-    input: &str,
+    sql: &str,
 ) -> Result<()> {
     let is_write = matches!(
         stmt,
@@ -166,7 +176,7 @@ pub fn translate_inner(
 
     match stmt {
         ast::Stmt::AlterTable(alter) => {
-            translate_alter_table(alter, resolver, program, connection, input)?;
+            translate_alter_table(alter, resolver, program, connection, sql)?;
         }
         ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program)?,
         ast::Stmt::Attach { expr, db_name, key } => {
@@ -179,7 +189,7 @@ pub fn translate_inner(
             translate_tx_commit(name, resolver.schema(), resolver, program)?
         }
         ast::Stmt::CreateIndex { .. } => {
-            translate_create_index(program, connection, resolver, stmt)?;
+            translate_create_index(program, connection, resolver, stmt, sql)?;
         }
         ast::Stmt::CreateTable {
             temporary,
@@ -194,49 +204,36 @@ pub fn translate_inner(
             body,
             program,
             connection,
+            sql,
         )?,
         ast::Stmt::CreateTrigger {
             temporary,
             if_not_exists,
             trigger_name,
             time,
-            event,
+            event: _,
             tbl_name,
-            for_each_row,
+            for_each_row: _,
             when_clause,
             commands,
-        } => {
-            // Reconstruct SQL for storage
-            let sql = trigger::create_trigger_to_sql(
-                temporary,
-                if_not_exists,
-                &trigger_name,
-                time,
-                &event,
-                &tbl_name,
-                for_each_row,
-                when_clause.as_deref(),
-                &commands,
-            );
-            trigger::translate_create_trigger(
-                trigger_name,
-                resolver,
-                temporary,
-                if_not_exists,
-                time,
-                tbl_name,
-                program,
-                sql,
-                &commands,
-                when_clause.as_deref(),
-            )?
-        }
+        } => trigger::translate_create_trigger(
+            trigger_name,
+            resolver,
+            temporary,
+            if_not_exists,
+            time,
+            tbl_name,
+            program,
+            sql.to_string(),
+            &commands,
+            when_clause.as_deref(),
+        )?,
         ast::Stmt::CreateView {
             view_name,
             select,
             columns,
             ..
-        } => view::translate_create_view(&view_name, resolver, &select, &columns, program)?,
+        } => view::translate_create_view(&view_name, resolver, &select, &columns, program, sql)?,
         ast::Stmt::CreateMaterializedView {
             view_name, select, ..
         } => view::translate_create_materialized_view(
@@ -245,9 +242,10 @@ pub fn translate_inner(
             &select,
             connection.clone(),
             program,
+            sql,
         )?,
         ast::Stmt::CreateVirtualTable(vtab) => {
-            translate_create_virtual_table(vtab, resolver, program, connection)?
+            translate_create_virtual_table(vtab, resolver, program, connection, sql)?
         }
         ast::Stmt::Delete {
             tbl_name,

@@ -1,7 +1,6 @@
 use crate::sync::Arc;
 
 use crate::ast;
-use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
 use crate::schema::{
     create_table, translate_ident_to_string_literal, BTreeTable, ColDef, Column, SchemaObjectType,
@@ -844,6 +843,7 @@ pub fn translate_create_table(
     body: ast::CreateTableBody,
     program: &mut ProgramBuilder,
     connection: &Connection,
+    sql: &str,
 ) -> Result<()> {
     let database_id = resolver.resolve_database_id(&tbl_name)?;
     if crate::is_attached_db(database_id) {
@@ -988,8 +988,6 @@ pub fn translate_create_table(
         false
     };
 
-    let sql = create_table_body_to_str(&tbl_name, &body)?;
-
     let parse_schema_label = program.allocate_label();
     // TODO: ReadCookie
     // TODO: If
@@ -1057,7 +1055,7 @@ pub fn translate_create_table(
         &normalized_tbl_name,
         &normalized_tbl_name,
         table_root_reg,
-        Some(sql),
+        Some(sql.to_string()),
     )?;
 
     if let Some(index_regs) = index_regs {
@@ -1258,72 +1256,12 @@ fn collect_autoindexes(
     }
 }
 
-fn create_table_body_to_str(
-    tbl_name: &ast::QualifiedName,
-    body: &ast::CreateTableBody,
-) -> crate::Result<String> {
-    let mut sql = String::new();
-    sql.push_str(format!("CREATE TABLE {} {}", tbl_name.name.as_ident(), body).as_str());
-    match body {
-        ast::CreateTableBody::ColumnsAndConstraints {
-            columns: _,
-            constraints: _,
-            options: _,
-        } => {}
-        ast::CreateTableBody::AsSelect(_select) => {
-            crate::bail_parse_error!("CREATE TABLE AS SELECT is not supported")
-        }
-    }
-    Ok(sql)
-}
-
-fn create_vtable_body_to_str(vtab: &ast::CreateVirtualTable, module: Arc<VTabImpl>) -> String {
-    let args = vtab
-        .args
-        .iter()
-        .map(|arg| arg.to_string())
-        .collect::<Vec<String>>()
-        .join(", ");
-    let if_not_exists = if vtab.if_not_exists {
-        "IF NOT EXISTS "
-    } else {
-        ""
-    };
-    let ext_args = vtab
-        .args
-        .iter()
-        .map(|a| turso_ext::Value::from_text(a.to_string()))
-        .collect::<Vec<_>>();
-    let schema = module
-        .implementation
-        .create_schema(ext_args)
-        .unwrap_or_default();
-    let vtab_args = if let Some(first_paren) = schema.find('(') {
-        let closing_paren = schema.rfind(')').unwrap_or_default();
-        &schema[first_paren..=closing_paren]
-    } else {
-        "()"
-    };
-    format!(
-        "CREATE VIRTUAL TABLE {} {} USING {}{}\n /*{}{}*/",
-        vtab.tbl_name.name.as_ident(),
-        if_not_exists,
-        vtab.module_name.as_ident(),
-        if args.is_empty() {
-            String::new()
-        } else {
-            format!("({args})")
-        },
-        vtab.tbl_name.name.as_ident(),
-        vtab_args
-    )
-}
-
 pub fn translate_create_virtual_table(
     vtab: ast::CreateVirtualTable,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
+    sql: &str,
 ) -> Result<()> {
     if connection.mvcc_enabled() {
         bail_parse_error!("Virtual tables are not supported in MVCC mode");
@@ -1395,7 +1333,6 @@ pub fn translate_create_virtual_table(
     });
 
     let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), SQLITE_TABLEID)?;
-    let sql = create_vtable_body_to_str(&vtab, vtab_module.clone());
     emit_schema_entry(
         program,
         resolver,
@@ -1405,7 +1342,7 @@ pub fn translate_create_virtual_table(
         tbl_name.name.as_str(),
         tbl_name.name.as_str(),
         0, // virtual tables dont have a root page
-        Some(sql),
+        Some(sql.to_string()),
     )?;
 
     program.emit_insn(Insn::SetCookie {

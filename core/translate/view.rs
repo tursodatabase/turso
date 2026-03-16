@@ -17,6 +17,7 @@ pub fn translate_create_materialized_view(
     select_stmt: &ast::Select,
     connection: Arc<Connection>,
     program: &mut ProgramBuilder,
+    sql: &str,
 ) -> Result<()> {
     // Check if experimental views are enabled
     if !connection.experimental_views_enabled() {
@@ -61,9 +62,6 @@ pub fn translate_create_materialized_view(
         IncrementalView::validate_and_extract_columns(select_stmt, s)
     })?;
     let view_columns = view_column_schema.flat_columns();
-
-    // Reconstruct the SQL string for storage
-    let sql = create_materialized_view_to_str(&view_name.name.as_ident(), select_stmt);
 
     // Create a btree for storing the materialized view state
     // This btree will hold the materialized rows (row_id -> values)
@@ -158,7 +156,7 @@ pub fn translate_create_materialized_view(
         &normalized_view_name,
         &normalized_view_name,
         view_root_reg, // btree root for materialized view data
-        Some(sql),
+        Some(sql.to_string()),
     )?;
 
     // Add the DBSP state table to sqlite_master (required for materialized views)
@@ -251,16 +249,13 @@ pub fn translate_create_materialized_view(
     Ok(())
 }
 
-fn create_materialized_view_to_str(view_name: &str, select_stmt: &ast::Select) -> String {
-    format!("CREATE MATERIALIZED VIEW {view_name} AS {select_stmt}")
-}
-
 pub fn translate_create_view(
     view_name: &ast::QualifiedName,
     resolver: &Resolver,
     select_stmt: &ast::Select,
-    columns: &[ast::IndexedColumn],
+    _columns: &[ast::IndexedColumn],
     program: &mut ProgramBuilder,
+    sql: &str,
 ) -> Result<()> {
     let database_id = resolver.resolve_database_id(view_name)?;
     if crate::is_attached_db(database_id) {
@@ -297,9 +292,6 @@ pub fn translate_create_view(
 
     crate::util::validate_select_for_views(select_stmt, view_name.db_name.as_ref())?;
 
-    // Reconstruct the SQL string
-    let sql = create_view_to_str(&view_name.name.as_ident(), columns, select_stmt);
-
     // Open cursor to sqlite_schema table
     let table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
@@ -319,7 +311,7 @@ pub fn translate_create_view(
         &normalized_view_name,
         &normalized_view_name,
         0, // Regular views don't have a btree
-        Some(sql),
+        Some(sql.to_string()),
     )?;
 
     // Parse schema to load the new view
@@ -338,22 +330,6 @@ pub fn translate_create_view(
     });
 
     Ok(())
-}
-
-fn create_view_to_str(
-    view_name: &str,
-    columns: &[ast::IndexedColumn],
-    select_stmt: &ast::Select,
-) -> String {
-    let columns_str = columns
-        .iter()
-        .map(|col| col.col_name.as_str())
-        .collect::<Vec<&str>>()
-        .join(", ");
-    if !columns_str.is_empty() {
-        return format!("CREATE VIEW {view_name} ({columns_str}) AS {select_stmt}");
-    }
-    format!("CREATE VIEW {view_name} AS {select_stmt}")
 }
 
 pub fn translate_drop_view(
