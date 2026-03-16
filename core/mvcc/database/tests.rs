@@ -7469,7 +7469,6 @@ fn test_secondary_index_partial_delete() {
     assert_eq!(rows[1][0].as_int().unwrap(), 3);
 }
 
-
 /// Same bug as `test_elle_lost_update_exclusive_concurrent` but with simplified SQLs.
 /// For this bug to happen, we need deferred conflict detection done at
 /// `check_version_conflicts`.
