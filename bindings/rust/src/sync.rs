@@ -1324,4 +1324,136 @@ mod tests {
             assert!(partial_db.stats().await.unwrap().network_received_bytes > 2000 * 1024);
         }
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    pub async fn test_sync_parallel_writes_with_sync_ops() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use tokio::sync::Mutex as TokioMutex;
+
+        let _ = tracing_subscriber::fmt::try_init();
+        let server = TursoServer::new().await.unwrap();
+
+        let db = crate::sync::Builder::new_remote(":memory:")
+            .with_remote_url(server.db_url())
+            .build()
+            .await
+            .unwrap();
+
+        let conn = db.connect().await.unwrap();
+        conn.execute(
+            "CREATE TABLE test_data (id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL)",
+            (),
+        )
+        .await
+        .unwrap();
+
+        // ~200KB payload per row
+        let payload = "X".repeat(200 * 1024);
+
+        let done = Arc::new(AtomicBool::new(false));
+        let sync_lock = Arc::new(TokioMutex::new(()));
+
+        // Spawn periodic push/pull/checkpoint task (sequential, guarded by sync_lock)
+        let sync_db = db.clone();
+        let sync_done = done.clone();
+        let sync_lock_clone = sync_lock.clone();
+        let sync_task = tokio::spawn(async move {
+            let mut cycle = 0u32;
+            while !sync_done.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let _guard = sync_lock_clone.lock().await;
+                eprintln!("sync cycle {cycle}: push");
+                if let Err(e) = sync_db.push().await {
+                    eprintln!("push error (cycle {cycle}): {e}");
+                }
+                eprintln!("sync cycle {cycle}: pull");
+                if let Err(e) = sync_db.pull().await {
+                    eprintln!("pull error (cycle {cycle}): {e}");
+                }
+                eprintln!("sync cycle {cycle}: checkpoint");
+                if let Err(e) = sync_db.checkpoint().await {
+                    eprintln!("checkpoint error (cycle {cycle}): {e}");
+                }
+                cycle += 1;
+            }
+            cycle
+        });
+
+        // Parallel writes: 4 connections, each inserting 5 rows (~200KB each)
+        let mut write_handles = Vec::new();
+        let mut connections = Vec::new();
+        let (conn_cnt, iterations_cnt, after_cnt) = (8u32, 100u32, 100u32);
+        for _ in 0..conn_cnt {
+            let db = db.clone();
+            let conn = db.connect().await.unwrap();
+            conn.execute("PRAGMA busy_timeout=5000", ()).await.unwrap();
+            connections.push(Some((db, conn)));
+        }
+        for conn_id in 0..conn_cnt {
+            let (_, conn) = connections[conn_id as usize].take().unwrap();
+            let payload = payload.clone();
+            write_handles.push(tokio::spawn(async move {
+                for row_id in 0..iterations_cnt {
+                    let tag = format!("conn{conn_id}_row{row_id}");
+                    let data = format!("{tag}_{payload}");
+                    loop {
+                        match conn
+                            .execute(
+                                "INSERT INTO test_data (payload) VALUES (?)",
+                                crate::params::Params::Positional(vec![Value::Text(data.clone())]),
+                            )
+                            .await
+                        {
+                            Ok(_) => break,
+                            Err(crate::Error::Busy(_)) => {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                                continue;
+                            }
+                            Err(e) => panic!("insert failed (conn{conn_id}, row{row_id}): {e:?}"),
+                        }
+                    }
+                }
+            }));
+        }
+        for h in write_handles {
+            h.await.unwrap();
+        }
+
+        // Sequential writes: 3 more large inserts
+        for i in 0..after_cnt {
+            let data = format!("sequential_{i}_{payload}");
+            conn.execute(
+                "INSERT INTO test_data (payload) VALUES (?)",
+                crate::params::Params::Positional(vec![Value::Text(data)]),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Signal sync task to stop and wait for it
+        done.store(true, Ordering::Relaxed);
+        let sync_cycles = sync_task.await.unwrap();
+        eprintln!("completed {sync_cycles} sync cycles during writes");
+
+        let rows = conn
+            .query("SELECT count(*) FROM test_data", ())
+            .await
+            .unwrap();
+        let all = all_rows(rows).await.unwrap();
+        assert_eq!(
+            all,
+            vec![vec![Value::Integer(
+                (after_cnt + conn_cnt * iterations_cnt) as i64
+            )]]
+        );
+
+        // Report WAL size via stats
+        let stats = db.stats().await.unwrap();
+        eprintln!(
+            "WAL size after all writes: {} bytes ({:.2} KB)",
+            stats.main_wal_size,
+            stats.main_wal_size as f64 / 1024.0
+        );
+    }
 }
