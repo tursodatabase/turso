@@ -18,8 +18,8 @@ use crate::{
         },
         main_loop::{CloseLoop, InitLoop, OpenLoop},
         plan::{
-            DeletePlan, EvalAt, JoinOrderMember, JoinedTable, Operation, ResultSetColumn, Search,
-            TableReferences,
+            DeletePlan, EvalAt, JoinOrderMember, JoinedTable, NonFromClauseSubquery, Operation,
+            ResultSetColumn, Search, TableReferences,
         },
         subquery::emit_non_from_clause_subquery,
         trigger_exec::{fire_trigger, has_relevant_triggers_type_only, TriggerContext},
@@ -115,6 +115,26 @@ pub fn emit_program_for_delete(
             )?;
         }
     }
+
+    // Drain RETURNING subqueries so they aren't evaluated during the main loop scan.
+    // They must be emitted inside the delete loop so correlated column references
+    // read post-rowid-seek values from the cursor.
+    // If there is a rowset_plan, all subqueries are drained as they are either RETURNING
+    // subqueries or were already moved to the rowset_plan (WHERE clause subqueries).
+    let mut delete_subqueries = if plan.rowset_plan.is_some() {
+        plan.non_from_clause_subqueries.drain(..).collect()
+    } else {
+        let mut subqueries = Vec::new();
+        let mut i = 0;
+        while i < plan.non_from_clause_subqueries.len() {
+            if plan.non_from_clause_subqueries[i].is_returning {
+                subqueries.push(plan.non_from_clause_subqueries.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        subqueries
+    };
 
     // Initialize cursors and other resources needed for query execution
     InitLoop::emit(
@@ -212,6 +232,7 @@ pub fn emit_program_for_delete(
             table_cursor_id,
             resolver,
             returning_buffer.as_ref(),
+            &mut delete_subqueries,
         )?;
 
         // Continue loop
@@ -244,6 +265,7 @@ pub fn emit_program_for_delete(
             &plan.result_columns,
             resolver,
             returning_buffer.as_ref(),
+            &mut delete_subqueries,
         )?;
 
         // Clean up and close the main execution loop
@@ -421,6 +443,7 @@ fn emit_delete_insns<'a>(
     result_columns: &'a [ResultSetColumn],
     resolver: &Resolver,
     returning_buffer: Option<&ReturningBufferCtx>,
+    returning_subqueries: &mut [NonFromClauseSubquery],
 ) -> Result<()> {
     // we can either use this obviously safe raw pointer or we can clone it
     let table_reference: *const JoinedTable = table_references.joined_tables().first().unwrap();
@@ -557,6 +580,7 @@ fn emit_delete_insns<'a>(
         Some(cursor_id), // Use the cursor_id from the operation for virtual tables
         resolver,
         returning_buffer,
+        returning_subqueries,
     )?;
 
     // Delete from the iteration index after deleting from the main table,
@@ -601,6 +625,7 @@ fn emit_delete_row_common(
     virtual_table_cursor_id: Option<usize>,
     resolver: &Resolver,
     returning_buffer: Option<&ReturningBufferCtx>,
+    returning_subqueries: &mut [NonFromClauseSubquery],
 ) -> Result<()> {
     let internal_id = unsafe { (*table_reference).internal_id };
     let table_name = unsafe { &*table_reference }.table.get_name();
@@ -762,6 +787,22 @@ fn emit_delete_row_common(
             )?;
         }
 
+        // Emit RETURNING subqueries so that correlated column references
+        // read post-rowid-seek values from the cursor.
+        for subquery in returning_subqueries
+            .iter_mut()
+            .filter(|s| !s.has_been_evaluated() && s.is_returning)
+        {
+            let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
+            emit_non_from_clause_subquery(
+                program,
+                &t_ctx.resolver,
+                *subquery_plan,
+                &subquery.query_type,
+                subquery.correlated,
+            )?;
+        }
+
         // Emit RETURNING results if specified (must be before DELETE)
         if !result_columns.is_empty() {
             let columns_start_reg = columns_start_reg
@@ -814,6 +855,7 @@ fn emit_delete_insns_when_triggers_present(
     main_table_cursor_id: usize,
     resolver: &Resolver,
     returning_buffer: Option<&ReturningBufferCtx>,
+    returning_subqueries: &mut [NonFromClauseSubquery],
 ) -> Result<()> {
     // Seek to the rowid and delete it
     let skip_not_found_label = program.allocate_label();
@@ -926,6 +968,7 @@ fn emit_delete_insns_when_triggers_present(
         None, // Use main_table_cursor_id for virtual tables
         resolver,
         returning_buffer,
+        returning_subqueries,
     )?;
 
     // Fire AFTER DELETE triggers

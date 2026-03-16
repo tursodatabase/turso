@@ -107,3 +107,20 @@ test delete-correlated-empty-table {
 expect {
     0
 }
+
+setup returning_subquery {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    INSERT INTO t1 VALUES(1,'x'),(2,'y'),(3,'z'),(4,'w');
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    INSERT INTO t2 VALUES(2,'p'),(4,'q');
+}
+
+@setup returning_subquery
+@cross-check-integrity
+test delete-returning-correlated-subquery {
+    DELETE FROM t1 WHERE a IN (SELECT c FROM t2) RETURNING a, b, (SELECT d FROM t2 WHERE t2.c = t1.a) AS matched_d;
+}
+expect {
+    2|y|p
+    4|w|q
+}
