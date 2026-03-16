@@ -1353,6 +1353,38 @@ expect {
     triggered for id 1
 }
 
+# Trigger WHEN comparisons must preserve rowid-alias affinity after NEW.* is
+# rewritten to registers, so string literals coerce numerically like SQLite.
+@cross-check-integrity
+test trigger-when-rowid-alias-string-literal-affinity {
+    CREATE TABLE t_5864(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE log_5864(msg TEXT);
+    CREATE TRIGGER t_5864_ai AFTER INSERT ON t_5864
+    WHEN NEW.a = '3' BEGIN
+      INSERT INTO log_5864 VALUES('match');
+    END;
+    INSERT INTO t_5864 VALUES(3, 'z');
+    SELECT * FROM log_5864;
+}
+expect {
+    match
+}
+
+# STRICT ANY must preserve no-affinity comparison semantics in trigger WHEN.
+@cross-check-integrity
+test trigger-when-strict-any-no-affinity {
+    CREATE TABLE t_5864_any(a ANY) STRICT;
+    CREATE TABLE log_5864_any(msg TEXT);
+    CREATE TRIGGER t_5864_any_ai AFTER INSERT ON t_5864_any
+    WHEN NEW.a = '3' BEGIN
+      INSERT INTO log_5864_any VALUES('match');
+    END;
+    INSERT INTO t_5864_any VALUES(3);
+    SELECT * FROM log_5864_any;
+}
+expect {
+}
+
 # https://github.com/tursodatabase/turso/issues/5175
 # Subquery in trigger body UPDATE SET clause
 @cross-check-integrity

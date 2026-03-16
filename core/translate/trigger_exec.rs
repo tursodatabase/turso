@@ -668,75 +668,81 @@ pub fn fire_trigger(
     let affinity_ctx = apply_new_column_affinity(program, &decoded_ctx)?;
     let ctx = &affinity_ctx;
 
-    // Evaluate WHEN clause if present
-    if let Some(mut when_expr) = trigger.when_clause.clone() {
-        // Rewrite BETWEEN expressions to AND/OR form before translation,
-        // since translate_expr expects this rewrite to have already happened.
-        rewrite_between_expr(&mut when_expr);
-        // Rewrite NEW/OLD references in WHEN clause to use registers
-        rewrite_trigger_expr_for_when_clause(&mut when_expr, &ctx.table, ctx)?;
+    let saved_register_affinities = std::mem::take(&mut resolver.register_affinities);
+    populate_trigger_register_affinities(resolver, ctx);
+    let result = (|| -> Result<()> {
+        // Evaluate WHEN clause if present
+        if let Some(mut when_expr) = trigger.when_clause.clone() {
+            // Rewrite BETWEEN expressions to AND/OR form before translation,
+            // since translate_expr expects this rewrite to have already happened.
+            rewrite_between_expr(&mut when_expr);
+            // Rewrite NEW/OLD references in WHEN clause to use registers
+            rewrite_trigger_expr_for_when_clause(&mut when_expr, &ctx.table, ctx)?;
 
-        // Plan and emit any subqueries in the WHEN clause (e.g. IN (SELECT ...), EXISTS, scalar subqueries).
-        // This transforms InSelect/Exists/Subquery nodes into SubqueryResult nodes that translate_expr can handle.
-        let mut subqueries = Vec::new();
-        plan_subqueries_from_trigger_when_clause(
-            program,
-            &mut subqueries,
-            &mut when_expr,
-            resolver,
-            connection,
-        )?;
-        // Emit the planned subqueries so their results are available when we evaluate the WHEN expression.
-        // Always treat these as correlated (no `Once` caching) because the WHEN clause is evaluated
-        // per-row, and trigger bodies may modify the tables referenced by the subquery between evaluations.
-        for subquery in &mut subqueries {
-            let plan = subquery.consume_plan(crate::translate::plan::EvalAt::BeforeLoop);
-            emit_non_from_clause_subquery(
+            // Plan and emit any subqueries in the WHEN clause (e.g. IN (SELECT ...), EXISTS, scalar subqueries).
+            // This transforms InSelect/Exists/Subquery nodes into SubqueryResult nodes that translate_expr can handle.
+            let mut subqueries = Vec::new();
+            plan_subqueries_from_trigger_when_clause(
+                program,
+                &mut subqueries,
+                &mut when_expr,
+                resolver,
+                connection,
+            )?;
+            // Emit the planned subqueries so their results are available when we evaluate the WHEN expression.
+            // Always treat these as correlated (no `Once` caching) because the WHEN clause is evaluated
+            // per-row, and trigger bodies may modify the tables referenced by the subquery between evaluations.
+            for subquery in &mut subqueries {
+                let plan = subquery.consume_plan(crate::translate::plan::EvalAt::BeforeLoop);
+                emit_non_from_clause_subquery(
+                    program,
+                    resolver,
+                    *plan,
+                    &subquery.query_type,
+                    true, // always re-evaluate: trigger WHEN is checked per-row
+                    false,
+                )?;
+            }
+
+            let when_reg = program.alloc_register();
+            translate_expr(program, None, &when_expr, when_reg, resolver)?;
+
+            let skip_label = program.allocate_label();
+            program.emit_insn(Insn::IfNot {
+                reg: when_reg,
+                jump_if_null: true,
+                target_pc: skip_label,
+            });
+
+            // Execute trigger commands if WHEN clause is true
+            execute_trigger_commands(
                 program,
                 resolver,
-                *plan,
-                &subquery.query_type,
-                true, // always re-evaluate: trigger WHEN is checked per-row
-                false,
+                &trigger,
+                ctx,
+                connection,
+                database_id,
+                ignore_jump_target,
+            )?;
+
+            program.preassign_label_to_next_insn(skip_label);
+        } else {
+            // No WHEN clause - always execute
+            execute_trigger_commands(
+                program,
+                resolver,
+                &trigger,
+                ctx,
+                connection,
+                database_id,
+                ignore_jump_target,
             )?;
         }
 
-        let when_reg = program.alloc_register();
-        translate_expr(program, None, &when_expr, when_reg, resolver)?;
-
-        let skip_label = program.allocate_label();
-        program.emit_insn(Insn::IfNot {
-            reg: when_reg,
-            jump_if_null: true,
-            target_pc: skip_label,
-        });
-
-        // Execute trigger commands if WHEN clause is true
-        execute_trigger_commands(
-            program,
-            resolver,
-            &trigger,
-            ctx,
-            connection,
-            database_id,
-            ignore_jump_target,
-        )?;
-
-        program.preassign_label_to_next_insn(skip_label);
-    } else {
-        // No WHEN clause - always execute
-        execute_trigger_commands(
-            program,
-            resolver,
-            &trigger,
-            ctx,
-            connection,
-            database_id,
-            ignore_jump_target,
-        )?;
-    }
-
-    Ok(())
+        Ok(())
+    })();
+    resolver.register_affinities = saved_register_affinities;
+    result
 }
 
 /// Decode encoded custom type registers in a TriggerContext.
@@ -855,6 +861,38 @@ fn apply_new_column_affinity(
         override_conflict: ctx.override_conflict,
         new_encoded: ctx.new_encoded,
     })
+}
+
+fn populate_trigger_register_affinities(resolver: &mut Resolver, ctx: &TriggerContext) {
+    populate_trigger_row_register_affinities(resolver, &ctx.table, ctx.new_registers.as_deref());
+    populate_trigger_row_register_affinities(resolver, &ctx.table, ctx.old_registers.as_deref());
+}
+
+fn populate_trigger_row_register_affinities(
+    resolver: &mut Resolver,
+    table: &BTreeTable,
+    row_registers: Option<&[usize]>,
+) {
+    let Some(registers) = row_registers else {
+        return;
+    };
+
+    for (idx, column) in table.columns.iter().enumerate() {
+        let affinity = if column.is_rowid_alias() {
+            Affinity::Integer
+        } else {
+            column.affinity_with_strict(table.is_strict)
+        };
+        if let Some(&register) = registers.get(idx) {
+            resolver.register_affinities.insert(register, affinity);
+        }
+    }
+
+    if let Some(&rowid_register) = registers.last() {
+        resolver
+            .register_affinities
+            .insert(rowid_register, Affinity::Integer);
+    }
 }
 
 /// Rewrite NEW/OLD references in WHEN clause expressions (uses Register expressions, not Variable)
