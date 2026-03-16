@@ -1,7 +1,7 @@
+use crate::LimboError::InvalidModifier;
 use crate::numeric::Numeric;
 use crate::types::AsValueRef;
 use crate::types::Value;
-use crate::LimboError::InvalidModifier;
 use crate::{Result, ValueRef};
 // chrono isn't used more due to incompatibility with sqlite
 use chrono::{Local, Offset, TimeZone};
@@ -10,6 +10,15 @@ use std::fmt::Write;
 
 const JD_TO_MS: i64 = 86_400_000;
 const MAX_JD: i64 = 464269060799999; // 9999-12-31 23:59:59.999
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DateTimeFunc {
+    Date,
+    Time,
+    DateTime,
+    JulianDay,
+    UnixEpoch,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct DateTime {
@@ -952,7 +961,7 @@ fn parse_datetime_value(val: ValueRef<'_>, p: &mut DateTime) -> Option<()> {
     Some(())
 }
 
-fn exec_datetime_general_inner<I, E, V>(values: I, func_type: &str) -> Option<Value>
+fn exec_datetime_general_inner<I, E, V>(values: I, func_type: DateTimeFunc) -> Option<Value>
 where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
@@ -988,8 +997,8 @@ where
     }
 
     match func_type {
-        "julianday" => Some(Value::from_f64(p.i_jd as f64 / 86400000.0)),
-        "unixepoch" => {
+        DateTimeFunc::JulianDay => Some(Value::from_f64(p.i_jd as f64 / 86400000.0)),
+        DateTimeFunc::UnixEpoch => {
             let unix = (p.i_jd - 210866760000000) / 1000;
             if p.use_subsec {
                 let ms = (p.i_jd - 210866760000000) as f64 / 1000.0;
@@ -998,62 +1007,58 @@ where
                 Some(Value::from_i64(unix))
             }
         }
-        _ => {
+        DateTimeFunc::Date | DateTimeFunc::Time | DateTimeFunc::DateTime => {
             p.compute_ymd_hms()?;
 
             let mut res = String::new();
-            if func_type == "date" {
-                if p.y < 0 {
-                    write!(res, "-{:04}-{:02}-{:02}", p.y.abs(), p.m, p.d).unwrap();
-                } else {
-                    write!(res, "{:04}-{:02}-{:02}", p.y, p.m, p.d).unwrap();
+            match func_type {
+                DateTimeFunc::Date => {
+                    if p.y < 0 {
+                        write!(res, "-{:04}-{:02}-{:02}", p.y.abs(), p.m, p.d).unwrap();
+                    } else {
+                        write!(res, "{:04}-{:02}-{:02}", p.y, p.m, p.d).unwrap();
+                    }
                 }
-            } else if func_type == "time" {
-                write!(res, "{:02}:{:02}", p.h, p.min).unwrap();
-                if p.use_subsec {
-                    write!(res, ":{:06.3}", p.s).unwrap();
-                } else {
-                    write!(res, ":{:02}", p.s as i32).unwrap();
+                DateTimeFunc::Time => {
+                    write!(res, "{:02}:{:02}", p.h, p.min).unwrap();
+                    if p.use_subsec {
+                        write!(res, ":{:06.3}", p.s).unwrap();
+                    } else {
+                        write!(res, ":{:02}", p.s as i32).unwrap();
+                    }
                 }
-            } else {
-                if p.y < 0 {
-                    write!(
-                        res,
-                        "-{:04}-{:02}-{:02} {:02}:{:02}",
-                        p.y.abs(),
-                        p.m,
-                        p.d,
-                        p.h,
-                        p.min
-                    )
-                    .unwrap();
-                } else {
-                    write!(
-                        res,
-                        "{:04}-{:02}-{:02} {:02}:{:02}",
-                        p.y, p.m, p.d, p.h, p.min
-                    )
-                    .unwrap();
-                }
+                DateTimeFunc::DateTime => {
+                    if p.y < 0 {
+                        write!(
+                            res,
+                            "-{:04}-{:02}-{:02} {:02}:{:02}",
+                            p.y.abs(),
+                            p.m,
+                            p.d,
+                            p.h,
+                            p.min
+                        )
+                        .unwrap();
+                    } else {
+                        write!(
+                            res,
+                            "{:04}-{:02}-{:02} {:02}:{:02}",
+                            p.y, p.m, p.d, p.h, p.min
+                        )
+                        .unwrap();
+                    }
 
-                if p.use_subsec {
-                    write!(res, ":{:06.3}", p.s).unwrap();
-                } else {
-                    write!(res, ":{:02}", p.s as i32).unwrap();
+                    if p.use_subsec {
+                        write!(res, ":{:06.3}", p.s).unwrap();
+                    } else {
+                        write!(res, ":{:02}", p.s as i32).unwrap();
+                    }
                 }
+                _ => unreachable!(),
             }
             Some(Value::from_text(res))
         }
     }
-}
-
-pub fn exec_datetime_general<I, E, V>(values: I, func_type: &str) -> Value
-where
-    V: AsValueRef,
-    E: ExactSizeIterator<Item = V>,
-    I: IntoIterator<IntoIter = E, Item = V>,
-{
-    exec_datetime_general_inner(values, func_type).unwrap_or(Value::Null)
 }
 
 pub fn exec_date<I, E, V>(values: I) -> Value
@@ -1062,7 +1067,7 @@ where
     E: ExactSizeIterator<Item = V>,
     I: IntoIterator<IntoIter = E, Item = V>,
 {
-    exec_datetime_general(values, "date")
+    exec_datetime_general_inner(values, DateTimeFunc::Date).unwrap_or(Value::Null)
 }
 
 pub fn exec_time<I, E, V>(values: I) -> Value
@@ -1071,7 +1076,7 @@ where
     E: ExactSizeIterator<Item = V>,
     I: IntoIterator<IntoIter = E, Item = V>,
 {
-    exec_datetime_general(values, "time")
+    exec_datetime_general_inner(values, DateTimeFunc::Time).unwrap_or(Value::Null)
 }
 
 pub fn exec_datetime_full<I, E, V>(values: I) -> Value
@@ -1080,7 +1085,7 @@ where
     E: ExactSizeIterator<Item = V>,
     I: IntoIterator<IntoIter = E, Item = V>,
 {
-    exec_datetime_general(values, "datetime")
+    exec_datetime_general_inner(values, DateTimeFunc::DateTime).unwrap_or(Value::Null)
 }
 
 pub fn exec_julianday<I, E, V>(values: I) -> Value
@@ -1089,7 +1094,7 @@ where
     E: ExactSizeIterator<Item = V>,
     I: IntoIterator<IntoIter = E, Item = V>,
 {
-    exec_datetime_general(values, "julianday")
+    exec_datetime_general_inner(values, DateTimeFunc::JulianDay).unwrap_or(Value::Null)
 }
 
 pub fn exec_unixepoch<I, E, V>(values: I) -> Value
@@ -1098,7 +1103,7 @@ where
     E: ExactSizeIterator<Item = V>,
     I: IntoIterator<IntoIter = E, Item = V>,
 {
-    exec_datetime_general(values, "unixepoch")
+    exec_datetime_general_inner(values, DateTimeFunc::UnixEpoch).unwrap_or(Value::Null)
 }
 
 fn exec_timediff_inner<I, E, V>(values: I) -> Option<Value>
@@ -2074,13 +2079,14 @@ mod tests {
 
     #[test]
     fn test_subsec_modifier() {
-        let res = exec_datetime_general(
+        let res = exec_datetime_general_inner(
             &[
                 Value::build_text("2023-06-15 12:30:45"),
                 Value::build_text("subsec"),
             ],
-            "time",
-        );
+            DateTimeFunc::Time,
+        )
+        .unwrap_or(Value::Null);
         assert_eq!(res.to_text().unwrap(), "12:30:45.000");
     }
 
@@ -2291,7 +2297,7 @@ mod tests {
             Value::build_text("2023-06-15 12:30:45".to_string()),
             Value::build_text("subsec".to_string()),
         ];
-        let res = exec_datetime_general(args, "datetime");
+        let res = exec_datetime_general_inner(args, DateTimeFunc::DateTime).unwrap_or(Value::Null);
         assert_eq!(res.to_text().unwrap(), "2023-06-15 12:30:45.000");
     }
 
@@ -2918,22 +2924,24 @@ mod tests {
             "23:59:59"
         );
 
-        let res1 = exec_datetime_general(
+        let res1 = exec_datetime_general_inner(
             vec![
                 Value::build_text("10:30:45.123".to_string()),
                 Value::build_text("subsec".to_string()),
             ],
-            "time",
-        );
+            DateTimeFunc::Time,
+        )
+        .unwrap_or(Value::Null);
         assert_eq!(res1.to_text().unwrap(), "10:30:45.123");
 
-        let res2 = exec_datetime_general(
+        let res2 = exec_datetime_general_inner(
             vec![
                 Value::build_text("10:30:45.1".to_string()),
                 Value::build_text("subsec".to_string()),
             ],
-            "time",
-        );
+            DateTimeFunc::Time,
+        )
+        .unwrap_or(Value::Null);
         assert_eq!(res2.to_text().unwrap(), "10:30:45.100");
     }
 
@@ -3057,7 +3065,10 @@ mod tests {
             Value::build_text("subsec".to_string()),
         ];
         assert_eq!(
-            exec_datetime_general(dt_args, "time").to_text().unwrap(),
+            exec_datetime_general_inner(dt_args, DateTimeFunc::Time)
+                .unwrap_or(Value::Null)
+                .to_text()
+                .unwrap(),
             "10:30:45.120"
         );
     }
