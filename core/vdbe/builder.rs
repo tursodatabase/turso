@@ -1186,6 +1186,8 @@ impl ProgramBuilder {
                 Insn::Yield {
                     yield_reg: _,
                     end_offset,
+                    subtype_clear_start_reg: _,
+                    subtype_clear_count: _,
                 } => {
                     resolve(end_offset, "Yield")?;
                 }

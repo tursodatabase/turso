@@ -1026,6 +1026,13 @@ pub enum Insn {
     Yield {
         yield_reg: usize,
         end_offset: BranchOffset,
+        /// For coroutine body yields (end_offset == 0): the start register of the
+        /// output columns and how many there are.  op_yield uses these to strip
+        /// the JSON subtype so that it does not survive the subquery boundary,
+        /// mirroring SQLite's OP_Copy P5=0x0002 behaviour.
+        /// Set to 0/0 for parent-side (non-body) yields.
+        subtype_clear_start_reg: usize,
+        subtype_clear_count: usize,
     },
 
     Insert {

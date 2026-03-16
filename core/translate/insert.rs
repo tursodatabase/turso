@@ -1910,6 +1910,8 @@ fn init_source_emission<'a>(
                     program.emit_insn(Insn::Yield {
                         yield_reg,
                         end_offset: yield_label, // stays local, we’ll route at loop end
+                        subtype_clear_start_reg: 0,
+                        subtype_clear_count: 0,
                     });
 
                     let record_reg = program.alloc_register();
@@ -1995,6 +1997,8 @@ fn init_source_emission<'a>(
                     program.emit_insn(Insn::Yield {
                         yield_reg,
                         end_offset: select_exhausted,
+                        subtype_clear_start_reg: 0,
+                        subtype_clear_count: 0,
                     });
                 }
 
