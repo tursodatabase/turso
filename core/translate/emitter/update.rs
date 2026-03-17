@@ -47,6 +47,7 @@ use crate::{
 };
 use std::num::NonZeroUsize;
 use tracing::{instrument, Level};
+use turso_macros::turso_assert;
 use turso_parser::ast::{ResolveType, TriggerEvent, TriggerTime};
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -1506,6 +1507,7 @@ fn emit_update_insns<'a>(
     let mut idx_phase_ctxs: Vec<IndexUpdatePhaseCtx> = Vec::with_capacity(indexes_to_update.len());
 
     // ---- Phase 1: Constraint checks + new key build ----
+    let mut seen_replace = false;
     for (index, (idx_cursor_id, record_reg)) in indexes_to_update.iter().zip(index_cursors) {
         let (old_satisfies_where, new_satisfies_where) = if index.where_clause.is_some() {
             // This means that we need to bind the column references to a copy of the index Expr,
@@ -1614,6 +1616,23 @@ fn emit_update_insns<'a>(
         // If the constraint check fails (Halt/Ignore/Replace), the old index
         // entry is still intact — no statement journal needed for rollback.
         if index.unique {
+            let idx_conflict = if program.has_statement_conflict {
+                or_conflict
+            } else {
+                index.on_conflict.unwrap_or(ResolveType::Abort)
+            };
+            // REPLACE indexes must be sorted after all non-REPLACE indexes
+            // (schema.rs:add_index ensures this). If a non-REPLACE index
+            // appears after a REPLACE one, constraint check ordering is wrong.
+            if idx_conflict == ResolveType::Replace {
+                seen_replace = true;
+            } else {
+                turso_assert!(
+                    !seen_replace,
+                    "non-REPLACE index after REPLACE index — sort order invariant violated"
+                );
+            }
+
             let constraint_check = program.allocate_label();
 
             // For partial indexes, skip the constraint check if new values don't
@@ -1648,12 +1667,6 @@ fn emit_update_insns<'a>(
                 flags: CmpInsFlags::default(),
                 collation: program.curr_collation(),
             });
-
-            let idx_conflict = if program.has_statement_conflict {
-                or_conflict
-            } else {
-                index.on_conflict.unwrap_or(ResolveType::Abort)
-            };
             match idx_conflict {
                 ResolveType::Ignore => {
                     // For IGNORE, skip this row's update but continue with other rows
