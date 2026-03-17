@@ -470,7 +470,10 @@ impl Whopper {
         };
 
         let db = {
-            let db_opts = DatabaseOpts::new().with_encryption(encryption_opts.is_some());
+            let db_opts = DatabaseOpts::new()
+                .with_encryption(encryption_opts.is_some())
+                .with_unsafe_testing(opts.enable_mvcc)
+                .with_simulator_seed(seed);
 
             match Database::open_file_with_flags(
                 io.clone(),
@@ -1019,7 +1022,10 @@ impl Whopper {
 
     /// Open database connections for all fibers.
     fn open_connections(&mut self) -> anyhow::Result<()> {
-        let db_opts = DatabaseOpts::new().with_encryption(self.encryption_opts.is_some());
+        let db_opts = DatabaseOpts::new()
+            .with_encryption(self.encryption_opts.is_some())
+            .with_unsafe_testing(self.context.enable_mvcc)
+            .with_simulator_seed(self.seed);
         let db = Database::open_file_with_flags(
             self.io.clone(),
             &self.db_path,
