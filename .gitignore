@@ -61,8 +61,8 @@ settings.local.json
 .build-hash
 
 # Track empty wals for read only databases
-!testing/runner/database/*
-testing/runner/database/integrity_*.db
+!testing/sqltests/database/*
+testing/sqltests/database/integrity_*.db
 
 
 # For simulator redo
