@@ -723,7 +723,7 @@ impl Schema {
     }
 
     pub fn add_trigger(&mut self, trigger: Trigger, table_name: &str) -> Result<()> {
-        self.check_object_name_conflict(&trigger.name)?;
+        self.check_trigger_name_conflict(&trigger.name)?;
         let table_name = normalize_ident(table_name);
 
         // See [Schema::add_index] for why we push to the front of the deque.
@@ -1748,6 +1748,16 @@ impl Schema {
             };
             return Err(crate::LimboError::ParseError(format!(
                 "{type_str} \"{name}\" already exists"
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_trigger_name_conflict(&self, name: &str) -> Result<()> {
+        let normalized_name = normalize_ident(name);
+        if self.get_trigger(&normalized_name).is_some() {
+            return Err(crate::LimboError::ParseError(format!(
+                "trigger {normalized_name} already exists"
             )));
         }
         Ok(())

@@ -122,7 +122,7 @@ pub fn translate_create_trigger(
         if if_not_exists {
             return Ok(());
         }
-        bail_parse_error!("Trigger {} already exists", normalized_trigger_name);
+        bail_parse_error!("trigger {} already exists", normalized_trigger_name);
     }
 
     // Verify the table exists
@@ -187,7 +187,9 @@ pub fn translate_create_trigger(
     let escaped_trigger_name = escape_sql_string_literal(&normalized_trigger_name);
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
-        where_clause: Some(format!("name = '{escaped_trigger_name}'")),
+        where_clause: Some(format!(
+            "type = 'trigger' AND name = '{escaped_trigger_name}'"
+        )),
     });
 
     Ok(())

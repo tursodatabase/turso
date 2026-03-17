@@ -53,3 +53,69 @@ test correct-trigger-fires-after-failed-duplicate {
 expect {
     from_t1
 }
+
+@setup schema
+test trigger-name-can-match-table-name {
+    CREATE TABLE tr(a);
+    CREATE TRIGGER tr AFTER INSERT ON t1 BEGIN INSERT INTO log VALUES('table'); END;
+    INSERT INTO t1 VALUES(1);
+    SELECT * FROM log;
+}
+expect {
+    table
+}
+
+@setup schema
+test trigger-name-can-match-index-name {
+    CREATE INDEX tr ON t1(a);
+    CREATE TRIGGER tr AFTER INSERT ON t2 BEGIN INSERT INTO log VALUES('index'); END;
+    INSERT INTO t2 VALUES(1);
+    SELECT * FROM log;
+}
+expect {
+    index
+}
+
+@setup schema
+test trigger-name-can-match-view-name {
+    CREATE VIEW tr AS SELECT a FROM t1;
+    CREATE TRIGGER tr AFTER INSERT ON t2 BEGIN INSERT INTO log VALUES('view'); END;
+    INSERT INTO t2 VALUES(1);
+    SELECT * FROM log;
+}
+expect {
+    view
+}
+
+@setup schema
+test table-name-can-match-trigger-name {
+    CREATE TRIGGER tr AFTER INSERT ON t1 BEGIN INSERT INTO log VALUES('table'); END;
+    CREATE TABLE tr(a);
+    SELECT type, name FROM sqlite_schema WHERE name = 'tr' ORDER BY type;
+}
+expect {
+    table|tr
+    trigger|tr
+}
+
+@setup schema
+test index-name-can-match-trigger-name {
+    CREATE TRIGGER tr AFTER INSERT ON t1 BEGIN INSERT INTO log VALUES('index'); END;
+    CREATE INDEX tr ON t2(a);
+    SELECT type, name FROM sqlite_schema WHERE name = 'tr' ORDER BY type;
+}
+expect {
+    index|tr
+    trigger|tr
+}
+
+@setup schema
+test view-name-can-match-trigger-name {
+    CREATE TRIGGER tr AFTER INSERT ON t1 BEGIN INSERT INTO log VALUES('view'); END;
+    CREATE VIEW tr AS SELECT a FROM t2;
+    SELECT type, name FROM sqlite_schema WHERE name = 'tr' ORDER BY type;
+}
+expect {
+    trigger|tr
+    view|tr
+}
