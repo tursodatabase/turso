@@ -137,7 +137,9 @@ use crate::{
 };
 use core::fmt;
 use rustc_hash::{FxBuildHasher, FxHashMap as HashMap, FxHashSet as HashSet};
-use std::collections::VecDeque;
+use std::borrow::Borrow;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, VecDeque};
 use std::ops::{Deref, Index as OpsIndex, IndexMut as OpsIndexMut};
 use std::slice::SliceIndex;
 use tracing::trace;
@@ -1891,10 +1893,83 @@ pub enum Table {
     FromClauseSubquery(Arc<FromClauseSubquery>),
 }
 
+#[derive(Debug, Eq)]
+pub struct Identifier(String);
+
+impl Identifier {
+    pub fn new(s: String) -> Self {
+        Identifier(s)
+    }
+}
+
+impl PartialEq for Identifier {
+    fn eq(&self, other: &Self) -> bool {
+        let a: &IdentifierRef = self.borrow();
+        a.eq(other.borrow())
+    }
+}
+
+impl From<String> for Identifier {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl PartialOrd for Identifier {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Identifier {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let a: &IdentifierRef = self.borrow();
+        a.cmp(other.borrow())
+    }
+}
+
+impl Borrow<IdentifierRef> for Identifier {
+    fn borrow(&self) -> &IdentifierRef {
+        IdentifierRef::new(&self.0)
+    }
+}
+
+#[derive(Debug, Eq)]
+#[repr(transparent)]
+pub struct IdentifierRef(str);
+
+impl IdentifierRef {
+    pub fn new(s: &str) -> &Self {
+        // SAFETY: IdentifierRef is #[repr(transparent)] over str
+        unsafe { &*(s as *const str as *const IdentifierRef) }
+    }
+}
+
+impl PartialEq for IdentifierRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.eq_ignore_ascii_case(&other.0)
+    }
+}
+
+impl PartialOrd for IdentifierRef {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for IdentifierRef {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0
+            .bytes()
+            .map(|b| b.to_ascii_lowercase())
+            .cmp(other.0.bytes().map(|b| b.to_ascii_lowercase()))
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Columns {
     columns: Vec<Column>,
-    lookup_cache: crate::sync::OnceLock<HashMap<String, usize>>,
+    lookup_cache: crate::sync::OnceLock<BTreeMap<Identifier, usize>>,
 }
 
 impl Clone for Columns {
@@ -1915,19 +1990,20 @@ impl Columns {
     }
 
     pub fn lookup(&self, name: &str) -> Option<(usize, &Column)> {
-        let normalized_name = normalize_ident(name);
-        let idx = self.lookup_cache().get(&normalized_name).copied()?;
+        let idx = self.lookup_cache().get(IdentifierRef::new(name)).copied()?;
         Some((idx, &self.columns[idx]))
     }
 
-    fn lookup_cache(&self) -> &HashMap<String, usize> {
+    fn lookup_cache(&self) -> &BTreeMap<Identifier, usize> {
         self.lookup_cache.get_or_init(|| {
-            let mut lookup_cache = HashMap::default();
+            let mut lookup_cache = BTreeMap::new();
             for (idx, column) in self.columns.iter().enumerate() {
                 let Some(name) = &column.name else {
                     continue;
                 };
-                lookup_cache.entry(normalize_ident(name)).or_insert(idx);
+                lookup_cache
+                    .entry(Identifier::from(name.to_string()))
+                    .or_insert(idx);
             }
             lookup_cache
         })
