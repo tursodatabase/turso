@@ -8,11 +8,11 @@ use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl};
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
-use crate::turso_assert;
 use crate::types::IOResult;
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::CursorID;
+use crate::{turso_assert, turso_debug_assert};
 use turso_macros::AtomicEnum;
 
 #[derive(Debug, Clone, AtomicEnum)]
@@ -859,6 +859,18 @@ impl Schema {
             // Non-REPLACE indexes go at the front, newest first.
             indexes_for_table.push_front(index);
         }
+        turso_debug_assert!(
+            indexes_for_table
+                .iter()
+                .position(|idx| idx.on_conflict == Some(ResolveType::Replace))
+                .is_none_or(|first_replace| {
+                    indexes_for_table
+                        .iter()
+                        .skip(first_replace)
+                        .all(|idx| idx.on_conflict == Some(ResolveType::Replace))
+                }),
+            "REPLACE indexes must form a contiguous suffix"
+        );
         Ok(())
     }
 

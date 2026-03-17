@@ -47,7 +47,7 @@ use crate::{
 };
 use std::num::NonZeroUsize;
 use tracing::{instrument, Level};
-use turso_macros::turso_assert;
+use turso_macros::{turso_assert, turso_assert_eq};
 use turso_parser::ast::{ResolveType, TriggerEvent, TriggerTime};
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -866,6 +866,11 @@ fn emit_update_insns<'a>(
     } else {
         None
     };
+
+    turso_assert!(
+        !has_user_provided_rowid || rowid_set_clause_reg.is_some(),
+        "has_user_provided_rowid requires rowid_set_clause_reg"
+    );
 
     // Effective INTEGER PK conflict resolution: statement-level OR clause takes precedence;
     // otherwise use the constraint-level rowid_alias_conflict_clause from the table DDL.
@@ -1832,6 +1837,12 @@ fn emit_update_insns<'a>(
             new_satisfies_where,
         });
     }
+
+    turso_assert_eq!(
+        idx_phase_ctxs.len(),
+        indexes_to_update.len(),
+        "idx_phase_ctxs.len() != indexes_to_update.len()"
+    );
 
     // PK REPLACE: when the new rowid conflicts with an existing row, delete it.
     // Runs AFTER Phase 1 (all index constraint checks) so that non-REPLACE index

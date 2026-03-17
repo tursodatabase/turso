@@ -1,3 +1,4 @@
+use crate::turso_debug_assert;
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{
@@ -3336,6 +3337,34 @@ fn build_constraints_to_check(
             constraints_to_check.push(pk);
         }
     }
+
+    // Post-condition: when no statement-level override exists, all REPLACE
+    // constraints (by DDL mode) must form a contiguous suffix. When a statement
+    // override exists, all constraints get the same effective mode, so the DDL
+    // ordering is irrelevant.
+    turso_debug_assert!(
+        has_statement_conflict || {
+            let mut saw_replace = false;
+            constraints_to_check.iter().all(|(c, _)| {
+                let mode = match c {
+                    ResolvedUpsertTarget::PrimaryKey => {
+                        rowid_alias_conflict_clause.unwrap_or(ResolveType::Abort)
+                    }
+                    ResolvedUpsertTarget::Index(idx) => {
+                        idx.on_conflict.unwrap_or(ResolveType::Abort)
+                    }
+                    ResolvedUpsertTarget::CatchAll => return true,
+                };
+                if mode == ResolveType::Replace {
+                    saw_replace = true;
+                    true
+                } else {
+                    !saw_replace
+                }
+            })
+        },
+        "constraints must have all REPLACE entries at the end"
+    );
 
     let upsert_catch_all_position =
         if let Some((ResolvedUpsertTarget::CatchAll, ..)) = upsert_actions.last() {
