@@ -14,7 +14,7 @@ use crate::{
     vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
     CaptureDataChangesExt, Connection,
 };
-use turso_parser::ast::{self, Expr, Indexed, SortOrder};
+use turso_parser::ast::{self, Expr, SortOrder};
 
 use super::emitter::emit_program;
 use super::expr::process_returning_clause;
@@ -180,14 +180,6 @@ fn validate_update(
     if body.from.is_some() {
         bail_parse_error!("FROM clause is not supported in UPDATE");
     }
-    if body
-        .indexed
-        .as_ref()
-        .is_some_and(|i| matches!(i, Indexed::IndexedBy(_)))
-    {
-        bail_parse_error!("INDEXED BY clause is not supported in UPDATE");
-    }
-
     if !body.order_by.is_empty() {
         bail_parse_error!("ORDER BY is not supported in UPDATE");
     }
@@ -244,9 +236,10 @@ pub fn prepare_update_plan(
         connection,
     )?;
 
-    // Extract WITH and OR conflict clause before borrowing body mutably
+    // Extract WITH, OR conflict clause, and INDEXED BY before borrowing body mutably
     let with = body.with.take();
     let or_conflict = body.or_conflict.take();
+    let indexed = body.indexed.take();
 
     let table_name = table.get_name();
     let iter_dir = body
@@ -277,6 +270,7 @@ pub fn prepare_update_plan(
         column_use_counts: Vec::new(),
         expression_index_usages: Vec::new(),
         database_id,
+        indexed,
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
 

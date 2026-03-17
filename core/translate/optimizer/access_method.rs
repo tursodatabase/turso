@@ -209,16 +209,24 @@ pub(super) fn choose_best_btree_candidate(
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
 ) -> Option<ChosenBtreeCandidate> {
-    let mut best_cost = estimate_cost_for_scan_or_seek(
-        None,
-        &[],
-        &[],
-        input_cardinality,
-        base_row_count,
-        false,
-        params,
-        None,
-    );
+    // Seed the baseline with a table scan only if a rowid candidate exists
+    // (i.e. no INDEXED BY has removed it). Otherwise start at infinite cost
+    // so the forced index candidate always wins.
+    let has_rowid_candidate = rhs_constraints.candidates.iter().any(|c| c.index.is_none());
+    let mut best_cost = if has_rowid_candidate {
+        estimate_cost_for_scan_or_seek(
+            None,
+            &[],
+            &[],
+            input_cardinality,
+            base_row_count,
+            false,
+            params,
+            None,
+        )
+    } else {
+        Cost(f64::MAX)
+    };
     let mut best_choice = ChosenBtreeCandidate {
         iter_dir: IterationDirection::Forwards,
         index: None,
@@ -764,7 +772,9 @@ fn find_best_access_method_for_btree(
         },
     };
 
-    if rhs_table.btree().is_some_and(|b| b.has_rowid) {
+    // Skip alternative access methods (in-seek, multi-index) when INDEXED BY or NOT INDEXED
+    // is specified — the user explicitly requested a specific index or no index.
+    if rhs_table.indexed.is_none() && rhs_table.btree().is_some_and(|b| b.has_rowid) {
         if let Some(in_seek_method) = consider_in_seek_access_method(
             rhs_table,
             rhs_constraints,
