@@ -106,7 +106,6 @@ pub enum WalPushResult {
 
 pub fn connect_untracked(tape: &DatabaseTape) -> Result<Arc<turso_core::Connection>> {
     let conn = tape.connect_untracked()?;
-    conn.wal_auto_checkpoint_disable();
     Ok(conn)
 }
 
