@@ -395,6 +395,7 @@ mod tests {
                 enable_autovacuum: false,
                 enable_attach: false,
                 unsafe_testing: false,
+                simulator_seed: None,
             },
             None,
         )?;

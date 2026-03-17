@@ -172,6 +172,7 @@ pub struct DatabaseOpts {
     pub enable_autovacuum: bool,
     pub enable_attach: bool,
     pub unsafe_testing: bool,
+    pub simulator_seed: Option<u64>,
     enable_load_extension: bool,
 }
 
@@ -218,6 +219,11 @@ impl DatabaseOpts {
 
     pub fn with_unsafe_testing(mut self, enable: bool) -> Self {
         self.unsafe_testing = enable;
+        self
+    }
+
+    pub fn with_simulator_seed(mut self, seed: u64) -> Self {
+        self.simulator_seed = Some(seed);
         self
     }
 }
@@ -1262,6 +1268,7 @@ impl Database {
                 self.open_flags,
                 self.durable_storage.clone(),
                 None,
+                &self.opts,
             )?;
             self.mv_store.store(Some(mv_store));
         }
