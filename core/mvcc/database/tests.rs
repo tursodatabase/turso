@@ -6750,6 +6750,74 @@ fn test_concurrent_commit_yield_spin() {
     assert_eq!(rows[0][0].as_int().unwrap(), 1);
 }
 
+fn abandon_commit_after_first_io(conn: &Arc<Connection>, mv_store: &Arc<MvStore<MvccClock>>) {
+    let lock = &mv_store.commit_coordinator.pager_commit_lock;
+    assert!(lock.write(), "should acquire commit lock");
+
+    let mut stmt = conn.prepare("COMMIT").unwrap();
+    assert!(
+        matches!(stmt.step().unwrap(), crate::StepResult::IO),
+        "COMMIT should yield while the commit lock is held",
+    );
+
+    drop(stmt);
+    lock.unlock();
+    conn.close().unwrap();
+}
+
+/// if a txn made some inserts, then aborted (or abandoned due to some IO issue), then those
+/// inserted rows should not be visible
+#[test]
+fn test_abandoned_commit_rolls_back_insert() {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'new')").unwrap();
+
+    let mv_store = db.get_mvcc_store();
+    abandon_commit_after_first_io(&conn, &mv_store);
+
+    let observer = db.connect();
+    let rows = get_rows(&observer, "SELECT id FROM t WHERE id = 1");
+    assert!(
+        rows.is_empty(),
+        "row from abandoned INSERT commit remained visible: {rows:?}",
+    );
+    observer.close().unwrap();
+}
+
+/// if a txn deleted some existing rows, but then aborted (or abandoned due to some IO issue), then
+/// those rows should not become deleted
+#[test]
+fn test_abandoned_commit_rolls_back_delete() {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'seed')").unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+
+    let mv_store = db.get_mvcc_store();
+    abandon_commit_after_first_io(&conn, &mv_store);
+
+    let observer = db.connect();
+    let rows = get_rows(&observer, "SELECT id, v FROM t WHERE id = 1");
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Numeric(Numeric::Integer(1)),
+            Value::Text(Text::new("seed".to_string())),
+        ]],
+        "row disappeared after abandoned DELETE commit: {rows:?}",
+    );
+    observer.close().unwrap();
+}
+
 /// ALTER TABLE RENAME TO on a table with a CREATE INDEX panics on the next
 /// session open. Reproduces the issue with 3 separate sessions (DB restarts).
 #[test]
