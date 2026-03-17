@@ -1091,6 +1091,10 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     /// Create read/write database connection and appropriately configure it before use
     pub async fn connect_rw<Ctx>(&self, coro: &Coro<Ctx>) -> Result<Arc<turso_core::Connection>> {
         let conn = self.main_tape.connect(coro).await?;
+        assert!(
+            conn.is_wal_auto_checkpoint_disabled(),
+            "tape must be configured to have autocheckpoint disabled"
+        );
         Ok(conn)
     }
 
