@@ -372,6 +372,8 @@ mod tests {
     /// types introduced by #5254 and #5729.
     #[test]
     fn test_vacuum_into_with_rich_builtin_and_array_types() {
+        type RichTypeInsertRow = (i64, i64, i64, String, String, String, String, String);
+
         let path = TempDir::new()
             .unwrap()
             .keep()
@@ -508,19 +510,18 @@ mod tests {
             )
             .unwrap();
 
-            let rows: Vec<(i64, i64, i64, String, String, String, String, String)> = conn
-                .exec_rows(
-                    "SELECT \
-                        amount, \
-                        array_length(flags), \
-                        array_length(balances), \
-                        tags[1], \
-                        json_extract(profile, '$.role'), \
-                        CAST(json_extract(profile_bin, '$.enabled') AS TEXT), \
-                        price, \
-                        label \
-                     FROM rich_types WHERE id = 2",
-                );
+            let rows: Vec<RichTypeInsertRow> = conn.exec_rows(
+                "SELECT \
+                    amount, \
+                    array_length(flags), \
+                    array_length(balances), \
+                    tags[1], \
+                    json_extract(profile, '$.role'), \
+                    CAST(json_extract(profile_bin, '$.enabled') AS TEXT), \
+                    price, \
+                    label \
+                 FROM rich_types WHERE id = 2",
+            );
             assert_eq!(
                 rows,
                 vec![(
