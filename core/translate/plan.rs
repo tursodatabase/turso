@@ -972,6 +972,12 @@ pub struct TableReferences {
     right_join_swapped: bool,
 }
 
+impl Default for TableReferences {
+    fn default() -> Self {
+        Self::new_empty()
+    }
+}
+
 impl TableReferences {
     /// The maximum number of tables that can be joined together in a query.
     /// This limit is arbitrary, although we currently use a u128 to represent the [crate::translate::planner::TableMask],
