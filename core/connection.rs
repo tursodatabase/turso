@@ -266,11 +266,32 @@ impl Connection {
         self.executing_triggers.write().pop();
     }
     pub fn prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
-        self._prepare(sql)
+        self._prepare_with_opts(sql, translate::TranslateOpts::default())
     }
 
     #[instrument(skip_all, level = Level::INFO)]
     pub fn _prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
+        self._prepare_with_opts(sql, translate::TranslateOpts::default())
+    }
+
+    pub(crate) fn prepare_preserving_storage_values(
+        self: &Arc<Connection>,
+        sql: impl AsRef<str>,
+    ) -> Result<Statement> {
+        self._prepare_with_opts(
+            sql,
+            translate::TranslateOpts {
+                preserve_storage_values: true,
+            },
+        )
+    }
+
+    #[instrument(skip_all, level = Level::INFO)]
+    fn _prepare_with_opts(
+        self: &Arc<Connection>,
+        sql: impl AsRef<str>,
+        translate_opts: translate::TranslateOpts,
+    ) -> Result<Statement> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
@@ -305,7 +326,7 @@ impl Connection {
         // where we try to read the schema again there
         let schema = self.schema.read().clone();
 
-        let program = translate::translate(
+        let program = translate::translate_with_opts(
             &schema,
             stmt,
             pager.clone(),
@@ -313,8 +334,15 @@ impl Connection {
             &syms,
             mode,
             input,
+            translate_opts,
         )?;
-        Ok(Statement::new(program, pager, mode, byte_offset_end))
+        Ok(Statement::new_with_options(
+            program,
+            pager,
+            mode,
+            byte_offset_end,
+            translate_opts.preserve_storage_values,
+        ))
     }
 
     /// Prepare a statement from an AST node directly, skipping SQL parsing.

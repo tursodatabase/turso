@@ -1672,8 +1672,8 @@ fn test_vacuum_into_with_strict_table(tmp_db: TempDatabase) -> anyhow::Result<()
                 3,
                 "charlie@example.com".to_string(),
                 "charlie".to_string(),
-                150
-            )
+                150,
+            ),
         ]
     );
 
@@ -1691,6 +1691,71 @@ fn test_vacuum_into_with_strict_table(tmp_db: TempDatabase) -> anyhow::Result<()
             .is_err(),
         "Unique index should reject duplicate email"
     );
+
+    Ok(())
+}
+
+/// Regression test for #5898 covering vector values during VACUUM INTO.
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_with_vector_types(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute(
+        "CREATE TABLE vectors (
+            id INTEGER PRIMARY KEY,
+            dense32 BLOB,
+            sparse32 BLOB,
+            dense64 BLOB,
+            quant8 BLOB,
+            bit1 BLOB
+        )",
+    )?;
+    conn.execute(
+        "INSERT INTO vectors VALUES (
+            1,
+            vector('[1,2,3]'),
+            vector32_sparse('[1,0,3]'),
+            vector64('[1.5,2.25]'),
+            vector8('[1,2,3,4]'),
+            vector1bit('[1,-1,1,1]')
+        )",
+    )?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed_vectors.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    let rows: Vec<(String, String, String, String, String)> = dest_conn.exec_rows(
+        "SELECT \
+            vector_extract(dense32), \
+            vector_extract(sparse32), \
+            vector_extract(dense64), \
+            vector_extract(quant8), \
+            vector_extract(bit1) \
+         FROM vectors",
+    );
+    assert_eq!(
+        rows,
+        vec![(
+            "[1,2,3]".to_string(),
+            "[1,0,3]".to_string(),
+            "[1.5,2.25]".to_string(),
+            "[1,2,3,4]".to_string(),
+            "[1,-1,1,1]".to_string(),
+        )]
+    );
+
+    let rows: Vec<(f64, f64, f64)> = dest_conn.exec_rows(
+        "SELECT \
+            vector_distance_dot(dense32, vector('[1,1,1]')), \
+            vector_distance_cos(sparse32, vector32_sparse('[1,0,3]')), \
+            vector_distance_dot(bit1, vector1bit('[1,-1,1,1]')) \
+         FROM vectors",
+    );
+    assert_eq!(rows, vec![(-6.0, 0.0, -4.0)]);
 
     Ok(())
 }
@@ -1748,7 +1813,7 @@ fn test_vacuum_into_with_strict_without_rowid(tmp_db: TempDatabase) -> anyhow::R
         vec![
             ("language".to_string(), "en".to_string(), 1704153600),
             ("theme".to_string(), "dark".to_string(), 1704067200),
-            ("timezone".to_string(), "UTC".to_string(), 1704240000)
+            ("timezone".to_string(), "UTC".to_string(), 1704240000),
         ]
     );
 
@@ -1758,6 +1823,102 @@ fn test_vacuum_into_with_strict_without_rowid(tmp_db: TempDatabase) -> anyhow::R
             .is_err(),
         "STRICT should reject wrong types"
     );
+
+    Ok(())
+}
+
+/// VACUUM INTO should preserve NULL vector columns, multiple rows, and
+/// post-vacuum inserts for the vector storage path.
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_with_vector_edge_cases(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute(
+        "CREATE TABLE vectors (
+            id INTEGER PRIMARY KEY,
+            dense32 BLOB,
+            sparse32 BLOB,
+            dense64 BLOB,
+            quant8 BLOB,
+            bit1 BLOB
+        )",
+    )?;
+    conn.execute(
+        "INSERT INTO vectors VALUES
+            (1, vector('[1,2,3]'), vector32_sparse('[1,0,3]'), NULL, NULL, NULL),
+            (2, NULL, NULL, vector64('[1.5,2.25]'), vector8('[1,2,3,4]'), vector1bit('[1,-1,1,1]'))",
+    )?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed_vectors_edges.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    let rows: Vec<(String, String)> = dest_conn.exec_rows(
+        "SELECT
+            vector_extract(dense32),
+            vector_extract(sparse32)
+         FROM vectors
+         WHERE id = 1",
+    );
+    assert_eq!(rows, vec![("[1,2,3]".to_string(), "[1,0,3]".to_string())]);
+
+    let rows: Vec<(i64, i64, i64)> = dest_conn.exec_rows(
+        "SELECT
+            dense64 IS NULL,
+            quant8 IS NULL,
+            bit1 IS NULL
+         FROM vectors
+         WHERE id = 1",
+    );
+    assert_eq!(rows, vec![(1, 1, 1)]);
+
+    let rows: Vec<(String, String, String)> = dest_conn.exec_rows(
+        "SELECT
+            vector_extract(dense64),
+            vector_extract(quant8),
+            vector_extract(bit1)
+         FROM vectors
+         WHERE id = 2",
+    );
+    assert_eq!(
+        rows,
+        vec![(
+            "[1.5,2.25]".to_string(),
+            "[1,2,3,4]".to_string(),
+            "[1,-1,1,1]".to_string(),
+        )]
+    );
+
+    let rows: Vec<(i64, i64)> = dest_conn.exec_rows(
+        "SELECT
+            dense32 IS NULL,
+            sparse32 IS NULL
+         FROM vectors
+         WHERE id = 2",
+    );
+    assert_eq!(rows, vec![(1, 1)]);
+
+    dest_conn.execute(
+        "INSERT INTO vectors VALUES (
+            3,
+            vector('[4,5,6]'),
+            NULL,
+            NULL,
+            NULL,
+            NULL
+        )",
+    )?;
+    let rows: Vec<(String, f64)> = dest_conn.exec_rows(
+        "SELECT
+            vector_extract(dense32),
+            vector_distance_dot(dense32, vector('[1,1,1]'))
+         FROM vectors
+         WHERE id = 3",
+    );
+    assert_eq!(rows, vec![("[4,5,6]".to_string(), -15.0)]);
 
     Ok(())
 }
@@ -1833,7 +1994,7 @@ fn test_vacuum_into_with_multiple_strict_tables(tmp_db: TempDatabase) -> anyhow:
         vec![
             (1, 1, "Widget".to_string(), 2, 19.99),
             (2, 1, "Gadget".to_string(), 1, 19.99),
-            (3, 2, "Gizmo".to_string(), 3, 9.99)
+            (3, 2, "Gizmo".to_string(), 3, 9.99),
         ]
     );
 

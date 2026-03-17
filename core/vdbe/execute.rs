@@ -13569,6 +13569,8 @@ pub(crate) struct OpVacuumIntoState {
     /// Keep dest_db alive while vacuum is in progress.
     #[allow(dead_code)]
     dest_db: Option<Arc<crate::Database>>,
+    /// Destination connection used throughout the vacuum state machine.
+    dest_conn: Option<Arc<Connection>>,
     /// Schema rows: [(type, name, tbl_name, sql), ...]
     schema_rows: Vec<Vec<Value>>,
     /// Names of tables to copy data for
@@ -13578,6 +13580,17 @@ pub(crate) struct OpVacuumIntoState {
     /// Meta values read from source database header
     source_user_version: i32,
     source_application_id: i32,
+    /// Original destination connection CHECK-constraint state.
+    dest_check_constraints_ignored: bool,
+}
+
+fn restore_vacuum_check_constraints(vacuum_state: &OpVacuumIntoState) {
+    let Some(dest_conn) = vacuum_state.dest_conn.as_ref() else {
+        return;
+    };
+    if dest_conn.check_constraints_ignored() != vacuum_state.dest_check_constraints_ignored {
+        dest_conn.set_check_constraints_ignored(vacuum_state.dest_check_constraints_ignored);
+    }
 }
 
 /// VACUUM INTO - create a compacted copy of the database at the specified path.
@@ -13611,6 +13624,9 @@ pub fn op_vacuum_into(
             unreachable!("op_vacuum_into_inner only returns Step or IO")
         }
         Err(err) => {
+            if let Some(vacuum_state) = state.op_vacuum_into_state.as_ref() {
+                restore_vacuum_check_constraints(vacuum_state);
+            }
             // Reset state on error
             state.op_vacuum_into_state = None;
             Err(err)
@@ -13656,6 +13672,7 @@ fn op_vacuum_into_inner(
                 let source_db = &program.connection.db;
                 let dest_opts = crate::DatabaseOpts::new()
                     .with_views(source_db.experimental_views_enabled())
+                    .with_custom_types(source_db.experimental_custom_types_enabled())
                     .with_index_method(source_db.experimental_index_method_enabled());
 
                 program.connection.execute("BEGIN")?;
@@ -13705,9 +13722,13 @@ fn op_vacuum_into_inner(
                 // Performance optimizations for destination database:
                 // 1. Disable fsync - destination is a new file, if crash occurs we just delete it
                 // 2. Disable foreign key checks - source data is already consistent
+                // 3. Disable CHECK enforcement while copying rows - VACUUM INTO
+                //    must preserve on-disk values without revalidating them
                 // These match SQLite's vacuum.c optimizations (PAGER_SYNCHRONOUS_OFF, ~SQLITE_ForeignKeys)
                 dest_conn.execute("PRAGMA synchronous = OFF")?;
                 dest_conn.execute("PRAGMA foreign_keys = OFF")?;
+                vacuum_state.dest_check_constraints_ignored = dest_conn.check_constraints_ignored();
+                dest_conn.set_check_constraints_ignored(true);
 
                 // Wrap all operations in a single transaction for atomicity and performance.
                 // This batches all writes and ensures destination is either empty or complete.
@@ -13723,6 +13744,7 @@ fn op_vacuum_into_inner(
                 let schema_stmt = program.connection.prepare(schema_sql.as_str())?;
 
                 vacuum_state.dest_db = Some(dest_db);
+                vacuum_state.dest_conn = Some(dest_conn.clone());
                 vacuum_state.source_user_version = user_version;
                 vacuum_state.source_application_id = application_id;
 
@@ -13999,7 +14021,9 @@ fn op_vacuum_into_inner(
                         let table_name = &vacuum_state.table_names[table_idx];
                         let escaped_table_name = table_name.replace('"', "\"\"");
                         let select_sql = format!("SELECT * FROM \"{escaped_table_name}\"");
-                        let select_stmt = program.connection.prepare(&select_sql)?;
+                        let select_stmt = program
+                            .connection
+                            .prepare_preserving_storage_values(&select_sql)?;
 
                         // Prepare INSERT statement once per table (reused for all rows)
                         let column_names = vacuum_state.current_table_columns.join(", ");
@@ -14018,7 +14042,8 @@ fn op_vacuum_into_inner(
                         if is_internal {
                             dest_conn.start_nested();
                         }
-                        let dest_insert_stmt = dest_conn.prepare(&insert_sql);
+                        let dest_insert_stmt =
+                            dest_conn.prepare_preserving_storage_values(&insert_sql);
                         if is_internal {
                             dest_conn.end_nested();
                         }
@@ -14140,6 +14165,7 @@ fn op_vacuum_into_inner(
             },
 
             OpVacuumIntoSubState::CopyMetaValues { dest_conn } => {
+                restore_vacuum_check_constraints(vacuum_state);
                 // Copy meta values to destination database
                 // Use pragma_update to set user_version and application_id
                 // Note: schema_version is not copied - VACUUM INTO creates a new file so
@@ -14513,6 +14539,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_restore_vacuum_check_constraints_restores_original_state() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.set_check_constraints_ignored(true);
+
+        let vacuum_state = OpVacuumIntoState {
+            sub_state: OpVacuumIntoSubState::Init,
+            dest_conn: Some(conn.clone()),
+            dest_check_constraints_ignored: false,
+            ..Default::default()
+        };
+
+        restore_vacuum_check_constraints(&vacuum_state);
+        assert!(!conn.check_constraints_ignored());
     }
 
     #[test]

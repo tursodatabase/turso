@@ -107,7 +107,7 @@ pub fn emit_select_result(
     // Emit ArrayDecode for result columns that produce array blobs.
     // Array values are stored as record-format blobs internally; decode
     // them to JSON text for user-facing display.
-    if !skip_column_eval {
+    if !skip_column_eval && !program.preserve_storage_values {
         emit_array_decode_for_results(
             program,
             &plan.result_columns,

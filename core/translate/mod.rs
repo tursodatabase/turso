@@ -66,6 +66,11 @@ use transaction::{translate_tx_begin, translate_tx_commit};
 use turso_parser::ast;
 use update::translate_update;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TranslateOpts {
+    pub preserve_storage_values: bool,
+}
+
 #[instrument(skip_all, level = Level::DEBUG)]
 #[allow(clippy::too_many_arguments)]
 pub fn translate(
@@ -76,6 +81,30 @@ pub fn translate(
     syms: &SymbolTable,
     query_mode: QueryMode,
     input: &str,
+) -> Result<Program> {
+    translate_with_opts(
+        schema,
+        stmt,
+        pager,
+        connection,
+        syms,
+        query_mode,
+        input,
+        Default::default(),
+    )
+}
+
+#[instrument(skip_all, level = Level::DEBUG)]
+#[allow(clippy::too_many_arguments)]
+pub fn translate_with_opts(
+    schema: &Schema,
+    stmt: ast::Stmt,
+    pager: Arc<Pager>,
+    connection: Arc<Connection>,
+    syms: &SymbolTable,
+    query_mode: QueryMode,
+    input: &str,
+    opts: TranslateOpts,
 ) -> Result<Program> {
     tracing::trace!("querying {}", input);
     let change_cnt_on = matches!(
@@ -96,6 +125,7 @@ pub fn translate(
             approx_num_labels: 2,
         },
     );
+    program.preserve_storage_values = opts.preserve_storage_values;
 
     program.prologue();
     let mut resolver = Resolver::new(

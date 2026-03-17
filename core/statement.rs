@@ -49,6 +49,8 @@ pub struct Statement {
     /// Byte offset in the original SQL string where this statement ends.
     /// Used by sqlite3_prepare_v2 to set the *pzTail output parameter.
     tail_offset: usize,
+    /// Whether this statement should preserve stored values on reprepare.
+    preserve_storage_values: bool,
 }
 
 crate::assert::assert_send_sync!(Statement);
@@ -72,6 +74,16 @@ impl Statement {
         query_mode: QueryMode,
         tail_offset: usize,
     ) -> Self {
+        Self::new_with_options(program, pager, query_mode, tail_offset, false)
+    }
+
+    pub fn new_with_options(
+        program: vdbe::Program,
+        pager: Arc<Pager>,
+        query_mode: QueryMode,
+        tail_offset: usize,
+        preserve_storage_values: bool,
+    ) -> Self {
         let (max_registers, cursor_count) = match query_mode {
             QueryMode::Normal => (program.max_registers, program.cursor_ref.len()),
             QueryMode::Explain => (EXPLAIN_COLUMNS.len(), 0),
@@ -87,6 +99,7 @@ impl Statement {
             busy_handler_state: None,
             has_returned_row: false,
             tail_offset,
+            preserve_storage_values,
         }
     }
 
@@ -358,7 +371,7 @@ impl Statement {
             turso_assert_eq!(QueryMode::new(&cmd), mode);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
             let schema = conn.schema.read().clone();
-            translate::translate(
+            translate::translate_with_opts(
                 &schema,
                 stmt,
                 self.pager.clone(),
@@ -366,6 +379,9 @@ impl Statement {
                 &syms,
                 mode,
                 &self.program.sql,
+                translate::TranslateOpts {
+                    preserve_storage_values: self.preserve_storage_values,
+                },
             )?
         };
 

@@ -587,32 +587,44 @@ pub fn translate_insert(
     program.preassign_label_to_next_insn(ctx.key_labels.key_ready_for_check);
 
     if ctx.table.is_strict {
-        // Pre-encode TypeCheck: validate input types match the custom type's
-        // declared value type BEFORE encoding. This catches type mismatches
-        // (e.g. TEXT into an INTEGER-based custom type) that would otherwise
-        // be silently converted by the encode expression.
-        program.emit_insn(Insn::TypeCheck {
-            start_reg: insertion.first_col_register(),
-            count: insertion.col_mappings.len(),
-            check_generated: true,
-            table_reference: BTreeTable::input_type_check_table_ref(
-                ctx.table,
-                resolver.schema(),
-                None,
-            ),
-        });
+        if program.preserve_storage_values {
+            // VACUUM INTO copies storage-form values directly.
+            // Validate the bound values against on-disk storage types, but do
+            // not run custom-type or array encoders again.
+            program.emit_insn(Insn::TypeCheck {
+                start_reg: insertion.first_col_register(),
+                count: insertion.col_mappings.len(),
+                check_generated: true,
+                table_reference: BTreeTable::type_check_table_ref(ctx.table, resolver.schema()),
+            });
+        } else {
+            // Pre-encode TypeCheck: validate input types match the custom type's
+            // declared value type BEFORE encoding. This catches type mismatches
+            // (e.g. TEXT into an INTEGER-based custom type) that would otherwise
+            // be silently converted by the encode expression.
+            program.emit_insn(Insn::TypeCheck {
+                start_reg: insertion.first_col_register(),
+                count: insertion.col_mappings.len(),
+                check_generated: true,
+                table_reference: BTreeTable::input_type_check_table_ref(
+                    ctx.table,
+                    resolver.schema(),
+                    None,
+                ),
+            });
 
-        // Encode values for columns with custom types.
-        emit_custom_type_encode(program, resolver, &insertion, &ctx.table.name)?;
+            // Encode values for columns with custom types.
+            emit_custom_type_encode(program, resolver, &insertion, &ctx.table.name)?;
 
-        // Post-encode TypeCheck: validate that encode produced the correct
-        // storage type (BASE).
-        program.emit_insn(Insn::TypeCheck {
-            start_reg: insertion.first_col_register(),
-            count: insertion.col_mappings.len(),
-            check_generated: true,
-            table_reference: BTreeTable::type_check_table_ref(ctx.table, resolver.schema()),
-        });
+            // Post-encode TypeCheck: validate that encode produced the correct
+            // storage type (BASE).
+            program.emit_insn(Insn::TypeCheck {
+                start_reg: insertion.first_col_register(),
+                count: insertion.col_mappings.len(),
+                check_generated: true,
+                table_reference: BTreeTable::type_check_table_ref(ctx.table, resolver.schema()),
+            });
+        }
     } else {
         // For non-STRICT tables, apply column affinity to the values.
         // This must happen early so that both index records and the table record

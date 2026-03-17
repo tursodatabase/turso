@@ -186,6 +186,9 @@ pub struct ProgramBuilder {
     /// This is used when building ORDER BY sort keys so the sorter compares
     /// encoded (on-disk) values. Decode is presentation-only.
     pub suppress_custom_type_decode: bool,
+    /// When set, compilation preserves stored values instead of producing
+    /// user-facing decoded values.
+    pub preserve_storage_values: bool,
     /// When true, the next `emit_column` call will not bake the default value
     /// into the Column instruction. Used for custom type columns where the default
     /// needs to be encoded before use.
@@ -449,6 +452,7 @@ impl ProgramBuilder {
             cursor_overrides: HashMap::default(),
             id_register_overrides: HashMap::default(),
             suppress_custom_type_decode: false,
+            preserve_storage_values: false,
             suppress_column_default: false,
             hash_build_signatures: HashMap::default(),
             hash_tables_to_keep_open: HashSet::default(),

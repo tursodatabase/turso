@@ -894,7 +894,8 @@ pub fn translate_expr(
         });
         // Hash join payloads store raw encoded values; apply DECODE for custom
         // type columns so the result set contains human-readable text.
-        if needs_decode && !program.suppress_custom_type_decode {
+        if needs_decode && !program.suppress_custom_type_decode && !program.preserve_storage_values
+        {
             if let ast::Expr::Column {
                 table: table_ref_id,
                 column,
@@ -1726,6 +1727,13 @@ pub fn translate_expr(
                                 index_reg,
                                 dest: target_register,
                             });
+                            maybe_decode_custom_array_element(
+                                program,
+                                referenced_tables,
+                                &args[0],
+                                target_register,
+                                resolver,
+                            )?;
                             Ok(target_register)
                         }
                         ScalarFunc::ArraySetElement => {
@@ -3060,7 +3068,8 @@ pub fn translate_expr(
 
                         // Decode custom type columns (skipped when building ORDER BY sort keys
                         // for types without a `<` operator, so the sorter sorts on encoded values)
-                        if !program.suppress_custom_type_decode {
+                        if !program.suppress_custom_type_decode && !program.preserve_storage_values
+                        {
                             // For custom type columns with a default, the Column
                             // instruction returns NULL for pre-existing rows
                             // (since we suppressed the default). Load the default
@@ -7200,8 +7209,13 @@ fn emit_array_element_loop(
     // Reserve a contiguous block for transformed elements.
     // At runtime, we only use registers[elem_base..elem_base+len].
     let elem_base = program.alloc_registers(MAX_ARRAY_LOOP_ELEMENTS);
+    let skip_transform_label = program.allocate_label();
 
     program.emit_insn(Insn::ArrayLength { reg, dest: reg_len });
+    program.emit_insn(Insn::IsNull {
+        reg: reg_len,
+        target_pc: skip_transform_label,
+    });
 
     // Guard: halt if the array exceeds the register block size.
     let max_reg = program.alloc_register();
@@ -7238,8 +7252,9 @@ fn emit_array_element_loop(
         dest: reg_offset,
     });
 
-    let loop_start = program.offset();
+    let loop_start_label = program.allocate_label();
     let loop_end_label = program.allocate_label();
+    program.preassign_label_to_next_insn(loop_start_label);
 
     program.emit_insn(Insn::Gt {
         lhs: reg_idx,
@@ -7283,7 +7298,7 @@ fn emit_array_element_loop(
         value: 1,
     });
     program.emit_insn(Insn::Goto {
-        target_pc: loop_start,
+        target_pc: loop_start_label,
     });
 
     program.preassign_label_to_next_insn(loop_end_label);
@@ -7294,8 +7309,114 @@ fn emit_array_element_loop(
         count_reg: reg_len,
         dest: reg,
     });
+    program.preassign_label_to_next_insn(skip_transform_label);
 
     Ok(())
+}
+
+fn maybe_decode_custom_array_element(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    array_expr: &ast::Expr,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    if program.preserve_storage_values {
+        return Ok(());
+    }
+
+    let Some(referenced_tables) = referenced_tables else {
+        return Ok(());
+    };
+
+    let Some((col, type_def, remaining_dims)) =
+        find_custom_array_source(array_expr, referenced_tables, resolver)
+    else {
+        return Ok(());
+    };
+    if remaining_dims != 1 {
+        return Ok(());
+    }
+    let Some(decode_expr) = type_def.decode.as_ref() else {
+        return Ok(());
+    };
+
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg: target_register,
+        target_pc: skip_label,
+    });
+    emit_type_expr(
+        program,
+        decode_expr,
+        target_register,
+        target_register,
+        col,
+        type_def,
+        resolver,
+    )?;
+    program.preassign_label_to_next_insn(skip_label);
+
+    Ok(())
+}
+
+fn find_custom_array_source<'a>(
+    expr: &'a ast::Expr,
+    referenced_tables: &'a TableReferences,
+    resolver: &'a Resolver,
+) -> Option<(&'a Column, &'a TypeDef, u32)> {
+    match expr {
+        ast::Expr::Column { table, column, .. } => {
+            let (_, table) = referenced_tables.find_table_by_internal_id(*table)?;
+            let col = table.get_column_at(*column)?;
+            if !col.is_array() {
+                return None;
+            }
+            let type_def = resolver
+                .schema()
+                .get_type_def(&col.ty_str, table.is_strict())?;
+            Some((col, type_def, col.array_dimensions()))
+        }
+        ast::Expr::FunctionCall { name, args, .. } => {
+            match name.as_str().to_ascii_lowercase().as_str() {
+                "array_element" => {
+                    let (col, type_def, dims) =
+                        find_custom_array_source(args.first()?, referenced_tables, resolver)?;
+                    Some((col, type_def, dims.saturating_sub(1)))
+                }
+                "coalesce" | "ifnull" | "min" | "max" => args
+                    .iter()
+                    .find_map(|arg| find_custom_array_source(arg, referenced_tables, resolver)),
+                "iif" => args
+                    .get(1)
+                    .and_then(|arg| find_custom_array_source(arg, referenced_tables, resolver))
+                    .or_else(|| {
+                        args.get(2).and_then(|arg| {
+                            find_custom_array_source(arg, referenced_tables, resolver)
+                        })
+                    }),
+                "nullif" => args
+                    .first()
+                    .and_then(|arg| find_custom_array_source(arg, referenced_tables, resolver)),
+                _ => None,
+            }
+        }
+        ast::Expr::Case {
+            when_then_pairs,
+            else_expr,
+            ..
+        } => when_then_pairs
+            .iter()
+            .find_map(|(_, then_expr)| {
+                find_custom_array_source(then_expr, referenced_tables, resolver)
+            })
+            .or_else(|| {
+                else_expr
+                    .as_ref()
+                    .and_then(|expr| find_custom_array_source(expr, referenced_tables, resolver))
+            }),
+        _ => None,
+    }
 }
 
 /// Emit bytecode to encode an array value: parse JSON text input, validate/coerce
