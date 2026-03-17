@@ -1,7 +1,7 @@
 use crate::sync::Arc;
 
 use crate::storage::sqlite3_ondisk::Version;
-use crate::{mvcc, MvStore, OpenFlags, Result, IO};
+use crate::{mvcc, DatabaseOpts, MvStore, OpenFlags, Result, IO};
 
 #[derive(
     Debug,
@@ -68,6 +68,7 @@ pub fn open_mv_store(
     flags: OpenFlags,
     durable_storage: Option<Arc<dyn mvcc::persistent_storage::DurableStorage>>,
     encryption_ctx: Option<crate::storage::encryption::EncryptionContext>,
+    opts: &DatabaseOpts,
 ) -> Result<Arc<MvStore>> {
     let storage: Arc<dyn mvcc::persistent_storage::DurableStorage> =
         if let Some(storage) = durable_storage {
@@ -87,7 +88,11 @@ pub fn open_mv_store(
             ))
         };
 
-    let mv_store = MvStore::new(mvcc::MvccClock::new(), storage);
+    let mv_store = MvStore::new(
+        mvcc::MvccClock::new(),
+        storage,
+        mvcc::database::SimulatorOpts::from_db_opts(opts),
+    );
     let mv_store = Arc::new(mv_store);
     Ok(mv_store)
 }

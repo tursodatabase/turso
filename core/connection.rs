@@ -1530,9 +1530,15 @@ impl Connection {
         let use_views = self.db.experimental_views_enabled();
         let use_custom_types = self.db.experimental_custom_types_enabled();
 
-        let db_opts = DatabaseOpts::new()
+        let mut db_opts = DatabaseOpts::new()
             .with_views(use_views)
             .with_custom_types(use_custom_types);
+        if self.db.opts.unsafe_testing {
+            db_opts = db_opts.with_unsafe_testing(true);
+        }
+        if let Some(seed) = self.db.opts.simulator_seed {
+            db_opts = db_opts.with_simulator_seed(seed);
+        }
         // Select the IO layer for the attached database:
         // - :memory: databases always get a fresh MemoryIO
         // - File-based databases reuse the parent's IO when the parent is also
@@ -1568,6 +1574,7 @@ impl Connection {
                 db.open_flags,
                 db.durable_storage.clone(),
                 None,
+                &db.opts,
             )?;
             db.mv_store.store(Some(mv_store.clone()));
             let bootstrap_conn = db._connect(true, Some(pager.clone()), encryption_key)?;
