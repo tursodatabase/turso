@@ -421,6 +421,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         // DB wasn't synced with remote but will be encrypted on remote - so we must properly set reserved bytes field in advance
         if meta.synced_revision.is_none() && opts.reserved_bytes != 0 {
             let conn = main_db.connect()?;
+            conn.wal_auto_checkpoint_disable();
             conn.set_reserved_bytes(opts.reserved_bytes as u8)?;
 
             // write transaction forces allocation of root DB page
