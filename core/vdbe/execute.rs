@@ -3494,6 +3494,9 @@ pub fn op_transaction_inner(
                             && *tx_mode == TransactionMode::Concurrent
                         {
                             mark_unlikely();
+                            pager.end_read_tx();
+                            conn.set_tx_state(TransactionState::None);
+                            state.auto_txn_cleanup = TxnCleanup::None;
                             return Err(LimboError::TxError(
                                 "Cannot start CONCURRENT transaction after BEGIN DEFERRED"
                                     .to_string(),
