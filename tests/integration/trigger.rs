@@ -2012,3 +2012,49 @@ fn test_trigger_upsert_clause_persists_after_rename() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[turso_macros::test()]
+fn test_changes_after_trigger_abort_resets_to_zero(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE seed(x)").unwrap();
+    conn.execute("INSERT INTO seed VALUES (1), (2)").unwrap();
+    conn.execute("CREATE TABLE t(a)").unwrap();
+    conn.execute("CREATE TABLE log(msg)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER tr AFTER INSERT ON t BEGIN
+         INSERT INTO log VALUES ('x');
+         SELECT RAISE(ABORT, 'boom');
+        END",
+    )
+    .unwrap();
+
+    let err = conn.execute("INSERT INTO t VALUES (1)").unwrap_err();
+    assert!(err.to_string().contains("boom"));
+
+    let changes: Vec<(i64,)> = conn.exec_rows("SELECT changes()");
+    assert_eq!(changes, vec![(0,)]);
+}
+
+#[turso_macros::test()]
+fn test_changes_after_trigger_fail_keeps_direct_row_count(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE seed(x)").unwrap();
+    conn.execute("INSERT INTO seed VALUES (1), (2)").unwrap();
+    conn.execute("CREATE TABLE t(a)").unwrap();
+    conn.execute("CREATE TABLE log(msg)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER tr AFTER INSERT ON t BEGIN
+         INSERT INTO log VALUES ('x');
+         SELECT RAISE(FAIL, 'boom');
+        END",
+    )
+    .unwrap();
+
+    let err = conn.execute("INSERT INTO t VALUES (1)").unwrap_err();
+    assert!(err.to_string().contains("boom"));
+
+    let changes: Vec<(i64,)> = conn.exec_rows("SELECT changes()");
+    assert_eq!(changes, vec![(1,)]);
+}
