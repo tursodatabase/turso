@@ -132,6 +132,7 @@ impl CheckpointMode {
     }
 }
 
+/// Immutable view of the WAL metadata a connection snapshots from shared state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WalSnapshot {
     max_frame: u64,
@@ -142,11 +143,13 @@ struct WalSnapshot {
 }
 
 impl WalSnapshot {
+    /// First frame that is still visible in the WAL after checkpoint backfill.
     const fn min_frame(self) -> u64 {
         self.nbackfills + 1
     }
 }
 
+/// Which read-mark, if any, currently protects this connection's snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReadGuardKind {
     None,
@@ -155,6 +158,7 @@ enum ReadGuardKind {
 }
 
 impl ReadGuardKind {
+    /// Convert the lock index stored on `WalFile` into a semantic guard kind.
     const fn from_lock_index(lock_index: usize) -> Self {
         match lock_index {
             NO_LOCK_HELD => Self::None,
@@ -163,6 +167,7 @@ impl ReadGuardKind {
         }
     }
 
+    /// Convert the semantic guard kind back into the legacy lock index representation.
     const fn lock_index(self) -> usize {
         match self {
             Self::None => NO_LOCK_HELD,
@@ -172,6 +177,7 @@ impl ReadGuardKind {
     }
 }
 
+/// Connection-local WAL state derived from a shared snapshot plus a held read guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WalConnectionState {
     snapshot: WalSnapshot,
@@ -179,6 +185,7 @@ struct WalConnectionState {
 }
 
 impl WalConnectionState {
+    /// Build a new connection-local WAL state bundle.
     const fn new(snapshot: WalSnapshot, read_guard: ReadGuardKind) -> Self {
         Self {
             snapshot,
@@ -186,6 +193,7 @@ impl WalConnectionState {
         }
     }
 
+    /// Replace just the shared snapshot while preserving the current read guard.
     const fn with_snapshot(self, snapshot: WalSnapshot) -> Self {
         Self {
             snapshot,
@@ -1018,6 +1026,7 @@ enum TryBeginReadResult {
 }
 
 impl WalFile {
+    /// Read the shared WAL metadata that defines a connection snapshot.
     fn load_shared_snapshot(shared: &WalFileShared) -> WalSnapshot {
         WalSnapshot {
             max_frame: shared.max_frame.load(Ordering::Acquire),
@@ -1028,6 +1037,7 @@ impl WalFile {
         }
     }
 
+    /// Reconstruct the connection-local WAL state stored on this `WalFile`.
     fn connection_state(&self) -> WalConnectionState {
         WalConnectionState::new(
             WalSnapshot {
@@ -1041,6 +1051,7 @@ impl WalFile {
         )
     }
 
+    /// Persist a connection-local WAL snapshot bundle back into the legacy fields on `WalFile`.
     fn install_connection_state(&self, state: WalConnectionState) {
         self.max_frame
             .store(state.snapshot.max_frame, Ordering::Release);
@@ -1055,6 +1066,7 @@ impl WalFile {
             .store(state.read_guard.lock_index(), Ordering::Release);
     }
 
+    /// Compare a freshly loaded shared snapshot against the connection's current snapshot.
     fn db_changed_against(&self, snapshot: WalSnapshot, local_state: WalConnectionState) -> bool {
         snapshot != local_state.snapshot
     }
