@@ -2815,6 +2815,7 @@ fn emit_preflight_constraint_checks(
     constraints: &ConstraintsToCheck,
     preflight: &mut PreflightCtx,
 ) -> Result<()> {
+    let mut seen_replace = false;
     for (constraint, position) in &constraints.constraints_to_check {
         // Compute per-constraint effective conflict resolution:
         // Statement-level OR clause overrides; otherwise use constraint's clause.
@@ -2835,6 +2836,17 @@ fn emit_preflight_constraint_checks(
                 ResolvedUpsertTarget::CatchAll => unreachable!(),
             }
         };
+        // REPLACE constraints must sort after all non-REPLACE ones
+        // (schema.rs:add_index + IPK deferral ensure this).
+        if effective == ResolveType::Replace {
+            seen_replace = true;
+        } else {
+            turso_assert!(
+                !seen_replace,
+                "non-REPLACE constraint after REPLACE constraint — sort order invariant violated"
+            );
+        }
+
         let effective_on_replace =
             matches!(effective, ResolveType::Replace) && preflight.upsert_actions.is_empty();
         preflight.on_replace = effective_on_replace;
