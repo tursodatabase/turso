@@ -1374,9 +1374,9 @@ pub fn parse_where(
                     end,
                 } = e
                 {
-                    let lhs_expr = std::mem::replace(lhs.as_mut(), Expr::Literal(Null));
-                    let start_expr = std::mem::replace(start.as_mut(), Expr::Literal(Null));
-                    let end_expr = std::mem::replace(end.as_mut(), Expr::Literal(Null));
+                    let lhs_expr = std::mem::take(lhs.as_mut());
+                    let start_expr = std::mem::take(start.as_mut());
+                    let end_expr = std::mem::take(end.as_mut());
 
                     let (lower, upper, combine_op) = if *not {
                         (

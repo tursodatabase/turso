@@ -45,32 +45,39 @@ pub struct ConditionMetadata {
 fn translate_between_expr(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&TableReferences>,
-    between_expr: &ast::Expr,
+    mut between_expr: ast::Expr,
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
     let ast::Expr::Between {
-        lhs,
+        ref mut lhs,
         not,
-        start,
-        end,
+        ref mut start,
+        ref mut end,
     } = between_expr
     else {
         unreachable!("translate_between_expr expects Expr::Between");
     };
 
     let lhs_reg = program.alloc_register();
-    translate_expr(program, referenced_tables, lhs, lhs_reg, resolver)?;
+    translate_expr(program, referenced_tables, &*lhs, lhs_reg, resolver)?;
 
     let mut between_resolver = resolver.fork_with_expr_cache();
     between_resolver.enable_expr_to_reg_cache();
-    between_resolver.expr_to_reg_cache.push((
-        std::borrow::Cow::Borrowed(lhs.as_ref()),
+    #[allow(clippy::or_fun_call)]
+    between_resolver.cache_scalar_expr_reg(
+        std::borrow::Cow::Owned(*lhs.to_owned()),
         lhs_reg,
         false,
-    ));
+        referenced_tables.unwrap_or(&TableReferences::default()),
+    )?;
 
-    let (lower_expr, upper_expr, combine_op) = build_between_terms(lhs, *not, start, end);
+    let (lower_expr, upper_expr, combine_op) = build_between_terms(
+        std::mem::take(lhs),
+        not,
+        std::mem::take(start),
+        std::mem::take(end),
+    );
     let lower_reg = program.alloc_register();
     translate_expr(
         program,
@@ -106,10 +113,10 @@ fn translate_between_expr(
 }
 
 fn build_between_terms(
-    lhs: &ast::Expr,
+    lhs: ast::Expr,
     not: bool,
-    start: &ast::Expr,
-    end: &ast::Expr,
+    start: ast::Expr,
+    end: ast::Expr,
 ) -> (ast::Expr, ast::Expr, ast::Operator) {
     let (lower_op, upper_op, combine_op) = if not {
         (
@@ -124,8 +131,8 @@ fn build_between_terms(
             ast::Operator::And,
         )
     };
-    let lower_expr = ast::Expr::Binary(Box::new(lhs.clone()), lower_op, Box::new(start.clone()));
-    let upper_expr = ast::Expr::Binary(Box::new(lhs.clone()), upper_op, Box::new(end.clone()));
+    let lower_expr = ast::Expr::Binary(Box::new(lhs.clone()), lower_op, Box::new(start));
+    let upper_expr = ast::Expr::Binary(Box::new(lhs), upper_op, Box::new(end));
     (lower_expr, upper_expr, combine_op)
 }
 
@@ -586,7 +593,7 @@ pub fn translate_condition_expr(
             translate_between_expr(
                 program,
                 Some(referenced_tables),
-                expr,
+                expr.clone(),
                 between_result_reg,
                 resolver,
             )?;
@@ -1241,7 +1248,13 @@ pub fn translate_expr(
             }
         }
         ast::Expr::Between { .. } => {
-            translate_between_expr(program, referenced_tables, expr, target_register, resolver)?;
+            translate_between_expr(
+                program,
+                referenced_tables,
+                expr.clone(),
+                target_register,
+                resolver,
+            )?;
             Ok(target_register)
         }
         ast::Expr::Binary(e1, op, e2) => {
@@ -7068,14 +7081,14 @@ pub(crate) fn emit_user_facing_column_value(
 pub(crate) fn decode_custom_type_registers_in_expr(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    expr: &mut turso_parser::ast::Expr,
+    expr: &mut ast::Expr,
     columns: &[Column],
     start_reg: usize,
     key_reg: Option<usize>,
     is_strict: bool,
 ) -> Result<()> {
     walk_expr_mut(expr, &mut |e| {
-        if let turso_parser::ast::Expr::Register(reg) = e {
+        if let ast::Expr::Register(reg) = e {
             let reg_val = *reg;
             // Skip the rowid register — it's not a custom type column.
             if key_reg == Some(reg_val) {
@@ -7098,7 +7111,7 @@ pub(crate) fn decode_custom_type_registers_in_expr(
                                 is_strict,
                                 resolver,
                             )?;
-                            *e = turso_parser::ast::Expr::Register(decoded_reg);
+                            *e = ast::Expr::Register(decoded_reg);
                         }
                     }
                 }
@@ -7115,7 +7128,7 @@ pub(crate) fn decode_custom_type_registers_in_expr(
 /// The expression result is written to `dest_reg`.
 pub(crate) fn emit_type_expr(
     program: &mut ProgramBuilder,
-    expr: &turso_parser::ast::Expr,
+    expr: &ast::Expr,
     value_reg: usize,
     dest_reg: usize,
     column: &Column,
@@ -7147,14 +7160,12 @@ pub(crate) fn emit_type_expr(
 
     // Translate body expression only if param setup succeeded
     let result = param_result.and_then(|()| {
-        let rewritten = expr.clone();
-
         // Translate the expression, disabling constant optimization since
         // the `value` placeholder refers to a register that changes per row.
         translate_expr_no_constant_opt(
             program,
             None,
-            &rewritten,
+            expr,
             dest_reg,
             resolver,
             NoConstantOptReason::RegisterReuse,
