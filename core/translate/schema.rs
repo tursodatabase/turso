@@ -850,7 +850,7 @@ pub fn translate_create_table(
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }
-    let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
+    let normalized_tbl_name = tbl_name.name.as_str().to_string();
     if temporary {
         bail_parse_error!("TEMPORARY table not supported yet");
     }
