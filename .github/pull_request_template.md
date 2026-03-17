@@ -1,9 +1,3 @@
-# NOTICE:
-<!-- 
-In order to streamline the contribution process, please check the "allow edits from maintainers" checkbox on your PR. If needed, this allows us to push tweaks to your PR and avoid a potentially lengthy back-and-forth. Your original commits will stay on the branch, and you will keep authorship of those commits.
--->
-
-
 ## Description
 
 <!-- 
@@ -17,6 +11,15 @@ Please include relevant motivation and context.
 Link relevant issues here.
 -->
 
+## Checklist
+
+- [ ] I have read, I understand, and I vouch for everything in this PR.
+- [ ] I do not have more than 3 open PRs simultaneously.
+- [ ] I have checked the "allow edits by maintainers" checkbox on my PR.
+
+<!-- 
+Checking "allow edits by maintainers" allows us to push tweaks to your PR if needed and avoids a potentially lengthy back-and-forth. Your original commits will stay on the branch, and you will keep authorship of those commits.
+-->
 
 ## Description of AI Usage
 
