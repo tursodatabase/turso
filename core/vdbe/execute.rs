@@ -3744,7 +3744,53 @@ pub enum OpProgramState {
         /// Saved last_insert_rowid to restore after trigger subprogram completes.
         /// Per SQLite docs, trigger-body INSERTs must not overwrite the top-level rowid.
         saved_last_insert_rowid: Option<i64>,
+        /// Saved connection-level `changes()` value to restore after a trigger subprogram.
+        /// Trigger-body statements temporarily replace it via ResetCount, but the caller's
+        /// value becomes visible again once the trigger returns.
+        saved_last_change: Option<i64>,
     },
+}
+
+fn finish_subprogram(
+    program: &Program,
+    statement: &Statement,
+    is_trigger: bool,
+    subprogram_aborted: bool,
+    saved_last_insert_rowid: Option<i64>,
+    saved_last_change: Option<i64>,
+) {
+    let pending_changes = statement.n_change();
+    if pending_changes != 0 {
+        program.connection.add_total_changes(pending_changes);
+    }
+
+    if is_trigger && !subprogram_aborted {
+        program.connection.end_trigger_execution();
+    }
+
+    if let Some(rowid) = saved_last_insert_rowid {
+        program.connection.update_last_rowid(rowid);
+    }
+
+    if let Some(last_change) = saved_last_change {
+        program.connection.set_last_change(last_change);
+    }
+}
+
+pub fn op_reset_count(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    if !matches!(insn, Insn::ResetCount) {
+        panic!("Expected Insn::ResetCount, got {insn:?}");
+    }
+
+    let nchange = state.n_change.swap(0, Ordering::SeqCst);
+    program.connection.set_changes(nchange);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
 }
 
 /// Execute a subprogram (Program opcode).
@@ -3764,7 +3810,7 @@ pub fn op_program(
         insn
     );
     loop {
-        match &mut state.op_program_state {
+        match std::mem::replace(&mut state.op_program_state, OpProgramState::Start) {
             OpProgramState::Start => {
                 let mut statement = Statement::new(
                     Program::from_prepared(subprogram.clone(), program.connection.clone()),
@@ -3776,12 +3822,16 @@ pub fn op_program(
 
                 // Check if this is a trigger subprogram - if so, track execution
                 // and save last_insert_rowid so it can be restored after the trigger finishes.
-                let (is_trigger, saved_last_insert_rowid) =
+                let (is_trigger, saved_last_insert_rowid, saved_last_change) =
                     if let Some(ref trigger) = statement.get_trigger() {
                         program.connection.start_trigger_execution(trigger.clone());
-                        (true, Some(program.connection.last_insert_rowid()))
+                        (
+                            true,
+                            Some(program.connection.last_insert_rowid()),
+                            Some(program.connection.changes()),
+                        )
                     } else {
-                        (false, None)
+                        (false, None, None)
                     };
 
                 // Extract register values from params (which contain register indices encoded as negative integers)
@@ -3813,15 +3863,15 @@ pub fn op_program(
                     is_trigger,
                     statement: Box::new(statement),
                     saved_last_insert_rowid,
+                    saved_last_change,
                 };
             }
             OpProgramState::Step {
                 is_trigger,
-                statement,
+                mut statement,
                 saved_last_insert_rowid,
+                saved_last_change,
             } => {
-                let is_trigger = *is_trigger;
-                let saved_last_insert_rowid = *saved_last_insert_rowid;
                 let mut raise_ignore = false;
                 // Track whether the subprogram aborted with an error. When abort()
                 // runs inside the subprogram, it already calls end_trigger_execution(),
@@ -3836,15 +3886,36 @@ pub fn op_program(
                                 let io = statement.take_io_completions().unwrap_or_else(|| {
                                     IOCompletions::Single(Completion::new_yield())
                                 });
+                                state.op_program_state = OpProgramState::Step {
+                                    is_trigger,
+                                    statement,
+                                    saved_last_insert_rowid,
+                                    saved_last_change,
+                                };
                                 return Ok(InsnFunctionStepResult::IO(io));
                             }
                             StepResult::Row => continue,
                             StepResult::Interrupt | StepResult::Busy => {
+                                state.op_program_state = OpProgramState::Step {
+                                    is_trigger,
+                                    statement,
+                                    saved_last_insert_rowid,
+                                    saved_last_change,
+                                };
                                 return Err(LimboError::Busy);
                             }
                         },
                         Err(LimboError::Constraint(constraint_err)) => {
                             if program.resolve_type != ResolveType::Ignore {
+                                subprogram_aborted = true;
+                                finish_subprogram(
+                                    program,
+                                    &statement,
+                                    is_trigger,
+                                    subprogram_aborted,
+                                    saved_last_insert_rowid,
+                                    saved_last_change,
+                                );
                                 return Err(LimboError::Constraint(constraint_err));
                             }
                             subprogram_aborted = true;
@@ -3856,24 +3927,28 @@ pub fn op_program(
                             break;
                         }
                         Err(err) => {
+                            subprogram_aborted = true;
+                            finish_subprogram(
+                                program,
+                                &statement,
+                                is_trigger,
+                                subprogram_aborted,
+                                saved_last_insert_rowid,
+                                saved_last_change,
+                            );
                             return Err(err);
                         }
                     }
                 }
 
-                // Only end trigger execution for normal completion. Error paths
-                // already called end_trigger_execution() via abort() in the subprogram.
-                if is_trigger && !subprogram_aborted {
-                    program.connection.end_trigger_execution();
-                }
-
-                // Restore last_insert_rowid after trigger execution, per SQLite semantics:
-                // trigger-body INSERTs must not overwrite the top-level rowid.
-                if let Some(rowid) = saved_last_insert_rowid {
-                    program.connection.update_last_rowid(rowid);
-                }
-
-                state.op_program_state = OpProgramState::Start;
+                finish_subprogram(
+                    program,
+                    &statement,
+                    is_trigger,
+                    subprogram_aborted,
+                    saved_last_insert_rowid,
+                    saved_last_change,
+                );
                 if raise_ignore {
                     // RAISE(IGNORE) — skip the current row by jumping to ignore_jump_target
                     state.pc = ignore_jump_target.as_offset_int();

@@ -515,6 +515,14 @@ fn execute_trigger_commands(
                 connection,
                 "trigger subprogram",
             )?;
+            if matches!(
+                command,
+                ast::TriggerCmd::Insert { .. }
+                    | ast::TriggerCmd::Update { .. }
+                    | ast::TriggerCmd::Delete { .. }
+            ) {
+                subprogram_builder.emit_insn(Insn::ResetCount);
+            }
         }
         Ok(())
     })();

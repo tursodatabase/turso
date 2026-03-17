@@ -737,6 +737,11 @@ pub enum Insn {
         ignore_jump_target: BranchOffset,
     },
 
+    /// Copy the current VM change counter to the connection-level counters, then reset it.
+    /// SQLite emits this between trigger-body DML statements so `changes()` and
+    /// `total_changes()` observe the just-completed statement without leaking into the next one.
+    ResetCount,
+
     /// Write an integer value into a register.
     Integer {
         value: i64,
@@ -1776,6 +1781,7 @@ impl InsnVariants {
             InsnVariants::Return => execute::op_return,
             InsnVariants::Integer => execute::op_integer,
             InsnVariants::Program => execute::op_program,
+            InsnVariants::ResetCount => execute::op_reset_count,
             InsnVariants::Real => execute::op_real,
             InsnVariants::RealAffinity => execute::op_real_affinity,
             InsnVariants::String8 => execute::op_string8,

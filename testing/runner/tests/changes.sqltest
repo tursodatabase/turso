@@ -276,3 +276,22 @@ expect {
     12|y
     3
 }
+
+@cross-check-integrity
+test changes-with-trigger-body-statements {
+    create table t(a);
+    create table log(msg);
+    create trigger tr after insert on t begin
+        insert into log values('x');
+        insert into log values(changes());
+    end;
+
+    insert into t values(1);
+    select msg from log;
+    select changes();
+}
+expect {
+    x
+    1
+    1
+}
