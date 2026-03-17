@@ -453,7 +453,7 @@ fn emit_materialized_build_inputs(
             has_rowid: true,
             has_autoincrement: false,
             primary_key_columns: vec![],
-            columns,
+            columns: columns.into(),
             is_strict: false,
             unique_sets: vec![],
             foreign_keys: vec![],

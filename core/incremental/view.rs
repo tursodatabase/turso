@@ -1453,7 +1453,8 @@ mod tests {
                     },
                 ),
                 SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
-            ],
+            ]
+            .into(),
             has_rowid: true,
             is_strict: false,
             unique_sets: vec![],
@@ -1499,7 +1500,8 @@ mod tests {
                     "INTEGER".to_string(),
                     None,
                 ),
-            ],
+            ]
+            .into(),
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,
@@ -1541,7 +1543,8 @@ mod tests {
                     None,
                     ColDef::default(),
                 ),
-            ],
+            ]
+            .into(),
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,
@@ -1576,7 +1579,8 @@ mod tests {
                     "INTEGER".to_string(),
                     None,
                 ),
-            ],
+            ]
+            .into(),
             has_rowid: true, // Has implicit rowid but no alias
             is_strict: false,
             has_autoincrement: false,

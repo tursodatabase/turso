@@ -1073,7 +1073,7 @@ fn parse_table(
         let btree_table = Arc::new(crate::schema::BTreeTable {
             name: view_guard.name().to_string(),
             root_page,
-            columns: view_guard.column_schema.flat_columns(),
+            columns: view_guard.column_schema.flat_columns().into(),
             primary_key_columns: Vec::new(),
             has_rowid: true,
             is_strict: false,

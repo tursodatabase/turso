@@ -2310,7 +2310,8 @@ mod tests {
                         "INTEGER".to_string(),
                         None,
                     ),
-                ],
+                ]
+                .into(),
                 has_rowid: true,
                 is_strict: false,
                 has_autoincrement: false,
@@ -2356,7 +2357,8 @@ mod tests {
                         "INTEGER".to_string(),
                         None,
                     ),
-                ],
+                ]
+                .into(),
                 has_rowid: true,
                 is_strict: false,
                 has_autoincrement: false,
@@ -2407,7 +2409,8 @@ mod tests {
                         "INTEGER".to_string(),
                         None,
                     ),
-                ],
+                ]
+                .into(),
                 has_rowid: true,
                 has_autoincrement: false,
                 is_strict: false,
@@ -2445,7 +2448,8 @@ mod tests {
                         "TEXT".to_string(),
                         None,
                     ),
-                ],
+                ]
+                .into(),
                 has_rowid: true,
                 is_strict: false,
                 has_autoincrement: false,
@@ -2493,7 +2497,8 @@ mod tests {
                         "INTEGER".to_string(),
                         None,
                     ),
-                ],
+                ]
+                .into(),
                 has_rowid: true,
                 is_strict: false,
                 has_autoincrement: false,
@@ -2536,7 +2541,8 @@ mod tests {
                         "INTEGER".to_string(),
                         None,
                     ),
-                ],
+                ]
+                .into(),
                 has_rowid: true,
                 is_strict: false,
                 has_autoincrement: false,
@@ -2564,7 +2570,8 @@ mod tests {
                         "INTEGER".to_string(),
                         None,
                     ),
-                ],
+                ]
+                .into(),
                 has_rowid: true,
                 is_strict: false,
                 has_autoincrement: false,

@@ -2445,7 +2445,8 @@ mod tests {
                     None,
                 ),
                 SchemaColumn::new_default_text(Some("email".to_string()), "TEXT".to_string(), None),
-            ],
+            ]
+            .into(),
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,
@@ -2494,7 +2495,8 @@ mod tests {
                     None,
                     ColDef::default(),
                 ),
-            ],
+            ]
+            .into(),
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,
@@ -2542,7 +2544,8 @@ mod tests {
                     "INTEGER".to_string(),
                     None,
                 ),
-            ],
+            ]
+            .into(),
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,

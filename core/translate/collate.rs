@@ -521,7 +521,8 @@ mod tests {
                 Type::Text,
                 collation,
                 ColDef::default(),
-            )],
+            )]
+            .into(),
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
@@ -579,7 +580,8 @@ mod tests {
                     Type::Text,
                     left,
                     ColDef::default(),
-                )],
+                )]
+                .into(),
                 unique_sets: vec![],
                 foreign_keys: vec![],
                 check_constraints: vec![],
@@ -615,7 +617,8 @@ mod tests {
                     Type::Text,
                     right,
                     ColDef::default(),
-                )],
+                )]
+                .into(),
                 unique_sets: vec![],
                 foreign_keys: vec![],
                 check_constraints: vec![],
@@ -666,7 +669,8 @@ mod tests {
                         hidden: false,
                         notnull_conflict_clause: None,
                     },
-                )],
+                )]
+                .into(),
                 unique_sets: vec![],
                 foreign_keys: vec![],
                 check_constraints: vec![],

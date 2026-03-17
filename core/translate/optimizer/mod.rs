@@ -925,7 +925,7 @@ fn add_ephemeral_table_to_update_plan(
         has_rowid: true,
         has_autoincrement: false,
         primary_key_columns: vec![],
-        columns: vec![(*ROWID_COLUMN).clone()],
+        columns: vec![(*ROWID_COLUMN).clone()].into(),
         is_strict: false,
         unique_sets: vec![],
         foreign_keys: vec![],

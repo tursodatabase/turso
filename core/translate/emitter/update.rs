@@ -1540,7 +1540,7 @@ fn emit_update_insns<'a>(
             // to refer to the new values, which are already loaded into registers starting at `start`.
             rewrite_where_for_update_registers(
                 &mut new_where,
-                target_table.table.columns(),
+                &target_table.table.columns(),
                 start,
                 rowid_set_clause_reg.unwrap_or(beg),
             )?;
@@ -1572,7 +1572,7 @@ fn emit_update_insns<'a>(
             emit_index_column_value_new_image(
                 program,
                 &t_ctx.resolver,
-                target_table.table.columns(),
+                &target_table.table.columns(),
                 start,
                 rowid_reg,
                 col,
@@ -2083,7 +2083,7 @@ fn emit_update_insns<'a>(
         let cdc_before_reg = if program.capture_data_changes_info().has_before() {
             Some(emit_cdc_full_record(
                 program,
-                target_table.table.columns(),
+                &target_table.table.columns(),
                 target_table_cursor_id,
                 cdc_rowid_before_reg.expect("cdc_rowid_before_reg must be set"),
                 target_table

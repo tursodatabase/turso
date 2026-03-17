@@ -1168,7 +1168,7 @@ mod tests {
             name: name.to_string(),
             has_autoincrement: false,
             primary_key_columns: vec![],
-            columns,
+            columns: columns.into(),
             has_rowid: true,
             is_strict: false,
             unique_sets: vec![],

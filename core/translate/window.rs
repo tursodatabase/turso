@@ -528,7 +528,7 @@ impl EmitWindow {
             name: format!("buffer_table_{window_name}"),
             has_rowid: true,
             primary_key_columns: vec![],
-            columns: src_columns,
+            columns: src_columns.into(),
             is_strict: false,
             unique_sets: vec![],
             has_autoincrement: false,

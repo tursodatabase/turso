@@ -1494,7 +1494,7 @@ fn emit_materialized_subquery_table(
     let ephemeral_table = Arc::new(BTreeTable {
         root_page: 0,
         name: String::new(),
-        columns: columns.to_vec(),
+        columns: columns.to_vec().into(),
         primary_key_columns: vec![],
         has_rowid: true,
         is_strict: false,

@@ -978,7 +978,7 @@ fn query_pragma(
             if let Some(name) = name {
                 resolver.with_schema(database_id, |db_schema| {
                     if let Some(table) = db_schema.get_table(&name) {
-                        emit_columns_for_table_info(program, table.columns(), base_reg, false);
+                        emit_columns_for_table_info(program, &table.columns(), base_reg, false);
                     } else if let Some(view_mutex) = db_schema.get_materialized_view(&name) {
                         let view = view_mutex.lock();
                         let flat_columns = view.column_schema.flat_columns();
@@ -1006,7 +1006,7 @@ fn query_pragma(
             if let Some(name) = name {
                 resolver.with_schema(database_id, |db_schema| {
                     if let Some(table) = db_schema.get_table(&name) {
-                        emit_columns_for_table_info(program, table.columns(), base_reg, true);
+                        emit_columns_for_table_info(program, &table.columns(), base_reg, true);
                     } else if let Some(view_mutex) = db_schema.get_materialized_view(&name) {
                         let view = view_mutex.lock();
                         let flat_columns = view.column_schema.flat_columns();

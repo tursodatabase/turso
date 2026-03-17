@@ -5457,12 +5457,7 @@ pub fn bind_and_rewrite_expr<'a>(
 
                     // First check joined tables
                     for joined_table in referenced_tables.joined_tables().iter() {
-                        let col_idx = joined_table.table.columns().iter().position(|c| {
-                            c.name
-                                .as_ref()
-                                .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
-                        });
-                        if col_idx.is_some() {
+                        if let Some((col_idx, col)) = joined_table.table.columns().lookup(&normalized_id) {
                             if match_result.is_some() {
                                 let mut ok = false;
                                 // Column name ambiguity is ok if it is in the USING clause because then it is deduplicated
@@ -5478,11 +5473,9 @@ pub fn bind_and_rewrite_expr<'a>(
                                     crate::bail_parse_error!("Column {} is ambiguous", id.as_str());
                                 }
                             } else {
-                                let col =
-                                    joined_table.table.columns().get(col_idx.unwrap()).unwrap();
                                 match_result = Some((
                                     joined_table.internal_id,
-                                    col_idx.unwrap(),
+                                    col_idx,
                                     col.is_rowid_alias(),
                                 ));
                             }
@@ -5519,19 +5512,13 @@ pub fn bind_and_rewrite_expr<'a>(
                             if matches!(outer_ref.table, Table::FromClauseSubquery(_)) {
                                 continue;
                             }
-                            let col_idx = outer_ref.table.columns().iter().position(|c| {
-                                c.name
-                                    .as_ref()
-                                    .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
-                            });
-                            if col_idx.is_some() {
+                            if let Some((col_idx, col)) = outer_ref.table.columns().lookup(&normalized_id) {
                                 if match_result.is_some() {
                                     crate::bail_parse_error!("Column {} is ambiguous", id.as_str());
                                 }
-                                let col = outer_ref.table.columns().get(col_idx.unwrap()).unwrap();
                                 match_result = Some((
                                     outer_ref.internal_id,
-                                    col_idx.unwrap(),
+                                    col_idx,
                                     col.is_rowid_alias(),
                                 ));
                             }
@@ -5612,17 +5599,12 @@ pub fn bind_and_rewrite_expr<'a>(
                     }
                     let (tbl_id, tbl) = matching_tbl.unwrap();
                     let normalized_id = normalize_ident(id.as_str());
-                    let col_idx = tbl.columns().iter().position(|c| {
-                        c.name
-                            .as_ref()
-                            .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
-                    });
                     // User-defined columns take precedence over rowid aliases
                     // (oid, rowid, _rowid_). Only fall back to parse_row_id()
                     // when no matching user column exists.
                     // Note: Only BTree tables have rowid; derived tables (FromClauseSubquery)
                     // don't have a rowid.
-                    let Some(col_idx) = col_idx else {
+                    let Some((col_idx, col)) = tbl.columns().lookup(&normalized_id) else {
                         if let Table::BTree(btree) = tbl {
                             if let Some(row_id_expr) =
                                 parse_row_id(&normalized_id, tbl_id, || false)?
@@ -5640,7 +5622,6 @@ pub fn bind_and_rewrite_expr<'a>(
                         }
                         crate::bail_parse_error!("no such column: {}", normalized_id);
                     };
-                    let col = tbl.columns().get(col_idx).unwrap();
                     *expr = Expr::Column {
                         database: None, // TODO: support different databases
                         table: tbl_id,
@@ -5687,12 +5668,8 @@ pub fn bind_and_rewrite_expr<'a>(
                     // Find the column in the table
                     let col_idx = table
                         .columns()
-                        .iter()
-                        .position(|c| {
-                            c.name
-                                .as_ref()
-                                .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_col_name))
-                        })
+                        .lookup(&normalized_col_name)
+                        .map(|(idx, _)| idx)
                         .ok_or_else(|| {
                             LimboError::ParseError(format!(
                                 "Column: {}.{}.{} not found",
@@ -5702,7 +5679,7 @@ pub fn bind_and_rewrite_expr<'a>(
                             ))
                         })?;
 
-                    let col = table.columns().get(col_idx).unwrap();
+                    let col = &table.columns()[col_idx];
 
                     // Check if this is a rowid alias
                     let is_rowid_alias = col.is_rowid_alias();

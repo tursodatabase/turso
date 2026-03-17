@@ -1,5 +1,5 @@
 use crate::pragma::{PragmaVirtualTable, PragmaVirtualTableCursor};
-use crate::schema::Column;
+use crate::schema::{Column, Columns};
 use crate::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use crate::sync::{Arc, RwLock, Weak};
 use crate::util::columns_from_create_table_body;
@@ -19,7 +19,7 @@ pub(crate) enum VirtualTableType {
 #[derive(Clone, Debug)]
 pub struct VirtualTable {
     pub(crate) name: String,
-    pub(crate) columns: Vec<Column>,
+    pub(crate) columns: Columns,
     pub(crate) kind: VTabKind,
     vtab_type: VirtualTableType,
     // identifier to tie a cursor to a specific instantiated virtual table instance
@@ -47,7 +47,8 @@ impl VirtualTable {
         let dbpage_vtab = VirtualTable {
             name: dbpage_table.name(),
             columns: Self::resolve_columns(dbpage_table.sql())
-                .expect("sqlite_dbpage schema resolution should not fail"),
+                .expect("sqlite_dbpage schema resolution should not fail")
+                .into(),
             kind: VTabKind::TableValuedFunction,
             vtab_type: VirtualTableType::Internal(Arc::new(RwLock::new(dbpage_table))),
             vtab_id: 0,
@@ -62,7 +63,8 @@ impl VirtualTable {
         let vtab = VirtualTable {
             name: btree_dump_table.name(),
             columns: Self::resolve_columns(btree_dump_table.sql())
-                .expect("btree_dump schema resolution should not fail"),
+                .expect("btree_dump schema resolution should not fail")
+                .into(),
             kind: VTabKind::TableValuedFunction,
             vtab_type: VirtualTableType::Internal(Arc::new(RwLock::new(btree_dump_table))),
             vtab_id: 0,
@@ -76,7 +78,8 @@ impl VirtualTable {
         let vtab = VirtualTable {
             name: table.name(),
             columns: Self::resolve_columns(table.sql())
-                .expect("sqlite_turso_types schema resolution should not fail"),
+                .expect("sqlite_turso_types schema resolution should not fail")
+                .into(),
             kind: VTabKind::TableValuedFunction,
             vtab_type: VirtualTableType::Internal(Arc::new(RwLock::new(table))),
             vtab_id: 0,
@@ -92,7 +95,8 @@ impl VirtualTable {
                 let vtab = VirtualTable {
                     name: format!("pragma_{}", tab.pragma_name),
                     columns: Self::resolve_columns(schema)
-                        .expect("pragma table-valued function schema resolution should not fail"),
+                        .expect("pragma table-valued function schema resolution should not fail")
+                        .into(),
                     kind: VTabKind::TableValuedFunction,
                     vtab_type: VirtualTableType::Pragma(tab),
                     vtab_id: 0,
@@ -127,7 +131,8 @@ impl VirtualTable {
         let json_each_virtual_table = VirtualTable {
             name: json_each.name(),
             columns: Self::resolve_columns(json_each.sql())
-                .expect("internal table-valued function schema resolution should not fail"),
+                .expect("internal table-valued function schema resolution should not fail")
+                .into(),
             kind: VTabKind::TableValuedFunction,
             vtab_type: VirtualTableType::Internal(Arc::new(RwLock::new(json_each))),
             vtab_id: 0,
@@ -139,7 +144,8 @@ impl VirtualTable {
         let json_tree_virtual_table = VirtualTable {
             name: json_tree.name(),
             columns: Self::resolve_columns(json_tree.sql())
-                .expect("internal table-valued function schema resolution should not fail"),
+                .expect("internal table-valued function schema resolution should not fail")
+                .into(),
             kind: VTabKind::TableValuedFunction,
             vtab_type: VirtualTableType::Internal(Arc::new(RwLock::new(json_tree))),
             vtab_id: 0,
@@ -165,7 +171,7 @@ impl VirtualTable {
 
         let vtab = VirtualTable {
             name: name.to_owned(),
-            columns: Self::resolve_columns(schema)?,
+            columns: Self::resolve_columns(schema)?.into(),
             kind: VTabKind::TableValuedFunction,
             vtab_type,
             vtab_id: 0,
@@ -185,7 +191,7 @@ impl VirtualTable {
             ExtVirtualTable::create(module_name, module, args, VTabKind::VirtualTable)?;
         let vtab = VirtualTable {
             name: tbl_name.unwrap_or(module_name).to_owned(),
-            columns: Self::resolve_columns(schema)?,
+            columns: Self::resolve_columns(schema)?.into(),
             kind: VTabKind::VirtualTable,
             vtab_type: VirtualTableType::External(table),
             vtab_id: VTAB_ID_COUNTER.fetch_add(1, Ordering::Acquire),

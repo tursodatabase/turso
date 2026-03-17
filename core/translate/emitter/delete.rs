@@ -745,7 +745,7 @@ fn emit_delete_row_common(
                 let table_reference = unsafe { &*table_reference };
                 Some(emit_cdc_full_record(
                     program,
-                    table_reference.table.columns(),
+                    &table_reference.table.columns(),
                     main_table_cursor_id,
                     rowid_reg,
                     table_reference

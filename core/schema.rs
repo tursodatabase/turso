@@ -138,7 +138,8 @@ use crate::{
 use core::fmt;
 use rustc_hash::{FxBuildHasher, FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::VecDeque;
-use std::ops::Deref;
+use std::ops::{Deref, Index as OpsIndex, IndexMut as OpsIndexMut};
+use std::slice::SliceIndex;
 use tracing::trace;
 use turso_parser::ast::{
     self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, RefAct, ResolveType, SortOrder,
@@ -1262,7 +1263,7 @@ impl Schema {
             let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
                 name: view_name.clone(),
                 root_page: main_root,
-                columns: incremental_view.column_schema.flat_columns(),
+                columns: incremental_view.column_schema.flat_columns().into(),
                 primary_key_columns: Vec::new(),
                 has_rowid: true,
                 is_strict: false,
@@ -1890,6 +1891,135 @@ pub enum Table {
     FromClauseSubquery(Arc<FromClauseSubquery>),
 }
 
+#[derive(Debug, Default)]
+pub struct Columns {
+    columns: Vec<Column>,
+    lookup_cache: crate::sync::OnceLock<HashMap<String, usize>>,
+}
+
+impl Clone for Columns {
+    fn clone(&self) -> Self {
+        Self {
+            columns: self.columns.clone(),
+            lookup_cache: crate::sync::OnceLock::new(),
+        }
+    }
+}
+
+impl Columns {
+    pub fn new(columns: Vec<Column>) -> Self {
+        Self {
+            columns,
+            lookup_cache: crate::sync::OnceLock::new(),
+        }
+    }
+
+    pub fn lookup(&self, name: &str) -> Option<(usize, &Column)> {
+        let normalized_name = normalize_ident(name);
+        let idx = self.lookup_cache().get(&normalized_name).copied()?;
+        Some((idx, &self.columns[idx]))
+    }
+
+    fn lookup_cache(&self) -> &HashMap<String, usize> {
+        self.lookup_cache.get_or_init(|| {
+            let mut lookup_cache = HashMap::default();
+            for (idx, column) in self.columns.iter().enumerate() {
+                let Some(name) = &column.name else {
+                    continue;
+                };
+                lookup_cache.entry(normalize_ident(name)).or_insert(idx);
+            }
+            lookup_cache
+        })
+    }
+
+    pub fn get(&self, index: usize) -> Option<&Column> {
+        self.columns.get(index)
+    }
+
+    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, Column> {
+        self.lookup_cache = crate::sync::OnceLock::new();
+        self.columns.iter_mut()
+    }
+
+    pub fn push(&mut self, column: Column) {
+        self.lookup_cache = crate::sync::OnceLock::new();
+        self.columns.push(column);
+    }
+
+    pub fn remove(&mut self, index: usize) -> Column {
+        self.lookup_cache = crate::sync::OnceLock::new();
+        self.columns.remove(index)
+    }
+}
+
+impl From<Vec<Column>> for Columns {
+    fn from(columns: Vec<Column>) -> Self {
+        Self::new(columns)
+    }
+}
+
+impl AsRef<[Column]> for Columns {
+    fn as_ref(&self) -> &[Column] {
+        &self.columns
+    }
+}
+
+impl Deref for Columns {
+    type Target = [Column];
+
+    fn deref(&self) -> &Self::Target {
+        &self.columns
+    }
+}
+
+impl std::ops::DerefMut for Columns {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.lookup_cache = crate::sync::OnceLock::new();
+        &mut self.columns
+    }
+}
+
+impl<I> OpsIndex<I> for Columns
+where
+    I: SliceIndex<[Column]>,
+{
+    type Output = I::Output;
+
+    fn index(&self, index: I) -> &Self::Output {
+        &self.columns[index]
+    }
+}
+
+impl<I> OpsIndexMut<I> for Columns
+where
+    I: SliceIndex<[Column]>,
+{
+    fn index_mut(&mut self, index: I) -> &mut Self::Output {
+        self.lookup_cache = crate::sync::OnceLock::new();
+        &mut self.columns[index]
+    }
+}
+
+impl<'a> IntoIterator for &'a Columns {
+    type Item = &'a Column;
+    type IntoIter = std::slice::Iter<'a, Column>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.columns.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut Columns {
+    type Item = &'a mut Column;
+    type IntoIter = std::slice::IterMut<'a, Column>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.lookup_cache = crate::sync::OnceLock::new();
+        self.columns.iter_mut()
+    }
+}
+
 impl Table {
     pub fn get_root_page(&self) -> crate::Result<i64> {
         match self {
@@ -1923,26 +2053,10 @@ impl Table {
 
     /// Returns the column position and column for a given column name.
     pub fn get_column_by_name(&self, name: &str) -> Option<(usize, &Column)> {
-        match self {
-            Self::BTree(table) => table.get_column(name),
-            Self::Virtual(table) => table.columns.iter().enumerate().find(|(_, col)| {
-                col.name
-                    .as_ref()
-                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
-            }),
-            Self::FromClauseSubquery(from_clause_subquery) => from_clause_subquery
-                .columns
-                .iter()
-                .enumerate()
-                .find(|(_, col)| {
-                    col.name
-                        .as_ref()
-                        .is_some_and(|n| n.eq_ignore_ascii_case(name))
-                }),
-        }
+        self.columns().lookup(name)
     }
 
-    pub fn columns(&self) -> &Vec<Column> {
+    pub fn columns(&self) -> &Columns {
         match self {
             Self::BTree(table) => &table.columns,
             Self::Virtual(table) => &table.columns,
@@ -2030,7 +2144,7 @@ pub struct BTreeTable {
     pub root_page: i64,
     pub name: String,
     pub primary_key_columns: Vec<(String, SortOrder)>,
-    pub columns: Vec<Column>,
+    pub columns: Columns,
     pub has_rowid: bool,
     pub is_strict: bool,
     pub has_autoincrement: bool,
@@ -2138,12 +2252,7 @@ impl BTreeTable {
     /// E.g. if table is CREATE TABLE t (a, b, c)
     /// then get_column("b") returns (1, &Column { .. })
     pub fn get_column(&self, name: &str) -> Option<(usize, &Column)> {
-        self.columns.iter().enumerate().find(|(_, column)| {
-            column
-                .name
-                .as_ref()
-                .is_some_and(|n| n.eq_ignore_ascii_case(name))
-        })
+        self.columns.lookup(name)
     }
 
     pub fn from_sql(sql: &str, root_page: i64) -> Result<BTreeTable> {
@@ -2375,7 +2484,7 @@ pub struct FromClauseSubquery {
     /// or a compound select (UNION/INTERSECT/EXCEPT).
     pub plan: Box<Plan>,
     /// The columns of the derived table.
-    pub columns: Vec<Column>,
+    pub columns: Columns,
     /// The start register for the result columns of the derived table;
     /// must be set before data is read from it.
     pub result_columns_start_reg: Option<usize>,
@@ -2877,7 +2986,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         has_rowid,
         primary_key_columns,
         has_autoincrement,
-        columns: cols,
+        columns: cols.into(),
         is_strict,
         foreign_keys,
         unique_sets: {
@@ -3458,7 +3567,8 @@ pub fn sqlite_schema_table() -> BTreeTable {
             Column::new_default_text(Some("tbl_name".to_string()), "TEXT".to_string(), None),
             Column::new_default_integer(Some("rootpage".to_string()), "INT".to_string(), None),
             Column::new_default_text(Some("sql".to_string()), "TEXT".to_string(), None),
-        ],
+        ]
+        .into(),
         foreign_keys: vec![],
         check_constraints: vec![],
         rowid_alias_conflict_clause: None,
@@ -3837,6 +3947,25 @@ mod tests {
             "column 'a´ has type different than INTEGER so can't be a rowid alias"
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_columns_lookup_updates_after_mutation() {
+        let mut columns = Columns::from(vec![Column::new_default_integer(
+            Some("a".to_string()),
+            "INTEGER".to_string(),
+            None,
+        )]);
+
+        let (idx, _) = columns.lookup("A").unwrap();
+        assert_eq!(idx, 0);
+
+        columns[0].name = Some("renamed".to_string());
+
+        assert!(columns.lookup("a").is_none());
+        let (idx, column) = columns.lookup("RENAMED").unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(column.name.as_deref(), Some("renamed"));
     }
 
     #[test]
@@ -4233,7 +4362,8 @@ mod tests {
                 Some("a".to_string()),
                 "INT".to_string(),
                 None,
-            )],
+            )]
+            .into(),
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],

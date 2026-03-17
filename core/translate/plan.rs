@@ -1707,7 +1707,7 @@ impl JoinedTable {
         let table = Table::FromClauseSubquery(Arc::new(FromClauseSubquery {
             name: identifier.clone(),
             plan: Box::new(Plan::Select(plan)),
-            columns,
+            columns: columns.into(),
             result_columns_start_reg: None,
             materialized_cursor_id: None,
             cte: None,
@@ -1808,7 +1808,7 @@ impl JoinedTable {
         let table = Table::FromClauseSubquery(Arc::new(FromClauseSubquery {
             name: identifier.clone(),
             plan: Box::new(plan),
-            columns,
+            columns: columns.into(),
             result_columns_start_reg: None,
             materialized_cursor_id: None,
             cte,
