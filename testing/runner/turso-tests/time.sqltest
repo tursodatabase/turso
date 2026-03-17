@@ -428,3 +428,375 @@ expect {
     3600000000000
 }
 
+test strftime_integer_overflow {
+    SELECT strftime('%Y', 99999999999999);
+}
+expect {
+
+}
+
+# Out-of-range julian day should return NULL for all format specifiers
+test strftime_overflow_d {
+    SELECT strftime('%d', 99999999999999);
+}
+expect {
+
+}
+
+test strftime_overflow_e {
+    SELECT strftime('%e', 99999999999999);
+}
+expect {
+
+}
+
+test strftime_overflow_f {
+    SELECT strftime('%f', 99999999999999);
+}
+expect {
+
+}
+
+test strftime_overflow_F {
+    SELECT strftime('%F', 99999999999999);
+}
+expect {
+
+}
+
+test strftime_overflow_H {
+    SELECT strftime('%H', 99999999999999);
+}
+expect {
+
+}
+
+test strftime_overflow_I {
+    SELECT strftime('%I', 99999999999999);
+}
+expect {
+
+}
+
+test strftime_overflow_j {
+    SELECT strftime('%j', 99999999999999);
+}
+expect {
+
+}
+
+test strftime_overflow_J {
+    SELECT strftime('%J', 99999999999999);
+}
+expect {
+
+}
+
+test strftime_overflow_m {
+    SELECT strftime('%m', 99999999999999);
+}
+expect {
+
+}
+
+test strftime_overflow_M {
+    SELECT strftime('%M', 99999999999999);
+}
+expect {
+
+}
+
+test strftime_overflow_s {
+    SELECT strftime('%s', 99999999999999);
+}
+expect {
+
+}
+
+test strftime_overflow_S {
+    SELECT strftime('%S', 99999999999999);
+}
+expect {
+
+}
+
+test strftime_overflow_w {
+    SELECT strftime('%w', 99999999999999);
+}
+expect {
+
+}
+
+test strftime_overflow_W {
+    SELECT strftime('%W', 99999999999999);
+}
+expect {
+
+}
+
+test strftime_overflow_U {
+    SELECT strftime('%U', 99999999999999);
+}
+expect {
+
+}
+
+test strftime_overflow_V {
+    SELECT strftime('%V', 99999999999999);
+}
+expect {
+
+}
+
+# Negative julian day values should return NULL
+test strftime_negative_year {
+    SELECT strftime('%Y', -1);
+}
+expect {
+
+}
+
+test strftime_negative_s {
+    SELECT strftime('%s', -1);
+}
+expect {
+
+}
+
+test strftime_negative_j {
+    SELECT strftime('%j', -1);
+}
+expect {
+
+}
+
+test strftime_negative_large {
+    SELECT strftime('%Y', -99999999999);
+}
+expect {
+
+}
+
+# i64 extreme values should return NULL
+test strftime_i64_max_year {
+    SELECT strftime('%Y', 9223372036854775807);
+}
+expect {
+
+}
+
+test strftime_i64_max_s {
+    SELECT strftime('%s', 9223372036854775807);
+}
+expect {
+
+}
+
+test strftime_i64_min_year {
+    SELECT strftime('%Y', -9223372036854775807);
+}
+expect {
+
+}
+
+test strftime_i64_min_j {
+    SELECT strftime('%j', -9223372036854775807);
+}
+expect {
+
+}
+
+# Boundary valid julian day (just under max ~5373484.5) should produce year 9999
+test strftime_boundary_jd_year {
+    SELECT strftime('%Y', 5373484.4);
+}
+expect {
+    9999
+}
+
+test strftime_boundary_max_date_year {
+    SELECT strftime('%Y', '9999-12-31 23:59:59');
+}
+expect {
+    9999
+}
+
+test strftime_boundary_max_date_j {
+    SELECT strftime('%j', '9999-12-31');
+}
+expect {
+    365
+}
+
+test strftime_boundary_max_date_W {
+    SELECT strftime('%W', '9999-12-31');
+}
+expect {
+    52
+}
+
+test strftime_boundary_max_date_U {
+    SELECT strftime('%U', '9999-12-31');
+}
+expect {
+    52
+}
+
+test strftime_boundary_max_date_V {
+    SELECT strftime('%V', '9999-12-31');
+}
+expect {
+    52
+}
+
+test strftime_boundary_max_date_w {
+    SELECT strftime('%w', '9999-12-31');
+}
+expect {
+    5
+}
+
+test strftime_boundary_max_date_s {
+    SELECT strftime('%s', '9999-12-31 23:59:59');
+}
+expect {
+    253402300799
+}
+
+# Year boundaries for day-of-year and week computations
+test strftime_year_start_j {
+    SELECT strftime('%j', '0001-01-01');
+}
+expect {
+    001
+}
+
+test strftime_year_start_W {
+    SELECT strftime('%W', '0001-01-01');
+}
+expect {
+    01
+}
+
+test strftime_year_start_U {
+    SELECT strftime('%U', '0001-01-01');
+}
+expect {
+    00
+}
+
+test strftime_year_start_w {
+    SELECT strftime('%w', '0001-01-01');
+}
+expect {
+    1
+}
+
+test strftime_year_start_Y {
+    SELECT strftime('%Y', '0001-01-01');
+}
+expect {
+    0001
+}
+
+# unixepoch modifier with boundary timestamps
+test strftime_unixepoch_max_year {
+    SELECT strftime('%Y', 253402300799, 'unixepoch');
+}
+expect {
+    9999
+}
+
+test strftime_unixepoch_max_datetime {
+    SELECT strftime('%Y-%m-%d %H:%M:%S', 253402300799, 'unixepoch');
+}
+expect {
+    9999-12-31 23:59:59
+}
+
+test strftime_unixepoch_zero_s {
+    SELECT strftime('%s', 0, 'unixepoch');
+}
+expect {
+    0
+}
+
+test strftime_unixepoch_zero_year {
+    SELECT strftime('%Y', 0, 'unixepoch');
+}
+expect {
+    1970
+}
+
+# unixepoch with values that overflow MAX_JD should return NULL
+test strftime_unixepoch_overflow_boundary {
+    SELECT strftime('%Y', 253402300800, 'unixepoch');
+}
+expect {
+
+}
+
+test strftime_unixepoch_overflow_large {
+    SELECT strftime('%Y', 99999999999999, 'unixepoch');
+}
+expect {
+
+}
+
+test strftime_unixepoch_overflow_large_s {
+    SELECT strftime('%s', 99999999999999, 'unixepoch');
+}
+expect {
+
+}
+
+test strftime_unixepoch_overflow_negative {
+    SELECT strftime('%Y', -99999999999999, 'unixepoch');
+}
+expect {
+
+}
+
+# Large float values should return NULL
+test strftime_float_overflow_large {
+    SELECT strftime('%Y', 1e18);
+}
+expect {
+
+}
+
+test strftime_float_overflow_negative {
+    SELECT strftime('%Y', -1e18);
+}
+expect {
+
+}
+
+test strftime_float_overflow_max_jd {
+    SELECT strftime('%Y', 5373484.5);
+}
+expect {
+
+}
+
+# Arithmetic modifiers near overflow boundaries
+test strftime_modifier_overflow_plus_day {
+    SELECT strftime('%Y', '9999-12-31', '+1 day');
+}
+expect {
+
+}
+
+test strftime_modifier_underflow_minus_day {
+    SELECT strftime('%Y', '0001-01-01', '-1 day');
+}
+expect {
+    0000
+}
+
+test strftime_modifier_overflow_plus_year {
+    SELECT strftime('%Y', '9999-12-31', '+1 year');
+}
+expect {
+
+}
