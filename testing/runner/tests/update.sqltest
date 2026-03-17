@@ -864,6 +864,28 @@ expect {
     3|has_items
 }
 
+@cross-check-integrity
+test update-correlated-self-exists-where-stable-write-set {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INT);
+    INSERT INTO t VALUES (1,1),(2,2),(3,3),(4,4),(5,5);
+
+    UPDATE t
+    SET v = v + 10
+    WHERE EXISTS (
+        SELECT 1 FROM t AS t2
+        WHERE t2.id = t.id - 1 AND t2.v < 3
+    );
+
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|1
+    2|12
+    3|13
+    4|4
+    5|5
+}
+
 # Test UPDATE with NOT EXISTS subquery
 
 @cross-check-integrity
@@ -1018,4 +1040,3 @@ expect {
     1|2
     2|1
 }
-

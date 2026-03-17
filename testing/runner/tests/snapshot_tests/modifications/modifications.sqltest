@@ -102,6 +102,29 @@ snapshot update-simple {
     WHERE category = 'Electronics';
 }
 
+@setup schema
+snapshot update-where-unrelated-subquery-no-stable-write-set {
+    UPDATE products
+    SET quantity = quantity + 1
+    WHERE EXISTS (
+        SELECT 1
+        FROM users
+        WHERE users.id = products.id
+    );
+}
+
+@setup schema
+snapshot update-where-self-subquery-stable-write-set {
+    UPDATE products
+    SET quantity = quantity + 1
+    WHERE EXISTS (
+        SELECT 1
+        FROM products AS p2
+        WHERE p2.id = products.id - 1
+          AND p2.quantity < 5
+    );
+}
+
 # TODO: Uncomment when subquery in UPDATE SET is supported
 # # UPDATE with subquery - computed update value
 # @setup schema
