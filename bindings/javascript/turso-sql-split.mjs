@@ -253,7 +253,7 @@ function hasMeaningfulSql(sql) {
 /**
  * Split SQL text into individual statements using sqlite3_complete-like semantics.
  *
- * This matches testing/runner/src/parser/sql_complete.rs so CREATE TRIGGER bodies
+ * This matches testing/sqltests/src/parser/sql_complete.rs so CREATE TRIGGER bodies
  * containing semicolons are treated as a single statement until the ;END; sentinel.
  */
 function splitStatements(sql) {
