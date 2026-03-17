@@ -36,6 +36,7 @@ use crate::{
 use crate::{Connection, Pager, SyncMode};
 use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::{SkipMap, SkipSet};
+use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet as HashSet;
 use std::collections::BTreeSet;
@@ -59,6 +60,160 @@ pub mod tests;
 
 /// Sentinel value for `MvStore::exclusive_tx` indicating no exclusive transaction is active.
 const NO_EXCLUSIVE_TX: u64 = 0;
+
+// Synthetic simulator yields are injected 💉from code that returns either
+// `TransitionResult<T>` state-machine steps or `IOResult<T>` cursor helpers.
+macro_rules! yield_transition_in_simulator {
+    ($state_machine:expr, $point:expr) => {
+        #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+        if let Some(result) = $state_machine.simulator_yield.maybe_transition($point) {
+            return Ok(result);
+        }
+    };
+}
+
+pub(crate) use yield_transition_in_simulator;
+
+macro_rules! yield_io_in_simulator {
+    ($state_machine:expr, $point:expr) => {
+        #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+        if let Some(result) = $state_machine.simulator_yield.maybe_io($point) {
+            return Ok(result);
+        }
+    };
+}
+
+pub(crate) use yield_io_in_simulator;
+
+/// Specifies how many yields can be present in a simulator run (0..4)
+const MAX_SIMULATOR_YIELDS: usize = 4;
+
+pub(crate) type SimulatorYieldPlan<YieldPoint> = [Option<YieldPoint>; MAX_SIMULATOR_YIELDS];
+
+#[allow(dead_code)]
+fn simulator_yield_seed(seed: u64, key: u64) -> u64 {
+    // Mix the global simulator seed with a local key so each state machine
+    // gets a deterministic but distinct RNG stream.
+    // 0x9E37_79B9_7F4A_7C15 is the 64-bit golden-ratio increment.
+    let mut z = key.wrapping_add(seed).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+#[allow(dead_code)]
+pub(crate) fn simulator_yield_plan<YieldPoint: Copy>(
+    seed: Option<u64>,
+    key: u64,
+    all: &[YieldPoint],
+) -> SimulatorYieldPlan<YieldPoint> {
+    let mut plan = [None; MAX_SIMULATOR_YIELDS];
+    if all.is_empty() {
+        return plan;
+    }
+
+    match seed {
+        Some(seed) => {
+            let max_points = all.len().min(MAX_SIMULATOR_YIELDS);
+            let mut rng = StdRng::seed_from_u64(simulator_yield_seed(seed, key));
+            let count = rng.random_range(0..=max_points);
+            let mut choices = all.to_vec();
+            choices.shuffle(&mut rng);
+            for (dst, point) in plan.iter_mut().zip(choices.into_iter().take(count)) {
+                *dst = Some(point);
+            }
+        }
+        None => {
+            // Unit tests without a simulator seed still force one deterministic
+            // yield so the focused regression coverage stays stable.
+            plan[0] = Some(all[(key as usize) % all.len()]);
+        }
+    }
+
+    plan
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SimulatorOpts {
+    #[allow(dead_code)]
+    pub(crate) simulator_seed: Option<u64>,
+}
+
+impl SimulatorOpts {
+    pub(crate) fn from_db_opts(opts: &crate::DatabaseOpts) -> Option<Self> {
+        opts.unsafe_testing.then_some(Self {
+            simulator_seed: opts.simulator_seed,
+        })
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SimulatorYield<YieldPoint> {
+    remaining_points: SimulatorYieldPlan<YieldPoint>,
+}
+
+#[allow(dead_code)]
+impl<YieldPoint: Copy + PartialEq + Debug> SimulatorYield<YieldPoint> {
+    pub(crate) fn disabled() -> Self {
+        Self {
+            remaining_points: [None; MAX_SIMULATOR_YIELDS],
+        }
+    }
+
+    pub(crate) fn enabled(points: SimulatorYieldPlan<YieldPoint>) -> Self {
+        Self {
+            remaining_points: points,
+        }
+    }
+
+    pub(crate) fn maybe_transition<T>(&mut self, point: YieldPoint) -> Option<TransitionResult<T>> {
+        if !self.consume(point) {
+            return None;
+        }
+        tracing::debug!(?point, "injecting MVCC yield");
+        Some(TransitionResult::Io(IOCompletions::Single(
+            Completion::new_yield(),
+        )))
+    }
+
+    pub(crate) fn maybe_io<T>(&mut self, point: YieldPoint) -> Option<IOResult<T>> {
+        if !self.consume(point) {
+            return None;
+        }
+        tracing::debug!(?point, "injecting MVCC yield");
+        Some(IOResult::IO(IOCompletions::Single(Completion::new_yield())))
+    }
+
+    fn consume(&mut self, point: YieldPoint) -> bool {
+        for slot in &mut self.remaining_points {
+            if *slot == Some(point) {
+                *slot = None;
+                return true;
+            }
+        }
+        false
+    }
+}
+
+pub(crate) fn simulator_yield_from_opts<YieldPoint: Copy + PartialEq + Debug>(
+    simulator_opts: Option<SimulatorOpts>,
+    plan: impl FnOnce(Option<u64>) -> SimulatorYieldPlan<YieldPoint>,
+) -> SimulatorYield<YieldPoint> {
+    #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+    {
+        if let Some(simulator_opts) = simulator_opts {
+            SimulatorYield::enabled(plan(simulator_opts.simulator_seed))
+        } else {
+            SimulatorYield::disabled()
+        }
+    }
+    #[cfg(not(any(test, feature = "test_helper", feature = "simulator")))]
+    {
+        let _ = (simulator_opts, plan);
+        SimulatorYield::disabled()
+    }
+}
 
 /// A table ID for MVCC.
 /// MVCC table IDs are always negative. Their corresponding rootpage entry in sqlite_schema
