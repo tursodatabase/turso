@@ -7014,6 +7014,275 @@ mod fuzz_tests {
         }
     }
 
+    /// Fuzz test for mixed constraint-level ON CONFLICT modes.
+    ///
+    /// Creates tables where different constraints have different conflict resolution
+    /// modes (e.g., IPK ON CONFLICT REPLACE + UNIQUE ON CONFLICT ABORT), then
+    /// performs random INSERT and UPDATE operations and compares against SQLite.
+    ///
+    /// This catches bugs where:
+    /// - REPLACE fires before ABORT/FAIL/IGNORE/ROLLBACK (premature row deletion)
+    /// - IPK REPLACE is not deferred past index constraint checks
+    /// - Commit phase skips non-REPLACE indexes in mixed-mode tables
+    #[turso_macros::test(mvcc)]
+    pub fn mixed_constraint_mode_fuzz(db: TempDatabase) {
+        let (mut rng, seed) = helpers::init_fuzz_test("mixed_constraint_mode_fuzz");
+
+        let num_fuzz_iterations = helpers::fuzz_iterations(100);
+
+        // Table schemas with mixed constraint-level ON CONFLICT modes.
+        // Each schema has at least one REPLACE constraint and one non-REPLACE constraint.
+        let schemas: &[(&str, &str)] = &[
+            // IPK REPLACE + UNIQUE ABORT
+            (
+                "ipk_replace_uniq_abort",
+                "CREATE TABLE t(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, a TEXT, b TEXT UNIQUE ON CONFLICT ABORT)",
+            ),
+            // IPK REPLACE + UNIQUE FAIL
+            (
+                "ipk_replace_uniq_fail",
+                "CREATE TABLE t(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, a TEXT UNIQUE ON CONFLICT FAIL)",
+            ),
+            // IPK REPLACE + UNIQUE IGNORE
+            (
+                "ipk_replace_uniq_ignore",
+                "CREATE TABLE t(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, a TEXT UNIQUE ON CONFLICT IGNORE)",
+            ),
+            // IPK REPLACE + UNIQUE ROLLBACK
+            (
+                "ipk_replace_uniq_rollback",
+                "CREATE TABLE t(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, a TEXT UNIQUE ON CONFLICT ROLLBACK)",
+            ),
+            // Index REPLACE + Index ABORT
+            (
+                "idx_replace_idx_abort",
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT UNIQUE ON CONFLICT REPLACE, b TEXT UNIQUE ON CONFLICT ABORT)",
+            ),
+            // Index REPLACE + Index FAIL
+            (
+                "idx_replace_idx_fail",
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT UNIQUE ON CONFLICT REPLACE, b TEXT UNIQUE ON CONFLICT FAIL)",
+            ),
+            // Index REPLACE + Index IGNORE
+            (
+                "idx_replace_idx_ignore",
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT UNIQUE ON CONFLICT REPLACE, b TEXT UNIQUE ON CONFLICT IGNORE)",
+            ),
+            // Three indexes: ROLLBACK + IGNORE + REPLACE
+            (
+                "three_modes",
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT UNIQUE ON CONFLICT ROLLBACK, b TEXT UNIQUE ON CONFLICT IGNORE, c TEXT UNIQUE ON CONFLICT REPLACE)",
+            ),
+            // IPK REPLACE + two indexes with different modes
+            (
+                "ipk_replace_two_indexes",
+                "CREATE TABLE t(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, a TEXT UNIQUE ON CONFLICT ABORT, b TEXT UNIQUE ON CONFLICT IGNORE)",
+            ),
+        ];
+
+        for (schema_name, ddl) in schemas {
+            // Count columns for this schema by checking ddl
+            let has_col_c = ddl.contains(", c TEXT");
+            let has_col_b = ddl.contains(", b TEXT");
+            let has_col_a = ddl.contains(", a TEXT");
+
+            let limbo_db = helpers::builder_from_db(&db)
+                .with_db_name(format!("mixed_fuzz_{schema_name}_{seed}.db"))
+                .build();
+            let limbo_conn = limbo_db.connect_limbo();
+            let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+            let mut debug_log = format!("{ddl}\n");
+            limbo_exec_rows(&limbo_conn, ddl);
+            sqlite_exec_rows(&sqlite_conn, ddl);
+
+            // Seed 20 rows.
+            for i in 1..=20i64 {
+                let stmt = if has_col_c {
+                    format!("INSERT INTO t VALUES({i}, 'a{i}', 'b{i}', 'c{i}')")
+                } else if has_col_b {
+                    format!("INSERT INTO t VALUES({i}, 'a{i}', 'b{i}')")
+                } else {
+                    format!("INSERT INTO t VALUES({i}, 'a{i}')")
+                };
+                debug_log.push_str(&stmt);
+                debug_log.push('\n');
+                limbo_exec_rows(&limbo_conn, &stmt);
+                sqlite_exec_rows(&sqlite_conn, &stmt);
+            }
+
+            for iter_num in 0..num_fuzz_iterations {
+                let op = rng.random_range(0..12u32);
+                let stmt = match op {
+                    // INSERT: conflict on IPK only
+                    0 => {
+                        let id = rng.random_range(1..=25i64);
+                        let fresh = 1000 + iter_num as i64;
+                        if has_col_c {
+                            format!(
+                                "INSERT INTO t VALUES({id}, 'f{fresh}', 'g{fresh}', 'h{fresh}')"
+                            )
+                        } else if has_col_b {
+                            format!("INSERT INTO t VALUES({id}, 'f{fresh}', 'g{fresh}')")
+                        } else {
+                            format!("INSERT INTO t VALUES({id}, 'f{fresh}')")
+                        }
+                    }
+                    // INSERT: conflict on UNIQUE a only
+                    1 if has_col_a => {
+                        let target = rng.random_range(1..=20i64);
+                        let fresh_id = 100 + iter_num as i64;
+                        if has_col_c {
+                            format!("INSERT INTO t VALUES({fresh_id}, 'a{target}', 'fresh_b{fresh_id}', 'fresh_c{fresh_id}')")
+                        } else if has_col_b {
+                            format!("INSERT INTO t VALUES({fresh_id}, 'a{target}', 'fresh_b{fresh_id}')")
+                        } else {
+                            format!("INSERT INTO t VALUES({fresh_id}, 'a{target}')")
+                        }
+                    }
+                    // INSERT: conflict on UNIQUE b only
+                    2 if has_col_b => {
+                        let target = rng.random_range(1..=20i64);
+                        let fresh_id = 200 + iter_num as i64;
+                        if has_col_c {
+                            format!("INSERT INTO t VALUES({fresh_id}, 'fresh_a{fresh_id}', 'b{target}', 'fresh_c{fresh_id}')")
+                        } else {
+                            format!("INSERT INTO t VALUES({fresh_id}, 'fresh_a{fresh_id}', 'b{target}')")
+                        }
+                    }
+                    // INSERT: conflict on both IPK and UNIQUE simultaneously
+                    3 => {
+                        let id = rng.random_range(1..=20i64);
+                        let other = (id % 20) + 1; // different row for cross-conflict
+                        if has_col_c {
+                            format!(
+                                "INSERT INTO t VALUES({id}, 'a{other}', 'b{other}', 'c{other}')"
+                            )
+                        } else if has_col_b {
+                            format!("INSERT INTO t VALUES({id}, 'a{other}', 'b{other}')")
+                        } else {
+                            format!("INSERT INTO t VALUES({id}, 'a{other}')")
+                        }
+                    }
+                    // UPDATE: change IPK to cause conflict
+                    4 => {
+                        let src = rng.random_range(1..=20i64);
+                        let dst = rng.random_range(1..=20i64);
+                        format!("UPDATE t SET id = {dst} WHERE id = {src}")
+                    }
+                    // UPDATE: change a to cause UNIQUE conflict
+                    5 if has_col_a => {
+                        let src = rng.random_range(1..=20i64);
+                        let target = rng.random_range(1..=20i64);
+                        format!("UPDATE t SET a = 'a{target}' WHERE id = {src}")
+                    }
+                    // UPDATE: change b to cause UNIQUE conflict
+                    6 if has_col_b => {
+                        let src = rng.random_range(1..=20i64);
+                        let target = rng.random_range(1..=20i64);
+                        format!("UPDATE t SET b = 'b{target}' WHERE id = {src}")
+                    }
+                    // UPDATE: change both IPK and UNIQUE column
+                    7 => {
+                        let src = rng.random_range(1..=20i64);
+                        let dst = rng.random_range(1..=20i64);
+                        let target = rng.random_range(1..=20i64);
+                        if has_col_b {
+                            format!("UPDATE t SET id = {dst}, b = 'b{target}' WHERE id = {src}")
+                        } else if has_col_a {
+                            format!("UPDATE t SET id = {dst}, a = 'a{target}' WHERE id = {src}")
+                        } else {
+                            format!("UPDATE t SET id = {dst} WHERE id = {src}")
+                        }
+                    }
+                    // INSERT: no conflict (fresh values)
+                    8 => {
+                        let fresh = 5000 + iter_num as i64;
+                        if has_col_c {
+                            format!("INSERT INTO t VALUES({fresh}, 'fa{fresh}', 'fb{fresh}', 'fc{fresh}')")
+                        } else if has_col_b {
+                            format!("INSERT INTO t VALUES({fresh}, 'fa{fresh}', 'fb{fresh}')")
+                        } else {
+                            format!("INSERT INTO t VALUES({fresh}, 'fa{fresh}')")
+                        }
+                    }
+                    // DELETE: reduce row count to keep conflicts likely
+                    9 => {
+                        let target = rng.random_range(1..=30i64);
+                        format!("DELETE FROM t WHERE id = {target}")
+                    }
+                    // UPDATE: safe update (no conflict)
+                    10 if has_col_a => {
+                        let src = rng.random_range(1..=20i64);
+                        let fresh = 9000 + iter_num as i64;
+                        format!("UPDATE t SET a = 'safe{fresh}' WHERE id = {src}")
+                    }
+                    // Multi-row INSERT with potential conflicts
+                    11 => {
+                        let id1 = rng.random_range(1..=25i64);
+                        let id2 = rng.random_range(1..=25i64);
+                        let fresh = 7000 + iter_num as i64;
+                        if has_col_b {
+                            format!(
+                                "INSERT INTO t VALUES({id1}, 'ma{fresh}', 'mb{fresh}'), ({id2}, 'ma{fresh}_2', 'mb{fresh}_2')"
+                            )
+                        } else if has_col_a {
+                            format!(
+                                "INSERT INTO t VALUES({id1}, 'ma{fresh}'), ({id2}, 'ma{fresh}_2')"
+                            )
+                        } else {
+                            format!("INSERT INTO t VALUES({fresh}, 'ma{fresh}')")
+                        }
+                    }
+                    // Fallback: safe insert
+                    _ => {
+                        let fresh = 6000 + iter_num as i64;
+                        if has_col_c {
+                            format!("INSERT INTO t VALUES({fresh}, 'sa{fresh}', 'sb{fresh}', 'sc{fresh}')")
+                        } else if has_col_b {
+                            format!("INSERT INTO t VALUES({fresh}, 'sa{fresh}', 'sb{fresh}')")
+                        } else {
+                            format!("INSERT INTO t VALUES({fresh}, 'sa{fresh}')")
+                        }
+                    }
+                };
+
+                debug_log.push_str(&stmt);
+                debug_log.push('\n');
+
+                // Execute on both (ignore errors from constraint violations).
+                let limbo_res = limbo_exec_rows_fallible(&limbo_db, &limbo_conn, &stmt);
+                let sqlite_res = sqlite_conn.execute(&stmt, params![]);
+
+                // Both must agree on success/failure.
+                match (sqlite_res.is_ok(), limbo_res.is_ok()) {
+                    (true, true) | (false, false) => {}
+                    _ => {
+                        panic!(
+                            "Outcome mismatch!\nSchema: {schema_name}\nStmt: {stmt}\n\
+                             SQLite: {sqlite_res:?}\nLimbo: {limbo_res:?}\n\
+                             Seed: {seed}\n\nDDL/DML to reproduce:\n{debug_log}"
+                        );
+                    }
+                }
+
+                // Verify table contents match.
+                let verify = "SELECT * FROM t ORDER BY id";
+                let limbo_rows = limbo_exec_rows(&limbo_conn, verify);
+                let sqlite_rows = sqlite_exec_rows(&sqlite_conn, verify);
+                if limbo_rows != sqlite_rows {
+                    panic!(
+                        "Results mismatch!\nSchema: {schema_name}\nStmt: {stmt}\n\
+                         Limbo: {limbo_rows:?}\nSQLite: {sqlite_rows:?}\n\
+                         Seed: {seed}\n\nDDL/DML to reproduce:\n{debug_log}"
+                    );
+                }
+            }
+
+            log::info!("{schema_name}: {num_fuzz_iterations} iterations passed (seed: {seed})");
+        }
+    }
+
     #[derive(Clone, Debug)]
     struct FuzzTestColumn {
         name: String,

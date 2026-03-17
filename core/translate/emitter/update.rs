@@ -1,5 +1,6 @@
 use super::TranslateCtx;
 use crate::translate::insert::halt_desc_and_on_error;
+use crate::translate::stmt_journal::any_effective_replace;
 use crate::{
     ast, emit_explain,
     error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
@@ -20,8 +21,9 @@ use crate::{
             NoConstantOptReason, ReturningBufferCtx,
         },
         fkeys::{
-            emit_fk_child_update_counters, emit_fk_update_parent_actions, fire_fk_update_actions,
-            stabilize_new_row_for_fk, ForeignKeyActions,
+            emit_fk_child_update_counters, emit_fk_parent_new_key_reconcile,
+            emit_fk_update_parent_actions, fire_fk_update_actions, stabilize_new_row_for_fk,
+            ForeignKeyActions,
         },
         main_loop::{CloseLoop, InitLoop, OpenLoop},
         plan::{
@@ -45,6 +47,7 @@ use crate::{
 };
 use std::num::NonZeroUsize;
 use tracing::{instrument, Level};
+use turso_macros::{turso_assert, turso_assert_eq};
 use turso_parser::ast::{ResolveType, TriggerEvent, TriggerTime};
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -266,11 +269,44 @@ pub fn emit_program_for_update(
         target_table_cursor_id
     };
 
-    // For REPLACE mode, we need cursors for ALL indexes because when we delete a
-    // conflicting row, we must delete from all indexes, not just those being updated.
-    // We construct this AFTER open_loop so we can determine which index is used for
-    // iteration and reuse that cursor instead of opening a new one.
-    let all_index_cursors = if matches!(program.resolve_type, ResolveType::Replace) {
+    // When any conflict resolution path may use REPLACE, we need cursors on ALL
+    // indexes — deleting a conflicting row requires removing its entries from every
+    // index, not just the ones touched by SET clauses.
+    //
+    // REPLACE can come from the statement (UPDATE OR REPLACE), the PK DDL
+    // (INTEGER PRIMARY KEY ON CONFLICT REPLACE), or a unique index DDL
+    // (UNIQUE ON CONFLICT REPLACE). Only indexes whose columns are being
+    // updated can trigger a conflict, so we only check indexes_to_update.
+    // Only consider PK REPLACE when the UPDATE actually changes the rowid,
+    // since PK REPLACE can only fire on rowid collisions.
+    let updates_rowid = {
+        let has_direct_rowid = plan
+            .set_clauses
+            .iter()
+            .any(|(idx, _)| *idx == ROWID_SENTINEL);
+        let has_alias_rowid = target_table
+            .table
+            .columns()
+            .iter()
+            .position(|c| c.is_rowid_alias())
+            .is_some_and(|alias_idx| plan.set_clauses.iter().any(|(idx, _)| *idx == alias_idx));
+        has_direct_rowid || has_alias_rowid
+    };
+    let rowid_alias_conflict = if updates_rowid {
+        target_table
+            .table
+            .btree()
+            .and_then(|bt| bt.rowid_alias_conflict_clause)
+    } else {
+        None
+    };
+    let any_replace = any_effective_replace(
+        program.has_statement_conflict,
+        program.resolve_type,
+        rowid_alias_conflict,
+        plan.indexes_to_update.iter().map(|idx| idx.on_conflict),
+    );
+    let all_index_cursors = if any_replace {
         let table_name = target_table.table.get_name();
         let all_indexes: Vec<_> = resolver.with_schema(target_database_id, |s| {
             s.get_indices(table_name).cloned().collect()
@@ -831,6 +867,23 @@ fn emit_update_insns<'a>(
         None
     };
 
+    turso_assert!(
+        !has_user_provided_rowid || rowid_set_clause_reg.is_some(),
+        "has_user_provided_rowid requires rowid_set_clause_reg"
+    );
+
+    // Effective INTEGER PK conflict resolution: statement-level OR clause takes precedence;
+    // otherwise use the constraint-level rowid_alias_conflict_clause from the table DDL.
+    let constraint_rowid_alias_conflict = target_table
+        .table
+        .btree()
+        .and_then(|bt| bt.rowid_alias_conflict_clause);
+    let effective_rowid_alias_conflict = if program.has_statement_conflict {
+        or_conflict
+    } else {
+        constraint_rowid_alias_conflict.unwrap_or(ResolveType::Abort)
+    };
+
     let not_exists_check_required =
         has_user_provided_rowid || iteration_cursor_id != target_table_cursor_id;
 
@@ -1228,234 +1281,83 @@ fn emit_update_insns<'a>(
         .btree()
         .is_some_and(|btree| btree.is_strict);
 
-    // For IGNORE, FAIL, and ROLLBACK modes, we need to do a preflight check for unique
-    // constraint violations BEFORE deleting any old index entries. This ensures that:
-    // Preflight: check ALL unique constraints and rowid conflicts BEFORE any index mutations.
-    // Without this, the per-index loop would interleave constraint checks with IdxDelete/IdxInsert,
-    // leaving orphan index entries if a later constraint fails.
-    // REPLACE is excluded because it handles conflicts by deleting conflicting rows inline.
-    //
-    // Also check per-constraint ON CONFLICT clauses from CREATE TABLE.
-    let needs_preflight = matches!(
-        or_conflict,
-        ResolveType::Abort | ResolveType::Ignore | ResolveType::Fail | ResolveType::Rollback
-    ) || (!program.has_statement_conflict
-        && indexes_to_update.iter().any(|idx| {
-            matches!(
-                idx.on_conflict,
-                Some(ResolveType::Ignore | ResolveType::Fail | ResolveType::Rollback)
-            )
-        }));
-    if needs_preflight {
-        let rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
-        for (index, (idx_cursor_id, _record_reg)) in indexes_to_update.iter().zip(index_cursors) {
-            if !index.unique {
-                continue;
-            }
-            // Skip partial indexes in preflight — the predicate evaluation needed to
-            // determine if the new values satisfy the WHERE clause is done in the
-            // per-index loop below. Partial index conflicts are handled there.
-            if index.where_clause.is_some() {
-                continue;
-            }
+    // Non-REPLACE PK constraint check. Must run BEFORE the index preflight so that
+    // PK ABORT/FAIL/ROLLBACK fires before an index IGNORE can silently skip the row.
+    // SQLite checks PK constraints before index constraints in the UPDATE path.
+    if target_table.table.btree().is_some()
+        && has_user_provided_rowid
+        && !matches!(effective_rowid_alias_conflict, ResolveType::Replace)
+    {
+        let record_label = program.allocate_label();
+        let target_reg = rowid_set_clause_reg.unwrap();
 
-            // Build the new index key for conflict checking
-            let num_cols = index.columns.len();
-            let idx_start_reg = program.alloc_registers(num_cols);
+        // If the new rowid equals the old rowid, no conflict
+        program.emit_insn(Insn::Eq {
+            lhs: target_reg,
+            rhs: beg,
+            target_pc: record_label,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
 
-            for (i, col) in index.columns.iter().enumerate() {
-                emit_index_column_value_new_image(
-                    program,
-                    &t_ctx.resolver,
-                    target_table.table.columns(),
-                    start,
-                    rowid_reg,
-                    col,
-                    idx_start_reg + i,
-                    target_table.table.is_strict(),
-                )?;
-            }
+        // If a row with the new rowid doesn't exist, no conflict
+        program.emit_insn(Insn::NotExists {
+            cursor: target_table_cursor_id,
+            rowid_reg: target_reg,
+            target_pc: record_label,
+        });
 
-            // Apply affinity for proper comparison
-            let aff = index
-                .columns
-                .iter()
-                .map(|ic| {
-                    if ic.expr.is_some() {
-                        Affinity::Blob.aff_mask()
-                    } else {
-                        target_table.table.columns()[ic.pos_in_table]
-                            .affinity_with_strict(target_is_strict)
-                            .aff_mask()
-                    }
-                })
-                .collect::<String>();
-            program.emit_insn(Insn::Affinity {
-                start_reg: idx_start_reg,
-                count: NonZeroUsize::new(num_cols).expect("nonzero col count"),
-                affinities: aff,
-            });
-
-            // Check for conflicts - NoConflict jumps if no conflict
-            let no_conflict_label = program.allocate_label();
-            program.emit_insn(Insn::NoConflict {
-                cursor_id: *idx_cursor_id,
-                target_pc: no_conflict_label,
-                record_reg: idx_start_reg,
-                num_regs: num_cols,
-            });
-
-            // A conflict was found - check if it's the same row we're updating
-            let idx_rowid_reg = program.alloc_register();
-            program.emit_insn(Insn::IdxRowId {
-                cursor_id: *idx_cursor_id,
-                dest: idx_rowid_reg,
-            });
-
-            // If the conflicting row is the one we're updating, that's not actually a conflict
-            program.emit_insn(Insn::Eq {
-                lhs: beg,
-                rhs: idx_rowid_reg,
-                target_pc: no_conflict_label,
-                flags: CmpInsFlags::default(),
-                collation: program.curr_collation(),
-            });
-
-            // Conflict with a different row - handle based on conflict resolution mode.
-            // Use per-constraint ON CONFLICT when no statement-level OR clause.
-            let idx_conflict = if program.has_statement_conflict {
-                or_conflict
-            } else {
-                index.on_conflict.unwrap_or(ResolveType::Abort)
-            };
-            match idx_conflict {
-                ResolveType::Ignore => {
-                    // Skip this row's update and continue with the next row
-                    program.emit_insn(Insn::Goto {
-                        target_pc: skip_row_label,
-                    });
-                }
-                ResolveType::Fail | ResolveType::Rollback | ResolveType::Abort => {
-                    // Halt with UNIQUE constraint error
-                    let column_names = index.columns.iter().enumerate().fold(
-                        String::with_capacity(50),
-                        |mut accum, (idx, col)| {
-                            if idx > 0 {
-                                accum.push_str(", ");
-                            }
-                            accum.push_str(table_name);
-                            accum.push('.');
-                            accum.push_str(&col.name);
-                            accum
-                        },
-                    );
-                    let (description, on_error) = halt_desc_and_on_error(
-                        &column_names,
-                        idx_conflict,
-                        program.has_statement_conflict,
-                    );
-                    program.emit_insn(Insn::Halt {
-                        err_code: SQLITE_CONSTRAINT_UNIQUE,
-                        description,
-                        on_error,
-                        description_reg: None,
-                    });
-                }
-                _ => {}
-            }
-
-            program.preassign_label_to_next_insn(no_conflict_label);
-        }
-
-        // Also check for rowid conflict in preflight
-        if has_user_provided_rowid {
-            let target_reg = rowid_set_clause_reg.unwrap();
-            let no_rowid_conflict_label = program.allocate_label();
-
-            // If the new rowid equals the old rowid, no conflict
-            program.emit_insn(Insn::Eq {
-                lhs: target_reg,
-                rhs: beg,
-                target_pc: no_rowid_conflict_label,
-                flags: CmpInsFlags::default(),
-                collation: program.curr_collation(),
-            });
-
-            // If a row with the new rowid doesn't exist, no conflict
-            program.emit_insn(Insn::NotExists {
-                cursor: target_table_cursor_id,
-                rowid_reg: target_reg,
-                target_pc: no_rowid_conflict_label,
-            });
-
-            // Conflict found - handle based on conflict resolution mode.
-            // Use per-constraint ON CONFLICT when no statement-level OR clause.
-            let pk_conflict = if program.has_statement_conflict {
-                or_conflict
-            } else {
-                target_table
-                    .table
-                    .btree()
-                    .and_then(|bt| {
-                        bt.unique_sets
-                            .iter()
-                            .find(|us| us.is_primary_key)
-                            .and_then(|us| us.conflict_clause)
-                    })
-                    .unwrap_or(ResolveType::Abort)
-            };
-            match pk_conflict {
-                ResolveType::Ignore => {
-                    // Skip this row's update and continue with the next row
-                    program.emit_insn(Insn::Goto {
-                        target_pc: skip_row_label,
-                    });
-                }
-                ResolveType::Fail | ResolveType::Rollback | ResolveType::Abort => {
-                    // Halt with PRIMARY KEY constraint error
-                    let raw_desc = if let Some(idx) = rowid_alias_index {
-                        String::from(table_name)
-                            + "."
-                            + target_table
-                                .table
-                                .columns()
-                                .get(idx)
-                                .expect("column to exist")
-                                .name
-                                .as_ref()
-                                .map_or("", |v| v)
-                    } else {
-                        String::from(table_name) + ".rowid"
-                    };
-                    let (description, on_error) = halt_desc_and_on_error(
-                        &raw_desc,
-                        pk_conflict,
-                        program.has_statement_conflict,
-                    );
-                    program.emit_insn(Insn::Halt {
-                        err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-                        description,
-                        on_error,
-                        description_reg: None,
-                    });
-                }
-                _ => {}
-            }
-
-            program.preassign_label_to_next_insn(no_rowid_conflict_label);
-        }
-
-        if has_user_provided_rowid {
-            if let Some(label) = check_rowid_not_exists_label {
-                // Important: the cursor was repositioned in the previous conflict checks,
-                // so if we didn't conflict above, we need to re-seek to the row under update,
-                // so that the old index row images (see below) read from the correct row.
-                program.emit_insn(Insn::NotExists {
-                    cursor: target_table_cursor_id,
-                    rowid_reg: beg,
-                    target_pc: label,
+        // Handle conflict resolution for rowid/primary key conflict.
+        // Replace is excluded by the outer guard; only Ignore/Abort/Fail/Rollback reach here.
+        match effective_rowid_alias_conflict {
+            ResolveType::Ignore => {
+                // For IGNORE, skip this row's update but continue with other rows
+                program.emit_insn(Insn::Goto {
+                    target_pc: skip_row_label,
                 });
             }
+            _ => {
+                // ABORT/FAIL/ROLLBACK behavior
+                let raw_desc = if let Some(idx) = rowid_alias_index {
+                    String::from(table_name)
+                        + "."
+                        + target_table
+                            .table
+                            .columns()
+                            .get(idx)
+                            .unwrap()
+                            .name
+                            .as_ref()
+                            .map_or("", |v| v)
+                } else {
+                    String::from(table_name) + ".rowid"
+                };
+                let (description, on_error) = halt_desc_and_on_error(
+                    &raw_desc,
+                    effective_rowid_alias_conflict,
+                    program.has_statement_conflict,
+                );
+                program.emit_insn(Insn::Halt {
+                    err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+                    description,
+                    on_error,
+                    description_reg: None,
+                });
+            }
+        }
+
+        program.preassign_label_to_next_insn(record_label);
+    }
+
+    // After the PK check above, NotExists may have repositioned the cursor.
+    // Re-seek to the row under update so old-image reads in Phase 2 are correct.
+    if has_user_provided_rowid && !matches!(effective_rowid_alias_conflict, ResolveType::Replace) {
+        if let Some(label) = check_rowid_not_exists_label {
+            program.emit_insn(Insn::NotExists {
+                cursor: target_table_cursor_id,
+                rowid_reg: beg,
+                target_pc: label,
+            });
         }
     }
 
@@ -1586,129 +1488,32 @@ fn emit_update_insns<'a>(
         }
     }
 
-    if target_table.table.btree().is_some()
-        && has_user_provided_rowid
-        && matches!(or_conflict, ResolveType::Replace)
-    {
-        let target_reg = rowid_set_clause_reg.expect("rowid_set_clause_reg must be set");
-        let no_rowid_conflict_label = program.allocate_label();
-        let row_not_found_label = check_rowid_not_exists_label
-            .expect("check_rowid_not_exists_label must be set when rowid is updated");
+    // =========================================================================
+    // Three-phase index update — matches SQLite's separated architecture.
+    // Phase 1: Evaluate partial WHERE predicates, build new index keys,
+    //          and check unique constraints (with inline REPLACE deletion;
+    //          REPLACE indexes are ordered last, after all other indexes,
+    //          because they are the only mutative ones).
+    // Phase 2: Delete old index entries from ALL indexes.
+    // Phase 3: Insert new index entries into ALL indexes.
+    // This ensures no index mutations happen until ALL constraint checks pass.
+    // =========================================================================
 
-        // If the new rowid equals the old rowid, no conflict.
-        program.emit_insn(Insn::Eq {
-            lhs: target_reg,
-            rhs: beg,
-            target_pc: no_rowid_conflict_label,
-            flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
-        });
-
-        // If a row with the new rowid doesn't exist, no conflict.
-        program.emit_insn(Insn::NotExists {
-            cursor: target_table_cursor_id,
-            rowid_reg: target_reg,
-            target_pc: no_rowid_conflict_label,
-        });
-
-        // Phase 1: Before Delete - prepare FK cascade actions for implicitly-deleted row.
-        // CASCADE/SetNull/SetDefault actions are prepared but deferred until after Delete.
-        let prepared_fk_actions = if connection.foreign_keys_enabled() {
-            let prepared = if t_ctx.resolver.with_schema(update_database_id, |s| {
-                s.any_resolved_fks_referencing(table_name)
-            }) {
-                ForeignKeyActions::prepare_fk_delete_actions(
-                    program,
-                    &mut t_ctx.resolver,
-                    table_name,
-                    target_table_cursor_id,
-                    target_reg,
-                    update_database_id,
-                )?
-            } else {
-                ForeignKeyActions::default()
-            };
-            if t_ctx
-                .resolver
-                .with_schema(update_database_id, |s| s.has_child_fks(table_name))
-            {
-                emit_fk_child_decrement_on_delete(
-                    program,
-                    &target_table
-                        .table
-                        .btree()
-                        .expect("UPDATE target must be a BTree table"),
-                    table_name,
-                    target_table_cursor_id,
-                    target_reg,
-                    update_database_id,
-                    &t_ctx.resolver,
-                )?;
-            }
-            prepared
-        } else {
-            ForeignKeyActions::default()
-        };
-
-        for (other_index, other_idx_cursor_id) in all_index_cursors {
-            let other_num_regs = other_index.columns.len() + 1;
-            let other_start_reg = program.alloc_registers(other_num_regs);
-
-            for (reg_offset, column_index) in other_index.columns.iter().enumerate() {
-                emit_index_column_value_old_image(
-                    program,
-                    &t_ctx.resolver,
-                    table_references,
-                    target_table_cursor_id,
-                    column_index,
-                    other_start_reg + reg_offset,
-                )?;
-            }
-
-            // Add the conflicting rowid.
-            program.emit_insn(Insn::Copy {
-                src_reg: target_reg,
-                dst_reg: other_start_reg + other_num_regs - 1,
-                extra_amount: 0,
-            });
-
-            program.emit_insn(Insn::IdxDelete {
-                start_reg: other_start_reg,
-                num_regs: other_num_regs,
-                cursor_id: *other_idx_cursor_id,
-                raise_error_if_no_matching_entry: other_index.where_clause.is_none(),
-            });
-        }
-
-        program.emit_insn(Insn::Delete {
-            cursor_id: target_table_cursor_id,
-            table_name: table_name.to_string(),
-            is_part_of_update: false,
-        });
-
-        // Phase 2: After Delete - fire CASCADE/SetNull/SetDefault FK actions.
-        prepared_fk_actions.fire_prepared_fk_delete_actions(
-            program,
-            &mut t_ctx.resolver,
-            connection,
-            update_database_id,
-        )?;
-
-        // NotExists repositions the cursor. Reseek to the row under update (beg)
-        // so that old-image reads/deletes operate on the correct row.
-        program.preassign_label_to_next_insn(no_rowid_conflict_label);
-        program.emit_insn(Insn::NotExists {
-            cursor: target_table_cursor_id,
-            rowid_reg: beg,
-            target_pc: row_not_found_label,
-        });
+    // Per-index context collected in Phase 1, consumed by Phases 2 and 3.
+    struct IndexUpdatePhaseCtx {
+        idx_cursor_id: usize,
+        record_reg: usize,
+        idx_start_reg: usize,
+        num_cols: usize,
+        old_satisfies_where: Option<usize>,
+        new_satisfies_where: Option<usize>,
     }
 
+    let mut idx_phase_ctxs: Vec<IndexUpdatePhaseCtx> = Vec::with_capacity(indexes_to_update.len());
+
+    // ---- Phase 1: Constraint checks + new key build ----
+    let mut seen_replace = false;
     for (index, (idx_cursor_id, record_reg)) in indexes_to_update.iter().zip(index_cursors) {
-        // We need to know whether or not the OLD values satisfied the predicate on the
-        // partial index, so we can know whether or not to delete the old index entry,
-        // as well as whether or not the NEW values satisfy the predicate, to determine whether
-        // or not to insert a new index entry for a partial index
         let (old_satisfies_where, new_satisfies_where) = if index.where_clause.is_some() {
             // This means that we need to bind the column references to a copy of the index Expr,
             // so we can emit Insn::Column instructions and refer to the old values.
@@ -1758,14 +1563,7 @@ fn emit_update_insns<'a>(
             (None, None)
         };
 
-        let mut skip_delete_label = None;
-        let mut skip_insert_label = None;
-
-        // Build new index entry FIRST (needed for unique constraint check before
-        // any modifications). Matches SQLite's codegen order: constraint checks
-        // precede IdxDelete so that a failing constraint does not leave the index
-        // in an inconsistent state (see update.c sqlite3GenerateConstraintChecks
-        // before sqlite3GenerateRowIndexDelete).
+        // Build new index key for constraint checking and later insertion (Phase 3).
         let num_cols = index.columns.len();
         let idx_start_reg = program.alloc_registers(num_cols + 1);
         let rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
@@ -1823,6 +1621,23 @@ fn emit_update_insns<'a>(
         // If the constraint check fails (Halt/Ignore/Replace), the old index
         // entry is still intact — no statement journal needed for rollback.
         if index.unique {
+            let idx_conflict = if program.has_statement_conflict {
+                or_conflict
+            } else {
+                index.on_conflict.unwrap_or(ResolveType::Abort)
+            };
+            // REPLACE indexes must be sorted after all non-REPLACE indexes
+            // (schema.rs:add_index ensures this). If a non-REPLACE index
+            // appears after a REPLACE one, constraint check ordering is wrong.
+            if idx_conflict == ResolveType::Replace {
+                seen_replace = true;
+            } else {
+                turso_assert!(
+                    !seen_replace,
+                    "non-REPLACE index after REPLACE index — sort order invariant violated"
+                );
+            }
+
             let constraint_check = program.allocate_label();
 
             // For partial indexes, skip the constraint check if new values don't
@@ -1857,12 +1672,6 @@ fn emit_update_insns<'a>(
                 flags: CmpInsFlags::default(),
                 collation: program.curr_collation(),
             });
-
-            let idx_conflict = if program.has_statement_conflict {
-                or_conflict
-            } else {
-                index.on_conflict.unwrap_or(ResolveType::Abort)
-            };
             match idx_conflict {
                 ResolveType::Ignore => {
                     // For IGNORE, skip this row's update but continue with other rows
@@ -2008,7 +1817,7 @@ fn emit_update_insns<'a>(
                         program.has_statement_conflict,
                     );
                     program.emit_insn(Insn::Halt {
-                        err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+                        err_code: SQLITE_CONSTRAINT_UNIQUE,
                         description,
                         on_error,
                         description_reg: None,
@@ -2019,10 +1828,147 @@ fn emit_update_insns<'a>(
             program.preassign_label_to_next_insn(constraint_check);
         }
 
-        // Delete old index entry (AFTER constraint check passes)
-        if let Some(old_satisfied) = old_satisfies_where {
+        idx_phase_ctxs.push(IndexUpdatePhaseCtx {
+            idx_cursor_id: *idx_cursor_id,
+            record_reg: *record_reg,
+            idx_start_reg,
+            num_cols,
+            old_satisfies_where,
+            new_satisfies_where,
+        });
+    }
+
+    turso_assert_eq!(
+        idx_phase_ctxs.len(),
+        indexes_to_update.len(),
+        "idx_phase_ctxs.len() != indexes_to_update.len()"
+    );
+
+    // PK REPLACE: when the new rowid conflicts with an existing row, delete it.
+    // Runs AFTER Phase 1 (all index constraint checks) so that non-REPLACE index
+    // constraints fire before this deletion, matching SQLite's ordering.
+    if target_table.table.btree().is_some()
+        && has_user_provided_rowid
+        && matches!(effective_rowid_alias_conflict, ResolveType::Replace)
+    {
+        let target_reg = rowid_set_clause_reg.expect("rowid_set_clause_reg must be set");
+        let no_rowid_conflict_label = program.allocate_label();
+        let row_not_found_label = check_rowid_not_exists_label
+            .expect("check_rowid_not_exists_label must be set when rowid is updated");
+
+        // If the new rowid equals the old rowid, no conflict.
+        program.emit_insn(Insn::Eq {
+            lhs: target_reg,
+            rhs: beg,
+            target_pc: no_rowid_conflict_label,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
+
+        // If a row with the new rowid doesn't exist, no conflict.
+        program.emit_insn(Insn::NotExists {
+            cursor: target_table_cursor_id,
+            rowid_reg: target_reg,
+            target_pc: no_rowid_conflict_label,
+        });
+
+        // Before Delete - prepare FK cascade actions for implicitly-deleted row.
+        let prepared_fk_actions = if connection.foreign_keys_enabled() {
+            let prepared = if t_ctx.resolver.with_schema(update_database_id, |s| {
+                s.any_resolved_fks_referencing(table_name)
+            }) {
+                ForeignKeyActions::prepare_fk_delete_actions(
+                    program,
+                    &mut t_ctx.resolver,
+                    table_name,
+                    target_table_cursor_id,
+                    target_reg,
+                    update_database_id,
+                )?
+            } else {
+                ForeignKeyActions::default()
+            };
+            if t_ctx
+                .resolver
+                .with_schema(update_database_id, |s| s.has_child_fks(table_name))
+            {
+                emit_fk_child_decrement_on_delete(
+                    program,
+                    &target_table
+                        .table
+                        .btree()
+                        .expect("UPDATE target must be a BTree table"),
+                    table_name,
+                    target_table_cursor_id,
+                    target_reg,
+                    update_database_id,
+                    &t_ctx.resolver,
+                )?;
+            }
+            prepared
+        } else {
+            ForeignKeyActions::default()
+        };
+
+        for (other_index, other_idx_cursor_id) in all_index_cursors {
+            let other_num_regs = other_index.columns.len() + 1;
+            let other_start_reg = program.alloc_registers(other_num_regs);
+
+            for (reg_offset, column_index) in other_index.columns.iter().enumerate() {
+                emit_index_column_value_old_image(
+                    program,
+                    &t_ctx.resolver,
+                    table_references,
+                    target_table_cursor_id,
+                    column_index,
+                    other_start_reg + reg_offset,
+                )?;
+            }
+
+            program.emit_insn(Insn::Copy {
+                src_reg: target_reg,
+                dst_reg: other_start_reg + other_num_regs - 1,
+                extra_amount: 0,
+            });
+
+            program.emit_insn(Insn::IdxDelete {
+                start_reg: other_start_reg,
+                num_regs: other_num_regs,
+                cursor_id: *other_idx_cursor_id,
+                raise_error_if_no_matching_entry: other_index.where_clause.is_none(),
+            });
+        }
+
+        program.emit_insn(Insn::Delete {
+            cursor_id: target_table_cursor_id,
+            table_name: table_name.to_string(),
+            is_part_of_update: false,
+        });
+
+        // After Delete - fire CASCADE/SetNull/SetDefault FK actions.
+        prepared_fk_actions.fire_prepared_fk_delete_actions(
+            program,
+            &mut t_ctx.resolver,
+            connection,
+            update_database_id,
+        )?;
+
+        // Re-seek to the row under update so Phase 2's old-image reads are correct.
+        program.preassign_label_to_next_insn(no_rowid_conflict_label);
+        program.emit_insn(Insn::NotExists {
+            cursor: target_table_cursor_id,
+            rowid_reg: beg,
+            target_pc: row_not_found_label,
+        });
+    }
+
+    // ---- Phase 2: Delete old index entries ----
+    // All constraint checks passed. Now safe to mutate indexes.
+    for (index, ctx) in indexes_to_update.iter().zip(idx_phase_ctxs.iter()) {
+        let mut skip_delete_label = None;
+
+        if let Some(old_satisfied) = ctx.old_satisfies_where {
             skip_delete_label = Some(program.allocate_label());
-            // If the old values don't satisfy the WHERE clause, skip the delete
             program.emit_insn(Insn::IfNot {
                 reg: old_satisfied,
                 target_pc: skip_delete_label.unwrap(),
@@ -2049,19 +1995,21 @@ fn emit_update_insns<'a>(
         program.emit_insn(Insn::IdxDelete {
             start_reg: delete_start_reg,
             num_regs,
-            cursor_id: *idx_cursor_id,
+            cursor_id: ctx.idx_cursor_id,
             raise_error_if_no_matching_entry: true,
         });
 
-        // Resolve delete skip label if it exists
         if let Some(label) = skip_delete_label {
             program.resolve_label(label, program.offset());
         }
+    }
 
-        // Insert the new index entry
-        if let Some(new_satisfied) = new_satisfies_where {
+    // ---- Phase 3: Insert new index entries ----
+    for ctx in idx_phase_ctxs.iter() {
+        let mut skip_insert_label = None;
+
+        if let Some(new_satisfied) = ctx.new_satisfies_where {
             skip_insert_label = Some(program.allocate_label());
-            // If the new values don't satisfy the WHERE clause, skip the idx insert
             program.emit_insn(Insn::IfNot {
                 reg: new_satisfied,
                 target_pc: skip_insert_label.unwrap(),
@@ -2070,96 +2018,19 @@ fn emit_update_insns<'a>(
         }
 
         program.emit_insn(Insn::IdxInsert {
-            cursor_id: *idx_cursor_id,
-            record_reg: *record_reg,
-            unpacked_start: Some(idx_start_reg),
-            unpacked_count: Some((num_cols + 1) as u16),
+            cursor_id: ctx.idx_cursor_id,
+            record_reg: ctx.record_reg,
+            unpacked_start: Some(ctx.idx_start_reg),
+            unpacked_count: Some((ctx.num_cols + 1) as u16),
             flags: IdxInsertFlags::new().nchange(true),
         });
 
-        // Resolve insert skip label if it exists
         if let Some(label) = skip_insert_label {
             program.resolve_label(label, program.offset());
         }
     }
 
     if target_table.table.btree().is_some() {
-        if has_user_provided_rowid && !matches!(or_conflict, ResolveType::Replace) {
-            let record_label = program.allocate_label();
-            let target_reg = rowid_set_clause_reg.unwrap();
-
-            // If the new rowid equals the old rowid, no conflict
-            program.emit_insn(Insn::Eq {
-                lhs: target_reg,
-                rhs: beg,
-                target_pc: record_label,
-                flags: CmpInsFlags::default(),
-                collation: program.curr_collation(),
-            });
-
-            // If a row with the new rowid doesn't exist, no conflict
-            program.emit_insn(Insn::NotExists {
-                cursor: target_table_cursor_id,
-                rowid_reg: target_reg,
-                target_pc: record_label,
-            });
-
-            // Handle conflict resolution for rowid/primary key conflict.
-            // Use per-constraint ON CONFLICT when no statement-level OR clause.
-            let pk_conflict = if program.has_statement_conflict {
-                or_conflict
-            } else {
-                target_table
-                    .table
-                    .btree()
-                    .and_then(|bt| {
-                        bt.unique_sets
-                            .iter()
-                            .find(|us| us.is_primary_key)
-                            .and_then(|us| us.conflict_clause)
-                    })
-                    .unwrap_or(ResolveType::Abort)
-            };
-            match pk_conflict {
-                ResolveType::Ignore => {
-                    // For IGNORE, skip this row's update but continue with other rows
-                    program.emit_insn(Insn::Goto {
-                        target_pc: skip_row_label,
-                    });
-                }
-                _ => {
-                    // ABORT/FAIL/ROLLBACK behavior
-                    let raw_desc = if let Some(idx) = rowid_alias_index {
-                        String::from(table_name)
-                            + "."
-                            + target_table
-                                .table
-                                .columns()
-                                .get(idx)
-                                .unwrap()
-                                .name
-                                .as_ref()
-                                .map_or("", |v| v)
-                    } else {
-                        String::from(table_name) + ".rowid"
-                    };
-                    let (description, on_error) = halt_desc_and_on_error(
-                        &raw_desc,
-                        pk_conflict,
-                        program.has_statement_conflict,
-                    );
-                    program.emit_insn(Insn::Halt {
-                        err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-                        description,
-                        on_error,
-                        description_reg: None,
-                    });
-                }
-            }
-
-            program.preassign_label_to_next_insn(record_label);
-        }
-
         let record_reg = program.alloc_register();
 
         let is_strict = target_table
@@ -2253,6 +2124,24 @@ fn emit_update_insns<'a>(
             },
             table_name: target_table.identifier.clone(),
         });
+
+        // Reconcile deferred FK violations after REPLACE.
+        // If Phase 1 REPLACE deleted a parent row referenced by deferred FK children,
+        // the counter was incremented. Now that the new row is inserted with the
+        // (potentially same) parent key, scan children and decrement.
+        if connection.foreign_keys_enabled() {
+            if let Some(table_btree) = target_table.table.btree() {
+                emit_fk_parent_new_key_reconcile(
+                    program,
+                    &table_btree,
+                    start,
+                    rowid_set_clause_reg.unwrap_or(beg),
+                    set_clauses,
+                    update_database_id,
+                    &t_ctx.resolver,
+                )?;
+            }
+        }
 
         // Fire FK CASCADE/SET NULL actions AFTER the parent row is updated
         // This ensures the new parent key exists when cascade actions update child rows

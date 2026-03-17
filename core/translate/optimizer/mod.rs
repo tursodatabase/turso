@@ -930,7 +930,7 @@ fn add_ephemeral_table_to_update_plan(
         unique_sets: vec![],
         foreign_keys: vec![],
         check_constraints: vec![],
-        pk_conflict_clause: None,
+        rowid_alias_conflict_clause: None,
     });
 
     let temp_cursor_id = program.alloc_cursor_id_keyed(

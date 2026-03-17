@@ -1504,7 +1504,7 @@ fn emit_materialized_subquery_table(
         unique_sets: vec![],
         foreign_keys: vec![],
         check_constraints: vec![],
-        pk_conflict_clause: None,
+        rowid_alias_conflict_clause: None,
     });
 
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ephemeral_table.clone()));

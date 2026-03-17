@@ -1050,7 +1050,7 @@ fn parse_table(
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
-            pk_conflict_clause: None,
+            rowid_alias_conflict_clause: None,
         });
         drop(view_guard);
 

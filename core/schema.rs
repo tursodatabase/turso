@@ -8,11 +8,11 @@ use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl};
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
-use crate::turso_assert;
 use crate::types::IOResult;
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::CursorID;
+use crate::{turso_assert, turso_debug_assert};
 use turso_macros::AtomicEnum;
 
 #[derive(Debug, Clone, AtomicEnum)]
@@ -842,13 +842,35 @@ impl Schema {
         let table_name = normalize_ident(&index.table_name);
         // We must add the new index to the front of the deque, because SQLite stores index definitions as a linked list
         // where the newest parsed index entry is at the head of list. If we would add it to the back of a regular Vec for example,
-        // then we would evaluate ON CONFLICT DO UPDATE clauses in the wrong index iteration order and UPDATE the wrong row. One might
-        // argue that this is an implementation detail and we should not care about this, but it makes e.g. the fuzz test 'partial_index_mutation_and_upsert_fuzz'
-        // fail, so let's just be compatible.
-        self.indexes
-            .entry(table_name)
-            .or_default()
-            .push_front(index);
+        // then we would evaluate ON CONFLICT DO UPDATE clauses in the wrong index iteration order and UPDATE the wrong row.
+        // Additionally, REPLACE indexes must go after all the non-REPLACE indexes so that
+        // non-mutating conflict resolutions all happen before mutating ones, ensuring that
+        // no half-committed state is left behind.
+        let is_replace = index.on_conflict == Some(ResolveType::Replace);
+        let indexes_for_table = self.indexes.entry(table_name).or_default();
+        if is_replace {
+            // REPLACE indexes sort newest-first among themselves.
+            let first_replace = indexes_for_table
+                .iter()
+                .position(|idx| idx.on_conflict == Some(ResolveType::Replace));
+            let pos = first_replace.unwrap_or(indexes_for_table.len());
+            indexes_for_table.insert(pos, index);
+        } else {
+            // Non-REPLACE indexes go at the front, newest first.
+            indexes_for_table.push_front(index);
+        }
+        turso_debug_assert!(
+            indexes_for_table
+                .iter()
+                .position(|idx| idx.on_conflict == Some(ResolveType::Replace))
+                .is_none_or(|first_replace| {
+                    indexes_for_table
+                        .iter()
+                        .skip(first_replace)
+                        .all(|idx| idx.on_conflict == Some(ResolveType::Replace))
+                }),
+            "REPLACE indexes must form a contiguous suffix"
+        );
         Ok(())
     }
 
@@ -1247,7 +1269,7 @@ impl Schema {
                 has_autoincrement: false,
                 foreign_keys: vec![],
                 check_constraints: vec![],
-                pk_conflict_clause: None,
+                rowid_alias_conflict_clause: None,
                 unique_sets: vec![],
             })));
 
@@ -2015,9 +2037,9 @@ pub struct BTreeTable {
     pub unique_sets: Vec<UniqueSet>,
     pub foreign_keys: Vec<Arc<ForeignKey>>,
     pub check_constraints: Vec<CheckConstraint>,
-    /// ON CONFLICT clause for the PRIMARY KEY constraint.
+    /// ON CONFLICT clause for the INTEGER PRIMARY KEY constraint.
     /// Stored here because rowid-alias PKs have their UniqueSet removed.
-    pub pk_conflict_clause: Option<ResolveType>,
+    pub rowid_alias_conflict_clause: Option<ResolveType>,
 }
 
 impl BTreeTable {
@@ -2825,7 +2847,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         .chain(unique_sets_constraints)
         .collect::<Vec<_>>();
     // Capture PK conflict clause before the rowid-alias UniqueSet is removed.
-    let pk_conflict_clause = unique_sets
+    let rowid_alias_conflict_clause = unique_sets
         .iter()
         .find(|us| us.is_primary_key)
         .and_then(|us| us.conflict_clause);
@@ -2900,7 +2922,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
             unique_sets
         },
         check_constraints,
-        pk_conflict_clause,
+        rowid_alias_conflict_clause,
     })
 }
 
@@ -3439,7 +3461,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
         ],
         foreign_keys: vec![],
         check_constraints: vec![],
-        pk_conflict_clause: None,
+        rowid_alias_conflict_clause: None,
         unique_sets: vec![],
     }
 }
@@ -4215,7 +4237,7 @@ mod tests {
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
-            pk_conflict_clause: None,
+            rowid_alias_conflict_clause: None,
         };
 
         let result = Index::automatic_from_primary_key(

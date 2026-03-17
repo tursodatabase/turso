@@ -26,7 +26,33 @@ use crate::translate::plan::{DeletePlan, DmlSafetyReason, UpdatePlan};
 use crate::translate::trigger_exec::has_relevant_triggers_type_only;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::{sync::Arc, Connection, HashSet, Result};
-use turso_parser::ast::TriggerEvent;
+use turso_parser::ast::{ResolveType, TriggerEvent};
+
+/// Check whether any DDL-level constraint (IPK or index) uses REPLACE.
+pub(crate) fn any_index_or_ipk_has_replace(
+    rowid_alias_conflict: Option<ResolveType>,
+    mut indexes: impl Iterator<Item = Option<ResolveType>>,
+) -> bool {
+    rowid_alias_conflict == Some(ResolveType::Replace)
+        || indexes.any(|oc| oc == Some(ResolveType::Replace))
+}
+
+/// Check whether any constraint's effective resolution is REPLACE.
+///
+/// When a statement-level override exists, only the statement conflict mode matters.
+/// Otherwise, both the PK's DDL mode and each index's DDL mode are checked.
+pub(crate) fn any_effective_replace(
+    has_statement_conflict: bool,
+    statement_conflict: ResolveType,
+    rowid_alias_conflict: Option<ResolveType>,
+    indexes: impl Iterator<Item = Option<ResolveType>>,
+) -> bool {
+    if has_statement_conflict {
+        matches!(statement_conflict, ResolveType::Replace)
+    } else {
+        any_index_or_ipk_has_replace(rowid_alias_conflict, indexes)
+    }
+}
 
 /// Check whether a table has any FK relationships (child or parent side).
 fn table_has_fks(
@@ -40,62 +66,111 @@ fn table_has_fks(
             || resolver.with_schema(database_id, |s| s.any_resolved_fks_referencing(table_name)))
 }
 
-/// Determine whether a DML statement may abort mid-execution.
+/// Determine whether any constraint's effective resolution can trigger an
+/// ABORT. Each constraint has an effective resolution mode — either the
+/// statement-level override (when present) or its DDL-level mode (defaulting
+/// to ABORT). A constraint can cause an ABORT when:
 ///
-/// REPLACE falls back to ABORT for NOT NULL (without default) and CHECK
-/// constraints, so even REPLACE statements can abort in those cases.
-fn compute_may_abort(
-    has_triggers: bool,
-    has_fks: bool,
-    has_abort_resolution: bool,
-    is_replace: bool,
+/// - Its effective mode is ABORT and it has any checkable constraint
+///   (NOT NULL, CHECK, UNIQUE).
+/// - Its effective mode is REPLACE and the table has NOT NULL or CHECK
+///   constraints, because REPLACE falls back to ABORT for those.
+///
+/// IGNORE and FAIL never trigger statement-level ABORT.
+/// Each index is represented as `(on_conflict, is_unique)`.
+pub(crate) fn constraint_may_abort(
+    has_statement_conflict: bool,
+    statement_conflict: ResolveType,
+    rowid_alias_conflict: Option<ResolveType>,
+    mut indexes: impl Iterator<Item = (Option<ResolveType>, bool)>,
     has_notnull: bool,
     has_check: bool,
     has_unique: bool,
 ) -> bool {
-    let has_constraint_that_aborts = has_notnull || has_check || has_unique;
-    let replace_can_abort = is_replace && (has_notnull || has_check);
-    has_triggers
-        || has_fks
-        || (has_abort_resolution && has_constraint_that_aborts)
-        || replace_can_abort
-}
-
-/// Context for INSERT statement journal flag analysis.
-pub(crate) struct InsertJournalCtx {
-    pub inserting_multiple_rows: bool,
-    pub has_triggers: bool,
-    pub has_fks: bool,
-    pub is_replace: bool,
-    pub has_upsert: bool,
-    pub has_autoincrement: bool,
-    pub has_abort_resolution: bool,
-    pub notnull_col_exists: bool,
-    pub has_check: bool,
-    pub has_unique: bool,
+    if has_statement_conflict {
+        // Statement-level override applies uniformly to all constraints.
+        return match statement_conflict {
+            ResolveType::Abort => has_notnull || has_check || has_unique,
+            ResolveType::Replace => has_notnull || has_check, // UNIQUE conflict gets replaced, not aborted.
+            _ => false, // IGNORE, FAIL, ROLLBACK don't need statement journal
+        };
+    }
+    // No statement-level override — each constraint uses its DDL-level mode.
+    let pk_mode = rowid_alias_conflict.unwrap_or(ResolveType::Abort);
+    let pk_aborts = match pk_mode {
+        ResolveType::Abort => has_unique, // PK is a unique constraint
+        ResolveType::Replace => false,    // PK REPLACE doesn't fall back for unique
+        _ => false,
+    };
+    let idx_aborts = indexes.any(|(on_conflict, unique)| {
+        let mode = on_conflict.unwrap_or(ResolveType::Abort);
+        match mode {
+            ResolveType::Abort => unique, // only unique indexes can conflict
+            ResolveType::Replace => has_notnull || has_check,
+            _ => false,
+        }
+    });
+    // Default ABORT applies to NOT NULL and CHECK (they aren't per-index).
+    let default_aborts = has_notnull || has_check;
+    pk_aborts || idx_aborts || default_aborts
 }
 
 /// Set multi_write / may_abort for INSERT statements.
-pub(crate) fn set_insert_stmt_journal_flags(program: &mut ProgramBuilder, ctx: &InsertJournalCtx) {
+///
+/// Constraint analysis (any_replace, constraint_may_abort) is computed internally
+/// from the table schema and resolver. The caller provides INSERT-specific flags
+/// that come from the emitter's own analysis.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn set_insert_stmt_journal_flags(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    database_id: usize,
+    table: &crate::schema::BTreeTable,
+    has_statement_conflict: bool,
+    statement_conflict: ResolveType,
+    inserting_multiple_rows: bool,
+    has_triggers: bool,
+    has_fks: bool,
+    has_upsert: bool,
+    has_autoincrement: bool,
+    notnull_col_exists: bool,
+    has_unique: bool,
+) {
+    let index_modes: Vec<(Option<ResolveType>, bool)> = resolver.with_schema(database_id, |s| {
+        s.get_indices(&table.name)
+            .map(|idx| (idx.on_conflict, idx.unique))
+            .collect()
+    });
+    let any_replace = any_effective_replace(
+        has_statement_conflict,
+        statement_conflict,
+        table.rowid_alias_conflict_clause,
+        index_modes.iter().map(|(oc, _)| *oc),
+    );
+    let has_check = !table.check_constraints.is_empty();
+    let may_abort = has_triggers
+        || has_fks
+        || constraint_may_abort(
+            has_statement_conflict,
+            statement_conflict,
+            table.rowid_alias_conflict_clause,
+            index_modes.into_iter(),
+            notnull_col_exists,
+            has_check,
+            has_unique,
+        );
+
     // UPSERT is multi-write because DO UPDATE modifies an existing row.
     // AUTOINCREMENT is multi-write because sqlite_sequence is updated before constraint checks.
-    if !ctx.inserting_multiple_rows
-        && !ctx.has_triggers
-        && !ctx.is_replace
-        && !ctx.has_upsert
-        && !ctx.has_autoincrement
+    if !inserting_multiple_rows
+        && !has_triggers
+        && !any_replace
+        && !has_upsert
+        && !has_autoincrement
     {
         program.set_multi_write(false);
     }
-    program.set_may_abort(compute_may_abort(
-        ctx.has_triggers,
-        ctx.has_fks,
-        ctx.has_abort_resolution,
-        ctx.is_replace,
-        ctx.notnull_col_exists,
-        ctx.has_check,
-        ctx.has_unique,
-    ));
+    program.set_may_abort(may_abort);
 }
 
 /// Set multi_write / may_abort for UPDATE statements.
@@ -125,32 +200,25 @@ pub(crate) fn set_update_stmt_journal_flags(
         has_relevant_triggers_type_only(s, TriggerEvent::Update, Some(&updated_cols), &btree_table)
     });
     let has_fks = table_has_fks(connection, resolver, database_id, btree_table.name.as_str());
-    let is_replace = plan
-        .or_conflict
-        .as_ref()
-        .is_some_and(|c| matches!(c, turso_parser::ast::ResolveType::Replace));
 
-    // Partial unique indexes can't be preflighted (their WHERE predicate isn't evaluated
-    // until the per-index loop), so the loop may interleave constraint checks with mutations
-    // from non-partial indexes. When this can happen, keep multi_write=true so the statement
-    // journal protects against orphan index entries on abort.
-    let has_partial_unique = plan
-        .indexes_to_update
-        .iter()
-        .any(|idx| idx.unique && idx.where_clause.is_some());
+    let or_conflict = plan.or_conflict.unwrap_or(ResolveType::Abort);
+    let has_statement_conflict = plan.or_conflict.is_some();
+
+    let any_replace = any_effective_replace(
+        has_statement_conflict,
+        or_conflict,
+        btree_table.rowid_alias_conflict_clause,
+        plan.indexes_to_update.iter().map(|idx| idx.on_conflict),
+    );
 
     // Ephemeral tables (used for key mutation / Halloween protection) always scan all
     // collected rows, so affects_max_1_row() returns false — multi_write stays true.
     let is_single_row =
         plan.limit.is_none() && plan.offset.is_none() && target_table.op.affects_max_1_row();
-    if is_single_row && !has_triggers && !is_replace && !has_fks && !has_partial_unique {
+    if is_single_row && !has_triggers && !any_replace && !has_fks {
         program.set_multi_write(false);
     }
 
-    let or_conflict = plan
-        .or_conflict
-        .unwrap_or(turso_parser::ast::ResolveType::Abort);
-    let has_abort_resolution = matches!(or_conflict, turso_parser::ast::ResolveType::Abort);
     let has_notnull_cols = plan.set_clauses.iter().any(|(col_idx, _)| {
         if *col_idx == crate::schema::ROWID_SENTINEL {
             return false;
@@ -164,15 +232,20 @@ pub(crate) fn set_update_stmt_journal_flags(
     let has_unique =
         !btree_table.unique_sets.is_empty() || plan.indexes_to_update.iter().any(|idx| idx.unique);
 
-    program.set_may_abort(compute_may_abort(
-        has_triggers,
-        has_fks,
-        has_abort_resolution,
-        is_replace,
-        has_notnull_cols,
-        has_check,
-        has_unique,
-    ));
+    let may_abort = has_triggers
+        || has_fks
+        || constraint_may_abort(
+            has_statement_conflict,
+            or_conflict,
+            btree_table.rowid_alias_conflict_clause,
+            plan.indexes_to_update
+                .iter()
+                .map(|idx| (idx.on_conflict, idx.unique)),
+            has_notnull_cols,
+            has_check,
+            has_unique,
+        );
+    program.set_may_abort(may_abort);
     Ok(())
 }
 
