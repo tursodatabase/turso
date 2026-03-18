@@ -24,6 +24,7 @@ pub struct DatabaseTape {
     cdc_table: Arc<String>,
     pragma_query: String,
     cdc_version: std::sync::RwLock<Option<turso_core::CdcVersion>>,
+    disable_auto_checkpoint: bool,
 }
 
 const DEFAULT_CDC_TABLE_NAME: &str = "turso_cdc";
@@ -35,6 +36,7 @@ pub const CDC_PRAGMA_NAME: &str = "capture_data_changes_conn";
 pub struct DatabaseTapeOpts {
     pub cdc_table: Option<String>,
     pub cdc_mode: Option<String>,
+    pub disable_auto_checkpoint: bool,
 }
 
 pub(crate) async fn run_stmt_once<'a, Ctx>(
@@ -114,6 +116,7 @@ impl DatabaseTape {
         let opts = DatabaseTapeOpts {
             cdc_table: None,
             cdc_mode: None,
+            disable_auto_checkpoint: false,
         };
         Self::new_with_opts(database, opts)
     }
@@ -127,14 +130,21 @@ impl DatabaseTape {
             cdc_table: Arc::new(cdc_table_name.to_string()),
             pragma_query,
             cdc_version: std::sync::RwLock::new(None),
+            disable_auto_checkpoint: opts.disable_auto_checkpoint,
         }
     }
     pub(crate) fn connect_untracked(&self) -> Result<Arc<turso_core::Connection>> {
         let connection = self.inner.connect()?;
+        if self.disable_auto_checkpoint {
+            connection.wal_auto_checkpoint_disable();
+        }
         Ok(connection)
     }
     pub async fn connect<Ctx>(&self, coro: &Coro<Ctx>) -> Result<Arc<turso_core::Connection>> {
         let connection = self.inner.connect()?;
+        if self.disable_auto_checkpoint {
+            connection.wal_auto_checkpoint_disable();
+        }
         tracing::debug!("set '{CDC_PRAGMA_NAME}' for new connection");
         let mut stmt = connection.prepare(&self.pragma_query)?;
         run_stmt_ignore_rows(coro, &mut stmt).await?;
@@ -183,6 +193,9 @@ impl DatabaseTape {
     ) -> Result<DatabaseChangesIterator> {
         tracing::debug!("opening changes iterator with options {:?}", opts);
         let conn = self.inner.connect()?;
+        if self.disable_auto_checkpoint {
+            conn.wal_auto_checkpoint_disable();
+        }
 
         let cdc_version = self
             .cdc_version
