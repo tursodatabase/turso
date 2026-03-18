@@ -1,0 +1,16 @@
+---
+source: indexes.sqltest
+expression: |-
+  SELECT id, event_type, timestamp
+      FROM events
+      WHERE timestamp >= '2024-01-01' AND timestamp < '2024-02-01';
+info:
+  statement_type: SELECT
+  tables:
+  - events
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+`--SEARCH events USING INDEX idx_events_timestamp (timestamp>=? AND timestamp<?)

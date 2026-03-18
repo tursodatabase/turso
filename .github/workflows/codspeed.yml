@@ -42,6 +42,12 @@ jobs:
         with:
           tool: cargo-codspeed
 
+      - name: Generate graph-queries DBs
+        run: |
+          python3 perf/graph-queries/generate_seed.py | sqlite3 perf/graph-queries/graph-queries.db
+          cp perf/graph-queries/graph-queries.db perf/graph-queries/graph-queries-analyzed.db
+          sqlite3 perf/graph-queries/graph-queries-analyzed.db "ANALYZE;"
+
       - name: Build benchmarks (excluding TPC-H)
         run: make codspeed-build-bench-exclude-tpc-h
 

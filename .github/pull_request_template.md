@@ -1,3 +1,9 @@
+# NOTICE:
+<!-- 
+In order to streamline the contribution process, please check the "allow edits from maintainers" checkbox on your PR. If needed, this allows us to push tweaks to your PR and avoid a potentially lengthy back-and-forth. Your original commits will stay on the branch, and you will keep authorship of those commits.
+-->
+
+
 ## Description
 
 <!-- 

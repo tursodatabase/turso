@@ -17,9 +17,10 @@
 //!
 //! https://www.sqlite.org/opcode.html
 
-use crate::types::Extendable;
-use crate::{turso_assert, turso_assert_ne, turso_debug_assert, HashSet};
+use crate::types::{Extendable, Text};
+use crate::{turso_assert, turso_assert_ne, turso_debug_assert, HashSet, NonNan};
 pub mod affinity;
+pub mod array;
 pub mod bloom_filter;
 pub mod builder;
 pub mod execute;
@@ -173,12 +174,12 @@ impl BranchOffset {
     /// Adds an integer value to the branch offset.
     /// Returns a new branch offset.
     /// Panics if the branch offset is a label or placeholder.
-    #[expect(clippy::should_implement_trait)]
+    #[allow(clippy::should_implement_trait)]
     pub fn add<N: Into<u32>>(self, n: N) -> BranchOffset {
         BranchOffset::Offset(self.as_offset_int() + n.into())
     }
 
-    #[expect(clippy::should_implement_trait)]
+    #[allow(clippy::should_implement_trait)]
     pub fn sub<N: Into<u32>>(self, n: N) -> BranchOffset {
         BranchOffset::Offset(self.as_offset_int() - n.into())
     }
@@ -246,8 +247,93 @@ impl Register {
             Register::Value(Value::Numeric(Numeric::Integer(existing))) => {
                 *existing = val;
             }
+            Register::Value(Value::Numeric(float)) => {
+                *float = Numeric::Integer(val);
+            }
+            Register::Value(other_value_kind) => {
+                *other_value_kind = Value::from_i64(val);
+            }
             _ => {
                 *self = Register::Value(Value::from_i64(val));
+            }
+        }
+    }
+    /// Set the value of the register to a floating point,
+    /// reusing Register::Value(Value::Numeric(Numeric::Float(_))) if possible.
+    #[inline(always)]
+    pub fn set_float(&mut self, val: NonNan) {
+        match self {
+            Register::Value(Value::Numeric(Numeric::Float(existing))) => {
+                *existing = val;
+            }
+            Register::Value(Value::Numeric(integer)) => {
+                *integer = Numeric::Float(val);
+            }
+            Register::Value(other_value_kind) => {
+                *other_value_kind = Value::Numeric(Numeric::Float(val));
+            }
+            _ => {
+                *self = Register::Value(Value::Numeric(Numeric::Float(val)));
+            }
+        }
+    }
+
+    /// Set the value of the register to a Text,
+    /// reusing Register::Value(Value::Text(_)) buffer if possible.
+    #[inline]
+    pub fn set_text(&mut self, val: Text) {
+        match self {
+            Register::Value(Value::Text(existing)) => {
+                existing.do_extend(&val);
+            }
+            Register::Value(other_value_kind) => {
+                *other_value_kind = Value::Text(val);
+            }
+            _ => {
+                *self = Register::Value(Value::Text(val));
+            }
+        }
+    }
+
+    /// Set the value of the register to a blob,
+    /// reusing Register::Value(Value::Blob(_)) buffer if possible.
+    #[inline]
+    pub fn set_blob(&mut self, val: Vec<u8>) {
+        match self {
+            Register::Value(Value::Blob(existing)) => {
+                existing.do_extend(&val);
+            }
+            Register::Value(other_value_kind) => {
+                *other_value_kind = Value::Blob(val);
+            }
+            _ => {
+                *self = Register::Value(Value::Blob(val));
+            }
+        }
+    }
+
+    // Set the value of the register to NULL,
+    // reusing the existing Register::Value(Value::Null) if possible.
+    pub fn set_null(&mut self) {
+        match self {
+            Register::Value(Value::Null) => {}
+            Register::Value(other_value_kind) => {
+                *other_value_kind = Value::Null;
+            }
+            _ => {
+                *self = Register::Value(Value::Null);
+            }
+        }
+    }
+
+    /// Set the register to a generic Value, attempting to reuse backing allocation if compatible.
+    pub fn set_value(&mut self, val: Value) {
+        match self {
+            Register::Value(v) => {
+                *v = val;
+            }
+            _ => {
+                *self = Register::Value(val);
             }
         }
     }
@@ -316,7 +402,7 @@ pub struct OpHashBuildState {
 }
 
 /// Re-entrant state for [Insn::HashProbe].
-/// Allows HashProbe to resume cleanly after async I/O when loading spilled partitions.
+/// Allows HashProbe to resume cleanly after async probe-row buffering I/O.
 #[derive(Debug, Default)]
 pub struct OpHashProbeState {
     /// Cached probe key values to avoid re-reading from registers
@@ -325,6 +411,8 @@ pub struct OpHashProbeState {
     pub hash_table_id: usize,
     /// Partition index being loaded (if any)
     pub partition_idx: usize,
+    /// Whether the probe row was already buffered for grace processing.
+    pub probe_buffered: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -396,6 +484,10 @@ pub struct ProgramState {
     distinct_key_values: Vec<Value>,
     hash_tables: HashMap<usize, HashTable>,
     uses_subjournal: bool,
+    /// Whether this statement is an active write inside an explicit transaction.
+    pub(crate) is_active_write: bool,
+    /// Whether begin_statement was called (savepoint + FK bookkeeping active).
+    has_stmt_transaction: bool,
     /// Attached pagers that have open savepoints for statement rollback.
     attached_savepoint_pagers: Vec<Arc<Pager>>,
     pub n_change: AtomicI64,
@@ -485,6 +577,8 @@ impl ProgramState {
             bloom_filters: HashMap::default(),
             hash_tables: HashMap::default(),
             uses_subjournal: false,
+            is_active_write: false,
+            has_stmt_transaction: false,
             attached_savepoint_pagers: Vec::new(),
             n_change: AtomicI64::new(0),
             explain_state: RwLock::new(ExplainState::default()),
@@ -566,7 +660,7 @@ impl ProgramState {
         for r in self.registers.iter_mut() {
             match r {
                 Register::Value(v) => *v = Value::Null,
-                _ => *r = Register::Value(Value::Null),
+                _ => r.set_null(),
             }
         }
         self.last_compare = None;
@@ -617,6 +711,8 @@ impl ProgramState {
         self.op_hash_build_state = None;
         self.op_hash_probe_state = None;
         self.uses_subjournal = false;
+        self.is_active_write = false;
+        self.has_stmt_transaction = false;
         self.distinct_key_values.clear();
         self.attached_savepoint_pagers.clear();
         self.n_change.store(0, Ordering::SeqCst);
@@ -635,16 +731,22 @@ impl ProgramState {
 
     /// Begin a statement subtransaction.
     ///
-    /// Creates a savepoint on the main DB's MvStore (or pager for WAL mode).
+    /// Creates a savepoint on the main DB's MvStore (or pager for WAL mode),
+    /// and snapshots FK violation counters for potential statement rollback.
     /// Attached DB savepoints are opened per-DB in `op_transaction_inner`
     /// when each DB's Transaction opcode is executed.
+    ///
+    /// Pager/MVCC savepoints are only opened for write statements inside an
+    /// explicit transaction. In autocommit mode, a statement abort is a
+    /// transaction abort, so savepoints are unnecessary.
     pub fn begin_statement(
         &mut self,
         connection: &Connection,
         pager: &Arc<Pager>,
         write: bool,
     ) -> Result<IOResult<()>> {
-        if write {
+        let in_explicit_txn = !connection.auto_commit.load(Ordering::SeqCst);
+        if write && in_explicit_txn {
             // Check if MVCC is active - if so, use MVCC savepoints instead of pager savepoints
             if let Some(mv_store) = connection.mv_store().as_ref() {
                 if let Some(tx_id) = connection.get_mv_tx_id() {
@@ -664,6 +766,8 @@ impl ProgramState {
             }
         }
 
+        self.has_stmt_transaction = true;
+
         // Store the deferred foreign key violations counter at the start of the statement.
         // This is used to ensure that if an interactive transaction had deferred FK violations and a statement subtransaction rolls back,
         // the deferred FK violations are not lost.
@@ -678,76 +782,100 @@ impl ProgramState {
     }
 
     /// End a statement subtransaction.
+    ///
+    /// Mirrors SQLite's vdbeCloseStatement (vdbeaux.c:3203-3248). Pager/MVCC
+    /// savepoint management and FK violation counter restoration are independent
+    /// concerns: pager savepoints may be skipped (e.g. autocommit optimization)
+    /// while FK bookkeeping still needs cleanup.
     pub fn end_statement(
         &mut self,
         connection: &Connection,
         pager: &Arc<Pager>,
         end_statement: EndStatement,
     ) -> Result<()> {
+        if self.is_active_write {
+            connection.n_active_writes.fetch_sub(1, Ordering::SeqCst);
+            self.is_active_write = false;
+        }
+        // If begin_statement was never called, no savepoint/FK cleanup needed.
+        if !self.has_stmt_transaction {
+            return Ok(());
+        }
+        self.has_stmt_transaction = false;
+
         // Drain attached pagers upfront so we can clean them up regardless of path.
         let attached_pagers: Vec<Arc<Pager>> = self.attached_savepoint_pagers.drain(..).collect();
-        let result = 'outer: {
-            match end_statement {
-                EndStatement::ReleaseSavepoint => {
-                    if let Some(mv_store) = connection.mv_store().as_ref() {
-                        if let Some(tx_id) = connection.get_mv_tx_id() {
-                            mv_store.release_savepoint(tx_id);
-                        }
-                        // Release savepoints on attached MVCC databases.
-                        connection.for_each_attached_mv_tx(|db_id, tx_id| {
-                            if let Some(attached_mv) = connection.mv_store_for_db(db_id) {
-                                attached_mv.release_savepoint(tx_id);
-                            }
-                        });
-                        Ok(()) // MVCC mode: no pager savepoint to release
-                    } else {
-                        pager.release_savepoint()?;
-                        for p in &attached_pagers {
-                            p.release_savepoint()?;
-                        }
-                        Ok(())
+        let result = match end_statement {
+            EndStatement::ReleaseSavepoint => {
+                if let Some(mv_store) = connection.mv_store().as_ref() {
+                    if let Some(tx_id) = connection.get_mv_tx_id() {
+                        mv_store.release_savepoint(tx_id);
                     }
-                }
-                EndStatement::RollbackSavepoint => {
-                    if let Some(mv_store) = connection.mv_store().as_ref() {
-                        if let Some(tx_id) = connection.get_mv_tx_id() {
-                            // Returns false if no savepoint was active - don't reset FK counters
-                            if !mv_store.rollback_first_savepoint(tx_id)? {
-                                break 'outer Ok(());
-                            }
+                    connection.for_each_attached_mv_tx(|db_id, tx_id| {
+                        if let Some(attached_mv) = connection.mv_store_for_db(db_id) {
+                            attached_mv.release_savepoint(tx_id);
                         }
-                        // Rollback savepoints on attached MVCC databases.
-                        let mut attached_err = None;
-                        connection.for_each_attached_mv_tx(|db_id, tx_id| {
-                            if let Some(attached_mv) = connection.mv_store_for_db(db_id) {
-                                if let Err(e) = attached_mv.rollback_first_savepoint(tx_id) {
-                                    attached_err = Some(e);
+                    });
+                    Ok(())
+                } else if self.uses_subjournal {
+                    pager.release_savepoint()?;
+                    for p in &attached_pagers {
+                        p.release_savepoint()?;
+                    }
+                    Ok(())
+                } else {
+                    Ok(())
+                }
+            }
+            EndStatement::RollbackSavepoint => {
+                // Rollback pager/MVCC savepoint if one was opened.
+                let pager_err = if let Some(mv_store) = connection.mv_store().as_ref() {
+                    let mut err = None;
+                    if let Some(tx_id) = connection.get_mv_tx_id() {
+                        if let Err(e) = mv_store.rollback_first_savepoint(tx_id) {
+                            err = Some(e);
+                        }
+                    }
+                    connection.for_each_attached_mv_tx(|db_id, tx_id| {
+                        if let Some(attached_mv) = connection.mv_store_for_db(db_id) {
+                            if let Err(e) = attached_mv.rollback_first_savepoint(tx_id) {
+                                if err.is_none() {
+                                    err = Some(e);
                                 }
                             }
-                        });
-                        if let Some(e) = attached_err {
-                            break 'outer Err(e);
                         }
-                    } else {
-                        match pager.rollback_to_newest_savepoint() {
-                            // We sometimes call end_statement() on errors without explicitly knowing whether a stmt transaction
-                            // caused the error or not. If it didn't, don't reset any FK violation counters.
-                            Ok(false) => break 'outer Ok(()),
-                            Err(err) => break 'outer Err(err),
-                            _ => {}
+                    });
+                    err
+                } else if self.uses_subjournal {
+                    match pager.rollback_to_newest_savepoint() {
+                        Ok(_) => {
+                            let mut err = None;
+                            for p in &attached_pagers {
+                                if let Err(e) = p.rollback_to_newest_savepoint() {
+                                    err = Some(e);
+                                    break;
+                                }
+                            }
+                            err
                         }
-                        for p in &attached_pagers {
-                            p.rollback_to_newest_savepoint()?;
-                        }
+                        Err(e) => Some(e),
                     }
-                    // Reset the deferred foreign key violations counter to the value it had at the start of the statement.
-                    // This is used to ensure that if an interactive transaction had deferred FK violations, they are not lost.
-                    connection.fk_deferred_violations.store(
-                        self.fk_deferred_violations_when_stmt_started
-                            .load(Ordering::Acquire),
-                        Ordering::SeqCst,
-                    );
-                    Ok(())
+                } else {
+                    None
+                };
+
+                // Always restore FK violation counters on statement rollback,
+                // regardless of whether a pager savepoint was opened.
+                // Mirrors SQLite's vdbeCloseStatement (vdbeaux.c:3243-3246).
+                connection.fk_deferred_violations.store(
+                    self.fk_deferred_violations_when_stmt_started
+                        .load(Ordering::Acquire),
+                    Ordering::SeqCst,
+                );
+
+                match pager_err {
+                    Some(e) => Err(e),
+                    None => Ok(()),
                 }
             }
         };
@@ -885,9 +1013,9 @@ pub struct PreparedProgram {
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: TableReferences,
     pub sql: String,
-    /// In SQLite, whether statement subtransactions will be used for executing a program (`usesStmtJournal`)
-    /// is determined by the parser flags "mayAbort" and "isMultiWrite". Essentially this means that the individual
-    /// statement may need to be aborted due to a constraint conflict, etc. instead of the entire transaction.
+    /// Whether the statement needs to be wrapped in a statement subtransaction
+    /// when run as part of an interactive (non-autocommit) transaction.
+    /// See [crate::vdbe::builder::ProgramBuilder::is_multi_write] and [crate::vdbe::builder::ProgramBuilder::may_abort] for more details.
     pub needs_stmt_subtransactions: Arc<AtomicBool>,
     /// If this Program is a trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
@@ -1085,14 +1213,14 @@ impl Program {
         }
         let (opcode, p1, p2, p3, p4, p5, comment) = row;
 
-        state.registers[0] = Register::Value(Value::from_i64(state.pc as i64));
-        state.registers[1] = Register::Value(Value::from_text(opcode));
-        state.registers[2] = Register::Value(Value::from_i64(p1));
-        state.registers[3] = Register::Value(Value::from_i64(p2));
-        state.registers[4] = Register::Value(Value::from_i64(p3));
-        state.registers[5] = Register::Value(p4);
-        state.registers[6] = Register::Value(Value::from_i64(p5));
-        state.registers[7] = Register::Value(Value::from_text(comment));
+        state.registers[0].set_int(state.pc as i64);
+        state.registers[1].set_value(Value::from_text(opcode));
+        state.registers[2].set_int(p1);
+        state.registers[3].set_int(p2);
+        state.registers[4].set_int(p3);
+        state.registers[5].set_value(p4);
+        state.registers[6].set_int(p5);
+        state.registers[7].set_value(Value::from_text(comment));
         state.result_row = Some(Row {
             values: &state.registers[0] as *const Register,
             count: EXPLAIN_COLUMNS.len(),
@@ -1133,11 +1261,11 @@ impl Program {
                 continue;
             };
 
-            state.registers[0] = Register::Value(Value::from_i64(*p1 as i64));
+            state.registers[0].set_int(*p1 as i64);
             state.registers[1] =
                 Register::Value(Value::from_i64(p2.as_ref().map(|p| *p).unwrap_or(0) as i64));
-            state.registers[2] = Register::Value(Value::from_i64(0));
-            state.registers[3] = Register::Value(Value::from_text(detail.clone()));
+            state.registers[2].set_int(0);
+            state.registers[3].set_value(Value::from_text(detail.clone()));
             state.result_row = Some(Row {
                 values: &state.registers[0] as *const Register,
                 count: EXPLAIN_QUERY_PLAN_COLUMNS.len(),
@@ -1839,6 +1967,8 @@ impl Program {
                     match effective_resolve {
                         ResolveType::Rollback => {
                             self.rollback_current_txn(pager);
+                            // All deferred FK violations are undone by the full rollback.
+                            self.connection.clear_deferred_foreign_key_violations();
                         }
                         ResolveType::Fail => {
                             // FAIL: Don't rollback the transaction.
@@ -2153,7 +2283,7 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
             // NULL
             0 => {
                 self.set_data_section(data);
-                *dest = Register::Value(Value::Null);
+                dest.set_null();
             }
             // I8
             1 => {
@@ -2227,17 +2357,10 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                 let val = f64::from_be_bytes([
                     data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
                 ]);
-                match dest {
-                    Register::Value(Value::Numeric(Numeric::Float(existing))) => {
-                        if let Some(nn) = crate::numeric::nonnan::NonNan::new(val) {
-                            *existing = nn;
-                        } else {
-                            *dest = Register::Value(Value::Null);
-                        }
-                    }
-                    _ => {
-                        *dest = Register::Value(Value::from_f64(val));
-                    }
+                if let Some(nn) = NonNan::new(val) {
+                    dest.set_float(nn);
+                } else {
+                    dest.set_null();
                 }
             }
             // CONST_INT0
@@ -2270,7 +2393,7 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                         existing_blob.do_extend(&blob_data);
                     }
                     _ => {
-                        *dest = Register::Value(Value::Blob(blob_data.to_vec()));
+                        dest.set_blob(blob_data.to_vec());
                     }
                 }
             }
@@ -2300,7 +2423,7 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                         existing_text.do_extend(&text_str);
                     }
                     _ => {
-                        *dest = Register::Value(Value::Text(Text::new(text_str.to_string())));
+                        dest.set_text(Text::new(text_str.to_string()));
                     }
                 }
             }
@@ -2346,8 +2469,8 @@ mod shuttle_tests {
                 let mut state = create_test_state(10, 2);
 
                 // Write some data to registers
-                state.registers[0] = Register::Value(Value::from_i64(42));
-                state.registers[1] = Register::Value(Value::from_text("test".to_string()));
+                state.registers[0].set_int(42);
+                state.registers[1].set_text(Text::new("test".to_string()));
 
                 // Send state to another thread
                 let handle = thread::spawn(move || {
@@ -2363,7 +2486,7 @@ mod shuttle_tests {
                     }
 
                     // Modify in new thread
-                    state.registers[2] = Register::Value(Value::from_i64(100));
+                    state.registers[2].set_int(100);
                     state
                 });
 
@@ -2386,9 +2509,9 @@ mod shuttle_tests {
                 let mut state = create_test_state(10, 2);
 
                 // Set up registers with test data
-                state.registers[0] = Register::Value(Value::from_i64(1));
-                state.registers[1] = Register::Value(Value::from_i64(2));
-                state.registers[2] = Register::Value(Value::from_i64(3));
+                state.registers[0].set_int(1);
+                state.registers[1].set_int(2);
+                state.registers[2].set_int(3);
 
                 // Create a result_row pointing to registers
                 state.result_row = Some(Row {
@@ -2430,8 +2553,8 @@ mod shuttle_tests {
                 let mut state = create_test_state(10, 2);
 
                 // Set up registers
-                state.registers[0] = Register::Value(Value::from_i64(42));
-                state.registers[1] = Register::Value(Value::from_i64(43));
+                state.registers[0].set_int(42);
+                state.registers[1].set_int(43);
 
                 // Create result_row
                 state.result_row = Some(Row {
@@ -2482,7 +2605,7 @@ mod shuttle_tests {
 
                 // Set up registers with distinct values
                 for i in 0..5 {
-                    state.registers[i] = Register::Value(Value::from_i64(i as i64 * 10));
+                    state.registers[i].set_int(i as i64 * 10);
                 }
 
                 state.result_row = Some(Row {
@@ -2524,7 +2647,7 @@ mod shuttle_tests {
             || {
                 let mut state = create_test_state(10, 2);
 
-                state.registers[0] = Register::Value(Value::from_i64(100));
+                state.registers[0].set_int(100);
                 state.result_row = Some(Row {
                     values: &state.registers[0] as *const Register,
                     count: 1,
@@ -2555,7 +2678,7 @@ mod shuttle_tests {
             || {
                 let mut state = create_test_state(10, 2);
 
-                state.registers[0] = Register::Value(Value::from_i64(1));
+                state.registers[0].set_int(1);
                 state.result_row = Some(Row {
                     values: &state.registers[0] as *const Register,
                     count: 1,
@@ -2565,7 +2688,7 @@ mod shuttle_tests {
                 let _ = state.result_row.take();
 
                 // Now safe to modify registers
-                state.registers[0] = Register::Value(Value::from_i64(999));
+                state.registers[0].set_int(999);
 
                 // Create new row pointing to modified registers
                 state.result_row = Some(Row {
@@ -2590,14 +2713,14 @@ mod shuttle_tests {
         shuttle::check_random(
             || {
                 let mut state = create_test_state(10, 2);
-                state.registers[0] = Register::Value(Value::from_i64(0));
+                state.registers[0].set_int(0);
 
                 // Thread 1: increment
                 let h1 = thread::spawn(move || {
                     if let Register::Value(Value::Numeric(Numeric::Integer(v))) =
                         &state.registers[0]
                     {
-                        state.registers[0] = Register::Value(Value::from_i64(v + 1));
+                        state.registers[0].set_int(v + 1);
                     }
                     state
                 });
@@ -2609,7 +2732,7 @@ mod shuttle_tests {
                     if let Register::Value(Value::Numeric(Numeric::Integer(v))) =
                         &state.registers[0]
                     {
-                        state.registers[0] = Register::Value(Value::from_i64(v + 1));
+                        state.registers[0].set_int(v + 1);
                     }
                     state
                 });
@@ -2621,7 +2744,7 @@ mod shuttle_tests {
                     if let Register::Value(Value::Numeric(Numeric::Integer(v))) =
                         &state.registers[0]
                     {
-                        state.registers[0] = Register::Value(Value::from_i64(v + 1));
+                        state.registers[0].set_int(v + 1);
                     }
                     state
                 });
@@ -2648,7 +2771,7 @@ mod shuttle_tests {
 
                 // Initialize with test data
                 for i in 0..5 {
-                    state.registers[i] = Register::Value(Value::from_i64(i as i64));
+                    state.registers[i].set_int(i as i64);
                 }
 
                 let state = Arc::new(state);
@@ -2686,9 +2809,9 @@ mod shuttle_tests {
             || {
                 let mut state = create_test_state(10, 2);
 
-                state.registers[0] = Register::Value(Value::from_i64(10));
-                state.registers[1] = Register::Value(Value::from_i64(20));
-                state.registers[2] = Register::Value(Value::from_i64(30));
+                state.registers[0].set_int(10);
+                state.registers[1].set_int(20);
+                state.registers[2].set_int(30);
 
                 state.result_row = Some(Row {
                     values: &state.registers[0] as *const Register,
@@ -2733,7 +2856,7 @@ mod shuttle_tests {
 
                 // Fill registers with identifiable data
                 for i in 0..20 {
-                    state.registers[i] = Register::Value(Value::from_i64(i as i64 * 100));
+                    state.registers[i].set_int(i as i64 * 100);
                 }
 
                 state.result_row = Some(Row {

@@ -646,8 +646,9 @@ mod tests {
             turso_statement_bind_positional_int, turso_statement_bind_positional_null,
             turso_statement_bind_positional_text, turso_statement_column_count,
             turso_statement_deinit, turso_statement_execute, turso_statement_n_change,
-            turso_statement_named_position, turso_statement_run_io, turso_statement_step,
-            turso_status_code_t, turso_str_deinit, turso_version,
+            turso_statement_named_position, turso_statement_parameters_count,
+            turso_statement_run_io, turso_statement_step, turso_status_code_t, turso_str_deinit,
+            turso_version,
         },
         value_from_c_value,
     };
@@ -1221,6 +1222,137 @@ mod tests {
                     turso_core::Value::Blob(vec![6]),
                 ]
             );
+        }
+    }
+
+    #[test]
+    pub fn test_db_stmt_named_position_requires_prefixed_name() {
+        unsafe {
+            let path = CString::new(":memory:").unwrap();
+            let config = c::turso_database_config_t {
+                path: path.as_ptr(),
+                ..Default::default()
+            };
+            let mut db = std::ptr::null();
+            let status = turso_database_new(&config, &mut db, std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            let status = turso_database_open(db, std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            let mut connection = std::ptr::null_mut();
+            let status = turso_database_connect(db, &mut connection, std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            let sql = c"SELECT :e";
+            let mut statement = std::ptr::null_mut();
+            let status = turso_connection_prepare_single(
+                connection,
+                sql.as_ptr(),
+                &mut statement,
+                std::ptr::null_mut(),
+            );
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            assert_eq!(turso_statement_named_position(statement, c":e".as_ptr()), 1);
+            assert_eq!(turso_statement_named_position(statement, c"e".as_ptr()), -1);
+
+            turso_statement_deinit(statement);
+            turso_connection_deinit(connection);
+            turso_database_deinit(db);
+        }
+    }
+
+    #[test]
+    pub fn test_db_stmt_bind_positional_out_of_bounds() {
+        unsafe {
+            let path = CString::new(":memory:").unwrap();
+            let config = c::turso_database_config_t {
+                path: path.as_ptr(),
+                ..Default::default()
+            };
+            let mut db = std::ptr::null();
+            let status = turso_database_new(&config, &mut db, std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            let status = turso_database_open(db, std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            let mut connection = std::ptr::null_mut();
+            let status = turso_database_connect(db, &mut connection, std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            let sql = c"SELECT ?1";
+            let mut statement = std::ptr::null_mut();
+            let status = turso_connection_prepare_single(
+                connection,
+                sql.as_ptr(),
+                &mut statement,
+                std::ptr::null_mut(),
+            );
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            assert_eq!(
+                turso_statement_bind_positional_int(statement, 1, 1),
+                turso_status_code_t::TURSO_OK
+            );
+            assert_eq!(
+                turso_statement_bind_positional_int(statement, 2, 2),
+                turso_status_code_t::TURSO_MISUSE
+            );
+
+            turso_statement_deinit(statement);
+            turso_connection_deinit(connection);
+            turso_database_deinit(db);
+        }
+    }
+
+    #[test]
+    pub fn test_db_stmt_sparse_positional_slot_range_matches_sqlite() {
+        unsafe {
+            let path = CString::new(":memory:").unwrap();
+            let config = c::turso_database_config_t {
+                path: path.as_ptr(),
+                ..Default::default()
+            };
+            let mut db = std::ptr::null();
+            let status = turso_database_new(&config, &mut db, std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            let status = turso_database_open(db, std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            let mut connection = std::ptr::null_mut();
+            let status = turso_database_connect(db, &mut connection, std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            let sql = c"SELECT ?3";
+            let mut statement = std::ptr::null_mut();
+            let status = turso_connection_prepare_single(
+                connection,
+                sql.as_ptr(),
+                &mut statement,
+                std::ptr::null_mut(),
+            );
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            assert_eq!(turso_statement_parameters_count(statement), 3);
+            assert_eq!(
+                turso_statement_bind_positional_int(statement, 1, 1),
+                turso_status_code_t::TURSO_OK
+            );
+            assert_eq!(
+                turso_statement_bind_positional_int(statement, 3, 3),
+                turso_status_code_t::TURSO_OK
+            );
+            assert_eq!(
+                turso_statement_bind_positional_int(statement, 4, 4),
+                turso_status_code_t::TURSO_MISUSE
+            );
+
+            turso_statement_deinit(statement);
+            turso_connection_deinit(connection);
+            turso_database_deinit(db);
         }
     }
 }

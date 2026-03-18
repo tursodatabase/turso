@@ -591,9 +591,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use shuttle::scheduler::{RandomScheduler, UncontrolledNondeterminismCheckScheduler};
 
-    let mut config = shuttle::Config::default();
-    config.stack_size *= 10;
-    config.max_steps = shuttle::MaxSteps::FailAfter(10_000_000);
+    let config = turso_stress::shuttle_config();
 
     let mut opts = Opts::parse();
     let seed = opts.seed.unwrap_or_else(rand::random);

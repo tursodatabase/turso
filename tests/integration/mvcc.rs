@@ -20,6 +20,84 @@ fn create_mvcc_db(io: &Arc<dyn turso_core::io::IO + Send>, path: &Path) -> anyho
     Ok(())
 }
 
+/// A minimal DurableStorage wrapper that delegates to the built-in implementation,
+/// but records that it was used. This validates per-database injection via
+/// `Database::open_file_with_flags_and_durable_storage`.
+#[derive(Debug)]
+struct RecordingDurableStorage {
+    inner: Arc<dyn turso_core::mvcc::persistent_storage::DurableStorage>,
+    used_log_tx: std::sync::atomic::AtomicBool,
+}
+
+impl RecordingDurableStorage {
+    fn new(inner: Arc<dyn turso_core::mvcc::persistent_storage::DurableStorage>) -> Self {
+        Self {
+            inner,
+            used_log_tx: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn saw_log_tx(&self) -> bool {
+        self.used_log_tx.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableStorage {
+    fn log_tx(
+        &self,
+        m: &turso_core::mvcc::database::LogRecord,
+        on_serialization_complete: Option<&dyn Fn(&[u8], u32)>,
+    ) -> turso_core::Result<(turso_core::Completion, u64)> {
+        self.used_log_tx
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.inner.log_tx(m, on_serialization_complete)
+    }
+
+    fn sync(
+        &self,
+        sync_type: turso_core::io::FileSyncType,
+    ) -> turso_core::Result<turso_core::Completion> {
+        self.inner.sync(sync_type)
+    }
+
+    fn update_header(&self) -> turso_core::Result<turso_core::Completion> {
+        self.inner.update_header()
+    }
+
+    fn truncate(&self) -> turso_core::Result<turso_core::Completion> {
+        self.inner.truncate()
+    }
+
+    fn get_logical_log_file(&self) -> Arc<dyn turso_core::File> {
+        self.inner.get_logical_log_file()
+    }
+
+    fn should_checkpoint(&self) -> bool {
+        self.inner.should_checkpoint()
+    }
+
+    fn set_checkpoint_threshold(&self, threshold: i64) {
+        self.inner.set_checkpoint_threshold(threshold)
+    }
+
+    fn checkpoint_threshold(&self) -> i64 {
+        self.inner.checkpoint_threshold()
+    }
+
+    fn advance_logical_log_offset_after_success(&self, bytes: u64) {
+        self.inner.advance_logical_log_offset_after_success(bytes)
+    }
+
+    fn restore_logical_log_state_after_recovery(&self, offset: u64, running_crc: u32) {
+        self.inner
+            .restore_logical_log_state_after_recovery(offset, running_crc)
+    }
+
+    fn set_header(&self, header: turso_core::mvcc::persistent_storage::logical_log::LogHeader) {
+        self.inner.set_header(header)
+    }
+}
+
 /// CREATE TABLE on an attached MVCC database must not deadlock.
 /// op_parse_schema must release the database_schemas lock before executing the
 /// nested statement that reads sqlite_schema, since reprepare() also acquires
@@ -41,6 +119,56 @@ fn test_mvcc_create_table_on_attached_db(tmp_db: TempDatabase) -> anyhow::Result
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0], (1, "hello".to_string()));
 
+    Ok(())
+}
+
+/// Injecting a custom MVCC durable storage implementation via
+/// `Database::open_file_with_flags_and_durable_storage` should work.
+/// We validate that MVCC commits route through the injected storage by recording `log_tx` calls.
+///
+/// Note: this uses the real on-disk DurableStorage under the hood and simply wraps it.
+#[turso_macros::test]
+fn test_mvcc_custom_durable_storage_injected(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    // We need an on-disk DB here, because the built-in durable storage opens a logical-log file.
+    let db_path = tmp_db.path.with_extension("custom_durable_storage.db");
+    let log_path = db_path.with_extension("db-log");
+
+    // Build the default durable storage, then wrap it with a recording implementation.
+    let file = tmp_db
+        .io
+        .open_file(log_path.to_str().unwrap(), OpenFlags::default(), false)?;
+    let default_storage: Arc<dyn turso_core::mvcc::persistent_storage::DurableStorage> = Arc::new(
+        turso_core::mvcc::persistent_storage::Storage::new(file, tmp_db.io.clone(), None),
+    );
+    let recording = Arc::new(RecordingDurableStorage::new(default_storage));
+
+    // Open DB with injected durable storage, then enable MVCC.
+    let db = Database::open_file_with_flags_and_durable_storage(
+        tmp_db.io.clone(),
+        db_path.to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Some(recording.clone()),
+    )?;
+    let conn = db.connect()?;
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+
+    // Cause a commit that should append to the MVCC logical log.
+    conn.execute("CREATE TABLE t(x INTEGER)")?;
+    conn.execute("INSERT INTO t VALUES (1)")?;
+
+    // Sanity check query result.
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t");
+    assert_eq!(rows, vec![(1,)]);
+
+    // Assert the injected storage was actually used.
+    assert!(
+        recording.saw_log_tx(),
+        "expected MVCC commit to call injected DurableStorage::log_tx()"
+    );
+
+    conn.close()?;
     Ok(())
 }
 

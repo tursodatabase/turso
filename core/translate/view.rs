@@ -1,12 +1,14 @@
-use crate::schema::{SchemaObjectType, DBSP_TABLE_PREFIX};
+use crate::schema::{SchemaObjectType, DBSP_TABLE_PREFIX, RESERVED_TABLE_PREFIXES};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
-use crate::util::{normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX};
+use crate::util::{
+    escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
+};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral};
-use crate::{Connection, Result};
+use crate::{bail_parse_error, Connection, Result};
 use turso_parser::ast;
 
 pub fn translate_create_materialized_view(
@@ -36,6 +38,15 @@ pub fn translate_create_materialized_view(
     }
 
     let normalized_view_name = normalize_ident(view_name.name.as_str());
+    if RESERVED_TABLE_PREFIXES
+        .iter()
+        .any(|prefix| normalized_view_name.starts_with(prefix))
+    {
+        bail_parse_error!(
+            "Object name reserved for internal use: {}",
+            view_name.name.as_str()
+        );
+    }
 
     // Check if view already exists
     if resolver.with_schema(database_id, |s| {
@@ -49,6 +60,10 @@ pub fn translate_create_materialized_view(
     // Validate the view can be created and extract its columns
     // This validation happens before updating sqlite_master to prevent
     // storing invalid view definitions
+
+    // Check for cross-database table references first
+    crate::util::validate_select_for_views(select_stmt, view_name.db_name.as_ref())?;
+
     use crate::incremental::view::IncrementalView;
     use crate::schema::BTreeTable;
     let view_column_schema = resolver.with_schema(database_id, |s| {
@@ -92,6 +107,7 @@ pub fn translate_create_materialized_view(
         unique_sets: vec![],
         foreign_keys: vec![],
         check_constraints: vec![],
+        rowid_alias_conflict_clause: None,
     });
 
     // Allocate a cursor for writing to the view's btree during population
@@ -216,10 +232,13 @@ pub fn translate_create_materialized_view(
     )?;
 
     // Parse schema to load the new view and DBSP state table
+    let escaped_view_name = escape_sql_string_literal(&normalized_view_name);
+    let escaped_dbsp_table_name = escape_sql_string_literal(dbsp_table_name.as_str());
+    let escaped_dbsp_index_name = escape_sql_string_literal(&dbsp_index_name);
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(format!(
-            "name = '{normalized_view_name}' OR name = '{dbsp_table_name}' OR name = '{dbsp_index_name}'"
+            "name = '{escaped_view_name}' OR name = '{escaped_dbsp_table_name}' OR name = '{escaped_dbsp_index_name}'"
         )),
     });
 
@@ -259,6 +278,16 @@ pub fn translate_create_view(
     }
     let normalized_view_name = normalize_ident(view_name.name.as_str());
 
+    if RESERVED_TABLE_PREFIXES
+        .iter()
+        .any(|prefix| normalized_view_name.starts_with(prefix))
+    {
+        bail_parse_error!(
+            "Object name reserved for internal use: {}",
+            view_name.name.as_str()
+        );
+    }
+
     // Check for name conflicts with existing schema objects
     if let Some(object_type) =
         resolver.with_schema(database_id, |s| s.get_object_type(&normalized_view_name))
@@ -285,7 +314,7 @@ pub fn translate_create_view(
         )));
     }
 
-    crate::util::validate_select_for_unsupported_features(select_stmt)?;
+    crate::util::validate_select_for_views(select_stmt, view_name.db_name.as_ref())?;
 
     // Reconstruct the SQL string
     let sql = create_view_to_str(&view_name.name.as_ident(), columns, select_stmt);
@@ -313,9 +342,10 @@ pub fn translate_create_view(
     )?;
 
     // Parse schema to load the new view
+    let escaped_view_name = escape_sql_string_literal(&normalized_view_name);
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
-        where_clause: Some(format!("name = '{normalized_view_name}'")),
+        where_clause: Some(format!("name = '{escaped_view_name}'")),
     });
 
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);

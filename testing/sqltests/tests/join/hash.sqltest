@@ -1,0 +1,840 @@
+@database :memory:
+
+# =============================================================================
+# Adversarial Grace Hash Join Tests
+# =============================================================================
+# These tests are designed to trigger grace hash join spilling (32KB budget in
+# debug builds) and verify correctness of partition-based processing.
+# Tables are created WITHOUT indexes on join columns to force hash join selection.
+
+# =============================================================================
+# 1. Basic INNER grace hash join - enough rows to force spilling
+# =============================================================================
+
+@cross-check-integrity
+test grace-inner-join-basic {
+    CREATE TABLE build(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE probe(id INTEGER PRIMARY KEY, fk INTEGER, label TEXT);
+    INSERT INTO build SELECT value, 'b' || value FROM generate_series(1, 800);
+    INSERT INTO probe SELECT value, value, 'p' || value FROM generate_series(1, 800);
+    SELECT count(*) FROM build JOIN probe ON build.id = probe.fk;
+}
+expect {
+    800
+}
+
+# =============================================================================
+# 2. INNER join with many-to-many duplicates (heavy hash collisions)
+# =============================================================================
+
+@cross-check-integrity
+test grace-inner-many-to-many {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    -- 800 rows, but only 40 distinct keys => 20 matches per key on each side
+    INSERT INTO t1 SELECT value % 40, 'left' || value FROM generate_series(1, 800);
+    INSERT INTO t2 SELECT value % 40, 'right' || value FROM generate_series(1, 800);
+    SELECT count(*) FROM t1 JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    16000
+}
+
+@cross-check-integrity
+test grace-inner-many-to-many-agg {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    INSERT INTO t1 SELECT value % 40, 'left' || value FROM generate_series(1, 800);
+    INSERT INTO t2 SELECT value % 40, 'right' || value FROM generate_series(1, 800);
+    SELECT t1.a, count(*) as cnt FROM t1 JOIN t2 ON t1.a = t2.c GROUP BY t1.a ORDER BY t1.a LIMIT 5;
+}
+expect {
+    0|400
+    1|400
+    2|400
+    3|400
+    4|400
+}
+
+# =============================================================================
+# 3. NULL keys in join columns - NULLs must never match
+# =============================================================================
+
+@cross-check-integrity
+test grace-null-keys-inner {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    -- Mix NULLs with real values. 400 rows with value, 400 with NULL key
+    INSERT INTO t1 SELECT CASE WHEN value <= 400 THEN value ELSE NULL END, 'L' || value FROM generate_series(1, 800);
+    INSERT INTO t2 SELECT CASE WHEN value <= 400 THEN value ELSE NULL END, 'R' || value FROM generate_series(1, 800);
+    SELECT count(*) FROM t1 JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    400
+}
+
+@cross-check-integrity
+test grace-null-keys-left-join {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    INSERT INTO t1 SELECT CASE WHEN value <= 400 THEN value ELSE NULL END, 'L' || value FROM generate_series(1, 800);
+    INSERT INTO t2 SELECT CASE WHEN value <= 400 THEN value ELSE NULL END, 'R' || value FROM generate_series(1, 800);
+    -- LEFT JOIN: all 800 rows from t1, but NULL keys don't match
+    SELECT count(*) FROM t1 LEFT JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    800
+}
+
+@cross-check-integrity
+test grace-null-keys-left-join-count-matched {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    INSERT INTO t1 SELECT CASE WHEN value <= 400 THEN value ELSE NULL END, 'L' || value FROM generate_series(1, 800);
+    INSERT INTO t2 SELECT CASE WHEN value <= 400 THEN value ELSE NULL END, 'R' || value FROM generate_series(1, 800);
+    -- count(t2.c) excludes NULLs from unmatched left rows
+    SELECT count(*), count(t2.c) FROM t1 LEFT JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    800|400
+}
+
+# =============================================================================
+# 4. Mixed INTEGER and REAL types in join keys
+# =============================================================================
+
+@cross-check-integrity
+test grace-mixed-int-real-join {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c REAL, d TEXT);
+    INSERT INTO t1 SELECT value, 'int' || value FROM generate_series(1, 600);
+    INSERT INTO t2 SELECT CAST(value AS REAL), 'real' || value FROM generate_series(1, 600);
+    SELECT count(*) FROM t1 JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    600
+}
+
+@cross-check-integrity
+test grace-mixed-int-real-spot-check {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c REAL, d TEXT);
+    INSERT INTO t1 SELECT value, 'int' || value FROM generate_series(1, 600);
+    INSERT INTO t2 SELECT CAST(value AS REAL), 'real' || value FROM generate_series(1, 600);
+    SELECT t1.a, t1.b, t2.d FROM t1 JOIN t2 ON t1.a = t2.c WHERE t1.a IN (1, 300, 600) ORDER BY t1.a;
+}
+expect {
+    1|int1|real1
+    300|int300|real300
+    600|int600|real600
+}
+
+# =============================================================================
+# 5. Multi-column join keys
+# =============================================================================
+
+@cross-check-integrity
+test grace-multi-column-key {
+    CREATE TABLE t1(a INTEGER, b INTEGER, payload TEXT);
+    CREATE TABLE t2(x INTEGER, y INTEGER, data TEXT);
+    INSERT INTO t1 SELECT value / 30, value % 30, 'L' || value FROM generate_series(1, 900);
+    INSERT INTO t2 SELECT value / 30, value % 30, 'R' || value FROM generate_series(1, 900);
+    SELECT count(*) FROM t1 JOIN t2 ON t1.a = t2.x AND t1.b = t2.y;
+}
+expect {
+    900
+}
+
+@cross-check-integrity
+test grace-multi-column-key-partial-overlap {
+    CREATE TABLE t1(a INTEGER, b INTEGER, payload TEXT);
+    CREATE TABLE t2(x INTEGER, y INTEGER, data TEXT);
+    -- t1 has composite keys (a, b) where a in [0..29], b in [0..29]
+    INSERT INTO t1 SELECT value / 30, value % 30, 'L' || value FROM generate_series(0, 899);
+    -- t2 has shifted range: a in [15..44], b in [0..29] -> overlap on a in [15..29]
+    INSERT INTO t2 SELECT (value / 30) + 15, value % 30, 'R' || value FROM generate_series(0, 899);
+    SELECT count(*) FROM t1 JOIN t2 ON t1.a = t2.x AND t1.b = t2.y;
+}
+expect {
+    450
+}
+
+# =============================================================================
+# 6. LEFT OUTER join with grace spilling - unmatched rows
+# =============================================================================
+
+@cross-check-integrity
+test grace-left-outer-all-unmatched {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    INSERT INTO t1 SELECT value, 'L' || value FROM generate_series(1, 600);
+    INSERT INTO t2 SELECT value + 1000, 'R' || value FROM generate_series(1, 600);
+    -- No overlap at all -> every left row is unmatched
+    SELECT count(*) FROM t1 LEFT JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    600
+}
+
+@cross-check-integrity
+test grace-left-outer-all-unmatched-nulls {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    INSERT INTO t1 SELECT value, 'L' || value FROM generate_series(1, 600);
+    INSERT INTO t2 SELECT value + 1000, 'R' || value FROM generate_series(1, 600);
+    -- All t2 columns should be NULL
+    SELECT count(*), count(t2.c) FROM t1 LEFT JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    600|0
+}
+
+@cross-check-integrity
+test grace-left-outer-partial-match {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    -- t1: 1..800, t2: 401..1200 -> overlap on 401..800 (400 matches)
+    INSERT INTO t1 SELECT value, 'L' || value FROM generate_series(1, 800);
+    INSERT INTO t2 SELECT value + 400, 'R' || value FROM generate_series(1, 800);
+    SELECT count(*) as total, count(t2.c) as matched FROM t1 LEFT JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    800|400
+}
+
+@cross-check-integrity
+test grace-left-outer-with-duplicates {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    -- t1: 800 rows with 40 distinct keys
+    -- t2: 400 rows with 20 distinct keys (subset of t1's keys)
+    INSERT INTO t1 SELECT value % 40, 'L' || value FROM generate_series(1, 800);
+    INSERT INTO t2 SELECT value % 20, 'R' || value FROM generate_series(1, 400);
+    -- Keys 0-19: each t1 key has 20 rows, each t2 key has 20 rows -> 400 per key, 20 keys -> 8000
+    -- Keys 20-39: each t1 key has 20 rows, no match -> 20 per key, 20 keys -> 400
+    -- Total: 8400
+    SELECT count(*) FROM t1 LEFT JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    8400
+}
+
+# =============================================================================
+# 7. FULL OUTER join with grace spilling
+# =============================================================================
+
+@cross-check-integrity
+test grace-full-outer-no-overlap {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    INSERT INTO t1 SELECT value, 'L' || value FROM generate_series(1, 500);
+    INSERT INTO t2 SELECT value + 500, 'R' || value FROM generate_series(1, 500);
+    -- No overlap: 500 unmatched from each side = 1000
+    SELECT count(*) FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    1000
+}
+
+@cross-check-integrity
+test grace-full-outer-complete-overlap {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    INSERT INTO t1 SELECT value, 'L' || value FROM generate_series(1, 600);
+    INSERT INTO t2 SELECT value, 'R' || value FROM generate_series(1, 600);
+    SELECT count(*) FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    600
+}
+
+@cross-check-integrity
+test grace-full-outer-partial-overlap {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    -- t1: 1..600, t2: 301..900 -> overlap 301..600 (300 matched)
+    -- unmatched t1: 1..300 (300), unmatched t2: 601..900 (300)
+    INSERT INTO t1 SELECT value, 'L' || value FROM generate_series(1, 600);
+    INSERT INTO t2 SELECT value + 300, 'R' || value FROM generate_series(1, 600);
+    SELECT count(*) FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    900
+}
+
+@cross-check-integrity
+test grace-full-outer-null-counting {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    INSERT INTO t1 SELECT value, 'L' || value FROM generate_series(1, 600);
+    INSERT INTO t2 SELECT value + 300, 'R' || value FROM generate_series(1, 600);
+    -- count(t1.a) = 600 (matched 300 + unmatched 300), count(t2.c) = 600 (matched 300 + unmatched 300)
+    SELECT count(*), count(t1.a), count(t2.c) FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    900|600|600
+}
+
+# =============================================================================
+# 8. Aggregation correctness over grace hash joins
+# =============================================================================
+
+@cross-check-integrity
+test grace-agg-sum {
+    CREATE TABLE t1(a INTEGER, v INTEGER);
+    CREATE TABLE t2(b INTEGER, w INTEGER);
+    INSERT INTO t1 SELECT value, value * 10 FROM generate_series(1, 600);
+    INSERT INTO t2 SELECT value, value * 100 FROM generate_series(1, 600);
+    SELECT sum(t1.v), sum(t2.w) FROM t1 JOIN t2 ON t1.a = t2.b;
+}
+expect {
+    1803000|18030000
+}
+
+@cross-check-integrity
+test grace-agg-group-by {
+    CREATE TABLE t1(a INTEGER, grp INTEGER);
+    CREATE TABLE t2(b INTEGER, val INTEGER);
+    -- 900 rows, 3 groups (0,1,2), 300 rows each
+    INSERT INTO t1 SELECT value, value % 3 FROM generate_series(1, 900);
+    INSERT INTO t2 SELECT value, value FROM generate_series(1, 900);
+    SELECT t1.grp, count(*), sum(t2.val) FROM t1 JOIN t2 ON t1.a = t2.b GROUP BY t1.grp ORDER BY t1.grp;
+}
+expect {
+    0|300|135450
+    1|300|134850
+    2|300|135150
+}
+
+@cross-check-integrity
+test grace-agg-count-distinct {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    -- 600 rows with 60 distinct keys (10 dupes each)
+    INSERT INTO t1 SELECT value % 60, 'L' || value FROM generate_series(1, 600);
+    INSERT INTO t2 SELECT value % 60, 'R' || value FROM generate_series(1, 600);
+    SELECT count(DISTINCT t1.a) FROM t1 JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    60
+}
+
+# =============================================================================
+# 9. ORDER BY over grace hash join results
+# =============================================================================
+
+@cross-check-integrity
+test grace-order-by {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    INSERT INTO t1 SELECT value, 'L' || value FROM generate_series(1, 600);
+    INSERT INTO t2 SELECT value, 'R' || value FROM generate_series(1, 600);
+    SELECT t1.a, t2.d FROM t1 JOIN t2 ON t1.a = t2.c ORDER BY t1.a LIMIT 5;
+}
+expect {
+    1|R1
+    2|R2
+    3|R3
+    4|R4
+    5|R5
+}
+
+@cross-check-integrity
+test grace-order-by-desc {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    INSERT INTO t1 SELECT value, 'L' || value FROM generate_series(1, 600);
+    INSERT INTO t2 SELECT value, 'R' || value FROM generate_series(1, 600);
+    SELECT t1.a, t2.d FROM t1 JOIN t2 ON t1.a = t2.c ORDER BY t1.a DESC LIMIT 5;
+}
+expect {
+    600|R600
+    599|R599
+    598|R598
+    597|R597
+    596|R596
+}
+
+# =============================================================================
+# 10. LIMIT with grace hash join (early termination)
+# =============================================================================
+
+@cross-check-integrity
+test grace-limit-small {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    INSERT INTO t1 SELECT value, 'L' || value FROM generate_series(1, 800);
+    INSERT INTO t2 SELECT value, 'R' || value FROM generate_series(1, 800);
+    SELECT count(*) FROM (SELECT t1.a FROM t1 JOIN t2 ON t1.a = t2.c LIMIT 10);
+}
+expect {
+    10
+}
+
+# =============================================================================
+# 11. Self-join with grace hash
+# =============================================================================
+
+@cross-check-integrity
+test grace-self-join {
+    CREATE TABLE t(a INTEGER, b INTEGER, label TEXT);
+    INSERT INTO t SELECT value, value % 50, 'row' || value FROM generate_series(1, 800);
+    SELECT count(*) FROM t t1 JOIN t t2 ON t1.b = t2.b;
+}
+expect {
+    12800
+}
+
+# =============================================================================
+# 12. Text join keys (tests string hashing and comparison through spill)
+# =============================================================================
+
+@cross-check-integrity
+test grace-text-keys {
+    CREATE TABLE t1(k TEXT, v INTEGER);
+    CREATE TABLE t2(k TEXT, v INTEGER);
+    INSERT INTO t1 SELECT 'key_' || printf('%04d', value), value FROM generate_series(1, 700);
+    INSERT INTO t2 SELECT 'key_' || printf('%04d', value), value * 10 FROM generate_series(1, 700);
+    SELECT count(*) FROM t1 JOIN t2 ON t1.k = t2.k;
+}
+expect {
+    700
+}
+
+@cross-check-integrity
+test grace-text-keys-spot-check {
+    CREATE TABLE t1(k TEXT, v INTEGER);
+    CREATE TABLE t2(k TEXT, v INTEGER);
+    INSERT INTO t1 SELECT 'key_' || printf('%04d', value), value FROM generate_series(1, 700);
+    INSERT INTO t2 SELECT 'key_' || printf('%04d', value), value * 10 FROM generate_series(1, 700);
+    SELECT t1.k, t1.v, t2.v FROM t1 JOIN t2 ON t1.k = t2.k
+    WHERE t1.k IN ('key_0001', 'key_0350', 'key_0700')
+    ORDER BY t1.k;
+}
+expect {
+    key_0001|1|10
+    key_0350|350|3500
+    key_0700|700|7000
+}
+
+# =============================================================================
+# 13. NOCASE collation text keys through grace spill
+# =============================================================================
+
+@cross-check-integrity
+test grace-nocase-text-keys {
+    CREATE TABLE t1(k TEXT COLLATE NOCASE, v INTEGER);
+    CREATE TABLE t2(k TEXT COLLATE NOCASE, v INTEGER);
+    INSERT INTO t1 SELECT 'Key_' || value, value FROM generate_series(1, 600);
+    INSERT INTO t2 SELECT 'KEY_' || value, value * 10 FROM generate_series(1, 600);
+    SELECT count(*) FROM t1 JOIN t2 ON t1.k = t2.k;
+}
+expect {
+    600
+}
+
+# =============================================================================
+# 14. WHERE clause filtering after grace hash join
+# =============================================================================
+
+@cross-check-integrity
+test grace-post-join-filter {
+    CREATE TABLE t1(a INTEGER, b INTEGER);
+    CREATE TABLE t2(c INTEGER, d INTEGER);
+    INSERT INTO t1 SELECT value, value * 2 FROM generate_series(1, 800);
+    INSERT INTO t2 SELECT value, value * 3 FROM generate_series(1, 800);
+    SELECT count(*) FROM t1 JOIN t2 ON t1.a = t2.c WHERE t1.b + t2.d > 2000;
+}
+expect {
+    400
+}
+
+# =============================================================================
+# 15. Asymmetric table sizes (small build, large probe)
+# =============================================================================
+
+@cross-check-integrity
+test grace-asymmetric-small-build-large-probe {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    INSERT INTO t1 SELECT value, 'build' || value FROM generate_series(1, 50);
+    INSERT INTO t2 SELECT value % 50 + 1, 'probe' || value FROM generate_series(1, 1000);
+    -- Each build key matches 20 probe rows -> 50 * 20 = 1000
+    SELECT count(*) FROM t1 JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    1000
+}
+
+@cross-check-integrity
+test grace-asymmetric-large-build-small-probe {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    INSERT INTO t1 SELECT value, 'build' || value FROM generate_series(1, 1000);
+    INSERT INTO t2 SELECT value * 10, 'probe' || value FROM generate_series(1, 100);
+    -- Only every 10th build key matches -> 100 matches
+    SELECT count(*) FROM t1 JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    100
+}
+
+# =============================================================================
+# 16. Empty table edge cases
+# =============================================================================
+
+@cross-check-integrity
+test grace-empty-build {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    INSERT INTO t2 SELECT value, 'R' || value FROM generate_series(1, 600);
+    SELECT count(*) FROM t1 JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test grace-empty-probe {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    INSERT INTO t1 SELECT value, 'L' || value FROM generate_series(1, 600);
+    SELECT count(*) FROM t1 JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test grace-left-join-empty-right-large {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    INSERT INTO t1 SELECT value, 'L' || value FROM generate_series(1, 600);
+    SELECT count(*), count(t2.c) FROM t1 LEFT JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    600|0
+}
+
+@cross-check-integrity
+test grace-full-outer-empty-right {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    INSERT INTO t1 SELECT value, 'L' || value FROM generate_series(1, 600);
+    SELECT count(*), count(t1.a), count(t2.c) FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    600|600|0
+}
+
+@cross-check-integrity
+test grace-full-outer-empty-left {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    INSERT INTO t2 SELECT value, 'R' || value FROM generate_series(1, 600);
+    SELECT count(*), count(t1.a), count(t2.c) FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    600|0|600
+}
+
+# =============================================================================
+# 17. Three-way join with one hash join spilling
+# =============================================================================
+
+@cross-check-integrity
+test grace-three-way-join {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    CREATE TABLE t3(e INTEGER, f TEXT);
+    INSERT INTO t1 SELECT value, 'A' || value FROM generate_series(1, 600);
+    INSERT INTO t2 SELECT value, 'B' || value FROM generate_series(1, 600);
+    INSERT INTO t3 SELECT value, 'C' || value FROM generate_series(1, 600);
+    SELECT count(*) FROM t1 JOIN t2 ON t1.a = t2.c JOIN t3 ON t2.c = t3.e;
+}
+expect {
+    600
+}
+
+# =============================================================================
+# 18. DISTINCT over grace hash join
+# =============================================================================
+
+@cross-check-integrity
+test grace-distinct {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    -- Heavy duplicates: 20 copies of each key on each side
+    INSERT INTO t1 SELECT value % 50, 'L' || value FROM generate_series(1, 1000);
+    INSERT INTO t2 SELECT value % 50, 'R' || value FROM generate_series(1, 1000);
+    SELECT count(*) FROM (SELECT DISTINCT t1.a FROM t1 JOIN t2 ON t1.a = t2.c);
+}
+expect {
+    50
+}
+
+# =============================================================================
+# 19. Subquery with grace hash join
+# =============================================================================
+
+@cross-check-integrity
+test grace-subquery-join {
+    CREATE TABLE t1(a INTEGER, b INTEGER);
+    CREATE TABLE t2(c INTEGER, d INTEGER);
+    INSERT INTO t1 SELECT value, value * 2 FROM generate_series(1, 800);
+    INSERT INTO t2 SELECT value, value * 3 FROM generate_series(1, 800);
+    SELECT count(*) FROM (
+        SELECT t1.a, t1.b, t2.d
+        FROM t1 JOIN t2 ON t1.a = t2.c
+        WHERE t1.b > 1000
+    ) sub;
+}
+expect {
+    300
+}
+
+# =============================================================================
+# 20. Verify exact row values across grace partitions
+# =============================================================================
+# This is the most adversarial correctness test: verify that every single
+# matched pair has the correct values, not just the count.
+
+@cross-check-integrity
+test grace-exact-values-checksum {
+    CREATE TABLE t1(a INTEGER, b INTEGER);
+    CREATE TABLE t2(c INTEGER, d INTEGER);
+    INSERT INTO t1 SELECT value, value * 7 FROM generate_series(1, 800);
+    INSERT INTO t2 SELECT value, value * 11 FROM generate_series(1, 800);
+    -- For each matched pair (a=c), verify a*7 = b and c*11 = d
+    -- If any grace partition corruption happens, this sum will be wrong
+    SELECT sum(t1.a), sum(t1.b), sum(t2.d), sum(t1.b + t2.d) FROM t1 JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    320400|2242800|3524400|5767200
+}
+
+# =============================================================================
+# 21. LEFT OUTER with aggregation over grace spill
+# =============================================================================
+
+@cross-check-integrity
+test grace-left-outer-agg-group {
+    CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER);
+    CREATE TABLE items(id INTEGER PRIMARY KEY, order_id INTEGER, amount INTEGER);
+    INSERT INTO orders SELECT value, value % 100 FROM generate_series(1, 800);
+    INSERT INTO items SELECT value, ((value - 1) % 800) + 1, value * 5 FROM generate_series(1, 1600);
+    -- Each order has 2 items. Left join ensures all orders appear.
+    SELECT count(DISTINCT orders.id), count(items.id), sum(items.amount)
+    FROM orders LEFT JOIN items ON orders.id = items.order_id;
+}
+expect {
+    800|1600|6404000
+}
+
+# =============================================================================
+# 22. HAVING clause with grace hash join
+# =============================================================================
+
+@cross-check-integrity
+test grace-having {
+    CREATE TABLE t1(a INTEGER, grp INTEGER);
+    CREATE TABLE t2(b INTEGER, val INTEGER);
+    INSERT INTO t1 SELECT value, value % 20 FROM generate_series(1, 800);
+    INSERT INTO t2 SELECT value, 1 FROM generate_series(1, 800);
+    SELECT t1.grp, count(*) as cnt FROM t1 JOIN t2 ON t1.a = t2.b
+    GROUP BY t1.grp HAVING count(*) > 39
+    ORDER BY t1.grp;
+}
+expect {
+    0|40
+    1|40
+    2|40
+    3|40
+    4|40
+    5|40
+    6|40
+    7|40
+    8|40
+    9|40
+    10|40
+    11|40
+    12|40
+    13|40
+    14|40
+    15|40
+    16|40
+    17|40
+    18|40
+    19|40
+}
+
+# =============================================================================
+# 23. Blob join keys through grace spill
+# =============================================================================
+
+@cross-check-integrity
+test grace-blob-keys {
+    CREATE TABLE t1(k BLOB, v INTEGER);
+    CREATE TABLE t2(k BLOB, v INTEGER);
+    INSERT INTO t1 SELECT CAST('blob_' || printf('%04d', value) AS BLOB), value FROM generate_series(1, 600);
+    INSERT INTO t2 SELECT CAST('blob_' || printf('%04d', value) AS BLOB), value * 10 FROM generate_series(1, 600);
+    SELECT count(*) FROM t1 JOIN t2 ON t1.k = t2.k;
+}
+expect {
+    600
+}
+
+# =============================================================================
+# 24. Negative and zero key values
+# =============================================================================
+
+@cross-check-integrity
+test grace-negative-keys {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    INSERT INTO t1 SELECT value - 400, 'L' || value FROM generate_series(1, 800);
+    INSERT INTO t2 SELECT value - 400, 'R' || value FROM generate_series(1, 800);
+    SELECT count(*) FROM t1 JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    800
+}
+
+@cross-check-integrity
+test grace-negative-keys-spot-check {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    INSERT INTO t1 SELECT value - 400, 'L' || value FROM generate_series(1, 800);
+    INSERT INTO t2 SELECT value - 400, 'R' || value FROM generate_series(1, 800);
+    SELECT t1.a, t1.b, t2.d FROM t1 JOIN t2 ON t1.a = t2.c
+    WHERE t1.a IN (-399, 0, 400) ORDER BY t1.a;
+}
+expect {
+    -399|L1|R1
+    0|L400|R400
+    400|L800|R800
+}
+
+# =============================================================================
+# 25. Large payload columns through grace spill
+# =============================================================================
+
+@cross-check-integrity
+test grace-large-payload {
+    CREATE TABLE t1(a INTEGER, payload TEXT);
+    CREATE TABLE t2(b INTEGER, data TEXT);
+    -- Long text payloads to stress serialization
+    INSERT INTO t1 SELECT value, printf('%0200d', value) FROM generate_series(1, 600);
+    INSERT INTO t2 SELECT value, printf('%0200d', value * 2) FROM generate_series(1, 600);
+    SELECT count(*), length(t1.payload), length(t2.data) FROM t1 JOIN t2 ON t1.a = t2.b WHERE t1.a = 1;
+}
+expect {
+    1|200|200
+}
+
+# =============================================================================
+# 26. FULL OUTER with duplicates on both sides during grace
+# =============================================================================
+
+@cross-check-integrity
+test grace-full-outer-heavy-duplicates {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    -- 10 copies of each key on t1, 10 on t2, 50 distinct keys
+    INSERT INTO t1 SELECT value % 50, 'L' || value FROM generate_series(1, 500);
+    INSERT INTO t2 SELECT value % 50, 'R' || value FROM generate_series(1, 500);
+    -- Inner matches: 50 keys * 10 * 10 = 5000
+    -- No unmatched on either side
+    SELECT count(*) FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    5000
+}
+
+@cross-check-integrity
+test grace-full-outer-partial-with-duplicates {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    -- t1: keys 0-49, 10 copies each (500 rows)
+    -- t2: keys 25-74, 10 copies each (500 rows)
+    -- Overlap: keys 25-49 (25 keys): 25 * 10 * 10 = 2500 matched
+    -- Unmatched t1: keys 0-24 (25 keys * 10 copies = 250)
+    -- Unmatched t2: keys 50-74 (25 keys * 10 copies = 250)
+    INSERT INTO t1 SELECT value % 50, 'L' || value FROM generate_series(1, 500);
+    INSERT INTO t2 SELECT (value % 50) + 25, 'R' || value FROM generate_series(1, 500);
+    SELECT count(*) FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    3000
+}
+
+# =============================================================================
+# 27. Verify LEFT OUTER unmatched build rows with grace
+# =============================================================================
+
+@cross-check-integrity
+test grace-left-outer-unmatched-build-rows {
+    CREATE TABLE build(id INTEGER, name TEXT);
+    CREATE TABLE probe(id INTEGER, fk INTEGER, label TEXT);
+    -- build: 800 rows, probe: only matches first 400
+    INSERT INTO build SELECT value, 'build_' || value FROM generate_series(1, 800);
+    INSERT INTO probe SELECT value, value, 'probe_' || value FROM generate_series(1, 400);
+    -- LEFT JOIN on build: all 800 build rows, but only 400 have matches
+    -- Wait - this is build LEFT JOIN probe, so build is on the left
+    SELECT count(*), count(probe.fk) FROM build LEFT JOIN probe ON build.id = probe.fk;
+}
+expect {
+    800|400
+}
+
+# =============================================================================
+# 28. Stress test: very large result set through grace
+# =============================================================================
+
+@cross-check-integrity
+test grace-stress-large-result {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c INTEGER, d TEXT);
+    -- 20 distinct keys, ~40 rows per key on each side -> 1600 combos per key
+    INSERT INTO t1 SELECT value % 20, 'L' || value FROM generate_series(1, 800);
+    INSERT INTO t2 SELECT value % 20, 'R' || value FROM generate_series(1, 800);
+    SELECT count(*) FROM t1 JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    32000
+}
+
+# =============================================================================
+# 29. Grace hash join with COALESCE/IFNULL in SELECT
+# =============================================================================
+
+@cross-check-integrity
+test grace-coalesce-select {
+    CREATE TABLE t1(a INTEGER, b INTEGER);
+    CREATE TABLE t2(c INTEGER, d INTEGER);
+    INSERT INTO t1 SELECT value, value FROM generate_series(1, 600);
+    INSERT INTO t2 SELECT value + 300, value FROM generate_series(1, 600);
+    SELECT count(*), sum(COALESCE(t2.d, -1))
+    FROM t1 LEFT JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    600|44850
+}
+
+# =============================================================================
+# 30. Grace hash join with complex ON condition and extra WHERE
+# =============================================================================
+
+@cross-check-integrity
+test grace-complex-on-and-where {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c TEXT);
+    CREATE TABLE t2(x INTEGER, y INTEGER, z TEXT);
+    INSERT INTO t1 SELECT value, value % 10, 'L' || value FROM generate_series(1, 800);
+    INSERT INTO t2 SELECT value, value % 10, 'R' || value FROM generate_series(1, 800);
+    -- Join on a=x, but also filter with WHERE on both sides
+    SELECT count(*) FROM t1 JOIN t2 ON t1.a = t2.x
+    WHERE t1.b < 5 AND t2.y < 5;
+}
+expect {
+    400
+}

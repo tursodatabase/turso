@@ -93,15 +93,37 @@ impl InternalVirtualTable for JsonVirtualTable {
 
         let mut json_idx: Option<usize> = None;
         let mut path_idx: Option<usize> = None;
+        let mut has_json_eq_constraint = false;
+        let mut has_root_eq_constraint = false;
         for (i, c) in constraints.iter().enumerate() {
-            if !c.usable || c.op != ConstraintOp::Eq {
+            if c.op != ConstraintOp::Eq {
                 continue;
             }
             match c.column_index as usize {
-                COL_JSON => json_idx = Some(i),
-                COL_ROOT => path_idx = Some(i),
+                COL_JSON => {
+                    has_json_eq_constraint = true;
+                    if c.usable {
+                        json_idx = Some(i);
+                    }
+                }
+                COL_ROOT => {
+                    has_root_eq_constraint = true;
+                    if c.usable {
+                        path_idx = Some(i);
+                    }
+                }
                 _ => {}
             }
+        }
+
+        // Hidden arguments supplied in SQL must be usable in the chosen loop.
+        // If they are present but unusable, reject this access shape so the
+        // optimizer can pick a join order where argument registers are available.
+        if has_json_eq_constraint && json_idx.is_none() {
+            return Err(ResultCode::ConstraintViolation);
+        }
+        if has_root_eq_constraint && path_idx.is_none() {
+            return Err(ResultCode::ConstraintViolation);
         }
 
         let argc = match (json_idx, path_idx) {

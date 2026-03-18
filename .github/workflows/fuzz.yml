@@ -113,6 +113,11 @@ jobs:
         prefix-key: "v1-rust-shuttle"
         cache-on-failure: true
     - uses: "./.github/shared/setup-sccache"
+    - name: Run shuttle mvcc tests
+      env:
+        RUST_BACKTRACE: "full"
+        RUSTFLAGS: "--cfg=shuttle"
+      run: cargo test -p turso_stress --locked --test shuttle_mvcc
     - name: Run shuttle stress test
       env:
         RUST_BACKTRACE: 1

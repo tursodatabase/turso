@@ -1,7 +1,7 @@
 pub mod check;
 pub mod fmt;
 
-use std::sync::Arc;
+use std::{num::NonZeroU32, sync::Arc};
 
 use crate::lexer::is_keyword;
 use strum_macros::{EnumIter, EnumString};
@@ -499,7 +499,7 @@ pub enum Expr {
     /// Unary expression
     Unary(UnaryOperator, Box<Expr>),
     /// Parameters
-    Variable(String),
+    Variable(Variable),
     /// Subqueries from e.g. the WHERE clause are planned separately
     /// and their results will be placed in registers or in an ephemeral index
     /// pointed to by this type.
@@ -518,6 +518,44 @@ pub enum Expr {
         /// The type of subquery.
         query_type: SubqueryType,
     },
+    /// `ARRAY[expr, ...]` array literal
+    Array {
+        /// elements of the array
+        elements: Vec<Box<Expr>>,
+    },
+    /// `expr[index]` subscript/element access
+    Subscript {
+        /// base expression (the array)
+        base: Box<Expr>,
+        /// index expression
+        index: Box<Expr>,
+    },
+}
+
+impl Default for Expr {
+    fn default() -> Self {
+        Self::Literal(Literal::Null)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Variable {
+    pub index: NonZeroU32,
+    pub name: Option<Box<str>>,
+}
+
+impl Variable {
+    pub fn indexed(index: NonZeroU32) -> Self {
+        Self { index, name: None }
+    }
+
+    pub fn named(name: impl Into<Box<str>>, index: NonZeroU32) -> Self {
+        Self {
+            index,
+            name: Some(name.into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -623,7 +661,7 @@ impl Expr {
 }
 
 /// SQL literal
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Literal {
     /// Number
@@ -636,6 +674,7 @@ pub enum Literal {
     Blob(String),
     /// Keyword
     Keyword(String),
+    #[default]
     /// `NULL`
     Null,
     /// `TRUE` - SQLite boolean literal (equivalent to 1 but semantically distinct for IS TRUE)
@@ -714,6 +753,10 @@ pub enum Operator {
     RightShift,
     /// `-`
     Subtract,
+    /// `@>` array contains
+    ArrayContains,
+    /// `&&` array overlap
+    ArrayOverlap,
 }
 
 impl Operator {
@@ -1734,7 +1777,7 @@ pub enum TriggerCmd {
 }
 
 /// Conflict resolution types
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ResolveType {
     /// `ROLLBACK`
@@ -1810,6 +1853,15 @@ pub struct Type {
     pub name: String, // TODO Validate: Ids+
     /// type size
     pub size: Option<TypeSize>,
+    /// Number of array dimensions: 0 = scalar, 1 = `type[]`, 2 = `type[][]`, etc.
+    pub array_dimensions: u32,
+}
+
+impl Type {
+    /// Returns true when this type has at least one array dimension.
+    pub fn is_array(&self) -> bool {
+        self.array_dimensions > 0
+    }
 }
 
 /// Column type size limit(s)

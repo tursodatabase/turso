@@ -107,6 +107,8 @@ fn emit_toplevel_values(
     program.emit_insn(Insn::Yield {
         yield_reg,
         end_offset: end_label,
+        subtype_clear_start_reg: 0,
+        subtype_clear_count: 0,
     });
 
     let goto_label = program.allocate_label();
@@ -162,6 +164,8 @@ fn emit_values_in_subquery(
         program.emit_insn(Insn::Yield {
             yield_reg,
             end_offset: BranchOffset::Offset(0),
+            subtype_clear_start_reg: start_reg,
+            subtype_clear_count: row_len,
         });
     }
 
@@ -193,6 +197,8 @@ fn emit_values_to_destination(
             program.emit_insn(Insn::Yield {
                 yield_reg: *yield_reg,
                 end_offset: BranchOffset::Offset(0),
+                subtype_clear_start_reg: start_reg,
+                subtype_clear_count: row_len,
             });
         }
         QueryDestination::EphemeralIndex { .. } => {
@@ -264,24 +270,44 @@ fn emit_values_to_index(
     } else {
         let record_reg = program.alloc_register();
 
-        // For ephemeral indexes with has_rowid, we need to add a rowid column to the record.
-        // This ensures each row gets a unique key even if column values are duplicated.
-        let (record_start, record_count) = if index.ephemeral && index.has_rowid {
-            let record_count = row_len + 1;
+        // Seek indexes may reorder key columns relative to the subquery result
+        // column layout, so materialized VALUES rows must be reordered to match
+        // the index key definition before insertion.
+        let needs_reorder = index
+            .columns
+            .iter()
+            .enumerate()
+            .any(|(idx_pos, col)| col.pos_in_table != idx_pos);
+        let extra_for_rowid = usize::from(index.ephemeral && index.has_rowid);
+
+        let (record_start, record_count) = if needs_reorder || extra_for_rowid != 0 {
+            let record_count = row_len + extra_for_rowid;
             let record_start = program.alloc_registers(record_count);
 
-            for i in 0..row_len {
-                program.emit_insn(Insn::Copy {
-                    src_reg: start_reg + i,
-                    dst_reg: record_start + i,
-                    extra_amount: 0,
-                });
+            if needs_reorder {
+                for (idx_pos, idx_col) in index.columns.iter().enumerate() {
+                    program.emit_insn(Insn::Copy {
+                        src_reg: start_reg + idx_col.pos_in_table,
+                        dst_reg: record_start + idx_pos,
+                        extra_amount: 0,
+                    });
+                }
+            } else {
+                for i in 0..row_len {
+                    program.emit_insn(Insn::Copy {
+                        src_reg: start_reg + i,
+                        dst_reg: record_start + i,
+                        extra_amount: 0,
+                    });
+                }
             }
 
-            program.emit_insn(Insn::Sequence {
-                cursor_id: *cursor_id,
-                target_reg: record_start + row_len,
-            });
+            if extra_for_rowid != 0 {
+                program.emit_insn(Insn::Sequence {
+                    cursor_id: *cursor_id,
+                    target_reg: record_start + row_len,
+                });
+            }
 
             (record_start, record_count)
         } else {

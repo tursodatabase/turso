@@ -20,6 +20,105 @@ use super::plan::{
     SelectPlan, SetOperation, UpdatePlan,
 };
 
+/// Format the EXPLAIN QUERY PLAN detail string for a table operation.
+/// Used by DELETE/UPDATE emitters to emit EQP annotations.
+pub(crate) fn format_eqp_detail(table: &JoinedTable) -> String {
+    match &table.op {
+        Operation::Scan(scan) => {
+            let table_name = if table.table.get_name() == table.identifier {
+                table.identifier.clone()
+            } else {
+                format!("{} AS {}", table.table.get_name(), table.identifier)
+            };
+            match scan {
+                Scan::BTreeTable { index, .. } => {
+                    if let Some(index) = index {
+                        if table.utilizes_covering_index() {
+                            format!("SCAN {table_name} USING COVERING INDEX {}", index.name)
+                        } else {
+                            format!("SCAN {table_name} USING INDEX {}", index.name)
+                        }
+                    } else {
+                        format!("SCAN {table_name}")
+                    }
+                }
+                Scan::VirtualTable { .. } | Scan::Subquery { .. } => {
+                    format!("SCAN {table_name}")
+                }
+            }
+        }
+        Operation::Search(search) => match search {
+            Search::RowidEq { .. }
+            | Search::Seek { index: None, .. }
+            | Search::InSeek { index: None, .. } => {
+                format!(
+                    "SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
+                    table.identifier
+                )
+            }
+            Search::Seek {
+                index: Some(index),
+                seek_def,
+            } => {
+                let constraints = seek_constraint_annotation(index, seek_def);
+                format!(
+                    "SEARCH {} USING INDEX {}{}",
+                    table.identifier, index.name, constraints
+                )
+            }
+            Search::InSeek {
+                index: Some(index), ..
+            } => {
+                let constraint = if let Some(col) = index.columns.first() {
+                    format!(" ({}=?)", col.name)
+                } else {
+                    String::new()
+                };
+                format!(
+                    "SEARCH {} USING INDEX {}{}",
+                    table.identifier, index.name, constraint
+                )
+            }
+        },
+        Operation::MultiIndexScan(multi_idx) => {
+            let index_names: Vec<&str> = multi_idx
+                .branches
+                .iter()
+                .map(|b| {
+                    b.index
+                        .as_ref()
+                        .map(|i| i.name.as_str())
+                        .unwrap_or("PRIMARY KEY")
+                })
+                .collect();
+            format!(
+                "MULTI-INDEX {} {} ({})",
+                match multi_idx.set_op {
+                    SetOperation::Union => "OR",
+                    SetOperation::Intersection { .. } => "AND",
+                },
+                table.identifier,
+                index_names.join(", ")
+            )
+        }
+        Operation::IndexMethodQuery(query) => {
+            let index_method = query.index.index_method.as_ref().unwrap();
+            format!(
+                "QUERY INDEX METHOD {}",
+                index_method.definition().method_name
+            )
+        }
+        Operation::HashJoin(_) => {
+            let table_name = if table.table.get_name() == table.identifier {
+                table.identifier.clone()
+            } else {
+                format!("{} AS {}", table.table.get_name(), table.identifier)
+            };
+            format!("HASH JOIN {table_name}")
+        }
+    }
+}
+
 /// Build SQLite-style constraint annotation string for an index seek.
 /// e.g. "(label=? AND fromId>?)"
 pub(crate) fn seek_constraint_annotation(
@@ -46,14 +145,16 @@ pub(crate) fn seek_constraint_annotation(
             parts.push(format!("{}{op_str}?", col.name));
         }
     }
-    // Range constraint from end key
+    // Range constraint from end key.
+    // The end key's SeekOp is the B-tree termination condition (the negation of the
+    // user-facing SQL operator), so we reverse it for display.
     if let SeekKeyComponent::Expr(_) = &seek_def.end.last_component {
         if let Some(col) = index.columns.get(range_col_idx) {
             let op_str = match seek_def.end.op {
-                SeekOp::LE { .. } => "<=",
-                SeekOp::LT => "<",
-                SeekOp::GE { .. } => ">=",
-                SeekOp::GT => ">",
+                SeekOp::GE { .. } => "<",
+                SeekOp::GT => "<=",
+                SeekOp::LE { .. } => ">",
+                SeekOp::LT => ">=",
             };
             parts.push(format!("{}{op_str}?", col.name));
         }
@@ -169,7 +270,7 @@ impl Display for SelectPlan {
                                 writeln!(f, "{indent}SCAN {table_name}")?;
                             }
                         }
-                        Scan::VirtualTable { .. } | Scan::Subquery => {
+                        Scan::VirtualTable { .. } | Scan::Subquery { .. } => {
                             writeln!(f, "{indent}SCAN {table_name}")?;
                         }
                     }
@@ -177,7 +278,9 @@ impl Display for SelectPlan {
                 Operation::Search(search) => {
                     let left_join_suffix = if member.is_outer { " LEFT-JOIN" } else { "" };
                     match search {
-                        Search::RowidEq { .. } | Search::Seek { index: None, .. } => {
+                        Search::RowidEq { .. }
+                        | Search::Seek { index: None, .. }
+                        | Search::InSeek { index: None, .. } => {
                             writeln!(
                                 f,
                                 "{indent}SEARCH {} USING INTEGER PRIMARY KEY (rowid=?){left_join_suffix}",
@@ -192,6 +295,20 @@ impl Display for SelectPlan {
                             writeln!(
                                 f,
                                 "{indent}SEARCH {} USING INDEX {}{constraints}{left_join_suffix}",
+                                reference.identifier, index.name
+                            )?;
+                        }
+                        Search::InSeek {
+                            index: Some(index), ..
+                        } => {
+                            let constraint = if let Some(col) = index.columns.first() {
+                                format!(" ({}=?)", col.name)
+                            } else {
+                                String::new()
+                            };
+                            writeln!(
+                                f,
+                                "{indent}SEARCH {} USING INDEX {}{constraint}{left_join_suffix}",
                                 reference.identifier, index.name
                             )?;
                         }
@@ -222,7 +339,7 @@ impl Display for SelectPlan {
                         .collect();
                     let op_name = match multi_idx.set_op {
                         SetOperation::Union => "MULTI-INDEX OR",
-                        SetOperation::Intersection => "MULTI-INDEX AND",
+                        SetOperation::Intersection { .. } => "MULTI-INDEX AND",
                     };
                     writeln!(
                         f,
@@ -276,13 +393,15 @@ impl Display for DeletePlan {
                                 writeln!(f, "{indent}DELETE FROM {table_name}")?;
                             }
                         }
-                        Scan::VirtualTable { .. } | Scan::Subquery => {
+                        Scan::VirtualTable { .. } | Scan::Subquery { .. } => {
                             writeln!(f, "{indent}DELETE FROM {table_name}")?;
                         }
                     }
                 }
                 Operation::Search(search) => match search {
-                    Search::RowidEq { .. } | Search::Seek { index: None, .. } => {
+                    Search::RowidEq { .. }
+                    | Search::Seek { index: None, .. }
+                    | Search::InSeek { index: None, .. } => {
                         writeln!(
                             f,
                             "{}SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
@@ -295,6 +414,20 @@ impl Display for DeletePlan {
                         writeln!(
                             f,
                             "{}SEARCH {} USING INDEX {}",
+                            indent, reference.identifier, index.name
+                        )?;
+                    }
+                    Search::InSeek {
+                        index: Some(index), ..
+                    } => {
+                        let constraint = if let Some(col) = index.columns.first() {
+                            format!(" ({}=?)", col.name)
+                        } else {
+                            String::new()
+                        };
+                        writeln!(
+                            f,
+                            "{}SEARCH {} USING INDEX {}{constraint}",
                             indent, reference.identifier, index.name
                         )?;
                     }
@@ -324,7 +457,7 @@ impl Display for DeletePlan {
                         .collect();
                     let op_name = match multi_idx.set_op {
                         SetOperation::Union => "MULTI-INDEX OR",
-                        SetOperation::Intersection => "MULTI-INDEX AND",
+                        SetOperation::Intersection { .. } => "MULTI-INDEX AND",
                     };
                     writeln!(
                         f,
@@ -384,7 +517,7 @@ impl fmt::Display for UpdatePlan {
                                 writeln!(f, "{indent}{action} {table_name}")?;
                             }
                         }
-                        Scan::VirtualTable { .. } | Scan::Subquery => {
+                        Scan::VirtualTable { .. } | Scan::Subquery { .. } => {
                             if i == 0 {
                                 writeln!(f, "{indent}UPDATE {table_name}")?;
                             } else {
@@ -394,7 +527,9 @@ impl fmt::Display for UpdatePlan {
                     }
                 }
                 Operation::Search(search) => match search {
-                    Search::RowidEq { .. } | Search::Seek { index: None, .. } => {
+                    Search::RowidEq { .. }
+                    | Search::Seek { index: None, .. }
+                    | Search::InSeek { index: None, .. } => {
                         writeln!(
                             f,
                             "{}SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
@@ -407,6 +542,20 @@ impl fmt::Display for UpdatePlan {
                         writeln!(
                             f,
                             "{}SEARCH {} USING INDEX {}",
+                            indent, reference.identifier, index.name
+                        )?;
+                    }
+                    Search::InSeek {
+                        index: Some(index), ..
+                    } => {
+                        let constraint = if let Some(col) = index.columns.first() {
+                            format!(" ({}=?)", col.name)
+                        } else {
+                            String::new()
+                        };
+                        writeln!(
+                            f,
+                            "{}SEARCH {} USING INDEX {}{constraint}",
                             indent, reference.identifier, index.name
                         )?;
                     }

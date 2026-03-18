@@ -228,6 +228,7 @@ impl Arbitrary for Type {
         Self {
             name,
             size: None, // TODO: come back later here
+            array_dimensions: 0,
         }
     }
 }

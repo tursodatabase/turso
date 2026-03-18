@@ -69,9 +69,6 @@ sudo dnf install mold
 
 # Ubuntu/Debian
 sudo apt install mold
-
-# macOS
-brew install mold
 ```
 
 Then configure Cargo to use mold by creating `.cargo/config.toml`:
@@ -80,18 +77,6 @@ Then configure Cargo to use mold by creating `.cargo/config.toml`:
 
 ```toml
 [target.x86_64-unknown-linux-gnu]
-linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
-```
-
-**For macOS:**
-
-```toml
-[target.x86_64-apple-darwin]
-linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
-
-[target.aarch64-apple-darwin]
 linker = "clang"
 rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 ```
@@ -255,15 +240,15 @@ When working on a new feature, please consider adding a test case for it.
 ## SQL Test Runner
 
 The `test-runner` crate provides a dedicated test runner with a custom DSL for writing SQL tests.
-Tests should be added to `testing/runner/tests/` using the `.sqltest` format.
+Tests should be added to `testing/sqltests/tests/` using the `.sqltest` format.
 
 To run tests:
 
 ```console
-make -C testing/runner run
+make -C testing/sqltests run
 ```
 
-For full documentation on the DSL syntax and CLI usage, see the [test-runner docs](testing/runner/docs/).
+For full documentation on the DSL syntax and CLI usage, see the [test-runner docs](testing/sqltests/docs/).
 
 ## TPC-H
 

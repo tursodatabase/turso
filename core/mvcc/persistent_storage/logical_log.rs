@@ -106,16 +106,23 @@ use crate::turso_assert;
 use crate::{
     io::ReadComplete,
     mvcc::database::{LogRecord, MVTableId, Row, RowID, RowKey, RowVersion, SortableIndexKey},
-    storage::sqlite3_ondisk::{read_varint, varint_len, write_varint_to_vec, DatabaseHeader},
+    storage::sqlite3_ondisk::{
+        read_varint, read_varint_partial, varint_len, write_varint_to_vec, DatabaseHeader,
+    },
     types::IndexInfo,
     Buffer, Completion, CompletionError, LimboError, Result,
 };
 
+use crate::storage::encryption::EncryptionContext;
 use crate::File;
 
 /// Logical log size in bytes at which a committing transaction will trigger a checkpoint.
 /// Default to the size of 1000 SQLite WAL frames; disable by setting a negative value.
 pub const DEFAULT_LOG_CHECKPOINT_THRESHOLD: i64 = 4120 * 1000;
+
+/// Optional callback invoked after serialization with a zero-copy reference to
+/// the serialized frame bytes and the running CRC, before the disk write.
+pub type OnSerializationComplete<'a> = Option<&'a dyn Fn(&[u8], u32)>;
 
 const LOG_MAGIC: u32 = 0x4C4D4C32; // "LML2" in LE
 const LOG_VERSION: u8 = 2;
@@ -143,7 +150,7 @@ const TX_MIN_FRAME_SIZE: usize = TX_HEADER_SIZE + TX_TRAILER_SIZE; // 32
 
 /// Log's Header, the first 56 bytes of any logical log file.
 #[derive(Clone, Debug)]
-pub(crate) struct LogHeader {
+pub struct LogHeader {
     version: u8,
     flags: u8,
     hdr_len: u16,
@@ -278,10 +285,17 @@ pub struct LogicalLog {
     /// `advance_offset_after_success` so that an abandoned write
     /// doesn't corrupt the chain.
     pending_running_crc: Option<u32>,
+    encryption_ctx: Option<EncryptionContext>,
+    /// Reusable scratch buffer for ops serialization on the encrypted write path.
+    encryption_scratch_buffer: Vec<u8>,
 }
 
 impl LogicalLog {
-    pub fn new(file: Arc<dyn File>, io: Arc<dyn crate::IO>) -> Self {
+    pub fn new(
+        file: Arc<dyn File>,
+        io: Arc<dyn crate::IO>,
+        encryption_ctx: Option<EncryptionContext>,
+    ) -> Self {
         Self {
             file,
             io,
@@ -290,6 +304,8 @@ impl LogicalLog {
             header: None,
             running_crc: 0,
             pending_running_crc: None,
+            encryption_ctx,
+            encryption_scratch_buffer: Vec::new(),
         }
     }
 
@@ -302,16 +318,18 @@ impl LogicalLog {
         self.header.as_ref()
     }
 
-    /// Serializes a transaction record and writes it to the log file.
-    /// `advance_offset_immediately`: when true, the writer offset advances right after
-    /// issuing the pwrite (used by `log_tx` for fire-and-forget appends). When false,
-    /// the offset stays behind until the caller confirms success via
-    /// `advance_offset_after_success` (used by `log_tx_deferred_offset` for two-phase
-    /// commit, where the offset must not advance if the commit is later aborted).
+    /// Serializes a transaction into `write_buf`, optionally calls
+    /// `on_serialization_complete` with a zero-copy reference to the frame bytes,
+    /// then writes to disk. `write_buf` retains its allocation across calls.
+    ///
+    /// `advance_offset_immediately`: when true, the writer offset advances right
+    /// after the pwrite (checkpoint path). When false, the offset stays behind
+    /// until `advance_offset_after_success` is called (MVCC commit path).
     fn serialize_and_pwrite_tx(
         &mut self,
         tx: &LogRecord,
         advance_offset_immediately: bool,
+        on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)> {
         self.write_buf.clear();
 
@@ -339,15 +357,8 @@ impl LogicalLog {
         let tx_header_start = self.write_buf.len();
         self.write_buf.resize(tx_header_start + TX_HEADER_SIZE, 0);
 
-        // 3. Serialize ops (both table and index rows)
-        let payload_start = self.write_buf.len();
-        for row_version in &tx.row_versions {
-            serialize_op_entry(&mut self.write_buf, row_version)?;
-        }
-        if let Some(header) = tx.header {
-            serialize_header_entry(&mut self.write_buf, &header);
-        }
-        let payload_size = (self.write_buf.len() - payload_start) as u64;
+        // 3. Serialize ops into write_buf (encrypted or plaintext).
+        let payload_size = self.serialize_ops_into_write_buf(tx, op_count, commit_ts)?;
         let payload_end = self.write_buf.len();
 
         // 4. Backfill TX HEADER: FRAME_MAGIC(4) | payload_size(8) | op_count(4) | commit_ts(8)
@@ -360,8 +371,9 @@ impl LogicalLog {
         self.write_buf[tx_header_start + 16..tx_header_start + 24]
             .copy_from_slice(&commit_ts.to_le_bytes());
 
-        // 5. Serialize trailer: chained CRC over TX_HEADER (24 B) + payload, then END_MAGIC.
-        // Seed from running_crc (derived from salt, or previous frame's CRC).
+        // 5. TX TRAILER layout (8 bytes): crc32c(4, le u32) | END_MAGIC(4)
+        // CRC is chained: seeded from running_crc (salt-derived, or previous frame's CRC),
+        // covers TX_HEADER (24 B) + payload (encrypted or plaintext).
         let crc = crc32c::crc32c_append(
             self.running_crc,
             &self.write_buf[tx_header_start..payload_end],
@@ -369,8 +381,13 @@ impl LogicalLog {
         self.write_buf.extend_from_slice(&crc.to_le_bytes());
         self.write_buf.extend_from_slice(&END_MAGIC.to_le_bytes());
 
-        // 6. Write to disk
-        let buffer = Arc::new(Buffer::new(self.write_buf.clone()));
+        // 6. Call observer before writing — zero-copy reference into write_buf.
+        if let Some(cb) = on_serialization_complete {
+            cb(&self.write_buf, crc);
+        }
+
+        // 7. Copy write_buf into an I/O buffer and pwrite. write_buf keeps its allocation.
+        let buffer = Arc::new(Buffer::new(self.write_buf.to_vec()));
         let c = Completion::new_write({
             let buffer_len = buffer.len();
             move |res: Result<i32, CompletionError>| {
@@ -395,20 +412,88 @@ impl LogicalLog {
         Ok((c, buffer_len as u64))
     }
 
+    /// Serializes ops into `write_buf`, encrypting if an encryption context is set.
+    /// Returns the plaintext payload size (used in the TX header's `payload_size` field).
+    ///
+    /// Encrypted on-disk blob layout: ciphertext(plaintext_len + tag_size) | nonce(nonce_size)
+    fn serialize_ops_into_write_buf(
+        &mut self,
+        tx: &LogRecord,
+        op_count: u32,
+        commit_ts: u64,
+    ) -> Result<u64> {
+        if let Some(enc_ctx) = &self.encryption_ctx {
+            self.encryption_scratch_buffer.clear();
+            for row_version in &tx.row_versions {
+                serialize_op_entry(&mut self.encryption_scratch_buffer, row_version)?;
+            }
+            if let Some(hdr) = tx.header {
+                serialize_header_entry(&mut self.encryption_scratch_buffer, &hdr);
+            }
+            let payload_size = self.encryption_scratch_buffer.len() as u64;
+
+            // AAD = salt(8 LE) || payload_size(8 LE) || op_count(4 LE) || commit_ts(8 LE)
+            // Binds ciphertext to this specific frame so payloads cannot be swapped
+            // between transactions.
+            let salt = self
+                .header
+                .as_ref()
+                .expect("log header must be set before writing")
+                .salt;
+            let mut aad = [0u8; 28];
+            aad[..8].copy_from_slice(&salt.to_le_bytes());
+            aad[8..16].copy_from_slice(&payload_size.to_le_bytes());
+            aad[16..20].copy_from_slice(&op_count.to_le_bytes());
+            aad[20..28].copy_from_slice(&commit_ts.to_le_bytes());
+
+            let (ciphertext, nonce) =
+                enc_ctx.encrypt_chunk(&self.encryption_scratch_buffer, &aad)?;
+            // encrypt_chunk returns ciphertext with the auth tag appended, so its
+            // length must be exactly plaintext_len + tag_size.  The read path
+            // relies on this to split the on-disk blob back into (ciphertext+tag, nonce).
+            debug_assert_eq!(
+                ciphertext.len(),
+                self.encryption_scratch_buffer.len() + enc_ctx.tag_size(),
+                "encrypt_chunk output size mismatch: expected plaintext({}) + tag({}), got {}",
+                self.encryption_scratch_buffer.len(),
+                enc_ctx.tag_size(),
+                ciphertext.len(),
+            );
+            self.write_buf.extend_from_slice(&ciphertext);
+            self.write_buf.extend_from_slice(&nonce);
+            Ok(payload_size)
+        } else {
+            let payload_start = self.write_buf.len();
+            for row_version in &tx.row_versions {
+                serialize_op_entry(&mut self.write_buf, row_version)?;
+            }
+            if let Some(header) = tx.header {
+                serialize_header_entry(&mut self.write_buf, &header);
+            }
+            Ok((self.write_buf.len() - payload_start) as u64)
+        }
+    }
+
     /// Writes a transaction to the log and immediately advances the writer offset.
     /// Used for checkpoint-initiated writes where no two-phase commit is needed.
     pub fn log_tx(&mut self, tx: &LogRecord) -> Result<Completion> {
-        let (c, _) = self.serialize_and_pwrite_tx(tx, true)?;
+        let (c, _) = self.serialize_and_pwrite_tx(tx, true, None)?;
         Ok(c)
     }
 
     /// Writes a transaction to the log but does NOT advance the writer offset.
     /// Returns `(completion, bytes_written)`. The caller must call
     /// `advance_offset_after_success(bytes)` after confirming the commit succeeded.
-    /// Used by the MVCC commit path where the offset must not advance if the
-    /// transaction is later aborted (the un-advanced bytes get overwritten by the next write).
-    pub fn log_tx_deferred_offset(&mut self, tx: &LogRecord) -> Result<(Completion, u64)> {
-        self.serialize_and_pwrite_tx(tx, false)
+    ///
+    /// If `on_serialization_complete` is provided, it is called with a zero-copy
+    /// reference to the serialized frame bytes and the running CRC after
+    /// serialization but before the disk write.
+    pub fn log_tx_deferred_offset(
+        &mut self,
+        tx: &LogRecord,
+        on_serialization_complete: OnSerializationComplete<'_>,
+    ) -> Result<(Completion, u64)> {
+        self.serialize_and_pwrite_tx(tx, false, on_serialization_complete)
     }
 
     pub fn advance_offset_after_success(&mut self, bytes: u64) {
@@ -494,6 +579,8 @@ impl LogicalLog {
     }
 }
 
+/// Serialize one op into `buffer`.
+/// Op layout: tag(1) | flags(1) | table_id(4, le i32) | payload_len(varint) | payload(variable)
 fn serialize_op_entry(buffer: &mut Vec<u8>, row_version: &RowVersion) -> Result<()> {
     let is_delete = row_version.end.is_some();
     let tag = match (&row_version.row.id.row_id, is_delete) {
@@ -569,6 +656,162 @@ fn serialize_header_entry(buffer: &mut Vec<u8>, header: &DatabaseHeader) {
     buffer.extend_from_slice(bytemuck::bytes_of(header));
 }
 
+/// Parse all ops from a decrypted plaintext buffer.
+/// Validates that `plaintext.len() == payload_size` and that every byte is consumed.
+fn parse_ops_from_plaintext(
+    plaintext: &[u8],
+    payload_size: usize,
+    op_count: u32,
+    commit_ts: u64,
+) -> Result<Vec<ParsedOp>> {
+    if plaintext.len() != payload_size {
+        return Err(LimboError::Corrupt(format!(
+            "decrypted size ({}) != payload_size ({payload_size})",
+            plaintext.len()
+        )));
+    }
+    let mut ops = Vec::with_capacity((op_count as usize).min(1024));
+    let mut cursor = 0usize;
+    for _ in 0..op_count {
+        match try_parse_one_op_from_buf(&plaintext[cursor..], commit_ts)? {
+            Some((op, consumed)) => {
+                cursor += consumed;
+                ops.push(op);
+            }
+            None => {
+                return Err(LimboError::Corrupt(
+                    "incomplete op in decrypted payload".into(),
+                ));
+            }
+        }
+    }
+    if cursor != plaintext.len() {
+        return Err(LimboError::Corrupt(format!(
+            "trailing bytes after ops: consumed {cursor}, total {}",
+            plaintext.len()
+        )));
+    }
+    Ok(ops)
+}
+
+/// Parse one op entry from a contiguous byte slice (no IO).
+/// Returns `Ok(Some((parsed_op, bytes_consumed)))` on success,
+/// `Ok(None)` when not enough bytes, or `Err` on structural corruption.
+///
+/// Op layout: tag(1) | flags(1) | table_id(4, le i32) | payload_len(varint) | payload(variable)
+fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(ParsedOp, usize)>> {
+    if buf.len() < 6 {
+        return Ok(None);
+    }
+
+    let tag = buf[0];
+    let flags = buf[1];
+    let table_id_i32 = i32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]);
+
+    let table_id: Option<MVTableId> = match tag {
+        OP_UPSERT_TABLE | OP_DELETE_TABLE | OP_UPSERT_INDEX | OP_DELETE_INDEX => {
+            if flags & !OP_FLAG_BTREE_RESIDENT != 0 || table_id_i32 >= 0 {
+                return Err(LimboError::Corrupt(
+                    "Invalid op flags or non-negative table_id".into(),
+                ));
+            }
+            Some(MVTableId::from(table_id_i32 as i64))
+        }
+        OP_UPDATE_HEADER => {
+            if flags != 0 || table_id_i32 != 0 {
+                return Err(LimboError::Corrupt(
+                    "Invalid UPDATE_HEADER flags/table_id".into(),
+                ));
+            }
+            None
+        }
+        _ => return Err(LimboError::Corrupt(format!("Unknown op tag: {tag}"))),
+    };
+    let btree_resident = (flags & OP_FLAG_BTREE_RESIDENT) != 0;
+
+    let Some((payload_len_u64, varint_bytes)) = read_varint_partial(&buf[6..])? else {
+        return Ok(None);
+    };
+    let payload_len = match usize::try_from(payload_len_u64) {
+        Ok(v) => v,
+        Err(_) => return Err(LimboError::Corrupt("payload_len overflows usize".into())),
+    };
+
+    let fixed = 6 + varint_bytes;
+    let total = fixed + payload_len;
+    if buf.len() < total {
+        return Ok(None);
+    }
+
+    let payload = buf[fixed..total].to_vec();
+
+    let parsed_op = match tag {
+        OP_UPSERT_TABLE => {
+            let table_id = table_id.expect("table op must have table_id");
+            let (rowid_u64, rowid_len) = read_varint(&payload)
+                .map_err(|_| LimboError::Corrupt("Bad rowid varint in UPSERT_TABLE".into()))?;
+            if rowid_len > payload.len() {
+                return Err(LimboError::Corrupt("rowid_len > payload".into()));
+            }
+            let mut p = payload;
+            let record_bytes = p.split_off(rowid_len);
+            let rowid = RowID::new(table_id, RowKey::Int(rowid_u64 as i64));
+            ParsedOp::UpsertTable {
+                table_id,
+                rowid,
+                record_bytes,
+                commit_ts,
+                btree_resident,
+            }
+        }
+        OP_DELETE_TABLE => {
+            let table_id = table_id.expect("table op must have table_id");
+            let (rowid_u64, rowid_len) = read_varint(&payload)
+                .map_err(|_| LimboError::Corrupt("Bad rowid varint in DELETE_TABLE".into()))?;
+            if rowid_len != payload.len() {
+                return Err(LimboError::Corrupt(
+                    "DELETE_TABLE payload size mismatch".into(),
+                ));
+            }
+            let rowid = RowID::new(table_id, RowKey::Int(rowid_u64 as i64));
+            ParsedOp::DeleteTable {
+                rowid,
+                commit_ts,
+                btree_resident,
+            }
+        }
+        OP_UPSERT_INDEX => ParsedOp::UpsertIndex {
+            table_id: table_id.expect("index op must have table_id"),
+            payload,
+            commit_ts,
+            btree_resident,
+        },
+        OP_DELETE_INDEX => ParsedOp::DeleteIndex {
+            table_id: table_id.expect("index op must have table_id"),
+            payload,
+            commit_ts,
+            btree_resident,
+        },
+        OP_UPDATE_HEADER => {
+            if payload.len() != DatabaseHeader::SIZE {
+                return Err(LimboError::Corrupt(
+                    "UPDATE_HEADER wrong payload size".into(),
+                ));
+            }
+            let mut bytes = [0u8; DatabaseHeader::SIZE];
+            bytes.copy_from_slice(&payload);
+            let header = *bytemuck::from_bytes::<DatabaseHeader>(&bytes);
+            if header.magic != *b"SQLite format 3\0" {
+                return Err(LimboError::Corrupt("UPDATE_HEADER bad SQLite magic".into()));
+            }
+            ParsedOp::UpdateHeader { header, commit_ts }
+        }
+        _ => unreachable!("tag validated above"),
+    };
+
+    Ok(Some((parsed_op, total)))
+}
+
 #[derive(Debug)]
 pub enum StreamingResult {
     UpsertTableRow {
@@ -638,10 +881,11 @@ pub struct StreamingLogicalLogReader {
     /// Running CRC state for chained checksum validation. Seeded from the header salt;
     /// updated after each successfully validated frame.
     running_crc: u32,
+    encryption_ctx: Option<EncryptionContext>,
 }
 
 impl StreamingLogicalLogReader {
-    pub fn new(file: Arc<dyn File>) -> Self {
+    pub fn new(file: Arc<dyn File>, encryption_ctx: Option<EncryptionContext>) -> Self {
         let file_size = file.size().expect("failed to get file size") as usize;
         Self {
             file,
@@ -654,6 +898,7 @@ impl StreamingLogicalLogReader {
             pending_ops: std::collections::VecDeque::new(),
             last_valid_offset: 0,
             running_crc: 0,
+            encryption_ctx,
         }
     }
 
@@ -767,64 +1012,91 @@ impl StreamingLogicalLogReader {
         self.remaining_bytes() == 0
     }
 
-    fn parse_next_transaction(&mut self, io: &Arc<dyn crate::IO>) -> Result<ParseResult> {
-        if self.remaining_bytes() < TX_MIN_FRAME_SIZE {
-            return Ok(ParseResult::Eof);
-        }
-        let frame_start = self.offset.saturating_sub(self.bytes_can_read());
+    /// Parse an encrypted payload: read the single AEAD blob, decrypt, then parse ops from plaintext.
+    /// Encrypted on-disk blob layout: ciphertext(plaintext_len + tag_size) | nonce(nonce_size)
+    fn parse_encrypted_payload(
+        &mut self,
+        io: &Arc<dyn crate::IO>,
+        op_count: u32,
+        payload_size: usize,
+        commit_ts: u64,
+        running_crc: u32,
+    ) -> Result<PayloadParseResult> {
+        let enc = self
+            .encryption_ctx
+            .as_ref()
+            .expect("encryption_ctx must be set for encrypted payload");
+        let nonce_size = enc.nonce_size();
+        let tag_size = enc.tag_size();
 
-        let header_bytes = match self.try_consume_fixed::<TX_HEADER_SIZE>(io)? {
-            Some(bytes) => bytes,
-            None => return Ok(ParseResult::Eof),
+        let on_disk_size = match payload_size
+            .checked_add(tag_size)
+            .and_then(|s| s.checked_add(nonce_size))
+        {
+            Some(s) => s,
+            None => return Ok(PayloadParseResult::InvalidFrame),
         };
 
-        // TX HEADER layout (24 bytes): FRAME_MAGIC(4) | payload_size(8) | op_count(4) | commit_ts(8)
-        let frame_magic = u32::from_le_bytes([
-            header_bytes[0],
-            header_bytes[1],
-            header_bytes[2],
-            header_bytes[3],
-        ]);
-        if frame_magic != FRAME_MAGIC {
-            self.last_valid_offset = frame_start;
-            return Ok(ParseResult::InvalidFrame);
-        }
-        let payload_size = u64::from_le_bytes([
-            header_bytes[4],
-            header_bytes[5],
-            header_bytes[6],
-            header_bytes[7],
-            header_bytes[8],
-            header_bytes[9],
-            header_bytes[10],
-            header_bytes[11],
-        ]);
-        let op_count = u32::from_le_bytes([
-            header_bytes[12],
-            header_bytes[13],
-            header_bytes[14],
-            header_bytes[15],
-        ]);
-        let commit_ts = u64::from_le_bytes([
-            header_bytes[16],
-            header_bytes[17],
-            header_bytes[18],
-            header_bytes[19],
-            header_bytes[20],
-            header_bytes[21],
-            header_bytes[22],
-            header_bytes[23],
-        ]);
+        let blob = match self.try_consume_bytes(io, on_disk_size)? {
+            Some(b) => b,
+            None => return Ok(PayloadParseResult::Eof),
+        };
+        let running_crc = crc32c::crc32c_append(running_crc, &blob);
 
-        // Chained CRC: seed from running_crc (derived from salt, or previous frame's CRC)
-        let mut running_crc = crc32c::crc32c_append(self.running_crc, &header_bytes);
-        let mut payload_bytes_read: u64 = 0;
+        // AAD = salt(8 LE) || payload_size(8 LE) || op_count(4 LE) || commit_ts(8 LE)
+        // Must match the write path exactly.
+        let salt = self
+            .header
+            .as_ref()
+            .expect("log header must be read before parsing")
+            .salt;
+        let mut aad = [0u8; 28];
+        aad[..8].copy_from_slice(&salt.to_le_bytes());
+        aad[8..16].copy_from_slice(&(payload_size as u64).to_le_bytes());
+        aad[16..20].copy_from_slice(&op_count.to_le_bytes());
+        aad[20..28].copy_from_slice(&commit_ts.to_le_bytes());
+
+        let ciphertext = &blob[..payload_size + tag_size];
+        let nonce = &blob[payload_size + tag_size..];
+
+        let enc_ctx = self
+            .encryption_ctx
+            .as_ref()
+            .expect("encryption_ctx must be set for encrypted payload");
+        let plaintext = match enc_ctx.decrypt_chunk(ciphertext, nonce, &aad) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("decrypt_chunk failed: {e}");
+                return Ok(PayloadParseResult::InvalidFrame);
+            }
+        };
+
+        match parse_ops_from_plaintext(&plaintext, payload_size, op_count, commit_ts) {
+            Ok(ops) => Ok(PayloadParseResult::Ok(ops, running_crc)),
+            Err(e) => {
+                tracing::warn!("encrypted frame parse error: {e}");
+                Ok(PayloadParseResult::InvalidFrame)
+            }
+        }
+    }
+
+    /// Parse an unencrypted payload via field-by-field streaming IO reads.
+    fn parse_streaming_payload(
+        &mut self,
+        io: &Arc<dyn crate::IO>,
+        op_count: u32,
+        payload_size: usize,
+        commit_ts: u64,
+        mut running_crc: u32,
+    ) -> Result<PayloadParseResult> {
         let mut parsed_ops = Vec::with_capacity((op_count as usize).min(1024));
+        let mut payload_bytes_read: u64 = 0;
 
         for _ in 0..op_count {
+            // Op header (6 bytes): tag(1) | flags(1) | table_id(4, little-endian i32)
             let op_bytes = match self.try_consume_fixed::<6>(io)? {
                 Some(bytes) => bytes,
-                None => return Ok(ParseResult::Eof),
+                None => return Ok(PayloadParseResult::Eof),
             };
             running_crc = crc32c::crc32c_append(running_crc, &op_bytes);
             let tag = op_bytes[0];
@@ -834,49 +1106,40 @@ impl StreamingLogicalLogReader {
             let table_id = match tag {
                 OP_UPSERT_TABLE | OP_DELETE_TABLE | OP_UPSERT_INDEX | OP_DELETE_INDEX => {
                     if flags & !OP_FLAG_BTREE_RESIDENT != 0 || table_id_i32 >= 0 {
-                        self.last_valid_offset = frame_start;
-                        return Ok(ParseResult::InvalidFrame);
+                        return Ok(PayloadParseResult::InvalidFrame);
                     }
                     Some(MVTableId::from(table_id_i32 as i64))
                 }
                 OP_UPDATE_HEADER => {
-                    // Header op must not carry row-level bits or table addressing.
                     if flags != 0 || table_id_i32 != 0 {
-                        self.last_valid_offset = frame_start;
-                        return Ok(ParseResult::InvalidFrame);
+                        return Ok(PayloadParseResult::InvalidFrame);
                     }
                     None
                 }
-                _ => {
-                    self.last_valid_offset = frame_start;
-                    return Ok(ParseResult::InvalidFrame);
-                }
+                _ => return Ok(PayloadParseResult::InvalidFrame),
             };
             let btree_resident = (flags & OP_FLAG_BTREE_RESIDENT) != 0;
 
             let (payload_len, payload_len_bytes, payload_len_bytes_len) =
                 match self.consume_varint_bytes(io) {
                     Ok(Some((value, bytes, len))) => (value, bytes, len),
-                    Ok(None) => return Ok(ParseResult::Eof),
-                    Err(LimboError::Corrupt(_)) => {
-                        self.last_valid_offset = frame_start;
-                        return Ok(ParseResult::InvalidFrame);
-                    }
+                    Ok(None) => return Ok(PayloadParseResult::Eof),
+                    Err(LimboError::Corrupt(_)) => return Ok(PayloadParseResult::InvalidFrame),
                     Err(err) => return Err(err),
                 };
             running_crc =
                 crc32c::crc32c_append(running_crc, &payload_len_bytes[..payload_len_bytes_len]);
             let payload_len = match usize::try_from(payload_len) {
                 Ok(v) => v,
-                Err(_) => {
-                    self.last_valid_offset = frame_start;
-                    return Ok(ParseResult::InvalidFrame);
+                Err(e) => {
+                    tracing::warn!("payload_len overflows usize: {e}");
+                    return Ok(PayloadParseResult::InvalidFrame);
                 }
             };
 
             let payload = match self.try_consume_bytes(io, payload_len)? {
                 Some(bytes) => bytes,
-                None => return Ok(ParseResult::Eof),
+                None => return Ok(PayloadParseResult::Eof),
             };
             running_crc = crc32c::crc32c_append(running_crc, &payload);
 
@@ -886,10 +1149,7 @@ impl StreamingLogicalLogReader {
                 .and_then(|op_size| payload_bytes_read.checked_add(op_size))
             {
                 Some(v) => v,
-                None => {
-                    self.last_valid_offset = frame_start;
-                    return Ok(ParseResult::InvalidFrame);
-                }
+                None => return Ok(PayloadParseResult::InvalidFrame),
             };
 
             let parsed_op = match tag {
@@ -897,15 +1157,14 @@ impl StreamingLogicalLogReader {
                     let table_id = table_id.expect("table op must carry table id");
                     let (rowid_u64, rowid_len) = match read_varint(&payload) {
                         Ok(v) => v,
-                        Err(_) => {
-                            self.last_valid_offset = frame_start;
-                            return Ok(ParseResult::InvalidFrame);
+                        Err(e) => {
+                            tracing::warn!("failed to read rowid varint in upsert op: {e}");
+                            return Ok(PayloadParseResult::InvalidFrame);
                         }
                     };
                     let rowid_i64 = rowid_u64 as i64;
                     if rowid_len > payload.len() {
-                        self.last_valid_offset = frame_start;
-                        return Ok(ParseResult::InvalidFrame);
+                        return Ok(PayloadParseResult::InvalidFrame);
                     }
                     let mut payload = payload;
                     let record_bytes = payload.split_off(rowid_len);
@@ -922,14 +1181,13 @@ impl StreamingLogicalLogReader {
                     let table_id = table_id.expect("table op must carry table id");
                     let (rowid_u64, rowid_len) = match read_varint(&payload) {
                         Ok(v) => v,
-                        Err(_) => {
-                            self.last_valid_offset = frame_start;
-                            return Ok(ParseResult::InvalidFrame);
+                        Err(e) => {
+                            tracing::warn!("failed to read rowid varint in delete op: {e}");
+                            return Ok(PayloadParseResult::InvalidFrame);
                         }
                     };
                     if rowid_len != payload.len() {
-                        self.last_valid_offset = frame_start;
-                        return Ok(ParseResult::InvalidFrame);
+                        return Ok(PayloadParseResult::InvalidFrame);
                     }
                     let rowid_i64 = rowid_u64 as i64;
                     let rowid = RowID::new(table_id, RowKey::Int(rowid_i64));
@@ -959,34 +1217,111 @@ impl StreamingLogicalLogReader {
                 }
                 OP_UPDATE_HEADER => {
                     if payload.len() != DatabaseHeader::SIZE {
-                        self.last_valid_offset = frame_start;
-                        return Ok(ParseResult::InvalidFrame);
+                        return Ok(PayloadParseResult::InvalidFrame);
                     }
                     let mut bytes = [0u8; DatabaseHeader::SIZE];
                     bytes.copy_from_slice(&payload);
                     let header = *bytemuck::from_bytes::<DatabaseHeader>(&bytes);
-                    // Fail closed on clearly invalid header payloads before handing it to recovery.
                     if header.magic != *b"SQLite format 3\0" {
-                        self.last_valid_offset = frame_start;
-                        return Ok(ParseResult::InvalidFrame);
+                        return Ok(PayloadParseResult::InvalidFrame);
                     }
                     ParsedOp::UpdateHeader { header, commit_ts }
                 }
-                _ => {
-                    self.last_valid_offset = frame_start;
-                    return Ok(ParseResult::InvalidFrame);
-                }
+                _ => return Ok(PayloadParseResult::InvalidFrame),
             };
 
             parsed_ops.push(parsed_op);
         }
 
+        if payload_size as u64 != payload_bytes_read {
+            return Ok(PayloadParseResult::InvalidFrame);
+        }
+
+        Ok(PayloadParseResult::Ok(parsed_ops, running_crc))
+    }
+
+    fn parse_next_transaction(&mut self, io: &Arc<dyn crate::IO>) -> Result<ParseResult> {
+        if self.remaining_bytes() < TX_MIN_FRAME_SIZE {
+            return Ok(ParseResult::Eof);
+        }
+        let frame_start = self.offset.saturating_sub(self.bytes_can_read());
+
+        let header_bytes = match self.try_consume_fixed::<TX_HEADER_SIZE>(io)? {
+            Some(bytes) => bytes,
+            None => return Ok(ParseResult::Eof),
+        };
+
+        // TX HEADER layout (24 bytes): FRAME_MAGIC(4) | payload_size(8) | op_count(4) | commit_ts(8)
+        let frame_magic = u32::from_le_bytes([
+            header_bytes[0],
+            header_bytes[1],
+            header_bytes[2],
+            header_bytes[3],
+        ]);
+        if frame_magic != FRAME_MAGIC {
+            self.last_valid_offset = frame_start;
+            return Ok(ParseResult::InvalidFrame);
+        }
+        let payload_size_u64 = u64::from_le_bytes([
+            header_bytes[4],
+            header_bytes[5],
+            header_bytes[6],
+            header_bytes[7],
+            header_bytes[8],
+            header_bytes[9],
+            header_bytes[10],
+            header_bytes[11],
+        ]);
+        let op_count = u32::from_le_bytes([
+            header_bytes[12],
+            header_bytes[13],
+            header_bytes[14],
+            header_bytes[15],
+        ]);
+        let commit_ts = u64::from_le_bytes([
+            header_bytes[16],
+            header_bytes[17],
+            header_bytes[18],
+            header_bytes[19],
+            header_bytes[20],
+            header_bytes[21],
+            header_bytes[22],
+            header_bytes[23],
+        ]);
+
+        let payload_size = match usize::try_from(payload_size_u64) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("payload_size overflows usize: {e}");
+                self.last_valid_offset = frame_start;
+                return Ok(ParseResult::InvalidFrame);
+            }
+        };
+
+        // Chained CRC: seed from running_crc (derived from salt, or previous frame's CRC)
+        let running_crc = crc32c::crc32c_append(self.running_crc, &header_bytes);
+
+        // 2. Parse payload — branches for encrypted vs unencrypted.
+        let payload_result = if self.encryption_ctx.is_some() {
+            self.parse_encrypted_payload(io, op_count, payload_size, commit_ts, running_crc)?
+        } else {
+            self.parse_streaming_payload(io, op_count, payload_size, commit_ts, running_crc)?
+        };
+        let (parsed_ops, running_crc) = match payload_result {
+            PayloadParseResult::Ok(ops, crc) => (ops, crc),
+            PayloadParseResult::Eof => return Ok(ParseResult::Eof),
+            PayloadParseResult::InvalidFrame => {
+                self.last_valid_offset = frame_start;
+                return Ok(ParseResult::InvalidFrame);
+            }
+        };
+
+        // 3. TX TRAILER layout (8 bytes): crc32c(4, le u32) | END_MAGIC(4)
         let trailer_bytes = match self.try_consume_fixed::<TX_TRAILER_SIZE>(io)? {
             Some(bytes) => bytes,
             None => return Ok(ParseResult::Eof),
         };
 
-        // TX TRAILER layout (8 bytes): crc32c(4) | END_MAGIC(4)
         let crc32c_expected = u32::from_le_bytes([
             trailer_bytes[0],
             trailer_bytes[1],
@@ -1000,11 +1335,6 @@ impl StreamingLogicalLogReader {
             trailer_bytes[7],
         ]);
 
-        // Validate payload_size from frame header against bytes actually consumed
-        if payload_size != payload_bytes_read {
-            self.last_valid_offset = frame_start;
-            return Ok(ParseResult::InvalidFrame);
-        }
         if crc32c_expected != running_crc {
             self.last_valid_offset = frame_start;
             return Ok(ParseResult::InvalidFrame);
@@ -1307,6 +1637,18 @@ impl StreamingLogicalLogReader {
     }
 }
 
+/// Result of parsing just the payload portion of a transaction frame.
+/// Used by `parse_encrypted_payload` and `parse_streaming_payload` to communicate
+/// back to `parse_next_transaction` without duplicating control flow.
+enum PayloadParseResult {
+    /// Successfully parsed ops and updated running CRC.
+    Ok(Vec<ParsedOp>, u32),
+    /// Not enough bytes to complete the payload.
+    Eof,
+    /// Payload data is structurally invalid.
+    InvalidFrame,
+}
+
 #[cfg_attr(test, derive(Debug))]
 enum ParseResult {
     /// A fully validated transaction frame was parsed.
@@ -1400,7 +1742,7 @@ mod tests {
         commit_ts: u64,
     ) -> (Arc<dyn crate::File>, usize) {
         let file = io.open_file(file_name, OpenFlags::Create, false).unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
         let mut tx = crate::mvcc::database::LogRecord {
             tx_timestamp: commit_ts,
@@ -1442,7 +1784,7 @@ mod tests {
     }
 
     fn read_table_ops(file: Arc<dyn crate::File>, io: &Arc<dyn crate::IO>) -> Vec<ExpectedTableOp> {
-        let mut reader = StreamingLogicalLogReader::new(file);
+        let mut reader = StreamingLogicalLogReader::new(file, None);
         reader.read_header(io).unwrap();
         let mut ops = Vec::new();
         loop {
@@ -1520,7 +1862,7 @@ mod tests {
         let file = io
             .open_file("logical_log_varint_decode_tmp", OpenFlags::Create, false)
             .unwrap();
-        let mut reader = StreamingLogicalLogReader::new(file);
+        let mut reader = StreamingLogicalLogReader::new(file, None);
         reader.buffer.write().extend_from_slice(bytes);
         reader.consume_varint_bytes(&io)
     }
@@ -1926,7 +2268,7 @@ mod tests {
         let file = io
             .open_file("test.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
         let row = generate_simple_string_row((-2).into(), 1, "foo");
         let rowid_len = varint_len(1);
@@ -1975,7 +2317,7 @@ mod tests {
                 .unwrap();
             io.wait_for_completion(c).unwrap();
 
-            let mut reader = StreamingLogicalLogReader::new(file.clone());
+            let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
             reader.read_header(&io).unwrap();
             let mut seen = 0;
             loop {
@@ -2005,7 +2347,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
         append_single_table_op_tx(&mut log, &io, (-2).into(), 1, 1, false, false, "a");
         append_single_table_op_tx(&mut log, &io, (-2).into(), 2, 2, false, false, "b");
@@ -2055,12 +2397,12 @@ mod tests {
         let file = io
             .open_file("logical_log_i32_min_table_id", OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
         let table_id = crate::mvcc::database::MVTableId::from(i32::MIN as i64);
 
         append_single_table_op_tx(&mut log, &io, table_id, 7, 11, false, false, "min");
 
-        let mut reader = StreamingLogicalLogReader::new(file);
+        let mut reader = StreamingLogicalLogReader::new(file, None);
         reader.read_header(&io).unwrap();
         match reader
             .next_record(&io, |_id| {
@@ -2094,7 +2436,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
         append_single_table_op_tx(&mut log, &io, (-2).into(), -1, 1, false, false, "neg");
         append_single_table_op_tx(&mut log, &io, (-2).into(), -1, 2, true, false, "neg");
@@ -2113,7 +2455,7 @@ mod tests {
             }],
             header: None,
         };
-        let (c, bytes_written) = log.log_tx_deferred_offset(&tx3).unwrap();
+        let (c, bytes_written) = log.log_tx_deferred_offset(&tx3, None).unwrap();
         io.wait_for_completion(c).unwrap();
 
         assert_eq!(
@@ -2152,7 +2494,7 @@ mod tests {
         let file = io
             .open_file("corrupt.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
         let mut tx = crate::mvcc::database::LogRecord {
             tx_timestamp: 123,
@@ -2172,7 +2514,7 @@ mod tests {
         io.wait_for_completion(c).unwrap();
 
         // Flip one byte in the op data (varint payload_len).
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
         // After read_header, reader.offset = LOG_HDR_SIZE.
         // Skip frame header (TX_HEADER_SIZE) + fixed op prefix (tag+flags+table_id = 6 bytes).
@@ -2183,7 +2525,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
         let res = reader.next_record(&io, |_id| {
             Err(LimboError::InternalError("no index".to_string()))
@@ -2204,7 +2546,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
         append_single_table_op_tx(&mut log, &io, (-2).into(), 1, 1, false, false, "first");
         let frame2_start = log.offset;
@@ -2257,7 +2599,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
         let res = reader.next_record(&io, |_id| {
             Err(LimboError::InternalError("no index".to_string()))
@@ -2285,7 +2627,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
         let res = reader.next_record(&io, |_id| {
             Err(LimboError::InternalError("no index".to_string()))
@@ -2309,7 +2651,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
         let res = reader.next_record(&io, |_id| {
             Err(LimboError::InternalError("no index".to_string()))
@@ -2332,7 +2674,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
         let res = reader.next_record(&io, |_id| {
             Err(LimboError::InternalError("no index".to_string()))
@@ -2353,7 +2695,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
         append_single_table_op_tx(&mut log, &io, (-2).into(), 1, 10, false, false, "a");
         let after_first = log.offset as usize;
@@ -2395,7 +2737,7 @@ mod tests {
         let file = io
             .open_file("header-corrupt.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
         let tx = crate::mvcc::database::LogRecord {
             tx_timestamp: 77,
             row_versions: vec![],
@@ -2409,7 +2751,7 @@ mod tests {
         let c = file.pwrite(0, bad, Completion::new_write(|_| {})).unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         let res = reader.read_header(&io);
         assert!(res.is_err());
     }
@@ -2432,7 +2774,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         let res = reader.read_header(&io);
         assert!(res.is_err());
     }
@@ -2469,7 +2811,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         let res = reader.read_header(&io);
         assert!(res.is_err());
 
@@ -2489,7 +2831,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file);
+        let mut reader = StreamingLogicalLogReader::new(file, None);
         let result = reader.try_read_header(&io).unwrap();
         assert!(
             matches!(result, HeaderReadResult::Invalid),
@@ -2531,7 +2873,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         let res = reader.read_header(&io);
         assert!(res.is_err());
     }
@@ -2554,7 +2896,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
         let res = reader.next_record(&io, |_id| {
             Err(LimboError::InternalError("no index".to_string()))
@@ -2580,7 +2922,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
         let res = reader.next_record(&io, |_id| {
             Err(LimboError::InternalError("no index".to_string()))
@@ -2600,7 +2942,7 @@ mod tests {
         let file = io
             .open_file("empty-tx.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
         // Frame 1: empty tx (no ops). The reader must skip it silently (ops.is_empty() → continue).
         let tx = crate::mvcc::database::LogRecord {
@@ -2623,7 +2965,7 @@ mod tests {
         let c = log.log_tx(&header_tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
 
         // The reader skips the empty frame and returns the UpdateHeader from frame 2.
@@ -2661,7 +3003,7 @@ mod tests {
         let file = io
             .open_file("bitflip.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
         let mut tx = crate::mvcc::database::LogRecord {
             tx_timestamp: 300,
             row_versions: Vec::new(),
@@ -2698,7 +3040,7 @@ mod tests {
                     .unwrap();
                 io.wait_for_completion(c).unwrap();
 
-                let mut reader = StreamingLogicalLogReader::new(file.clone());
+                let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
                 reader.read_header(&io).unwrap();
                 let res = reader.next_record(&io, |_id| {
                     Err(LimboError::InternalError("no index".to_string()))
@@ -2733,7 +3075,7 @@ mod tests {
         let file = io
             .open_file("roundtrip-rand.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
         let mut expected = Vec::new();
         for tx_i in 0..128u64 {
@@ -2840,7 +3182,7 @@ mod tests {
             Ok(f) => f,
             Err(_) => return false,
         };
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
         let mut expected = Vec::new();
 
         for (idx, (is_delete, rowid, btree_resident)) in events.into_iter().take(64).enumerate() {
@@ -2953,7 +3295,7 @@ mod tests {
         let file = io
             .open_file("btree.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
         let mut tx = crate::mvcc::database::LogRecord {
             tx_timestamp: 55,
@@ -2993,7 +3335,7 @@ mod tests {
             "payload_size at bytes [4..12] must be non-zero for a non-empty op"
         );
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
         let rec = reader
             .next_record(&io, |_id| {
@@ -3017,7 +3359,7 @@ mod tests {
         let file = io
             .open_file("header.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
         let mut tx = crate::mvcc::database::LogRecord {
             tx_timestamp: 10,
@@ -3041,7 +3383,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
         let header = reader.header().unwrap();
         // Verify the on-disk CRC matches a fresh computation over the header bytes
@@ -3085,7 +3427,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
         append_single_table_op_tx(&mut log, &io, (-2).into(), 1, 11, false, false, "foo");
         let c = file
@@ -3097,7 +3439,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file);
+        let mut reader = StreamingLogicalLogReader::new(file, None);
         let result = reader.try_read_header(&io).unwrap();
         assert!(matches!(result, HeaderReadResult::Invalid));
     }
@@ -3112,7 +3454,7 @@ mod tests {
         let file = io
             .open_file("salt-regen.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
         // Write a frame and capture the salt
         append_single_table_op_tx(&mut log, &io, (-2).into(), 1, 10, false, false, "a");
@@ -3131,7 +3473,7 @@ mod tests {
         append_single_table_op_tx(&mut log, &io, (-2).into(), 2, 20, false, false, "b");
 
         // Reader should see only the new frame (old data was truncated)
-        let mut reader = StreamingLogicalLogReader::new(file);
+        let mut reader = StreamingLogicalLogReader::new(file, None);
         assert!(matches!(
             reader.try_read_header(&io).unwrap(),
             HeaderReadResult::Valid(_)
@@ -3164,7 +3506,7 @@ mod tests {
         let file = io
             .open_file("crc-chain.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
         // Write 3 frames
         append_single_table_op_tx(&mut log, &io, (-2).into(), 1, 10, false, false, "aaa");
@@ -3173,7 +3515,7 @@ mod tests {
         append_single_table_op_tx(&mut log, &io, (-2).into(), 3, 30, false, false, "ccc");
 
         // Without corruption, all 3 frames should read back
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         assert!(matches!(
             reader.try_read_header(&io).unwrap(),
             HeaderReadResult::Valid(_)
@@ -3197,7 +3539,7 @@ mod tests {
 
         // Now frame 1 should fail CRC, and frames 2+3 should NOT be returned
         // (chained CRC means the reader stops at the first invalid frame)
-        let mut reader = StreamingLogicalLogReader::new(file);
+        let mut reader = StreamingLogicalLogReader::new(file, None);
         assert!(matches!(
             reader.try_read_header(&io).unwrap(),
             HeaderReadResult::Valid(_)
@@ -3229,7 +3571,7 @@ mod tests {
         let file_a = io
             .open_file("splice-a.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log_a = LogicalLog::new(file_a.clone(), io.clone());
+        let mut log_a = LogicalLog::new(file_a.clone(), io.clone(), None);
         append_single_table_op_tx(&mut log_a, &io, (-2).into(), 1, 10, false, false, "aaa");
         let log_a_end = log_a.offset as usize;
 
@@ -3237,7 +3579,7 @@ mod tests {
         let file_b = io
             .open_file("splice-b.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log_b = LogicalLog::new(file_b.clone(), io.clone());
+        let mut log_b = LogicalLog::new(file_b.clone(), io.clone(), None);
         append_single_table_op_tx(&mut log_b, &io, (-2).into(), 2, 20, false, false, "bbb");
         let log_b_end = log_b.offset as usize;
 
@@ -3272,7 +3614,7 @@ mod tests {
         io.wait_for_completion(c).unwrap();
 
         // Read log A — should get 1 valid frame (A's own), then reject the spliced frame
-        let mut reader = StreamingLogicalLogReader::new(file_a);
+        let mut reader = StreamingLogicalLogReader::new(file_a, None);
         assert!(matches!(
             reader.try_read_header(&io).unwrap(),
             HeaderReadResult::Valid(_)
@@ -3290,6 +3632,320 @@ mod tests {
             other => {
                 panic!("spliced frame from a different log should NOT validate, got {other:?}")
             }
+        }
+    }
+
+    fn test_enc_ctx() -> crate::storage::encryption::EncryptionContext {
+        use crate::storage::encryption::{CipherMode, EncryptionKey};
+        let key = EncryptionKey::Key128([0x42u8; 16]);
+        crate::storage::encryption::EncryptionContext::new(CipherMode::Aes128Gcm, &key, 4096)
+            .unwrap()
+    }
+
+    fn wrong_key_enc_ctx() -> crate::storage::encryption::EncryptionContext {
+        use crate::storage::encryption::{CipherMode, EncryptionKey};
+        let key = EncryptionKey::Key128([0xFFu8; 16]);
+        crate::storage::encryption::EncryptionContext::new(CipherMode::Aes128Gcm, &key, 4096)
+            .unwrap()
+    }
+
+    fn make_test_row_version(
+        table_id: MVTableId,
+        rowid: i64,
+        value: &str,
+        commit_ts: u64,
+    ) -> crate::mvcc::database::RowVersion {
+        let row = generate_simple_string_row(table_id, rowid, value);
+        crate::mvcc::database::RowVersion {
+            id: rowid as u64,
+            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts)),
+            end: None,
+            row,
+            btree_resident: false,
+        }
+    }
+
+    /// Write an encrypted frame, verify the on-disk layout invariant
+    /// (blob = plaintext + tag_size + nonce_size), then read back and
+    /// verify roundtrip correctness with multiple ops.
+    #[test]
+    fn test_encrypted_log_roundtrip_and_layout() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("enc-roundtrip.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let table_id: MVTableId = (-2).into();
+        let enc_ctx = test_enc_ctx();
+        let tag_size = enc_ctx.tag_size();
+        let nonce_size = enc_ctx.nonce_size();
+
+        // Write one encrypted frame with 2 ops.
+        let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
+        let tx = crate::mvcc::database::LogRecord {
+            tx_timestamp: 100,
+            row_versions: vec![
+                make_test_row_version(table_id, 1, "hello", 100),
+                make_test_row_version(table_id, 2, "world", 100),
+            ],
+            header: None,
+        };
+        let c = log.log_tx(&tx).unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        // ── Layout invariant check ──
+        // Read the raw TX header to extract payload_size.
+        let frame_hdr_buf = Arc::new(Buffer::new_temporary(TX_HEADER_SIZE));
+        let frame_hdr_out = Arc::new(crate::sync::RwLock::new(Vec::new()));
+        let out = frame_hdr_out.clone();
+        let c = Completion::new_read(
+            frame_hdr_buf,
+            Box::new(
+                move |res: std::result::Result<(Arc<Buffer>, i32), crate::CompletionError>| {
+                    let Ok((buf, n)) = res else { return None };
+                    out.write().extend_from_slice(&buf.as_slice()[..n as usize]);
+                    None
+                },
+            ),
+        );
+        let c = file.pread(LOG_HDR_SIZE as u64, c).unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        let frame_hdr = frame_hdr_out.read();
+        assert_eq!(frame_hdr.len(), TX_HEADER_SIZE);
+        let payload_size = u64::from_le_bytes(frame_hdr[4..12].try_into().unwrap()) as usize;
+
+        let file_size = file.size().unwrap() as usize;
+        let encrypted_blob_size = file_size - LOG_HDR_SIZE - TX_HEADER_SIZE - TX_TRAILER_SIZE;
+        assert_eq!(
+            encrypted_blob_size,
+            payload_size + tag_size + nonce_size,
+            "on-disk blob size ({encrypted_blob_size}) != \
+             payload_size({payload_size}) + tag_size({tag_size}) + nonce_size({nonce_size})"
+        );
+
+        // ── Roundtrip read ──
+        let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
+        reader.read_header(&io).unwrap();
+
+        let ops = match reader.parse_next_transaction(&io).unwrap() {
+            ParseResult::Ops(ops) => ops,
+            other => panic!("expected Ops, got {other:?}"),
+        };
+        assert_eq!(ops.len(), 2);
+
+        match &ops[0] {
+            super::ParsedOp::UpsertTable { rowid, .. } => {
+                assert_eq!(rowid.row_id, RowKey::Int(1));
+            }
+            other => panic!("expected UpsertTable, got {other:?}"),
+        }
+        match &ops[1] {
+            super::ParsedOp::UpsertTable { rowid, .. } => {
+                assert_eq!(rowid.row_id, RowKey::Int(2));
+            }
+            other => panic!("expected UpsertTable, got {other:?}"),
+        }
+
+        assert!(matches!(
+            reader.parse_next_transaction(&io).unwrap(),
+            ParseResult::Eof
+        ));
+    }
+
+    #[test]
+    fn test_encrypted_log_multiple_frames_crc_chain() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("enc-multi.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let table_id: MVTableId = (-2).into();
+        let enc_ctx = test_enc_ctx();
+
+        let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
+        for i in 0..5u64 {
+            let tx = crate::mvcc::database::LogRecord {
+                tx_timestamp: 100 + i,
+                row_versions: vec![make_test_row_version(
+                    table_id,
+                    i as i64,
+                    &format!("val_{i}"),
+                    100 + i,
+                )],
+                header: None,
+            };
+            let c = log.log_tx(&tx).unwrap();
+            io.wait_for_completion(c).unwrap();
+        }
+
+        let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
+        reader.read_header(&io).unwrap();
+
+        for i in 0..5u64 {
+            let ops = match reader.parse_next_transaction(&io).unwrap() {
+                ParseResult::Ops(ops) => ops,
+                other => panic!("frame {i}: expected Ops, got {other:?}"),
+            };
+            assert_eq!(ops.len(), 1, "frame {i}");
+            match &ops[0] {
+                super::ParsedOp::UpsertTable {
+                    rowid, commit_ts, ..
+                } => {
+                    assert_eq!(rowid.row_id, RowKey::Int(i as i64));
+                    assert_eq!(*commit_ts, 100 + i);
+                }
+                other => panic!("frame {i}: expected UpsertTable, got {other:?}"),
+            }
+        }
+
+        assert!(matches!(
+            reader.parse_next_transaction(&io).unwrap(),
+            ParseResult::Eof
+        ));
+    }
+
+    /// AEAD integrity: wrong key and tampered ciphertext must both be rejected.
+    #[test]
+    fn test_encrypted_log_integrity_rejection() {
+        init_tracing();
+        let table_id: MVTableId = (-2).into();
+        let enc_ctx = test_enc_ctx();
+
+        // ── Wrong key ──
+        {
+            let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+            let file = io
+                .open_file("enc-wrongkey.db-log", OpenFlags::Create, false)
+                .unwrap();
+
+            let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
+            let tx = crate::mvcc::database::LogRecord {
+                tx_timestamp: 100,
+                row_versions: vec![make_test_row_version(table_id, 1, "secret", 100)],
+                header: None,
+            };
+            let c = log.log_tx(&tx).unwrap();
+            io.wait_for_completion(c).unwrap();
+
+            let mut reader = StreamingLogicalLogReader::new(file, Some(wrong_key_enc_ctx()));
+            reader.read_header(&io).unwrap();
+
+            match reader.parse_next_transaction(&io).unwrap() {
+                ParseResult::InvalidFrame => {}
+                other => panic!("expected InvalidFrame with wrong key, got {other:?}"),
+            }
+        }
+
+        // ── Tampered TX header (commit_ts) ──
+        // commit_ts is part of the AAD, so flipping a byte in it causes AEAD
+        // decryption to fail even though the ciphertext itself is untouched.
+        {
+            let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+            let file = io
+                .open_file("enc-hdr-tamper.db-log", OpenFlags::Create, false)
+                .unwrap();
+
+            let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
+            let tx = crate::mvcc::database::LogRecord {
+                tx_timestamp: 100,
+                row_versions: vec![make_test_row_version(table_id, 1, "hdr_tamper", 100)],
+                header: None,
+            };
+            let c = log.log_tx(&tx).unwrap();
+            io.wait_for_completion(c).unwrap();
+
+            // Flip a byte in the commit_ts field (TX header offset 16..24, file offset = LOG_HDR + 16).
+            let corrupt_offset = (LOG_HDR_SIZE + 16) as u64;
+            let byte_buf = Arc::new(Buffer::new(vec![0xFF]));
+            let c = Completion::new_write(move |_| {});
+            io.wait_for_completion(file.pwrite(corrupt_offset, byte_buf, c).unwrap())
+                .unwrap();
+
+            let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx.clone()));
+            reader.read_header(&io).unwrap();
+
+            match reader.parse_next_transaction(&io).unwrap() {
+                ParseResult::InvalidFrame => {}
+                other => panic!("expected InvalidFrame after TX header tamper, got {other:?}"),
+            }
+        }
+
+        // ── Tampered ciphertext ──
+        {
+            let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+            let file = io
+                .open_file("enc-tamper.db-log", OpenFlags::Create, false)
+                .unwrap();
+
+            let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
+            let tx = crate::mvcc::database::LogRecord {
+                tx_timestamp: 100,
+                row_versions: vec![make_test_row_version(table_id, 1, "tamper_me", 100)],
+                header: None,
+            };
+            let c = log.log_tx(&tx).unwrap();
+            io.wait_for_completion(c).unwrap();
+
+            // Flip a byte in the ciphertext (after log header + TX header).
+            let corrupt_offset = (LOG_HDR_SIZE + TX_HEADER_SIZE + 1) as u64;
+            let byte_buf = Arc::new(Buffer::new(vec![0xFF]));
+            let c = Completion::new_write(move |_| {});
+            io.wait_for_completion(file.pwrite(corrupt_offset, byte_buf, c).unwrap())
+                .unwrap();
+
+            let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
+            reader.read_header(&io).unwrap();
+
+            match reader.parse_next_transaction(&io).unwrap() {
+                ParseResult::InvalidFrame => {}
+                other => panic!("expected InvalidFrame after ciphertext tamper, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_encrypted_log_torn_tail_rejected() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("enc-torn.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let table_id: MVTableId = (-2).into();
+        let enc_ctx = test_enc_ctx();
+
+        // Write 2 frames.
+        let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
+        for i in 0..2u64 {
+            let tx = crate::mvcc::database::LogRecord {
+                tx_timestamp: 100 + i,
+                row_versions: vec![make_test_row_version(table_id, i as i64, "data", 100 + i)],
+                header: None,
+            };
+            let c = log.log_tx(&tx).unwrap();
+            io.wait_for_completion(c).unwrap();
+        }
+
+        // Truncate mid-way through the second frame.
+        let file_size = file.size().unwrap();
+        let truncate_at = file_size - 5; // remove last 5 bytes
+        let c = Completion::new_trunc(|_| {});
+        io.wait_for_completion(file.truncate(truncate_at, c).unwrap())
+            .unwrap();
+
+        let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
+        reader.read_header(&io).unwrap();
+
+        // First frame should parse fine.
+        match reader.parse_next_transaction(&io).unwrap() {
+            ParseResult::Ops(ops) => assert_eq!(ops.len(), 1),
+            other => panic!("expected Ops for frame 1, got {other:?}"),
+        }
+
+        // Second frame is torn — should be EOF.
+        match reader.parse_next_transaction(&io).unwrap() {
+            ParseResult::Eof => {}
+            other => panic!("expected Eof for torn frame 2, got {other:?}"),
         }
     }
 }

@@ -1,6 +1,7 @@
 use crate::translate::expression_index::expression_index_column_usage;
+use crate::translate::plan::MultiIndexBranchAccess;
 use crate::{
-    function::Deterministic,
+    function::{AggFunc, Deterministic},
     index_method::IndexMethodCostEstimate,
     numeric::Numeric,
     schema::{BTreeTable, Index, IndexColumn, Schema, Table, ROWID_SENTINEL},
@@ -8,8 +9,11 @@ use crate::{
         insert::ROWID_COLUMN,
         optimizer::{
             access_method::AccessMethodParams,
-            constraints::{RangeConstraintRef, SeekRangeConstraint, TableConstraints},
+            constraints::{
+                ConstraintUseCandidate, RangeConstraintRef, SeekRangeConstraint, TableConstraints,
+            },
             cost::RowCountEstimate,
+            multi_index::MultiIndexBranchAccessParams,
             order::{ColumnTarget, OrderTarget},
         },
         plan::{
@@ -36,20 +40,25 @@ use constraints::{
     ConstraintOperator, ConstraintRef,
 };
 use cost::Cost;
-use join::{compute_best_join_order, BestJoinOrderResult};
+use join::{compute_best_join_order_with_context, BestJoinOrderResult, JoinPlanningContext};
 use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
-use order::{compute_order_target, plan_satisfies_order_target, EliminatesSortBy};
+use order::{
+    compute_order_target, plan_satisfies_order_target, simple_aggregate_order_target,
+    EliminatesSortBy, OrderTargetPurpose,
+};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
-use turso_parser::ast::{self, Expr, SortOrder, TriggerEvent};
+use turso_parser::ast::{self, Expr, SortOrder, SubqueryType, TriggerEvent};
 
 use super::{
+    collate::get_collseq_from_expr,
     emitter::Resolver,
     plan::{
-        DeletePlan, GroupBy, IterationDirection, JoinOrderMember, JoinType, JoinedTable,
-        MultiIndexBranch, MultiIndexScanOp, Operation, Plan, Search, SeekDef, SeekKey, SelectPlan,
-        TableReferences, UpdatePlan, WhereTerm,
+        DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinOrderMember, JoinType,
+        JoinedTable, MinMaxDef, MultiIndexBranch, MultiIndexScanOp, Operation, Plan, Search,
+        SeekDef, SeekKey, SelectPlan, SetOperation, SimpleAggregate, TableReferences, UpdatePlan,
+        WhereTerm,
     },
     planner::TableMask,
 };
@@ -60,6 +69,7 @@ pub(crate) mod cost;
 mod cost_params;
 pub(crate) mod join;
 pub(crate) mod lift_common_subexpressions;
+pub(crate) mod multi_index;
 pub(crate) mod order;
 pub(crate) mod unnest;
 
@@ -440,10 +450,40 @@ pub fn optimize_plan(
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 /// Transform MATCH expressions to fts_match() function calls.
-fn transform_match_to_fts_match(where_clause: &mut [WhereTerm]) {
-    use super::ast::{FunctionTail, LikeOperator, Name};
+fn transform_match_to_fts_match(
+    where_clause: &mut [WhereTerm],
+    schema: &Schema,
+    table_references: &TableReferences,
+) -> Result<()> {
+    use super::ast::{FunctionTail, LikeOperator, Name, TableInternalId};
     use super::expr::{walk_expr_mut, WalkControl};
 
+    // Helper to extract table ID from a column expression
+    fn get_table_id_from_expr(expr: &Expr) -> Option<TableInternalId> {
+        match expr {
+            Expr::Column { table, .. } => Some(*table),
+            Expr::Parenthesized(exprs) if !exprs.is_empty() => get_table_id_from_expr(&exprs[0]),
+            _ => None,
+        }
+    }
+
+    // Helper to check if a table has an FTS index by its internal ID
+    let table_has_fts_index = |table_id: TableInternalId| -> bool {
+        table_references
+            .joined_tables()
+            .iter()
+            .find(|t| t.internal_id == table_id)
+            .and_then(|t| {
+                if let Table::BTree(btree) = &t.table {
+                    Some(schema.has_fts_index(&btree.name))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(false)
+    };
+
+    let mut match_without_fts = false;
     for term in where_clause.iter_mut() {
         let _ = walk_expr_mut(&mut term.expr, &mut |e: &mut Expr| -> Result<WalkControl> {
             match e {
@@ -454,6 +494,15 @@ fn transform_match_to_fts_match(where_clause: &mut [WhereTerm]) {
                     rhs,
                     escape: _,
                 } => {
+                    // Check if the specific table referenced by this MATCH has an FTS index
+                    let has_fts = get_table_id_from_expr(lhs).is_some_and(table_has_fts_index);
+
+                    if !has_fts {
+                        match_without_fts = true;
+                        // Don't transform, we'll error after the walk
+                        return Ok(WalkControl::SkipChildren);
+                    }
+
                     // Transform MATCH to fts_match():
                     // - `col MATCH 'query'` -> `fts_match(col, 'query')`
                     // - `(col1, col2) MATCH 'query'` -> `fts_match(col1, col2, 'query')`
@@ -485,6 +534,85 @@ fn transform_match_to_fts_match(where_clause: &mut [WhereTerm]) {
             }
         });
     }
+
+    if match_without_fts {
+        return Err(LimboError::ParseError(
+            "unable to use function MATCH in the requested context".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Detect whether this plan qualifies for the simple-aggregate fast path.
+///
+/// Analogous to SQLite's `isSimpleCount()` + `minMaxQuery()`.
+/// Must be called before `optimize_table_access` so the order target is available.
+fn detect_simple_aggregate(plan: &SelectPlan) -> Option<SimpleAggregate> {
+    // Common preconditions shared by count(*) and min/max.
+    if plan.aggregates.len() != 1
+        || plan.table_references.joined_tables().len() != 1
+        || plan.result_columns.len() != 1
+        || plan.group_by.is_some()
+        || plan.contains_constant_false_condition
+    {
+        return None;
+    }
+
+    let table_ref = plan.table_references.joined_tables().first().unwrap();
+    let agg = plan.aggregates.first().unwrap();
+    let result_expr = &plan.result_columns.first().unwrap().expr;
+
+    // The result column must be exactly the aggregate expression (not wrapped in
+    // something like `length(count(*))`).
+    if !exprs_are_equivalent(result_expr, &agg.original_expr) {
+        return None;
+    }
+
+    match agg.func {
+        AggFunc::Count0
+            if matches!(table_ref.table, Table::BTree(..))
+                && plan.table_references.outer_query_refs().is_empty()
+                && plan.where_clause.is_empty()
+                && plan.limit.is_none()
+                && plan.offset.is_none() =>
+        {
+            Some(SimpleAggregate::Count)
+        }
+        AggFunc::Min | AggFunc::Max
+            if agg.args.len() == 1
+                && matches!(
+                    table_ref.table,
+                    Table::BTree(..) | Table::FromClauseSubquery(..)
+                ) =>
+        {
+            // Unlike COUNT(*), MIN/MAX may still use the fast path with a
+            // WHERE clause as long as the chosen access path can walk directly
+            // to the first qualifying extremum row.
+            let argument = agg.args[0].clone();
+            let order = if matches!(agg.func, AggFunc::Min) {
+                SortOrder::Asc
+            } else {
+                SortOrder::Desc
+            };
+            let collation = get_collseq_from_expr(&argument, &plan.table_references)
+                .ok()
+                .flatten();
+            Some(SimpleAggregate::MinMax(Box::new(MinMaxDef {
+                func: agg.func.clone(),
+                argument,
+                order,
+                collation,
+            })))
+        }
+        _ => None,
+    }
+}
+
+struct OptimizeTableAccessResult {
+    join_order: Vec<JoinOrderMember>,
+    output_rows: f64,
+    min_max_fast_path: bool,
 }
 
 /**
@@ -495,7 +623,7 @@ fn transform_match_to_fts_match(where_clause: &mut [WhereTerm]) {
 pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
     // Transform MATCH expressions to fts_match() for FTS optimizer recognition
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-    transform_match_to_fts_match(&mut plan.where_clause);
+    transform_match_to_fts_match(&mut plan.where_clause, schema, &plan.table_references)?;
 
     unnest::unnest_exists_subqueries(plan)?;
     // EXISTS only needs 1 row. Add LIMIT 1 to surviving (non-unnested) EXISTS
@@ -521,6 +649,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
         return Ok(());
     }
 
+    plan.simple_aggregate = detect_simple_aggregate(plan);
     let best_join_order = optimize_table_access(
         schema,
         &mut plan.result_columns,
@@ -529,13 +658,28 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
         &mut plan.where_clause,
         &mut plan.order_by,
         &mut plan.group_by,
+        plan.simple_aggregate.as_ref(),
         &plan.non_from_clause_subqueries,
         &mut plan.limit,
         &mut plan.offset,
+        plan.input_cardinality_hint.unwrap_or(1.0),
     )?;
 
-    if let Some((best_join_order, output_rows)) = best_join_order {
-        plan.join_order = best_join_order;
+    if matches!(plan.simple_aggregate, Some(SimpleAggregate::MinMax(_)))
+        && !best_join_order
+            .as_ref()
+            .is_some_and(|result| result.min_max_fast_path)
+    {
+        plan.simple_aggregate = None;
+    }
+
+    if let Some(OptimizeTableAccessResult {
+        join_order,
+        output_rows,
+        ..
+    }) = best_join_order
+    {
+        plan.join_order = join_order;
         let mut est = output_rows;
         // Clamp to LIMIT when it's a literal non-negative number.
         // Negative LIMIT means "no limit" in SQLite, so we skip those.
@@ -561,12 +705,14 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
         plan.estimated_output_rows = Some(est);
     }
 
+    reoptimize_correlated_subqueries(plan, schema)?;
+
     Ok(())
 }
 
 fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-    transform_match_to_fts_match(&mut plan.where_clause);
+    transform_match_to_fts_match(&mut plan.where_clause, schema, &plan.table_references)?;
 
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
@@ -588,9 +734,11 @@ fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
         &mut plan.where_clause,
         &mut plan.order_by,
         &mut None,
+        None,
         &plan.non_from_clause_subqueries,
         &mut plan.limit,
         &mut plan.offset,
+        1.0,
     )?;
 
     Ok(())
@@ -603,7 +751,7 @@ fn optimize_update_plan(
 ) -> Result<()> {
     let schema = resolver.schema();
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-    transform_match_to_fts_match(&mut plan.where_clause);
+    transform_match_to_fts_match(&mut plan.where_clause, schema, &plan.table_references)?;
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
@@ -619,9 +767,11 @@ fn optimize_update_plan(
         &mut plan.where_clause,
         &mut plan.order_by,
         &mut None,
+        None,
         &plan.non_from_clause_subqueries,
         &mut plan.limit,
         &mut plan.offset,
+        1.0,
     )?;
 
     if let Some(reason) = first_update_safety_reason(plan, resolver)? {
@@ -780,6 +930,7 @@ fn add_ephemeral_table_to_update_plan(
         unique_sets: vec![],
         foreign_keys: vec![],
         check_constraints: vec![],
+        rowid_alias_conflict_clause: None,
     });
 
     let temp_cursor_id = program.alloc_cursor_id_keyed(
@@ -802,6 +953,7 @@ fn add_ephemeral_table_to_update_plan(
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: 0,
+            indexed: None,
         }],
         vec![],
     );
@@ -878,6 +1030,7 @@ fn add_ephemeral_table_to_update_plan(
         distinctness: super::plan::Distinctness::NonDistinct,
         values: vec![],
         window: None,
+        input_cardinality_hint: None,
         estimated_output_rows: None,
         // Only move WHERE clause subqueries to the ephemeral plan.
         // SET clause and RETURNING clause subqueries must remain in the main update plan
@@ -898,6 +1051,7 @@ fn add_ephemeral_table_to_update_plan(
             plan.non_from_clause_subqueries = remaining;
             ephemeral_subs
         },
+        simple_aggregate: None,
     };
 
     plan.ephemeral_plan = Some(ephemeral_plan);
@@ -934,6 +1088,79 @@ fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Re-run correlated subqueries once the enclosing plan has learned a better
+/// estimate for how many times they will be invoked.
+///
+/// This converges because `input_cardinality_hint` is monotonic within one
+/// optimization pass: once a plan receives a hint, later re-entry compares
+/// against that stored hint and skips re-optimization unless the new hint is
+/// strictly larger. The recursive call therefore only propagates larger hints
+/// down the subquery tree; it does not oscillate based on newly estimated row
+/// counts.
+fn reoptimize_correlated_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
+    let Some(invocation_hint) = plan
+        .input_cardinality_hint
+        .or(plan.estimated_output_rows)
+        .filter(|hint| *hint > 1.0)
+    else {
+        return Ok(());
+    };
+
+    for subquery in &mut plan.non_from_clause_subqueries {
+        if !subquery.correlated {
+            continue;
+        }
+        let SubqueryState::Unevaluated {
+            plan: Some(inner_plan),
+        } = &mut subquery.state
+        else {
+            continue;
+        };
+        if !select_plan_contains_cte_from_clause_subquery(inner_plan) {
+            continue;
+        }
+
+        if inner_plan
+            .input_cardinality_hint
+            .is_some_and(|hint| hint >= invocation_hint)
+        {
+            continue;
+        }
+
+        inner_plan.input_cardinality_hint = Some(invocation_hint);
+        optimize_select_plan(inner_plan, schema)?;
+    }
+
+    Ok(())
+}
+
+/// Return whether this plan contains any FROM-clause CTE reference whose
+/// access-path choice may change when the enclosing invocation count grows.
+fn select_plan_contains_cte_from_clause_subquery(plan: &SelectPlan) -> bool {
+    plan.table_references
+        .joined_tables()
+        .iter()
+        .any(|table| match &table.table {
+            Table::FromClauseSubquery(subquery) => {
+                subquery.cte_id().is_some()
+                    || match subquery.plan.as_ref() {
+                        Plan::Select(select_plan) => {
+                            select_plan_contains_cte_from_clause_subquery(select_plan)
+                        }
+                        Plan::CompoundSelect {
+                            left, right_most, ..
+                        } => {
+                            left.iter().any(|(select_plan, _)| {
+                                select_plan_contains_cte_from_clause_subquery(select_plan)
+                            }) || select_plan_contains_cte_from_clause_subquery(right_most)
+                        }
+                        Plan::Delete(_) | Plan::Update(_) => false,
+                    }
+            }
+            _ => false,
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1261,6 +1488,60 @@ fn expr_has_null_masking_for_table(expr: &ast::Expr, table_id: ast::TableInterna
     found
 }
 
+/// Enforce INDEXED BY / NOT INDEXED hints by validating index existence and
+/// filtering constraint candidates accordingly.
+fn enforce_indexed_by_hints(
+    table_references: &TableReferences,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    constraints_per_table: &mut [TableConstraints],
+) -> Result<()> {
+    for (i, table_ref) in table_references.joined_tables().iter().enumerate() {
+        let Some(ref indexed) = table_ref.indexed else {
+            continue;
+        };
+        let Some(btree) = table_ref.btree() else {
+            continue;
+        };
+        let Some(cs) = constraints_per_table.get_mut(i) else {
+            continue;
+        };
+        match indexed {
+            ast::Indexed::IndexedBy(name) => {
+                let idx_name = name.as_str();
+                // Verify the index exists and belongs to this table.
+                let forced_index = available_indexes.get(&btree.name).and_then(|indexes| {
+                    indexes.iter().find(|idx| {
+                        idx.name.eq_ignore_ascii_case(idx_name) && idx.index_method.is_none()
+                    })
+                });
+                let Some(forced_index) = forced_index else {
+                    crate::bail_parse_error!("no such index: {}", idx_name);
+                };
+                // Keep only the candidate for the forced index.
+                let forced_index = forced_index.clone();
+                cs.candidates.retain(|c| {
+                    c.index
+                        .as_ref()
+                        .is_some_and(|idx| Arc::ptr_eq(idx, &forced_index))
+                });
+                // If no candidate survived (no WHERE constraints matched), add an empty one
+                // so the optimizer can still scan the index.
+                if cs.candidates.is_empty() {
+                    cs.candidates.push(ConstraintUseCandidate {
+                        index: Some(forced_index),
+                        refs: Vec::new(),
+                    });
+                }
+            }
+            ast::Indexed::NotIndexed => {
+                // Remove all secondary index candidates, keep only rowid.
+                cs.candidates.retain(|c| c.index.is_none());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Optimize the join order and index selection for a query.
 ///
 /// This function does the following:
@@ -1281,10 +1562,12 @@ fn optimize_table_access(
     where_clause: &mut [WhereTerm],
     order_by: &mut Vec<(Box<ast::Expr>, SortOrder)>,
     group_by: &mut Option<GroupBy>,
+    simple_aggregate: Option<&SimpleAggregate>,
     subqueries: &[NonFromClauseSubquery],
     limit: &mut Option<Box<Expr>>,
     offset: &mut Option<Box<Expr>>,
-) -> Result<Option<(Vec<JoinOrderMember>, f64)>> {
+    initial_input_cardinality: f64,
+) -> Result<Option<OptimizeTableAccessResult>> {
     // When optimizer_params feature is enabled, use lazily-loaded params (cached process-wide).
     // Otherwise, use the compile-time static for zero overhead.
     #[cfg(feature = "optimizer_params")]
@@ -1319,8 +1602,13 @@ fn optimize_table_access(
 
     // For single-table queries, try to optimize with custom index methods directly.
     // This is the fast path that preserves the original behavior.
+    // Skip when INDEXED BY / NOT INDEXED is specified — those force a specific btree index or table scan.
     let is_single_table = table_references.joined_tables().len() == 1;
-    if is_single_table {
+    let has_indexed_by_hint = table_references
+        .joined_tables()
+        .iter()
+        .any(|t| t.indexed.is_some());
+    if is_single_table && !has_indexed_by_hint {
         let optimized = optimize_table_access_with_custom_modules(
             result_columns,
             table_references,
@@ -1361,7 +1649,9 @@ fn optimize_table_access(
     } else {
         Vec::new()
     };
-    let maybe_order_target = compute_order_target(order_by, group_by.as_mut(), table_references);
+    let maybe_order_target = simple_aggregate
+        .and_then(|sa| simple_aggregate_order_target(sa, table_references))
+        .or_else(|| compute_order_target(order_by, group_by.as_mut(), table_references));
     let mut constraints_per_table = constraints_from_where_clause(
         where_clause,
         table_references,
@@ -1369,6 +1659,13 @@ fn optimize_table_access(
         subqueries,
         schema,
         params,
+    )?;
+
+    // Enforce INDEXED BY / NOT INDEXED hints on constraint candidates.
+    enforce_indexed_by_hints(
+        table_references,
+        available_indexes,
+        &mut constraints_per_table,
     )?;
 
     let base_table_rows = table_references
@@ -1442,11 +1739,21 @@ fn optimize_table_access(
             schema,
             params,
         )?;
+        enforce_indexed_by_hints(
+            table_references,
+            available_indexes,
+            &mut constraints_per_table,
+        )?;
     }
 
-    let Some(best_join_order_result) = compute_best_join_order(
+    let planning_context = JoinPlanningContext {
+        maybe_order_target: maybe_order_target.as_ref(),
+    };
+
+    let Some(best_join_order_result) = compute_best_join_order_with_context(
         table_references.joined_tables(),
-        maybe_order_target.as_ref(),
+        initial_input_cardinality,
+        planning_context,
         &constraints_per_table,
         &base_table_rows,
         &mut access_methods_arena,
@@ -1498,17 +1805,22 @@ fn optimize_table_access(
             schema,
         );
         if satisfies_order_target {
-            match order_target.1 {
-                EliminatesSortBy::Group => {
-                    let _ = group_by.as_mut().and_then(|g| g.sort_order.take());
+            match &order_target.purpose {
+                OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Group) => {
+                    if let Some(g) = group_by.as_mut() {
+                        g.sort_elided = true;
+                    }
                 }
-                EliminatesSortBy::Order => {
+                OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order) => {
                     order_by.clear();
                 }
-                EliminatesSortBy::GroupByAndOrder => {
-                    let _ = group_by.as_mut().and_then(|g| g.sort_order.take());
+                OrderTargetPurpose::EliminatesSort(EliminatesSortBy::GroupByAndOrder) => {
+                    if let Some(g) = group_by.as_mut() {
+                        g.sort_elided = true;
+                    }
                     order_by.clear();
                 }
+                OrderTargetPurpose::Extremum => {}
             }
         }
         sort_eliminated = satisfies_order_target;
@@ -1794,9 +2106,10 @@ fn optimize_table_access(
                         {"constraint_refs": format!("{constraint_refs:?}")}
                     );
                     table_references.joined_tables_mut()[table_idx].op =
-                        if let Some(eq) = constraint_refs[0].eq {
+                        if let Some(ref eq) = constraint_refs[0].eq {
                             Operation::Search(Search::RowidEq {
-                                cmp_expr: constraints_per_table[table_idx].constraints[eq]
+                                cmp_expr: constraints_per_table[table_idx].constraints
+                                    [eq.constraint_pos]
                                     .get_constraining_expr(where_clause, Some(table_references))
                                     .1,
                             })
@@ -1830,33 +2143,35 @@ fn optimize_table_access(
                     Some(table_references),
                 )?;
             }
-            AccessMethodParams::Subquery => {
+            AccessMethodParams::Subquery { iter_dir } => {
                 table_references.joined_tables_mut()[table_idx].op =
-                    Operation::Scan(Scan::Subquery);
+                    Operation::Scan(Scan::Subquery {
+                        iter_dir: *iter_dir,
+                    });
             }
             AccessMethodParams::MaterializedSubquery {
                 index,
                 constraint_refs,
+                iter_dir,
             } => {
-                // Mark constraints as consumed
-                // RangeConstraintRef.eq contains the position in the constraints array for equality constraints
                 let table_constraints = constraints_per_table
                     .iter()
                     .find(|c| c.table_id == table_references.joined_tables()[table_idx].internal_id)
                     .expect("should have constraints for this table");
 
-                for cref in constraint_refs.iter() {
-                    if let Some(eq_pos) = cref.eq {
-                        let constraint = &table_constraints.constraints[eq_pos];
-                        where_clause[constraint.where_clause_pos.0].consumed = true;
-                    }
-                }
+                mark_seek_constraints_consumed(
+                    &table_constraints.constraints,
+                    constraint_refs,
+                    where_clause,
+                    false,
+                    false,
+                );
 
                 // Build seek definition from the constraints
                 let seek_def = build_seek_def_from_constraints(
                     &table_constraints.constraints,
                     constraint_refs,
-                    IterationDirection::Forwards,
+                    *iter_dir,
                     where_clause,
                     Some(table_references),
                 )?;
@@ -1908,41 +2223,87 @@ fn optimize_table_access(
                 branches,
                 where_term_idx,
                 set_op,
-                additional_consumed_terms,
-                estimated_rows_per_outer_row: _,
             } => {
                 // Mark the primary WHERE clause term as consumed
                 where_clause[*where_term_idx].consumed = true;
                 // For intersection, also mark additional consumed terms
-                for term_idx in additional_consumed_terms.iter() {
-                    where_clause[*term_idx].consumed = true;
+                if let SetOperation::Intersection {
+                    additional_consumed_terms,
+                } = set_op
+                {
+                    for term_idx in additional_consumed_terms.iter() {
+                        where_clause[*term_idx].consumed = true;
+                    }
                 }
 
+                let w_idx = *where_term_idx;
+                let s_op = set_op.clone();
                 // Build the MultiIndexScanOp from the branch parameters
-                let mut multi_idx_branches: Vec<MultiIndexBranch> = Vec::new();
-                for branch in branches.iter() {
-                    // Build seek_def from constraint_refs using the branch's own constraint
-                    // (not constraints_per_table, since the branch constraint was created separately)
-                    let seek_def = build_seek_def_from_constraints(
-                        &[branch.constraint.clone()],
-                        &branch.constraint_refs,
-                        IterationDirection::Forwards, // Multi-index always scans forward
-                        where_clause,
-                        Some(table_references),
-                    )?;
+                let mut multi_idx_branches = Vec::with_capacity(branches.len());
+                for branch in std::mem::take(branches) {
+                    let access = match branch.access {
+                        MultiIndexBranchAccessParams::Seek {
+                            constraints,
+                            constraint_refs,
+                        } => MultiIndexBranchAccess::Seek {
+                            seek_def: build_seek_def_from_constraints(
+                                &constraints,
+                                &constraint_refs,
+                                IterationDirection::Forwards, // Multi-index always scans forward
+                                where_clause,
+                                Some(table_references),
+                            )?,
+                        },
+                        MultiIndexBranchAccessParams::InSeek { source } => {
+                            MultiIndexBranchAccess::InSeek { source }
+                        }
+                    };
                     multi_idx_branches.push(MultiIndexBranch {
-                        index: branch.index.clone(),
-                        seek_def,
+                        index: branch.index,
+                        access,
                         estimated_rows: branch.estimated_rows,
+                        union_residuals: branch.residuals,
                     });
                 }
 
                 table_references.joined_tables_mut()[table_idx].op =
                     Operation::MultiIndexScan(MultiIndexScanOp {
                         branches: multi_idx_branches,
-                        where_term_idx: *where_term_idx,
-                        set_op: *set_op,
-                        additional_consumed_terms: additional_consumed_terms.clone(),
+                        where_term_idx: w_idx,
+                        set_op: s_op,
+                    });
+            }
+            AccessMethodParams::InSeek {
+                index,
+                affinity,
+                where_term_idx,
+            } => {
+                let source = match &where_clause[*where_term_idx].expr {
+                    Expr::InList { rhs, .. } => {
+                        let in_values: Vec<ast::Expr> = rhs.iter().map(|e| *e.clone()).collect();
+                        InSeekSource::LiteralList {
+                            values: in_values,
+                            affinity: *affinity,
+                        }
+                    }
+                    Expr::SubqueryResult {
+                        query_type: SubqueryType::In { cursor_id, .. },
+                        ..
+                    } => InSeekSource::Subquery {
+                        cursor_id: *cursor_id,
+                    },
+                    _ => {
+                        return Err(crate::LimboError::InternalError(
+                            "InSeek where term is not an InList or SubqueryResult expression"
+                                .into(),
+                        ));
+                    }
+                };
+                where_clause[*where_term_idx].consumed = true;
+                table_references.joined_tables_mut()[table_idx].op =
+                    Operation::Search(Search::InSeek {
+                        index: index.clone(),
+                        source,
                     });
             }
         }
@@ -2007,7 +2368,12 @@ fn optimize_table_access(
         }
     }
 
-    Ok(Some((best_join_order, final_output_cardinality)))
+    Ok(Some(OptimizeTableAccessResult {
+        join_order: best_join_order,
+        output_rows: final_output_cardinality,
+        min_max_fast_path: matches!(simple_aggregate, Some(SimpleAggregate::MinMax(_)))
+            && sort_eliminated,
+    }))
 }
 
 fn build_vtab_scan_op(
@@ -2099,9 +2465,13 @@ fn mark_seek_constraints_consumed(
     defer_cross_table: bool,
 ) {
     for cref in constraint_refs.iter() {
-        for pos in &[cref.eq, cref.lower_bound, cref.upper_bound] {
+        for pos in [
+            cref.eq.as_ref().map(|e| e.constraint_pos),
+            cref.lower_bound,
+            cref.upper_bound,
+        ] {
             let Some(pos) = pos else { continue };
-            let constraint = &constraints[*pos];
+            let constraint = &constraints[pos];
             let where_term = &mut where_clause[constraint.where_clause_pos.0];
             if where_term.consumed {
                 continue;
@@ -2167,7 +2537,7 @@ fn maybe_remove_index_candidate(
         return;
     }
     if let Some((idx, order_target)) = index.as_mut().zip(order_target) {
-        for col_order in &order_target.0 {
+        for col_order in &order_target.columns {
             // Only check columns from this table
             if col_order.table_id != table_reference.internal_id {
                 continue;
@@ -2311,6 +2681,9 @@ impl Optimizable for ast::Expr {
             Expr::Unary(_, expr) => expr.is_nonnull(tables),
             Expr::Variable(..) => false,
             Expr::Register(..) => false, // Register values can be null
+            Expr::Array { .. } | Expr::Subscript { .. } => {
+                unreachable!("Array and Subscript are desugared into function calls by the parser")
+            }
         }
     }
     /// Returns true if the expression is a constant i.e. does not depend on columns and can be evaluated only once during the execution
@@ -2347,7 +2720,15 @@ impl Optimizable for ast::Expr {
             // contain DoublyQualified nodes.
             Expr::DoublyQualified(_, _, _) => false,
             Expr::Exists(_) => false,
-            Expr::FunctionCall { args, name, .. } => {
+            Expr::FunctionCall {
+                args,
+                name,
+                filter_over,
+                ..
+            } => {
+                if filter_over.over_clause.is_some() {
+                    return false;
+                }
                 let Some(func) = resolver.resolve_function(name.as_str(), args.len()) else {
                     return false;
                 };
@@ -2388,6 +2769,9 @@ impl Optimizable for ast::Expr {
             Expr::Unary(_, expr) => expr.is_constant(resolver),
             Expr::Variable(_) => true,
             Expr::Register(_) => false,
+            Expr::Array { .. } | Expr::Subscript { .. } => {
+                unreachable!("Array and Subscript are desugared into function calls by the parser")
+            }
         }
     }
     /// Returns true if the expression is a constant expression that, when evaluated as a condition, is always true or false
@@ -2544,6 +2928,7 @@ fn ephemeral_index_build(
             .btree()
             .is_some_and(|btree| btree.has_rowid),
         index_method: None,
+        on_conflict: None,
     };
 
     ephemeral_index
@@ -2557,10 +2942,29 @@ pub fn build_seek_def_from_constraints(
     where_clause: &[WhereTerm],
     referenced_tables: Option<&TableReferences>,
 ) -> Result<SeekDef> {
-    turso_assert!(
-        !constraint_refs.is_empty(),
-        "cannot build seek def from empty list of constraint refs"
-    );
+    if constraint_refs.is_empty() {
+        // Zero-prefix seeks are used for extremum scans over an already ordered
+        // source: start at one end of the cursor and stop after the first
+        // qualifying row.
+        let (start_op, end_op) = match iter_dir {
+            IterationDirection::Forwards => (SeekOp::GE { eq_only: true }, SeekOp::GT),
+            IterationDirection::Backwards => (SeekOp::LE { eq_only: true }, SeekOp::LT),
+        };
+        return Ok(SeekDef {
+            prefix: Vec::new(),
+            iter_dir,
+            start: SeekKey {
+                last_component: SeekKeyComponent::None,
+                op: start_op,
+                affinity: Affinity::Blob,
+            },
+            end: SeekKey {
+                last_component: SeekKeyComponent::None,
+                op: end_op,
+                affinity: Affinity::Blob,
+            },
+        });
+    }
     // Extract the key values and operators
     let key = constraint_refs
         .iter()
@@ -2971,16 +3375,6 @@ fn build_seek_def(
     })
 }
 
-pub trait TakeOwnership {
-    fn take_ownership(&mut self) -> Self;
-}
-
-impl TakeOwnership for ast::Expr {
-    fn take_ownership(&mut self) -> Self {
-        std::mem::replace(self, ast::Expr::Literal(ast::Literal::Null))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{where_term_is_null_rejecting_for_table, Optimizable};
@@ -2995,7 +3389,7 @@ mod tests {
         attached_databases: &'a RwLock<DatabaseCatalog>,
         syms: &'a SymbolTable,
     ) -> Resolver<'a> {
-        Resolver::new(schema, database_schemas, attached_databases, syms)
+        Resolver::new(schema, database_schemas, attached_databases, syms, true)
     }
 
     fn no_tail() -> FunctionTail {

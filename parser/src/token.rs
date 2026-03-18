@@ -181,6 +181,11 @@ pub enum TokenType {
     TK_CONCURRENT = 186,
     TK_OPTIMIZE = 187,
     TK_TYPE = 188,
+    TK_LBRACKET = 189,
+    TK_RBRACKET = 190,
+    TK_COLON = 191,
+    TK_ARRAY_CONTAINS = 192, // @>
+    TK_ARRAY_OVERLAP = 193,  // &&
     // None token
     TK_NONE = 255,
 }
@@ -347,6 +352,11 @@ impl TokenType {
             TokenType::TK_SEMI => Some(";"),
             TokenType::TK_SLASH => Some("/"),
             TokenType::TK_STAR => Some("*"),
+            TokenType::TK_LBRACKET => Some("["),
+            TokenType::TK_RBRACKET => Some("]"),
+            TokenType::TK_COLON => Some(":"),
+            TokenType::TK_ARRAY_CONTAINS => Some("@>"),
+            TokenType::TK_ARRAY_OVERLAP => Some("&&"),
             _ => None,
         }
     }
@@ -544,6 +554,11 @@ impl Display for TokenType {
             TK_OVER => "TK_OVER",
             TK_FILTER => "TK_FILTER",
             TK_ILLEGAL => "TK_ILLEGAL",
+            TK_LBRACKET => "TK_LBRACKET",
+            TK_RBRACKET => "TK_RBRACKET",
+            TK_COLON => "TK_COLON",
+            TK_ARRAY_CONTAINS => "TK_ARRAY_CONTAINS",
+            TK_ARRAY_OVERLAP => "TK_ARRAY_OVERLAP",
             // None
             TK_NONE => "TK_NONE",
         };

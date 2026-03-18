@@ -9,12 +9,14 @@ use crate::ast::{
     QualifiedName, RefAct, RefArg, ResolveType, ResultColumn, Select, SelectBody, SelectTable, Set,
     SortOrder, SortedColumn, Stmt, TableConstraint, TableOptions, TransactionType, TriggerCmd,
     TriggerEvent, TriggerTime, Type, TypeOperator, TypeParam, TypeSize, UnaryOperator, Update,
-    Upsert, UpsertDo, UpsertIndex, Window, WindowDef, With,
+    Upsert, UpsertDo, UpsertIndex, Variable, Window, WindowDef, With,
 };
 use crate::error::Error;
 use crate::lexer::{Lexer, Token};
 use crate::token::TokenType::{self, *};
 use crate::Result;
+use std::collections::HashMap;
+use std::num::NonZeroU32;
 use turso_macros::match_ignore_ascii_case;
 
 macro_rules! peek_expect {
@@ -150,6 +152,7 @@ pub struct Parser<'a> {
     /// Last assigned id of positional variable
     /// Parser tracks that in order to properly auto-assign variable ids in correct order for anonymous parameters '?'
     last_variable_id: u32,
+    named_variables: HashMap<&'a [u8], NonZeroU32>,
 }
 
 impl<'a> Iterator for Parser<'a> {
@@ -173,16 +176,29 @@ impl<'a> Parser<'a> {
             peekable: false,
             current_token: Token::new(&input[..0], TokenType::TK_NONE),
             last_variable_id: 0,
+            named_variables: HashMap::new(),
         }
     }
 
-    fn create_variable(&mut self, token: &[u8]) -> Result<Expr> {
+    fn create_variable(&mut self, token: &'a [u8]) -> Result<Expr> {
         if token.is_empty() {
             // Rewrite anonymous variables in encounter order
             self.last_variable_id += 1;
-            Ok(Expr::Variable(format!("{}", self.last_variable_id)))
+            let index = NonZeroU32::new(self.last_variable_id).unwrap();
+            Ok(Expr::Variable(Variable::indexed(index)))
         } else if matches!(token[0], b':' | b'@' | b'$' | b'#') {
-            Ok(Expr::Variable(from_bytes(token)))
+            let index = if let Some(index) = self.named_variables.get(token).copied() {
+                index
+            } else {
+                self.last_variable_id += 1;
+                let index = NonZeroU32::new(self.last_variable_id).unwrap();
+                self.named_variables.insert(token, index);
+                index
+            };
+            Ok(Expr::Variable(Variable::named(
+                from_bytes_as_str(token),
+                index,
+            )))
         } else {
             let variable_str = std::str::from_utf8(token)
                 .map_err(|e| Error::Custom(format!("non-utf8 positional variable id: {e}")))?;
@@ -194,8 +210,14 @@ impl<'a> Parser<'a> {
                     "variable number must be between ?1 and ?250000".to_string(),
                 ));
             }
-            self.last_variable_id = variable_id;
-            Ok(Expr::Variable(from_bytes(token)))
+            if variable_id > 250000 {
+                return Err(Error::Custom(
+                    "variable number must be between ?1 and ?250000".to_string(),
+                ));
+            }
+            self.last_variable_id = self.last_variable_id.max(variable_id);
+            let index = NonZeroU32::new(variable_id).unwrap();
+            Ok(Expr::Variable(Variable::indexed(index)))
         }
     }
 
@@ -212,6 +234,9 @@ impl<'a> Parser<'a> {
 
     // entrypoint of parsing
     pub fn next_cmd(&mut self) -> Result<Option<Cmd>> {
+        self.last_variable_id = 0;
+        self.named_variables.clear();
+
         // consumes prefix SEMI
         while let Some(token) = self.peek()? {
             if token.token_type == TK_SEMI {
@@ -645,8 +670,37 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_nm(&mut self) -> Result<Name> {
+        if let Some(tok) = self.peek()? {
+            if tok.token_type == TK_LBRACKET {
+                // Bracket-quoted identifier: [name] or [multi word name]
+                return self.parse_bracket_quoted_name();
+            }
+        }
         let tok = eat_expect!(self, TK_ID, TK_STRING, TK_INDEXED, TK_JOIN_KW);
         Ok(Name::from_bytes(tok.as_bytes()))
+    }
+
+    /// Parse a bracket-quoted identifier like `[name]` or `[ multi word name]`.
+    /// Captures the raw bytes between `[` and `]` so whitespace is preserved
+    /// verbatim (the lexer discards inter-token whitespace, so we can't
+    /// reassemble from tokens without losing e.g. leading spaces).
+    fn parse_bracket_quoted_name(&mut self) -> Result<Name> {
+        eat_assert!(self, TK_LBRACKET);
+        // Byte offset right after the `[` token
+        let start = self.lexer.offset;
+        loop {
+            let tok = match self.eat()? {
+                Some(t) => t,
+                None => return Err(Error::ParseUnexpectedEOF),
+            };
+            if tok.token_type == TK_RBRACKET {
+                // tok.value points to `]`; its start is the end of our content
+                let end = tok.value.as_ptr() as usize - self.lexer.input.as_ptr() as usize;
+                let raw = &self.lexer.input[start..end];
+                let name = String::from_utf8_lossy(raw).into_owned();
+                return Ok(Name::exact(name));
+            }
+        }
     }
 
     fn parse_transopt(&mut self) -> Result<Option<Name>> {
@@ -1050,9 +1104,18 @@ impl<'a> Parser<'a> {
             None
         };
 
+        // Check for array suffix(es) [], [][], etc.
+        let mut array_dimensions = 0u32;
+        while self.peek()?.is_some_and(|t| t.token_type == TK_LBRACKET) {
+            eat_assert!(self, TK_LBRACKET);
+            eat_expect!(self, TK_RBRACKET);
+            array_dimensions += 1;
+        }
+
         Ok(Some(Type {
             name: type_name,
             size,
+            array_dimensions,
         }))
     }
 
@@ -1091,7 +1154,7 @@ impl<'a> Parser<'a> {
             TK_NOT => Ok(Some(3)), // NOT is 3 because of binary operator
             TK_EQ | TK_NE | TK_IS | TK_BETWEEN | TK_IN | TK_MATCH | TK_LIKE_KW | TK_ISNULL
             | TK_NOTNULL => Ok(Some(3)),
-            TK_LT | TK_GT | TK_LE | TK_GE => Ok(Some(4)),
+            TK_LT | TK_GT | TK_LE | TK_GE | TK_ARRAY_CONTAINS | TK_ARRAY_OVERLAP => Ok(Some(4)),
             TK_ESCAPE => Ok(None), // ESCAPE will be consumed after parsing MATCH|LIKE_KW
             TK_BITAND | TK_BITOR | TK_LSHIFT | TK_RSHIFT => Ok(Some(6)),
             TK_PLUS | TK_MINUS => Ok(Some(7)),
@@ -1099,6 +1162,7 @@ impl<'a> Parser<'a> {
             TK_CONCAT | TK_PTR => Ok(Some(9)),
             TK_COLLATE => Ok(Some(10)),
             // no need 11 because its for unary operators
+            TK_LBRACKET => Ok(Some(12)), // subscript: expr[n]
             _ => Ok(None),
         }
     }
@@ -1344,6 +1408,7 @@ impl<'a> Parser<'a> {
             TK_MINUS,
             TK_EXISTS,
             TK_CASE,
+            TK_LBRACKET,
         );
 
         match tok.token_type {
@@ -1505,12 +1570,39 @@ impl<'a> Parser<'a> {
                 eat_expect!(self, TK_RP);
                 Ok(Box::new(Expr::Raise(resolve, expr)))
             }
+            TK_LBRACKET => {
+                // Bracket-quoted identifier: [name] or [multi word name]
+                let name = self.parse_bracket_quoted_name()?;
+                Ok(Box::new(Expr::Id(name)))
+            }
             _ => {
                 let can_be_lit_str = tok.token_type == TK_STRING;
 
                 // can be either Literal::String or Name - so we parse raw value early and decide later
                 let tok = eat_expect!(self, TK_ID, TK_STRING, TK_INDEXED, TK_JOIN_KW);
                 let name = tok.value;
+
+                // Check for ARRAY[...] literal
+                if name.eq_ignore_ascii_case(b"array") {
+                    if let Some(tok) = self.peek()? {
+                        if tok.token_type == TK_LBRACKET {
+                            eat_assert!(self, TK_LBRACKET);
+                            let elements = self.parse_expr_list()?;
+                            eat_expect!(self, TK_RBRACKET);
+                            // Desugar ARRAY[...] into array(...) function call
+                            return Ok(Box::new(Expr::FunctionCall {
+                                name: Name::from_bytes(b"array"),
+                                distinctness: None,
+                                args: elements,
+                                order_by: vec![],
+                                filter_over: FunctionTail {
+                                    filter_clause: None,
+                                    over_clause: None,
+                                },
+                            }));
+                        }
+                    }
+                }
 
                 let second_name = if let Some(tok) = self.peek()? {
                     if tok.token_type == TK_DOT {
@@ -1615,7 +1707,7 @@ impl<'a> Parser<'a> {
             match tok.token_type.fallback_id_if_ok() {
                 TK_LP | TK_CAST | TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW | TK_NULL
                 | TK_BLOB | TK_FLOAT | TK_INTEGER | TK_VARIABLE | TK_CTIME_KW | TK_NOT
-                | TK_BITNOT | TK_PLUS | TK_MINUS | TK_EXISTS | TK_CASE => {}
+                | TK_BITNOT | TK_PLUS | TK_MINUS | TK_EXISTS | TK_CASE | TK_LBRACKET => {}
                 _ => break,
             }
 
@@ -1944,6 +2036,22 @@ impl<'a> Parser<'a> {
                         self.parse_expr(pre + 1)?,
                     ))
                 }
+                TK_ARRAY_CONTAINS => {
+                    eat_assert!(self, TK_ARRAY_CONTAINS);
+                    Box::new(Expr::Binary(
+                        result,
+                        Operator::ArrayContains,
+                        self.parse_expr(pre + 1)?,
+                    ))
+                }
+                TK_ARRAY_OVERLAP => {
+                    eat_assert!(self, TK_ARRAY_OVERLAP);
+                    Box::new(Expr::Binary(
+                        result,
+                        Operator::ArrayOverlap,
+                        self.parse_expr(pre + 1)?,
+                    ))
+                }
                 TK_CONCAT => {
                     eat_assert!(self, TK_CONCAT);
                     Box::new(Expr::Binary(
@@ -1963,6 +2071,40 @@ impl<'a> Parser<'a> {
                     Box::new(Expr::Binary(result, op, self.parse_expr(pre + 1)?))
                 }
                 TK_COLLATE => Box::new(Expr::Collate(result, self.parse_collate()?.unwrap())),
+                TK_LBRACKET => {
+                    eat_assert!(self, TK_LBRACKET);
+                    let first = self.parse_expr(0)?;
+                    // Slice syntax: expr[start:end]
+                    if self.peek()?.is_some_and(|t| t.token_type == TK_COLON) {
+                        eat_assert!(self, TK_COLON);
+                        let second = self.parse_expr(0)?;
+                        eat_expect!(self, TK_RBRACKET);
+                        // Desugar to array_slice(expr, start, end)
+                        Box::new(Expr::FunctionCall {
+                            name: Name::from_bytes(b"array_slice"),
+                            distinctness: None,
+                            args: vec![result, first, second],
+                            order_by: vec![],
+                            filter_over: FunctionTail {
+                                filter_clause: None,
+                                over_clause: None,
+                            },
+                        })
+                    } else {
+                        // Desugar expr[index] into array_element(expr, index)
+                        eat_expect!(self, TK_RBRACKET);
+                        Box::new(Expr::FunctionCall {
+                            name: Name::from_bytes(b"array_element"),
+                            distinctness: None,
+                            args: vec![result, first],
+                            order_by: vec![],
+                            filter_over: FunctionTail {
+                                filter_clause: None,
+                                over_clause: None,
+                            },
+                        })
+                    }
+                }
                 _ => unreachable!(),
             }
         }
@@ -2129,7 +2271,7 @@ impl<'a> Parser<'a> {
                     eat_assert!(self, TK_AS);
                     Ok(Some(As::As(self.parse_nm()?)))
                 }
-                TK_STRING | TK_ID => Ok(Some(As::Elided(self.parse_nm()?))),
+                TK_STRING | TK_ID | TK_LBRACKET => Ok(Some(As::Elided(self.parse_nm()?))),
                 _ => Ok(None),
             },
         }
@@ -2337,10 +2479,18 @@ impl<'a> Parser<'a> {
                 _ => break,
             };
 
-            let tok = peek_expect!(self, TK_ID, TK_STRING, TK_INDEXED, TK_JOIN_KW, TK_LP);
+            let tok = peek_expect!(
+                self,
+                TK_ID,
+                TK_STRING,
+                TK_INDEXED,
+                TK_JOIN_KW,
+                TK_LP,
+                TK_LBRACKET
+            );
 
             match tok.token_type.fallback_id_if_ok() {
-                TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW => {
+                TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW | TK_LBRACKET => {
                     let name = self.parse_fullname(false)?;
                     match self.peek()? {
                         None => {
@@ -2411,10 +2561,18 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_from_clause(&mut self) -> Result<FromClause> {
-        let tok = peek_expect!(self, TK_ID, TK_STRING, TK_INDEXED, TK_JOIN_KW, TK_LP);
+        let tok = peek_expect!(
+            self,
+            TK_ID,
+            TK_STRING,
+            TK_INDEXED,
+            TK_JOIN_KW,
+            TK_LP,
+            TK_LBRACKET
+        );
 
         match tok.token_type.fallback_id_if_ok() {
-            TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW => {
+            TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW | TK_LBRACKET => {
                 let name = self.parse_fullname(false)?;
                 match self.peek()? {
                     None => Ok(FromClause {
@@ -2490,7 +2648,12 @@ impl<'a> Parser<'a> {
             }
             tt => {
                 // dot STAR case
-                if tt == TK_ID || tt == TK_STRING || tt == TK_INDEXED || tt == TK_JOIN_KW {
+                if tt == TK_ID
+                    || tt == TK_STRING
+                    || tt == TK_INDEXED
+                    || tt == TK_JOIN_KW
+                    || tt == TK_LBRACKET
+                {
                     if let Ok(res) = self.mark(|p| -> Result<ResultColumn> {
                         let name = p.parse_nm()?;
                         eat_expect!(p, TK_DOT);
@@ -3067,6 +3230,15 @@ impl<'a> Parser<'a> {
             }
             TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW => {
                 Ok(Box::new(Expr::Name(self.parse_nm()?)))
+            }
+            tt if tt
+                .as_str()
+                .is_some_and(|s| s.chars().next().is_some_and(|c| c.is_ascii_alphabetic())) =>
+            {
+                // Accept any SQL keyword as a pragma value (e.g. PRAGMA journal_mode=OFF)
+                let keyword = tt.as_str().unwrap().to_owned();
+                self.eat()?; // consume the peeked token
+                Ok(Box::new(Expr::Literal(Literal::Keyword(keyword))))
             }
             _ => self.parse_signed(),
         }
@@ -3749,11 +3921,35 @@ impl<'a> Parser<'a> {
             }
             _ => {
                 let name = self.parse_nm()?;
-                eat_expect!(self, TK_EQ);
-                Ok(Set {
-                    col_names: vec![name],
-                    expr: self.parse_expr(0)?,
-                })
+                // Check for array subscript: col[n] = value
+                // Desugar SET col[n] = val → SET col = array_set_element(col, n, val)
+                if self.peek()?.is_some_and(|t| t.token_type == TK_LBRACKET) {
+                    eat_assert!(self, TK_LBRACKET);
+                    let idx_expr = self.parse_expr(0)?;
+                    eat_expect!(self, TK_RBRACKET);
+                    eat_expect!(self, TK_EQ);
+                    let val_expr = self.parse_expr(0)?;
+                    let col_ref = Box::new(Expr::Id(name.clone()));
+                    Ok(Set {
+                        col_names: vec![name],
+                        expr: Box::new(Expr::FunctionCall {
+                            name: Name::from_bytes(b"array_set_element"),
+                            distinctness: None,
+                            args: vec![col_ref, idx_expr, val_expr],
+                            order_by: vec![],
+                            filter_over: FunctionTail {
+                                filter_clause: None,
+                                over_clause: None,
+                            },
+                        }),
+                    })
+                } else {
+                    eat_expect!(self, TK_EQ);
+                    Ok(Set {
+                        col_names: vec![name],
+                        expr: self.parse_expr(0)?,
+                    })
+                }
             }
         }
     }
@@ -3870,6 +4066,11 @@ impl<'a> Parser<'a> {
         let col_names = self.parse_nm_list_opt()?;
         let select = self.parse_select()?;
         let (upsert, returning) = self.parse_upsert()?;
+        if !returning.is_empty() {
+            return Err(Error::Custom(
+                "cannot use RETURNING in a trigger".to_owned(),
+            ));
+        }
         Ok(TriggerCmd::Insert {
             or_conflict: resolve_type,
             tbl_name,
@@ -3888,6 +4089,11 @@ impl<'a> Parser<'a> {
         let sets = self.parse_set_list()?;
         let from = self.parse_from_clause_opt()?;
         let where_clause = self.parse_where()?;
+        if matches!(self.peek()?, Some(tok) if tok.token_type == TK_RETURNING) {
+            return Err(Error::Custom(
+                "cannot use RETURNING in a trigger".to_owned(),
+            ));
+        }
         Ok(TriggerCmd::Update {
             or_conflict,
             tbl_name,
@@ -3902,6 +4108,11 @@ impl<'a> Parser<'a> {
         eat_expect!(self, TK_FROM);
         let tbl_name = self.parse_nm()?;
         let where_clause = self.parse_where()?;
+        if matches!(self.peek()?, Some(tok) if tok.token_type == TK_RETURNING) {
+            return Err(Error::Custom(
+                "cannot use RETURNING in a trigger".to_owned(),
+            ));
+        }
         Ok(TriggerCmd::Delete {
             tbl_name,
             where_clause,
@@ -4427,6 +4638,42 @@ mod tests {
     }
 
     #[test]
+    fn test_offset_multiple_statements_with_insert_columns() {
+        let s = "CREATE TABLE test (id INTEGER PRIMARY KEY AUTOINCREMENT, col_a TEXT, col_b TEXT, col_c TEXT, col_d TEXT); INSERT INTO test (col_b, col_d, col_a, col_c) VALUES ('1', '2', '3', '4'); SELECT * FROM test;";
+        let mut p = Parser::new(s.as_bytes());
+
+        p.next_cmd().unwrap();
+        let first = p.offset();
+        assert_eq!(&s[..first], "CREATE TABLE test (id INTEGER PRIMARY KEY AUTOINCREMENT, col_a TEXT, col_b TEXT, col_c TEXT, col_d TEXT); ");
+
+        p.next_cmd().unwrap();
+        let second = p.offset();
+        assert_eq!(
+            &s[first..second],
+            "INSERT INTO test (col_b, col_d, col_a, col_c) VALUES ('1', '2', '3', '4'); "
+        );
+
+        p.next_cmd().unwrap();
+        let third = p.offset();
+        assert_eq!(&s[second..third], "SELECT * FROM test;");
+    }
+
+    #[test]
+    fn test_variable_index_bounds() {
+        for sql in ["SELECT ?0", "SELECT ?250001"] {
+            let mut p = Parser::new(sql.as_bytes());
+            let err = p.next_cmd().unwrap_err().to_string();
+            assert!(
+                err.contains("variable number must be between ?1 and ?250000"),
+                "unexpected error for {sql}: {err}"
+            );
+        }
+
+        let mut p = Parser::new("SELECT ?250000".as_bytes());
+        assert!(p.next_cmd().is_ok());
+    }
+
+    #[test]
     fn test_expect_fail() {
         let testcases = vec![
             "ALTER TABLE my_table ADD COLUMN my_column PRIMARY KEY",
@@ -4443,6 +4690,11 @@ mod tests {
             "INSERT INTO my_table(bar) DEFAULT VALUES",
             "INSERT INTO my_table(bar, baz, barr) VALUES (1, 1)",
             "UPDATE foo SET bar = 1 ORDER BY bar",
+            "CREATE TRIGGER foo INSERT ON bar BEGIN INSERT INTO foo VALUES (1, 2) RETURNING bar, baz; END",
+            "CREATE TRIGGER foo INSERT ON bar BEGIN INSERT INTO foo VALUES (1, 2) ON CONFLICT (bar, baz) WHERE 1 DO NOTHING RETURNING bar, baz; END",
+            "CREATE TRIGGER foo INSERT ON bar BEGIN INSERT INTO foo VALUES (1, 2) ON CONFLICT DO UPDATE SET (bar, baz) = 1 WHERE 1 RETURNING bar, baz; END",
+            "CREATE TRIGGER foo INSERT ON bar BEGIN DELETE FROM foo RETURNING *; END",
+            "CREATE TRIGGER foo INSERT ON bar BEGIN UPDATE foo SET bar = 1 RETURNING *; END",
         ];
 
         for tc in testcases {
@@ -4795,9 +5047,44 @@ mod tests {
                         select: OneSelect::Select {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
-                                Box::new(Expr::Variable("1".to_owned())),
+                                Box::new(Expr::Variable(Variable::indexed(1u32.try_into().unwrap()))),
                                 None,
                             )],
+                            from: None,
+                            where_clause: None,
+                            group_by: None,
+                            window_clause: vec![],
+                        },
+                        compounds: vec![],
+                    },
+                    order_by: vec![],
+                    limit: None,
+                }))],
+            ),
+            (
+                b"SELECT ?, :named, ?".as_slice(),
+                vec![Cmd::Stmt(Stmt::Select(Select {
+                    with: None,
+                    body: SelectBody {
+                        select: OneSelect::Select {
+                            distinctness: None,
+                            columns: vec![
+                                ResultColumn::Expr(
+                                    Box::new(Expr::Variable(Variable::indexed(1u32.try_into().unwrap()))),
+                                    None,
+                                ),
+                                ResultColumn::Expr(
+                                    Box::new(Expr::Variable(Variable::named(
+                                        ":named".to_owned(),
+                                        2u32.try_into().unwrap(),
+                                    ))),
+                                    None,
+                                ),
+                                ResultColumn::Expr(
+                                    Box::new(Expr::Variable(Variable::indexed(3u32.try_into().unwrap()))),
+                                    None,
+                                ),
+                            ],
                             from: None,
                             where_clause: None,
                             group_by: None,
@@ -4817,7 +5104,7 @@ mod tests {
                         select: OneSelect::Select {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
-                                Box::new(Expr::Variable("1".to_owned())),
+                                Box::new(Expr::Variable(Variable::indexed(1u32.try_into().unwrap()))),
                                 None,
                             )],
                             from: None,
@@ -4844,6 +5131,7 @@ mod tests {
                                     type_name: Some(Type {
                                         name: "INTEGER".to_owned(),
                                         size: None,
+                                        array_dimensions: 0,
                                     }),
                                 }),
                                 None,
@@ -4874,6 +5162,7 @@ mod tests {
                                         size: Some(TypeSize::MaxSize(Box::new(Expr::Literal(
                                             Literal::Numeric("255".to_owned()),
                                         )))),
+                                        array_dimensions: 0,
                                     }),
                                 }),
                                 None,
@@ -4909,6 +5198,7 @@ mod tests {
                                                 "5".to_owned(),
                                             ))),
                                         )),
+                                        array_dimensions: 0,
                                     }),
                                 }),
                                 None,
@@ -9600,6 +9890,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![],
                     }),
@@ -9614,6 +9905,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9635,6 +9927,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9658,6 +9951,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9682,6 +9976,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9706,6 +10001,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9727,6 +10023,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9749,6 +10046,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9771,6 +10069,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9793,6 +10092,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9815,6 +10115,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9837,6 +10138,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9858,6 +10160,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9879,6 +10182,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9905,6 +10209,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9945,6 +10250,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9985,6 +10291,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10025,6 +10332,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10065,6 +10373,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10105,6 +10414,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10145,6 +10455,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10185,6 +10496,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10214,6 +10526,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10243,6 +10556,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10272,6 +10586,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10301,6 +10616,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10322,6 +10638,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10344,6 +10661,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10366,6 +10684,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10390,6 +10709,7 @@ mod tests {
                             col_type: Some(Type {
                                 name: "INTEGER".to_owned(),
                                 size: None,
+                                array_dimensions: 0,
                             }),
                             constraints: vec![],
                         },
@@ -10555,6 +10875,7 @@ mod tests {
                                 col_type: Some(Type {
                                     name: "INTEGER".to_owned(),
                                     size: None,
+                                    array_dimensions: 0,
                                 }),
                                 constraints: vec![],
                             },
@@ -10596,6 +10917,7 @@ mod tests {
                                 col_type: Some(Type {
                                     name: "INTEGER".to_owned(),
                                     size: None,
+                                    array_dimensions: 0,
                                 }),
                                 constraints: vec![
                                     NamedColumnConstraint {
@@ -10613,6 +10935,7 @@ mod tests {
                                 col_type: Some(Type {
                                     name: "INTEGER".to_owned(),
                                     size: None,
+                                    array_dimensions: 0,
                                 }),
                                 constraints: vec![],
                             },
@@ -10658,6 +10981,7 @@ mod tests {
                                 col_type: Some(Type {
                                     name: "INTEGER".to_owned(),
                                     size: None,
+                                    array_dimensions: 0,
                                 }),
                                 constraints: vec![],
                             },
@@ -10696,6 +11020,7 @@ mod tests {
                                 col_type: Some(Type {
                                     name: "INTEGER".to_owned(),
                                     size: None,
+                                    array_dimensions: 0,
                                 }),
                                 constraints: vec![],
                             },
@@ -11000,198 +11325,6 @@ mod tests {
                 })],
             ),
             (
-                b"CREATE TRIGGER foo INSERT ON bar BEGIN INSERT INTO foo VALUES (1, 2) RETURNING bar, baz; END".as_slice(),
-                vec![Cmd::Stmt(Stmt::CreateTrigger {
-                    temporary: false,
-                    if_not_exists: false,
-                    trigger_name: QualifiedName {
-                        db_name: None,
-                        name: Name::exact("foo".to_owned()),
-                        alias: None,
-                    },
-                    time: None,
-                    event: TriggerEvent::Insert,
-                    tbl_name: QualifiedName {
-                        db_name: None,
-                        name: Name::exact("bar".to_owned()),
-                        alias: None,
-                    },
-                    for_each_row: false,
-                    when_clause: None,
-                    commands: vec![
-                        TriggerCmd::Insert {
-                            or_conflict: None,
-                            tbl_name: Name::exact("foo".to_owned()),
-                            col_names: vec![],
-                            select: Select {
-                                with: None,
-                                body: SelectBody {
-                                    select: OneSelect::Values(vec![
-                                        vec![
-                                            Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                                            Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
-                                        ],
-                                    ]),
-                                    compounds: vec![],
-                                },
-                                order_by: vec![],
-                                limit: None,
-                            },
-                            upsert: None,
-                            returning: vec![
-                                ResultColumn::Expr(
-                                    Box::new(Expr::Id(Name::exact("bar".to_owned()))),
-                                    None,
-                                ),
-                                ResultColumn::Expr(
-                                    Box::new(Expr::Id(Name::exact("baz".to_owned()))),
-                                    None,
-                                ),
-                            ],
-                        },
-                    ],
-                })],
-            ),
-            (
-                b"CREATE TRIGGER foo INSERT ON bar BEGIN INSERT INTO foo VALUES (1, 2) ON CONFLICT (bar, baz) WHERE 1 DO NOTHING RETURNING bar, baz; END".as_slice(),
-                vec![Cmd::Stmt(Stmt::CreateTrigger {
-                    temporary: false,
-                    if_not_exists: false,
-                    trigger_name: QualifiedName {
-                        db_name: None,
-                        name: Name::exact("foo".to_owned()),
-                        alias: None,
-                    },
-                    time: None,
-                    event: TriggerEvent::Insert,
-                    tbl_name: QualifiedName {
-                        db_name: None,
-                        name: Name::exact("bar".to_owned()),
-                        alias: None,
-                    },
-                    for_each_row: false,
-                    when_clause: None,
-                    commands: vec![
-                        TriggerCmd::Insert {
-                            or_conflict: None,
-                            tbl_name: Name::exact("foo".to_owned()),
-                            col_names: vec![],
-                            select: Select {
-                                with: None,
-                                body: SelectBody {
-                                    select: OneSelect::Values(vec![
-                                        vec![
-                                            Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                                            Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
-                                        ],
-                                    ]),
-                                    compounds: vec![],
-                                },
-                                order_by: vec![],
-                                limit: None,
-                            },
-                            upsert: Some(Box::new(Upsert {
-                                index: Some(UpsertIndex {
-                                    targets: vec![
-                                        SortedColumn {
-                                            expr: Box::new(Expr::Id(Name::exact("bar".to_owned()))),
-                                            order: None,
-                                            nulls: None
-                                        },
-                                        SortedColumn {
-                                            expr: Box::new(Expr::Id(Name::exact("baz".to_owned()))),
-                                            order: None,
-                                            nulls: None
-                                        },
-                                    ],
-                                    where_clause: Some(Box::new(Expr::Literal(Literal::Numeric("1".to_owned())))),
-                                }),
-                                do_clause: UpsertDo::Nothing,
-                                next: None
-                            })),
-                            returning: vec![
-                                ResultColumn::Expr(
-                                    Box::new(Expr::Id(Name::exact("bar".to_owned()))),
-                                    None,
-                                ),
-                                ResultColumn::Expr(
-                                    Box::new(Expr::Id(Name::exact("baz".to_owned()))),
-                                    None,
-                                ),
-                            ],
-                        },
-                    ],
-                })],
-            ),
-            (
-                b"CREATE TRIGGER foo INSERT ON bar BEGIN INSERT INTO foo VALUES (1, 2) ON CONFLICT DO UPDATE SET (bar, baz) = 1 WHERE 1 RETURNING bar, baz; END".as_slice(),
-                vec![Cmd::Stmt(Stmt::CreateTrigger {
-                    temporary: false,
-                    if_not_exists: false,
-                    trigger_name: QualifiedName {
-                        db_name: None,
-                        name: Name::exact("foo".to_owned()),
-                        alias: None,
-                    },
-                    time: None,
-                    event: TriggerEvent::Insert,
-                    tbl_name: QualifiedName {
-                        db_name: None,
-                        name: Name::exact("bar".to_owned()),
-                        alias: None,
-                    },
-                    for_each_row: false,
-                    when_clause: None,
-                    commands: vec![
-                        TriggerCmd::Insert {
-                            or_conflict: None,
-                            tbl_name: Name::exact("foo".to_owned()),
-                            col_names: vec![],
-                            select: Select {
-                                with: None,
-                                body: SelectBody {
-                                    select: OneSelect::Values(vec![
-                                        vec![
-                                            Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                                            Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
-                                        ],
-                                    ]),
-                                    compounds: vec![],
-                                },
-                                order_by: vec![],
-                                limit: None,
-                            },
-                            upsert: Some(Box::new(Upsert {
-                                index: None,
-                                do_clause: UpsertDo::Set {
-                                    sets: vec![
-                                        Set {
-                                            col_names: vec![
-                                                Name::exact("bar".to_owned()),
-                                                Name::exact("baz".to_owned()),
-                                            ],
-                                            expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                                        }
-                                    ],
-                                    where_clause: Some(Box::new(Expr::Literal(Literal::Numeric("1".to_owned())))),
-                                },
-                                next: None
-                            })),
-                            returning: vec![
-                                ResultColumn::Expr(
-                                    Box::new(Expr::Id(Name::exact("bar".to_owned()))),
-                                    None,
-                                ),
-                                ResultColumn::Expr(
-                                    Box::new(Expr::Id(Name::exact("baz".to_owned()))),
-                                    None,
-                                ),
-                            ],
-                        },
-                    ],
-                })],
-            ),
-            (
                 b"CREATE TRIGGER foo INSERT ON bar BEGIN INSERT INTO foo VALUES (1, 2) ON CONFLICT (bar, baz) DO NOTHING ON CONFLICT DO NOTHING; END".as_slice(),
                 vec![Cmd::Stmt(Stmt::CreateTrigger {
                     temporary: false,
@@ -11283,6 +11416,7 @@ mod tests {
                             sets: vec![
                                 Set {
                                     col_names: vec![Name::exact("bar".to_owned())],
+
                                     expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                                 },
                             ],
@@ -11881,6 +12015,7 @@ mod tests {
                             col_names: vec![
                                 Name::exact("bar".to_owned()),
                             ],
+
                             expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                         }
                     ],
@@ -11935,6 +12070,7 @@ mod tests {
                             col_names: vec![
                                 Name::exact("bar".to_owned()),
                             ],
+
                             expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                         }
                     ],
@@ -12005,6 +12141,7 @@ mod tests {
                                 col_type: Some(Type {
                                     name: "INTEGER".to_owned(),
                                     size: None,
+                                    array_dimensions: 0,
                                 }),
                                 constraints: vec![
                                     NamedColumnConstraint {

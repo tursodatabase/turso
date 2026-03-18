@@ -65,9 +65,13 @@ pub fn assert_differential_no_ordering(
     // Check if results match
     if limbo_results.len() != sqlite_results.len() {
         panic!(
-                "Row count mismatch for query: {}\nLimbo: {} rows, SQLite: {} rows\nLimbo: {:?}\nSQLite: {:?}\n",
-                query, limbo_results.len(), sqlite_results.len(), limbo_results, sqlite_results,
-            );
+            "Row count mismatch for query: {}\nLimbo: {} rows, SQLite: {} rows\nLimbo: {:?}\nSQLite: {:?}\n",
+            query,
+            limbo_results.len(),
+            sqlite_results.len(),
+            limbo_results,
+            sqlite_results,
+        );
     }
 
     // Check if all rows match (order might be different)
@@ -85,8 +89,8 @@ pub fn assert_differential_no_ordering(
 
     if !all_limbo_in_sqlite || !all_sqlite_in_limbo {
         panic!(
-                "Results mismatch for query: {query}\nLimbo: {limbo_results:?}\nSQLite: {sqlite_results:?}\n{context}",
-            );
+            "Results mismatch for query: {query}\nLimbo: {limbo_results:?}\nSQLite: {sqlite_results:?}\n{context}",
+        );
     }
 }
 

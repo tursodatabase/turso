@@ -1,0 +1,2190 @@
+@database :memory:
+
+@cross-check-integrity
+test alter-table-rename-table {
+    CREATE TABLE t1 (x INTEGER PRIMARY KEY, u);
+    ALTER TABLE t1 RENAME TO t2;
+    SELECT name FROM sqlite_schema WHERE type = 'table';
+}
+expect {
+    t2
+}
+
+@cross-check-integrity
+test alter-table-rename-autoindex-updated {
+    CREATE TABLE new_cas (id integer, database_id integer UNIQUE, cluster_id integer UNIQUE, PRIMARY KEY (id));
+    ALTER TABLE new_cas RENAME TO cas;
+    SELECT name FROM sqlite_schema WHERE type = 'index' ORDER BY name;
+}
+expect {
+    sqlite_autoindex_cas_1
+    sqlite_autoindex_cas_2
+}
+
+@cross-check-integrity
+test alter-table-rename-then-recreate-with-autoindex {
+    CREATE TABLE new_t (a integer, b integer UNIQUE, PRIMARY KEY (a));
+    ALTER TABLE new_t RENAME TO t;
+    CREATE TABLE IF NOT EXISTS new_t (a integer, b integer UNIQUE, PRIMARY KEY (a));
+    SELECT name, tbl_name FROM sqlite_schema WHERE type = 'index' ORDER BY name;
+}
+expect {
+    sqlite_autoindex_new_t_1|new_t
+    sqlite_autoindex_t_1|t
+}
+
+@cross-check-integrity
+test alter-table-rename-column {
+    CREATE TABLE t (a INTEGER);
+    CREATE INDEX i ON t (a);
+    ALTER TABLE t RENAME a TO b;
+    SELECT sql FROM sqlite_schema;
+}
+expect {
+    CREATE TABLE t (b INTEGER)
+    CREATE INDEX i ON t (b)
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-column-view {
+    CREATE TABLE t (a, b);
+    CREATE VIEW v AS SELECT a, b FROM t;
+    ALTER TABLE t RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'v';
+}
+expect {
+    CREATE VIEW v AS SELECT a, c FROM t
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-column-view-qualified {
+    CREATE TABLE t (a, b);
+    CREATE VIEW v AS SELECT t.a, t.b FROM t;
+    ALTER TABLE t RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'v';
+}
+expect {
+    CREATE VIEW v AS SELECT t.a, t.c FROM t
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-column-view-star {
+    CREATE TABLE t (a INT, b TEXT);
+    CREATE VIEW v AS SELECT * FROM t;
+    ALTER TABLE t RENAME COLUMN b TO c;
+    PRAGMA table_info(v);
+}
+expect {
+    0|a|INT|0||0
+    1|c|TEXT|0||0
+}
+
+# SQLite does not rewrite dependent views (view-on-view) on RENAME COLUMN.
+@skip-if mvcc "views not supported in MVCC mode"
+@skip-if sqlite "sqlite does not rewrite dependent views on RENAME COLUMN"
+test alter-table-rename-column-view-on-view {
+    CREATE TABLE t (a, b);
+    CREATE VIEW v1 AS SELECT a, b FROM t;
+    CREATE VIEW v2 AS SELECT b FROM v1;
+    ALTER TABLE t RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'v1';
+    SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'v2';
+}
+expect {
+    CREATE VIEW v1 AS SELECT a, c FROM t
+    CREATE VIEW v2 AS SELECT c FROM v1
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-column-view-subquery {
+    CREATE TABLE t (a, b);
+    CREATE VIEW v AS SELECT a FROM t WHERE EXISTS (SELECT 1 FROM t WHERE t.b = 1);
+    ALTER TABLE t RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'v';
+}
+expect {
+    CREATE VIEW v AS SELECT a FROM t WHERE EXISTS (SELECT 1 FROM t WHERE t.c = 1)
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-column-view-correlated-subquery {
+    CREATE TABLE t (a, b);
+    CREATE VIEW v AS SELECT a FROM t WHERE EXISTS (SELECT 1 WHERE t.b = 1);
+    ALTER TABLE t RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'v';
+}
+expect {
+    CREATE VIEW v AS SELECT a FROM t WHERE EXISTS (SELECT 1 WHERE t.c = 1)
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-column-view-correlated-outer-shadow {
+    CREATE TABLE t (a, b);
+    CREATE TABLE u (b);
+    CREATE VIEW v AS SELECT u.b FROM u WHERE EXISTS (SELECT 1 FROM t WHERE b = 1);
+    ALTER TABLE t RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'v';
+}
+expect {
+    CREATE VIEW v AS SELECT u.b FROM u WHERE EXISTS (SELECT 1 FROM t WHERE c = 1)
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-column-view-correlated-outer-shadow-nested {
+    CREATE TABLE t (a, b);
+    CREATE TABLE u (b);
+    CREATE VIEW v AS SELECT u.b FROM u WHERE EXISTS (SELECT 1 FROM t WHERE EXISTS (SELECT 1 WHERE b = 1));
+    ALTER TABLE t RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'v';
+}
+expect {
+    CREATE VIEW v AS SELECT u.b FROM u WHERE EXISTS (SELECT 1 FROM t WHERE EXISTS (SELECT 1 WHERE c = 1))
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-column-view-select-branch {
+    CREATE TABLE t (a, b);
+    INSERT INTO t VALUES (1, 2);
+    CREATE VIEW v AS SELECT s.x FROM (SELECT b AS x FROM t) AS s;
+    ALTER TABLE t RENAME COLUMN b TO c;
+    SELECT * FROM v;
+}
+expect {
+    2
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-column-view-tablecall-branch {
+    CREATE TABLE t (a, b);
+    INSERT INTO t VALUES (1, 't');
+    CREATE VIEW v AS SELECT j.value FROM t JOIN json_each(json_array(t.b)) AS j;
+    ALTER TABLE t RENAME COLUMN b TO c;
+    SELECT COUNT(*) FROM v;
+}
+expect {
+    1
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-column-view-self-cycle {
+    CREATE TABLE t (a, b);
+    CREATE VIEW v AS SELECT * FROM v;
+    ALTER TABLE t RENAME COLUMN b TO c;
+}
+expect error {
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-column-view-mutual-cycle {
+    CREATE TABLE t (a, b);
+    CREATE VIEW v1 AS SELECT * FROM t;
+    CREATE VIEW v2 AS SELECT * FROM v1;
+    DROP VIEW v1;
+    CREATE VIEW v1 AS SELECT * FROM v2;
+    ALTER TABLE t RENAME COLUMN b TO c;
+}
+expect error {
+}
+
+@skip-if mvcc "ATTACH is not supported in MVCC mode"
+test alter-table-rename-column-view-attached-db-qualified {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE t (a, b);
+    CREATE TABLE aux.t (a, b);
+    CREATE VIEW v AS SELECT a, b FROM aux.t;
+}
+expect error {
+    cannot reference
+}
+
+@skip-if mvcc "ATTACH is not supported in MVCC mode"
+test alter-table-rename-column-trigger-attached-db-same-db {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t (a, b);
+    CREATE TABLE aux.log (v);
+    CREATE TRIGGER aux.trig AFTER INSERT ON t BEGIN
+        INSERT INTO log VALUES (NEW.b);
+    END;
+    ALTER TABLE aux.t RENAME COLUMN b TO c;
+    INSERT INTO aux.t VALUES (1, 7);
+    SELECT * FROM aux.log;
+}
+expect {
+    7
+}
+
+@skip-if mvcc "ATTACH is not supported in MVCC mode"
+test alter-table-rename-column-view-attached-db-same-db {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t (a, b);
+    CREATE VIEW aux.v AS SELECT b FROM t;
+    ALTER TABLE aux.t RENAME COLUMN b TO c;
+    SELECT sql FROM aux.sqlite_schema WHERE type = 'view' AND name = 'v';
+}
+expect {
+    CREATE VIEW v AS SELECT c FROM t
+}
+
+# https://github.com/tursodatabase/turso/issues/5246
+@cross-check-integrity
+test alter-table-rename-column-case-insensitive {
+    CREATE TABLE t (a INT);
+    ALTER TABLE t RENAME COLUMN A TO b;
+    SELECT sql FROM sqlite_schema;
+}
+expect {
+    CREATE TABLE t (b INT)
+}
+
+@cross-check-integrity
+test alter-table-rename-quoted-column {
+    CREATE TABLE t (a INTEGER);
+    ALTER TABLE t RENAME a TO "ab cd";
+    SELECT sql FROM sqlite_schema;
+}
+expect {
+    CREATE TABLE t ("ab cd" INTEGER)
+}
+
+@cross-check-integrity
+test alter-table-add-column {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1);
+    SELECT * FROM t;
+
+    ALTER TABLE t ADD b;
+    SELECT sql FROM sqlite_schema;
+    SELECT * FROM t;
+}
+expect {
+    1
+    CREATE TABLE t (a, b)
+    1|
+}
+
+@cross-check-integrity
+test alter-table-add-column-typed {
+    CREATE TABLE t (a);
+    ALTER TABLE t ADD b DEFAULT 0;
+    SELECT sql FROM sqlite_schema;
+    INSERT INTO t (a) VALUES (1);
+    SELECT * FROM t;
+}
+expect {
+    CREATE TABLE t (a, b DEFAULT 0)
+    1|0
+}
+
+@cross-check-integrity
+test alter-table-add-column-invalid-multi-column-fk {
+    CREATE TABLE t(a, c);
+    CREATE TABLE s(a);
+    ALTER TABLE s ADD COLUMN b REFERENCES t(a, c);
+}
+expect error {
+}
+
+@cross-check-integrity
+test alter-table-add-column-default {
+    CREATE TABLE test (a);
+    INSERT INTO test VALUES (1), (2), (3);
+
+    ALTER TABLE test ADD b DEFAULT 0.1;
+    ALTER TABLE test ADD c DEFAULT 'hello';
+    SELECT * FROM test;
+
+    CREATE INDEX idx ON test (b);
+    SELECT b, c FROM test WHERE b = 0.1;
+
+    ALTER TABLE test DROP a;
+    SELECT * FROM test;
+}
+expect {
+    1|0.1|hello
+    2|0.1|hello
+    3|0.1|hello
+    0.1|hello
+    0.1|hello
+    0.1|hello
+    0.1|hello
+    0.1|hello
+    0.1|hello
+}
+
+@cross-check-integrity
+test alter-table-add-quoted-column {
+    CREATE TABLE test (a);
+    ALTER TABLE test ADD COLUMN [b c];
+    SELECT sql FROM sqlite_schema;
+}
+expect {
+    CREATE TABLE test (a, [b c])
+}
+
+@cross-check-integrity
+test alter-table-add-column-default-affinity-text {
+    CREATE TABLE t(a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES(1);
+    INSERT INTO t VALUES(2);
+    ALTER TABLE t ADD COLUMN c TEXT DEFAULT 0;
+    SELECT a, typeof(c), c FROM t;
+}
+expect {
+    1|text|0
+    2|text|0
+}
+
+@cross-check-integrity
+test alter-table-add-column-default-affinity-integer {
+    CREATE TABLE t(a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN c INTEGER DEFAULT '5';
+    SELECT a, typeof(c), c FROM t;
+}
+expect {
+    1|integer|5
+}
+
+@cross-check-integrity
+test alter-table-add-column-default-affinity-real {
+    CREATE TABLE t(a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN c REAL DEFAULT '3';
+    SELECT a, typeof(c), c FROM t;
+}
+expect {
+    1|real|3.0
+}
+expect @js {
+    1|real|3
+}
+
+@cross-check-integrity
+test alter-table-add-column-default-affinity-numeric {
+    CREATE TABLE t(a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN c NUMERIC DEFAULT '7';
+    SELECT a, typeof(c), c FROM t;
+}
+expect {
+    1|integer|7
+}
+
+# https://github.com/tursodatabase/turso/issues/4987
+@cross-check-integrity
+test alter-table-add-column-trailing-named-constraint {
+    CREATE TABLE t(x);
+    ALTER TABLE t ADD COLUMN a CONSTRAINT c;
+    INSERT INTO t(x, a) VALUES(1, 2);
+    SELECT name FROM pragma_table_info('t') ORDER BY cid;
+    SELECT x, a FROM t;
+}
+expect {
+    x
+    a
+    1|2
+}
+
+@cross-check-integrity
+test alter-table-drop-column {
+    CREATE TABLE t (a, b);
+    INSERT INTO t VALUES (1, 1), (2, 2), (3, 3);
+    SELECT * FROM t;
+
+    ALTER TABLE t DROP b;
+    SELECT sql FROM sqlite_schema;
+
+    SELECT * FROM t;
+}
+expect {
+    1|1
+    2|2
+    3|3
+    CREATE TABLE t (a)
+    1
+    2
+    3
+}
+
+@cross-check-integrity
+test alter-table-drop-column-special-name {
+    CREATE TABLE t (a, b, [c c]);
+    INSERT INTO t VALUES (1, 2, 3);
+    ALTER TABLE t DROP COLUMN b;
+
+    SELECT "c c" FROM t;
+    SELECT sql FROM sqlite_schema;
+}
+expect {
+    3
+    CREATE TABLE t (a, [c c])
+}
+
+@cross-check-integrity
+test fail-alter-table-drop-unique-column {
+    CREATE TABLE t (a, b UNIQUE);
+    ALTER TABLE t DROP b;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fail-alter-table-drop-unique-column-constraint {
+    CREATE TABLE t (a, b, UNIQUE (b));
+    ALTER TABLE t DROP b;
+}
+expect error {
+}
+
+# refer https://github.com/tursodatabase/turso/issues/3231
+@cross-check-integrity
+test fail-alter-table-add-duplicate-column {
+    CREATE TABLE t1 (a);
+    ALTER TABLE t1 ADD COLUMN a;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fail-alter-table-add-duplicate-column-case-insensitive {
+    CREATE TABLE t1 (a);
+    ALTER TABLE t1 ADD COLUMN A;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fail-alter-table-drop-primary-key-column {
+    CREATE TABLE t (a PRIMARY KEY, b);
+    ALTER TABLE t DROP a;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fail-alter-table-drop-primary-key-column-constrait {
+    CREATE TABLE t (a, b, PRIMARY KEY (a));
+    ALTER TABLE t DROP a;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fail-alter-table-rename-to-existing-index {
+    CREATE TABLE x (a);
+    CREATE INDEX y ON x (a);
+    ALTER TABLE x RENAME TO y;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fail-alter-table-rename-to-existing-table {
+    CREATE TABLE x (a);
+    CREATE TABLE y (a);
+    ALTER TABLE x RENAME TO y;
+}
+expect error {
+}
+
+@cross-check-integrity
+test alter-table-rename-to-quoted-identifier {
+    CREATE TABLE t (a);
+    CREATE INDEX idx ON t (a);
+    INSERT INTO t VALUES (1);
+
+    ALTER TABLE t RENAME TO "t t";
+    SELECT sql FROM sqlite_schema;
+
+    INSERT INTO "t t" VALUES (2);
+    SELECT a FROM "t t";
+
+    DELETE FROM "t t" WHERE a = 1;
+    SELECT a FROM "t t";
+
+    ALTER TABLE "t t" RENAME COLUMN a TO "a a";
+    SELECT sql FROM sqlite_schema;
+    SELECT "a a" FROM "t t";
+    
+    ALTER TABLE "t t" RENAME COLUMN "a a" TO "b b";
+    SELECT sql FROM sqlite_schema;
+    SELECT "b b" FROM "t t";
+}
+expect {
+    CREATE TABLE "t t" (a)
+    CREATE INDEX idx ON "t t" (a)
+    1
+    2
+    2
+    CREATE TABLE "t t" ("a a")
+    CREATE INDEX idx ON "t t" ("a a")
+    2
+    CREATE TABLE "t t" ("b b")
+    CREATE INDEX idx ON "t t" ("b b")
+    2
+}
+
+# https://github.com/tursodatabase/turso/issues/3391
+@cross-check-integrity
+test alter-table-add-notnull-col {
+    CREATE TABLE t (a);
+    ALTER TABLE t ADD b NOT NULL;
+    SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 't';
+}
+expect {
+    CREATE TABLE t (a, b NOT NULL)
+}
+
+# https://github.com/tursodatabase/turso/issues/3448
+@cross-check-integrity
+test drop-column-regression {
+    CREATE TABLE t (id, col1 BLOB, col2 UNIQUE);
+    INSERT INTO t VALUES ('id', 'col1', 'col2');
+    ALTER TABLE t ADD COLUMN col3 BLOB;
+    ALTER TABLE t DROP COLUMN col1;
+    SELECT col3 FROM t;
+}
+expect {
+}
+
+# https://github.com/tursodatabase/turso/issues/3886
+@cross-check-integrity
+test alter-tbl-regression {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p_ren1(id INTEGER PRIMARY KEY);
+    CREATE TABLE c_ren1(id INTEGER PRIMARY KEY, pid INTEGER,
+    FOREIGN KEY(pid) REFERENCES p_ren1(id)
+    );
+    INSERT INTO p_ren1 VALUES (1);
+    INSERT INTO c_ren1 VALUES (10,1);
+    ALTER TABLE p_ren1 RENAME TO p_ren1_new;
+    INSERT INTO p_ren1_new VALUES (2);
+    INSERT INTO c_ren1 VALUES (20,2);
+    SELECT c_ren1.id, c_ren1.pid
+    FROM c_ren1 JOIN p_ren1_new ON p_ren1_new.id = c_ren1.pid
+    ORDER BY c_ren1.id;
+}
+expect {
+    10|1
+    20|2
+}
+
+@cross-check-integrity
+test drop-column-removes-check-constraint {
+    CREATE TABLE t_check (a INTEGER PRIMARY KEY, b REAL CHECK (b BETWEEN 0.0 AND 1000.0), c INTEGER NOT NULL);
+    INSERT INTO t_check VALUES (1, 500.0, 42);
+    ALTER TABLE t_check DROP COLUMN b;
+    INSERT INTO t_check VALUES (2, 99);
+    SELECT * FROM t_check;
+}
+expect {
+    1|42
+    2|99
+}
+
+@cross-check-integrity
+test fail-drop-column-table-level-check-constraint {
+    CREATE TABLE t_check2 (a INTEGER PRIMARY KEY, b INTEGER, c TEXT, CHECK (b > 0));
+    ALTER TABLE t_check2 DROP COLUMN b;
+}
+expect error {
+    error in table t_check2 after drop column: no such column: b
+}
+
+@cross-check-integrity
+test strict-alter-add-column-invalid-varchar {
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b FAKETYPE;
+}
+expect error {
+}
+
+@cross-check-integrity
+test strict-alter-add-column-invalid-datetime {
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b DATETIME;
+}
+expect error {
+}
+
+@cross-check-integrity
+test strict-alter-add-column-no-type {
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b;
+}
+expect error {
+}
+
+@cross-check-integrity
+test strict-alter-add-column-integer {
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b INTEGER;
+    INSERT INTO t VALUES(1, 42);
+    SELECT a, b FROM t;
+}
+expect {
+    1|42
+}
+
+@cross-check-integrity
+test strict-alter-add-column-text {
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b TEXT;
+    INSERT INTO t VALUES(1, 'hello');
+    SELECT a, b FROM t;
+}
+expect {
+    1|hello
+}
+
+@cross-check-integrity
+test strict-alter-add-column-any {
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b ANY;
+    INSERT INTO t VALUES(1, 3.14);
+    SELECT a, b FROM t;
+}
+expect {
+    1|3.14
+}
+
+@cross-check-integrity
+test strict-alter-add-column-default-type-mismatch {
+    CREATE TABLE t1(name TEXT) STRICT;
+    INSERT INTO t1 VALUES ('alice'), ('bob');
+    ALTER TABLE t1 ADD COLUMN id INTEGER DEFAULT 'corrupted';
+}
+expect error {
+    type mismatch on DEFAULT
+}
+
+@cross-check-integrity
+test strict-alter-add-column-default-integer-from-text {
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b INTEGER DEFAULT '10';
+    INSERT INTO t(a) VALUES (1);
+    SELECT typeof(b), b FROM t;
+}
+expect {
+    integer|10
+}
+
+@cross-check-integrity
+test strict-alter-add-column-default-real-from-text {
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b REAL DEFAULT '1.25';
+    INSERT INTO t(a) VALUES (1);
+    SELECT typeof(b), b FROM t;
+}
+expect {
+    real|1.25
+}
+
+@cross-check-integrity
+test strict-alter-add-column-default-text-from-integer {
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b TEXT DEFAULT 123;
+    INSERT INTO t(a) VALUES (1);
+    SELECT typeof(b), b FROM t;
+}
+expect {
+    text|123
+}
+
+@cross-check-integrity
+test strict-alter-add-column-default-integer-fractional {
+    CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t(a) VALUES (1);
+    ALTER TABLE t ADD COLUMN b INTEGER DEFAULT 3.14;
+}
+expect error {
+    type mismatch on DEFAULT
+}
+
+@cross-check-integrity
+test strict-alter-add-column-default-real-nonnumeric {
+    CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t(a) VALUES (1);
+    ALTER TABLE t ADD COLUMN b REAL DEFAULT 'abc';
+}
+expect error {
+    type mismatch on DEFAULT
+}
+
+@cross-check-integrity
+test strict-alter-add-column-default-text-blob {
+    CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t(a) VALUES (1);
+    ALTER TABLE t ADD COLUMN b TEXT DEFAULT X'CAFE';
+}
+expect error {
+    type mismatch on DEFAULT
+}
+
+@cross-check-integrity
+test strict-alter-add-column-default-blob-text {
+    CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t(a) VALUES (1);
+    ALTER TABLE t ADD COLUMN b BLOB DEFAULT 'abc';
+}
+expect error {
+    type mismatch on DEFAULT
+}
+
+@cross-check-integrity
+test strict-alter-add-column-default-mismatch-empty-table {
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b INTEGER DEFAULT 3.14;
+    INSERT INTO t(a) VALUES (1);
+}
+expect error {
+    cannot store REAL value in INTEGER column t.b
+}
+
+@cross-check-integrity
+test alter-add-column-invalid-collation {
+    CREATE TABLE t(c1 INTEGER);
+    ALTER TABLE t ADD COLUMN c2 INTEGER COLLATE compile_options;
+}
+expect error {
+    no such collation sequence: compile_options
+}
+
+# https://github.com/tursodatabase/turso/issues/5481
+@cross-check-integrity
+test fail-alter-table-drop-column-expr-index-substr {
+    CREATE TABLE t(a, b, c);
+    CREATE INDEX i_expr ON t(substr(b, 1, 1));
+    INSERT INTO t VALUES(1, 'bee', 2);
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fail-alter-table-drop-column-expr-index-arithmetic {
+    CREATE TABLE t(a, b, c);
+    CREATE INDEX i_expr ON t(a + b);
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fail-alter-table-drop-column-expr-index-arithmetic-first-col {
+    CREATE TABLE t(a, b, c);
+    CREATE INDEX i_expr ON t(a + b);
+    ALTER TABLE t DROP COLUMN a;
+}
+expect error {
+}
+
+@cross-check-integrity
+test alter-table-drop-column-expr-index-unreferenced {
+    CREATE TABLE t(a, b, c);
+    CREATE INDEX i_expr ON t(substr(b, 1, 1));
+    INSERT INTO t VALUES(1, 'bee', 2);
+    ALTER TABLE t DROP COLUMN c;
+    SELECT * FROM t;
+}
+expect {
+    1|bee
+}
+
+@cross-check-integrity
+test alter-table-rename-column-updates-unique-sets {
+    CREATE TABLE t(a INTEGER, b TEXT, UNIQUE(b));
+    INSERT INTO t VALUES (1, 'hello');
+    ALTER TABLE t RENAME b TO c;
+
+    -- Adding a column triggers to_sql() which reads unique_sets.
+    -- If unique_sets still has the old name "b", the regenerated
+    -- CREATE TABLE will reference a non-existent column.
+    ALTER TABLE t ADD d INTEGER;
+    SELECT sql FROM sqlite_schema WHERE type = 'table';
+}
+expect pattern {
+    CREATE TABLE t\s*\(a INTEGER, c TEXT, d INTEGER, UNIQUE\s*\(c\)\)
+}
+
+@cross-check-integrity
+test fail-alter-table-drop-column-expr-index-multi-col {
+    CREATE TABLE t(a, b, c);
+    CREATE INDEX i_expr ON t(a + c, substr(b, 1, 1));
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+}
+
+
+# Regression: DEFAULT with negative integer on pre-existing rows
+@cross-check-integrity
+test alter-add-column-default-negative-integer {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES(1);
+    INSERT INTO t VALUES(2);
+    ALTER TABLE t ADD COLUMN y INTEGER DEFAULT -1;
+    SELECT x, y FROM t;
+}
+expect {
+    1|-1
+    2|-1
+}
+
+# Regression: DEFAULT with negative float on pre-existing rows
+@cross-check-integrity
+test alter-add-column-default-negative-float {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN y REAL DEFAULT -3.14;
+    SELECT x, y FROM t;
+}
+expect {
+    1|-3.14
+}
+
+# Regression: DEFAULT with positive unary on pre-existing rows
+@cross-check-integrity
+test alter-add-column-default-positive-unary {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN y INTEGER DEFAULT +5;
+    SELECT x, y FROM t;
+}
+expect {
+    1|5
+}
+
+# Regression: negative default with TEXT affinity coercion
+@cross-check-integrity
+test alter-add-column-default-negative-text-affinity {
+    CREATE TABLE t(a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN c TEXT DEFAULT -99;
+    SELECT a, typeof(c), c FROM t;
+}
+expect {
+    1|text|-99
+}
+
+# Regression: negative default with REAL affinity coercion
+@cross-check-integrity
+test alter-add-column-default-negative-real-affinity {
+    CREATE TABLE t(a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN c REAL DEFAULT -7;
+    SELECT a, typeof(c), c FROM t;
+}
+expect {
+    1|real|-7.0
+}
+expect @js {
+    1|real|-7
+}
+
+# Regression: multiple columns with negative defaults on pre-existing rows
+@cross-check-integrity
+test alter-add-column-multiple-negative-defaults {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN a INTEGER DEFAULT -1;
+    ALTER TABLE t ADD COLUMN b REAL DEFAULT -2.5;
+    ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 100;
+    SELECT x, a, b, c FROM t;
+}
+expect {
+    1|-1|-2.5|100
+}
+
+# Regression: negative default value survives new row insertion
+@cross-check-integrity
+test alter-add-column-negative-default-new-rows {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN y INTEGER DEFAULT -1;
+    INSERT INTO t(x) VALUES(2);
+    SELECT x, y FROM t ORDER BY x;
+}
+expect {
+    1|-1
+    2|-1
+}
+
+# Regression: negative default with index lookup on pre-existing rows
+@cross-check-integrity
+test alter-add-column-negative-default-index-scan {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES(1), (2), (3);
+    ALTER TABLE t ADD COLUMN y INTEGER DEFAULT -1;
+    CREATE INDEX idx_y ON t(y);
+    SELECT x FROM t WHERE y = -1 ORDER BY x;
+}
+expect {
+    1
+    2
+    3
+}
+
+# Regression: DEFAULT TRUE / FALSE on pre-existing rows
+@cross-check-integrity
+test alter-add-column-default-boolean {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN a DEFAULT TRUE;
+    ALTER TABLE t ADD COLUMN b DEFAULT FALSE;
+    SELECT x, a, b FROM t;
+}
+expect {
+    1|1|0
+}
+
+# Regression: parenthesized negative default on pre-existing rows
+@cross-check-integrity
+test alter-add-column-default-parenthesized-negative {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN y INTEGER DEFAULT (-42);
+    SELECT x, y FROM t;
+}
+expect {
+    1|-42
+}
+
+# Regression: large negative integer default
+@cross-check-integrity
+test alter-add-column-default-large-negative {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN y INTEGER DEFAULT -9223372036854775807;
+    SELECT x, y, typeof(y) FROM t;
+}
+expect {
+    1|-9223372036854775807|integer
+}
+
+# Regression: negative zero float default
+@cross-check-integrity
+test alter-add-column-default-negative-zero-float {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN y REAL DEFAULT -0.0;
+    SELECT x, y, typeof(y) FROM t;
+}
+expect {
+    1|0.0|real
+}
+expect @js {
+    1|0|real
+}
+
+# Regression: blob default on pre-existing rows
+@cross-check-integrity
+test alter-add-column-default-blob {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN y BLOB DEFAULT X'CAFE';
+    SELECT x, hex(y), typeof(y) FROM t;
+}
+expect {
+    1|CAFE|blob
+}
+
+# Regression: explicit NULL default on pre-existing rows
+@cross-check-integrity
+test alter-add-column-default-null {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN y DEFAULT NULL;
+    SELECT x, y, typeof(y) FROM t;
+}
+expect {
+    1||null
+}
+
+# Regression: string default with spaces on pre-existing rows
+@cross-check-integrity
+test alter-add-column-default-string-spaces {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN y TEXT DEFAULT 'hello world';
+    SELECT x, y, typeof(y) FROM t;
+}
+expect {
+    1|hello world|text
+}
+
+# https://github.com/tursodatabase/turso/issues/5632
+@cross-check-integrity
+test alter_table_add_column_with_single_quote_in_name {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE TABLE t3(c);
+    CREATE INDEX i1 ON t1(a);
+    CREATE INDEX i2 ON t2(b);
+
+    CREATE TABLE "z' OR 1=1 -- "(x);
+    ALTER TABLE "z' OR 1=1 -- " ADD COLUMN y;
+
+    SELECT lower(rtrim(name)) FROM sqlite_schema WHERE type = 'table' ORDER BY lower(name);
+    SELECT replace(replace(lower(sql), '"', ''), ' ', '')
+    FROM sqlite_schema
+    WHERE type = 'table' AND lower(name) LIKE 'z'' or 1=1 -- %';
+    PRAGMA integrity_check;
+}
+expect {
+    t1
+    t2
+    t3
+    z' or 1=1 --
+    createtablez'or1=1--(x,y)
+    ok
+}
+
+# https://github.com/tursodatabase/turso/issues/5632
+@cross-check-integrity
+test alter_table_drop_column_with_single_quote_in_name {
+    CREATE TABLE "z' OR 1=1 -- "(x, y);
+    CREATE TABLE ok(v);
+    INSERT INTO ok VALUES(1);
+
+    ALTER TABLE "z' OR 1=1 -- " DROP COLUMN y;
+
+    SELECT * FROM ok;
+    SELECT replace(replace(lower(sql), '"', ''), ' ', '')
+    FROM sqlite_schema
+    WHERE type = 'table' AND lower(name) LIKE 'z'' or 1=1 -- %';
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    createtablez'or1=1--(x)
+    ok
+}
+
+# Regression for quoted table names with spaces after ADD COLUMN.
+# If sqlite_schema.sql drops quotes around the table name, reopening the DB can fail to parse schema.
+@cross-check-integrity
+test alter_table_add_column_with_space_in_name_keeps_quoted_schema_sql {
+    CREATE TABLE "t t"("a a" TEXT, "b b" TEXT);
+    ALTER TABLE "t t" ADD COLUMN "c c" TEXT;
+
+    SELECT sql LIKE 'CREATE TABLE "t t"%' FROM sqlite_schema WHERE type = 'table' AND name = 't t';
+    SELECT instr(sql, 'c c') > 0 FROM sqlite_schema WHERE type = 'table' AND name = 't t';
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    1
+    ok
+}
+# --- Trigger rewriting for ALTER TABLE RENAME ---
+
+# Verify trigger fires correctly after table rename
+@cross-check-integrity
+test alter-table-rename-trigger-fires-after-rename {
+    CREATE TABLE t1 (a, b);
+    CREATE TABLE log (x, y);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN
+        INSERT INTO log VALUES (new.a, new.b);
+    END;
+    ALTER TABLE t1 RENAME TO t2;
+    INSERT INTO t2 VALUES (1, 2);
+    SELECT * FROM log;
+}
+expect {
+    1|2
+}
+
+# Verify trigger body UPDATE command targets renamed table
+@cross-check-integrity
+test alter-table-rename-trigger-body-update {
+    CREATE TABLE t1 (a, b);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN
+        UPDATE t1 SET b = 99 WHERE a = new.a;
+    END;
+    ALTER TABLE t1 RENAME TO t2;
+    INSERT INTO t2 VALUES (1, 0);
+    SELECT * FROM t2;
+}
+expect {
+    1|99
+}
+
+# Verify trigger body DELETE command targets renamed table
+@cross-check-integrity
+test alter-table-rename-trigger-body-delete {
+    CREATE TABLE t1 (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE t2 (id, x);
+    INSERT INTO t2 VALUES (1, 'keep');
+    INSERT INTO t2 VALUES (2, 'remove');
+    CREATE TRIGGER trig1 AFTER UPDATE ON t1 BEGIN
+        DELETE FROM t2 WHERE id = old.a;
+    END;
+    INSERT INTO t1 VALUES (2, 'hello');
+    ALTER TABLE t2 RENAME TO t3;
+    UPDATE t1 SET b = 'world' WHERE a = 2;
+    SELECT * FROM t3;
+}
+expect {
+    1|keep
+}
+
+# Verify trigger body INSERT into a different renamed table
+@cross-check-integrity
+test alter-table-rename-trigger-body-insert-other-table {
+    CREATE TABLE t1 (a, b);
+    CREATE TABLE log (a, b);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN
+        INSERT INTO log VALUES (new.a, new.b);
+    END;
+    ALTER TABLE log RENAME TO log2;
+    INSERT INTO t1 VALUES (10, 20);
+    SELECT * FROM log2;
+}
+expect {
+    10|20
+}
+
+# Verify trigger schema entry tbl_name is updated
+@cross-check-integrity
+test alter-table-rename-trigger-schema-tbl-name {
+    CREATE TABLE t1 (a);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN
+        SELECT 1;
+    END;
+    ALTER TABLE t1 RENAME TO t2;
+    SELECT tbl_name FROM sqlite_schema WHERE type = 'trigger';
+}
+expect {
+    t2
+}
+
+# --- Trigger rewriting for ALTER TABLE RENAME COLUMN ---
+
+# Verify trigger fires after column rename (NEW refs updated)
+@cross-check-integrity
+test alter-table-rename-column-trigger-fires {
+    CREATE TABLE t1 (a, b);
+    CREATE TABLE log (x, y);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN
+        INSERT INTO log VALUES (new.a, new.b);
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO c;
+    INSERT INTO t1 VALUES (10, 20);
+    SELECT * FROM log;
+}
+expect {
+    10|20
+}
+
+# Verify UPDATE OF column list is rewritten
+@cross-check-integrity
+test alter-table-rename-column-trigger-update-of {
+    CREATE TABLE t1 (a, b, c);
+    INSERT INTO t1 VALUES (1, 2, 3);
+    CREATE TABLE log (x);
+    CREATE TRIGGER trig1 AFTER UPDATE OF b ON t1 BEGIN
+        INSERT INTO log VALUES (new.b);
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO d;
+    UPDATE t1 SET d = 42 WHERE a = 1;
+    SELECT * FROM log;
+}
+expect {
+    42
+}
+
+# Verify trigger body UPDATE SET column names and WHERE refs updated
+@cross-check-integrity
+test alter-table-rename-column-trigger-body-update-refs {
+    CREATE TABLE t1 (a INTEGER PRIMARY KEY, b);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN
+        UPDATE t1 SET b = new.b + 1 WHERE a = new.a;
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO c;
+    INSERT INTO t1 VALUES (1, 100);
+    SELECT a, c FROM t1;
+}
+expect {
+    1|101
+}
+
+# Verify WHEN clause column refs are rewritten
+@cross-check-integrity
+test alter-table-rename-column-trigger-when-clause {
+    CREATE TABLE t1 (a, b);
+    CREATE TABLE log (x);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 WHEN new.b > 0 BEGIN
+        INSERT INTO log VALUES (new.b);
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO c;
+    INSERT INTO t1 VALUES (1, -5);
+    INSERT INTO t1 VALUES (2, 10);
+    SELECT * FROM log;
+}
+expect {
+    10
+}
+
+# Verify INSERT column list in trigger body is NOT rewritten for different table
+@cross-check-integrity
+test alter-table-rename-column-trigger-insert-other-table {
+    CREATE TABLE t1 (a, b);
+    CREATE TABLE log (a, b);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN
+        INSERT INTO log (a, b) VALUES (new.a, new.b);
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO c;
+    INSERT INTO t1 VALUES (1, 2);
+    SELECT * FROM log;
+}
+expect {
+    1|2
+}
+
+test alter-table-rename-column-scoping-other-table {
+    DROP TABLE IF EXISTS t1;
+    DROP TABLE IF EXISTS t2;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE t1 (a, b);
+    CREATE TABLE t2 (a, b);
+    INSERT INTO t2 VALUES (1, 999);
+    CREATE TABLE log (v);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN
+        INSERT INTO log SELECT t2.b FROM t2 WHERE t2.a = new.a;
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO c;
+    INSERT INTO t1 VALUES (1, 0);
+    SELECT * FROM log;
+}
+expect {
+    999
+}
+
+test alter-table-rename-column-subquery {
+    DROP TABLE IF EXISTS t1;
+    DROP TABLE IF EXISTS t2;
+    CREATE TABLE t1 (a, b);
+    CREATE TABLE t2 (x, y);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN
+        INSERT INTO t2 VALUES (new.a, (SELECT b FROM t1 WHERE a = new.a));
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO c;
+    INSERT INTO t1 VALUES (1, 55);
+    SELECT * FROM t2;
+}
+expect {
+    1|55
+}
+
+test alter-table-rename-trigger-exists-subquery {
+    DROP TABLE IF EXISTS t1;
+    DROP TABLE IF EXISTS t2;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE t1 (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE t2 (x, y);
+    CREATE TABLE log (v);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN
+        INSERT INTO log SELECT b FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x = t1.a);
+    END;
+    INSERT INTO t2 VALUES (1, 0);
+    ALTER TABLE t1 RENAME COLUMN b TO c;
+    INSERT INTO t1 VALUES (1, 42);
+    SELECT * FROM log;
+}
+expect {
+    42
+}
+
+test alter-table-rename-then-rename-column-trigger {
+    DROP TABLE IF EXISTS t1;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE t1 (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE log (v);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN
+        INSERT INTO log VALUES (new.b + 100);
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO c;
+    INSERT INTO t1 VALUES (1, 77);
+    SELECT * FROM log;
+}
+expect {
+    177
+}
+
+test alter-table-rename-column-case-expr-trigger {
+    DROP TABLE IF EXISTS t1;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE t1 (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE log (v);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN
+        INSERT INTO log VALUES (CASE WHEN new.b > 10 THEN 'big' ELSE 'small' END);
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO c;
+    INSERT INTO t1 VALUES (1, 50);
+    INSERT INTO t1 VALUES (2, 5);
+    SELECT * FROM log ORDER BY rowid;
+}
+expect {
+    big
+    small
+}
+
+test alter-table-rename-column-union-trigger {
+    DROP TABLE IF EXISTS t1;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE t1 (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE log (v);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN
+        INSERT INTO log SELECT new.b UNION ALL SELECT new.b * 2;
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO c;
+    INSERT INTO t1 VALUES (1, 10);
+    SELECT * FROM log ORDER BY v;
+}
+expect {
+    10
+    20
+}
+
+test alter-table-rename-column-old-ref-trigger {
+    DROP TABLE IF EXISTS t1;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE t1 (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE log (old_val, new_val);
+    CREATE TRIGGER trig1 AFTER UPDATE ON t1 BEGIN
+        INSERT INTO log VALUES (old.b, new.b);
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO c;
+    INSERT INTO t1 VALUES (1, 10);
+    UPDATE t1 SET c = 20 WHERE a = 1;
+    SELECT * FROM log;
+}
+expect {
+    10|20
+}
+
+test alter-table-rename-column-multiple-triggers {
+    DROP TABLE IF EXISTS t1;
+    DROP TABLE IF EXISTS log1;
+    DROP TABLE IF EXISTS log2;
+    CREATE TABLE t1 (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE log1 (v);
+    CREATE TABLE log2 (v);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN
+        INSERT INTO log1 VALUES (new.b);
+    END;
+    CREATE TRIGGER trig2 AFTER INSERT ON t1 BEGIN
+        INSERT INTO log2 VALUES (new.b * 10);
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO c;
+    INSERT INTO t1 VALUES (1, 7);
+    SELECT * FROM log1;
+}
+expect {
+    7
+}
+
+test alter-table-rename-column-cross-table-insert {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE dst (x, y);
+    CREATE TABLE log (v);
+    INSERT INTO src VALUES (1, 500);
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT b FROM src WHERE a = new.x;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    INSERT INTO dst VALUES (1, 0);
+    SELECT * FROM log;
+}
+expect {
+    500
+}
+
+test alter-rename-col-cross-table-aggregate {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE dst (x, y);
+    CREATE TABLE log (v);
+    INSERT INTO src VALUES (1, 10);
+    INSERT INTO src VALUES (2, 20);
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT SUM(b) FROM src;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    INSERT INTO dst VALUES (1, 0);
+    SELECT * FROM log;
+}
+expect {
+    30
+}
+
+test alter-rename-col-cross-table-qualified-ref {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE dst (x, y);
+    CREATE TABLE log (v);
+    INSERT INTO src VALUES (1, 99);
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT src.b FROM src WHERE src.a = new.x;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    INSERT INTO dst VALUES (1, 0);
+    SELECT * FROM log;
+}
+expect {
+    99
+}
+
+test alter-rename-col-cross-table-multi-from {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS other;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE other (a INTEGER PRIMARY KEY, d);
+    CREATE TABLE dst (x, y);
+    CREATE TABLE log (v);
+    INSERT INTO src VALUES (1, 42);
+    INSERT INTO other VALUES (1, 7);
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT src.b FROM src, other WHERE src.a = other.a AND other.a = new.x;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    INSERT INTO dst VALUES (1, 0);
+    SELECT * FROM log;
+}
+expect {
+    42
+}
+
+test alter-rename-col-cross-table-join-on {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS other;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE other (a INTEGER PRIMARY KEY, d);
+    CREATE TABLE dst (x, y);
+    CREATE TABLE log (v);
+    INSERT INTO src VALUES (1, 55);
+    INSERT INTO other VALUES (1, 8);
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT b FROM src JOIN other ON src.a = other.a WHERE other.a = new.x;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    INSERT INTO dst VALUES (1, 0);
+    SELECT * FROM log;
+}
+expect {
+    55
+}
+
+test alter-rename-col-cross-table-nested-subquery {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE dst (x, y);
+    CREATE TABLE log (v);
+    INSERT INTO src VALUES (1, 77);
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT * FROM (SELECT b FROM src WHERE a = new.x);
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    INSERT INTO dst VALUES (1, 0);
+    SELECT * FROM log;
+}
+expect {
+    77
+}
+
+test alter-rename-col-no-rename-other-table-col {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS other;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE other (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE dst (x, y);
+    CREATE TABLE log (v);
+    INSERT INTO other VALUES (1, 999);
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT b FROM other WHERE a = new.x;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    INSERT INTO dst VALUES (1, 0);
+    SELECT * FROM log;
+}
+expect {
+    999
+}
+
+test alter-rename-col-cross-table-update-cmd {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    CREATE TABLE src (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE dst (x, y);
+    INSERT INTO src VALUES (1, 0);
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN
+        UPDATE src SET b = b + 1 WHERE a = new.x;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    INSERT INTO dst VALUES (1, 0);
+    SELECT c FROM src WHERE a = 1;
+}
+expect {
+    1
+}
+
+test alter-rename-col-cross-table-delete-where {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    CREATE TABLE src (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE dst (x, y);
+    INSERT INTO src VALUES (1, 100);
+    INSERT INTO src VALUES (2, 200);
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN
+        DELETE FROM src WHERE b = new.y;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    INSERT INTO dst VALUES (1, 100);
+    SELECT a, c FROM src;
+}
+expect {
+    2|200
+}
+
+test alter-rename-col-cross-table-insert-col-list {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    CREATE TABLE src (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE dst (x, y);
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN
+        INSERT INTO src (a, b) VALUES (new.x, new.y);
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    INSERT INTO dst VALUES (5, 88);
+    SELECT a, c FROM src;
+}
+expect {
+    5|88
+}
+
+test alter-rename-col-verify-schema-rewritten {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE dst (x, y);
+    CREATE TABLE log (v);
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT b FROM src WHERE a = new.x;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'trig1';
+}
+expect pattern {
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN\s+INSERT INTO log SELECT c FROM src WHERE a = new\.x;\s+END
+}
+
+test alter-rename-col-cross-table-group-by {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a INTEGER, b);
+    CREATE TABLE dst (x, y);
+    CREATE TABLE log (v);
+    INSERT INTO src VALUES (1, 10);
+    INSERT INTO src VALUES (1, 20);
+    INSERT INTO src VALUES (2, 30);
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT SUM(b) FROM src GROUP BY a HAVING a = new.x;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    INSERT INTO dst VALUES (1, 0);
+    SELECT * FROM log;
+}
+expect {
+    30
+}
+
+test alter-rename-col-schema-aggregate {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE dst (x, y);
+    CREATE TABLE log (v);
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT SUM(b) FROM src;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'trig1';
+}
+expect pattern {
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN\s+INSERT INTO log SELECT SUM\s*\(c\) FROM src;\s+END
+}
+
+test alter-rename-col-schema-qualified-ref {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE dst (x, y);
+    CREATE TABLE log (v);
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT src.b FROM src WHERE src.a = new.x;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'trig1';
+}
+expect pattern {
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN\s+INSERT INTO log SELECT src\.c FROM src WHERE src\.a = new\.x;\s+END
+}
+
+test alter-rename-col-schema-multi-from {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS other;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE other (a INTEGER PRIMARY KEY, d);
+    CREATE TABLE dst (x, y);
+    CREATE TABLE log (v);
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT src.b FROM src, other WHERE src.a = other.a AND other.a = new.x;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'trig1';
+}
+expect pattern {
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN\s+INSERT INTO log SELECT src\.c FROM src, other WHERE src\.a = other\.a AND other\.a = new\.x;\s+END
+}
+
+test alter-rename-col-schema-join-on {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS other;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE other (a INTEGER PRIMARY KEY, d);
+    CREATE TABLE dst (x, y);
+    CREATE TABLE log (v);
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT b FROM src JOIN other ON src.a = other.a WHERE other.a = new.x;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'trig1';
+}
+expect pattern {
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN\s+INSERT INTO log SELECT c FROM src JOIN other ON src\.a = other\.a WHERE other\.a = new\.x;\s+END
+}
+
+test alter-rename-col-schema-no-rename-other-col {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS other;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE other (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE dst (x, y);
+    CREATE TABLE log (v);
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT b FROM other WHERE a = new.x;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'trig1';
+}
+expect pattern {
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN\s+INSERT INTO log SELECT b FROM other WHERE a = new\.x;\s+END
+}
+
+test alter-rename-col-schema-update-cmd {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    CREATE TABLE src (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE dst (x, y);
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN
+        UPDATE src SET b = b + 10 WHERE a = new.x;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'trig1';
+}
+expect pattern {
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN\s+UPDATE src SET c = c \+ 10 WHERE a = new\.x;\s+END
+}
+
+test alter-rename-col-schema-update-cmd-from {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS aux;
+    DROP TABLE IF EXISTS dst;
+    CREATE TABLE src (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE aux (a INTEGER PRIMARY KEY, z);
+    CREATE TABLE dst (x);
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN
+        UPDATE aux SET z = src.b FROM src WHERE aux.a = src.a AND src.a = new.x;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'trig1';
+}
+expect pattern {
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN\s+UPDATE aux SET z = src\.c FROM src WHERE aux\.a = src\.a AND src\.a = new\.x;\s+END
+}
+
+test alter-rename-col-schema-delete-where {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    CREATE TABLE src (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE dst (x, y);
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN
+        DELETE FROM src WHERE b = new.y;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'trig1';
+}
+expect pattern {
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN\s+DELETE FROM src WHERE c = new\.y;\s+END
+}
+
+test alter-rename-col-schema-insert-col-list {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    CREATE TABLE src (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE dst (x, y);
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN
+        INSERT INTO src (a, b) VALUES (new.x, new.y);
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'trig1';
+}
+expect pattern {
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN\s+INSERT INTO src \(a, c\) VALUES\s*\(new\.x, new\.y\);\s+END
+}
+
+test alter-rename-col-schema-nested-subquery {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE dst (x, y);
+    CREATE TABLE log (v);
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT * FROM (SELECT b FROM src WHERE a = new.x);
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'trig1';
+}
+expect pattern {
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN\s+INSERT INTO log SELECT \* FROM \(SELECT c FROM src WHERE a = new\.x\);\s+END
+}
+
+test alter-rename-col-schema-group-by {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a INTEGER, b);
+    CREATE TABLE dst (x, y);
+    CREATE TABLE log (v);
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT SUM(b) FROM src GROUP BY a HAVING a = new.x;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'trig1';
+}
+expect pattern {
+    CREATE TRIGGER trig1 AFTER INSERT ON dst BEGIN\s+INSERT INTO log SELECT SUM\s*\(c\) FROM src GROUP BY a HAVING a = new\.x;\s+END
+}
+
+test alter-rename-col-schema-same-table-trigger {
+    DROP TABLE IF EXISTS t1;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE t1 (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE log (v);
+    CREATE TRIGGER trig1 AFTER UPDATE ON t1 BEGIN
+        INSERT INTO log VALUES (new.b);
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'trig1';
+}
+expect pattern {
+    CREATE TRIGGER trig1 AFTER UPDATE ON t1 BEGIN\s+INSERT INTO log VALUES\s*\(new\.c\);\s+END
+}
+
+# Cross-table trigger: UPDATE WHERE references dropped column → fail
+@cross-check-integrity
+test fail-drop-column-cross-table-trigger-update-where-expr {
+    CREATE TABLE t (n REAL);
+    CREATE TABLE t1 (m TEXT, d REAL);
+    CREATE TRIGGER trg BEFORE DELETE ON t BEGIN
+        UPDATE t1 SET m = 'x' WHERE m = 'y';
+    END;
+    ALTER TABLE t1 DROP COLUMN m;
+}
+expect error {
+    error in trigger trg after drop column: no such column: m
+}
+
+# Cross-table trigger: UPDATE WHERE only references dropped column → fail
+@cross-check-integrity
+test fail-drop-column-cross-table-trigger-update-where-only {
+    CREATE TABLE t (n REAL);
+    CREATE TABLE t1 (m TEXT, d REAL);
+    CREATE TRIGGER trg BEFORE DELETE ON t BEGIN
+        UPDATE t1 SET d = 0 WHERE m = 'y';
+    END;
+    ALTER TABLE t1 DROP COLUMN m;
+}
+expect error {
+    error in trigger trg after drop column: no such column: m
+}
+
+# Cross-table trigger: UPDATE SET value expr references dropped column → fail
+@cross-check-integrity
+test fail-drop-column-cross-table-trigger-set-value-expr {
+    CREATE TABLE t (n REAL);
+    CREATE TABLE t1 (m TEXT, d REAL);
+    CREATE TRIGGER trg BEFORE DELETE ON t BEGIN
+        UPDATE t1 SET d = m WHERE d = 1.0;
+    END;
+    ALTER TABLE t1 DROP COLUMN m;
+}
+expect error {
+    error in trigger trg after drop column: no such column: m
+}
+
+# Cross-table trigger: INSERT column list references dropped column → succeed
+# (SQLite defers INSERT column list validation to trigger execution time)
+@cross-check-integrity
+test drop-column-cross-table-trigger-insert-col-list-deferred {
+    CREATE TABLE t (n REAL);
+    CREATE TABLE t1 (m TEXT, d REAL);
+    CREATE TRIGGER trg BEFORE DELETE ON t BEGIN
+        INSERT INTO t1 (m, d) VALUES ('x', 1.0);
+    END;
+    ALTER TABLE t1 DROP COLUMN m;
+    SELECT sql FROM sqlite_schema WHERE name = 't1';
+}
+expect pattern {
+    CREATE TABLE t1\s*\(d REAL\)
+}
+
+# Cross-table trigger: UPDATE SET target is dropped col but WHERE is valid → succeed
+# (SQLite defers SET target name validation to trigger execution time)
+@cross-check-integrity
+test drop-column-cross-table-trigger-set-target-deferred {
+    CREATE TABLE t (n REAL);
+    CREATE TABLE t1 (m TEXT, d REAL);
+    CREATE TRIGGER trg BEFORE DELETE ON t BEGIN
+        UPDATE t1 SET m = 'x' WHERE d = 1.0;
+    END;
+    ALTER TABLE t1 DROP COLUMN m;
+    SELECT sql FROM sqlite_schema WHERE name = 't1';
+}
+expect pattern {
+    CREATE TABLE t1\s*\(d REAL\)
+}
+
+# Cross-table trigger: DELETE WHERE references dropped column → fail
+@cross-check-integrity
+test fail-drop-column-cross-table-trigger-delete-where {
+    CREATE TABLE t (n REAL);
+    CREATE TABLE t1 (m TEXT, d REAL);
+    CREATE TRIGGER trg BEFORE DELETE ON t BEGIN
+        DELETE FROM t1 WHERE m = 'y';
+    END;
+    ALTER TABLE t1 DROP COLUMN m;
+}
+expect error {
+    error in trigger trg after drop column: no such column: m
+}
+
+# Drop column NOT referenced by the cross-table trigger should succeed
+@cross-check-integrity
+test drop-column-cross-table-trigger-unreferenced {
+    CREATE TABLE t (n REAL);
+    CREATE TABLE t1 (m TEXT, d REAL, e INTEGER);
+    CREATE TRIGGER trg BEFORE DELETE ON t BEGIN
+        UPDATE t1 SET m = 'x' WHERE m = 'y';
+    END;
+    ALTER TABLE t1 DROP COLUMN e;
+    SELECT sql FROM sqlite_schema WHERE name = 't1';
+}
+expect {
+    CREATE TABLE t1 (m TEXT, d REAL)
+}
+
+# Trigger on owning table with invalid column ref in command targeting another table → fail
+@cross-check-integrity
+test fail-drop-column-trigger-invalid-col-ref-other-table {
+    CREATE TABLE t (x, y);
+    CREATE TABLE u (x, y);
+    CREATE TRIGGER tu BEFORE INSERT ON t BEGIN
+        UPDATE u SET x = NEW.y WHERE z = 1;
+    END;
+    ALTER TABLE t DROP COLUMN x;
+}
+expect error {
+    error in trigger tu
+}
+
+# INSERT col list on OTHER table refs dropped col → succeed (deferred)
+@cross-check-integrity
+test drop-column-other-table-trigger-insert-col-deferred {
+    CREATE TABLE t (x INTEGER PRIMARY KEY);
+    CREATE TABLE u (z INTEGER, zer INTEGER);
+    CREATE TRIGGER tu BEFORE INSERT ON t BEGIN
+        INSERT INTO u(z, zer) VALUES (NEW.x, NEW.x);
+    END;
+    ALTER TABLE u DROP COLUMN zer;
+    SELECT name FROM pragma_table_info('u');
+}
+expect {
+    z
+}
+
+# INSERT col list targets owning table → succeed (deferred)
+@cross-check-integrity
+test drop-column-owning-table-trigger-insert-col-deferred {
+    CREATE TABLE t (x INTEGER, y INTEGER);
+    CREATE TRIGGER tu BEFORE INSERT ON t BEGIN
+        INSERT INTO t(x) VALUES (NEW.y);
+    END;
+    ALTER TABLE t DROP COLUMN x;
+    SELECT name FROM pragma_table_info('t');
+}
+expect {
+    y
+}
+
+# UPDATE SET target on owning table → succeed (deferred)
+@cross-check-integrity
+test drop-column-owning-table-trigger-update-set-deferred {
+    CREATE TABLE t (x INTEGER, y INTEGER);
+    CREATE TRIGGER tu BEFORE INSERT ON t BEGIN
+        UPDATE t SET x = NEW.y WHERE y = 1;
+    END;
+    ALTER TABLE t DROP COLUMN x;
+    SELECT name FROM pragma_table_info('t');
+}
+expect {
+    y
+}
+
+# ──────────────────────────────────────────────────────────────────────
+# Adversarial DROP COLUMN + trigger tests
+# ──────────────────────────────────────────────────────────────────────
+
+# WHEN clause referencing dropped column via NEW qualifier
+@cross-check-integrity
+test fail-drop-column-when-clause-new-ref {
+    CREATE TABLE t (a, b, c);
+    CREATE TRIGGER tr AFTER INSERT ON t WHEN NEW.b > 0 BEGIN SELECT 1; END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
+# Trigger body UPDATE SET value via NEW.dropped_col
+@cross-check-integrity
+test fail-drop-column-new-qualified-ref-in-set {
+    CREATE TABLE t (a, b, c);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET c = NEW.b WHERE a = 1; END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
+# INSERT VALUES referencing dropped column via NEW qualifier
+@cross-check-integrity
+test fail-drop-column-insert-values-new-ref {
+    CREATE TABLE t (a, b);
+    CREATE TABLE u (x);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO u VALUES (NEW.b); END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
+# INSERT INTO ... SELECT referencing dropped column
+@cross-check-integrity
+test fail-drop-column-insert-select-ref {
+    CREATE TABLE t (a, b, c);
+    CREATE TABLE u (x);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO u SELECT b FROM t; END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
+# Subquery inside trigger DELETE WHERE references dropped column
+@cross-check-integrity
+test fail-drop-column-subquery-in-delete-where {
+    CREATE TABLE t (a, b);
+    CREATE TABLE u (x, y);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN DELETE FROM u WHERE x = (SELECT b FROM t LIMIT 1); END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
+# Table-qualified reference to dropped column (t.col)
+@cross-check-integrity
+test fail-drop-column-table-qualified-ref {
+    CREATE TABLE t (a, b, c);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET c = t.b; END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
+# RAISE in WHEN clause referencing dropped column via NEW
+@cross-check-integrity
+test fail-drop-column-raise-when-new-ref {
+    CREATE TABLE t (a, b);
+    CREATE TRIGGER tr BEFORE INSERT ON t WHEN NEW.b IS NULL BEGIN SELECT RAISE(ABORT, 'b is null'); END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
+# Multiple triggers, only second one references dropped column
+@cross-check-integrity
+test fail-drop-column-multiple-triggers-one-bad {
+    CREATE TABLE t (a, b, c);
+    CREATE TRIGGER tr1 AFTER INSERT ON t BEGIN SELECT 1; END;
+    CREATE TRIGGER tr2 AFTER INSERT ON t BEGIN UPDATE t SET c = b; END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr2 after drop column: no such column:
+}
+
+# EXISTS subquery referencing dropped column
+@cross-check-integrity
+test fail-drop-column-exists-subquery-ref {
+    CREATE TABLE t (a, b, c);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET c = 1 WHERE EXISTS (SELECT 1 FROM t WHERE b = 0); END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
+# Cross-table trigger with subquery in INSERT VALUES referencing dropped column
+@cross-check-integrity
+test fail-drop-column-cross-table-subquery-in-insert {
+    CREATE TABLE t (a, b);
+    CREATE TABLE u (x);
+    CREATE TRIGGER tr AFTER INSERT ON u BEGIN INSERT INTO u(x) VALUES ((SELECT b FROM t LIMIT 1)); END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
+# Aggregate in subquery referencing dropped column (cross-table)
+@cross-check-integrity
+test fail-drop-column-aggregate-subquery-cross-table {
+    CREATE TABLE t (a, b);
+    CREATE TABLE u (x);
+    CREATE TRIGGER tr AFTER INSERT ON u BEGIN INSERT INTO u(x) VALUES ((SELECT sum(b) FROM t)); END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
+# DROP non-referenced column should succeed even with complex triggers present
+@cross-check-integrity
+test drop-column-unreferenced-with-complex-trigger {
+    CREATE TABLE t (a, b, c, d);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET c = b WHERE a = 1; END;
+    ALTER TABLE t DROP COLUMN d;
+    SELECT name FROM pragma_table_info('t');
+}
+expect {
+    a
+    b
+    c
+}
+
+# Nested function call referencing dropped column
+@cross-check-integrity
+test fail-drop-column-nested-function-ref {
+    CREATE TABLE t (a, b, c);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET c = upper(substr(b, 1, 3)); END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
+# COALESCE referencing dropped column
+@cross-check-integrity
+test fail-drop-column-coalesce-ref {
+    CREATE TABLE t (a, b, c);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET c = coalesce(b, 0); END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
+# IN expression referencing dropped column
+@cross-check-integrity
+test fail-drop-column-in-expr-ref {
+    CREATE TABLE t (a, b, c);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET c = 1 WHERE a IN (b, c); END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
+# BETWEEN referencing dropped column
+@cross-check-integrity
+test fail-drop-column-between-ref {
+    CREATE TABLE t (a, b, c);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET c = 1 WHERE a BETWEEN b AND c; END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
+# Compound expression (||) referencing dropped column
+@cross-check-integrity
+test fail-drop-column-compound-expr-ref {
+    CREATE TABLE t (a, b, c);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET c = a || b; END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
+# CASE expression referencing dropped column
+@cross-check-integrity
+test fail-drop-column-case-expr-ref {
+    CREATE TABLE t (a, b, c);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET c = CASE WHEN b > 0 THEN 1 ELSE 0 END; END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}

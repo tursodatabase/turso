@@ -1,0 +1,17 @@
+---
+source: sorting.sqltest
+expression: |-
+  SELECT * FROM articles
+      WHERE status > 'draft'
+      ORDER BY category;
+info:
+  statement_type: SELECT
+  tables:
+  - articles
+  setup_blocks:
+  - sort_elim
+  database: ':memory:'
+---
+QUERY PLAN
+|--SEARCH articles USING INDEX idx_articles_status_cat_pub (status>?)
+`--USE SORTER FOR ORDER BY

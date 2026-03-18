@@ -412,6 +412,14 @@ impl Value {
         }
     }
 
+    pub fn to_float_or_zero(&self) -> f64 {
+        match self {
+            Value::Numeric(Numeric::Float(f)) => f64::from(*f),
+            Value::Numeric(Numeric::Integer(i)) => *i as f64,
+            _ => 0.0,
+        }
+    }
+
     pub fn as_int(&self) -> Option<i64> {
         match self {
             Value::Numeric(Numeric::Integer(i)) => Some(*i),
@@ -709,11 +717,20 @@ impl AggContext {
         }
     }
 
-    /// Get a mutable reference to the builtin payload
+    /// Get a mutable reference to the builtin payload as a slice
     pub fn payload_mut(&mut self) -> &mut [Value] {
         match self {
             Self::Builtin(payload) => payload,
             Self::External(_) => panic!("payload_mut() called on External aggregate"),
+        }
+    }
+
+    /// Get a mutable reference to the builtin payload Vec (for aggregates that
+    /// grow the payload, e.g. array_agg).
+    pub fn payload_vec_mut(&mut self) -> &mut Vec<Value> {
+        match self {
+            Self::Builtin(payload) => payload,
+            Self::External(_) => panic!("payload_vec_mut() called on External aggregate"),
         }
     }
 
@@ -1433,7 +1450,10 @@ impl<'a> ValueIterator<'a> {
         let (header_size, header_varint_len) = read_varint(payload)?;
         let header_size = header_size as usize;
 
-        if header_size > payload.len() || header_varint_len > payload.len() {
+        if header_size > payload.len()
+            || header_varint_len > payload.len()
+            || header_varint_len > header_size
+        {
             return Err(LimboError::Corrupt(
                 "Payload too small for indicated header size".into(),
             ));

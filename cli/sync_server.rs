@@ -30,6 +30,7 @@ pub struct TursoSyncServer {
 
 impl TursoSyncServer {
     pub fn new(address: String, conn: Arc<Connection>, interrupt_count: Arc<AtomicUsize>) -> Self {
+        conn.wal_auto_checkpoint_disable();
         Self {
             address,
             conn: Arc::new(Mutex::new(conn)),
@@ -489,6 +490,14 @@ impl TursoSyncServer {
         let frame_size = WAL_FRAME_HEADER_SIZE + PAGE_SIZE;
         let mut frame_buffer = vec![0u8; frame_size];
 
+        debug!(
+            "pull-updates: scanning WAL frames {}..={} (client_revision={}, server_revision={})",
+            client_revision + 1,
+            server_revision,
+            client_revision,
+            server_revision
+        );
+
         if server_revision > client_revision {
             for frame_no in (client_revision + 1..=server_revision).rev() {
                 let frame_info = conn.wal_get_frame(frame_no, &mut frame_buffer)?;
@@ -509,11 +518,22 @@ impl TursoSyncServer {
 
                 seen_pages.insert(page_no);
 
+                let type_byte = frame_buffer[WAL_FRAME_HEADER_SIZE];
+                debug!(
+                    "pull-updates: including page_no={}, frame_no={}, type_byte={}, db_size={}",
+                    page_no, frame_no, type_byte, frame_info.db_size
+                );
+
                 let page_data = frame_buffer[WAL_FRAME_HEADER_SIZE..].to_vec();
                 pages_to_send.push((page_id, page_data));
             }
         }
 
+        debug!(
+            "pull-updates: sending {} pages, seen_pages={:?}",
+            pages_to_send.len(),
+            seen_pages
+        );
         pages_to_send.reverse();
 
         let db_size = if wal_state.max_frame > 0 {

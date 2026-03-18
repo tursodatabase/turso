@@ -469,6 +469,43 @@ fn generate_update_sets<C: Capabilities>(
 
     for _ in 0..num_sets {
         let col = ctx.choose(&candidates).unwrap();
+
+        // For array columns, 50% chance of read-modify-write expression
+        if col.data_type.is_array() && ctx.gen_bool_with_prob(0.5) {
+            let col_name = col.name.clone();
+            let col_data_type = col.data_type;
+            let variant = ctx.gen_range(3);
+            let col_ref = Expr::column_ref(ctx, None, col_name.clone());
+            let array_expr = match variant {
+                0 => {
+                    // array_append(col, <literal>)
+                    let elem_type = col_data_type
+                        .array_element_type()
+                        .unwrap_or(DataType::Integer);
+                    let lit = generate_literal(ctx, elem_type, generator.policy());
+                    let lit_expr = Expr::literal(ctx, lit);
+                    Expr::function_call(ctx, "ARRAY_APPEND".to_string(), vec![col_ref, lit_expr])
+                }
+                1 => {
+                    // array_remove(col, <literal>)
+                    let elem_type = col_data_type
+                        .array_element_type()
+                        .unwrap_or(DataType::Integer);
+                    let lit = generate_literal(ctx, elem_type, generator.policy());
+                    let lit_expr = Expr::literal(ctx, lit);
+                    Expr::function_call(ctx, "ARRAY_REMOVE".to_string(), vec![col_ref, lit_expr])
+                }
+                _ => {
+                    // array_cat(col, <array_literal>)
+                    let lit = generate_literal(ctx, col_data_type, generator.policy());
+                    let lit_expr = Expr::literal(ctx, lit);
+                    Expr::function_call(ctx, "ARRAY_CAT".to_string(), vec![col_ref, lit_expr])
+                }
+            };
+            sets.push((col_name, array_expr));
+            continue;
+        }
+
         if let Some(ref expr_gen) = update_expr_gen {
             if ctx.gen_bool_with_prob(expr_prob) {
                 if let Ok(expr) = generate_expr(expr_gen, ctx, 0) {
@@ -598,14 +635,27 @@ pub fn generate_create_table<C: Capabilities>(
     });
 
     // Generate additional columns
-    let types = [
-        DataType::Integer,
-        DataType::Real,
-        DataType::Text,
-        DataType::Blob,
-    ];
     for _ in 1..num_cols {
-        let data_type = *ctx.choose(&types).unwrap();
+        let data_type = if create_table_config.array_column_probability > 0.0
+            && ctx.gen_bool_with_prob(create_table_config.array_column_probability)
+        {
+            // Pick an array type
+            let array_types = [
+                DataType::IntegerArray,
+                DataType::RealArray,
+                DataType::TextArray,
+            ];
+            *ctx.choose(&array_types).unwrap()
+        } else {
+            // Pick a non-array type
+            let base_types = [
+                DataType::Integer,
+                DataType::Real,
+                DataType::Text,
+                DataType::Blob,
+            ];
+            *ctx.choose(&base_types).unwrap()
+        };
         let not_null = ctx.gen_bool_with_prob(create_table_config.not_null_probability);
         let unique = ctx.gen_bool_with_prob(create_table_config.unique_probability);
         let default = if ctx.gen_bool_with_prob(create_table_config.default_probability) {
@@ -660,7 +710,9 @@ pub fn generate_create_table<C: Capabilities>(
         }
     };
 
-    let strict = ctx.gen_bool_with_prob(create_table_config.strict_probability);
+    // Force STRICT when any column has an array type (arrays require STRICT tables).
+    let has_array_column = columns.iter().any(|c| c.data_type.is_array());
+    let strict = has_array_column || ctx.gen_bool_with_prob(create_table_config.strict_probability);
 
     // STRICT tables don't allow untyped (Null) columns — convert to Integer.
     if strict {
@@ -1256,8 +1308,12 @@ fn generate_check_constraint<C: Capabilities>(
             };
             Ok(Some(expr))
         }
-        // Blob and Null types don't have useful check constraints
-        DataType::Blob | DataType::Null => Ok(None),
+        // Blob, Null, and array types don't have useful check constraints
+        DataType::Blob
+        | DataType::Null
+        | DataType::IntegerArray
+        | DataType::RealArray
+        | DataType::TextArray => Ok(None),
     }
 }
 

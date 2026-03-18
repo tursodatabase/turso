@@ -320,6 +320,9 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
 
     /// Returns the current row as an immutable record.
     pub fn current_row(&mut self) -> Result<IOResult<Option<&crate::types::ImmutableRecord>>> {
+        if self.get_null_flag() {
+            return Ok(IOResult::Done(None));
+        }
         let current_pos = &self.current_pos;
         tracing::trace!("current_row({:?})", current_pos);
         match current_pos {
@@ -842,10 +845,11 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     self.dual_peek.mvcc_peek = CursorPeek::Exhausted;
                 }
             },
-            MvccCursorType::Index(_) => match self
-                .db
-                .get_last_index_rowid(self.table_id, &mut self.index_iterator)
-            {
+            MvccCursorType::Index(_) => match self.db.get_last_index_rowid(
+                self.table_id,
+                self.tx_id,
+                &mut self.index_iterator,
+            ) {
                 Some(k) => {
                     self.dual_peek.mvcc_peek = CursorPeek::Row(k);
                 }
@@ -1027,6 +1031,9 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn rowid(&mut self) -> Result<IOResult<Option<i64>>> {
+        if self.get_null_flag() {
+            return Ok(IOResult::Done(None));
+        }
         let rowid = match self.get_current_pos() {
             CursorPosition::Loaded {
                 row_id,
@@ -1656,6 +1663,11 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
 
     fn get_skip_advance(&self) -> bool {
         todo!()
+    }
+
+    /// Returns true if this cursor operates in MVCC mode.
+    fn is_mvcc(&self) -> bool {
+        true
     }
 }
 

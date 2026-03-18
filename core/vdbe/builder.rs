@@ -31,7 +31,7 @@ impl TableRefIdCounter {
         }
     }
 
-    #[expect(clippy::should_implement_trait)]
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> ast::TableInternalId {
         let id = self.next_free;
         self.next_free += 1;
@@ -153,15 +153,24 @@ pub struct ProgramBuilder {
     /// Current parent explain address, if any.
     current_parent_explain_idx: Option<usize>,
     pub(crate) reg_result_cols_start: Option<usize>,
-    /// Whether the program needs to use statement subtransactions,
-    /// i.e. the individual statement may need to be aborted due to a constraint conflict, etc.
-    /// instead of the entire transaction.
-    needs_stmt_subtransactions: bool,
+    /// Mirrors SQLite's isMultiWrite: true if the statement may modify/insert multiple rows.
+    /// If a non-autocommit transaction can modify multiple rows, statement subjournaling is always
+    /// required for proper cleanup on abort. If only one row can be modified, then journaling is not
+    /// necessary because on abort there is nothing to clean up.
+    /// Defaults to true for safety; specific translate paths (e.g., single-row INSERT) set false.
+    is_multi_write: bool,
+    /// Mirrors SQLite's mayAbort: true if the statement may throw an ABORT exception.
+    /// This flag is used in combination with is_multi_write to determine if statement subjournaling is required.
+    /// Defaults to true for safety; specific translate paths (e.g., INSERT with no constraints) set false.
+    may_abort: bool,
     /// If this ProgramBuilder is building trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
     /// Whether this is a subprogram (trigger or FK action). Subprograms skip Transaction instructions.
     pub is_subprogram: bool,
     pub resolve_type: ResolveType,
+    /// Whether the resolve_type was explicitly set from a statement-level OR clause.
+    /// When false, per-constraint ON CONFLICT clauses from CREATE TABLE should be used.
+    pub has_statement_conflict: bool,
     /// When set, all triggers fired from this program should use this conflict resolution.
     /// This is used in UPSERT DO UPDATE context to ensure nested trigger's OR IGNORE/REPLACE
     /// clauses don't suppress errors.
@@ -236,8 +245,6 @@ pub struct MaterializedCteInfo {
     pub cursor_id: CursorID,
     /// The table definition, needed for allocating dup cursors with the same CursorType.
     pub table: Arc<BTreeTable>,
-    /// Start register for reading result columns.
-    pub result_columns_start_reg: usize,
     /// Number of result columns.
     pub num_columns: usize,
 }
@@ -354,6 +361,18 @@ macro_rules! emit_explain {
 }
 
 impl ProgramBuilder {
+    /// Run a nested emission scope without leaking its result-column register base
+    /// into the surrounding builder state.
+    pub fn with_scoped_result_cols_start<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> crate::Result<T>,
+    ) -> crate::Result<T> {
+        let saved = self.reg_result_cols_start;
+        let result = f(self);
+        self.reg_result_cols_start = saved;
+        result
+    }
+
     pub fn new(
         query_mode: QueryMode,
         capture_data_changes_info: Option<CaptureDataChangesInfo>,
@@ -420,10 +439,12 @@ impl ProgramBuilder {
             query_mode,
             current_parent_explain_idx: None,
             reg_result_cols_start: None,
-            needs_stmt_subtransactions: false,
+            is_multi_write: true,
+            may_abort: true,
             trigger,
             is_subprogram,
             resolve_type: ResolveType::Abort,
+            has_statement_conflict: false,
             trigger_conflict_override: None,
             cursor_overrides: HashMap::default(),
             id_register_overrides: HashMap::default(),
@@ -581,8 +602,15 @@ impl ProgramBuilder {
         self.subquery_result_regs.get(&internal_id).copied()
     }
 
-    pub fn set_needs_stmt_subtransactions(&mut self, needs_stmt_subtransactions: bool) {
-        self.needs_stmt_subtransactions = needs_stmt_subtransactions;
+    /// Mark that this statement may modify/insert multiple rows (mirrors SQLite's sqlite3MultiWrite).
+    /// When false, statement journals are skipped since single-write statements are atomic.
+    pub fn set_multi_write(&mut self, is_multi_write: bool) {
+        self.is_multi_write = is_multi_write;
+    }
+
+    /// Mark that this statement may throw an ABORT exception (mirrors SQLite's sqlite3MayAbort).
+    pub fn set_may_abort(&mut self, may_abort: bool) {
+        self.may_abort = may_abort;
     }
 
     pub fn capture_data_changes_info(&self) -> &Option<CaptureDataChangesInfo> {
@@ -715,6 +743,18 @@ impl ProgramBuilder {
         Ok(self._alloc_cursor_id(key, CursorType::BTreeIndex(index.clone())))
     }
 
+    pub fn alloc_cursor_index_if_not_exists(
+        &mut self,
+        key: CursorKey,
+        index: &Arc<Index>,
+    ) -> crate::Result<usize> {
+        if let Some(cursor_id) = self.resolve_cursor_id_safe(&key) {
+            Ok(cursor_id)
+        } else {
+            self.alloc_cursor_index(Some(key), index)
+        }
+    }
+
     pub fn alloc_cursor_id(&mut self, cursor_type: CursorType) -> usize {
         self._alloc_cursor_id(None, cursor_type)
     }
@@ -800,6 +840,7 @@ impl ProgramBuilder {
                 String::new()
             },
             on_error: None,
+            description_reg: None,
         });
     }
 
@@ -812,6 +853,7 @@ impl ProgramBuilder {
             err_code,
             description,
             on_error: None,
+            description_reg: None,
         });
     }
 
@@ -1144,6 +1186,8 @@ impl ProgramBuilder {
                 Insn::Yield {
                     yield_reg: _,
                     end_offset,
+                    subtype_clear_start_reg: _,
+                    subtype_clear_count: _,
                 } => {
                     resolve(end_offset, "Yield")?;
                 }
@@ -1191,6 +1235,16 @@ impl ProgramBuilder {
                 }
                 Insn::HashNextUnmatched { target_pc, .. } => {
                     resolve(target_pc, "HashNextUnmatched")?
+                }
+                Insn::HashGraceInit { target_pc, .. } => resolve(target_pc, "HashGraceInit")?,
+                Insn::HashGraceLoadPartition { target_pc, .. } => {
+                    resolve(target_pc, "HashGraceLoadPartition")?
+                }
+                Insn::HashGraceNextProbe { target_pc, .. } => {
+                    resolve(target_pc, "HashGraceNextProbe")?
+                }
+                Insn::HashGraceAdvancePartition { target_pc, .. } => {
+                    resolve(target_pc, "HashGraceAdvancePartition")?
                 }
                 Insn::Program {
                     ignore_jump_target, ..
@@ -1405,6 +1459,7 @@ impl ProgramBuilder {
                 err_code: 0,
                 description: description.to_string(),
                 on_error: None,
+                description_reg: None,
             });
             return;
         }
@@ -1461,6 +1516,11 @@ impl ProgramBuilder {
     /// Checks whether `table` or any of its indices has been opened in the program
     pub fn is_table_open(&self, table: &Table) -> bool {
         self.table_references.contains_table(table)
+    }
+
+    /// Returns true if the cursor is a BTreeTable cursor.
+    pub fn cursor_is_btree(&self, cursor_id: CursorID) -> bool {
+        matches!(self.cursor_ref[cursor_id].1, CursorType::BTreeTable(_))
     }
 
     #[inline]
@@ -1589,11 +1649,14 @@ impl ProgramBuilder {
 
         self.parameters.list.dedup();
 
-        // before, we required stmt subtransaction only if !self.table_references.is_empty()
-        // this is wrong in case of CREATE UNIQUE INDEX statements - as they can fail with CONSTRAINT error and we need to properly behave in this case
-        if matches!(self.txn_mode, TransactionMode::Write) {
-            self.needs_stmt_subtransactions = true;
-        }
+        // Mirrors SQLite's: usesStmtJournal = isMultiWrite && mayAbort
+        // Statement journals are only needed when a statement writes multiple rows AND could
+        // abort midway (e.g. constraint violation). Single-row writes are atomic and don't
+        // need statement-level rollback. Both flags default to true; specific translate paths
+        // (e.g., single-row INSERT) set is_multi_write=false to opt out.
+        let needs_stmt_subtransactions = matches!(self.txn_mode, TransactionMode::Write)
+            && self.is_multi_write
+            && self.may_abort;
 
         let contains_trigger_subprograms = self
             .insns
@@ -1611,7 +1674,7 @@ impl ProgramBuilder {
             table_references: self.table_references,
             sql: sql.to_string(),
             needs_stmt_subtransactions: crate::Arc::new(crate::AtomicBool::new(
-                self.needs_stmt_subtransactions,
+                needs_stmt_subtransactions,
             )),
             trigger: self.trigger.take(),
             is_subprogram: self.is_subprogram,

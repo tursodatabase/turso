@@ -61,8 +61,8 @@ settings.local.json
 .build-hash
 
 # Track empty wals for read only databases
-!testing/runner/database/*
-testing/runner/database/integrity_*.db
+!testing/sqltests/database/*
+testing/sqltests/database/integrity_*.db
 
 
 # For simulator redo
@@ -71,7 +71,7 @@ test.sql
 # for elle edn transaction history
 *.edn
 elle-history-results/
-
+custom-types-fuzzer-output/
 CLAUDE.md
 bindings/python/dev.py
 bindings/python/implementation-test/

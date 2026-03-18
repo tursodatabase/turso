@@ -7,7 +7,7 @@ use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::schema::{BTreeTable, IndexColumn, ROWID_SENTINEL};
 use crate::translate::emitter::{emit_check_constraints, UpdateRowSource};
-use crate::translate::expr::{rewrite_between_expr, walk_expr, WalkControl};
+use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{
     emit_fk_child_update_counters, emit_parent_key_change_checks, fire_fk_update_actions,
 };
@@ -589,6 +589,7 @@ pub fn emit_upsert(
                 &bt.columns,
                 new_start,
                 None,
+                &bt.name,
             )?;
 
             // Post-encode TypeCheck: validate encoded values match storage type.
@@ -995,6 +996,7 @@ pub fn emit_upsert(
                     err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                     description,
                     on_error: None,
+                    description_reg: None,
                 });
                 program.preassign_label_to_next_insn(ok);
             }
@@ -1061,6 +1063,7 @@ pub fn emit_upsert(
                     .unwrap_or("rowid")
             ),
             on_error: None,
+            description_reg: None,
         });
         program.preassign_label_to_next_insn(ok);
 
@@ -1328,7 +1331,6 @@ fn eval_partial_pred_for_row_image(
         return None;
     };
     let mut e = where_expr.as_ref().clone();
-    rewrite_between_expr(&mut e);
     rewrite_expr_to_registers(
         &mut e, table, row_start, rowid_reg, None,  // table_name
         None,  // insertion

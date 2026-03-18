@@ -163,6 +163,10 @@ fn to_prop_schema(schema: &sql_gen::Schema) -> sql_gen_prop::Schema {
                     sql_gen::DataType::Text => sql_gen_prop::DataType::Text,
                     sql_gen::DataType::Blob => sql_gen_prop::DataType::Blob,
                     sql_gen::DataType::Null => sql_gen_prop::DataType::Null,
+                    // Array types have no prop equivalent — map to Blob
+                    sql_gen::DataType::IntegerArray
+                    | sql_gen::DataType::RealArray
+                    | sql_gen::DataType::TextArray => sql_gen_prop::DataType::Blob,
                 };
                 let mut col = sql_gen_prop::ColumnDef::new(c.name.clone(), dt);
                 if !c.nullable {

@@ -625,6 +625,128 @@ pub fn insn_to_row(
                 0,
                 String::from(""),
             ),
+            Insn::ArrayEncode {
+                reg,
+                element_type,
+                table_name,
+                col_name,
+                ..
+            } => (
+                "ArrayEncode",
+                *reg as i64,
+                0,
+                0,
+                Value::build_text(""),
+                0,
+                format!("{table_name}.{col_name} ({element_type})"),
+            ),
+            Insn::ArrayDecode { reg } => (
+                "ArrayDecode",
+                *reg as i64,
+                0,
+                0,
+                Value::build_text(""),
+                0,
+                String::new(),
+            ),
+            Insn::ArrayElement {
+                array_reg,
+                index_reg,
+                dest,
+            } => (
+                "ArrayElement",
+                *array_reg as i64,
+                *index_reg as i64,
+                *dest as i64,
+                Value::build_text(""),
+                0,
+                String::new(),
+            ),
+            Insn::ArrayLength { reg, dest } => (
+                "ArrayLength",
+                *reg as i64,
+                *dest as i64,
+                0,
+                Value::build_text(""),
+                0,
+                String::new(),
+            ),
+            Insn::MakeArray {
+                start_reg,
+                count,
+                dest,
+            } => (
+                "MakeArray",
+                *start_reg as i64,
+                *count as i64,
+                *dest as i64,
+                Value::build_text(""),
+                0,
+                String::new(),
+            ),
+            Insn::MakeArrayDynamic {
+                start_reg,
+                count_reg,
+                dest,
+            } => (
+                "MakeArrayDynamic",
+                *start_reg as i64,
+                *count_reg as i64,
+                *dest as i64,
+                Value::build_text(""),
+                0,
+                String::new(),
+            ),
+            Insn::RegCopyOffset {
+                src,
+                base,
+                offset_reg,
+            } => (
+                "RegCopyOffset",
+                *src as i64,
+                *base as i64,
+                *offset_reg as i64,
+                Value::build_text(""),
+                0,
+                String::new(),
+            ),
+            Insn::ArrayConcat { lhs, rhs, dest } => (
+                "ArrayConcat",
+                *lhs as i64,
+                *rhs as i64,
+                *dest as i64,
+                Value::build_text(""),
+                0,
+                String::new(),
+            ),
+            Insn::ArraySetElement {
+                array_reg,
+                index_reg,
+                value_reg,
+                dest,
+            } => (
+                "ArraySetElement",
+                *array_reg as i64,
+                *index_reg as i64,
+                *dest as i64,
+                Value::build_text(""),
+                0,
+                format!("r[{value_reg}]"),
+            ),
+            Insn::ArraySlice {
+                array_reg,
+                start_reg,
+                end_reg,
+                dest,
+            } => (
+                "ArraySlice",
+                *array_reg as i64,
+                *start_reg as i64,
+                *dest as i64,
+                Value::build_text(""),
+                0,
+                format!("end_reg=r[{end_reg}]"),
+            ),
             Insn::MakeRecord {
                 start_reg,
                 count,
@@ -678,6 +800,7 @@ pub fn insn_to_row(
                 err_code,
                 description,
                 on_error,
+                description_reg,
             } => {
                 let p2 = match on_error {
                     Some(ResolveType::Rollback) => 1,
@@ -687,11 +810,12 @@ pub fn insn_to_row(
                     Some(ResolveType::Replace) => 5,
                     None => 0,
                 };
+                let p3 = description_reg.unwrap_or(0) as i64;
                 (
                     "Halt",
                     *err_code as i64,
                     p2,
-                    0,
+                    p3,
                     Value::build_text(description.clone()),
                     0,
                     "".to_string(),
@@ -1011,7 +1135,7 @@ pub fn insn_to_row(
                 acc_reg,
                 delimiter: _,
                 col,
-                comparator_func_name: _,
+                comparator: _,
             } => (
                 "AggStep",
                 0,
@@ -1228,6 +1352,7 @@ pub fn insn_to_row(
             Insn::Yield {
                 yield_reg,
                 end_offset,
+                ..
             } => (
                 "Yield",
                 *yield_reg as i64,
@@ -2068,7 +2193,7 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        Insn::HashProbe{hash_table_id: hash_table_reg, key_start_reg, num_keys, dest_reg, target_pc, payload_dest_reg, num_payload} => {
+        Insn::HashProbe{hash_table_id: hash_table_reg, key_start_reg, num_keys, dest_reg, target_pc, payload_dest_reg, num_payload, probe_rowid_reg: _} => {
             let payload_info = if let Some(p_reg) = payload_dest_reg {
                 format!(" payload=r[{}]..r[{}]", p_reg, p_reg + num_payload - 1)
             } else {
@@ -2136,6 +2261,15 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
+        Insn::HashResetMatched { hash_table_id } => (
+            "HashResetMatched",
+            *hash_table_id as i64,
+            0,
+            0,
+            Value::build_text(""),
+            0,
+            String::new(),
+        ),
         Insn::HashScanUnmatched { hash_table_id, dest_reg, target_pc, payload_dest_reg, num_payload } => {
             let payload_info = if let Some(p_reg) = payload_dest_reg {
                 format!(" payload=r[{}]..r[{}]", p_reg, p_reg + num_payload - 1)
@@ -2166,6 +2300,50 @@ pub fn insn_to_row(
                 Value::build_text(""),
                 0,
                 format!("hash_table_id={hash_table_id}{payload_info}"),
+            )
+        },
+        Insn::HashGraceInit { hash_table_id, target_pc } => {
+            (
+                "HashGraceInit",
+                *hash_table_id as i64,
+                0,
+                target_pc.as_debug_int() as i64,
+                Value::build_text(""),
+                0,
+                format!("hash_table_id={hash_table_id}"),
+            )
+        },
+        Insn::HashGraceLoadPartition { hash_table_id, target_pc } => {
+            (
+                "HashGraceLoadPart",
+                *hash_table_id as i64,
+                0,
+                target_pc.as_debug_int() as i64,
+                Value::build_text(""),
+                0,
+                format!("hash_table_id={hash_table_id}"),
+            )
+        },
+        Insn::HashGraceNextProbe { hash_table_id, key_start_reg, num_keys, probe_rowid_dest, target_pc } => {
+            (
+                "HashGraceNextProbe",
+                *hash_table_id as i64,
+                *key_start_reg as i64,
+                target_pc.as_debug_int() as i64,
+                Value::build_text(""),
+                0,
+                format!("hash_table_id={hash_table_id} keys=r[{}]..r[{}] probe_rowid_dest=r[{probe_rowid_dest}]", key_start_reg, *key_start_reg + *num_keys - 1),
+            )
+        },
+        Insn::HashGraceAdvancePartition { hash_table_id, target_pc } => {
+            (
+                "HashGraceAdvPart",
+                *hash_table_id as i64,
+                0,
+                target_pc.as_debug_int() as i64,
+                Value::build_text(""),
+                0,
+                format!("hash_table_id={hash_table_id}"),
             )
         },
         Insn::VacuumInto { dest_path } => (

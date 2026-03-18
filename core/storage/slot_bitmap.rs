@@ -1,103 +1,135 @@
+use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::turso_assert;
-#[derive(Debug)]
-/// Fixed-size bitmap for tracking allocated slots in an arena.
+
+/// Shared constants for bitmap operations.
+const WORD_SHIFT: u32 = 6;
+const WORD_BITS: u32 = 64;
+const WORD_MASK: u32 = 63;
+
+const ALL_FREE: u64 = u64::MAX;
+const ALL_ALLOCATED: u64 = 0u64;
+
+#[inline]
+const fn word_and_bit_to_slot(word_idx: usize, bit: u32) -> u32 {
+    (word_idx as u32) << WORD_SHIFT | bit
+}
+
+#[inline]
+const fn slot_to_word_and_bit(slot_idx: u32) -> (usize, u32) {
+    ((slot_idx >> WORD_SHIFT) as usize, slot_idx & WORD_MASK)
+}
+
+/// Lock-free atomic bitmap for tracking allocated slots in an arena.
 ///
 /// Bit meaning:
 /// - 1 = free
 /// - 0 = allocated
-pub(super) struct SlotBitmap {
-    words: Box<[u64]>,
+///
+/// `alloc_one` is lock-free (CAS retry bounded by contention, not blocking).
+/// `free_one` is wait-free (single `fetch_or`).
+pub(super) struct AtomicSlotBitmap {
+    words: Box<[AtomicU64]>,
     n_slots: u32,
-    /// Hint for where the next allocation scan should start (word index).
-    next_word: usize,
+    /// Performance hint for where to start scanning. Not correctness-critical.
+    next_word_hint: AtomicUsize,
 }
 
-impl SlotBitmap {
-    /// 64 bits per word, so shift by 6 to get slot index.
-    const WORD_SHIFT: u32 = 6;
-    const WORD_BITS: u32 = 64;
-    const WORD_MASK: u32 = 63;
+// SAFETY: All fields are atomics or immutable after construction.
+unsafe impl Send for AtomicSlotBitmap {}
+unsafe impl Sync for AtomicSlotBitmap {}
 
-    const ALL_FREE: u64 = u64::MAX;
-    const ALL_ALLOCATED: u64 = 0u64;
+impl std::fmt::Debug for AtomicSlotBitmap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AtomicSlotBitmap")
+            .field("n_slots", &self.n_slots)
+            .finish()
+    }
+}
 
-    /// Creates a new `SlotBitmap` capable of tracking `n_slots` slots.
+impl AtomicSlotBitmap {
+    /// Creates a new `AtomicSlotBitmap` capable of tracking `n_slots` slots.
+    /// All slots start as free.
     pub fn new(n_slots: u32) -> Self {
         turso_assert!(n_slots > 0, "number of slots must be non-zero");
         turso_assert!(
-            n_slots % Self::WORD_BITS == 0,
+            n_slots % WORD_BITS == 0,
             "number of slots in map must be a multiple of 64"
         );
-        let n_words = (n_slots / Self::WORD_BITS) as usize;
-        let words = vec![Self::ALL_FREE; n_words].into_boxed_slice();
+        let n_words = (n_slots / WORD_BITS) as usize;
+        let words: Vec<AtomicU64> = (0..n_words).map(|_| AtomicU64::new(ALL_FREE)).collect();
         Self {
-            words,
+            words: words.into_boxed_slice(),
             n_slots,
-            next_word: 0,
+            next_word_hint: AtomicUsize::new(0),
         }
     }
 
-    #[inline]
-    const fn word_and_bit_to_slot(word_idx: usize, bit: u32) -> u32 {
-        (word_idx as u32) << Self::WORD_SHIFT | bit
-    }
-
-    #[inline]
-    const fn slot_to_word_and_bit(slot_idx: u32) -> (usize, u32) {
-        (
-            (slot_idx >> Self::WORD_SHIFT) as usize,
-            slot_idx & Self::WORD_MASK,
-        )
-    }
-
-    /// Returns whether a slot is currently free.
-    pub(super) fn is_free(&self, slot: u32) -> bool {
+    /// Returns whether a slot is currently free (snapshot, may be stale).
+    pub fn is_free(&self, slot: u32) -> bool {
         if slot >= self.n_slots {
             return false;
         }
-        let (word_idx, bit) = Self::slot_to_word_and_bit(slot);
-        (self.words[word_idx] & (1u64 << bit)) != 0
+        let (word_idx, bit) = slot_to_word_and_bit(slot);
+        (self.words[word_idx].load(Ordering::Acquire) & (1u64 << bit)) != 0
     }
 
-    /// Allocates a single free slot from the bitmap.
-    pub fn alloc_one(&mut self) -> Option<u32> {
+    /// Allocates a single free slot from the bitmap. Lock-free.
+    ///
+    /// Returns `Some(slot_index)` on success, `None` if all slots are allocated.
+    pub fn alloc_one(&self) -> Option<u32> {
         let n_words = self.words.len();
         if n_words == 0 {
             return None;
         }
 
-        let mut start = self.next_word.min(n_words - 1);
-        for _pass in 0..2 {
-            for word_idx in start..n_words {
-                let word = self.words[word_idx];
-                if word == Self::ALL_ALLOCATED {
-                    continue;
-                }
+        let hint = self.next_word_hint.load(Ordering::Acquire).min(n_words - 1);
+
+        // Scan from hint to end, then wrap around from 0 to hint.
+        for offset in 0..n_words {
+            let word_idx = (hint + offset) % n_words;
+            let mut word = self.words[word_idx].load(Ordering::Acquire);
+
+            while word != ALL_ALLOCATED {
                 let bit = word.trailing_zeros();
-                self.words[word_idx] &= !(1u64 << bit);
+                let new_word = word & !(1u64 << bit);
 
-                if self.words[word_idx] == Self::ALL_ALLOCATED {
-                    self.next_word = (word_idx + 1) % n_words;
-                } else {
-                    self.next_word = word_idx;
+                match self.words[word_idx].compare_exchange_weak(
+                    word,
+                    new_word,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        // Update hint: if word is now fully allocated, advance past it.
+                        let new_hint = if new_word == ALL_ALLOCATED {
+                            (word_idx + 1) % n_words
+                        } else {
+                            word_idx
+                        };
+                        self.next_word_hint.store(new_hint, Ordering::Release);
+                        return Some(word_and_bit_to_slot(word_idx, bit));
+                    }
+                    Err(actual) => {
+                        // CAS failed — another thread changed this word. Retry with fresh value.
+                        word = actual;
+                    }
                 }
-
-                return Some(Self::word_and_bit_to_slot(word_idx, bit));
             }
-            start = 0;
         }
         None
     }
 
-    /// Frees a previously allocated slot.
-    pub fn free_one(&mut self, slot: u32) {
+    /// Frees a previously allocated slot. Wait-free (single atomic op).
+    pub fn free_one(&self, slot: u32) {
         turso_assert!(slot < self.n_slots, "free_one out of bounds");
-        let (word_idx, bit) = Self::slot_to_word_and_bit(slot);
+        let (word_idx, bit) = slot_to_word_and_bit(slot);
         let mask = 1u64 << bit;
-        turso_assert!((self.words[word_idx] & mask) == 0, "slot already free");
-        self.words[word_idx] |= mask;
-        if word_idx < self.next_word {
-            self.next_word = word_idx;
+        let old = self.words[word_idx].fetch_or(mask, Ordering::Release);
+        debug_assert!((old & mask) == 0, "double-free detected for slot {slot}");
+        // If this word is before the current hint, pull the hint back.
+        let hint = self.next_word_hint.load(Ordering::Acquire);
+        if word_idx < hint {
+            self.next_word_hint.store(word_idx, Ordering::Release);
         }
     }
 }
@@ -107,71 +139,60 @@ pub mod tests {
     use super::*;
     use rand::{rngs::StdRng, Rng, SeedableRng};
 
-    fn pb_free_vec(pb: &SlotBitmap) -> Vec<bool> {
-        let mut v = vec![false; pb.n_slots as usize];
-        v.iter_mut()
-            .enumerate()
-            .take(pb.n_slots as usize)
-            .map(|(i, v)| {
-                let w = pb.words[i >> 6];
-                let bit = i & 63;
-                *v = (w & (1u64 << bit)) != 0;
-                *v
-            })
-            .collect()
+    fn atomic_free_vec(ab: &AtomicSlotBitmap) -> Vec<bool> {
+        (0..ab.n_slots).map(|i| ab.is_free(i)).collect()
     }
 
-    /// Returns `true` if the bitmap's notion of free bits equals the reference model exactly.
-    fn assert_equivalent(pb: &SlotBitmap, model: &[bool]) {
-        let pv = pb_free_vec(pb);
-        assert_eq!(pv, model, "bitmap bits disagree with reference model");
+    fn assert_equivalent(ab: &AtomicSlotBitmap, model: &[bool]) {
+        let av = atomic_free_vec(ab);
+        assert_eq!(av, model, "bitmap bits disagree with reference model");
     }
 
     #[test]
     fn alloc_one_exhausts_all() {
-        let mut pb = SlotBitmap::new(256);
+        let ab = AtomicSlotBitmap::new(256);
         let mut model = vec![true; 256];
 
         let mut count = 0;
-        while let Some(idx) = pb.alloc_one() {
+        while let Some(idx) = ab.alloc_one() {
             assert!(model[idx as usize], "must be free in model");
             model[idx as usize] = false;
             count += 1;
         }
         assert_eq!(count, 256, "should allocate all slots once");
-        assert!(pb.alloc_one().is_none(), "no slots left");
-        assert_equivalent(&pb, &model);
+        assert!(ab.alloc_one().is_none(), "no slots left");
+        assert_equivalent(&ab, &model);
     }
 
     #[test]
     fn free_one_allows_reuse() {
-        let mut pb = SlotBitmap::new(128);
+        let ab = AtomicSlotBitmap::new(128);
         let mut model = vec![true; 128];
 
-        let a = pb.alloc_one().unwrap();
-        let b = pb.alloc_one().unwrap();
+        let a = ab.alloc_one().unwrap();
+        let b = ab.alloc_one().unwrap();
         model[a as usize] = false;
         model[b as usize] = false;
 
-        pb.free_one(a);
+        ab.free_one(a);
         model[a as usize] = true;
-        assert_equivalent(&pb, &model);
+        assert_equivalent(&ab, &model);
 
-        let c = pb.alloc_one().unwrap();
+        let c = ab.alloc_one().unwrap();
         model[c as usize] = false;
-        assert_equivalent(&pb, &model);
+        assert_equivalent(&ab, &model);
     }
 
     #[test]
     fn freeing_earlier_slot_updates_hint() {
-        let mut pb = SlotBitmap::new(64);
+        let ab = AtomicSlotBitmap::new(64);
         let mut allocated = Vec::new();
-        while let Some(s) = pb.alloc_one() {
+        while let Some(s) = ab.alloc_one() {
             allocated.push(s);
         }
         let freed = allocated[0];
-        pb.free_one(freed);
-        assert_eq!(pb.alloc_one(), Some(freed));
+        ab.free_one(freed);
+        assert_eq!(ab.alloc_one(), Some(freed));
     }
 
     #[test]
@@ -189,13 +210,13 @@ pub mod tests {
         for &seed in seeds {
             let mut rng = StdRng::seed_from_u64(seed);
             let n_slots = rng.random_range(1..10) * 64;
-            let mut pb = SlotBitmap::new(n_slots);
+            let ab = AtomicSlotBitmap::new(n_slots);
             let mut model = vec![true; n_slots as usize];
 
             for _ in 0..2000usize {
                 match rng.random_range(0..100) {
                     0..=59 => {
-                        let got = pb.alloc_one();
+                        let got = ab.alloc_one();
                         if let Some(i) = got {
                             assert!(i < n_slots, "index in range");
                             assert!(model[i as usize], "bit must be free");
@@ -208,15 +229,14 @@ pub mod tests {
                         }
                     }
                     _ => {
-                        // Free a random allocated slot (if any).
                         let idx = rng.random_range(0..model.len());
                         if !model[idx] {
-                            pb.free_one(idx as u32);
+                            ab.free_one(idx as u32);
                             model[idx] = true;
                         }
                     }
                 }
-                assert_equivalent(&pb, &model);
+                assert_equivalent(&ab, &model);
             }
         }
     }

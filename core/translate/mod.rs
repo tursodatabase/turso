@@ -34,6 +34,7 @@ pub(crate) mod result_row;
 pub(crate) mod rollback;
 pub(crate) mod schema;
 pub(crate) mod select;
+pub(crate) mod stmt_journal;
 pub(crate) mod subquery;
 pub(crate) mod transaction;
 pub(crate) mod trigger;
@@ -62,7 +63,7 @@ use schema::{translate_create_table, translate_create_virtual_table, translate_d
 use select::translate_select;
 use tracing::{instrument, Level};
 use transaction::{translate_tx_begin, translate_tx_commit};
-use turso_parser::ast::{self, Indexed};
+use turso_parser::ast;
 use update::translate_update;
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -102,6 +103,7 @@ pub fn translate(
         connection.database_schemas(),
         connection.attached_databases(),
         syms,
+        connection.experimental_custom_types_enabled(),
     );
 
     match stmt {
@@ -225,6 +227,8 @@ pub fn translate_inner(
                 tbl_name,
                 program,
                 sql,
+                &commands,
+                when_clause.as_deref(),
             )?
         }
         ast::Stmt::CreateView {
@@ -254,15 +258,12 @@ pub fn translate_inner(
             order_by,
             with,
         } => {
-            if indexed.is_some_and(|i| matches!(i, Indexed::IndexedBy(_))) {
-                bail_parse_error!("INDEXED BY clause is not supported in DELETE");
-            }
             if !order_by.is_empty() {
                 bail_parse_error!("ORDER BY clause is not supported in DELETE");
             }
             if where_clause.is_none() && connection.get_dml_require_where() {
                 bail_parse_error!(
-                    "DELETE without a WHERE clause is not allowed when require_where is enabled"
+                    "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
                 );
             }
             translate_delete(
@@ -271,6 +272,7 @@ pub fn translate_inner(
                 where_clause,
                 limit,
                 returning,
+                indexed,
                 with,
                 program,
                 connection,
@@ -339,7 +341,7 @@ pub fn translate_inner(
         ast::Stmt::Update(update) => {
             if update.where_clause.is_none() && connection.get_dml_require_where() {
                 bail_parse_error!(
-                    "UPDATE without a WHERE clause is not allowed when require_where is enabled"
+                    "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
                 );
             }
             translate_update(update, resolver, program, connection)?

@@ -14,7 +14,7 @@ use crate::{
     vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
     CaptureDataChangesExt, Connection,
 };
-use turso_parser::ast::{self, Expr, Indexed, SortOrder};
+use turso_parser::ast::{self, Expr, SortOrder};
 
 use super::emitter::emit_program;
 use super::expr::process_returning_clause;
@@ -92,6 +92,16 @@ pub fn translate_update(
     }
 
     optimize_plan(program, &mut plan, resolver)?;
+
+    if let Plan::Update(ref update_plan) = plan {
+        super::stmt_journal::set_update_stmt_journal_flags(
+            program,
+            update_plan,
+            resolver,
+            connection,
+        )?;
+    }
+
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 20,
@@ -170,14 +180,6 @@ fn validate_update(
     if body.from.is_some() {
         bail_parse_error!("FROM clause is not supported in UPDATE");
     }
-    if body
-        .indexed
-        .as_ref()
-        .is_some_and(|i| matches!(i, Indexed::IndexedBy(_)))
-    {
-        bail_parse_error!("INDEXED BY clause is not supported in UPDATE");
-    }
-
     if !body.order_by.is_empty() {
         bail_parse_error!("ORDER BY is not supported in UPDATE");
     }
@@ -234,9 +236,10 @@ pub fn prepare_update_plan(
         connection,
     )?;
 
-    // Extract WITH and OR conflict clause before borrowing body mutably
+    // Extract WITH, OR conflict clause, and INDEXED BY before borrowing body mutably
     let with = body.with.take();
     let or_conflict = body.or_conflict.take();
+    let indexed = body.indexed.take();
 
     let table_name = table.get_name();
     let iter_dir = body
@@ -267,6 +270,7 @@ pub fn prepare_update_plan(
         column_use_counts: Vec::new(),
         expression_index_usages: Vec::new(),
         database_id,
+        indexed,
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
 
@@ -341,7 +345,40 @@ pub fn prepare_update_plan(
                 }
             };
             match set_clauses.iter_mut().find(|(idx, _)| *idx == col_index) {
-                Some((_, existing_expr)) => existing_expr.clone_from(expr),
+                Some((_, existing_expr)) => {
+                    // When multiple SET col[n] = val for the same column are desugared,
+                    // compose them: replace the column reference in the new expression
+                    // with the existing expression, so
+                    //   col = array_set_element(col, 0, 'X')  then  col = array_set_element(col, 2, 'Z')
+                    // becomes col = array_set_element(array_set_element(col, 0, 'X'), 2, 'Z')
+                    if let Expr::FunctionCall {
+                        name,
+                        args: new_args,
+                        ..
+                    } = expr.as_ref()
+                    {
+                        if name.as_str().eq_ignore_ascii_case("array_set_element")
+                            && new_args.len() == 3
+                        {
+                            let mut composed_args = new_args.clone();
+                            composed_args[0].clone_from(existing_expr);
+                            *existing_expr = Box::new(Expr::FunctionCall {
+                                name: name.clone(),
+                                distinctness: None,
+                                args: composed_args,
+                                order_by: vec![],
+                                filter_over: turso_parser::ast::FunctionTail {
+                                    filter_clause: None,
+                                    over_clause: None,
+                                },
+                            });
+                        } else {
+                            existing_expr.clone_from(expr);
+                        }
+                    } else {
+                        existing_expr.clone_from(expr);
+                    }
+                }
                 None => set_clauses.push((col_index, expr.clone())),
             }
         }

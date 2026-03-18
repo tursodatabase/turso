@@ -1963,6 +1963,7 @@ impl<'a> LogicalPlanBuilder<'a> {
             b"GROUP_CONCAT" => Some(AggFunc::GroupConcat),
             b"STRING_AGG" => Some(AggFunc::StringAgg),
             b"TOTAL" => Some(AggFunc::Total),
+            b"ARRAY_AGG" => Some(AggFunc::ArrayAgg),
             _ => None,
         })
     }
@@ -2386,6 +2387,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 AggFunc::Sum | AggFunc::Avg | AggFunc::Total => Ok(Type::Real),
                 AggFunc::Min | AggFunc::Max => Ok(Type::Text),
                 AggFunc::GroupConcat | AggFunc::StringAgg => Ok(Type::Text),
+                AggFunc::ArrayAgg => Ok(Type::Blob),
                 #[cfg(feature = "json")]
                 AggFunc::JsonbGroupArray
                 | AggFunc::JsonGroupArray
@@ -2420,6 +2422,7 @@ mod tests {
             primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
             foreign_keys: vec![],
             check_constraints: vec![],
+            rowid_alias_conflict_clause: None,
             columns: vec![
                 SchemaColumn::new(
                     Some("id".to_string()),
@@ -2498,6 +2501,7 @@ mod tests {
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
+            rowid_alias_conflict_clause: None,
         };
         schema
             .add_btree_table(Arc::new(orders_table))
@@ -2545,6 +2549,7 @@ mod tests {
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
+            rowid_alias_conflict_clause: None,
         };
         schema
             .add_btree_table(Arc::new(products_table))

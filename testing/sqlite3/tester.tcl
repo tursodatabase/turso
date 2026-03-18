@@ -2,7 +2,7 @@
 # Based on the official SQLite tester.tcl
 #
 # Requires the native TCL extension (libturso_tcl) to be built.
-# Build with: cargo build -p turso-tcl
+# Build with: make -C bindings/tcl
 
 # Global variables for test execution (safe to re-initialize)
 if {![info exists TC(errors)]} {
@@ -38,7 +38,7 @@ foreach _native_candidate [list \
 }
 if {!$_native_loaded} {
   puts stderr "FATAL: Could not load native TCL extension (libturso_tcl)."
-  puts stderr "Build it with: cargo build -p turso-tcl"
+  puts stderr "Build it with: make -C bindings/tcl"
   puts stderr "Searched:"
   puts stderr "  [file join $script_dir bindings tcl libturso_tcl.so]"
   puts stderr "  [file join $script_dir bindings tcl libturso_tcl.dylib]"

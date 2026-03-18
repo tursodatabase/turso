@@ -1,8 +1,9 @@
-use super::{slot_bitmap::SlotBitmap, sqlite3_ondisk::WAL_FRAME_HEADER_SIZE};
-use crate::fast_lock::SpinLock;
+use branches::unlikely;
+
+use super::{slot_bitmap::AtomicSlotBitmap, sqlite3_ondisk::WAL_FRAME_HEADER_SIZE};
 use crate::io::TEMP_BUFFER_CACHE;
-use crate::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use crate::sync::{Arc, Weak};
+use crate::sync::atomic::{AtomicUsize, Ordering};
+use crate::sync::Arc;
 use crate::turso_assert;
 use crate::{Buffer, LimboError, IO};
 
@@ -14,7 +15,7 @@ use std::sync::OnceLock;
 /// A buffer allocated from an arena from `[BufferPool]`
 pub struct ArenaBuffer {
     /// The `Arena` the buffer came from
-    arena: Weak<Arena>,
+    arena: Arc<Arena>,
     /// Pointer to the start of the buffer
     ptr: NonNull<u8>,
     /// Identifier for the `[Arena]` the buffer came from
@@ -32,13 +33,7 @@ unsafe impl Send for ArenaBuffer {}
 crate::assert::assert_send_sync!(ArenaBuffer);
 
 impl ArenaBuffer {
-    const fn new(
-        arena: Weak<Arena>,
-        ptr: NonNull<u8>,
-        len: usize,
-        arena_id: u32,
-        slot_idx: u32,
-    ) -> Self {
+    fn new(arena: Arc<Arena>, ptr: NonNull<u8>, len: usize, arena_id: u32, slot_idx: u32) -> Self {
         ArenaBuffer {
             arena,
             ptr,
@@ -74,9 +69,7 @@ impl ArenaBuffer {
 
 impl Drop for ArenaBuffer {
     fn drop(&mut self) {
-        if let Some(arena) = self.arena.upgrade() {
-            arena.free(self.slot_idx, self.logical_len());
-        }
+        self.arena.free(self.slot_idx, self.logical_len());
     }
 }
 
@@ -335,6 +328,7 @@ impl PoolInner {
 }
 
 /// Preallocated block of memory used by the pool to distribute `ArenaBuffer`s
+#[derive(Debug)]
 struct Arena {
     /// Identifier to tie allocations back to the arena. If the arena is registerd
     /// with `io_uring`, then the ID represents the index of the arena into the ring's
@@ -344,8 +338,8 @@ struct Arena {
     base: NonNull<u8>,
     /// Total number of slots currently allocated/in use.
     allocated_slots: AtomicUsize,
-    /// Currently free slots.
-    free_slots: SpinLock<SlotBitmap>,
+    /// Currently free slots (lock-free atomic bitmap).
+    free_slots: AtomicSlotBitmap,
     /// Total size of the arena in bytes
     arena_size: usize,
     /// Slot size the total arena is divided into.
@@ -353,7 +347,7 @@ struct Arena {
 }
 
 // SAFETY: Arena's base pointer comes from mmap and is never aliased. All mutable
-// state is behind AtomicUsize or SpinLock, so concurrent access is safe.
+// state is behind atomics (AtomicUsize, AtomicSlotBitmap), so concurrent access is safe.
 unsafe impl Send for Arena {}
 unsafe impl Sync for Arena {}
 
@@ -369,7 +363,10 @@ const UNREGISTERED_START: u32 = 2;
 
 /// ID's for an Arena which is not registered with `io_uring`
 /// registered arena will always have id = 0..=1
-static NEXT_ID: AtomicU32 = AtomicU32::new(UNREGISTERED_START);
+/// we purposely use std::sync::AtomicU32 instead of core::sync::AtomicU32 because
+/// this is a global static variable and can mess with shuttle tests
+static NEXT_ID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(UNREGISTERED_START);
 
 impl Arena {
     /// Create a new arena with the given size and page size.
@@ -379,7 +376,7 @@ impl Arena {
         let rounded_slots = (min_slots.max(64) + 63) & !63;
         let rounded_bytes = rounded_slots * slot_size;
         // Guard against the global cap
-        if rounded_bytes > BufferPool::MAX_ARENA_SIZE {
+        if unlikely(rounded_bytes > BufferPool::MAX_ARENA_SIZE) {
             return Err(format!(
                 "arena size {} B exceeds hard limit of {} B",
                 rounded_bytes,
@@ -392,15 +389,15 @@ impl Arena {
             .register_fixed_buffer(base, rounded_bytes)
             .unwrap_or_else(|_| {
                 // Register with io_uring if possible, otherwise use next available ID
-                let next_id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+                let next_id = NEXT_ID.fetch_add(1, Ordering::AcqRel);
                 tracing::trace!("Allocating arena with id {}", next_id);
                 next_id
             });
-        let map = SlotBitmap::new(rounded_slots as u32);
+        let map = AtomicSlotBitmap::new(rounded_slots as u32);
         Ok(Self {
             id,
             base,
-            free_slots: SpinLock::new(map),
+            free_slots: map,
             allocated_slots: AtomicUsize::new(0),
             slot_size,
             arena_size: rounded_bytes,
@@ -414,13 +411,12 @@ impl Arena {
             // temporary heap buffers via the caller.
             return None;
         }
-        let mut freemap = arena.free_slots.lock();
-        let first_idx = freemap.alloc_one()?;
-        arena.allocated_slots.fetch_add(1, Ordering::SeqCst);
+        let first_idx = arena.free_slots.alloc_one()?;
+        arena.allocated_slots.fetch_add(1, Ordering::AcqRel);
         let offset = first_idx as usize * arena.slot_size;
         let ptr = unsafe { NonNull::new_unchecked(arena.base.as_ptr().add(offset)) };
         Some(Buffer::new_pooled(ArenaBuffer::new(
-            Arc::downgrade(arena),
+            Arc::clone(arena),
             ptr,
             size,
             arena.id,
@@ -434,10 +430,12 @@ impl Arena {
             size <= self.slot_size,
             "pooled buffers must not exceed one slot"
         );
-        let mut bm = self.free_slots.lock();
-        turso_assert!(!bm.is_free(slot_idx), "must not already be marked free");
-        bm.free_one(slot_idx);
-        self.allocated_slots.fetch_sub(1, Ordering::SeqCst);
+        turso_assert!(
+            !self.free_slots.is_free(slot_idx),
+            "must not already be marked free"
+        );
+        self.free_slots.free_one(slot_idx);
+        self.allocated_slots.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

@@ -1,0 +1,96 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE t(a TEXT);
+    CREATE TABLE log(msg TEXT);
+}
+
+@setup schema
+test json-each-in-trigger {
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN
+      INSERT INTO log SELECT value FROM json_each(NEW.a);
+    END;
+    INSERT INTO t VALUES('[1,2,3]');
+    SELECT msg FROM log ORDER BY msg;
+}
+expect {
+    1
+    2
+    3
+}
+
+setup schema2 {
+    CREATE TABLE t2(a TEXT);
+    CREATE TABLE log2(key_name TEXT, val TEXT);
+}
+
+@setup schema2
+test json-tree-in-trigger {
+    CREATE TRIGGER tr2 AFTER INSERT ON t2 BEGIN
+      INSERT INTO log2 SELECT key, value FROM json_tree(NEW.a) WHERE type != 'object';
+    END;
+    INSERT INTO t2 VALUES('{"x":10,"y":20}');
+    SELECT key_name, val FROM log2 ORDER BY key_name;
+}
+expect {
+    x|10
+    y|20
+}
+
+setup schema3 {
+    CREATE TABLE items(data TEXT);
+    CREATE TABLE flat(val TEXT);
+}
+
+@setup schema3
+test json-each-nested-array-in-trigger {
+    CREATE TRIGGER tr3 AFTER INSERT ON items BEGIN
+      INSERT INTO flat SELECT value FROM json_each(NEW.data);
+    END;
+    INSERT INTO items VALUES('[]');
+    INSERT INTO items VALUES('[42]');
+    INSERT INTO items VALUES('[10,20,30]');
+    SELECT val FROM flat ORDER BY rowid;
+}
+expect {
+    42
+    10
+    20
+    30
+}
+
+setup schema4 {
+    CREATE TABLE src(payload TEXT);
+    CREATE TABLE dest(k TEXT, v TEXT);
+}
+
+@setup schema4
+test json-each-with-subquery-in-trigger {
+    CREATE TRIGGER tr4 AFTER INSERT ON src BEGIN
+      INSERT INTO dest SELECT je.key, je.value FROM json_each(NEW.payload) AS je WHERE je.type = 'integer';
+    END;
+    INSERT INTO src VALUES('{"a":1,"b":"hello","c":3}');
+    SELECT k, v FROM dest ORDER BY k;
+}
+expect {
+    a|1
+    c|3
+}
+
+setup schema5 {
+    CREATE TABLE input(data TEXT);
+    CREATE TABLE output(msg TEXT);
+}
+
+@setup schema5
+test json-each-before-trigger {
+    CREATE TRIGGER tr5 BEFORE INSERT ON input BEGIN
+      INSERT INTO output SELECT value FROM json_each(NEW.data);
+    END;
+    INSERT INTO input VALUES('[100,200]');
+    SELECT msg FROM output ORDER BY msg;
+}
+expect {
+    100
+    200
+}

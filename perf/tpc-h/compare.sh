@@ -10,16 +10,32 @@ fi
 MAIN_BIN=$1
 CURR_BIN=${2:-./target/release/tursodb}
 DB=perf/tpc-h/TPC-H.db
+QUERY_GLOB=${TPCH_QUERY_GLOB:-*.sql}
 if [ ! -f "$DB" ]; then
     echo "Error: Database file '$DB' not found" >&2
     exit 1
 fi
+if [ ! -f "$MAIN_BIN" ]; then
+    echo "Error: Main binary '$MAIN_BIN' not found" >&2
+    exit 1
+fi
+if [ ! -f "$CURR_BIN" ]; then
+    echo "Error: Current binary '$CURR_BIN' not found" >&2
+    exit 1
+fi
 QUERIES_DIR=perf/tpc-h/queries
+QUERY_PATHS=("$QUERIES_DIR"/$QUERY_GLOB)
+
+if [ ! -e "${QUERY_PATHS[0]}" ]; then
+    echo "Error: No queries matched '$QUERY_GLOB' in '$QUERIES_DIR'" >&2
+    exit 1
+fi
+
 
 printf "%-8s %12s %12s %10s\n" "Query" "Main (ms)" "Current (ms)" "Delta"
 printf "%-8s %12s %12s %10s\n" "-----" "---------" "------------" "-----"
 
-for q in $(ls $QUERIES_DIR/*.sql | sort -V); do
+for q in $(printf '%s\n' "${QUERY_PATHS[@]}" | sort -V); do
     # Skip if first line contains LIMBO_SKIP
     if head -1 "$q" | grep -q "LIMBO_SKIP"; then
         continue

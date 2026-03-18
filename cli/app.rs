@@ -1,6 +1,6 @@
 use crate::{
     commands::{
-        args::{EchoMode, HeadersMode, TimerMode},
+        args::{EchoMode, HeadersMode, ParameterArgs, ParameterCommand, TimerMode},
         import::ImportFile,
         Command, CommandParser,
     },
@@ -19,6 +19,7 @@ use anyhow::{anyhow, Context};
 use clap::Parser;
 use comfy_table::{Attribute, Cell, CellAlignment, ContentArrangement, Row, Table};
 use rustyline::{error::ReadlineError, history::DefaultHistory, Editor};
+use std::num::NonZeroUsize;
 use std::{
     fs::File,
     io::{self, BufRead, BufReader, IsTerminal, Write},
@@ -90,6 +91,9 @@ pub struct Opts {
     pub experimental_autovacuum: bool,
     #[clap(long, help = "Enable experimental attach feature")]
     pub experimental_attach: bool,
+    #[cfg(feature = "mvcc_repl")]
+    #[clap(long, help = "Start MVCC concurrent transaction harness")]
+    pub mvcc: bool,
     #[clap(
         long,
         help = "Enable unsafe testing features (e.g. sqlite_dbpage writes)"
@@ -112,6 +116,14 @@ pub struct Limbo {
     pub rl: Option<Editor<LimboHelper, DefaultHistory>>,
     config: Option<Config>,
     had_query_error: bool,
+    parameter_bindings: Vec<ParameterBinding>,
+}
+
+#[derive(Clone)]
+struct ParameterBinding {
+    name: Box<str>,
+    index: Option<NonZeroUsize>,
+    value: Value,
 }
 
 struct QueryStatistics {
@@ -220,7 +232,9 @@ impl Limbo {
             .with_attach(opts.experimental_attach)
             .with_unsafe_testing(opts.unsafe_testing);
 
-        let (io, conn) = if db_file.contains([':', '?', '&', '#']) {
+        let db_file = normalize_db_path(db_file);
+
+        let (io, conn) = if db_file.starts_with("file:") {
             Connection::from_uri(&db_file, db_opts)?
         } else {
             let flags = if opts.readonly {
@@ -273,6 +287,7 @@ impl Limbo {
             rl: None,
             config: Some(config),
             had_query_error: false,
+            parameter_bindings: Vec::new(),
         };
         app.first_run(has_sql, quiet)?;
         Ok((app, guard))
@@ -532,6 +547,9 @@ impl Limbo {
         let capture_stats = self.opts.stats;
         let mut last_stmt_metrics = None;
         for mut output in runner {
+            if let Ok(Some(ref mut stmt)) = output {
+                self.apply_parameter_bindings(stmt);
+            }
             if self
                 .print_query_result(input, &mut output, stats.as_mut())
                 .is_err()
@@ -554,6 +572,76 @@ impl Limbo {
         if let Some(ref last) = last_stmt_metrics {
             let _ = self.writeln(format!("\n{last}"));
         }
+    }
+
+    fn apply_parameter_bindings(&self, stmt: &mut Statement) {
+        for binding in &self.parameter_bindings {
+            if let Some(index) = binding.index {
+                if stmt.parameters().has_slot(index) {
+                    stmt.bind_at(index, binding.value.clone());
+                }
+                continue;
+            }
+
+            if let Some(index) = stmt.parameter_index(&binding.name) {
+                stmt.bind_at(index, binding.value.clone());
+            }
+        }
+    }
+
+    fn handle_parameter_command(&mut self, args: ParameterArgs) -> Result<(), String> {
+        match args.command {
+            ParameterCommand::Set(args) => {
+                validate_parameter_name(&args.name)?;
+                let index = parameter_name_to_index(&args.name);
+                let value = parse_parameter_value(&args.value)?;
+
+                if let Some(existing) = self
+                    .parameter_bindings
+                    .iter_mut()
+                    .find(|binding| binding.name.as_ref() == args.name)
+                {
+                    existing.index = index;
+                    existing.value = value;
+                } else {
+                    self.parameter_bindings.push(ParameterBinding {
+                        name: args.name.into_boxed_str(),
+                        index,
+                        value,
+                    });
+                }
+                Ok(())
+            }
+            ParameterCommand::List => self.list_parameter_bindings(),
+            ParameterCommand::Clear(args) => {
+                if let Some(name) = args.name {
+                    validate_parameter_name(&name)?;
+                    self.parameter_bindings
+                        .retain(|binding| binding.name.as_ref() != name);
+                } else {
+                    self.parameter_bindings.clear();
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn list_parameter_bindings(&mut self) -> Result<(), String> {
+        if self.parameter_bindings.is_empty() {
+            return Ok(());
+        }
+
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| "writer is not initialized".to_string())?;
+
+        for binding in &self.parameter_bindings {
+            writer
+                .write_fmt(format_args!("{} = {}\n", binding.name, binding.value))
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
     fn print_query_performance_stats(&mut self, start: Instant, stats: Option<&QueryStatistics>) {
@@ -673,11 +761,25 @@ impl Limbo {
     }
 
     pub fn handle_dot_command(&mut self, line: &str) {
-        let args: Vec<&str> = line.split_whitespace().collect();
-        if args.is_empty() {
-            return;
-        }
-        match CommandParser::try_parse_from(args) {
+        let first = line.split_whitespace().next();
+        let parse = match first {
+            Some("parameter") | Some("param") => {
+                let args = shlex::split(line).unwrap_or_else(|| {
+                    line.split_whitespace()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                });
+                if args.is_empty() {
+                    return;
+                }
+                CommandParser::try_parse_from(args)
+            }
+            _ => {
+                let args = line.split_whitespace();
+                CommandParser::try_parse_from(args)
+            }
+        };
+        match parse {
             Err(err) => {
                 // Let clap print with Styled Colors instead
                 let _ = err.print();
@@ -813,6 +915,11 @@ impl Limbo {
                 Command::Read(args) => {
                     if let Err(e) = self.read_sql_file(&args.path) {
                         let _ = self.writeln(e.to_string());
+                    }
+                }
+                Command::Parameter(args) => {
+                    if let Err(e) = self.handle_parameter_command(args) {
+                        let _ = self.writeln_fmt(format_args!("Error: {e}"));
                     }
                 }
                 Command::Dbtotxt(args) => {
@@ -1899,96 +2006,24 @@ impl Limbo {
         let reader = BufReader::new(file);
 
         let mut query_buffer = String::new();
-        let mut in_single_quote: bool = false; // ''
-        let mut in_double_quote: bool = false; // ""
-        let mut in_block_comment = false; //  /* */
-        let mut in_hash = false; // #
-        let mut in_line_comment = false; // --
+        let mut state = ReadState::default();
 
         for line in reader.lines() {
-            let mut line = line
+            let line = line
                 .map_err(|e| anyhow!("Error: file \"{}\" is not valid UTF-8 text – {}", path, e))?;
-            line.push('\n');
-            let mut iter = line.chars().peekable();
 
-            while let Some(ch) = iter.next() {
-                // Check exit for line comment and hash
-                if (in_line_comment || in_hash) && ch == '\n' {
-                    in_line_comment = false;
-                    in_hash = false;
-                    query_buffer.push(ch);
-                    continue;
-                }
-
-                // Check exit for block comment
-                if in_block_comment && ch == '*' && iter.peek() == Some(&'/') {
-                    query_buffer.push(ch);
-                    query_buffer.push('/');
-                    iter.next();
-                    in_block_comment = false;
-                    continue;
-                }
-
-                // Push into the query buffer if its inside comments
-                if in_line_comment || in_block_comment || in_hash {
-                    query_buffer.push(ch);
-                    continue;
-                }
-
-                // Block comment detection
-                if ch == '/' && iter.peek() == Some(&'*') && !in_single_quote && !in_double_quote {
-                    query_buffer.push('/');
-                    query_buffer.push('*');
-                    iter.next();
-                    in_block_comment = true;
-                    continue;
-                }
-
-                // Hash detection, instead of pushing '#' it pushes '-', '-'
-                // to make it act like line comment
-                if ch == '#' && !in_single_quote && !in_double_quote {
-                    query_buffer.push('-');
-                    query_buffer.push('-');
-                    in_hash = true;
-                    continue;
-                }
-
-                // Line comment detection
-                if ch == '-' && iter.peek() == Some(&'-') && !in_single_quote && !in_double_quote {
-                    query_buffer.push(ch);
-                    query_buffer.push('-');
-                    iter.next();
-                    in_line_comment = true;
-                    continue;
-                }
-
-                // Single quote
-                if ch == '\'' && !in_double_quote {
-                    in_single_quote = !in_single_quote;
-                }
-
-                // Double quote
-                if ch == '"' && !in_single_quote {
-                    in_double_quote = !in_double_quote;
-                }
-
-                query_buffer.push(ch);
-
-                if ch == ';'
-                    && !in_single_quote
-                    && !in_double_quote
-                    && !in_block_comment
-                    && !in_line_comment
-                    && !in_hash
-                {
-                    self.run_query(&query_buffer);
-                    query_buffer.clear();
-                }
+            if !query_buffer.is_empty() {
+                query_buffer.push('\n');
             }
+            query_buffer.push_str(&line);
 
-            // Reset comments
-            in_line_comment = false;
-            in_hash = false;
+            state.process(&line);
+
+            if state.is_complete() {
+                self.run_query(&query_buffer);
+                query_buffer.clear();
+                state = ReadState::default();
+            }
         }
 
         let remaining = query_buffer.trim();
@@ -2159,6 +2194,101 @@ fn sql_quote_string(s: &str) -> String {
     out.push('\'');
     out
 }
+
+fn validate_parameter_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("parameter name cannot be empty".to_string());
+    }
+
+    match name.as_bytes()[0] {
+        b':' | b'@' | b'$' | b'#' => Ok(()),
+        b'?' => {
+            let Some(rest) = name.strip_prefix('?') else {
+                return Err("invalid parameter name".to_string());
+            };
+            if rest.is_empty() {
+                return Err("parameter name '?N' must include digits".to_string());
+            }
+            if rest.parse::<usize>().ok().filter(|idx| *idx > 0).is_none() {
+                return Err("parameter name '?N' must use an index >= 1".to_string());
+            }
+            Ok(())
+        }
+        _ => Err("parameter name must start with one of ':', '@', '$', '#', '?'".to_string()),
+    }
+}
+
+fn parameter_name_to_index(name: &str) -> Option<NonZeroUsize> {
+    let value = name.strip_prefix('?')?.parse::<usize>().ok()?;
+    value.try_into().ok()
+}
+
+fn parse_parameter_value(value: &str) -> Result<Value, String> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("null") {
+        return Ok(Value::Null);
+    }
+
+    if let Ok(integer) = value.parse::<i64>() {
+        return Ok(Value::from_i64(integer));
+    }
+
+    if value.contains(['.', 'e', 'E']) {
+        if let Ok(float) = value.parse::<f64>() {
+            return Ok(Value::from_f64(float));
+        }
+    }
+
+    if let Some(hex) = value
+        .strip_prefix("x'")
+        .or_else(|| value.strip_prefix("X'"))
+        .and_then(|stripped| stripped.strip_suffix('\''))
+    {
+        return parse_hex_blob(hex).map(Value::from_blob);
+    }
+
+    if let Some(inner) = value
+        .strip_prefix('\'')
+        .and_then(|stripped| stripped.strip_suffix('\''))
+    {
+        return Ok(Value::build_text(unescape_single_quoted(inner)));
+    }
+
+    Ok(Value::build_text(value.to_owned()))
+}
+
+fn parse_hex_blob(hex: &str) -> Result<Vec<u8>, String> {
+    if !hex.len().is_multiple_of(2) {
+        return Err("hex blob literal must contain an even number of digits".to_string());
+    }
+
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let mut bytes = hex.as_bytes().iter().copied();
+    while let (Some(hi), Some(lo)) = (bytes.next(), bytes.next()) {
+        let h = decode_hex_nibble(hi)?;
+        let l = decode_hex_nibble(lo)?;
+        out.push((h << 4) | l);
+    }
+    Ok(out)
+}
+
+fn decode_hex_nibble(byte: u8) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(10 + (byte - b'a')),
+        b'A'..=b'F' => Ok(10 + (byte - b'A')),
+        _ => Err("hex blob literal contains non-hex characters".to_string()),
+    }
+}
+
+fn unescape_single_quoted(s: &str) -> String {
+    if !s.contains("''") {
+        return s.to_owned();
+    }
+
+    s.replace("''", "'")
+}
+
 impl Drop for Limbo {
     fn drop(&mut self) {
         self.save_history();
@@ -2175,4 +2305,106 @@ fn fetch_single_i64(rows: &mut turso_core::Statement) -> anyhow::Result<i64> {
         Ok(())
     })?;
     result.ok_or_else(|| anyhow!("query did not return a row"))
+}
+
+/// Normalize `path?key=val` to `file:path?key=val` so query parameters
+/// are parsed as URI options (e.g. `?locking=shared_reads`) instead of
+/// being treated as part of the filename.
+///
+/// Only the *last* `?` that introduces a valid `key=value` query string is
+/// treated as the query separator. Earlier `?` characters are
+/// percent-encoded (`%3F`) so they remain part of the filename.
+/// A trailing `?` with no `key=value` pair is left alone (it is just part
+/// of the filename).
+fn normalize_db_path(db_file: String) -> String {
+    if db_file.starts_with("file:") {
+        return db_file;
+    }
+
+    // Walk from the right to find the last '?' whose suffix looks like
+    // query parameters (contains at least one '=').
+    if let Some(pos) = db_file.rfind('?') {
+        let query = &db_file[pos + 1..];
+        if query.contains('=') {
+            let path = &db_file[..pos];
+            // Percent-encode any '?' inside the path portion so the URI
+            // parser does not mistake them for the query separator.
+            let encoded_path = path.replace('?', "%3F");
+            return format!("file:{encoded_path}?{query}");
+        }
+    }
+
+    db_file
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_db_path_adds_file_prefix_for_query_params() {
+        assert_eq!(
+            normalize_db_path("test.db?locking=shared_reads".into()),
+            "file:test.db?locking=shared_reads"
+        );
+    }
+
+    #[test]
+    fn test_normalize_db_path_preserves_existing_file_prefix() {
+        assert_eq!(
+            normalize_db_path("file:test.db?mode=ro".into()),
+            "file:test.db?mode=ro"
+        );
+    }
+
+    #[test]
+    fn test_normalize_db_path_preserves_file_triple_slash() {
+        assert_eq!(
+            normalize_db_path("file:///tmp/test.db?mode=ro".into()),
+            "file:///tmp/test.db?mode=ro"
+        );
+    }
+
+    #[test]
+    fn test_normalize_db_path_plain_path_unchanged() {
+        assert_eq!(normalize_db_path("test.db".into()), "test.db");
+    }
+
+    #[test]
+    fn test_normalize_db_path_memory_unchanged() {
+        assert_eq!(normalize_db_path(":memory:".into()), ":memory:");
+    }
+
+    #[test]
+    fn test_normalize_db_path_multiple_query_params() {
+        assert_eq!(
+            normalize_db_path("test.db?locking=shared_reads&cache=shared".into()),
+            "file:test.db?locking=shared_reads&cache=shared"
+        );
+    }
+
+    #[test]
+    fn test_normalize_db_path_absolute_path_with_query() {
+        assert_eq!(
+            normalize_db_path("/tmp/my.db?mode=ro".into()),
+            "file:/tmp/my.db?mode=ro"
+        );
+    }
+
+    #[test]
+    fn test_normalize_db_path_question_mark_in_filename_no_query() {
+        // '?' is legitimately part of the filename, no key=value follows
+        assert_eq!(normalize_db_path("what?.db".into()), "what?.db");
+    }
+
+    #[test]
+    fn test_normalize_db_path_filename_contains_question_mark_with_query() {
+        // File is literally "foo.bar?mode=ro", opened with ?mode=ro query.
+        // The '?' in the filename must be percent-encoded so the URI parser
+        // treats only the last ?mode=ro as the query string.
+        assert_eq!(
+            normalize_db_path("foo.bar?mode=ro?mode=ro".into()),
+            "file:foo.bar%3Fmode=ro?mode=ro"
+        );
+    }
 }

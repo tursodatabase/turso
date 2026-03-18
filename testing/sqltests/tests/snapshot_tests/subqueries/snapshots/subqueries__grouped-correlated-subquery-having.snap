@@ -1,0 +1,88 @@
+---
+source: subqueries.sqltest
+expression: |-
+  SELECT gv.grp, SUM(gv.val) AS total
+      FROM grouped_values gv
+      GROUP BY gv.grp
+      HAVING (
+          SELECT MAX(gv2.val)
+          FROM grouped_values gv2
+          WHERE gv2.grp = gv.grp
+      ) IS NOT NULL;
+info:
+  statement_type: SELECT
+  tables:
+  - grouped_values
+  setup_blocks:
+  - grouped_subquery_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN grouped_values AS gv USING INDEX idx_grouped_values_grp
+`--CORRELATED SCALAR SUBQUERY 1
+   `--SEARCH gv2 USING INDEX idx_grouped_values_grp (grp=?)
+
+BYTECODE
+addr  opcode                    p1  p2  p3  p4            p5  comment
+   0            Init             0  60   0                 0  Start at 60
+   1            Null             0   9   0                 0  r[9]=NULL
+   2            Integer          0   6   0                 0  r[6]=0; clear group by abort flag
+   3            Null             0   7   0                 0  r[7]=NULL; initialize group by comparison registers to NULL
+   4            Gosub           13  56   0                 0  ; go to clear accumulator subroutine
+   5            OpenRead         0   2   0  k(3,B,B)       0  table=grouped_values, root=2, iDb=0
+   6            OpenRead         1   3   0  k(2,B)         0  index=idx_grouped_values_grp, root=3, iDb=0
+   7            Rewind           1  22   0                 0  Rewind index idx_grouped_values_grp
+   8              DeferredSeek   1   0   0                 0
+   9              Column         0   0  11                 0  r[11]=grouped_values.grp
+  10              Column         0   1  12                 0  r[12]=grouped_values.val
+  11              Compare        7  11   1  k(1, Binary)   0  r[7..7]==r[11..11]
+  12              Jump          13  17  13                 0  ; start new group if comparison is not equal
+  13              Gosub          4  26   0                 0  ; check if ended group had data, and output if so
+  14              Move          11   7   1                 0  r[7..7]=r[11..11]
+  15              IfPos          6  59   0                 0  r[6]>0 -> r[6]-=0, goto 59; check abort flag
+  16              Gosub         13  56   0                 0  ; goto clear accumulator subroutine
+  17              AggStep        0  12   9  sum            0  accum=r[9] step(r[12])
+  18              If             5  20   0                 0  if r[5] goto 20; don't emit group columns if continuing existing group
+  19              Column         0   0   8                 0  r[8]=grouped_values.grp
+  20              Integer        1   5   0                 0  r[5]=1; indicate data in accumulator
+  21            Next             1   8   0                 0
+  22            Gosub            4  26   0                 0  ; emit row for final group
+  23            Goto             0  59   0                 0  ; group by finished
+  24            Integer          1   6   0                 0  r[6]=1
+  25          Return             4   0   0                 0
+  26          IfPos              5  28   0                 0  r[5]>0 -> r[5]-=0, goto 28; output group by row subroutine start
+  27        Return               4   0   0                 0
+  28        AggFinal             0   9   0  sum            0  accum=r[9]
+  29        BeginSubrtn         14   0   0                 0  r[14]=NULL
+  30        Null                 0   1   0                 0  r[1]=NULL
+  31        Null                 0  16   0                 0  r[16]=NULL
+  32        Integer              1  17   0                 0  r[17]=1; LIMIT counter
+  33        IfNot               17  46   0                 0  if !r[17] goto 46
+  34        OpenRead             2   2   0  k(3,B,B)       0  table=grouped_values, root=2, iDb=0
+  35        OpenRead             3   3   0  k(2,B)         0  index=idx_grouped_values_grp, root=3, iDb=0
+  36        Copy                 8  18   0                 0  r[18]=r[8]
+  37        IsNull              18  46   0                 0  if (r[18]==NULL) goto 46
+  38        Affinity            18   1   0                 0  r[18..19] = B
+  39        SeekGE               3  46  18                 0  key=[18..18]
+  40          IdxGT              3  46  18                 0  key=[18..18]
+  41          DeferredSeek       3   2   0                 0
+  42          Column             2   1  19                 0  r[19]=grouped_values.val
+  43          CollSeq            0   0   0  Binary         0  collation=Binary
+  44          AggStep            0  19  16  max            0  accum=r[16] step(r[19])
+  45        Next                 3  40   0                 0
+  46        AggFinal             0  16   0  max            0  accum=r[16]
+  47        Copy                16  15   0                 0  r[15]=r[16]
+  48        Copy                15   1   0                 0  r[1]=r[15]
+  49      Return                14   0   1                 0
+  50      Copy                   1  20   0                 0  r[20]=r[1]
+  51      IsNull                20  27   0                 0  if (r[20]==NULL) goto 27
+  52      Copy                   8   2   0                 0  r[2]=r[8]
+  53      Copy                   9   3   0                 0  r[3]=r[9]
+  54      ResultRow              2   2   0                 0  output=r[2..3]
+  55    Return                   4   0   0                 0
+  56    Null                     0   8   9                 0  r[8..9]=NULL; clear accumulator subroutine start
+  57    Integer                  0   5   0                 0  r[5]=0
+  58  Return                    13   0   0                 0
+  59  Halt                       0   0   0                 0
+  60  Transaction                0   1   2                 0  iDb=0 tx_mode=Read
+  61  Goto                       0   1   0                 0

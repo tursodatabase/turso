@@ -63,15 +63,15 @@ test: build uv-sync-test test-compat test-sqlite3 test-shell test-memory test-wr
 .PHONY: test
 
 test-runner:
-	@make -C testing/runner run
+	@make -C testing/sqltests run
 .PHONY: test-runner
 
 test-runner-js:
-	@make -C testing/runner run-js
+	@make -C testing/sqltests run-js
 .PHONY: test-runner-js
 
 test-runner-cli:
-	@make -C testing/runner run-cli
+	@make -C testing/sqltests run-cli
 .PHONY: test-runner-cli
 
 test-extensions: build uv-sync-test
@@ -99,7 +99,8 @@ reset-db:
 .PHONY: reset-db
 
 test-fuzz:
-	RUST_LOG=$(RUST_LOG) cargo test -p core_tester --release -- fuzz 
+	RUST_LOG=$(RUST_LOG) cargo test -p core_tester --release -- fuzz
+	RUST_LOG=$(RUST_LOG) cargo run -p differential-fuzzer --bin custom_types_fuzzer -- --seed $(or $(SEED), $$(date +%s)) -n $(or $(N),200) -t $(or $(TABLES),2)
 .PHONY: test-fuzz
 
 test-sqlite3: reset-db
