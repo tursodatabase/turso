@@ -4325,6 +4325,16 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         pager
             .io
             .block(|| wal.truncate_wal(&mut checkpoint_result, pager.get_sync_type()))?;
+
+        // Truncate the logical log to 0 — all data has been checkpointed into the DB file.
+        // This mirrors the TruncateLogicalLog step in the MVCC checkpoint state machine.
+        let c = self.storage.truncate()?;
+        pager.io.wait_for_completion(c)?;
+        if connection.get_sync_mode() != SyncMode::Off {
+            let c = self.storage.sync(pager.get_sync_type())?;
+            pager.io.wait_for_completion(c)?;
+        }
+
         Ok(())
     }
 
