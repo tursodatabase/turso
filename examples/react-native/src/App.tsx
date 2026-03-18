@@ -379,6 +379,118 @@ export default function App() {
     }
 
     // ========================================
+    // MIGRATE-TEMP CHECKPOINT TEST (reproduces #6037)
+    // Tests the exact user flow: bootstrap at temp path, push, checkpoint,
+    // close, rename to final path, reopen, pull/push/checkpoint cycles.
+    // ========================================
+    if (ENCRYPTION_ENABLED) {
+      testResults.push({ name: '--- Migrate-Temp Checkpoint Test (#6037) ---', passed: true });
+      setResults([...testResults]);
+
+      const ts = Date.now();
+      const tempPath = `migrate-temp-${ts}.db`;
+      const finalPath = `data-store-${ts}.db`;
+      const suffixes = ['', '-wal', '-info', '-wal-revert', '-changes'];
+
+      // Helper to rename all sync-related files
+      const renameSyncFiles = (src: string, dst: string) => {
+        for (const suffix of suffixes) {
+          const renamed = (globalThis as any).__TursoProxy.fsRenameFile(src + suffix, dst + suffix);
+          console.log(`rename ${src}${suffix} -> ${dst}${suffix}: ${renamed}`);
+        }
+      };
+
+      try {
+        // Phase 1: Open at migrate-temp path with encryption
+        let tempDb = await connect({
+          path: tempPath,
+          url: TURSO_DATABASE_URL,
+          authToken: TURSO_AUTH_TOKEN,
+          bootstrapIfEmpty: false,
+          remoteEncryption: {
+            key: TURSO_ENCRYPTION_KEY!,
+            cipher: TURSO_ENCRYPTION_CIPHER,
+          },
+        });
+
+        // Create table and insert data
+        await tempDb.exec('CREATE TABLE IF NOT EXISTS migrate_test (id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL)');
+        const payload = 'X'.repeat(100 * 1024);
+        for (let i = 0; i < 20; i++) {
+          await tempDb.run('INSERT INTO migrate_test (payload) VALUES (?)', `row_${i}_${payload}`);
+        }
+
+        // Push + checkpoint
+        await tempDb.push();
+        await tempDb.checkpoint();
+
+        testResults.push({ name: 'Migrate: Phase 1 (temp path push+checkpoint)', passed: true });
+        setResults([...testResults]);
+
+        // Close temp DB
+        tempDb.close();
+
+        // Phase 2: Rename files to final destination
+        renameSyncFiles(tempPath, finalPath);
+        testResults.push({ name: 'Migrate: Phase 2 (rename files)', passed: true });
+        setResults([...testResults]);
+
+        // Phase 3: Open at final path, do pull/push/checkpoint cycles
+        let finalDb = await connect({
+          path: finalPath,
+          url: TURSO_DATABASE_URL,
+          authToken: TURSO_AUTH_TOKEN,
+          bootstrapIfEmpty: false,
+          remoteEncryption: {
+            key: TURSO_ENCRYPTION_KEY!,
+            cipher: TURSO_ENCRYPTION_CIPHER,
+          },
+        });
+
+        // Immediately pull (matches user flow)
+        await finalDb.pull();
+        await finalDb.push();
+        await finalDb.checkpoint();
+
+        testResults.push({ name: 'Migrate: Phase 3 cycle 0 (pull+push+checkpoint)', passed: true });
+        setResults([...testResults]);
+
+        // Repeat cycles with writes in between
+        for (let cycle = 1; cycle <= 3; cycle++) {
+          const cyclePayload = 'Y'.repeat(50 * 1024);
+          for (let i = 0; i < 5; i++) {
+            await finalDb.run(
+              'INSERT INTO migrate_test (payload) VALUES (?)',
+              `final_c${cycle}_r${i}_${cyclePayload}`,
+            );
+          }
+
+          await finalDb.pull();
+          await finalDb.push();
+          await finalDb.checkpoint();
+
+          testResults.push({ name: `Migrate: Phase 3 cycle ${cycle} (write+pull+push+checkpoint)`, passed: true });
+          setResults([...testResults]);
+        }
+
+        // Verify data
+        const rows = await finalDb.all('SELECT count(*) as cnt FROM migrate_test');
+        const count = rows[0]?.cnt;
+        testResults.push({
+          name: `Migrate: Verify data (${count} rows)`,
+          passed: count === 35, // 20 from phase 1 + 5*3 from phase 3
+          error: count !== 35 ? `Expected 35, got ${count}` : undefined,
+        });
+
+        finalDb.close();
+      } catch (e) {
+        testResults.push({ name: 'Migrate-Temp Checkpoint Test', passed: false, error: String(e) });
+      }
+
+      setResults([...testResults]);
+    }
+
+    // ========================================
     // SYNC API TESTS (requires env vars, skipped if encryption is enabled)
     // ========================================
     if (SYNC_ENABLED && !ENCRYPTION_ENABLED) {

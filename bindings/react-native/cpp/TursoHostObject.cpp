@@ -664,12 +664,45 @@ namespace turso
                 return jsi::Value::undefined();
             });
 
+        // fsRenameFile(src, dst) -> bool
+        // Returns true if rename succeeded, false if source doesn't exist
+        auto fsRenameFile = jsi::Function::createFromHostFunction(
+            rt,
+            jsi::PropNameID::forAscii(rt, "fsRenameFile"),
+            2,
+            [](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value
+            {
+                if (count < 2 || !args[0].isString() || !args[1].isString())
+                {
+                    throw jsi::JSError(rt, "fsRenameFile() requires two path strings");
+                }
+
+                std::string src = args[0].asString(rt).utf8(rt);
+                std::string dst = args[1].asString(rt).utf8(rt);
+
+                // Check if source exists
+                FILE* check = fopen(src.c_str(), "rb");
+                if (!check)
+                {
+                    return jsi::Value(false);
+                }
+                fclose(check);
+
+                if (rename(src.c_str(), dst.c_str()) != 0)
+                {
+                    throw jsi::JSError(rt, "Failed to rename file");
+                }
+
+                return jsi::Value(true);
+            });
+
         module.setProperty(rt, "newDatabase", std::move(newDatabase));
         module.setProperty(rt, "newSyncDatabase", std::move(newSyncDatabase));
         module.setProperty(rt, "version", std::move(version));
         module.setProperty(rt, "setup", std::move(setup));
         module.setProperty(rt, "fsReadFile", std::move(fsReadFile));
         module.setProperty(rt, "fsWriteFile", std::move(fsWriteFile));
+        module.setProperty(rt, "fsRenameFile", std::move(fsRenameFile));
 
         // Install as global __TursoProxy
         rt.global().setProperty(rt, "__TursoProxy", std::move(module));

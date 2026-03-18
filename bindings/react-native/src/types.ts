@@ -389,6 +389,7 @@ export interface TursoProxy {
   setup(options: { logLevel?: string; logger?: TursoLoggerFn }): void;
   fsReadFile(path: string): ArrayBuffer | null;
   fsWriteFile(path: string, data: ArrayBuffer): void;
+  fsRenameFile(src: string, dst: string): boolean;
 }
 
 /**
