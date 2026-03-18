@@ -90,8 +90,10 @@ pub struct CostModelParams {
     pub hash_nested_probe_selectivity_threshold: f64,
 
     // === Join Optimization ===
-    /// Selectivity heuristic factor for closed ranges (e.g., `x > 5 AND x < 10`).
-    /// Applied when both lower and upper bounds exist on an index column.
+    /// Selectivity estimate for closed ranges (e.g., `x BETWEEN a AND b`).
+    /// Used directly as the combined selectivity when both lower and upper
+    /// bounds exist on the same column (heuristic fallback when no ANALYZE stats).
+    /// Matches SQLite's whereRangeAdjust: divide by 4 per bound → 1/16 = 0.0625.
     pub closed_range_selectivity_factor: f64,
 }
 
@@ -106,7 +108,7 @@ impl CostModelParams {
             // Selectivity fallbacks
             sel_eq_unindexed: 0.1,
             sel_eq_indexed: 0.001,
-            sel_range: 0.4,
+            sel_range: 0.33,
             sel_is_null: 0.1,
             sel_is_not_null: 0.9,
             sel_like: 0.2,
@@ -132,7 +134,7 @@ impl CostModelParams {
             hash_nested_probe_selectivity_threshold: 0.15,
 
             // Join optimization
-            closed_range_selectivity_factor: 0.2,
+            closed_range_selectivity_factor: 1.0 / 16.0,
         }
     }
 }

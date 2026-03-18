@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use crate::{turso_assert_eq, turso_assert_greater_than};
+use crate::{translate::optimizer::selectivity, turso_assert_eq, turso_assert_greater_than};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use smallvec::SmallVec;
@@ -89,9 +89,8 @@ fn constraint_output_multipliers(
 
     // Track range bounds per column so they can be combined into a single
     // effective selectivity rather than being dampened as independent predicates.
-    // (col_pos, lower_sel, upper_sel, is_on_clause)
-    let mut range_bounds: SmallVec<[(Option<usize>, Option<f64>, Option<f64>, bool); 4]> =
-        SmallVec::new();
+    type RangeBound = (Option<usize>, Option<f64>, Option<f64>, bool, bool);
+    let mut range_bounds: SmallVec<[RangeBound; 4]> = SmallVec::new();
 
     for constraint in rhs_constraints.constraints.iter().filter(|constraint| {
         (lhs_mask.contains_all(&constraint.lhs_mask)
@@ -116,19 +115,22 @@ fn constraint_output_multipliers(
             // Defer range bounds — they'll be combined per-column after the loop.
             let col = constraint.table_col_pos;
             let is_on = constraint.from_outer_join;
-            if let Some(entry) = range_bounds.iter_mut().find(|(c, _, _, _)| *c == col) {
+            let is_stat4 = constraint.stat4_informed;
+            if let Some(entry) = range_bounds.iter_mut().find(|(c, _, _, _, _)| *c == col) {
                 if is_lower {
                     entry.1 = Some(constraint.selectivity);
                 } else {
                     entry.2 = Some(constraint.selectivity);
                 }
+                // Both bounds must be stat4 for additive formula
+                entry.4 = entry.4 && is_stat4;
             } else {
                 let (lo, hi) = if is_lower {
                     (Some(constraint.selectivity), None)
                 } else {
                     (None, Some(constraint.selectivity))
                 };
-                range_bounds.push((col, lo, hi, is_on));
+                range_bounds.push((col, lo, hi, is_on, is_stat4));
             }
         } else if constraint.from_outer_join {
             on_sels.push(constraint.selectivity);
@@ -142,17 +144,24 @@ fn constraint_output_multipliers(
     }
 
     // Combine range bounds: two bounds on the same column become one entry
-    // for dampening purposes, corrected by closed_range_factor.
-    for &(_, lower_sel, upper_sel, is_on_clause) in &range_bounds {
-        if let Some(combined) = super::selectivity::closed_range_selectivity(
-            lower_sel,
-            upper_sel,
-            params.closed_range_selectivity_factor,
-        ) {
+    // for dampening purposes.
+    for &(_, lower_sel, upper_sel, is_on_clause, both_stat4) in &range_bounds {
+        let combined = if let (true, Some(l), Some(u)) = (both_stat4, lower_sel, upper_sel) {
+            // Additive CDF formula: exact when selectivities are true CDF probabilities
+            Some((l + u - 1.0).max(0.001))
+        } else {
+            // Heuristic: use closed_range_selectivity_factor directly as interval estimate
+            selectivity::closed_range_selectivity(
+                lower_sel,
+                upper_sel,
+                params.closed_range_selectivity_factor,
+            )
+        };
+        if let Some(sel) = combined {
             if is_on_clause {
-                on_sels.push(combined);
+                on_sels.push(sel);
             } else {
-                where_sels.push(combined);
+                where_sels.push(sel);
             }
         }
     }
@@ -810,6 +819,7 @@ pub fn join_lhs_and_rhs<'a>(
         join_type,
     );
     let rows_per_outer = best_access_method.estimated_rows_per_outer_row;
+
     let output_cardinality = match best_access_method.residual_constraints {
         ResidualConstraintMode::None => input_cardinality * rows_per_outer,
         ResidualConstraintMode::ApplyUnconsumed => {

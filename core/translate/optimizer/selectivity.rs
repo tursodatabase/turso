@@ -33,18 +33,17 @@ pub(crate) fn dampened_product(selectivities: &mut SmallVec<[f64; 4]>) -> f64 {
 /// effective selectivity.
 ///
 /// Two bounds on the same column (e.g. `x > 5 AND x < 10`) define a single
-/// interval, not two independent predicates. The `closed_range_factor` corrects
-/// for the geometric relationship between individual bound selectivities and
-/// the actual interval width.
+/// interval, not two independent predicates. When both bounds are present,
+/// `closed_range_sel` is used directly as the combined selectivity estimate
 ///
 /// Returns `None` when no bounds are present.
 pub(crate) fn closed_range_selectivity(
     lower_sel: Option<f64>,
     upper_sel: Option<f64>,
-    closed_range_factor: f64,
+    closed_range_sel: f64,
 ) -> Option<f64> {
     match (lower_sel, upper_sel) {
-        (Some(l), Some(u)) => Some(l * u * closed_range_factor),
+        (Some(_), Some(_)) => Some(closed_range_sel),
         (Some(s), None) | (None, Some(s)) => Some(s),
         (None, None) => None,
     }
@@ -77,18 +76,19 @@ mod tests {
 
     #[test]
     fn closed_range_both_bounds() {
-        let sel = closed_range_selectivity(Some(0.4), Some(0.4), 0.2);
-        assert!((sel.unwrap() - 0.032).abs() < 1e-10);
+        // When both bounds present, uses the closed_range_sel directly
+        let sel = closed_range_selectivity(Some(0.4), Some(0.4), 0.11);
+        assert!((sel.unwrap() - 0.11).abs() < 1e-10);
     }
 
     #[test]
     fn closed_range_single_bound() {
-        assert!((closed_range_selectivity(Some(0.4), None, 0.2).unwrap() - 0.4).abs() < 1e-10);
-        assert!((closed_range_selectivity(None, Some(0.4), 0.2).unwrap() - 0.4).abs() < 1e-10);
+        assert!((closed_range_selectivity(Some(0.4), None, 0.11).unwrap() - 0.4).abs() < 1e-10);
+        assert!((closed_range_selectivity(None, Some(0.4), 0.11).unwrap() - 0.4).abs() < 1e-10);
     }
 
     #[test]
     fn closed_range_no_bounds() {
-        assert!(closed_range_selectivity(None, None, 0.2).is_none());
+        assert!(closed_range_selectivity(None, None, 0.11).is_none());
     }
 }

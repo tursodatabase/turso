@@ -1,0 +1,37 @@
+# Constant Propagation Snapshot Tests
+# Verifies that the optimizer propagates constants through column equality chains.
+# e.g. t1.a = 5 AND t1.a = t2.a → derives t2.a = 5
+
+@database :memory:
+@skip-file-if mvcc "mvcc has slightly different cursor ids"
+
+setup schema {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a INT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, a INT);
+    CREATE TABLE t3(id INTEGER PRIMARY KEY, a INT);
+    CREATE INDEX idx_t1_a ON t1(a);
+    CREATE INDEX idx_t2_a ON t2(a);
+    CREATE INDEX idx_t3_a ON t3(a);
+}
+
+# t1.a = 5 AND t1.a = t2.a
+# Without constant prop: t1 seeks idx_t1_a (a=5), t2 seeks idx_t2_a via join
+# With constant prop: t2.a = 5 is derived, both tables have direct constant seeks
+@setup schema
+snapshot two-table-const-prop {
+    SELECT * FROM t1, t2 WHERE t1.a = 5 AND t1.a = t2.a;
+}
+
+# Three table chain: t1.a = 5 AND t1.a = t2.a AND t2.a = t3.a
+# Constant propagation derives t2.a = 5 and t3.a = 5
+@setup schema
+snapshot three-table-chain {
+    SELECT * FROM t1, t2, t3 WHERE t1.a = 5 AND t1.a = t2.a AND t2.a = t3.a;
+}
+
+# Constant on RHS of join: t2.a = t1.a AND t1.a = 5
+# Same propagation regardless of operand order
+@setup schema
+snapshot const-on-rhs {
+    SELECT * FROM t1, t2 WHERE t2.a = t1.a AND t1.a = 5;
+}

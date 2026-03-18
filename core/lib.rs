@@ -1355,7 +1355,7 @@ impl Database {
         let builtin_syms = self.builtin_syms.read();
         // add built-in extensions symbols to the connection to prevent having to load each time
         conn.syms.write().extend(&builtin_syms);
-        refresh_analyze_stats(&conn);
+        refresh_analyze_stats(&conn)?;
         Ok(conn)
     }
 

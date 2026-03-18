@@ -41,7 +41,7 @@ use constraints::{
 };
 use cost::Cost;
 use join::{compute_best_join_order_with_context, BestJoinOrderResult, JoinPlanningContext};
-use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
+use rewrite_rules::{decompose_cross_table_ors, lift_common_subexpressions_from_binary_or_terms};
 use order::{
     compute_order_target, plan_satisfies_order_target, simple_aggregate_order_target,
     EliminatesSortBy, OrderTargetPurpose,
@@ -68,9 +68,9 @@ pub(crate) mod constraints;
 pub(crate) mod cost;
 mod cost_params;
 pub(crate) mod join;
-pub(crate) mod lift_common_subexpressions;
 pub(crate) mod multi_index;
 pub(crate) mod order;
+mod rewrite_rules;
 mod selectivity;
 mod transitive_equalities;
 pub(crate) mod unnest;
@@ -644,6 +644,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
     }
     optimize_subqueries(plan, schema)?;
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
+    decompose_cross_table_ors(&mut plan.where_clause);
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
     {
@@ -717,6 +718,7 @@ fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
     transform_match_to_fts_match(&mut plan.where_clause, schema, &plan.table_references)?;
 
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
+    decompose_cross_table_ors(&mut plan.where_clause);
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
     {
@@ -755,6 +757,7 @@ fn optimize_update_plan(
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, schema, &plan.table_references)?;
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
+    decompose_cross_table_ors(&mut plan.where_clause);
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
     {
@@ -1322,7 +1325,8 @@ fn base_row_estimate(
 ) -> RowCountEstimate {
     match &table.table {
         Table::BTree(btree) => {
-            if let Some(stats) = schema.analyze_stats.table_stats(&btree.name) {
+            let stats_lookup = schema.analyze_stats.table_stats(&btree.name);
+            if let Some(stats) = stats_lookup {
                 if let Some(rows) = stats.row_count.or_else(|| {
                     stats
                         .index_stats
@@ -1749,9 +1753,12 @@ fn optimize_table_access(
     }
 
     let transitive_synthetic_whereterms_start = where_clause.len();
-    let transitive_synthetic_whereterm_count =
+    let transitive_count =
         transitive_equalities::add_transitive_equalities(where_clause, table_references);
-    if transitive_synthetic_whereterm_count > 0 {
+    let transitive_synthetic_whereterms_end = where_clause.len();
+    let constant_prop_count =
+        transitive_equalities::add_constant_propagation(where_clause, table_references);
+    if transitive_count + constant_prop_count > 0 {
         constraints_per_table = constraints_from_where_clause(
             where_clause,
             table_references,
@@ -2384,11 +2391,18 @@ fn optimize_table_access(
         }
     }
 
-    // Mark synthetic transitive-equality terms as consumed so the emitter
-    // never evaluates them at runtime. They only existed to give the optimizer
-    // more index seek opportunities. We can't truncate because Constraint
-    // objects hold where_clause_pos indices into these entries.
-    for term in where_clause[transitive_synthetic_whereterms_start..].iter_mut() {
+    // Mark synthetic transitive-equality terms (col=col) as consumed so the
+    // emitter never evaluates them at runtime. They are always redundant
+    // (implied by the original column equalities). We can't truncate because
+    // Constraint objects hold where_clause_pos indices into these entries.
+    //
+    // Constant-propagation terms (col=const) are NOT blanket-consumed here:
+    // they carry new information and must be evaluated at runtime (either via
+    // index seek or residual filter) to preserve correctness.
+    for term in
+        where_clause[transitive_synthetic_whereterms_start..transitive_synthetic_whereterms_end]
+            .iter_mut()
+    {
         term.consumed = true;
     }
 

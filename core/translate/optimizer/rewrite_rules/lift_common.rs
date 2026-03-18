@@ -1,3 +1,17 @@
+//! Lifts shared conjuncts (ANDs) from sibling OR terms.
+//!
+//! For example, given:
+//! `(a AND b AND c AND d) OR (a AND b AND e AND f)`
+//!
+//! This lifts common conjuncts (a, b) to the top level, producing:
+//! 1. `(c AND d) OR (e AND f)`
+//! 2. `a`
+//! 3. `b`
+//!
+//! This optimization is important because we rely on individual WhereTerms
+//! for index selection. With an index on (a,b), the original OR term wouldn't
+//! allow index usage, but lifting a,b to the top level enables it.
+
 use crate::{turso_assert, turso_assert_greater_than};
 use turso_parser::ast::{Expr, Operator};
 
@@ -6,29 +20,9 @@ use crate::{
     util::exprs_are_equivalent,
     Result,
 };
-/// Lifts shared conjuncts (ANDs) from sibling OR terms.
-/// For example, given:
-/// (a AND b AND c AND d)
-///     OR
-/// (a AND b AND e AND f)
-/// Notice that both OR terms contain the same conjuncts (a AND b).
-///
-/// This function will lift the common conjuncts (a AND b) to the top level,
-/// resulting in a Vec of three [WhereTerm]s like:
-/// 1. (c AND d) OR (e AND f)
-/// 2. a,
-/// 3. b,
-///
-/// where `a` and `b` become separate WhereTerms, and the original WhereTerm
-/// is updated to `(c AND d) OR (e AND f)`.
-///
-/// This optimization is important because we rely on individual [WhereTerm]s
-/// for index selection. Imagine an index on (a,b) -- with our current optimizer
-/// we wouldn't be able to use the index based on the original [WhereTerm]s, but
-/// if we can lift [a,b] to the top level, we can use the index.
-///
-/// This function is horribly inefficient atm, but it at least makes certain
-/// less trivial queries (e.g. perf/tpc-h/queries/19.sql) finish reasonably fast.
+
+use super::{flatten_and_expr_owned, flatten_or_expr_owned, rebuild_and_expr_from_list, rebuild_or_expr_from_list};
+
 pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
     where_clause: &mut Vec<WhereTerm>,
 ) -> Result<()> {
@@ -133,56 +127,6 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
         i += 1;
     }
     Ok(())
-}
-
-/// Flatten an ast::Expr::Binary(lhs, OR, rhs) into a list of disjuncts.
-fn flatten_or_expr_owned(expr: Expr) -> Result<Vec<Expr>> {
-    let Expr::Binary(lhs, Operator::Or, rhs) = expr else {
-        return Ok(vec![expr]);
-    };
-    let mut flattened = flatten_or_expr_owned(*lhs)?;
-    flattened.extend(flatten_or_expr_owned(*rhs)?);
-    Ok(flattened)
-}
-
-/// Flatten an ast::Expr::Binary(lhs, AND, rhs) into a list of conjuncts.
-fn flatten_and_expr_owned(expr: Expr) -> Result<Vec<Expr>> {
-    let Expr::Binary(lhs, Operator::And, rhs) = expr else {
-        return Ok(vec![expr]);
-    };
-    let mut flattened = flatten_and_expr_owned(*lhs)?;
-    flattened.extend(flatten_and_expr_owned(*rhs)?);
-    Ok(flattened)
-}
-
-/// Rebuild an ast::Expr::Binary(lhs, AND, rhs) for a list of conjuncts.
-fn rebuild_and_expr_from_list(mut conjuncts: Vec<Expr>) -> Expr {
-    turso_assert!(!conjuncts.is_empty());
-
-    if conjuncts.len() == 1 {
-        return conjuncts.pop().unwrap();
-    }
-
-    let mut current_expr = conjuncts.remove(0);
-    for next_expr in conjuncts {
-        current_expr = Expr::Binary(Box::new(current_expr), Operator::And, Box::new(next_expr));
-    }
-    current_expr
-}
-
-/// Rebuild an ast::Expr::Binary(lhs, OR, rhs) for a list of operands.
-fn rebuild_or_expr_from_list(mut operands: Vec<Expr>) -> Expr {
-    turso_assert!(!operands.is_empty());
-
-    if operands.len() == 1 {
-        return operands.pop().unwrap();
-    }
-
-    let mut current_expr = operands.remove(0);
-    for next_expr in operands {
-        current_expr = Expr::Binary(Box::new(current_expr), Operator::Or, Box::new(next_expr));
-    }
-    current_expr
 }
 
 #[cfg(test)]

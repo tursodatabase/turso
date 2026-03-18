@@ -239,12 +239,78 @@ pub fn translate_analyze(
         });
     };
 
+    // --- sqlite_stat4 table creation / opening ---
+    let sqlite_stat4_btreetable: Arc<BTreeTable>;
+    let sqlite_stat4_source: RegisterOrLiteral<_>;
+
+    let stat4_table: Option<Arc<BTreeTable>> =
+        resolver.with_schema(database_id, |s| s.get_btree_table("sqlite_stat4"));
+    if let Some(sqlite_stat4) = stat4_table {
+        sqlite_stat4_btreetable = sqlite_stat4.clone();
+        sqlite_stat4_source = RegisterOrLiteral::Literal(sqlite_stat4.root_page);
+    } else {
+        let table_root_reg = program.alloc_register();
+        program.emit_insn(Insn::CreateBtree {
+            db: database_id,
+            root: table_root_reg,
+            flags: CreateBTreeFlags::new_table(),
+        });
+        let sql = "CREATE TABLE sqlite_stat4(tbl,idx,neq,nlt,ndlt,sample)";
+        sqlite_stat4_btreetable = Arc::new(BTreeTable::from_sql(sql, 0)?);
+        sqlite_stat4_source = RegisterOrLiteral::Register(table_root_reg);
+
+        let table = resolver
+            .with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))
+            .unwrap();
+        let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: sqlite_schema_cursor_id,
+            root_page: 1i64.into(),
+            db: database_id,
+        });
+
+        emit_schema_entry(
+            program,
+            resolver,
+            sqlite_schema_cursor_id,
+            None,
+            SchemaEntryType::Table,
+            "sqlite_stat4",
+            "sqlite_stat4",
+            table_root_reg,
+            Some(sql.to_string()),
+        )?;
+
+        let parse_schema_where_clause =
+            "tbl_name = 'sqlite_stat4' AND type != 'trigger'".to_string();
+        program.emit_insn(Insn::ParseSchema {
+            db: database_id,
+            where_clause: Some(parse_schema_where_clause),
+        });
+
+        let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
+        program.emit_insn(Insn::SetCookie {
+            db: database_id,
+            cookie: Cookie::SchemaVersion,
+            value: schema_version as i32 + 1,
+            p5: 0,
+        });
+    };
+
     // Count the number of rows in the target table(s), and insert into sqlite_stat1.
     let sqlite_stat1 = sqlite_stat1_btreetable;
     let stat_cursor = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_stat1));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: stat_cursor,
         root_page: sqlite_stat1_source,
+        db: database_id,
+    });
+
+    let sqlite_stat4 = sqlite_stat4_btreetable;
+    let stat4_cursor = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_stat4));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: stat4_cursor,
+        root_page: sqlite_stat4_source,
         db: database_id,
     });
 
@@ -344,6 +410,9 @@ pub fn translate_analyze(
         });
         program.preassign_label_to_next_insn(rewind_done);
 
+        // Delete old stat4 rows for this target table.
+        emit_delete_stat_rows(program, stat4_cursor, &target_table.name, target_index.as_deref(), "sqlite_stat4");
+
         let target_cursor = program.alloc_cursor_id(CursorType::BTreeTable(target_table.clone()));
         program.emit_insn(Insn::OpenRead {
             cursor_id: target_cursor,
@@ -419,13 +488,106 @@ pub fn translate_analyze(
             }),
         };
         for index in indexes {
-            emit_index_stats(program, stat_cursor, &target_table, &index, database_id);
+            emit_index_stats(
+                program,
+                stat_cursor,
+                stat4_cursor,
+                &target_table,
+                &index,
+                database_id,
+                count_reg,
+            );
         }
     }
 
     // FIXME: Emit LoadAnalysis
     // FIXME: Emit Expire
     Ok(())
+}
+
+/// Emit a delete loop for rows matching a table (and optionally index) in a stat table.
+fn emit_delete_stat_rows(
+    program: &mut ProgramBuilder,
+    cursor: usize,
+    table_name: &str,
+    target_index: Option<&Index>,
+    stat_table_name: &str,
+) {
+    let rewind_done = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: cursor,
+        pc_if_empty: rewind_done,
+    });
+    let loop_start = program.allocate_label();
+    program.preassign_label_to_next_insn(loop_start);
+
+    let tbl_col_reg = program.alloc_register();
+    program.emit_insn(Insn::Column {
+        cursor_id: cursor,
+        column: 0,
+        dest: tbl_col_reg,
+        default: None,
+    });
+    let target_tbl_reg = program.alloc_register();
+    program.emit_insn(Insn::String8 {
+        value: table_name.to_string(),
+        dest: target_tbl_reg,
+    });
+    program.mark_last_insn_constant();
+
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::Ne {
+        lhs: tbl_col_reg,
+        rhs: target_tbl_reg,
+        target_pc: skip_label,
+        flags: Default::default(),
+        collation: None,
+    });
+
+    if let Some(idx) = target_index {
+        let idx_col_reg = program.alloc_register();
+        program.emit_insn(Insn::Column {
+            cursor_id: cursor,
+            column: 1,
+            dest: idx_col_reg,
+            default: None,
+        });
+        let target_idx_reg = program.alloc_register();
+        program.emit_insn(Insn::String8 {
+            value: idx.name.to_string(),
+            dest: target_idx_reg,
+        });
+        program.mark_last_insn_constant();
+        program.emit_insn(Insn::Ne {
+            lhs: idx_col_reg,
+            rhs: target_idx_reg,
+            target_pc: skip_label,
+            flags: Default::default(),
+            collation: None,
+        });
+    }
+
+    let rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::RowId {
+        cursor_id: cursor,
+        dest: rowid_reg,
+    });
+    program.emit_insn(Insn::Delete {
+        cursor_id: cursor,
+        table_name: stat_table_name.to_string(),
+        is_part_of_update: false,
+    });
+    program.emit_insn(Insn::Next {
+        cursor_id: cursor,
+        pc_if_next: loop_start,
+    });
+
+    program.preassign_label_to_next_insn(skip_label);
+    program.emit_insn(Insn::Next {
+        cursor_id: cursor,
+        pc_if_next: loop_start,
+    });
+    program.preassign_label_to_next_insn(rewind_done);
 }
 
 /// Emit VDBE code to gather and insert statistics for a single index.
@@ -439,9 +601,11 @@ pub fn translate_analyze(
 fn emit_index_stats(
     program: &mut ProgramBuilder,
     stat_cursor: usize,
+    stat4_cursor: usize,
     table: &Arc<BTreeTable>,
     index: &Arc<Index>,
     database_id: usize,
+    count_reg: usize,
 ) {
     let n_cols = index.columns.len();
     if n_cols == 0 {
@@ -456,27 +620,34 @@ fn emit_index_stats(
         db: database_id,
     });
 
-    // Allocate registers contiguously for stat_push(accum, chng):
+    // Allocate registers contiguously for stat_push(accum, chng, sample_key):
     let reg_accum = program.alloc_register();
     let reg_chng = program.alloc_register();
+    let reg_sample_key = program.alloc_register();
 
     // Registers for previous row values and comparison temp
     let reg_prev_base = program.alloc_registers(n_cols);
     let reg_temp = program.alloc_register();
 
-    // Initialize the accumulator with stat_init(n_cols)
-    // Reuse reg_chng temporarily for the n_cols argument
+    // Initialize the accumulator with stat_init(n_cols, estimated_rows)
+    // Use two contiguous registers for the arguments
+    let reg_init_args = program.alloc_registers(2);
     program.emit_insn(Insn::Integer {
         value: n_cols as i64,
-        dest: reg_chng,
+        dest: reg_init_args,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: count_reg,
+        dst_reg: reg_init_args + 1,
+        extra_amount: 0,
     });
     program.emit_insn(Insn::Function {
         constant_mask: 0,
-        start_reg: reg_chng,
+        start_reg: reg_init_args,
         dest: reg_accum,
         func: FuncCtx {
             func: Func::Scalar(ScalarFunc::StatInit),
-            arg_count: 1,
+            arg_count: 2,
         },
     });
 
@@ -558,13 +729,47 @@ fn emit_index_stats(
     }
 
     program.preassign_label_to_next_insn(lbl_stat_push);
+
+    // Build the sample record blob: index columns + rowid.
+    // We use reg_prev_base which holds the current row's column values.
+    // The rowid is the last column in the index for has_rowid tables.
+    let reg_rowid_temp = program.alloc_register();
+    program.emit_insn(Insn::Column {
+        cursor_id: idx_cursor,
+        column: n_cols, // rowid is at position n_cols in btree indexes
+        dest: reg_rowid_temp,
+        default: None,
+    });
+    // Build record from prev columns + rowid into reg_sample_key
+    // Allocate contiguous registers for the record values
+    let reg_sample_vals = program.alloc_registers(n_cols + 1);
+    for i in 0..n_cols {
+        program.emit_insn(Insn::Copy {
+            src_reg: reg_prev_base + i,
+            dst_reg: reg_sample_vals + i,
+            extra_amount: 0,
+        });
+    }
+    program.emit_insn(Insn::Copy {
+        src_reg: reg_rowid_temp,
+        dst_reg: reg_sample_vals + n_cols,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u16(reg_sample_vals),
+        count: to_u16(n_cols + 1),
+        dest_reg: to_u16(reg_sample_key),
+        index_name: None,
+        affinity_str: None,
+    });
+
     program.emit_insn(Insn::Function {
         constant_mask: 0,
         start_reg: reg_accum,
         dest: reg_accum,
         func: FuncCtx {
             func: Func::Scalar(ScalarFunc::StatPush),
-            arg_count: 2,
+            arg_count: 3,
         },
     });
 
@@ -633,6 +838,174 @@ fn emit_index_stats(
         flag: Default::default(),
         table_name: "sqlite_stat1".to_string(),
     });
+
+    // --- stat4 sample insertion loop ---
+    // Use reg_accum, reg_chng, reg_sample_key as contiguous args for stat_get.
+    // reg_chng = mode, reg_sample_key = sample_idx
+    // stat_get(accum, 1) → sample count (also finalizes stat4)
+    program.emit_insn(Insn::Integer {
+        value: 1,
+        dest: reg_chng,
+    });
+    let reg_sample_count = program.alloc_register();
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: reg_accum,
+        dest: reg_sample_count,
+        func: FuncCtx {
+            func: Func::Scalar(ScalarFunc::StatGet),
+            arg_count: 2,
+        },
+    });
+
+    // Loop: for i = 0; i < sample_count; i++
+    program.emit_insn(Insn::Integer {
+        value: 0,
+        dest: reg_sample_key, // reuse as loop counter
+    });
+    let lbl_s4_done = program.allocate_label();
+    let lbl_s4_loop = program.allocate_label();
+    program.preassign_label_to_next_insn(lbl_s4_loop);
+    program.emit_insn(Insn::Ge {
+        lhs: reg_sample_key,
+        rhs: reg_sample_count,
+        target_pc: lbl_s4_done,
+        flags: Default::default(),
+        collation: None,
+    });
+
+    // Get sample fields via stat_get modes 2-5
+    let reg_neq = program.alloc_register();
+    let reg_nlt = program.alloc_register();
+    let reg_ndlt = program.alloc_register();
+    let reg_sample_blob = program.alloc_register();
+
+    // neq = stat_get(accum, 2, i)
+    program.emit_insn(Insn::Integer {
+        value: 2,
+        dest: reg_chng,
+    });
+    // reg_sample_key already holds i (the loop counter)
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: reg_accum,
+        dest: reg_neq,
+        func: FuncCtx {
+            func: Func::Scalar(ScalarFunc::StatGet),
+            arg_count: 3,
+        },
+    });
+
+    // nlt = stat_get(accum, 3, i)
+    program.emit_insn(Insn::Integer {
+        value: 3,
+        dest: reg_chng,
+    });
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: reg_accum,
+        dest: reg_nlt,
+        func: FuncCtx {
+            func: Func::Scalar(ScalarFunc::StatGet),
+            arg_count: 3,
+        },
+    });
+
+    // ndlt = stat_get(accum, 4, i)
+    program.emit_insn(Insn::Integer {
+        value: 4,
+        dest: reg_chng,
+    });
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: reg_accum,
+        dest: reg_ndlt,
+        func: FuncCtx {
+            func: Func::Scalar(ScalarFunc::StatGet),
+            arg_count: 3,
+        },
+    });
+
+    // sample = stat_get(accum, 5, i)
+    program.emit_insn(Insn::Integer {
+        value: 5,
+        dest: reg_chng,
+    });
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: reg_accum,
+        dest: reg_sample_blob,
+        func: FuncCtx {
+            func: Func::Scalar(ScalarFunc::StatGet),
+            arg_count: 3,
+        },
+    });
+
+    // MakeRecord(tbl_name, idx_name, neq, nlt, ndlt, sample) → stat4 record
+    let reg_s4_rec_start = program.alloc_registers(6);
+    program.emit_insn(Insn::String8 {
+        value: table.name.to_string(),
+        dest: reg_s4_rec_start,
+    });
+    program.mark_last_insn_constant();
+    program.emit_insn(Insn::String8 {
+        value: index.name.to_string(),
+        dest: reg_s4_rec_start + 1,
+    });
+    program.mark_last_insn_constant();
+    program.emit_insn(Insn::Copy {
+        src_reg: reg_neq,
+        dst_reg: reg_s4_rec_start + 2,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: reg_nlt,
+        dst_reg: reg_s4_rec_start + 3,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: reg_ndlt,
+        dst_reg: reg_s4_rec_start + 4,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: reg_sample_blob,
+        dst_reg: reg_s4_rec_start + 5,
+        extra_amount: 0,
+    });
+
+    let reg_s4_record = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u16(reg_s4_rec_start),
+        count: to_u16(6),
+        dest_reg: to_u16(reg_s4_record),
+        index_name: None,
+        affinity_str: None,
+    });
+
+    let reg_s4_rowid = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: stat4_cursor,
+        rowid_reg: reg_s4_rowid,
+        prev_largest_reg: 0,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: stat4_cursor,
+        key_reg: reg_s4_rowid,
+        record_reg: reg_s4_record,
+        flag: Default::default(),
+        table_name: "sqlite_stat4".to_string(),
+    });
+
+    // i++
+    program.emit_insn(Insn::AddImm {
+        register: reg_sample_key,
+        value: 1,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: lbl_s4_loop,
+    });
+    program.preassign_label_to_next_insn(lbl_s4_done);
 
     // Label for empty index case, just skip the insert
     program.preassign_label_to_next_insn(lbl_empty);

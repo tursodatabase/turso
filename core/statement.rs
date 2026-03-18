@@ -193,7 +193,7 @@ impl Statement {
             // After ANALYZE completes, refresh in-memory stats so planners can use them.
             let sql = self.program.sql.trim_start().as_bytes();
             if sql.len() >= 7 && sql[..7].eq_ignore_ascii_case(b"ANALYZE") {
-                refresh_analyze_stats(&self.program.connection);
+                refresh_analyze_stats(&self.program.connection)?;
             }
         } else {
             self.busy = true;

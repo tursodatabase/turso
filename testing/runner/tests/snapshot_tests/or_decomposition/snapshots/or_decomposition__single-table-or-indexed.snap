@@ -1,0 +1,13 @@
+---
+source: or_decomposition.sqltest
+expression: SELECT * FROM n1 WHERE n1.name = 'name1' OR n1.name = 'name2';
+info:
+  statement_type: SELECT
+  tables:
+  - n1
+  setup_blocks:
+  - indexed_schema
+  database: ':memory:'
+---
+QUERY PLAN
+`--SEARCH n1 USING INDEX idx_n1_name (name=?)

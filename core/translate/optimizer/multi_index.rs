@@ -338,6 +338,7 @@ fn choose_multi_index_branch_access(
         1.0,
         base_row_count,
         params,
+        None,
     );
 
     let mut best_branch = chosen_seek
@@ -355,6 +356,8 @@ fn choose_multi_index_branch_access(
                 rhs_table,
                 index: chosen.index.as_ref(),
                 stats: analyze_stats,
+                constraints: Some(&table_constraints.constraints),
+                where_clause: None,
             };
             let branch_cost = estimate_cost_for_scan_or_seek(
                 Some(index_info),
@@ -426,10 +429,17 @@ struct MultiOrResidualPrePostFilters {
     post_filter_exprs: Vec<ast::Expr>,
     /// Combined table mask for `post_filter_exprs`.
     post_mask: TableMask,
+    /// True if any residual references tables outside `allowed_mask` and was
+    /// deferred (not included in `post_filter_exprs`). When set, the OR term
+    /// should not be consumed by this table's access method so that the inner
+    /// table can also plan a multi-index OR from the same term.
+    has_deferred: bool,
 }
 
 /// Classify unconsumed branch conjuncts into pre-filters (outer-table-only,
-/// evaluated before the index seek) and post-filters (evaluated after the seek).
+/// evaluated before the index seek), post-filters (evaluated after the seek),
+/// and deferred conditions (referencing not-yet-joined tables, handled by the
+/// inner table's own multi-index OR planning).
 ///
 /// Returns `None` if any residual contains a subquery or has an unresolvable
 /// table mask—matching the old `residual_tables_mask` rejection.
@@ -437,6 +447,7 @@ fn partition_residual_multi_or_exprs(
     branch_terms: &[WhereTerm],
     access: &MultiIdxBranchAccess,
     lhs_mask: &TableMask,
+    allowed_mask: &TableMask,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
 ) -> Option<MultiOrResidualPrePostFilters> {
@@ -465,6 +476,7 @@ fn partition_residual_multi_or_exprs(
     let mut pre_filter_exprs = Vec::new();
     let mut post_filter_exprs = Vec::new();
     let mut post_mask = TableMask::new();
+    let mut has_deferred = false;
 
     for (idx, term) in branch_terms.iter().enumerate() {
         if consumed[idx] {
@@ -477,9 +489,13 @@ fn partition_residual_multi_or_exprs(
         let mask = table_mask_from_expr(expr, table_references, subqueries).ok()?;
         if lhs_mask.contains_all(&mask) {
             pre_filter_exprs.push(expr.clone());
-        } else {
+        } else if allowed_mask.contains_all(&mask) {
             post_mask |= mask;
             post_filter_exprs.push(expr.clone());
+        } else {
+            // Cross-table condition referencing not-yet-joined tables.
+            // The inner table's multi-index OR planning will handle this.
+            has_deferred = true;
         }
     }
 
@@ -487,6 +503,7 @@ fn partition_residual_multi_or_exprs(
         pre_filter_exprs,
         post_filter_exprs,
         post_mask,
+        has_deferred,
     })
 }
 
@@ -634,6 +651,7 @@ fn evaluate_multi_index_branches(
     input_cardinality: f64,
     params: &CostModelParams,
     best_cost: Cost,
+    consume_where_term: bool,
 ) -> Option<AccessMethod> {
     let mut branch_costs = Vec::with_capacity(branches.len());
     let mut branch_rows = Vec::with_capacity(branches.len());
@@ -701,7 +719,9 @@ fn evaluate_multi_index_branches(
 
     if multi_index_cost < best_cost {
         let mut consumed_where_terms = SmallVec::<[usize; 4]>::new();
-        consumed_where_terms.push(where_term_idx);
+        if consume_where_term {
+            consumed_where_terms.push(where_term_idx);
+        }
         if let SetOperation::Intersection {
             additional_consumed_terms,
         } = &set_op
@@ -712,12 +732,18 @@ fn evaluate_multi_index_branches(
                 }
             }
         }
-        for branch in &branch_params {
-            if let MultiIndexBranchAccessParams::Seek { constraints, .. } = &branch.access {
-                for constraint in constraints {
-                    let where_term_idx = constraint.where_clause_pos.0;
-                    if !consumed_where_terms.contains(&where_term_idx) {
-                        consumed_where_terms.push(where_term_idx);
+        // For intersection, branches map directly to top-level where terms,
+        // so we consume those positions. For union, branch constraints come
+        // from synthetic (branch-local) where terms — their positions are NOT
+        // valid top-level where_clause indices.
+        if matches!(&set_op, SetOperation::Intersection { .. }) {
+            for branch in &branch_params {
+                if let MultiIndexBranchAccessParams::Seek { constraints, .. } = &branch.access {
+                    for constraint in constraints {
+                        let where_term_idx = constraint.where_clause_pos.0;
+                        if !consumed_where_terms.contains(&where_term_idx) {
+                            consumed_where_terms.push(where_term_idx);
+                        }
                     }
                 }
             }
@@ -912,6 +938,7 @@ pub fn consider_multi_index_union(
         // Each disjunct is replanned with branch-local `TableConstraints`, so
         // compound conjuncts can reuse the same compound-seek analysis as
         // ordinary btree access.
+        let mut any_branch_has_deferred = false;
         let branches: Option<Vec<_>> = disjuncts
             .into_iter()
             .map(|disjunct_expr| {
@@ -946,19 +973,22 @@ pub fn consider_multi_index_union(
                     params,
                 )
                 .ok()??;
-                // Partition residuals in a single pass: pre-filters reference
+                // Partition residuals into three buckets: pre-filters reference
                 // only outer (lhs) tables and can short-circuit the branch
                 // before the index seek; post-filters reference the target
-                // table and are evaluated after the seek.
+                // table and are evaluated after the seek; deferred conditions
+                // reference not-yet-joined tables and will be handled by the
+                // inner table's own multi-index OR planning.
                 let partitioned_pre_post = partition_residual_multi_or_exprs(
                     &synthetic_where_terms,
                     &chosen.access,
                     lhs_mask,
+                    &allowed_mask,
                     table_references,
                     subqueries,
                 )?;
-                if !allowed_mask.contains_all(&partitioned_pre_post.post_mask) {
-                    return None;
+                if partitioned_pre_post.has_deferred {
+                    any_branch_has_deferred = true;
                 }
                 chosen.union_prepost_filters = Some(UnionBranchPrePostFilters {
                     requires_table_cursor: partitioned_pre_post.post_mask.contains_table(rhs_idx),
@@ -973,6 +1003,11 @@ pub fn consider_multi_index_union(
             continue;
         };
 
+        // When branches have deferred cross-table residuals, don't consume
+        // the OR term so the inner table can also plan a multi-index OR from
+        // it. The DP planner never modifies where_clause during evaluation,
+        // so both tables can independently create multi-index OR plans.
+        let consume_where_term = !any_branch_has_deferred;
         if let Some(access_method) = evaluate_multi_index_branches(
             branches,
             SetOperation::Union,
@@ -986,6 +1021,7 @@ pub fn consider_multi_index_union(
             input_cardinality,
             params,
             best_cost,
+            consume_where_term,
         ) {
             return Some(access_method);
         }
@@ -1052,6 +1088,8 @@ pub fn consider_multi_index_intersection(
                 rhs_table,
                 index: b.index.as_ref(),
                 stats: analyze_stats,
+                constraints: Some(&constraints),
+                where_clause: None,
             };
             MultiIdxBranch {
                 index: b.index.clone(),
@@ -1101,6 +1139,7 @@ pub fn consider_multi_index_intersection(
         input_cardinality,
         params,
         best_cost,
+        true, // intersection always consumes its terms
     )
 }
 
@@ -1228,7 +1267,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_index_union_rejects_residuals_on_future_tables() {
+    fn test_multi_index_union_defers_residuals_on_future_tables() {
         let link = create_btree_table(
             "link",
             vec![
@@ -1403,9 +1442,13 @@ mod tests {
             &AnalyzeStats::default(),
         );
 
+        let access_method = access_method
+            .expect("multi-index OR should succeed even with future-table residuals (deferred)");
+        // The OR term must NOT be consumed, because it has deferred cross-table
+        // residuals that the future table's planning pass will handle.
         assert!(
-            access_method.is_none(),
-            "future-table residuals must not produce a multi-index OR access method"
+            access_method.consumed_where_terms.is_empty(),
+            "OR term must not be consumed when branches have deferred future-table residuals"
         );
     }
 

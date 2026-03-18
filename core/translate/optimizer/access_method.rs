@@ -208,6 +208,7 @@ pub(super) fn choose_best_btree_candidate(
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
+    where_clause: Option<&[WhereTerm]>,
 ) -> Option<ChosenBtreeCandidate> {
     // Seed the baseline with a table scan only if a rowid candidate exists
     // (i.e. no INDEXED BY has removed it). Otherwise start at infinite cost
@@ -239,6 +240,7 @@ pub(super) fn choose_best_btree_candidate(
     // Build a mask for the rhs table itself.
     let mut rhs_table_mask = TableMask::new();
     rhs_table_mask.add_table(rhs_table_idx);
+
 
     // Estimate cost for each candidate index (including the rowid index) and
     // keep the best candidate.
@@ -321,6 +323,8 @@ pub(super) fn choose_best_btree_candidate(
             rhs_table,
             index: candidate.index.as_ref(),
             stats: analyze_stats,
+            constraints: Some(&rhs_constraints.constraints),
+            where_clause,
         };
         let cost = estimate_cost_for_scan_or_seek(
             Some(index_info),
@@ -721,6 +725,7 @@ fn find_best_access_method_for_btree(
         input_cardinality,
         base_row_count,
         params,
+        Some(where_clause),
     )
     .expect("btree candidate selection must always consider the rowid candidate");
 
@@ -749,6 +754,8 @@ fn find_best_access_method_for_btree(
             rhs_table,
             index: best.index.as_ref(),
             stats: analyze_stats,
+            constraints: Some(&rhs_constraints.constraints),
+            where_clause: Some(where_clause),
         };
         estimate_rows_per_seek(
             index_info,

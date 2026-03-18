@@ -74,6 +74,10 @@ pub struct Constraint {
     /// Used by the cardinality estimator to separate ON-clause residuals from WHERE-clause residuals
     /// for join-type-aware cardinality estimation (e.g. LEFT JOIN output floor, anti-join detection).
     pub from_outer_join: bool,
+    /// Whether the selectivity was computed from stat4 histogram data (true) or
+    /// from hardcoded heuristics (false). When true, the selectivity represents
+    /// an actual CDF probability and can be combined additively for range bounds.
+    pub stat4_informed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -258,12 +262,13 @@ fn estimate_selectivity(
     op: ConstraintOperator,
     params: &CostModelParams,
     is_rowid: bool,
-) -> f64 {
+    constraining_expr: Option<&ast::Expr>,
+) -> (f64, bool) {
     // Get ANALYZE stats for this table if available
     let table_stats = schema.analyze_stats.table_stats(table_name);
     let row_count = table_stats.and_then(|s| s.row_count).unwrap_or(0);
 
-    match op {
+    let sel = match op {
         ConstraintOperator::AstNativeOperator(ast::Operator::Equals) => {
             let is_pk_or_rowid_alias =
                 is_rowid || column.is_some_and(|c| c.is_rowid_alias() || c.primary_key());
@@ -291,7 +296,7 @@ fn estimate_selectivity(
                                 // For composite unique indexes like tpc-h (l_orderkey, l_linenumber),
                                 // the first column alone is NOT unique.
                                 if index.unique && index.columns.len() == 1 {
-                                    return selectivity_when_unique;
+                                    return (selectivity_when_unique, false);
                                 }
                                 if let Some(stats) = table_stats {
                                     if let Some(idx_stat) = stats.index_stats.get(&index.name) {
@@ -301,12 +306,12 @@ fn estimate_selectivity(
                                         ) {
                                             if total > 0 && avg_rows > 0 {
                                                 // selectivity = avg_rows_per_key / total_rows
-                                                return avg_rows as f64 / total as f64;
+                                                return (avg_rows as f64 / total as f64, false);
                                             }
                                         }
                                     }
                                 } else {
-                                    return params.sel_eq_indexed;
+                                    return (params.sel_eq_indexed, false);
                                 }
                             }
                         }
@@ -322,7 +327,25 @@ fn estimate_selectivity(
         ConstraintOperator::AstNativeOperator(ast::Operator::Greater)
         | ConstraintOperator::AstNativeOperator(ast::Operator::GreaterEquals)
         | ConstraintOperator::AstNativeOperator(ast::Operator::Less)
-        | ConstraintOperator::AstNativeOperator(ast::Operator::LessEquals) => params.sel_range,
+        | ConstraintOperator::AstNativeOperator(ast::Operator::LessEquals) => {
+            // Try stat4 range estimation when a constant bound value is available
+            if let Some(col_pos) = column_pos {
+                if let Some(expr) = constraining_expr {
+                    if let Some(sel) = stat4_range_sel_for_bound(
+                        schema,
+                        table_name,
+                        col_pos,
+                        available_indexes,
+                        op,
+                        expr,
+                        row_count,
+                    ) {
+                        return (sel, true);
+                    }
+                }
+            }
+            params.sel_range
+        }
         ConstraintOperator::AstNativeOperator(ast::Operator::Is) => params.sel_is_null,
         ConstraintOperator::AstNativeOperator(ast::Operator::IsNot) => params.sel_is_not_null,
         ConstraintOperator::Like { not: false } => params.sel_like,
@@ -332,11 +355,70 @@ fn estimate_selectivity(
             estimated_values,
         } => estimate_in_selectivity(estimated_values, row_count as f64, not),
         _ => params.sel_other,
+    };
+    (sel, false)
+}
+
+/// Try to compute a range bound selectivity using stat4 histogram data.
+/// Finds an index with stat4 samples where `col_pos` is the first column,
+/// extracts the constant value from the expression, and uses stat4_key_stats.
+fn stat4_range_sel_for_bound(
+    schema: &Schema,
+    table_name: &str,
+    col_pos: usize,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    op: ConstraintOperator,
+    constraining_expr: &ast::Expr,
+    row_count: u64,
+) -> Option<f64> {
+    if row_count == 0 {
+        return None;
     }
+    // Don't try to extract column references as constants
+    if matches!(constraining_expr, ast::Expr::Id(_) | ast::Expr::Column { .. }) {
+        return None;
+    }
+    let val = crate::translate::alter::eval_constant_default_value(constraining_expr).ok()?;
+
+    let table_stats = schema.analyze_stats.table_stats(table_name)?;
+    let indexes = available_indexes.get(table_name)?;
+
+    for index in indexes {
+        if let Some(0) = index.column_table_pos_to_index_pos(col_pos) {
+            let Some(idx_stat) = table_stats.index_stats.get(&index.name) else {
+                continue;
+            };
+            if idx_stat.samples.is_empty() {
+                continue;
+            }
+            let collation = index
+                .columns
+                .first()
+                .and_then(|c| c.collation)
+                .unwrap_or_default();
+
+            let (n_lt, n_eq) =
+                crate::stats::stat4_key_stats(idx_stat, &val, collation, false)?;
+            let total = row_count as f64;
+
+            let ast_op = op.as_ast_operator()?;
+            let sel = match ast_op {
+                ast::Operator::Less => n_lt as f64 / total,
+                ast::Operator::LessEquals => (n_lt + n_eq) as f64 / total,
+                ast::Operator::Greater => (total - n_lt as f64 - n_eq as f64) / total,
+                ast::Operator::GreaterEquals => (total - n_lt as f64) / total,
+                _ => return None,
+            };
+            // Clamp to reasonable range
+            return Some(sel.clamp(1.0 / total, 1.0));
+        }
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
 /// Estimate selectivity for a single WHERE/ON constraint applied to `table_reference`.
+/// Returns (selectivity, stat4_informed).
 fn estimate_constraint_selectivity(
     schema: &Schema,
     table_reference: &JoinedTable,
@@ -346,7 +428,8 @@ fn estimate_constraint_selectivity(
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
     params: &CostModelParams,
     is_rowid: bool,
-) -> f64 {
+    constraining_expr: Option<&ast::Expr>,
+) -> (f64, bool) {
     estimate_selectivity(
         schema,
         table_reference.table.get_name(),
@@ -356,6 +439,7 @@ fn estimate_constraint_selectivity(
         operator,
         params,
         is_rowid,
+        constraining_expr,
     )
 }
 
@@ -438,6 +522,17 @@ pub fn constraints_from_where_clause(
                     ast::Expr::Column { table, column, .. } => {
                         if *table == table_reference.internal_id {
                             let table_column = &table_reference.table.columns()[*column];
+                            let (selectivity, stat4_informed) = estimate_constraint_selectivity(
+                                schema,
+                                table_reference,
+                                Some(table_column),
+                                Some(*column),
+                                operator,
+                                available_indexes,
+                                params,
+                                false,
+                                Some(rhs),
+                            );
                             cs.constraints.push(Constraint {
                                 where_clause_pos: (i, BinaryExprSide::Rhs),
                                 operator,
@@ -445,19 +540,11 @@ pub fn constraints_from_where_clause(
                                 expr: None,
                                 constraining_expr: None,
                                 lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
-                                selectivity: estimate_constraint_selectivity(
-                                    schema,
-                                    table_reference,
-                                    Some(table_column),
-                                    Some(*column),
-                                    operator,
-                                    available_indexes,
-                                    params,
-                                    false,
-                                ),
+                                selectivity,
                                 usable: true,
                                 is_rowid: false,
                                 from_outer_join: is_from_outer_join,
+                                stat4_informed,
                             });
                         }
                     }
@@ -468,6 +555,17 @@ pub fn constraints_from_where_clause(
                             } else {
                                 (None, None)
                             };
+                            let (selectivity, stat4_informed) = estimate_constraint_selectivity(
+                                schema,
+                                table_reference,
+                                col,
+                                col_pos,
+                                operator,
+                                available_indexes,
+                                params,
+                                true,
+                                Some(rhs),
+                            );
                             cs.constraints.push(Constraint {
                                 where_clause_pos: (i, BinaryExprSide::Rhs),
                                 operator,
@@ -475,19 +573,11 @@ pub fn constraints_from_where_clause(
                                 expr: None,
                                 constraining_expr: None,
                                 lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
-                                selectivity: estimate_constraint_selectivity(
-                                    schema,
-                                    table_reference,
-                                    col,
-                                    col_pos,
-                                    operator,
-                                    available_indexes,
-                                    params,
-                                    true,
-                                ),
+                                selectivity,
                                 usable: true,
                                 is_rowid: true,
                                 from_outer_join: is_from_outer_join,
+                                stat4_informed,
                             });
                         }
                     }
@@ -498,7 +588,7 @@ pub fn constraints_from_where_clause(
                         subqueries,
                     ) =>
                     {
-                        let selectivity = estimate_constraint_selectivity(
+                        let (selectivity, stat4_informed) = estimate_constraint_selectivity(
                             schema,
                             table_reference,
                             None,
@@ -507,6 +597,7 @@ pub fn constraints_from_where_clause(
                             available_indexes,
                             params,
                             false,
+                            None,
                         );
                         tracing::debug!(
                             table = table_reference.table.get_name(),
@@ -527,6 +618,7 @@ pub fn constraints_from_where_clause(
                             usable: true,
                             is_rowid: false,
                             from_outer_join: is_from_outer_join,
+                            stat4_informed,
                         });
                     }
                     _ => {}
@@ -535,6 +627,17 @@ pub fn constraints_from_where_clause(
                     ast::Expr::Column { table, column, .. } => {
                         if *table == table_reference.internal_id {
                             let table_column = &table_reference.table.columns()[*column];
+                            let (selectivity, stat4_informed) = estimate_constraint_selectivity(
+                                schema,
+                                table_reference,
+                                Some(table_column),
+                                Some(*column),
+                                operator,
+                                available_indexes,
+                                params,
+                                false,
+                                Some(lhs),
+                            );
                             cs.constraints.push(Constraint {
                                 where_clause_pos: (i, BinaryExprSide::Lhs),
                                 operator: opposite_cmp_op(operator),
@@ -542,19 +645,11 @@ pub fn constraints_from_where_clause(
                                 expr: None,
                                 constraining_expr: None,
                                 lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
-                                selectivity: estimate_constraint_selectivity(
-                                    schema,
-                                    table_reference,
-                                    Some(table_column),
-                                    Some(*column),
-                                    operator,
-                                    available_indexes,
-                                    params,
-                                    false,
-                                ),
+                                selectivity,
                                 usable: true,
                                 is_rowid: false,
                                 from_outer_join: is_from_outer_join,
+                                stat4_informed,
                             });
                         }
                     }
@@ -565,6 +660,17 @@ pub fn constraints_from_where_clause(
                             } else {
                                 (None, None)
                             };
+                            let (selectivity, stat4_informed) = estimate_constraint_selectivity(
+                                schema,
+                                table_reference,
+                                col,
+                                col_pos,
+                                operator,
+                                available_indexes,
+                                params,
+                                true,
+                                Some(lhs),
+                            );
                             cs.constraints.push(Constraint {
                                 where_clause_pos: (i, BinaryExprSide::Lhs),
                                 operator: opposite_cmp_op(operator),
@@ -572,19 +678,11 @@ pub fn constraints_from_where_clause(
                                 expr: None,
                                 constraining_expr: None,
                                 lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
-                                selectivity: estimate_constraint_selectivity(
-                                    schema,
-                                    table_reference,
-                                    col,
-                                    col_pos,
-                                    operator,
-                                    available_indexes,
-                                    params,
-                                    true,
-                                ),
+                                selectivity,
                                 usable: true,
                                 is_rowid: true,
                                 from_outer_join: is_from_outer_join,
+                                stat4_informed,
                             });
                         }
                     }
@@ -595,7 +693,7 @@ pub fn constraints_from_where_clause(
                         subqueries,
                     ) =>
                     {
-                        let selectivity = estimate_constraint_selectivity(
+                        let (selectivity, stat4_informed) = estimate_constraint_selectivity(
                             schema,
                             table_reference,
                             None,
@@ -604,6 +702,7 @@ pub fn constraints_from_where_clause(
                             available_indexes,
                             params,
                             false,
+                            None,
                         );
                         tracing::debug!(
                             table = table_reference.table.get_name(),
@@ -624,6 +723,7 @@ pub fn constraints_from_where_clause(
                             usable: true,
                             is_rowid: false,
                             from_outer_join: is_from_outer_join,
+                            stat4_informed,
                         });
                     }
                     _ => {}
@@ -670,6 +770,7 @@ pub fn constraints_from_where_clause(
                             usable: false, // IN uses a separate seek path, not the range-seek model
                             is_rowid,
                             from_outer_join: is_from_outer_join,
+                            stat4_informed: false,
                         });
                     }
                     ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
@@ -687,6 +788,7 @@ pub fn constraints_from_where_clause(
                             usable: false,
                             is_rowid: true,
                             from_outer_join: is_from_outer_join,
+                            stat4_informed: false,
                         });
                     }
                     _ => {}
@@ -737,6 +839,7 @@ pub fn constraints_from_where_clause(
                                 usable: false, // IN uses a separate seek path (consider_in_list_seek)
                                 is_rowid,
                                 from_outer_join: is_from_outer_join,
+                                stat4_informed: false,
                             });
                         }
                         ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
@@ -754,6 +857,7 @@ pub fn constraints_from_where_clause(
                                 usable: false,
                                 is_rowid: true,
                                 from_outer_join: is_from_outer_join,
+                                stat4_informed: false,
                             });
                         }
                         _ => {}
@@ -1347,7 +1451,7 @@ pub(crate) fn analyze_binary_term_for_index(
     }
 
     let table_column = table_col_pos.and_then(|pos| table_reference.table.columns().get(pos));
-    let selectivity = estimate_constraint_selectivity(
+    let (selectivity, stat4_informed) = estimate_constraint_selectivity(
         schema,
         table_reference,
         table_column,
@@ -1356,6 +1460,7 @@ pub(crate) fn analyze_binary_term_for_index(
         available_indexes,
         params,
         is_rowid,
+        Some(&constraining_expr),
     );
 
     let lhs_mask = table_mask_from_expr(&constraining_expr, table_references, subqueries)
@@ -1402,6 +1507,7 @@ pub(crate) fn analyze_binary_term_for_index(
         usable: true,
         is_rowid,
         from_outer_join: false, // multi-index branches don't participate in outer join residual splitting
+        stat4_informed,
     };
 
     Some(AnalyzedTerm {

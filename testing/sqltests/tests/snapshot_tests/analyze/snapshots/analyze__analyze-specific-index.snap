@@ -11,65 +11,117 @@ QUERY PLAN
 
 
 BYTECODE
-addr  opcode       p1  p2  p3  p4                                               p5  comment
-   0  Init          0  54   0                                                    0  Start at 54
-   1  Null          0   1   0                                                    0  r[1]=NULL
-   2  CreateBtree   0   2   1                                                    0  r[2]=root iDb=0 flags=1
-   3  OpenWrite     0   1   0                                                    0  root=1; iDb=0
-   4  NewRowid      0   3   0                                                    0  r[3]=rowid
-   5  String8       0   4   0  table                                             0  r[4]='table'
-   6  String8       0   5   0  sqlite_stat1                                      0  r[5]='sqlite_stat1'
-   7  String8       0   6   0  sqlite_stat1                                      0  r[6]='sqlite_stat1'
-   8  Copy          2   7   0                                                    0  r[7]=r[2]
-   9  String8       0   8   0  CREATE TABLE sqlite_stat1(tbl,idx,stat)           0  r[8]='CREATE TABLE sqlite_stat1(tbl,idx,stat)'
-  10  MakeRecord    4   5   9                                                    0  r[9]=mkrec(r[4..8])
-  11  Insert        0   9   3  sqlite_stat1                                      0  intkey=r[3] data=r[9]
-  12  ParseSchema   0   0   0  tbl_name = 'sqlite_stat1' AND type != 'trigger'   0  tbl_name = 'sqlite_stat1' AND type != 'trigger'
-  13  SetCookie     0   1  10                                                    0
-  14  OpenWrite     1   2   0                                                    0  root=2; iDb=0
-  15  Rewind        1  24   0                                                    0  Rewind  sqlite_stat1
-  16      Column    1   0  10                                                    0  r[10]=sqlite_stat1.tbl
-  17      Ne       10  11  23                                                    0  if r[10]!=r[11] goto 23
-  18      Column    1   1  12                                                    0  r[12]=sqlite_stat1.idx
-  19      Ne       12  13  23                                                    0  if r[12]!=r[13] goto 23
-  20      RowId     1  14   0                                                    0  r[14]=sqlite_stat1.rowid
-  21      Delete    1   0   0  sqlite_stat1                                      0
-  22    Next        1  16   0                                                    0
-  23  Next          1  16   0                                                    0
-  24  OpenRead      2   2   0  k(6,B,B,B,B,B,B)                                  0  =products, root=2, iDb=0
-  25  Count         2  20   0                                                    0
-  26  IfNot        20  33   0                                                    0  if !r[20] goto 33
-  27  Null          0  17   0                                                    0  r[17]=NULL
-  28  Copy         20  18   0                                                    0  r[18]=r[20]
-  29  Cast         18   0   0                                                    0  affinity(r[18]=Text)
-  30  MakeRecord   16   3  19                                                    0  r[19]=mkrec(r[16..18])
-  31  NewRowid      1  15   0                                                    0  r[15]=rowid
-  32  Insert        1  19  15  sqlite_stat1                                      0  intkey=r[15] data=r[19]
-  33  OpenRead      3   3   0  k(2,B)                                            0  =idx_products_sku, root=3, iDb=0
-  34  Integer       1  22   0                                                    0  r[22]=1
-  35  Function      0  22  21  stat_init                                         0  r[21]=func(r[22])
-  36  Rewind        3  53   0                                                    0  Rewind  idx_products_sku
-  37  Integer       0  22   0                                                    0  r[22]=0
-  38  Goto          0  44   0                                                    0
-  39    Integer     0  22   0                                                    0  r[22]=0
-  40    Column      3   0  24                                                    0  r[24]=idx_products_sku.sku
-  41    Ne         24  23  44                                                    0  if r[24]!=r[23] goto 44
-  42    Integer     1  22   0                                                    0  r[22]=1
-  43    Goto        0  45   0                                                    0
-  44    Column      3   0  23                                                    0  r[23]=idx_products_sku.sku
-  45    Function    0  21  21  stat_push                                         0  r[21]=func(r[21..22])
-  46  Next          3  39   0                                                    0
-  47  Function      0  21  25  stat_get                                          0  r[25]=func(r[21])
-  48  IsNull       25  53   0                                                    0  if (r[25]==NULL) goto 53
-  49  Copy         25  28   0                                                    0  r[28]=r[25]
-  50  MakeRecord   26   3  29                                                    0  r[29]=mkrec(r[26..28])
-  51  NewRowid      1  30   0                                                    0  r[30]=rowid
-  52  Insert        1  29  30  sqlite_stat1                                      0  intkey=r[30] data=r[29]
-  53  Halt          0   0   0                                                    0
-  54  Transaction   0   2   9                                                    0  iDb=0 tx_mode=Write
-  55  String8       0  11   0  products                                          0  r[11]='products'
-  56  String8       0  13   0  idx_products_sku                                  0  r[13]='idx_products_sku'
-  57  String8       0  16   0  products                                          0  r[16]='products'
-  58  String8       0  26   0  products                                          0  r[26]='products'
-  59  String8       0  27   0  idx_products_sku                                  0  r[27]='idx_products_sku'
-  60  Goto          0   1   0                                                    0
+addr  opcode        p1   p2   p3  p4                                                      p5  comment
+   0  Init           0  102    0                                                           0  Start at 102
+   1  Null           0    1    0                                                           0  r[1]=NULL
+   2  CreateBtree    0    2    1                                                           0  r[2]=root iDb=0 flags=1
+   3  OpenWrite      0    1    0                                                           0  root=1; iDb=0
+   4  NewRowid       0    3    0                                                           0  r[3]=rowid
+   5  String8        0    4    0  table                                                    0  r[4]='table'
+   6  String8        0    5    0  sqlite_stat1                                             0  r[5]='sqlite_stat1'
+   7  String8        0    6    0  sqlite_stat1                                             0  r[6]='sqlite_stat1'
+   8  Copy           2    7    0                                                           0  r[7]=r[2]
+   9  String8        0    8    0  CREATE TABLE sqlite_stat1(tbl,idx,stat)                  0  r[8]='CREATE TABLE sqlite_stat1(tbl,idx,stat)'
+  10  MakeRecord     4    5    9                                                           0  r[9]=mkrec(r[4..8])
+  11  Insert         0    9    3  sqlite_stat1                                             0  intkey=r[3] data=r[9]
+  12  ParseSchema    0    0    0  tbl_name = 'sqlite_stat1' AND type != 'trigger'          0  tbl_name = 'sqlite_stat1' AND type != 'trigger'
+  13  SetCookie      0    1   10                                                           0
+  14  CreateBtree    0   10    1                                                           0  r[10]=root iDb=0 flags=1
+  15  OpenWrite      1    1    0                                                           0  root=1; iDb=0
+  16  NewRowid       1   11    0                                                           0  r[11]=rowid
+  17  String8        0   12    0  table                                                    0  r[12]='table'
+  18  String8        0   13    0  sqlite_stat4                                             0  r[13]='sqlite_stat4'
+  19  String8        0   14    0  sqlite_stat4                                             0  r[14]='sqlite_stat4'
+  20  Copy          10   15    0                                                           0  r[15]=r[10]
+  21  String8        0   16    0  CREATE TABLE sqlite_stat4(tbl,idx,neq,nlt,ndlt,sample)   0  r[16]='CREATE TABLE sqlite_stat4(tbl,idx,neq,nlt,ndlt,sample)'
+  22  MakeRecord    12    5   17                                                           0  r[17]=mkrec(r[12..16])
+  23  Insert         1   17   11  sqlite_stat4                                             0  intkey=r[11] data=r[17]
+  24  ParseSchema    0    0    0  tbl_name = 'sqlite_stat4' AND type != 'trigger'          0  tbl_name = 'sqlite_stat4' AND type != 'trigger'
+  25  SetCookie      0    1   10                                                           0
+  26  OpenWrite      2    2    0                                                           0  root=2; iDb=0
+  27  OpenWrite      3   10    0                                                           0  root=10; iDb=0
+  28  Rewind         2   37    0                                                           0  Rewind  sqlite_stat1
+  29      Column     2    0   18                                                           0  r[18]=sqlite_stat1.tbl
+  30      Ne        18   19   36                                                           0  if r[18]!=r[19] goto 36
+  31      Column     2    1   20                                                           0  r[20]=sqlite_stat1.idx
+  32      Ne        20   21   36                                                           0  if r[20]!=r[21] goto 36
+  33      RowId      2   22    0                                                           0  r[22]=sqlite_stat1.rowid
+  34      Delete     2    0    0  sqlite_stat1                                             0
+  35    Next         2   29    0                                                           0
+  36  Next           2   29    0                                                           0
+  37  Rewind         3   46    0                                                           0  Rewind  sqlite_stat4
+  38      Column     3    0   23                                                           0  r[23]=sqlite_stat4.tbl
+  39      Ne        23   24   45                                                           0  if r[23]!=r[24] goto 45
+  40      Column     3    1   25                                                           0  r[25]=sqlite_stat4.idx
+  41      Ne        25   26   45                                                           0  if r[25]!=r[26] goto 45
+  42      RowId      3   27    0                                                           0  r[27]=sqlite_stat4.rowid
+  43      Delete     3    0    0  sqlite_stat4                                             0
+  44    Next         3   38    0                                                           0
+  45  Next           3   38    0                                                           0
+  46  OpenRead       4    2    0  k(6,B,B,B,B,B,B)                                         0  =products, root=2, iDb=0
+  47  Count          4   33    0                                                           0
+  48  IfNot         33   55    0                                                           0  if !r[33] goto 55
+  49  Null           0   30    0                                                           0  r[30]=NULL
+  50  Copy          33   31    0                                                           0  r[31]=r[33]
+  51  Cast          31    0    0                                                           0  affinity(r[31]=Text)
+  52  MakeRecord    29    3   32                                                           0  r[32]=mkrec(r[29..31])
+  53  NewRowid       2   28    0                                                           0  r[28]=rowid
+  54  Insert         2   32   28  sqlite_stat1                                             0  intkey=r[28] data=r[32]
+  55  OpenRead       5    3    0  k(2,B)                                                   0  =idx_products_sku, root=3, iDb=0
+  56  Integer        1   39    0                                                           0  r[39]=1
+  57  Copy          33   40    0                                                           0  r[40]=r[33]
+  58  Function       0   39   34  stat_init                                                0  r[34]=func(r[39..40])
+  59  Rewind         5  101    0                                                           0  Rewind  idx_products_sku
+  60  Integer        0   35    0                                                           0  r[35]=0
+  61  Goto           0   67    0                                                           0
+  62    Integer      0   35    0                                                           0  r[35]=0
+  63    Column       5    0   38                                                           0  r[38]=idx_products_sku.sku
+  64    Ne          38   37   67                                                           0  if r[38]!=r[37] goto 67
+  65    Integer      1   35    0                                                           0  r[35]=1
+  66    Goto         0   68    0                                                           0
+  67    Column       5    0   37                                                           0  r[37]=idx_products_sku.sku
+  68    Column       5    1   41                                                           0  r[41]=idx_products_sku.column 1
+  69    Copy        37   42    0                                                           0  r[42]=r[37]
+  70    Copy        41   43    0                                                           0  r[43]=r[41]
+  71    MakeRecord  42    2   36                                                           0  r[36]=mkrec(r[42..43])
+  72    Function     0   34   34  stat_push                                                0  r[34]=func(r[34..36])
+  73  Next           5   62    0                                                           0
+  74  Function       0   34   44  stat_get                                                 0  r[44]=func(r[34])
+  75  IsNull        44  101    0                                                           0  if (r[44]==NULL) goto 101
+  76  Copy          44   47    0                                                           0  r[47]=r[44]
+  77  MakeRecord    45    3   48                                                           0  r[48]=mkrec(r[45..47])
+  78  NewRowid       2   49    0                                                           0  r[49]=rowid
+  79  Insert         2   48   49  sqlite_stat1                                             0  intkey=r[49] data=r[48]
+  80  Integer        1   35    0                                                           0  r[35]=1
+  81  Function       0   34   50  stat_get                                                 0  r[50]=func(r[34..35])
+  82  Integer        0   36    0                                                           0  r[36]=0
+  83  Ge            36   50  101                                                           0  if r[36]>=r[50] goto 101
+  84  Integer        2   35    0                                                           0  r[35]=2
+  85  Function       0   34   51  stat_get                                                 0  r[51]=func(r[34..36])
+  86  Integer        3   35    0                                                           0  r[35]=3
+  87  Function       0   34   52  stat_get                                                 0  r[52]=func(r[34..36])
+  88  Integer        4   35    0                                                           0  r[35]=4
+  89  Function       0   34   53  stat_get                                                 0  r[53]=func(r[34..36])
+  90  Integer        5   35    0                                                           0  r[35]=5
+  91  Function       0   34   54  stat_get                                                 0  r[54]=func(r[34..36])
+  92  Copy          51   57    0                                                           0  r[57]=r[51]
+  93  Copy          52   58    0                                                           0  r[58]=r[52]
+  94  Copy          53   59    0                                                           0  r[59]=r[53]
+  95  Copy          54   60    0                                                           0  r[60]=r[54]
+  96  MakeRecord    55    6   61                                                           0  r[61]=mkrec(r[55..60])
+  97  NewRowid       3   62    0                                                           0  r[62]=rowid
+  98  Insert         3   61   62  sqlite_stat4                                             0  intkey=r[62] data=r[61]
+  99  AddImm        36    1    0                                                           0  r[36]=r[36]+1
+ 100  Goto           0   83    0                                                           0
+ 101  Halt           0    0    0                                                           0
+ 102  Transaction    0    2    9                                                           0  iDb=0 tx_mode=Write
+ 103  String8        0   19    0  products                                                 0  r[19]='products'
+ 104  String8        0   21    0  idx_products_sku                                         0  r[21]='idx_products_sku'
+ 105  String8        0   24    0  products                                                 0  r[24]='products'
+ 106  String8        0   26    0  idx_products_sku                                         0  r[26]='idx_products_sku'
+ 107  String8        0   29    0  products                                                 0  r[29]='products'
+ 108  String8        0   45    0  products                                                 0  r[45]='products'
+ 109  String8        0   46    0  idx_products_sku                                         0  r[46]='idx_products_sku'
+ 110  String8        0   55    0  products                                                 0  r[55]='products'
+ 111  String8        0   56    0  idx_products_sku                                         0  r[56]='idx_products_sku'
+ 112  Goto           0    1    0                                                           0
