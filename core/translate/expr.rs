@@ -5439,13 +5439,11 @@ pub fn bind_and_rewrite_expr<'a>(
                         }
                         crate::bail_parse_error!("no such column: {}", id.as_str());
                     };
-                    let normalized_id = normalize_ident(id.as_str());
-
                     if binding_behavior == BindingBehavior::TryResultColumnsFirst {
                         if let Some(result_columns) = result_columns {
                             for result_column in result_columns.iter() {
                                 if let Some(alias) = &result_column.alias {
-                                    if alias.eq_ignore_ascii_case(&normalized_id) {
+                                    if alias.eq_ignore_ascii_case(id.as_str()) {
                                         *expr = result_column.expr.clone();
                                         return Ok(WalkControl::Continue);
                                     }
@@ -5457,14 +5455,14 @@ pub fn bind_and_rewrite_expr<'a>(
 
                     // First check joined tables
                     for joined_table in referenced_tables.joined_tables().iter() {
-                        if let Some((col_idx, col)) = joined_table.table.columns().lookup(&normalized_id) {
+                        if let Some((col_idx, col)) = joined_table.table.columns().lookup(id.as_str()) {
                             if match_result.is_some() {
                                 let mut ok = false;
                                 // Column name ambiguity is ok if it is in the USING clause because then it is deduplicated
                                 // and the left table is used.
                                 if let Some(join_info) = &joined_table.join_info {
                                     if join_info.using.iter().any(|using_col| {
-                                        using_col.as_str().eq_ignore_ascii_case(&normalized_id)
+                                        using_col.as_str().eq_ignore_ascii_case(id.as_str())
                                     }) {
                                         ok = true;
                                     }
@@ -5482,7 +5480,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         // only if we haven't found a match, check for explicit rowid reference
                         } else if let Table::BTree(btree) = &joined_table.table {
                             if let Some(row_id_expr) = parse_row_id(
-                                &normalized_id,
+                                id.as_str(),
                                 referenced_tables.joined_tables()[0].internal_id,
                                 || referenced_tables.joined_tables().len() != 1,
                             )? {
@@ -5512,7 +5510,7 @@ pub fn bind_and_rewrite_expr<'a>(
                             if matches!(outer_ref.table, Table::FromClauseSubquery(_)) {
                                 continue;
                             }
-                            if let Some((col_idx, col)) = outer_ref.table.columns().lookup(&normalized_id) {
+                            if let Some((col_idx, col)) = outer_ref.table.columns().lookup(id.as_str()) {
                                 if match_result.is_some() {
                                     crate::bail_parse_error!("Column {} is ambiguous", id.as_str());
                                 }
@@ -5540,7 +5538,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         if let Some(result_columns) = result_columns {
                             for result_column in result_columns.iter() {
                                 if let Some(alias) = &result_column.alias {
-                                    if alias.eq_ignore_ascii_case(&normalized_id) {
+                                    if alias.eq_ignore_ascii_case(id.as_str()) {
                                         *expr = result_column.expr.clone();
                                         return Ok(WalkControl::Continue);
                                     }
@@ -5644,8 +5642,6 @@ pub fn bind_and_rewrite_expr<'a>(
                             col_name.as_str()
                         );
                     };
-                    let normalized_col_name = normalize_ident(col_name.as_str());
-
                     // Create a QualifiedName and use existing resolve_database_id method
                     let qualified_name = ast::QualifiedName {
                         db_name: Some(db_name.clone()),
@@ -5668,7 +5664,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     // Find the column in the table
                     let col_idx = table
                         .columns()
-                        .lookup(&normalized_col_name)
+                        .lookup(col_name.as_str())
                         .map(|(idx, _)| idx)
                         .ok_or_else(|| {
                             LimboError::ParseError(format!(

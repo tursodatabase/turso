@@ -2015,15 +2015,14 @@ fn init_source_emission<'a>(
                         columns
                             .iter()
                             .map(|col_name| {
-                                let column_name = normalize_ident(col_name.as_str());
                                 if ROWID_STRS
                                     .iter()
-                                    .any(|s| s.eq_ignore_ascii_case(&column_name))
+                                    .any(|s| s.eq_ignore_ascii_case(col_name.as_str()))
                                 {
                                     return Ok(Affinity::Integer.aff_mask());
                                 }
                                 table
-                                    .get_column_by_name(&column_name)
+                                    .get_column_by_name(col_name.as_str())
                                     .map(|(_, col)| {
                                         col.affinity_with_strict(ctx.table.is_strict).aff_mask()
                                     })
@@ -2031,7 +2030,7 @@ fn init_source_emission<'a>(
                                         crate::error::LimboError::ParseError(format!(
                                             "table {} has no column named {}",
                                             table.get_name(),
-                                            column_name
+                                            col_name.as_str()
                                         ))
                                     })
                             })
@@ -2316,8 +2315,7 @@ fn build_insertion<'a>(
         // Case 2: Columns specified - map named columns to their values
         // Map each named column to its value index
         for (value_index, column_name) in columns.iter().enumerate() {
-            let column_name = normalize_ident(column_name.as_str());
-            if let Some((idx_in_table, col_in_table)) = table.get_column_by_name(&column_name) {
+            if let Some((idx_in_table, col_in_table)) = table.get_column_by_name(column_name.as_str()) {
                 // Named column
                 if col_in_table.is_rowid_alias() {
                     insertion_key = InsertionKey::RowidAlias(ColMapping {
@@ -2330,7 +2328,7 @@ fn build_insertion<'a>(
                 }
             } else if ROWID_STRS
                 .iter()
-                .any(|s| s.eq_ignore_ascii_case(&column_name))
+                .any(|s| s.eq_ignore_ascii_case(column_name.as_str()))
             {
                 // Explicit use of the 'rowid' keyword
                 if let Some(col_in_table) = table_columns.iter().find(|c| c.is_rowid_alias()) {

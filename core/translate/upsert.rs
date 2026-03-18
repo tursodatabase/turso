@@ -1,4 +1,4 @@
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashSet as HashSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -224,7 +224,7 @@ fn index_expression_cols(table: &Table, out: &mut HashSet<usize>, expr: &ast::Ex
     let _ = walk_expr(expr, &mut |e: &ast::Expr| -> crate::Result<WalkControl> {
         match e {
             Expr::Id(n) => {
-                if let Some((i, _)) = table.get_column_by_name(&normalize_ident(n.as_str())) {
+                if let Some((i, _)) = table.get_column_by_name(n.as_str()) {
                     out.insert(i);
                 } else if ROWID_STRS
                     .iter()
@@ -239,10 +239,8 @@ fn index_expression_cols(table: &Table, out: &mut HashSet<usize>, expr: &ast::Ex
                 }
             }
             Expr::Qualified(ns, c) | Expr::DoublyQualified(_, ns, c) => {
-                let nsn = normalize_ident(ns.as_str());
-                let tname = normalize_ident(table.get_name());
-                if nsn.eq_ignore_ascii_case(&tname) {
-                    if let Some((i, _)) = table.get_column_by_name(&normalize_ident(c.as_str())) {
+                if ns.as_str().eq_ignore_ascii_case(table.get_name()) {
+                    if let Some((i, _)) = table.get_column_by_name(c.as_str()) {
                         out.insert(i);
                     }
                 }
@@ -1284,13 +1282,6 @@ pub fn collect_set_clauses_for_upsert(
     table: &Table,
     set_items: &mut [ast::Set],
 ) -> crate::Result<Vec<(usize, Box<ast::Expr>)>> {
-    let lookup: HashMap<String, usize> = table
-        .columns()
-        .iter()
-        .enumerate()
-        .filter_map(|(i, c)| c.name.as_ref().map(|n| (n.to_lowercase(), i)))
-        .collect();
-
     let mut out: Vec<(usize, Box<ast::Expr>)> = vec![];
 
     for set in set_items {
@@ -1306,13 +1297,13 @@ pub fn collect_set_clauses_for_upsert(
             );
         }
         for (cn, e) in set.col_names.iter().zip(values.into_iter()) {
-            let Some(idx) = lookup.get(&normalize_ident(cn.as_str())) else {
+            let Some(idx) = table.get_column_by_name(cn.as_str()).map(|(idx, _)| idx) else {
                 bail_parse_error!("no such column: {}", cn);
             };
-            if let Some(existing) = out.iter_mut().find(|(i, _)| *i == *idx) {
+            if let Some(existing) = out.iter_mut().find(|(i, _)| *i == idx) {
                 existing.1 = e;
             } else {
-                out.push((*idx, e));
+                out.push((idx, e));
             }
         }
     }
@@ -1375,7 +1366,7 @@ fn rewrite_expr_to_registers(
     excluded_decoded_start: Option<usize>,
 ) -> crate::Result<WalkControl> {
     use ast::Expr;
-    let table_name_norm = table_name.map(normalize_ident);
+    let table_name_norm = table_name;
 
     // Map a column name to a register within the row image at `base_start`.
     let col_reg_from_row_image = |name: &str| -> Option<usize> {
@@ -1395,19 +1386,17 @@ fn rewrite_expr_to_registers(
         &mut |expr: &mut ast::Expr| -> crate::Result<WalkControl> {
             match expr {
                 Expr::Qualified(ns, c) | Expr::DoublyQualified(_, ns, c) => {
-                    let ns = normalize_ident(ns.as_str());
-                    let c = normalize_ident(c.as_str());
                     // Handle EXCLUDED.* if enabled
-                    if allow_excluded && ns.eq_ignore_ascii_case("excluded") {
+                    if allow_excluded && ns.as_str().eq_ignore_ascii_case("excluded") {
                         if let Some(ins) = insertion {
-                            if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&c)) {
+                            if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(c.as_str())) {
                                 *expr = Expr::Register(ins.key_register());
-                            } else if let Some(cm) = ins.get_col_mapping_by_name(&c) {
+                            } else if let Some(cm) = ins.get_col_mapping_by_name(c.as_str()) {
                                 // Use decoded excluded registers when available
                                 // to prevent double-encoding of custom type values
                                 if let Some(decoded_start) = excluded_decoded_start {
                                     let (col_idx, _) =
-                                        table.get_column_by_name(&c).expect("column exists");
+                                        table.get_column_by_name(c.as_str()).expect("column exists");
                                     *expr = Expr::Register(decoded_start + col_idx);
                                 } else {
                                     *expr = Expr::Register(cm.register);
@@ -1421,9 +1410,9 @@ fn rewrite_expr_to_registers(
                     }
 
                     // Match the target table namespace if provided
-                    if let Some(ref tn) = table_name_norm {
-                        if ns.eq_ignore_ascii_case(tn) {
-                            if let Some(r) = col_reg_from_row_image(&c) {
+                    if let Some(tn) = table_name_norm {
+                        if ns.as_str().eq_ignore_ascii_case(tn) {
+                            if let Some(r) = col_reg_from_row_image(c.as_str()) {
                                 *expr = Expr::Register(r);
                             } else {
                                 bail_parse_error!("no such column: {}.{}", ns, c);
@@ -1442,7 +1431,7 @@ fn rewrite_expr_to_registers(
                 }
                 // Unqualified id -> row image (CURRENT/NEW depending on caller)
                 Expr::Id(name) => {
-                    if let Some(r) = col_reg_from_row_image(&normalize_ident(name.as_str())) {
+                    if let Some(r) = col_reg_from_row_image(name.as_str()) {
                         *expr = Expr::Register(r);
                     }
                 }

@@ -1,5 +1,5 @@
 use crate::sync::Arc;
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashSet as HashSet;
 
 use crate::schema::ROWID_SENTINEL;
 use crate::translate::emitter::Resolver;
@@ -10,7 +10,6 @@ use crate::translate::planner::{parse_limit, ROWID_STRS};
 use crate::{
     bail_parse_error,
     schema::{Schema, Table},
-    util::normalize_ident,
     vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
     CaptureDataChangesExt, Connection,
 };
@@ -277,13 +276,6 @@ pub fn prepare_update_plan(
     // Plan CTEs and add them as outer query references for subquery resolution
     plan_ctes_as_outer_refs(with, resolver, program, &mut table_references, connection)?;
 
-    let column_lookup: HashMap<String, usize> = table
-        .columns()
-        .iter()
-        .enumerate()
-        .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
-        .collect();
-
     let mut set_clauses: Vec<(usize, Box<Expr>)> = Vec::with_capacity(body.sets.len());
 
     // Process each SET assignment and map column names to expressions
@@ -311,13 +303,11 @@ pub fn prepare_update_plan(
         }
 
         for (col_name, expr) in set.col_names.iter().zip(values.iter()) {
-            let ident = normalize_ident(col_name.as_str());
-
-            let col_index = match column_lookup.get(&ident) {
-                Some(idx) => *idx,
+            let col_index = match table.get_column_by_name(col_name.as_str()).map(|(idx, _)| idx) {
+                Some(idx) => idx,
                 None => {
                     // Check if this is the 'rowid' keyword
-                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&ident)) {
+                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(col_name.as_str())) {
                         // Find the rowid alias column if it exists
                         if let Some((idx, _col)) = table
                             .columns()

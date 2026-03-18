@@ -7906,7 +7906,7 @@ pub fn op_function(
                                     let column = columns
                                         .iter_mut()
                                         .find(|column| {
-                                            normalize_ident(column.col_name.as_str()) == rename_from
+                                            column.col_name.as_str().eq_ignore_ascii_case(&rename_from)
                                         })
                                         .expect("column being renamed should be present");
 
