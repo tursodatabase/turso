@@ -2,18 +2,20 @@ use std::{
     borrow::Cow,
     num::NonZero,
     ops::Deref,
-    sync::{atomic::Ordering, Arc},
+    sync::{Arc, atomic::Ordering},
     task::Waker,
     time::Duration,
 };
 
-use tracing::{instrument, Level};
+use tracing::{Level, instrument};
 use turso_parser::{
-    ast::{fmt::ToTokens, Cmd},
+    ast::{Cmd, fmt::ToTokens},
     parser::Parser,
 };
 
 use crate::{
+    EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS, LimboError, MvStore, Pager, QueryMode, Result,
+    TransactionState, Value,
     busy::BusyHandlerState,
     parameters,
     schema::Trigger,
@@ -23,8 +25,6 @@ use crate::{
         self,
         explain::{EXPLAIN_COLUMNS_TYPE, EXPLAIN_QUERY_PLAN_COLUMNS_TYPE},
     },
-    LimboError, MvStore, Pager, QueryMode, Result, Value, EXPLAIN_COLUMNS,
-    EXPLAIN_QUERY_PLAN_COLUMNS,
 };
 
 type ProgramExecutionState = vdbe::ProgramExecutionState;
@@ -421,7 +421,7 @@ impl Statement {
                 vdbe::StepResult::IO => self.pager.io.step()?,
                 vdbe::StepResult::Row => continue,
                 vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
-                    return Err(LimboError::Busy)
+                    return Err(LimboError::Busy);
                 }
             }
         }
@@ -438,7 +438,7 @@ impl Statement {
                     continue;
                 }
                 vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
-                    return Err(LimboError::Busy)
+                    return Err(LimboError::Busy);
                 }
             }
         }
@@ -515,11 +515,23 @@ impl Statement {
             }
         }
 
+        // When this connection has performed DDL within a write transaction
+        // (schema_did_change == true), the connection's schema is more up-to-date
+        // than the shared DB schema (which won't be updated until COMMIT).
+        // Overwriting it here would revert the schema cookie and cause an
+        // infinite reprepare loop. In all other cases, refresh from the shared DB.
         // if current connection is within a transaction which changed schema - we must use its schema version instead of DB schema version
         // see test_prepared_stmt_reprepare_ddl_change_txn (plus test_sync_pull_after_local_ddl_and_remote_writes)
         {
             let mut conn_schema = conn.schema.write();
-            if conn_schema.schema_version < conn.db.schema.lock().schema_version {
+            if conn_schema.schema_version < conn.db.schema.lock().schema_version
+                && !matches!(
+                    conn.get_tx_state(),
+                    TransactionState::Write {
+                        schema_did_change: true
+                    }
+                )
+            {
                 *conn_schema = conn.db.clone_schema();
             }
         }
@@ -998,7 +1010,7 @@ impl Drop for Statement {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Database, DatabaseOpts, MemoryIO, OpenFlags, IO};
+    use crate::{Database, DatabaseOpts, IO, MemoryIO, OpenFlags};
 
     fn open_test_connection() -> crate::Result<Arc<crate::Connection>> {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
