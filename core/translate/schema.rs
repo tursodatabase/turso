@@ -1822,7 +1822,7 @@ pub fn translate_drop_table(
         let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
         let seq_table_name_reg = program.alloc_register();
         let dropped_table_name_reg =
-            program.emit_string8_new_reg(tbl_name.name.as_str().to_string());
+            program.emit_string8_new_reg(normalize_ident(tbl_name.name.as_str()));
         program.mark_last_insn_constant();
 
         program.emit_insn(Insn::OpenWrite {
@@ -1875,7 +1875,7 @@ pub fn translate_drop_table(
     {
         let ver_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(version_table.clone()));
         let ver_table_name_reg = program.alloc_register();
-        let dropped_name_reg = program.emit_string8_new_reg(tbl_name.name.as_str().to_string());
+        let dropped_name_reg = program.emit_string8_new_reg(normalize_ident(tbl_name.name.as_str()));
         program.mark_last_insn_constant();
 
         program.emit_insn(Insn::OpenWrite {
