@@ -169,6 +169,23 @@ test autoinc-drop-last-table-empties-sequence {
 expect {
 }
 
+# https://github.com/tursodatabase/turso/issues/5807
+# DROP TABLE should remove sqlite_sequence entries even for quoted mixed-case names.
+@cross-check-integrity
+test autoinc-drop-mixed-case-table-removes-sequence-entry {
+    CREATE TABLE "MiXeD Name"(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO "MiXeD Name"(v) VALUES('x');
+    DROP TABLE "MiXeD Name";
+    CREATE TABLE "MiXeD Name"(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO "MiXeD Name"(v) VALUES('y');
+    SELECT id, v FROM "MiXeD Name";
+    SELECT seq FROM sqlite_sequence;
+}
+expect {
+    1|y
+    1
+}
+
 # Test: Renaming an AUTOINCREMENT table updates sqlite_sequence in place.
 @cross-check-integrity
 test autoinc-rename-table-updates-sequence-entry {
