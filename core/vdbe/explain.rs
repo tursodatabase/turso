@@ -2346,14 +2346,18 @@ pub fn insn_to_row(
                 format!("hash_table_id={hash_table_id}"),
             )
         },
-        Insn::VacuumInto { dest_path } => (
-            "VacuumInto",
+        Insn::Vacuum { dest_path_reg } => (
+            "Vacuum",
             0,
+            dest_path_reg.unwrap_or(0) as i64,
             0,
+            Value::Null,
             0,
-            Value::build_text(dest_path.to_string()),
-            0,
-            format!("dest={dest_path}"),
+            if dest_path_reg.is_some() {
+                format!("dest=r[{}]", dest_path_reg.unwrap())
+            } else {
+                "".to_string()
+            },
         ),
         Insn::InitCdcVersion { cdc_table_name, version, cdc_mode } => (
             "InitCdcVersion",

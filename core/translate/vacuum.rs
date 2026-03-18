@@ -7,8 +7,7 @@ use turso_parser::ast::{Expr, Literal, Name};
 
 /// Translate a VACUUM statement into VDBE bytecode.
 ///
-/// Currently only VACUUM INTO is supported. Plain VACUUM (which compacts
-/// the database in place) is not yet implemented.
+/// Supports both plain VACUUM (in-place compaction) and VACUUM INTO (copy to destination).
 ///
 /// # Arguments
 /// * `program` - The program builder to emit instructions to
@@ -29,16 +28,41 @@ pub fn translate_vacuum(
 
     match into {
         Some(dest_expr) => {
-            // VACUUM INTO 'path' - create compacted copy at destination
-            let dest_path = extract_path_from_expr(dest_expr)?;
-            program.emit_insn(Insn::VacuumInto { dest_path });
+            let dest_reg = program.alloc_register();
+            match dest_expr {
+                // VACUUM INTO ?1 / @name
+                Expr::Variable(variable) => {
+                    let index = usize::try_from(variable.index.get())
+                        .expect("u32 variable index must fit into usize")
+                        .try_into()
+                        .expect("variable index must be non-zero");
+                    if let Some(name) = variable.name.as_deref() {
+                        program.parameters.push_named_at(name, index);
+                    } else {
+                        program.parameters.push_index(index);
+                    }
+                    program.emit_insn(Insn::Variable {
+                        index,
+                        dest: dest_reg,
+                    });
+                }
+                // VACUUM INTO 'path' / VACUUM INTO foo
+                _ => {
+                    let dest_path = extract_path_from_expr(dest_expr)?;
+                    program.emit_string8(dest_path, dest_reg);
+                }
+            }
+            program.emit_insn(Insn::Vacuum {
+                dest_path_reg: Some(dest_reg),
+            });
             Ok(())
         }
         None => {
-            // Plain VACUUM - not yet supported
-            bail_parse_error!(
-                "VACUUM is not supported yet. Use VACUUM INTO 'filename' to create a compacted copy."
-            );
+            // Plain VACUUM - compact database in-place
+            program.emit_insn(Insn::Vacuum {
+                dest_path_reg: None,
+            });
+            Ok(())
         }
     }
 }
@@ -63,7 +87,9 @@ fn extract_path_from_expr(expr: &Expr) -> Result<String> {
             Ok(name.as_str().to_string())
         }
         _ => {
-            bail_parse_error!("VACUUM INTO requires a string literal path");
+            bail_parse_error!(
+                "VACUUM INTO requires a string literal path, identifier, or bound parameter"
+            );
         }
     }
 }

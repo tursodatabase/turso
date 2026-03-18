@@ -1,4 +1,5 @@
 use crate::error::io_error;
+use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use crate::storage::journal_mode;
 use crate::sync::{
     atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, Ordering},
@@ -1881,6 +1882,9 @@ impl Connection {
     pub fn set_reserved_bytes(&self, reserved_bytes: u8) -> Result<()> {
         let pager = self.pager.load();
         pager.set_reserved_space_bytes(reserved_bytes);
+        if !pager.is_encryption_ctx_set() && reserved_bytes != CHECKSUM_REQUIRED_RESERVED_BYTES {
+            pager.reset_checksum_context();
+        }
         Ok(())
     }
 

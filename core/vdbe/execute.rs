@@ -10581,11 +10581,19 @@ pub fn op_set_cookie(
                     if *db == crate::MAIN_DB_ID {
                         match program.connection.get_tx_state() {
                             TransactionState::Write { .. } => {
-                                program.connection.set_tx_state(TransactionState::Write { schema_did_change: true });
-                            },
-                            TransactionState::Read => unreachable!("invalid transaction state for SetCookie: TransactionState::Read, should be write"),
-                            TransactionState::None => unreachable!("invalid transaction state for SetCookie: TransactionState::None, should be write"),
-                            TransactionState::PendingUpgrade { .. } => unreachable!("invalid transaction state for SetCookie: TransactionState::PendingUpgrade, should be write"),
+                                program.connection.set_tx_state(TransactionState::Write {
+                                    schema_did_change: true,
+                                });
+                            }
+                            TransactionState::Read => unreachable!(
+                                "invalid transaction state for SetCookie: TransactionState::Read, should be write"
+                            ),
+                            TransactionState::None => unreachable!(
+                                "invalid transaction state for SetCookie: TransactionState::None, should be write"
+                            ),
+                            TransactionState::PendingUpgrade { .. } => unreachable!(
+                                "invalid transaction state for SetCookie: TransactionState::PendingUpgrade, should be write"
+                            ),
                         }
                     }
                     program.connection.with_database_schema_mut(*db, |schema| {
@@ -13501,9 +13509,9 @@ where
         })
 }
 
-/// Sub-states for the VACUUM INTO operation state machine.
+/// Sub-states for the VACUUM operation state machine.
 #[derive(Default)]
-pub(crate) enum OpVacuumIntoSubState {
+pub(crate) enum OpVacuumSubState {
     /// Initial state - validate preconditions and create destination database
     #[default]
     Init,
@@ -13565,10 +13573,10 @@ pub(crate) enum OpVacuumIntoSubState {
     Done { dest_conn: Arc<Connection> },
 }
 
-/// Holds the state for the VACUUM INTO operation.
+/// Holds the state for the VACUUM operation.
 #[derive(Default)]
-pub(crate) struct OpVacuumIntoState {
-    sub_state: OpVacuumIntoSubState,
+pub(crate) struct OpVacuumState {
+    sub_state: OpVacuumSubState,
     /// Keep dest_db alive while vacuum is in progress.
     #[allow(dead_code)]
     dest_db: Option<Arc<crate::Database>>,
@@ -13578,12 +13586,18 @@ pub(crate) struct OpVacuumIntoState {
     table_names: Vec<String>,
     /// Column names for the current table being copied
     current_table_columns: Vec<String>,
+    /// Reused bind parameter indexes for INSERT during row copy
+    bind_param_indexes: Vec<std::num::NonZeroUsize>,
     /// Meta values read from source database header
     source_user_version: i32,
     source_application_id: i32,
+    /// For plain VACUUM: track if this is plain VACUUM and the original/temp paths
+    is_plain_vacuum: bool,
+    original_db_path: Option<String>,
+    temp_vacuum_path: Option<String>,
 }
 
-/// VACUUM INTO - create a compacted copy of the database at the specified path.
+/// VACUUM - compact the database in-place or create a compacted copy.
 ///
 /// This is an async state machine implementation that yields on I/O operations.
 /// It:
@@ -13594,16 +13608,16 @@ pub(crate) struct OpVacuumIntoState {
 /// 4. Copies data for each table, including sqlite_sequence to preserve AUTOINCREMENT counters
 /// 5. Copies meta values (user_version, application_id) from source to destination
 /// 6. Creates triggers and views last (after data copy to avoid triggers firing during copy)
-pub fn op_vacuum_into(
+pub fn op_vacuum(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    match op_vacuum_into_inner(program, state, insn) {
+    match op_vacuum_inner(program, state, insn) {
         Ok(InsnFunctionStepResult::Step) => {
             // Instruction complete, reset state
-            state.op_vacuum_into_state = None;
+            state.op_vacuum_state = None;
             Ok(InsnFunctionStepResult::Step)
         }
         Ok(InsnFunctionStepResult::IO(io)) => {
@@ -13611,42 +13625,174 @@ pub fn op_vacuum_into(
             Ok(InsnFunctionStepResult::IO(io))
         }
         Ok(InsnFunctionStepResult::Done | InsnFunctionStepResult::Row) => {
-            unreachable!("op_vacuum_into_inner only returns Step or IO")
+            unreachable!("op_vacuum_inner only returns Step or IO")
         }
         Err(err) => {
             // Reset state on error
-            state.op_vacuum_into_state = None;
+            state.op_vacuum_state = None;
             Err(err)
         }
     }
 }
 
-fn op_vacuum_into_inner(
+fn op_vacuum_inner(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(VacuumInto { dest_path }, insn);
+    fn remove_vacuum_sidecars(db_path: &str) -> Result<()> {
+        if db_path == ":memory:" {
+            return Ok(());
+        }
+
+        // Clean up known sidecars so reopen cannot replay stale
+        // data over the newly vacuumed file.
+        let sidecars = [
+            format!("{db_path}-wal"),
+            format!("{db_path}-shm"),
+            format!("{db_path}-journal"),
+            format!("{db_path}-log"),
+        ];
+
+        for sidecar in sidecars {
+            match std::fs::remove_file(&sidecar) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(LimboError::InternalError(format!(
+                        "Failed to remove VACUUM sidecar {sidecar}: {err}"
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn copy_vacuum_file_into_source(temp_path: &str, original_path: &str) -> Result<()> {
+        let mut temp_file = std::fs::File::open(temp_path).map_err(|err| {
+            LimboError::InternalError(format!(
+                "Failed to open VACUUM temp file {temp_path}: {err}"
+            ))
+        })?;
+        let mut source_file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(original_path)
+            .map_err(|err| {
+                LimboError::InternalError(format!(
+                    "Failed to open source database {original_path} for VACUUM copy-back: {err}"
+                ))
+            })?;
+        std::io::copy(&mut temp_file, &mut source_file).map_err(|err| {
+            LimboError::InternalError(format!(
+                "Failed to copy VACUUM temp file into source database: {err}"
+            ))
+        })?;
+        source_file.sync_all().map_err(|err| {
+            LimboError::InternalError(format!(
+                "Failed to fsync source database after VACUUM copy-back: {err}"
+            ))
+        })?;
+        Ok(())
+    }
+
+    load_insn!(Vacuum { dest_path_reg }, insn);
 
     let vacuum_state = state
-        .op_vacuum_into_state
-        .get_or_insert_with(OpVacuumIntoState::default);
+        .op_vacuum_state
+        .get_or_insert_with(OpVacuumState::default);
 
     loop {
         let current_sub_state = std::mem::take(&mut vacuum_state.sub_state);
 
         match current_sub_state {
-            OpVacuumIntoSubState::Init => {
+            OpVacuumSubState::Init => {
                 // Check if we're in a transaction
                 // as vacuum cannot be run inside a transaction
                 if !program.connection.auto_commit.load(Ordering::SeqCst) {
-                    return Err(LimboError::TxError(
-                        "cannot VACUUM INTO from within a transaction".to_string(),
-                    ));
+                    let msg = if dest_path_reg.is_some() {
+                        "cannot VACUUM INTO from within a transaction"
+                    } else {
+                        "cannot VACUUM from within a transaction"
+                    };
+                    return Err(LimboError::TxError(msg.to_string()));
                 }
 
-                // we always vacuum into a new file, so check if it exists
-                if std::path::Path::new(dest_path).exists() {
+                vacuum_state.is_plain_vacuum = dest_path_reg.is_none();
+                let original_db_path = if vacuum_state.is_plain_vacuum {
+                    Some(program.connection.db.path.clone())
+                } else {
+                    None
+                };
+
+                // SQLite treats plain VACUUM on :memory: as a no-op
+                // Also skip when MVCC is enabled: the file-level copy-back
+                // would invalidate the MvStore's in-memory version metadata.
+                if vacuum_state.is_plain_vacuum
+                    && (original_db_path.as_deref() == Some(":memory:")
+                        || program.connection.db.mvcc_enabled())
+                {
+                    state.pc += 1;
+                    return Ok(InsnFunctionStepResult::Step);
+                }
+
+                let dest_path = if let Some(reg_idx) = dest_path_reg {
+                    // VACUUM INTO: read destination path from register
+                    let path_value = state.registers[*reg_idx].get_value();
+                    match path_value {
+                        Value::Text(text) => {
+                            let path = text.as_str().to_string();
+                            if path.is_empty() {
+                                return Err(LimboError::ParseError(
+                                    "VACUUM INTO path cannot be empty".to_string(),
+                                ));
+                            }
+                            path
+                        }
+                        _ => {
+                            return Err(LimboError::ParseError(
+                                "VACUUM INTO requires a text destination path".to_string(),
+                            ));
+                        }
+                    }
+                } else {
+                    // Plain VACUUM: create a unique temporary file atomically.
+                    let temp_parent = original_db_path
+                        .as_ref()
+                        .and_then(|p| {
+                            std::path::Path::new(p)
+                                .parent()
+                                .map(std::path::Path::to_path_buf)
+                        })
+                        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+                    let temp_file = tempfile::Builder::new()
+                        .prefix("turso_vacuum_")
+                        .suffix(".db")
+                        .tempfile_in(&temp_parent)
+                        .map_err(|err| {
+                            LimboError::InternalError(format!(
+                                "Failed to create temporary file for VACUUM: {err}"
+                            ))
+                        })?;
+
+                    let (_file, path) = temp_file.keep().map_err(|err| {
+                        LimboError::InternalError(format!(
+                            "Failed to persist temporary file for VACUUM: {err}"
+                        ))
+                    })?;
+                    path.to_string_lossy().to_string()
+                };
+
+                // Store vacuum metadata and get original database path for plain VACUUM
+                if vacuum_state.is_plain_vacuum {
+                    vacuum_state.original_db_path = original_db_path;
+                    vacuum_state.temp_vacuum_path = Some(dest_path.clone());
+                }
+
+                // For VACUUM INTO, check if destination file exists
+                if dest_path_reg.is_some() && std::path::Path::new(&dest_path).exists() {
                     return Err(LimboError::ParseError(format!(
                         "output file already exists: {dest_path}"
                     )));
@@ -13661,7 +13807,14 @@ fn op_vacuum_into_inner(
                     .with_views(source_db.experimental_views_enabled())
                     .with_index_method(source_db.experimental_index_method_enabled());
 
-                program.connection.execute("BEGIN")?;
+                // Plain VACUUM must block concurrent writers from the start to avoid
+                // producing a compacted image from a stale snapshot and then clobbering
+                // newer commits during the final swap/copy-back step.
+                if vacuum_state.is_plain_vacuum {
+                    program.connection.execute("BEGIN EXCLUSIVE")?;
+                } else {
+                    program.connection.execute("BEGIN")?;
+                }
                 // lets set the same meta values as source db
                 let user_version: i32 = extract_pragma_int(
                     &program.connection.pragma_query("user_version")?,
@@ -13687,7 +13840,7 @@ fn op_vacuum_into_inner(
 
                 let dest_db = crate::Database::open_file_with_flags(
                     io,
-                    dest_path,
+                    &dest_path,
                     OpenFlags::Create,
                     dest_opts,
                     None,
@@ -13716,9 +13869,8 @@ fn op_vacuum_into_inner(
                 // This batches all writes and ensures destination is either empty or complete.
                 dest_conn.execute("BEGIN")?;
 
-                // Exclude the MVCC metadata table from the vacuum destination — it is an
-                // internal artifact of mvcc mode and must not appear in a
-                // standalone SQLite file produced by VACUUM INTO.
+                // Skip MVCC internal metadata table in destination schema.
+                // In MVCC mode destination bootstrap can create this table itself.
                 let schema_sql = format!(
                     "SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE sql IS NOT NULL AND name <> '{}' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'index' THEN 2 WHEN 'trigger' THEN 3 WHEN 'view' THEN 4 ELSE 5 END",
                     crate::mvcc::database::MVCC_META_TABLE_NAME
@@ -13729,14 +13881,14 @@ fn op_vacuum_into_inner(
                 vacuum_state.source_user_version = user_version;
                 vacuum_state.source_application_id = application_id;
 
-                vacuum_state.sub_state = OpVacuumIntoSubState::CollectSchemaRows {
+                vacuum_state.sub_state = OpVacuumSubState::CollectSchemaRows {
                     dest_conn,
                     schema_stmt: Box::new(schema_stmt),
                 };
                 continue;
             }
 
-            OpVacuumIntoSubState::CollectSchemaRows {
+            OpVacuumSubState::CollectSchemaRows {
                 dest_conn,
                 mut schema_stmt,
             } => {
@@ -13749,7 +13901,7 @@ fn op_vacuum_into_inner(
                             .expect("StepResult::Row but row() returned None");
                         let values: Vec<Value> = row.get_values().cloned().collect();
                         vacuum_state.schema_rows.push(values);
-                        vacuum_state.sub_state = OpVacuumIntoSubState::CollectSchemaRows {
+                        vacuum_state.sub_state = OpVacuumSubState::CollectSchemaRows {
                             dest_conn,
                             schema_stmt,
                         };
@@ -13781,18 +13933,19 @@ fn op_vacuum_into_inner(
                             .collect();
 
                         vacuum_state.sub_state =
-                            OpVacuumIntoSubState::PrepareDestSchema { dest_conn, idx: 0 };
+                            OpVacuumSubState::PrepareDestSchema { dest_conn, idx: 0 };
                         continue;
                     }
                     crate::StepResult::IO => {
-                        let io = schema_stmt
-                            .take_io_completions()
-                            .expect("StepResult::IO returned but no completions available");
-                        vacuum_state.sub_state = OpVacuumIntoSubState::CollectSchemaRows {
+                        let maybe_io = schema_stmt.take_io_completions();
+                        vacuum_state.sub_state = OpVacuumSubState::CollectSchemaRows {
                             dest_conn,
                             schema_stmt,
                         };
-                        return Ok(InsnFunctionStepResult::IO(io));
+                        if let Some(io) = maybe_io {
+                            return Ok(InsnFunctionStepResult::IO(io));
+                        }
+                        continue;
                     }
                     crate::StepResult::Busy | crate::StepResult::Interrupt => {
                         return Err(LimboError::Busy);
@@ -13800,7 +13953,7 @@ fn op_vacuum_into_inner(
                 }
             }
 
-            OpVacuumIntoSubState::PrepareDestSchema { dest_conn, idx } => {
+            OpVacuumSubState::PrepareDestSchema { dest_conn, idx } => {
                 let schema_rows_len = vacuum_state.schema_rows.len();
                 turso_assert!(
                     idx <= schema_rows_len,
@@ -13809,7 +13962,7 @@ fn op_vacuum_into_inner(
                 );
                 if idx == schema_rows_len {
                     // Done creating schema, start copying data
-                    vacuum_state.sub_state = OpVacuumIntoSubState::StartCopyTable {
+                    vacuum_state.sub_state = OpVacuumSubState::StartCopyTable {
                         dest_conn,
                         table_idx: 0,
                     };
@@ -13828,7 +13981,7 @@ fn op_vacuum_into_inner(
                 if let Value::Text(type_val) = &row[0] {
                     let type_str = type_val.as_str();
                     if type_str == "trigger" || type_str == "view" {
-                        vacuum_state.sub_state = OpVacuumIntoSubState::PrepareDestSchema {
+                        vacuum_state.sub_state = OpVacuumSubState::PrepareDestSchema {
                             dest_conn,
                             idx: idx + 1,
                         };
@@ -13845,7 +13998,7 @@ fn op_vacuum_into_inner(
                 // We still copy sqlite_sequence data in StartCopyTable to preserve counters.
                 if let Value::Text(name_val) = &row[1] {
                     if name_val.as_str() == "sqlite_sequence" {
-                        vacuum_state.sub_state = OpVacuumIntoSubState::PrepareDestSchema {
+                        vacuum_state.sub_state = OpVacuumSubState::PrepareDestSchema {
                             dest_conn,
                             idx: idx + 1,
                         };
@@ -13874,7 +14027,7 @@ fn op_vacuum_into_inner(
                     dest_conn.end_nested();
                 }
                 let dest_stmt = dest_stmt?;
-                vacuum_state.sub_state = OpVacuumIntoSubState::StepDestSchema {
+                vacuum_state.sub_state = OpVacuumSubState::StepDestSchema {
                     dest_conn,
                     dest_schema_stmt: Box::new(dest_stmt),
                     idx,
@@ -13882,7 +14035,7 @@ fn op_vacuum_into_inner(
                 continue;
             }
 
-            OpVacuumIntoSubState::StepDestSchema {
+            OpVacuumSubState::StepDestSchema {
                 dest_conn,
                 mut dest_schema_stmt,
                 idx,
@@ -13914,29 +14067,30 @@ fn op_vacuum_into_inner(
                         });
                     }
 
-                    vacuum_state.sub_state = OpVacuumIntoSubState::PrepareDestSchema {
+                    vacuum_state.sub_state = OpVacuumSubState::PrepareDestSchema {
                         dest_conn,
                         idx: idx + 1,
                     };
                     continue;
                 }
                 crate::StepResult::IO => {
-                    let io = dest_schema_stmt
-                        .take_io_completions()
-                        .expect("StepResult::IO returned but no completions available");
-                    vacuum_state.sub_state = OpVacuumIntoSubState::StepDestSchema {
+                    let maybe_io = dest_schema_stmt.take_io_completions();
+                    vacuum_state.sub_state = OpVacuumSubState::StepDestSchema {
                         dest_conn,
                         dest_schema_stmt,
                         idx,
                     };
-                    return Ok(InsnFunctionStepResult::IO(io));
+                    if let Some(io) = maybe_io {
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                    continue;
                 }
                 crate::StepResult::Busy | crate::StepResult::Interrupt => {
                     return Err(LimboError::Busy);
                 }
             },
 
-            OpVacuumIntoSubState::StartCopyTable {
+            OpVacuumSubState::StartCopyTable {
                 dest_conn,
                 table_idx,
             } => {
@@ -13948,7 +14102,7 @@ fn op_vacuum_into_inner(
                 );
                 if table_idx == table_names_len {
                     // Done copying all tables, now copy meta values
-                    vacuum_state.sub_state = OpVacuumIntoSubState::CopyMetaValues { dest_conn };
+                    vacuum_state.sub_state = OpVacuumSubState::CopyMetaValues { dest_conn };
                     continue;
                 }
 
@@ -13958,7 +14112,7 @@ fn op_vacuum_into_inner(
                 let pragma_sql = format!("PRAGMA table_info(\"{escaped_table_name}\")");
                 let column_stmt = program.connection.prepare(&pragma_sql)?;
                 vacuum_state.current_table_columns.clear();
-                vacuum_state.sub_state = OpVacuumIntoSubState::CollectColumnInfo {
+                vacuum_state.sub_state = OpVacuumSubState::CollectColumnInfo {
                     dest_conn,
                     column_stmt: Box::new(column_stmt),
                     table_idx,
@@ -13966,7 +14120,7 @@ fn op_vacuum_into_inner(
                 continue;
             }
 
-            OpVacuumIntoSubState::CollectColumnInfo {
+            OpVacuumSubState::CollectColumnInfo {
                 dest_conn,
                 mut column_stmt,
                 table_idx,
@@ -13983,7 +14137,7 @@ fn op_vacuum_into_inner(
                             let col_name = format!("\"{escaped_name}\"");
                             vacuum_state.current_table_columns.push(col_name);
                         }
-                        vacuum_state.sub_state = OpVacuumIntoSubState::CollectColumnInfo {
+                        vacuum_state.sub_state = OpVacuumSubState::CollectColumnInfo {
                             dest_conn,
                             column_stmt,
                             table_idx,
@@ -14073,6 +14227,12 @@ fn op_vacuum_into_inner(
                         let insert_sql = format!(
                             "INSERT INTO \"{escaped_table_name}\" ({insert_columns}) VALUES ({placeholders})"
                         );
+                        vacuum_state.bind_param_indexes = (1..=bind_count)
+                            .map(|i| {
+                                std::num::NonZeroUsize::new(i)
+                                    .expect("bind parameter indexes are always non-zero")
+                            })
+                            .collect();
 
                         // Internal tables need nested mode to bypass "may not
                         // be modified" checks during prepare (compile time).
@@ -14087,7 +14247,7 @@ fn op_vacuum_into_inner(
                         }
                         let dest_insert_stmt = dest_insert_stmt?;
 
-                        vacuum_state.sub_state = OpVacuumIntoSubState::CopyRows {
+                        vacuum_state.sub_state = OpVacuumSubState::CopyRows {
                             dest_conn,
                             select_stmt: Box::new(select_stmt),
                             dest_insert_stmt: Box::new(dest_insert_stmt),
@@ -14096,15 +14256,16 @@ fn op_vacuum_into_inner(
                         continue;
                     }
                     crate::StepResult::IO => {
-                        let io = column_stmt
-                            .take_io_completions()
-                            .expect("StepResult::IO returned but no completions available");
-                        vacuum_state.sub_state = OpVacuumIntoSubState::CollectColumnInfo {
+                        let maybe_io = column_stmt.take_io_completions();
+                        vacuum_state.sub_state = OpVacuumSubState::CollectColumnInfo {
                             dest_conn,
                             column_stmt,
                             table_idx,
                         };
-                        return Ok(InsnFunctionStepResult::IO(io));
+                        if let Some(io) = maybe_io {
+                            return Ok(InsnFunctionStepResult::IO(io));
+                        }
+                        continue;
                     }
                     crate::StepResult::Busy | crate::StepResult::Interrupt => {
                         return Err(LimboError::Busy);
@@ -14112,7 +14273,7 @@ fn op_vacuum_into_inner(
                 }
             }
 
-            OpVacuumIntoSubState::CopyRows {
+            OpVacuumSubState::CopyRows {
                 dest_conn,
                 mut select_stmt,
                 mut dest_insert_stmt,
@@ -14123,17 +14284,25 @@ fn op_vacuum_into_inner(
                         .row()
                         .expect("StepResult::Row but row() returned None");
 
-                    let values: Vec<Value> = row.get_values().cloned().collect();
-
                     dest_insert_stmt.reset()?;
                     dest_insert_stmt.clear_bindings();
-                    for (i, value) in values.iter().enumerate() {
-                        let index =
-                            std::num::NonZero::new(i + 1).expect("i + 1 is always non-zero");
+                    if row.len() != vacuum_state.bind_param_indexes.len() {
+                        return Err(LimboError::InternalError(format!(
+                            "VACUUM copy arity mismatch for table index {table_idx}: source row has {} values but destination expects {}",
+                            row.len(),
+                            vacuum_state.bind_param_indexes.len()
+                        )));
+                    }
+                    for (index, value) in vacuum_state
+                        .bind_param_indexes
+                        .iter()
+                        .copied()
+                        .zip(row.get_values())
+                    {
                         dest_insert_stmt.bind_at(index, value.clone());
                     }
 
-                    vacuum_state.sub_state = OpVacuumIntoSubState::StepDestInsert {
+                    vacuum_state.sub_state = OpVacuumSubState::StepDestInsert {
                         dest_conn,
                         select_stmt,
                         dest_insert_stmt,
@@ -14143,30 +14312,31 @@ fn op_vacuum_into_inner(
                 }
                 crate::StepResult::Done => {
                     // Move to next table
-                    vacuum_state.sub_state = OpVacuumIntoSubState::StartCopyTable {
+                    vacuum_state.sub_state = OpVacuumSubState::StartCopyTable {
                         dest_conn,
                         table_idx: table_idx + 1,
                     };
                     continue;
                 }
                 crate::StepResult::IO => {
-                    let io = select_stmt
-                        .take_io_completions()
-                        .expect("StepResult::IO returned but no completions available");
-                    vacuum_state.sub_state = OpVacuumIntoSubState::CopyRows {
+                    let maybe_io = select_stmt.take_io_completions();
+                    vacuum_state.sub_state = OpVacuumSubState::CopyRows {
                         dest_conn,
                         select_stmt,
                         dest_insert_stmt,
                         table_idx,
                     };
-                    return Ok(InsnFunctionStepResult::IO(io));
+                    if let Some(io) = maybe_io {
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                    continue;
                 }
                 crate::StepResult::Busy | crate::StepResult::Interrupt => {
                     return Err(LimboError::Busy);
                 }
             },
 
-            OpVacuumIntoSubState::StepDestInsert {
+            OpVacuumSubState::StepDestInsert {
                 dest_conn,
                 select_stmt,
                 mut dest_insert_stmt,
@@ -14177,7 +14347,7 @@ fn op_vacuum_into_inner(
                 }
                 crate::StepResult::Done => {
                     // Go back to get next row from source
-                    vacuum_state.sub_state = OpVacuumIntoSubState::CopyRows {
+                    vacuum_state.sub_state = OpVacuumSubState::CopyRows {
                         dest_conn,
                         select_stmt,
                         dest_insert_stmt,
@@ -14186,23 +14356,24 @@ fn op_vacuum_into_inner(
                     continue;
                 }
                 crate::StepResult::IO => {
-                    let io = dest_insert_stmt
-                        .take_io_completions()
-                        .expect("StepResult::IO returned but no completions available");
-                    vacuum_state.sub_state = OpVacuumIntoSubState::StepDestInsert {
+                    let maybe_io = dest_insert_stmt.take_io_completions();
+                    vacuum_state.sub_state = OpVacuumSubState::StepDestInsert {
                         dest_conn,
                         select_stmt,
                         dest_insert_stmt,
                         table_idx,
                     };
-                    return Ok(InsnFunctionStepResult::IO(io));
+                    if let Some(io) = maybe_io {
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                    continue;
                 }
                 crate::StepResult::Busy | crate::StepResult::Interrupt => {
                     return Err(LimboError::Busy);
                 }
             },
 
-            OpVacuumIntoSubState::CopyMetaValues { dest_conn } => {
+            OpVacuumSubState::CopyMetaValues { dest_conn } => {
                 // Copy meta values to destination database
                 // Use pragma_update to set user_version and application_id
                 // Note: schema_version is not copied - VACUUM INTO creates a new file so
@@ -14217,11 +14388,11 @@ fn op_vacuum_into_inner(
 
                 // Now create triggers and views (after data copy to avoid triggers firing)
                 vacuum_state.sub_state =
-                    OpVacuumIntoSubState::PrepareTriggersViews { dest_conn, idx: 0 };
+                    OpVacuumSubState::PrepareTriggersViews { dest_conn, idx: 0 };
                 continue;
             }
 
-            OpVacuumIntoSubState::PrepareTriggersViews { dest_conn, idx } => {
+            OpVacuumSubState::PrepareTriggersViews { dest_conn, idx } => {
                 let schema_rows_len = vacuum_state.schema_rows.len();
                 turso_assert!(
                     idx <= schema_rows_len,
@@ -14230,7 +14401,7 @@ fn op_vacuum_into_inner(
                 );
                 if idx == schema_rows_len {
                     // Done creating triggers and views
-                    vacuum_state.sub_state = OpVacuumIntoSubState::Done { dest_conn };
+                    vacuum_state.sub_state = OpVacuumSubState::Done { dest_conn };
                     continue;
                 }
 
@@ -14244,7 +14415,7 @@ fn op_vacuum_into_inner(
                         if let Value::Text(sql) = &row[3] {
                             let sql_str = sql.as_str();
                             let dest_stmt = dest_conn.prepare(sql_str)?;
-                            vacuum_state.sub_state = OpVacuumIntoSubState::StepTriggersViews {
+                            vacuum_state.sub_state = OpVacuumSubState::StepTriggersViews {
                                 dest_conn,
                                 dest_schema_stmt: Box::new(dest_stmt),
                                 idx,
@@ -14255,13 +14426,13 @@ fn op_vacuum_into_inner(
                 }
 
                 // Skip non-trigger/view entries
-                vacuum_state.sub_state = OpVacuumIntoSubState::PrepareTriggersViews {
+                vacuum_state.sub_state = OpVacuumSubState::PrepareTriggersViews {
                     dest_conn,
                     idx: idx + 1,
                 };
             }
 
-            OpVacuumIntoSubState::StepTriggersViews {
+            OpVacuumSubState::StepTriggersViews {
                 dest_conn,
                 mut dest_schema_stmt,
                 idx,
@@ -14270,32 +14441,121 @@ fn op_vacuum_into_inner(
                     unreachable!("CREATE TRIGGER/VIEW statement unexpectedly returned a row");
                 }
                 crate::StepResult::Done => {
-                    vacuum_state.sub_state = OpVacuumIntoSubState::PrepareTriggersViews {
+                    vacuum_state.sub_state = OpVacuumSubState::PrepareTriggersViews {
                         dest_conn,
                         idx: idx + 1,
                     };
                     continue;
                 }
                 crate::StepResult::IO => {
-                    let io = dest_schema_stmt
-                        .take_io_completions()
-                        .expect("StepResult::IO returned but no completions available");
-                    vacuum_state.sub_state = OpVacuumIntoSubState::StepTriggersViews {
+                    let maybe_io = dest_schema_stmt.take_io_completions();
+                    vacuum_state.sub_state = OpVacuumSubState::StepTriggersViews {
                         dest_conn,
                         dest_schema_stmt,
                         idx,
                     };
-                    return Ok(InsnFunctionStepResult::IO(io));
+                    if let Some(io) = maybe_io {
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                    continue;
                 }
                 crate::StepResult::Busy | crate::StepResult::Interrupt => {
                     return Err(LimboError::Busy);
                 }
             },
 
-            OpVacuumIntoSubState::Done { dest_conn } => {
-                // Commit the transaction that was started in Init state
+            OpVacuumSubState::Done { dest_conn } => {
                 dest_conn.execute("COMMIT")?;
-                program.connection.execute("COMMIT")?;
+                let finalize_result = (|| -> Result<()> {
+                    if vacuum_state.is_plain_vacuum {
+                        let original_path =
+                            vacuum_state.original_db_path.as_ref().ok_or_else(|| {
+                                LimboError::InternalError(
+                                    "Missing original database path for plain VACUUM".to_string(),
+                                )
+                            })?;
+                        let temp_path =
+                            vacuum_state.temp_vacuum_path.as_ref().ok_or_else(|| {
+                                LimboError::InternalError(
+                                    "Missing temporary database path for plain VACUUM".to_string(),
+                                )
+                            })?;
+
+                        if original_path != ":memory:" {
+                            // Flush destination WAL into the main DB file so the
+                            // copied temp file is a complete standalone image.
+                            dest_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+                            drop(dest_conn);
+
+                            // In non-MVCC mode we keep the source exclusive transaction
+                            // open during copy-back so no concurrent writers can interleave.
+                            if program.connection.db.mvcc_enabled() {
+                                remove_vacuum_sidecars(temp_path)?;
+                                match std::fs::rename(temp_path, original_path) {
+                                    Ok(()) => {}
+                                    Err(err)
+                                        if err.kind() == std::io::ErrorKind::CrossesDevices =>
+                                    {
+                                        copy_vacuum_file_into_source(temp_path, original_path)?;
+                                        match std::fs::remove_file(temp_path) {
+                                            Ok(()) => {}
+                                            Err(remove_err)
+                                                if remove_err.kind()
+                                                    == std::io::ErrorKind::NotFound => {}
+                                            Err(remove_err) => {
+                                                return Err(LimboError::InternalError(format!(
+                                                    "Failed to remove VACUUM temp database {temp_path}: {remove_err}"
+                                                )));
+                                            }
+                                        }
+                                    }
+                                    Err(err) => {
+                                        return Err(LimboError::InternalError(format!(
+                                            "Failed to overwrite database during VACUUM: {err}"
+                                        )));
+                                    }
+                                }
+                            } else {
+                                copy_vacuum_file_into_source(temp_path, original_path)?;
+                                match std::fs::remove_file(temp_path) {
+                                    Ok(()) => {}
+                                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                                    Err(err) => {
+                                        return Err(LimboError::InternalError(format!(
+                                            "Failed to remove VACUUM temp database {temp_path}: {err}"
+                                        )));
+                                    }
+                                }
+                                remove_vacuum_sidecars(temp_path)?;
+                            }
+
+                            // Source DB content changed under the existing pager.
+                            let source_pager = program.connection.pager.load();
+                            source_pager.clear_page_cache(true);
+                            source_pager.set_schema_cookie(None);
+                        } else {
+                            // Plain VACUUM on :memory: is treated as a no-op in Init.
+                            drop(dest_conn);
+                            let _ = std::fs::remove_file(temp_path);
+                        }
+                    } else {
+                        // VACUUM INTO keeps destination as-is.
+                        drop(dest_conn);
+                    }
+                    Ok(())
+                })();
+
+                if let Err(err) = finalize_result {
+                    let _ = program.connection.execute("ROLLBACK");
+                    return Err(err);
+                }
+
+                if vacuum_state.is_plain_vacuum && !program.connection.db.mvcc_enabled() {
+                    // Discard stale WAL frames from the source transaction after copy-back.
+                    program.connection.execute("ROLLBACK")?;
+                } else {
+                    program.connection.execute("COMMIT")?;
+                }
 
                 state.pc += 1;
                 return Ok(InsnFunctionStepResult::Step);

@@ -1,0 +1,153 @@
+@database :temp:
+
+test plain-vacuum-rejected-in-transaction {
+    CREATE TABLE t(a INTEGER);
+    BEGIN;
+    VACUUM;
+}
+expect error {
+    cannot VACUUM from within a transaction
+}
+
+test plain-vacuum-preserves-rows-after-delete {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd');
+    DELETE FROM t WHERE id IN (2, 4);
+    VACUUM;
+    SELECT id, v FROM t ORDER BY id;
+}
+expect {
+    1|a
+    3|c
+}
+
+test plain-vacuum-post-vacuum-write-same-connection {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES (1);
+    VACUUM;
+    INSERT INTO t VALUES (2);
+    SELECT x FROM t ORDER BY x;
+}
+expect {
+    1
+    2
+}
+
+test plain-vacuum-shadowed-rowid-column-table {
+    CREATE TABLE t2(rowid TEXT, val INTEGER);
+    INSERT INTO t2 VALUES ('r1', 10), ('r2', 20);
+    VACUUM;
+    SELECT rowid, val FROM t2 ORDER BY val;
+}
+expect {
+    r1|10
+    r2|20
+}
+
+test plain-vacuum-empty-database {
+    VACUUM;
+}
+expect {
+}
+
+test plain-vacuum-multiple-tables {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, x TEXT);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, y INTEGER);
+    INSERT INTO a VALUES (1, 'hello'), (2, 'world');
+    INSERT INTO b VALUES (10, 100), (20, 200);
+    VACUUM;
+    SELECT id, x FROM a ORDER BY id;
+}
+expect {
+    1|hello
+    2|world
+}
+
+test plain-vacuum-multiple-tables-second-table {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, x TEXT);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, y INTEGER);
+    INSERT INTO a VALUES (1, 'hello'), (2, 'world');
+    INSERT INTO b VALUES (10, 100), (20, 200);
+    VACUUM;
+    SELECT id, y FROM b ORDER BY id;
+}
+expect {
+    10|100
+    20|200
+}
+
+test plain-vacuum-with-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE INDEX idx_name ON t(name);
+    INSERT INTO t VALUES (1, 'zebra'), (2, 'apple'), (3, 'mango');
+    VACUUM;
+    SELECT id, name FROM t ORDER BY name;
+}
+expect {
+    2|apple
+    3|mango
+    1|zebra
+}
+
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
+test plain-vacuum-preserves-autoincrement-counter {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    INSERT INTO t(v) VALUES ('a'), ('b'), ('c');
+    DELETE FROM t WHERE id = 3;
+    VACUUM;
+    INSERT INTO t(v) VALUES ('d');
+    SELECT id, v FROM t ORDER BY id;
+}
+expect {
+    1|a
+    2|b
+    4|d
+}
+
+test plain-vacuum-preserves-null-values {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b INTEGER, c REAL);
+    INSERT INTO t VALUES (1, NULL, NULL, NULL);
+    INSERT INTO t VALUES (2, 'x', 42, 3.14);
+    VACUUM;
+    SELECT id, a, b, c FROM t ORDER BY id;
+}
+expect {
+    1|||
+    2|x|42|3.14
+}
+
+test plain-vacuum-after-update {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1, 'original'), (2, 'keep');
+    UPDATE t SET v = 'modified' WHERE id = 1;
+    VACUUM;
+    SELECT id, v FROM t ORDER BY id;
+}
+expect {
+    1|modified
+    2|keep
+}
+
+test plain-vacuum-schema-survives {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+    CREATE INDEX idx_v ON t(v);
+    INSERT INTO t VALUES (1, 'a');
+    VACUUM;
+    SELECT type, name FROM sqlite_schema WHERE name IN ('t', 'idx_v') ORDER BY name;
+}
+expect {
+    index|idx_v
+    table|t
+}
+
+test plain-vacuum-twice-idempotent {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1, 'a'), (2, 'b');
+    VACUUM;
+    VACUUM;
+    SELECT id, v FROM t ORDER BY id;
+}
+expect {
+    1|a
+    2|b
+}

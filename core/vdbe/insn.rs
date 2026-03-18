@@ -1659,11 +1659,12 @@ pub enum Insn {
         target_pc: BranchOffset,
     },
 
-    /// VACUUM INTO - create a compacted copy of the database at the specified path.
-    /// This copies all schema and data from the current database to a new file.
-    VacuumInto {
-        /// Destination file path for the vacuumed database
-        dest_path: String,
+    /// VACUUM: creates a compact the database in-place or to a specified destination.
+    /// If dest_path_reg is None, compacts the database in-place (plain VACUUM).
+    /// If dest_path_reg is Some(reg), copies to the path in register[reg] (VACUUM INTO).
+    Vacuum {
+        /// Register containing destination file path for VACUUM INTO, None for plain VACUUM
+        dest_path_reg: Option<usize>,
     },
 
     /// Ensure turso_cdc_version table exists and insert/replace a version row,
@@ -1895,7 +1896,7 @@ impl InsnVariants {
             InsnVariants::HashGraceLoadPartition => execute::op_hash_grace_load_partition,
             InsnVariants::HashGraceNextProbe => execute::op_hash_grace_next_probe,
             InsnVariants::HashGraceAdvancePartition => execute::op_hash_grace_advance_partition,
-            InsnVariants::VacuumInto => execute::op_vacuum_into,
+            InsnVariants::Vacuum => execute::op_vacuum,
             InsnVariants::InitCdcVersion => execute::op_init_cdc_version,
         }
     }
