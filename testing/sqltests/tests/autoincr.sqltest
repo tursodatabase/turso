@@ -311,3 +311,18 @@ test autoinc-expicit-negative-rowid-initializes-seq-table {
 } expect {
 	t|0
 }
+
+
+# regression test for https://github.com/tursodatabase/turso/issues/5809
+test autoinc-mixed-case-table-name-preserved-in-sqlite-sequence {
+    CREATE TABLE "MiXeD Name"(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO "MiXeD Name"(v) VALUES('x');
+    UPDATE sqlite_sequence SET seq=100 WHERE name='MiXeD Name';
+    INSERT INTO "MiXeD Name"(v) VALUES('y');
+    SELECT id,v FROM "MiXeD Name" ORDER BY id;
+    SELECT name,seq FROM sqlite_sequence;
+} expect {
+    1|x
+    101|y
+    MiXeD Name|101
+}
