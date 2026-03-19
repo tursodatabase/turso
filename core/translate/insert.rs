@@ -314,6 +314,7 @@ pub fn translate_insert(
         program,
         resolver,
         &table,
+        &columns,
         &mut body,
         on_conflict.unwrap_or(ResolveType::Abort),
         database_id,
@@ -1731,10 +1732,48 @@ fn expr_contains_subquery(expr: &Expr) -> bool {
     found_subquery
 }
 
+/// Resolve `Expr::Default` in a VALUES row by replacing it with the column's
+/// default expression from the schema.
+fn resolve_defaults_in_row(
+    row: &mut [Box<Expr>],
+    table: &Table,
+    columns: &[ast::Name],
+    resolver: &Resolver,
+) {
+    let is_strict = table.is_strict();
+    for (i, expr) in row.iter_mut().enumerate() {
+        if !matches!(expr.as_ref(), Expr::Default) {
+            continue;
+        }
+        let col = if columns.is_empty() {
+            // No column list — position maps to non-hidden columns in order
+            table.columns().iter().filter(|c| !c.hidden()).nth(i)
+        } else {
+            // Column list — map by name
+            columns.get(i).and_then(|name| {
+                let name = crate::util::normalize_ident(name.as_str());
+                table.get_column_by_name(&name).map(|(_, col)| col)
+            })
+        };
+        *expr = match col {
+            Some(col) => col.default.clone().unwrap_or_else(|| {
+                if let Some(type_def) = resolver.schema().get_type_def(&col.ty_str, is_strict) {
+                    if let Some(ref default_expr) = type_def.default {
+                        return default_expr.clone();
+                    }
+                }
+                Box::new(ast::Expr::Literal(ast::Literal::Null))
+            }),
+            None => Box::new(ast::Expr::Literal(ast::Literal::Null)),
+        };
+    }
+}
+
 fn bind_insert(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     table: &Table,
+    columns: &[ast::Name],
     body: &mut InsertBody,
     on_conflict: ResolveType,
     database_id: usize,
@@ -1766,6 +1805,19 @@ fn bind_insert(
                 .collect();
         }
         InsertBody::Select(select, upsert_opt) => {
+            // Resolve Expr::Default in all VALUES rows before any compilation.
+            if let OneSelect::Values(values_expr) = &mut select.body.select {
+                for row in values_expr.iter_mut() {
+                    resolve_defaults_in_row(row, table, columns, resolver);
+                }
+            }
+            for compound in select.body.compounds.iter_mut() {
+                if let OneSelect::Values(values_expr) = &mut compound.select {
+                    for row in values_expr.iter_mut() {
+                        resolve_defaults_in_row(row, table, columns, resolver);
+                    }
+                }
+            }
             if select.body.compounds.is_empty() {
                 match &mut select.body.select {
                     // TODO see how to avoid clone

@@ -1409,9 +1409,14 @@ impl<'a> Parser<'a> {
             TK_EXISTS,
             TK_CASE,
             TK_LBRACKET,
+            TK_DEFAULT,
         );
 
         match tok.token_type {
+            TK_DEFAULT => {
+                eat_assert!(self, TK_DEFAULT);
+                Ok(Box::new(Expr::Default))
+            }
             TK_LP => {
                 eat_assert!(self, TK_LP);
                 match self.peek_no_eof()?.token_type {

@@ -518,6 +518,8 @@ pub enum Expr {
         /// The type of subquery.
         query_type: SubqueryType,
     },
+    /// `DEFAULT` keyword in INSERT VALUES
+    Default,
     /// `ARRAY[expr, ...]` array literal
     Array {
         /// elements of the array
