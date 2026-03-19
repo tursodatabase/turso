@@ -1,0 +1,20 @@
+---
+source: analyze.sqltest
+expression: |-
+  SELECT count(*)
+      FROM big
+      JOIN map ON map.big_id = big.id
+      WHERE big.category IN ('A', 'B');
+info:
+  statement_type: SELECT
+  tables:
+  - big
+  - map
+  - map.big_id
+  setup_blocks:
+  - low_cardinality_in_join
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN map
+`--SEARCH big USING INTEGER PRIMARY KEY (rowid=?)

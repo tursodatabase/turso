@@ -172,9 +172,11 @@ fn load_sqlite_stat1_from_stmt(
         };
         let stat = match stat_value {
             Value::Text(s) => s.as_str(),
-            _ => return Err(crate::LimboError::InternalError(
-                format!("sqlite_stat1: expected text for stat column, got {stat_value}")
-            )),
+            _ => {
+                return Err(crate::LimboError::InternalError(format!(
+                    "sqlite_stat1: expected text for stat column, got {stat_value}"
+                )))
+            }
         };
 
         // Skip if table is not a regular B-tree (may have been dropped after ANALYZE).
@@ -182,14 +184,14 @@ fn load_sqlite_stat1_from_stmt(
             return Ok(());
         }
         let Some(numbers) = parse_stat_numbers(stat) else {
-            return Err(crate::LimboError::InternalError(
-                format!("sqlite_stat1: malformed stat string: {stat:?}")
-            ));
+            return Err(crate::LimboError::InternalError(format!(
+                "sqlite_stat1: malformed stat string: {stat:?}"
+            )));
         };
         if numbers.is_empty() {
-            return Err(crate::LimboError::InternalError(
-                format!("sqlite_stat1: empty stat string for table {table_name}")
-            ));
+            return Err(crate::LimboError::InternalError(format!(
+                "sqlite_stat1: empty stat string for table {table_name}"
+            )));
         }
         if idx_name.is_none() {
             if let Some(total_rows) = numbers.first().copied() {
@@ -247,9 +249,11 @@ fn load_sqlite_stat4_from_stmt(
 
         let idx_name = match idx_value {
             Value::Text(s) => s.as_str(),
-            _ => return Err(crate::LimboError::InternalError(
-                format!("sqlite_stat4: expected text for idx column, got {idx_value}")
-            )),
+            _ => {
+                return Err(crate::LimboError::InternalError(format!(
+                    "sqlite_stat4: expected text for idx column, got {idx_value}"
+                )))
+            }
         };
 
         // Skip if table or index doesn't exist in the schema (may have been dropped after ANALYZE).
@@ -263,43 +267,51 @@ fn load_sqlite_stat4_from_stmt(
 
         let neq_str = match neq_value {
             Value::Text(s) => s.as_str(),
-            _ => return Err(crate::LimboError::InternalError(
-                format!("sqlite_stat4: expected text for neq column, got {neq_value}")
-            )),
+            _ => {
+                return Err(crate::LimboError::InternalError(format!(
+                    "sqlite_stat4: expected text for neq column, got {neq_value}"
+                )))
+            }
         };
         let nlt_str = match nlt_value {
             Value::Text(s) => s.as_str(),
-            _ => return Err(crate::LimboError::InternalError(
-                format!("sqlite_stat4: expected text for nlt column, got {nlt_value}")
-            )),
+            _ => {
+                return Err(crate::LimboError::InternalError(format!(
+                    "sqlite_stat4: expected text for nlt column, got {nlt_value}"
+                )))
+            }
         };
         let ndlt_str = match ndlt_value {
             Value::Text(s) => s.as_str(),
-            _ => return Err(crate::LimboError::InternalError(
-                format!("sqlite_stat4: expected text for ndlt column, got {ndlt_value}")
-            )),
+            _ => {
+                return Err(crate::LimboError::InternalError(format!(
+                    "sqlite_stat4: expected text for ndlt column, got {ndlt_value}"
+                )))
+            }
         };
         let sample_blob = match sample_value {
             Value::Blob(b) => b.clone(),
-            _ => return Err(crate::LimboError::InternalError(
-                format!("sqlite_stat4: expected blob for sample column, got {sample_value}")
-            )),
+            _ => {
+                return Err(crate::LimboError::InternalError(format!(
+                    "sqlite_stat4: expected blob for sample column, got {sample_value}"
+                )))
+            }
         };
 
         let Some(n_eq) = parse_stat_numbers(neq_str) else {
-            return Err(crate::LimboError::InternalError(
-                format!("sqlite_stat4: malformed neq string: {neq_str:?}")
-            ));
+            return Err(crate::LimboError::InternalError(format!(
+                "sqlite_stat4: malformed neq string: {neq_str:?}"
+            )));
         };
         let Some(n_lt) = parse_stat_numbers(nlt_str) else {
-            return Err(crate::LimboError::InternalError(
-                format!("sqlite_stat4: malformed nlt string: {nlt_str:?}")
-            ));
+            return Err(crate::LimboError::InternalError(format!(
+                "sqlite_stat4: malformed nlt string: {nlt_str:?}"
+            )));
         };
         let Some(n_distinct_lt) = parse_stat_numbers(ndlt_str) else {
-            return Err(crate::LimboError::InternalError(
-                format!("sqlite_stat4: malformed ndlt string: {ndlt_str:?}")
-            ));
+            return Err(crate::LimboError::InternalError(format!(
+                "sqlite_stat4: malformed ndlt string: {ndlt_str:?}"
+            )));
         };
 
         let idx_stats = stats.table_stats_mut(table_name).index_stats_mut(&idx_name);
@@ -852,11 +864,7 @@ impl StatAccum {
                     continue;
                 }
                 if i_min.is_none()
-                    || sample_is_better(
-                        self.n_col,
-                        &self.samples[i_min.unwrap()],
-                        &self.samples[i],
-                    )
+                    || sample_is_better(self.n_col, &self.samples[i_min.unwrap()], &self.samples[i])
                 {
                     i_min = Some(i);
                 }
@@ -995,7 +1003,6 @@ impl StatAccum {
         }
         parts.join(" ")
     }
-
 }
 
 /// Returns true if sample `a` is "better" than sample `b`.
@@ -1179,12 +1186,9 @@ mod tests {
     fn stat4_range_selectivity_empty_stats() {
         let stats = IndexStat::default();
         let v = Value::Numeric(Numeric::Integer(42));
-        assert!(stat4_range_selectivity(
-            &stats,
-            Some((&v, false)),
-            None,
-            CollationSeq::Binary
-        )
-        .is_none());
+        assert!(
+            stat4_range_selectivity(&stats, Some((&v, false)), None, CollationSeq::Binary)
+                .is_none()
+        );
     }
 }

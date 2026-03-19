@@ -85,7 +85,10 @@ fn extract_per_table_terms(or_expr: &Expr) -> Vec<Expr> {
     let mut candidates: Vec<(TableInternalId, usize)> = Vec::new();
     for eqs in &branch_equalities {
         for &(table_id, col_idx, _, _) in eqs {
-            if !candidates.iter().any(|(t, c)| *t == table_id && *c == col_idx) {
+            if !candidates
+                .iter()
+                .any(|(t, c)| *t == table_id && *c == col_idx)
+            {
                 candidates.push((table_id, col_idx));
             }
         }
@@ -261,7 +264,10 @@ mod tests {
         let ax = col(1, 0);
         let by = col(2, 0);
 
-        let branch1 = paren(and(eq(ax.clone(), lit_num("1")), eq(by.clone(), lit_num("2"))));
+        let branch1 = paren(and(
+            eq(ax.clone(), lit_num("1")),
+            eq(by.clone(), lit_num("2")),
+        ));
         let branch2 = paren(and(eq(ax, lit_num("3")), eq(by, lit_num("4"))));
         let or_expr = or(branch1, branch2);
 
@@ -348,7 +354,10 @@ mod tests {
         let ax = col(1, 0);
         let by = col(2, 0);
 
-        let branch1 = paren(and(eq(ax.clone(), lit_num("1")), eq(by.clone(), lit_num("2"))));
+        let branch1 = paren(and(
+            eq(ax.clone(), lit_num("1")),
+            eq(by.clone(), lit_num("2")),
+        ));
         let branch2 = paren(and(eq(ax, lit_num("1")), eq(by, lit_num("3"))));
         let or_expr = or(branch1, branch2);
 

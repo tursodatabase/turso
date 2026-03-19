@@ -12,5 +12,5 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SEARCH n1 USING INDEX idx_n1_name (name=?)
-`--SCAN n2
+|--SCAN n2
+`--SEARCH n1 USING INDEX idx_n1_name (name=?)

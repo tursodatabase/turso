@@ -241,7 +241,6 @@ pub(super) fn choose_best_btree_candidate(
     let mut rhs_table_mask = TableMask::new();
     rhs_table_mask.add_table(rhs_table_idx);
 
-
     // Estimate cost for each candidate index (including the rowid index) and
     // keep the best candidate.
     for candidate in rhs_constraints.candidates.iter() {
@@ -1091,7 +1090,7 @@ pub fn try_hash_join_access_method(
 
     // Avoid hash joins when there are correlated subqueries that reference the joined tables.
     for subquery in subqueries {
-        if !subquery.correlated {
+        if !subquery.outer_scope_dependency {
             continue;
         }
         // Check if the subquery references the build or probe table

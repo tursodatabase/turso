@@ -17,10 +17,10 @@ use crate::{
         },
         optimizer::optimize_select_plan,
         plan::{
-            plan_has_outer_scope_dependency, plan_is_correlated, ColumnUsedMask, EvalAt,
-            JoinOrderMember, NonFromClauseSubquery, OuterQueryReference, Plan, SetOperation,
-            SubqueryEvalPhase, SubqueryOrigin, SubqueryPosition, SubqueryState, TableReferences,
-            WhereTerm,
+            plan_has_outer_scope_dependency, plan_is_correlated,
+            select_plan_has_outer_scope_dependency, ColumnUsedMask, EvalAt, JoinOrderMember,
+            NonFromClauseSubquery, OuterQueryReference, Plan, SetOperation, SubqueryEvalPhase,
+            SubqueryOrigin, SubqueryPosition, SubqueryState, TableReferences, WhereTerm,
         },
         select::prepare_select_plan,
     },
@@ -529,15 +529,17 @@ fn get_subquery_parser<'a>(
                     );
                 };
                 optimize_select_plan(&mut plan, resolver.schema())?;
-                let correlated = plan.is_correlated();
-                handle_unsupported_correlation(correlated, position, allow_correlated)?;
+                let contains_correlation = plan.is_correlated();
+                let outer_scope_dependency = select_plan_has_outer_scope_dependency(&plan);
+                handle_unsupported_correlation(outer_scope_dependency, position, allow_correlated)?;
                 out_subqueries.push(NonFromClauseSubquery {
                     internal_id: subquery_id,
                     query_type: subquery_type,
                     state: SubqueryState::Unevaluated {
                         plan: Some(Box::new(plan)),
                     },
-                    correlated,
+                    contains_correlation,
+                    outer_scope_dependency,
                     origin,
                     eval_phase: origin.phase_floor(),
                 });
@@ -616,8 +618,9 @@ fn get_subquery_parser<'a>(
                 *result_reg_start = reg_start;
                 *num_regs = reg_count;
 
-                let correlated = plan.is_correlated();
-                handle_unsupported_correlation(correlated, position, allow_correlated)?;
+                let contains_correlation = plan.is_correlated();
+                let outer_scope_dependency = select_plan_has_outer_scope_dependency(&plan);
+                handle_unsupported_correlation(outer_scope_dependency, position, allow_correlated)?;
 
                 out_subqueries.push(NonFromClauseSubquery {
                     internal_id: *subquery_id,
@@ -628,7 +631,8 @@ fn get_subquery_parser<'a>(
                     state: SubqueryState::Unevaluated {
                         plan: Some(Box::new(plan)),
                     },
-                    correlated,
+                    contains_correlation,
+                    outer_scope_dependency,
                     origin,
                     eval_phase: origin.phase_floor(),
                 });
@@ -743,8 +747,9 @@ fn get_subquery_parser<'a>(
                     },
                 };
 
-                let correlated = plan.is_correlated();
-                handle_unsupported_correlation(correlated, position, allow_correlated)?;
+                let contains_correlation = plan.is_correlated();
+                let outer_scope_dependency = select_plan_has_outer_scope_dependency(&plan);
+                handle_unsupported_correlation(outer_scope_dependency, position, allow_correlated)?;
 
                 out_subqueries.push(NonFromClauseSubquery {
                     internal_id: subquery_id,
@@ -755,7 +760,8 @@ fn get_subquery_parser<'a>(
                     state: SubqueryState::Unevaluated {
                         plan: Some(Box::new(plan)),
                     },
-                    correlated,
+                    contains_correlation,
+                    outer_scope_dependency,
                     origin,
                     eval_phase: origin.phase_floor(),
                 });
@@ -1592,12 +1598,16 @@ pub fn emit_non_from_clause_subquery(
     resolver: &Resolver,
     plan: SelectPlan,
     query_type: &SubqueryType,
-    is_correlated: bool,
+    outer_scope_dependency: bool,
     preserve_outer_expr_cache: bool,
 ) -> Result<()> {
     program.nested(|program| {
         let subquery_id = program.next_subquery_eqp_id();
-        let correlated_prefix = if is_correlated { "CORRELATED " } else { "" };
+        let correlated_prefix = if outer_scope_dependency {
+            "CORRELATED "
+        } else {
+            ""
+        };
         match query_type {
             SubqueryType::Exists { .. } => {
                 // EXISTS subqueries don't get a separate EQP annotation in SQLite;
@@ -1619,7 +1629,7 @@ pub fn emit_non_from_clause_subquery(
             }
         }
 
-        let label_skip_after_first_run = if !is_correlated {
+        let label_skip_after_first_run = if !outer_scope_dependency {
             let label = program.allocate_label();
             program.emit_insn(Insn::Once {
                 target_pc_when_reentered: label,
@@ -1754,7 +1764,7 @@ pub fn emit_non_from_clause_subqueries_for_phase(
             resolver,
             *subquery_plan,
             &subquery.query_type,
-            subquery.correlated,
+            subquery.outer_scope_dependency,
             !matches!(
                 phase,
                 SubqueryEvalPhase::BeforeLoop | SubqueryEvalPhase::Loop(_)

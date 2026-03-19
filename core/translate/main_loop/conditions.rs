@@ -37,7 +37,7 @@ fn emit_correlated_subqueries(
         Some(table_references),
         EvalAt::Loop(join_index),
         |subquery| {
-            subquery.correlated
+            subquery.outer_scope_dependency
                 && (!on_only
                     || subquery_referenced_in_predicates(predicates, true, subquery.internal_id))
         },

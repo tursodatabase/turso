@@ -6904,11 +6904,10 @@ pub fn op_function(
                     _ => 0,
                 };
                 let accum = if arg_count >= 2 {
-                    let estimated_rows =
-                        match state.registers[*start_reg + 1].get_value() {
-                            Value::Numeric(Numeric::Integer(n)) => *n as u64,
-                            _ => 0,
-                        };
+                    let estimated_rows = match state.registers[*start_reg + 1].get_value() {
+                        Value::Numeric(Numeric::Integer(n)) => *n as u64,
+                        _ => 0,
+                    };
                     StatAccum::new_with_stat4(n_col, estimated_rows)
                 } else {
                     StatAccum::new(n_col)
@@ -6931,7 +6930,9 @@ pub fn op_function(
                 } else {
                     None
                 };
-                let accum = state.stat_accums.get_mut(start_reg)
+                let accum = state
+                    .stat_accums
+                    .get_mut(start_reg)
                     .expect("StatPush: no accumulator at start_reg (StatInit not called?)");
                 accum.push(i_chng, key);
             }
@@ -6957,7 +6958,9 @@ pub fn op_function(
                 } else {
                     0
                 };
-                let accum = state.stat_accums.get_mut(start_reg)
+                let accum = state
+                    .stat_accums
+                    .get_mut(start_reg)
                     .expect("StatGet: no accumulator at start_reg (StatInit not called?)");
                 let result = match mode {
                     0 => {

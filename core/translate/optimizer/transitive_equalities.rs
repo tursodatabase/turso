@@ -175,7 +175,10 @@ fn is_column_free(expr: &Expr) -> bool {
             Ok(WalkControl::SkipChildren)
         }
         // walk_expr doesn't descend into subqueries, so reject them explicitly.
-        Expr::Exists(_) | Expr::Subquery(_) | Expr::SubqueryResult { .. } | Expr::InSelect { .. } => {
+        Expr::Exists(_)
+        | Expr::Subquery(_)
+        | Expr::SubqueryResult { .. }
+        | Expr::InSelect { .. } => {
             ok = false;
             Ok(WalkControl::SkipChildren)
         }
@@ -484,13 +487,17 @@ mod tests {
     fn is_col_const(term: &WhereTerm, t: usize, c: usize, expected: &Expr) -> bool {
         if let Expr::Binary(lhs, Operator::Equals, rhs) = &term.expr {
             if let Some(cr) = ColRef::extract(lhs) {
-                if cr.table == TableInternalId::from(t) && cr.column == c && rhs.as_ref() == expected
+                if cr.table == TableInternalId::from(t)
+                    && cr.column == c
+                    && rhs.as_ref() == expected
                 {
                     return true;
                 }
             }
             if let Some(cr) = ColRef::extract(rhs) {
-                if cr.table == TableInternalId::from(t) && cr.column == c && lhs.as_ref() == expected
+                if cr.table == TableInternalId::from(t)
+                    && cr.column == c
+                    && lhs.as_ref() == expected
                 {
                     return true;
                 }
@@ -503,7 +510,10 @@ mod tests {
     fn constant_prop_basic() {
         // A.0 = 5, A.0 = B.0 → derives B.0 = 5
         let five = num_lit("5");
-        let mut wc = vec![eq_term(col(1, 0), five.clone()), eq_term(col(1, 0), col(2, 0))];
+        let mut wc = vec![
+            eq_term(col(1, 0), five.clone()),
+            eq_term(col(1, 0), col(2, 0)),
+        ];
         assert_eq!(add_constant_propagation_impl(&mut wc, &all_eligible), 1);
         assert_eq!(wc.len(), 3);
         assert!(is_col_const(&wc[2], 2, 0, &five));
@@ -535,7 +545,10 @@ mod tests {
     fn constant_prop_bind_param() {
         // A.0 = ?1, A.0 = B.0 → derives B.0 = ?1
         let param = Expr::Variable("?1".to_string());
-        let mut wc = vec![eq_term(col(1, 0), param.clone()), eq_term(col(1, 0), col(2, 0))];
+        let mut wc = vec![
+            eq_term(col(1, 0), param.clone()),
+            eq_term(col(1, 0), col(2, 0)),
+        ];
         assert_eq!(add_constant_propagation_impl(&mut wc, &all_eligible), 1);
         assert_eq!(wc.len(), 3);
         assert!(is_col_const(&wc[2], 2, 0, &param));
@@ -601,7 +614,10 @@ mod tests {
     fn constant_prop_bidirectional() {
         // 5 = A.0, A.0 = B.0 → derives B.0 = 5 (constant on LHS)
         let five = num_lit("5");
-        let mut wc = vec![eq_term(five.clone(), col(1, 0)), eq_term(col(1, 0), col(2, 0))];
+        let mut wc = vec![
+            eq_term(five.clone(), col(1, 0)),
+            eq_term(col(1, 0), col(2, 0)),
+        ];
         assert_eq!(add_constant_propagation_impl(&mut wc, &all_eligible), 1);
         assert_eq!(wc.len(), 3);
         assert!(is_col_const(&wc[2], 2, 0, &five));
@@ -611,7 +627,10 @@ mod tests {
     fn constant_prop_string_literal() {
         // A.0 = 'hello', A.0 = B.0 → derives B.0 = 'hello'
         let hello = str_lit("hello");
-        let mut wc = vec![eq_term(col(1, 0), hello.clone()), eq_term(col(1, 0), col(2, 0))];
+        let mut wc = vec![
+            eq_term(col(1, 0), hello.clone()),
+            eq_term(col(1, 0), col(2, 0)),
+        ];
         assert_eq!(add_constant_propagation_impl(&mut wc, &all_eligible), 1);
         assert_eq!(wc.len(), 3);
         assert!(is_col_const(&wc[2], 2, 0, &hello));
@@ -620,7 +639,10 @@ mod tests {
     #[test]
     fn constant_prop_ineligible_table() {
         // A.0 = 5, A.0 = B.0, but table 2 (B) is ineligible
-        let mut wc = vec![eq_term(col(1, 0), num_lit("5")), eq_term(col(1, 0), col(2, 0))];
+        let mut wc = vec![
+            eq_term(col(1, 0), num_lit("5")),
+            eq_term(col(1, 0), col(2, 0)),
+        ];
         let not_table_2 = |id: &TableInternalId| *id != TableInternalId::from(2);
         assert_eq!(add_constant_propagation_impl(&mut wc, &not_table_2), 0);
         assert_eq!(wc.len(), 2);

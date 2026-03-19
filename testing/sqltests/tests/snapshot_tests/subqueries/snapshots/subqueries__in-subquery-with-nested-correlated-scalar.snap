@@ -1,0 +1,30 @@
+---
+source: subqueries.sqltest
+expression: |-
+  SELECT c.id, c.name
+      FROM customers c
+      WHERE c.id IN (
+          SELECT o.customer_id
+          FROM orders o
+          WHERE o.total_amount > (
+              SELECT avg(oi.unit_price)
+              FROM order_items oi
+              WHERE oi.order_id = o.id
+          )
+      );
+info:
+  statement_type: SELECT
+  tables:
+  - customers
+  - order_items
+  - orders
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--LIST SUBQUERY 1
+|  |--SCAN orders AS o
+|  `--CORRELATED SCALAR SUBQUERY 2
+|     `--SEARCH oi USING INDEX idx_order_items_order (order_id=?)
+`--SEARCH c USING INTEGER PRIMARY KEY (rowid=?)

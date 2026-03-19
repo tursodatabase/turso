@@ -926,7 +926,7 @@ fn emit_update_insns<'a>(
             &t_ctx.resolver,
             *subquery_plan,
             &subquery.query_type,
-            subquery.correlated,
+            subquery.outer_scope_dependency,
             false,
         )?;
     }
@@ -2262,7 +2262,7 @@ fn emit_update_insns<'a>(
                         &t_ctx.resolver,
                         *subquery_plan,
                         &subquery.query_type,
-                        subquery.correlated || rerun_for_target_scan,
+                        subquery.outer_scope_dependency || rerun_for_target_scan,
                         true,
                     )?;
                 }

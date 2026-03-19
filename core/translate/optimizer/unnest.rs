@@ -50,7 +50,7 @@ pub fn unnest_exists_subqueries(plan: &mut SelectPlan) -> Result<()> {
     while i < plan.non_from_clause_subqueries.len() {
         let subquery = &plan.non_from_clause_subqueries[i];
         // Only consider unevaluated, correlated EXISTS subqueries.
-        if !subquery.correlated {
+        if !subquery.outer_scope_dependency {
             i += 1;
             continue;
         }
@@ -271,7 +271,11 @@ fn can_unnest_inner_plan(plan: &SelectPlan) -> bool {
     // Blocker ([MYSQL-SEMIJOIN]): nested correlated subqueries need layered
     // decorrelation ordering not implemented in this pass.
     // Example: inner WHERE contains `EXISTS (SELECT ... correlated to inner)`.
-    if plan.non_from_clause_subqueries.iter().any(|s| s.correlated) {
+    if plan
+        .non_from_clause_subqueries
+        .iter()
+        .any(|s| s.contains_correlation)
+    {
         return false;
     }
     // Blocker ([PG-SUBQUERY]): side-effecting/volatile expressions may be

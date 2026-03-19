@@ -236,21 +236,21 @@ pub(crate) fn estimate_rows_per_seek(
             if let Some(est) = estimate_rows_from_analyze_stats(ctx, usable_constraint_refs) {
                 // Apply range selectivity for any trailing non-equality constraints
                 // beyond the equality prefix.
-                let mut range_sels: SmallVec<[f64; 4]> =
-                    usable_constraint_refs[est.eq_prefix_len..]
-                        .iter()
-                        .filter_map(|cref| {
-                            range_selectivity_for_cref(
-                                cref,
-                                constraints,
-                                Some(est.idx_stats),
-                                ctx.index.map(|arc| arc.as_ref()),
-                                Some(ctx),
-                                *base_row_count,
-                                params,
-                            )
-                        })
-                        .collect();
+                let mut range_sels: SmallVec<[f64; 4]> = usable_constraint_refs
+                    [est.eq_prefix_len..]
+                    .iter()
+                    .filter_map(|cref| {
+                        range_selectivity_for_cref(
+                            cref,
+                            constraints,
+                            Some(est.idx_stats),
+                            ctx.index.map(|arc| arc.as_ref()),
+                            Some(ctx),
+                            *base_row_count,
+                            params,
+                        )
+                    })
+                    .collect();
                 let range_selectivity = dampened_product(&mut range_sels);
                 return (est.rows * range_selectivity).max(1.0);
             }
@@ -263,16 +263,8 @@ pub(crate) fn estimate_rows_per_seek(
             if let Some(ref eq) = cref.eq {
                 return constraints[eq.constraint_pos].selectivity;
             }
-            range_selectivity_for_cref(
-                cref,
-                constraints,
-                None,
-                None,
-                None,
-                *base_row_count,
-                params,
-            )
-            .unwrap_or(1.0)
+            range_selectivity_for_cref(cref, constraints, None, None, None, *base_row_count, params)
+                .unwrap_or(1.0)
         })
         .collect();
     let selectivity_multiplier = dampened_product(&mut sels);
@@ -377,8 +369,7 @@ fn estimate_rows_from_analyze_stats<'a>(
         }
 
         if !probe_values.is_empty() {
-            if let Some(est) =
-                stats::stat4_equality_estimate(idx_stats, &probe_values, &collations)
+            if let Some(est) = stats::stat4_equality_estimate(idx_stats, &probe_values, &collations)
             {
                 return Some(AnalyzeRowEstimate {
                     rows: est,

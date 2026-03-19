@@ -606,13 +606,20 @@ impl SelectPlan {
         self.aggregates.iter().map(|agg| agg.args.len()).sum()
     }
 
-    /// Whether this query or any of its subqueries reference columns from the outer query.
+    /// Whether this query subtree contains any correlation.
+    ///
+    /// This is intentionally broader than outer-scope dependency for the
+    /// current query level: nested subqueries correlated only to inner scopes
+    /// still count here.
     pub fn is_correlated(&self) -> bool {
         self.table_references
             .outer_query_refs()
             .iter()
             .any(|t| t.is_used())
-            || self.non_from_clause_subqueries.iter().any(|s| s.correlated)
+            || self
+                .non_from_clause_subqueries
+                .iter()
+                .any(|s| s.contains_correlation)
             || self
                 .table_references
                 .joined_tables()
@@ -2527,7 +2534,12 @@ pub struct NonFromClauseSubquery {
     pub internal_id: TableInternalId,
     pub query_type: SubqueryType,
     pub state: SubqueryState,
-    pub correlated: bool,
+    /// True when this subquery plan contains any correlation in its subtree.
+    /// This is broader than outer-scope dependency: nested subqueries may be
+    /// correlated only to this subquery's own scope.
+    pub contains_correlation: bool,
+    /// True only when this subquery must be re-evaluated for each enclosing query row.
+    pub outer_scope_dependency: bool,
     pub origin: SubqueryOrigin,
     pub eval_phase: SubqueryEvalPhase,
 }
@@ -2646,6 +2658,87 @@ pub fn plan_is_correlated(plan: &Plan) -> bool {
     }
 }
 
+fn select_plan_has_outer_scope_dependency_with_tables(
+    plan: &SelectPlan,
+    accessible_table_ids: &mut Vec<TableInternalId>,
+) -> bool {
+    let outer_scope_base_len = accessible_table_ids.len();
+    accessible_table_ids.extend(
+        plan.table_references
+            .joined_tables()
+            .iter()
+            .map(|table| table.internal_id),
+    );
+
+    let has_outer_scope_dependency =
+        plan.table_references
+            .outer_query_refs()
+            .iter()
+            .any(|outer_ref| {
+                outer_ref.is_used() && !accessible_table_ids.contains(&outer_ref.internal_id)
+            })
+            || plan
+                .non_from_clause_subqueries
+                .iter()
+                .any(|subquery| match &subquery.state {
+                    SubqueryState::Unevaluated {
+                        plan: Some(subquery_plan),
+                    } => select_plan_has_outer_scope_dependency_with_tables(
+                        subquery_plan,
+                        accessible_table_ids,
+                    ),
+                    SubqueryState::Unevaluated { plan: None } => false,
+                    SubqueryState::Evaluated { outer_ref_ids, .. } => outer_ref_ids
+                        .iter()
+                        .any(|outer_ref_id| !accessible_table_ids.contains(outer_ref_id)),
+                })
+            || plan
+                .table_references
+                .joined_tables()
+                .iter()
+                .any(|table| match &table.table {
+                    Table::FromClauseSubquery(subquery) => {
+                        plan_has_outer_scope_dependency_with_tables(
+                            subquery.plan.as_ref(),
+                            accessible_table_ids,
+                        )
+                    }
+                    _ => false,
+                });
+
+    accessible_table_ids.truncate(outer_scope_base_len);
+    has_outer_scope_dependency
+}
+
+fn plan_has_outer_scope_dependency_with_tables(
+    plan: &Plan,
+    accessible_table_ids: &mut Vec<TableInternalId>,
+) -> bool {
+    match plan {
+        Plan::Select(select_plan) => {
+            select_plan_has_outer_scope_dependency_with_tables(select_plan, accessible_table_ids)
+        }
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            left.iter().any(|(select_plan, _)| {
+                select_plan_has_outer_scope_dependency_with_tables(
+                    select_plan,
+                    accessible_table_ids,
+                )
+            }) || select_plan_has_outer_scope_dependency_with_tables(
+                right_most,
+                accessible_table_ids,
+            )
+        }
+        Plan::Delete(_) | Plan::Update(_) => false,
+    }
+}
+
+pub fn select_plan_has_outer_scope_dependency(plan: &SelectPlan) -> bool {
+    select_plan_has_outer_scope_dependency_with_tables(plan, &mut Vec::new())
+}
+
 /// Returns true when evaluating this plan depends on table values from an
 /// enclosing query scope outside the plan itself.
 ///
@@ -2654,77 +2747,6 @@ pub fn plan_is_correlated(plan: &Plan) -> bool {
 /// references another table in the same CTE) without depending on an enclosing
 /// query row. Those plans are still safe to materialize once and reuse.
 pub fn plan_has_outer_scope_dependency(plan: &Plan) -> bool {
-    fn select_plan_has_outer_scope_dependency(
-        plan: &SelectPlan,
-        accessible_table_ids: &mut Vec<TableInternalId>,
-    ) -> bool {
-        let outer_scope_base_len = accessible_table_ids.len();
-        accessible_table_ids.extend(
-            plan.table_references
-                .joined_tables()
-                .iter()
-                .map(|table| table.internal_id),
-        );
-
-        let has_outer_scope_dependency =
-            plan.table_references
-                .outer_query_refs()
-                .iter()
-                .any(|outer_ref| {
-                    outer_ref.is_used() && !accessible_table_ids.contains(&outer_ref.internal_id)
-                })
-                || plan
-                    .non_from_clause_subqueries
-                    .iter()
-                    .any(|subquery| match &subquery.state {
-                        SubqueryState::Unevaluated {
-                            plan: Some(subquery_plan),
-                        } => select_plan_has_outer_scope_dependency(
-                            subquery_plan,
-                            accessible_table_ids,
-                        ),
-                        SubqueryState::Unevaluated { plan: None } => false,
-                        SubqueryState::Evaluated { outer_ref_ids, .. } => outer_ref_ids
-                            .iter()
-                            .any(|outer_ref_id| !accessible_table_ids.contains(outer_ref_id)),
-                    })
-                || plan
-                    .table_references
-                    .joined_tables()
-                    .iter()
-                    .any(|table| match &table.table {
-                        Table::FromClauseSubquery(subquery) => {
-                            plan_has_outer_scope_dependency_with_tables(
-                                subquery.plan.as_ref(),
-                                accessible_table_ids,
-                            )
-                        }
-                        _ => false,
-                    });
-
-        accessible_table_ids.truncate(outer_scope_base_len);
-        has_outer_scope_dependency
-    }
-
-    fn plan_has_outer_scope_dependency_with_tables(
-        plan: &Plan,
-        accessible_table_ids: &mut Vec<TableInternalId>,
-    ) -> bool {
-        match plan {
-            Plan::Select(select_plan) => {
-                select_plan_has_outer_scope_dependency(select_plan, accessible_table_ids)
-            }
-            Plan::CompoundSelect {
-                left, right_most, ..
-            } => {
-                left.iter().any(|(select_plan, _)| {
-                    select_plan_has_outer_scope_dependency(select_plan, accessible_table_ids)
-                }) || select_plan_has_outer_scope_dependency(right_most, accessible_table_ids)
-            }
-            Plan::Delete(_) | Plan::Update(_) => false,
-        }
-    }
-
     plan_has_outer_scope_dependency_with_tables(plan, &mut Vec::new())
 }
 

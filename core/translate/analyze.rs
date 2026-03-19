@@ -411,7 +411,13 @@ pub fn translate_analyze(
         program.preassign_label_to_next_insn(rewind_done);
 
         // Delete old stat4 rows for this target table.
-        emit_delete_stat_rows(program, stat4_cursor, &target_table.name, target_index.as_deref(), "sqlite_stat4");
+        emit_delete_stat_rows(
+            program,
+            stat4_cursor,
+            &target_table.name,
+            target_index.as_deref(),
+            "sqlite_stat4",
+        );
 
         let target_cursor = program.alloc_cursor_id(CursorType::BTreeTable(target_table.clone()));
         program.emit_insn(Insn::OpenRead {

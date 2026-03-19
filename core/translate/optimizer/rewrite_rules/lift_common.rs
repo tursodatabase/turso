@@ -21,7 +21,10 @@ use crate::{
     Result,
 };
 
-use super::{flatten_and_expr_owned, flatten_or_expr_owned, rebuild_and_expr_from_list, rebuild_or_expr_from_list};
+use super::{
+    flatten_and_expr_owned, flatten_or_expr_owned, rebuild_and_expr_from_list,
+    rebuild_or_expr_from_list,
+};
 
 pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
     where_clause: &mut Vec<WhereTerm>,

@@ -41,11 +41,11 @@ use constraints::{
 };
 use cost::Cost;
 use join::{compute_best_join_order_with_context, BestJoinOrderResult, JoinPlanningContext};
-use rewrite_rules::{decompose_cross_table_ors, lift_common_subexpressions_from_binary_or_terms};
 use order::{
     compute_order_target, plan_satisfies_order_target, simple_aggregate_order_target,
     EliminatesSortBy, OrderTargetPurpose,
 };
+use rewrite_rules::{decompose_cross_table_ors, lift_common_subexpressions_from_binary_or_terms};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
@@ -1114,7 +1114,7 @@ fn reoptimize_correlated_subqueries(plan: &mut SelectPlan, schema: &Schema) -> R
     };
 
     for subquery in &mut plan.non_from_clause_subqueries {
-        if !subquery.correlated {
+        if !subquery.outer_scope_dependency {
             continue;
         }
         let SubqueryState::Unevaluated {
@@ -2399,9 +2399,9 @@ fn optimize_table_access(
     // Constant-propagation terms (col=const) are NOT blanket-consumed here:
     // they carry new information and must be evaluated at runtime (either via
     // index seek or residual filter) to preserve correctness.
-    for term in
-        where_clause[transitive_synthetic_whereterms_start..transitive_synthetic_whereterms_end]
-            .iter_mut()
+    for term in where_clause
+        [transitive_synthetic_whereterms_start..transitive_synthetic_whereterms_end]
+        .iter_mut()
     {
         term.consumed = true;
     }
