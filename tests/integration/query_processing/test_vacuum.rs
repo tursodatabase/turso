@@ -2154,7 +2154,7 @@ fn test_vacuum_into_compacts_fragmented_database(tmp_db: TempDatabase) -> anyhow
     let dest_path = dest_dir.path().join("vacuumed.db");
     let dest_path_str = dest_path.to_str().unwrap();
 
-    conn.execute(format!("VACUUM INTO '{}'", dest_path_str))?;
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
 
     let dest_db = TempDatabase::new_with_existent(&dest_path);
     let dest_conn = dest_db.connect_limbo();
@@ -2189,9 +2189,7 @@ fn test_vacuum_into_compacts_fragmented_database(tmp_db: TempDatabase) -> anyhow
     let dest_size = std::fs::metadata(&dest_path)?.len();
     assert!(
         dest_size < source_size,
-        "VACUUM INTO should reduce file size. Source: {} bytes, Destination: {} bytes",
-        source_size,
-        dest_size
+        "VACUUM INTO should reduce file size. Source: {source_size} bytes, Destination: {dest_size} bytes"
     );
 
     Ok(())
