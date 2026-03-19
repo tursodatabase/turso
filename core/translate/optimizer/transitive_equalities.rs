@@ -319,7 +319,7 @@ fn add_constant_propagation_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use turso_parser::ast::Operator;
+    use turso_parser::ast::{Operator, Variable};
 
     /// All tables eligible (simulates all-inner-join query).
     fn all_eligible(_: &TableInternalId) -> bool {
@@ -544,7 +544,7 @@ mod tests {
     #[test]
     fn constant_prop_bind_param() {
         // A.0 = ?1, A.0 = B.0 → derives B.0 = ?1
-        let param = Expr::Variable("?1".to_string());
+        let param = Expr::Variable(Variable::indexed(1.try_into().unwrap()));
         let mut wc = vec![
             eq_term(col(1, 0), param.clone()),
             eq_term(col(1, 0), col(2, 0)),
