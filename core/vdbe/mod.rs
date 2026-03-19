@@ -437,6 +437,9 @@ pub struct ProgramState {
     /// Indicate whether an [Insn::Once] instruction at a given program counter position has already been executed, well, once.
     once: SmallVec<[u32; 4]>,
     pub execution_state: ProgramExecutionState,
+    /// Per-execution statement deadline derived from the connection query timeout.
+    /// `None` means no timeout.
+    pub query_deadline: Option<crate::MonotonicInstant>,
     pub parameters: Vec<Value>,
     commit_state: CommitState,
     #[cfg(feature = "json")]
@@ -537,6 +540,7 @@ impl ProgramState {
             ended_coroutine: vec![],
             once: SmallVec::<[u32; 4]>::new(),
             execution_state: ProgramExecutionState::Init,
+            query_deadline: None,
             parameters: Vec::new(),
             commit_state: CommitState::Ready,
             #[cfg(feature = "json")]
@@ -668,6 +672,7 @@ impl ProgramState {
         self.ended_coroutine.clear();
         self.once.clear();
         self.execution_state = ProgramExecutionState::Init;
+        self.query_deadline = None;
         self.current_collation = None;
         #[cfg(feature = "json")]
         self.json_cache.clear();
@@ -1144,6 +1149,12 @@ impl Program {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
 
+        if let Some(deadline) = state.query_deadline {
+            if pager.io.current_time_monotonic() >= deadline {
+                state.execution_state = ProgramExecutionState::Interrupting;
+            }
+        }
+
         if matches!(state.execution_state, ProgramExecutionState::Interrupting) {
             return Ok(StepResult::Interrupt);
         }
@@ -1245,6 +1256,12 @@ impl Program {
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
 
+            if let Some(deadline) = state.query_deadline {
+                if pager.io.current_time_monotonic() >= deadline {
+                    state.execution_state = ProgramExecutionState::Interrupting;
+                }
+            }
+
             if matches!(state.execution_state, ProgramExecutionState::Interrupting) {
                 return Ok(StepResult::Interrupt);
             }
@@ -1291,6 +1308,11 @@ impl Program {
                     pager.rollback_tx(&self.connection);
                 }
                 return Err(LimboError::InternalError("Connection closed".to_string()));
+            }
+            if let Some(deadline) = state.query_deadline {
+                if pager.io.current_time_monotonic() >= deadline {
+                    state.execution_state = ProgramExecutionState::Interrupting;
+                }
             }
             if matches!(state.execution_state, ProgramExecutionState::Interrupting) {
                 self.abort(pager, None, state)?;

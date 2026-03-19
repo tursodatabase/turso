@@ -1,3 +1,4 @@
+#[cfg(debug_assertions)]
 use crate::turso_assert_eq;
 use std::{
     borrow::Cow,
@@ -5,6 +6,7 @@ use std::{
     ops::Deref,
     sync::{atomic::Ordering, Arc},
     task::Waker,
+    time::Duration,
 };
 
 use tracing::{instrument, Level};
@@ -41,6 +43,11 @@ pub struct Statement {
     busy: bool,
     /// Busy handler state for tracking invocations and timeouts
     busy_handler_state: Option<BusyHandlerState>,
+    /// Per-execution timeout override for this statement.
+    /// - `None`: use connection default
+    /// - `Some(Some(duration))`: override with a query-specific timeout
+    /// - `Some(None)`: disable timeout for this execution
+    query_timeout_override: Option<Option<Duration>>,
     /// True once step() has returned Row for a write statement (INSERT/UPDATE/DELETE
     /// with RETURNING). With ephemeral-buffered RETURNING, the first Row proves all
     /// DML completed — only the scan-back remains. Used by reset_internal to decide
@@ -85,6 +92,7 @@ impl Statement {
             query_mode,
             busy: false,
             busy_handler_state: None,
+            query_timeout_override: None,
             has_returned_row: false,
             tail_offset,
         }
@@ -124,6 +132,15 @@ impl Statement {
         self.state.interrupt();
     }
 
+    /// Sets a per-execution timeout override for this statement.
+    ///
+    /// - `None`: use connection default
+    /// - `Some(Some(duration))`: use query-specific timeout
+    /// - `Some(None)`: disable timeout for this execution
+    pub fn set_query_timeout_override(&mut self, timeout: Option<Option<Duration>>) {
+        self.query_timeout_override = timeout;
+    }
+
     pub fn execution_state(&self) -> ProgramExecutionState {
         self.state.execution_state
     }
@@ -144,6 +161,37 @@ impl Statement {
         self.state.io_completions.take()
     }
 
+    fn arm_query_timeout_if_needed(&mut self) {
+        if !matches!(self.state.execution_state, ProgramExecutionState::Init)
+            || self.state.query_deadline.is_some()
+        {
+            return;
+        }
+        let timeout = match self.query_timeout_override {
+            Some(timeout_override) => timeout_override,
+            None => {
+                let connection_timeout = self.program.connection.get_query_timeout();
+                if connection_timeout.is_zero() {
+                    None
+                } else {
+                    Some(connection_timeout)
+                }
+            }
+        };
+        let Some(timeout) = timeout else {
+            return;
+        };
+        self.state.query_deadline = Some(self.pager.io.current_time_monotonic() + timeout);
+    }
+
+    fn maybe_interrupt_for_query_timeout(&mut self) {
+        if let Some(deadline) = self.state.query_deadline {
+            if self.pager.io.current_time_monotonic() >= deadline {
+                self.state.interrupt();
+            }
+        }
+    }
+
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
         if matches!(self.state.execution_state, ProgramExecutionState::Init)
             && !self
@@ -153,6 +201,10 @@ impl Statement {
         {
             self.reprepare()?;
         }
+
+        self.arm_query_timeout_if_needed();
+        self.maybe_interrupt_for_query_timeout();
+
         // If we're waiting for a busy handler timeout, check if we can proceed
         if let Some(busy_state) = self.busy_handler_state.as_ref() {
             if self.pager.io.current_time_monotonic() < busy_state.timeout() {
@@ -189,6 +241,7 @@ impl Statement {
                 .record_statement(&self.state.metrics);
             self.busy = false;
             self.busy_handler_state = None; // Reset busy state on completion
+            self.state.query_deadline = None;
 
             // After ANALYZE completes, refresh in-memory stats so planners can use them.
             let sql = self.program.sql.trim_start().as_bytes();
@@ -697,6 +750,7 @@ impl Statement {
         self.state.n_change.store(0, Ordering::SeqCst);
         self.busy = false;
         self.busy_handler_state = None;
+        self.query_timeout_override = None;
         self.has_returned_row = false;
 
         if let Some(err) = reset_error {
