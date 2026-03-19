@@ -1548,6 +1548,33 @@ fn enforce_indexed_by_hints(
     Ok(())
 }
 
+/// Compute available constraints from the WHERE clause,
+/// and then enforce INDEXED BY / NOT INDEXED if provided
+/// in the statement.
+fn constraints_with_indexed_by_hints(
+    where_clause: &[WhereTerm],
+    table_references: &TableReferences,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    subqueries: &[NonFromClauseSubquery],
+    schema: &Schema,
+    params: &cost_params::CostModelParams,
+) -> Result<Vec<TableConstraints>> {
+    let mut constraints_per_table = constraints_from_where_clause(
+        where_clause,
+        table_references,
+        available_indexes,
+        subqueries,
+        schema,
+        params,
+    )?;
+    enforce_indexed_by_hints(
+        table_references,
+        available_indexes,
+        &mut constraints_per_table,
+    )?;
+    Ok(constraints_per_table)
+}
+
 /// Optimize the join order and index selection for a query.
 ///
 /// This function does the following:
@@ -1658,20 +1685,13 @@ fn optimize_table_access(
     let maybe_order_target = simple_aggregate
         .and_then(|sa| simple_aggregate_order_target(sa, table_references))
         .or_else(|| compute_order_target(order_by, group_by.as_mut(), table_references));
-    let mut constraints_per_table = constraints_from_where_clause(
+    let mut constraints_per_table = constraints_with_indexed_by_hints(
         where_clause,
         table_references,
         available_indexes,
         subqueries,
         schema,
         params,
-    )?;
-
-    // Enforce INDEXED BY / NOT INDEXED hints on constraint candidates.
-    enforce_indexed_by_hints(
-        table_references,
-        available_indexes,
-        &mut constraints_per_table,
     )?;
 
     let base_table_rows = table_references
@@ -1737,18 +1757,13 @@ fn optimize_table_access(
         if !outer_join_rewritten {
             break;
         }
-        constraints_per_table = constraints_from_where_clause(
+        constraints_per_table = constraints_with_indexed_by_hints(
             where_clause,
             table_references,
             available_indexes,
             subqueries,
             schema,
             params,
-        )?;
-        enforce_indexed_by_hints(
-            table_references,
-            available_indexes,
-            &mut constraints_per_table,
         )?;
     }
 
@@ -1759,7 +1774,7 @@ fn optimize_table_access(
     let constant_prop_count =
         transitive_equalities::add_constant_propagation(where_clause, table_references);
     if transitive_count + constant_prop_count > 0 {
-        constraints_per_table = constraints_from_where_clause(
+        constraints_per_table = constraints_with_indexed_by_hints(
             where_clause,
             table_references,
             available_indexes,

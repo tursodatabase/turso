@@ -1424,7 +1424,7 @@ test full-outer-with-not-exists-subquery {
     WHERE NOT EXISTS (SELECT * FROM v WHERE v.x=t.x);
 }
 expect error {
-    FULL OUTER JOIN is not supported with correlated subqueries that reference the joined tables
+    FULL OUTER JOIN is not supported with subqueries that contain correlation
 }
 
 # Regression: FULL OUTER with IN subquery on probe table column.
