@@ -30,7 +30,6 @@ use crate::{
         expr::comparison_affinity,
         planner::{table_mask_from_expr, TableMask},
         result_row::emit_select_result,
-        subquery::emit_non_from_clause_subquery,
     },
     turso_assert, turso_assert_eq,
     types::SeekOp,

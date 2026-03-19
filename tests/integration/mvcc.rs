@@ -46,10 +46,11 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
     fn log_tx(
         &self,
         m: &turso_core::mvcc::database::LogRecord,
+        on_serialization_complete: Option<&dyn Fn(&[u8], u32)>,
     ) -> turso_core::Result<(turso_core::Completion, u64)> {
         self.used_log_tx
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        self.inner.log_tx(m)
+        self.inner.log_tx(m, on_serialization_complete)
     }
 
     fn sync(
@@ -137,7 +138,7 @@ fn test_mvcc_custom_durable_storage_injected(tmp_db: TempDatabase) -> anyhow::Re
         .io
         .open_file(log_path.to_str().unwrap(), OpenFlags::default(), false)?;
     let default_storage: Arc<dyn turso_core::mvcc::persistent_storage::DurableStorage> = Arc::new(
-        turso_core::mvcc::persistent_storage::Storage::new(file, tmp_db.io.clone()),
+        turso_core::mvcc::persistent_storage::Storage::new(file, tmp_db.io.clone(), None),
     );
     let recording = Arc::new(RecordingDurableStorage::new(default_storage));
 

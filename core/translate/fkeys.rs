@@ -240,6 +240,7 @@ pub fn emit_fk_restrict_halt(program: &mut ProgramBuilder) -> Result<()> {
         err_code: SQLITE_CONSTRAINT_FOREIGNKEY,
         description: "FOREIGN KEY constraint failed".to_string(),
         on_error: None,
+        description_reg: None,
     });
     Ok(())
 }
@@ -536,6 +537,103 @@ pub fn emit_fk_parent_pk_change_counters(
             resolver,
         )?;
     }
+    Ok(())
+}
+
+/// After INSERT in the UPDATE path, if REPLACE fired during Phase 1,
+/// children referencing the NEW parent key may resolve deferred FK violations
+/// that the REPLACE delete incremented. This emits a FkIfZero-guarded scan
+/// that decrements the counter for each matching child row.
+///
+/// Matches SQLite's post-delete / pre-insert FK reconciliation
+/// (sqlite3FkCheck → fkScanChildren with isIgnoreErr=1 path).
+#[allow(clippy::too_many_arguments)]
+pub fn emit_fk_parent_new_key_reconcile(
+    program: &mut ProgramBuilder,
+    table_btree: &BTreeTable,
+    new_values_start: usize,
+    new_rowid_reg: usize,
+    set_clauses: &[(usize, Box<ast::Expr>)],
+    database_id: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let updated_positions: HashSet<usize> = set_clauses.iter().map(|(i, _)| *i).collect();
+    let incoming = resolver.with_schema(database_id, |s| {
+        s.resolved_fks_referencing(&table_btree.name)
+    })?;
+
+    let is_relevant = |fk: &ResolvedFkRef| -> bool {
+        fk.fk.deferred && fk.parent_key_may_change(&updated_positions, table_btree)
+    };
+    if !incoming.iter().any(&is_relevant) {
+        return Ok(());
+    }
+
+    // FkIfZero guard: skip entire section if counter is already zero.
+    let skip_all = program.allocate_label();
+    program.emit_insn(Insn::FkIfZero {
+        deferred: true,
+        target_pc: skip_all,
+    });
+
+    for fk_ref in incoming.iter().filter(|fk| is_relevant(fk)) {
+        if fk_ref.parent_uses_rowid {
+            emit_fk_parent_key_probe(
+                program,
+                fk_ref,
+                new_rowid_reg,
+                1,
+                ParentProbePass::New,
+                database_id,
+                resolver,
+            )?;
+            continue;
+        }
+
+        // Build contiguous NEW key registers from the parent column positions.
+        // Parent columns come from explicit FK declaration, or implicitly from PK.
+        let explicit = &fk_ref.fk.parent_columns;
+        let pk = &table_btree.primary_key_columns;
+        let n_cols = if explicit.is_empty() {
+            pk.len()
+        } else {
+            explicit.len()
+        };
+        let new_key = program.alloc_registers(n_cols);
+
+        for i in 0..n_cols {
+            let col_name = if explicit.is_empty() {
+                pk[i].0.as_str()
+            } else {
+                explicit[i].as_str()
+            };
+            let (pos, col) = table_btree
+                .get_column(col_name)
+                .ok_or_else(|| LimboError::InternalError(format!("col {col_name} missing")))?;
+            let src = if col.is_rowid_alias() {
+                new_rowid_reg
+            } else {
+                new_values_start + pos
+            };
+            program.emit_insn(Insn::Copy {
+                src_reg: src,
+                dst_reg: new_key + i,
+                extra_amount: 0,
+            });
+        }
+
+        emit_fk_parent_key_probe(
+            program,
+            fk_ref,
+            new_key,
+            n_cols,
+            ParentProbePass::New,
+            database_id,
+            resolver,
+        )?;
+    }
+
+    program.preassign_label_to_next_insn(skip_all);
     Ok(())
 }
 
@@ -1453,7 +1551,12 @@ fn generate_cascade_update_stmt(
                 .expect("new params required for cascade update");
             ast::Set {
                 col_names: vec![Name::from_string(col)],
-                expr: Box::new(Expr::Variable(format!("{}", param_idx.get()))),
+                expr: Box::new(Expr::Variable(ast::Variable::indexed(
+                    u32::try_from(param_idx.get())
+                        .ok()
+                        .and_then(std::num::NonZeroU32::new)
+                        .expect("fk parameter index must fit into NonZeroU32"),
+                ))),
             }
         })
         .collect();
@@ -1483,7 +1586,12 @@ fn build_fk_match_where_clause(child_cols: &[String], ctx: &FkSubprogramContext)
         let cond = Expr::Binary(
             Box::new(Expr::Id(Name::from_string(col))),
             ast::Operator::Equals,
-            Box::new(Expr::Variable(format!("{}", param_idx.get()))),
+            Box::new(Expr::Variable(ast::Variable::indexed(
+                u32::try_from(param_idx.get())
+                    .ok()
+                    .and_then(std::num::NonZeroU32::new)
+                    .expect("fk parameter index must fit into NonZeroU32"),
+            ))),
         );
         conditions.push(cond);
     }

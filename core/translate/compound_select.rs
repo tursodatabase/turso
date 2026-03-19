@@ -146,21 +146,18 @@ pub fn emit_program_for_compound_select(
     }
     program.table_references.extend(right_plan.table_references);
 
-    emit_compound_select(
-        program,
-        plan,
-        &right_most_ctx.resolver,
-        limit_ctx,
-        offset_reg,
-        reg_result_cols_start,
-        &query_destination,
-    )?;
+    program.with_scoped_result_cols_start(|program| {
+        emit_compound_select(
+            program,
+            plan,
+            &right_most_ctx.resolver,
+            limit_ctx,
+            offset_reg,
+            reg_result_cols_start,
+            &query_destination,
+        )
+    })?;
     program.pop_current_parent_explain();
-
-    // Restore reg_result_cols_start after emit_compound_select, because nested
-    // subqueries (e.g. CTE coroutines) can overwrite program.reg_result_cols_start
-    // with their own result column registers. This mirrors the same fix in
-    // emit_program_for_select_with_inputs.
     program.reg_result_cols_start = reg_result_cols_start;
 
     Ok(reg_result_cols_start)
@@ -488,6 +485,7 @@ fn create_dedupe_index(
         has_rowid: false,
         where_clause: None,
         index_method: None,
+        on_conflict: None,
     });
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(dedupe_index.clone()));
     program.emit_insn(Insn::OpenEphemeral {

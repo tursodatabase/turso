@@ -25,26 +25,29 @@ use super::{
     result_row::{emit_offset, emit_result_row_and_limit},
 };
 
-/// Returns true if the given function name has a known sort comparator
-/// implementation in the VDBE sorter. Functions not in this list will
-/// produce wrong ORDER BY results, so they should be treated as if the
-/// type has no `<` operator (sort on encoded blobs instead).
-fn has_known_sort_comparator(func_name: &str) -> bool {
-    matches!(
-        func_name,
-        "numeric_lt" | "test_uint_lt" | "string_reverse" | "array_lt"
-    )
+use crate::vdbe::insn::SortComparatorType;
+
+/// Maps a custom type `<` operator function name to a SortComparatorType.
+/// Returns None if the function name is not recognized.
+fn sort_comparator_from_func_name(func_name: &str) -> Option<SortComparatorType> {
+    match func_name {
+        "numeric_lt" => Some(SortComparatorType::NumericLt),
+        "test_uint_lt" => Some(SortComparatorType::TestUintLt),
+        "string_reverse" => Some(SortComparatorType::StringReverse),
+        "array_lt" => Some(SortComparatorType::ArrayLt),
+        _ => None,
+    }
 }
 
 /// For an ORDER BY expression that is a column reference to a custom type,
-/// returns the `<` operator function name if the type has one AND the function
-/// has a known sort comparator. Returns None otherwise, which causes the
-/// sorter to use encoded blob ordering instead of silently wrong results.
-pub(crate) fn custom_type_lt_func(
+/// returns the SortComparatorType if the type has a `<` operator with a known
+/// comparator. Returns None otherwise, which causes the sorter to use encoded
+/// blob ordering instead of silently wrong results.
+pub(crate) fn custom_type_comparator(
     expr: &ast::Expr,
     referenced_tables: &TableReferences,
     schema: &Schema,
-) -> Option<String> {
+) -> Option<SortComparatorType> {
     if let ast::Expr::Column {
         table: table_ref_id,
         column,
@@ -55,7 +58,7 @@ pub(crate) fn custom_type_lt_func(
         let col = table.get_column_at(*column)?;
         // Array columns use element-wise comparison
         if col.is_array() {
-            return Some("array_lt".to_string());
+            return Some(SortComparatorType::ArrayLt);
         }
         let type_def = schema.get_type_def(&col.ty_str, table.is_strict())?;
         type_def
@@ -63,10 +66,9 @@ pub(crate) fn custom_type_lt_func(
             .iter()
             .find(|op| op.op == "<")
             .and_then(|op| op.func_name.as_ref())
-            .filter(|func_name| has_known_sort_comparator(func_name))
-            .cloned()
+            .and_then(|func_name| sort_comparator_from_func_name(func_name))
     } else if super::expr::expr_is_array(expr, Some(referenced_tables)) {
-        Some("array_lt".to_string())
+        Some(SortComparatorType::ArrayLt)
     } else {
         None
     }
@@ -236,6 +238,7 @@ impl EmitOrderBy {
                 has_rowid: false,
                 where_clause: None,
                 index_method: None,
+                on_conflict: None,
             });
             program.alloc_cursor_id(CursorType::BTreeIndex(index))
         } else {
@@ -272,17 +275,17 @@ impl EmitOrderBy {
 
             // Resolve custom type comparators for ORDER BY columns.
             // For types with a `<` operator, the comparator is used for correct sort ordering.
-            let mut comparator_func_names: Vec<Option<String>> = order_by
+            let mut comparators: Vec<Option<SortComparatorType>> = order_by
                 .iter()
                 .map(|(expr, _)| {
-                    custom_type_lt_func(expr, referenced_tables, t_ctx.resolver.schema())
+                    custom_type_comparator(expr, referenced_tables, t_ctx.resolver.schema())
                 })
                 .collect();
 
             if has_sequence {
                 // sequence column: ascending with BINARY collation, no comparator
                 order_and_collations.push((SortOrder::Asc, Some(CollationSeq::default())));
-                comparator_func_names.push(None);
+                comparators.push(None);
             }
 
             let key_len = order_and_collations.len();
@@ -291,7 +294,7 @@ impl EmitOrderBy {
                 cursor_id: sort_cursor,
                 columns: key_len,
                 order_and_collations,
-                comparator_func_names,
+                comparators,
             });
         }
         Ok(())

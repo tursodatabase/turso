@@ -532,6 +532,22 @@ impl EncryptionContext {
         self.cipher_mode.metadata_size() as u8
     }
 
+    pub fn encrypt_chunk(&self, plaintext: &[u8], aad: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+        self.encrypt_raw_with_ad(plaintext, aad)
+    }
+
+    pub fn decrypt_chunk(&self, ciphertext: &[u8], nonce: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+        self.decrypt_raw_with_ad(ciphertext, nonce, aad)
+    }
+
+    pub fn nonce_size(&self) -> usize {
+        self.cipher_mode.nonce_size()
+    }
+
+    pub fn tag_size(&self) -> usize {
+        self.cipher_mode.tag_size()
+    }
+
     /// Creates Turso header for encrypted page 1
     fn create_turso_header(&self) -> [u8; TURSO_HEADER_SIZE] {
         let mut header = [0u8; TURSO_HEADER_SIZE];

@@ -729,8 +729,10 @@ mod tests {
         let mut expected = Vec::new();
         let mut rng = rand::rng();
         let mut i = 0;
+        const RANGE_MIN: i64 = -1000;
+        const RANGE_MAX: i64 = 1000;
         while i < 100 {
-            let val = rng.random_range(-1000..1000);
+            let val = rng.random_range(RANGE_MIN..RANGE_MAX);
             if expected.contains(&val) {
                 continue;
             }
@@ -744,7 +746,7 @@ mod tests {
         expected.sort();
 
         // Query all values and verify they come back in sorted order
-        let ret: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t");
+        let ret: Vec<(i64,)> = conn.exec_rows(&format!("SELECT x FROM t WHERE x >= {RANGE_MIN}"));
         let actual: Vec<i64> = ret.into_iter().map(|row| row.0).collect();
 
         assert_eq!(actual, expected, "Values not returned in sorted order");

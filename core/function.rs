@@ -309,6 +309,33 @@ pub enum AggFunc {
     External(Arc<ExtFunc>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumIter)]
+pub enum WindowFunc {
+    RowNumber,
+}
+
+impl WindowFunc {
+    pub fn arities(&self) -> &'static [i32] {
+        match self {
+            Self::RowNumber => &[0],
+        }
+    }
+}
+
+impl Deterministic for WindowFunc {
+    fn is_deterministic(&self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Display for WindowFunc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RowNumber => write!(f, "row_number"),
+        }
+    }
+}
+
 impl PartialEq for AggFunc {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -1037,6 +1064,7 @@ impl Display for AlterTableFunc {
 #[derive(Debug, Clone)]
 pub enum Func {
     Agg(AggFunc),
+    Window(WindowFunc),
     Scalar(ScalarFunc),
     Math(MathFunc),
     Vector(VectorFunc),
@@ -1052,6 +1080,7 @@ impl Display for Func {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Agg(agg_func) => write!(f, "{}", agg_func.as_str()),
+            Self::Window(window_func) => write!(f, "{window_func}"),
             Self::Scalar(scalar_func) => write!(f, "{scalar_func}"),
             Self::Math(math_func) => write!(f, "{math_func}"),
             Self::Vector(vector_func) => write!(f, "{vector_func}"),
@@ -1075,6 +1104,7 @@ impl Deterministic for Func {
     fn is_deterministic(&self) -> bool {
         match self {
             Self::Agg(agg_func) => agg_func.is_deterministic(),
+            Self::Window(window_func) => window_func.is_deterministic(),
             Self::Scalar(scalar_func) => scalar_func.is_deterministic(),
             Self::Math(math_func) => math_func.is_deterministic(),
             Self::Vector(vector_func) => vector_func.is_deterministic(),
@@ -1112,6 +1142,7 @@ impl Func {
             }
             // Aggregate functions with (*) syntax are handled separately in the planner
             Self::Agg(_) => false,
+            Self::Window(_) => false,
             _ => false,
         }
     }
@@ -1200,6 +1231,12 @@ impl Func {
                     crate::bail_parse_error!("wrong number of arguments to function {}()", name)
                 }
                 Ok(Self::Agg(AggFunc::Total))
+            }
+            "row_number" => {
+                if arg_count != 0 {
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+                Ok(Self::Window(WindowFunc::RowNumber))
             }
             "timediff" => {
                 if arg_count != 2 {
@@ -1438,6 +1475,11 @@ impl Func {
         // SQLite reports built-in aggregates as "w" (window-capable) since they
         // can all be used with OVER clauses.
         for f in AggFunc::iter() {
+            push(f.to_string(), "w", f.arities(), f.is_deterministic());
+        }
+
+        // Window functions.
+        for f in WindowFunc::iter() {
             push(f.to_string(), "w", f.arities(), f.is_deterministic());
         }
 

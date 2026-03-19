@@ -312,6 +312,8 @@ pub fn emit_columns_to_destination(
             program.emit_insn(Insn::Yield {
                 yield_reg: *yield_reg,
                 end_offset: BranchOffset::Offset(0),
+                subtype_clear_start_reg: start_reg,
+                subtype_clear_count: num_columns,
             });
         }
         QueryDestination::ExistsSubqueryResult { result_reg } => {

@@ -648,7 +648,7 @@ mod shuttle_tests {
     /// Creates a test for MemoryIO, and conditionally for PlatformIO and UringIO.
     macro_rules! shuttle_io_test {
         ($test_name:ident, $test_impl:ident) => {
-            paste::paste! {
+            pastey::paste! {
                 #[test]
                 fn [<shuttle_ $test_name _memory>]() {
                     shuttle::check_random(|| $test_impl(MemoryIOFactory::new()), 1000);

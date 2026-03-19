@@ -15,7 +15,10 @@ use crate::numeric::Numeric;
 use crate::types::{AsValueRef, Text, TextSubtype, Value, ValueType};
 use crate::{bail_constraint_error, bail_parse_error, LimboError, ValueRef};
 pub use cache::JsonCacheCell;
-use jsonb::{ElementType, Jsonb, JsonbHeader, PathOperationMode, SearchOperation, SetOperation};
+use jsonb::{
+    unescape_string, ElementType, Jsonb, JsonbHeader, PathOperationMode, SearchOperation,
+    SetOperation,
+};
 use std::borrow::Cow;
 use std::str::FromStr;
 
@@ -284,6 +287,10 @@ pub fn json_array_length(
     path: Option<&Value>,
     json_cache: &JsonCacheCell,
 ) -> crate::Result<Value> {
+    if let Value::Null = value {
+        return Ok(Value::Null);
+    }
+
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
     let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
 
@@ -597,7 +604,7 @@ pub fn json_string_to_db_type(
             if matches!(flag, OutputVariant::ElementType) {
                 json_string.remove(json_string.len() - 1);
                 json_string.remove(0);
-                Ok(Value::Text(Text::new(json_string)))
+                Ok(Value::Text(Text::new(unescape_string(&json_string))))
             } else {
                 Ok(Value::Text(Text::new(json_string)))
             }
@@ -1131,6 +1138,14 @@ mod tests {
         } else {
             panic!("Expected Value::Numeric(Numeric::Integer)");
         }
+    }
+
+    #[test]
+    fn test_json_array_length_null() {
+        let input = Value::Null;
+        let json_cache = JsonCacheCell::new();
+        let result = json_array_length(&input, None, &json_cache).unwrap();
+        assert_eq!(result, Value::Null);
     }
 
     #[test]

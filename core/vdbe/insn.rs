@@ -24,6 +24,16 @@ use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
 use turso_macros::Description;
 use turso_parser::ast::{ResolveType, SortOrder};
 
+/// Known custom type comparator functions for sorting and MIN/MAX aggregates.
+/// These replace heap-allocated String names with a compact enum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortComparatorType {
+    NumericLt,
+    StringReverse,
+    TestUintLt,
+    ArrayLt,
+}
+
 /// Flags provided to comparison instructions (e.g. Eq, Ne) which determine behavior related to NULL values.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CmpInsFlags(usize);
@@ -662,6 +672,9 @@ pub enum Insn {
         description: String,
         /// Override the program's resolve_type for error handling (used by RAISE).
         on_error: Option<ResolveType>,
+        /// If set, read the error description from this register instead of
+        /// the static `description` field (used by RAISE with expression messages).
+        description_reg: Option<usize>,
     },
 
     /// Halt the program if P3 is null.
@@ -894,8 +907,8 @@ pub enum Insn {
         col: usize,
         delimiter: usize,
         func: AggFunc,
-        /// Optional custom type comparator function name for MIN/MAX aggregates.
-        comparator_func_name: Option<String>,
+        /// Optional custom type comparator for MIN/MAX aggregates.
+        comparator: Option<SortComparatorType>,
     },
 
     AggFinal {
@@ -918,9 +931,9 @@ pub enum Insn {
         columns: usize,      // P2
         /// Combined order and collation per column (keeps Insn small, and order+collations are always the same length).
         order_and_collations: Vec<(SortOrder, Option<CollationSeq>)>,
-        /// Per-column custom type comparator function names for ORDER BY sorting.
+        /// Per-column custom type comparators for ORDER BY sorting.
         /// When present, the comparator is used instead of standard value comparison.
-        comparator_func_names: Vec<Option<String>>,
+        comparators: Vec<Option<SortComparatorType>>,
     },
 
     /// Insert a row into the sorter.
@@ -1013,6 +1026,13 @@ pub enum Insn {
     Yield {
         yield_reg: usize,
         end_offset: BranchOffset,
+        /// For coroutine body yields (end_offset == 0): the start register of the
+        /// output columns and how many there are.  op_yield uses these to strip
+        /// the JSON subtype so that it does not survive the subquery boundary,
+        /// mirroring SQLite's OP_Copy P5=0x0002 behaviour.
+        /// Set to 0/0 for parent-side (non-body) yields.
+        subtype_clear_start_reg: usize,
+        subtype_clear_count: usize,
     },
 
     Insert {
@@ -1539,6 +1559,12 @@ pub enum Insn {
         payload_dest_reg: Option<u16>,
         /// Number of payload columns expected
         num_payload: u16,
+        /// Register containing probe-side rowid for grace hash join buffering.
+        /// When Some and target partition is on disk, buffer the probe row
+        /// instead of loading the partition on demand.
+        /// When None, this instruction is running inside grace processing and
+        /// the build partition must already be loaded.
+        probe_rowid_reg: Option<u16>,
     },
 
     /// Advance to next matching row in hash table bucket.
@@ -1571,6 +1597,13 @@ pub enum Insn {
         hash_table_id: usize,
     },
 
+    /// Reset all matched_bits in a hash table to false.
+    /// Emitted at the start of each outer-loop iteration so that marks from
+    /// a previous probe pass don't suppress NULL-fill rows in the current one.
+    HashResetMatched {
+        hash_table_id: usize,
+    },
+
     /// Begin scanning unmatched entries in the hash table (for FULL OUTER JOIN).
     /// Writes the first unmatched entry's rowid to dest_reg and payload to payload_dest_reg.
     /// If no unmatched entries exist, jumps to target_pc.
@@ -1591,6 +1624,39 @@ pub enum Insn {
         target_pc: BranchOffset,
         payload_dest_reg: Option<usize>,
         num_payload: usize,
+    },
+
+    /// Initialize grace hash join processing after the probe cursor is exhausted.
+    /// Finalizes probe-side spills and calls grace_begin.
+    /// Jumps to target_pc if no spilling occurred or no partitions to process.
+    HashGraceInit {
+        hash_table_id: u16,
+        target_pc: BranchOffset,
+    },
+
+    /// Load the current grace partition's build side from disk.
+    /// Also loads the first probe chunk. Jumps to target_pc when all partitions done.
+    HashGraceLoadPartition {
+        hash_table_id: u16,
+        target_pc: BranchOffset,
+    },
+
+    /// Advance to next probe entry in the current grace partition.
+    /// Writes probe keys to key_start_reg..key_start_reg+num_keys-1 and probe rowid to probe_rowid_dest.
+    /// Jumps to target_pc when probe entries exhausted.
+    HashGraceNextProbe {
+        hash_table_id: u16,
+        key_start_reg: u16,
+        num_keys: u16,
+        probe_rowid_dest: u16,
+        target_pc: BranchOffset,
+    },
+
+    /// Evict current grace partition and advance to the next one.
+    /// Jumps to target_pc when all partitions are processed.
+    HashGraceAdvancePartition {
+        hash_table_id: u16,
+        target_pc: BranchOffset,
     },
 
     /// VACUUM INTO - create a compacted copy of the database at the specified path.
@@ -1822,8 +1888,13 @@ impl InsnVariants {
             InsnVariants::HashClose => execute::op_hash_close,
             InsnVariants::HashClear => execute::op_hash_clear,
             InsnVariants::HashMarkMatched => execute::op_hash_mark_matched,
+            InsnVariants::HashResetMatched => execute::op_hash_reset_matched,
             InsnVariants::HashScanUnmatched => execute::op_hash_scan_unmatched,
             InsnVariants::HashNextUnmatched => execute::op_hash_next_unmatched,
+            InsnVariants::HashGraceInit => execute::op_hash_grace_init,
+            InsnVariants::HashGraceLoadPartition => execute::op_hash_grace_load_partition,
+            InsnVariants::HashGraceNextProbe => execute::op_hash_grace_next_probe,
+            InsnVariants::HashGraceAdvancePartition => execute::op_hash_grace_advance_partition,
             InsnVariants::VacuumInto => execute::op_vacuum_into,
             InsnVariants::InitCdcVersion => execute::op_init_cdc_version,
         }

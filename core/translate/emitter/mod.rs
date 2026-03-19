@@ -1,3 +1,4 @@
+use crate::translate::collate::{get_expr_collation_ctx, CollationSeq};
 use crate::translate::emitter::delete::emit_program_for_delete;
 use crate::translate::emitter::select::emit_program_for_select;
 use crate::translate::emitter::update::emit_program_for_update;
@@ -20,8 +21,8 @@ use crate::function::Func;
 use crate::schema::{BTreeTable, CheckConstraint, Column, IndexColumn, Schema, Table};
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{
-    bind_and_rewrite_expr, rewrite_between_expr, translate_expr_no_constant_opt, walk_expr,
-    walk_expr_mut, BindingBehavior, NoConstantOptReason, WalkControl,
+    bind_and_rewrite_expr, translate_expr_no_constant_opt, walk_expr, walk_expr_mut,
+    BindingBehavior, NoConstantOptReason, WalkControl,
 };
 use crate::translate::plan::{JoinedTable, NonFromClauseSubquery, Plan, ResultSetColumn};
 use crate::translate::planner::TableMask;
@@ -83,16 +84,27 @@ fn init_exists_result_regs(
 // Would make more sense to not have RwLock for the attached databases and get all the schemas on prepare,
 // because there could be some data race where at 1 point you check the attached db, it has a table,
 // but after some write it could not be there anymore. However, leaving it as it is to avoid more complicated logic on something that is experimental
+#[derive(Debug, Clone)]
+pub struct CachedExprReg<'a> {
+    pub expr: Cow<'a, ast::Expr>,
+    pub reg: usize,
+    pub needs_decode: bool,
+    pub collation: CachedExprCollation,
+}
+
+pub type CachedExprCollation = Option<(CollationSeq, bool)>;
+pub type CachedExprRegHit = (usize, bool, CachedExprCollation);
+
 pub struct Resolver<'a> {
     schema: &'a Schema,
     database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
     attached_databases: &'a RwLock<DatabaseCatalog>,
     pub symbol_table: &'a SymbolTable,
     pub expr_to_reg_cache_enabled: bool,
-    /// Cache entries: (expression, register, needs_custom_type_decode).
+    /// Cache entries for previously translated expressions.
     /// The `needs_custom_type_decode` flag is true for hash-join payload registers
     /// that contain raw encoded values and need DECODE applied when read.
-    pub expr_to_reg_cache: Vec<(Cow<'a, ast::Expr>, usize, bool)>,
+    pub expr_to_reg_cache: Vec<CachedExprReg<'a>>,
     /// Maps register indices to column affinities for expression index evaluation.
     /// Populated temporarily during UPDATE new-image expression index key computation,
     /// where column references have been rewritten to Expr::Register and comparison
@@ -158,6 +170,20 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    pub fn fork_with_expr_cache(&self) -> Resolver<'a> {
+        Resolver {
+            schema: self.schema,
+            database_schemas: self.database_schemas,
+            attached_databases: self.attached_databases,
+            symbol_table: self.symbol_table,
+            expr_to_reg_cache_enabled: self.expr_to_reg_cache_enabled,
+            expr_to_reg_cache: self.expr_to_reg_cache.clone(),
+            register_affinities: self.register_affinities.clone(),
+            enable_custom_types: self.enable_custom_types,
+            trigger_context: self.trigger_context.clone(),
+        }
+    }
+
     pub fn require_custom_types(&self, feature: &str) -> crate::Result<()> {
         if !self.enable_custom_types {
             crate::bail_parse_error!("{} require --experimental-custom-types flag", feature);
@@ -187,18 +213,47 @@ impl<'a> Resolver<'a> {
         self.expr_to_reg_cache_enabled = true;
     }
 
-    /// Returns the register and decode flag for a previously translated expression.
+    pub fn cache_expr_reg(
+        &mut self,
+        expr: Cow<'a, ast::Expr>,
+        reg: usize,
+        needs_decode: bool,
+        collation: CachedExprCollation,
+    ) {
+        self.expr_to_reg_cache.push(CachedExprReg {
+            expr,
+            reg,
+            needs_decode,
+            collation,
+        });
+    }
+
+    /// Cache a scalar expression result together with the collation metadata that
+    /// standalone expression translation would have propagated to a parent comparison.
+    pub fn cache_scalar_expr_reg(
+        &mut self,
+        expr: Cow<'a, ast::Expr>,
+        reg: usize,
+        needs_decode: bool,
+        referenced_tables: &TableReferences,
+    ) -> Result<()> {
+        let collation = get_expr_collation_ctx(expr.as_ref(), referenced_tables)?;
+        self.cache_expr_reg(expr, reg, needs_decode, collation);
+        Ok(())
+    }
+
+    /// Returns the register, decode flag, and collation metadata for a previously translated expression.
     ///
     /// We scan from newest to oldest so later translations win when equivalent
     /// expressions are seen multiple times in the same translation pass.
-    /// Returns `(register, needs_custom_type_decode)`.
-    pub fn resolve_cached_expr_reg(&self, expr: &ast::Expr) -> Option<(usize, bool)> {
+    /// Returns `(register, needs_custom_type_decode, collation_ctx)`.
+    pub fn resolve_cached_expr_reg(&self, expr: &ast::Expr) -> Option<CachedExprRegHit> {
         if self.expr_to_reg_cache_enabled {
             self.expr_to_reg_cache
                 .iter()
                 .rev()
-                .find(|(e, _, _)| exprs_are_equivalent(expr, e))
-                .map(|(_, reg, needs_decode)| (*reg, *needs_decode))
+                .find(|entry| exprs_are_equivalent(expr, &entry.expr))
+                .map(|entry| (entry.reg, entry.needs_decode, entry.collation))
         } else {
             None
         }
@@ -377,17 +432,44 @@ impl LimitCtx {
         }
     }
 }
+
+#[derive(Clone, Debug)]
+pub(crate) struct HashLabels {
+    /// Label for hash join match processing (points to just after HashProbe instruction)
+    /// Used by HashNext to jump back to process additional matches without re-probing
+    pub match_found: BranchOffset,
+    /// Label for advancing to the next hash match (points to HashNext instruction).
+    /// When conditions fail within a hash join, they should jump here to try the next
+    /// hash match, rather than jumping to the outer loop's next label.
+    pub next: BranchOffset,
+    /// Jump target for unmatched probe rows (outer joins only).
+    pub check_outer: Option<BranchOffset>,
+    /// Entry label for the inner-loop subroutine.
+    pub inner_loop_gosub: Option<BranchOffset>,
+    /// Label that skips past the subroutine body (resolved after Return).
+    pub inner_loop_skip: Option<BranchOffset>,
+    /// Label for the grace loop's own HashNext (resolved during grace loop emission).
+    pub grace_hash_next: Option<BranchOffset>,
+}
+
+impl HashLabels {
+    pub fn new(match_found: BranchOffset, next: BranchOffset) -> Self {
+        Self {
+            match_found,
+            next,
+            check_outer: None,
+            inner_loop_gosub: None,
+            inner_loop_skip: None,
+            grace_hash_next: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HashCtx {
     pub match_reg: usize,
     pub hash_table_reg: usize,
-    /// Label for hash join match processing (points to just after HashProbe instruction)
-    /// Used by HashNext to jump back to process additional matches without re-probing
-    pub match_found_label: BranchOffset,
-    /// Label for advancing to the next hash match (points to HashNext instruction).
-    /// When conditions fail within a hash join, they should jump here to try the next
-    /// hash match, rather than jumping to the outer loop's next label.
-    pub hash_next_label: BranchOffset,
+    pub labels: HashLabels,
     /// Starting register where payload columns are stored after HashProbe/HashNext.
     /// None if payload optimization is not used for this hash join.
     pub payload_start_reg: Option<usize>,
@@ -396,18 +478,21 @@ pub struct HashCtx {
     /// These references may point at multiple tables when a build input was
     /// materialized from a join prefix.
     pub payload_columns: Vec<MaterializedColumnRef>,
-    /// Jump target for unmatched probe rows (outer joins only).
-    pub check_outer_label: Option<BranchOffset>,
     /// Build table cursor (for NullRow in outer joins).
     pub build_cursor_id: Option<CursorID>,
     pub join_type: HashJoinType,
     /// Gosub register for the inner-loop subroutine wrapping subsequent tables.
     /// Outer hash joins wrap inner loops so unmatched-row paths can re-enter via Gosub.
     pub inner_loop_gosub_reg: Option<usize>,
-    /// Entry label for the inner-loop subroutine.
-    pub inner_loop_gosub_label: Option<BranchOffset>,
-    /// Label that skips past the subroutine body (resolved after Return).
-    pub inner_loop_skip_label: Option<BranchOffset>,
+    /// Probe-side rowid register for grace hash join (from RowId before HashProbe).
+    pub probe_rowid_reg: Option<usize>,
+    /// Starting register for probe key values.
+    pub key_start_reg: usize,
+    /// Number of join keys.
+    pub num_keys: usize,
+    /// Register: 0 during main probe loop, 1 during grace loop.
+    /// Used by IfPos dispatch before HashNext to route to the grace loop's HashNext.
+    pub grace_flag_reg: Option<usize>,
 }
 
 /// The TranslateCtx struct holds various information and labels used during bytecode generation.
@@ -459,6 +544,11 @@ pub struct TranslateCtx<'a> {
     /// - First: all `GROUP BY` expressions, in the order they appear in the `GROUP BY` clause.
     /// - Then: remaining non-aggregate expressions that are not part of `GROUP BY`.
     pub non_aggregate_expressions: Vec<(&'a Expr, bool)>,
+    /// Unique leaf column expressions extracted from aggregate function arguments.
+    /// Only populated when GROUP BY uses a sorter, enabling deferred expression
+    /// evaluation: the sorter stores raw columns instead of pre-computed expressions,
+    /// and full expressions are re-evaluated from the pseudo cursor during aggregation.
+    pub agg_leaf_columns: Vec<Expr>,
     /// Cursor id for cdc table (if capture_data_changes PRAGMA is set and query can modify the data)
     pub cdc_cursor_id: Option<usize>,
     pub meta_window: Option<WindowMetadata<'a>>,
@@ -499,6 +589,7 @@ impl<'a> TranslateCtx<'a> {
             materialized_build_inputs: HashMap::default(),
             resolver,
             non_aggregate_expressions: Vec::new(),
+            agg_leaf_columns: Vec::new(),
             cdc_cursor_id: None,
             meta_window: None,
             meta_in_seeks: (0..table_count).map(|_| None).collect(),
@@ -1197,7 +1288,6 @@ fn rewrite_where_for_update_registers(
     columns_start_reg: usize,
     rowid_reg: usize,
 ) -> Result<WalkControl> {
-    rewrite_between_expr(expr);
     walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
         match e {
             Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
@@ -1348,7 +1438,6 @@ fn emit_check_constraint_bytecode(
         let expr_result_reg = program.alloc_register();
 
         let mut rewritten_expr = check_constraint.expr.clone();
-        rewrite_between_expr(&mut rewritten_expr);
         if let Some(referenced_tables) = referenced_tables {
             let mut binding_tables = referenced_tables.clone();
             if let Some(joined_table) = binding_tables.joined_tables_mut().first_mut() {
@@ -1410,6 +1499,7 @@ fn emit_check_constraint_bytecode(
                     err_code: SQLITE_CONSTRAINT_CHECK,
                     description: constraint_name.to_string(),
                     on_error: None,
+                    description_reg: None,
                 });
             }
         }
@@ -1450,49 +1540,51 @@ pub(crate) fn emit_check_constraints<'a>(
 
     let column_mappings: Vec<(&str, usize)> = column_mappings.collect();
     let initial_cache_size = resolver.expr_to_reg_cache.len();
+    let joined_table = referenced_tables.and_then(|tables| tables.joined_tables().first());
 
     // Map rowid aliases to the actual rowid register.
     // We cache both unqualified (Expr::Id) and qualified (Expr::Qualified) forms
     // so that CHECK expressions like `CHECK(rowid > 0)` and `CHECK(t.rowid > 0)` both resolve.
     for rowid_name in ROWID_STRS {
         let rowid_expr = ast::Expr::Id(ast::Name::exact(rowid_name.to_string()));
-        resolver
-            .expr_to_reg_cache
-            .push((Cow::Owned(rowid_expr), rowid_reg, false));
+        resolver.cache_expr_reg(Cow::Owned(rowid_expr), rowid_reg, false, None);
         let qualified_expr = ast::Expr::Qualified(
             ast::Name::exact(table_name.to_string()),
             ast::Name::exact(rowid_name.to_string()),
         );
-        resolver
-            .expr_to_reg_cache
-            .push((Cow::Owned(qualified_expr), rowid_reg, false));
+        resolver.cache_expr_reg(Cow::Owned(qualified_expr), rowid_reg, false, None);
     }
 
     // Map each column to its register (both unqualified and qualified forms).
     for (col_name, register) in column_mappings.iter().copied() {
+        let collation = joined_table
+            .and_then(|table| {
+                table.columns().iter().find(|col| {
+                    col.name
+                        .as_ref()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(col_name))
+                })
+            })
+            .map(|col| (col.collation(), false));
         let column_expr = ast::Expr::Id(ast::Name::exact(col_name.to_string()));
-        resolver
-            .expr_to_reg_cache
-            .push((Cow::Owned(column_expr), register, false));
+        resolver.cache_expr_reg(Cow::Owned(column_expr), register, false, collation);
         let qualified_expr = ast::Expr::Qualified(
             ast::Name::exact(table_name.to_string()),
             ast::Name::exact(col_name.to_string()),
         );
-        resolver
-            .expr_to_reg_cache
-            .push((Cow::Owned(qualified_expr), register, false));
+        resolver.cache_expr_reg(Cow::Owned(qualified_expr), register, false, collation);
     }
 
-    if let Some(joined_table) = referenced_tables.and_then(|tables| tables.joined_tables().first())
-    {
-        resolver.expr_to_reg_cache.push((
+    if let Some(joined_table) = joined_table {
+        resolver.cache_expr_reg(
             Cow::Owned(ast::Expr::RowId {
                 database: None,
                 table: joined_table.internal_id,
             }),
             rowid_reg,
             false,
-        ));
+            None,
+        );
 
         for (col_name, register) in column_mappings.iter().copied() {
             if let Some((idx, col)) = joined_table.columns().iter().enumerate().find(|(_, c)| {
@@ -1500,7 +1592,7 @@ pub(crate) fn emit_check_constraints<'a>(
                     .as_ref()
                     .is_some_and(|n| n.eq_ignore_ascii_case(col_name))
             }) {
-                resolver.expr_to_reg_cache.push((
+                resolver.cache_expr_reg(
                     Cow::Owned(ast::Expr::Column {
                         database: None,
                         table: joined_table.internal_id,
@@ -1509,7 +1601,8 @@ pub(crate) fn emit_check_constraints<'a>(
                     }),
                     register,
                     false,
-                ));
+                    Some((col.collation(), false)),
+                );
             }
         }
     }

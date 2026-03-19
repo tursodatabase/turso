@@ -14,11 +14,11 @@ use crate::{
         order_by::EmitOrderBy,
         plan::{
             Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinOrderMember, Operation,
-            QueryDestination, Scan, Search, SeekKeyComponent, SelectPlan,
+            QueryDestination, Scan, Search, SeekKeyComponent, SelectPlan, SimpleAggregate,
         },
         planner::table_mask_from_expr,
         select::emit_simple_count,
-        subquery::{emit_from_clause_subqueries, emit_non_from_clause_subquery},
+        subquery::{emit_from_clause_subqueries, emit_non_from_clause_subqueries_for_eval_at},
         values::emit_values,
         window::{emit_window_results, EmitWindow},
         ProgramBuilder, Resolver,
@@ -34,10 +34,18 @@ use turso_parser::ast::Expr;
 pub fn emit_program_for_select(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
+    plan: SelectPlan,
+) -> Result<()> {
+    emit_program_for_select_with_resolver(program, resolver.fork(), plan)
+}
+
+pub fn emit_program_for_select_with_resolver(
+    program: &mut ProgramBuilder,
+    resolver: Resolver,
     mut plan: SelectPlan,
 ) -> Result<()> {
-    let materialized_build_inputs = emit_materialized_build_inputs(program, resolver, &mut plan)?;
-    emit_program_for_select_with_inputs(program, resolver, plan, materialized_build_inputs)
+    let materialized_build_inputs = emit_materialized_build_inputs(program, &resolver, &mut plan)?;
+    emit_program_for_select_with_inputs(program, &resolver, plan, materialized_build_inputs)
 }
 
 fn emit_program_for_select_with_inputs(
@@ -46,26 +54,20 @@ fn emit_program_for_select_with_inputs(
     mut plan: SelectPlan,
     materialized_build_inputs: HashMap<usize, MaterializedBuildInput>,
 ) -> Result<()> {
-    let mut t_ctx = TranslateCtx::new(
-        program,
-        resolver.fork(),
-        plan.table_references.joined_tables().len(),
-        false,
-    );
-    t_ctx.materialized_build_inputs = materialized_build_inputs;
-
-    // Emit main parts of query
-    let result_cols_start = emit_query(program, &mut plan, &mut t_ctx)?;
-    // TODO: This solution works but it's just a hack/quick fix.
-    // Ideally we should do some refactor on how we scope queries, subqueries, and registers so that we don't have to do these ad-hoc/unintuitive adjustments.
-
-    // Restore reg_result_cols_start after emit_query, because nested subqueries
-    // (e.g. correlated scalar subqueries in WHERE) can overwrite
-    // program.reg_result_cols_start with their own result column registers.
-    program.reg_result_cols_start = Some(result_cols_start);
+    let result_cols_start = program.with_scoped_result_cols_start(|program| {
+        let mut t_ctx = TranslateCtx::new(
+            program,
+            resolver.fork_with_expr_cache(),
+            plan.table_references.joined_tables().len(),
+            false,
+        );
+        t_ctx.materialized_build_inputs = materialized_build_inputs;
+        emit_query(program, &mut plan, &mut t_ctx)
+    })?;
 
     program.result_columns = plan.result_columns;
     program.table_references.extend(plan.table_references);
+    program.reg_result_cols_start = Some(result_cols_start);
     Ok(())
 }
 
@@ -80,25 +82,15 @@ pub fn emit_query<'a>(
 
     // Evaluate uncorrelated subqueries as early as possible, because even LIMIT can reference a subquery.
     // This must happen before VALUES emission since VALUES expressions may contain scalar subqueries.
-    for subquery in plan
-        .non_from_clause_subqueries
-        .iter_mut()
-        .filter(|s| !s.has_been_evaluated())
-    {
-        let eval_at = subquery.get_eval_at(&plan.join_order, Some(&plan.table_references))?;
-        if eval_at != EvalAt::BeforeLoop {
-            continue;
-        }
-        let plan = subquery.consume_plan(EvalAt::BeforeLoop);
-
-        emit_non_from_clause_subquery(
-            program,
-            &t_ctx.resolver,
-            *plan,
-            &subquery.query_type,
-            subquery.correlated,
-        )?;
-    }
+    emit_non_from_clause_subqueries_for_eval_at(
+        program,
+        &t_ctx.resolver,
+        &mut plan.non_from_clause_subqueries,
+        &plan.join_order,
+        Some(&plan.table_references),
+        EvalAt::BeforeLoop,
+        |_| true,
+    )?;
 
     // Handle VALUES clause - emit values after subqueries are prepared
     if !plan.values.is_empty() {
@@ -226,7 +218,9 @@ pub fn emit_query<'a>(
         &mut plan.non_from_clause_subqueries,
     )?;
 
-    if plan.is_simple_count() && emit_simple_count(program, t_ctx, plan)? {
+    if matches!(plan.simple_aggregate, Some(SimpleAggregate::Count))
+        && emit_simple_count(program, t_ctx, plan)?
+    {
         // Keep LIMIT's early-exit jump target valid even on the simple_count fast path.
         // init_limit may emit an IfNot to after_main_loop_label (e.g. scalar subquery injects LIMIT 1).
         // Without resolving this label before the early return, bytecode assembly fails
@@ -262,8 +256,9 @@ pub fn emit_query<'a>(
 
     program.preassign_label_to_next_insn(after_main_loop_label);
 
-    let order_by_necessary = !plan.order_by.is_empty() && !plan.contains_constant_false_condition;
-    let order_by = &plan.order_by;
+    let has_order_by = !plan.order_by.is_empty();
+    let order_by_necessary = has_order_by && !plan.contains_constant_false_condition;
+    let mut grouped_output_subqueries = plan.non_from_clause_subqueries.clone();
 
     // Handle GROUP BY and aggregation processing
     if has_group_by_exprs {
@@ -275,7 +270,7 @@ pub fn emit_query<'a>(
         if matches!(row_source, GroupByRowSource::Sorter { .. }) {
             group_by_agg_phase(program, t_ctx, plan)?;
         }
-        group_by_emit_row_phase(program, t_ctx, plan)?;
+        group_by_emit_row_phase(program, t_ctx, plan, &mut grouped_output_subqueries)?;
     } else if !plan.aggregates.is_empty() {
         // Handle aggregation without GROUP BY (or HAVING without GROUP BY)
         emit_ungrouped_aggregation(program, t_ctx, plan)?;
@@ -284,7 +279,7 @@ pub fn emit_query<'a>(
     }
 
     // Process ORDER BY results if needed
-    if !order_by.is_empty() && order_by_necessary {
+    if has_order_by && order_by_necessary {
         EmitOrderBy::emit(program, t_ctx, plan)?;
     }
 
@@ -463,6 +458,7 @@ fn emit_materialized_build_inputs(
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
+            rowid_alias_conflict_clause: None,
         });
         let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ephemeral_table.clone()));
 
@@ -979,7 +975,9 @@ fn build_materialized_build_input_plan(
         values: vec![],
         window: None,
         non_from_clause_subqueries: plan.non_from_clause_subqueries.clone(),
+        input_cardinality_hint: None,
         estimated_output_rows: None,
+        simple_aggregate: None,
     };
 
     prune_join_order_for_materialized_inputs(&mut materialize_plan, materialized_build_inputs)?;

@@ -2,7 +2,7 @@ use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::translate::ProgramBuilder;
 use crate::translate::ProgramBuilderOpts;
-use crate::util::normalize_ident;
+use crate::util::{escape_sql_string_literal, normalize_ident};
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{Cookie, Insn};
 use crate::{bail_parse_error, Result};
@@ -31,7 +31,7 @@ pub(crate) fn create_trigger_to_sql(
         sql.push_str(" IF NOT EXISTS");
     }
     sql.push(' ');
-    sql.push_str(trigger_name.name.as_str());
+    sql.push_str(&trigger_name.name.as_ident());
     sql.push(' ');
 
     if let Some(t) = time {
@@ -52,13 +52,13 @@ pub(crate) fn create_trigger_to_sql(
                 if i > 0 {
                     sql.push_str(", ");
                 }
-                sql.push_str(col.as_str());
+                sql.push_str(&col.as_ident());
             }
         }
     }
 
     sql.push_str(" ON ");
-    sql.push_str(tbl_name.name.as_str());
+    sql.push_str(&tbl_name.name.as_ident());
     if for_each_row {
         sql.push_str(" FOR EACH ROW");
     }
@@ -117,8 +117,7 @@ pub fn translate_create_trigger(
 
     // Check if trigger already exists
     if resolver.with_schema(database_id, |s| {
-        s.get_trigger_for_table(&normalized_table_name, &normalized_trigger_name)
-            .is_some()
+        s.get_trigger(&normalized_trigger_name).is_some()
     }) {
         if if_not_exists {
             return Ok(());
@@ -185,9 +184,10 @@ pub fn translate_create_trigger(
     });
 
     // Parse schema to load the new trigger
+    let escaped_trigger_name = escape_sql_string_literal(&normalized_trigger_name);
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
-        where_clause: Some(format!("name = '{normalized_trigger_name}'")),
+        where_clause: Some(format!("name = '{escaped_trigger_name}'")),
     });
 
     Ok(())

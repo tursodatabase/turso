@@ -843,7 +843,8 @@ pub enum CommitState<Clock: LogicalClock> {
     Commit {
         end_ts: u64,
     },
-    /// Wait for unresolved commit dependencies before postprocessing.
+    /// Wait for unresolved commit dependencies before building the durable
+    /// committed view for the logical log.
     /// Hekaton Section 3.2: "If T passes validation, it must wait for outstanding
     /// commit dependencies to be resolved."
     WaitForDependencies {
@@ -1116,9 +1117,47 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                 continue;
             }
 
-            // Skip non-tombstone deleted versions, we check these at `delete` via atomic update of `end` field.
-            if version.end.is_some() {
-                continue;
+            match version.end {
+                Some(TxTimestampOrID::Timestamp(end_ts)) => {
+                    // Committed deletion. If end_ts > our begin_ts, the conflict
+                    // would have been already caught earlier when we iterate through
+                    // the row versions in reverse. If end_ts < our
+                    // begin_ts, the deletion predates our snapshot — no conflict.
+                    turso_assert!(
+                        end_ts < tx.begin_ts,
+                        "row version's end_ts cannot be greater than txns begin_ts"
+                    );
+                    continue;
+                }
+                Some(TxTimestampOrID::TxID(end_tx_id)) => {
+                    // Deletion not yet finalized; the deleting transaction may still be in Preparing.
+                    if end_tx_id == self.tx_id {
+                        // We deleted this version ourselves, so it cannot conflict with our commit.
+                        continue;
+                    }
+
+                    match lookup_tx_state(
+                        &mvcc_store.txs,
+                        &mvcc_store.finalized_tx_states,
+                        end_tx_id,
+                    ) {
+                        Some(TransactionState::Committed(committed_end_ts)) => {
+                            turso_assert!(committed_end_ts != tx.begin_ts, "committed end_ts and begin_ts cannot be equal: txn timestamps are strictly monotonic");
+                            if committed_end_ts > tx.begin_ts {
+                                return Err(LimboError::WriteWriteConflict);
+                            }
+                            continue;
+                        }
+                        _ => {
+                            // Deleting tx is Active, Preparing, Aborted, or gone.
+                            // The deletion may not stick, so this version may still be live.
+                            // Fall through to check begin for conflicts.
+                        }
+                    }
+                }
+                None => {
+                    // No end — version is live. Fall through to check begin.
+                }
             }
 
             match version.begin {
@@ -1178,6 +1217,161 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             }
         }
         Ok(())
+    }
+
+    /// Build the committed image for the logical log without mutating the
+    /// live MVCC version chains, which must stay TxID-backed until CommitEnd.
+    fn build_committed_log_record(
+        &mut self,
+        mvcc_store: &Arc<MvStore<Clock>>,
+        tx: &Transaction,
+        end_ts: u64,
+    ) -> LogRecord {
+        let mut log_record = LogRecord::new(end_ts);
+        if tx.header_dirty.load(Ordering::Acquire) {
+            // Persist the transaction-local header snapshot in the same logical-log frame.
+            log_record.header = Some(*tx.header.read());
+        }
+
+        for id in &self.write_set {
+            if let Some(row_versions) = mvcc_store.rows.get(id) {
+                let row_versions = row_versions.value().read();
+                for row_version in row_versions.iter() {
+                    let mut committed_version = row_version.clone();
+                    let mut changed = false;
+                    if let Some(TxTimestampOrID::TxID(id)) = committed_version.begin {
+                        if id == self.tx_id {
+                            // New version is valid STARTING FROM the committing
+                            // transaction's end timestamp. See Hekaton page 299.
+                            committed_version.begin = Some(TxTimestampOrID::Timestamp(end_ts));
+                            changed = true;
+                            if committed_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                                self.did_commit_schema_change = true;
+                            }
+                        }
+                    }
+                    if let Some(TxTimestampOrID::TxID(id)) = committed_version.end {
+                        if id == self.tx_id {
+                            // Old version is valid UNTIL the committing
+                            // transaction's end timestamp. See Hekaton page 299.
+                            committed_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
+                            changed = true;
+                            if committed_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                                self.did_commit_schema_change = true;
+                            }
+                        }
+                    }
+                    if changed {
+                        mvcc_store
+                            .insert_version_raw(&mut log_record.row_versions, committed_version);
+                    }
+                }
+            }
+
+            if let Some(index) = mvcc_store.index_rows.get(&id.table_id) {
+                let index = index.value();
+                let RowKey::Record(ref index_key) = id.row_id else {
+                    panic!("Index writes must have a record key");
+                };
+                if let Some(row_versions) = index.get(index_key) {
+                    let row_versions = row_versions.value().read();
+                    for row_version in row_versions.iter() {
+                        let mut committed_version = row_version.clone();
+                        let mut changed = false;
+                        if let Some(TxTimestampOrID::TxID(id)) = committed_version.begin {
+                            if id == self.tx_id {
+                                // New version is valid STARTING FROM the committing
+                                // transaction's end timestamp. See Hekaton page 299.
+                                committed_version.begin = Some(TxTimestampOrID::Timestamp(end_ts));
+                                changed = true;
+                            }
+                        }
+                        if let Some(TxTimestampOrID::TxID(id)) = committed_version.end {
+                            if id == self.tx_id {
+                                // Old version is valid UNTIL the committing
+                                // transaction's end timestamp. See Hekaton page 299.
+                                committed_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
+                                changed = true;
+                            }
+                        }
+                        if changed {
+                            mvcc_store.insert_version_raw(
+                                &mut log_record.row_versions,
+                                committed_version,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        log_record
+    }
+
+    /// Publish committed timestamps into the live MVCC chains after the
+    /// transaction has been finalized as Committed(end_ts).
+    /// This must run as postprocessing step i.e. the txn is written to log and is durable
+    fn rewrite_live_versions_to_timestamps(&self, mvcc_store: &Arc<MvStore<Clock>>, end_ts: u64) {
+        let tx_state = mvcc_store
+            .txs
+            .get(&self.tx_id)
+            .map(|entry| entry.value().state.load());
+        turso_assert!(
+            matches!(tx_state, Some(TransactionState::Committed(ts)) if ts == end_ts),
+            "rewrite_live_versions_to_timestamps requires a committed transaction state"
+        );
+
+        for id in &self.write_set {
+            if let Some(row_versions) = mvcc_store.rows.get(id) {
+                let mut row_versions = row_versions.value().write();
+                for row_version in row_versions.iter_mut() {
+                    if let Some(TxTimestampOrID::TxID(id)) = row_version.begin {
+                        if id == self.tx_id {
+                            // Publish the committed begin timestamp into the live
+                            // version chain only after CommitEnd has decided the
+                            // transaction's fate.
+                            row_version.begin = Some(TxTimestampOrID::Timestamp(end_ts));
+                        }
+                    }
+                    if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
+                        if id == self.tx_id {
+                            // Publish the committed end timestamp into the live
+                            // version chain only after CommitEnd has decided the
+                            // transaction's fate.
+                            row_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
+                        }
+                    }
+                }
+            }
+
+            if let Some(index) = mvcc_store.index_rows.get(&id.table_id) {
+                let index = index.value();
+                let RowKey::Record(ref index_key) = id.row_id else {
+                    panic!("Index writes must have a record key");
+                };
+                if let Some(row_versions) = index.get(index_key) {
+                    let mut row_versions = row_versions.value().write();
+                    for row_version in row_versions.iter_mut() {
+                        if let Some(TxTimestampOrID::TxID(id)) = row_version.begin {
+                            if id == self.tx_id {
+                                // Publish the committed begin timestamp into the live
+                                // version chain only after CommitEnd has decided the
+                                // transaction's fate.
+                                row_version.begin = Some(TxTimestampOrID::Timestamp(end_ts));
+                            }
+                        }
+                        if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
+                            if id == self.tx_id {
+                                // Publish the committed end timestamp into the live
+                                // version chain only after CommitEnd has decided the
+                                // transaction's fate.
+                                row_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1397,15 +1591,15 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     }
                 }
 
-                // Validation passed. Wait for commit dependencies before postprocessing.
-                // Hekaton Section 3.2: validation → wait for deps → logging.
-                // Placing the wait BEFORE timestamp updates is critical: if AbortNow is
-                // detected, we haven't converted any TxID→Timestamp yet, so rollback_tx
-                // works correctly (it matches on TxID(self.tx_id)).
+                // Validation passed. Wait for commit dependencies before building
+                // the durable commit record. The live row versions must stay on
+                // TxID references until CommitEnd so an abandoned commit can
+                // still be rolled back by matching on TxID(self.tx_id).
                 self.state = CommitState::WaitForDependencies { end_ts: *end_ts };
                 return Ok(TransitionResult::Continue);
             }
             CommitState::WaitForDependencies { end_ts } => {
+                let end_ts = *end_ts;
                 let tx = mvcc_store
                     .txs
                     .get(&self.tx_id)
@@ -1445,7 +1639,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         tx.commit_dep_set.lock().is_empty(),
                         "MVCC read-only transaction should not have other transactions depending on it"
                     );
-                    tx.state.store(TransactionState::Committed(*end_ts));
+                    tx.state.store(TransactionState::Committed(end_ts));
                     if mvcc_store.is_exclusive_tx(&self.tx_id) {
                         mvcc_store.release_exclusive_tx(&self.tx_id);
                         self.commit_coordinator.pager_commit_lock.unlock();
@@ -1455,97 +1649,21 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     return Ok(TransitionResult::Done(()));
                 }
 
-                // All dependencies resolved — proceed with timestamp updates
-                // (Hekaton Section 3.3: Postprocessing).
-                let mut log_record = LogRecord::new(*end_ts);
-                if tx.header_dirty.load(Ordering::Acquire) {
-                    // Persist the transaction-local header snapshot in the same logical-log frame.
-                    log_record.header = Some(*tx.header.read());
-                }
-                for id in &self.write_set {
-                    if let Some(row_versions) = mvcc_store.rows.get(id) {
-                        let mut row_versions = row_versions.value().write();
-                        for row_version in row_versions.iter_mut() {
-                            if let Some(TxTimestampOrID::TxID(id)) = row_version.begin {
-                                if id == self.tx_id {
-                                    // New version is valid STARTING FROM committing transaction's end timestamp
-                                    // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-                                    row_version.begin = Some(TxTimestampOrID::Timestamp(*end_ts));
-                                    mvcc_store.insert_version_raw(
-                                        &mut log_record.row_versions,
-                                        row_version.clone(),
-                                    ); // FIXME: optimize cloning out
-
-                                    if row_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                                        self.did_commit_schema_change = true;
-                                    }
-                                }
-                            }
-                            if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
-                                if id == self.tx_id {
-                                    // Old version is valid UNTIL committing transaction's end timestamp
-                                    // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-                                    row_version.end = Some(TxTimestampOrID::Timestamp(*end_ts));
-                                    mvcc_store.insert_version_raw(
-                                        &mut log_record.row_versions,
-                                        row_version.clone(),
-                                    ); // FIXME: optimize cloning out
-
-                                    if row_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                                        self.did_commit_schema_change = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if let Some(index) = mvcc_store.index_rows.get(&id.table_id) {
-                        let index = index.value();
-                        let RowKey::Record(ref index_key) = id.row_id else {
-                            panic!("Index writes must have a record key");
-                        };
-                        if let Some(row_versions) = index.get(index_key) {
-                            let mut row_versions = row_versions.value().write();
-                            for row_version in row_versions.iter_mut() {
-                                if let Some(TxTimestampOrID::TxID(id)) = row_version.begin {
-                                    if id == self.tx_id {
-                                        // New version is valid STARTING FROM committing transaction's end timestamp
-                                        // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-                                        row_version.begin =
-                                            Some(TxTimestampOrID::Timestamp(*end_ts));
-                                        mvcc_store.insert_version_raw(
-                                            &mut log_record.row_versions,
-                                            row_version.clone(),
-                                        ); // FIXME: optimize cloning out
-                                    }
-                                }
-                                if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
-                                    if id == self.tx_id {
-                                        // Old version is valid UNTIL committing transaction's end timestamp
-                                        // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-                                        row_version.end = Some(TxTimestampOrID::Timestamp(*end_ts));
-                                        mvcc_store.insert_version_raw(
-                                            &mut log_record.row_versions,
-                                            row_version.clone(),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                tracing::trace!("updated(tx_id={})", self.tx_id);
+                // All dependencies resolved. Build the committed image for the
+                // logical log, but keep live row versions on TxID references
+                // until CommitEnd so rollback of an abandoned commit can still
+                // match them.
+                let log_record = self.build_committed_log_record(mvcc_store, tx, end_ts);
+                tracing::trace!("prepared_log_record(tx_id={})", self.tx_id);
 
                 if log_record.row_versions.is_empty() && log_record.header.is_none() {
                     // Nothing to do, just end commit.
                     if mvcc_store.is_exclusive_tx(&self.tx_id) {
                         mvcc_store.unlock_commit_lock_if_held(tx);
                     }
-                    self.state = CommitState::CommitEnd { end_ts: *end_ts };
+                    self.state = CommitState::CommitEnd { end_ts };
                 } else {
-                    self.state = CommitState::BeginCommitLogicalLog {
-                        end_ts: *end_ts,
-                        log_record,
-                    };
+                    self.state = CommitState::BeginCommitLogicalLog { end_ts, log_record };
                 }
                 return Ok(TransitionResult::Continue);
             }
@@ -1566,7 +1684,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         .pager_commit_lock_held
                         .store(true, Ordering::Release);
                 }
-                let (c, append_bytes) = mvcc_store.storage.log_tx(log_record)?;
+                let (c, append_bytes) = mvcc_store.storage.log_tx(log_record, None)?;
                 self.pending_log_append_bytes = Some(append_bytes);
                 self.state = CommitState::SyncLogicalLog { end_ts: *end_ts };
                 // if Completion Completed without errors we can continue
@@ -1614,15 +1732,21 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
             CommitState::CommitEnd { end_ts } => {
                 // Order of operations matters here:
                 // 1. Advance logical log writer offset (makes the written bytes "owned")
-                // 2. Mark transaction Committed (publishes versions to readers)
-                // 3. Release commit lock (allows next committer)
-                // 4. Update cached global header
+                // 2. Mark transaction Committed
+                // 3. Rewrite live row versions from TxID to Timestamp
+                // 4. Notify dependents
+                // 5. Release commit lock (allows next committer)
+                // 6. Update cached global header
                 //
-                // (1) must precede (3): the commit lock serializes log writes, and
+                // (1) must precede (5): the commit lock serializes log writes, and
                 // log_tx() writes at the current offset. If we released the lock before
                 // advancing, the next committer would overwrite our bytes.
                 //
-                // (2) must precede (3): the next committer's validation (CommitState::Commit)
+                // (2) must precede (3): rewriting before marking Committed would
+                // publish the transaction's effects to readers before its fate is
+                // decided, which breaks rollback of abandoned commits.
+                //
+                // (2) must also precede (5): the next committer's validation (CommitState::Commit)
                 // checks our transaction state. If it still sees Preparing instead of
                 // Committed, the tie-breaking logic (lower end_ts wins) applies instead
                 // of the definitive "already committed = conflict" path.
@@ -1644,6 +1768,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 tx_unlocked
                     .state
                     .store(TransactionState::Committed(*end_ts));
+
+                self.rewrite_live_versions_to_timestamps(mvcc_store, *end_ts);
 
                 // Hekaton Section 3.3: "The transaction then processes all outgoing
                 // commit dependencies listed in its CommitDepSet. If it committed, it
@@ -2511,7 +2637,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.update_to_table_or_index(tx_id, row, None)
     }
 
-    /// Same as update() but can update a table or an index, indicated by the `maybe_index_id` argument.    
+    /// Same as update() but can update a table or an index, indicated by the `maybe_index_id` argument.
     pub fn update_to_table_or_index(
         &self,
         tx_id: TxID,
@@ -4057,6 +4183,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn get_last_index_rowid(
         &self,
         index_id: MVTableId,
+        tx_id: TxID,
         index_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>>>,
     ) -> Option<RowKey> {
         let index = self.index_rows.get_or_insert_with(index_id, SkipMap::new);
@@ -4066,8 +4193,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let iter = index_iterator
             .as_mut()
             .expect("index_iterator was assigned above");
-        iter.next()
-            .map(|entry| RowKey::Record((**entry.key()).clone()))
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .expect("transaction should exist in txs map");
+        let tx = tx.value();
+        self.find_next_visible_index_row(tx, iter)
+            .map(|row| row.row_id)
     }
 
     pub fn get_logical_log_file(&self) -> Arc<dyn File> {
@@ -4076,7 +4208,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     fn logical_log_header_crc_valid(&self, pager: &Arc<Pager>) -> Result<bool> {
         let file = self.get_logical_log_file();
-        let mut reader = StreamingLogicalLogReader::new(file);
+        let mut reader = StreamingLogicalLogReader::new(file, None);
         match reader.try_read_header(&pager.io)? {
             HeaderReadResult::Valid(_) => Ok(true),
             HeaderReadResult::NoLog | HeaderReadResult::Invalid => Ok(false),
@@ -4102,7 +4234,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         let wal_max_frame = wal.get_max_frame_in_wal();
         let file = self.get_logical_log_file();
-        let mut reader = StreamingLogicalLogReader::new(file);
+        let mut reader = StreamingLogicalLogReader::new(file, None);
         let header_result = reader.try_read_header(&pager.io)?;
 
         let is_readonly = connection.db.is_readonly();
@@ -4205,7 +4337,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn maybe_recover_logical_log(&self, connection: Arc<Connection>) -> Result<bool> {
         let pager = connection.pager.load().clone();
         let file = self.get_logical_log_file();
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         let preserved_table_valued_functions =
             Self::capture_table_valued_functions(&connection.schema.read());
 

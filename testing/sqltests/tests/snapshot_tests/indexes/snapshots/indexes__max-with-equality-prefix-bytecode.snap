@@ -1,0 +1,33 @@
+---
+source: indexes.sqltest
+expression: SELECT MAX(value) FROM measurements WHERE category = 'a';
+info:
+  statement_type: SELECT
+  tables:
+  - measurements
+  setup_blocks:
+  - min_max_equality_prefix
+  database: ':memory:'
+---
+QUERY PLAN
+`--SEARCH measurements USING INDEX idx_measurements_category_value (category=?)
+
+BYTECODE
+addr  opcode       p1  p2  p3  p4        p5  comment
+   0  Init          0  15   0             0  Start at 15
+   1  Null          0   2   0             0  r[2]=NULL
+   2  OpenRead      0   3   0  k(3,B,B)   0  index=idx_measurements_category_value, root=3, iDb=0
+   3  String8       0   3   0  a          0  r[3]='a'
+   4  SeekLE        0  11   3             0  key=[3..3]
+   5    IdxLT       0  11   3             0  key=[3..3]
+   6    Column      0   1   4             0  r[4]=idx_measurements_category_value.value
+   7    CollSeq     0   0   0  Binary     0  collation=Binary
+   8    AggStep     0   4   2  max        0  accum=r[2] step(r[4])
+   9    Goto        0  11   0             0
+  10  Prev          0   5   0             0
+  11  AggFinal      0   2   0  max        0  accum=r[2]
+  12  Copy          2   1   0             0  r[1]=r[2]
+  13  ResultRow     1   1   0             0  output=r[1]
+  14  Halt          0   0   0             0
+  15  Transaction   0   1   2             0  iDb=0 tx_mode=Read
+  16  Goto          0   1   0             0

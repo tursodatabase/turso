@@ -317,6 +317,18 @@ impl Value {
         }
     }
 
+    /// Returns the text value for any ValueType
+    pub fn to_text_coerced(&self) -> Option<String> {
+        match self.value_type {
+            ValueType::Text => self.to_text().map(|s| s.to_string()),
+            ValueType::Integer => self.to_integer().map(|i| i.to_string()),
+            ValueType::Float => self.to_float().map(|f| f.to_string()),
+            ValueType::Blob => self.to_blob().and_then(|b| String::from_utf8(b).ok()),
+            ValueType::Null => None,
+            ValueType::Error => None,
+        }
+    }
+
     pub fn is_json(&self) -> bool {
         unsafe {
             if self.value_type == ValueType::Text && !self.value.text.is_null() {
@@ -327,20 +339,27 @@ impl Value {
         false
     }
 
-    /// Returns the blob value if the ValueType is Blob
+    /// Returns the blob value if the ValueType is Blob (copies the data)
     pub fn to_blob(&self) -> Option<Vec<u8>> {
+        self.blob_ref().map(|s| s.to_vec())
+    }
+
+    /// Returns a reference to the blob data without copying.
+    ///
+    /// Unlike `to_blob()` which returns an owned `Vec<u8>`, this method
+    /// returns a slice reference that borrows from the underlying storage.
+    pub fn blob_ref(&self) -> Option<&[u8]> {
         match self.value_type {
             ValueType::Blob => {
                 if unsafe { self.value.blob.is_null() } {
                     return None;
                 }
                 let blob = unsafe { &*(self.value.blob) };
-                let slice = unsafe { std::slice::from_raw_parts(blob.data, blob.size as usize) };
-                Some(slice.to_vec())
-            }
-            ValueType::Text => {
-                let txt = self.to_text().unwrap_or_default();
-                Some(txt.as_bytes().to_vec())
+                if blob.data.is_null() {
+                    Some(&[])
+                } else {
+                    Some(unsafe { std::slice::from_raw_parts(blob.data, blob.size as usize) })
+                }
             }
             _ => None,
         }

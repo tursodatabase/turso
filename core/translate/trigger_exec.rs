@@ -1,13 +1,17 @@
 use crate::schema::{BTreeTable, Trigger};
 use crate::sync::Arc;
 use crate::translate::expr::WalkControl;
+use crate::translate::subquery::{
+    emit_non_from_clause_subquery, plan_subqueries_from_trigger_when_clause,
+};
 use crate::translate::{
     emitter::Resolver,
-    expr::{self, rewrite_between_expr, translate_expr, walk_expr_mut},
+    expr::{self, translate_expr, walk_expr_mut},
     planner::ROWID_STRS,
     translate_inner, ProgramBuilder, ProgramBuilderOpts,
 };
 use crate::util::normalize_ident;
+use crate::vdbe::affinity::Affinity;
 use crate::vdbe::insn::Insn;
 use crate::vdbe::BranchOffset;
 use crate::HashSet;
@@ -122,6 +126,15 @@ struct TriggerSubprogramContext {
     override_conflict: Option<ast::ResolveType>,
     /// Database name for the trigger's database (used to qualify unqualified table names in body)
     db_name: Option<ast::Name>,
+}
+
+fn variable_from_parameter_index(index: NonZero<usize>) -> Expr {
+    Expr::Variable(ast::Variable::indexed(
+        u32::try_from(index.get())
+            .ok()
+            .and_then(std::num::NonZeroU32::new)
+            .expect("trigger parameter index must fit into NonZeroU32"),
+    ))
 }
 
 impl TriggerSubprogramContext {
@@ -336,20 +349,17 @@ fn rewrite_trigger_expr_single_for_subprogram(
                 if let Some(new_params) = &ctx.new_param_map {
                     if let Some((idx, col_def)) = ctx.table.get_column(&col) {
                         if col_def.is_rowid_alias() {
-                            *e = Expr::Variable(format!(
-                                "{}",
+                            *e = variable_from_parameter_index(
                                 ctx.get_new_rowid_param()
-                                    .expect("NEW parameters must be provided")
-                            ));
+                                    .expect("NEW parameters must be provided"),
+                            );
                             return Ok(());
                         }
                         if idx < new_params.len() {
-                            *e = Expr::Variable(format!(
-                                "{}",
+                            *e = variable_from_parameter_index(
                                 ctx.get_new_param(idx)
-                                    .expect("NEW parameters must be provided")
-                                    .get()
-                            ));
+                                    .expect("NEW parameters must be provided"),
+                            );
                             return Ok(());
                         } else {
                             crate::bail_parse_error!("no such column in NEW: {}", col);
@@ -357,11 +367,10 @@ fn rewrite_trigger_expr_single_for_subprogram(
                     }
                     // Handle NEW.rowid
                     if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
-                        *e = Expr::Variable(format!(
-                            "{}",
+                        *e = variable_from_parameter_index(
                             ctx.get_new_rowid_param()
-                                .expect("NEW parameters must be provided")
-                        ));
+                                .expect("NEW parameters must be provided"),
+                        );
                         return Ok(());
                     }
                     bail_parse_error!("no such column in NEW: {}", col);
@@ -377,20 +386,17 @@ fn rewrite_trigger_expr_single_for_subprogram(
                 if let Some(old_params) = &ctx.old_param_map {
                     if let Some((idx, col_def)) = ctx.table.get_column(&col) {
                         if col_def.is_rowid_alias() {
-                            *e = Expr::Variable(format!(
-                                "{}",
+                            *e = variable_from_parameter_index(
                                 ctx.get_old_rowid_param()
-                                    .expect("OLD parameters must be provided")
-                            ));
+                                    .expect("OLD parameters must be provided"),
+                            );
                             return Ok(());
                         }
                         if idx < old_params.len() {
-                            *e = Expr::Variable(format!(
-                                "{}",
+                            *e = variable_from_parameter_index(
                                 ctx.get_old_param(idx)
-                                    .expect("OLD parameters must be provided")
-                                    .get()
-                            ));
+                                    .expect("OLD parameters must be provided"),
+                            );
                             return Ok(());
                         } else {
                             crate::bail_parse_error!("no such column in OLD: {}", col)
@@ -398,11 +404,10 @@ fn rewrite_trigger_expr_single_for_subprogram(
                     }
                     // Handle OLD.rowid
                     if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
-                        *e = Expr::Variable(format!(
-                            "{}",
+                        *e = variable_from_parameter_index(
                             ctx.get_old_rowid_param()
-                                .expect("OLD parameters must be provided")
-                        ));
+                                .expect("OLD parameters must be provided"),
+                        );
                         return Ok(());
                     }
                     bail_parse_error!("no such column in OLD: {}", col);
@@ -656,52 +661,85 @@ pub fn fire_trigger(
     // - OLD registers always come from cursor reads → always encoded → always decode
     // - NEW registers are only encoded for AFTER triggers (post-encode) → decode when new_encoded
     let decoded_ctx = decode_trigger_registers(program, resolver, ctx)?;
-    let ctx = &decoded_ctx;
+    // Apply column affinity to copies of NEW values so that both WHEN clauses
+    // and trigger bodies see affinity-applied values (e.g., integer 42 becomes
+    // real 42.0 for REAL columns). SQLite applies affinity before trigger
+    // evaluation via OP_Affinity + OP_Copy before OP_Program.
+    let affinity_ctx = apply_new_column_affinity(program, &decoded_ctx)?;
+    let ctx = &affinity_ctx;
 
-    // Evaluate WHEN clause if present
-    if let Some(mut when_expr) = trigger.when_clause.clone() {
-        // Rewrite BETWEEN expressions to AND/OR form before translation,
-        // since translate_expr expects this rewrite to have already happened.
-        rewrite_between_expr(&mut when_expr);
-        // Rewrite NEW/OLD references in WHEN clause to use registers
-        rewrite_trigger_expr_for_when_clause(&mut when_expr, &ctx.table, ctx)?;
+    let saved_register_affinities = std::mem::take(&mut resolver.register_affinities);
+    populate_trigger_register_affinities(resolver, ctx);
+    let result = (|| -> Result<()> {
+        // Evaluate WHEN clause if present
+        if let Some(mut when_expr) = trigger.when_clause.clone() {
+            // Rewrite NEW/OLD references in WHEN clause to use registers
+            rewrite_trigger_expr_for_when_clause(&mut when_expr, &ctx.table, ctx)?;
 
-        let when_reg = program.alloc_register();
-        translate_expr(program, None, &when_expr, when_reg, resolver)?;
+            // Plan and emit any subqueries in the WHEN clause (e.g. IN (SELECT ...), EXISTS, scalar subqueries).
+            // This transforms InSelect/Exists/Subquery nodes into SubqueryResult nodes that translate_expr can handle.
+            let mut subqueries = Vec::new();
+            plan_subqueries_from_trigger_when_clause(
+                program,
+                &mut subqueries,
+                &mut when_expr,
+                resolver,
+                connection,
+            )?;
+            // Emit the planned subqueries so their results are available when we evaluate the WHEN expression.
+            // Always treat these as correlated (no `Once` caching) because the WHEN clause is evaluated
+            // per-row, and trigger bodies may modify the tables referenced by the subquery between evaluations.
+            for subquery in &mut subqueries {
+                let plan = subquery.consume_plan(crate::translate::plan::EvalAt::BeforeLoop);
+                emit_non_from_clause_subquery(
+                    program,
+                    resolver,
+                    *plan,
+                    &subquery.query_type,
+                    true, // always re-evaluate: trigger WHEN is checked per-row
+                    false,
+                )?;
+            }
 
-        let skip_label = program.allocate_label();
-        program.emit_insn(Insn::IfNot {
-            reg: when_reg,
-            jump_if_null: true,
-            target_pc: skip_label,
-        });
+            let when_reg = program.alloc_register();
+            translate_expr(program, None, &when_expr, when_reg, resolver)?;
 
-        // Execute trigger commands if WHEN clause is true
-        execute_trigger_commands(
-            program,
-            resolver,
-            &trigger,
-            ctx,
-            connection,
-            database_id,
-            ignore_jump_target,
-        )?;
+            let skip_label = program.allocate_label();
+            program.emit_insn(Insn::IfNot {
+                reg: when_reg,
+                jump_if_null: true,
+                target_pc: skip_label,
+            });
 
-        program.preassign_label_to_next_insn(skip_label);
-    } else {
-        // No WHEN clause - always execute
-        execute_trigger_commands(
-            program,
-            resolver,
-            &trigger,
-            ctx,
-            connection,
-            database_id,
-            ignore_jump_target,
-        )?;
-    }
+            // Execute trigger commands if WHEN clause is true
+            execute_trigger_commands(
+                program,
+                resolver,
+                &trigger,
+                ctx,
+                connection,
+                database_id,
+                ignore_jump_target,
+            )?;
 
-    Ok(())
+            program.preassign_label_to_next_insn(skip_label);
+        } else {
+            // No WHEN clause - always execute
+            execute_trigger_commands(
+                program,
+                resolver,
+                &trigger,
+                ctx,
+                connection,
+                database_id,
+                ignore_jump_target,
+            )?;
+        }
+
+        Ok(())
+    })();
+    resolver.register_affinities = saved_register_affinities;
+    result
 }
 
 /// Decode encoded custom type registers in a TriggerContext.
@@ -764,6 +802,94 @@ fn decode_trigger_registers(
         override_conflict: ctx.override_conflict,
         new_encoded: false, // decoded now
     })
+}
+
+/// Apply column affinity to copies of NEW registers for non-strict tables.
+/// This ensures both WHEN clauses and trigger bodies see affinity-applied values
+/// (e.g., integer 42 becomes real 42.0 for REAL columns), matching SQLite's behavior.
+fn apply_new_column_affinity(
+    program: &mut ProgramBuilder,
+    ctx: &TriggerContext,
+) -> Result<TriggerContext> {
+    let new_registers = if let Some(new_regs) = &ctx.new_registers {
+        let num_cols = ctx.table.columns.len();
+        if !ctx.table.is_strict && num_cols > 0 {
+            let affinities: String = ctx
+                .table
+                .columns
+                .iter()
+                .map(|c| c.affinity().aff_mask())
+                .collect();
+            if affinities.chars().any(|c| c != Affinity::Blob.aff_mask()) {
+                let temp_start = program.alloc_registers(num_cols);
+                for (i, &reg) in new_regs.iter().take(num_cols).enumerate() {
+                    program.emit_insn(Insn::Copy {
+                        src_reg: reg,
+                        dst_reg: temp_start + i,
+                        extra_amount: 0,
+                    });
+                }
+                if let Ok(count) = std::num::NonZeroUsize::try_from(num_cols) {
+                    program.emit_insn(Insn::Affinity {
+                        start_reg: temp_start,
+                        count,
+                        affinities,
+                    });
+                }
+                let mut regs: Vec<usize> = (temp_start..temp_start + num_cols).collect();
+                // Preserve the rowid register (always last in the NEW registers list)
+                if new_regs.len() > num_cols {
+                    regs.push(*new_regs.last().unwrap());
+                }
+                Some(regs)
+            } else {
+                Some(new_regs.clone())
+            }
+        } else {
+            Some(new_regs.clone())
+        }
+    } else {
+        None
+    };
+    Ok(TriggerContext {
+        table: ctx.table.clone(),
+        new_registers,
+        old_registers: ctx.old_registers.clone(),
+        override_conflict: ctx.override_conflict,
+        new_encoded: ctx.new_encoded,
+    })
+}
+
+fn populate_trigger_register_affinities(resolver: &mut Resolver, ctx: &TriggerContext) {
+    populate_trigger_row_register_affinities(resolver, &ctx.table, ctx.new_registers.as_deref());
+    populate_trigger_row_register_affinities(resolver, &ctx.table, ctx.old_registers.as_deref());
+}
+
+fn populate_trigger_row_register_affinities(
+    resolver: &mut Resolver,
+    table: &BTreeTable,
+    row_registers: Option<&[usize]>,
+) {
+    let Some(registers) = row_registers else {
+        return;
+    };
+
+    for (idx, column) in table.columns.iter().enumerate() {
+        let affinity = if column.is_rowid_alias() {
+            Affinity::Integer
+        } else {
+            column.affinity_with_strict(table.is_strict)
+        };
+        if let Some(&register) = registers.get(idx) {
+            resolver.register_affinities.insert(register, affinity);
+        }
+    }
+
+    if let Some(&rowid_register) = registers.last() {
+        resolver
+            .register_affinities
+            .insert(rowid_register, Affinity::Integer);
+    }
 }
 
 /// Rewrite NEW/OLD references in WHEN clause expressions (uses Register expressions, not Variable)

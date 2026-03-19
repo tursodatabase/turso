@@ -1,5 +1,45 @@
 use super::*;
 use crate::translate::main_loop::{conditions::LoopConditionEmitter, hash::HashProbeSetupEmitter};
+use crate::translate::{
+    main_loop::close::AutoIndexBuild,
+    plan::{self, SubqueryEvalPhase},
+    subquery::{materialized_from_clause_subquery_storage, MaterializedFromClauseSubqueryStorage},
+};
+
+fn emit_materialized_subquery_result_columns(
+    program: &mut ProgramBuilder,
+    from_clause_subquery: &crate::schema::FromClauseSubquery,
+    cursor_id: CursorID,
+    index: Option<&Index>,
+) {
+    let Some(start_reg) = from_clause_subquery.result_columns_start_reg else {
+        return;
+    };
+
+    let index_to_table = index.map(|index| {
+        let mut source_cols = vec![None; from_clause_subquery.columns.len()];
+        for (source_col, idx_col) in index.columns.iter().enumerate() {
+            source_cols[idx_col.pos_in_table] = Some(source_col);
+        }
+        source_cols
+    });
+
+    for col_idx in 0..from_clause_subquery.columns.len() {
+        let source_col = index_to_table
+            .as_ref()
+            .map(|source_cols| {
+                source_cols[col_idx]
+                    .expect("direct materialized subquery index must cover every result column")
+            })
+            .unwrap_or(col_idx);
+        program.emit_insn(Insn::Column {
+            cursor_id,
+            column: source_col,
+            dest: start_reg + col_idx,
+            default: None,
+        });
+    }
+}
 
 /// Opens the main loop for each table in the join order, emitting instructions to initialize
 /// cursors and perform index seeks as necessary.
@@ -137,12 +177,20 @@ impl OpenLoop {
                             });
                             program.preassign_label_to_next_insn(loop_start);
                         }
-                        (Scan::Subquery, Table::FromClauseSubquery(from_clause_subquery)) => {
+                        (
+                            Scan::Subquery { iter_dir },
+                            Table::FromClauseSubquery(from_clause_subquery),
+                        ) => {
                             match from_clause_subquery.plan.select_query_destination() {
                                 Some(QueryDestination::CoroutineYield {
                                     yield_reg,
                                     coroutine_implementation_start,
                                 }) => {
+                                    turso_assert_eq!(
+                                        *iter_dir,
+                                        IterationDirection::Forwards,
+                                        "coroutine-backed subqueries cannot scan backwards"
+                                    );
                                     // Coroutine-based subquery execution
                                     // In case the subquery is an inner loop, it needs to be reinitialized on each iteration of the outer loop.
                                     program.emit_insn(Insn::InitCoroutine {
@@ -158,29 +206,30 @@ impl OpenLoop {
                                     program.emit_insn(Insn::Yield {
                                         yield_reg: *yield_reg,
                                         end_offset: loop_end,
+                                        subtype_clear_start_reg: 0,
+                                        subtype_clear_count: 0,
                                     });
                                 }
                                 Some(QueryDestination::EphemeralTable { cursor_id, .. }) => {
                                     // Materialized CTE - scan the ephemeral table with Rewind/Next
-                                    program.emit_insn(Insn::Rewind {
-                                        cursor_id: *cursor_id,
-                                        pc_if_empty: loop_end,
-                                    });
-                                    program.preassign_label_to_next_insn(loop_start);
-                                    // Emit Column instructions to read from the ephemeral table
-                                    // into the result registers at the start of each iteration
-                                    if let Some(start_reg) =
-                                        from_clause_subquery.result_columns_start_reg
-                                    {
-                                        for col_idx in 0..from_clause_subquery.columns.len() {
-                                            program.emit_insn(Insn::Column {
-                                                cursor_id: *cursor_id,
-                                                column: col_idx,
-                                                dest: start_reg + col_idx,
-                                                default: None,
-                                            });
-                                        }
+                                    if *iter_dir == IterationDirection::Backwards {
+                                        program.emit_insn(Insn::Last {
+                                            cursor_id: *cursor_id,
+                                            pc_if_empty: loop_end,
+                                        });
+                                    } else {
+                                        program.emit_insn(Insn::Rewind {
+                                            cursor_id: *cursor_id,
+                                            pc_if_empty: loop_end,
+                                        });
                                     }
+                                    program.preassign_label_to_next_insn(loop_start);
+                                    emit_materialized_subquery_result_columns(
+                                        program,
+                                        from_clause_subquery,
+                                        *cursor_id,
+                                        None,
+                                    );
                                 }
                                 _ => {
                                     unreachable!("Subquery table with unexpected query destination")
@@ -202,11 +251,17 @@ impl OpenLoop {
                     }
                 }
                 Operation::Search(search) => {
-                    // Check if this is a FROM clause subquery with a materialized ephemeral index
-                    let is_materialized_subquery = matches!(
-                        &table.table,
-                        Table::FromClauseSubquery(_)
-                    ) && matches!(search, Search::Seek { index: Some(idx), .. } if idx.ephemeral);
+                    let materialized_subquery_storage = match (&table.table, search) {
+                        (
+                            Table::FromClauseSubquery(from_clause_subquery),
+                            Search::Seek {
+                                index: Some(index), ..
+                            },
+                        ) if index.ephemeral => {
+                            materialized_from_clause_subquery_storage(from_clause_subquery)
+                        }
+                        _ => None,
+                    };
 
                     // Open the loop for the index search.
                     // Rowid equality point lookups are handled with a SeekRowid instruction which does not loop, since it is a single row lookup.
@@ -237,36 +292,47 @@ impl OpenLoop {
                             // Otherwise, it's an index/rowid scan, i.e. first a seek is performed and then a scan until the comparison expression is not satisfied anymore.
                             let mut bloom_filter = false;
                             if let Some(index) = index {
-                                if index.ephemeral && !is_materialized_subquery {
-                                    // For regular tables with ephemeral indexes, build the auto-index now.
-                                    // For materialized subqueries, the index was already built during emission.
+                                if index.ephemeral
+                                    && !matches!(
+                                        materialized_subquery_storage,
+                                        Some(MaterializedFromClauseSubqueryStorage::DirectIndex)
+                                    )
+                                {
+                                    // Build auxiliary ephemeral indexes lazily from the row source,
+                                    // whether it is a base table or a table-backed materialized subquery.
                                     let table_has_rowid = if let Table::BTree(btree) = &table.table
                                     {
                                         btree.has_rowid
                                     } else {
-                                        false
+                                        matches!(&table.table, Table::FromClauseSubquery(_))
                                     };
                                     let num_seek_keys = seek_def.size(&seek_def.start);
                                     let AutoIndexResult {
                                         use_bloom_filter, ..
                                     } = emit_autoindex(
                                         program,
-                                        index,
-                                        table_cursor_id.expect(
-                                            "an ephemeral index must have a source table cursor",
-                                        ),
-                                        index_cursor_id
-                                            .expect("an ephemeral index must have an index cursor"),
-                                        table_has_rowid,
-                                        num_seek_keys,
-                                        seek_def,
+                                        AutoIndexBuild {
+                                            index,
+                                            table_cursor_id: table_cursor_id.expect(
+                                                "an ephemeral index must have a source table cursor",
+                                            ),
+                                            index_cursor_id: index_cursor_id.expect(
+                                                "an ephemeral index must have an index cursor",
+                                            ),
+                                            table_has_rowid,
+                                            num_seek_keys,
+                                            seek_def,
+                                            affinity_str: plan::synthesized_seek_affinity_str(
+                                                index, seek_def,
+                                            )
+                                            .as_ref(),
+                                        },
                                     )?;
                                     bloom_filter = use_bloom_filter;
                                 }
                             }
 
-                            // For materialized subqueries, use the index cursor directly
-                            let seek_cursor_id = if is_materialized_subquery {
+                            let seek_cursor_id = if materialized_subquery_storage.is_some() {
                                 index_cursor_id
                                     .expect("materialized subquery must have index cursor")
                             } else {
@@ -295,26 +361,40 @@ impl OpenLoop {
                             )
                             .emit(loop_start, bloom_filter)?;
 
-                            if is_materialized_subquery {
-                                // For materialized subqueries with seek indexes, emit Column
-                                // instructions to populate result registers from the covering index.
-                                // The index contains all columns so we can read directly from it.
-                                if let Table::FromClauseSubquery(from_clause_subquery) =
-                                    &table.table
-                                {
-                                    if let Some(start_reg) =
-                                        from_clause_subquery.result_columns_start_reg
-                                    {
-                                        let index_cursor = index_cursor_id
-                                            .expect("materialized subquery must have index cursor");
-                                        for col_idx in 0..from_clause_subquery.columns.len() {
-                                            program.emit_insn(Insn::Column {
-                                                cursor_id: index_cursor,
-                                                column: col_idx,
-                                                dest: start_reg + col_idx,
-                                                default: None,
-                                            });
-                                        }
+                            if let Some(materialized_subquery_storage) =
+                                materialized_subquery_storage
+                            {
+                                let index_cursor_id = index_cursor_id
+                                    .expect("materialized subquery seek requires index cursor");
+                                let Table::FromClauseSubquery(from_clause_subquery) = &table.table
+                                else {
+                                    unreachable!("materialized subquery seek requires subquery")
+                                };
+                                match materialized_subquery_storage {
+                                    MaterializedFromClauseSubqueryStorage::TableBacked => {
+                                        let table_cursor_id = table_cursor_id
+                                            .expect("materialized subquery must have table cursor");
+                                        program.emit_insn(Insn::DeferredSeek {
+                                            index_cursor_id,
+                                            table_cursor_id,
+                                        });
+                                        emit_materialized_subquery_result_columns(
+                                            program,
+                                            from_clause_subquery,
+                                            table_cursor_id,
+                                            None,
+                                        );
+                                    }
+                                    MaterializedFromClauseSubqueryStorage::DirectIndex => {
+                                        let index = index.as_ref().expect(
+                                            "direct-index materialized subquery requires index",
+                                        );
+                                        emit_materialized_subquery_result_columns(
+                                            program,
+                                            from_clause_subquery,
+                                            index_cursor_id,
+                                            Some(index.as_ref()),
+                                        );
                                     }
                                 }
                             } else {
@@ -475,7 +555,7 @@ impl OpenLoop {
                 t_ctx
                     .hash_table_contexts
                     .get(&hj.build_table_idx)
-                    .map(|ctx| ctx.hash_next_label)
+                    .map(|ctx| ctx.labels.next)
                     .expect("should have hash context for build table")
             } else {
                 next
@@ -590,21 +670,26 @@ impl OpenLoop {
 
                     if let Some(hash_ctx) = t_ctx.hash_table_contexts.get_mut(&hj.build_table_idx) {
                         hash_ctx.inner_loop_gosub_reg = Some(return_reg);
-                        hash_ctx.inner_loop_gosub_label = Some(gosub_label);
-                        hash_ctx.inner_loop_skip_label = Some(skip_label);
+                        hash_ctx.labels.inner_loop_gosub = Some(gosub_label);
+                        hash_ctx.labels.inner_loop_skip = Some(skip_label);
                     }
                 }
             }
         }
 
-        if subqueries.iter().any(|s| !s.has_been_evaluated()) {
+        if subqueries.iter().any(|s| {
+            !s.has_been_evaluated() && matches!(s.eval_phase, SubqueryEvalPhase::BeforeLoop)
+        }) {
             crate::bail_parse_error!(
-            "all subqueries should have already been emitted, but found {} unevaluated subqueries",
-            subqueries
-                .iter()
-                .filter(|s| !s.has_been_evaluated())
-                .count()
-        );
+                "all before-loop subqueries should have already been emitted, but found {} unevaluated subqueries",
+                subqueries
+                    .iter()
+                    .filter(|s| {
+                        !s.has_been_evaluated()
+                            && matches!(s.eval_phase, SubqueryEvalPhase::BeforeLoop)
+                    })
+                    .count()
+            );
         }
 
         Ok(())

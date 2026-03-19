@@ -1,4 +1,5 @@
 use crate::io::FileSyncType;
+use crate::storage::encryption::EncryptionContext;
 use crate::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use crate::sync::Arc;
 use crate::sync::RwLock;
@@ -6,11 +7,25 @@ use std::fmt::Debug;
 
 pub mod logical_log;
 use crate::mvcc::database::LogRecord;
-use crate::mvcc::persistent_storage::logical_log::{LogicalLog, DEFAULT_LOG_CHECKPOINT_THRESHOLD};
+use crate::mvcc::persistent_storage::logical_log::{
+    LogicalLog, OnSerializationComplete, DEFAULT_LOG_CHECKPOINT_THRESHOLD,
+};
 use crate::{Completion, File, Result};
 
 pub trait DurableStorage: Send + Sync + Debug {
-    fn log_tx(&self, m: &LogRecord) -> Result<(Completion, u64)>;
+    /// Write a transaction to the logical log without advancing the writer offset.
+    ///
+    /// If `on_serialization_complete` is provided, it is called with a zero-copy
+    /// reference to the serialized frame bytes and the running CRC after
+    /// serialization but before the disk write. The callback runs while the
+    /// internal write lock is held, so it should be fast (e.g. memcpy to a side
+    /// buffer).
+    fn log_tx(
+        &self,
+        m: &LogRecord,
+        on_serialization_complete: OnSerializationComplete<'_>,
+    ) -> Result<(Completion, u64)>;
+
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion>;
 
     /// Persist the current logical-log header to durable storage.
@@ -33,6 +48,15 @@ pub trait DurableStorage: Send + Sync + Debug {
     ///
     /// Called during recovery to seed the CRC state from the header's salt.
     fn set_header(&self, header: logical_log::LogHeader);
+
+    /// Called when a checkpoint begins, before any rows are written to the B-tree.
+    /// `durable_txid_max` is the transaction watermark that will be durably persisted
+    /// once the checkpoint completes.
+    fn on_checkpoint_start(&self, _durable_txid_max: u64) {}
+
+    /// Called after the checkpoint has fully completed: rows are flushed, WAL is
+    /// truncated, and the logical log is reset.
+    fn on_checkpoint_end(&self, _durable_txid_max: u64) {}
 }
 
 pub struct Storage {
@@ -43,9 +67,13 @@ pub struct Storage {
 }
 
 impl Storage {
-    pub fn new(file: Arc<dyn File>, io: Arc<dyn crate::IO>) -> Self {
+    pub fn new(
+        file: Arc<dyn File>,
+        io: Arc<dyn crate::IO>,
+        encryption_ctx: Option<EncryptionContext>,
+    ) -> Self {
         Self {
-            logical_log: RwLock::new(LogicalLog::new(file, io)),
+            logical_log: RwLock::new(LogicalLog::new(file, io, encryption_ctx)),
             log_offset: AtomicU64::new(0),
             checkpoint_threshold: AtomicI64::new(DEFAULT_LOG_CHECKPOINT_THRESHOLD),
         }
@@ -65,8 +93,14 @@ impl Storage {
 }
 
 impl DurableStorage for Storage {
-    fn log_tx(&self, m: &LogRecord) -> Result<(Completion, u64)> {
-        self.logical_log.write().log_tx_deferred_offset(m)
+    fn log_tx(
+        &self,
+        m: &LogRecord,
+        on_serialization_complete: OnSerializationComplete<'_>,
+    ) -> Result<(Completion, u64)> {
+        self.logical_log
+            .write()
+            .log_tx_deferred_offset(m, on_serialization_complete)
     }
 
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion> {

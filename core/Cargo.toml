@@ -87,7 +87,7 @@ strum_macros = { workspace = true }
 bitflags = { workspace = true }
 serde = { workspace = true, optional = true, features = ["derive"] }
 serde_json = { workspace = true, optional = true }
-paste = "1.0.15"
+pastey = "0.2.1"
 uuid = { version = "1.11.0", features = ["v4", "v5", "v7"], optional = true }
 tempfile = { workspace = true }
 pack1 = { version = "1.0.0", features = ["bytemuck"] }
@@ -197,3 +197,7 @@ harness = false
 name = "fts_benchmark"
 harness = false
 required-features = ["fts"]
+
+[[bench]]
+name = "graph_queries_benchmark"
+harness = false

@@ -3,13 +3,14 @@ use turso_parser::ast::{self, SortOrder};
 use super::{
     emitter::TranslateCtx,
     expr::{translate_condition_expr, translate_expr, ConditionMetadata},
-    plan::{Distinctness, GroupBy, SelectPlan},
+    plan::{Distinctness, GroupBy, SelectPlan, SubqueryEvalPhase, SubqueryOrigin},
     result_row::emit_select_result,
 };
 use crate::translate::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
-    order_by::{custom_type_lt_func, EmitOrderBy},
-    plan::Aggregate,
+    order_by::{custom_type_comparator, EmitOrderBy},
+    plan::{Aggregate, NonFromClauseSubquery},
+    subquery::emit_non_from_clause_subqueries_for_phase,
 };
 use crate::translate::{
     emitter::Resolver,
@@ -132,10 +133,18 @@ impl EmitGroupBy {
         // END BLOCK
 
         let reg_sorter_key = program.alloc_register();
-        let column_count = plan.agg_args_count() + t_ctx.non_aggregate_expressions.len();
+        let column_count = if !group_by.sort_elided {
+            // Sorter path: store only unique leaf columns from aggregate args
+            // instead of pre-computed expression results.
+            t_ctx.agg_leaf_columns = collect_agg_leaf_columns(&plan.aggregates, plan)?;
+            t_ctx.non_aggregate_expressions.len() + t_ctx.agg_leaf_columns.len()
+        } else {
+            plan.agg_args_count() + t_ctx.non_aggregate_expressions.len()
+        };
         let reg_group_by_source_cols_start = program.alloc_registers(column_count);
 
-        let row_source = if let Some(sort_order) = group_by.sort_order.as_ref() {
+        let row_source = if !group_by.sort_elided {
+            let sort_order = &group_by.sort_order;
             let sort_cursor = program.alloc_cursor_id(CursorType::Sorter);
             // Should work the same way as Order By
             /*
@@ -156,11 +165,11 @@ impl EmitGroupBy {
                 .collect::<Result<Vec<_>>>()?;
 
             // Resolve custom type comparators for GROUP BY columns (e.g. array_lt).
-            let comparator_func_names: Vec<Option<String>> = group_by
+            let comparators = group_by
                 .exprs
                 .iter()
                 .map(|expr| {
-                    custom_type_lt_func(expr, &plan.table_references, t_ctx.resolver.schema())
+                    custom_type_comparator(expr, &plan.table_references, t_ctx.resolver.schema())
                 })
                 .collect();
 
@@ -168,7 +177,7 @@ impl EmitGroupBy {
                 cursor_id: sort_cursor,
                 columns: column_count,
                 order_and_collations,
-                comparator_func_names,
+                comparators,
             });
             emit_explain!(program, false, "USE SORTER FOR GROUP BY".to_owned());
             let pseudo_cursor = group_by_create_pseudo_table(program, column_count);
@@ -305,6 +314,35 @@ pub fn compute_group_by_sort_order(
     result
 }
 
+/// Extracts unique leaf column references from all aggregate function arguments.
+/// These are the base table columns that aggregate expressions depend on.
+/// By storing only these in the GROUP BY sorter (instead of pre-computed expression
+/// results), we reduce sorter record size and avoid redundant B-tree column reads.
+fn collect_agg_leaf_columns(aggregates: &[Aggregate], plan: &SelectPlan) -> Result<Vec<ast::Expr>> {
+    let mut leaf_columns: Vec<ast::Expr> = Vec::new();
+    for agg in aggregates {
+        for arg in &agg.args {
+            walk_expr(arg, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+                match expr {
+                    ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => {
+                        if plan
+                            .table_references
+                            .find_joined_table_by_internal_id(*table)
+                            .is_some()
+                            && !leaf_columns.iter().any(|e| exprs_are_equivalent(e, expr))
+                        {
+                            leaf_columns.push(expr.clone());
+                        }
+                        Ok(WalkControl::SkipChildren)
+                    }
+                    _ => Ok(WalkControl::Continue),
+                }
+            })?;
+        }
+    }
+    Ok(leaf_columns)
+}
+
 fn collect_non_aggregate_expressions<'a>(
     non_aggregate_expressions: &mut Vec<(&'a ast::Expr, bool)>,
     group_by: &'a GroupBy,
@@ -350,6 +388,16 @@ fn collect_result_columns<'a>(
     plan: &SelectPlan,
     result_columns: &mut Vec<&'a ast::Expr>,
 ) -> Result<()> {
+    fn is_deferred_grouped_output_subquery(
+        plan: &SelectPlan,
+        subquery_id: turso_parser::ast::TableInternalId,
+    ) -> bool {
+        plan.non_from_clause_subqueries
+            .iter()
+            .find(|subquery| subquery.internal_id == subquery_id)
+            .is_some_and(|subquery| matches!(subquery.eval_phase, SubqueryEvalPhase::GroupedOutput))
+    }
+
     walk_expr(root_expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
         match expr {
             ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => {
@@ -368,7 +416,12 @@ fn collect_result_columns<'a>(
             //
             // However, if the subquery is of the form: 'aggregate_result IN (SELECT...)', we need to skip it because the aggregation
             // is done later.
-            ast::Expr::SubqueryResult { lhs, .. } => {
+            ast::Expr::SubqueryResult {
+                subquery_id, lhs, ..
+            } => {
+                if is_deferred_grouped_output_subquery(plan, *subquery_id) {
+                    return Ok(WalkControl::SkipChildren);
+                }
                 if let Some(ref lhs) = lhs {
                     let mut lhs_contains_agg = false;
                     walk_expr(lhs, &mut |expr: &ast::Expr| -> Result<WalkControl> {
@@ -616,40 +669,80 @@ pub fn group_by_process_single_group(
 
     // Process each aggregate function for the current row
     program.preassign_label_to_next_insn(labels.label_grouping_agg_step);
-    let cursor_index = t_ctx.non_aggregate_expressions.len(); // Skipping all columns in sorter that not an aggregation arguments
-    let mut offset = 0;
-    for (i, agg) in plan.aggregates.iter().enumerate() {
-        let start_reg = t_ctx
-            .reg_agg_start
-            .expect("aggregate registers must be initialized");
-        let agg_result_reg = start_reg + i;
-        let agg_arg_source = match &row_source {
-            GroupByRowSource::Sorter { pseudo_cursor, .. } => AggArgumentSource::new_from_cursor(
-                program,
-                *pseudo_cursor,
-                cursor_index + offset,
-                agg,
-            ),
-            GroupByRowSource::MainLoop { start_reg_src, .. } => {
-                // Aggregation arguments are always placed in the registers that follow any scalars.
-                let start_reg_aggs = start_reg_src + t_ctx.non_aggregate_expressions.len();
-                AggArgumentSource::new_from_registers(start_reg_aggs + offset, agg)
+
+    match &row_source {
+        GroupByRowSource::Sorter { pseudo_cursor, .. } => {
+            // Read leaf columns from the pseudo cursor and cache them so that
+            // translate_expr can resolve column references during expression evaluation.
+            let leaf_start_idx = t_ctx.non_aggregate_expressions.len();
+            let leaf_regs = program.alloc_registers(t_ctx.agg_leaf_columns.len());
+            for i in 0..t_ctx.agg_leaf_columns.len() {
+                program.emit_column_or_rowid(*pseudo_cursor, leaf_start_idx + i, leaf_regs + i);
             }
-        };
-        translate_aggregation_step(
-            program,
-            &plan.table_references,
-            agg_arg_source,
-            agg_result_reg,
-            &t_ctx.resolver,
-        )?;
-        if let Distinctness::Distinct { ctx } = &agg.distinctness {
-            let ctx = ctx
-                .as_ref()
-                .expect("distinct aggregate context not populated");
-            program.preassign_label_to_next_insn(ctx.label_on_conflict);
+
+            let cache_len = t_ctx.resolver.expr_to_reg_cache.len();
+            let cache_was_enabled = t_ctx.resolver.expr_to_reg_cache_enabled;
+            for (i, leaf_expr) in t_ctx.agg_leaf_columns.drain(..).enumerate() {
+                t_ctx.resolver.cache_expr_reg(
+                    std::borrow::Cow::Owned(leaf_expr),
+                    leaf_regs + i,
+                    false,
+                    None,
+                );
+            }
+            t_ctx.resolver.enable_expr_to_reg_cache();
+
+            for (i, agg) in plan.aggregates.iter().enumerate() {
+                let agg_start_reg = t_ctx
+                    .reg_agg_start
+                    .expect("aggregate registers must be initialized");
+                let agg_result_reg = agg_start_reg + i;
+                let agg_arg_source =
+                    AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness);
+                translate_aggregation_step(
+                    program,
+                    &plan.table_references,
+                    agg_arg_source,
+                    agg_result_reg,
+                    &t_ctx.resolver,
+                )?;
+                if let Distinctness::Distinct { ctx } = &agg.distinctness {
+                    let ctx = ctx
+                        .as_ref()
+                        .expect("distinct aggregate context not populated");
+                    program.preassign_label_to_next_insn(ctx.label_on_conflict);
+                }
+            }
+
+            t_ctx.resolver.expr_to_reg_cache.truncate(cache_len);
+            t_ctx.resolver.expr_to_reg_cache_enabled = cache_was_enabled;
         }
-        offset += agg.args.len();
+        GroupByRowSource::MainLoop { start_reg_src, .. } => {
+            let mut offset = 0;
+            for (i, agg) in plan.aggregates.iter().enumerate() {
+                let agg_start_reg = t_ctx
+                    .reg_agg_start
+                    .expect("aggregate registers must be initialized");
+                let agg_result_reg = agg_start_reg + i;
+                let start_reg_aggs = start_reg_src + t_ctx.non_aggregate_expressions.len();
+                let agg_arg_source =
+                    AggArgumentSource::new_from_registers(start_reg_aggs + offset, agg);
+                translate_aggregation_step(
+                    program,
+                    &plan.table_references,
+                    agg_arg_source,
+                    agg_result_reg,
+                    &t_ctx.resolver,
+                )?;
+                if let Distinctness::Distinct { ctx } = &agg.distinctness {
+                    let ctx = ctx
+                        .as_ref()
+                        .expect("distinct aggregate context not populated");
+                    program.preassign_label_to_next_insn(ctx.label_on_conflict);
+                }
+                offset += agg.args.len();
+            }
+        }
     }
 
     // We only need to store non-aggregate columns once per group
@@ -678,11 +771,12 @@ pub fn group_by_process_single_group(
             {
                 if *expr_appears_in_result_columns {
                     program.emit_column_or_rowid(*pseudo_cursor, sorter_column_index, next_reg);
-                    t_ctx.resolver.expr_to_reg_cache.push((
+                    t_ctx.resolver.cache_scalar_expr_reg(
                         std::borrow::Cow::Borrowed(expr),
                         next_reg,
                         false,
-                    ));
+                        &plan.table_references,
+                    )?;
                     next_reg += 1;
                 }
             }
@@ -705,11 +799,12 @@ pub fn group_by_process_single_group(
                     dest_reg,
                     &t_ctx.resolver,
                 )?;
-                t_ctx.resolver.expr_to_reg_cache.push((
+                t_ctx.resolver.cache_scalar_expr_reg(
                     std::borrow::Cow::Borrowed(expr),
                     dest_reg,
                     false,
-                ));
+                    &plan.table_references,
+                )?;
             }
         }
     }
@@ -767,7 +862,8 @@ pub fn group_by_agg_phase(
 pub fn group_by_emit_row_phase<'a>(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx<'a>,
-    plan: &'a SelectPlan,
+    plan: &SelectPlan,
+    non_from_clause_subqueries: &mut [NonFromClauseSubquery],
 ) -> Result<()> {
     let group_by = plan.group_by.as_ref().expect("group by not found");
     let GroupByMetadata {
@@ -832,16 +928,27 @@ pub fn group_by_emit_row_phase<'a>(
             register: agg_result_reg,
             func: agg.func.clone(),
         });
-        t_ctx.resolver.expr_to_reg_cache.push((
-            std::borrow::Cow::Borrowed(&agg.original_expr),
+        t_ctx.resolver.cache_expr_reg(
+            std::borrow::Cow::Owned(agg.original_expr.clone()),
             agg_result_reg,
             false,
-        ));
+            None,
+        );
     }
 
     t_ctx.resolver.enable_expr_to_reg_cache();
 
     if let Some(having) = &group_by.having {
+        emit_non_from_clause_subqueries_for_phase(
+            program,
+            &t_ctx.resolver,
+            non_from_clause_subqueries,
+            &plan.join_order,
+            Some(&plan.table_references),
+            SubqueryEvalPhase::GroupedOutput,
+            |subquery| matches!(subquery.origin, SubqueryOrigin::SelectHaving),
+        )?;
+
         for expr in having.iter() {
             let if_true_target = program.allocate_label();
             translate_condition_expr(
@@ -866,6 +973,16 @@ pub fn group_by_emit_row_phase<'a>(
     // (targeting label_agg_final) to land in the init block, which ends
     // with Goto back to the start of the program, creating an infinite loop.
     let span_idx = program.constant_spans_next_idx();
+    emit_non_from_clause_subqueries_for_phase(
+        program,
+        &t_ctx.resolver,
+        non_from_clause_subqueries,
+        &plan.join_order,
+        Some(&plan.table_references),
+        SubqueryEvalPhase::GroupedOutput,
+        |subquery| !matches!(subquery.origin, SubqueryOrigin::SelectHaving),
+    )?;
+
     match plan.order_by.is_empty() {
         true => {
             emit_select_result(

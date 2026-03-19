@@ -3,7 +3,7 @@ use crate::{turso_assert, turso_assert_greater_than_or_equal, turso_assert_less_
 use std::cmp::PartialEq;
 
 use super::{
-    expr::walk_expr,
+    expr::{walk_expr, walk_expr_mut},
     plan::{
         Aggregate, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
         JoinOrderMember, JoinType as PlanJoinType, JoinedTable, Operation, OuterQueryReference,
@@ -28,7 +28,7 @@ use crate::{
     translate::expr::bind_and_rewrite_expr,
 };
 use crate::{
-    translate::plan::{Window, WindowFunction},
+    translate::plan::{Window, WindowFunction, WindowFunctionKind},
     vdbe::builder::ProgramBuilder,
 };
 use smallvec::SmallVec;
@@ -222,13 +222,27 @@ pub fn resolve_window_and_aggregate_functions(
                             link_with_window(
                                 windows.as_deref_mut(),
                                 expr,
-                                f,
+                                WindowFunctionKind::Agg(f),
                                 over_clause,
                                 distinctness,
                             )?;
                         } else {
                             add_aggregate_if_not_exists(aggs, expr, args, distinctness, f)?;
                             contains_aggregates = true;
+                        }
+                        return Ok(WalkControl::SkipChildren);
+                    }
+                    Ok(Func::Window(f)) => {
+                        if let Some(over_clause) = filter_over.over_clause.as_ref() {
+                            link_with_window(
+                                windows.as_deref_mut(),
+                                expr,
+                                WindowFunctionKind::Window(f),
+                                over_clause,
+                                distinctness,
+                            )?;
+                        } else {
+                            crate::bail_parse_error!("misuse of window function: {}()", f);
                         }
                         return Ok(WalkControl::SkipChildren);
                     }
@@ -243,7 +257,7 @@ pub fn resolve_window_and_aggregate_functions(
                                     link_with_window(
                                         windows.as_deref_mut(),
                                         expr,
-                                        func,
+                                        WindowFunctionKind::Agg(func),
                                         over_clause,
                                         distinctness,
                                     )?;
@@ -281,7 +295,7 @@ pub fn resolve_window_and_aggregate_functions(
                             link_with_window(
                                 windows.as_deref_mut(),
                                 expr,
-                                f,
+                                WindowFunctionKind::Agg(f),
                                 over_clause,
                                 Distinctness::NonDistinct,
                             )?;
@@ -294,6 +308,20 @@ pub fn resolve_window_and_aggregate_functions(
                                 f,
                             )?;
                             contains_aggregates = true;
+                        }
+                        return Ok(WalkControl::SkipChildren);
+                    }
+                    Ok(Func::Window(f)) => {
+                        if let Some(over_clause) = filter_over.over_clause.as_ref() {
+                            link_with_window(
+                                windows.as_deref_mut(),
+                                expr,
+                                WindowFunctionKind::Window(f),
+                                over_clause,
+                                Distinctness::NonDistinct,
+                            )?;
+                        } else {
+                            crate::bail_parse_error!("misuse of window function: {}()", f);
                         }
                         return Ok(WalkControl::SkipChildren);
                     }
@@ -350,7 +378,7 @@ pub fn resolve_window_and_aggregate_functions(
 fn link_with_window(
     windows: Option<&mut Vec<Window>>,
     expr: &Expr,
-    func: AggFunc,
+    func: WindowFunctionKind,
     over_clause: &Over,
     distinctness: Distinctness,
 ) -> Result<()> {
@@ -365,7 +393,11 @@ fn link_with_window(
             original_expr: expr.clone(),
         });
     } else {
-        crate::bail_parse_error!("misuse of window function: {}()", func.as_str());
+        let func_name = match &func {
+            WindowFunctionKind::Agg(f) => f.as_str().to_string(),
+            WindowFunctionKind::Window(f) => f.to_string(),
+        };
+        crate::bail_parse_error!("misuse of window function: {}()", func_name);
     }
     Ok(())
 }
@@ -661,24 +693,18 @@ fn parse_from_clause_table(
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     match table {
-        ast::SelectTable::Table(qualified_name, maybe_alias, indexed) => {
-            if indexed.is_some() {
-                crate::bail_parse_error!(
-                    "INDEXED BY / NOT INDEXED clauses are not supported yet in FROM clause"
-                );
-            }
-            parse_table(
-                table_references,
-                resolver,
-                program,
-                cte_definitions,
-                vtab_predicates,
-                &qualified_name,
-                maybe_alias.as_ref(),
-                &[],
-                connection,
-            )
-        }
+        ast::SelectTable::Table(qualified_name, maybe_alias, indexed) => parse_table(
+            table_references,
+            resolver,
+            program,
+            cte_definitions,
+            vtab_predicates,
+            &qualified_name,
+            maybe_alias.as_ref(),
+            &[],
+            indexed,
+            connection,
+        ),
         ast::SelectTable::Select(subselect, maybe_alias) => {
             // For inline subqueries, we plan all CTEs once and pass them as outer_query_refs.
             // This allows the subquery to reference CTEs defined in the parent's WITH clause.
@@ -767,6 +793,7 @@ fn parse_from_clause_table(
             &qualified_name,
             maybe_alias.as_ref(),
             &args,
+            None, // table-valued functions don't support INDEXED BY
             connection,
         ),
         ast::SelectTable::Sub(..) => {
@@ -785,6 +812,7 @@ fn parse_table(
     qualified_name: &QualifiedName,
     maybe_alias: Option<&As>,
     args: &[Box<Expr>],
+    indexed: Option<ast::Indexed>,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     let normalized_qualified_name = normalize_ident(qualified_name.name.as_str());
@@ -859,7 +887,7 @@ fn parse_table(
         let cte_id = outer_ref.cte_id;
         let outer_table = outer_ref.table.clone();
         let materialize_hint = match &outer_table {
-            Table::FromClauseSubquery(subquery) => subquery.materialize_hint,
+            Table::FromClauseSubquery(subquery) => subquery.materialize_hint(),
             _ => false,
         };
 
@@ -924,6 +952,7 @@ fn parse_table(
                 column_use_counts: Vec::new(),
                 expression_index_usages: Vec::new(),
                 database_id,
+                indexed: None,
             });
         }
         return Ok(());
@@ -960,6 +989,7 @@ fn parse_table(
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id,
+            indexed,
         });
         return Ok(());
     };
@@ -1052,6 +1082,7 @@ fn parse_table(
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
+            rowid_alias_conflict_clause: None,
         });
         drop(view_guard);
 
@@ -1075,6 +1106,7 @@ fn parse_table(
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id,
+            indexed: None,
         });
         return Ok(());
     }
@@ -1100,6 +1132,7 @@ fn parse_table(
                 column_use_counts: Vec::new(),
                 expression_index_usages: Vec::new(),
                 database_id,
+                indexed: None,
             });
             return Ok(());
         }
@@ -1333,8 +1366,54 @@ pub fn parse_where(
                 resolver,
                 BindingBehavior::TryCanonicalColumnsFirst,
             )?;
+            let _ = walk_expr_mut(&mut expr.expr, &mut |e: &mut Expr| -> Result<WalkControl> {
+                if let Expr::Between {
+                    lhs,
+                    not,
+                    start,
+                    end,
+                } = e
+                {
+                    let lhs_expr = std::mem::take(lhs.as_mut());
+                    let start_expr = std::mem::take(start.as_mut());
+                    let end_expr = std::mem::take(end.as_mut());
+
+                    let (lower, upper, combine_op) = if *not {
+                        (
+                            Expr::Binary(
+                                Box::new(start_expr),
+                                ast::Operator::Greater,
+                                Box::new(lhs_expr.clone()),
+                            ),
+                            Expr::Binary(
+                                Box::new(lhs_expr),
+                                ast::Operator::Greater,
+                                Box::new(end_expr),
+                            ),
+                            ast::Operator::Or,
+                        )
+                    } else {
+                        (
+                            Expr::Binary(
+                                Box::new(start_expr),
+                                ast::Operator::LessEquals,
+                                Box::new(lhs_expr.clone()),
+                            ),
+                            Expr::Binary(
+                                Box::new(lhs_expr),
+                                ast::Operator::LessEquals,
+                                Box::new(end_expr),
+                            ),
+                            ast::Operator::And,
+                        )
+                    };
+                    *e = Expr::Binary(Box::new(lower), combine_op, Box::new(upper));
+                }
+                Ok(WalkControl::Continue)
+            });
         }
-        // BETWEEN is rewritten to (lhs >= start) AND (lhs <= end) by bind_and_rewrite_expr.
+        // BETWEEN in WHERE is rewritten to binary terms here so each side can be
+        // considered independently by constraint extraction and range planning.
         // Re-break any ANDs that were created so they become separate WhereTerms for
         // constraint extraction.
         let mut i = start_idx;
@@ -1782,7 +1861,7 @@ fn parse_join(
             }
         }
         if distinct_names.is_empty() {
-            crate::bail_parse_error!("No columns found to NATURAL join on");
+            None // No common columns = cross join
         } else {
             Some(ast::JoinConstraint::Using(distinct_names))
         }

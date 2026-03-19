@@ -1,7 +1,7 @@
 pub mod check;
 pub mod fmt;
 
-use std::sync::Arc;
+use std::{num::NonZeroU32, sync::Arc};
 
 use crate::lexer::is_keyword;
 use strum_macros::{EnumIter, EnumString};
@@ -499,7 +499,7 @@ pub enum Expr {
     /// Unary expression
     Unary(UnaryOperator, Box<Expr>),
     /// Parameters
-    Variable(String),
+    Variable(Variable),
     /// Subqueries from e.g. the WHERE clause are planned separately
     /// and their results will be placed in registers or in an ephemeral index
     /// pointed to by this type.
@@ -530,6 +530,32 @@ pub enum Expr {
         /// index expression
         index: Box<Expr>,
     },
+}
+
+impl Default for Expr {
+    fn default() -> Self {
+        Self::Literal(Literal::Null)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Variable {
+    pub index: NonZeroU32,
+    pub name: Option<Box<str>>,
+}
+
+impl Variable {
+    pub fn indexed(index: NonZeroU32) -> Self {
+        Self { index, name: None }
+    }
+
+    pub fn named(name: impl Into<Box<str>>, index: NonZeroU32) -> Self {
+        Self {
+            index,
+            name: Some(name.into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -635,7 +661,7 @@ impl Expr {
 }
 
 /// SQL literal
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Literal {
     /// Number
@@ -648,6 +674,7 @@ pub enum Literal {
     Blob(String),
     /// Keyword
     Keyword(String),
+    #[default]
     /// `NULL`
     Null,
     /// `TRUE` - SQLite boolean literal (equivalent to 1 but semantically distinct for IS TRUE)
@@ -1750,7 +1777,7 @@ pub enum TriggerCmd {
 }
 
 /// Conflict resolution types
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ResolveType {
     /// `ROLLBACK`

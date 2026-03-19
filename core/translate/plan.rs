@@ -6,7 +6,7 @@ use turso_parser::ast::{
 };
 
 use crate::{
-    function::AggFunc,
+    function::{AggFunc, WindowFunc},
     schema::{BTreeTable, ColDef, Column, FromClauseSubquery, Index, Schema, Table},
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
@@ -17,7 +17,7 @@ use crate::{
         planner::determine_where_to_eval_term,
     },
     vdbe::{
-        affinity::Affinity,
+        affinity::{self, Affinity},
         builder::{CursorKey, CursorType, ProgramBuilder},
         insn::{HashDistinctData, Insn},
         BranchOffset, CursorID,
@@ -108,8 +108,14 @@ impl ResultSetColumn {
 #[derive(Debug, Clone)]
 pub struct GroupBy {
     pub exprs: Vec<ast::Expr>,
-    /// sort order, if a sorter is required (= the columns aren't already in the correct order)
-    pub sort_order: Option<Vec<SortOrder>>,
+    /// Sort direction for each GROUP BY key column. Always present once
+    /// `compute_group_by_sort_order` has run; the outer optimizer reads
+    /// this to derive the materialized CTE's output order.
+    pub sort_order: Vec<SortOrder>,
+    /// When true the scan already provides the GROUP BY order and no
+    /// sorter is emitted. The `sort_order` is kept so that the outer
+    /// query can still read the effective output order.
+    pub sort_elided: bool,
     /// having clause split into a vec at 'AND' boundaries.
     pub having: Option<Vec<ast::Expr>>,
 }
@@ -239,6 +245,52 @@ impl Ord for EvalAt {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubqueryEvalPhase {
+    BeforeLoop,
+    Loop(usize),
+    GroupedOutput,
+    UngroupedAggregateOutput,
+    WindowOutput,
+    PreWrite,
+    PostWriteReturning,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubqueryOrigin {
+    SelectList,
+    SelectWhere,
+    SelectGroupBy,
+    SelectHaving,
+    SelectOrderBy,
+    SelectLimitOffset,
+    DmlWhere,
+    DmlSet,
+    DmlReturning,
+    TriggerWhen,
+}
+
+impl SubqueryOrigin {
+    pub fn phase_floor(self) -> SubqueryEvalPhase {
+        match self {
+            SubqueryOrigin::SelectList
+            | SubqueryOrigin::SelectWhere
+            | SubqueryOrigin::SelectGroupBy
+            | SubqueryOrigin::SelectHaving
+            | SubqueryOrigin::SelectOrderBy
+            | SubqueryOrigin::SelectLimitOffset
+            | SubqueryOrigin::TriggerWhen => SubqueryEvalPhase::BeforeLoop,
+            SubqueryOrigin::DmlWhere => SubqueryEvalPhase::BeforeLoop,
+            SubqueryOrigin::DmlSet => SubqueryEvalPhase::PreWrite,
+            SubqueryOrigin::DmlReturning => SubqueryEvalPhase::PostWriteReturning,
+        }
+    }
+
+    pub fn is_post_write_returning(self) -> bool {
+        matches!(self, SubqueryOrigin::DmlReturning)
+    }
+}
+
 /// A query plan is either a SELECT or a DELETE (for now)
 #[derive(Debug, Clone)]
 pub enum Plan {
@@ -310,6 +362,22 @@ impl Plan {
             Plan::Select(select_plan) => Some(&select_plan.table_references),
             Plan::CompoundSelect { right_most, .. } => Some(&right_most.table_references),
             Plan::Delete(_) | Plan::Update(_) => None,
+        }
+    }
+
+    /// Returns true if this plan or any of its subplans read from the given table.
+    /// (Not for Delete/Update plans)
+    fn reads_table(&self, database_id: usize, table_name: &str) -> bool {
+        match self {
+            Plan::Select(select_plan) => select_plan.reads_table(database_id, table_name),
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => {
+                left.iter()
+                    .any(|(select_plan, _)| select_plan.reads_table(database_id, table_name))
+                    || right_most.reads_table(database_id, table_name)
+            }
+            Plan::Delete(_) | Plan::Update(_) => false,
         }
     }
 }
@@ -458,6 +526,30 @@ impl DistinctCtx {
     }
 }
 
+/// Detected simple-aggregate optimization.
+///
+/// Analogous to SQLite's `isSimpleCount()` / `minMaxQuery()`. When set on a
+/// `SelectPlan`, the emitter can use a specialised fast path instead of a full
+/// scan + accumulate loop.
+#[derive(Debug, Clone)]
+pub struct MinMaxDef {
+    pub func: AggFunc,
+    pub argument: ast::Expr,
+    pub order: SortOrder,
+    /// Explicit COLLATE override, if any. `None` means use the column default.
+    pub collation: Option<CollationSeq>,
+}
+
+#[derive(Debug, Clone)]
+pub enum SimpleAggregate {
+    /// `SELECT count(*) FROM <tbl>` — uses the `Insn::Count` opcode directly.
+    Count,
+    /// `SELECT min(expr) FROM …` or `SELECT max(expr) FROM …` — the optimizer
+    /// will pick an index that delivers rows in the right order so the emitter
+    /// only needs to read the first (non-NULL for MIN) row.
+    MinMax(Box<MinMaxDef>),
+}
+
 #[derive(Debug, Clone)]
 pub struct SelectPlan {
     pub table_references: TableReferences,
@@ -491,9 +583,18 @@ pub struct SelectPlan {
     pub window: Option<Window>,
     /// Subqueries that appear in any part of the query apart from the FROM clause
     pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
+    /// Estimated number of times this SELECT will be invoked by its parent scope.
+    ///
+    /// Top-level queries and standalone FROM-subqueries default to 1. Correlated
+    /// non-FROM subqueries may be re-optimized after their parent join order is
+    /// known so their inner FROM-subqueries can cost repeated probes correctly.
+    pub input_cardinality_hint: Option<f64>,
     /// Estimated output rows from the optimizer's join order computation.
     /// Used to propagate cardinality estimates for CTE/subquery tables.
     pub estimated_output_rows: Option<f64>,
+    /// When set, this query is a simple aggregate (COUNT(*), MIN, or MAX)
+    /// that can be satisfied without a full table scan.
+    pub simple_aggregate: Option<SimpleAggregate>,
 }
 
 impl SelectPlan {
@@ -522,38 +623,19 @@ impl SelectPlan {
                 })
     }
 
-    /// Reference: https://github.com/sqlite/sqlite/blob/5db695197b74580c777b37ab1b787531f15f7f9f/src/select.c#L8613
-    ///
-    /// Checks to see if the query is of the format `SELECT count(*) FROM <tbl>`
-    pub fn is_simple_count(&self) -> bool {
-        if !self.where_clause.is_empty()
-            || self.aggregates.len() != 1
-            || !matches!(self.query_destination, QueryDestination::ResultRows)
-            || self.table_references.joined_tables().len() != 1
-            || !self.table_references.outer_query_refs().is_empty()
-            || self.result_columns.len() != 1
-            || self.group_by.is_some()
-            || self.limit.is_some()
-            || self.offset.is_some()
-            || self.contains_constant_false_condition
-        // TODO: (pedrocarlo) maybe can optimize to use the count optmization with more columns
-        {
-            return false;
-        }
-        let table_ref = self.table_references.joined_tables().first().unwrap();
-        if !matches!(table_ref.table, crate::schema::Table::BTree(..)) {
-            return false;
-        }
-        let agg = self
-            .aggregates
-            .first()
-            .expect("we already checked aggregates.len() == 1");
-        let result_expr = &self
-            .result_columns
-            .first()
-            .expect("we already checked result_columns.len() == 1")
-            .expr;
-        matches!(agg.func, AggFunc::Count0) && exprs_are_equivalent(result_expr, &agg.original_expr)
+    fn reads_table(&self, database_id: usize, table_name: &str) -> bool {
+        self.table_references.joined_tables().iter().any(|table| {
+            table.matches(database_id, table_name)
+                || match &table.table {
+                    Table::FromClauseSubquery(subquery) => {
+                        subquery.plan.reads_table(database_id, table_name)
+                    }
+                    Table::BTree(_) | Table::Virtual(_) => false,
+                }
+        }) || self
+            .non_from_clause_subqueries
+            .iter()
+            .any(|subquery| subquery.reads_table(database_id, table_name))
     }
 }
 
@@ -809,6 +891,8 @@ pub struct JoinedTable {
     pub expression_index_usages: Vec<ExpressionIndexUsage>,
     /// The index of the database. "main" is always zero.
     pub database_id: usize,
+    /// INDEXED BY / NOT INDEXED hint from the SQL statement.
+    pub indexed: Option<ast::Indexed>,
 }
 
 #[derive(Debug, Clone)]
@@ -886,6 +970,12 @@ pub struct TableReferences {
     /// Set when a RIGHT JOIN is rewritten as LEFT JOIN by swapping the two tables,
     /// so `select_star` emits columns in the original user-visible order.
     right_join_swapped: bool,
+}
+
+impl Default for TableReferences {
+    fn default() -> Self {
+        Self::new_empty()
+    }
 }
 
 impl TableReferences {
@@ -1394,12 +1484,15 @@ pub struct HashJoinOp {
 }
 
 /// Distinguishes union (OR) from intersection (AND) operations for multi-index scans.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SetOperation {
     /// Union: rowid appears in result if it's in ANY branch (OR)
     Union,
-    /// Intersection: rowid appears in result only if it's in ALL branches (AND)
-    Intersection,
+    /// Intersection: rowid appears in result only if it's in ALL branches (AND).
+    /// Carries the indices of additional WHERE terms consumed beyond the primary one.
+    Intersection {
+        additional_consumed_terms: Vec<usize>,
+    },
 }
 
 /// Multi-index scan operation metadata for OR-by-union or AND-by-intersection optimization.
@@ -1421,8 +1514,24 @@ pub struct MultiIndexScanOp {
     pub where_term_idx: usize,
     /// The set operation to perform when combining branches
     pub set_op: SetOperation,
-    /// For Intersection: indices of additional WHERE terms consumed (besides where_term_idx)
-    pub additional_consumed_terms: Vec<usize>,
+}
+
+/// Residual filters that apply only to union (OR) branches.
+///
+/// Each OR disjunct may be a compound expression (e.g. `a = 1 AND c > 5`), so
+/// after the index seek satisfies the indexable part, these residuals filter
+/// the remaining conditions.
+#[derive(Debug, Clone)]
+pub struct UnionBranchPrePostFilters {
+    /// Outer-table-only residuals evaluated before the branch's index seek.
+    /// These reference only tables from earlier (outer) loops, so they can
+    /// short-circuit the entire branch without touching the index.
+    pub pre_filter_exprs: Vec<ast::Expr>,
+    /// Residual filter expressions that could not be satisfied by the index seek.
+    /// Applied within the branch loop after positioning on the table row.
+    pub post_filter_exprs: Vec<ast::Expr>,
+    /// Whether residual evaluation needs the scanned table cursor positioned.
+    pub requires_table_cursor: bool,
 }
 
 /// A single branch of a multi-index scan, representing one disjunct of an OR expression.
@@ -1434,11 +1543,8 @@ pub struct MultiIndexBranch {
     pub access: MultiIndexBranchAccess,
     /// Estimated number of rows from this branch
     pub estimated_rows: f64,
-    /// Residual filter expressions for compound AND disjuncts.
-    /// Applied within the branch loop after positioning on the table row.
-    pub residual_exprs: Vec<ast::Expr>,
-    /// Whether residual evaluation needs the scanned table cursor positioned.
-    pub requires_table_cursor: bool,
+    /// Residual filters for union (OR) branches. `None` for intersection branches.
+    pub union_residuals: Option<UnionBranchPrePostFilters>,
 }
 
 /// Access shape for a single multi-index branch.
@@ -1486,7 +1592,9 @@ impl Operation {
                 idx_str: None,
                 constraints: Vec::new(),
             }),
-            Table::FromClauseSubquery(_) => Operation::Scan(Scan::Subquery),
+            Table::FromClauseSubquery(_) => Operation::Scan(Scan::Subquery {
+                iter_dir: IterationDirection::Forwards,
+            }),
         }
     }
 
@@ -1552,6 +1660,12 @@ impl JoinedTable {
         }
     }
 
+    fn matches(&self, database_id: usize, table_name: &str) -> bool {
+        self.database_id == database_id
+            && matches!(self.table, Table::BTree(_) | Table::Virtual(_))
+            && self.table.get_name().eq_ignore_ascii_case(table_name)
+    }
+
     /// Creates a new TableReference for a subquery from a SelectPlan.
     pub fn new_subquery(
         identifier: String,
@@ -1595,8 +1709,8 @@ impl JoinedTable {
             plan: Box::new(Plan::Select(plan)),
             columns,
             result_columns_start_reg: None,
-            cte_id: None,
-            materialize_hint: false,
+            materialized_cursor_id: None,
+            cte: None,
         }));
         Ok(Self {
             op: Operation::default_scan_for(&table),
@@ -1608,6 +1722,7 @@ impl JoinedTable {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: 0,
+            indexed: None,
         })
     }
 
@@ -1685,13 +1800,18 @@ impl JoinedTable {
         // materialize_hint is set true for explicit WITH ... AS MATERIALIZED hint.
         // Multi-reference CTEs are also detected at emission time via reference counting,
         // and they may be materialized regardless of explicit keyword usage.
+        let cte = cte_id.map(|id| crate::schema::FromClauseSubqueryCteMetadata {
+            id,
+            shared_materialization: false,
+            materialize_hint,
+        });
         let table = Table::FromClauseSubquery(Arc::new(FromClauseSubquery {
             name: identifier.clone(),
             plan: Box::new(plan),
             columns,
             result_columns_start_reg: None,
-            cte_id,
-            materialize_hint,
+            materialized_cursor_id: None,
+            cte,
         }));
         Ok(Self {
             op: Operation::default_scan_for(&table),
@@ -1703,6 +1823,7 @@ impl JoinedTable {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: 0,
+            indexed: None,
         })
     }
 
@@ -1849,8 +1970,8 @@ impl JoinedTable {
 
                 let index_cursor_id = index
                     .map(|index| {
-                        program.alloc_cursor_index(
-                            Some(CursorKey::index(self.internal_id, index.clone())),
+                        program.alloc_cursor_index_if_not_exists(
+                            CursorKey::index(self.internal_id, index.clone()),
                             index,
                         )
                     })
@@ -1865,7 +1986,17 @@ impl JoinedTable {
                 let index_cursor_id = None;
                 Ok((table_cursor_id, index_cursor_id))
             }
-            Table::FromClauseSubquery(..) => Ok((None, None)),
+            Table::FromClauseSubquery(..) => {
+                let index_cursor_id = index
+                    .map(|index| {
+                        program.alloc_cursor_index_if_not_exists(
+                            CursorKey::index(self.internal_id, index.clone()),
+                            index,
+                        )
+                    })
+                    .transpose()?;
+                Ok((None, index_cursor_id))
+            }
         }
     }
 
@@ -1876,16 +2007,17 @@ impl JoinedTable {
         mode: OperationMode,
     ) -> Result<(Option<CursorID>, Option<CursorID>)> {
         let index = self.op.index();
-        let table_cursor_id =
-            if let OperationMode::UPDATE(UpdateRowSource::PrebuiltEphemeralTable {
-                target_table,
-                ..
-            }) = &mode
-            {
-                program.resolve_cursor_id_safe(&CursorKey::table(target_table.internal_id))
-            } else {
-                program.resolve_cursor_id_safe(&CursorKey::table(self.internal_id))
-            };
+        let table_cursor_id = if let Table::FromClauseSubquery(from_clause_subquery) = &self.table {
+            from_clause_subquery.materialized_cursor_id
+        } else if let OperationMode::UPDATE(UpdateRowSource::PrebuiltEphemeralTable {
+            target_table,
+            ..
+        }) = &mode
+        {
+            program.resolve_cursor_id_safe(&CursorKey::table(target_table.internal_id))
+        } else {
+            program.resolve_cursor_id_safe(&CursorKey::table(self.internal_id))
+        };
         let index_cursor_id = index.map(|index| {
             program.resolve_cursor_id(&CursorKey::index(self.internal_id, index.clone()))
         });
@@ -2073,6 +2205,27 @@ impl SeekDef {
     }
 }
 
+/// Build the affinity string for a synthesized ephemeral seek index.
+///
+/// The seek key only constrains the leading key prefix, but the backing record
+/// stored in the ephemeral index still includes the remaining payload columns
+/// (and possibly a synthetic rowid). Pad those trailing slots with NONE affinity
+/// so MakeRecord sees the same layout the index insert path produced.
+pub fn synthesized_seek_affinity_str(index: &Index, seek_def: &SeekDef) -> Option<Arc<String>> {
+    let num_key_cols = seek_def.size(&seek_def.start);
+    let total_cols = index.columns.len() + if index.has_rowid { 1 } else { 0 };
+    let mut aff: String = seek_def
+        .iter_affinity(&seek_def.start)
+        .map(|a| a.aff_mask())
+        .collect();
+    for _ in num_key_cols..total_cols {
+        aff.push(affinity::SQLITE_AFF_NONE);
+    }
+    aff.chars()
+        .any(|c| c != affinity::SQLITE_AFF_NONE)
+        .then(|| Arc::new(aff))
+}
+
 /// [SeekKeyComponent] represents the optional trailing component of a seek key.
 /// Besides user-provided expressions, planner logic may inject a synthetic NULL sentinel
 /// to encode SQLite-compatible boundary behavior on composite indexes.
@@ -2118,8 +2271,13 @@ pub enum Scan {
         /// The order of expressions matches the argument order expected by the virtual table.
         constraints: Vec<Expr>,
     },
-    /// A scan of a subquery in the `FROM` clause (using coroutines).
-    Subquery,
+    /// A scan of a subquery in the `FROM` clause.
+    Subquery {
+        /// Coroutine-backed scans run forwards. Materialized subqueries may
+        /// also be scanned backwards when the planner relies on intrinsic
+        /// subquery order for an extremum fast path.
+        iter_dir: IterationDirection,
+    },
 }
 
 /// An enum that represents a search operation that can be used to search for a row in a table using an index
@@ -2292,10 +2450,16 @@ impl Window {
 }
 
 #[derive(Debug, Clone)]
+pub enum WindowFunctionKind {
+    Agg(AggFunc),
+    Window(WindowFunc),
+}
+
+#[derive(Debug, Clone)]
 pub struct WindowFunction {
-    /// The resolved function. Currently, only regular aggregate functions are supported.
-    /// In the future, more specialized window functions such as `RANK()`, `ROW_NUMBER()`, etc. will be added.
-    pub func: AggFunc,
+    /// The resolved function. Aggregate window functions and specialized window
+    /// functions such as ROW_NUMBER() are supported.
+    pub func: WindowFunctionKind,
     /// The expression from which the function was resolved.
     pub original_expr: Expr,
 }
@@ -2333,13 +2497,13 @@ pub enum SubqueryPosition {
 
 impl SubqueryPosition {
     /// Returns true if a subquery in this position of the SELECT can be correlated, i.e. if it can reference columns from the outer query.
-    /// FIXME: HAVING and ORDER BY should allow correlated subqueries, but our translation system currently does not support this well.
-    /// Subqueries in these positions should be evaluated after the main loop, AND they should also have access to aggregations computed
-    /// in the main query.
     pub fn allow_correlated(&self) -> bool {
         matches!(
             self,
-            SubqueryPosition::ResultColumn | SubqueryPosition::Where | SubqueryPosition::GroupBy
+            SubqueryPosition::ResultColumn
+                | SubqueryPosition::Where
+                | SubqueryPosition::GroupBy
+                | SubqueryPosition::OrderBy
         )
     }
 
@@ -2364,16 +2528,28 @@ pub struct NonFromClauseSubquery {
     pub query_type: SubqueryType,
     pub state: SubqueryState,
     pub correlated: bool,
-    /// Whether this subquery originates from a RETURNING clause.
-    /// RETURNING subqueries must be evaluated after the Insert instruction
-    /// so that correlated column references read post-UPDATE values.
-    pub is_returning: bool,
+    pub origin: SubqueryOrigin,
+    pub eval_phase: SubqueryEvalPhase,
 }
 
 impl NonFromClauseSubquery {
     /// Returns true if the subquery has been evaluated (translated into bytecode).
     pub fn has_been_evaluated(&self) -> bool {
         matches!(self.state, SubqueryState::Evaluated { .. })
+    }
+
+    pub fn is_post_write_returning(&self) -> bool {
+        self.origin.is_post_write_returning()
+            && matches!(self.eval_phase, SubqueryEvalPhase::PostWriteReturning)
+    }
+
+    pub fn reads_table(&self, database_id: usize, table_name: &str) -> bool {
+        match &self.state {
+            SubqueryState::Unevaluated { plan: Some(plan) } => {
+                plan.reads_table(database_id, table_name)
+            }
+            _ => false,
+        }
     }
 
     /// Returns the loop index where the subquery should be evaluated in this join order.
@@ -2468,6 +2644,88 @@ pub fn plan_is_correlated(plan: &Plan) -> bool {
         } => left.iter().any(|(plan, _)| plan.is_correlated()) || right_most.is_correlated(),
         Plan::Delete(_) | Plan::Update(_) => false,
     }
+}
+
+/// Returns true when evaluating this plan depends on table values from an
+/// enclosing query scope outside the plan itself.
+///
+/// This is narrower than [`plan_is_correlated()`]: a plan may contain
+/// internally correlated scalar subqueries (for example, a scalar subquery that
+/// references another table in the same CTE) without depending on an enclosing
+/// query row. Those plans are still safe to materialize once and reuse.
+pub fn plan_has_outer_scope_dependency(plan: &Plan) -> bool {
+    fn select_plan_has_outer_scope_dependency(
+        plan: &SelectPlan,
+        accessible_table_ids: &mut Vec<TableInternalId>,
+    ) -> bool {
+        let outer_scope_base_len = accessible_table_ids.len();
+        accessible_table_ids.extend(
+            plan.table_references
+                .joined_tables()
+                .iter()
+                .map(|table| table.internal_id),
+        );
+
+        let has_outer_scope_dependency =
+            plan.table_references
+                .outer_query_refs()
+                .iter()
+                .any(|outer_ref| {
+                    outer_ref.is_used() && !accessible_table_ids.contains(&outer_ref.internal_id)
+                })
+                || plan
+                    .non_from_clause_subqueries
+                    .iter()
+                    .any(|subquery| match &subquery.state {
+                        SubqueryState::Unevaluated {
+                            plan: Some(subquery_plan),
+                        } => select_plan_has_outer_scope_dependency(
+                            subquery_plan,
+                            accessible_table_ids,
+                        ),
+                        SubqueryState::Unevaluated { plan: None } => false,
+                        SubqueryState::Evaluated { outer_ref_ids, .. } => outer_ref_ids
+                            .iter()
+                            .any(|outer_ref_id| !accessible_table_ids.contains(outer_ref_id)),
+                    })
+                || plan
+                    .table_references
+                    .joined_tables()
+                    .iter()
+                    .any(|table| match &table.table {
+                        Table::FromClauseSubquery(subquery) => {
+                            plan_has_outer_scope_dependency_with_tables(
+                                subquery.plan.as_ref(),
+                                accessible_table_ids,
+                            )
+                        }
+                        _ => false,
+                    });
+
+        accessible_table_ids.truncate(outer_scope_base_len);
+        has_outer_scope_dependency
+    }
+
+    fn plan_has_outer_scope_dependency_with_tables(
+        plan: &Plan,
+        accessible_table_ids: &mut Vec<TableInternalId>,
+    ) -> bool {
+        match plan {
+            Plan::Select(select_plan) => {
+                select_plan_has_outer_scope_dependency(select_plan, accessible_table_ids)
+            }
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => {
+                left.iter().any(|(select_plan, _)| {
+                    select_plan_has_outer_scope_dependency(select_plan, accessible_table_ids)
+                }) || select_plan_has_outer_scope_dependency(right_most, accessible_table_ids)
+            }
+            Plan::Delete(_) | Plan::Update(_) => false,
+        }
+    }
+
+    plan_has_outer_scope_dependency_with_tables(plan, &mut Vec::new())
 }
 
 /// Determine when a SELECT plan can be evaluated, including nested non-FROM and FROM-clause subqueries.

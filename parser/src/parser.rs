@@ -9,12 +9,14 @@ use crate::ast::{
     QualifiedName, RefAct, RefArg, ResolveType, ResultColumn, Select, SelectBody, SelectTable, Set,
     SortOrder, SortedColumn, Stmt, TableConstraint, TableOptions, TransactionType, TriggerCmd,
     TriggerEvent, TriggerTime, Type, TypeOperator, TypeParam, TypeSize, UnaryOperator, Update,
-    Upsert, UpsertDo, UpsertIndex, Window, WindowDef, With,
+    Upsert, UpsertDo, UpsertIndex, Variable, Window, WindowDef, With,
 };
 use crate::error::Error;
 use crate::lexer::{Lexer, Token};
 use crate::token::TokenType::{self, *};
 use crate::Result;
+use std::collections::HashMap;
+use std::num::NonZeroU32;
 use turso_macros::match_ignore_ascii_case;
 
 macro_rules! peek_expect {
@@ -150,6 +152,7 @@ pub struct Parser<'a> {
     /// Last assigned id of positional variable
     /// Parser tracks that in order to properly auto-assign variable ids in correct order for anonymous parameters '?'
     last_variable_id: u32,
+    named_variables: HashMap<&'a [u8], NonZeroU32>,
 }
 
 impl<'a> Iterator for Parser<'a> {
@@ -173,16 +176,29 @@ impl<'a> Parser<'a> {
             peekable: false,
             current_token: Token::new(&input[..0], TokenType::TK_NONE),
             last_variable_id: 0,
+            named_variables: HashMap::new(),
         }
     }
 
-    fn create_variable(&mut self, token: &[u8]) -> Result<Expr> {
+    fn create_variable(&mut self, token: &'a [u8]) -> Result<Expr> {
         if token.is_empty() {
             // Rewrite anonymous variables in encounter order
             self.last_variable_id += 1;
-            Ok(Expr::Variable(format!("{}", self.last_variable_id)))
+            let index = NonZeroU32::new(self.last_variable_id).unwrap();
+            Ok(Expr::Variable(Variable::indexed(index)))
         } else if matches!(token[0], b':' | b'@' | b'$' | b'#') {
-            Ok(Expr::Variable(from_bytes(token)))
+            let index = if let Some(index) = self.named_variables.get(token).copied() {
+                index
+            } else {
+                self.last_variable_id += 1;
+                let index = NonZeroU32::new(self.last_variable_id).unwrap();
+                self.named_variables.insert(token, index);
+                index
+            };
+            Ok(Expr::Variable(Variable::named(
+                from_bytes_as_str(token),
+                index,
+            )))
         } else {
             let variable_str = std::str::from_utf8(token)
                 .map_err(|e| Error::Custom(format!("non-utf8 positional variable id: {e}")))?;
@@ -194,8 +210,14 @@ impl<'a> Parser<'a> {
                     "variable number must be between ?1 and ?250000".to_string(),
                 ));
             }
-            self.last_variable_id = variable_id;
-            Ok(Expr::Variable(from_bytes(token)))
+            if variable_id > 250000 {
+                return Err(Error::Custom(
+                    "variable number must be between ?1 and ?250000".to_string(),
+                ));
+            }
+            self.last_variable_id = self.last_variable_id.max(variable_id);
+            let index = NonZeroU32::new(variable_id).unwrap();
+            Ok(Expr::Variable(Variable::indexed(index)))
         }
     }
 
@@ -212,6 +234,9 @@ impl<'a> Parser<'a> {
 
     // entrypoint of parsing
     pub fn next_cmd(&mut self) -> Result<Option<Cmd>> {
+        self.last_variable_id = 0;
+        self.named_variables.clear();
+
         // consumes prefix SEMI
         while let Some(token) = self.peek()? {
             if token.token_type == TK_SEMI {
@@ -4041,6 +4066,11 @@ impl<'a> Parser<'a> {
         let col_names = self.parse_nm_list_opt()?;
         let select = self.parse_select()?;
         let (upsert, returning) = self.parse_upsert()?;
+        if !returning.is_empty() {
+            return Err(Error::Custom(
+                "cannot use RETURNING in a trigger".to_owned(),
+            ));
+        }
         Ok(TriggerCmd::Insert {
             or_conflict: resolve_type,
             tbl_name,
@@ -4059,6 +4089,11 @@ impl<'a> Parser<'a> {
         let sets = self.parse_set_list()?;
         let from = self.parse_from_clause_opt()?;
         let where_clause = self.parse_where()?;
+        if matches!(self.peek()?, Some(tok) if tok.token_type == TK_RETURNING) {
+            return Err(Error::Custom(
+                "cannot use RETURNING in a trigger".to_owned(),
+            ));
+        }
         Ok(TriggerCmd::Update {
             or_conflict,
             tbl_name,
@@ -4073,6 +4108,11 @@ impl<'a> Parser<'a> {
         eat_expect!(self, TK_FROM);
         let tbl_name = self.parse_nm()?;
         let where_clause = self.parse_where()?;
+        if matches!(self.peek()?, Some(tok) if tok.token_type == TK_RETURNING) {
+            return Err(Error::Custom(
+                "cannot use RETURNING in a trigger".to_owned(),
+            ));
+        }
         Ok(TriggerCmd::Delete {
             tbl_name,
             where_clause,
@@ -4598,6 +4638,42 @@ mod tests {
     }
 
     #[test]
+    fn test_offset_multiple_statements_with_insert_columns() {
+        let s = "CREATE TABLE test (id INTEGER PRIMARY KEY AUTOINCREMENT, col_a TEXT, col_b TEXT, col_c TEXT, col_d TEXT); INSERT INTO test (col_b, col_d, col_a, col_c) VALUES ('1', '2', '3', '4'); SELECT * FROM test;";
+        let mut p = Parser::new(s.as_bytes());
+
+        p.next_cmd().unwrap();
+        let first = p.offset();
+        assert_eq!(&s[..first], "CREATE TABLE test (id INTEGER PRIMARY KEY AUTOINCREMENT, col_a TEXT, col_b TEXT, col_c TEXT, col_d TEXT); ");
+
+        p.next_cmd().unwrap();
+        let second = p.offset();
+        assert_eq!(
+            &s[first..second],
+            "INSERT INTO test (col_b, col_d, col_a, col_c) VALUES ('1', '2', '3', '4'); "
+        );
+
+        p.next_cmd().unwrap();
+        let third = p.offset();
+        assert_eq!(&s[second..third], "SELECT * FROM test;");
+    }
+
+    #[test]
+    fn test_variable_index_bounds() {
+        for sql in ["SELECT ?0", "SELECT ?250001"] {
+            let mut p = Parser::new(sql.as_bytes());
+            let err = p.next_cmd().unwrap_err().to_string();
+            assert!(
+                err.contains("variable number must be between ?1 and ?250000"),
+                "unexpected error for {sql}: {err}"
+            );
+        }
+
+        let mut p = Parser::new("SELECT ?250000".as_bytes());
+        assert!(p.next_cmd().is_ok());
+    }
+
+    #[test]
     fn test_expect_fail() {
         let testcases = vec![
             "ALTER TABLE my_table ADD COLUMN my_column PRIMARY KEY",
@@ -4614,6 +4690,11 @@ mod tests {
             "INSERT INTO my_table(bar) DEFAULT VALUES",
             "INSERT INTO my_table(bar, baz, barr) VALUES (1, 1)",
             "UPDATE foo SET bar = 1 ORDER BY bar",
+            "CREATE TRIGGER foo INSERT ON bar BEGIN INSERT INTO foo VALUES (1, 2) RETURNING bar, baz; END",
+            "CREATE TRIGGER foo INSERT ON bar BEGIN INSERT INTO foo VALUES (1, 2) ON CONFLICT (bar, baz) WHERE 1 DO NOTHING RETURNING bar, baz; END",
+            "CREATE TRIGGER foo INSERT ON bar BEGIN INSERT INTO foo VALUES (1, 2) ON CONFLICT DO UPDATE SET (bar, baz) = 1 WHERE 1 RETURNING bar, baz; END",
+            "CREATE TRIGGER foo INSERT ON bar BEGIN DELETE FROM foo RETURNING *; END",
+            "CREATE TRIGGER foo INSERT ON bar BEGIN UPDATE foo SET bar = 1 RETURNING *; END",
         ];
 
         for tc in testcases {
@@ -4966,9 +5047,44 @@ mod tests {
                         select: OneSelect::Select {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
-                                Box::new(Expr::Variable("1".to_owned())),
+                                Box::new(Expr::Variable(Variable::indexed(1u32.try_into().unwrap()))),
                                 None,
                             )],
+                            from: None,
+                            where_clause: None,
+                            group_by: None,
+                            window_clause: vec![],
+                        },
+                        compounds: vec![],
+                    },
+                    order_by: vec![],
+                    limit: None,
+                }))],
+            ),
+            (
+                b"SELECT ?, :named, ?".as_slice(),
+                vec![Cmd::Stmt(Stmt::Select(Select {
+                    with: None,
+                    body: SelectBody {
+                        select: OneSelect::Select {
+                            distinctness: None,
+                            columns: vec![
+                                ResultColumn::Expr(
+                                    Box::new(Expr::Variable(Variable::indexed(1u32.try_into().unwrap()))),
+                                    None,
+                                ),
+                                ResultColumn::Expr(
+                                    Box::new(Expr::Variable(Variable::named(
+                                        ":named".to_owned(),
+                                        2u32.try_into().unwrap(),
+                                    ))),
+                                    None,
+                                ),
+                                ResultColumn::Expr(
+                                    Box::new(Expr::Variable(Variable::indexed(3u32.try_into().unwrap()))),
+                                    None,
+                                ),
+                            ],
                             from: None,
                             where_clause: None,
                             group_by: None,
@@ -4988,7 +5104,7 @@ mod tests {
                         select: OneSelect::Select {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
-                                Box::new(Expr::Variable("1".to_owned())),
+                                Box::new(Expr::Variable(Variable::indexed(1u32.try_into().unwrap()))),
                                 None,
                             )],
                             from: None,
@@ -11204,199 +11320,6 @@ mod tests {
                             },
                             upsert: None,
                             returning: vec![],
-                        },
-                    ],
-                })],
-            ),
-            (
-                b"CREATE TRIGGER foo INSERT ON bar BEGIN INSERT INTO foo VALUES (1, 2) RETURNING bar, baz; END".as_slice(),
-                vec![Cmd::Stmt(Stmt::CreateTrigger {
-                    temporary: false,
-                    if_not_exists: false,
-                    trigger_name: QualifiedName {
-                        db_name: None,
-                        name: Name::exact("foo".to_owned()),
-                        alias: None,
-                    },
-                    time: None,
-                    event: TriggerEvent::Insert,
-                    tbl_name: QualifiedName {
-                        db_name: None,
-                        name: Name::exact("bar".to_owned()),
-                        alias: None,
-                    },
-                    for_each_row: false,
-                    when_clause: None,
-                    commands: vec![
-                        TriggerCmd::Insert {
-                            or_conflict: None,
-                            tbl_name: Name::exact("foo".to_owned()),
-                            col_names: vec![],
-                            select: Select {
-                                with: None,
-                                body: SelectBody {
-                                    select: OneSelect::Values(vec![
-                                        vec![
-                                            Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                                            Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
-                                        ],
-                                    ]),
-                                    compounds: vec![],
-                                },
-                                order_by: vec![],
-                                limit: None,
-                            },
-                            upsert: None,
-                            returning: vec![
-                                ResultColumn::Expr(
-                                    Box::new(Expr::Id(Name::exact("bar".to_owned()))),
-                                    None,
-                                ),
-                                ResultColumn::Expr(
-                                    Box::new(Expr::Id(Name::exact("baz".to_owned()))),
-                                    None,
-                                ),
-                            ],
-                        },
-                    ],
-                })],
-            ),
-            (
-                b"CREATE TRIGGER foo INSERT ON bar BEGIN INSERT INTO foo VALUES (1, 2) ON CONFLICT (bar, baz) WHERE 1 DO NOTHING RETURNING bar, baz; END".as_slice(),
-                vec![Cmd::Stmt(Stmt::CreateTrigger {
-                    temporary: false,
-                    if_not_exists: false,
-                    trigger_name: QualifiedName {
-                        db_name: None,
-                        name: Name::exact("foo".to_owned()),
-                        alias: None,
-                    },
-                    time: None,
-                    event: TriggerEvent::Insert,
-                    tbl_name: QualifiedName {
-                        db_name: None,
-                        name: Name::exact("bar".to_owned()),
-                        alias: None,
-                    },
-                    for_each_row: false,
-                    when_clause: None,
-                    commands: vec![
-                        TriggerCmd::Insert {
-                            or_conflict: None,
-                            tbl_name: Name::exact("foo".to_owned()),
-                            col_names: vec![],
-                            select: Select {
-                                with: None,
-                                body: SelectBody {
-                                    select: OneSelect::Values(vec![
-                                        vec![
-                                            Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                                            Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
-                                        ],
-                                    ]),
-                                    compounds: vec![],
-                                },
-                                order_by: vec![],
-                                limit: None,
-                            },
-                            upsert: Some(Box::new(Upsert {
-                                index: Some(UpsertIndex {
-                                    targets: vec![
-                                        SortedColumn {
-                                            expr: Box::new(Expr::Id(Name::exact("bar".to_owned()))),
-                                            order: None,
-                                            nulls: None
-                                        },
-                                        SortedColumn {
-                                            expr: Box::new(Expr::Id(Name::exact("baz".to_owned()))),
-                                            order: None,
-                                            nulls: None
-                                        },
-                                    ],
-                                    where_clause: Some(Box::new(Expr::Literal(Literal::Numeric("1".to_owned())))),
-                                }),
-                                do_clause: UpsertDo::Nothing,
-                                next: None
-                            })),
-                            returning: vec![
-                                ResultColumn::Expr(
-                                    Box::new(Expr::Id(Name::exact("bar".to_owned()))),
-                                    None,
-                                ),
-                                ResultColumn::Expr(
-                                    Box::new(Expr::Id(Name::exact("baz".to_owned()))),
-                                    None,
-                                ),
-                            ],
-                        },
-                    ],
-                })],
-            ),
-            (
-                b"CREATE TRIGGER foo INSERT ON bar BEGIN INSERT INTO foo VALUES (1, 2) ON CONFLICT DO UPDATE SET (bar, baz) = 1 WHERE 1 RETURNING bar, baz; END".as_slice(),
-                vec![Cmd::Stmt(Stmt::CreateTrigger {
-                    temporary: false,
-                    if_not_exists: false,
-                    trigger_name: QualifiedName {
-                        db_name: None,
-                        name: Name::exact("foo".to_owned()),
-                        alias: None,
-                    },
-                    time: None,
-                    event: TriggerEvent::Insert,
-                    tbl_name: QualifiedName {
-                        db_name: None,
-                        name: Name::exact("bar".to_owned()),
-                        alias: None,
-                    },
-                    for_each_row: false,
-                    when_clause: None,
-                    commands: vec![
-                        TriggerCmd::Insert {
-                            or_conflict: None,
-                            tbl_name: Name::exact("foo".to_owned()),
-                            col_names: vec![],
-                            select: Select {
-                                with: None,
-                                body: SelectBody {
-                                    select: OneSelect::Values(vec![
-                                        vec![
-                                            Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                                            Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
-                                        ],
-                                    ]),
-                                    compounds: vec![],
-                                },
-                                order_by: vec![],
-                                limit: None,
-                            },
-                            upsert: Some(Box::new(Upsert {
-                                index: None,
-                                do_clause: UpsertDo::Set {
-                                    sets: vec![
-                                        Set {
-                                            col_names: vec![
-                                                Name::exact("bar".to_owned()),
-                                                Name::exact("baz".to_owned()),
-                                            ],
-
-                                            expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                                        }
-                                    ],
-                                    where_clause: Some(Box::new(Expr::Literal(Literal::Numeric("1".to_owned())))),
-                                },
-                                next: None
-                            })),
-                            returning: vec![
-                                ResultColumn::Expr(
-                                    Box::new(Expr::Id(Name::exact("bar".to_owned()))),
-                                    None,
-                                ),
-                                ResultColumn::Expr(
-                                    Box::new(Expr::Id(Name::exact("baz".to_owned()))),
-                                    None,
-                                ),
-                            ],
                         },
                     ],
                 })],

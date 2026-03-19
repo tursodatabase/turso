@@ -31,7 +31,7 @@ impl TableRefIdCounter {
         }
     }
 
-    #[expect(clippy::should_implement_trait)]
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> ast::TableInternalId {
         let id = self.next_free;
         self.next_free += 1;
@@ -168,6 +168,9 @@ pub struct ProgramBuilder {
     /// Whether this is a subprogram (trigger or FK action). Subprograms skip Transaction instructions.
     pub is_subprogram: bool,
     pub resolve_type: ResolveType,
+    /// Whether the resolve_type was explicitly set from a statement-level OR clause.
+    /// When false, per-constraint ON CONFLICT clauses from CREATE TABLE should be used.
+    pub has_statement_conflict: bool,
     /// When set, all triggers fired from this program should use this conflict resolution.
     /// This is used in UPSERT DO UPDATE context to ensure nested trigger's OR IGNORE/REPLACE
     /// clauses don't suppress errors.
@@ -242,8 +245,6 @@ pub struct MaterializedCteInfo {
     pub cursor_id: CursorID,
     /// The table definition, needed for allocating dup cursors with the same CursorType.
     pub table: Arc<BTreeTable>,
-    /// Start register for reading result columns.
-    pub result_columns_start_reg: usize,
     /// Number of result columns.
     pub num_columns: usize,
 }
@@ -360,6 +361,18 @@ macro_rules! emit_explain {
 }
 
 impl ProgramBuilder {
+    /// Run a nested emission scope without leaking its result-column register base
+    /// into the surrounding builder state.
+    pub fn with_scoped_result_cols_start<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> crate::Result<T>,
+    ) -> crate::Result<T> {
+        let saved = self.reg_result_cols_start;
+        let result = f(self);
+        self.reg_result_cols_start = saved;
+        result
+    }
+
     pub fn new(
         query_mode: QueryMode,
         capture_data_changes_info: Option<CaptureDataChangesInfo>,
@@ -431,6 +444,7 @@ impl ProgramBuilder {
             trigger,
             is_subprogram,
             resolve_type: ResolveType::Abort,
+            has_statement_conflict: false,
             trigger_conflict_override: None,
             cursor_overrides: HashMap::default(),
             id_register_overrides: HashMap::default(),
@@ -729,6 +743,18 @@ impl ProgramBuilder {
         Ok(self._alloc_cursor_id(key, CursorType::BTreeIndex(index.clone())))
     }
 
+    pub fn alloc_cursor_index_if_not_exists(
+        &mut self,
+        key: CursorKey,
+        index: &Arc<Index>,
+    ) -> crate::Result<usize> {
+        if let Some(cursor_id) = self.resolve_cursor_id_safe(&key) {
+            Ok(cursor_id)
+        } else {
+            self.alloc_cursor_index(Some(key), index)
+        }
+    }
+
     pub fn alloc_cursor_id(&mut self, cursor_type: CursorType) -> usize {
         self._alloc_cursor_id(None, cursor_type)
     }
@@ -814,6 +840,7 @@ impl ProgramBuilder {
                 String::new()
             },
             on_error: None,
+            description_reg: None,
         });
     }
 
@@ -826,6 +853,7 @@ impl ProgramBuilder {
             err_code,
             description,
             on_error: None,
+            description_reg: None,
         });
     }
 
@@ -1158,6 +1186,8 @@ impl ProgramBuilder {
                 Insn::Yield {
                     yield_reg: _,
                     end_offset,
+                    subtype_clear_start_reg: _,
+                    subtype_clear_count: _,
                 } => {
                     resolve(end_offset, "Yield")?;
                 }
@@ -1205,6 +1235,16 @@ impl ProgramBuilder {
                 }
                 Insn::HashNextUnmatched { target_pc, .. } => {
                     resolve(target_pc, "HashNextUnmatched")?
+                }
+                Insn::HashGraceInit { target_pc, .. } => resolve(target_pc, "HashGraceInit")?,
+                Insn::HashGraceLoadPartition { target_pc, .. } => {
+                    resolve(target_pc, "HashGraceLoadPartition")?
+                }
+                Insn::HashGraceNextProbe { target_pc, .. } => {
+                    resolve(target_pc, "HashGraceNextProbe")?
+                }
+                Insn::HashGraceAdvancePartition { target_pc, .. } => {
+                    resolve(target_pc, "HashGraceAdvancePartition")?
                 }
                 Insn::Program {
                     ignore_jump_target, ..
@@ -1419,6 +1459,7 @@ impl ProgramBuilder {
                 err_code: 0,
                 description: description.to_string(),
                 on_error: None,
+                description_reg: None,
             });
             return;
         }

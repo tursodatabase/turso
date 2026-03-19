@@ -14,7 +14,7 @@ use crate::{
 use super::{
     emitter::{Resolver, TranslateCtx},
     expr::{
-        translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
+        resolve_expr, translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
         ConditionMetadata, NoConstantOptReason,
     },
     plan::{Aggregate, Distinctness, SelectPlan, TableReferences},
@@ -42,11 +42,12 @@ pub fn emit_ungrouped_aggregation<'a>(
     // we need to call translate_expr on each result column, but replace the expr with a register copy in case any part of the
     // result column expression matches a) a group by column or b) an aggregation result.
     for (i, agg) in plan.aggregates.iter().enumerate() {
-        t_ctx.resolver.expr_to_reg_cache.push((
+        t_ctx.resolver.cache_expr_reg(
             std::borrow::Cow::Borrowed(&agg.original_expr),
             agg_start_reg + i,
             false,
-        ));
+            None,
+        );
     }
     t_ctx.resolver.enable_expr_to_reg_cache();
 
@@ -169,7 +170,7 @@ pub fn emit_ungrouped_aggregation<'a>(
     Ok(())
 }
 
-fn emit_collseq_if_needed(
+pub(crate) fn emit_collseq_if_needed(
     program: &mut ProgramBuilder,
     referenced_tables: &TableReferences,
     expr: &ast::Expr,
@@ -234,32 +235,18 @@ pub fn handle_distinct(
     });
 }
 
-/// Enum representing the source of the aggregate function arguments
+/// Source of aggregate function arguments during bytecode emission.
 ///
-/// Aggregate arguments can come from different sources, depending on how the aggregation
-/// is evaluated:
-/// * In the common grouped case, the aggregate function arguments are  first inserted
-///   into a sorter in the main loop, and in the group by aggregation phase we read
-///   the data from the sorter.
-/// * In grouped cases where no sorting is required, arguments are retrieved  directly
-///   from registers allocated in the main loop.
-/// * In ungrouped cases, arguments are computed directly from the `args` expressions.
+/// * `Register`: arguments were pre-computed into contiguous registers
+///   (used for GROUP BY without a sorter, where the main loop is already sorted).
+/// * `Expression`: arguments are evaluated on-the-fly from the original AST
+///   (used for ungrouped aggregates, window functions, and for the GROUP BY sorter
+///   path where leaf columns are cached in `expr_to_reg_cache` before evaluation).
 pub enum AggArgumentSource<'a> {
-    /// The aggregate function arguments are retrieved from a pseudo cursor
-    /// which reads from the GROUP BY sorter.
-    PseudoCursor {
-        cursor_id: usize,
-        col_start: usize,
-        dest_reg_start: usize,
-        aggregate: &'a Aggregate,
-    },
-    /// The aggregate function arguments are retrieved from a contiguous block of registers
-    /// allocated in the main loop for that given aggregate function.
     Register {
         src_reg_start: usize,
         aggregate: &'a Aggregate,
     },
-    /// The aggregate function arguments are retrieved by evaluating expressions.
     Expression {
         func: &'a AggFunc,
         args: &'a Vec<ast::Expr>,
@@ -268,23 +255,6 @@ pub enum AggArgumentSource<'a> {
 }
 
 impl<'a> AggArgumentSource<'a> {
-    /// Create a new [AggArgumentSource] that retrieves the values from a GROUP BY sorter.
-    pub fn new_from_cursor(
-        program: &mut ProgramBuilder,
-        cursor_id: usize,
-        col_start: usize,
-        aggregate: &'a Aggregate,
-    ) -> Self {
-        let dest_reg_start = program.alloc_registers(aggregate.args.len());
-        Self::PseudoCursor {
-            cursor_id,
-            col_start,
-            dest_reg_start,
-            aggregate,
-        }
-    }
-    /// Create a new [AggArgumentSource] that retrieves the values directly from an already
-    /// populated register or registers.
     pub fn new_from_registers(src_reg_start: usize, aggregate: &'a Aggregate) -> Self {
         Self::Register {
             src_reg_start,
@@ -292,7 +262,6 @@ impl<'a> AggArgumentSource<'a> {
         }
     }
 
-    /// Create a new [AggArgumentSource] that retrieves the values by evaluating `args` expressions.
     pub fn new_from_expression(
         func: &'a AggFunc,
         args: &'a Vec<ast::Expr>,
@@ -307,7 +276,6 @@ impl<'a> AggArgumentSource<'a> {
 
     pub fn distinctness(&self) -> &Distinctness {
         match self {
-            AggArgumentSource::PseudoCursor { aggregate, .. } => &aggregate.distinctness,
             AggArgumentSource::Register { aggregate, .. } => &aggregate.distinctness,
             AggArgumentSource::Expression { distinctness, .. } => distinctness,
         }
@@ -315,26 +283,26 @@ impl<'a> AggArgumentSource<'a> {
 
     pub fn agg_func(&self) -> &AggFunc {
         match self {
-            AggArgumentSource::PseudoCursor { aggregate, .. } => &aggregate.func,
             AggArgumentSource::Register { aggregate, .. } => &aggregate.func,
             AggArgumentSource::Expression { func, .. } => func,
         }
     }
+
     pub fn arg_at(&self, idx: usize) -> &ast::Expr {
         match self {
-            AggArgumentSource::PseudoCursor { aggregate, .. } => &aggregate.args[idx],
             AggArgumentSource::Register { aggregate, .. } => &aggregate.args[idx],
             AggArgumentSource::Expression { args, .. } => &args[idx],
         }
     }
+
     pub fn num_args(&self) -> usize {
         match self {
-            AggArgumentSource::PseudoCursor { aggregate, .. } => aggregate.args.len(),
             AggArgumentSource::Register { aggregate, .. } => aggregate.args.len(),
             AggArgumentSource::Expression { args, .. } => args.len(),
         }
     }
-    /// Read the value of an aggregate function argument
+
+    /// Emit bytecode to read an aggregate function argument into a register.
     pub fn translate(
         &self,
         program: &mut ProgramBuilder,
@@ -343,32 +311,12 @@ impl<'a> AggArgumentSource<'a> {
         arg_idx: usize,
     ) -> Result<usize> {
         match self {
-            AggArgumentSource::PseudoCursor {
-                cursor_id,
-                col_start,
-                dest_reg_start,
-                ..
-            } => {
-                program.emit_column_or_rowid(
-                    *cursor_id,
-                    *col_start + arg_idx,
-                    dest_reg_start + arg_idx,
-                );
-                Ok(dest_reg_start + arg_idx)
-            }
             AggArgumentSource::Register {
                 src_reg_start: start_reg,
                 ..
             } => Ok(*start_reg + arg_idx),
             AggArgumentSource::Expression { args, .. } => {
-                let dest_reg = program.alloc_register();
-                translate_expr(
-                    program,
-                    Some(referenced_tables),
-                    &args[arg_idx],
-                    dest_reg,
-                    resolver,
-                )
+                resolve_expr(program, Some(referenced_tables), &args[arg_idx], resolver)
             }
         }
     }
@@ -406,7 +354,7 @@ pub fn translate_aggregation_step(
                 col: expr_reg,
                 delimiter: 0,
                 func: AggFunc::Avg,
-                comparator_func_name: None,
+                comparator: None,
             });
             target_register
         }
@@ -419,7 +367,7 @@ pub fn translate_aggregation_step(
                 col: expr_reg,
                 delimiter: 0,
                 func: AggFunc::Count0,
-                comparator_func_name: None,
+                comparator: None,
             });
             target_register
         }
@@ -434,7 +382,7 @@ pub fn translate_aggregation_step(
                 col: expr_reg,
                 delimiter: 0,
                 func: AggFunc::Count,
-                comparator_func_name: None,
+                comparator: None,
             });
             target_register
         }
@@ -459,7 +407,7 @@ pub fn translate_aggregation_step(
                 col: expr_reg,
                 delimiter: delimiter_reg,
                 func: AggFunc::GroupConcat,
-                comparator_func_name: None,
+                comparator: None,
             });
 
             target_register
@@ -472,14 +420,14 @@ pub fn translate_aggregation_step(
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             let expr = &agg_arg_source.arg_at(0);
             emit_collseq_if_needed(program, referenced_tables, expr);
-            let comparator_func_name =
-                super::order_by::custom_type_lt_func(expr, referenced_tables, resolver.schema());
+            let comparator =
+                super::order_by::custom_type_comparator(expr, referenced_tables, resolver.schema());
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: 0,
                 func: AggFunc::Max,
-                comparator_func_name,
+                comparator,
             });
             target_register
         }
@@ -491,14 +439,14 @@ pub fn translate_aggregation_step(
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             let expr = &agg_arg_source.arg_at(0);
             emit_collseq_if_needed(program, referenced_tables, expr);
-            let comparator_func_name =
-                super::order_by::custom_type_lt_func(expr, referenced_tables, resolver.schema());
+            let comparator =
+                super::order_by::custom_type_comparator(expr, referenced_tables, resolver.schema());
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: 0,
                 func: AggFunc::Min,
-                comparator_func_name,
+                comparator,
             });
             target_register
         }
@@ -516,7 +464,7 @@ pub fn translate_aggregation_step(
                 col: expr_reg,
                 delimiter: value_reg,
                 func: AggFunc::JsonGroupObject,
-                comparator_func_name: None,
+                comparator: None,
             });
             target_register
         }
@@ -532,7 +480,7 @@ pub fn translate_aggregation_step(
                 col: expr_reg,
                 delimiter: 0,
                 func: AggFunc::JsonGroupArray,
-                comparator_func_name: None,
+                comparator: None,
             });
             target_register
         }
@@ -550,7 +498,7 @@ pub fn translate_aggregation_step(
                 col: expr_reg,
                 delimiter: delimiter_reg,
                 func: AggFunc::StringAgg,
-                comparator_func_name: None,
+                comparator: None,
             });
 
             target_register
@@ -566,7 +514,7 @@ pub fn translate_aggregation_step(
                 col: expr_reg,
                 delimiter: 0,
                 func: AggFunc::Sum,
-                comparator_func_name: None,
+                comparator: None,
             });
             target_register
         }
@@ -581,7 +529,7 @@ pub fn translate_aggregation_step(
                 col: expr_reg,
                 delimiter: 0,
                 func: AggFunc::Total,
-                comparator_func_name: None,
+                comparator: None,
             });
             target_register
         }
@@ -597,7 +545,7 @@ pub fn translate_aggregation_step(
                 col: expr_reg,
                 delimiter: 0,
                 func: AggFunc::ArrayAgg,
-                comparator_func_name: None,
+                comparator: None,
             });
             target_register
         }
@@ -627,11 +575,15 @@ pub fn translate_aggregation_step(
                 col: expr_reg,
                 delimiter: 0,
                 func: AggFunc::External(func.clone()),
-                comparator_func_name: None,
+                comparator: None,
             });
             target_register
         }
     };
+    // Aggregate arguments can carry column or explicit COLLATE metadata for the
+    // aggregate's internal comparator, but that state must not leak to the
+    // surrounding expression that consumes the aggregate result.
+    program.reset_collation();
     Ok(dest)
 }
 

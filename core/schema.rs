@@ -8,10 +8,11 @@ use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl};
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
-use crate::turso_assert;
 use crate::types::IOResult;
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::affinity::Affinity;
+use crate::vdbe::CursorID;
+use crate::{turso_assert, turso_debug_assert};
 use turso_macros::AtomicEnum;
 
 #[derive(Debug, Clone, AtomicEnum)]
@@ -140,7 +141,8 @@ use std::collections::VecDeque;
 use std::ops::Deref;
 use tracing::trace;
 use turso_parser::ast::{
-    self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, RefAct, SortOrder, TypeOperator,
+    self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, RefAct, ResolveType, SortOrder,
+    TypeOperator,
 };
 use turso_parser::{
     ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
@@ -840,13 +842,35 @@ impl Schema {
         let table_name = normalize_ident(&index.table_name);
         // We must add the new index to the front of the deque, because SQLite stores index definitions as a linked list
         // where the newest parsed index entry is at the head of list. If we would add it to the back of a regular Vec for example,
-        // then we would evaluate ON CONFLICT DO UPDATE clauses in the wrong index iteration order and UPDATE the wrong row. One might
-        // argue that this is an implementation detail and we should not care about this, but it makes e.g. the fuzz test 'partial_index_mutation_and_upsert_fuzz'
-        // fail, so let's just be compatible.
-        self.indexes
-            .entry(table_name)
-            .or_default()
-            .push_front(index);
+        // then we would evaluate ON CONFLICT DO UPDATE clauses in the wrong index iteration order and UPDATE the wrong row.
+        // Additionally, REPLACE indexes must go after all the non-REPLACE indexes so that
+        // non-mutating conflict resolutions all happen before mutating ones, ensuring that
+        // no half-committed state is left behind.
+        let is_replace = index.on_conflict == Some(ResolveType::Replace);
+        let indexes_for_table = self.indexes.entry(table_name).or_default();
+        if is_replace {
+            // REPLACE indexes sort newest-first among themselves.
+            let first_replace = indexes_for_table
+                .iter()
+                .position(|idx| idx.on_conflict == Some(ResolveType::Replace));
+            let pos = first_replace.unwrap_or(indexes_for_table.len());
+            indexes_for_table.insert(pos, index);
+        } else {
+            // Non-REPLACE indexes go at the front, newest first.
+            indexes_for_table.push_front(index);
+        }
+        turso_debug_assert!(
+            indexes_for_table
+                .iter()
+                .position(|idx| idx.on_conflict == Some(ResolveType::Replace))
+                .is_none_or(|first_replace| {
+                    indexes_for_table
+                        .iter()
+                        .skip(first_replace)
+                        .all(|idx| idx.on_conflict == Some(ResolveType::Replace))
+                }),
+            "REPLACE indexes must form a contiguous suffix"
+        );
         Ok(())
     }
 
@@ -857,6 +881,16 @@ impl Schema {
             .map(|v| v.iter())
             .unwrap_or_default()
             .filter(|i| !i.is_backing_btree_index())
+    }
+
+    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    pub fn has_fts_index(&self, table_name: &str) -> bool {
+        use crate::index_method::fts::FTS_INDEX_METHOD_NAME;
+        self.get_indices(table_name).any(|idx| {
+            idx.index_method
+                .as_ref()
+                .is_some_and(|m| m.definition().method_name == FTS_INDEX_METHOD_NAME)
+        })
     }
 
     pub fn get_index(&self, table_name: &str, index_name: &str) -> Option<&Arc<Index>> {
@@ -1116,6 +1150,7 @@ impl Schema {
                             table.as_ref(),
                             index_entry,
                             unique_set.columns.len(),
+                            unique_set.conflict_clause,
                         )?))?;
                     } else if mvcc_enabled {
                         // In MVCC mode, automatic indices might not be fully populated yet during recovery
@@ -1145,6 +1180,7 @@ impl Schema {
                             table.as_ref(),
                             index_entry,
                             column_indices_and_sort_orders,
+                            unique_set.conflict_clause,
                         )?))?;
                     } else if mvcc_enabled {
                         // In MVCC mode, automatic indices might not be fully populated yet during recovery
@@ -1233,6 +1269,7 @@ impl Schema {
                 has_autoincrement: false,
                 foreign_keys: vec![],
                 check_constraints: vec![],
+                rowid_alias_conflict_clause: None,
                 unique_sets: vec![],
             })));
 
@@ -1959,6 +1996,7 @@ impl PartialEq for Table {
 pub struct UniqueSet {
     pub columns: Vec<(String, SortOrder)>,
     pub is_primary_key: bool,
+    pub conflict_clause: Option<ResolveType>,
 }
 
 #[derive(Clone, Debug)]
@@ -1999,6 +2037,9 @@ pub struct BTreeTable {
     pub unique_sets: Vec<UniqueSet>,
     pub foreign_keys: Vec<Arc<ForeignKey>>,
     pub check_constraints: Vec<CheckConstraint>,
+    /// ON CONFLICT clause for the INTEGER PRIMARY KEY constraint.
+    /// Stored here because rowid-alias PKs have their UniqueSet removed.
+    pub rowid_alias_conflict_clause: Option<ResolveType>,
 }
 
 impl BTreeTable {
@@ -2122,7 +2163,7 @@ impl BTreeTable {
     /// For example, if a user creates a table like: `CREATE TABLE t              (x)`, we store it as
     /// `CREATE TABLE t (x)`, whereas sqlite stores it with the original extra whitespace.
     pub fn to_sql(&self) -> String {
-        let mut sql = format!("CREATE TABLE {} (", self.name);
+        let mut sql = format!("CREATE TABLE {} (", quote_ident(&self.name));
         let needs_pk_inline = self.primary_key_columns.len() == 1;
         // Add columns
         for (i, column) in self.columns.iter().enumerate() {
@@ -2338,16 +2379,57 @@ pub struct FromClauseSubquery {
     /// The start register for the result columns of the derived table;
     /// must be set before data is read from it.
     pub result_columns_start_reg: Option<usize>,
-    /// CTE identity for sharing materialized data across multiple references.
-    /// None means this is a regular inline subquery (not from a CTE).
-    /// Some(id) means this references a CTE with the given identity.
-    /// Multiple references to the same CTE will have the same cte_id.
-    pub cte_id: Option<usize>,
-    /// If true, this subquery has an explicit hint to materialize itself into an ephemeral table
-    /// (not emitted as a coroutine). This is set for CTEs to enable sharing
-    /// materialized data across multiple references via OpenDup,
-    /// and also via WITH .., AS MATERIALIZED.
+    /// The table cursor backing a materialized EphemeralTable representation of
+    /// this subquery, if one was emitted.
+    pub materialized_cursor_id: Option<CursorID>,
+    /// CTE-specific materialization metadata, when this FROM-subquery is a CTE
+    /// reference rather than an inline derived table.
+    pub cte: Option<FromClauseSubqueryCteMetadata>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FromClauseSubqueryCteMetadata {
+    /// Identity shared by all references to the same CTE definition.
+    pub id: usize,
+    /// True when this CTE is referenced more than once inside the enclosing
+    /// query tree and therefore must be materialized once and shared.
+    pub shared_materialization: bool,
+    /// True for explicit WITH ... AS MATERIALIZED.
     pub materialize_hint: bool,
+}
+
+impl FromClauseSubquery {
+    pub fn cte_id(&self) -> Option<usize> {
+        self.cte.map(|cte| cte.id)
+    }
+
+    pub fn materialize_hint(&self) -> bool {
+        self.cte.is_some_and(|cte| cte.materialize_hint)
+    }
+
+    pub fn shared_materialization(&self) -> bool {
+        self.cte.is_some_and(|cte| cte.shared_materialization)
+    }
+
+    pub fn set_shared_materialization(&mut self, shared: bool) {
+        if let Some(cte) = &mut self.cte {
+            cte.shared_materialization = shared;
+        }
+    }
+
+    /// Shared CTE references and explicit MATERIALIZED hints both force a
+    /// table-backed materialization that can be scanned or probed later.
+    pub fn requires_table_materialization(&self) -> bool {
+        self.shared_materialization() || self.materialize_hint()
+    }
+
+    /// Only simple single-reference SELECT subqueries can safely use their
+    /// synthesized seek index as the storage target directly. Compound
+    /// subqueries still need table-backed storage so their set-operation
+    /// semantics are preserved before any later SEARCH shape is chosen.
+    pub fn supports_direct_index_materialization(&self) -> bool {
+        matches!(self.plan.as_ref(), Plan::Select(_)) && !self.requires_table_materialization()
+    }
 }
 
 pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> Result<BTreeTable> {
@@ -2381,11 +2463,6 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     conflict_clause,
                 } = &c.constraint
                 {
-                    if conflict_clause.is_some() {
-                        crate::bail_parse_error!(
-                            "ON CONFLICT not implemented for PRIMARY KEY constraint"
-                        );
-                    }
                     if !primary_key_columns.is_empty() {
                         crate::bail_parse_error!(
                             "table \"{}\" has more than one primary key",
@@ -2412,17 +2489,13 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     unique_sets_constraints.push(UniqueSet {
                         columns: primary_key_columns.clone(),
                         is_primary_key: true,
+                        conflict_clause: *conflict_clause,
                     });
                 } else if let ast::TableConstraint::Unique {
                     columns,
                     conflict_clause,
                 } = &c.constraint
                 {
-                    if conflict_clause.is_some() {
-                        crate::bail_parse_error!(
-                            "ON CONFLICT not implemented for UNIQUE constraint"
-                        );
-                    }
                     let mut unique_columns = Vec::with_capacity(columns.len());
                     for column in columns {
                         match column.expr.as_ref() {
@@ -2442,6 +2515,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     let unique_set = UniqueSet {
                         columns: unique_columns,
                         is_primary_key: false,
+                        conflict_clause: *conflict_clause,
                     };
                     unique_sets_constraints.push(unique_set);
                 } else if let ast::TableConstraint::ForeignKey {
@@ -2567,6 +2641,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 let mut default = None;
                 let mut primary_key = false;
                 let mut notnull = false;
+                let mut notnull_conflict_clause = None;
                 let mut order = SortOrder::Asc;
                 let mut unique = false;
                 let mut collation = None;
@@ -2589,11 +2664,6 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             conflict_clause,
                             ..
                         } => {
-                            if conflict_clause.is_some() {
-                                crate::bail_parse_error!(
-                                    "ON CONFLICT not implemented for column definition"
-                                );
-                            }
                             if !primary_key_columns.is_empty() {
                                 crate::bail_parse_error!(
                                     "table \"{}\" has more than one primary key",
@@ -2610,6 +2680,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             unique_sets_columns.push(UniqueSet {
                                 columns: vec![(name.clone(), order)],
                                 is_primary_key: true,
+                                conflict_clause: *conflict_clause,
                             });
                         }
                         ast::ColumnConstraint::NotNull {
@@ -2617,12 +2688,8 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             conflict_clause,
                             ..
                         } => {
-                            if conflict_clause.is_some() {
-                                crate::bail_parse_error!(
-                                    "ON CONFLICT not implemented for column definition"
-                                );
-                            }
                             notnull = !nullable;
+                            notnull_conflict_clause = *conflict_clause;
                         }
                         ast::ColumnConstraint::Default(ref expr) => {
                             default = Some(
@@ -2630,17 +2697,12 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                     .unwrap_or_else(|| expr.clone()),
                             );
                         }
-                        // TODO: for now we don't check Resolve type of unique
                         ast::ColumnConstraint::Unique(conflict) => {
-                            if conflict.is_some() {
-                                crate::bail_parse_error!(
-                                    "ON CONFLICT not implemented for column definition"
-                                );
-                            }
                             unique = true;
                             unique_sets_columns.push(UniqueSet {
                                 columns: vec![(name.clone(), order)],
                                 is_primary_key: false,
+                                conflict_clause: *conflict,
                             });
                         }
                         ast::ColumnConstraint::Collate { ref collation_name } => {
@@ -2730,6 +2792,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         notnull,
                         unique,
                         hidden: false,
+                        notnull_conflict_clause,
                     },
                 );
                 col.ty_params = ty_params;
@@ -2783,6 +2846,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         .into_iter()
         .chain(unique_sets_constraints)
         .collect::<Vec<_>>();
+    // Capture PK conflict clause before the rowid-alias UniqueSet is removed.
+    let rowid_alias_conflict_clause = unique_sets
+        .iter()
+        .find(|us| us.is_primary_key)
+        .and_then(|us| us.conflict_clause);
     for col in cols.iter() {
         if col.is_rowid_alias() {
             // Unique sets are used for creating automatic indexes. An index is not created for a rowid alias PRIMARY KEY.
@@ -2832,6 +2900,18 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             .zip(unique_sets[j].columns.iter())
                             .all(|((a_name, _), (b_name, _))| a_name.eq_ignore_ascii_case(b_name))
                     {
+                        // SQLite rejects duplicate constraints on the same columns when both
+                        // specify ON CONFLICT with different resolve types.
+                        if let (Some(a), Some(b)) = (
+                            unique_sets[i].conflict_clause,
+                            unique_sets[j].conflict_clause,
+                        ) {
+                            if a != b {
+                                crate::bail_parse_error!(
+                                    "conflicting ON CONFLICT clauses specified"
+                                );
+                            }
+                        }
                         unique_sets.remove(j);
                     } else {
                         j += 1;
@@ -2842,6 +2922,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
             unique_sets
         },
         check_constraints,
+        rowid_alias_conflict_clause,
     })
 }
 
@@ -2981,6 +3062,8 @@ pub struct Column {
     pub default: Option<Box<Expr>>,
     pub generated: Option<Box<Expr>>,
     raw: u16,
+    /// ON CONFLICT clause for NOT NULL constraint on this column.
+    pub notnull_conflict_clause: Option<ResolveType>,
 }
 
 #[derive(Default)]
@@ -2990,6 +3073,7 @@ pub struct ColDef {
     pub notnull: bool,
     pub unique: bool,
     pub hidden: bool,
+    pub notnull_conflict_clause: Option<ResolveType>,
 }
 
 // flags
@@ -3118,6 +3202,7 @@ impl Column {
             default,
             generated,
             raw,
+            notnull_conflict_clause: coldef.notnull_conflict_clause,
         }
     }
     #[inline]
@@ -3238,6 +3323,7 @@ impl TryFrom<&ColumnDefinition> for Column {
         let mut default = None;
         let mut generated = None;
         let mut notnull = false;
+        let mut notnull_conflict_clause = None;
         let mut primary_key = false;
         let mut unique = false;
         let mut collation = None;
@@ -3245,7 +3331,12 @@ impl TryFrom<&ColumnDefinition> for Column {
         for ast::NamedColumnConstraint { constraint, .. } in &value.constraints {
             match constraint {
                 ast::ColumnConstraint::PrimaryKey { .. } => primary_key = true,
-                ast::ColumnConstraint::NotNull { .. } => notnull = true,
+                ast::ColumnConstraint::NotNull {
+                    conflict_clause, ..
+                } => {
+                    notnull = true;
+                    notnull_conflict_clause = *conflict_clause;
+                }
                 ast::ColumnConstraint::Unique(..) => unique = true,
                 ast::ColumnConstraint::Default(expr) => {
                     default.replace(
@@ -3300,6 +3391,7 @@ impl TryFrom<&ColumnDefinition> for Column {
                 notnull,
                 unique,
                 hidden,
+                notnull_conflict_clause,
             },
         );
         col.ty_params = ty_params;
@@ -3369,6 +3461,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
         ],
         foreign_keys: vec![],
         check_constraints: vec![],
+        rowid_alias_conflict_clause: None,
         unique_sets: vec![],
     }
 }
@@ -3390,6 +3483,8 @@ pub struct Index {
     pub has_rowid: bool,
     pub where_clause: Option<Box<Expr>>,
     pub index_method: Option<Arc<dyn IndexMethodAttachment>>,
+    /// ON CONFLICT clause from the constraint definition (PRIMARY KEY or UNIQUE).
+    pub on_conflict: Option<ResolveType>,
 }
 
 #[allow(dead_code)]
@@ -3459,6 +3554,7 @@ impl Index {
                         has_rowid: table.has_rowid,
                         where_clause: None,
                         index_method: Some(descriptor),
+                        on_conflict: None,
                     })
                 } else {
                     Ok(Index {
@@ -3471,6 +3567,7 @@ impl Index {
                         has_rowid: table.has_rowid,
                         where_clause,
                         index_method: None,
+                        on_conflict: None,
                     })
                 }
             }
@@ -3494,6 +3591,7 @@ impl Index {
         table: &BTreeTable,
         auto_index: (String, i64), // name, root_page
         column_count: usize,
+        conflict_clause: Option<ResolveType>,
     ) -> Result<Index> {
         let has_primary_key_index =
             table.get_rowid_alias_column().is_none() && !table.primary_key_columns.is_empty();
@@ -3531,6 +3629,7 @@ impl Index {
             has_rowid: table.has_rowid,
             where_clause: None,
             index_method: None,
+            on_conflict: conflict_clause,
         })
     }
 
@@ -3538,6 +3637,7 @@ impl Index {
         table: &BTreeTable,
         auto_index: (String, i64), // name, root_page
         column_indices_and_sort_orders: Vec<(usize, SortOrder)>,
+        conflict_clause: Option<ResolveType>,
     ) -> Result<Index> {
         let (index_name, root_page) = auto_index;
 
@@ -3574,6 +3674,7 @@ impl Index {
             has_rowid: table.has_rowid,
             where_clause: None,
             index_method: None,
+            on_conflict: conflict_clause,
         })
     }
 
@@ -3847,6 +3948,43 @@ mod tests {
     }
 
     #[test]
+    pub fn test_conflicting_on_conflict_unique_rejected() -> Result<()> {
+        let sql =
+            r#"CREATE TABLE t1 (a UNIQUE ON CONFLICT FAIL, b, UNIQUE(a) ON CONFLICT IGNORE);"#;
+        let table = BTreeTable::from_sql(sql, 0);
+        let error = table.unwrap_err();
+        assert!(
+            matches!(error, LimboError::ParseError(e) if e.contains("conflicting ON CONFLICT clauses"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_conflicting_on_conflict_composite_unique_rejected() -> Result<()> {
+        let sql = r#"CREATE TABLE t1 (a, b, UNIQUE(a, b) ON CONFLICT FAIL, UNIQUE(a, b) ON CONFLICT IGNORE);"#;
+        let table = BTreeTable::from_sql(sql, 0);
+        let error = table.unwrap_err();
+        assert!(
+            matches!(error, LimboError::ParseError(e) if e.contains("conflicting ON CONFLICT clauses"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_same_on_conflict_unique_allowed() -> Result<()> {
+        let sql = r#"CREATE TABLE t1 (a UNIQUE ON CONFLICT FAIL, b, UNIQUE(a) ON CONFLICT FAIL);"#;
+        assert!(BTreeTable::from_sql(sql, 0).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_one_on_conflict_unique_allowed() -> Result<()> {
+        let sql = r#"CREATE TABLE t1 (a UNIQUE ON CONFLICT FAIL, b, UNIQUE(a));"#;
+        assert!(BTreeTable::from_sql(sql, 0).is_ok());
+        Ok(())
+    }
+
+    #[test]
     pub fn test_primary_key_separate_single() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, c REAL, PRIMARY KEY(a desc));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -4005,22 +4143,55 @@ mod tests {
     }
 
     #[test]
+    fn test_special_table_names_are_quoted_in_to_sql() -> Result<()> {
+        let tests = [
+            (
+                r#"CREATE TABLE "t t" (x TEXT)"#,
+                r#"CREATE TABLE "t t" (x TEXT)"#,
+            ),
+            (
+                r#"CREATE TABLE "123table" (x TEXT)"#,
+                r#"CREATE TABLE "123table" (x TEXT)"#,
+            ),
+            (
+                r#"CREATE TABLE "t""t" (x TEXT)"#,
+                r#"CREATE TABLE "t""t" (x TEXT)"#,
+            ),
+        ];
+
+        for (input_sql, expected_sql) in tests {
+            let actual = BTreeTable::from_sql(input_sql, 0)?.to_sql();
+            assert_eq!(actual, expected_sql);
+        }
+
+        Ok(())
+    }
+
+    #[test]
     #[should_panic]
     fn test_automatic_index_single_column() {
         // Without composite primary keys, we should not have an automatic index on a primary key that is a rowid alias
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT);"#;
         let table = BTreeTable::from_sql(sql, 0).unwrap();
-        let _index =
-            Index::automatic_from_primary_key(&table, ("sqlite_autoindex_t1_1".to_string(), 2), 1)
-                .unwrap();
+        let _index = Index::automatic_from_primary_key(
+            &table,
+            ("sqlite_autoindex_t1_1".to_string(), 2),
+            1,
+            None,
+        )
+        .unwrap();
     }
 
     #[test]
     fn test_automatic_index_composite_key() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, PRIMARY KEY(a, b));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
-        let index =
-            Index::automatic_from_primary_key(&table, ("sqlite_autoindex_t1_1".to_string(), 2), 2)?;
+        let index = Index::automatic_from_primary_key(
+            &table,
+            ("sqlite_autoindex_t1_1".to_string(), 2),
+            2,
+            None,
+        )?;
 
         assert_eq!(index.name, "sqlite_autoindex_t1_1");
         assert_eq!(index.table_name, "t1");
@@ -4039,8 +4210,13 @@ mod tests {
     fn test_automatic_index_no_primary_key() {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT);"#;
         let table = BTreeTable::from_sql(sql, 0).unwrap();
-        Index::automatic_from_primary_key(&table, ("sqlite_autoindex_t1_1".to_string(), 2), 1)
-            .unwrap();
+        Index::automatic_from_primary_key(
+            &table,
+            ("sqlite_autoindex_t1_1".to_string(), 2),
+            1,
+            None,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -4061,10 +4237,15 @@ mod tests {
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
+            rowid_alias_conflict_clause: None,
         };
 
-        let result =
-            Index::automatic_from_primary_key(&table, ("sqlite_autoindex_t1_1".to_string(), 2), 1);
+        let result = Index::automatic_from_primary_key(
+            &table,
+            ("sqlite_autoindex_t1_1".to_string(), 2),
+            1,
+            None,
+        );
         assert!(result.is_err());
     }
 
@@ -4076,6 +4257,7 @@ mod tests {
             &table,
             ("sqlite_autoindex_t1_1".to_string(), 2),
             vec![(1, SortOrder::Asc)],
+            None,
         )?;
 
         assert_eq!(index.name, "sqlite_autoindex_t1_1");
@@ -4093,11 +4275,17 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (x PRIMARY KEY, y UNIQUE);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let indices = [
-            Index::automatic_from_primary_key(&table, ("sqlite_autoindex_t1_1".to_string(), 2), 1)?,
+            Index::automatic_from_primary_key(
+                &table,
+                ("sqlite_autoindex_t1_1".to_string(), 2),
+                1,
+                None,
+            )?,
             Index::automatic_from_unique(
                 &table,
                 ("sqlite_autoindex_t1_2".to_string(), 3),
                 vec![(1, SortOrder::Asc)],
+                None,
             )?,
         ];
 
@@ -4130,16 +4318,23 @@ mod tests {
             ("sqlite_autoindex_t1_3".to_string(), 4),
         ];
         let indices = vec![
-            Index::automatic_from_primary_key(&table, ("sqlite_autoindex_t1_1".to_string(), 2), 1)?,
+            Index::automatic_from_primary_key(
+                &table,
+                ("sqlite_autoindex_t1_1".to_string(), 2),
+                1,
+                None,
+            )?,
             Index::automatic_from_unique(
                 &table,
                 ("sqlite_autoindex_t1_2".to_string(), 3),
                 vec![(1, SortOrder::Asc)],
+                None,
             )?,
             Index::automatic_from_unique(
                 &table,
                 ("sqlite_autoindex_t1_3".to_string(), 4),
                 vec![(2, SortOrder::Asc), (3, SortOrder::Asc)],
+                None,
             )?,
         ];
 
@@ -4178,6 +4373,7 @@ mod tests {
             &table,
             ("sqlite_autoindex_t1_1".to_string(), 2),
             vec![(0, SortOrder::Asc), (1, SortOrder::Asc)],
+            None,
         )?;
 
         assert_eq!(index.name, "sqlite_autoindex_t1_1");
@@ -4197,8 +4393,12 @@ mod tests {
     fn test_automatic_index_primary_key_is_unique() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a primary key unique);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
-        let index =
-            Index::automatic_from_primary_key(&table, ("sqlite_autoindex_t1_1".to_string(), 2), 1)?;
+        let index = Index::automatic_from_primary_key(
+            &table,
+            ("sqlite_autoindex_t1_1".to_string(), 2),
+            1,
+            None,
+        )?;
 
         assert_eq!(index.name, "sqlite_autoindex_t1_1");
         assert_eq!(index.table_name, "t1");
@@ -4215,8 +4415,12 @@ mod tests {
     fn test_automatic_index_primary_key_is_unique_and_composite() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a, b, PRIMARY KEY(a, b), UNIQUE(a, b));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
-        let index =
-            Index::automatic_from_primary_key(&table, ("sqlite_autoindex_t1_1".to_string(), 2), 2)?;
+        let index = Index::automatic_from_primary_key(
+            &table,
+            ("sqlite_autoindex_t1_1".to_string(), 2),
+            2,
+            None,
+        )?;
 
         assert_eq!(index.name, "sqlite_autoindex_t1_1");
         assert_eq!(index.table_name, "t1");
@@ -4283,8 +4487,14 @@ mod tests {
                 &table,
                 ("sqlite_autoindex_t1_1".to_string(), 2),
                 vec![(0, SortOrder::Asc)],
+                None,
             )?,
-            Index::automatic_from_primary_key(&table, ("sqlite_autoindex_t1_2".to_string(), 3), 1)?,
+            Index::automatic_from_primary_key(
+                &table,
+                ("sqlite_autoindex_t1_2".to_string(), 3),
+                1,
+                None,
+            )?,
         ];
 
         assert!(indexes.len() == 2);

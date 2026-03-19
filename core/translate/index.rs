@@ -2,7 +2,7 @@ use crate::sync::Arc;
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
-use crate::function::{Deterministic, Func};
+use crate::function::{Deterministic, Func, ScalarFunc};
 use crate::index_method::IndexMethodConfiguration;
 use crate::numeric::Numeric;
 use crate::schema::{Column, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
@@ -25,7 +25,7 @@ use crate::{bail_parse_error, CaptureDataChangesExt, LimboError};
 use crate::{
     schema::{BTreeTable, Index, IndexColumn, PseudoCursorType},
     storage::pager::CreateBTreeFlags,
-    util::normalize_ident,
+    util::{escape_sql_string_literal, normalize_ident},
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::{IdxInsertFlags, Insn, RegisterOrLiteral},
@@ -176,6 +176,7 @@ pub fn translate_create_index(
         // before translating, and it cannot reference a table alias
         where_clause: where_clause.clone(),
         index_method: index_method.clone(),
+        on_conflict: None,
     });
 
     if !idx.validate_where_expr(&table, resolver) {
@@ -223,6 +224,7 @@ pub fn translate_create_index(
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: 0,
+            indexed: None,
         }],
         vec![],
     );
@@ -366,7 +368,7 @@ pub fn translate_create_index(
             cursor_id: sorter_cursor_id,
             columns: columns.len(),
             order_and_collations,
-            comparator_func_names: vec![],
+            comparators: vec![],
         });
         let content_reg = program.alloc_register();
         program.emit_insn(Insn::OpenPseudo {
@@ -492,6 +494,7 @@ pub fn translate_create_index(
                 err_code: SQLITE_CONSTRAINT_UNIQUE,
                 description: format_unique_violation_desc(tbl_name.as_str(), &idx),
                 on_error: None,
+                description_reg: None,
             });
             program.preassign_label_to_next_insn(label_after_sorter_compare);
         } else {
@@ -536,7 +539,8 @@ pub fn translate_create_index(
         p5: 0,
     });
     // Parse the schema table to get the index root page and add new index to Schema
-    let parse_schema_where_clause = format!("name = '{idx_name}' AND type = 'index'");
+    let escaped_idx_name = escape_sql_string_literal(&idx_name);
+    let parse_schema_where_clause = format!("name = '{escaped_idx_name}' AND type = 'index'");
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(parse_schema_where_clause),
@@ -658,9 +662,9 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
             .any(|c| c.name.as_ref().is_some_and(|cn| normalize_ident(cn) == n))
     };
     let is_tbl = |ns: &str| normalize_ident(ns).eq_ignore_ascii_case(&tbl_norm);
-    let is_deterministic_fn = |name: &str, argc: usize| {
+    let is_deterministic_fn = |name: &str, args: &[Box<Expr>]| {
         let n = normalize_ident(name);
-        Func::resolve_function(&n, argc).is_ok_and(|f| f.is_deterministic())
+        Func::resolve_function(&n, args.len()).is_ok_and(|f| is_valid_index_function_call(&f, args))
     };
 
     let mut ok = true;
@@ -672,6 +676,13 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
             // String literals inside expressions are allowed (e.g., `c0 || 'suffix'`).
             // Standalone string literals are handled by resolve_index_column() which interprets
             // them as column names (SQLite backwards compat quirk).
+            Expr::Literal(
+                ast::Literal::CurrentDate
+                | ast::Literal::CurrentTime
+                | ast::Literal::CurrentTimestamp,
+            ) => {
+                ok = false;
+            }
             Expr::Literal(_) | Expr::RowId { .. } => {}
             // must be a column of the target table
             Expr::Id(n) | Expr::Name(n) => {
@@ -696,8 +707,8 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
                     ok = false;
                 } else {
                     let argc = match e {
-                        Expr::FunctionCall { args, .. } => args.len(),
-                        Expr::FunctionCallStar { .. } => 0,
+                        Expr::FunctionCall { args, .. } => args.as_slice(),
+                        Expr::FunctionCallStar { .. } => &[] as &[Box<Expr>],
                         _ => unreachable!(),
                     };
                     if !is_deterministic_fn(name.as_str(), argc) {
@@ -722,6 +733,74 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
         })
     });
     ok
+}
+
+fn is_valid_index_function_call(func: &Func, args: &[Box<Expr>]) -> bool {
+    match func {
+        Func::Scalar(
+            ScalarFunc::Date
+            | ScalarFunc::Time
+            | ScalarFunc::DateTime
+            | ScalarFunc::UnixEpoch
+            | ScalarFunc::JulianDay
+            | ScalarFunc::StrfTime
+            | ScalarFunc::TimeDiff,
+        ) => is_deterministic_datetime_index_call(func, args),
+        _ => func.is_deterministic(),
+    }
+}
+
+// SQLite allows date/time functions in expression indexes only when they do not
+// depend on the current clock or local timezone.
+fn is_deterministic_datetime_index_call(func: &Func, args: &[Box<Expr>]) -> bool {
+    match func {
+        Func::Scalar(ScalarFunc::Date)
+        | Func::Scalar(ScalarFunc::Time)
+        | Func::Scalar(ScalarFunc::DateTime)
+        | Func::Scalar(ScalarFunc::UnixEpoch)
+        | Func::Scalar(ScalarFunc::JulianDay) => {
+            !args.is_empty()
+                && !is_current_time_expr(args[0].as_ref())
+                && !args[1..]
+                    .iter()
+                    .any(|arg| is_unsafe_datetime_modifier(arg.as_ref()))
+        }
+        Func::Scalar(ScalarFunc::StrfTime) => {
+            args.len() >= 2
+                && !is_current_time_expr(args[1].as_ref())
+                && !args[2..]
+                    .iter()
+                    .any(|arg| is_unsafe_datetime_modifier(arg.as_ref()))
+        }
+        Func::Scalar(ScalarFunc::TimeDiff) => {
+            !args.iter().any(|arg| is_current_time_expr(arg.as_ref()))
+        }
+        _ => unreachable!("non-datetime function passed to datetime index validator"),
+    }
+}
+
+fn is_current_time_expr(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Literal(ast::Literal::String(value)) if string_literal_eq(value, "now")
+    ) || matches!(
+        expr,
+        Expr::Literal(
+            ast::Literal::CurrentDate | ast::Literal::CurrentTime | ast::Literal::CurrentTimestamp
+        )
+    )
+}
+
+fn is_unsafe_datetime_modifier(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Literal(ast::Literal::String(value))
+            if string_literal_eq(value, "localtime") || string_literal_eq(value, "utc")
+    ) || is_current_time_expr(expr)
+}
+
+fn string_literal_eq(value: &str, expected: &str) -> bool {
+    value.trim_matches('\'').eq_ignore_ascii_case(expected)
 }
 
 fn emit_index_column_value_from_cursor(

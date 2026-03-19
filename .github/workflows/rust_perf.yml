@@ -36,6 +36,8 @@ jobs:
             features: "--features bench"
           - bench: parser_benchmark
             features: ""
+          - bench: graph_queries_benchmark
+            features: "--features bench"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -43,6 +45,12 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
+      - name: Generate graph-queries DB
+        if: matrix.bench == 'graph_queries_benchmark'
+        run: |
+          python3 perf/graph-queries/generate_seed.py | sqlite3 perf/graph-queries/graph-queries.db
+          cp perf/graph-queries/graph-queries.db perf/graph-queries/graph-queries-analyzed.db
+          sqlite3 perf/graph-queries/graph-queries-analyzed.db "ANALYZE;"
       - name: Bench ${{ matrix.bench }}
         run: cargo bench --bench ${{ matrix.bench }} ${{ matrix.features }} 2>&1 | tee output.txt
       - uses: actions/upload-artifact@v4

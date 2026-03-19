@@ -1,0 +1,91 @@
+---
+source: windows.sqltest
+expression: |-
+  SELECT
+          sale_id,
+          emp_id,
+          sale_date,
+          amount,
+          region,
+          ROW_NUMBER() OVER (ORDER BY sale_date ASC, amount DESC) AS sale_order
+      FROM sales;
+info:
+  statement_type: SELECT
+  tables:
+  - sales
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+`--SCAN window_subquery_0
+   |--SCAN sales
+   `--USE SORTER FOR ORDER BY
+
+BYTECODE
+addr  opcode            p1  p2  p3  p4                     p5  comment
+   0    Init             0  63   0                          0  Start at 63
+   1    InitCoroutine    1  24   2                          0
+   2    SorterOpen       0   2   0  k(2,B,-B)               0  cursor=0
+   3    OpenRead         1   3   0  k(5,B,B,B,B,B)          0  table=sales, root=3, iDb=0
+   4    Rewind           1  13   0                          0  Rewind table sales
+   5      Column         1   2   8                          0  r[8]=sales.sale_date
+   6      Column         1   3   9                          0  r[9]=sales.amount
+   7      RowId          1  10   0                          0  r[10]=sales.rowid
+   8      Column         1   1  11                          0  r[11]=sales.emp_id
+   9      Column         1   4  12                          0  r[12]=sales.region
+  10      MakeRecord     8   5   7                          0  r[7]=mkrec(r[8..12])
+  11      SorterInsert   0   7   0  0                       0  key=r[7]
+  12    Next             1   5   0                          0
+  13    OpenPseudo       2   7   5                          0  5 columns in r[7]
+  14    SorterSort       0  23   0                          0
+  15      SorterData     0   7   2                          0  r[7]=data
+  16      Column         2   0   2                          0  r[2]=pseudo.column 0
+  17      Column         2   1   3                          0  r[3]=pseudo.column 1
+  18      Column         2   2   4                          0  r[4]=pseudo.column 2
+  19      Column         2   3   5                          0  r[5]=pseudo.column 3
+  20      Column         2   4   6                          0  r[6]=pseudo.column 4
+  21      Yield          1   0   0                          0
+  22    SorterNext       0  15   0                          0
+  23    EndCoroutine     1   0   0                          0
+  24    OpenEphemeral    3   1   0                          0  cursor=3 is_table=true
+  25    OpenDup          4   3   0                          0  new_cursor=4, original_cursor=3
+  26    Null             0  26   0                          0  r[26]=NULL
+  27    InitCoroutine    1   0   2                          0
+  28      Yield          1  43   0                          0
+  29      Copy           2  30   0                          0  r[30]=r[2]
+  30      Copy           3  31   0                          0  r[31]=r[3]
+  31      NotNull       26  35   0                          0  r[26]!=NULL -> goto 35
+  32      Copy          30  28   1                          0  r[28]=r[30]; initialize previous peer register for new partition
+  33      Null           0  19  19                          0  r[19..19]=NULL; reset accumulator registers
+  34      Integer        0  20   0                          0  r[20]=0
+  35      Compare       28  30   2  k(2, Binary, Binary)    0  r[28..29]==r[30..31]; compare ORDER BY columns to detect peer
+  36      Jump          37  39  37                          0
+  37      Gosub         27  44   0                          0  ; detected non-peer row
+  38      Copy          30  28   1                          0  r[28]=r[30]
+  39      MakeRecord     2   5  32                          0  r[32]=mkrec(r[2..6])
+  40      NewRowid       4  26   0                          0  r[26]=rowid
+  41      Insert         4  32  26  buffer_table_window_0   0  intkey=r[26] data=r[32]
+  42    Goto             0  28   0                          0
+  43    Null             0  27   0                          0  r[27]=NULL; return remaining buffered rows
+  44    Rewind           3  60   0                          0  Rewind  ephemeral(buffer_table_window_0)
+  45    Integer          1  33   0                          0  r[33]=1
+  46      Column         3   2  21                          0  r[21]=ephemeral(buffer_table_window_0).sale_id
+  47      Column         3   3  22                          0  r[22]=ephemeral(buffer_table_window_0).emp_id
+  48      Column         3   0  23                          0  r[23]=ephemeral(buffer_table_window_0).sale_date
+  49      Column         3   1  24                          0  r[24]=ephemeral(buffer_table_window_0).amount
+  50      Column         3   4  25                          0  r[25]=ephemeral(buffer_table_window_0).region
+  51      Add           20  33  20                          0  r[20]=r[20]+r[33]
+  52      Copy          21  13   0                          0  r[13]=r[21]
+  53      Copy          22  14   0                          0  r[14]=r[22]
+  54      Copy          23  15   0                          0  r[15]=r[23]
+  55      Copy          24  16   0                          0  r[16]=r[24]
+  56      Copy          25  17   0                          0  r[17]=r[25]
+  57      Copy          20  18   0                          0  r[18]=r[20]
+  58      ResultRow     13   6   0                          0  output=r[13..18]
+  59    Next             3  46   0                          0
+  60    ResetSorter      3   0   0                          0  cursor=3
+  61  Return            27   0   1                          0
+  62  Halt               0   0   0                          0
+  63  Transaction        0   1   7                          0  iDb=0 tx_mode=Read
+  64  Goto               0   1   0                          0

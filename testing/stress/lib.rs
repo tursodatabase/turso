@@ -39,3 +39,11 @@ pub mod future {
 pub mod future {
     pub use tokio::{spawn, task::JoinHandle};
 }
+
+#[cfg(shuttle)]
+pub fn shuttle_config() -> shuttle::Config {
+    let mut config = shuttle::Config::default();
+    config.stack_size *= 10;
+    config.max_steps = shuttle::MaxSteps::FailAfter(10_000_000);
+    config
+}

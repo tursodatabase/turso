@@ -1,4 +1,9 @@
-use crate::translate::{order_by::EmitOrderBy, window::EmitWindow};
+use crate::translate::plan::SimpleAggregate;
+use crate::translate::{
+    aggregation::emit_collseq_if_needed,
+    order_by::{custom_type_comparator, EmitOrderBy},
+    window::EmitWindow,
+};
 
 use super::*;
 
@@ -130,15 +135,6 @@ fn emit_loop_source<'a>(
 ) -> Result<()> {
     match emit_target {
         LoopEmitTarget::GroupBy => {
-            // This function either:
-            // - creates a sorter for GROUP BY operations by allocating registers and translating expressions for three types of columns:
-            // 1) GROUP BY columns (used as sorting keys)
-            // 2) non-aggregate, non-GROUP BY columns
-            // 3) aggregate function arguments
-            // - or if the rows produced by the loop are already sorted in the order required by the GROUP BY keys,
-            // the group by comparisons are done directly inside the main loop.
-            let aggregates = &plan.aggregates;
-
             let GroupByMetadata {
                 row_source,
                 registers,
@@ -168,25 +164,6 @@ fn emit_loop_source<'a>(
                 )?;
             }
 
-            // Step 2: Process arguments for all aggregate functions
-            // For each aggregate, translate all its argument expressions
-            for agg in aggregates.iter() {
-                // For a query like: SELECT group_col, SUM(val1), AVG(val2) FROM table GROUP BY group_col
-                // we'll process val1 and val2 here, storing them in the sorter so they're available
-                // when computing the aggregates after sorting by group_col
-                for expr in agg.args.iter() {
-                    let agg_reg = cur_reg;
-                    cur_reg += 1;
-                    translate_expr(
-                        program,
-                        Some(&plan.table_references),
-                        expr,
-                        agg_reg,
-                        &t_ctx.resolver,
-                    )?;
-                }
-            }
-
             match row_source {
                 GroupByRowSource::Sorter {
                     sort_cursor,
@@ -194,6 +171,19 @@ fn emit_loop_source<'a>(
                     reg_sorter_key,
                     ..
                 } => {
+                    // Sorter path: store only unique leaf columns from aggregate args.
+                    // Full expressions are re-evaluated from the pseudo cursor during aggregation.
+                    for leaf_expr in t_ctx.agg_leaf_columns.iter() {
+                        let reg = cur_reg;
+                        cur_reg += 1;
+                        translate_expr(
+                            program,
+                            Some(&plan.table_references),
+                            leaf_expr,
+                            reg,
+                            &t_ctx.resolver,
+                        )?;
+                    }
                     sorter_insert(
                         program,
                         start_reg,
@@ -202,7 +192,22 @@ fn emit_loop_source<'a>(
                         *reg_sorter_key,
                     );
                 }
-                GroupByRowSource::MainLoop { .. } => group_by_agg_phase(program, t_ctx, plan)?,
+                GroupByRowSource::MainLoop { .. } => {
+                    for agg in plan.aggregates.iter() {
+                        for expr in agg.args.iter() {
+                            let agg_reg = cur_reg;
+                            cur_reg += 1;
+                            translate_expr(
+                                program,
+                                Some(&plan.table_references),
+                                expr,
+                                agg_reg,
+                                &t_ctx.resolver,
+                            )?;
+                        }
+                    }
+                    group_by_agg_phase(program, t_ctx, plan)?;
+                }
             }
 
             Ok(())
@@ -221,6 +226,53 @@ fn emit_loop_source<'a>(
             let start_reg = t_ctx
                 .reg_agg_start
                 .expect("aggregate registers must be initialized");
+            if let Some(SimpleAggregate::MinMax(min_max)) = &plan.simple_aggregate {
+                let expr_reg = program.alloc_register();
+                translate_expr(
+                    program,
+                    Some(&plan.table_references),
+                    &min_max.argument,
+                    expr_reg,
+                    &t_ctx.resolver,
+                )?;
+                let loop_end = t_ctx
+                    .label_main_loop_end
+                    .expect("simple min/max requires the main-loop end label");
+                let label_on_null = if matches!(min_max.func, crate::function::AggFunc::Min) {
+                    // Ascending index order places NULLs first. Keep scanning until
+                    // the first non-NULL value, then jump straight to AggFinal.
+                    let label_on_null = program.allocate_label();
+                    program.emit_insn(Insn::IsNull {
+                        reg: expr_reg,
+                        target_pc: label_on_null,
+                    });
+                    Some(label_on_null)
+                } else {
+                    None
+                };
+
+                emit_collseq_if_needed(program, &plan.table_references, &min_max.argument);
+                let comparator = custom_type_comparator(
+                    &min_max.argument,
+                    &plan.table_references,
+                    t_ctx.resolver.schema(),
+                );
+                program.emit_insn(Insn::AggStep {
+                    acc_reg: start_reg,
+                    col: expr_reg,
+                    delimiter: 0,
+                    func: min_max.func.clone(),
+                    comparator,
+                });
+                program.emit_insn(Insn::Goto {
+                    target_pc: loop_end,
+                });
+
+                if let Some(label_on_null) = label_on_null {
+                    program.preassign_label_to_next_insn(label_on_null);
+                }
+                return Ok(());
+            }
 
             // In planner.rs, we have collected all aggregates from the SELECT clause, including ones where the aggregate is embedded inside
             // a more complex expression. Some examples: length(sum(x)), sum(x) + avg(y), sum(x) + 1, etc.
@@ -291,7 +343,7 @@ fn emit_loop_source<'a>(
                 .iter()
                 .filter(|rc| rc.contains_aggregates)
             {
-                walk_expr(&rc.expr, &mut |expr: &'a Expr| -> Result<WalkControl> {
+                walk_expr(&rc.expr, &mut |expr: &Expr| -> Result<WalkControl> {
                     match expr {
                         Expr::Column { .. } | Expr::RowId { .. } => {
                             let reg = program.alloc_register();
@@ -302,11 +354,12 @@ fn emit_loop_source<'a>(
                                 reg,
                                 &t_ctx.resolver,
                             )?;
-                            t_ctx.resolver.expr_to_reg_cache.push((
-                                Cow::Borrowed(expr),
+                            t_ctx.resolver.cache_scalar_expr_reg(
+                                Cow::Owned(expr.clone()),
                                 reg,
                                 false,
-                            ));
+                                &plan.table_references,
+                            )?;
                             Ok(WalkControl::SkipChildren)
                         }
                         _ => {

@@ -102,6 +102,51 @@ pub fn get_collseq_from_expr(
     Ok(explicit.or(column))
 }
 
+/// Return the collation context that standalone expression translation would
+/// propagate to a parent comparison when this expression is reused from cache.
+///
+/// This differs from `get_collseq_from_expr()` in one important way: plain
+/// column references keep their default BINARY collation, because standalone
+/// column translation records that fact in `ProgramBuilder::curr_collation_ctx()`.
+/// Synthetic expressions such as aggregates must opt out by storing `None` in
+/// the cache entry instead of calling this helper.
+pub fn get_expr_collation_ctx(
+    top_expr: &Expr,
+    referenced_tables: &TableReferences,
+) -> Result<Option<(CollationSeq, bool)>> {
+    let mut maybe_column_collseq = None;
+    let mut maybe_explicit_collseq = None;
+
+    walk_expr(top_expr, &mut |expr: &Expr| -> Result<WalkControl> {
+        match expr {
+            Expr::Collate(_, seq) => {
+                if maybe_explicit_collseq.is_none() {
+                    maybe_explicit_collseq =
+                        Some(CollationSeq::new(seq.as_str()).unwrap_or_default());
+                }
+                return Ok(WalkControl::SkipChildren);
+            }
+            Expr::Column { table, column, .. } => {
+                let (_, table_ref) = referenced_tables
+                    .find_table_by_internal_id(*table)
+                    .ok_or_else(|| crate::LimboError::ParseError("table not found".to_string()))?;
+                let column = table_ref
+                    .get_column_at(*column)
+                    .ok_or_else(|| crate::LimboError::ParseError("column not found".to_string()))?;
+                if maybe_column_collseq.is_none() {
+                    maybe_column_collseq = Some(column.collation());
+                }
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+
+    Ok(maybe_explicit_collseq
+        .map(|collation| (collation, true))
+        .or_else(|| maybe_column_collseq.map(|collation| (collation, false))))
+}
+
 /// Resolve the collation for a binary comparison (=, <, >, etc.) per SQLite rules:
 /// 1. Explicit COLLATE operator on either side wins (LHS takes precedence)
 /// 2. Column with defined collation on either side wins (LHS takes precedence)
@@ -480,6 +525,7 @@ mod tests {
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
+            rowid_alias_conflict_clause: None,
         }));
         table_references.add_joined_table(JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
@@ -494,6 +540,7 @@ mod tests {
             internal_id: TableInternalId::from(1),
             join_info: None,
             table,
+            indexed: None,
         });
 
         table_references
@@ -536,7 +583,9 @@ mod tests {
                 unique_sets: vec![],
                 foreign_keys: vec![],
                 check_constraints: vec![],
+                rowid_alias_conflict_clause: None,
             })),
+            indexed: None,
         });
         // Right table t2(id=2)
         table_references.add_joined_table(JoinedTable {
@@ -570,7 +619,9 @@ mod tests {
                 unique_sets: vec![],
                 foreign_keys: vec![],
                 check_constraints: vec![],
+                rowid_alias_conflict_clause: None,
             })),
+            indexed: None,
         });
         table_references
     }
@@ -592,6 +643,7 @@ mod tests {
             identifier: "bar".to_string(),
             internal_id: TableInternalId::from(1),
             join_info: None,
+            indexed: None,
             table: Table::BTree(Arc::new(BTreeTable {
                 root_page: 0,
                 has_autoincrement: false,
@@ -612,11 +664,13 @@ mod tests {
                         notnull: false,
                         unique: true,
                         hidden: false,
+                        notnull_conflict_clause: None,
                     },
                 )],
                 unique_sets: vec![],
                 foreign_keys: vec![],
                 check_constraints: vec![],
+                rowid_alias_conflict_clause: None,
             })),
         });
         table_references

@@ -6249,6 +6249,74 @@ fn test_savepoint_insert_delete_then_fail() {
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
 
+#[test]
+fn test_delete_row_is_hidden_from_desc_unique_index_scan() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (42, 46)").unwrap();
+    conn.execute("DELETE FROM t WHERE id = 42").unwrap();
+
+    let rows = get_rows(&conn, "SELECT id, val FROM t ORDER BY val DESC");
+    assert_eq!(rows, Vec::<Vec<Value>>::new());
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_delete_row_is_skipped_by_desc_explicit_index_scan() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    conn.execute("CREATE INDEX idx_t_val ON t(val)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    conn.execute("DELETE FROM t WHERE id = 2").unwrap();
+
+    let rows = get_rows(&conn, "SELECT id, val FROM t ORDER BY val DESC");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].as_int().unwrap(), 10);
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_delete_btree_resident_row_is_skipped_by_desc_unique_index_scan() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER UNIQUE)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+
+    db.restart();
+
+    let conn = db.connect();
+    conn.execute("DELETE FROM t WHERE id = 2").unwrap();
+
+    let rows = get_rows(&conn, "SELECT id, val FROM t ORDER BY val DESC");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].as_int().unwrap(), 10);
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
 /// Test DELETE all B-tree rows and re-insert with same IDs in MVCC.
 /// Verifies tombstones correctly shadow B-tree and new rows are visible.
 ///
@@ -6680,6 +6748,74 @@ fn test_concurrent_commit_yield_spin() {
     // Verify the insert is visible
     let rows = get_rows(&conn, "SELECT COUNT(*) FROM t");
     assert_eq!(rows[0][0].as_int().unwrap(), 1);
+}
+
+fn abandon_commit_after_first_io(conn: &Arc<Connection>, mv_store: &Arc<MvStore<MvccClock>>) {
+    let lock = &mv_store.commit_coordinator.pager_commit_lock;
+    assert!(lock.write(), "should acquire commit lock");
+
+    let mut stmt = conn.prepare("COMMIT").unwrap();
+    assert!(
+        matches!(stmt.step().unwrap(), crate::StepResult::IO),
+        "COMMIT should yield while the commit lock is held",
+    );
+
+    drop(stmt);
+    lock.unlock();
+    conn.close().unwrap();
+}
+
+/// if a txn made some inserts, then aborted (or abandoned due to some IO issue), then those
+/// inserted rows should not be visible
+#[test]
+fn test_abandoned_commit_rolls_back_insert() {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'new')").unwrap();
+
+    let mv_store = db.get_mvcc_store();
+    abandon_commit_after_first_io(&conn, &mv_store);
+
+    let observer = db.connect();
+    let rows = get_rows(&observer, "SELECT id FROM t WHERE id = 1");
+    assert!(
+        rows.is_empty(),
+        "row from abandoned INSERT commit remained visible: {rows:?}",
+    );
+    observer.close().unwrap();
+}
+
+/// if a txn deleted some existing rows, but then aborted (or abandoned due to some IO issue), then
+/// those rows should not become deleted
+#[test]
+fn test_abandoned_commit_rolls_back_delete() {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'seed')").unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+
+    let mv_store = db.get_mvcc_store();
+    abandon_commit_after_first_io(&conn, &mv_store);
+
+    let observer = db.connect();
+    let rows = get_rows(&observer, "SELECT id, v FROM t WHERE id = 1");
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Numeric(Numeric::Integer(1)),
+            Value::Text(Text::new("seed".to_string())),
+        ]],
+        "row disappeared after abandoned DELETE commit: {rows:?}",
+    );
+    observer.close().unwrap();
 }
 
 /// ALTER TABLE RENAME TO on a table with a CREATE INDEX panics on the next
@@ -7392,5 +7528,326 @@ fn test_autoincrement_no_reuse_after_delete_and_restart() {
          but new rowid after delete+restart is {new_rowid}. \
          sqlite_sequence had {seq_count} duplicate rows; \
          init_autoincrement picked the stale one (seq=1 instead of seq=2)."
+    );
+}
+
+/// Same bug as `test_elle_lost_update_exclusive_concurrent` but with simplified SQLs.
+/// For this bug to happen, we need deferred conflict detection done at
+/// `check_version_conflicts`.
+/// Requires UPSERT (INSERT ... ON CONFLICT DO UPDATE) — to hit `insert_btree_resident`
+/// and then `check_version_conflicts`.
+/// (Note: plain UPDATE eagerly detects conflicts via `delete_from_table_or_index`)
+///
+/// We need three txns for this bug to happen:
+/// Initial state: some row btree resident
+/// tx2: starts
+/// tx1: upserts the row, commits
+/// tx3: upserts the same row, which sets end=TxID(T3) on tx1's version (speculative delete)
+/// tx2: upserts the same row, should get WriteWriteConflict at commit time because tx1 committed previously
+#[test]
+fn test_speculative_delete_hides_committed_version_sql() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t (key TEXT PRIMARY KEY, val TEXT)")
+            .unwrap();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 1")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES ('k1', 'a')").unwrap();
+        conn.close().unwrap();
+    }
+    // lets do this so that row becomes b tree resident
+    db.restart();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.close().unwrap();
+    }
+
+    let upsert = |val: &str| {
+        format!(
+            "INSERT INTO t VALUES ('k1', '{val}') \
+             ON CONFLICT(key) DO UPDATE SET val = excluded.val"
+        )
+    };
+
+    // T2: begin early so T1's future commit is invisible under SI.
+    let conn2 = db.connect();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+
+    // T1: auto-commit UPSERT → insert_btree_resident, commits.
+    let conn1 = db.connect();
+    conn1.execute(upsert("b")).unwrap();
+    conn1.close().unwrap();
+
+    // T3: UPSERT → sets end=TxID(T3) on T1's version.
+    let conn3 = db.connect();
+    conn3.execute("BEGIN CONCURRENT").unwrap();
+    conn3.execute(upsert("d")).unwrap();
+
+    // T2: UPSERT → insert_btree_resident (T1 invisible, T3 invisible).
+    conn2.execute(upsert("c")).unwrap();
+
+    // T2: COMMIT → must detect conflict with T1.
+    let result = conn2.execute("COMMIT");
+    assert!(
+        matches!(&result, Err(LimboError::WriteWriteConflict)),
+        "Expected WriteWriteConflict, got: {result:?}."
+    );
+}
+
+/// Regression test for Elle bug (https://github.com/tursodatabase/turso/actions/runs/22855976911/job/66296309873?pr=5819#logs)
+/// Previously, `check_version_conflicts` skipped any version with `end.is_some()`,
+/// so a speculative delete by T3 (setting end=TxID(T3)) hid T1's committed version
+/// from T2's conflict check, allowing a lost update.
+///
+/// The SQL statements resemble the ones in Elle. For simplified variant, check
+/// `test_speculative_delete_hides_committed_version_sql` test
+///
+/// 1. Row for key "k8" exists in B-tree (B-tree-resident, no MVCC version)
+/// 2. T2 starts via BEGIN CONCURRENT
+/// 3. T1 does auto-commit UPSERT on "k8" → insert_btree_resident, commits
+/// 4. T3 starts via BEGIN CONCURRENT, does UPSERT on "k8" → update path sets
+///    end=TxID(T3) on T1's committed version
+/// 5. T2 does UPSERT on "k8" → insert_btree_resident (T1's version invisible, T3's invisible)
+/// 6. T2 COMMIT → check_version_conflicts SKIPS T1's version because end.is_some()
+///    → no WriteWriteConflict detected → lost update!
+/// 7. T3 eventually aborts, restoring T1's version, but T2 already committed.
+#[test]
+fn test_elle_lost_update_exclusive_concurrent() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+
+    // Setup: create the elle-style table and seed initial data into the B-tree
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE elle_lists (key TEXT PRIMARY KEY, vals TEXT DEFAULT '')")
+            .unwrap();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 1")
+            .unwrap();
+        conn.execute("INSERT INTO elle_lists (key, vals) VALUES ('k8', '100')")
+            .unwrap();
+        conn.close().unwrap();
+    }
+    // Restart: data is only in B-tree, MVCC store is empty.
+    db.restart();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.close().unwrap();
+    }
+
+    // T2: start concurrent transaction (begin_ts established early)
+    let conn2 = db.connect();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+
+    // T1: auto-commit UPSERT on k8 → insert_btree_resident, commits immediately
+    let conn1 = db.connect();
+    conn1
+        .execute(
+            "INSERT INTO elle_lists (key, vals) VALUES ('k8', '200') \
+             ON CONFLICT(key) DO UPDATE SET vals = CASE WHEN vals = '' THEN '200' ELSE vals || ',' || '200' END",
+        )
+        .unwrap();
+    conn1.close().unwrap();
+
+    // T3: start concurrent transaction (begin_ts > T1.end_ts, so T1's version IS visible to T3)
+    let conn3 = db.connect();
+    conn3.execute("BEGIN CONCURRENT").unwrap();
+
+    // T3: UPSERT on k8 → update path: deletes T1's version (sets end=TxID(T3))
+    // and creates T3's own version. This speculatively hides T1's version.
+    conn3
+        .execute(
+            "INSERT INTO elle_lists (key, vals) VALUES ('k8', '400') \
+             ON CONFLICT(key) DO UPDATE SET vals = CASE WHEN vals = '' THEN '400' ELSE vals || ',' || '400' END",
+        )
+        .unwrap();
+
+    // T2: UPSERT on k8 → insert_btree_resident (T1's version invisible under SI,
+    // T3's version invisible as Active)
+    conn2
+        .execute(
+            "INSERT INTO elle_lists (key, vals) VALUES ('k8', '300') \
+             ON CONFLICT(key) DO UPDATE SET vals = CASE WHEN vals = '' THEN '300' ELSE vals || ',' || '300' END",
+        )
+        .unwrap();
+
+    // T2: COMMIT → should detect write-write conflict with T1's committed version.
+    // BUG: T1's version has end=TxID(T3), and the old code skips versions with
+    // end.is_some() → conflict missed → lost update.
+    let commit_result = conn2.execute("COMMIT");
+    assert!(
+        matches!(&commit_result, Err(LimboError::WriteWriteConflict)),
+        "Expected WriteWriteConflict, got: {commit_result:?}. \
+         T1's committed version was hidden by T3's speculative delete (end=TxID), \
+         causing check_version_conflicts to skip it."
+    );
+}
+
+/// Regression test: speculative delete by an active transaction must not hide a
+/// committed version from commit-time conflict checks.
+///
+/// Previously, `check_version_conflicts` skipped any version with `end.is_some()`,
+/// including versions where `end` was `TxID` of an active (uncommitted) transaction.
+/// This allowed T2 to commit without detecting the write-write conflict with T1.
+///
+/// Minimal reproduction using the MvStore API directly (no SQL, no restart, no UPSERT).
+/// Note: T2 begins after T1 commits, so T2 *can* see T1 under SI. We call
+/// `insert_btree_resident` directly to simulate the UPSERT code path where the
+/// cursor doesn't go through normal read visibility.
+///
+/// Timeline:
+///   T1: insert row 1, commit
+///   T2: begin (will write later)
+///   T3: begin, update row 1 → sets end=TxID(T3) on T1's version
+///   T2: insert_btree_resident row 1 (via API, bypassing read visibility)
+///   T2: commit → must detect conflict with T1
+#[test]
+fn test_speculative_delete_hides_committed_version() {
+    let db = MvccTestDb::new();
+    let table_id: MVTableId = (-2).into();
+
+    // T1: insert row 1 and commit.
+    let tx1 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    let row_v1 = generate_simple_string_row(table_id, 1, "v1");
+    db.mvcc_store.insert(tx1, row_v1).unwrap();
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
+
+    // T2: begin (will write later).
+    let conn2 = db.db.connect().unwrap();
+    let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
+
+    // T3: begin, update row 1 → delete sets end=TxID(T3) on T1's version.
+    let conn3 = db.db.connect().unwrap();
+    let tx3 = db.mvcc_store.begin_tx(conn3.pager.load().clone()).unwrap();
+    let row_v3 = generate_simple_string_row(table_id, 1, "v3");
+    assert!(db.mvcc_store.update(tx3, row_v3).unwrap());
+
+    // T2: insert_btree_resident for the same row (called directly via API to
+    // simulate the UPSERT code path that bypasses eager conflict detection).
+    let row_v2 = generate_simple_string_row(table_id, 1, "v2");
+    db.mvcc_store
+        .insert_btree_resident_to_table_or_index(tx2, row_v2, None)
+        .unwrap();
+
+    // T2: commit → must fail with WriteWriteConflict.
+    let result = commit_tx(db.mvcc_store, &conn2, tx2);
+    assert!(
+        matches!(&result, Err(LimboError::WriteWriteConflict)),
+        "Expected WriteWriteConflict, got: {result:?}. \
+         T3's speculative delete (end=TxID) on T1's version must not hide it from conflict checks."
+    );
+}
+
+/// Verify that a committed pure delete (tombstone) is detected as a conflict.
+///
+/// Scenario: Td deletes a row and commits. Between Td's Commit and CommitEnd
+/// (when TxID→Timestamp conversion happens), the tombstone still has
+/// end=TxID(Td). T2 does insert_btree_resident for the same row and tries to
+/// commit. The tombstone's begin=None, end=TxID(Td) should be caught by the
+/// B-tree tombstone check in check_version_conflicts.
+///
+/// Timeline:
+///   T1: insert row 1, commit
+///   T2: begin (will write later)
+///   Td: delete row 1, commit
+///   T2: insert_btree_resident row 1
+///   T2: commit → must detect conflict with Td's tombstone
+#[test]
+fn test_committed_delete_tombstone_conflict() {
+    let db = MvccTestDb::new();
+    let table_id: MVTableId = (-2).into();
+
+    // T1: insert row 1 and commit.
+    let tx1 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    let row_v1 = generate_simple_string_row(table_id, 1, "v1");
+    db.mvcc_store.insert(tx1, row_v1).unwrap();
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
+
+    // T2: begin (will write later).
+    let conn2 = db.db.connect().unwrap();
+    let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
+
+    // Td: delete row 1 and commit.
+    let conn_d = db.db.connect().unwrap();
+    let tx_d = db.mvcc_store.begin_tx(conn_d.pager.load().clone()).unwrap();
+    assert!(db
+        .mvcc_store
+        .delete(tx_d, RowID::new(table_id, RowKey::Int(1)))
+        .unwrap());
+    commit_tx(db.mvcc_store.clone(), &conn_d, tx_d).unwrap();
+
+    // T2: insert_btree_resident for the same row.
+    let row_v2 = generate_simple_string_row(table_id, 1, "v2");
+    db.mvcc_store
+        .insert_btree_resident_to_table_or_index(tx2, row_v2, None)
+        .unwrap();
+
+    // T2: commit → must detect conflict with Td.
+    let result = commit_tx(db.mvcc_store, &conn2, tx2);
+    assert!(
+        matches!(&result, Err(LimboError::WriteWriteConflict)),
+        "Expected WriteWriteConflict, got: {result:?}. \
+         Td's committed delete (tombstone) must be detected as a conflict."
+    );
+}
+
+/// Verify that when a transaction (Td) updates a row and commits, another
+/// transaction (T2) that also writes to the same row detects the conflict —
+/// even though T1's version has end=TxID(Td) with Td committed.
+///
+/// This tests the `Committed(_) => continue` branch in `check_version_conflicts`:
+/// skipping T1's version is safe because Td's NEW version (begin=TxID(Td)) catches
+/// the conflict.
+///
+/// Timeline:
+///   T1: insert row 1, commit
+///   T2: begin (will write later)
+///   Td: update row 1 (sets end=TxID(Td) on T1's version, creates new version), commit
+///   T2: insert_btree_resident row 1
+///   T2: commit → must detect conflict with Td's new version
+#[test]
+fn test_committed_update_version_conflict() {
+    let db = MvccTestDb::new();
+    let table_id: MVTableId = (-2).into();
+
+    // T1: insert row 1 and commit.
+    let tx1 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    let row_v1 = generate_simple_string_row(table_id, 1, "v1");
+    db.mvcc_store.insert(tx1, row_v1).unwrap();
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
+
+    // T2: begin (will write later).
+    let conn2 = db.db.connect().unwrap();
+    let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
+
+    // Td: update row 1 and commit.
+    let conn_d = db.db.connect().unwrap();
+    let tx_d = db.mvcc_store.begin_tx(conn_d.pager.load().clone()).unwrap();
+    let row_vd = generate_simple_string_row(table_id, 1, "vd");
+    assert!(db.mvcc_store.update(tx_d, row_vd).unwrap());
+    commit_tx(db.mvcc_store.clone(), &conn_d, tx_d).unwrap();
+
+    // T2: insert_btree_resident for the same row.
+    let row_v2 = generate_simple_string_row(table_id, 1, "v2");
+    db.mvcc_store
+        .insert_btree_resident_to_table_or_index(tx2, row_v2, None)
+        .unwrap();
+
+    // T2: commit → must detect conflict with Td.
+    let result = commit_tx(db.mvcc_store, &conn2, tx2);
+    assert!(
+        matches!(&result, Err(LimboError::WriteWriteConflict)),
+        "Expected WriteWriteConflict, got: {result:?}. \
+         Td's committed update must be detected via Td's new version."
     );
 }

@@ -845,10 +845,11 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     self.dual_peek.mvcc_peek = CursorPeek::Exhausted;
                 }
             },
-            MvccCursorType::Index(_) => match self
-                .db
-                .get_last_index_rowid(self.table_id, &mut self.index_iterator)
-            {
+            MvccCursorType::Index(_) => match self.db.get_last_index_rowid(
+                self.table_id,
+                self.tx_id,
+                &mut self.index_iterator,
+            ) {
                 Some(k) => {
                     self.dual_peek.mvcc_peek = CursorPeek::Row(k);
                 }
