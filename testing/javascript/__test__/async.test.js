@@ -596,6 +596,58 @@ test.serial("Concurrent writes over same connection", async (t) => {
   t.is(rows[0][0], 22);
 });
 
+// ==========================================================================
+// Database rename
+// ==========================================================================
+
+test.serial("Open database after rename", async (t) => {
+  if (process.env.PROVIDER === "serverless") {
+    t.pass("Skipping rename test for serverless");
+    return;
+  }
+
+  // 1. Open database A, create a table and insert data.
+  const pathA = genDatabaseFilename();
+  const pathB = genDatabaseFilename();
+  const [dbA] = await connect(pathA);
+  await dbA.exec("CREATE TABLE t(x INTEGER)");
+  await dbA.exec("INSERT INTO t VALUES (42)");
+  const row = await (await dbA.prepare("SELECT x FROM t")).get();
+  t.is(row.x, 42);
+
+  // 2. Close database A.
+  await dbA.close();
+
+  // 3. Rename A -> B on disk (main file + WAL + SHM).
+  fs.renameSync(pathA, pathB);
+  if (fs.existsSync(pathA + "-wal")) {
+    fs.renameSync(pathA + "-wal", pathB + "-wal");
+  }
+  if (fs.existsSync(pathA + "-shm")) {
+    fs.renameSync(pathA + "-shm", pathB + "-shm");
+  }
+
+  // 4. Open a new database at the original path A.
+  const [dbA2] = await connect(pathA);
+
+  // 5. The new A should be a fresh, empty database — table 't' must not exist.
+  const tables = await (await dbA2.prepare(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='t'"
+  )).all();
+  t.is(tables.length, 0,
+    "New database at A should not have table 't' — " +
+    "DATABASE_MANAGER returned stale Database after rename"
+  );
+
+  // Cleanup.
+  await dbA2.close();
+  for (const p of [pathA, pathB]) {
+    for (const suffix of ["", "-wal", "-shm"]) {
+      if (fs.existsSync(p + suffix)) fs.unlinkSync(p + suffix);
+    }
+  }
+});
+
 const connect = async (path, options = {}) => {
   if (!path) {
     path = genDatabaseFilename();

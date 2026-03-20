@@ -16,7 +16,7 @@ pub mod browser;
 use napi::bindgen_prelude::*;
 use napi::{Env, Task};
 use napi_derive::napi;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, Weak};
 use std::{
     cell::{Cell, RefCell},
     num::NonZeroUsize,
@@ -24,6 +24,16 @@ use std::{
 };
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
+
+/// Shared ownership of a `turso_core::Statement` that can be explicitly finalized.
+///
+/// Both `Statement`/`BatchExecutor` and `DatabaseInner` hold an `Arc` to this
+/// handle. When `Database::close()` is called it sets every live handle to
+/// `None`, which drops the `turso_core::Statement` and — crucially — releases the
+/// `Arc<Connection>` held inside `Program`, breaking the reference chain that
+/// would otherwise keep the `turso_core::Database` alive in the
+/// `DATABASE_MANAGER` registry.
+type StatementHandle = Arc<RefCell<Option<turso_core::Statement>>>;
 
 /// Step result constants
 const STEP_ROW: u32 = 1;
@@ -53,6 +63,10 @@ pub struct DatabaseInner {
     io: Arc<dyn turso_core::IO>,
     connect: OnceLock<DatabaseConnect>,
     default_safe_integers: Mutex<bool>,
+    /// Weak refs to every shared statement handle created by this database.
+    /// `close()` upgrades each live handle and sets it to `None`, which
+    /// finalizes the statement and releases its `Arc<Connection>`.
+    stmts: Mutex<Vec<Weak<RefCell<Option<turso_core::Statement>>>>>,
 }
 
 pub struct DatabaseConnect {
@@ -166,9 +180,12 @@ pub struct DatabaseOpts {
     pub encryption: Option<EncryptionOpts>,
 }
 
-fn step_sync(stmt: &Arc<RefCell<turso_core::Statement>>) -> napi::Result<u32> {
-    let mut stmt = stmt.borrow_mut();
-    match stmt.step() {
+fn step_sync(stmt: &StatementHandle) -> napi::Result<u32> {
+    let mut guard = stmt.borrow_mut();
+    let core_stmt = guard
+        .as_mut()
+        .ok_or_else(|| create_generic_error("statement has been finalized"))?;
+    match core_stmt.step() {
         Ok(turso_core::StepResult::Row) => Ok(STEP_ROW),
         Ok(turso_core::StepResult::IO) => Ok(STEP_IO),
         Ok(turso_core::StepResult::Done) => Ok(STEP_DONE),
@@ -324,6 +341,7 @@ impl Database {
                 io,
                 connect: OnceLock::new(),
                 default_safe_integers: Mutex::new(false),
+                stmts: Mutex::new(Vec::new()),
             })),
         })
     }
@@ -406,6 +424,7 @@ impl Database {
     /// A `Statement` instance.
     #[napi]
     pub fn prepare(&self, sql: String) -> napi::Result<Statement> {
+        let inner = self.inner()?;
         let stmt = self
             .conn()?
             .prepare(&sql)
@@ -413,12 +432,14 @@ impl Database {
         let column_names: Vec<std::ffi::CString> = (0..stmt.num_columns())
             .map(|i| std::ffi::CString::new(stmt.get_column_name(i).to_string()).unwrap())
             .collect();
+        #[allow(clippy::arc_with_non_send_sync)]
+        let stmt: StatementHandle = Arc::new(RefCell::new(Some(stmt)));
+        inner.stmts.lock().unwrap().push(Arc::downgrade(&stmt));
         Ok(Statement {
-            #[allow(clippy::arc_with_non_send_sync)]
-            stmt: Some(Arc::new(RefCell::new(stmt))),
+            stmt,
             column_names,
             mode: RefCell::new(PresentationMode::Expanded),
-            safe_integers: Cell::new(*self.inner()?.default_safe_integers.lock().unwrap()),
+            safe_integers: Cell::new(*inner.default_safe_integers.lock().unwrap()),
         })
     }
 
@@ -469,7 +490,19 @@ impl Database {
     /// `Ok(())` if the database is closed successfully.
     #[napi]
     pub fn close(&mut self) -> napi::Result<()> {
-        let _ = self.inner.take();
+        if let Some(inner) = self.inner.take() {
+            // Finalize all outstanding statements.  Each turso_core::Statement
+            // holds Program { connection: Arc<Connection> } which in turn holds
+            // Arc<Database>.  If we don't clear them, the Weak in
+            // DATABASE_MANAGER can still be upgraded after the file is renamed,
+            // causing a stale Database to be returned on the next open().
+            let mut stmts = inner.stmts.lock().unwrap();
+            for weak in stmts.drain(..) {
+                if let Some(stmt) = weak.upgrade() {
+                    *stmt.borrow_mut() = None;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -533,7 +566,7 @@ pub struct BatchExecutor {
     conn: Option<Arc<turso_core::Connection>>,
     sql: String,
     position: usize,
-    stmt: Option<Arc<RefCell<turso_core::Statement>>>,
+    stmt: Option<StatementHandle>,
 }
 
 #[napi]
@@ -550,7 +583,7 @@ impl BatchExecutor {
                     #[allow(clippy::arc_with_non_send_sync)]
                     Ok(Some((stmt, offset))) => {
                         self.position += offset;
-                        self.stmt = Some(Arc::new(RefCell::new(stmt)));
+                        self.stmt = Some(Arc::new(RefCell::new(Some(stmt))));
                     }
                     Ok(None) => return Ok(STEP_DONE),
                     Err(err) => return Err(to_generic_error("failed to consume stmt", err)),
@@ -577,7 +610,7 @@ impl BatchExecutor {
 /// A prepared statement.
 #[napi]
 pub struct Statement {
-    stmt: Option<Arc<RefCell<turso_core::Statement>>>,
+    stmt: StatementHandle,
     column_names: Vec<std::ffi::CString>,
     mode: RefCell<PresentationMode>,
     safe_integers: Cell<bool>,
@@ -585,15 +618,18 @@ pub struct Statement {
 
 #[napi]
 impl Statement {
-    pub fn stmt(&self) -> napi::Result<&Arc<RefCell<turso_core::Statement>>> {
-        self.stmt
-            .as_ref()
-            .ok_or_else(|| create_generic_error("statement has been finalized"))
+    fn statement_handle(&self) -> napi::Result<&StatementHandle> {
+        if self.stmt.borrow().is_none() {
+            return Err(create_generic_error("statement has been finalized"));
+        }
+        Ok(&self.stmt)
     }
     #[napi]
     pub fn reset(&self) -> Result<()> {
-        self.stmt()?
-            .borrow_mut()
+        let mut guard = self.statement_handle()?.borrow_mut();
+        guard
+            .as_mut()
+            .ok_or_else(|| create_generic_error("statement has been finalized"))?
             .reset()
             .map_err(|e| to_generic_error("reset failed", e))?;
         Ok(())
@@ -602,7 +638,11 @@ impl Statement {
     /// Returns the number of parameters in the statement.
     #[napi]
     pub fn parameter_count(&self) -> Result<u32> {
-        Ok(self.stmt()?.borrow().parameters_count() as u32)
+        let guard = self.statement_handle()?.borrow();
+        let stmt = guard
+            .as_ref()
+            .ok_or_else(|| create_generic_error("statement has been finalized"))?;
+        Ok(stmt.parameters_count() as u32)
     }
 
     /// Returns the name of a parameter at a specific 1-based index.
@@ -616,7 +656,10 @@ impl Statement {
             create_error(Status::InvalidArg, "parameter index must be greater than 0")
         })?;
 
-        let stmt = self.stmt()?.borrow();
+        let guard = self.statement_handle()?.borrow();
+        let stmt = guard
+            .as_ref()
+            .ok_or_else(|| create_generic_error("statement has been finalized"))?;
         Ok(stmt.parameters().name(non_zero_idx))
     }
 
@@ -680,7 +723,11 @@ impl Statement {
             }
         };
 
-        self.stmt()?.borrow_mut().bind_at(non_zero_idx, turso_value);
+        self.statement_handle()?
+            .borrow_mut()
+            .as_mut()
+            .ok_or_else(|| create_generic_error("statement has been finalized"))?
+            .bind_at(non_zero_idx, turso_value);
         Ok(())
     }
 
@@ -688,13 +735,16 @@ impl Statement {
     /// 1 = Row available, 2 = Done, 3 = I/O needed
     #[napi]
     pub fn step_sync(&self) -> Result<u32> {
-        step_sync(self.stmt()?)
+        step_sync(self.statement_handle()?)
     }
 
     /// Get the current row data according to the presentation mode
     #[napi]
     pub fn row<'env>(&self, env: &'env Env) -> Result<Unknown<'env>> {
-        let stmt = self.stmt()?.borrow();
+        let guard = self.statement_handle()?.borrow();
+        let stmt = guard
+            .as_ref()
+            .ok_or_else(|| create_generic_error("statement has been finalized"))?;
         let row_data = stmt
             .row()
             .ok_or_else(|| create_generic_error("no row data available"))?;
@@ -771,8 +821,10 @@ impl Statement {
     /// Get column information for the statement
     #[napi(ts_return_type = "Promise<any>")]
     pub fn columns<'env>(&self, env: &'env Env) -> Result<Array<'env>> {
-        let stmt = self.stmt()?.borrow();
-
+        let guard = self.statement_handle()?.borrow();
+        let stmt = guard
+            .as_ref()
+            .ok_or_else(|| create_generic_error("statement has been finalized"))?;
         let column_count = stmt.num_columns();
         let mut js_array = env.create_array(column_count as u32)?;
 
@@ -804,7 +856,7 @@ impl Statement {
     /// Finalizes the statement.
     #[napi]
     pub fn finalize(&mut self) -> Result<()> {
-        let _ = self.stmt.take();
+        *self.stmt.borrow_mut() = None;
         Ok(())
     }
 }
