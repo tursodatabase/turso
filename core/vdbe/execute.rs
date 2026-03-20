@@ -4156,6 +4156,7 @@ pub fn op_seek_rowid(
     if !target_pc.is_offset() {
         crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
     }
+    invalidate_deferred_seek_for_table_cursor(state, *cursor_id);
     let (pc, did_seek) = {
         let cursor = get_cursor!(state, *cursor_id);
 
@@ -9520,7 +9521,7 @@ pub fn op_not_exists(
         insn
     );
     let cursor_id = *cursor;
-    state.deferred_seeks[cursor_id].take();
+    invalidate_deferred_seek_for_table_cursor(state, cursor_id);
     let cursor = must_be_btree_cursor!(cursor_id, program.cursor_ref, state, "NotExists");
     let cursor = cursor.as_btree_mut();
     let exists = return_if_io!(cursor.exists(state.registers[*rowid_reg].get_value()));
@@ -9952,6 +9953,14 @@ pub fn op_destroy(
             }
         }
     }
+}
+
+fn invalidate_deferred_seek_for_table_cursor(state: &mut ProgramState, cursor_id: usize) {
+    state
+        .deferred_seeks
+        .get_mut(cursor_id)
+        .expect("deferred_seeks cursor_id should be valid")
+        .take();
 }
 
 pub fn op_reset_sorter(
