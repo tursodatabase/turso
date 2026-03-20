@@ -6,7 +6,9 @@ use super::plan::{
 use crate::schema::Table;
 use crate::sync::Arc;
 use crate::translate::emitter::{OperationMode, Resolver};
-use crate::translate::expr::{bind_and_rewrite_expr, expr_vector_size, BindingBehavior};
+use crate::translate::expr::{
+    bind_and_rewrite_expr, expr_vector_size, walk_expr, BindingBehavior, WalkControl,
+};
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan, SubqueryState};
@@ -618,6 +620,8 @@ fn prepare_one_select_plan(
 
             plan_subqueries_from_select_plan(program, &mut plan, resolver, connection)?;
 
+            validate_group_by_outer_scope_refs(&plan)?;
+
             validate_expr_correct_column_counts(&plan)?;
 
             // Return the unoptimized query plan
@@ -782,6 +786,149 @@ fn validate_expr_correct_column_counts(plan: &SelectPlan) -> Result<()> {
             crate::bail_parse_error!("offset expression must return 1 value, got {}", vec_size);
         }
     }
+    Ok(())
+}
+
+/// SQLite compatibility: GROUP BY expressions in a correlated subquery cannot
+/// reference columns from the outer query scope.
+fn validate_group_by_outer_scope_refs(plan: &SelectPlan) -> Result<()> {
+    if plan.table_references.outer_query_refs().is_empty() {
+        return Ok(());
+    }
+    let Some(group_by) = &plan.group_by else {
+        return Ok(());
+    };
+    for expr in &group_by.exprs {
+        reject_outer_query_refs_in_group_by_expr(
+            expr,
+            &plan.table_references,
+            &plan.non_from_clause_subqueries,
+        )?;
+    }
+    Ok(())
+}
+
+fn reject_outer_query_refs_in_group_by_expr(
+    expr: &Expr,
+    table_references: &TableReferences,
+    subqueries: &[super::plan::NonFromClauseSubquery],
+) -> Result<()> {
+    walk_expr(expr, &mut |node: &Expr| -> Result<WalkControl> {
+        match node {
+            Expr::Column { table, column, .. } => {
+                if let Some(outer_ref) =
+                    table_references.find_outer_query_ref_by_internal_id(*table)
+                {
+                    let column_name = outer_ref
+                        .columns()
+                        .get(*column)
+                        .and_then(|col| col.name.as_deref())
+                        .expect(
+                            "bound outer-scope Expr::Column must point to a named column in schema",
+                        );
+                    crate::bail_parse_error!(
+                        "no such column: {}.{}",
+                        outer_ref.identifier,
+                        column_name
+                    );
+                }
+            }
+            Expr::RowId { table, .. } => {
+                if let Some(outer_ref) =
+                    table_references.find_outer_query_ref_by_internal_id(*table)
+                {
+                    crate::bail_parse_error!("no such column: {}.rowid", outer_ref.identifier);
+                }
+            }
+            Expr::SubqueryResult { subquery_id, .. } => {
+                let subquery = subqueries
+                    .iter()
+                    .find(|subquery| subquery.internal_id == *subquery_id)
+                    .expect("GROUP BY SubqueryResult must reference a planned subquery");
+                let super::plan::SubqueryState::Unevaluated {
+                    plan: Some(subquery_plan),
+                } = &subquery.state
+                else {
+                    unreachable!("GROUP BY subquery must be in unevaluated state during planning");
+                };
+                reject_outer_scope_refs_inside_select_plan(subquery_plan, table_references)?;
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
+fn reject_outer_scope_refs_inside_plan_tree(
+    plan: &Plan,
+    current_scope_table_refs: &TableReferences,
+) -> Result<()> {
+    match plan {
+        Plan::Select(select_plan) => {
+            reject_outer_scope_refs_inside_select_plan(select_plan, current_scope_table_refs)
+        }
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            for (sub_plan, _) in left {
+                reject_outer_scope_refs_inside_select_plan(sub_plan, current_scope_table_refs)?;
+            }
+            reject_outer_scope_refs_inside_select_plan(right_most, current_scope_table_refs)
+        }
+        Plan::Delete(_) | Plan::Update(_) => Ok(()),
+    }
+}
+
+fn reject_outer_scope_refs_inside_select_plan(
+    plan: &SelectPlan,
+    current_scope_table_refs: &TableReferences,
+) -> Result<()> {
+    for outer_ref in plan
+        .table_references
+        .outer_query_refs()
+        .iter()
+        .filter(|outer_ref| outer_ref.is_used())
+    {
+        if current_scope_table_refs
+            .find_outer_query_ref_by_internal_id(outer_ref.internal_id)
+            .is_none()
+        {
+            continue;
+        }
+        if let Some(col_idx) = outer_ref.col_used_mask.iter().next() {
+            let column_name = outer_ref
+                .columns()
+                .get(col_idx)
+                .and_then(|col| col.name.as_deref())
+                .expect("bound outer-scope Expr::Column must point to a named column in schema");
+            crate::bail_parse_error!("no such column: {}.{}", outer_ref.identifier, column_name);
+        }
+        if outer_ref.rowid_referenced {
+            crate::bail_parse_error!("no such column: {}.rowid", outer_ref.identifier);
+        }
+        unreachable!("used outer query reference must reference at least one column or rowid");
+    }
+
+    for subquery in &plan.non_from_clause_subqueries {
+        let super::plan::SubqueryState::Unevaluated {
+            plan: Some(subquery_plan),
+        } = &subquery.state
+        else {
+            continue;
+        };
+        reject_outer_scope_refs_inside_select_plan(subquery_plan, current_scope_table_refs)?;
+    }
+
+    for joined_table in plan.table_references.joined_tables().iter() {
+        if let Table::FromClauseSubquery(from_clause_subquery) = &joined_table.table {
+            reject_outer_scope_refs_inside_plan_tree(
+                from_clause_subquery.plan.as_ref(),
+                current_scope_table_refs,
+            )?;
+        }
+    }
+
     Ok(())
 }
 
