@@ -2012,7 +2012,8 @@ pub fn check_expr_references_column(expr: &ast::Expr, col_name_normalized: &str)
 /// Rewrite column name references; used in e.g. ALTER TABLE RENAME COLUMN
 /// to rewrite references to the old column name to the new column name.
 /// Replaces `Id(old)` and `Name(old)` with `Id(new)`, and updates the
-/// column name in `Qualified(tbl, old)` references.
+/// column name in `Qualified(tbl, old)` and
+/// `DoublyQualified(schema, tbl, old)` references.
 pub fn rename_identifiers(expr: &mut ast::Expr, from: &str, to: &str) {
     let from_normalized = normalize_ident(from);
     // The closure is infallible, so walk_expr_mut cannot fail.
@@ -2030,6 +2031,13 @@ pub fn rename_identifiers(expr: &mut ast::Expr, from: &str, to: &str) {
                 {
                     let tbl = tbl.clone();
                     *e = ast::Expr::Qualified(tbl, ast::Name::exact(to.to_owned()));
+                }
+                ast::Expr::DoublyQualified(ref schema, ref tbl, ref col_name)
+                    if normalize_ident(col_name.as_str()) == from_normalized =>
+                {
+                    let schema = schema.clone();
+                    let tbl = tbl.clone();
+                    *e = ast::Expr::DoublyQualified(schema, tbl, ast::Name::exact(to.to_owned()));
                 }
                 _ => {}
             }

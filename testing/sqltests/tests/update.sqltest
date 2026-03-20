@@ -846,6 +846,23 @@ expect {
     4|d
 }
 
+@cross-check-integrity
+test update-in-list-mutating-driven-indexed-column {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INT);
+    CREATE INDEX idx_x ON t(x);
+    INSERT INTO t VALUES (1,1), (2,1), (3,2), (4,9);
+    UPDATE t SET x = x + 1 WHERE x IN (1,2);
+    SELECT id, x FROM t ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    1|2
+    2|2
+    3|3
+    4|9
+    ok
+}
+
 # Test UPDATE with NOT IN subquery
 
 @cross-check-integrity

@@ -63,6 +63,17 @@ expect {
 }
 
 @cross-check-integrity
+test rename-column-partial-index-doubly-qualified-where {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t (b) WHERE aux.t.a > 0;
+    ALTER TABLE t RENAME COLUMN a TO a2;
+    SELECT sql FROM sqlite_schema WHERE type = 'index';
+}
+expect {
+    CREATE INDEX idx ON t (b) WHERE aux.t.a2 > 0
+}
+
+@cross-check-integrity
 test rename-column-partial-index-rename-where-col-only {
     CREATE TABLE t (a, b, c);
     CREATE INDEX idx ON t (b) WHERE c = 1;

@@ -237,6 +237,36 @@ expect {
 }
 
 @cross-check-integrity
+test alter-table-rename-column-case-only {
+    CREATE TABLE t (A INT);
+    CREATE INDEX i ON t (A);
+    ALTER TABLE t RENAME COLUMN A TO a;
+    SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 't';
+    SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = 'i';
+}
+expect {
+    CREATE TABLE t (a INT)
+    CREATE INDEX i ON t (a)
+}
+
+@cross-check-integrity
+test alter-table-rename-column-same-name {
+    CREATE TABLE t (a INT);
+    CREATE INDEX i ON t (a);
+    PRAGMA schema_version;
+    ALTER TABLE t RENAME COLUMN a TO a;
+    PRAGMA schema_version;
+    SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 't';
+    SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = 'i';
+}
+expect {
+    2
+    3
+    CREATE TABLE t (a INT)
+    CREATE INDEX i ON t (a)
+}
+
+@cross-check-integrity
 test alter-table-rename-quoted-column {
     CREATE TABLE t (a INTEGER);
     ALTER TABLE t RENAME a TO "ab cd";
