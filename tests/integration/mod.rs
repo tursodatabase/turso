@@ -2,6 +2,7 @@ mod assert_details;
 mod common;
 mod conflict_resolution;
 mod custom_types;
+mod database;
 mod functions;
 mod fuzz_transaction;
 mod index_method;
