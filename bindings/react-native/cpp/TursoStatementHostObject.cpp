@@ -17,9 +17,21 @@ void TursoStatementHostObject::throwError(jsi::Runtime &rt, const char *error) {
     throw jsi::JSError(rt, error ? error : "Unknown error");
 }
 
+void TursoStatementHostObject::checkStatement(jsi::Runtime &rt) {
+    if (!stmt_) {
+        throw jsi::JSError(rt, "statement has been finalized");
+    }
+}
+
 jsi::Value TursoStatementHostObject::get(jsi::Runtime &rt, const jsi::PropNameID &name) {
     auto propName = name.utf8(rt);
 
+    if (propName == "dispose") {
+        return jsi::Function::createFromHostFunction(rt, name, 0,
+            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return this->dispose(rt);
+            });
+    }
     if (propName == "bindPositionalNull") {
         return jsi::Function::createFromHostFunction(rt, name, 1,
             [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
@@ -162,6 +174,7 @@ void TursoStatementHostObject::set(jsi::Runtime &rt, const jsi::PropNameID &name
 
 std::vector<jsi::PropNameID> TursoStatementHostObject::getPropertyNames(jsi::Runtime &rt) {
     std::vector<jsi::PropNameID> props;
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "dispose"));
     props.emplace_back(jsi::PropNameID::forAscii(rt, "bindPositionalNull"));
     props.emplace_back(jsi::PropNameID::forAscii(rt, "bindPositionalInt"));
     props.emplace_back(jsi::PropNameID::forAscii(rt, "bindPositionalDouble"));
@@ -189,7 +202,16 @@ std::vector<jsi::PropNameID> TursoStatementHostObject::getPropertyNames(jsi::Run
 
 // 1:1 C API mapping - NO logic, just calls through to C API
 
+jsi::Value TursoStatementHostObject::dispose(jsi::Runtime &rt) {
+    if (stmt_) {
+        turso_statement_deinit(stmt_);
+        stmt_ = nullptr;
+    }
+    return jsi::Value::undefined();
+}
+
 jsi::Value TursoStatementHostObject::bindPositionalNull(jsi::Runtime &rt, const jsi::Value *args, size_t count) {
+    checkStatement(rt);
     if (count < 1 || !args[0].isNumber()) {
         throw jsi::JSError(rt, "bindPositionalNull: expected number argument (position)");
     }
@@ -199,6 +221,7 @@ jsi::Value TursoStatementHostObject::bindPositionalNull(jsi::Runtime &rt, const 
 }
 
 jsi::Value TursoStatementHostObject::bindPositionalInt(jsi::Runtime &rt, const jsi::Value *args, size_t count) {
+    checkStatement(rt);
     if (count < 2 || !args[0].isNumber() || !args[1].isNumber()) {
         throw jsi::JSError(rt, "bindPositionalInt: expected two number arguments (position, value)");
     }
@@ -209,6 +232,7 @@ jsi::Value TursoStatementHostObject::bindPositionalInt(jsi::Runtime &rt, const j
 }
 
 jsi::Value TursoStatementHostObject::bindPositionalDouble(jsi::Runtime &rt, const jsi::Value *args, size_t count) {
+    checkStatement(rt);
     if (count < 2 || !args[0].isNumber() || !args[1].isNumber()) {
         throw jsi::JSError(rt, "bindPositionalDouble: expected two number arguments (position, value)");
     }
@@ -219,6 +243,7 @@ jsi::Value TursoStatementHostObject::bindPositionalDouble(jsi::Runtime &rt, cons
 }
 
 jsi::Value TursoStatementHostObject::bindPositionalBlob(jsi::Runtime &rt, const jsi::Value *args, size_t count) {
+    checkStatement(rt);
     if (count < 2 || !args[0].isNumber() || !args[1].isObject()) {
         throw jsi::JSError(rt, "bindPositionalBlob: expected number and ArrayBuffer arguments");
     }
@@ -234,6 +259,7 @@ jsi::Value TursoStatementHostObject::bindPositionalBlob(jsi::Runtime &rt, const 
 }
 
 jsi::Value TursoStatementHostObject::bindPositionalText(jsi::Runtime &rt, const jsi::Value *args, size_t count) {
+    checkStatement(rt);
     if (count < 2 || !args[0].isNumber() || !args[1].isString()) {
         throw jsi::JSError(rt, "bindPositionalText: expected number and string arguments");
     }
@@ -244,6 +270,7 @@ jsi::Value TursoStatementHostObject::bindPositionalText(jsi::Runtime &rt, const 
 }
 
 jsi::Value TursoStatementHostObject::execute(jsi::Runtime &rt) {
+    checkStatement(rt);
     uint64_t rows_changed = 0;
     const char* error = nullptr;
     turso_status_code_t status = turso_statement_execute(stmt_, &rows_changed, &error);
@@ -260,6 +287,7 @@ jsi::Value TursoStatementHostObject::execute(jsi::Runtime &rt) {
 }
 
 jsi::Value TursoStatementHostObject::step(jsi::Runtime &rt) {
+    checkStatement(rt);
     const char* error = nullptr;
     turso_status_code_t status = turso_statement_step(stmt_, &error);
 
@@ -271,6 +299,7 @@ jsi::Value TursoStatementHostObject::step(jsi::Runtime &rt) {
 }
 
 jsi::Value TursoStatementHostObject::runIo(jsi::Runtime &rt) {
+    checkStatement(rt);
     const char* error = nullptr;
     turso_status_code_t status = turso_statement_run_io(stmt_, &error);
 
@@ -282,6 +311,7 @@ jsi::Value TursoStatementHostObject::runIo(jsi::Runtime &rt) {
 }
 
 jsi::Value TursoStatementHostObject::reset(jsi::Runtime &rt) {
+    checkStatement(rt);
     const char* error = nullptr;
     turso_status_code_t status = turso_statement_reset(stmt_, &error);
 
@@ -312,16 +342,19 @@ jsi::Value TursoStatementHostObject::finalize(jsi::Runtime &rt) {
 }
 
 jsi::Value TursoStatementHostObject::nChange(jsi::Runtime &rt) {
+    checkStatement(rt);
     int64_t n = turso_statement_n_change(stmt_);
     return jsi::Value(static_cast<double>(n));
 }
 
 jsi::Value TursoStatementHostObject::columnCount(jsi::Runtime &rt) {
+    checkStatement(rt);
     int64_t count = turso_statement_column_count(stmt_);
     return jsi::Value(static_cast<double>(count));
 }
 
 jsi::Value TursoStatementHostObject::columnName(jsi::Runtime &rt, const jsi::Value *args, size_t count) {
+    checkStatement(rt);
     if (count < 1 || !args[0].isNumber()) {
         throw jsi::JSError(rt, "columnName: expected number argument (index)");
     }
@@ -339,6 +372,7 @@ jsi::Value TursoStatementHostObject::columnName(jsi::Runtime &rt, const jsi::Val
 }
 
 jsi::Value TursoStatementHostObject::rowValueKind(jsi::Runtime &rt, const jsi::Value *args, size_t count) {
+    checkStatement(rt);
     if (count < 1 || !args[0].isNumber()) {
         throw jsi::JSError(rt, "rowValueKind: expected number argument (index)");
     }
@@ -348,6 +382,7 @@ jsi::Value TursoStatementHostObject::rowValueKind(jsi::Runtime &rt, const jsi::V
 }
 
 jsi::Value TursoStatementHostObject::rowValueBytesCount(jsi::Runtime &rt, const jsi::Value *args, size_t count) {
+    checkStatement(rt);
     if (count < 1 || !args[0].isNumber()) {
         throw jsi::JSError(rt, "rowValueBytesCount: expected number argument (index)");
     }
@@ -357,6 +392,7 @@ jsi::Value TursoStatementHostObject::rowValueBytesCount(jsi::Runtime &rt, const 
 }
 
 jsi::Value TursoStatementHostObject::rowValueBytesPtr(jsi::Runtime &rt, const jsi::Value *args, size_t count) {
+    checkStatement(rt);
     if (count < 1 || !args[0].isNumber()) {
         throw jsi::JSError(rt, "rowValueBytesPtr: expected number argument (index)");
     }
@@ -378,6 +414,7 @@ jsi::Value TursoStatementHostObject::rowValueBytesPtr(jsi::Runtime &rt, const js
 }
 
 jsi::Value TursoStatementHostObject::rowValueText(jsi::Runtime &rt, const jsi::Value *args, size_t count) {
+    checkStatement(rt);
     if (count < 1 || !args[0].isNumber()) {
         throw jsi::JSError(rt, "rowValueText: expected number argument (index)");
     }
@@ -395,6 +432,7 @@ jsi::Value TursoStatementHostObject::rowValueText(jsi::Runtime &rt, const jsi::V
 }
 
 jsi::Value TursoStatementHostObject::rowValueInt(jsi::Runtime &rt, const jsi::Value *args, size_t count) {
+    checkStatement(rt);
     if (count < 1 || !args[0].isNumber()) {
         throw jsi::JSError(rt, "rowValueInt: expected number argument (index)");
     }
@@ -404,6 +442,7 @@ jsi::Value TursoStatementHostObject::rowValueInt(jsi::Runtime &rt, const jsi::Va
 }
 
 jsi::Value TursoStatementHostObject::rowValueDouble(jsi::Runtime &rt, const jsi::Value *args, size_t count) {
+    checkStatement(rt);
     if (count < 1 || !args[0].isNumber()) {
         throw jsi::JSError(rt, "rowValueDouble: expected number argument (index)");
     }
@@ -413,6 +452,7 @@ jsi::Value TursoStatementHostObject::rowValueDouble(jsi::Runtime &rt, const jsi:
 }
 
 jsi::Value TursoStatementHostObject::namedPosition(jsi::Runtime &rt, const jsi::Value *args, size_t count) {
+    checkStatement(rt);
     if (count < 1 || !args[0].isString()) {
         throw jsi::JSError(rt, "namedPosition: expected string argument (name)");
     }
@@ -422,11 +462,13 @@ jsi::Value TursoStatementHostObject::namedPosition(jsi::Runtime &rt, const jsi::
 }
 
 jsi::Value TursoStatementHostObject::parametersCount(jsi::Runtime &rt) {
+    checkStatement(rt);
     int64_t count = turso_statement_parameters_count(stmt_);
     return jsi::Value(static_cast<double>(count));
 }
 
 jsi::Value TursoStatementHostObject::getAllRows(jsi::Runtime &rt) {
+    checkStatement(rt);
     int64_t colCount = turso_statement_column_count(stmt_);
     if (colCount < 0) {
         // defensive fallback to 0 to not allocate a vector with a negative size

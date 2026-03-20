@@ -38,7 +38,11 @@ private:
     // Helper to throw JS errors
     void throwError(jsi::Runtime &rt, const char *error);
 
+    // Throws if stmt_ is null (statement was finalized or disposed)
+    void checkStatement(jsi::Runtime &rt);
+
     // 1:1 C API mapping methods (NO logic - just calls through to C API)
+    jsi::Value dispose(jsi::Runtime &rt);
     jsi::Value bindPositionalNull(jsi::Runtime &rt, const jsi::Value *args, size_t count);
     jsi::Value bindPositionalInt(jsi::Runtime &rt, const jsi::Value *args, size_t count);
     jsi::Value bindPositionalDouble(jsi::Runtime &rt, const jsi::Value *args, size_t count);

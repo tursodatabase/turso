@@ -25,12 +25,17 @@ export class Statement {
   private _execLock: AsyncLock | null;
   private _finalized = false;
   private _extraIo?: () => Promise<void>;
+  private _stmtTracker?: Set<Statement>;
 
-  constructor(statement: NativeStatement, connection: NativeConnection, execLock: AsyncLock | null, extraIo?: () => Promise<void>) {
+  constructor(statement: NativeStatement, connection: NativeConnection, execLock: AsyncLock | null, extraIo?: () => Promise<void>, stmtTracker?: Set<Statement>) {
     this._statement = statement;
     this._connection = connection;
     this._execLock = execLock;
     this._extraIo = extraIo;
+    this._stmtTracker = stmtTracker;
+    if (stmtTracker) {
+      stmtTracker.add(this);
+    }
   }
 
   /**
@@ -425,10 +430,33 @@ export class Statement {
         break;
       }
       this._finalized = true;
+      this._removeFromTracker();
     } finally {
       if (this._execLock) {
         this._execLock.release();
       }
+    }
+  }
+
+  /**
+   * Synchronously dispose the native statement. Called by Database.close() to
+   * break the reference chain (Statement -> Connection -> Database) that would
+   * otherwise keep the database alive in DATABASE_MANAGER.
+   * @internal
+   */
+  _dispose(): void {
+    if (this._finalized) {
+      return;
+    }
+    this._statement.dispose();
+    this._finalized = true;
+    this._removeFromTracker();
+  }
+
+  private _removeFromTracker(): void {
+    if (this._stmtTracker) {
+      this._stmtTracker.delete(this);
+      this._stmtTracker = undefined;
     }
   }
 

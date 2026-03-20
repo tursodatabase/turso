@@ -50,6 +50,7 @@ export interface NativeStatement {
   runIo(): number;
   reset(): void;
   finalize(): number;
+  dispose(): void;
 
   // Query methods
   nChange(): number;

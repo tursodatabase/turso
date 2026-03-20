@@ -77,6 +77,7 @@ export class Database {
   private _isSync = false;
   private _connected = false;
   private _closed = false;
+  private _statements: Set<Statement> = new Set();
   private _execLock: AsyncLock;
   private _extraIo?: () => Promise<void>;
   private _ioContext?: {
@@ -226,7 +227,7 @@ export class Database {
     }
 
     const nativeStmt = this._connection.prepareSingle(sql);
-    return new Statement(nativeStmt, this._connection!, this._execLock, this._extraIo);
+    return new Statement(nativeStmt, this._connection!, this._execLock, this._extraIo, this._statements);
   }
 
   /**
@@ -408,6 +409,15 @@ export class Database {
     if (this._closed) {
       return;
     }
+
+    // Dispose all outstanding statements. Each turso_statement holds an
+    // Arc<Connection> -> Arc<Database> chain; if we don't release them the
+    // Weak in DATABASE_MANAGER can still be upgraded after a file rename,
+    // causing a stale Database to be returned on the next open().
+    for (const stmt of this._statements) {
+      stmt._dispose();
+    }
+    this._statements.clear();
 
     if (this._connection) {
       this._connection.close();
