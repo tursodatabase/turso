@@ -202,16 +202,41 @@ pub fn prepare_select_plan(
                 .limit
                 .map_or(Ok((None, None)), |l| parse_limit(l, resolver))?;
 
-            // FIXME: handle ORDER BY for compound selects
-            if !select.order_by.is_empty() {
-                crate::bail_parse_error!("ORDER BY is not supported for compound SELECTs yet");
-            }
+            // Parse ORDER BY for compound selects.
+            // ORDER BY can reference columns by number (1-based) or by name/alias
+            // from the leftmost SELECT's result columns.
+            let leftmost_plan = &left[0].0;
+            let leftmost_result_columns = &leftmost_plan.result_columns;
+            let leftmost_table_refs = &leftmost_plan.table_references;
+            let order_by = if select.order_by.is_empty() {
+                None
+            } else {
+                if select
+                    .order_by
+                    .iter()
+                    .filter_map(|o| o.nulls)
+                    .any(|n| n == ast::NullsOrder::Last)
+                {
+                    crate::bail_parse_error!("NULLS LAST is not supported yet in ORDER BY");
+                }
+                let mut key = Vec::with_capacity(select.order_by.len());
+                for o in &select.order_by {
+                    let col_idx = resolve_compound_order_by_expr(
+                        &o.expr,
+                        leftmost_result_columns,
+                        leftmost_table_refs,
+                    )?;
+                    key.push((col_idx, o.order.unwrap_or(ast::SortOrder::Asc)));
+                }
+                Some(key)
+            };
+
             Ok(Plan::CompoundSelect {
                 left,
                 right_most: last,
                 limit,
                 offset,
-                order_by: None,
+                order_by,
             })
         }
     }
@@ -864,6 +889,65 @@ fn replace_column_number_with_copy_of_column_expr(
         // Otherwise, leave the expression as-is (constant expression, case 3 per SQLite docs)
     }
     Ok(())
+}
+
+/// Resolves a compound SELECT ORDER BY expression to a 0-based column index.
+/// ORDER BY in compound selects can reference columns by:
+/// 1. Numeric position (1-based): ORDER BY 1
+/// 2. Column name or alias from the leftmost SELECT: ORDER BY name
+fn resolve_compound_order_by_expr(
+    expr: &ast::Expr,
+    result_columns: &[ResultSetColumn],
+    table_references: &TableReferences,
+) -> Result<usize> {
+    match expr {
+        // Case 1: Numeric column reference (e.g., ORDER BY 1)
+        ast::Expr::Literal(ast::Literal::Numeric(num)) => {
+            if let Ok(column_number) = num.parse::<usize>() {
+                if column_number == 0 || column_number > result_columns.len() {
+                    crate::bail_parse_error!(
+                        "{} ORDER BY term out of range - should be between 1 and {}",
+                        column_number,
+                        result_columns.len()
+                    );
+                }
+                Ok(column_number - 1)
+            } else {
+                crate::bail_parse_error!(
+                    "ORDER BY expression in compound SELECT must be a column number or name"
+                );
+            }
+        }
+        // Case 2: Name reference (e.g., ORDER BY name or ORDER BY alias)
+        ast::Expr::Id(name) => {
+            let name_normalized = normalize_ident(name.as_str());
+            // First try matching against aliases
+            for (i, rc) in result_columns.iter().enumerate() {
+                if let Some(alias) = &rc.alias {
+                    if normalize_ident(alias) == name_normalized {
+                        return Ok(i);
+                    }
+                }
+            }
+            // Then try matching against column names from the table references
+            for (i, rc) in result_columns.iter().enumerate() {
+                if let Some(col_name) = rc.name(table_references) {
+                    if normalize_ident(col_name) == name_normalized {
+                        return Ok(i);
+                    }
+                }
+            }
+            crate::bail_parse_error!(
+                "ORDER BY term \"{}\" does not match any result column",
+                name.as_str()
+            );
+        }
+        _ => {
+            crate::bail_parse_error!(
+                "ORDER BY expression in compound SELECT must be a column number or name"
+            );
+        }
+    }
 }
 
 /// Count required cursors for a Plan (either Select or CompoundSelect)
