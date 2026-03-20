@@ -329,7 +329,7 @@ impl Statement {
                     let mut values = Vec::with_capacity(columns);
                     for i in 0..columns {
                         let value = stmt.row_value(i)?;
-                        values.push(value.to_owned());
+                        values.push(value);
                     }
                     Poll::Ready(Ok(Some(Row { values })))
                 } else {
@@ -416,8 +416,7 @@ impl Statement {
         }
         Ok(stmt
             .column_name(idx)
-            .expect("column index must be within valid range")
-            .into_owned())
+            .expect("column index must be within valid range"))
     }
 
     /// Returns the names of all columns in the result set.
@@ -428,7 +427,6 @@ impl Statement {
             .map(|i| {
                 stmt.column_name(i)
                     .expect("column index must be within valid range")
-                    .into_owned()
             })
             .collect()
     }
@@ -441,7 +439,7 @@ impl Statement {
             let col_name = stmt
                 .column_name(i)
                 .expect("column index must be within valid range");
-            if col_name.eq_ignore_ascii_case(name) {
+            if col_name.as_str().eq_ignore_ascii_case(name) {
                 return Ok(i);
             }
         }
@@ -461,8 +459,7 @@ impl Statement {
         for i in 0..n {
             let name = stmt
                 .column_name(i)
-                .expect("column index must be within valid range")
-                .into_owned();
+                .expect("column index must be within valid range");
             let decl_type = stmt.column_decltype(i);
             cols.push(Column { name, decl_type });
         }
