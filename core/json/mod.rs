@@ -581,7 +581,7 @@ where
 ///
 /// - `jsonb` – the value to convert
 /// - `element_type` – the element type of the jsonb
-/// - `flag` – how the result should be formatted.
+/// - `flag` – how the result should be formatted (null values will stay null).
 ///   - If the flag is `OutputVariant::Binary`, the result is a `Value::Blob`.
 ///   - If it is `OutputVariant::ElementType` and the `element_type` is text, the result has a subtype of `TestSubtype::Text`, with the outer quotes removed.
 ///   - If it is `OutputVariant::String` and the `element_type` is text, the result has a subtype of `TextSubtype::Text`.
@@ -591,6 +591,9 @@ pub fn json_string_to_db_type(
     element_type: ElementType,
     flag: OutputVariant,
 ) -> crate::Result<Value> {
+    if element_type == ElementType::NULL {
+        return Ok(Value::Null);
+    }
     if matches!(flag, OutputVariant::Binary) {
         return Ok(Value::Blob(json.data()));
     }
@@ -640,7 +643,6 @@ pub fn json_string_to_db_type(
         }
         ElementType::TRUE => Ok(Value::from_i64(1)),
         ElementType::FALSE => Ok(Value::from_i64(0)),
-        ElementType::NULL => Ok(Value::Null),
         _ => unreachable!(),
     }
 }

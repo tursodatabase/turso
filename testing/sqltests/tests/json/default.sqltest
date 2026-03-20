@@ -3255,3 +3255,24 @@ expect {
     tab	here
 newline	tab
 }
+
+test json-set-field-null {
+    SELECT typeof(json_set(null, '$.field', 'value'));
+}
+expect {
+  null
+}
+
+test json-insert-null {
+    SELECT typeof(json_insert(NULL, '$.a', 1));
+}
+expect {
+  null
+}
+
+test json-remove-null {
+    SELECT typeof(json_remove(NULL, '$.a'));
+}
+expect {
+  null
+}
