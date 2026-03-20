@@ -1,0 +1,75 @@
+@database :memory:
+
+test direct-comparison {
+    SELECT 3036093696168066048.0 = 3036093696168066000;
+}
+expect {
+    0
+}
+
+test through-cast {
+    SELECT CAST(3036093696168066048.0 AS REAL) = 3036093696168066000;
+}
+expect {
+    0
+}
+
+test through-table-column {
+    CREATE TABLE t1 (val REAL);
+    INSERT INTO t1 VALUES (3036093696168066048.0);
+    SELECT val = 3036093696168066000 FROM t1;
+}
+expect {
+    0
+}
+
+test all-six-operators {
+    CREATE TABLE t2 (val REAL);
+    INSERT INTO t2 VALUES (3036093696168066048.0);
+    SELECT val = 3036093696168066000,
+           val != 3036093696168066000,
+           val < 3036093696168066000,
+           val > 3036093696168066000,
+           val <= 3036093696168066000,
+           val >= 3036093696168066000
+    FROM t2;
+}
+expect {
+    0|1|0|1|0|1
+}
+
+test precision-boundary-2pow53 {
+    CREATE TABLE t9 (val REAL);
+    INSERT INTO t9 VALUES (9007199254740992.0);
+    SELECT val = 9007199254740993 FROM t9;
+}
+expect {
+    0
+}
+
+test negative-values-equality {
+    CREATE TABLE t11 (val REAL);
+    INSERT INTO t11 VALUES (-3036093696168066048.0);
+    SELECT val = -3036093696168066000 FROM t11;
+}
+expect {
+    0
+}
+
+test negative-values-less-than {
+    CREATE TABLE t12 (val REAL);
+    INSERT INTO t12 VALUES (-3036093696168066048.0);
+    SELECT val < -3036093696168066000 FROM t12;
+}
+expect {
+    1
+}
+
+test i64max-real {
+    CREATE TABLE t_pavan (id INTEGER PRIMARY KEY, x1 REAL, x2 REAL);
+    INSERT INTO t_pavan VALUES(1, 0, 9223372036854775807);
+    SELECT count(*) FROM t_pavan WHERE x2 <= 9223372036854775807;
+}
+expect {
+    0
+}
