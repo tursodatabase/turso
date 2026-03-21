@@ -396,7 +396,6 @@ mod tests {
                 enable_attach: false,
                 enable_generated_columns: false,
                 unsafe_testing: false,
-                simulator_seed: None,
             },
             None,
         )?;

@@ -3,21 +3,22 @@ use rustc_hash::FxHashSet as HashSet;
 use super::*;
 use crate::io::PlatformIO;
 use crate::mvcc::clock::MvccClock;
-use crate::mvcc::cursor::MvccCursorType;
+use crate::mvcc::cursor::{CursorYieldPoint, MvccCursorType};
 use crate::mvcc::persistent_storage::logical_log::LOG_HDR_SIZE;
+use crate::mvcc::yield_points::{YieldInjector, YieldSite, YieldSiteMarker};
 use crate::state_machine::{StateTransition, TransitionResult};
 use crate::storage::sqlite3_ondisk::{
     checksum_wal, read_varint, write_varint, DatabaseHeader, WalHeader, WAL_FRAME_HEADER_SIZE,
     WAL_HEADER_SIZE,
 };
 use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::sync::Mutex;
 use crate::sync::RwLock;
 use crate::{Buffer, Completion, DatabaseOpts, OpenFlags};
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-
 pub(crate) struct MvccTestDbNoConn {
     pub(crate) db: Option<Arc<Database>>,
     path: Option<String>,
@@ -31,15 +32,29 @@ pub(crate) struct MvccTestDb {
     pub(crate) conn: Arc<Connection>,
 }
 
+#[derive(Debug)]
+struct FixedYieldInjector {
+    remaining: Mutex<HashSet<YieldSite>>,
+}
+
+impl FixedYieldInjector {
+    fn new(points: impl IntoIterator<Item = YieldSite>) -> Arc<Self> {
+        Arc::new(Self {
+            remaining: Mutex::new(points.into_iter().collect()),
+        })
+    }
+}
+
+impl YieldInjector for FixedYieldInjector {
+    fn should_yield(&self, _instance_id: u64, _selection_key: u64, site: YieldSite) -> bool {
+        self.remaining.lock().remove(&site)
+    }
+}
+
 impl MvccTestDb {
     pub fn new() -> Self {
-        Self::new_with_opts(DatabaseOpts::new())
-    }
-
-    pub fn new_with_opts(opts: DatabaseOpts) -> Self {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file_with_flags(io, ":memory:", OpenFlags::default(), opts, None)
-            .unwrap();
+        let db = Database::open_file(io, ":memory:").unwrap();
         let conn = db.connect().unwrap();
         // Enable MVCC via PRAGMA
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
@@ -2594,77 +2609,8 @@ fn setup_lazy_db(initial_keys: &[i64]) -> (MvccTestDb, u64, MVTableId, i64) {
 }
 
 #[test]
-fn test_write_row_state_machine_yields_with_unsafe_testing() {
-    let db = MvccTestDb::new_with_opts(DatabaseOpts::new().with_unsafe_testing(true));
-    db.conn
-        .execute("CREATE TABLE write_row_yield_test(x INTEGER PRIMARY KEY, v TEXT)")
-        .unwrap();
-    let root_page = get_rows(
-        &db.conn,
-        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 'write_row_yield_test'",
-    )[0][0]
-        .as_int()
-        .unwrap();
-    let table_id = db.mvcc_store.get_table_id_from_root_page(root_page);
-    let row = generate_simple_string_row(table_id, 0, "row0");
-    let cursor = Arc::new(RwLock::new(BTreeCursor::new_table(
-        db.conn.pager.load().clone(),
-        root_page.abs(),
-        1,
-    )));
-
-    let mut state_machine = db
-        .mvcc_store
-        .write_row_to_pager(&row, cursor, true)
-        .unwrap();
-    match state_machine.step(&()).unwrap() {
-        IOResult::IO(io) => assert!(
-            io.is_explicit_yield(),
-            "unsafe_testing write-row state machine should inject an explicit yield, not ordinary IO",
-        ),
-        other => panic!(
-            "unsafe_testing write-row state machine should yield on its first reachable transition, got {other:?}"
-        ),
-    }
-}
-
-#[test]
-fn test_delete_row_state_machine_yields_with_unsafe_testing() {
-    let db = MvccTestDb::new_with_opts(DatabaseOpts::new().with_unsafe_testing(true));
-    db.conn
-        .execute("CREATE TABLE delete_row_yield_test(x INTEGER PRIMARY KEY, v TEXT)")
-        .unwrap();
-    let root_page = get_rows(
-        &db.conn,
-        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 'delete_row_yield_test'",
-    )[0][0]
-        .as_int()
-        .unwrap();
-    let table_id = db.mvcc_store.get_table_id_from_root_page(root_page);
-    let cursor = Arc::new(RwLock::new(BTreeCursor::new_table(
-        db.conn.pager.load().clone(),
-        root_page.abs(),
-        1,
-    )));
-
-    let mut state_machine = db
-        .mvcc_store
-        .delete_row_from_pager(RowID::new(table_id, RowKey::Int(0)), cursor)
-        .unwrap();
-    match state_machine.step(&()).unwrap() {
-        IOResult::IO(io) => assert!(
-            io.is_explicit_yield(),
-            "unsafe_testing delete-row state machine should inject an explicit yield, not ordinary IO",
-        ),
-        other => panic!(
-            "unsafe_testing delete-row state machine should yield on its first reachable transition, got {other:?}"
-        ),
-    }
-}
-
-#[test]
-fn test_mvcc_cursor_next_yields_with_unsafe_testing() {
-    let db = MvccTestDb::new_with_opts(DatabaseOpts::new().with_unsafe_testing(true));
+fn test_mvcc_cursor_next_yields_with_injected_yield() {
+    let db = MvccTestDb::new();
     db.conn
         .execute("CREATE TABLE cursor_yield_test(x INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
@@ -2675,83 +2621,38 @@ fn test_mvcc_cursor_next_yields_with_unsafe_testing() {
         .as_int()
         .unwrap();
     let table_id = db.mvcc_store.get_table_id_from_root_page(root_page);
-    let mut saw_yield = false;
-    // The unseeded cursor plan is keyed by table_id ^ tx_id, so not every tx_id
-    // selects NextInit; probe a small deterministic range until one does.
-    for _ in 0..64 {
-        let tx_id = db
-            .mvcc_store
-            .begin_tx(db.conn.pager.load().clone())
-            .unwrap();
-
-        let mut cursor = MvccLazyCursor::new(
-            db.mvcc_store.clone(),
-            tx_id,
-            i64::from(table_id),
-            MvccCursorType::Table,
-            Box::new(BTreeCursor::new(
-                db.conn.pager.load().clone(),
-                root_page.abs(),
-                1,
-            )),
-        )
+    let tx_id = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
         .unwrap();
+    db.conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CursorYieldPoint::NextStart.site()
+    ])));
 
-        saw_yield = matches!(cursor.next().unwrap(), IOResult::IO(_));
-        db.mvcc_store
-            .rollback_tx(tx_id, db.conn.pager.load().clone(), db.conn.as_ref(), 0);
+    let mut cursor = MvccLazyCursor::new(
+        db.mvcc_store.clone(),
+        &db.conn,
+        tx_id,
+        i64::from(table_id),
+        MvccCursorType::Table,
+        Box::new(BTreeCursor::new(
+            db.conn.pager.load().clone(),
+            root_page.abs(),
+            1,
+        )),
+    )
+    .unwrap();
 
-        if saw_yield {
-            break;
-        }
-    }
+    let saw_yield = matches!(
+        cursor.next().unwrap(),
+        IOResult::IO(io) if io.is_explicit_yield()
+    );
+    db.mvcc_store
+        .rollback_tx(tx_id, db.conn.pager.load().clone(), db.conn.as_ref(), 0);
 
     assert!(
         saw_yield,
-        "unsafe_testing MVCC cursor should yield on a first next() transition for some deterministic tx id",
-    );
-}
-
-#[test]
-fn test_seeded_unsafe_testing_plan_uses_simulator_seed() {
-    let key = 42;
-    let unseeded = SimulatorCommitYieldPoint::plan(None, key);
-    assert_eq!(
-        unseeded.iter().flatten().count(),
-        1,
-        "unseeded unsafe_testing should keep the existing single-yield fallback",
-    );
-
-    let seeded_plans = (0..4096_u64)
-        .map(|seed| (seed, SimulatorCommitYieldPoint::plan(Some(seed), key)))
-        .collect::<Vec<_>>();
-
-    let seeded = seeded_plans
-        .iter()
-        .find(|(_, plan)| *plan != unseeded)
-        .map(|(seed, plan)| (*seed, *plan))
-        .expect("expected at least one simulator seed to change the yield plan");
-
-    assert_eq!(
-        seeded.1,
-        SimulatorCommitYieldPoint::plan(Some(seeded.0), key),
-        "seeded unsafe_testing plan should be deterministic",
-    );
-    assert!(
-        seeded.1.iter().flatten().count() <= 4,
-        "seeded unsafe_testing should select at most four yield points",
-    );
-    assert!(
-        seeded_plans
-            .iter()
-            .any(|(_, plan)| plan.iter().flatten().count() == 0),
-        "seeded unsafe_testing should be able to inject zero yields",
-    );
-    assert!(
-        seeded_plans
-            .iter()
-            .any(|(_, plan)| plan.iter().flatten().count() > 1),
-        "seeded unsafe_testing should be able to inject multiple yields",
+        "MVCC cursor should inject an explicit yield on the first next() transition",
     );
 }
 
@@ -2804,6 +2705,7 @@ fn test_lazy_scan_cursor_basic() {
 
     let mut cursor = MvccLazyCursor::new(
         db.mvcc_store.clone(),
+        &db.conn,
         tx_id,
         i64::from(table_id),
         MvccCursorType::Table,
@@ -2856,6 +2758,7 @@ fn test_lazy_scan_cursor_with_gaps() {
 
     let mut cursor = MvccLazyCursor::new(
         db.mvcc_store.clone(),
+        &db.conn,
         tx_id,
         i64::from(table_id),
         MvccCursorType::Table,
@@ -2915,6 +2818,7 @@ fn test_cursor_basic() {
 
     let mut cursor = MvccLazyCursor::new(
         db.mvcc_store.clone(),
+        &db.conn,
         tx_id,
         i64::from(table_id),
         MvccCursorType::Table,
@@ -2978,6 +2882,7 @@ fn test_cursor_with_empty_table() {
     // Test LazyScanCursor with empty table
     let mut cursor = MvccLazyCursor::new(
         db.mvcc_store.clone(),
+        &db.conn,
         tx_id,
         table_id,
         MvccCursorType::Table,
@@ -2998,6 +2903,7 @@ fn test_cursor_modification_during_scan() {
 
     let mut cursor = MvccLazyCursor::new(
         db.mvcc_store.clone(),
+        &db.conn,
         tx_id,
         i64::from(table_id),
         MvccCursorType::Table,
@@ -6933,21 +6839,22 @@ fn abandon_commit_after_first_io(conn: &Arc<Connection>, mv_store: &Arc<MvStore<
 }
 
 #[test]
-fn test_abandoned_commit_rolls_back_insert_with_unsafe_testing_yield() {
-    let db = MvccTestDbNoConn::new_with_random_db_with_opts(
-        DatabaseOpts::new().with_unsafe_testing(true),
-    );
+fn test_abandoned_commit_rolls_back_insert_with_injected_yield() {
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new());
     let conn = db.connect();
 
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
     conn.execute("BEGIN CONCURRENT").unwrap();
     conn.execute("INSERT INTO t VALUES (1, 'new')").unwrap();
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.site(),
+    ])));
 
     let mut stmt = conn.prepare("COMMIT").unwrap();
     assert!(
         matches!(stmt.step().unwrap(), crate::StepResult::IO),
-        "unsafe_testing MVCC commit should yield before completion",
+        "MVCC commit should yield before completion",
     );
 
     drop(stmt);
@@ -6957,7 +6864,7 @@ fn test_abandoned_commit_rolls_back_insert_with_unsafe_testing_yield() {
     let rows = get_rows(&observer, "SELECT id FROM t WHERE id = 1");
     assert!(
         rows.is_empty(),
-        "row from unsafe-testing abandoned INSERT commit remained visible: {rows:?}",
+        "row from abandoned INSERT commit remained visible: {rows:?}",
     );
     observer.close().unwrap();
 }

@@ -1,5 +1,6 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
+use crate::mvcc::yield_points::{inject_transition_yield, YieldKind, YieldSiteMarker};
 use crate::schema::{Schema, Table};
 use crate::state_machine::StateMachine;
 use crate::state_machine::StateTransition;
@@ -36,13 +37,13 @@ use crate::{
 use crate::{Connection, Pager, SyncMode};
 use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::{SkipMap, SkipSet};
-use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet as HashSet;
 use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Bound;
+use strum::EnumCount;
 use tracing::instrument;
 use tracing::Level;
 
@@ -60,160 +61,6 @@ pub mod tests;
 
 /// Sentinel value for `MvStore::exclusive_tx` indicating no exclusive transaction is active.
 const NO_EXCLUSIVE_TX: u64 = 0;
-
-// Synthetic simulator yields are injected 💉from code that returns either
-// `TransitionResult<T>` state-machine steps or `IOResult<T>` cursor helpers.
-macro_rules! yield_transition_in_simulator {
-    ($state_machine:expr, $point:expr) => {
-        #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-        if let Some(result) = $state_machine.simulator_yield.maybe_transition($point) {
-            return Ok(result);
-        }
-    };
-}
-
-pub(crate) use yield_transition_in_simulator;
-
-macro_rules! yield_io_in_simulator {
-    ($state_machine:expr, $point:expr) => {
-        #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-        if let Some(result) = $state_machine.simulator_yield.maybe_io($point) {
-            return Ok(result);
-        }
-    };
-}
-
-pub(crate) use yield_io_in_simulator;
-
-/// Specifies how many yields can be present in a simulator run (0..4)
-const MAX_SIMULATOR_YIELDS: usize = 4;
-
-pub(crate) type SimulatorYieldPlan<YieldPoint> = [Option<YieldPoint>; MAX_SIMULATOR_YIELDS];
-
-#[allow(dead_code)]
-fn simulator_yield_seed(seed: u64, key: u64) -> u64 {
-    // Mix the global simulator seed with a local key so each state machine
-    // gets a deterministic but distinct RNG stream.
-    // 0x9E37_79B9_7F4A_7C15 is the 64-bit golden-ratio increment.
-    let mut z = key.wrapping_add(seed).wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
-
-#[allow(dead_code)]
-pub(crate) fn simulator_yield_plan<YieldPoint: Copy>(
-    seed: Option<u64>,
-    key: u64,
-    all: &[YieldPoint],
-) -> SimulatorYieldPlan<YieldPoint> {
-    let mut plan = [None; MAX_SIMULATOR_YIELDS];
-    if all.is_empty() {
-        return plan;
-    }
-
-    match seed {
-        Some(seed) => {
-            let max_points = all.len().min(MAX_SIMULATOR_YIELDS);
-            let mut rng = StdRng::seed_from_u64(simulator_yield_seed(seed, key));
-            let count = rng.random_range(0..=max_points);
-            let mut choices = all.to_vec();
-            choices.shuffle(&mut rng);
-            for (dst, point) in plan.iter_mut().zip(choices.into_iter().take(count)) {
-                *dst = Some(point);
-            }
-        }
-        None => {
-            // Unit tests without a simulator seed still force one deterministic
-            // yield so the focused regression coverage stays stable.
-            plan[0] = Some(all[(key as usize) % all.len()]);
-        }
-    }
-
-    plan
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct SimulatorOpts {
-    #[allow(dead_code)]
-    pub(crate) simulator_seed: Option<u64>,
-}
-
-impl SimulatorOpts {
-    pub(crate) fn from_db_opts(opts: &crate::DatabaseOpts) -> Option<Self> {
-        opts.unsafe_testing.then_some(Self {
-            simulator_seed: opts.simulator_seed,
-        })
-    }
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct SimulatorYield<YieldPoint> {
-    remaining_points: SimulatorYieldPlan<YieldPoint>,
-}
-
-#[allow(dead_code)]
-impl<YieldPoint: Copy + PartialEq + Debug> SimulatorYield<YieldPoint> {
-    pub(crate) fn disabled() -> Self {
-        Self {
-            remaining_points: [None; MAX_SIMULATOR_YIELDS],
-        }
-    }
-
-    pub(crate) fn enabled(points: SimulatorYieldPlan<YieldPoint>) -> Self {
-        Self {
-            remaining_points: points,
-        }
-    }
-
-    pub(crate) fn maybe_transition<T>(&mut self, point: YieldPoint) -> Option<TransitionResult<T>> {
-        if !self.consume(point) {
-            return None;
-        }
-        tracing::debug!(?point, "injecting MVCC yield");
-        Some(TransitionResult::Io(IOCompletions::Single(
-            Completion::new_yield(),
-        )))
-    }
-
-    pub(crate) fn maybe_io<T>(&mut self, point: YieldPoint) -> Option<IOResult<T>> {
-        if !self.consume(point) {
-            return None;
-        }
-        tracing::debug!(?point, "injecting MVCC yield");
-        Some(IOResult::IO(IOCompletions::Single(Completion::new_yield())))
-    }
-
-    fn consume(&mut self, point: YieldPoint) -> bool {
-        for slot in &mut self.remaining_points {
-            if *slot == Some(point) {
-                *slot = None;
-                return true;
-            }
-        }
-        false
-    }
-}
-
-pub(crate) fn simulator_yield_from_opts<YieldPoint: Copy + PartialEq + Debug>(
-    simulator_opts: Option<SimulatorOpts>,
-    plan: impl FnOnce(Option<u64>) -> SimulatorYieldPlan<YieldPoint>,
-) -> SimulatorYield<YieldPoint> {
-    #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-    {
-        if let Some(simulator_opts) = simulator_opts {
-            SimulatorYield::enabled(plan(simulator_opts.simulator_seed))
-        } else {
-            SimulatorYield::disabled()
-        }
-    }
-    #[cfg(not(any(test, feature = "test_helper", feature = "simulator")))]
-    {
-        let _ = (simulator_opts, plan);
-        SimulatorYield::disabled()
-    }
-}
 
 /// A table ID for MVCC.
 /// MVCC table IDs are always negative. Their corresponding rootpage entry in sqlite_schema
@@ -1048,79 +895,28 @@ impl CommitCoordinator {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SimulatorCommitYieldPoint {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
+#[repr(u8)]
+enum CommitYieldPoint {
     CommitValidation,
     WaitForDependencies,
     LogRecordPrepared,
-    LogicalLogWritten,
-    LogicalLogSynced,
 }
 
-#[allow(dead_code)]
-impl SimulatorCommitYieldPoint {
-    const ALL: [Self; 5] = [
-        Self::CommitValidation,
-        Self::WaitForDependencies,
-        Self::LogRecordPrepared,
-        Self::LogicalLogWritten,
-        Self::LogicalLogSynced,
-    ];
+impl YieldSiteMarker for CommitYieldPoint {
+    const KIND: YieldKind = YieldKind::Commit;
+    const POINT_COUNT: u8 = Self::COUNT as u8;
 
-    fn plan(seed: Option<u64>, tx_id: TxID) -> SimulatorYieldPlan<Self> {
-        simulator_yield_plan(seed, tx_id, &Self::ALL)
-    }
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SimulatorWriteRowYieldPoint {
-    WritePrepared,
-    SeekComplete,
-    InsertComplete,
-}
-
-#[allow(dead_code)]
-impl SimulatorWriteRowYieldPoint {
-    const ALL: [Self; 3] = [
-        Self::WritePrepared,
-        Self::SeekComplete,
-        Self::InsertComplete,
-    ];
-
-    fn plan(seed: Option<u64>, rowid: &RowID) -> SimulatorYieldPlan<Self> {
-        let key = match &rowid.row_id {
-            RowKey::Int(rowid) => rowid.unsigned_abs(),
-            RowKey::Record(_) => i64::from(rowid.table_id).unsigned_abs(),
-        };
-        simulator_yield_plan(seed, key, &Self::ALL)
-    }
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SimulatorDeleteRowYieldPoint {
-    SeekReady,
-    SeekResolved,
-    AdvanceComplete,
-}
-
-#[allow(dead_code)]
-impl SimulatorDeleteRowYieldPoint {
-    const ALL: [Self; 3] = [Self::SeekReady, Self::SeekResolved, Self::AdvanceComplete];
-
-    fn plan(seed: Option<u64>, rowid: &RowID) -> SimulatorYieldPlan<Self> {
-        let key = match &rowid.row_id {
-            RowKey::Int(rowid) => rowid.unsigned_abs(),
-            RowKey::Record(_) => i64::from(rowid.table_id).unsigned_abs(),
-        };
-        simulator_yield_plan(seed, key, &Self::ALL)
+    fn ordinal(self) -> u8 {
+        self as u8
     }
 }
 
 pub struct CommitStateMachine<Clock: LogicalClock> {
     state: CommitState<Clock>,
     is_finalized: bool,
+    #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+    yield_instance_id: u64,
     did_commit_schema_change: bool,
     tx_id: TxID,
     connection: Arc<Connection>,
@@ -1133,8 +929,6 @@ pub struct CommitStateMachine<Clock: LogicalClock> {
     pending_log_append_bytes: Option<u64>,
     /// The synchronous mode for fsync operations. When set to Off, fsync is skipped.
     sync_mode: SyncMode,
-    #[allow(dead_code)]
-    simulator_yield: SimulatorYield<SimulatorCommitYieldPoint>,
     _phantom: PhantomData<Clock>,
 }
 
@@ -1154,8 +948,6 @@ pub struct WriteRowStateMachine {
     record: Option<ImmutableRecord>,
     cursor: Arc<RwLock<BTreeCursor>>,
     requires_seek: bool,
-    #[allow(dead_code)]
-    simulator_yield: SimulatorYield<SimulatorWriteRowYieldPoint>,
 }
 
 #[derive(Debug)]
@@ -1173,8 +965,6 @@ pub struct DeleteRowStateMachine {
     is_finalized: bool,
     rowid: RowID,
     cursor: Arc<RwLock<BTreeCursor>>,
-    #[allow(dead_code)]
-    simulator_yield: SimulatorYield<SimulatorDeleteRowYieldPoint>,
 }
 
 impl<Clock: LogicalClock> CommitStateMachine<Clock> {
@@ -1187,13 +977,11 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         sync_mode: SyncMode,
     ) -> Self {
         let pager = connection.pager.load().clone();
-        let simulator_yield =
-            simulator_yield_from_opts(SimulatorOpts::from_db_opts(&connection.db.opts), |seed| {
-                SimulatorCommitYieldPoint::plan(seed, tx_id)
-            });
         Self {
             state,
             is_finalized: false,
+            #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+            yield_instance_id: connection.next_yield_instance_id(),
             did_commit_schema_change: false,
             tx_id,
             connection,
@@ -1203,7 +991,6 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             header,
             pending_log_append_bytes: None,
             sync_mode,
-            simulator_yield,
             _phantom: PhantomData,
         }
     }
@@ -1613,15 +1400,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
 }
 
 impl WriteRowStateMachine {
-    fn new(
-        row: Row,
-        cursor: Arc<RwLock<BTreeCursor>>,
-        requires_seek: bool,
-        simulator_opts: Option<SimulatorOpts>,
-    ) -> Self {
-        let simulator_yield = simulator_yield_from_opts(simulator_opts, |seed| {
-            SimulatorWriteRowYieldPoint::plan(seed, &row.id)
-        });
+    fn new(row: Row, cursor: Arc<RwLock<BTreeCursor>>, requires_seek: bool) -> Self {
         Self {
             state: WriteRowState::Initial,
             is_finalized: false,
@@ -1629,7 +1408,6 @@ impl WriteRowStateMachine {
             record: None,
             cursor,
             requires_seek,
-            simulator_yield,
         }
     }
 }
@@ -1813,7 +1591,12 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     return Ok(TransitionResult::Done(()));
                 }
                 self.state = CommitState::Commit { end_ts };
-                yield_transition_in_simulator!(self, SimulatorCommitYieldPoint::CommitValidation);
+                inject_transition_yield!(
+                    self.connection.yield_injector(),
+                    self.yield_instance_id,
+                    self.tx_id,
+                    CommitYieldPoint::CommitValidation
+                );
                 Ok(TransitionResult::Continue)
             }
             CommitState::Commit { end_ts } => {
@@ -1843,9 +1626,11 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // TxID references until CommitEnd so an abandoned commit can
                 // still be rolled back by matching on TxID(self.tx_id).
                 self.state = CommitState::WaitForDependencies { end_ts: *end_ts };
-                yield_transition_in_simulator!(
-                    self,
-                    SimulatorCommitYieldPoint::WaitForDependencies
+                inject_transition_yield!(
+                    self.connection.yield_injector(),
+                    self.yield_instance_id,
+                    self.tx_id,
+                    CommitYieldPoint::WaitForDependencies
                 );
                 return Ok(TransitionResult::Continue);
             }
@@ -1916,7 +1701,12 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 } else {
                     self.state = CommitState::BeginCommitLogicalLog { end_ts, log_record };
                 }
-                yield_transition_in_simulator!(self, SimulatorCommitYieldPoint::LogRecordPrepared);
+                inject_transition_yield!(
+                    self.connection.yield_injector(),
+                    self.yield_instance_id,
+                    self.tx_id,
+                    CommitYieldPoint::LogRecordPrepared
+                );
                 return Ok(TransitionResult::Continue);
             }
             CommitState::BeginCommitLogicalLog { end_ts, log_record } => {
@@ -1941,10 +1731,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 self.state = CommitState::SyncLogicalLog { end_ts: *end_ts };
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
-                    yield_transition_in_simulator!(
-                        self,
-                        SimulatorCommitYieldPoint::LogicalLogWritten
-                    );
                     Ok(TransitionResult::Continue)
                 } else {
                     Ok(TransitionResult::Io(IOCompletions::Single(c)))
@@ -1957,20 +1743,12 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 if self.sync_mode != SyncMode::Full {
                     tracing::debug!("Skipping fsync of logical log (synchronous!=full)");
                     self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
-                    yield_transition_in_simulator!(
-                        self,
-                        SimulatorCommitYieldPoint::LogicalLogSynced
-                    );
                     return Ok(TransitionResult::Continue);
                 }
                 let c = mvcc_store.storage.sync(self.pager.get_sync_type())?;
                 self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
-                    yield_transition_in_simulator!(
-                        self,
-                        SimulatorCommitYieldPoint::LogicalLogSynced
-                    );
                     Ok(TransitionResult::Continue)
                 } else {
                     Ok(TransitionResult::Io(IOCompletions::Single(c)))
@@ -2146,7 +1924,6 @@ impl StateTransition for WriteRowStateMachine {
                 } else {
                     self.state = WriteRowState::Insert;
                 }
-                yield_transition_in_simulator!(self, SimulatorWriteRowYieldPoint::WritePrepared);
                 Ok(TransitionResult::Continue)
             }
             WriteRowState::Seek => {
@@ -2168,7 +1945,6 @@ impl StateTransition for WriteRowStateMachine {
                 }
                 turso_assert_eq!(self.cursor.write().valid_state, CursorValidState::Valid);
                 self.state = WriteRowState::Insert;
-                yield_transition_in_simulator!(self, SimulatorWriteRowYieldPoint::SeekComplete);
                 Ok(TransitionResult::Continue)
             }
             WriteRowState::Insert => {
@@ -2190,7 +1966,6 @@ impl StateTransition for WriteRowStateMachine {
                     }
                 }
                 self.state = WriteRowState::Next;
-                yield_transition_in_simulator!(self, SimulatorWriteRowYieldPoint::InsertComplete);
                 Ok(TransitionResult::Continue)
             }
             WriteRowState::Next => {
@@ -2232,7 +2007,6 @@ impl StateTransition for DeleteRowStateMachine {
         match self.state {
             DeleteRowState::Initial => {
                 self.state = DeleteRowState::Seek;
-                yield_transition_in_simulator!(self, SimulatorDeleteRowYieldPoint::SeekReady);
                 Ok(TransitionResult::Continue)
             }
             DeleteRowState::Seek => {
@@ -2265,10 +2039,6 @@ impl StateTransition for DeleteRowStateMachine {
                                 );
                             }
                         }
-                        yield_transition_in_simulator!(
-                            self,
-                            SimulatorDeleteRowYieldPoint::SeekResolved
-                        );
                         Ok(TransitionResult::Continue)
                     }
                     IOResult::IO(io) => {
@@ -2287,10 +2057,6 @@ impl StateTransition for DeleteRowStateMachine {
                             );
                         }
                         self.state = DeleteRowState::Delete;
-                        yield_transition_in_simulator!(
-                            self,
-                            SimulatorDeleteRowYieldPoint::AdvanceComplete
-                        );
                         Ok(TransitionResult::Continue)
                     }
                     IOResult::IO(io) => {
@@ -2334,20 +2100,12 @@ impl StateTransition for DeleteRowStateMachine {
 }
 
 impl DeleteRowStateMachine {
-    fn new(
-        rowid: RowID,
-        cursor: Arc<RwLock<BTreeCursor>>,
-        simulator_opts: Option<SimulatorOpts>,
-    ) -> Self {
-        let simulator_yield = simulator_yield_from_opts(simulator_opts, |seed| {
-            SimulatorDeleteRowYieldPoint::plan(seed, &rowid)
-        });
+    fn new(rowid: RowID, cursor: Arc<RwLock<BTreeCursor>>) -> Self {
         Self {
             state: DeleteRowState::Initial,
             is_finalized: false,
             rowid,
             cursor,
-            simulator_yield,
         }
     }
 }
@@ -2437,7 +2195,6 @@ pub struct MvStore<Clock: LogicalClock> {
     /// to exclusive, it will abort if another transaction committed after its begin timestamp.
     last_committed_tx_ts: AtomicU64,
     table_id_to_last_rowid: RwLock<HashMap<MVTableId, Arc<RowidAllocator>>>,
-    pub(crate) simulator_opts: Option<SimulatorOpts>,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -2488,10 +2245,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     }
 
     /// Creates a new database.
-    pub(crate) fn new(
+    pub fn new(
         clock: Clock,
         storage: Arc<dyn crate::mvcc::persistent_storage::DurableStorage>,
-        simulator_opts: Option<SimulatorOpts>,
     ) -> Self {
         Self {
             rows: SkipMap::new(),
@@ -2513,7 +2269,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             last_committed_schema_change_ts: AtomicU64::new(0),
             last_committed_tx_ts: AtomicU64::new(0),
             table_id_to_last_rowid: RwLock::new(HashMap::default()),
-            simulator_opts,
         }
     }
 
@@ -4385,7 +4140,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 row.clone(),
                 cursor,
                 requires_seek,
-                self.simulator_opts,
             ));
 
         Ok(state_machine)
@@ -4396,11 +4150,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         rowid: RowID,
         cursor: Arc<RwLock<BTreeCursor>>,
     ) -> Result<StateMachine<DeleteRowStateMachine>> {
-        let state_machine: StateMachine<DeleteRowStateMachine> = StateMachine::<
-            DeleteRowStateMachine,
-        >::new(
-            DeleteRowStateMachine::new(rowid, cursor, self.simulator_opts),
-        );
+        let state_machine: StateMachine<DeleteRowStateMachine> =
+            StateMachine::<DeleteRowStateMachine>::new(DeleteRowStateMachine::new(rowid, cursor));
 
         Ok(state_machine)
     }
