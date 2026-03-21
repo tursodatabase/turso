@@ -20,6 +20,10 @@ pub trait SimIO: turso_core::IO {
     /// Files whose path contains a given stem get that fault setting.
     fn inject_fault_selective(&self, faults: &[(&str, bool)]);
 
+    fn inject_async_fault(&self, fault: bool);
+
+    fn inject_async_fault_selective(&self, faults: &[(&str, bool)]);
+
     fn print_stats(&self);
 
     fn syncing(&self) -> bool;

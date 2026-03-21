@@ -71,8 +71,25 @@ impl SimIO for SimulatorIO {
     fn inject_fault_selective(&self, faults: &[(&str, bool)]) {
         for file in self.files.borrow().iter() {
             for (stem, fault) in faults {
-                if file.path.contains(stem) {
+                if file.path.ends_with(stem) {
                     file.inject_fault(*fault);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn inject_async_fault(&self, fault: bool) {
+        for file in self.files.borrow().iter() {
+            file.inject_async_fault(fault);
+        }
+    }
+
+    fn inject_async_fault_selective(&self, faults: &[(&str, bool)]) {
+        for file in self.files.borrow().iter() {
+            for (stem, fault) in faults {
+                if file.path.ends_with(stem) {
+                    file.inject_async_fault(*fault);
                     break;
                 }
             }
@@ -133,6 +150,8 @@ impl IO for SimulatorIO {
             path: path.to_string(),
             inner,
             fault: Cell::new(false),
+            async_fault: Cell::new(false),
+
             nr_pread_faults: Cell::new(0),
             nr_pwrite_faults: Cell::new(0),
             nr_sync_faults: Cell::new(0),

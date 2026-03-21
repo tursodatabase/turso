@@ -314,6 +314,20 @@ pub fn execute_interaction_turso(
                 limbo_integrity_check(&conn)?;
             }
         }
+        InteractionType::Checkpoint => {
+            let conn = {
+                let SimConnection::LimboConnection(conn) = &mut env.connections[connection_index]
+                else {
+                    unreachable!()
+                };
+                conn.clone()
+            };
+            let mut rows = conn
+                .query("PRAGMA wal_checkpoint(TRUNCATE);")?
+                .unwrap();
+            // Drive the step loop so async IO (and any injected faults) are actually executed
+            rows.run_with_row_callback(|_| Ok(()))?;
+        }
     }
     if let Err(e) = interaction.shadow(&mut env.get_conn_tables_mut(connection_index)) {
         return Err(LimboError::InternalError(format!(
@@ -425,6 +439,12 @@ fn execute_interaction_rusqlite(
         }
         InteractionType::FaultyQuery(_) => {
             unimplemented!("cannot implement faulty query in rusqlite, as we do not control IO");
+        }
+        InteractionType::Checkpoint => {
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);", ())
+                .map_err(|e| {
+                    turso_core::LimboError::InternalError(format!("error executing checkpoint: {e}"))
+                })?;
         }
     }
 

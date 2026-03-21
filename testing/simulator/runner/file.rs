@@ -14,6 +14,8 @@ pub(crate) struct SimulatorFile {
     pub path: String,
     pub(crate) inner: Arc<dyn File>,
     pub(crate) fault: Cell<bool>,
+    pub(crate) async_fault: Cell<bool>,
+
 
     /// Number of `pread` function calls (both success and failures).
     pub(crate) nr_pread_calls: Cell<usize>,
@@ -65,6 +67,10 @@ unsafe impl Sync for SimulatorFile {}
 impl SimulatorFile {
     pub(crate) fn inject_fault(&self, fault: bool) {
         self.fault.replace(fault);
+    }
+
+    pub(crate) fn inject_async_fault(&self, fault: bool) {
+        self.async_fault.replace(fault);
     }
 
     pub(crate) fn stats_table(&self) -> String {
@@ -172,6 +178,21 @@ impl File for SimulatorFile {
                 FAULT_ERROR_MSG.into(),
             ));
         }
+        if self.async_fault.get() {
+            tracing::debug!("pwrite async fault");
+            self.nr_pwrite_faults.set(self.nr_pwrite_faults.get() + 1);
+            let now = self.clock.now();
+            let latency = now + std::time::Duration::from_millis(10);
+            let cloned_c = c.clone();
+            let op = Box::new(move |_file: &SimulatorFile| {
+                cloned_c.error(turso_core::CompletionError::Aborted);
+                Ok(cloned_c)
+            });
+            self.queued_io
+                .borrow_mut()
+                .push(DelayedIo { time: latency.into(), op });
+            return Ok(c);
+        }
         if let Some(latency) = self.generate_latency_duration() {
             let cloned_c = c.clone();
             let op = Box::new(move |file: &SimulatorFile| file.inner.pwrite(pos, buffer, cloned_c));
@@ -229,6 +250,21 @@ impl File for SimulatorFile {
             return Err(turso_core::LimboError::InternalError(
                 FAULT_ERROR_MSG.into(),
             ));
+        }
+        if self.async_fault.get() {
+            tracing::debug!("pwritev async fault");
+            self.nr_pwrite_faults.set(self.nr_pwrite_faults.get() + 1);
+            let now = self.clock.now();
+            let latency = now + std::time::Duration::from_millis(10);
+            let cloned_c = c.clone();
+            let op = Box::new(move |_file: &SimulatorFile| {
+                cloned_c.error(turso_core::CompletionError::Aborted);
+                Ok(cloned_c)
+            });
+            self.queued_io
+                .borrow_mut()
+                .push(DelayedIo { time: latency.into(), op });
+            return Ok(c);
         }
         if let Some(latency) = self.generate_latency_duration() {
             let cloned_c = c.clone();

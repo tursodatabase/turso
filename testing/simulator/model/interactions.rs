@@ -26,7 +26,7 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub(crate) struct InteractionPlan {
-    plan: Vec<Interaction>,
+    pub plan: Vec<Interaction>,
     stats: InteractionStats,
     // In the future, this should probably be a stack of interactions
     // so we can have nested properties
@@ -301,7 +301,7 @@ impl Interactions {
         match &self.interactions {
             InteractionsType::Property(property) => property.check_tables(),
             InteractionsType::Query(query) => query.is_dml(),
-            InteractionsType::Fault(..) => false,
+            InteractionsType::Fault(..) | InteractionsType::Checkpoint => false,
         }
     }
 
@@ -337,6 +337,7 @@ pub enum InteractionsType {
     Property(Property),
     Query(Query),
     Fault(Fault),
+    Checkpoint,
 }
 
 impl InteractionsType {
@@ -428,6 +429,7 @@ impl Assertion {
 pub enum Fault {
     Disconnect,
     ReopenDatabase,
+    CheckpointAsyncFault,
 }
 
 impl Display for Fault {
@@ -435,6 +437,7 @@ impl Display for Fault {
         match self {
             Fault::Disconnect => write!(f, "DISCONNECT"),
             Fault::ReopenDatabase => write!(f, "REOPEN_DATABASE"),
+            Fault::CheckpointAsyncFault => write!(f, "CHECKPOINT_ASYNC_FAULT"),
         }
     }
 }
@@ -535,6 +538,7 @@ pub enum InteractionType {
     /// close all connections and reopen the database and assert that no data was lost
     FsyncQuery(Query),
     FaultyQuery(Query),
+    Checkpoint,
 }
 
 // FIXME: add the connection index here later
@@ -559,6 +563,7 @@ impl Display for InteractionType {
                 write!(f, "{query};")
             }
             Self::FaultyQuery(query) => write!(f, "{query}; -- FAULTY QUERY"),
+            Self::Checkpoint => write!(f, "PRAGMA wal_checkpoint(TRUNCATE);"),
         }
     }
 }
@@ -572,7 +577,8 @@ impl Shadow for InteractionType {
             | Self::Assertion(_)
             | Self::Fault(_)
             | Self::FaultyQuery(_)
-            | Self::FsyncQuery(_) => Ok(vec![]),
+            | Self::FsyncQuery(_)
+            | Self::Checkpoint => Ok(vec![]),
         }
     }
 }
@@ -697,6 +703,15 @@ impl InteractionType {
                     }
                     Fault::ReopenDatabase => {
                         reopen_database(env);
+                    }
+                    Fault::CheckpointAsyncFault => {
+                        let main_db_stem = format!("{}.db", env
+                            .get_db_path()
+                            .file_stem()
+                            .unwrap()
+                            .to_str()
+                            .unwrap());
+                        env.io.inject_async_fault_selective(&[(&main_db_stem, true)]);
                     }
                 }
                 Ok(())
