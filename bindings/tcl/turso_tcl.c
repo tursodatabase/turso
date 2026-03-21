@@ -135,7 +135,7 @@ static void tcl_scalar_bridge(void *ctx, int argc, void **argv)
     } else if (Tcl_GetDoubleFromObj(NULL, result, &dval) == TCL_OK) {
         sqlite3_result_double(ctx, dval);
     } else {
-        int         slen;
+        Tcl_Size    slen;
         const char *str = Tcl_GetStringFromObj(result, &slen);
         sqlite3_result_text(ctx, str, slen, SQLITE_TRANSIENT);
     }
@@ -500,7 +500,7 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
          * objc == 5: db func name argspec body  → argspec is a Tcl list
          * objc >= 6: db func name a b … body    → each word is a name
          */
-        int         n_args   = 0;
+        Tcl_Size    n_args   = 0;
         Tcl_Obj   **arg_objs = NULL;
 
         if (objc == 5) {
