@@ -16,7 +16,6 @@ pub(crate) struct SimulatorFile {
     pub(crate) fault: Cell<bool>,
     pub(crate) async_fault: Cell<bool>,
 
-
     /// Number of `pread` function calls (both success and failures).
     pub(crate) nr_pread_calls: Cell<usize>,
 
@@ -188,9 +187,10 @@ impl File for SimulatorFile {
                 cloned_c.error(turso_core::CompletionError::Aborted);
                 Ok(cloned_c)
             });
-            self.queued_io
-                .borrow_mut()
-                .push(DelayedIo { time: latency.into(), op });
+            self.queued_io.borrow_mut().push(DelayedIo {
+                time: latency.into(),
+                op,
+            });
             return Ok(c);
         }
         if let Some(latency) = self.generate_latency_duration() {
@@ -261,9 +261,10 @@ impl File for SimulatorFile {
                 cloned_c.error(turso_core::CompletionError::Aborted);
                 Ok(cloned_c)
             });
-            self.queued_io
-                .borrow_mut()
-                .push(DelayedIo { time: latency.into(), op });
+            self.queued_io.borrow_mut().push(DelayedIo {
+                time: latency.into(),
+                op,
+            });
             return Ok(c);
         }
         if let Some(latency) = self.generate_latency_duration() {

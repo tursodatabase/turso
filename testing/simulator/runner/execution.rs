@@ -322,9 +322,7 @@ pub fn execute_interaction_turso(
                 };
                 conn.clone()
             };
-            let mut rows = conn
-                .query("PRAGMA wal_checkpoint(TRUNCATE);")?
-                .unwrap();
+            let mut rows = conn.query("PRAGMA wal_checkpoint(TRUNCATE);")?.unwrap();
             // Drive the step loop so async IO (and any injected faults) are actually executed
             rows.run_with_row_callback(|_| Ok(()))?;
         }
@@ -443,7 +441,9 @@ fn execute_interaction_rusqlite(
         InteractionType::Checkpoint => {
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE);", ())
                 .map_err(|e| {
-                    turso_core::LimboError::InternalError(format!("error executing checkpoint: {e}"))
+                    turso_core::LimboError::InternalError(format!(
+                        "error executing checkpoint: {e}"
+                    ))
                 })?;
         }
     }

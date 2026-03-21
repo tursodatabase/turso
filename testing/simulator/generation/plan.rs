@@ -63,10 +63,16 @@ impl InteractionPlan {
                 let conn_index = env.choose_conn(rng);
                 let conn_ctx = &env.connection_context(conn_index);
                 let insert = sql_generation::model::query::Insert::arbitrary(rng, conn_ctx);
-                return Some(Interactions::new(conn_index, InteractionsType::Query(Query::Insert(insert))));
+                return Some(Interactions::new(
+                    conn_index,
+                    InteractionsType::Query(Query::Insert(insert)),
+                ));
             }
             if self.plan.len() == 2 {
-                return Some(Interactions::new(0, InteractionsType::Fault(Fault::CheckpointAsyncFault)));
+                return Some(Interactions::new(
+                    0,
+                    InteractionsType::Fault(Fault::CheckpointAsyncFault),
+                ));
             }
             if self.plan.len() == 3 {
                 return Some(Interactions::new(0, InteractionsType::Checkpoint));
@@ -308,8 +314,7 @@ impl Interactions {
                 vec![interaction]
             }
             InteractionsType::Checkpoint => {
-                let mut builder =
-                    InteractionBuilder::with_interaction(InteractionType::Checkpoint);
+                let mut builder = InteractionBuilder::with_interaction(InteractionType::Checkpoint);
                 builder.connection_index(self.connection_index).id(id);
                 let interaction = builder.build().unwrap();
                 vec![interaction]

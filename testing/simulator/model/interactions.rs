@@ -705,13 +705,12 @@ impl InteractionType {
                         reopen_database(env);
                     }
                     Fault::CheckpointAsyncFault => {
-                        let main_db_stem = format!("{}.db", env
-                            .get_db_path()
-                            .file_stem()
-                            .unwrap()
-                            .to_str()
-                            .unwrap());
-                        env.io.inject_async_fault_selective(&[(&main_db_stem, true)]);
+                        let main_db_stem = format!(
+                            "{}.db",
+                            env.get_db_path().file_stem().unwrap().to_str().unwrap()
+                        );
+                        env.io
+                            .inject_async_fault_selective(&[(&main_db_stem, true)]);
                     }
                 }
                 Ok(())
