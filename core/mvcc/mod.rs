@@ -35,6 +35,7 @@ pub mod clock;
 pub mod cursor;
 pub mod database;
 pub mod persistent_storage;
+pub mod yield_points;
 
 pub use clock::MvccClock;
 pub use database::MvStore;

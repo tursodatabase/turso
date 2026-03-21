@@ -1049,24 +1049,20 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         };
                         return Ok(TransitionResult::Continue);
                     }
-                    let state_machine = StateMachine::new(DeleteRowStateMachine::new(
-                        row_version.row.id.clone(),
-                        cursor,
-                        None,
-                    ));
+                    let state_machine = self
+                        .mvstore
+                        .delete_row_from_pager(row_version.row.id.clone(), cursor)?;
                     self.delete_row_state_machine = Some(state_machine);
                     self.state = CheckpointState::DeleteRowStateMachine { write_set_index };
                 } else {
                     // This is an insert/update operation
-                    let state_machine = StateMachine::new(WriteRowStateMachine::new(
-                        row_version.row.clone(),
-                        cursor,
-                        requires_seek,
-                        None,
-                    ));
+                    let state_machine =
+                        self.mvstore
+                            .write_row_to_pager(&row_version.row, cursor, requires_seek)?;
                     self.write_row_state_machine = Some(state_machine);
                     self.state = CheckpointState::WriteRowStateMachine { write_set_index };
                 }
+
                 Ok(TransitionResult::Continue)
             }
 
@@ -1184,28 +1180,24 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         };
                         return Ok(TransitionResult::Continue);
                     }
-                    let state_machine = StateMachine::new(DeleteRowStateMachine::new(
-                        row_version.row.id.clone(),
-                        cursor,
-                        None,
-                    ));
+                    let state_machine = self
+                        .mvstore
+                        .delete_row_from_pager(row_version.row.id.clone(), cursor)?;
                     self.delete_row_state_machine = Some(state_machine);
                     self.state = CheckpointState::DeleteIndexRowStateMachine {
                         index_write_set_index,
                     };
                 } else {
                     // This is an insert/update operation
-                    let state_machine = StateMachine::new(WriteRowStateMachine::new(
-                        row_version.row.clone(),
-                        cursor,
-                        requires_seek,
-                        None,
-                    ));
+                    let state_machine =
+                        self.mvstore
+                            .write_row_to_pager(&row_version.row, cursor, requires_seek)?;
                     self.write_row_state_machine = Some(state_machine);
                     self.state = CheckpointState::WriteIndexRowStateMachine {
                         index_write_set_index,
                     };
                 }
+
                 Ok(TransitionResult::Continue)
             }
 

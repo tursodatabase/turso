@@ -5,9 +5,9 @@ use crossbeam_skiplist::SkipMap;
 
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    create_seek_range, yield_io_in_simulator, MVTableId, MvStore, Row, RowID, RowKey, RowVersion,
-    SimulatorYield, SimulatorYieldPlan, SortableIndexKey,
+    create_seek_range, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, SortableIndexKey,
 };
+use crate::mvcc::yield_points::{inject_io_yield, YieldKind, YieldSiteMarker};
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::sync::Arc;
 use crate::translate::plan::IterationDirection;
@@ -17,10 +17,14 @@ use crate::types::{
 };
 use crate::vdbe::make_record;
 use crate::vdbe::Register;
-use crate::{return_if_io, Completion, LimboError, Pager, Result};
+use crate::{return_if_io, Completion, Connection, LimboError, Pager, Result};
 use std::any::Any;
 use std::fmt::Debug;
 use std::ops::Bound;
+use strum::EnumCount;
+
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+use crate::mvcc::yield_points::YieldInjector;
 
 #[derive(Debug, Clone)]
 enum CursorPosition {
@@ -104,8 +108,9 @@ enum MvccLazyCursorState {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SimulatorCursorYieldPoint {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
+#[repr(u8)]
+pub(crate) enum CursorYieldPoint {
     NextStart,
     NextBtreeAdvance,
     PrevBtreeAdvance,
@@ -117,24 +122,19 @@ enum SimulatorCursorYieldPoint {
     AdvanceBtreeBackwardProgress,
 }
 
-#[allow(dead_code)]
-impl SimulatorCursorYieldPoint {
-    const ALL: [Self; 9] = [
-        Self::NextStart,
-        Self::NextBtreeAdvance,
-        Self::PrevBtreeAdvance,
-        Self::SeekStart,
-        Self::SeekBtreeProgress,
-        Self::ExistsBtreeFallback,
-        Self::CountProgress,
-        Self::AdvanceBtreeForwardProgress,
-        Self::AdvanceBtreeBackwardProgress,
-    ];
+impl YieldSiteMarker for CursorYieldPoint {
+    const KIND: YieldKind = YieldKind::Cursor;
+    const POINT_COUNT: u8 = Self::COUNT as u8;
 
-    fn plan(seed: Option<u64>, tx_id: u64, table_id: MVTableId) -> SimulatorYieldPlan<Self> {
-        let key = i64::from(table_id).unsigned_abs().saturating_sub(2);
-        super::database::simulator_yield_plan(seed, key ^ tx_id, &Self::ALL)
+    fn ordinal(self) -> u8 {
+        self as u8
     }
+}
+
+#[allow(dead_code)]
+fn cursor_yield_key(tx_id: u64, table_id: MVTableId) -> u64 {
+    // no reason for 17, any arbitrary number would do, we just want to mix the bits
+    tx_id ^ (i64::from(table_id) as u64).rotate_left(17)
 }
 
 /// We read rows from MVCC index or BTree in a dual-cursor approach.
@@ -288,6 +288,10 @@ pub(crate) use static_iterator_hack;
 
 pub struct MvccLazyCursor<Clock: LogicalClock + 'static> {
     pub db: Arc<MvStore<Clock>>,
+    #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+    connection: Arc<Connection>,
+    #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+    yield_instance_id: u64,
     current_pos: CursorPosition,
     /// Stateful MVCC table iterator if this is a table cursor.
     table_iterator: Option<MvccIterator<'static, RowID>>,
@@ -307,8 +311,6 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static> {
     btree_advance_state: Option<AdvanceBtreeState>,
     /// Dual-cursor peek state for proper iteration
     dual_peek: DualCursorPeek,
-    #[allow(dead_code)]
-    simulator_yield: SimulatorYield<SimulatorCursorYieldPoint>,
 }
 
 pub enum NextRowidResult {
@@ -326,6 +328,7 @@ pub enum NextRowidResult {
 impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
     pub fn new(
         db: Arc<MvStore<Clock>>,
+        connection: &Arc<Connection>,
         tx_id: u64,
         root_page_or_table_id: i64,
         mv_cursor_type: MvccCursorType,
@@ -336,12 +339,14 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             "BTreeCursor expected for mvcc cursor"
         );
         let table_id = db.get_table_id_from_root_page(root_page_or_table_id);
-        let simulator_yield =
-            super::database::simulator_yield_from_opts(db.simulator_opts, |seed| {
-                SimulatorCursorYieldPoint::plan(seed, tx_id, table_id)
-            });
+        #[cfg(not(any(test, feature = "test_helper", feature = "simulator")))]
+        let _ = connection;
         Ok(Self {
             db,
+            #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+            yield_instance_id: connection.next_yield_instance_id(),
+            #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+            connection: connection.clone(),
             tx_id,
             table_iterator: None,
             index_iterator: None,
@@ -356,8 +361,13 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             count_state: None,
             btree_advance_state: None,
             dual_peek: DualCursorPeek::default(),
-            simulator_yield,
         })
+    }
+
+    #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+    #[allow(dead_code)]
+    fn yield_injector(&self) -> Option<Arc<dyn YieldInjector>> {
+        self.connection.yield_injector()
     }
 
     /// Returns the current row as an immutable record.
@@ -544,9 +554,11 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     } else {
                         self.btree_advance_state = Some(AdvanceBtreeState::NextBtree);
                     }
-                    yield_io_in_simulator!(
-                        self,
-                        SimulatorCursorYieldPoint::AdvanceBtreeForwardProgress
+                    inject_io_yield!(
+                        self.yield_injector(),
+                        self.yield_instance_id,
+                        cursor_yield_key(self.tx_id, self.table_id),
+                        CursorYieldPoint::AdvanceBtreeForwardProgress
                     );
                 }
                 Some(AdvanceBtreeState::RewindCheckBtreeKey) => {
@@ -578,9 +590,11 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                         return Ok(IOResult::Done(()));
                     }
                     self.btree_advance_state = Some(AdvanceBtreeState::NextCheckBtreeKey);
-                    yield_io_in_simulator!(
-                        self,
-                        SimulatorCursorYieldPoint::AdvanceBtreeForwardProgress
+                    inject_io_yield!(
+                        self.yield_injector(),
+                        self.yield_instance_id,
+                        cursor_yield_key(self.tx_id, self.table_id),
+                        CursorYieldPoint::AdvanceBtreeForwardProgress
                     );
                 }
                 Some(AdvanceBtreeState::NextCheckBtreeKey) => {
@@ -632,9 +646,11 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     } else {
                         self.btree_advance_state = Some(AdvanceBtreeState::NextBtree);
                     }
-                    yield_io_in_simulator!(
-                        self,
-                        SimulatorCursorYieldPoint::AdvanceBtreeBackwardProgress
+                    inject_io_yield!(
+                        self.yield_injector(),
+                        self.yield_instance_id,
+                        cursor_yield_key(self.tx_id, self.table_id),
+                        CursorYieldPoint::AdvanceBtreeBackwardProgress
                     );
                 }
                 Some(AdvanceBtreeState::RewindCheckBtreeKey) => {
@@ -666,9 +682,11 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                         return Ok(IOResult::Done(()));
                     }
                     self.btree_advance_state = Some(AdvanceBtreeState::NextCheckBtreeKey);
-                    yield_io_in_simulator!(
-                        self,
-                        SimulatorCursorYieldPoint::AdvanceBtreeBackwardProgress
+                    inject_io_yield!(
+                        self.yield_injector(),
+                        self.yield_instance_id,
+                        cursor_yield_key(self.tx_id, self.table_id),
+                        CursorYieldPoint::AdvanceBtreeBackwardProgress
                     );
                 }
                 Some(AdvanceBtreeState::NextCheckBtreeKey) => {
@@ -781,9 +799,11 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                                 SeekState::SeekBtree(SeekBtreeState::AdvanceBTree),
                                 direction,
                             ));
-                            yield_io_in_simulator!(
-                                self,
-                                SimulatorCursorYieldPoint::SeekBtreeProgress
+                            inject_io_yield!(
+                                self.yield_injector(),
+                                self.yield_instance_id,
+                                cursor_yield_key(self.tx_id, self.table_id),
+                                CursorYieldPoint::SeekBtreeProgress
                             );
                         }
                         SeekResult::Found => {
@@ -791,9 +811,11 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                                 SeekState::SeekBtree(SeekBtreeState::CheckRow),
                                 direction,
                             ));
-                            yield_io_in_simulator!(
-                                self,
-                                SimulatorCursorYieldPoint::SeekBtreeProgress
+                            inject_io_yield!(
+                                self.yield_injector(),
+                                self.yield_instance_id,
+                                cursor_yield_key(self.tx_id, self.table_id),
+                                CursorYieldPoint::SeekBtreeProgress
                             );
                         }
                     }
@@ -811,7 +833,12 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                         SeekState::SeekBtree(SeekBtreeState::CheckRow),
                         direction,
                     ));
-                    yield_io_in_simulator!(self, SimulatorCursorYieldPoint::SeekBtreeProgress);
+                    inject_io_yield!(
+                        self.yield_injector(),
+                        self.yield_instance_id,
+                        cursor_yield_key(self.tx_id, self.table_id),
+                        CursorYieldPoint::SeekBtreeProgress
+                    );
                 }
                 SeekBtreeState::CheckRow => {
                     let key = self.get_btree_current_key()?;
@@ -826,9 +853,11 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                                 SeekState::SeekBtree(SeekBtreeState::AdvanceBTree),
                                 direction,
                             ));
-                            yield_io_in_simulator!(
-                                self,
-                                SimulatorCursorYieldPoint::SeekBtreeProgress
+                            inject_io_yield!(
+                                self.yield_injector(),
+                                self.yield_instance_id,
+                                cursor_yield_key(self.tx_id, self.table_id),
+                                CursorYieldPoint::SeekBtreeProgress
                             );
                         }
                         None => {
@@ -956,11 +985,21 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     self.state
                         .replace(MvccLazyCursorState::Next(NextState::CheckNeedsAdvance));
                 }
-                yield_io_in_simulator!(self, SimulatorCursorYieldPoint::NextStart);
+                inject_io_yield!(
+                    self.yield_injector(),
+                    self.yield_instance_id,
+                    cursor_yield_key(self.tx_id, self.table_id),
+                    CursorYieldPoint::NextStart
+                );
             } else {
                 self.state
                     .replace(MvccLazyCursorState::Next(NextState::CheckNeedsAdvance));
-                yield_io_in_simulator!(self, SimulatorCursorYieldPoint::NextStart);
+                inject_io_yield!(
+                    self.yield_injector(),
+                    self.yield_instance_id,
+                    cursor_yield_key(self.tx_id, self.table_id),
+                    CursorYieldPoint::NextStart
+                );
             }
         }
         // If it was uninitialized, we need to advance the btree first
@@ -1006,7 +1045,12 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             if need_advance_btree && !self.dual_peek.btree_exhausted() {
                 self.state
                     .replace(MvccLazyCursorState::Next(NextState::Advance));
-                yield_io_in_simulator!(self, SimulatorCursorYieldPoint::NextBtreeAdvance);
+                inject_io_yield!(
+                    self.yield_injector(),
+                    self.yield_instance_id,
+                    cursor_yield_key(self.tx_id, self.table_id),
+                    CursorYieldPoint::NextBtreeAdvance
+                );
             }
         }
 
@@ -1088,7 +1132,12 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             if need_advance_btree && !self.dual_peek.btree_exhausted() {
                 self.state
                     .replace(MvccLazyCursorState::Prev(PrevState::Advance));
-                yield_io_in_simulator!(self, SimulatorCursorYieldPoint::PrevBtreeAdvance);
+                inject_io_yield!(
+                    self.yield_injector(),
+                    self.yield_instance_id,
+                    cursor_yield_key(self.tx_id, self.table_id),
+                    CursorYieldPoint::PrevBtreeAdvance
+                );
             }
         }
 
@@ -1240,13 +1289,23 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                         SeekState::SeekBtree(SeekBtreeState::SeekBtree),
                         direction,
                     ));
-                    yield_io_in_simulator!(self, SimulatorCursorYieldPoint::SeekStart);
+                    inject_io_yield!(
+                        self.yield_injector(),
+                        self.yield_instance_id,
+                        cursor_yield_key(self.tx_id, self.table_id),
+                        CursorYieldPoint::SeekStart
+                    );
                 }
                 Some(MvccLazyCursorState::Seek(SeekState::SeekBtree(_), direction)) => {
                     return_if_io!(self.seek_btree_and_set_peek(seek_key.clone(), op));
                     self.state
                         .replace(MvccLazyCursorState::Seek(SeekState::PickWinner, direction));
-                    yield_io_in_simulator!(self, SimulatorCursorYieldPoint::SeekBtreeProgress);
+                    inject_io_yield!(
+                        self.yield_injector(),
+                        self.yield_instance_id,
+                        cursor_yield_key(self.tx_id, self.table_id),
+                        CursorYieldPoint::SeekBtreeProgress
+                    );
                 }
                 Some(MvccLazyCursorState::Seek(SeekState::PickWinner, direction)) => {
                     // Pick winner and return result
@@ -1506,7 +1565,12 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 }
                 self.state
                     .replace(MvccLazyCursorState::Exists(ExistsState::ExistsBtree));
-                yield_io_in_simulator!(self, SimulatorCursorYieldPoint::ExistsBtreeFallback);
+                inject_io_yield!(
+                    self.yield_injector(),
+                    self.yield_instance_id,
+                    cursor_yield_key(self.tx_id, self.table_id),
+                    CursorYieldPoint::ExistsBtreeFallback
+                );
             } else {
                 // No B-tree allocated, row doesn't exist
                 self.state = None;
@@ -1575,13 +1639,23 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             match state {
                 None => {
                     self.count_state.replace(CountState::Rewind);
-                    yield_io_in_simulator!(self, SimulatorCursorYieldPoint::CountProgress);
+                    inject_io_yield!(
+                        self.yield_injector(),
+                        self.yield_instance_id,
+                        cursor_yield_key(self.tx_id, self.table_id),
+                        CursorYieldPoint::CountProgress
+                    );
                 }
                 Some(CountState::Rewind) => {
                     return_if_io!(self.rewind());
                     self.count_state
                         .replace(CountState::CheckBtreeKey { count: 0 });
-                    yield_io_in_simulator!(self, SimulatorCursorYieldPoint::CountProgress);
+                    inject_io_yield!(
+                        self.yield_injector(),
+                        self.yield_instance_id,
+                        cursor_yield_key(self.tx_id, self.table_id),
+                        CursorYieldPoint::CountProgress
+                    );
                 }
                 Some(CountState::CheckBtreeKey { count }) => {
                     if let CursorPosition::Loaded {
@@ -1591,7 +1665,12 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     {
                         self.count_state
                             .replace(CountState::NextBtree { count: count + 1 });
-                        yield_io_in_simulator!(self, SimulatorCursorYieldPoint::CountProgress);
+                        inject_io_yield!(
+                            self.yield_injector(),
+                            self.yield_instance_id,
+                            cursor_yield_key(self.tx_id, self.table_id),
+                            CursorYieldPoint::CountProgress
+                        );
                     } else {
                         self.count_state = None;
                         return Ok(IOResult::Done(count));
@@ -1602,7 +1681,12 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     return_if_io!(self.next());
                     self.count_state
                         .replace(CountState::CheckBtreeKey { count });
-                    yield_io_in_simulator!(self, SimulatorCursorYieldPoint::CountProgress);
+                    inject_io_yield!(
+                        self.yield_injector(),
+                        self.yield_instance_id,
+                        cursor_yield_key(self.tx_id, self.table_id),
+                        CursorYieldPoint::CountProgress
+                    );
                 }
             }
         }

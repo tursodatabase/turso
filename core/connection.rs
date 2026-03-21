@@ -1,4 +1,5 @@
 use crate::error::io_error;
+use crate::mvcc::yield_points::{YieldInjector, YieldInjectorSlot};
 use crate::storage::journal_mode;
 use crate::sync::{
     atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, Ordering},
@@ -89,6 +90,8 @@ pub struct Connection {
     /// Main DB uses `mv_tx` above for zero-cost hot path access.
     pub(crate) attached_mv_txs:
         RwLock<HashMap<usize, (crate::mvcc::database::TxID, TransactionMode)>>,
+    pub(crate) yield_injector: YieldInjectorSlot,
+    pub(crate) yield_instance_id_counter: AtomicU64,
 
     /// Per-connection view transaction states for uncommitted changes. This represents
     /// one entry per view that was touched in the transaction.
@@ -1395,6 +1398,37 @@ impl Connection {
         }
     }
 
+    pub fn set_yield_injector(&self, injector: Option<Arc<dyn YieldInjector>>) {
+        let mut slot = self.yield_injector.write();
+        match injector {
+            Some(injector) => {
+                turso_assert!(
+                    slot.is_none(),
+                    "yield injector should be empty before installing a new one"
+                );
+                *slot = Some(injector);
+            }
+            None => {
+                turso_assert!(
+                    slot.is_some(),
+                    "yield injector should be installed before it is cleared"
+                );
+                *slot = None;
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn yield_injector(&self) -> Option<Arc<dyn YieldInjector>> {
+        self.yield_injector.read().clone()
+    }
+
+    #[inline(always)]
+    pub(crate) fn next_yield_instance_id(&self) -> u64 {
+        self.yield_instance_id_counter
+            .fetch_add(1, Ordering::Relaxed)
+    }
+
     /// Query the current value(s) of `pragma_name` associated to
     /// `pragma_value`.
     ///
@@ -1525,15 +1559,9 @@ impl Connection {
         let use_views = self.db.experimental_views_enabled();
         let use_custom_types = self.db.experimental_custom_types_enabled();
 
-        let mut db_opts = DatabaseOpts::new()
+        let db_opts = DatabaseOpts::new()
             .with_views(use_views)
             .with_custom_types(use_custom_types);
-        if self.db.opts.unsafe_testing {
-            db_opts = db_opts.with_unsafe_testing(true);
-        }
-        if let Some(seed) = self.db.opts.simulator_seed {
-            db_opts = db_opts.with_simulator_seed(seed);
-        }
         // Select the IO layer for the attached database:
         // - :memory: databases always get a fresh MemoryIO
         // - File-based databases reuse the parent's IO when the parent is also
@@ -1569,7 +1597,6 @@ impl Connection {
                 db.open_flags,
                 db.durable_storage.clone(),
                 None,
-                &db.opts,
             )?;
             db.mv_store.store(Some(mv_store.clone()));
             let bootstrap_conn = db._connect(true, Some(pager.clone()), encryption_key)?;

@@ -1109,6 +1109,7 @@ pub fn op_open_read(
                 .clone();
             Ok(Box::new(MvCursor::new(
                 mv_store,
+                &program.connection,
                 tx_id,
                 *root_page,
                 mv_cursor_type,
@@ -9658,6 +9659,7 @@ pub fn op_open_write(
                     .clone();
                 Ok(Box::new(MvCursor::new(
                     mv_store,
+                    &program.connection,
                     tx_id,
                     root_page,
                     mv_cursor_type,
@@ -11097,6 +11099,7 @@ pub fn op_open_dup(
                         .clone();
                     Box::new(MvCursor::new(
                         mv_store,
+                        &program.connection,
                         tx_id,
                         root_page,
                         MvccCursorType::Table,
@@ -13382,7 +13385,6 @@ fn op_journal_mode_inner(
                         program.connection.db.open_flags,
                         program.connection.db.durable_storage.clone(),
                         None,
-                        &program.connection.db.opts,
                     )?;
                     program.connection.db.mv_store.store(Some(mv_store.clone()));
                     program.connection.demote_to_mvcc_connection();
