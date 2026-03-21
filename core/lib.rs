@@ -100,6 +100,18 @@ use turso_macros::{match_ignore_ascii_case, AtomicEnum};
 use turso_parser::{ast, ast::Cmd, parser::Parser};
 use util::parse_schema_rows;
 
+/// A unique identifier for a database instance in the process-wide registry.
+///
+/// This ensures that we only share database instances when their configuration
+/// and access modes are compatible. Keying by both path and normalized flags
+/// prevents "mode leak" (e.g. a Read-Write request receiving a cached Read-Only
+/// instance) while still allowing efficient sharing of compatible instances.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct DatabaseRegistryKey {
+    path: String,
+    flags: OpenFlags,
+}
+
 pub use connection::{resolve_ext_path, Connection, Row, StepResult, SymbolTable};
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
 pub use error::{io_error, CompletionError, LimboError};
@@ -304,10 +316,14 @@ pub struct OpenDbAsyncState {
     /// Schema lock held during LoadingSchema phase to ensure atomicity across IO yields
     schema_guard: Option<sync::ArcMutexGuard<Arc<Schema>>>,
     /// Registry lock held during open_with_flags_async to prevent concurrent opens
-    registry_guard:
-        Option<parking_lot::ArcMutexGuard<parking_lot::RawMutex, HashMap<String, Weak<Database>>>>,
-    /// Canonical path for registry insertion (computed once at start)
-    canonical_path: Option<String>,
+    registry_guard: Option<
+        parking_lot::ArcMutexGuard<
+            parking_lot::RawMutex,
+            HashMap<DatabaseRegistryKey, Weak<Database>>,
+        >,
+    >,
+    /// Canonical key for registry insertion (computed once at start)
+    canonical_key: Option<DatabaseRegistryKey>,
 }
 
 impl Default for OpenDbAsyncState {
@@ -327,7 +343,7 @@ impl OpenDbAsyncState {
             make_from_btree_state: schema::MakeFromBtreeState::new(),
             schema_guard: None,
             registry_guard: None,
-            canonical_path: None,
+            canonical_key: None,
         }
     }
 }
@@ -343,8 +359,9 @@ impl OpenDbAsyncState {
 /// Mutex here would cause panics when the second iteration tries to lock a
 /// mutex that belongs to a stale execution context.
 #[allow(clippy::type_complexity)]
-static DATABASE_MANAGER: LazyLock<Arc<parking_lot::Mutex<HashMap<String, Weak<Database>>>>> =
-    LazyLock::new(|| Arc::new(parking_lot::Mutex::new(HashMap::default())));
+static DATABASE_MANAGER: LazyLock<
+    Arc<parking_lot::Mutex<HashMap<DatabaseRegistryKey, Weak<Database>>>>,
+> = LazyLock::new(|| Arc::new(parking_lot::Mutex::new(HashMap::default())));
 
 /// The `Database` object contains per database file state that is shared
 /// between multiple connections.
@@ -523,6 +540,7 @@ impl Database {
     fn lookup_in_registry(
         path: &str,
         encryption_opts: &Option<EncryptionOpts>,
+        flags: OpenFlags,
     ) -> Result<Option<Arc<Database>>> {
         if path.starts_with(":memory:") {
             return Ok(None);
@@ -534,8 +552,12 @@ impl Database {
             Some(c) => c,
             None => return Ok(None),
         };
+        let canonical_key = DatabaseRegistryKey {
+            path: canonical,
+            flags: flags.normalize(),
+        };
         let registry = DATABASE_MANAGER.lock_arc();
-        let db = match registry.get(&canonical).and_then(Weak::upgrade) {
+        let db = match registry.get(&canonical_key).and_then(Weak::upgrade) {
             Some(db) => db,
             None => return Ok(None),
         };
@@ -574,7 +596,7 @@ impl Database {
     ) -> Result<Arc<Database>> {
         // Check the registry before opening the file to avoid acquiring a file
         // lock that would conflict with an already-open Database in this process.
-        if let Some(db) = Self::lookup_in_registry(path, &encryption_opts)? {
+        if let Some(db) = Self::lookup_in_registry(path, &encryption_opts, flags)? {
             if durable_storage.is_some() && db.durable_storage.is_none() {
                 return Err(LimboError::InvalidArgument(
                     "database already open without custom durable storage; \
@@ -701,10 +723,14 @@ impl Database {
                 .ok()
                 .and_then(|p| p.to_str().map(|s| s.to_string()))
                 .unwrap_or_else(|| path.to_string());
+            let canonical_key = DatabaseRegistryKey {
+                path: canonical_path,
+                flags: flags.normalize(),
+            };
 
             // Check if already in registry
-            if let Some(db) = registry.get(&canonical_path).and_then(Weak::upgrade) {
-                tracing::debug!("took database {canonical_path:?} from the registry");
+            if let Some(db) = registry.get(&canonical_key).and_then(Weak::upgrade) {
+                tracing::debug!("took database {canonical_key:?} from the registry");
 
                 // Check encryption compatibility using cipher mode (key is not stored in Database for security)
                 let db_is_encrypted = !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
@@ -721,7 +747,7 @@ impl Database {
 
             // Not in registry, hold the lock and store canonical path for later insertion
             state.registry_guard = Some(registry);
-            state.canonical_path = Some(canonical_path);
+            state.canonical_key = Some(canonical_key);
         }
 
         // Open the database asynchronously (registry lock is held in state for not `:memory:.*` pathes)
@@ -739,10 +765,10 @@ impl Database {
 
         if let IOResult::Done(ref db) = result {
             // will be unset in case of `:memory:.*` path
-            if let (Some(mut registry), Some(canonical_path)) =
-                (state.registry_guard.take(), state.canonical_path.take())
+            if let (Some(mut registry), Some(canonical_key)) =
+                (state.registry_guard.take(), state.canonical_key.take())
             {
-                registry.insert(canonical_path, Arc::downgrade(db));
+                registry.insert(canonical_key, Arc::downgrade(db));
             }
         }
 
@@ -1327,7 +1353,8 @@ impl Database {
             cdc_transaction_id: AtomicI64::new(-1),
             closed: AtomicBool::new(false),
             attached_databases: RwLock::new(DatabaseCatalog::new()),
-            query_only: AtomicBool::new(false),
+            // Initialize based on the database access mode to enable early write detection in the translator
+            query_only: AtomicBool::new(self.open_flags.contains(OpenFlags::ReadOnly)),
             dml_require_where: AtomicBool::new(false),
             mv_tx: RwLock::new(None),
             attached_mv_txs: RwLock::new(HashMap::default()),

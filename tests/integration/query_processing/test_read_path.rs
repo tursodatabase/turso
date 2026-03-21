@@ -934,3 +934,127 @@ fn test_too_many_columns_in_select(tmp_db: TempDatabase) {
         "Expected error for UNION with 2001 columns"
     );
 }
+
+#[test]
+fn test_database_mode_is_dependent_on_per_connection_flags_ro_isolation() -> anyhow::Result<()> {
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use turso_core::{Database, DatabaseOpts, OpenFlags};
+
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test_ro.db");
+    let db_path_str = db_path.to_str().unwrap();
+
+    // 1. Setup Initial Data
+    {
+        let io = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path_str,
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+        )?;
+        let conn = db.connect()?;
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")?;
+        conn.execute("INSERT INTO t VALUES (1)")?;
+    }
+
+    // 2. Trigger the Cache Bug
+    // Step 1: Open the database as ReadOnly. Keep this alive.
+    let io_ro = Arc::new(turso_core::PlatformIO::new().unwrap());
+    let _db_ro = Database::open_file_with_flags(
+        io_ro.clone(),
+        db_path_str,
+        OpenFlags::ReadOnly,
+        DatabaseOpts::new(),
+        None,
+    )?;
+
+    // Step 2: Attempt to open the same database file again, but this time using default flags (Read-Write).
+    let io_rw = Arc::new(turso_core::PlatformIO::new().unwrap());
+    let db_rw = Database::open_file_with_flags(
+        io_rw.clone(),
+        db_path_str,
+        OpenFlags::Create, // This is default, which should be Read-Write
+        DatabaseOpts::new(),
+        None,
+    )?;
+
+    let conn_rw = db_rw.connect()?;
+
+    // 3. Observe the Success
+    // This used to fail with "ReadOnly" because it was taking the ReadOnly instance from registry
+    let result = conn_rw.execute("INSERT INTO t VALUES (2)");
+    let err = result.as_ref().err();
+    assert!(
+        result.is_ok(),
+        "INSERT on read-write connection failed: {err:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_database_mode_is_dependent_on_per_connection_flags_rw_isolation() -> anyhow::Result<()> {
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use turso_core::{Database, DatabaseOpts, OpenFlags};
+
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test_rw.db");
+    let db_path_str = db_path.to_str().unwrap();
+
+    // 1. Setup Initial Data
+    {
+        let io = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path_str,
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+        )?;
+        let conn = db.connect()?;
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")?;
+    }
+
+    // 2. Trigger the Cache Bug
+    // Step 1: Open the database as Read-Write. Keep this alive.
+    let io_rw = Arc::new(turso_core::PlatformIO::new().unwrap());
+    let _db_rw = Database::open_file_with_flags(
+        io_rw.clone(),
+        db_path_str,
+        OpenFlags::Create,
+        DatabaseOpts::new(),
+        None,
+    )?;
+
+    // Step 2: Attempt to open the same database file again, but this time using ReadOnly flags.
+    let io_ro = Arc::new(turso_core::PlatformIO::new().unwrap());
+    let db_ro = Database::open_file_with_flags(
+        io_ro.clone(),
+        db_path_str,
+        OpenFlags::ReadOnly,
+        DatabaseOpts::new(),
+        None,
+    )?;
+
+    let conn_ro = db_ro.connect()?;
+
+    // 3. Observe the Failure
+    // This SHOULD fail because the connection is Read-Only
+    let result = conn_ro.execute("INSERT INTO t VALUES (1)");
+
+    assert!(
+        result.is_err(),
+        "INSERT on read-only connection SHOULD fail"
+    );
+    let err = result.err().unwrap();
+    assert!(
+        matches!(err, turso_core::LimboError::ReadOnly),
+        "Expected ReadOnly error, got: {err:?}"
+    );
+
+    Ok(())
+}
