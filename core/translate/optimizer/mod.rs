@@ -1441,7 +1441,8 @@ fn expr_has_null_masking_for_table(expr: &ast::Expr, table_id: ast::TableInterna
     let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
         match e {
             ast::Expr::FunctionCall { name, args, .. } => {
-                if let Ok(func) = crate::function::Func::resolve_function(name.as_str(), args.len())
+                if let Ok(Some(func)) =
+                    crate::function::Func::resolve_function(name.as_str(), args.len())
                 {
                     // IIF(cond, then, else) is like CASE WHEN cond THEN then ELSE else END.
                     // If the condition is a null check on the target table, IIF masks nulls.
@@ -2729,7 +2730,11 @@ impl Optimizable for ast::Expr {
                 if filter_over.over_clause.is_some() {
                     return false;
                 }
-                let Some(func) = resolver.resolve_function(name.as_str(), args.len()) else {
+                let Some(func) = resolver
+                    .resolve_function(name.as_str(), args.len())
+                    .ok()
+                    .flatten()
+                else {
                     return false;
                 };
                 func.is_deterministic() && args.iter().all(|arg| arg.is_constant(resolver))

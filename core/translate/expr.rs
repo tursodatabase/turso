@@ -1502,10 +1502,10 @@ pub fn translate_expr(
             order_by: _,
         } => {
             let args_count = args.len();
-            let func_type = resolver.resolve_function(name.as_str(), args_count);
+            let func_type = resolver.resolve_function(name.as_str(), args_count)?;
 
             if func_type.is_none() {
-                crate::bail_parse_error!("unknown function {}", name.as_str());
+                crate::bail_parse_error!("no such function: {}", name.as_str());
             }
 
             let func_ctx = FuncCtx {
@@ -2827,10 +2827,10 @@ pub fn translate_expr(
             // Handle func(*) syntax as a function call with 0 arguments
             // This is equivalent to func() for functions that accept 0 arguments
             let args_count = 0;
-            let func_type = resolver.resolve_function(name.as_str(), args_count);
+            let func_type = resolver.resolve_function(name.as_str(), args_count)?;
 
             if func_type.is_none() {
-                crate::bail_parse_error!("unknown function {}", name.as_str());
+                crate::bail_parse_error!("no such function: {}", name.as_str());
             }
 
             let func = func_type.unwrap();
@@ -4502,7 +4502,7 @@ pub(crate) fn expr_is_array(expr: &Expr, referenced_tables: Option<&TableReferen
             }
         }
         Expr::FunctionCall { name, args, .. } => {
-            if let Ok(f) = Func::resolve_function(name.as_str(), args.len()) {
+            if let Ok(Some(f)) = Func::resolve_function(name.as_str(), args.len()) {
                 match &f {
                     Func::Scalar(sf) if sf.returns_array_blob() => return true,
                     Func::Agg(AggFunc::ArrayAgg) => return true,
@@ -5003,7 +5003,7 @@ fn translate_like_base(
             if escape.is_some() {
                 crate::bail_parse_error!("wrong number of arguments to function regexp()");
             }
-            let func = resolver.resolve_function("regexp", 2);
+            let func = resolver.resolve_function("regexp", 2)?;
             let Some(func) = func else {
                 crate::bail_parse_error!("no such function: regexp");
             };
@@ -5734,7 +5734,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     // expand the * to all columns from the referenced tables as key-value pairs
                     // This needs to happen during bind/rewrite so WHERE clauses can use these functions
                     if let Some(referenced_tables) = &mut referenced_tables {
-                        if let Ok(func) = Func::resolve_function(name.as_str(), 0) {
+                        if let Ok(Some(func)) = Func::resolve_function(name.as_str(), 0) {
                             if func.needs_star_expansion() {
                                 // Only expand if there are actual tables - otherwise leave as
                                 // FunctionCallStar so translate_expr can generate the error
@@ -6731,7 +6731,7 @@ fn emit_custom_type_operator(
     resolver: &Resolver,
 ) -> Result<usize> {
     let func = resolver
-        .resolve_function(&resolved.func_name, 2)
+        .resolve_function(&resolved.func_name, 2)?
         .ok_or_else(|| {
             LimboError::InternalError(format!("function not found: {}", resolved.func_name))
         })?;

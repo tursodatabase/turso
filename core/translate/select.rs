@@ -1460,7 +1460,7 @@ fn check_aliased_aggregate_misuse(
             Expr::FunctionCall { name, args, .. } => {
                 let is_agg = matches!(
                     crate::function::Func::resolve_function(name.as_str(), args.len()),
-                    Ok(crate::function::Func::Agg(_))
+                    Ok(Some(crate::function::Func::Agg(_)))
                 );
                 if is_agg {
                     for arg in args.iter() {
@@ -1472,7 +1472,7 @@ fn check_aliased_aggregate_misuse(
             Expr::FunctionCallStar { name, .. } => {
                 if matches!(
                     crate::function::Func::resolve_function(name.as_str(), 0),
-                    Ok(crate::function::Func::Agg(_))
+                    Ok(Some(crate::function::Func::Agg(_)))
                 ) {
                     return Ok(WalkControl::SkipChildren);
                 }
