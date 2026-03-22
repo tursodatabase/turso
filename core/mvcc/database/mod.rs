@@ -4253,7 +4253,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     fn logical_log_header_crc_valid(&self, pager: &Arc<Pager>) -> Result<bool> {
         let file = self.get_logical_log_file();
-        // Header is never encrypted; no need to clone EncryptionContext here.
+        // Header is never encrypted; no need to pass EncryptionContext here.
         let mut reader = StreamingLogicalLogReader::new(file, None);
         match reader.try_read_header(&pager.io)? {
             HeaderReadResult::Valid(_) => Ok(true),
@@ -4280,7 +4280,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         let wal_max_frame = wal.get_max_frame_in_wal();
         let file = self.get_logical_log_file();
-        // This method only reads the header (never encrypted); skip cloning EncryptionContext.
+        // This method only reads the header (never encrypted); no need to pass EncryptionContext.
         let mut reader = StreamingLogicalLogReader::new(file, None);
         let header_result = reader.try_read_header(&pager.io)?;
 

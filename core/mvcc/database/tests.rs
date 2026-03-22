@@ -4,7 +4,7 @@ use super::*;
 use crate::io::PlatformIO;
 use crate::mvcc::clock::MvccClock;
 use crate::mvcc::cursor::{CursorYieldPoint, MvccCursorType};
-use crate::mvcc::persistent_storage::logical_log::LOG_HDR_SIZE;
+use crate::mvcc::persistent_storage::logical_log::{FRAME_MAGIC, LOG_HDR_SIZE};
 use crate::mvcc::yield_hooks::YieldPointMarker;
 use crate::mvcc::yield_points::{YieldInjector, YieldPoint};
 use crate::state_machine::{StateTransition, TransitionResult};
@@ -15,7 +15,7 @@ use crate::storage::sqlite3_ondisk::{
 use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::Mutex;
 use crate::sync::RwLock;
-use crate::{Buffer, Completion, DatabaseOpts, EncryptionKey, OpenFlags};
+use crate::{Buffer, Completion, DatabaseOpts, EncryptionKey, LimboError, OpenFlags};
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
 use rand::{Rng, SeedableRng};
@@ -165,10 +165,13 @@ impl MvccTestDbNoConn {
     /// Like `restart`, but returns the error instead of panicking.
     /// Useful for testing wrong-key scenarios.
     pub fn restart_result(&mut self) -> crate::Result<()> {
+        // First let's clear any entries in database manager in order to force restart.
+        // If not, we will load the same database instance again.
         {
             let mut manager = DATABASE_MANAGER.lock();
             manager.clear();
         }
+        // Now open again.
         let io = Arc::new(PlatformIO::new().unwrap());
         let path = self.path.as_ref().unwrap();
         let db = Database::open_file_with_flags(
@@ -8113,6 +8116,74 @@ fn test_mvcc_encrypted_log_recovery_and_wrong_key() {
     );
 }
 
+/// Enabling MVCC on a file-backed database must still bootstrap durable MVCC
+/// metadata even if encryption has only been opted-in and no key/cipher exists yet.
+#[test]
+fn test_mvcc_late_encryption_setup_keeps_metadata_bootstrapped() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir
+        .path()
+        .join(format!("test_{}", rand::random::<u64>()));
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let opts = DatabaseOpts::new().with_encryption(true);
+    let db = Database::open_file_with_flags(
+        io,
+        path.as_os_str().to_str().unwrap(),
+        OpenFlags::default(),
+        opts,
+        None,
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+
+    // Reproduce the deferred-key flow: encryption is enabled as a feature, but
+    // the session has not configured any key/cipher when MVCC bootstrap runs.
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+
+    let metadata_root = metadata_root_page(&conn);
+    assert!(
+        metadata_root > 0,
+        "metadata table must be present after enabling MVCC on a file-backed db",
+    );
+
+    let meta = get_rows(
+        &conn,
+        "SELECT k, v FROM __turso_internal_mvcc_meta ORDER BY rowid",
+    );
+    assert_eq!(meta.len(), 1);
+    assert_eq!(meta[0][0].to_string(), "persistent_tx_ts_max");
+    assert_eq!(meta[0][1].as_int().unwrap(), 0);
+}
+
+/// Reopening an encrypted MVCC database without any key material must fail before
+/// logical-log recovery, even if there is an outstanding MVCC log tail on disk.
+#[test]
+fn test_mvcc_encrypted_restart_without_key_fails_before_recovery() {
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
+    let log_path = std::path::PathBuf::from(db.path.as_ref().unwrap()).with_extension("db-log");
+
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'secret')").unwrap();
+        conn.close().unwrap();
+    }
+
+    let log_bytes = std::fs::read(&log_path).expect("db-log should exist after MVCC writes");
+    assert!(
+        log_bytes.len() > LOG_HDR_SIZE,
+        "db-log should contain at least one frame before restart"
+    );
+
+    db.enc_opts = None;
+    assert!(
+        matches!(db.restart_result(), Err(LimboError::NotADB)),
+        "reopening an encrypted MVCC database without a key must fail during db open, before recovery",
+    );
+}
+
 /// Read the raw db-log file and verify every TX frame payload can be decrypted.
 /// Panics if the file is missing, has no frames, or any payload fails to decrypt.
 fn assert_log_payloads_decrypt(
@@ -8143,15 +8214,13 @@ fn assert_log_payloads_decrypt(
     while offset + 24 + 8 <= log_bytes.len() {
         // TX Header: frame_magic(4) | payload_size(8) | op_count(4) | commit_ts(8)
         let frame_magic = u32::from_le_bytes(log_bytes[offset..offset + 4].try_into().unwrap());
-        if frame_magic != 0x5854564D {
+        if frame_magic != FRAME_MAGIC {
             break; // not a valid frame
         }
         let payload_size =
             u64::from_le_bytes(log_bytes[offset + 4..offset + 12].try_into().unwrap()) as usize;
-        let op_count =
-            u32::from_le_bytes(log_bytes[offset + 12..offset + 16].try_into().unwrap());
-        let commit_ts =
-            u64::from_le_bytes(log_bytes[offset + 16..offset + 24].try_into().unwrap());
+        let op_count = u32::from_le_bytes(log_bytes[offset + 12..offset + 16].try_into().unwrap());
+        let commit_ts = u64::from_le_bytes(log_bytes[offset + 16..offset + 24].try_into().unwrap());
 
         let payload_offset = offset + 24;
         let on_disk_size = payload_size + tag_size + nonce_size;
@@ -8204,7 +8273,11 @@ fn test_encrypted_recovery_checkpoint_then_more_writes() {
 
     let log_path = std::path::PathBuf::from(db.path.as_ref().unwrap()).with_extension("db-log");
     assert!(log_path.exists(), "db-log file should exist before restart");
-    assert_log_payloads_decrypt(&log_path, hex_key, crate::storage::encryption::CipherMode::Aes256Gcm);
+    assert_log_payloads_decrypt(
+        &log_path,
+        hex_key,
+        crate::storage::encryption::CipherMode::Aes256Gcm,
+    );
 
     db.restart();
     let conn = db.connect();
@@ -8234,7 +8307,11 @@ fn test_encrypted_recovery_multiple_restart_cycles() {
     }
 
     assert!(log_path.exists(), "db-log file should exist after cycle 1");
-    assert_log_payloads_decrypt(&log_path, hex_key, crate::storage::encryption::CipherMode::Aes256Gcm);
+    assert_log_payloads_decrypt(
+        &log_path,
+        hex_key,
+        crate::storage::encryption::CipherMode::Aes256Gcm,
+    );
     db.restart();
 
     // Cycle 2: insert more rows
@@ -8279,7 +8356,11 @@ fn test_encrypted_recovery_corrupted_ciphertext() {
         log_path.exists(),
         "db-log file should exist before corruption"
     );
-    assert_log_payloads_decrypt(&log_path, hex_key, crate::storage::encryption::CipherMode::Aes256Gcm);
+    assert_log_payloads_decrypt(
+        &log_path,
+        hex_key,
+        crate::storage::encryption::CipherMode::Aes256Gcm,
+    );
 
     // Corrupt the payload of the second (non-checkpointed) frame in the log file.
     // The log header is 56 bytes, then the TX header is 24 bytes. Flip a byte

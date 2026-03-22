@@ -175,7 +175,7 @@ const LOG_HDR_SALT_SIZE: usize = 8;
 const LOG_HDR_RESERVED_START: usize = LOG_HDR_SALT_START + LOG_HDR_SALT_SIZE; // 16
 const LOG_HDR_CRC_START: usize = 52;
 const LOG_HDR_RESERVED_SIZE: usize = LOG_HDR_CRC_START - LOG_HDR_RESERVED_START; // 36
-const FRAME_MAGIC: u32 = 0x5854564D; // "MVTX" in LE
+pub(crate) const FRAME_MAGIC: u32 = 0x5854564D; // "MVTX" in LE
 const END_MAGIC: u32 = 0x4554564D; // "MVTE" in LE
 
 const OP_UPSERT_TABLE: u8 = 0;
@@ -328,7 +328,7 @@ pub struct LogicalLog {
     /// `advance_offset_after_success` so that an abandoned write
     /// doesn't corrupt the chain.
     pending_running_crc: Option<u32>,
-    pub(crate) encryption_ctx: Option<EncryptionContext>,
+    encryption_ctx: Option<EncryptionContext>,
     /// Reusable scratch buffer for ops serialization on the encrypted write path.
     encryption_scratch_buffer: Vec<u8>,
 }
@@ -359,6 +359,10 @@ impl LogicalLog {
 
     pub(crate) fn header(&self) -> Option<&LogHeader> {
         self.header.as_ref()
+    }
+
+    pub(crate) fn encryption_ctx(&self) -> Option<&EncryptionContext> {
+        self.encryption_ctx.as_ref()
     }
 
     /// Serializes a transaction into `write_buf`, optionally calls
