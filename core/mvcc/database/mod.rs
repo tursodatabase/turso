@@ -2391,45 +2391,38 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 None => {
                     let log_size = self.get_logical_log_file().size()?;
                     let pager = bootstrap_conn.pager.load().clone();
-                    // Skip metadata-table bootstrap when encryption is opted-in
-                    // but not yet configured (e.g. key will be set later via PRAGMA).
-                    // Writing unencrypted pages now would make them unreadable once
-                    // encryption is activated. When encryption context IS already
-                    // set (e.g. opened via URI with key), bootstrap proceeds normally.
-                    if !pager.is_encryption_enabled() || pager.is_encryption_ctx_set() {
-                        if bootstrap_conn.db.is_readonly() {
-                            return Err(LimboError::Corrupt(
-                                "Missing MVCC metadata table in read-only mode".to_string(),
-                            ));
-                        }
-                        if log_size > LOG_HDR_SIZE as u64 {
-                            return Err(LimboError::Corrupt(
-                                "Missing MVCC metadata table while logical log state exists"
-                                    .to_string(),
-                            ));
-                        }
-                        // First-time MVCC bootstrap: ensure a durable logical-log header exists
-                        // before any metadata-table writes can commit into WAL.
-                        // If a previous crash left a torn header tail (0 < size < LOG_HDR_SIZE),
-                        // clear it before rewriting the header.
-                        if log_size > 0 && log_size < LOG_HDR_SIZE as u64 {
-                            let log_file = self.get_logical_log_file();
-                            let c = log_file.truncate(0, Completion::new_trunc(|_| {}))?;
-                            bootstrap_conn.db.io.wait_for_completion(c)?;
-                        }
-                        if log_size <= LOG_HDR_SIZE as u64 {
-                            let c = self.storage.update_header()?;
-                            pager.io.wait_for_completion(c)?;
-                            if bootstrap_conn.get_sync_mode() != SyncMode::Off {
-                                let c = self.storage.sync(pager.get_sync_type())?;
-                                pager.io.wait_for_completion(c)?;
-                            }
-                        }
-                        self.initialize_mvcc_metadata_table(&bootstrap_conn)?;
-                        // Metadata bootstrap writes land in SQLite WAL first; reconcile immediately so
-                        // subsequent opens (including read-only opens) do not depend on WAL replay.
-                        self.maybe_complete_interrupted_checkpoint(&bootstrap_conn)?;
+                    if bootstrap_conn.db.is_readonly() {
+                        return Err(LimboError::Corrupt(
+                            "Missing MVCC metadata table in read-only mode".to_string(),
+                        ));
                     }
+                    if log_size > LOG_HDR_SIZE as u64 {
+                        return Err(LimboError::Corrupt(
+                            "Missing MVCC metadata table while logical log state exists"
+                                .to_string(),
+                        ));
+                    }
+                    // First-time MVCC bootstrap: ensure a durable logical-log header exists
+                    // before any metadata-table writes can commit into WAL.
+                    // If a previous crash left a torn header tail (0 < size < LOG_HDR_SIZE),
+                    // clear it before rewriting the header.
+                    if log_size > 0 && log_size < LOG_HDR_SIZE as u64 {
+                        let log_file = self.get_logical_log_file();
+                        let c = log_file.truncate(0, Completion::new_trunc(|_| {}))?;
+                        bootstrap_conn.db.io.wait_for_completion(c)?;
+                    }
+                    if log_size <= LOG_HDR_SIZE as u64 {
+                        let c = self.storage.update_header()?;
+                        pager.io.wait_for_completion(c)?;
+                        if bootstrap_conn.get_sync_mode() != SyncMode::Off {
+                            let c = self.storage.sync(pager.get_sync_type())?;
+                            pager.io.wait_for_completion(c)?;
+                        }
+                    }
+                    self.initialize_mvcc_metadata_table(&bootstrap_conn)?;
+                    // Metadata bootstrap writes land in SQLite WAL first; reconcile immediately so
+                    // subsequent opens (including read-only opens) do not depend on WAL replay.
+                    self.maybe_complete_interrupted_checkpoint(&bootstrap_conn)?;
                 }
             }
         }
@@ -4412,9 +4405,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let persistent_tx_ts_max = if self.uses_durable_mvcc_metadata(&connection) {
             match self.try_read_persistent_tx_ts_max(&connection)? {
                 Some(ts) => ts,
-                // Metadata table was not created when encryption is opted-in
-                // but not yet configured (keys set later via PRAGMA).
-                None if pager.is_encryption_enabled() && !pager.is_encryption_ctx_set() => 0,
                 None if header.is_none() => 0,
                 None => {
                     return Err(LimboError::Corrupt(
