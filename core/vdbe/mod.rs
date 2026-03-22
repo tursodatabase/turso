@@ -713,6 +713,7 @@ impl ProgramState {
         self.rowsets.clear();
         self.bloom_filters.clear();
         self.hash_tables.clear();
+        self.ephemeral_temp_files.clear();
         self.op_hash_build_state = None;
         self.op_hash_probe_state = None;
         self.uses_subjournal = false;

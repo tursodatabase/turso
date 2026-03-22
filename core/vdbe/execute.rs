@@ -10986,9 +10986,8 @@ pub fn op_open_ephemeral(
                 unreachable!()
             };
 
-            if let Some(tf) = temp_file {
-                state.ephemeral_temp_files.insert(cursor_id, tf);
-            }
+            let tf = temp_file.expect("temp_file must be present in Rewind state");
+            state.ephemeral_temp_files.insert(cursor_id, tf);
 
             // Table content is erased if the cursor already exists
             match cursor_type {
