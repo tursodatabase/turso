@@ -328,7 +328,7 @@ pub struct LogicalLog {
     /// `advance_offset_after_success` so that an abandoned write
     /// doesn't corrupt the chain.
     pending_running_crc: Option<u32>,
-    pub(crate) encryption_ctx: Option<EncryptionContext>,
+    encryption_ctx: Option<EncryptionContext>,
     /// Reusable scratch buffer for ops serialization on the encrypted write path.
     encryption_scratch_buffer: Vec<u8>,
 }
