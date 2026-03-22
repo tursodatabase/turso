@@ -1285,3 +1285,33 @@ fn test_encrypted_db_with_data_then_enable_mvcc(_db: TempDatabase) -> anyhow::Re
 
     Ok(())
 }
+
+#[turso_macros::test]
+fn test_non_4k_page_size_encryption_enable_mvcc_after_encryption(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    run_query(&tmp_db, &conn, "PRAGMA page_size = 8192;")?;
+    run_query(
+        &tmp_db,
+        &conn,
+        "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';",
+    )?;
+    run_query(&tmp_db, &conn, "PRAGMA cipher = 'aegis256';")?;
+    run_query(&tmp_db, &conn, "PRAGMA journal_mode = 'mvcc';")?;
+    run_query(
+        &tmp_db,
+        &conn,
+        "CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT);",
+    )?;
+    run_query(
+        &tmp_db,
+        &conn,
+        "INSERT INTO test (value) VALUES ('Hello, World!')",
+    )?;
+    do_flush(&conn, &tmp_db)?;
+
+    Ok(())
+}
