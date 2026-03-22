@@ -1,5 +1,6 @@
 mod test_alter_table_reopen;
 mod test_btree;
+mod test_ephemeral_cleanup;
 mod test_ddl;
 mod test_hash_join_materialization;
 mod test_materialized_subquery;
