@@ -11,7 +11,7 @@ use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 
 // support equality for status codes
-#[pyclass(eq, eq_int)]
+#[pyclass(eq, eq_int, skip_from_py_object)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)] // Add necessary traits for your use case
 pub enum PyTursoStatusCode {
     Ok = 0,
@@ -99,7 +99,7 @@ impl PyTursoSetupConfig {
     }
 }
 
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyTursoEncryptionConfig {
     pub cipher: String,
