@@ -42,8 +42,5 @@ fn test_ephemeral_temp_files_cleaned_up() {
 
     let after = snapshot_temp_dir();
     let leaked = find_leaked_temp_files(&before, &after);
-    assert!(
-        leaked.is_empty(),
-        "Ephemeral temp files leaked: {leaked:?}"
-    );
+    assert!(leaked.is_empty(), "Ephemeral temp files leaked: {leaked:?}");
 }

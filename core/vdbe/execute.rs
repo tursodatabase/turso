@@ -1,5 +1,6 @@
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::AlterTableFunc;
+use crate::io::TempFile;
 use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
 use crate::mvcc::database::CheckpointStateMachine;
 use crate::mvcc::MvccClock;
@@ -71,7 +72,6 @@ use branches::{mark_unlikely, unlikely};
 use either::Either;
 use smallvec::SmallVec;
 use std::any::Any;
-use crate::io::TempFile;
 use std::str::FromStr;
 use std::{
     borrow::BorrowMut,
@@ -10970,7 +10970,10 @@ pub fn op_open_ephemeral(
                 temp_file: temp_file.take(),
             };
         }
-        OpOpenEphemeralState::Rewind { cursor, temp_file: _ } => {
+        OpOpenEphemeralState::Rewind {
+            cursor,
+            temp_file: _,
+        } => {
             return_if_io!(cursor.rewind());
 
             let cursors = &mut state.cursors;
