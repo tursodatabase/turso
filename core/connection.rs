@@ -666,20 +666,7 @@ impl Connection {
             let conn = db.connect()?;
             return Ok((io, conn));
         }
-        let encryption_opts = match (opts.cipher.clone(), opts.hexkey.clone()) {
-            (Some(cipher), Some(hexkey)) => Some(EncryptionOpts { cipher, hexkey }),
-            (Some(_), None) => {
-                return Err(LimboError::InvalidArgument(
-                    "hexkey is required when cipher is provided".to_string(),
-                ))
-            }
-            (None, Some(_)) => {
-                return Err(LimboError::InvalidArgument(
-                    "cipher is required when hexkey is provided".to_string(),
-                ))
-            }
-            (None, None) => None,
-        };
+        let encryption_opts = opts.get_encryption_opts()?;
         let (io, db) = Database::open_new(
             &opts.path,
             opts.vfs.as_ref(),
@@ -714,20 +701,7 @@ impl Connection {
         if main_db_flags.contains(OpenFlags::ReadOnly) {
             flags |= OpenFlags::ReadOnly;
         }
-        let encryption_opts = match (opts.cipher.clone(), opts.hexkey.clone()) {
-            (Some(cipher), Some(hexkey)) => Some(EncryptionOpts { cipher, hexkey }),
-            (Some(_), None) => {
-                return Err(LimboError::InvalidArgument(
-                    "hexkey is required when cipher is provided".to_string(),
-                ))
-            }
-            (None, Some(_)) => {
-                return Err(LimboError::InvalidArgument(
-                    "cipher is required when hexkey is provided".to_string(),
-                ))
-            }
-            (None, None) => None,
-        };
+        let encryption_opts = opts.get_encryption_opts()?;
         if encryption_opts.is_some() {
             db_opts = db_opts.with_encryption(true);
         }

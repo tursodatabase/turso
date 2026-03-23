@@ -11,7 +11,7 @@ use crate::IO;
 use crate::{
     schema::{Column, Schema, Table, Type},
     types::{Value, ValueType},
-    LimboError, OpenFlags, Result, Statement, SymbolTable,
+    EncryptionOpts, LimboError, OpenFlags, Result, Statement, SymbolTable,
 };
 use either::Either;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -1047,12 +1047,29 @@ impl<'a> OpenOptions<'a> {
                 "modeof is not applicable without mode=rwc".to_string(),
             ));
         }
-        // If modeof is not applicable or file doesn't exist, use default flags
+        // Map SQLite URI modes to the corresponding open flags.
         Ok(match self.mode {
             OpenMode::ReadWriteCreate => OpenFlags::Create,
             OpenMode::ReadOnly => OpenFlags::ReadOnly,
-            _ => OpenFlags::default(),
+            OpenMode::ReadWrite => OpenFlags::None,
+            OpenMode::Memory => OpenFlags::Create,
         })
+    }
+
+    pub fn get_encryption_opts(&self) -> Result<Option<EncryptionOpts>> {
+        match (&self.cipher, &self.hexkey) {
+            (Some(cipher), Some(hexkey)) => Ok(Some(EncryptionOpts {
+                cipher: cipher.clone(),
+                hexkey: hexkey.clone(),
+            })),
+            (Some(_), None) => Err(LimboError::InvalidArgument(
+                "hexkey is required when cipher is provided".to_string(),
+            )),
+            (None, Some(_)) => Err(LimboError::InvalidArgument(
+                "cipher is required when hexkey is provided".to_string(),
+            )),
+            (None, None) => Ok(None),
+        }
     }
 }
 
@@ -4468,6 +4485,7 @@ pub mod tests {
         let opts = OpenOptions::parse(uri).unwrap();
         assert_eq!(opts.path, "/home/user/db.sqlite");
         assert_eq!(opts.mode, OpenMode::ReadWrite);
+        assert_eq!(opts.get_flags().unwrap(), OpenFlags::None);
         assert_eq!(opts.vfs, None);
     }
 
@@ -4485,6 +4503,16 @@ pub mod tests {
         assert_eq!(opts.path, "");
         assert_eq!(opts.mode, OpenMode::Memory);
         assert_eq!(opts.cache, CacheMode::Shared);
+        assert_eq!(opts.get_flags().unwrap(), OpenFlags::Create);
+    }
+
+    #[test]
+    fn test_uri_memory_mode_uses_create_flag() {
+        let uri = "file::memory:?mode=memory";
+        let opts = OpenOptions::parse(uri).unwrap();
+        assert_eq!(opts.path, MEMORY_PATH);
+        assert_eq!(opts.mode, OpenMode::Memory);
+        assert_eq!(opts.get_flags().unwrap(), OpenFlags::Create);
     }
 
     #[test]
@@ -4584,6 +4612,35 @@ pub mod tests {
         let uri = "file:/home/user/db.sqlite?vfs=&mode=";
         let res = OpenOptions::parse(uri);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_uri_encryption_opts_complete() {
+        let uri = "file:/home/user/db.sqlite?cipher=aegis256&hexkey=abcd";
+        let opts = OpenOptions::parse(uri).unwrap();
+        let encryption_opts = opts.get_encryption_opts().unwrap().unwrap();
+        assert_eq!(encryption_opts.cipher, "aegis256");
+        assert_eq!(encryption_opts.hexkey, "abcd");
+    }
+
+    #[test]
+    fn test_uri_encryption_opts_cipher_without_hexkey_fails() {
+        let uri = "file:/home/user/db.sqlite?cipher=aegis256";
+        let opts = OpenOptions::parse(uri).unwrap();
+        let err = opts.get_encryption_opts().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("hexkey is required when cipher is provided"));
+    }
+
+    #[test]
+    fn test_uri_encryption_opts_hexkey_without_cipher_fails() {
+        let uri = "file:/home/user/db.sqlite?hexkey=abcd";
+        let opts = OpenOptions::parse(uri).unwrap();
+        let err = opts.get_encryption_opts().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("cipher is required when hexkey is provided"));
     }
 
     // Some examples from https://www.sqlite.org/c3ref/open.html#urifilenameexamples
