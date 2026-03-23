@@ -1497,9 +1497,6 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     .store(self.durable_txid_max_new, Ordering::SeqCst);
                 self.gc_checkpointed_versions();
                 self.mvstore.drop_unused_row_versions();
-                self.mvstore
-                    .storage
-                    .on_checkpoint_end(self.durable_txid_max_new);
                 self.checkpoint_lock.unlock();
                 self.finalize(&())?;
                 Ok(TransitionResult::Done(
@@ -1519,10 +1516,19 @@ impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
     fn step(&mut self, _context: &Self::Context) -> Result<TransitionResult<Self::SMResult>> {
         let res = self.step_inner(&());
         match res {
-            Err(err) => {
+            Err(ref err) => {
+                self.mvstore
+                    .storage
+                    .on_checkpoint_end(self.durable_txid_max_new, Err(err.clone()));
                 tracing::debug!("Error in checkpoint state machine: {err}");
                 self.cleanup_after_external_io_error();
-                Err(err)
+                res
+            }
+            Ok(TransitionResult::Done(ref result)) => {
+                self.mvstore
+                    .storage
+                    .on_checkpoint_end(self.durable_txid_max_new, Ok(result));
+                res
             }
             Ok(result) => Ok(result),
         }
