@@ -1565,6 +1565,14 @@ impl Database {
         self.init_page_1.load().is_none()
     }
 
+    pub(crate) fn prepare_new_database_encryption(&self, cipher_mode: CipherMode) {
+        self.encryption_cipher_mode.set(cipher_mode);
+        if !self.initialized() {
+            self.init_page_1
+                .store(Some(pager::default_page1(Some(&cipher_mode))));
+        }
+    }
+
     pub(crate) fn can_load_extensions(&self) -> bool {
         self.opts.enable_load_extension
     }

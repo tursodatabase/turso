@@ -26,7 +26,8 @@ use crate::util::{
     rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
     rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
     rewrite_trigger_cmd_column_refs, rewrite_trigger_cmd_table_refs,
-    rewrite_view_sql_for_column_rename, trim_ascii_whitespace, RewrittenView,
+    rewrite_view_sql_for_column_rename, trim_ascii_whitespace, OpenMode, OpenOptions,
+    RewrittenView, MEMORY_PATH,
 };
 use crate::vdbe::affinity::{
     apply_numeric_affinity, try_for_float, Affinity, NumericParseResult, ParsedNumber,
@@ -13583,6 +13584,66 @@ pub(crate) struct OpVacuumIntoState {
     source_application_id: i32,
 }
 
+enum VacuumIntoTarget<'a> {
+    Plain(&'a str),
+    Uri(OpenOptions<'a>),
+}
+
+fn classify_vacuum_into_target(dest_path: &str) -> Result<VacuumIntoTarget<'_>> {
+    if dest_path.starts_with("file:") {
+        return Ok(VacuumIntoTarget::Uri(OpenOptions::parse(dest_path)?));
+    }
+    Ok(VacuumIntoTarget::Plain(dest_path))
+}
+
+fn open_vacuum_into_uri_target(
+    dest_path: &str,
+    dest_opts: crate::DatabaseOpts,
+    uri_opts: &OpenOptions<'_>,
+) -> Result<Arc<crate::Database>> {
+    let mut flags = uri_opts.get_flags()?;
+    if uri_opts.path == MEMORY_PATH || matches!(uri_opts.mode, OpenMode::Memory) {
+        let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
+        return crate::Database::open_file_with_flags(io, MEMORY_PATH, flags, dest_opts, None);
+    }
+    let existing_target = match std::fs::metadata(&uri_opts.path) {
+        Ok(metadata) => Some(metadata),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(crate::error::io_error(err, "metadata")),
+    };
+    if let Some(metadata) = existing_target {
+        if metadata.is_file() && metadata.len() == 0 && !flags.contains(OpenFlags::ReadOnly) {
+            std::fs::remove_file(&uri_opts.path)
+                .map_err(|e| crate::error::io_error(e, "remove_file"))?;
+            flags |= OpenFlags::Create;
+        } else {
+            return Err(LimboError::ParseError(format!(
+                "output file already exists: {dest_path}"
+            )));
+        }
+    }
+    // Do not pass encryption opts to `open_new()`: `VACUUM INTO` needs a blank
+    // destination, and the normal encrypted-open path initializes it too early.
+    let (_io, dest_db) = crate::Database::open_new(
+        &uri_opts.path,
+        uri_opts.vfs.as_deref(),
+        flags,
+        dest_opts,
+        None,
+    )?;
+    if dest_db.initialized() {
+        return Err(LimboError::ParseError(format!(
+            "output file already exists: {dest_path}"
+        )));
+    }
+    if let Some(modeof) = uri_opts.modeof.as_ref() {
+        let perms = std::fs::metadata(modeof).map_err(|e| crate::error::io_error(e, "metadata"))?;
+        std::fs::set_permissions(&uri_opts.path, perms.permissions())
+            .map_err(|e| crate::error::io_error(e, "set_permissions"))?;
+    }
+    Ok(dest_db)
+}
+
 /// VACUUM INTO - create a compacted copy of the database at the specified path.
 ///
 /// This is an async state machine implementation that yields on I/O operations.
@@ -13645,21 +13706,49 @@ fn op_vacuum_into_inner(
                     ));
                 }
 
-                // we always vacuum into a new file, so check if it exists
-                if std::path::Path::new(dest_path).exists() {
-                    return Err(LimboError::ParseError(format!(
-                        "output file already exists: {dest_path}"
-                    )));
-                }
-
                 // make sure to create destination database with same experimental features as source
-                // Always use PlatformIO for the destination file, even if source is in-memory.
-                // This ensures VACUUM INTO actually writes to disk.
-                let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
+                // Plain filename destinations keep using PlatformIO so VACUUM INTO writes to disk
+                // even when the source database is in-memory.
+                let blocking_io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
                 let source_db = &program.connection.db;
-                let dest_opts = crate::DatabaseOpts::new()
+                let mut dest_opts = crate::DatabaseOpts::new()
                     .with_views(source_db.experimental_views_enabled())
                     .with_index_method(source_db.experimental_index_method_enabled());
+                let target = classify_vacuum_into_target(dest_path)?;
+                let dest_encryption_opts = match &target {
+                    VacuumIntoTarget::Plain(_) => None,
+                    VacuumIntoTarget::Uri(uri_opts) => uri_opts.get_encryption_opts()?,
+                };
+                let dest_cipher_mode = dest_encryption_opts
+                    .as_ref()
+                    .map(|opts| crate::CipherMode::try_from(opts.cipher.as_str()))
+                    .transpose()?;
+                if dest_encryption_opts.is_some() {
+                    dest_opts = dest_opts.with_encryption(true);
+                }
+                let dest_db = match &target {
+                    VacuumIntoTarget::Plain(path) => {
+                        if std::path::Path::new(path).exists() {
+                            return Err(LimboError::ParseError(format!(
+                                "output file already exists: {dest_path}"
+                            )));
+                        }
+                        crate::Database::open_file_with_flags(
+                            blocking_io.clone(),
+                            path,
+                            OpenFlags::Create,
+                            dest_opts,
+                            None,
+                        )?
+                    }
+                    VacuumIntoTarget::Uri(uri_opts) => {
+                        open_vacuum_into_uri_target(dest_path, dest_opts, uri_opts)?
+                    }
+                };
+                if let Some(dest_cipher_mode) = dest_cipher_mode {
+                    dest_db.prepare_new_database_encryption(dest_cipher_mode);
+                }
+                let dest_conn = dest_db.connect()?;
 
                 program.connection.execute("BEGIN")?;
                 // lets set the same meta values as source db
@@ -13676,28 +13765,39 @@ fn op_vacuum_into_inner(
                     "page_size",
                 )?;
 
-                let reserved_space = {
+                let preserve_source_reserved_space =
+                    program.connection.get_encryption_cipher_mode().is_none()
+                        && dest_encryption_opts.is_none();
+                let source_reserved_space = if preserve_source_reserved_space {
                     let pager = program.connection.pager.load();
-                    let reserved_space: u8 = match program.connection.get_reserved_bytes() {
+                    Some(match program.connection.get_reserved_bytes() {
                         Some(val) => val,
-                        None => io.block(|| pager.with_header(|header| header.reserved_space))?,
-                    };
-                    reserved_space
+                        None => blocking_io
+                            .block(|| pager.with_header(|header| header.reserved_space))?,
+                    })
+                } else {
+                    None
                 };
 
-                let dest_db = crate::Database::open_file_with_flags(
-                    io,
-                    dest_path,
-                    OpenFlags::Create,
-                    dest_opts,
-                    None,
-                )?;
-                let dest_conn = dest_db.connect()?;
                 dest_conn.reset_page_size(page_size)?;
-                // set reserved_space on destination to match source
-                // this is important for databases using encryption or checksums
-                // must be set before page 1 is allocated (before any schema operations)
-                dest_conn.set_reserved_bytes(reserved_space)?;
+                if let Some(dest_encryption_opts) = &dest_encryption_opts {
+                    let cipher_mode = dest_cipher_mode.expect(
+                        "cipher mode must be set when destination encryption options are present",
+                    );
+                    dest_conn.execute(format!(
+                        "PRAGMA cipher = '{}'",
+                        escape_sql_string_literal(&dest_encryption_opts.cipher)
+                    ))?;
+                    dest_conn.execute(format!(
+                        "PRAGMA hexkey = '{}'",
+                        escape_sql_string_literal(&dest_encryption_opts.hexkey)
+                    ))?;
+                    dest_conn.set_reserved_bytes(cipher_mode.metadata_size() as u8)?;
+                } else if let Some(source_reserved_space) = source_reserved_space {
+                    // Preserve plain/checksum layouts, but let encrypted destinations choose their
+                    // own reserved bytes from the destination cipher metadata.
+                    dest_conn.set_reserved_bytes(source_reserved_space)?;
+                }
 
                 // Enable MVCC on destination if source has it enabled
                 // Must be done before any schema operations to ensure the log file is created

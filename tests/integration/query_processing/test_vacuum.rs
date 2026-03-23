@@ -1,8 +1,17 @@
 use crate::common::{compute_dbhash, ExecRows, TempDatabase};
 use rusqlite::Connection as SqliteConnection;
+use std::path::Path;
 use std::sync::Arc;
 use tempfile::TempDir;
-use turso_core::{Connection, Value};
+use turso_core::{
+    Connection, Database, DatabaseOpts, EncryptionKey, EncryptionOpts, OpenFlags, PlatformIO,
+    Value, IO,
+};
+
+const VACUUM_URI_CIPHER_A: &str = "aegis256";
+const VACUUM_URI_KEY_A: &str = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+const VACUUM_URI_CIPHER_B: &str = "aes256gcm";
+const VACUUM_URI_KEY_B: &str = "a2ccfeb5f690ed0ebf01a843f22222f11ed11d9348213f6d8113b677ae84ad38";
 
 /// Helper to run integrity_check and return the result string
 fn run_integrity_check(conn: &Arc<Connection>) -> String {
@@ -26,6 +35,112 @@ fn run_integrity_check(conn: &Arc<Connection>) -> String {
 
 fn escape_sqlite_string_literal(text: &str) -> String {
     text.replace('\'', "''")
+}
+
+fn vacuum_into_literal(conn: &Arc<Connection>, dest_literal: &str) -> anyhow::Result<()> {
+    conn.execute(format!(
+        "VACUUM INTO '{}'",
+        escape_sqlite_string_literal(dest_literal)
+    ))?;
+    Ok(())
+}
+
+fn hash_database_path_with_encryption(
+    path: &Path,
+    encryption_opts: Option<EncryptionOpts>,
+) -> anyhow::Result<turso_dbhash::DbHashResult> {
+    Ok(turso_dbhash::hash_database_with_encryption(
+        path.to_str()
+            .expect("test database paths must be valid UTF-8"),
+        &turso_dbhash::DbHashOptions::default(),
+        encryption_opts,
+    )?)
+}
+
+fn can_read_query_from_uri(uri: &str, query: &str) -> bool {
+    let Ok((_io, conn)) =
+        turso_core::Connection::from_uri(uri, DatabaseOpts::new().with_encryption(true))
+    else {
+        return false;
+    };
+    let Ok(mut stmt) = conn.prepare(query) else {
+        return false;
+    };
+    stmt.run_collect_rows().is_ok()
+}
+
+#[derive(Clone, Copy)]
+enum VacuumIntoTargetLiteral {
+    Plain,
+    Uri { query: &'static str },
+}
+
+#[derive(Clone, Copy)]
+enum VacuumIntoDestinationSeed {
+    Missing,
+    EmptyFile,
+    ArbitraryFile,
+    ExistingDb,
+}
+
+fn sqlite_vacuum_literal(path: &Path, target: VacuumIntoTargetLiteral) -> String {
+    let path = path
+        .to_str()
+        .expect("test database paths must be valid UTF-8");
+    match target {
+        VacuumIntoTargetLiteral::Plain => path.to_string(),
+        VacuumIntoTargetLiteral::Uri { query: "" } => format!("file:{path}"),
+        VacuumIntoTargetLiteral::Uri { query } => format!("file:{path}?{query}"),
+    }
+}
+
+fn seed_destination_file(path: &Path, seed: VacuumIntoDestinationSeed) -> anyhow::Result<()> {
+    match seed {
+        VacuumIntoDestinationSeed::Missing => Ok(()),
+        VacuumIntoDestinationSeed::EmptyFile => {
+            std::fs::write(path, [])?;
+            Ok(())
+        }
+        VacuumIntoDestinationSeed::ArbitraryFile => {
+            std::fs::write(path, b"not a database file")?;
+            Ok(())
+        }
+        VacuumIntoDestinationSeed::ExistingDb => {
+            let conn = SqliteConnection::open(path)?;
+            conn.execute_batch(
+                "CREATE TABLE preexisting(value TEXT);
+                 INSERT INTO preexisting VALUES ('occupied');",
+            )?;
+            Ok(())
+        }
+    }
+}
+
+fn create_vacuum_source(path: &Path) -> anyhow::Result<()> {
+    let db = TempDatabase::builder().with_db_path(path).build();
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")?;
+    conn.execute("INSERT INTO t(value) VALUES ('alpha')")?;
+    conn.execute("INSERT INTO t(value) VALUES ('beta')")?;
+    Ok(())
+}
+
+fn open_encrypted_connection(
+    path: &Path,
+    encryption_opts: &EncryptionOpts,
+) -> anyhow::Result<(Arc<Database>, Arc<Connection>)> {
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
+    let db = Database::open_file_with_flags(
+        io,
+        path.to_str()
+            .expect("test database paths must be valid UTF-8"),
+        OpenFlags::default(),
+        DatabaseOpts::new().with_encryption(true),
+        Some(encryption_opts.clone()),
+    )?;
+    let key = EncryptionKey::from_hex_string(&encryption_opts.hexkey)?;
+    let conn = db.connect_with_encryption(Some(key))?;
+    Ok((db, conn))
 }
 
 #[cfg_attr(feature = "checksum", ignore)]
@@ -1544,6 +1659,356 @@ fn test_vacuum_into_preserves_reserved_space(tmp_db: TempDatabase) -> anyhow::Re
         rows,
         vec![(1, "confidential".to_string()), (2, "private".to_string())]
     );
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_connection_from_uri_memory_mode_opens_in_memory_db(
+    _tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let (_io, conn) = Connection::from_uri("file::memory:?mode=memory", DatabaseOpts::new())?;
+
+    conn.execute("CREATE TABLE t(value TEXT)")?;
+    conn.execute("INSERT INTO t VALUES ('ok')")?;
+
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT value FROM t");
+    assert_eq!(rows, vec![("ok".to_string(),)]);
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_vacuum_into_file_uri_open_mode_parity_with_sqlite(
+    _tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    struct Case {
+        name: &'static str,
+        target: VacuumIntoTargetLiteral,
+        seed: VacuumIntoDestinationSeed,
+        expected_ok: bool,
+        writes_file: bool,
+    }
+
+    let cases = [
+        Case {
+            name: "plain-existing-empty",
+            target: VacuumIntoTargetLiteral::Plain,
+            seed: VacuumIntoDestinationSeed::EmptyFile,
+            expected_ok: false,
+            writes_file: true,
+        },
+        Case {
+            name: "uri-default-existing-empty",
+            target: VacuumIntoTargetLiteral::Uri { query: "" },
+            seed: VacuumIntoDestinationSeed::EmptyFile,
+            expected_ok: true,
+            writes_file: true,
+        },
+        Case {
+            name: "uri-default-existing-db",
+            target: VacuumIntoTargetLiteral::Uri { query: "" },
+            seed: VacuumIntoDestinationSeed::ExistingDb,
+            expected_ok: false,
+            writes_file: true,
+        },
+        Case {
+            name: "uri-default-existing-file",
+            target: VacuumIntoTargetLiteral::Uri { query: "" },
+            seed: VacuumIntoDestinationSeed::ArbitraryFile,
+            expected_ok: false,
+            writes_file: true,
+        },
+        Case {
+            name: "uri-rw-existing-empty",
+            target: VacuumIntoTargetLiteral::Uri { query: "mode=rw" },
+            seed: VacuumIntoDestinationSeed::EmptyFile,
+            expected_ok: true,
+            writes_file: true,
+        },
+        Case {
+            name: "uri-rw-existing-db",
+            target: VacuumIntoTargetLiteral::Uri { query: "mode=rw" },
+            seed: VacuumIntoDestinationSeed::ExistingDb,
+            expected_ok: false,
+            writes_file: true,
+        },
+        Case {
+            name: "uri-rw-existing-file",
+            target: VacuumIntoTargetLiteral::Uri { query: "mode=rw" },
+            seed: VacuumIntoDestinationSeed::ArbitraryFile,
+            expected_ok: false,
+            writes_file: true,
+        },
+        Case {
+            name: "uri-rw-missing",
+            target: VacuumIntoTargetLiteral::Uri { query: "mode=rw" },
+            seed: VacuumIntoDestinationSeed::Missing,
+            expected_ok: false,
+            writes_file: true,
+        },
+        Case {
+            name: "uri-rwc-existing-empty",
+            target: VacuumIntoTargetLiteral::Uri { query: "mode=rwc" },
+            seed: VacuumIntoDestinationSeed::EmptyFile,
+            expected_ok: true,
+            writes_file: true,
+        },
+        Case {
+            name: "uri-rwc-existing-db",
+            target: VacuumIntoTargetLiteral::Uri { query: "mode=rwc" },
+            seed: VacuumIntoDestinationSeed::ExistingDb,
+            expected_ok: false,
+            writes_file: true,
+        },
+        Case {
+            name: "uri-rwc-existing-file",
+            target: VacuumIntoTargetLiteral::Uri { query: "mode=rwc" },
+            seed: VacuumIntoDestinationSeed::ArbitraryFile,
+            expected_ok: false,
+            writes_file: true,
+        },
+        Case {
+            name: "uri-rwc-missing",
+            target: VacuumIntoTargetLiteral::Uri { query: "mode=rwc" },
+            seed: VacuumIntoDestinationSeed::Missing,
+            expected_ok: true,
+            writes_file: true,
+        },
+        Case {
+            name: "uri-ro-existing-empty",
+            target: VacuumIntoTargetLiteral::Uri { query: "mode=ro" },
+            seed: VacuumIntoDestinationSeed::EmptyFile,
+            expected_ok: false,
+            writes_file: true,
+        },
+        Case {
+            name: "uri-memory-missing",
+            target: VacuumIntoTargetLiteral::Uri {
+                query: "mode=memory",
+            },
+            seed: VacuumIntoDestinationSeed::Missing,
+            expected_ok: true,
+            writes_file: false,
+        },
+        Case {
+            name: "uri-memory-existing-file",
+            target: VacuumIntoTargetLiteral::Uri {
+                query: "mode=memory",
+            },
+            seed: VacuumIntoDestinationSeed::ArbitraryFile,
+            expected_ok: true,
+            writes_file: false,
+        },
+    ];
+
+    for case in cases {
+        let case_dir = TempDir::new()?;
+        let turso_source = case_dir
+            .path()
+            .join(format!("turso-{}-source.db", case.name));
+        create_vacuum_source(&turso_source)?;
+
+        let turso_dest = case_dir.path().join(format!("turso-{}-dest.db", case.name));
+        seed_destination_file(&turso_dest, case.seed)?;
+        let dest_before = turso_dest
+            .exists()
+            .then(|| std::fs::read(&turso_dest))
+            .transpose()?;
+        let turso_literal = sqlite_vacuum_literal(&turso_dest, case.target);
+        let turso_ok = {
+            let turso_source_db = TempDatabase::new_with_existent(&turso_source);
+            let conn = turso_source_db.connect_limbo();
+            vacuum_into_literal(&conn, &turso_literal).is_ok()
+        };
+
+        assert_eq!(
+            turso_ok, case.expected_ok,
+            "{}: VACUUM INTO result should match the sqlite3 3.51 runtime for {}",
+            case.name, turso_literal
+        );
+
+        if turso_ok && case.writes_file {
+            let source_hash = hash_database_path_with_encryption(&turso_source, None)?;
+            let dest_hash = hash_database_path_with_encryption(&turso_dest, None)?;
+            assert_eq!(
+                source_hash.hash, dest_hash.hash,
+                "{}: successful URI VACUUM should preserve logical content",
+                case.name
+            );
+        } else if turso_ok {
+            match dest_before {
+                Some(before) => {
+                    let after = std::fs::read(&turso_dest)?;
+                    assert_eq!(
+                        after, before,
+                        "{}: memory-mode URI VACUUM should not modify on-disk targets",
+                        case.name
+                    );
+                }
+                None => {
+                    assert!(
+                        !turso_dest.exists(),
+                        "{}: memory-mode URI VACUUM should not create an on-disk target",
+                        case.name
+                    );
+                }
+            }
+        } else {
+            match dest_before {
+                Some(before) => {
+                    let after = std::fs::read(&turso_dest)?;
+                    assert_eq!(
+                        after, before,
+                        "{}: failed URI VACUUM must not modify the preexisting target",
+                        case.name
+                    );
+                }
+                None => {
+                    assert!(
+                        !turso_dest.exists(),
+                        "{}: failed URI VACUUM must not create a destination file",
+                        case.name
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_vacuum_into_uri_encrypts_plain_destination(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE secrets (id INTEGER PRIMARY KEY, value TEXT)")?;
+    conn.execute("INSERT INTO secrets VALUES (1, 'plain')")?;
+    conn.execute("INSERT INTO secrets VALUES (2, 'source')")?;
+
+    let source_hash = compute_dbhash(&tmp_db);
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuum-encrypted.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+    let dest_encryption_opts = EncryptionOpts {
+        cipher: VACUUM_URI_CIPHER_A.to_string(),
+        hexkey: VACUUM_URI_KEY_A.to_string(),
+    };
+    let dest_uri = format!(
+        "file:{dest_path_str}?cipher={}&hexkey={}",
+        dest_encryption_opts.cipher, dest_encryption_opts.hexkey
+    );
+    let plain_uri = format!("file:{dest_path_str}");
+
+    vacuum_into_literal(&conn, &dest_uri)?;
+
+    assert!(
+        !can_read_query_from_uri(&plain_uri, "SELECT COUNT(*) FROM secrets"),
+        "Encrypted VACUUM destination should not be readable without encryption params"
+    );
+    assert!(
+        can_read_query_from_uri(&dest_uri, "SELECT COUNT(*) FROM secrets"),
+        "Encrypted VACUUM destination should be readable with destination URI params"
+    );
+
+    let dest_hash =
+        hash_database_path_with_encryption(&dest_path, Some(dest_encryption_opts.clone()))?;
+    assert_eq!(
+        source_hash.hash, dest_hash.hash,
+        "Encrypted VACUUM destination should preserve logical content"
+    );
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_vacuum_into_uri_reencrypts_encrypted_source(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let source_encryption_opts = EncryptionOpts {
+        cipher: VACUUM_URI_CIPHER_A.to_string(),
+        hexkey: VACUUM_URI_KEY_A.to_string(),
+    };
+    let source_dir = TempDir::new()?;
+    let source_path = source_dir.path().join("encrypted-source.db");
+    {
+        let (_source_db, conn) = open_encrypted_connection(&source_path, &source_encryption_opts)?;
+        conn.execute("CREATE TABLE secrets (id INTEGER PRIMARY KEY, value TEXT)")?;
+        conn.execute("INSERT INTO secrets VALUES (1, 'alpha')")?;
+        conn.execute("INSERT INTO secrets VALUES (2, 'beta')")?;
+    }
+    let source_hash =
+        hash_database_path_with_encryption(&source_path, Some(source_encryption_opts.clone()))?;
+    let (_source_db, conn) = open_encrypted_connection(&source_path, &source_encryption_opts)?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuum-reencrypted.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+    let dest_encryption_opts = EncryptionOpts {
+        cipher: VACUUM_URI_CIPHER_B.to_string(),
+        hexkey: VACUUM_URI_KEY_B.to_string(),
+    };
+    let dest_uri = format!(
+        "file:{dest_path_str}?cipher={}&hexkey={}",
+        dest_encryption_opts.cipher, dest_encryption_opts.hexkey
+    );
+    let source_uri = format!(
+        "file:{dest_path_str}?cipher={}&hexkey={}",
+        source_encryption_opts.cipher, source_encryption_opts.hexkey
+    );
+
+    vacuum_into_literal(&conn, &dest_uri)?;
+
+    assert!(
+        !can_read_query_from_uri(&source_uri, "SELECT COUNT(*) FROM secrets"),
+        "Destination should not be readable with the source encryption params"
+    );
+    assert!(
+        can_read_query_from_uri(&dest_uri, "SELECT COUNT(*) FROM secrets"),
+        "Destination should be readable with the destination encryption params"
+    );
+
+    let dest_hash =
+        hash_database_path_with_encryption(&dest_path, Some(dest_encryption_opts.clone()))?;
+    assert_eq!(
+        source_hash.hash, dest_hash.hash,
+        "Re-encrypted VACUUM destination should preserve logical content"
+    );
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_vacuum_into_uri_decrypts_encrypted_source(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let source_encryption_opts = EncryptionOpts {
+        cipher: VACUUM_URI_CIPHER_A.to_string(),
+        hexkey: VACUUM_URI_KEY_A.to_string(),
+    };
+    let source_dir = TempDir::new()?;
+    let source_path = source_dir.path().join("encrypted-source.db");
+    {
+        let (_source_db, conn) = open_encrypted_connection(&source_path, &source_encryption_opts)?;
+        conn.execute("CREATE TABLE secrets (id INTEGER PRIMARY KEY, value TEXT)")?;
+        conn.execute("INSERT INTO secrets VALUES (1, 'locked')")?;
+        conn.execute("INSERT INTO secrets VALUES (2, 'open')")?;
+    }
+    let source_hash =
+        hash_database_path_with_encryption(&source_path, Some(source_encryption_opts.clone()))?;
+    let (_source_db, conn) = open_encrypted_connection(&source_path, &source_encryption_opts)?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuum-plain.db");
+    let dest_uri = format!("file:{}", dest_path.to_str().unwrap());
+
+    vacuum_into_literal(&conn, &dest_uri)?;
+
+    assert!(
+        can_read_query_from_uri(&dest_uri, "SELECT COUNT(*) FROM secrets"),
+        "Plain VACUUM destination should be readable without encryption params"
+    );
+
+    let dest_hash = hash_database_path_with_encryption(&dest_path, None)?;
+    assert_eq!(
+        source_hash.hash, dest_hash.hash,
+        "Plain VACUUM destination should preserve logical content"
+    );
+
     Ok(())
 }
 
