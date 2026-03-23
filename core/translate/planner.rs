@@ -216,8 +216,8 @@ pub fn resolve_window_and_aggregate_functions(
                 let args_count = args.len();
                 let distinctness = Distinctness::from_ast(distinctness.as_ref());
 
-                match Func::resolve_function(name.as_str(), args_count) {
-                    Ok(Func::Agg(f)) => {
+                match Func::resolve_function(name.as_str(), args_count)? {
+                    Some(Func::Agg(f)) => {
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
                                 windows.as_deref_mut(),
@@ -232,7 +232,7 @@ pub fn resolve_window_and_aggregate_functions(
                         }
                         return Ok(WalkControl::SkipChildren);
                     }
-                    Ok(Func::Window(f)) => {
+                    Some(Func::Window(f)) => {
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
                                 windows.as_deref_mut(),
@@ -246,7 +246,7 @@ pub fn resolve_window_and_aggregate_functions(
                         }
                         return Ok(WalkControl::SkipChildren);
                     }
-                    Err(e) => {
+                    None => {
                         if let Some(f) = resolver
                             .symbol_table
                             .resolve_function(name.as_str(), args_count)
@@ -273,8 +273,6 @@ pub fn resolve_window_and_aggregate_functions(
                                 }
                                 return Ok(WalkControl::SkipChildren);
                             }
-                        } else {
-                            return Err(e);
                         }
                     }
                     _ => {
@@ -289,8 +287,8 @@ pub fn resolve_window_and_aggregate_functions(
             }
             Expr::FunctionCallStar { name, filter_over } => {
                 validate_aggregate_function_tail(filter_over, &[])?;
-                match Func::resolve_function(name.as_str(), 0) {
-                    Ok(Func::Agg(f)) => {
+                match Func::resolve_function(name.as_str(), 0)? {
+                    Some(Func::Agg(f)) => {
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
                                 windows.as_deref_mut(),
@@ -311,7 +309,7 @@ pub fn resolve_window_and_aggregate_functions(
                         }
                         return Ok(WalkControl::SkipChildren);
                     }
-                    Ok(Func::Window(f)) => {
+                    Some(Func::Window(f)) => {
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
                                 windows.as_deref_mut(),
@@ -325,7 +323,7 @@ pub fn resolve_window_and_aggregate_functions(
                         }
                         return Ok(WalkControl::SkipChildren);
                     }
-                    Ok(_) => {
+                    Some(func) => {
                         if filter_over.over_clause.is_some() {
                             crate::bail_parse_error!(
                                 "{} may not be used as a window function",
@@ -334,36 +332,43 @@ pub fn resolve_window_and_aggregate_functions(
                         }
 
                         // Check if the function supports (*) syntax using centralized logic
-                        match crate::function::Func::resolve_function(name.as_str(), 0) {
-                            Ok(func) => {
-                                if func.supports_star_syntax() {
-                                    return Ok(WalkControl::Continue);
-                                } else {
-                                    crate::bail_parse_error!(
-                                        "wrong number of arguments to function {}()",
-                                        name.as_str()
-                                    );
-                                }
-                            }
-                            Err(_) => {
-                                crate::bail_parse_error!(
-                                    "wrong number of arguments to function {}()",
-                                    name.as_str()
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => match e {
-                        crate::LimboError::ParseError(e) => {
-                            crate::bail_parse_error!("{}", e);
-                        }
-                        _ => {
+                        if func.supports_star_syntax() {
+                            return Ok(WalkControl::Continue);
+                        } else {
                             crate::bail_parse_error!(
-                                "Invalid aggregate function: {}",
+                                "wrong number of arguments to function {}()",
                                 name.as_str()
                             );
                         }
-                    },
+                    }
+                    None => {
+                        if let Some(f) = resolver.symbol_table.resolve_function(name.as_str(), 0) {
+                            let func = AggFunc::External(f.func.clone().into());
+                            if let ExtFunc::Aggregate { .. } = f.as_ref().func {
+                                if let Some(over_clause) = filter_over.over_clause.as_ref() {
+                                    link_with_window(
+                                        windows.as_deref_mut(),
+                                        expr,
+                                        WindowFunctionKind::Agg(func),
+                                        over_clause,
+                                        Distinctness::NonDistinct,
+                                    )?;
+                                } else {
+                                    add_aggregate_if_not_exists(
+                                        aggs,
+                                        expr,
+                                        &[],
+                                        Distinctness::NonDistinct,
+                                        func,
+                                    )?;
+                                    contains_aggregates = true;
+                                }
+                                return Ok(WalkControl::SkipChildren);
+                            }
+                        } else {
+                            crate::bail_parse_error!("no such function: {}", name.as_str());
+                        }
+                    }
                 }
             }
             _ => {}

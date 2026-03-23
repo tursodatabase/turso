@@ -1728,7 +1728,9 @@ impl<'a> LogicalPlanBuilder<'a> {
                         args: vec![],
                         distinct: false,
                     })
-                } else if let Ok(func) = crate::function::Func::resolve_function(&func_name, 0) {
+                } else if let Ok(Some(func)) =
+                    crate::function::Func::resolve_function(&func_name, 0)
+                {
                     // Check if this function supports star expansion (e.g., json_object, jsonb_object)
                     if func.needs_star_expansion() {
                         // Expand * to all columns as alternating key-value pairs
