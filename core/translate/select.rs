@@ -519,6 +519,11 @@ fn prepare_one_select_plan(
 
             // Parse the ORDER BY clause
             let mut key = Vec::new();
+            let agg_count_before_order_by = plan.aggregates.len();
+            let has_group_by = plan
+                .group_by
+                .as_ref()
+                .is_some_and(|gb| !gb.exprs.is_empty());
 
             for mut o in order_by {
                 replace_column_number_with_copy_of_column_expr(&mut o.expr, &plan.result_columns)?;
@@ -530,12 +535,23 @@ fn prepare_one_select_plan(
                     resolver,
                     BindingBehavior::TryResultColumnsFirst,
                 )?;
-                resolve_window_and_aggregate_functions(
+                let had_agg = resolve_window_and_aggregate_functions(
                     &o.expr,
                     resolver,
                     &mut plan.aggregates,
                     Some(&mut windows),
                 )?;
+
+                // SQLite rejects aggregate functions in ORDER BY when the query
+                // has a FROM clause and is not already an aggregate query (no
+                // GROUP BY and no aggregates in SELECT/HAVING).
+                // e.g. SELECT f1 FROM t ORDER BY min(f1);
+                // But SELECT 1 ORDER BY sum(1) is allowed (no FROM clause).
+                let has_from = !plan.table_references.joined_tables().is_empty();
+                if had_agg && has_from && !has_group_by && agg_count_before_order_by == 0 {
+                    let agg = &plan.aggregates[agg_count_before_order_by];
+                    crate::bail_parse_error!("misuse of aggregate: {}()", agg.func);
+                }
 
                 key.push((o.expr, o.order.unwrap_or(ast::SortOrder::Asc)));
             }
