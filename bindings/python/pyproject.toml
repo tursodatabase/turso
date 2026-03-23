@@ -1,5 +1,5 @@
 [build-system]
-requires = ['maturin>=1,<2', 'typing_extensions']
+requires = ['maturin>=1.12.6,<2', 'typing_extensions']
 build-backend = 'maturin'
 
 [project]
@@ -36,7 +36,7 @@ dev = [
     "pytest-cov==5.0.0",
     "ruff==0.5.4",
     "coverage==7.6.1",
-    "maturin==1.7.8",
+    "maturin==1.12.6",
 ]
 sqlalchemy = [
     "sqlalchemy>=2.0",
@@ -53,7 +53,6 @@ Source = "https://github.com/tursodatabase/turso"
 [tool.maturin]
 bindings = 'pyo3'
 module-name = "turso._turso"
-features = ["pyo3/extension-module"]
 
 [tool.pip-tools]
 strip-extras = true
@@ -82,7 +81,7 @@ exclude_lines = [
 dev = [
     "coverage>=7.6.1",
     "iniconfig>=2.1.0",
-    "maturin>=1.7.8",
+    "maturin>=1.12.6",
     "mypy>=1.11.0",
     "mypy-extensions>=1.1.0",
     "pluggy>=1.6.0",

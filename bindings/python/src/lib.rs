@@ -23,7 +23,8 @@ use crate::{
 pub mod turso;
 pub mod turso_sync;
 
-#[pymodule]
+// TODO: audit thread-safety of wrapped types and Python::attach() usage before removing gil_used
+#[pymodule(gil_used = true)]
 fn _turso(m: &Bound<PyModule>) -> PyResult<()> {
     m.add("__version__", TursoDatabase::version())?;
     // database exports
