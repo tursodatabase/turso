@@ -3093,4 +3093,237 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    #[cfg(not(feature = "sqlite3"))]
+    fn test_shared_memory_uri_connections() {
+        unsafe {
+            let uri = c"file:shared_mem_test?mode=memory&cache=shared";
+            let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI;
+
+            let mut db1: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(
+                sqlite3_open_v2(uri.as_ptr(), &mut db1, flags, ptr::null()),
+                SQLITE_OK,
+                "first open failed"
+            );
+
+            let mut errmsg: *mut libc::c_char = ptr::null_mut();
+            assert_eq!(
+                sqlite3_exec(
+                    db1,
+                    c"CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg,
+                ),
+                SQLITE_OK,
+                "CREATE TABLE failed"
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    db1,
+                    c"INSERT INTO t1 VALUES (1, 'from_conn1')".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg,
+                ),
+                SQLITE_OK,
+                "INSERT failed"
+            );
+
+            // Second connection to the same URI must see shared state
+            let mut db2: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(
+                sqlite3_open_v2(uri.as_ptr(), &mut db2, flags, ptr::null()),
+                SQLITE_OK,
+                "second open failed"
+            );
+
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db2,
+                    c"SELECT val FROM t1 WHERE id = 1".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK,
+                "SELECT on connection 2 failed — table not shared"
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            let text = sqlite3_column_text(stmt, 0);
+            assert!(!text.is_null());
+            let val = std::ffi::CStr::from_ptr(text).to_str().unwrap();
+            assert_eq!(val, "from_conn1");
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            assert_eq!(sqlite3_close(db2), SQLITE_OK);
+            assert_eq!(sqlite3_close(db1), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "sqlite3"))]
+    fn test_different_named_memory_dbs_are_independent() {
+        unsafe {
+            let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI;
+
+            // Open db "alpha"
+            let mut db1: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(
+                sqlite3_open_v2(
+                    c"file:alpha_iso?mode=memory&cache=shared".as_ptr(),
+                    &mut db1,
+                    flags,
+                    ptr::null(),
+                ),
+                SQLITE_OK
+            );
+            let mut errmsg: *mut libc::c_char = ptr::null_mut();
+            assert_eq!(
+                sqlite3_exec(
+                    db1,
+                    c"CREATE TABLE t1 (id INTEGER PRIMARY KEY)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg,
+                ),
+                SQLITE_OK
+            );
+
+            // Open db "beta" — should NOT see t1
+            let mut db2: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(
+                sqlite3_open_v2(
+                    c"file:beta_iso?mode=memory&cache=shared".as_ptr(),
+                    &mut db2,
+                    flags,
+                    ptr::null(),
+                ),
+                SQLITE_OK
+            );
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            let rc = sqlite3_prepare_v2(
+                db2,
+                c"SELECT * FROM t1".as_ptr(),
+                -1,
+                &mut stmt,
+                ptr::null_mut(),
+            );
+            // t1 only exists in "alpha", not "beta"
+            assert_eq!(rc, SQLITE_ERROR);
+
+            assert_eq!(sqlite3_close(db2), SQLITE_OK);
+            assert_eq!(sqlite3_close(db1), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "sqlite3"))]
+    fn test_plain_memory_stays_independent() {
+        unsafe {
+            let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI;
+
+            let mut db1: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(
+                sqlite3_open_v2(c"file::memory:".as_ptr(), &mut db1, flags, ptr::null(),),
+                SQLITE_OK
+            );
+            let mut errmsg: *mut libc::c_char = ptr::null_mut();
+            assert_eq!(
+                sqlite3_exec(
+                    db1,
+                    c"CREATE TABLE t1 (id INTEGER PRIMARY KEY)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg,
+                ),
+                SQLITE_OK
+            );
+
+            // Unnamed :memory: must remain independent
+            let mut db2: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(
+                sqlite3_open_v2(c"file::memory:".as_ptr(), &mut db2, flags, ptr::null(),),
+                SQLITE_OK
+            );
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            let rc = sqlite3_prepare_v2(
+                db2,
+                c"SELECT * FROM t1".as_ptr(),
+                -1,
+                &mut stmt,
+                ptr::null_mut(),
+            );
+            assert_eq!(rc, SQLITE_ERROR, "plain :memory: should not share state");
+
+            assert_eq!(sqlite3_close(db2), SQLITE_OK);
+            assert_eq!(sqlite3_close(db1), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "sqlite3"))]
+    fn test_unnamed_memory_cache_shared() {
+        unsafe {
+            let uri = c"file::memory:?cache=shared";
+            let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI;
+
+            let mut db1: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(
+                sqlite3_open_v2(uri.as_ptr(), &mut db1, flags, ptr::null()),
+                SQLITE_OK,
+            );
+            let mut errmsg: *mut libc::c_char = ptr::null_mut();
+            assert_eq!(
+                sqlite3_exec(
+                    db1,
+                    c"CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg,
+                ),
+                SQLITE_OK,
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    db1,
+                    c"INSERT INTO t1 VALUES (1, 'shared')".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg,
+                ),
+                SQLITE_OK,
+            );
+
+            // Same URI must share the database
+            let mut db2: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(
+                sqlite3_open_v2(uri.as_ptr(), &mut db2, flags, ptr::null()),
+                SQLITE_OK,
+            );
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db2,
+                    c"SELECT val FROM t1 WHERE id = 1".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK,
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            let text = sqlite3_column_text(stmt, 0);
+            assert!(!text.is_null());
+            let val = std::ffi::CStr::from_ptr(text).to_str().unwrap();
+            assert_eq!(val, "shared");
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            assert_eq!(sqlite3_close(db2), SQLITE_OK);
+            assert_eq!(sqlite3_close(db1), SQLITE_OK);
+        }
+    }
 }
