@@ -2,9 +2,9 @@
 
 use crate::SqlGen;
 use crate::ast::{
-    BinOp, CteDefinition, CteMaterialization, Expr, FromClause, GroupByClause, JoinClause,
-    JoinConstraint, JoinType, NullsOrder, OrderByItem, OrderDirection, SelectColumn, SelectStmt,
-    WithClause,
+    BinOp, CompoundOperator, CompoundSelectArm, CteDefinition, CteMaterialization, Expr,
+    FromClause, GroupByClause, JoinClause, JoinConstraint, JoinType, Literal, NullsOrder,
+    OrderByItem, OrderDirection, SelectColumn, SelectStmt, WithClause,
 };
 use crate::capabilities::Capabilities;
 use crate::context::Context;
@@ -13,6 +13,7 @@ use crate::functions::{AGGREGATE_FUNCTIONS, FunctionCategory};
 use crate::generate::expr::generate_condition;
 use crate::generate::expr::generate_expr;
 use crate::generate::literal::generate_literal;
+use crate::policy::SelectConfig;
 use crate::schema::{ColumnDef, DataType, Table};
 use crate::trace::Origin;
 use sql_gen_macros::trace_gen;
@@ -62,6 +63,7 @@ pub fn generate_tableless_select<C: Capabilities>(
         joins: vec![],
         where_clause: None,
         group_by: None,
+        compounds: vec![],
         order_by: vec![],
         limit: None,
         offset: None,
@@ -251,17 +253,6 @@ fn generate_select_impl_inner<C: Capabilities>(
         None
     };
 
-    // --- ORDER BY ---
-    let mut order_by = if ctx.gen_bool_with_prob(order_by_prob) {
-        if let Some(gb) = &group_by {
-            generate_grouped_order_by(generator, ctx, &gb.exprs)?
-        } else {
-            generate_order_by(generator, ctx)?
-        }
-    } else {
-        vec![]
-    };
-
     // --- DISTINCT ---
     let distinct = match mode {
         SelectMode::Full => ctx.gen_bool_with_prob(select_config.distinct_probability),
@@ -271,21 +262,6 @@ fn generate_select_impl_inner<C: Capabilities>(
                 && ctx.gen_bool_with_prob(select_config.subquery_distinct_probability)
         }
     };
-
-    // --- LIMIT / OFFSET ---
-    let (limit, offset) = match mode {
-        SelectMode::Full => generate_limit_offset(generator, ctx),
-        SelectMode::Scalar => (Some(1), None),
-    };
-
-    // Enforce deterministic LIMIT semantics when configured.
-    if limit.is_some() && order_by.is_empty() && select_config.require_order_by_with_limit {
-        order_by = if let Some(gb) = &group_by {
-            generate_grouped_order_by(generator, ctx, &gb.exprs)?
-        } else {
-            generate_order_by(generator, ctx)?
-        };
-    }
 
     let from = {
         let primary_qualified = ctx.tables_in_scope()[0].table.qualified_name();
@@ -308,23 +284,96 @@ fn generate_select_impl_inner<C: Capabilities>(
         let _ = generate_derived_table(generator, ctx);
     }
 
-    // --- Compound (not yet implemented) ---
-    if ctx.gen_bool_with_prob(select_config.compound_probability) {
-        let _ = generate_compound_union(generator, ctx);
-    }
+    // --- Compound SELECT decision ---
+    // Only at top level (not inside subqueries) since Turso doesn't support
+    // compound SELECTs in subquery positions yet.
+    let is_compound = mode == SelectMode::Full
+        && ctx.subquery_depth() == 0
+        && joins.is_empty()
+        && group_by.is_none()
+        && ctx.gen_bool_with_prob(select_config.compound_probability);
 
-    Ok(SelectStmt {
-        with_clause: None,
-        distinct,
-        columns,
-        from,
-        joins,
-        where_clause,
-        group_by,
-        order_by,
-        limit,
-        offset,
-    })
+    if is_compound {
+        let num_result_cols = if columns.is_empty() {
+            // SELECT * — count columns from primary table
+            ctx.tables_in_scope()[0].table.columns.len()
+        } else {
+            columns.len()
+        };
+        let compounds = generate_compound_arms(generator, ctx, num_result_cols)?;
+
+        // ORDER BY for compounds uses positional indices (1..N)
+        let mut order_by = if ctx.gen_bool_with_prob(select_config.compound_order_by_probability) {
+            generate_compound_order_by(ctx, num_result_cols, select_config)?
+        } else {
+            vec![]
+        };
+
+        let (limit, offset) = if ctx.gen_bool_with_prob(select_config.compound_limit_probability) {
+            generate_limit_offset(generator, ctx)
+        } else {
+            (None, None)
+        };
+
+        // Enforce deterministic LIMIT semantics when configured.
+        if limit.is_some() && order_by.is_empty() && select_config.require_order_by_with_limit {
+            order_by = generate_compound_order_by(ctx, num_result_cols, select_config)?;
+        }
+
+        Ok(SelectStmt {
+            with_clause: None,
+            distinct,
+            columns,
+            from,
+            joins,
+            where_clause,
+            group_by,
+            compounds,
+            order_by,
+            limit,
+            offset,
+        })
+    } else {
+        // --- ORDER BY ---
+        let mut order_by = if ctx.gen_bool_with_prob(order_by_prob) {
+            if let Some(gb) = &group_by {
+                generate_grouped_order_by(generator, ctx, &gb.exprs)?
+            } else {
+                generate_order_by(generator, ctx)?
+            }
+        } else {
+            vec![]
+        };
+
+        // --- LIMIT / OFFSET ---
+        let (limit, offset) = match mode {
+            SelectMode::Full => generate_limit_offset(generator, ctx),
+            SelectMode::Scalar => (Some(1), None),
+        };
+
+        // Enforce deterministic LIMIT semantics when configured.
+        if limit.is_some() && order_by.is_empty() && select_config.require_order_by_with_limit {
+            order_by = if let Some(gb) = &group_by {
+                generate_grouped_order_by(generator, ctx, &gb.exprs)?
+            } else {
+                generate_order_by(generator, ctx)?
+            };
+        }
+
+        Ok(SelectStmt {
+            with_clause: None,
+            distinct,
+            columns,
+            from,
+            joins,
+            where_clause,
+            group_by,
+            compounds: vec![],
+            order_by,
+            limit,
+            offset,
+        })
+    }
 }
 
 /// Generate a GROUP BY clause with optional HAVING.
@@ -940,36 +989,117 @@ fn generate_join_on_condition<C: Capabilities>(
     Ok(Expr::binary_op(ctx, col_expr, op, lit_expr))
 }
 
-#[trace_gen(Origin::CompoundUnion)]
-fn generate_compound_union<C: Capabilities>(
-    _generator: &SqlGen<C>,
-    _ctx: &mut Context,
-) -> Result<SelectStmt, GenError> {
-    todo!("UNION generation")
+/// Generate compound arms for a compound SELECT.
+///
+/// Each arm picks a table, generates columns matching `num_cols`, and optionally
+/// generates a WHERE clause. The compound operator is chosen by weighted random.
+fn generate_compound_arms<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    num_cols: usize,
+) -> Result<Vec<CompoundSelectArm>, GenError> {
+    let select_config = &generator.policy().select_config;
+    let weights = &select_config.compound_operator_weights;
+    let max_arms = select_config.compound_max_arms.max(1);
+    let num_arms = ctx.gen_range_inclusive(1, max_arms);
+
+    let mut arms = Vec::with_capacity(num_arms);
+    for _ in 0..num_arms {
+        // Pick operator
+        let op_weights = [
+            weights.union,
+            weights.union_all,
+            weights.intersect,
+            weights.except,
+        ];
+        let operator = match ctx.weighted_index(&op_weights) {
+            Some(0) => CompoundOperator::Union,
+            Some(1) => CompoundOperator::UnionAll,
+            Some(2) => CompoundOperator::Intersect,
+            Some(3) => CompoundOperator::Except,
+            _ => CompoundOperator::UnionAll,
+        };
+
+        // Record coverage for the specific compound operator
+        let origin = match operator {
+            CompoundOperator::Union => Origin::CompoundUnion,
+            CompoundOperator::UnionAll => Origin::CompoundUnionAll,
+            CompoundOperator::Intersect => Origin::CompoundIntersect,
+            CompoundOperator::Except => Origin::CompoundExcept,
+        };
+
+        let arm = ctx.scope(origin, |ctx| {
+            // Pick a table for this arm
+            let table = ctx
+                .choose(&generator.schema().tables)
+                .ok_or_else(|| GenError::schema_empty("tables"))?;
+            let table = table.clone();
+            let table_name = table.qualified_name();
+
+            // Generate columns in a temporary table scope for this arm's table
+            let (columns, where_clause) = ctx.with_table_scope(vec![(table, None)], |ctx| {
+                // Generate columns matching the required count
+                let mut cols = Vec::with_capacity(num_cols);
+                for _ in 0..num_cols {
+                    let expr = pick_scoped_column_ref(ctx)?;
+                    cols.push(SelectColumn { expr, alias: None });
+                }
+
+                // Optionally generate WHERE
+                let where_clause =
+                    if ctx.gen_bool_with_prob(select_config.compound_where_probability) {
+                        Some(generate_condition(generator, ctx)?)
+                    } else {
+                        None
+                    };
+
+                Ok::<_, GenError>((cols, where_clause))
+            })?;
+
+            Ok(CompoundSelectArm {
+                operator,
+                distinct: false,
+                columns,
+                from: Some(FromClause {
+                    table: table_name,
+                    alias: None,
+                }),
+                where_clause,
+            })
+        })?;
+
+        arms.push(arm);
+    }
+
+    Ok(arms)
 }
 
-#[trace_gen(Origin::CompoundUnionAll)]
-fn generate_compound_union_all<C: Capabilities>(
-    _generator: &SqlGen<C>,
-    _ctx: &mut Context,
-) -> Result<SelectStmt, GenError> {
-    todo!("UNION ALL generation")
-}
+/// Generate ORDER BY for compound SELECTs using positional column indices.
+///
+/// Compound SELECTs require ORDER BY to use integer positions (e.g. `ORDER BY 1`)
+/// since column names from the first SELECT may not be valid across arms.
+fn generate_compound_order_by(
+    ctx: &mut Context,
+    num_result_cols: usize,
+    select_config: &SelectConfig,
+) -> Result<Vec<OrderByItem>, GenError> {
+    let max_items = num_result_cols.max(1);
+    let num_items = ctx.gen_range_inclusive(1, max_items);
+    let mut items = Vec::with_capacity(num_items);
 
-#[trace_gen(Origin::CompoundIntersect)]
-fn generate_compound_intersect<C: Capabilities>(
-    _generator: &SqlGen<C>,
-    _ctx: &mut Context,
-) -> Result<SelectStmt, GenError> {
-    todo!("INTERSECT generation")
-}
+    for _ in 0..num_items {
+        let pos = ctx.gen_range_inclusive(1, num_result_cols.max(1));
+        let expr = Expr::Literal(Literal::Integer(pos as i64));
+        let direction = select_order_direction(ctx, &select_config.order_direction_weights);
+        let nulls = select_nulls_order(ctx, &select_config.nulls_order_weights);
+        items.push(OrderByItem {
+            expr,
+            direction,
+            nulls,
+        });
+    }
 
-#[trace_gen(Origin::CompoundExcept)]
-fn generate_compound_except<C: Capabilities>(
-    _generator: &SqlGen<C>,
-    _ctx: &mut Context,
-) -> Result<SelectStmt, GenError> {
-    todo!("EXCEPT generation")
+    Ok(items)
 }
 
 /// Generate a WITH clause containing 1..max_ctes CTEs.
@@ -1736,6 +1866,7 @@ mod tests {
             limit_probability: 1.0,
             order_by_probability: 0.0,
             require_order_by_with_limit: true,
+            compound_probability: 0.0,
             ..Default::default()
         });
         let schema = SchemaBuilder::new()

@@ -173,6 +173,21 @@ expect {
 
 @setup indexed_nullable_values
 @cross-check-integrity
+test orderby_asc_nulls_first_explicit {
+    SELECT id, val FROM t
+    ORDER BY val ASC NULLS FIRST, id;
+}
+expect {
+    1|
+    4|
+    3|1
+    6|2
+    5|3
+    2|5
+}
+
+@setup indexed_nullable_values
+@cross-check-integrity
 test orderby_asc_nulls_last {
     SELECT id, val FROM t
     ORDER BY val NULLS LAST, id;
@@ -182,6 +197,21 @@ expect {
     6|2
     5|3
     2|5
+    1|
+    4|
+}
+
+@setup indexed_nullable_values
+@cross-check-integrity
+test orderby_desc_nulls_last_explicit {
+    SELECT id, val FROM t
+    ORDER BY val DESC NULLS LAST, id;
+}
+expect {
+    2|5
+    5|3
+    6|2
+    3|1
     1|
     4|
 }
@@ -199,4 +229,95 @@ expect {
     3|1
     6|2
     5|3
+}
+
+@setup indexed_nullable_values
+@cross-check-integrity
+test orderby_desc_nulls_first_limit_indexed_nullable_column {
+    SELECT id, val FROM t
+    ORDER BY val DESC NULLS FIRST, id
+    LIMIT 3;
+}
+expect {
+    1|
+    4|
+    2|5
+}
+
+setup grouped_nullable_values {
+    CREATE TABLE t2(
+        id INTEGER PRIMARY KEY,
+        grp INTEGER,
+        val INTEGER
+    );
+
+    INSERT INTO t2 VALUES
+        (1, 1, NULL),
+        (2, 1, 2),
+        (3, 1, 1),
+        (4, 2, NULL),
+        (5, 2, 2),
+        (6, 2, 1);
+}
+
+@setup grouped_nullable_values
+@cross-check-integrity
+test orderby_multikey_secondary_desc_nulls_first {
+    SELECT id, grp, val FROM t2
+    ORDER BY grp, val DESC NULLS FIRST, id;
+}
+expect {
+    1|1|
+    2|1|2
+    3|1|1
+    4|2|
+    5|2|2
+    6|2|1
+}
+
+# Unary-plus on integer literals should still resolve as column index
+# references, matching SQLite behavior.
+# Fixes select1-4.9.2 in testing/sqlite3/all.test.
+
+test order-by-plus-2 {
+    CREATE TABLE t8(a, b);
+    INSERT INTO t8 VALUES(1,10);
+    INSERT INTO t8 VALUES(2,9);
+    SELECT * FROM t8 ORDER BY +2;
+}
+expect {
+    2|9
+    1|10
+}
+
+test order-by-plus-1 {
+    CREATE TABLE t9(a, b);
+    INSERT INTO t9 VALUES(2,10);
+    INSERT INTO t9 VALUES(1,9);
+    SELECT * FROM t9 ORDER BY +1;
+}
+expect {
+    1|9
+    2|10
+}
+
+test order-by-plus-2-desc {
+    CREATE TABLE t10(a, b);
+    INSERT INTO t10 VALUES(1,10);
+    INSERT INTO t10 VALUES(2,9);
+    SELECT * FROM t10 ORDER BY +2 DESC;
+}
+expect {
+    1|10
+    2|9
+}
+
+test group-by-plus-1 {
+    CREATE TABLE t11(a text, b int);
+    INSERT INTO t11 VALUES('x',1),('x',2),('y',3);
+    SELECT a, sum(b) FROM t11 GROUP BY +1;
+}
+expect {
+    x|3
+    y|3
 }

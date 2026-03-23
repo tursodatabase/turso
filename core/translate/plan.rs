@@ -301,10 +301,26 @@ pub enum Plan {
         right_most: SelectPlan,
         limit: Option<Box<Expr>>,
         offset: Option<Box<Expr>>,
-        order_by: Option<Vec<(ast::Expr, SortOrder)>>,
+        /// ORDER BY for compound selects. Each entry identifies a result column plus
+        /// its requested direction and optional explicit NULL placement.
+        order_by: Option<Vec<CompoundOrderByTerm>>,
     },
     Delete(DeletePlan),
     Update(UpdatePlan),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompoundOrderByTerm {
+    /// 0-based index into the compound SELECT result set.
+    pub result_column_index: usize,
+    pub sort_order: SortOrder,
+    pub nulls_order: Option<ast::NullsOrder>,
+}
+
+impl CompoundOrderByTerm {
+    pub fn normalized_nulls_order(&self) -> ast::NullsOrder {
+        normalize_nulls_order(self.sort_order, self.nulls_order)
+    }
 }
 
 pub fn sorted_column_order(sorted_column: &ast::SortedColumn) -> SortOrder {

@@ -203,16 +203,27 @@ impl Display for Plan {
                 }
                 if let Some(order_by) = order_by {
                     writeln!(f, "ORDER BY:")?;
-                    for (expr, dir) in order_by {
+                    for order_by_term in order_by {
                         writeln!(
                             f,
-                            "  - {} {}",
-                            expr,
-                            if *dir == SortOrder::Asc {
+                            "  - {} {}{}",
+                            order_by_term.result_column_index + 1,
+                            if order_by_term.sort_order == SortOrder::Asc {
                                 "ASC"
                             } else {
                                 "DESC"
-                            }
+                            },
+                            order_by_term
+                                .nulls_order
+                                .map_or(String::new(), |nulls_order| {
+                                    format!(
+                                        " NULLS {}",
+                                        match nulls_order {
+                                            ast::NullsOrder::First => "FIRST",
+                                            ast::NullsOrder::Last => "LAST",
+                                        }
+                                    )
+                                })
                         )?;
                     }
                 }
@@ -672,10 +683,12 @@ impl ToTokens for Plan {
                     s.append(TokenType::TK_BY, None)?;
 
                     s.comma(
-                        order_by.iter().map(|(expr, order)| ast::SortedColumn {
-                            expr: expr.clone().into(),
-                            order: Some(*order),
-                            nulls: None,
+                        order_by.iter().map(|order_by_term| ast::SortedColumn {
+                            expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric(
+                                (order_by_term.result_column_index + 1).to_string(),
+                            ))),
+                            order: Some(order_by_term.sort_order),
+                            nulls: order_by_term.nulls_order,
                         }),
                         context,
                     )?;

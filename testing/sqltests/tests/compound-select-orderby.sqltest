@@ -1,0 +1,897 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE t1 (a INTEGER, b TEXT, c INTEGER);
+    INSERT INTO t1 VALUES (3, 'cherry', 30);
+    INSERT INTO t1 VALUES (1, 'apple', 10);
+    INSERT INTO t1 VALUES (5, 'elderberry', 50);
+    INSERT INTO t1 VALUES (2, 'banana', 20);
+    INSERT INTO t1 VALUES (4, 'date', 40);
+
+    CREATE TABLE t2 (a INTEGER, b TEXT, c INTEGER);
+    INSERT INTO t2 VALUES (6, 'fig', 60);
+    INSERT INTO t2 VALUES (2, 'banana', 20);
+    INSERT INTO t2 VALUES (8, 'honeydew', 80);
+    INSERT INTO t2 VALUES (4, 'date', 40);
+    INSERT INTO t2 VALUES (7, 'grape', 70);
+
+    CREATE TABLE t3 (x INTEGER, y TEXT);
+    INSERT INTO t3 VALUES (10, 'zulu');
+    INSERT INTO t3 VALUES (1, 'alpha');
+    INSERT INTO t3 VALUES (5, 'echo');
+}
+
+setup nullable_compound_orderby {
+    CREATE TABLE n1(a INTEGER, src TEXT);
+    INSERT INTO n1 VALUES (NULL, 'n1-null');
+    INSERT INTO n1 VALUES (2, 'n1-two');
+    INSERT INTO n1 VALUES (1, 'n1-one');
+
+    CREATE TABLE n2(a INTEGER, src TEXT);
+    INSERT INTO n2 VALUES (NULL, 'n2-null');
+    INSERT INTO n2 VALUES (4, 'n2-four');
+    INSERT INTO n2 VALUES (3, 'n2-three');
+}
+
+# ===== UNION ALL + ORDER BY =====
+
+@setup schema
+test union-all-order-by-col-number {
+    SELECT a, b FROM t1
+    UNION ALL
+    SELECT a, b FROM t2
+    ORDER BY 1;
+}
+expect {
+    1|apple
+    2|banana
+    2|banana
+    3|cherry
+    4|date
+    4|date
+    5|elderberry
+    6|fig
+    7|grape
+    8|honeydew
+}
+
+@setup schema
+test union-all-order-by-col-name {
+    SELECT a, b FROM t1
+    UNION ALL
+    SELECT a, b FROM t2
+    ORDER BY b;
+}
+expect {
+    1|apple
+    2|banana
+    2|banana
+    3|cherry
+    4|date
+    4|date
+    5|elderberry
+    6|fig
+    7|grape
+    8|honeydew
+}
+
+@setup schema
+test union-all-order-by-desc {
+    SELECT a, b FROM t1
+    UNION ALL
+    SELECT a, b FROM t2
+    ORDER BY 1 DESC;
+}
+expect {
+    8|honeydew
+    7|grape
+    6|fig
+    5|elderberry
+    4|date
+    4|date
+    3|cherry
+    2|banana
+    2|banana
+    1|apple
+}
+
+@setup schema
+test union-all-order-by-second-col {
+    SELECT a, b FROM t1
+    UNION ALL
+    SELECT a, b FROM t2
+    ORDER BY 2 DESC;
+}
+expect {
+    8|honeydew
+    7|grape
+    6|fig
+    5|elderberry
+    4|date
+    4|date
+    3|cherry
+    2|banana
+    2|banana
+    1|apple
+}
+
+@setup schema
+test union-all-order-by-multiple-cols {
+    SELECT a, b, c FROM t1
+    UNION ALL
+    SELECT a, b, c FROM t2
+    ORDER BY c, a;
+}
+expect {
+    1|apple|10
+    2|banana|20
+    2|banana|20
+    3|cherry|30
+    4|date|40
+    4|date|40
+    5|elderberry|50
+    6|fig|60
+    7|grape|70
+    8|honeydew|80
+}
+
+@setup nullable_compound_orderby
+test union-all-order-by-nulls-last {
+    SELECT a, src FROM n1
+    UNION ALL
+    SELECT a, src FROM n2
+    ORDER BY 1 NULLS LAST, 2;
+}
+expect {
+    1|n1-one
+    2|n1-two
+    3|n2-three
+    4|n2-four
+    |n1-null
+    |n2-null
+}
+
+@setup nullable_compound_orderby
+test union-all-order-by-desc-nulls-first {
+    SELECT a, src FROM n1
+    UNION ALL
+    SELECT a, src FROM n2
+    ORDER BY 1 DESC NULLS FIRST, 2;
+}
+expect {
+    |n1-null
+    |n2-null
+    4|n2-four
+    3|n2-three
+    2|n1-two
+    1|n1-one
+}
+
+# ===== UNION (distinct) + ORDER BY =====
+
+@setup schema
+test union-order-by-col-number {
+    SELECT a, b FROM t1
+    UNION
+    SELECT a, b FROM t2
+    ORDER BY 1;
+}
+expect {
+    1|apple
+    2|banana
+    3|cherry
+    4|date
+    5|elderberry
+    6|fig
+    7|grape
+    8|honeydew
+}
+
+@setup schema
+test union-order-by-col-name {
+    SELECT a, b FROM t1
+    UNION
+    SELECT a, b FROM t2
+    ORDER BY b;
+}
+expect {
+    1|apple
+    2|banana
+    3|cherry
+    4|date
+    5|elderberry
+    6|fig
+    7|grape
+    8|honeydew
+}
+
+@setup schema
+test union-order-by-desc {
+    SELECT a, b FROM t1
+    UNION
+    SELECT a, b FROM t2
+    ORDER BY 1 DESC;
+}
+expect {
+    8|honeydew
+    7|grape
+    6|fig
+    5|elderberry
+    4|date
+    3|cherry
+    2|banana
+    1|apple
+}
+
+@setup schema
+test union-order-by-multiple-cols {
+    SELECT a, b, c FROM t1
+    UNION
+    SELECT a, b, c FROM t2
+    ORDER BY c DESC, a ASC;
+}
+expect {
+    8|honeydew|80
+    7|grape|70
+    6|fig|60
+    5|elderberry|50
+    4|date|40
+    3|cherry|30
+    2|banana|20
+    1|apple|10
+}
+
+# ===== INTERSECT + ORDER BY =====
+
+@setup schema
+test intersect-order-by {
+    SELECT a, b FROM t1
+    INTERSECT
+    SELECT a, b FROM t2
+    ORDER BY 1;
+}
+expect {
+    2|banana
+    4|date
+}
+
+@setup schema
+test intersect-order-by-desc {
+    SELECT a, b FROM t1
+    INTERSECT
+    SELECT a, b FROM t2
+    ORDER BY 1 DESC;
+}
+expect {
+    4|date
+    2|banana
+}
+
+@setup schema
+test intersect-order-by-col-name {
+    SELECT a, b FROM t1
+    INTERSECT
+    SELECT a, b FROM t2
+    ORDER BY b DESC;
+}
+expect {
+    4|date
+    2|banana
+}
+
+# ===== EXCEPT + ORDER BY =====
+
+@setup schema
+test except-order-by {
+    SELECT a, b FROM t1
+    EXCEPT
+    SELECT a, b FROM t2
+    ORDER BY 1;
+}
+expect {
+    1|apple
+    3|cherry
+    5|elderberry
+}
+
+@setup schema
+test except-order-by-desc {
+    SELECT a, b FROM t1
+    EXCEPT
+    SELECT a, b FROM t2
+    ORDER BY 1 DESC;
+}
+expect {
+    5|elderberry
+    3|cherry
+    1|apple
+}
+
+@setup schema
+test except-order-by-col-name {
+    SELECT a, b FROM t1
+    EXCEPT
+    SELECT a, b FROM t2
+    ORDER BY b;
+}
+expect {
+    1|apple
+    3|cherry
+    5|elderberry
+}
+
+# ===== ORDER BY + LIMIT =====
+
+@setup schema
+test union-all-order-by-limit {
+    SELECT a, b FROM t1
+    UNION ALL
+    SELECT a, b FROM t2
+    ORDER BY 1
+    LIMIT 3;
+}
+expect {
+    1|apple
+    2|banana
+    2|banana
+}
+
+@setup schema
+test union-order-by-limit {
+    SELECT a, b FROM t1
+    UNION
+    SELECT a, b FROM t2
+    ORDER BY 1
+    LIMIT 4;
+}
+expect {
+    1|apple
+    2|banana
+    3|cherry
+    4|date
+}
+
+@setup schema
+test except-order-by-limit {
+    SELECT a, b FROM t1
+    EXCEPT
+    SELECT a, b FROM t2
+    ORDER BY 1
+    LIMIT 2;
+}
+expect {
+    1|apple
+    3|cherry
+}
+
+@setup schema
+test intersect-order-by-limit {
+    SELECT a, b FROM t1
+    INTERSECT
+    SELECT a, b FROM t2
+    ORDER BY 1
+    LIMIT 1;
+}
+expect {
+    2|banana
+}
+
+# ===== ORDER BY + LIMIT + OFFSET =====
+
+@setup schema
+test union-all-order-by-limit-offset {
+    SELECT a, b FROM t1
+    UNION ALL
+    SELECT a, b FROM t2
+    ORDER BY 1
+    LIMIT 3 OFFSET 2;
+}
+expect {
+    2|banana
+    3|cherry
+    4|date
+}
+
+@setup schema
+test union-order-by-limit-offset {
+    SELECT a, b FROM t1
+    UNION
+    SELECT a, b FROM t2
+    ORDER BY 1
+    LIMIT 3 OFFSET 3;
+}
+expect {
+    4|date
+    5|elderberry
+    6|fig
+}
+
+# ===== Three-way compound + ORDER BY =====
+
+@setup schema
+test three-way-union-all-order-by {
+    SELECT a, b FROM t1
+    UNION ALL
+    SELECT a, b FROM t2
+    UNION ALL
+    SELECT x, y FROM t3
+    ORDER BY 1;
+}
+expect {
+    1|apple
+    1|alpha
+    2|banana
+    2|banana
+    3|cherry
+    4|date
+    4|date
+    5|elderberry
+    5|echo
+    6|fig
+    7|grape
+    8|honeydew
+    10|zulu
+}
+
+@setup schema
+test three-way-union-order-by {
+    SELECT a, b FROM t1
+    UNION
+    SELECT a, b FROM t2
+    UNION
+    SELECT x, y FROM t3
+    ORDER BY 1;
+}
+expect {
+    1|alpha
+    1|apple
+    2|banana
+    3|cherry
+    4|date
+    5|echo
+    5|elderberry
+    6|fig
+    7|grape
+    8|honeydew
+    10|zulu
+}
+
+@setup schema
+test three-way-union-order-by-desc {
+    SELECT a, b FROM t1
+    UNION
+    SELECT a, b FROM t2
+    UNION
+    SELECT x, y FROM t3
+    ORDER BY 2 DESC;
+}
+expect {
+    10|zulu
+    8|honeydew
+    7|grape
+    6|fig
+    5|elderberry
+    5|echo
+    4|date
+    3|cherry
+    2|banana
+    1|apple
+    1|alpha
+}
+
+# ===== Mixed compound operators + ORDER BY =====
+
+@setup schema
+test union-then-union-all-order-by {
+    SELECT a, b FROM t1
+    UNION
+    SELECT a, b FROM t2
+    UNION ALL
+    SELECT x, y FROM t3
+    ORDER BY 1;
+}
+expect {
+    1|apple
+    1|alpha
+    2|banana
+    3|cherry
+    4|date
+    5|elderberry
+    5|echo
+    6|fig
+    7|grape
+    8|honeydew
+    10|zulu
+}
+
+@setup schema
+test union-all-then-except-order-by {
+    SELECT a FROM t1
+    UNION ALL
+    SELECT a FROM t2
+    EXCEPT
+    SELECT x FROM t3
+    ORDER BY 1;
+}
+expect {
+    2
+    3
+    4
+    6
+    7
+    8
+}
+
+@setup schema
+test union-then-intersect-order-by {
+    SELECT a FROM t1
+    UNION
+    SELECT a FROM t2
+    INTERSECT
+    SELECT x FROM t3
+    ORDER BY 1;
+}
+expect {
+    1
+    5
+}
+
+# ===== Single-column ORDER BY =====
+
+@setup schema
+test simple-union-order-by-1 {
+    SELECT 2 UNION SELECT 1 UNION SELECT 3 ORDER BY 1;
+}
+expect {
+    1
+    2
+    3
+}
+
+@setup schema
+test simple-union-all-order-by-1 {
+    SELECT 2 UNION ALL SELECT 1 UNION ALL SELECT 3 ORDER BY 1;
+}
+expect {
+    1
+    2
+    3
+}
+
+@setup schema
+test simple-union-order-by-1-desc {
+    SELECT 2 UNION SELECT 1 UNION SELECT 3 ORDER BY 1 DESC;
+}
+expect {
+    3
+    2
+    1
+}
+
+# ===== ORDER BY with alias =====
+
+@setup schema
+test union-order-by-alias {
+    SELECT a AS num, b AS name FROM t1
+    UNION
+    SELECT a, b FROM t2
+    ORDER BY num;
+}
+expect {
+    1|apple
+    2|banana
+    3|cherry
+    4|date
+    5|elderberry
+    6|fig
+    7|grape
+    8|honeydew
+}
+
+@setup schema
+test union-all-order-by-alias-desc {
+    SELECT a AS val, b AS label FROM t1
+    UNION ALL
+    SELECT a, b FROM t2
+    ORDER BY val DESC;
+}
+expect {
+    8|honeydew
+    7|grape
+    6|fig
+    5|elderberry
+    4|date
+    4|date
+    3|cherry
+    2|banana
+    2|banana
+    1|apple
+}
+
+# ===== ORDER BY with expressions in SELECT =====
+
+@setup schema
+test union-all-expressions-order-by {
+    SELECT a * 10 AS val FROM t1
+    UNION ALL
+    SELECT a * 10 FROM t2
+    ORDER BY 1;
+}
+expect {
+    10
+    20
+    20
+    30
+    40
+    40
+    50
+    60
+    70
+    80
+}
+
+# ===== Compound with NULLs + ORDER BY =====
+
+@setup schema
+test union-all-nulls-order-by {
+    SELECT a, b FROM t1
+    UNION ALL
+    SELECT NULL, NULL
+    ORDER BY 1;
+}
+expect {
+    |
+    1|apple
+    2|banana
+    3|cherry
+    4|date
+    5|elderberry
+}
+
+@setup schema
+test union-nulls-order-by-desc {
+    SELECT NULL AS a UNION SELECT 1 UNION SELECT 2 UNION SELECT NULL ORDER BY 1 DESC;
+}
+expect {
+    2
+    1
+
+}
+
+# ===== ORDER BY with WHERE in subselects =====
+
+@setup schema
+test union-all-where-order-by {
+    SELECT a, b FROM t1 WHERE a > 2
+    UNION ALL
+    SELECT a, b FROM t2 WHERE a < 7
+    ORDER BY 1;
+}
+expect {
+    2|banana
+    3|cherry
+    4|date
+    4|date
+    5|elderberry
+    6|fig
+}
+
+# ===== ORDER BY with three-way + LIMIT =====
+
+@setup schema
+test three-way-union-all-order-by-limit {
+    SELECT a, b FROM t1
+    UNION ALL
+    SELECT a, b FROM t2
+    UNION ALL
+    SELECT x, y FROM t3
+    ORDER BY 1
+    LIMIT 5;
+}
+expect {
+    1|apple
+    1|alpha
+    2|banana
+    2|banana
+    3|cherry
+}
+
+@setup schema
+test three-way-union-all-order-by-limit-offset {
+    SELECT a, b FROM t1
+    UNION ALL
+    SELECT a, b FROM t2
+    UNION ALL
+    SELECT x, y FROM t3
+    ORDER BY 1
+    LIMIT 3 OFFSET 5;
+}
+expect {
+    4|date
+    4|date
+    5|elderberry
+}
+
+# ===== EXCEPT order reversed =====
+
+@setup schema
+test except-reversed-order-by {
+    SELECT a, b FROM t2
+    EXCEPT
+    SELECT a, b FROM t1
+    ORDER BY 1;
+}
+expect {
+    6|fig
+    7|grape
+    8|honeydew
+}
+
+# ===== INTERSECT with three-way + ORDER BY =====
+
+@setup schema
+test intersect-union-order-by {
+    SELECT a FROM t1
+    INTERSECT
+    SELECT a FROM t2
+    UNION
+    SELECT x FROM t3
+    ORDER BY 1;
+}
+expect {
+    1
+    2
+    4
+    5
+    10
+}
+
+# ===== ORDER BY multiple columns with mixed ASC/DESC =====
+
+@setup schema
+test union-all-order-by-mixed-asc-desc {
+    SELECT a, b, c FROM t1
+    UNION ALL
+    SELECT a, b, c FROM t2
+    ORDER BY c ASC, b DESC;
+}
+expect {
+    1|apple|10
+    2|banana|20
+    2|banana|20
+    3|cherry|30
+    4|date|40
+    4|date|40
+    5|elderberry|50
+    6|fig|60
+    7|grape|70
+    8|honeydew|80
+}
+
+# ===== Compound select with subquery in FROM =====
+
+@setup schema
+test subquery-union-order-by {
+    SELECT * FROM (
+        SELECT a, b FROM t1
+        UNION
+        SELECT a, b FROM t2
+        ORDER BY 1
+    );
+}
+expect {
+    1|apple
+    2|banana
+    3|cherry
+    4|date
+    5|elderberry
+    6|fig
+    7|grape
+    8|honeydew
+}
+
+# ===== ORDER BY 1 with single-value selects =====
+
+@setup schema
+test union-literals-order-by {
+    SELECT 'c' UNION SELECT 'a' UNION SELECT 'b' ORDER BY 1;
+}
+expect {
+    a
+    b
+    c
+}
+
+@setup schema
+test union-all-literals-order-by-desc {
+    SELECT 'c' UNION ALL SELECT 'a' UNION ALL SELECT 'b' ORDER BY 1 DESC;
+}
+expect {
+    c
+    b
+    a
+}
+
+# ===== Large UNION ALL to verify stability =====
+
+@setup schema
+test union-all-many-order-by {
+    SELECT 5 AS v
+    UNION ALL SELECT 3
+    UNION ALL SELECT 7
+    UNION ALL SELECT 1
+    UNION ALL SELECT 9
+    UNION ALL SELECT 2
+    UNION ALL SELECT 8
+    UNION ALL SELECT 4
+    UNION ALL SELECT 6
+    UNION ALL SELECT 10
+    ORDER BY 1;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+    6
+    7
+    8
+    9
+    10
+}
+
+@setup schema
+test union-all-many-order-by-desc {
+    SELECT 5 AS v
+    UNION ALL SELECT 3
+    UNION ALL SELECT 7
+    UNION ALL SELECT 1
+    UNION ALL SELECT 9
+    UNION ALL SELECT 2
+    UNION ALL SELECT 8
+    UNION ALL SELECT 4
+    UNION ALL SELECT 6
+    UNION ALL SELECT 10
+    ORDER BY 1 DESC;
+}
+expect {
+    10
+    9
+    8
+    7
+    6
+    5
+    4
+    3
+    2
+    1
+}
+
+# ===== UNION with ORDER BY + LIMIT 0 =====
+
+@setup schema
+test union-order-by-limit-zero {
+    SELECT a FROM t1
+    UNION
+    SELECT a FROM t2
+    ORDER BY 1
+    LIMIT 0;
+}
+expect {
+}
+
+# ===== EXCEPT with ORDER BY + LIMIT =====
+
+@setup schema
+test except-order-by-limit-offset {
+    SELECT a, b FROM t1
+    EXCEPT
+    SELECT a, b FROM t2
+    ORDER BY 1
+    LIMIT 2 OFFSET 1;
+}
+expect {
+    3|cherry
+    5|elderberry
+}

@@ -31,7 +31,7 @@ INSERT [OR conflict_action] INTO table_name [(column_name [, ...])]
 | `conflict_action` | keyword | One of REPLACE, IGNORE, ABORT, ROLLBACK, or FAIL. Controls behavior on constraint violations |
 | `table_name` | identifier | The table to insert rows into |
 | `column_name` | identifier | Column to assign a value to. Unlisted columns receive their default value or NULL |
-| `expression` | expression | A value to insert. Must match the position or name of the target column |
+| `expression` | expression | A value to insert, or the keyword `DEFAULT` to use the column's default value. Must match the position or name of the target column |
 | `select_statement` | SELECT query | A query whose result rows are inserted into the table |
 | `result_column` | expression | Column or expression to return for each inserted row |
 
@@ -125,6 +125,37 @@ CREATE TABLE tasks (
 -- status, priority, and created_at use their defaults
 INSERT INTO tasks (title) VALUES ('Review pull request');
 ```
+
+## DEFAULT Keyword in VALUES
+
+<Info>
+**Turso extension** -- This feature follows the SQL standard (SQL:2016) but is not supported by SQLite.
+</Info>
+
+The `DEFAULT` keyword can be used in place of any value expression in a VALUES list. It resolves to the column's default value as defined in the CREATE TABLE statement, or NULL if no default is defined. This is particularly useful when inserting multiple rows where different rows need defaults for different columns -- something that cannot be achieved by simply omitting columns from the column list.
+
+```sql
+CREATE TABLE tasks (
+  id INTEGER PRIMARY KEY,
+  title TEXT NOT NULL,
+  status TEXT DEFAULT 'pending',
+  priority INTEGER DEFAULT 0
+);
+
+-- Use DEFAULT for specific columns
+INSERT INTO tasks (id, title, status, priority)
+VALUES (1, 'Fix bug', DEFAULT, 5);
+-- Inserts: (1, 'Fix bug', 'pending', 5)
+
+-- Different columns use DEFAULT in different rows
+INSERT INTO tasks (id, title, status, priority) VALUES
+  (2, 'Write docs', DEFAULT, 3),
+  (3, 'Code review', 'in_progress', DEFAULT);
+-- Inserts: (2, 'Write docs', 'pending', 3)
+--          (3, 'Code review', 'in_progress', 0)
+```
+
+The `DEFAULT` keyword is only valid inside INSERT VALUES lists. Using it in other contexts (SELECT, WHERE, UPDATE) produces an error.
 
 ## Conflict Handling
 

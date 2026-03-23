@@ -192,6 +192,19 @@ impl SelectStmt {
                 }
             }
         }
+        // Check compound arms' subquery expressions
+        for arm in &self.compounds {
+            for col in &arm.columns {
+                if let Some(reason) = col.expr.unordered_limit_reason() {
+                    return Some(reason);
+                }
+            }
+            if let Some(w) = &arm.where_clause {
+                if let Some(reason) = w.unordered_limit_reason() {
+                    return Some(reason);
+                }
+            }
+        }
         // Check ORDER BY expressions
         for item in &self.order_by {
             if let Some(reason) = item.expr.unordered_limit_reason() {
@@ -205,6 +218,12 @@ impl SelectStmt {
     /// with `ORDER BY` that doesn't include a unique column, meaning tie-breaking
     /// is engine-dependent.
     pub fn non_unique_order_by_reason(&self, schema: &Schema) -> Option<&'static str> {
+        // Compound SELECTs with LIMIT always flag as non-unique: ORDER BY uses
+        // positional indices so unique-column checking doesn't apply.
+        if self.limit.is_some() && !self.compounds.is_empty() {
+            return Some("compound_limit_non_unique_order_by");
+        }
+
         // Check THIS select: LIMIT + ORDER BY without a unique tiebreaker
         if self.limit.is_some()
             && !self.order_by.is_empty()
@@ -663,6 +682,61 @@ pub enum JoinConstraint {
     On(Expr),
 }
 
+/// A compound operator connecting two SELECT arms.
+#[derive(Debug, Clone, Copy)]
+pub enum CompoundOperator {
+    Union,
+    UnionAll,
+    Intersect,
+    Except,
+}
+
+impl fmt::Display for CompoundOperator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CompoundOperator::Union => write!(f, "UNION"),
+            CompoundOperator::UnionAll => write!(f, "UNION ALL"),
+            CompoundOperator::Intersect => write!(f, "INTERSECT"),
+            CompoundOperator::Except => write!(f, "EXCEPT"),
+        }
+    }
+}
+
+/// A compound SELECT arm (e.g. `UNION SELECT ...`).
+#[derive(Debug, Clone)]
+pub struct CompoundSelectArm {
+    pub operator: CompoundOperator,
+    pub distinct: bool,
+    pub columns: Vec<SelectColumn>,
+    pub from: Option<FromClause>,
+    pub where_clause: Option<Expr>,
+}
+
+impl fmt::Display for CompoundSelectArm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, " {} SELECT ", self.operator)?;
+        if self.distinct {
+            write!(f, "DISTINCT ")?;
+        }
+        for (i, col) in self.columns.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{col}")?;
+        }
+        if let Some(from) = &self.from {
+            write!(f, " FROM {}", from.table)?;
+            if let Some(alias) = &from.alias {
+                write!(f, " AS {alias}")?;
+            }
+        }
+        if let Some(where_clause) = &self.where_clause {
+            write!(f, " WHERE {where_clause}")?;
+        }
+        Ok(())
+    }
+}
+
 /// A SELECT statement.
 #[derive(Debug, Clone)]
 pub struct SelectStmt {
@@ -674,6 +748,8 @@ pub struct SelectStmt {
     pub joins: Vec<JoinClause>,
     pub where_clause: Option<Expr>,
     pub group_by: Option<GroupByClause>,
+    /// Compound arms (UNION/INTERSECT/EXCEPT) following the first SELECT core.
+    pub compounds: Vec<CompoundSelectArm>,
     pub order_by: Vec<OrderByItem>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
@@ -744,6 +820,10 @@ impl fmt::Display for SelectStmt {
             if let Some(having) = &group_by.having {
                 write!(f, " HAVING {having}")?;
             }
+        }
+
+        for arm in &self.compounds {
+            write!(f, "{arm}")?;
         }
 
         if !self.order_by.is_empty() {
@@ -1246,7 +1326,7 @@ pub enum TriggerStmt {
     Insert(InsertStmt),
     Update(UpdateStmt),
     Delete(DeleteStmt),
-    Select(SelectStmt),
+    Select(Box<SelectStmt>),
 }
 
 impl fmt::Display for TriggerStmt {
@@ -1942,6 +2022,7 @@ mod tests {
             joins: vec![],
             where_clause: None,
             group_by: None,
+            compounds: vec![],
             order_by: vec![],
             limit: Some(10),
             offset: None,
@@ -1969,6 +2050,7 @@ mod tests {
             joins: vec![],
             where_clause: None,
             group_by: None,
+            compounds: vec![],
             order_by: vec![],
             limit: None,
             offset: None,
@@ -1998,6 +2080,7 @@ mod tests {
             }],
             where_clause: None,
             group_by: None,
+            compounds: vec![],
             order_by: vec![],
             limit: None,
             offset: None,
@@ -2071,6 +2154,7 @@ mod tests {
             joins: vec![],
             where_clause: None,
             group_by: None,
+            compounds: vec![],
             order_by: vec![OrderByItem {
                 expr: Expr::Literal(Literal::Integer(1)),
                 direction: OrderDirection::Asc,
@@ -2102,6 +2186,7 @@ mod tests {
             joins: vec![],
             where_clause: None,
             group_by: None,
+            compounds: vec![],
             order_by: vec![OrderByItem {
                 expr: Expr::ColumnRef(ColumnRef {
                     table: None,
@@ -2136,6 +2221,7 @@ mod tests {
             joins: vec![],
             where_clause: None,
             group_by: None,
+            compounds: vec![],
             order_by: vec![OrderByItem {
                 expr: Expr::BinaryOp(Box::new(BinaryOpExpr {
                     left: Expr::ColumnRef(ColumnRef {
@@ -2154,6 +2240,7 @@ mod tests {
                         joins: vec![],
                         where_clause: None,
                         group_by: None,
+                        compounds: vec![],
                         order_by: vec![],
                         limit: Some(1),
                         offset: None,
@@ -2192,6 +2279,7 @@ mod tests {
             joins: vec![],
             where_clause: None,
             group_by: None,
+            compounds: vec![],
             order_by: vec![OrderByItem {
                 expr: Expr::Literal(Literal::Integer(1)),
                 direction: OrderDirection::Asc,
@@ -2224,6 +2312,7 @@ mod tests {
                 joins: vec![],
                 where_clause: None,
                 group_by: None,
+                compounds: vec![],
                 order_by: vec![],
                 limit: None,
                 offset: None,
@@ -2252,6 +2341,7 @@ mod tests {
                         joins: vec![],
                         where_clause: None,
                         group_by: None,
+                        compounds: vec![],
                         order_by: vec![],
                         limit: None,
                         offset: None,
@@ -2272,6 +2362,7 @@ mod tests {
                         joins: vec![],
                         where_clause: None,
                         group_by: None,
+                        compounds: vec![],
                         order_by: vec![],
                         limit: None,
                         offset: None,
@@ -2305,6 +2396,7 @@ mod tests {
                         joins: vec![],
                         where_clause: None,
                         group_by: None,
+                        compounds: vec![],
                         order_by: vec![],
                         limit: None,
                         offset: None,
@@ -2320,6 +2412,7 @@ mod tests {
             joins: vec![],
             where_clause: None,
             group_by: None,
+            compounds: vec![],
             order_by: vec![],
             limit: None,
             offset: None,
@@ -2351,6 +2444,7 @@ mod tests {
                         joins: vec![],
                         where_clause: None,
                         group_by: None,
+                        compounds: vec![],
                         order_by: vec![],
                         limit: None,
                         offset: None,
@@ -2402,6 +2496,7 @@ mod tests {
                         joins: vec![],
                         where_clause: None,
                         group_by: None,
+                        compounds: vec![],
                         order_by: vec![],
                         limit: Some(5),
                         offset: None,
@@ -2417,6 +2512,7 @@ mod tests {
             joins: vec![],
             where_clause: None,
             group_by: None,
+            compounds: vec![],
             order_by: vec![],
             limit: None,
             offset: None,
@@ -2459,6 +2555,7 @@ mod tests {
             joins: vec![],
             where_clause: None,
             group_by: None,
+            compounds: vec![],
             order_by: vec![OrderByItem {
                 expr: Expr::ColumnRef(ColumnRef {
                     table: None,
@@ -2506,6 +2603,7 @@ mod tests {
             joins: vec![],
             where_clause: None,
             group_by: None,
+            compounds: vec![],
             order_by: vec![OrderByItem {
                 expr: Expr::ColumnRef(ColumnRef {
                     table: None,
@@ -2556,6 +2654,7 @@ mod tests {
             joins: vec![],
             where_clause: None,
             group_by: None,
+            compounds: vec![],
             order_by: vec![OrderByItem {
                 expr: Expr::ColumnRef(ColumnRef {
                     table: None,
@@ -2580,6 +2679,7 @@ mod tests {
             joins: vec![],
             where_clause: Some(Expr::Subquery(Box::new(inner))),
             group_by: None,
+            compounds: vec![],
             order_by: vec![],
             limit: None,
             offset: None,
