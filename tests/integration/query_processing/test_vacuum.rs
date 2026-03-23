@@ -2016,6 +2016,8 @@ fn test_plain_vacuum_concurrent_successful_writes_survive(
     }
     setup_conn.execute("COMMIT")?;
 
+    drop(setup_conn);
+
     let db = Arc::clone(&tmp_db.db);
     let vacuum_started = Arc::new(AtomicBool::new(false));
     let vacuum_done = Arc::new(AtomicBool::new(false));
