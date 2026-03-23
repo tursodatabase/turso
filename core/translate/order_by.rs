@@ -294,7 +294,11 @@ impl EmitOrderBy {
             let mut comparators: Vec<Option<SortComparatorType>> = order_by
                 .iter()
                 .map(|sorted_column| {
-                    custom_type_comparator(&sorted_column.expr, referenced_tables, t_ctx.resolver.schema())
+                    custom_type_comparator(
+                        &sorted_column.expr,
+                        referenced_tables,
+                        t_ctx.resolver.schema(),
+                    )
                 })
                 .collect();
 
