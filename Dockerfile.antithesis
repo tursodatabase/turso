@@ -51,7 +51,7 @@ FROM chef AS builder
 ARG antithesis=true
 
 RUN apt-get update && apt-get install -y pip && rm -rf /var/lib/apt/lists/*
-RUN pip install maturin
+RUN pip install --break-system-packages maturin
 
 # Antithesis instrumentation library
 ADD https://antithesis.com/assets/instrumentation/libvoidstar.so /opt/antithesis/libvoidstar.so
@@ -117,7 +117,7 @@ RUN make
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y bash curl xz-utils python3 procps sqlite3 bc binutils pip rust-gdb && rm -rf /var/lib/apt/lists/*
-RUN pip install antithesis
+RUN pip install --break-system-packages antithesis
 
 WORKDIR /app
 EXPOSE 8080
@@ -129,7 +129,7 @@ COPY testing/stress/docker-entrypoint.sh /bin
 RUN chmod +x /bin/docker-entrypoint.sh
 
 COPY --from=builder /app/target/wheels/* /tmp
-RUN pip install /tmp/*.whl
+RUN pip install --break-system-packages /tmp/*.whl
 
 WORKDIR /app
 COPY ./testing/antithesis/bank-test/*.py /opt/antithesis/test/v1/bank-test/
