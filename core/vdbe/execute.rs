@@ -173,6 +173,19 @@ macro_rules! check_arg_count {
 pub type InsnFunction =
     fn(&Program, &mut ProgramState, &Insn, &Arc<Pager>) -> Result<InsnFunctionStepResult>;
 
+/// Format a slice of u64 as space-separated string without intermediate Vec allocation.
+fn join_u64_space_separated(vals: &[u64]) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    for (i, v) in vals.iter().enumerate() {
+        if i > 0 {
+            s.push(' ');
+        }
+        write!(s, "{v}").unwrap();
+    }
+    s
+}
+
 /// Parse a Value (text, int, float, or blob) into a BigDecimal.
 fn value_to_bigdecimal(val: &Value) -> Result<bigdecimal::BigDecimal> {
     use bigdecimal::BigDecimal;
@@ -6883,53 +6896,100 @@ pub fn op_function(
                 );
             }
             ScalarFunc::StatInit => {
-                // stat_init(n_col): Initialize a statistics accumulator
-                // Returns a blob containing the serialized StatAccum
+                // stat_init(n_col[, estimated_rows]): Initialize a statistics accumulator.
+                // Stored directly in ProgramState to avoid serialize/deserialize per row.
                 assert!(arg_count >= 1);
                 let n_col = match state.registers[*start_reg].get_value() {
                     Value::Numeric(Numeric::Integer(n)) => *n as usize,
                     _ => 0,
                 };
-                let accum = StatAccum::new(n_col);
-                state.registers[*dest].set_blob(accum.to_bytes());
+                let accum = if arg_count >= 2 {
+                    let estimated_rows = match state.registers[*start_reg + 1].get_value() {
+                        Value::Numeric(Numeric::Integer(n)) => *n as u64,
+                        _ => 0,
+                    };
+                    StatAccum::new_with_stat4(n_col, estimated_rows)
+                } else {
+                    StatAccum::new(n_col)
+                };
+                state.stat_accums.insert(*dest, accum);
             }
             ScalarFunc::StatPush => {
-                // stat_push(accum_blob, i_chng): Push a row into the accumulator
-                // i_chng is the index of the leftmost column that changed from the previous row
-                // Returns the updated accumulator blob
+                // stat_push(accum_reg, i_chng[, sample_record_blob]): Push a row.
+                // Mutates the StatAccum in-place (no serialization).
                 assert!(arg_count >= 2);
-                let accum_blob = state.registers[*start_reg].get_value();
                 let i_chng = match state.registers[*start_reg + 1].get_value() {
                     Value::Numeric(Numeric::Integer(n)) => *n as usize,
                     _ => 0,
                 };
-                let result = match accum_blob {
-                    Value::Blob(bytes) => {
-                        if let Some(mut accum) = StatAccum::from_bytes(bytes) {
-                            accum.push(i_chng);
-                            Value::Blob(accum.to_bytes())
+                let key = if arg_count >= 3 {
+                    match state.registers[*start_reg + 2].get_value() {
+                        Value::Blob(b) => Some(b.clone()),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let accum = state
+                    .stat_accums
+                    .get_mut(start_reg)
+                    .expect("StatPush: no accumulator at start_reg (StatInit not called?)");
+                accum.push(i_chng, key);
+            }
+            ScalarFunc::StatGet => {
+                // stat_get(accum_reg[, mode[, sample_idx]]): Get statistics.
+                // mode 0 (default): stat1 string
+                // mode 1: sample count (integer) — also finalizes stat4
+                // mode 2-5: per-sample neq/nlt/ndlt/blob
+                assert!(arg_count >= 1);
+                let mode = if arg_count >= 2 {
+                    match state.registers[*start_reg + 1].get_value() {
+                        Value::Numeric(Numeric::Integer(n)) => *n as usize,
+                        _ => 0,
+                    }
+                } else {
+                    0
+                };
+                let sample_idx = if arg_count >= 3 {
+                    match state.registers[*start_reg + 2].get_value() {
+                        Value::Numeric(Numeric::Integer(n)) => *n as usize,
+                        _ => 0,
+                    }
+                } else {
+                    0
+                };
+                let accum = state
+                    .stat_accums
+                    .get_mut(start_reg)
+                    .expect("StatGet: no accumulator at start_reg (StatInit not called?)");
+                let result = match mode {
+                    0 => {
+                        let stat_str = accum.get_stat1();
+                        if stat_str.is_empty() {
+                            Value::Null
+                        } else {
+                            Value::build_text(stat_str)
+                        }
+                    }
+                    1 => {
+                        accum.finalize_stat4();
+                        Value::from_i64(accum.stat4_sample_count() as i64)
+                    }
+                    2..=4 => {
+                        if let Some(s) = accum.get_stat4_sample(sample_idx) {
+                            let vals = match mode {
+                                2 => &s.n_eq,
+                                3 => &s.n_lt,
+                                _ => &s.n_distinct_lt,
+                            };
+                            Value::build_text(join_u64_space_separated(vals))
                         } else {
                             Value::Null
                         }
                     }
-                    _ => Value::Null,
-                };
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::StatGet => {
-                // stat_get(accum_blob): Get the stat1 string from the accumulator
-                // Returns the stat string "total avg1 avg2 ..."
-                assert!(arg_count >= 1);
-                let accum_blob = state.registers[*start_reg].get_value();
-                let result = match accum_blob {
-                    Value::Blob(bytes) => {
-                        if let Some(accum) = StatAccum::from_bytes(bytes) {
-                            let stat_str = accum.get_stat1();
-                            if stat_str.is_empty() {
-                                Value::Null
-                            } else {
-                                Value::build_text(stat_str)
-                            }
+                    5 => {
+                        if let Some(s) = accum.get_stat4_sample(sample_idx) {
+                            Value::Blob(s.key.clone())
                         } else {
                             Value::Null
                         }

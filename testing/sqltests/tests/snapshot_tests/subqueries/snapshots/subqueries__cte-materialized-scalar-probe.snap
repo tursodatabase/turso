@@ -61,7 +61,7 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--CORRELATED SCALAR SUBQUERY 1
+|--SCALAR SUBQUERY 1
 |  |--SCALAR SUBQUERY 2
 |  |  |--SCAN sample_points
 |  |  |--USE HASH TABLE FOR DISTINCT
@@ -73,7 +73,7 @@ QUERY PLAN
 |  |--SCAN previous_points
 |  |--SCAN window_subquery_0
 |  |  `--SCAN run_markers
-|  `--SEARCH run_ids USING INDEX ephemeral_subquery_t63 (point_key=?)
+|  `--SCAN run_ids
 `--SCAN run_lengths
    |--SCAN run_ids
    `--USE SORTER FOR GROUP BY

@@ -41,11 +41,11 @@ use constraints::{
 };
 use cost::Cost;
 use join::{compute_best_join_order_with_context, BestJoinOrderResult, JoinPlanningContext};
-use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
 use order::{
     compute_order_target, plan_satisfies_order_target, simple_aggregate_order_target,
     EliminatesSortBy, OrderTargetPurpose,
 };
+use rewrite_rules::{decompose_cross_table_ors, lift_common_subexpressions_from_binary_or_terms};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
@@ -68,9 +68,11 @@ pub(crate) mod constraints;
 pub(crate) mod cost;
 mod cost_params;
 pub(crate) mod join;
-pub(crate) mod lift_common_subexpressions;
 pub(crate) mod multi_index;
 pub(crate) mod order;
+mod rewrite_rules;
+mod selectivity;
+mod transitive_equalities;
 pub(crate) mod unnest;
 
 /// A candidate index method that could be used for table access in a join query.
@@ -642,6 +644,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
     }
     optimize_subqueries(plan, schema)?;
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
+    decompose_cross_table_ors(&mut plan.where_clause);
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
     {
@@ -715,6 +718,7 @@ fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
     transform_match_to_fts_match(&mut plan.where_clause, schema, &plan.table_references)?;
 
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
+    decompose_cross_table_ors(&mut plan.where_clause);
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
     {
@@ -753,6 +757,7 @@ fn optimize_update_plan(
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, schema, &plan.table_references)?;
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
+    decompose_cross_table_ors(&mut plan.where_clause);
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
     {
@@ -1109,7 +1114,7 @@ fn reoptimize_correlated_subqueries(plan: &mut SelectPlan, schema: &Schema) -> R
     };
 
     for subquery in &mut plan.non_from_clause_subqueries {
-        if !subquery.correlated {
+        if !subquery.outer_scope_dependency {
             continue;
         }
         let SubqueryState::Unevaluated {
@@ -1320,7 +1325,8 @@ fn base_row_estimate(
 ) -> RowCountEstimate {
     match &table.table {
         Table::BTree(btree) => {
-            if let Some(stats) = schema.analyze_stats.table_stats(&btree.name) {
+            let stats_lookup = schema.analyze_stats.table_stats(&btree.name);
+            if let Some(stats) = stats_lookup {
                 if let Some(rows) = stats.row_count.or_else(|| {
                     stats
                         .index_stats
@@ -1543,6 +1549,33 @@ fn enforce_indexed_by_hints(
     Ok(())
 }
 
+/// Compute available constraints from the WHERE clause,
+/// and then enforce INDEXED BY / NOT INDEXED if provided
+/// in the statement.
+fn constraints_with_indexed_by_hints(
+    where_clause: &[WhereTerm],
+    table_references: &TableReferences,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    subqueries: &[NonFromClauseSubquery],
+    schema: &Schema,
+    params: &cost_params::CostModelParams,
+) -> Result<Vec<TableConstraints>> {
+    let mut constraints_per_table = constraints_from_where_clause(
+        where_clause,
+        table_references,
+        available_indexes,
+        subqueries,
+        schema,
+        params,
+    )?;
+    enforce_indexed_by_hints(
+        table_references,
+        available_indexes,
+        &mut constraints_per_table,
+    )?;
+    Ok(constraints_per_table)
+}
+
 /// Optimize the join order and index selection for a query.
 ///
 /// This function does the following:
@@ -1560,7 +1593,7 @@ fn optimize_table_access(
     result_columns: &mut [ResultSetColumn],
     table_references: &mut TableReferences,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
-    where_clause: &mut [WhereTerm],
+    where_clause: &mut Vec<WhereTerm>,
     order_by: &mut Vec<(Box<ast::Expr>, SortOrder)>,
     group_by: &mut Option<GroupBy>,
     simple_aggregate: Option<&SimpleAggregate>,
@@ -1653,20 +1686,13 @@ fn optimize_table_access(
     let maybe_order_target = simple_aggregate
         .and_then(|sa| simple_aggregate_order_target(sa, table_references))
         .or_else(|| compute_order_target(order_by, group_by.as_mut(), table_references));
-    let mut constraints_per_table = constraints_from_where_clause(
+    let mut constraints_per_table = constraints_with_indexed_by_hints(
         where_clause,
         table_references,
         available_indexes,
         subqueries,
         schema,
         params,
-    )?;
-
-    // Enforce INDEXED BY / NOT INDEXED hints on constraint candidates.
-    enforce_indexed_by_hints(
-        table_references,
-        available_indexes,
-        &mut constraints_per_table,
     )?;
 
     let base_table_rows = table_references
@@ -1732,7 +1758,7 @@ fn optimize_table_access(
         if !outer_join_rewritten {
             break;
         }
-        constraints_per_table = constraints_from_where_clause(
+        constraints_per_table = constraints_with_indexed_by_hints(
             where_clause,
             table_references,
             available_indexes,
@@ -1740,10 +1766,22 @@ fn optimize_table_access(
             schema,
             params,
         )?;
-        enforce_indexed_by_hints(
+    }
+
+    let transitive_synthetic_whereterms_start = where_clause.len();
+    let transitive_count =
+        transitive_equalities::add_transitive_equalities(where_clause, table_references);
+    let transitive_synthetic_whereterms_end = where_clause.len();
+    let constant_prop_count =
+        transitive_equalities::add_constant_propagation(where_clause, table_references);
+    if transitive_count + constant_prop_count > 0 {
+        constraints_per_table = constraints_with_indexed_by_hints(
+            where_clause,
             table_references,
             available_indexes,
-            &mut constraints_per_table,
+            subqueries,
+            schema,
+            params,
         )?;
     }
 
@@ -2367,6 +2405,21 @@ fn optimize_table_access(
         if !has_prior_constraints {
             hash_join_op.materialize_build_input = false;
         }
+    }
+
+    // Mark synthetic transitive-equality terms (col=col) as consumed so the
+    // emitter never evaluates them at runtime. They are always redundant
+    // (implied by the original column equalities). We can't truncate because
+    // Constraint objects hold where_clause_pos indices into these entries.
+    //
+    // Constant-propagation terms (col=const) are NOT blanket-consumed here:
+    // they carry new information and must be evaluated at runtime (either via
+    // index seek or residual filter) to preserve correctness.
+    for term in where_clause
+        [transitive_synthetic_whereterms_start..transitive_synthetic_whereterms_end]
+        .iter_mut()
+    {
+        term.consumed = true;
     }
 
     Ok(Some(OptimizeTableAccessResult {

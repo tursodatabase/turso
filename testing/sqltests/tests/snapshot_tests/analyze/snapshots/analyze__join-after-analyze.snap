@@ -35,7 +35,7 @@ addr  opcode          p1  p2  p3  p4          p5  comment
   11    FilterAdd      2   4   1               0  bloom_filter_add(r[4..5])
   12    IdxInsert      2   7   4               0  key=r[7]
   13  Next             1   7   0               0
-  14  RowId            0   8   0               0  r[8]=customers.rowid
+  14  Integer          2   8   0               0  r[8]=2
   15  Filter           2  24   8               1  if !bloom_filter(r[8..9]) goto 24
   16  SeekGE           2  24   8               0  key=[8..8]
   17    IdxGT          2  24   8               0  key=[8..8]

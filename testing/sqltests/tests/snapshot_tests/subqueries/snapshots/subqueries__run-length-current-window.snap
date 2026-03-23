@@ -77,7 +77,7 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--CORRELATED SCALAR SUBQUERY 1
+|--SCALAR SUBQUERY 1
 |  |--SCALAR SUBQUERY 2
 |  |  |--SCAN subquery_0
 |  |  |  `--COMPOUND QUERY
@@ -102,7 +102,7 @@ QUERY PLAN
 |  |--SCAN prior_days
 |  |--SCAN window_subquery_0
 |  |  `--SCAN run_boundaries
-|  `--SEARCH run_ids USING INDEX ephemeral_subquery_t111 (signal_day=?)
+|  `--SCAN run_ids
 `--SCAN run_lengths
    |--SCAN run_ids
    `--USE SORTER FOR GROUP BY

@@ -11,72 +11,137 @@ QUERY PLAN
 
 
 BYTECODE
-addr  opcode       p1  p2  p3  p4                  p5  comment
-   0  Init          0  60   0                       0  Start at 60
-   1  Null          0   1   0                       0  r[1]=NULL
-   2  OpenWrite     0   5   0                       0  root=5; iDb=0
-   3  Rewind        0  10   0                       0  Rewind  sqlite_stat1
-   4      Column    0   0   2                       0  r[2]=sqlite_stat1.tbl
-   5      Ne        2   3   9                       0  if r[2]!=r[3] goto 9
-   6      RowId     0   4   0                       0  r[4]=sqlite_stat1.rowid
-   7      Delete    0   0   0  sqlite_stat1         0
-   8    Next        0   4   0                       0
-   9  Next          0   4   0                       0
-  10  OpenRead      1   2   0  k(3,B,B,B)           0  =items, root=2, iDb=0
-  11  Count         1  10   0                       0
-  12  IfNot        10  19   0                       0  if !r[10] goto 19
-  13  Null          0   7   0                       0  r[7]=NULL
-  14  Copy         10   8   0                       0  r[8]=r[10]
-  15  Cast          8   0   0                       0  affinity(r[8]=Text)
-  16  MakeRecord    6   3   9                       0  r[9]=mkrec(r[6..8])
-  17  NewRowid      0   5   0                       0  r[5]=rowid
-  18  Insert        0   9   5  sqlite_stat1         0  intkey=r[5] data=r[9]
-  19  OpenRead      2   4   0  k(2,B)               0  =idx_items_category, root=4, iDb=0
-  20  Integer       1  12   0                       0  r[12]=1
-  21  Function      0  12  11  stat_init            0  r[11]=func(r[12])
-  22  Rewind        2  39   0                       0  Rewind  idx_items_category
-  23  Integer       0  12   0                       0  r[12]=0
-  24  Goto          0  30   0                       0
-  25    Integer     0  12   0                       0  r[12]=0
-  26    Column      2   0  14                       0  r[14]=idx_items_category.category
-  27    Ne         14  13  30                       0  if r[14]!=r[13] goto 30
-  28    Integer     1  12   0                       0  r[12]=1
-  29    Goto        0  31   0                       0
-  30    Column      2   0  13                       0  r[13]=idx_items_category.category
-  31    Function    0  11  11  stat_push            0  r[11]=func(r[11..12])
-  32  Next          2  25   0                       0
-  33  Function      0  11  15  stat_get             0  r[15]=func(r[11])
-  34  IsNull       15  39   0                       0  if (r[15]==NULL) goto 39
-  35  Copy         15  18   0                       0  r[18]=r[15]
-  36  MakeRecord   16   3  19                       0  r[19]=mkrec(r[16..18])
-  37  NewRowid      0  20   0                       0  r[20]=rowid
-  38  Insert        0  19  20  sqlite_stat1         0  intkey=r[20] data=r[19]
-  39  OpenRead      3   3   0  k(2,B)               0  =idx_items_name, root=3, iDb=0
-  40  Integer       1  22   0                       0  r[22]=1
-  41  Function      0  22  21  stat_init            0  r[21]=func(r[22])
-  42  Rewind        3  59   0                       0  Rewind  idx_items_name
-  43  Integer       0  22   0                       0  r[22]=0
-  44  Goto          0  50   0                       0
-  45    Integer     0  22   0                       0  r[22]=0
-  46    Column      3   0  24                       0  r[24]=idx_items_name.name
-  47    Ne         24  23  50                       0  if r[24]!=r[23] goto 50
-  48    Integer     1  22   0                       0  r[22]=1
-  49    Goto        0  51   0                       0
-  50    Column      3   0  23                       0  r[23]=idx_items_name.name
-  51    Function    0  21  21  stat_push            0  r[21]=func(r[21..22])
-  52  Next          3  45   0                       0
-  53  Function      0  21  25  stat_get             0  r[25]=func(r[21])
-  54  IsNull       25  59   0                       0  if (r[25]==NULL) goto 59
-  55  Copy         25  28   0                       0  r[28]=r[25]
-  56  MakeRecord   26   3  29                       0  r[29]=mkrec(r[26..28])
-  57  NewRowid      0  30   0                       0  r[30]=rowid
-  58  Insert        0  29  30  sqlite_stat1         0  intkey=r[30] data=r[29]
-  59  Halt          0   0   0                       0
-  60  Transaction   0   2   4                       0  iDb=0 tx_mode=Write
-  61  String8       0   3   0  items                0  r[3]='items'
-  62  String8       0   6   0  items                0  r[6]='items'
-  63  String8       0  16   0  items                0  r[16]='items'
-  64  String8       0  17   0  idx_items_category   0  r[17]='idx_items_category'
-  65  String8       0  26   0  items                0  r[26]='items'
-  66  String8       0  27   0  idx_items_name       0  r[27]='idx_items_name'
-  67  Goto          0   1   0                       0
+addr  opcode        p1   p2   p3  p4                  p5  comment
+   0  Init           0  120    0                       0  Start at 120
+   1  Null           0    1    0                       0  r[1]=NULL
+   2  OpenWrite      0    5    0                       0  root=5; iDb=0
+   3  OpenWrite      1    6    0                       0  root=6; iDb=0
+   4  Rewind         0   11    0                       0  Rewind  sqlite_stat1
+   5      Column     0    0    2                       0  r[2]=sqlite_stat1.tbl
+   6      Ne         2    3   10                       0  if r[2]!=r[3] goto 10
+   7      RowId      0    4    0                       0  r[4]=sqlite_stat1.rowid
+   8      Delete     0    0    0  sqlite_stat1         0
+   9    Next         0    5    0                       0
+  10  Next           0    5    0                       0
+  11  Rewind         1   18    0                       0  Rewind  sqlite_stat4
+  12      Column     1    0    5                       0  r[5]=sqlite_stat4.tbl
+  13      Ne         5    6   17                       0  if r[5]!=r[6] goto 17
+  14      RowId      1    7    0                       0  r[7]=sqlite_stat4.rowid
+  15      Delete     1    0    0  sqlite_stat4         0
+  16    Next         1   12    0                       0
+  17  Next           1   12    0                       0
+  18  OpenRead       2    2    0  k(3,B,B,B)           0  =items, root=2, iDb=0
+  19  Count          2   13    0                       0
+  20  IfNot         13   27    0                       0  if !r[13] goto 27
+  21  Null           0   10    0                       0  r[10]=NULL
+  22  Copy          13   11    0                       0  r[11]=r[13]
+  23  Cast          11    0    0                       0  affinity(r[11]=Text)
+  24  MakeRecord     9    3   12                       0  r[12]=mkrec(r[9..11])
+  25  NewRowid       0    8    0                       0  r[8]=rowid
+  26  Insert         0   12    8  sqlite_stat1         0  intkey=r[8] data=r[12]
+  27  OpenRead       3    4    0  k(2,B)               0  =idx_items_category, root=4, iDb=0
+  28  Integer        1   19    0                       0  r[19]=1
+  29  Copy          13   20    0                       0  r[20]=r[13]
+  30  Function       0   19   14  stat_init            0  r[14]=func(r[19..20])
+  31  Rewind         3   73    0                       0  Rewind  idx_items_category
+  32  Integer        0   15    0                       0  r[15]=0
+  33  Goto           0   39    0                       0
+  34    Integer      0   15    0                       0  r[15]=0
+  35    Column       3    0   18                       0  r[18]=idx_items_category.category
+  36    Ne          18   17   39                       0  if r[18]!=r[17] goto 39
+  37    Integer      1   15    0                       0  r[15]=1
+  38    Goto         0   40    0                       0
+  39    Column       3    0   17                       0  r[17]=idx_items_category.category
+  40    Column       3    1   21                       0  r[21]=idx_items_category.column 1
+  41    Copy        17   22    0                       0  r[22]=r[17]
+  42    Copy        21   23    0                       0  r[23]=r[21]
+  43    MakeRecord  22    2   16                       0  r[16]=mkrec(r[22..23])
+  44    Function     0   14   14  stat_push            0  r[14]=func(r[14..16])
+  45  Next           3   34    0                       0
+  46  Function       0   14   24  stat_get             0  r[24]=func(r[14])
+  47  IsNull        24   73    0                       0  if (r[24]==NULL) goto 73
+  48  Copy          24   27    0                       0  r[27]=r[24]
+  49  MakeRecord    25    3   28                       0  r[28]=mkrec(r[25..27])
+  50  NewRowid       0   29    0                       0  r[29]=rowid
+  51  Insert         0   28   29  sqlite_stat1         0  intkey=r[29] data=r[28]
+  52  Integer        1   15    0                       0  r[15]=1
+  53  Function       0   14   30  stat_get             0  r[30]=func(r[14..15])
+  54  Integer        0   16    0                       0  r[16]=0
+  55  Ge            16   30   73                       0  if r[16]>=r[30] goto 73
+  56  Integer        2   15    0                       0  r[15]=2
+  57  Function       0   14   31  stat_get             0  r[31]=func(r[14..16])
+  58  Integer        3   15    0                       0  r[15]=3
+  59  Function       0   14   32  stat_get             0  r[32]=func(r[14..16])
+  60  Integer        4   15    0                       0  r[15]=4
+  61  Function       0   14   33  stat_get             0  r[33]=func(r[14..16])
+  62  Integer        5   15    0                       0  r[15]=5
+  63  Function       0   14   34  stat_get             0  r[34]=func(r[14..16])
+  64  Copy          31   37    0                       0  r[37]=r[31]
+  65  Copy          32   38    0                       0  r[38]=r[32]
+  66  Copy          33   39    0                       0  r[39]=r[33]
+  67  Copy          34   40    0                       0  r[40]=r[34]
+  68  MakeRecord    35    6   41                       0  r[41]=mkrec(r[35..40])
+  69  NewRowid       1   42    0                       0  r[42]=rowid
+  70  Insert         1   41   42  sqlite_stat4         0  intkey=r[42] data=r[41]
+  71  AddImm        16    1    0                       0  r[16]=r[16]+1
+  72  Goto           0   55    0                       0
+  73  OpenRead       4    3    0  k(2,B)               0  =idx_items_name, root=3, iDb=0
+  74  Integer        1   48    0                       0  r[48]=1
+  75  Copy          13   49    0                       0  r[49]=r[13]
+  76  Function       0   48   43  stat_init            0  r[43]=func(r[48..49])
+  77  Rewind         4  119    0                       0  Rewind  idx_items_name
+  78  Integer        0   44    0                       0  r[44]=0
+  79  Goto           0   85    0                       0
+  80    Integer      0   44    0                       0  r[44]=0
+  81    Column       4    0   47                       0  r[47]=idx_items_name.name
+  82    Ne          47   46   85                       0  if r[47]!=r[46] goto 85
+  83    Integer      1   44    0                       0  r[44]=1
+  84    Goto         0   86    0                       0
+  85    Column       4    0   46                       0  r[46]=idx_items_name.name
+  86    Column       4    1   50                       0  r[50]=idx_items_name.column 1
+  87    Copy        46   51    0                       0  r[51]=r[46]
+  88    Copy        50   52    0                       0  r[52]=r[50]
+  89    MakeRecord  51    2   45                       0  r[45]=mkrec(r[51..52])
+  90    Function     0   43   43  stat_push            0  r[43]=func(r[43..45])
+  91  Next           4   80    0                       0
+  92  Function       0   43   53  stat_get             0  r[53]=func(r[43])
+  93  IsNull        53  119    0                       0  if (r[53]==NULL) goto 119
+  94  Copy          53   56    0                       0  r[56]=r[53]
+  95  MakeRecord    54    3   57                       0  r[57]=mkrec(r[54..56])
+  96  NewRowid       0   58    0                       0  r[58]=rowid
+  97  Insert         0   57   58  sqlite_stat1         0  intkey=r[58] data=r[57]
+  98  Integer        1   44    0                       0  r[44]=1
+  99  Function       0   43   59  stat_get             0  r[59]=func(r[43..44])
+ 100  Integer        0   45    0                       0  r[45]=0
+ 101  Ge            45   59  119                       0  if r[45]>=r[59] goto 119
+ 102  Integer        2   44    0                       0  r[44]=2
+ 103  Function       0   43   60  stat_get             0  r[60]=func(r[43..45])
+ 104  Integer        3   44    0                       0  r[44]=3
+ 105  Function       0   43   61  stat_get             0  r[61]=func(r[43..45])
+ 106  Integer        4   44    0                       0  r[44]=4
+ 107  Function       0   43   62  stat_get             0  r[62]=func(r[43..45])
+ 108  Integer        5   44    0                       0  r[44]=5
+ 109  Function       0   43   63  stat_get             0  r[63]=func(r[43..45])
+ 110  Copy          60   66    0                       0  r[66]=r[60]
+ 111  Copy          61   67    0                       0  r[67]=r[61]
+ 112  Copy          62   68    0                       0  r[68]=r[62]
+ 113  Copy          63   69    0                       0  r[69]=r[63]
+ 114  MakeRecord    64    6   70                       0  r[70]=mkrec(r[64..69])
+ 115  NewRowid       1   71    0                       0  r[71]=rowid
+ 116  Insert         1   70   71  sqlite_stat4         0  intkey=r[71] data=r[70]
+ 117  AddImm        45    1    0                       0  r[45]=r[45]+1
+ 118  Goto           0  101    0                       0
+ 119  Halt           0    0    0                       0
+ 120  Transaction    0    2    4                       0  iDb=0 tx_mode=Write
+ 121  String8        0    3    0  items                0  r[3]='items'
+ 122  String8        0    6    0  items                0  r[6]='items'
+ 123  String8        0    9    0  items                0  r[9]='items'
+ 124  String8        0   25    0  items                0  r[25]='items'
+ 125  String8        0   26    0  idx_items_category   0  r[26]='idx_items_category'
+ 126  String8        0   35    0  items                0  r[35]='items'
+ 127  String8        0   36    0  idx_items_category   0  r[36]='idx_items_category'
+ 128  String8        0   54    0  items                0  r[54]='items'
+ 129  String8        0   55    0  idx_items_name       0  r[55]='idx_items_name'
+ 130  String8        0   64    0  items                0  r[64]='items'
+ 131  String8        0   65    0  idx_items_name       0  r[65]='idx_items_name'
+ 132  Goto           0    1    0                       0

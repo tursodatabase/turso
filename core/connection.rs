@@ -487,8 +487,8 @@ impl Connection {
             }
         }
 
-        // Best-effort load stats if sqlite_stat1 is present and DB is initialized.
-        refresh_analyze_stats(self);
+        // Load stats if sqlite_stat1/sqlite_stat4 are present and DB is initialized.
+        refresh_analyze_stats(self)?;
 
         tracing::debug!(
             "reparse_schema: schema_version={}, tables={:?}",

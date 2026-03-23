@@ -1,11 +1,15 @@
 use crate::schema::Index;
-use crate::stats::AnalyzeStats;
+use crate::stats::{self, AnalyzeStats};
 use crate::sync::Arc;
 use crate::translate::optimizer::constraints::RangeConstraintRef;
-use crate::translate::plan::JoinedTable;
+use crate::translate::plan::{JoinedTable, WhereTerm};
+use crate::Value;
+
+use smallvec::SmallVec;
 
 use super::constraints::Constraint;
 use super::cost_params::CostModelParams;
+use super::selectivity::{closed_range_selectivity, dampened_product};
 
 /// A simple newtype wrapper over a f64 that represents the cost of an operation.
 ///
@@ -75,26 +79,21 @@ pub fn rows_per_leaf_page_for_index(
     )
 }
 
+/// IO cost for `num_scans` passes over `pages`, where the first scan is cold
+/// and subsequent scans benefit from the buffer pool.
+fn cached_io_cost(pages: f64, num_scans: f64, cache_reuse_factor: f64) -> f64 {
+    if num_scans <= 1.0 {
+        pages
+    } else {
+        pages + (num_scans - 1.0) * pages * cache_reuse_factor
+    }
+}
+
 /// Estimate IO and CPU cost for a full table scan.
-///
-/// # Arguments
-/// * `base_row_count` - Total rows in the table
-/// * `num_scans` - Number of times we scan the table (e.g., from outer loop in nested loop join)
-/// * `params` - Cost model parameters
 fn estimate_scan_cost(base_row_count: f64, num_scans: f64, params: &CostModelParams) -> Cost {
     let table_pages = (base_row_count / params.rows_per_table_page).max(1.0);
-
-    // First scan reads all pages; subsequent scans benefit from caching
-    let io_cost = if num_scans <= 1.0 {
-        table_pages
-    } else {
-        // First scan + discounted cost for subsequent scans
-        table_pages + (num_scans - 1.0) * table_pages * params.cache_reuse_factor
-    };
-
-    // CPU cost for processing all rows on each scan
+    let io_cost = cached_io_cost(table_pages, num_scans, params.cache_reuse_factor);
     let cpu_cost = num_scans * base_row_count * params.cpu_cost_per_row;
-
     Cost(io_cost + cpu_cost)
 }
 
@@ -103,14 +102,6 @@ fn estimate_scan_cost(base_row_count: f64, num_scans: f64, params: &CostModelPar
 /// This properly separates the number of B-tree seeks from the number of rows
 /// returned per seek. A range scan does ONE seek followed by sequential leaf
 /// page reads, not one seek per row.
-///
-/// # Arguments
-/// * `base_row_count` - Total rows in the table (for estimating tree depth and page counts)
-/// * `tree_depth` - B-tree depth (number of pages to traverse per seek)
-/// * `index_info` - Index properties (covering, unique, etc.)
-/// * `num_seeks` - Number of B-tree traversals (typically = outer cardinality for joins)
-/// * `rows_per_seek` - Expected rows returned per seek (1 for point lookup, more for range)
-/// * `params` - Cost model parameters
 pub fn estimate_index_cost(
     base_row_count: f64,
     tree_depth: f64,
@@ -127,36 +118,30 @@ pub fn estimate_index_cost(
     let seek_cost = if is_full_scan {
         // Full scan: one seek to start, then sequential reads.
         // When re-scanned (nested loop inner), first scan is cold, rest are cached.
-        if input_cardinality <= 1.0 {
-            tree_depth
-        } else {
-            tree_depth + (input_cardinality - 1.0) * tree_depth * params.cache_reuse_factor
-        }
-    } else {
+        cached_io_cost(tree_depth, input_cardinality, params.cache_reuse_factor)
+    } else if input_cardinality <= 1.0 {
         input_cardinality * tree_depth
+    } else {
+        // Repeated seeks on the same B-tree: the root page (and often upper
+        // internal pages) stay in the buffer pool after the first traversal.
+        // Subsequent seeks only need to read from the first uncached level,
+        // giving an effective depth of (tree_depth - 1), minimum 1 page.
+        let subsequent_seek_depth = (tree_depth - 1.0).max(params.cache_reuse_factor);
+        tree_depth + (input_cardinality - 1.0) * subsequent_seek_depth
     };
 
     let index_leaf_pages_count = (rows_per_seek / index_info.rows_per_leaf_page).max(1.0);
-    let leaf_scan_cost = if is_full_scan {
-        // Full scan of all leaf pages. Repeated scans benefit from caching.
-        if input_cardinality <= 1.0 {
-            index_leaf_pages_count
-        } else {
-            index_leaf_pages_count
-                + (input_cardinality - 1.0) * index_leaf_pages_count * params.cache_reuse_factor
-        }
-    } else if rows_per_seek <= 1.0 {
+    let leaf_scan_cost = if !is_full_scan && rows_per_seek <= 1.0 {
         // Point lookup: the leaf page is the last page of the B-tree traversal,
         // already counted in seek_cost.
         0.0
-    } else if input_cardinality <= 1.0 {
-        index_leaf_pages_count
     } else {
-        // Range scan in a nested-loop join: after the first iteration the inner
-        // table's pages are largely in the buffer pool.  Apply the same caching
-        // discount as full scans.
-        index_leaf_pages_count
-            + (input_cardinality - 1.0) * index_leaf_pages_count * params.cache_reuse_factor
+        // Full scan or range scan: first iteration cold, subsequent cached.
+        cached_io_cost(
+            index_leaf_pages_count,
+            input_cardinality,
+            params.cache_reuse_factor,
+        )
     };
 
     // For non-covering indexes, we need to fetch from the table for each row.
@@ -214,12 +199,24 @@ impl std::ops::Deref for RowCountEstimate {
 }
 
 /// ANALYZE-based context for cost estimation.
-/// Uses sqlite_stat1 histogram data for row estimates when available,
+/// Uses sqlite_stat1/stat4 histogram data for row estimates when available,
 /// otherwise falls through to heuristic selectivity multipliers.
 pub struct AnalyzeCtx<'a> {
     pub rhs_table: &'a JoinedTable,
     pub index: Option<&'a Arc<Index>>,
     pub stats: &'a AnalyzeStats,
+    /// The constraint array for this table (needed to extract constant values for stat4).
+    pub constraints: Option<&'a [Constraint]>,
+    /// The WHERE clause terms (needed to extract constant values for stat4).
+    pub where_clause: Option<&'a [WhereTerm]>,
+}
+
+/// Result from ANALYZE-based row estimation, carrying the eq prefix length
+/// and resolved idx_stats so callers avoid recomputing them.
+struct AnalyzeRowEstimate<'a> {
+    rows: f64,
+    eq_prefix_len: usize,
+    idx_stats: &'a stats::IndexStat,
 }
 
 pub(crate) fn estimate_rows_per_seek(
@@ -228,6 +225,7 @@ pub(crate) fn estimate_rows_per_seek(
     usable_constraint_refs: &[RangeConstraintRef],
     base_row_count: RowCountEstimate,
     analyze_ctx: Option<&AnalyzeCtx>,
+    params: &CostModelParams,
 ) -> f64 {
     if is_unique_point_lookup(index_info, usable_constraint_refs) {
         return 1.0;
@@ -235,90 +233,240 @@ pub(crate) fn estimate_rows_per_seek(
 
     if let Some(ctx) = analyze_ctx {
         if !usable_constraint_refs.is_empty() {
-            if let Some(eq_prefix_rows) =
-                estimate_rows_from_analyze_stats(ctx, usable_constraint_refs)
-            {
+            if let Some(est) = estimate_rows_from_analyze_stats(ctx, usable_constraint_refs) {
                 // Apply range selectivity for any trailing non-equality constraints
-                // beyond the equality prefix. SQLite does this via whereRangeAdjust
-                // which divides by ~4 per range bound.
-                let eq_prefix_len = usable_constraint_refs
+                // beyond the equality prefix.
+                let mut range_sels: SmallVec<[f64; 4]> = usable_constraint_refs
+                    [est.eq_prefix_len..]
                     .iter()
-                    .take_while(|cref| cref.eq.is_some())
-                    .count();
-                let range_selectivity: f64 = usable_constraint_refs[eq_prefix_len..]
-                    .iter()
-                    .map(|cref| {
-                        let mut sel = 1.0;
-                        if let Some(lb) = cref.lower_bound {
-                            sel *= constraints[lb].selectivity;
-                        }
-                        if let Some(ub) = cref.upper_bound {
-                            sel *= constraints[ub].selectivity;
-                        }
-                        sel
+                    .filter_map(|cref| {
+                        range_selectivity_for_cref(
+                            cref,
+                            constraints,
+                            Some(est.idx_stats),
+                            ctx.index.map(|arc| arc.as_ref()),
+                            Some(ctx),
+                            *base_row_count,
+                            params,
+                        )
                     })
-                    .product();
-                return (eq_prefix_rows * range_selectivity).max(1.0);
+                    .collect();
+                let range_selectivity = dampened_product(&mut range_sels);
+                return (est.rows * range_selectivity).max(1.0);
             }
         }
     }
 
-    let selectivity_multiplier: f64 = usable_constraint_refs
+    let mut sels: SmallVec<[f64; 4]> = usable_constraint_refs
         .iter()
         .map(|cref| {
             if let Some(ref eq) = cref.eq {
                 return constraints[eq.constraint_pos].selectivity;
             }
-            let mut selectivity = 1.0;
-            if let Some(lower_bound) = cref.lower_bound {
-                selectivity *= constraints[lower_bound].selectivity;
-            }
-            if let Some(upper_bound) = cref.upper_bound {
-                selectivity *= constraints[upper_bound].selectivity;
-            }
-            selectivity
+            range_selectivity_for_cref(cref, constraints, None, None, None, *base_row_count, params)
+                .unwrap_or(1.0)
         })
-        .product();
-
+        .collect();
+    let selectivity_multiplier = dampened_product(&mut sels);
     (selectivity_multiplier * *base_row_count).max(1.0)
 }
 
-/// Estimate rows per seek using ANALYZE stats (sqlite_stat1 histogram data).
+/// Compute range selectivity for a single constraint ref, trying stat4 first,
+/// then stat4-informed CDF combination, then heuristic closed-range selectivity.
+fn range_selectivity_for_cref(
+    cref: &RangeConstraintRef,
+    constraints: &[Constraint],
+    idx_stats: Option<&stats::IndexStat>,
+    index: Option<&Index>,
+    ctx: Option<&AnalyzeCtx>,
+    base_row_count: f64,
+    params: &CostModelParams,
+) -> Option<f64> {
+    if let (Some(idx_stats), Some(index), Some(ctx)) = (idx_stats, index, ctx) {
+        if let Some(sel) =
+            try_stat4_range_for_constraint_ref(idx_stats, index, ctx, cref, constraints)
+        {
+            return Some(sel);
+        }
+    }
+    let lower = cref.lower_bound.map(|i| constraints[i].selectivity);
+    let upper = cref.upper_bound.map(|i| constraints[i].selectivity);
+    if let (Some(l), Some(u)) = (lower, upper) {
+        let l_idx = cref.lower_bound.expect("must be Some");
+        let u_idx = cref.upper_bound.expect("must be Some");
+        if constraints[l_idx].stat4_informed && constraints[u_idx].stat4_informed {
+            // Additive CDF formula for stat4-informed bounds
+            return Some((l + u - 1.0).max(1.0 / base_row_count));
+        }
+    }
+    closed_range_selectivity(lower, upper, params.closed_range_selectivity_factor)
+}
+
+/// Estimate rows per seek using ANALYZE stats (sqlite_stat4 then stat1).
 /// Returns `None` when no actual stats exist for this index, signaling the
 /// caller to fall back to selectivity-based estimation.
-fn estimate_rows_from_analyze_stats(
-    ctx: &AnalyzeCtx,
+fn estimate_rows_from_analyze_stats<'a>(
+    ctx: &AnalyzeCtx<'a>,
     constraint_refs: &[RangeConstraintRef],
-) -> Option<f64> {
+) -> Option<AnalyzeRowEstimate<'a>> {
     let index = ctx.index?;
+    let table_name = ctx.rhs_table.table.get_name();
+    let table_stats = ctx.stats.table_stats(table_name)?;
+    let idx_stats = table_stats.index_stats.get(&index.name)?;
 
-    // Only count leading equality-constrained columns. ANALYZE stats give
-    // avg rows per distinct prefix value, which is only meaningful for
-    // equality lookups. A range constraint (>, <, >=, <=) scans a portion
-    // of the index rather than fixing a prefix value, so it should not
-    // consume a prefix position in the stats lookup.
     let eq_prefix_len = constraint_refs
         .iter()
         .take_while(|cref| cref.eq.is_some())
         .count();
 
     if eq_prefix_len == 0 {
-        // Pure range scan — ANALYZE per-distinct-value stats don't apply.
+        // Pure range scan — try stat4 direct range estimation on the first index column.
+        if let Some(first_cref) = constraint_refs.first() {
+            let constraints = ctx.constraints?;
+            if let Some(sel) =
+                try_stat4_range_for_constraint_ref(idx_stats, index, ctx, first_cref, constraints)
+            {
+                if let Some(total) = table_stats.row_count {
+                    if total > 0 {
+                        return Some(AnalyzeRowEstimate {
+                            rows: (sel * total as f64).max(1.0),
+                            eq_prefix_len: 0,
+                            idx_stats,
+                        });
+                    }
+                }
+            }
+        }
         return None;
     }
 
-    let table_name = ctx.rhs_table.table.get_name();
+    // Try stat4 for constant equality lookups on ALL leading equality columns.
+    // Extract constant values for as many leading equality columns as possible,
+    // then do a multi-column binary search over the stat4 samples.
+    if !idx_stats.samples.is_empty() && eq_prefix_len >= 1 {
+        let mut probe_values: Vec<Value> = Vec::with_capacity(eq_prefix_len);
+        let mut collations: Vec<crate::translate::collate::CollationSeq> =
+            Vec::with_capacity(eq_prefix_len);
 
-    let table_stats = ctx.stats.table_stats(table_name)?;
-    let idx_stats = table_stats.index_stats.get(&index.name)?;
+        for (i, cref) in constraint_refs[..eq_prefix_len].iter().enumerate() {
+            let eq_ref = cref
+                .eq
+                .as_ref()
+                .expect("must be Some due to eq_prefix range");
+            if !eq_ref.is_const {
+                break;
+            }
+            let Some(val) = extract_const_value_from_constraint(ctx, eq_ref.constraint_pos) else {
+                break;
+            };
+            let collation = index
+                .columns
+                .get(i)
+                .and_then(|c| c.collation)
+                .unwrap_or_default();
+            probe_values.push(val);
+            collations.push(collation);
+        }
 
+        if !probe_values.is_empty() {
+            if let Some(est) = stats::stat4_equality_estimate(idx_stats, &probe_values, &collations)
+            {
+                return Some(AnalyzeRowEstimate {
+                    rows: est,
+                    eq_prefix_len,
+                    idx_stats,
+                });
+            }
+        }
+    }
+
+    // Fallback to stat1 average.
     if eq_prefix_len <= idx_stats.avg_rows_per_distinct_prefix.len() {
-        Some(idx_stats.avg_rows_per_distinct_prefix[eq_prefix_len - 1] as f64)
+        let rows = idx_stats.avg_rows_per_distinct_prefix[eq_prefix_len - 1] as f64;
+        Some(AnalyzeRowEstimate {
+            rows,
+            eq_prefix_len,
+            idx_stats,
+        })
     } else {
         // Stats exist for this index but don't cover the equality prefix length.
         // Return None to fall through to selectivity-based estimation.
         None
     }
+}
+
+/// Try stat4 direct range estimation for a single RangeConstraintRef.
+/// Extracts constant bound values from constraints and calls stat4_range_selectivity.
+fn try_stat4_range_for_constraint_ref(
+    idx_stats: &stats::IndexStat,
+    index: &Index,
+    ctx: &AnalyzeCtx,
+    cref: &RangeConstraintRef,
+    constraints: &[Constraint],
+) -> Option<f64> {
+    if idx_stats.samples.is_empty() {
+        return None;
+    }
+
+    // Only handle range on the first index column for now
+    if cref.index_col_pos != 0 {
+        return None;
+    }
+
+    let collation = index
+        .columns
+        .first()
+        .and_then(|c| c.collation)
+        .unwrap_or_default();
+
+    let lower = if let Some(i) = cref.lower_bound {
+        let val = extract_const_value_from_constraint(ctx, i)?;
+        let is_strict = matches!(
+            constraints[i].operator.as_ast_operator(),
+            Some(turso_parser::ast::Operator::Greater)
+        );
+        Some((val, is_strict))
+    } else {
+        None
+    };
+
+    let upper = if let Some(i) = cref.upper_bound {
+        let val = extract_const_value_from_constraint(ctx, i)?;
+        let is_strict = matches!(
+            constraints[i].operator.as_ast_operator(),
+            Some(turso_parser::ast::Operator::Less)
+        );
+        Some((val, is_strict))
+    } else {
+        None
+    };
+
+    if lower.is_none() && upper.is_none() {
+        return None;
+    }
+
+    stats::stat4_range_selectivity(
+        idx_stats,
+        lower.as_ref().map(|(v, s)| (v, *s)),
+        upper.as_ref().map(|(v, s)| (v, *s)),
+        collation,
+    )
+}
+
+/// Extract a constant literal Value from a constraint's constraining expression.
+/// Handles literals, negative numbers, booleans, and parenthesized constant expressions
+/// via the shared `eval_constant_default_value` infrastructure.
+fn extract_const_value_from_constraint(ctx: &AnalyzeCtx, constraint_pos: usize) -> Option<Value> {
+    let constraints = ctx.constraints?;
+    let where_clause = ctx.where_clause?;
+    let constraint = &constraints[constraint_pos];
+    let expr = constraint.get_constraining_expr_ref(where_clause);
+    // eval_constant_default_value handles Expr::Id as a bare string (ALTER DEFAULT
+    // context), which is not what we want here — column references are not constants.
+    if matches!(expr, turso_parser::ast::Expr::Id(_)) {
+        return None;
+    }
+    crate::translate::alter::eval_constant_default_value(expr).ok()
 }
 
 /// Estimate the cost of a scan or seek operation.
@@ -366,6 +514,7 @@ pub fn estimate_cost_for_scan_or_seek(
         usable_constraint_refs,
         RowCountEstimate::AnalyzeStats(base_row_count),
         analyze_ctx,
+        params,
     );
 
     let base_cost = estimate_index_cost(

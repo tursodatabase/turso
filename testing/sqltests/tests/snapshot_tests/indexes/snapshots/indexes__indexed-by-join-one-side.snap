@@ -16,5 +16,5 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SEARCH o USING INDEX idx_orders_customer_date (customer_id=?)
-`--SEARCH p USING INTEGER PRIMARY KEY (rowid=?)
+|--SEARCH p USING INTEGER PRIMARY KEY (rowid=?)
+`--SEARCH o USING INDEX idx_orders_customer_date (customer_id=?)

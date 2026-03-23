@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use crate::{turso_assert_eq, turso_assert_greater_than};
+use crate::{translate::optimizer::selectivity, turso_assert_eq, turso_assert_greater_than};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use smallvec::SmallVec;
@@ -29,8 +29,8 @@ use crate::{
             order::plan_satisfies_order_target,
         },
         plan::{
-            HashJoinKey, HashJoinType, JoinOrderMember, JoinedTable, NonFromClauseSubquery,
-            TableReferences, WhereTerm,
+            HashJoinKey, HashJoinType, JoinOrderMember, JoinType, JoinedTable,
+            NonFromClauseSubquery, TableReferences, WhereTerm,
         },
         planner::TableMask,
     },
@@ -58,30 +58,39 @@ impl<'a> JoinPlanningContext<'a> {
 // This is a safety limit, not a cost tuning parameter.
 const MAX_MATERIALIZED_BUILD_ROWS: f64 = 200_000.0;
 
+/// Residual selectivity information split by constraint origin.
+///
+/// For outer joins (LEFT JOIN), ON-clause and WHERE-clause residuals must be
+/// handled differently: the ON-clause residual determines match rate (used for
+/// LEFT JOIN output floor and anti-join formulas), while WHERE-clause residuals
+/// are post-join filters applied after the join guarantee.
+struct ResidualInfo {
+    /// Product of unconsumed ON-clause (outer join) constraint selectivities.
+    on_clause_residual: f64,
+    /// Product of unconsumed WHERE-clause constraint selectivities,
+    /// excluding any IS NULL constraint identified as part of an anti-join pattern.
+    where_clause_residual: f64,
+    /// True when a WHERE-clause IS NULL was found on the outer-joined table,
+    /// indicating a `LEFT JOIN ... WHERE right.col IS NULL` anti-join pattern.
+    is_anti_join_pattern: bool,
+}
+
 fn constraint_output_multipliers(
     rhs_constraints: &TableConstraints,
     lhs_mask: &TableMask,
     rhs_self_mask: TableMask,
     consumed_where_terms: &[usize],
     params: &CostModelParams,
-) -> f64 {
-    let mut multiplier = 1.0;
-    let mut bounds: SmallVec<[(Option<usize>, bool, bool); 4]> = SmallVec::new();
+    join_type: Option<JoinType>,
+) -> ResidualInfo {
+    let mut on_sels: SmallVec<[f64; 4]> = SmallVec::new();
+    let mut where_sels: SmallVec<[f64; 4]> = SmallVec::new();
+    let mut has_where_is_null = false;
 
-    let record_bound = |bounds: &mut SmallVec<[(Option<usize>, bool, bool); 4]>,
-                        dominated_col: Option<usize>,
-                        is_lower: bool,
-                        is_upper: bool| {
-        if !(is_lower || is_upper) {
-            return;
-        }
-        if let Some(entry) = bounds.iter_mut().find(|(col, _, _)| *col == dominated_col) {
-            entry.1 |= is_lower;
-            entry.2 |= is_upper;
-        } else {
-            bounds.push((dominated_col, is_lower, is_upper));
-        }
-    };
+    // Track range bounds per column so they can be combined into a single
+    // effective selectivity rather than being dampened as independent predicates.
+    type RangeBound = (Option<usize>, Option<f64>, Option<f64>, bool, bool);
+    let mut range_bounds: SmallVec<[RangeBound; 4]> = SmallVec::new();
 
     for constraint in rhs_constraints.constraints.iter().filter(|constraint| {
         (lhs_mask.contains_all(&constraint.lhs_mask)
@@ -89,9 +98,10 @@ fn constraint_output_multipliers(
             || constraint.lhs_mask.is_empty())
             && !consumed_where_terms.contains(&constraint.where_clause_pos.0)
     }) {
-        multiplier *= constraint.selectivity;
-
-        let dominated_col = constraint.table_col_pos;
+        let is_is_null = matches!(
+            constraint.operator,
+            super::constraints::ConstraintOperator::AstNativeOperator(Operator::Is)
+        );
         let is_lower = matches!(
             constraint.operator.as_ast_operator(),
             Some(Operator::Greater | Operator::GreaterEquals)
@@ -100,16 +110,67 @@ fn constraint_output_multipliers(
             constraint.operator.as_ast_operator(),
             Some(Operator::Less | Operator::LessEquals)
         );
-        record_bound(&mut bounds, dominated_col, is_lower, is_upper);
-    }
 
-    for (_, has_lower, has_upper) in &bounds {
-        if *has_lower && *has_upper {
-            multiplier *= params.closed_range_selectivity_factor;
+        if is_lower || is_upper {
+            // Defer range bounds — they'll be combined per-column after the loop.
+            let col = constraint.table_col_pos;
+            let is_on = constraint.from_outer_join;
+            let is_stat4 = constraint.stat4_informed;
+            if let Some(entry) = range_bounds.iter_mut().find(|(c, _, _, _, _)| *c == col) {
+                if is_lower {
+                    entry.1 = Some(constraint.selectivity);
+                } else {
+                    entry.2 = Some(constraint.selectivity);
+                }
+                // Both bounds must be stat4 for additive formula
+                entry.4 = entry.4 && is_stat4;
+            } else {
+                let (lo, hi) = if is_lower {
+                    (Some(constraint.selectivity), None)
+                } else {
+                    (None, Some(constraint.selectivity))
+                };
+                range_bounds.push((col, lo, hi, is_on, is_stat4));
+            }
+        } else if constraint.from_outer_join {
+            on_sels.push(constraint.selectivity);
+        } else if is_is_null && matches!(join_type, Some(JoinType::LeftOuter)) {
+            // WHERE-clause IS NULL on a LEFT JOIN's RHS table → anti-join pattern.
+            // Don't multiply into residual; the anti-join formula accounts for it.
+            has_where_is_null = true;
+        } else {
+            where_sels.push(constraint.selectivity);
         }
     }
 
-    multiplier
+    // Combine range bounds: two bounds on the same column become one entry
+    // for dampening purposes.
+    for &(_, lower_sel, upper_sel, is_on_clause, both_stat4) in &range_bounds {
+        let combined = if let (true, Some(l), Some(u)) = (both_stat4, lower_sel, upper_sel) {
+            // Additive CDF formula: exact when selectivities are true CDF probabilities
+            Some((l + u - 1.0).max(0.001))
+        } else {
+            // Heuristic: use closed_range_selectivity_factor directly as interval estimate
+            selectivity::closed_range_selectivity(
+                lower_sel,
+                upper_sel,
+                params.closed_range_selectivity_factor,
+            )
+        };
+        if let Some(sel) = combined {
+            if is_on_clause {
+                on_sels.push(sel);
+            } else {
+                where_sels.push(sel);
+            }
+        }
+    }
+
+    ResidualInfo {
+        on_clause_residual: super::selectivity::dampened_product(&mut on_sels),
+        where_clause_residual: super::selectivity::dampened_product(&mut where_sels),
+        is_anti_join_pattern: has_where_is_null,
+    }
 }
 
 /// Represents an n-ary join, anywhere from 1 table to N tables.
@@ -732,31 +793,66 @@ pub fn join_lhs_and_rhs<'a>(
     // OUTPUT CARDINALITY CALCULATION
     // ============================================================================
     //
-    // Formula: output_rows = input_rows × rows_from_access_path × remaining_filter_selectivity.
+    // For INNER JOIN:
+    //   output = input × rows_per_outer × (on_residual × where_residual)
     //
-    // Each access method provides its own per-outer-row row estimate for:
-    // - full BTree scans and full index scans
-    // - rowid seeks
-    // - ordinary secondary-index seeks
-    // - multi-index OR/AND scans
-    // - index-method access such as FTS
+    // For LEFT OUTER JOIN:
+    //   The LEFT JOIN guarantee: every input row appears at least once.
+    //   inner_card = input × rows_per_outer × on_residual
+    //   clamped    = max(inner_card, input)
+    //   output     = clamped × where_residual
     //
-    // Join planning only applies the selectivity of WHERE terms that the chosen
-    // access path did not already consume.
+    // For LEFT OUTER + anti-join (WHERE right.col IS NULL):
+    //   match_rate = min(1, rows_per_outer × on_residual)
+    //   output     = input × (1 - match_rate) × other_where_residual
     //
-    let unconsumed_constraint_multiplier = constraint_output_multipliers(
+    let join_type = rhs_table_reference
+        .join_info
+        .as_ref()
+        .map(|ji| ji.join_type);
+    let residual_info = constraint_output_multipliers(
         rhs_constraints,
         &lhs_mask,
         rhs_self_mask,
         &best_access_method.consumed_where_terms,
         params,
+        join_type,
     );
-    let residual_multiplier = match best_access_method.residual_constraints {
-        ResidualConstraintMode::ApplyUnconsumed => unconsumed_constraint_multiplier,
-        ResidualConstraintMode::None => 1.0,
+    let rows_per_outer = best_access_method.estimated_rows_per_outer_row;
+
+    let output_cardinality = match best_access_method.residual_constraints {
+        ResidualConstraintMode::None => input_cardinality * rows_per_outer,
+        ResidualConstraintMode::ApplyUnconsumed => {
+            match join_type {
+                Some(JoinType::LeftOuter) if residual_info.is_anti_join_pattern => {
+                    // Anti-join pattern: LEFT JOIN ... WHERE right.col IS NULL
+                    // Unlike inner/left joins which ask "how many matches per
+                    // row", anti-join asks "does this row have any match at
+                    // all?" — a yes/no question. We convert the estimated match
+                    // count (λ) into a probability of zero matches via the
+                    // Poisson distribution: P(no match) = e^(-λ). This smoothly
+                    // approaches zero but never reaches it, so downstream joins
+                    // always see nonzero cardinality and pick sane plans.
+                    let lambda = rows_per_outer * residual_info.on_clause_residual;
+                    let survival_rate = (-lambda).exp();
+                    input_cardinality * survival_rate * residual_info.where_clause_residual
+                }
+                Some(JoinType::LeftOuter) => {
+                    // LEFT JOIN: every input row appears at least once
+                    let inner_card =
+                        input_cardinality * rows_per_outer * residual_info.on_clause_residual;
+                    inner_card.max(input_cardinality) * residual_info.where_clause_residual
+                }
+                _ => {
+                    // INNER JOIN and other join types: standard formula
+                    input_cardinality
+                        * rows_per_outer
+                        * residual_info.on_clause_residual
+                        * residual_info.where_clause_residual
+                }
+            }
+        }
     };
-    let output_cardinality =
-        input_cardinality * best_access_method.estimated_rows_per_outer_row * residual_multiplier;
 
     access_methods_arena.push(best_access_method);
 
@@ -813,8 +909,7 @@ fn build_prior_constraint_selectivity(
     build_constraints: &TableConstraints,
     prior_mask: &TableMask,
 ) -> f64 {
-    let mut selectivity = 1.0;
-    let mut saw_constraint = false;
+    let mut sels: SmallVec<[f64; 4]> = SmallVec::new();
     for constraint in build_constraints.constraints.iter() {
         if constraint.operator == Operator::Equals.into()
             && constraint.lhs_mask.intersects(prior_mask)
@@ -826,14 +921,10 @@ fn build_prior_constraint_selectivity(
                 selectivity = constraint.selectivity,
                 "prior constraint selectivity contributor"
             );
-            selectivity *= constraint.selectivity;
-            saw_constraint = true;
+            sels.push(constraint.selectivity);
         }
     }
-    if !saw_constraint {
-        return 1.0;
-    }
-    selectivity.clamp(0.0, 1.0)
+    super::selectivity::dampened_product(&mut sels).clamp(0.0, 1.0)
 }
 
 /// Estimates selectivity from build-side constraints that reference only the build table.
@@ -842,19 +933,14 @@ fn build_self_constraint_selectivity(
     build_table_idx: usize,
 ) -> f64 {
     let build_only_mask = TableMask::from_table_number_iter([build_table_idx].into_iter());
-    let mut selectivity = 1.0;
-    let mut saw_constraint = false;
+    let mut sels: SmallVec<[f64; 4]> = SmallVec::new();
     for constraint in build_constraints.constraints.iter() {
         if !build_only_mask.contains_all(&constraint.lhs_mask) {
             continue;
         }
-        selectivity *= constraint.selectivity;
-        saw_constraint = true;
+        sels.push(constraint.selectivity);
     }
-    if !saw_constraint {
-        return 1.0;
-    }
-    selectivity.clamp(0.0, 1.0)
+    super::selectivity::dampened_product(&mut sels).clamp(0.0, 1.0)
 }
 
 /// Returns true if any prior constraints can be turned into an index lookup.
@@ -1322,11 +1408,12 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                             && other.join_info.as_ref().is_some_and(|ji| ji.is_outer())
                     })
                 });
-                let has_correlated_subquery = subqueries.iter().any(|sq| sq.correlated);
+                let has_subquery_with_correlation =
+                    subqueries.iter().any(|sq| sq.contains_correlation);
                 let msg = if build_is_outer {
                     "FULL OUTER JOIN chaining is not yet supported"
-                } else if has_correlated_subquery {
-                    "FULL OUTER JOIN is not supported with correlated subqueries that reference the joined tables"
+                } else if has_subquery_with_correlation {
+                    "FULL OUTER JOIN is not supported with subqueries that contain correlation"
                 } else {
                     "FULL OUTER JOIN requires an equality condition in the ON clause"
                 };
@@ -1590,12 +1677,13 @@ fn find_best_starting_table(
         };
 
         // Include literal constraints (lhs_mask empty) and self-constraints in selectivity
-        let selectivity: f64 = constraints[t]
+        let mut sels: SmallVec<[f64; 4]> = constraints[t]
             .constraints
             .iter()
             .filter(|c| c.lhs_mask.is_empty() || c.lhs_mask == self_mask)
             .map(|c| c.selectivity)
-            .product();
+            .collect();
+        let selectivity = super::selectivity::dampened_product(&mut sels);
 
         let score = base_rows * selectivity / (1.0 + hub_score[t] as f64);
 

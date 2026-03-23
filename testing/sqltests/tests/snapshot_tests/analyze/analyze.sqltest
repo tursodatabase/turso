@@ -440,3 +440,51 @@ snapshot join-aggregate-after-analyze {
     JOIN purchases p ON c.id = p.customer_id
     GROUP BY c.id;
 }
+
+setup low_cardinality_in_join {
+    CREATE TABLE big (
+        id INTEGER PRIMARY KEY,
+        category TEXT NOT NULL
+    );
+    CREATE INDEX idx_big_category ON big(category);
+
+    CREATE TABLE map (
+        big_id INTEGER NOT NULL,
+        payload INTEGER NOT NULL
+    );
+    CREATE INDEX idx_map_big_id ON map(big_id);
+
+    CREATE TABLE digits (d INTEGER NOT NULL);
+    INSERT INTO digits VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9);
+
+    INSERT INTO big(id, category)
+    SELECT
+        ones.d + 10 * tens.d + 100 * hundreds.d + 1,
+        CASE
+            WHEN (ones.d + 10 * tens.d + 100 * hundreds.d + 1) % 2 = 0 THEN 'A'
+            ELSE 'B'
+        END
+    FROM digits ones, digits tens, digits hundreds;
+
+    INSERT INTO map VALUES (10, 1);
+    INSERT INTO map VALUES (20, 2);
+    INSERT INTO map VALUES (30, 3);
+    INSERT INTO map VALUES (40, 4);
+    INSERT INTO map VALUES (50, 5);
+    INSERT INTO map VALUES (60, 6);
+    INSERT INTO map VALUES (70, 7);
+    INSERT INTO map VALUES (80, 8);
+    INSERT INTO map VALUES (90, 9);
+    INSERT INTO map VALUES (100, 10);
+
+    ANALYZE;
+}
+
+# Low-cardinality IN lists should not make the large table look highly selective.
+@setup low_cardinality_in_join
+snapshot-eqp low-cardinality-in-join-prefers-small-outer {
+    SELECT count(*)
+    FROM big
+    JOIN map ON map.big_id = big.id
+    WHERE big.category IN ('A', 'B');
+}

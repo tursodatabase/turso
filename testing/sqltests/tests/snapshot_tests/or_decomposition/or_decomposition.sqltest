@@ -1,0 +1,128 @@
+@database :memory:
+
+# Tests for cross-table OR decomposition into per-table IN lists.
+# The optimizer decomposes:
+#   (n1.name = 'A' AND n2.name = 'X') OR (n1.name = 'B' AND n2.name = 'Y')
+# into synthetic terms:
+#   n1.name IN ('A', 'B') AND n2.name IN ('X', 'Y')
+# The original OR is kept for correctness; the IN lists inform selectivity.
+
+setup indexed_schema {
+    CREATE TABLE n1(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE n2(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE INDEX idx_n1_name ON n1(name);
+    CREATE INDEX idx_n2_name ON n2(name);
+    INSERT INTO n1 SELECT value, 'name' || value FROM generate_series(1, 100);
+    INSERT INTO n2 SELECT value, 'val' || value FROM generate_series(1, 100);
+}
+
+setup small_schema {
+    CREATE TABLE n1(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE n2(id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO n1 VALUES (1, 'A'), (2, 'B'), (3, 'C');
+    INSERT INTO n2 VALUES (1, 'X'), (2, 'Y'), (3, 'Z');
+}
+
+# ===== Snapshot EQP tests (indexed tables) =====
+
+# Cross-table OR should decompose into per-table IN lists, enabling index seeks
+@setup indexed_schema
+snapshot-eqp cross-table-or-indexed {
+    SELECT * FROM n1, n2
+    WHERE (n1.name = 'name1' AND n2.name = 'val1') OR (n1.name = 'name2' AND n2.name = 'val2');
+}
+
+# Three-way cross-table OR
+@setup indexed_schema
+snapshot-eqp cross-table-or-three-way-indexed {
+    SELECT * FROM n1, n2
+    WHERE (n1.name = 'name1' AND n2.name = 'val1')
+       OR (n1.name = 'name2' AND n2.name = 'val2')
+       OR (n1.name = 'name3' AND n2.name = 'val3');
+}
+
+# Single-table OR (standard OR-to-IN, no cross-table decomposition needed)
+@setup indexed_schema
+snapshot-eqp single-table-or-indexed {
+    SELECT * FROM n1 WHERE n1.name = 'name1' OR n1.name = 'name2';
+}
+
+# Partial branch: only one table has equality in all branches
+@setup indexed_schema
+snapshot-eqp partial-branch-or-indexed {
+    SELECT * FROM n1, n2
+    WHERE (n1.name = 'name1' AND n2.name = 'val1') OR (n1.name = 'name2');
+}
+
+# ===== Correctness tests (small unindexed tables for readable output) =====
+
+@setup small_schema
+test cross-table-or-correctness {
+    SELECT n1.id, n2.id, n1.name, n2.name FROM n1, n2
+    WHERE (n1.name = 'A' AND n2.name = 'X') OR (n1.name = 'B' AND n2.name = 'Y')
+    ORDER BY n1.id, n2.id;
+}
+expect {
+    1|1|A|X
+    2|2|B|Y
+}
+
+@setup small_schema
+test cross-table-or-three-way-correctness {
+    SELECT n1.id, n2.id, n1.name, n2.name FROM n1, n2
+    WHERE (n1.name = 'A' AND n2.name = 'X')
+       OR (n1.name = 'B' AND n2.name = 'Y')
+       OR (n1.name = 'C' AND n2.name = 'Z')
+    ORDER BY n1.id, n2.id;
+}
+expect {
+    1|1|A|X
+    2|2|B|Y
+    3|3|C|Z
+}
+
+@setup small_schema
+test partial-branch-correctness {
+    SELECT n1.id, n2.id FROM n1, n2
+    WHERE (n1.name = 'A' AND n2.name = 'X') OR (n1.name = 'B')
+    ORDER BY n1.id, n2.id;
+}
+expect {
+    1|1
+    2|1
+    2|2
+    2|3
+}
+
+@setup small_schema
+test duplicate-value-correctness {
+    SELECT n1.id, n2.id FROM n1, n2
+    WHERE (n1.name = 'A' AND n2.name = 'X') OR (n1.name = 'A' AND n2.name = 'Y')
+    ORDER BY n1.id, n2.id;
+}
+expect {
+    1|1
+    1|2
+}
+
+@setup small_schema
+test no-match-correctness {
+    SELECT n1.id, n2.id FROM n1, n2
+    WHERE (n1.name = 'A' AND n2.name = 'Z') OR (n1.name = 'C' AND n2.name = 'X')
+    ORDER BY n1.id, n2.id;
+}
+expect {
+    1|3
+    3|1
+}
+
+@setup small_schema
+test single-table-or-correctness {
+    SELECT id, name FROM n1
+    WHERE n1.name = 'A' OR n1.name = 'C'
+    ORDER BY id;
+}
+expect {
+    1|A
+    3|C
+}

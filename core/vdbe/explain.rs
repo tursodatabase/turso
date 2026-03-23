@@ -584,8 +584,9 @@ pub fn insn_to_row(
                         name
                     }
                     CursorType::BTreeIndex(index) => {
-                        let name = &index.columns.get(*column).expect("column index out of bounds").name;
-                        Some(name)
+                        // column == index.columns.len() is the implicit rowid
+                        // stored after the key columns in the B-tree.
+                        index.columns.get(*column).map(|c| &c.name)
                     }
                     CursorType::MaterializedView(table, _) => {
                         let name = table.columns.get(*column).and_then(|v| v.name.as_ref());

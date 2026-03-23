@@ -483,6 +483,9 @@ pub struct ProgramState {
     /// Scratch buffer for [Insn::HashDistinct] to avoid per-row allocations.
     distinct_key_values: Vec<Value>,
     hash_tables: HashMap<usize, HashTable>,
+    /// StatAccum objects stored by register index, avoiding serialize/deserialize
+    /// round-trips on every stat_push during ANALYZE.
+    stat_accums: HashMap<usize, crate::stats::StatAccum>,
     uses_subjournal: bool,
     /// Whether this statement is an active write inside an explicit transaction.
     pub(crate) is_active_write: bool,
@@ -576,6 +579,7 @@ impl ProgramState {
             rowsets: HashMap::default(),
             bloom_filters: HashMap::default(),
             hash_tables: HashMap::default(),
+            stat_accums: HashMap::default(),
             uses_subjournal: false,
             is_active_write: false,
             has_stmt_transaction: false,
