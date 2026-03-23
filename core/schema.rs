@@ -5,7 +5,9 @@ use crate::return_if_io;
 use crate::stats::AnalyzeStats;
 use crate::sync::RwLock;
 use crate::translate::emitter::Resolver;
-use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl};
+use crate::translate::expr::{
+    bind_and_rewrite_expr, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
+};
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
 use crate::types::IOResult;
@@ -142,7 +144,7 @@ use std::ops::Deref;
 use tracing::trace;
 use turso_parser::ast::{
     self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, RefAct, ResolveType, SortOrder,
-    TypeOperator,
+    TableInternalId, TypeOperator,
 };
 use turso_parser::{
     ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
@@ -397,6 +399,8 @@ pub struct Schema {
 
     /// Custom type registry, loaded from sqlite_turso_types
     pub type_registry: HashMap<String, Arc<TypeDef>>,
+
+    pub generated_columns_enabled: bool,
 }
 
 impl Default for Schema {
@@ -502,6 +506,7 @@ impl Schema {
                 }
                 registry
             },
+            generated_columns_enabled: false,
         }
     }
 
@@ -1259,10 +1264,12 @@ impl Schema {
             let referenced_tables = incremental_view.get_referenced_table_names();
 
             // Create a BTreeTable for the materialized view
+            let cols = incremental_view.column_schema.flat_columns();
+            let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&cols);
             let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
                 name: view_name.clone(),
                 root_page: main_root,
-                columns: incremental_view.column_schema.flat_columns(),
+                columns: cols,
                 primary_key_columns: Vec::new(),
                 has_rowid: true,
                 is_strict: false,
@@ -1271,6 +1278,8 @@ impl Schema {
                 check_constraints: vec![],
                 rowid_alias_conflict_clause: None,
                 unique_sets: vec![],
+                has_virtual_columns: false,
+                logical_to_physical_map,
             })));
 
             // Only add to schema if compatible
@@ -1323,6 +1332,13 @@ impl Schema {
                     self.add_virtual_table(vtab)?;
                 } else {
                     let table = BTreeTable::from_sql(sql, root_page)?;
+
+                    if table.has_virtual_columns && !self.generated_columns_enabled {
+                        return Err(LimboError::ParseError(format!(
+                            "table '{}' uses generated columns but the generated_columns feature is not enabled",
+                            table.name
+                        )));
+                    }
 
                     // Check if this is a DBSP state table
                     if table.name.starts_with(DBSP_TABLE_PREFIX) {
@@ -1879,6 +1895,117 @@ impl Clone for Schema {
             incompatible_views,
             dropped_root_pages: self.dropped_root_pages.clone(),
             type_registry: self.type_registry.clone(),
+            generated_columns_enabled: self.generated_columns_enabled,
+        }
+    }
+}
+
+/// Maps schema column indices to register offsets for DML operations.
+//TODO this should be integrated into a Columns domain type
+// This type should also replace BTreeTable::has_virtual_columns
+#[derive(Debug, Clone)]
+pub enum ColumnLayout {
+    Identity {
+        column_count: usize,
+    },
+    Mapped {
+        // col_index -> offset
+        offsets: Vec<usize>,
+        non_virtual_col_count: usize,
+    },
+}
+
+impl ColumnLayout {
+    pub fn from_table(table: &Table) -> Self {
+        match table {
+            Table::BTree(btree) => Self::from_columns(&btree.columns),
+            Table::Virtual(vtable) => Self::Identity {
+                column_count: vtable.as_ref().columns.len(),
+            },
+            Table::FromClauseSubquery(subquery) => Self::Identity {
+                column_count: subquery.columns.len(),
+            },
+        }
+    }
+
+    pub fn from_btree(btree: &BTreeTable) -> Self {
+        Self::from_columns(&btree.columns)
+    }
+
+    pub fn from_columns(columns: &[Column]) -> Self {
+        let total = columns.len();
+        let non_virtual_col_count = columns.iter().filter(|c| !c.is_virtual_generated()).count();
+        if non_virtual_col_count == total {
+            return Self::Identity {
+                column_count: total,
+            };
+        }
+        let mut offsets = vec![0usize; total];
+        let mut nv_idx = 0;
+        let mut v_idx = non_virtual_col_count;
+        for (i, col) in columns.iter().enumerate() {
+            if col.is_virtual_generated() {
+                offsets[i] = v_idx;
+                v_idx += 1;
+            } else {
+                offsets[i] = nv_idx;
+                nv_idx += 1;
+            }
+        }
+        Self::Mapped {
+            offsets,
+            non_virtual_col_count,
+        }
+    }
+
+    /// Map a schema column index to its register offset.
+    #[inline(always)]
+    pub fn to_reg_offset(&self, col_idx: usize) -> usize {
+        match self {
+            Self::Identity { .. } => col_idx,
+            Self::Mapped { offsets, .. } => offsets[col_idx],
+        }
+    }
+
+    /// Resolve schema column index to an absolute register.
+    #[inline(always)]
+    pub fn to_register(&self, base: usize, schema_idx: usize) -> usize {
+        base + self.to_reg_offset(schema_idx)
+    }
+
+    #[inline(always)]
+    pub fn num_non_virtual_cols(&self) -> usize {
+        match self {
+            Self::Identity {
+                column_count: total,
+            } => *total,
+            Self::Mapped {
+                non_virtual_col_count,
+                ..
+            } => *non_virtual_col_count,
+        }
+    }
+
+    #[inline(always)]
+    pub fn column_count(&self) -> usize {
+        match self {
+            Self::Identity {
+                column_count: total,
+            } => *total,
+            Self::Mapped { offsets, .. } => offsets.len(),
+        }
+    }
+
+    pub fn column_idx_for_offset(&self, offset: usize) -> Option<usize> {
+        match self {
+            Self::Identity { column_count } => {
+                if offset < *column_count {
+                    Some(offset)
+                } else {
+                    None
+                }
+            }
+            Self::Mapped { offsets, .. } => offsets.iter().position(|&s| s == offset),
         }
     }
 }
@@ -2040,22 +2167,29 @@ pub struct BTreeTable {
     /// ON CONFLICT clause for the INTEGER PRIMARY KEY constraint.
     /// Stored here because rowid-alias PKs have their UniqueSet removed.
     pub rowid_alias_conflict_clause: Option<ResolveType>,
+    pub has_virtual_columns: bool,
+    pub logical_to_physical_map: Vec<usize>,
 }
 
 impl BTreeTable {
     /// Create a table reference for TypeCheck where custom type columns have
-    /// their `ty_str` replaced with the base type name. This ensures TypeCheck
-    /// validates the encoded value against the correct base type (e.g., BLOB)
-    /// rather than accepting any STRICT type via the wildcard arm.
+    /// their `ty_str` replaced with the base type name, and where virtual columns
+    /// are skipped. This ensures TypeCheck validates the encoded value against the
+    /// correct base type (e.g., BLOB) rather than accepting any STRICT type via the wildcard arm.
     pub fn type_check_table_ref(table: &Arc<BTreeTable>, schema: &Schema) -> Arc<BTreeTable> {
+        let has_virtual = table.has_virtual_columns();
         let has_custom = table
             .columns
             .iter()
             .any(|c| c.is_array() || schema.get_type_def(&c.ty_str, table.is_strict).is_some());
-        if !has_custom {
+        if !has_custom && !has_virtual {
             return Arc::clone(table);
         }
         let mut modified = (**table).clone();
+        if has_virtual {
+            modified.columns.retain(|c| !c.is_virtual_generated());
+            modified.has_virtual_columns = false;
+        }
         for col in &mut modified.columns {
             if col.is_array() {
                 // Arrays are stored as record-format blobs.
@@ -2076,18 +2210,40 @@ impl BTreeTable {
         schema: &Schema,
         only_columns: Option<&std::collections::HashSet<usize>>,
     ) -> Arc<BTreeTable> {
+        let has_virtual = table.has_virtual_columns();
         let has_custom = table
             .columns
             .iter()
             .any(|c| c.is_array() || schema.get_type_def(&c.ty_str, table.is_strict).is_some());
-        if !has_custom {
+        if !has_custom && !has_virtual {
             return Arc::clone(table);
         }
         let mut modified = (**table).clone();
+        let remapped_only_columns = if has_virtual {
+            let remapped = only_columns.map(|only| {
+                let mut new_set = std::collections::HashSet::new();
+                let mut physical = 0usize;
+                for (orig, col) in modified.columns.iter().enumerate() {
+                    if col.is_virtual_generated() {
+                        continue;
+                    }
+                    if only.contains(&orig) {
+                        new_set.insert(physical);
+                    }
+                    physical += 1;
+                }
+                new_set
+            });
+            modified.columns.retain(|c| !c.is_virtual_generated());
+            modified.has_virtual_columns = false;
+            remapped
+        } else {
+            None
+        };
+        let effective_only = remapped_only_columns.as_ref().or(only_columns);
         for (i, col) in modified.columns.iter_mut().enumerate() {
-            if let Some(only) = only_columns {
+            if let Some(only) = effective_only {
                 if !only.contains(&i) {
-                    // Non-SET column in UPDATE: holds encoded value, skip check
                     col.ty_str = "ANY".to_string();
                     continue;
                 }
@@ -2131,6 +2287,15 @@ impl BTreeTable {
             .iter()
             .enumerate()
             .find(|(_, column)| column.is_rowid_alias())
+    }
+
+    pub fn has_virtual_columns(&self) -> bool {
+        self.has_virtual_columns
+    }
+
+    /// Build a `ColumnLayout` for this table's register mapping.
+    pub fn column_layout(&self) -> ColumnLayout {
+        ColumnLayout::from_btree(self)
     }
 
     /// Returns the column position and column for a given column name.
@@ -2204,7 +2369,7 @@ impl BTreeTable {
                 sql.push_str(&default.to_string());
             }
 
-            if let Some(generated) = &column.generated {
+            if let GeneratedType::Virtual(generated) = &column.generated_type() {
                 sql.push_str(" AS (");
                 sql.push_str(&generated.to_string());
                 sql.push(')');
@@ -2343,6 +2508,23 @@ impl BTreeTable {
             .map(|column| column.collation())
             .collect()
     }
+
+    #[inline]
+    pub fn logical_to_physical_column(&self, logical: usize) -> usize {
+        self.logical_to_physical_map[logical]
+    }
+
+    pub fn build_logical_to_physical_map(columns: &[Column]) -> Vec<usize> {
+        let mut map = Vec::with_capacity(columns.len());
+        let mut physical = 0;
+        for col in columns {
+            map.push(physical);
+            if !col.is_generated() {
+                physical += 1;
+            }
+        }
+        map
+    }
 }
 
 fn identifier_contains_special_chars(name: &str) -> bool {
@@ -2432,6 +2614,305 @@ impl FromClauseSubquery {
     }
 }
 
+fn collect_column_refs(expr: &Expr) -> HashSet<String> {
+    collect_column_dependencies_of_expr(expr, &[])
+}
+
+/// Extract all column name references from an expression as a set.
+/// `columns` is used to resolve pre-resolved `Expr::Column { SELF_TABLE }` back to names.
+//TODO all this usage of [normalize_ident] should be replaced with a proper [Identifier] domain type.
+pub fn collect_column_dependencies_of_expr(expr: &Expr, columns: &[Column]) -> HashSet<String> {
+    let mut refs = HashSet::default();
+
+    let _ = walk_expr(expr, &mut |e| match e {
+        Expr::Id(name) | Expr::Name(name) => {
+            refs.insert(normalize_ident(name.as_str()));
+            Ok(WalkControl::Continue)
+        }
+        Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
+            refs.insert(normalize_ident(col.as_str()));
+            Ok(WalkControl::Continue)
+        }
+        Expr::Column { table, column, .. } if table.is_self_table() => {
+            if let Some(col) = columns.get(*column) {
+                if let Some(name) = &col.name {
+                    refs.insert(normalize_ident(name));
+                }
+            }
+            Ok(WalkControl::Continue)
+        }
+        Expr::Subquery(_)
+        | Expr::Exists(_)
+        | Expr::InTable { .. }
+        | Expr::SubqueryResult { .. } => Ok(WalkControl::SkipChildren),
+        _ => Ok(WalkControl::Continue),
+    });
+
+    refs
+}
+
+pub(crate) fn columns_affected_by_update(
+    columns: &[Column],
+    updated_cols: &HashSet<usize>,
+) -> HashSet<usize> {
+    let mut affected = updated_cols.clone();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (idx, col) in columns.iter().enumerate() {
+            if affected.contains(&idx) {
+                continue;
+            }
+            let GeneratedType::Virtual(ref expr) = col.generated_type() else {
+                continue;
+            };
+            if expr_refers_one_of(expr, columns, &affected) {
+                affected.insert(idx);
+                changed = true;
+            }
+        }
+    }
+    affected
+}
+
+/// Returns true if `expr` references any column in `target_set`.
+fn expr_refers_one_of(expr: &Expr, columns: &[Column], target_set: &HashSet<usize>) -> bool {
+    let mut found = false;
+    let _ = walk_expr(expr, &mut |e| {
+        if found {
+            return Ok(WalkControl::SkipChildren);
+        }
+        match e {
+            Expr::Column { table, column, .. } if table.is_self_table() => {
+                found = target_set.contains(column);
+                Ok(WalkControl::Continue)
+            }
+            Expr::Id(name) | Expr::Name(name) => {
+                if let Some(idx) = find_column_index_by_name(columns, name.as_str()) {
+                    found = target_set.contains(&idx);
+                }
+                Ok(WalkControl::Continue)
+            }
+            Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
+                if let Some(idx) = find_column_index_by_name(columns, col.as_str()) {
+                    found = target_set.contains(&idx);
+                }
+                Ok(WalkControl::Continue)
+            }
+            Expr::Subquery(_)
+            | Expr::Exists(_)
+            | Expr::InTable { .. }
+            | Expr::SubqueryResult { .. } => Ok(WalkControl::SkipChildren),
+            _ => Ok(WalkControl::Continue),
+        }
+    });
+    found
+}
+
+fn find_column_index_by_name(columns: &[Column], col_name: &str) -> Option<usize> {
+    columns.iter().enumerate().find_map(|(i, col)| {
+        col.name
+            .as_ref()
+            .filter(|name| name.eq_ignore_ascii_case(col_name))
+            .map(|_| i)
+    })
+}
+
+fn has_transitive_dependency(start: &str, target: &str, columns: &[Column]) -> bool {
+    let mut visited = std::collections::HashSet::new();
+    has_transitive_dependency_inner(start, target, columns, &mut visited)
+}
+
+fn has_transitive_dependency_inner(
+    start: &str,
+    target: &str,
+    columns: &[Column],
+    visited: &mut std::collections::HashSet<String>,
+) -> bool {
+    if !visited.insert(start.to_owned()) {
+        return false;
+    }
+
+    let Some(col) = columns.iter().find(|c| c.name.as_deref() == Some(start)) else {
+        return false;
+    };
+
+    let GeneratedType::Virtual(ref gen_expr) = col.generated_type() else {
+        return false;
+    };
+
+    let deps = collect_column_refs(gen_expr);
+
+    if deps.contains(target) {
+        return true;
+    }
+
+    for dep in deps {
+        if has_transitive_dependency_inner(&dep, target, columns, visited) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Resolve [Expr::Id] / [Expr::Qualified] in a generated column expression to
+/// `Expr::Column { table: SELF_TABLE, column: idx }`.
+pub fn resolve_gencol_expr_columns(gencol_expr: &mut Expr, columns: &[Column]) -> Result<()> {
+    walk_expr_mut(gencol_expr, &mut |e| match e {
+        Expr::Id(name) | Expr::Qualified(_, name) => {
+            let col_name = normalize_ident(name.as_str());
+            let (idx, col) = columns
+                .iter()
+                .enumerate()
+                .find(|(_, c)| {
+                    c.name
+                        .as_ref()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(&col_name))
+                })
+                .ok_or_else(|| LimboError::ParseError(format!("no such column: {col_name}")))?;
+            *e = Expr::Column {
+                database: None,
+                table: TableInternalId::SELF_TABLE,
+                column: idx,
+                is_rowid_alias: col.is_rowid_alias(),
+            };
+            Ok(WalkControl::Continue)
+        }
+        _ => Ok(WalkControl::Continue),
+    })?;
+    Ok(())
+}
+
+fn validate_generated_expr(expr: &Expr) -> Result<()> {
+    use ast::Expr;
+    match expr {
+        Expr::Qualified(_, _) => {
+            bail_parse_error!("the \".\" operator prohibited in generated columns");
+        }
+        Expr::DoublyQualified(_, _, _) => {
+            bail_parse_error!("the \".\" operator prohibited in generated columns");
+        }
+
+        Expr::Variable(_) => {
+            bail_parse_error!("bind parameters prohibited in generated columns");
+        }
+
+        Expr::Subquery(_) | Expr::InSelect { .. } | Expr::Exists(_) | Expr::InTable { .. } => {
+            bail_parse_error!("subqueries prohibited in generated columns");
+        }
+
+        Expr::FunctionCall {
+            name,
+            args,
+            filter_over,
+            ..
+        } => {
+            if filter_over.over_clause.is_some() {
+                bail_parse_error!("window functions prohibited in generated columns");
+            }
+            let arg_count = args.len();
+            let Some(func) = Func::resolve_function(name.as_str(), arg_count)? else {
+                return Err(LimboError::ParseError(format!(
+                    "could not resolve function {}",
+                    name.as_str()
+                )));
+            };
+            if matches!(func, Func::Agg(_)) {
+                bail_parse_error!("aggregate functions prohibited in generated columns");
+            }
+            if !func.is_deterministic() {
+                bail_parse_error!("non-deterministic functions prohibited in generated columns");
+            }
+            for arg in args {
+                validate_generated_expr(arg)?;
+            }
+        }
+
+        Expr::FunctionCallStar { name, filter_over } => {
+            if filter_over.over_clause.is_some() {
+                bail_parse_error!("window functions prohibited in generated columns");
+            }
+            let Some(func) = Func::resolve_function(name.as_str(), 0)? else {
+                return Err(LimboError::ParseError(format!(
+                    "could not resolve function {}",
+                    name.as_str()
+                )));
+            };
+
+            if matches!(func, Func::Agg(_)) {
+                bail_parse_error!("aggregate functions prohibited in generated columns");
+            }
+            if !func.is_deterministic() {
+                bail_parse_error!("non-deterministic functions prohibited in generated columns");
+            }
+        }
+
+        Expr::Binary(lhs, _, rhs) => {
+            validate_generated_expr(lhs)?;
+            validate_generated_expr(rhs)?;
+        }
+        Expr::Unary(_, inner) => {
+            validate_generated_expr(inner)?;
+        }
+        Expr::Parenthesized(exprs) => {
+            for e in exprs {
+                validate_generated_expr(e)?;
+            }
+        }
+        Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+            ..
+        } => {
+            if let Some(b) = base {
+                validate_generated_expr(b)?;
+            }
+            for (w, t) in when_then_pairs {
+                validate_generated_expr(w)?;
+                validate_generated_expr(t)?;
+            }
+            if let Some(e) = else_expr {
+                validate_generated_expr(e)?;
+            }
+        }
+        Expr::Cast { expr, .. } => {
+            validate_generated_expr(expr)?;
+        }
+        Expr::InList { lhs, rhs, .. } => {
+            validate_generated_expr(lhs)?;
+            for e in rhs {
+                validate_generated_expr(e)?;
+            }
+        }
+        Expr::Between {
+            lhs, start, end, ..
+        } => {
+            validate_generated_expr(lhs)?;
+            validate_generated_expr(start)?;
+            validate_generated_expr(end)?;
+        }
+        Expr::Like {
+            lhs, rhs, escape, ..
+        } => {
+            validate_generated_expr(lhs)?;
+            validate_generated_expr(rhs)?;
+            if let Some(e) = escape {
+                validate_generated_expr(e)?;
+            }
+        }
+        Expr::Collate(inner, _) => {
+            validate_generated_expr(inner)?;
+        }
+        Expr::IsNull(inner) | Expr::NotNull(inner) => {
+            validate_generated_expr(inner)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> Result<BTreeTable> {
     let table_name = normalize_ident(tbl_name);
     trace!("Creating table {}", table_name);
@@ -2440,7 +2921,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     let mut primary_key_columns = vec![];
     let mut foreign_keys = vec![];
     let mut check_constraints = vec![];
-    let mut cols = vec![];
+    let mut cols: Vec<Column> = vec![];
     let is_strict: bool;
     let mut unique_sets_columns: Vec<UniqueSet> = vec![];
     let mut unique_sets_constraints: Vec<UniqueSet> = vec![];
@@ -2639,6 +3120,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 };
 
                 let mut default = None;
+                let mut generated: Option<Box<Expr>> = None;
                 let mut primary_key = false;
                 let mut notnull = false;
                 let mut notnull_conflict_clause = None;
@@ -2654,9 +3136,15 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 Some(&name),
                             ));
                         }
-                        ast::ColumnConstraint::Generated { .. } => {
-                            // todo(sivukhin): table_xinfo must be updated when generated columns will be supported in order to properly emit "hidden" column value
-                            crate::bail_parse_error!("GENERATED columns are not yet supported");
+                        ast::ColumnConstraint::Generated { expr, typ } => {
+                            if typ
+                                .as_ref()
+                                .is_some_and(|t| t.as_str().eq_ignore_ascii_case("STORED"))
+                            {
+                                bail_parse_error!("Stored generated columns are not supported");
+                            }
+                            validate_generated_expr(expr)?;
+                            generated = Some(expr.clone());
                         }
                         ast::ColumnConstraint::PrimaryKey {
                             order: o,
@@ -2765,6 +3253,38 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     }
                 }
 
+                if let Some(ref gen_expr) = generated {
+                    if primary_key {
+                        bail_parse_error!(
+                            "generated column \"{}\" cannot be part of the PRIMARY KEY",
+                            name
+                        );
+                    }
+                    if default.is_some() {
+                        bail_parse_error!(
+                            "generated column \"{}\" cannot have a DEFAULT value",
+                            name
+                        );
+                    }
+
+                    let referenced_cols = collect_column_refs(gen_expr);
+                    let current_col_name = normalize_ident(&name);
+
+                    if referenced_cols.iter().any(|c| c == &current_col_name) {
+                        bail_parse_error!("generated column \"{}\" cannot reference itself", name);
+                    }
+
+                    for ref_col in &referenced_cols {
+                        if has_transitive_dependency(ref_col, &current_col_name, &cols) {
+                            bail_parse_error!(
+                                "circular dependency in generated columns \"{}\" and \"{}\"",
+                                name,
+                                ref_col
+                            );
+                        }
+                    }
+                }
+
                 if primary_key {
                     primary_key_columns.push((name.clone(), order));
                     if order == SortOrder::Desc {
@@ -2774,6 +3294,12 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     .iter()
                     .any(|(col_name, _)| col_name.eq_ignore_ascii_case(&name))
                 {
+                    if generated.is_some() {
+                        crate::bail_parse_error!(
+                            "generated column \"{}\" cannot be part of the PRIMARY KEY",
+                            name
+                        );
+                    }
                     primary_key = true;
                 }
 
@@ -2781,7 +3307,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     Some(name),
                     ty_str,
                     default,
-                    None,
+                    generated,
                     ty,
                     collation,
                     ColDef {
@@ -2871,6 +3397,18 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         }
     }
 
+    // Pre-resolve generated column names to Expr::Column { table: SELF_TABLE, ... }
+    let mut has_virtual_columns = false;
+    for i in 0..cols.len() {
+        if cols[i].is_virtual_generated() {
+            has_virtual_columns = true;
+            let mut expr = cols[i].generated_expr().cloned().unwrap();
+            resolve_gencol_expr_columns(&mut expr, &cols)?;
+            *cols[i].generated_expr_mut().unwrap() = expr;
+        }
+    }
+
+    let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&cols);
     Ok(BTreeTable {
         root_page,
         name: table_name,
@@ -2923,6 +3461,8 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         },
         check_constraints,
         rowid_alias_conflict_clause,
+        has_virtual_columns,
+        logical_to_physical_map,
     })
 }
 
@@ -3060,7 +3600,7 @@ pub struct Column {
     pub ty_str: String,
     pub ty_params: Vec<Box<Expr>>,
     pub default: Option<Box<Expr>>,
-    pub generated: Option<Box<Expr>>,
+    generated_type: GeneratedType,
     raw: u16,
     /// ON CONFLICT clause for NOT NULL constraint on this column.
     pub notnull_conflict_clause: Option<ResolveType>,
@@ -3074,6 +3614,13 @@ pub struct ColDef {
     pub unique: bool,
     pub hidden: bool,
     pub notnull_conflict_clause: Option<ResolveType>,
+}
+
+#[derive(Debug, Clone)]
+pub enum GeneratedType {
+    Virtual(Box<Expr>),
+    // Stored(Box<Expr>),
+    NotGenerated,
 }
 
 // flags
@@ -3175,6 +3722,10 @@ impl Column {
         col: Option<CollationSeq>,
         coldef: ColDef,
     ) -> Self {
+        let generated_type = match generated {
+            Some(expr) => GeneratedType::Virtual(expr),
+            None => GeneratedType::NotGenerated,
+        };
         let mut raw = 0u16;
         raw |= (ty as u16) << TYPE_SHIFT;
         if let Some(c) = col {
@@ -3200,7 +3751,7 @@ impl Column {
             ty_str,
             ty_params: Vec::new(),
             default,
-            generated,
+            generated_type,
             raw,
             notnull_conflict_clause: coldef.notnull_conflict_clause,
         }
@@ -3263,6 +3814,46 @@ impl Column {
     #[inline]
     pub const fn hidden(&self) -> bool {
         self.raw & F_HIDDEN != 0
+    }
+
+    /// Returns an error if this column is a generated column.
+    /// `verb_phrase` should describe the operation, e.g. "INSERT into" or "UPDATE".
+    pub fn ensure_not_generated(&self, verb_phrase: &str, col_name: &str) -> Result<()> {
+        if !matches!(self.generated_type, GeneratedType::NotGenerated) {
+            bail_parse_error!("cannot {} generated column \"{}\"", verb_phrase, col_name);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub fn generated_type(&self) -> &GeneratedType {
+        &self.generated_type
+    }
+
+    #[inline]
+    pub const fn is_generated(&self) -> bool {
+        !matches!(self.generated_type, GeneratedType::NotGenerated)
+    }
+
+    #[inline]
+    pub const fn is_virtual_generated(&self) -> bool {
+        matches!(self.generated_type, GeneratedType::Virtual(_))
+    }
+
+    #[inline]
+    pub fn generated_expr(&self) -> Option<&Expr> {
+        match &self.generated_type {
+            GeneratedType::Virtual(expr) => Some(expr.as_ref()),
+            GeneratedType::NotGenerated => None,
+        }
+    }
+
+    #[inline]
+    pub fn generated_expr_mut(&mut self) -> Option<&mut Expr> {
+        match &mut self.generated_type {
+            GeneratedType::Virtual(expr) => Some(expr.as_mut()),
+            GeneratedType::NotGenerated => None,
+        }
     }
 
     #[inline]
@@ -3445,6 +4036,14 @@ impl fmt::Display for Type {
 }
 
 pub fn sqlite_schema_table() -> BTreeTable {
+    let columns = vec![
+        Column::new_default_text(Some("type".to_string()), "TEXT".to_string(), None),
+        Column::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+        Column::new_default_text(Some("tbl_name".to_string()), "TEXT".to_string(), None),
+        Column::new_default_integer(Some("rootpage".to_string()), "INT".to_string(), None),
+        Column::new_default_text(Some("sql".to_string()), "TEXT".to_string(), None),
+    ];
+    let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
     BTreeTable {
         root_page: 1,
         name: "sqlite_schema".to_string(),
@@ -3452,17 +4051,13 @@ pub fn sqlite_schema_table() -> BTreeTable {
         is_strict: false,
         has_autoincrement: false,
         primary_key_columns: vec![],
-        columns: vec![
-            Column::new_default_text(Some("type".to_string()), "TEXT".to_string(), None),
-            Column::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
-            Column::new_default_text(Some("tbl_name".to_string()), "TEXT".to_string(), None),
-            Column::new_default_integer(Some("rootpage".to_string()), "INT".to_string(), None),
-            Column::new_default_text(Some("sql".to_string()), "TEXT".to_string(), None),
-        ],
+        columns,
         foreign_keys: vec![],
         check_constraints: vec![],
         rowid_alias_conflict_clause: None,
         unique_sets: vec![],
+        has_virtual_columns: false,
+        logical_to_physical_map,
     }
 }
 
@@ -4222,6 +4817,12 @@ mod tests {
     #[test]
     fn test_automatic_index_nonexistent_column() {
         // Create a table with a primary key column that doesn't exist in the table
+        let columns = vec![Column::new_default_integer(
+            Some("a".to_string()),
+            "INT".to_string(),
+            None,
+        )];
+        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let table = BTreeTable {
             root_page: 0,
             name: "t1".to_string(),
@@ -4229,15 +4830,13 @@ mod tests {
             is_strict: false,
             has_autoincrement: false,
             primary_key_columns: vec![("nonexistent".to_string(), SortOrder::Asc)],
-            columns: vec![Column::new_default_integer(
-                Some("a".to_string()),
-                "INT".to_string(),
-                None,
-            )],
+            columns,
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
             rowid_alias_conflict_clause: None,
+            has_virtual_columns: false,
+            logical_to_physical_map,
         };
 
         let result = Index::automatic_from_primary_key(
@@ -4517,5 +5116,29 @@ mod tests {
         assert!(matches!(index.columns[0].order, SortOrder::Asc));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_schema_loading_rejects_gencol_without_flag() {
+        let mut schema = Schema::new();
+        schema.generated_columns_enabled = false;
+
+        let result = schema.handle_schema_row(
+            "table",
+            "t1",
+            "t1",
+            2,
+            Some("CREATE TABLE t1(a INTEGER, b AS (a*2))"),
+            &SymbolTable::default(),
+            &mut Vec::new(),
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("generated columns"));
     }
 }

@@ -1,7 +1,7 @@
 use super::{Resolver, Result, TranslateCtx};
 use crate::{
     emit_explain,
-    schema::BTreeTable,
+    schema::{BTreeTable, ColumnLayout},
     sync::Arc,
     translate::{
         display::format_eqp_detail,
@@ -783,12 +783,14 @@ fn emit_delete_row_common(
         let columns_start_reg = columns_start_reg
             .expect("columns_start_reg must be provided when there are triggers or RETURNING");
         let delete_table = unsafe { &*table_reference };
+        let delete_layout = ColumnLayout::from_columns(delete_table.columns());
         let cache_state = seed_returning_row_image_in_cache(
             program,
             table_references,
             columns_start_reg,
             rowid_reg,
             &mut t_ctx.resolver,
+            &delete_layout,
         )?;
         let result: Result<()> = (|| {
             for subquery in non_from_clause_subqueries
@@ -819,6 +821,7 @@ fn emit_delete_row_common(
             rowid_reg,
             &mut t_ctx.resolver,
             returning_buffer,
+            &delete_layout,
         )?;
     }
 

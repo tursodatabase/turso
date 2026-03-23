@@ -128,6 +128,7 @@ pub use storage::{
     pager::{Page, PageRef, Pager},
     wal::{CheckpointMode, CheckpointResult, Wal, WalFile, WalFileShared},
 };
+pub use translate::expr::{walk_expr_mut, WalkControl};
 pub use turso_macros::{
     turso_assert, turso_assert_all, turso_assert_eq, turso_assert_greater_than,
     turso_assert_greater_than_or_equal, turso_assert_less_than, turso_assert_less_than_or_equal,
@@ -171,6 +172,7 @@ pub struct DatabaseOpts {
     pub enable_index_method: bool,
     pub enable_autovacuum: bool,
     pub enable_attach: bool,
+    pub enable_generated_columns: bool,
     pub unsafe_testing: bool,
     enable_load_extension: bool,
 }
@@ -213,6 +215,11 @@ impl DatabaseOpts {
 
     pub fn with_attach(mut self, enable: bool) -> Self {
         self.enable_attach = enable;
+        self
+    }
+
+    pub fn with_generated_columns(mut self, enable: bool) -> Self {
+        self.enable_generated_columns = enable;
         self
     }
 
@@ -483,9 +490,11 @@ impl Database {
             mv_store,
             path: path.into(),
             wal_path: wal_path.into(),
-            schema: Arc::new(Mutex::new(Arc::new(Schema::with_options(
-                opts.enable_custom_types,
-            )))),
+            schema: Arc::new(Mutex::new(Arc::new({
+                let mut s = Schema::with_options(opts.enable_custom_types);
+                s.generated_columns_enabled = opts.enable_generated_columns;
+                s
+            }))),
             _shared_page_cache: shared_page_cache,
             shared_wal,
             db_file,
@@ -1641,6 +1650,10 @@ impl Database {
 
     pub fn experimental_attach_enabled(&self) -> bool {
         self.opts.enable_attach
+    }
+
+    pub fn experimental_generated_columns_enabled(&self) -> bool {
+        self.opts.enable_generated_columns
     }
 
     /// check if database is currently in MVCC mode

@@ -1,6 +1,7 @@
-use crate::translate::emitter::HashLabels;
-
 use super::*;
+use crate::schema::GeneratedType;
+use crate::translate::emitter::HashLabels;
+use crate::vdbe::builder::SelfTableContext;
 
 #[derive(Debug, Clone)]
 /// Payload layout metadata recorded during hash-build planning or reuse.
@@ -415,11 +416,38 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
         let (payload_start_reg, mut payload_info) = if num_payload > 0 {
             let payload_reg = planner.program.alloc_registers(num_payload);
             for (i, &col_idx) in config.payload_signature_columns.iter().enumerate() {
-                planner.program.emit_column_or_rowid(
-                    payload_source_cursor_id,
-                    col_idx,
-                    payload_reg + i,
-                );
+                match build_table
+                    .columns()
+                    .get(col_idx)
+                    .map(|c| c.generated_type())
+                {
+                    Some(GeneratedType::Virtual(expr)) => {
+                        planner.program.with_self_table_context(
+                            Some(&SelfTableContext::ForSelect {
+                                table_ref_id: build_table.internal_id,
+                                referenced_tables: planner.table_references.clone(),
+                            }),
+                            |program, _| -> Result<()> {
+                                translate_expr(
+                                    program,
+                                    Some(planner.table_references),
+                                    expr,
+                                    payload_reg + i,
+                                    &planner.t_ctx.resolver,
+                                )?;
+                                Ok(())
+                            },
+                        )?;
+
+                        planner.program.emit_column_affinity(
+                            payload_reg + i,
+                            build_table.columns()[col_idx].affinity(),
+                        );
+                    }
+                    Some(GeneratedType::NotGenerated) | None => planner
+                        .program
+                        .emit_column_or_rowid(payload_source_cursor_id, col_idx, payload_reg + i),
+                };
             }
             (
                 Some(payload_reg),

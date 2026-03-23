@@ -195,6 +195,7 @@ impl CliDatabaseInstance {
             cmd.arg("--experimental-custom-types");
             cmd.arg("--experimental-attach");
             cmd.arg("--experimental-index-method");
+            cmd.arg("--experimental-generated-columns");
         }
 
         if self.readonly {

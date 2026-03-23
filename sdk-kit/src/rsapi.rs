@@ -658,6 +658,7 @@ impl TursoDatabase {
                                 "autovacuum" => opts.with_autovacuum(true),
                                 "encryption" => opts.with_encryption(true),
                                 "attach" => opts.with_attach(true),
+                                "generated_columns" => opts.with_generated_columns(true),
                                 _ => opts,
                             };
                         }

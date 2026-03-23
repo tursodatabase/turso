@@ -439,6 +439,7 @@ impl Connection {
 
         // create fresh schema as some objects can be deleted
         let mut fresh = Schema::with_options(self.experimental_custom_types_enabled());
+        fresh.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
 
         // Preserve existing views to avoid expensive repopulation.
@@ -1370,6 +1371,10 @@ impl Connection {
 
     pub fn experimental_attach_enabled(&self) -> bool {
         self.db.experimental_attach_enabled()
+    }
+
+    pub fn experimental_generated_columns_enabled(&self) -> bool {
+        self.db.experimental_generated_columns_enabled()
     }
 
     pub fn mvcc_enabled(&self) -> bool {

@@ -18,7 +18,9 @@ use super::order_by::SortMetadata;
 use super::plan::{HashJoinType, TableReferences};
 use crate::error::SQLITE_CONSTRAINT_CHECK;
 use crate::function::Func;
-use crate::schema::{BTreeTable, CheckConstraint, Column, IndexColumn, Schema, Table};
+use crate::schema::{
+    BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema, Table,
+};
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{
     bind_and_rewrite_expr, translate_expr_no_constant_opt, walk_expr, walk_expr_mut,
@@ -33,16 +35,17 @@ use crate::util::{
     check_expr_references_column, exprs_are_equivalent, normalize_ident, parse_numeric_literal,
 };
 use crate::vdbe::affinity::Affinity;
-use crate::vdbe::builder::{CursorType, ProgramBuilder};
+use crate::vdbe::builder::{CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext};
 use crate::vdbe::insn::{to_u16, InsertFlags};
 use crate::vdbe::{insn::Insn, BranchOffset, CursorID};
 use crate::{bail_parse_error, Database, DatabaseCatalog, LimboError, Result, RwLock, SymbolTable};
 use crate::{CaptureDataChangesExt, Connection};
-use tracing::{instrument, Level};
+use tracing::instrument;
 use turso_parser::ast::{
     self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerTime,
 };
 pub(crate) mod delete;
+pub(crate) mod gencol;
 pub(crate) mod select;
 pub(crate) mod update;
 
@@ -640,7 +643,7 @@ pub enum TransactionMode {
 
 /// Main entry point for emitting bytecode for a SQL query
 /// Takes a query plan and generates the corresponding bytecode program
-#[instrument(skip_all, level = Level::DEBUG)]
+#[instrument(skip_all, level = tracing::Level::DEBUG)]
 pub fn emit_program(
     connection: &Arc<Connection>,
     resolver: &Resolver,
@@ -727,6 +730,33 @@ pub fn emit_cdc_patch_record(
     } else {
         record_reg
     }
+}
+
+pub(super) fn emit_make_record<'a>(
+    program: &mut ProgramBuilder,
+    cols: impl IntoIterator<Item = &'a Column>,
+    start_reg: usize,
+    dest_reg: usize,
+    is_strict: bool,
+) {
+    let storable_cols: Vec<&Column> = cols
+        .into_iter()
+        .filter(|c| !c.is_virtual_generated())
+        .collect();
+    let storable_count = storable_cols.len();
+
+    let affinity_str: String = storable_cols
+        .iter()
+        .map(|c| c.affinity_with_strict(is_strict).aff_mask())
+        .collect();
+
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u16(start_reg),
+        count: to_u16(storable_count),
+        dest_reg: to_u16(dest_reg),
+        index_name: None,
+        affinity_str: Some(affinity_str),
+    });
 }
 
 pub fn emit_cdc_full_record(
@@ -1291,6 +1321,7 @@ fn rewrite_where_for_update_registers(
     columns: &[Column],
     columns_start_reg: usize,
     rowid_reg: usize,
+    layout: &ColumnLayout,
 ) -> Result<WalkControl> {
     walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
         match e {
@@ -1304,7 +1335,7 @@ fn rewrite_where_for_update_registers(
                     if c.is_rowid_alias() {
                         *e = Expr::Register(rowid_reg);
                     } else {
-                        *e = Expr::Register(columns_start_reg + idx);
+                        *e = Expr::Register(layout.to_register(columns_start_reg, idx));
                     }
                 }
             }
@@ -1323,12 +1354,15 @@ fn rewrite_where_for_update_registers(
                     if c.is_rowid_alias() {
                         *e = Expr::Register(rowid_reg);
                     } else {
-                        *e = Expr::Register(columns_start_reg + idx);
+                        *e = Expr::Register(layout.to_register(columns_start_reg, idx));
                     }
                 }
             }
             Expr::RowId { .. } => {
                 *e = Expr::Register(rowid_reg);
+            }
+            Expr::Column { table, .. } if table.is_self_table() => {
+                return Ok(WalkControl::SkipChildren);
             }
             _ => {}
         }
@@ -1355,14 +1389,26 @@ pub(crate) fn emit_index_column_value_old_image(
             resolver,
             BindingBehavior::ResultColumnsNotAllowed,
         )?;
-        translate_expr_no_constant_opt(
-            program,
-            Some(table_references),
-            &expr,
-            dest_reg,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        )?;
+
+        let self_table_context =
+            table_references
+                .joined_tables()
+                .first()
+                .map(|jt| SelfTableContext::ForSelect {
+                    table_ref_id: jt.internal_id,
+                    referenced_tables: table_references.clone(),
+                });
+        program.with_self_table_context(self_table_context.as_ref(), |program, _| {
+            translate_expr_no_constant_opt(
+                program,
+                Some(table_references),
+                &expr,
+                dest_reg,
+                resolver,
+                NoConstantOptReason::RegisterReuse,
+            )?;
+            Ok(())
+        })?;
     } else {
         program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
     }
@@ -1381,10 +1427,17 @@ fn emit_index_column_value_new_image(
     idx_col: &IndexColumn,
     dest_reg: usize,
     is_strict: bool,
+    layout: &ColumnLayout,
 ) -> Result<()> {
     if let Some(expr) = &idx_col.expr {
         let mut expr = expr.as_ref().clone();
-        rewrite_where_for_update_registers(&mut expr, columns, columns_start_reg, rowid_reg)?;
+        rewrite_where_for_update_registers(
+            &mut expr,
+            columns,
+            columns_start_reg,
+            rowid_reg,
+            layout,
+        )?;
         // The caller must have populated resolver.register_affinities so that
         // comparison instructions in the expression get the correct column
         // affinity even though column references have been rewritten to
@@ -1400,29 +1453,57 @@ fn emit_index_column_value_new_image(
             columns_start_reg,
             Some(rowid_reg),
             is_strict,
+            layout,
         )?;
-        translate_expr_no_constant_opt(
-            program,
-            None,
-            &expr,
-            dest_reg,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        )?;
+
+        let ctx = SelfTableContext::ForDML(DmlColumnContext::layout(
+            columns,
+            columns_start_reg,
+            rowid_reg,
+            layout.clone(),
+        ));
+        program.with_self_table_context(Some(&ctx), |program, _| {
+            translate_expr_no_constant_opt(
+                program,
+                None,
+                &expr,
+                dest_reg,
+                resolver,
+                NoConstantOptReason::RegisterReuse,
+            )?;
+            Ok(())
+        })?;
     } else {
         let col_in_table = columns
             .get(idx_col.pos_in_table)
             .expect("column index out of bounds");
-        let src_reg = if col_in_table.is_rowid_alias() {
-            rowid_reg
-        } else {
-            columns_start_reg + idx_col.pos_in_table
-        };
-        program.emit_insn(Insn::Copy {
-            src_reg,
-            dst_reg: dest_reg,
-            extra_amount: 0,
-        });
+        match col_in_table.generated_type() {
+            GeneratedType::Virtual(ref expr) => {
+                gencol::emit_gencol_expr_from_registers(
+                    program,
+                    expr,
+                    dest_reg,
+                    columns_start_reg,
+                    columns,
+                    resolver,
+                    rowid_reg,
+                    layout,
+                )?;
+                program.emit_column_affinity(dest_reg, col_in_table.affinity());
+            }
+            GeneratedType::NotGenerated => {
+                let src_reg = if col_in_table.is_rowid_alias() {
+                    rowid_reg
+                } else {
+                    layout.to_register(columns_start_reg, idx_col.pos_in_table)
+                };
+                program.emit_insn(Insn::Copy {
+                    src_reg,
+                    dst_reg: dest_reg,
+                    extra_amount: 0,
+                });
+            }
+        }
     }
     Ok(())
 }

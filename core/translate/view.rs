@@ -95,6 +95,7 @@ pub fn translate_create_materialized_view(
     });
 
     // Create a proper BTreeTable for the cursor with the actual view columns
+    let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&view_columns);
     let view_table = Arc::new(BTreeTable {
         root_page: 0, // Will be set to actual root page after creation
         name: normalized_view_name.clone(),
@@ -108,6 +109,8 @@ pub fn translate_create_materialized_view(
         foreign_keys: vec![],
         check_constraints: vec![],
         rowid_alias_conflict_clause: None,
+        has_virtual_columns: false,
+        logical_to_physical_map,
     });
 
     // Allocate a cursor for writing to the view's btree during population

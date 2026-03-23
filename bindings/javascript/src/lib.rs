@@ -243,6 +243,7 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
                     "index_method" => core_opts.with_index_method(true),
                     "autovacuum" => core_opts.with_autovacuum(true),
                     "attach" => core_opts.with_attach(true),
+                    "generated_columns" => core_opts.with_generated_columns(true),
                     _ => core_opts,
                 };
             }

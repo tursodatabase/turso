@@ -325,6 +325,15 @@ pub enum Stmt {
 /// FIXME: rename this to TableReferenceId.
 pub struct TableInternalId(usize);
 
+impl TableInternalId {
+    /// used in generated columns to signify "the table that the column belongs to"
+    pub const SELF_TABLE: Self = Self(0);
+
+    pub fn is_self_table(&self) -> bool {
+        self.0 == 0
+    }
+}
+
 impl Default for TableInternalId {
     fn default() -> Self {
         Self(1)

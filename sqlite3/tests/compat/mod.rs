@@ -3326,4 +3326,76 @@ mod tests {
             assert_eq!(sqlite3_close(db1), SQLITE_OK);
         }
     }
+
+    /// We don't support external functions yet in generated columns. This test asserts that nothing
+    /// breaks in a bad way when we try to use one.
+    #[cfg(not(feature = "sqlite3"))]
+    #[test]
+    fn test_external_function_rejected_in_generated_column() {
+        unsafe extern "C" fn return_zero(
+            ctx: *mut libc::c_void,
+            _argc: i32,
+            _argv: *mut *mut libc::c_void,
+        ) {
+            sqlite3_result_int(ctx, 0);
+        }
+
+        unsafe {
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            // Register a scalar function named "my_ext_func"
+            assert_eq!(
+                sqlite3_create_function_v2(
+                    db,
+                    c"my_ext_func".as_ptr(),
+                    1,
+                    SQLITE_UTF8,
+                    ptr::null_mut(),
+                    Some(return_zero),
+                    None,
+                    None,
+                    None,
+                ),
+                SQLITE_OK,
+                "registering external function should succeed"
+            );
+
+            // Verify the function works in a normal SELECT
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT my_ext_func(1)".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK,
+                "external function should work in normal queries"
+            );
+            sqlite3_finalize(stmt);
+
+            // Now try to use it in a generated column — should fail
+            let mut errmsg: *mut libc::c_char = ptr::null_mut();
+            let rc = sqlite3_exec(
+                db,
+                c"CREATE TABLE t1(a INTEGER, b INTEGER AS (my_ext_func(a)))".as_ptr(),
+                None,
+                ptr::null_mut(),
+                &mut errmsg,
+            );
+            assert_ne!(
+                rc, SQLITE_OK,
+                "external function in generated column should fail"
+            );
+
+            assert!(!errmsg.is_null(), "error message should be set");
+            let msg = std::ffi::CStr::from_ptr(errmsg).to_str().unwrap();
+            assert_eq!(msg, "Parse error: no such function: my_ext_func");
+            sqlite3_free(errmsg as *mut libc::c_void);
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
 }

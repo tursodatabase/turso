@@ -141,6 +141,7 @@ pub struct Builder {
     enable_custom_types: bool,
     enable_index_method: bool,
     enable_materialized_views: bool,
+    enable_generated_columns: bool,
     vfs: Option<String>,
     encryption_opts: Option<turso_sdk_kit::rsapi::EncryptionOpts>,
 }
@@ -155,6 +156,7 @@ impl Builder {
             enable_custom_types: false,
             enable_index_method: false,
             enable_materialized_views: false,
+            enable_generated_columns: false,
             vfs: None,
             encryption_opts: None,
         }
@@ -190,6 +192,11 @@ impl Builder {
         self
     }
 
+    pub fn experimental_generated_columns(mut self, gencols_enabled: bool) -> Self {
+        self.enable_generated_columns = gencols_enabled;
+        self
+    }
+
     pub fn experimental_index_method(mut self, index_method_enabled: bool) -> Self {
         self.enable_index_method = index_method_enabled;
         self
@@ -220,6 +227,9 @@ impl Builder {
         }
         if self.enable_materialized_views {
             features.push("views");
+        }
+        if self.enable_generated_columns {
+            features.push("generated_columns");
         }
         if features.is_empty() {
             return None;

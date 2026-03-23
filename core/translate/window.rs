@@ -519,6 +519,7 @@ impl EmitWindow {
         let window_function_count = window.functions.len();
 
         // An ephemeral table used to buffer rows for the current frame
+        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&src_columns);
         let buffer_table = Arc::new(BTreeTable {
             root_page: 0,
             // TODO: Generating the name this way may cause collisions with real tables in the
@@ -535,6 +536,8 @@ impl EmitWindow {
             foreign_keys: vec![],
             check_constraints: vec![],
             rowid_alias_conflict_clause: None,
+            has_virtual_columns: false,
+            logical_to_physical_map,
         });
         let cursor_buffer_read =
             program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone()));
