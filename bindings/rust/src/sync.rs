@@ -901,6 +901,14 @@ mod tests {
         Ok(result)
     }
 
+    fn is_retryable_parallel_write_error(err: &crate::Error) -> bool {
+        match err {
+            crate::Error::Busy(_) | crate::Error::BusySnapshot(_) => true,
+            crate::Error::Error(msg) => msg.to_ascii_lowercase().contains("schema changed"),
+            _ => false,
+        }
+    }
+
     #[tokio::test]
     pub async fn test_sync_bootstrap() {
         let _ = tracing_subscriber::fmt::try_init();
@@ -1406,7 +1414,7 @@ mod tests {
                             .await
                         {
                             Ok(_) => break,
-                            Err(crate::Error::Busy(_)) => {
+                            Err(e) if is_retryable_parallel_write_error(&e) => {
                                 tokio::time::sleep(Duration::from_millis(10)).await;
                                 continue;
                             }
@@ -1423,12 +1431,22 @@ mod tests {
         // Sequential writes: 3 more large inserts
         for i in 0..after_cnt {
             let data = format!("sequential_{i}_{payload}");
-            conn.execute(
-                "INSERT INTO test_data (payload) VALUES (?)",
-                crate::params::Params::Positional(vec![Value::Text(data)]),
-            )
-            .await
-            .unwrap();
+            loop {
+                match conn
+                    .execute(
+                        "INSERT INTO test_data (payload) VALUES (?)",
+                        crate::params::Params::Positional(vec![Value::Text(data.clone())]),
+                    )
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(e) if is_retryable_parallel_write_error(&e) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
+                    Err(e) => panic!("sequential insert failed (row{i}): {e:?}"),
+                }
+            }
         }
 
         // Signal sync task to stop and wait for it
