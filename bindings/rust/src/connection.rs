@@ -82,6 +82,30 @@ impl Connection {
         connection
     }
 
+    pub(crate) fn can_recycle_into_pool(&self) -> bool {
+        let Some(inner) = self.inner.as_ref() else {
+            return false;
+        };
+
+        if Arc::strong_count(inner) != 1 {
+            return false;
+        }
+
+        if self.dangling_tx.load(Ordering::SeqCst) != DropBehavior::Ignore {
+            return false;
+        }
+
+        self.get_inner_connection()
+            .map(|conn| conn.get_auto_commit())
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn reset_for_reuse(&mut self) {
+        self.transaction_behavior = TransactionBehavior::Deferred;
+        self.dangling_tx
+            .store(DropBehavior::Ignore, Ordering::SeqCst);
+    }
+
     pub(crate) async fn maybe_handle_dangling_tx(&self) -> Result<()> {
         match self.dangling_tx.load(Ordering::SeqCst) {
             DropBehavior::Rollback => {
