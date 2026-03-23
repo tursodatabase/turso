@@ -672,8 +672,10 @@ impl ToTokens for Plan {
                     s.append(TokenType::TK_BY, None)?;
 
                     s.comma(
-                        order_by.iter().map(|(expr, order)| ast::SortedColumn {
-                            expr: expr.clone().into(),
+                        order_by.iter().map(|(col_idx, order)| ast::SortedColumn {
+                            expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric(
+                                (col_idx + 1).to_string(),
+                            ))),
                             order: Some(*order),
                             nulls: None,
                         }),

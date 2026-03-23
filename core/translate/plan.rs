@@ -300,7 +300,9 @@ pub enum Plan {
         right_most: SelectPlan,
         limit: Option<Box<Expr>>,
         offset: Option<Box<Expr>>,
-        order_by: Option<Vec<(ast::Expr, SortOrder)>>,
+        /// ORDER BY for compound selects. Each entry is (result_column_index, sort_order).
+        /// The column index is 0-based into the result set.
+        order_by: Option<Vec<(usize, SortOrder)>>,
     },
     Delete(DeletePlan),
     Update(UpdatePlan),

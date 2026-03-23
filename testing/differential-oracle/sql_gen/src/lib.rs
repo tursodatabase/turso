@@ -60,11 +60,12 @@ pub use context::Context;
 pub use error::{GenError, GenErrorKind};
 pub use functions::{FunctionCategory, FunctionDef, SCALAR_FUNCTIONS};
 pub use policy::{
-    BinOpCategoryWeights, BinOpWeights, CompoundOpWeights, CteConfig, CteMaterializationWeights,
-    DeleteConfig, ExprConfig, ExprWeights, FunctionConfig, IdentifierConfig, InsertConfig,
-    LiteralConfig, LiteralTypeWeights, NullsOrderWeights, OrderDirectionWeights, Policy,
-    SelectConfig, StmtWeights, StringCharset, TriggerBodyStmtWeights, TriggerConfig,
-    TriggerEventWeights, TriggerTimingWeights, UnaryOpWeights, UpdateConfig,
+    BinOpCategoryWeights, BinOpWeights, CompoundOpWeights, CompoundOperatorWeights, CteConfig,
+    CteMaterializationWeights, DeleteConfig, ExprConfig, ExprWeights, FunctionConfig,
+    IdentifierConfig, InsertConfig, LiteralConfig, LiteralTypeWeights, NullsOrderWeights,
+    OrderDirectionWeights, Policy, SelectConfig, StmtWeights, StringCharset,
+    TriggerBodyStmtWeights, TriggerConfig, TriggerEventWeights, TriggerTimingWeights,
+    UnaryOpWeights, UpdateConfig,
 };
 pub use schema::{ColumnDef, DataType, Index, Schema, SchemaBuilder, Table};
 pub use strategy::{GeneratedSql, SqlStrategy};
