@@ -2642,15 +2642,9 @@ fn emit_pk_uniqueness_check(
             });
             break 'emit_halt;
         }
-        if matches!(preflight.effective_on_conflict, ResolveType::Ignore) {
-            // IGNORE: skip this row entirely on PK conflict
-            program.emit_insn(Insn::Goto {
-                target_pc: ctx.loop_labels.row_done,
-            });
-            break 'emit_halt;
-        }
         if let Some(position) = position.or(upsert_catch_all) {
-            // PK conflict: the conflicting rowid is exactly the attempted key
+            // PK conflict: the conflicting rowid is exactly the attempted key.
+            // Upsert clause takes precedence over column-level ON CONFLICT.
             program.emit_insn(Insn::Copy {
                 src_reg: insertion.key_register(),
                 dst_reg: ctx.conflict_rowid_reg,
@@ -2658,6 +2652,13 @@ fn emit_pk_uniqueness_check(
             });
             program.emit_insn(Insn::Goto {
                 target_pc: preflight.upsert_actions[position].1,
+            });
+            break 'emit_halt;
+        }
+        if matches!(preflight.effective_on_conflict, ResolveType::Ignore) {
+            // IGNORE: skip this row entirely on PK conflict
+            program.emit_insn(Insn::Goto {
+                target_pc: ctx.loop_labels.row_done,
             });
             break 'emit_halt;
         }
