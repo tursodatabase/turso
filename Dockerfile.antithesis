@@ -1,4 +1,4 @@
-FROM lukemathwalker/cargo-chef:0.1.72-rust-1.88.0-slim-bullseye AS chef
+FROM lukemathwalker/cargo-chef:0.1.72-rust-1.88.0-slim-bookworm AS chef
 RUN apt update \
     && apt install -y git libssl-dev pkg-config\
     && apt clean \
@@ -115,7 +115,7 @@ RUN make
 # The final image.
 #
 
-FROM debian:bullseye-slim AS runtime
+FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y bash curl xz-utils python3 procps sqlite3 bc binutils pip rust-gdb && rm -rf /var/lib/apt/lists/*
 RUN pip install antithesis
 
