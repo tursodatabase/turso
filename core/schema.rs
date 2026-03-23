@@ -3139,7 +3139,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         ast::ColumnConstraint::Generated { expr, typ } => {
                             if typ
                                 .as_ref()
-                                .is_some_and(|t| t.as_str().eq_ignore_ascii_case("STORED"))
+                                .is_some_and(|t| matches!(t, ast::GeneratedColumnType::Stored))
                             {
                                 bail_parse_error!("Stored generated columns are not supported");
                             }

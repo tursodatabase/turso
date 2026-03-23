@@ -1355,8 +1355,18 @@ pub enum ColumnConstraint {
         /// expression
         expr: Box<Expr>,
         /// `STORED` / `VIRTUAL`
-        typ: Option<Name>,
+        typ: Option<GeneratedColumnType>,
     },
+}
+
+/// Generated column type
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum GeneratedColumnType {
+    /// `STORED`
+    Stored,
+    /// `VIRTUAL`
+    Virtual,
 }
 
 /// Named table constraint
