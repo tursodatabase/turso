@@ -1328,7 +1328,8 @@ fn expr_contains_subquery(expr: &Expr) -> bool {
             | Expr::Qualified(_, _)
             | Expr::Register(_)
             | Expr::RowId { .. }
-            | Expr::Variable(_) => {}
+            | Expr::Variable(_)
+            | Expr::Default => {}
         }
     }
     false

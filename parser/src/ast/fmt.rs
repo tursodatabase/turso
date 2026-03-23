@@ -1009,6 +1009,7 @@ impl ToTokens for Expr {
                 let indexed = format!("?{}", var.index.get());
                 s.append(TK_VARIABLE, Some(indexed.as_str()))
             }
+            Self::Default => s.append(TK_DEFAULT, None),
             Self::Array { elements } => {
                 s.append(TK_ID, Some("ARRAY"))?;
                 s.append(TK_LBRACKET, None)?;

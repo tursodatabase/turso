@@ -872,6 +872,9 @@ pub fn translate_condition_expr(
             translate_expr(program, Some(referenced_tables), expr, expr_reg, resolver)?;
             emit_cond_jump(program, condition_metadata, expr_reg);
         }
+        ast::Expr::Default => {
+            crate::bail_parse_error!("DEFAULT is only valid in INSERT VALUES");
+        }
         ast::Expr::Array { .. } | ast::Expr::Subscript { .. } => {
             unreachable!("Array and Subscript are desugared into function calls by the parser")
         }
@@ -3689,6 +3692,9 @@ pub fn translate_expr(
             });
             Ok(target_register)
         }
+        ast::Expr::Default => {
+            crate::bail_parse_error!("DEFAULT is only valid in INSERT VALUES");
+        }
         ast::Expr::Array { .. } | ast::Expr::Subscript { .. } => {
             unreachable!("Array and Subscript are desugared into function calls by the parser")
         }
@@ -5346,7 +5352,8 @@ where
                 | ast::Expr::Name(_)
                 | ast::Expr::Qualified(..)
                 | ast::Expr::Variable(_)
-                | ast::Expr::Register(_) => {
+                | ast::Expr::Register(_)
+                | ast::Expr::Default => {
                     // No nested expressions
                 }
             }
@@ -5959,7 +5966,8 @@ where
                 | ast::Expr::Name(_)
                 | ast::Expr::Qualified(..)
                 | ast::Expr::Variable(_)
-                | ast::Expr::Register(_) => {
+                | ast::Expr::Register(_)
+                | ast::Expr::Default => {
                     // No nested expressions
                 }
             }
@@ -6696,6 +6704,7 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             SubqueryType::In { .. } => 1,
             SubqueryType::RowValue { num_regs, .. } => *num_regs,
         },
+        Expr::Default => 1,
         Expr::Array { .. } | Expr::Subscript { .. } => {
             unreachable!("Array and Subscript are desugared into function calls by the parser")
         }
