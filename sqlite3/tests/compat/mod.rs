@@ -3263,4 +3263,67 @@ mod tests {
             assert_eq!(sqlite3_close(db1), SQLITE_OK);
         }
     }
+
+    #[test]
+    #[cfg(not(feature = "sqlite3"))]
+    fn test_unnamed_memory_cache_shared() {
+        unsafe {
+            let uri = c"file::memory:?cache=shared";
+            let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI;
+
+            let mut db1: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(
+                sqlite3_open_v2(uri.as_ptr(), &mut db1, flags, ptr::null()),
+                SQLITE_OK,
+            );
+            let mut errmsg: *mut libc::c_char = ptr::null_mut();
+            assert_eq!(
+                sqlite3_exec(
+                    db1,
+                    c"CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg,
+                ),
+                SQLITE_OK,
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    db1,
+                    c"INSERT INTO t1 VALUES (1, 'shared')".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg,
+                ),
+                SQLITE_OK,
+            );
+
+            // Same URI must share the database
+            let mut db2: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(
+                sqlite3_open_v2(uri.as_ptr(), &mut db2, flags, ptr::null()),
+                SQLITE_OK,
+            );
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db2,
+                    c"SELECT val FROM t1 WHERE id = 1".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK,
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            let text = sqlite3_column_text(stmt, 0);
+            assert!(!text.is_null());
+            let val = std::ffi::CStr::from_ptr(text).to_str().unwrap();
+            assert_eq!(val, "shared");
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            assert_eq!(sqlite3_close(db2), SQLITE_OK);
+            assert_eq!(sqlite3_close(db1), SQLITE_OK);
+        }
+    }
 }

@@ -422,13 +422,7 @@ fn parse_uri_filename(uri: &str) -> Result<(String, bool, bool), ()> {
         percent_decode(raw_path).ok_or(())?
     };
 
-    // Check for :memory: path
-    if path == ":memory:" {
-        return Ok((":memory:".to_string(), true, false));
-    }
-
-    // Parse query parameters
-    let mut is_memory = false;
+    let mut is_memory = path == ":memory:";
     let mut cache_shared = false;
     if let Some(query) = query {
         for param in query.split('&') {
@@ -490,10 +484,7 @@ pub unsafe extern "C" fn sqlite3_open_v2(
             (filename_str.to_string(), false, false)
         };
 
-    let use_shared_memory = use_memory
-        && cache_shared
-        && effective_filename != ":memory:"
-        && !effective_filename.is_empty();
+    let use_shared_memory = use_memory && cache_shared;
 
     let (io, db) = if use_shared_memory {
         match turso_core::Database::open_shared_memory(&effective_filename) {
