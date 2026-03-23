@@ -2810,6 +2810,7 @@ mod tests {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: 0,
+            indexed: None,
         });
 
         // Create where clause that only references second column
@@ -2927,6 +2928,7 @@ mod tests {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: 0,
+            indexed: None,
         });
 
         // Create where clause that references first and third columns
@@ -3065,6 +3067,7 @@ mod tests {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: 0,
+            indexed: None,
         });
 
         // Create where clause: c1 = 5 AND c2 > 10 AND c3 = 7
@@ -3212,7 +3215,7 @@ mod tests {
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
-            pk_conflict_clause: None,
+            rowid_alias_conflict_clause: None,
         })
     }
 
@@ -3234,6 +3237,7 @@ mod tests {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: 0,
+            indexed: None,
         }
     }
 

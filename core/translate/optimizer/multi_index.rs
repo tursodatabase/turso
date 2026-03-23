@@ -1174,7 +1174,7 @@ mod tests {
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
-            pk_conflict_clause: None,
+            rowid_alias_conflict_clause: None,
         })
     }
 
@@ -1195,6 +1195,7 @@ mod tests {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: 0,
+            indexed: None,
         }
     }
 

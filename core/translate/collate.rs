@@ -525,7 +525,7 @@ mod tests {
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
-            pk_conflict_clause: None,
+            rowid_alias_conflict_clause: None,
         }));
         table_references.add_joined_table(JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
@@ -540,6 +540,7 @@ mod tests {
             internal_id: TableInternalId::from(1),
             join_info: None,
             table,
+            indexed: None,
         });
 
         table_references
@@ -582,8 +583,9 @@ mod tests {
                 unique_sets: vec![],
                 foreign_keys: vec![],
                 check_constraints: vec![],
-                pk_conflict_clause: None,
+                rowid_alias_conflict_clause: None,
             })),
+            indexed: None,
         });
         // Right table t2(id=2)
         table_references.add_joined_table(JoinedTable {
@@ -617,8 +619,9 @@ mod tests {
                 unique_sets: vec![],
                 foreign_keys: vec![],
                 check_constraints: vec![],
-                pk_conflict_clause: None,
+                rowid_alias_conflict_clause: None,
             })),
+            indexed: None,
         });
         table_references
     }
@@ -640,6 +643,7 @@ mod tests {
             identifier: "bar".to_string(),
             internal_id: TableInternalId::from(1),
             join_info: None,
+            indexed: None,
             table: Table::BTree(Arc::new(BTreeTable {
                 root_page: 0,
                 has_autoincrement: false,
@@ -666,7 +670,7 @@ mod tests {
                 unique_sets: vec![],
                 foreign_keys: vec![],
                 check_constraints: vec![],
-                pk_conflict_clause: None,
+                rowid_alias_conflict_clause: None,
             })),
         });
         table_references

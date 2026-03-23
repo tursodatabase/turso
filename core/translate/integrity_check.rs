@@ -228,6 +228,7 @@ fn translate_integrity_check_impl(
                 column_use_counts: Vec::new(),
                 expression_index_usages: Vec::new(),
                 database_id,
+                indexed: None,
             }],
             vec![],
         );

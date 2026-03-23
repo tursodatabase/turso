@@ -4953,8 +4953,17 @@ pub fn op_decr_jump_zero(
 }
 
 fn apply_kbn_step(acc: &mut Value, r: f64, state: &mut SumAggState) {
-    let s = acc.as_float();
+    // NaN from Inf + (-Inf) is sticky: once acc is Null, it stays Null.
+    // See https://sqlite.org/lang_aggfunc.html ("result is NULL").
+    if matches!(acc, Value::Null) {
+        return;
+    }
+    let s = acc.to_float_or_zero();
     let t = s + r;
+    if t.is_nan() {
+        *acc = Value::Null;
+        return;
+    }
     // When t is infinite, the KBN correction computes inf - inf = NaN,
     // which is meaningless. Skip compensation in that case.
     if t.is_finite() {
@@ -5108,7 +5117,10 @@ fn update_agg_payload(
                     "Avg: payload too short".to_string(),
                 ));
             };
-            let r_err = r_err_val.as_float();
+            if matches!(*sum_val, Value::Null) {
+                return Ok(());
+            }
+            let r_err = r_err_val.to_float_or_zero();
             let Value::Numeric(Numeric::Integer(count)) = count_val else {
                 mark_unlikely();
                 return Err(LimboError::InternalError(
@@ -5131,7 +5143,7 @@ fn update_agg_payload(
                 _ => unreachable!(),
             };
             // Use Kahan-Babuška-Neumaier compensation for better floating-point precision
-            let s = sum_val.as_float();
+            let s = sum_val.to_float_or_zero();
             let t = s + val;
             // When t is infinite, the KBN correction computes inf - inf = NaN,
             // which is meaningless. Skip compensation in that case.
@@ -5154,7 +5166,7 @@ fn update_agg_payload(
                     "Sum/Total: payload too short".to_string(),
                 ));
             };
-            let r_err_f = r_err_val.as_float();
+            let r_err_f = r_err_val.to_float_or_zero();
             let Value::Numeric(Numeric::Integer(approx_i)) = approx_val else {
                 mark_unlikely();
                 return Err(LimboError::InternalError(
@@ -5172,6 +5184,9 @@ fn update_agg_payload(
                 approx: *approx_i != 0,
                 ovrfl: *ovrfl_i != 0,
             };
+            if matches!(*acc, Value::Null) && sum_state.approx {
+                return Ok(());
+            }
             match arg {
                 Value::Null => {}
                 Value::Numeric(Numeric::Integer(i)) => match acc {
@@ -5346,12 +5361,12 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
         AggFunc::Count | AggFunc::Count0 => payload[0].clone(),
         AggFunc::Avg => {
             // Payload: [sum, r_err, count]
-            let sum = payload[0].as_float();
-            let r_err = payload[1].as_float();
             let count = payload[2].as_int().unwrap_or(0);
-            if count == 0 {
+            if count == 0 || matches!(&payload[0], Value::Null) {
                 Value::Null
             } else {
+                let sum = payload[0].to_float_or_zero();
+                let r_err = payload[1].to_float_or_zero();
                 // Apply KBN compensation before dividing
                 Value::from_f64((sum + r_err) / count as f64)
             }
@@ -5360,24 +5375,21 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
             let acc = &payload[0];
             let approx = payload[2].as_int().unwrap_or(0) != 0;
             let ovrfl = payload[3].as_int().unwrap_or(0) != 0;
-            let r_err = payload[1].as_float();
+            let r_err = payload[1].to_float_or_zero();
             match acc {
-                Value::Null => {
-                    if approx {
-                        Value::from_f64(0.0)
-                    } else {
-                        Value::Null
-                    }
-                }
+                Value::Null => Value::Null,
                 Value::Numeric(Numeric::Integer(i)) if !approx && !ovrfl => Value::from_i64(*i),
-                _ => Value::from_f64(acc.as_float() + r_err),
+                Value::Numeric(Numeric::Float(f)) => Value::from_f64(f64::from(*f) + r_err),
+                _ => Value::from_f64(acc.to_float_or_zero() + r_err),
             }
         }
         AggFunc::Total => {
             // Payload: [acc, r_err, approx, ovrfl]
             let acc = &payload[0];
-            let r_err = payload[1].as_float();
+            let approx = payload[2].as_int().unwrap_or(0) != 0;
+            let r_err = payload[1].to_float_or_zero();
             match acc {
+                Value::Null if approx => Value::Null,
                 Value::Null => Value::from_f64(0.0),
                 Value::Numeric(Numeric::Integer(i)) => Value::from_f64(*i as f64 + r_err),
                 Value::Numeric(Numeric::Float(f)) => Value::from_f64(f64::from(*f) + r_err),
@@ -8169,6 +8181,9 @@ pub fn op_function(
         }
         crate::function::Func::Agg(_) => {
             unreachable!("Aggregate functions should not be handled here")
+        }
+        crate::function::Func::Window(_) => {
+            unreachable!("Window functions should not be handled here")
         }
     }
     state.pc += 1;
@@ -13981,17 +13996,77 @@ fn op_vacuum_into_inner(
                         // Prepare SELECT and INSERT statements for this table
                         let table_name = &vacuum_state.table_names[table_idx];
                         let escaped_table_name = table_name.replace('"', "\"\"");
-                        let select_sql = format!("SELECT * FROM \"{escaped_table_name}\"");
+                        let source_btree_table =
+                            program.connection.schema.read().get_btree_table(table_name);
+                        let rowid_alias = source_btree_table
+                            .as_ref()
+                            .filter(|table| table.has_rowid)
+                            .and_then(|table| {
+                                ["rowid", "_rowid_", "oid"]
+                                    .iter()
+                                    .copied()
+                                    .find(|alias| table.get_column(alias).is_none())
+                            });
+                        let rowid_alias_column_index = source_btree_table
+                            .as_ref()
+                            .and_then(|table| table.get_rowid_alias_column().map(|(idx, _)| idx));
+
+                        let mut data_columns: Vec<&str> = vacuum_state
+                            .current_table_columns
+                            .iter()
+                            .map(String::as_str)
+                            .collect();
+                        let mut excluded_rowid_alias_column = false;
+                        if rowid_alias.is_some() {
+                            if let Some(idx) = rowid_alias_column_index {
+                                turso_assert!(
+                                    idx < data_columns.len(),
+                                    "rowid alias column index out of bounds for table columns",
+                                    { "idx": idx, "columns_len": data_columns.len() }
+                                );
+                                data_columns.remove(idx);
+                                excluded_rowid_alias_column = true;
+                            }
+                        }
+                        let column_names = data_columns.join(", ");
+
+                        let select_sql = match rowid_alias {
+                            Some(alias)
+                                if excluded_rowid_alias_column && column_names.is_empty() =>
+                            {
+                                format!("SELECT {alias} FROM \"{escaped_table_name}\"")
+                            }
+                            Some(alias) if excluded_rowid_alias_column => {
+                                format!(
+                                    "SELECT {alias}, {column_names} FROM \"{escaped_table_name}\""
+                                )
+                            }
+                            Some(alias) => {
+                                format!("SELECT {alias}, * FROM \"{escaped_table_name}\"")
+                            }
+                            None => format!("SELECT * FROM \"{escaped_table_name}\""),
+                        };
                         let select_stmt = program.connection.prepare(&select_sql)?;
 
                         // Prepare INSERT statement once per table (reused for all rows)
-                        let column_names = vacuum_state.current_table_columns.join(", ");
-                        let placeholders: String = (0..vacuum_state.current_table_columns.len())
-                            .map(|_| "?")
-                            .collect::<Vec<_>>()
-                            .join(", ");
+                        let bind_count = if rowid_alias.is_some() {
+                            data_columns.len() + 1
+                        } else {
+                            data_columns.len()
+                        };
+                        let placeholders: String =
+                            (0..bind_count).map(|_| "?").collect::<Vec<_>>().join(", ");
+                        let insert_columns = if let Some(alias) = rowid_alias {
+                            if column_names.is_empty() {
+                                alias.to_string()
+                            } else {
+                                format!("{alias}, {column_names}")
+                            }
+                        } else {
+                            column_names
+                        };
                         let insert_sql = format!(
-                            "INSERT INTO \"{escaped_table_name}\" ({column_names}) VALUES ({placeholders})"
+                            "INSERT INTO \"{escaped_table_name}\" ({insert_columns}) VALUES ({placeholders})"
                         );
 
                         // Internal tables need nested mode to bypass "may not

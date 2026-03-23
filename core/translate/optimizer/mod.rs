@@ -9,7 +9,9 @@ use crate::{
         insert::ROWID_COLUMN,
         optimizer::{
             access_method::AccessMethodParams,
-            constraints::{RangeConstraintRef, SeekRangeConstraint, TableConstraints},
+            constraints::{
+                ConstraintUseCandidate, RangeConstraintRef, SeekRangeConstraint, TableConstraints,
+            },
             cost::RowCountEstimate,
             multi_index::MultiIndexBranchAccessParams,
             order::{ColumnTarget, OrderTarget},
@@ -966,7 +968,7 @@ fn add_ephemeral_table_to_update_plan(
         unique_sets: vec![],
         foreign_keys: vec![],
         check_constraints: vec![],
-        pk_conflict_clause: None,
+        rowid_alias_conflict_clause: None,
     });
 
     let temp_cursor_id = program.alloc_cursor_id_keyed(
@@ -989,6 +991,7 @@ fn add_ephemeral_table_to_update_plan(
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: 0,
+            indexed: None,
         }],
         vec![],
     );
@@ -1476,7 +1479,8 @@ fn expr_has_null_masking_for_table(expr: &ast::Expr, table_id: ast::TableInterna
     let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
         match e {
             ast::Expr::FunctionCall { name, args, .. } => {
-                if let Ok(func) = crate::function::Func::resolve_function(name.as_str(), args.len())
+                if let Ok(Some(func)) =
+                    crate::function::Func::resolve_function(name.as_str(), args.len())
                 {
                     // IIF(cond, then, else) is like CASE WHEN cond THEN then ELSE else END.
                     // If the condition is a null check on the target table, IIF masks nulls.
@@ -1521,6 +1525,60 @@ fn expr_has_null_masking_for_table(expr: &ast::Expr, table_id: ast::TableInterna
         Ok(WalkControl::Continue)
     });
     found
+}
+
+/// Enforce INDEXED BY / NOT INDEXED hints by validating index existence and
+/// filtering constraint candidates accordingly.
+fn enforce_indexed_by_hints(
+    table_references: &TableReferences,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    constraints_per_table: &mut [TableConstraints],
+) -> Result<()> {
+    for (i, table_ref) in table_references.joined_tables().iter().enumerate() {
+        let Some(ref indexed) = table_ref.indexed else {
+            continue;
+        };
+        let Some(btree) = table_ref.btree() else {
+            continue;
+        };
+        let Some(cs) = constraints_per_table.get_mut(i) else {
+            continue;
+        };
+        match indexed {
+            ast::Indexed::IndexedBy(name) => {
+                let idx_name = name.as_str();
+                // Verify the index exists and belongs to this table.
+                let forced_index = available_indexes.get(&btree.name).and_then(|indexes| {
+                    indexes.iter().find(|idx| {
+                        idx.name.eq_ignore_ascii_case(idx_name) && idx.index_method.is_none()
+                    })
+                });
+                let Some(forced_index) = forced_index else {
+                    crate::bail_parse_error!("no such index: {}", idx_name);
+                };
+                // Keep only the candidate for the forced index.
+                let forced_index = forced_index.clone();
+                cs.candidates.retain(|c| {
+                    c.index
+                        .as_ref()
+                        .is_some_and(|idx| Arc::ptr_eq(idx, &forced_index))
+                });
+                // If no candidate survived (no WHERE constraints matched), add an empty one
+                // so the optimizer can still scan the index.
+                if cs.candidates.is_empty() {
+                    cs.candidates.push(ConstraintUseCandidate {
+                        index: Some(forced_index),
+                        refs: Vec::new(),
+                    });
+                }
+            }
+            ast::Indexed::NotIndexed => {
+                // Remove all secondary index candidates, keep only rowid.
+                cs.candidates.retain(|c| c.index.is_none());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Optimize the join order and index selection for a query.
@@ -1583,8 +1641,13 @@ fn optimize_table_access(
 
     // For single-table queries, try to optimize with custom index methods directly.
     // This is the fast path that preserves the original behavior.
+    // Skip when INDEXED BY / NOT INDEXED is specified — those force a specific btree index or table scan.
     let is_single_table = table_references.joined_tables().len() == 1;
-    if is_single_table {
+    let has_indexed_by_hint = table_references
+        .joined_tables()
+        .iter()
+        .any(|t| t.indexed.is_some());
+    if is_single_table && !has_indexed_by_hint {
         let optimized = optimize_table_access_with_custom_modules(
             result_columns,
             table_references,
@@ -1635,6 +1698,13 @@ fn optimize_table_access(
         subqueries,
         schema,
         params,
+    )?;
+
+    // Enforce INDEXED BY / NOT INDEXED hints on constraint candidates.
+    enforce_indexed_by_hints(
+        table_references,
+        available_indexes,
+        &mut constraints_per_table,
     )?;
 
     let base_table_rows = table_references
@@ -1707,6 +1777,11 @@ fn optimize_table_access(
             subqueries,
             schema,
             params,
+        )?;
+        enforce_indexed_by_hints(
+            table_references,
+            available_indexes,
+            &mut constraints_per_table,
         )?;
     }
 
@@ -2684,8 +2759,20 @@ impl Optimizable for ast::Expr {
             // contain DoublyQualified nodes.
             Expr::DoublyQualified(_, _, _) => false,
             Expr::Exists(_) => false,
-            Expr::FunctionCall { args, name, .. } => {
-                let Some(func) = resolver.resolve_function(name.as_str(), args.len()) else {
+            Expr::FunctionCall {
+                args,
+                name,
+                filter_over,
+                ..
+            } => {
+                if filter_over.over_clause.is_some() {
+                    return false;
+                }
+                let Some(func) = resolver
+                    .resolve_function(name.as_str(), args.len())
+                    .ok()
+                    .flatten()
+                else {
                     return false;
                 };
                 func.is_deterministic() && args.iter().all(|arg| arg.is_constant(resolver))
@@ -3329,16 +3416,6 @@ fn build_seek_def(
             }
         }
     })
-}
-
-pub trait TakeOwnership {
-    fn take_ownership(&mut self) -> Self;
-}
-
-impl TakeOwnership for ast::Expr {
-    fn take_ownership(&mut self) -> Self {
-        std::mem::replace(self, ast::Expr::Literal(ast::Literal::Null))
-    }
 }
 
 #[cfg(test)]

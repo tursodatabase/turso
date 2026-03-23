@@ -1459,7 +1459,7 @@ mod tests {
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
-            pk_conflict_clause: None,
+            rowid_alias_conflict_clause: None,
             has_autoincrement: false,
         };
 
@@ -1505,7 +1505,7 @@ mod tests {
             has_autoincrement: false,
             foreign_keys: vec![],
             check_constraints: vec![],
-            pk_conflict_clause: None,
+            rowid_alias_conflict_clause: None,
             unique_sets: vec![],
         };
 
@@ -1547,7 +1547,7 @@ mod tests {
             has_autoincrement: false,
             foreign_keys: vec![],
             check_constraints: vec![],
-            pk_conflict_clause: None,
+            rowid_alias_conflict_clause: None,
             unique_sets: vec![],
         };
 
@@ -1582,7 +1582,7 @@ mod tests {
             has_autoincrement: false,
             foreign_keys: vec![],
             check_constraints: vec![],
-            pk_conflict_clause: None,
+            rowid_alias_conflict_clause: None,
             unique_sets: vec![],
         };
 

@@ -6,7 +6,7 @@ use turso_parser::ast::{
 };
 
 use crate::{
-    function::AggFunc,
+    function::{AggFunc, WindowFunc},
     schema::{BTreeTable, ColDef, Column, FromClauseSubquery, Index, Schema, Table},
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
@@ -912,6 +912,8 @@ pub struct JoinedTable {
     pub expression_index_usages: Vec<ExpressionIndexUsage>,
     /// The index of the database. "main" is always zero.
     pub database_id: usize,
+    /// INDEXED BY / NOT INDEXED hint from the SQL statement.
+    pub indexed: Option<ast::Indexed>,
 }
 
 #[derive(Debug, Clone)]
@@ -989,6 +991,12 @@ pub struct TableReferences {
     /// Set when a RIGHT JOIN is rewritten as LEFT JOIN by swapping the two tables,
     /// so `select_star` emits columns in the original user-visible order.
     right_join_swapped: bool,
+}
+
+impl Default for TableReferences {
+    fn default() -> Self {
+        Self::new_empty()
+    }
 }
 
 impl TableReferences {
@@ -1735,6 +1743,7 @@ impl JoinedTable {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: 0,
+            indexed: None,
         })
     }
 
@@ -1835,6 +1844,7 @@ impl JoinedTable {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: 0,
+            indexed: None,
         })
     }
 
@@ -2461,10 +2471,16 @@ impl Window {
 }
 
 #[derive(Debug, Clone)]
+pub enum WindowFunctionKind {
+    Agg(AggFunc),
+    Window(WindowFunc),
+}
+
+#[derive(Debug, Clone)]
 pub struct WindowFunction {
-    /// The resolved function. Currently, only regular aggregate functions are supported.
-    /// In the future, more specialized window functions such as `RANK()`, `ROW_NUMBER()`, etc. will be added.
-    pub func: AggFunc,
+    /// The resolved function. Aggregate window functions and specialized window
+    /// functions such as ROW_NUMBER() are supported.
+    pub func: WindowFunctionKind,
     /// The expression from which the function was resolved.
     pub original_expr: Expr,
 }

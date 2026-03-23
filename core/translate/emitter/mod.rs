@@ -21,8 +21,8 @@ use crate::function::Func;
 use crate::schema::{BTreeTable, CheckConstraint, Column, IndexColumn, Schema, Table};
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{
-    bind_and_rewrite_expr, rewrite_between_expr, translate_expr_no_constant_opt, walk_expr,
-    walk_expr_mut, BindingBehavior, NoConstantOptReason, WalkControl,
+    bind_and_rewrite_expr, translate_expr_no_constant_opt, walk_expr, walk_expr_mut,
+    BindingBehavior, NoConstantOptReason, WalkControl,
 };
 use crate::translate::plan::{JoinedTable, NonFromClauseSubquery, Plan, ResultSetColumn};
 use crate::translate::planner::TableMask;
@@ -199,13 +199,17 @@ impl<'a> Resolver<'a> {
         });
     }
 
-    pub fn resolve_function(&self, func_name: &str, arg_count: usize) -> Option<Func> {
-        match Func::resolve_function(func_name, arg_count).ok() {
-            Some(func) => Some(func),
-            None => self
+    pub fn resolve_function(
+        &self,
+        func_name: &str,
+        arg_count: usize,
+    ) -> Result<Option<Func>, LimboError> {
+        match Func::resolve_function(func_name, arg_count)? {
+            Some(func) => Ok(Some(func)),
+            None => Ok(self
                 .symbol_table
                 .resolve_function(func_name, arg_count)
-                .map(Func::External),
+                .map(Func::External)),
         }
     }
 
@@ -821,7 +825,7 @@ fn emit_cdc_insns_v1(
     });
     program.mark_last_insn_constant();
 
-    let Some(unixepoch_fn) = resolver.resolve_function("unixepoch", 0) else {
+    let Some(unixepoch_fn) = resolver.resolve_function("unixepoch", 0)? else {
         bail_parse_error!("no function {}", "unixepoch");
     };
     let unixepoch_fn_ctx = crate::function::FuncCtx {
@@ -933,7 +937,7 @@ fn emit_cdc_insns_v2(
     program.mark_last_insn_constant();
 
     // change_time = unixepoch()
-    let Some(unixepoch_fn) = resolver.resolve_function("unixepoch", 0) else {
+    let Some(unixepoch_fn) = resolver.resolve_function("unixepoch", 0)? else {
         bail_parse_error!("no function {}", "unixepoch");
     };
     let unixepoch_fn_ctx = crate::function::FuncCtx {
@@ -955,7 +959,7 @@ fn emit_cdc_insns_v2(
         rowid_reg: candidate_reg,
         prev_largest_reg: 0,
     });
-    let Some(conn_txn_id_fn) = resolver.resolve_function("conn_txn_id", 1) else {
+    let Some(conn_txn_id_fn) = resolver.resolve_function("conn_txn_id", 1)? else {
         bail_parse_error!("no function {}", "conn_txn_id");
     };
     let conn_txn_id_fn_ctx = crate::function::FuncCtx {
@@ -1068,7 +1072,7 @@ pub fn emit_cdc_commit_insns(
     program.mark_last_insn_constant();
 
     // reg+1: change_time = unixepoch()
-    let Some(unixepoch_fn) = resolver.resolve_function("unixepoch", 0) else {
+    let Some(unixepoch_fn) = resolver.resolve_function("unixepoch", 0)? else {
         bail_parse_error!("no function {}", "unixepoch");
     };
     let unixepoch_fn_ctx = crate::function::FuncCtx {
@@ -1086,7 +1090,7 @@ pub fn emit_cdc_commit_insns(
     // Pass -1 as candidate: if a txn_id exists, return it; if not, -1 is stored (and will be reset).
     let minus_one_reg = program.alloc_register();
     program.emit_int(-1, minus_one_reg);
-    let Some(conn_txn_id_fn) = resolver.resolve_function("conn_txn_id", 1) else {
+    let Some(conn_txn_id_fn) = resolver.resolve_function("conn_txn_id", 1)? else {
         bail_parse_error!("no function {}", "conn_txn_id");
     };
     let conn_txn_id_fn_ctx = crate::function::FuncCtx {
@@ -1147,7 +1151,7 @@ pub fn emit_cdc_autocommit_commit(
     let cdc_info = program.capture_data_changes_info().as_ref();
     if cdc_info.is_some_and(|info| info.cdc_version().has_commit_record()) {
         // Check if we're in autocommit mode; if so, emit a COMMIT record.
-        let Some(is_autocommit_fn) = resolver.resolve_function("is_autocommit", 0) else {
+        let Some(is_autocommit_fn) = resolver.resolve_function("is_autocommit", 0)? else {
             bail_parse_error!("no function {}", "is_autocommit");
         };
         let is_autocommit_fn_ctx = crate::function::FuncCtx {
@@ -1288,7 +1292,6 @@ fn rewrite_where_for_update_registers(
     columns_start_reg: usize,
     rowid_reg: usize,
 ) -> Result<WalkControl> {
-    rewrite_between_expr(expr);
     walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
         match e {
             Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
@@ -1439,7 +1442,6 @@ fn emit_check_constraint_bytecode(
         let expr_result_reg = program.alloc_register();
 
         let mut rewritten_expr = check_constraint.expr.clone();
-        rewrite_between_expr(&mut rewritten_expr);
         if let Some(referenced_tables) = referenced_tables {
             let mut binding_tables = referenced_tables.clone();
             if let Some(joined_table) = binding_tables.joined_tables_mut().first_mut() {
