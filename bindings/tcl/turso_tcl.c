@@ -24,6 +24,10 @@
 #include <string.h>
 #include <stdlib.h>
 
+#ifndef SQLITE_DETERMINISTIC
+#define SQLITE_DETERMINISTIC 0x00000800
+#endif
+
 #define TURSO_TCL_VERSION "1.0"
 #define MAX_FUNC_ARGS 64
 
@@ -49,6 +53,31 @@ typedef struct TclFuncData {
 /* ------------------------------------------------------------------ */
 /* Value helpers                                                        */
 /* ------------------------------------------------------------------ */
+
+/* --- Binds Tcl variables to SQL parameters ($x1, etc.) --- */
+static void bind_tcl_parameters(Tcl_Interp *interp, sqlite3_stmt *stmt) {
+    int i, n = sqlite3_bind_parameter_count(stmt);
+    for (i = 1; i <= n; i++) {
+        const char *zVar = sqlite3_bind_parameter_name(stmt, i);
+        if (zVar && (zVar[0] == '$')) {
+            Tcl_Obj *pVar = Tcl_GetVar2Ex(interp, &zVar[1], NULL, 0);
+            if (!pVar) pVar = Tcl_GetVar2Ex(interp, &zVar[1], NULL, TCL_GLOBAL_ONLY);
+            if (pVar) {
+                double dval;
+                Tcl_WideInt ival;
+                if (Tcl_GetWideIntFromObj(NULL, pVar, &ival) == TCL_OK) {
+                    sqlite3_bind_int64(stmt, i, (sqlite3_int64)ival);
+                } else if (Tcl_GetDoubleFromObj(NULL, pVar, &dval) == TCL_OK) {
+                    sqlite3_bind_double(stmt, i, dval);
+                } else {
+                    Tcl_Size len;
+                    const char *str = Tcl_GetStringFromObj(pVar, &len);
+                    sqlite3_bind_text(stmt, i, str, (int)len, SQLITE_TRANSIENT);
+                }
+            }
+        }
+    }
+}
 
 /* Convert a column value to a Tcl_Obj. */
 static Tcl_Obj *column_to_obj(sqlite3_stmt *stmt, int i, const char *null_str)
@@ -194,6 +223,8 @@ static int exec_sql_collect(Tcl_Interp *interp, sqlite3 *db,
             remaining = tail;
             continue;
         }
+		
+				bind_tcl_parameters(interp, stmt);
 
         /* reset the list for each non-empty statement so the caller
            sees the results of the final one (matches SQLite tclsqlite behaviour) */
@@ -245,14 +276,14 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
     TursoDb    *tdb = (TursoDb *)cd;
     static const char *cmds[] = {
         "eval", "one", "exists", "changes", "total_changes",
-        "last_insert_rowid", "errorcode", "errmsg", "null",
-        "func", "function", "close", "limit",
+        "last_insert_rowid", "errorcode", "errmsg", "nullvalue",
+        "func", "function", "close", "limit", "cache",
         NULL
     };
     enum {
         CMD_EVAL, CMD_ONE, CMD_EXISTS, CMD_CHANGES, CMD_TOTAL_CHANGES,
-        CMD_LAST_INSERT_ROWID, CMD_ERRORCODE, CMD_ERRMSG, CMD_NULL,
-        CMD_FUNC, CMD_FUNCTION, CMD_CLOSE, CMD_LIMIT
+        CMD_LAST_INSERT_ROWID, CMD_ERRORCODE, CMD_ERRMSG, CMD_NULLVALUE,
+        CMD_FUNC, CMD_FUNCTION, CMD_CLOSE, CMD_LIMIT, CMD_CACHE
     };
     int cmdIdx;
 
@@ -267,6 +298,23 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
     }
 
     switch (cmdIdx) {
+    case CMD_CACHE: {
+        if (objc < 3) {
+            Tcl_WrongNumArgs(interp, 2, objv, "flush|size ?n?");
+            return TCL_ERROR;
+        }
+        const char *subCmd = Tcl_GetString(objv[2]);
+        if (strcmp(subCmd, "flush") == 0) {
+            /* No-op: we finalize statements immediately, so the cache is always empty */
+            return TCL_OK;
+        } else if (strcmp(subCmd, "size") == 0) {
+            /* No-op: accept size limits but ignore them */
+            return TCL_OK;
+        } else {
+            Tcl_AppendResult(interp, "bad option \"", subCmd, "\": must be flush or size", NULL);
+            return TCL_ERROR;
+        }
+    }
 
     /* ---- simple counters / metadata ---- */
 
@@ -293,7 +341,7 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
 
     /* ---- null value string ---- */
 
-    case CMD_NULL:
+    case CMD_NULLVALUE:
         if (objc == 3) {
             if (tdb->null_obj) Tcl_DecrRefCount(tdb->null_obj);
             tdb->null_obj = objv[2];
@@ -365,6 +413,8 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
                 }
                 if (!stmt) { remaining = tail; continue; }
 
+								bind_tcl_parameters(interp, stmt);
+          
                 int ncols = sqlite3_column_count(stmt);
 
                 /* Set array(*) to the list of column names. */
@@ -438,6 +488,8 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
             return TCL_ERROR;
         }
 
+				bind_tcl_parameters(interp, stmt);
+      
         Tcl_Obj *result = Tcl_NewStringObj(null_str, -1);
         if (sqlite3_step(stmt) == SQLITE_ROW) {
             result = column_to_obj(stmt, 0, null_str);
@@ -462,6 +514,9 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
             Tcl_SetResult(interp, (char *)sqlite3_errmsg(tdb->db), TCL_VOLATILE);
             return TCL_ERROR;
         }
+
+			  bind_tcl_parameters(interp, stmt);
+
         int exists = (sqlite3_step(stmt) == SQLITE_ROW) ? 1 : 0;
         sqlite3_finalize(stmt);
         Tcl_SetObjResult(interp, Tcl_NewBooleanObj(exists));
@@ -558,10 +613,19 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
 /* sqlite3 open command                                                 */
 /* ------------------------------------------------------------------ */
 
-static int TursoOpenCmd(ClientData cd, Tcl_Interp *interp,
-                        int objc, Tcl_Obj *const objv[])
+static int TursoOpenCmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[])
 {
-    (void)cd;
+    if (objc == 2) {
+        const char *zArg = Tcl_GetString(objv[1]);
+        if (strcmp(zArg, "-version") == 0) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj(sqlite3_libversion(), -1));
+            return TCL_OK;
+        }
+        if (strcmp(zArg, "-has-codec") == 0) {
+            Tcl_SetObjResult(interp, Tcl_NewIntObj(0));
+            return TCL_OK;
+        }
+    }
 
     if (objc < 3) {
         Tcl_WrongNumArgs(interp, 1, objv, "name filename ?options?");
@@ -586,9 +650,163 @@ static int TursoOpenCmd(ClientData cd, Tcl_Interp *interp,
     tdb->interp   = interp;
     tdb->null_obj = NULL;
 
-    Tcl_CreateObjCommand(interp, handle_name, TursoDbCmd,
-                         (ClientData)tdb, TursoDbFree);
+    Tcl_CreateObjCommand(interp, handle_name, TursoDbCmd, (ClientData)tdb, TursoDbFree);
     Tcl_SetResult(interp, (char *)handle_name, TCL_VOLATILE);
+    return TCL_OK;
+}
+
+static int Sqlite3ConnectionPointerCmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
+    if (objc != 2) {
+        Tcl_WrongNumArgs(interp, 1, objv, "dbcmd");
+        return TCL_ERROR;
+    }
+
+    const char *cmdName = Tcl_GetString(objv[1]);
+    Tcl_CmdInfo cmdInfo;
+    
+    if (!Tcl_GetCommandInfo(interp, cmdName, &cmdInfo)) {
+        Tcl_AppendResult(interp, "no such command: ", cmdName, NULL);
+        return TCL_ERROR;
+    }
+
+    /* Extract the TursoDb struct we stored in the command's client data */
+    TursoDb *tdb = (TursoDb *)cmdInfo.objClientData;
+    
+    /* Return the raw sqlite3 pointer as a string */
+    char buf[100];
+    snprintf(buf, sizeof(buf), "%p", (void *)tdb->db);
+    Tcl_SetObjResult(interp, Tcl_NewStringObj(buf, -1));
+    
+    return TCL_OK;
+}
+
+static void testFuncCallback(void *ctx, int argc, void **argv) {
+    if (argc < 2) {
+        sqlite3_result_error(ctx, "first argument should be one of: int int64 string double null value", -1);
+        return;
+    }
+
+    int i;
+    for (i = 0; i < argc - 1; i += 2) {
+        const char *zType = (const char *)sqlite3_value_text(argv[i]);
+        
+        if (!zType) {
+            sqlite3_result_error(ctx, "first argument should be one of: int int64 string double null value", -1);
+            return;
+        }
+
+        if (strcmp(zType, "int") == 0) {
+            sqlite3_result_int(ctx, sqlite3_value_int(argv[i+1]));
+        } else if (strcmp(zType, "int64") == 0) {
+            sqlite3_result_int64(ctx, sqlite3_value_int64(argv[i+1]));
+        } else if (strcmp(zType, "string") == 0) {
+            sqlite3_result_text(ctx, (const char *)sqlite3_value_text(argv[i+1]), -1, SQLITE_TRANSIENT);
+        } else if (strcmp(zType, "double") == 0) {
+            sqlite3_result_double(ctx, sqlite3_value_double(argv[i+1]));
+        } else if (strcmp(zType, "null") == 0) {
+            sqlite3_result_null(ctx);
+        } else if (strcmp(zType, "value") == 0) {
+            int vtype = sqlite3_value_type(argv[i+1]);
+            if (vtype == 1) {
+                sqlite3_result_int64(ctx, sqlite3_value_int64(argv[i+1]));
+            } else if (vtype == 2) {
+                sqlite3_result_double(ctx, sqlite3_value_double(argv[i+1]));
+            } else if (vtype == 3) {
+                sqlite3_result_text(ctx, (const char *)sqlite3_value_text(argv[i+1]), -1, SQLITE_TRANSIENT);
+            } else if (vtype == 4) {
+                sqlite3_result_blob(ctx, sqlite3_value_blob(argv[i+1]), sqlite3_value_bytes(argv[i+1]), SQLITE_TRANSIENT);
+            } else {
+                sqlite3_result_null(ctx);
+            }
+        } else {
+            sqlite3_result_error(ctx, "first argument should be one of: int int64 string double null value", -1);
+            return;
+        }
+    }
+}
+
+static int SqliteRegisterTestFunctionCmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
+    if (objc != 3) {
+        Tcl_WrongNumArgs(interp, 1, objv, "db-pointer function-name");
+        return TCL_ERROR;
+    }
+
+    const char *dbPtrStr = Tcl_GetString(objv[1]);
+    const char *funcName = Tcl_GetString(objv[2]);
+    sqlite3 *db = NULL;
+
+    if (sscanf(dbPtrStr, "%p", (void **)&db) != 1) {
+        Tcl_AppendResult(interp, "invalid db pointer format", NULL);
+        return TCL_ERROR;
+    }
+
+    int rc = sqlite3_create_function_v2(
+        db, 
+        funcName, 
+        -1, 
+        0, 
+        NULL, 
+        (void (*)(void))testFuncCallback, 
+        NULL, 
+        NULL,
+        NULL
+    );
+
+    if (rc != SQLITE_OK) {
+        Tcl_AppendResult(interp, "failed to register test function", NULL);
+        return TCL_ERROR;
+    }
+
+    return TCL_OK;
+}
+
+static int Working64bitIntCmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
+    Tcl_SetObjResult(interp, Tcl_NewIntObj(1));
+    return TCL_OK;
+}
+
+static int PermutationCmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
+    Tcl_SetObjResult(interp, Tcl_NewStringObj("", 0));
+    return TCL_OK;
+}
+
+static int counter1_val = 0;
+static void counterFunc1(void *ctx, int argc, void **argv) {
+    counter1_val++;
+    sqlite3_result_int(ctx, counter1_val);
+}
+
+static int counter2_val = 0;
+static void counterFunc2(void *ctx, int argc, void **argv) {
+    counter2_val++;
+    sqlite3_result_int(ctx, counter2_val);
+}
+
+static int Sqlite3CreateFunctionCmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
+    if (objc != 2) {
+        Tcl_WrongNumArgs(interp, 1, objv, "dbcmd");
+        return TCL_ERROR;
+    }
+
+    const char *cmdName = Tcl_GetString(objv[1]);
+    Tcl_CmdInfo cmdInfo;
+    if (!Tcl_GetCommandInfo(interp, cmdName, &cmdInfo)) {
+        Tcl_AppendResult(interp, "no such command: ", cmdName, NULL);
+        return TCL_ERROR;
+    }
+
+    TursoDb *tdb = (TursoDb *)cmdInfo.objClientData;
+
+    /* Reset the counters whenever this command is called so tests are repeatable */
+    counter1_val = 0;
+    counter2_val = 0;
+
+    /* counter1 is non-deterministic (flag: 0) */
+    sqlite3_create_function_v2(tdb->db, "counter1", -1, 0, NULL, (void (*)(void))counterFunc1, NULL, NULL, NULL);
+    
+    /* counter2 is deterministic (flag: SQLITE_DETERMINISTIC) */
+    sqlite3_create_function_v2(tdb->db, "counter2", -1, SQLITE_DETERMINISTIC, NULL, (void (*)(void))counterFunc2, NULL, NULL, NULL);
+
     return TCL_OK;
 }
 
@@ -601,8 +819,15 @@ int Tursotcl_Init(Tcl_Interp *interp)
     if (Tcl_InitStubs(interp, TCL_VERSION, 0) == NULL) {
         return TCL_ERROR;
     }
+	
+    Tcl_SetVar(interp, "bitmask_size", "64", TCL_GLOBAL_ONLY);
 
     Tcl_CreateObjCommand(interp, "sqlite3", TursoOpenCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_connection_pointer", Sqlite3ConnectionPointerCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite_register_test_function", SqliteRegisterTestFunctionCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "working_64bit_int", Working64bitIntCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "permutation", PermutationCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_create_function", Sqlite3CreateFunctionCmd, NULL, NULL);
 
     Tcl_PkgProvide(interp, "tursotcl", TURSO_TCL_VERSION);
     return TCL_OK;
