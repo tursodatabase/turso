@@ -1032,7 +1032,21 @@ fn replace_column_number_with_copy_of_column_expr(
     order_by_or_group_by_expr: &mut ast::Expr,
     columns: &[ResultSetColumn],
 ) -> Result<()> {
-    if let ast::Expr::Literal(ast::Literal::Numeric(num)) = order_by_or_group_by_expr {
+    // Extract the numeric literal string, handling both bare integers (e.g. `2`)
+    // and unary-plus integers (e.g. `+2`). In SQLite, `ORDER BY +2` strips the
+    // unary plus and still resolves `2` as a column index reference.
+    let num_str = match order_by_or_group_by_expr {
+        ast::Expr::Literal(ast::Literal::Numeric(num)) => Some(num.clone()),
+        ast::Expr::Unary(ast::UnaryOperator::Positive, inner) => {
+            if let ast::Expr::Literal(ast::Literal::Numeric(num)) = inner.as_ref() {
+                Some(num.clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    if let Some(num) = num_str {
         // Only treat as column reference if it parses as a positive integer.
         // Float literals like "0.5" or "1.0" are valid constant expressions, not column references.
         if let Ok(column_number) = num.parse::<usize>() {
