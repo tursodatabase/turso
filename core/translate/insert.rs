@@ -2388,11 +2388,15 @@ fn build_insertion<'a>(
 
     if columns.is_empty() {
         // Case 1: No columns specified - map values to columns in order
-        if num_values != layout.num_non_virtual_cols() {
+        let num_storable_columns = table_columns
+            .iter()
+            .filter(|c| !c.hidden() && !c.is_generated())
+            .count();
+        if num_values != num_storable_columns {
             crate::bail_parse_error!(
                 "table {} has {} columns but {} values were supplied",
                 &table.get_name(),
-                layout.num_non_virtual_cols(),
+                num_storable_columns,
                 num_values
             );
         }
