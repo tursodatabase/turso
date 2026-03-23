@@ -45,3 +45,10 @@ tclsh select1.test
 - `tester.tcl` — Test framework (loaded by all test files). Provides `do_test`, `do_execsql_test`, `do_catchsql_test`, and other helpers.
 - `all.test` — Runner that sources all individual test files.
 - `*.test` — Individual test files organized by SQL feature (e.g., `select1.test`, `insert.test`, `join.test`, `func.test`, `alter.test`).
+
+## Info on TCL Tests
+- select1: deprecated PRAGMA short_column_names and PRAGMA full_column_names
+- insert2: deprecated PRAGMA count_changes
+- func4: tests totype extension
+- join8: tests series extension
+- selectG: 120 passes but very slow
