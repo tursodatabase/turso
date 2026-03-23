@@ -29,6 +29,6 @@
     "test": "echo 'no tests'"
   },
   "dependencies": {
-    "@napi-rs/wasm-runtime": "^1.0.5"
+    "@napi-rs/wasm-runtime": "^1.1.1"
   }
 }
