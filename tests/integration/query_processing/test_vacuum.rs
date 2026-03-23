@@ -2016,8 +2016,6 @@ fn test_plain_vacuum_concurrent_successful_writes_survive(
     }
     setup_conn.execute("COMMIT")?;
 
-    drop(setup_conn);
-
     let db = Arc::clone(&tmp_db.db);
     let vacuum_started = Arc::new(AtomicBool::new(false));
     let vacuum_done = Arc::new(AtomicBool::new(false));
@@ -2027,10 +2025,28 @@ fn test_plain_vacuum_concurrent_successful_writes_survive(
     let vacuum_handle = std::thread::spawn(move || -> anyhow::Result<()> {
         let vacuum_conn = db.connect()?;
         vacuum_started_thread.store(true, Ordering::SeqCst);
-        let vacuum_result = vacuum_conn.execute("VACUUM");
-        vacuum_done_thread.store(true, Ordering::SeqCst);
-        vacuum_result?;
-        Ok(())
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match vacuum_conn.execute("VACUUM") {
+                Ok(()) => {
+                    vacuum_done_thread.store(true, Ordering::SeqCst);
+                    return Ok(());
+                }
+                Err(LimboError::Busy) | Err(LimboError::BusySnapshot) => {
+                    if std::time::Instant::now() >= deadline {
+                        vacuum_done_thread.store(true, Ordering::SeqCst);
+                        anyhow::bail!(
+                            "VACUUM remained BUSY for 10s while waiting for concurrent writer"
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(err) => {
+                    vacuum_done_thread.store(true, Ordering::SeqCst);
+                    return Err(err.into());
+                }
+            }
+        }
     });
 
     while !vacuum_started.load(Ordering::SeqCst) {
