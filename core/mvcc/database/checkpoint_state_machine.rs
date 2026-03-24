@@ -728,7 +728,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
                 self.mvstore
                     .storage
-                    .on_checkpoint_start(self.durable_txid_max_new);
+                    .on_checkpoint_start(self.durable_txid_max_new)?;
 
                 if self.write_set.is_empty() && self.index_write_set.is_empty() {
                     // Nothing to checkpoint, skip pager txn and go straight to WAL checkpoint.
@@ -1519,7 +1519,7 @@ impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
             Err(ref err) => {
                 self.mvstore
                     .storage
-                    .on_checkpoint_end(self.durable_txid_max_new, Err(err.clone()));
+                    .on_checkpoint_end(self.durable_txid_max_new, Err(err.clone()))?;
                 tracing::debug!("Error in checkpoint state machine: {err}");
                 self.cleanup_after_external_io_error();
                 res
@@ -1527,7 +1527,7 @@ impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
             Ok(TransitionResult::Done(ref result)) => {
                 self.mvstore
                     .storage
-                    .on_checkpoint_end(self.durable_txid_max_new, Ok(result));
+                    .on_checkpoint_end(self.durable_txid_max_new, Ok(result))?;
                 res
             }
             Ok(result) => Ok(result),
