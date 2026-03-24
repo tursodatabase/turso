@@ -2,8 +2,8 @@ use crate::ast::{
     check::ColumnCount, AlterTable, AlterTableBody, As, Cmd, ColumnConstraint, ColumnDefinition,
     CommonTableExpr, CompoundOperator, CompoundSelect, CreateTableBody, CreateTypeBody,
     CreateVirtualTable, DeferSubclause, Distinctness, Expr, ForeignKeyClause, FrameBound,
-    FrameClause, FrameExclude, FrameMode, FromClause, FunctionTail, GroupBy, Indexed,
-    IndexedColumn, InitDeferredPred, InsertBody, JoinConstraint, JoinOperator, JoinType,
+    FrameClause, FrameExclude, FrameMode, FromClause, FunctionTail, GeneratedColumnType, GroupBy,
+    Indexed, IndexedColumn, InitDeferredPred, InsertBody, JoinConstraint, JoinOperator, JoinType,
     JoinedSelectTable, LikeOperator, Limit, Literal, Materialized, Name, NamedColumnConstraint,
     NamedTableConstraint, NullsOrder, OneSelect, Operator, Over, PragmaBody, PragmaValue,
     QualifiedName, RefAct, RefArg, ResolveType, ResultColumn, Select, SelectBody, SelectTable, Set,
@@ -3593,7 +3593,14 @@ impl<'a> Parser<'a> {
             Some(tok) => match tok.token_type.fallback_id_if_ok() {
                 TK_ID => {
                     let tok = eat_assert!(self, TK_ID);
-                    Some(Name::exact(from_bytes(tok.as_bytes())))
+                    let s = from_bytes(tok.as_bytes());
+                    if s.eq_ignore_ascii_case("STORED") {
+                        Some(GeneratedColumnType::Stored)
+                    } else if s.eq_ignore_ascii_case("VIRTUAL") {
+                        Some(GeneratedColumnType::Virtual)
+                    } else {
+                        None
+                    }
                 }
                 _ => None,
             },
@@ -10696,7 +10703,7 @@ mod tests {
                                 name: None,
                                 constraint: ColumnConstraint::Generated {
                                     expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                                    typ: Some(Name::exact("STORED".to_owned())),
+                                    typ: Some(GeneratedColumnType::Stored),
                                 },
                             },
                         ],

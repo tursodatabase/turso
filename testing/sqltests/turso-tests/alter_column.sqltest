@@ -331,10 +331,10 @@ expect {
     CREATE TABLE c3 (x INTEGER PRIMARY KEY, fa INTEGER, fb INTEGER, FOREIGN KEY (fa, fb) REFERENCES p3_new (a, b))
 }
 
-# Adding a generated column via ALTER TABLE should error
+# Adding a stored generated column via ALTER TABLE should error
 test alter-table-add-generated-column-error {
     CREATE TABLE t(a);
-    ALTER TABLE t ADD COLUMN b AS (NULL);
+    ALTER TABLE t ADD COLUMN b AS (NULL) STORED;
 }
 expect error {
     Parse error: Alter table does not support adding generated columns
@@ -354,7 +354,7 @@ test alter-column-all-to-generated-error {
     ALTER TABLE t ALTER COLUMN b TO d AS (123);
 }
 expect error {
-    Parse error: must have at least one non-generated column
+    Parse error: renaming generated columns is not supported yet
 }
 
 test alter-column-to-generated-with-other-columns {
@@ -362,8 +362,8 @@ test alter-column-to-generated-with-other-columns {
     ALTER TABLE t ALTER COLUMN a TO c AS (123);
     SELECT sql FROM sqlite_schema WHERE name = 't';
 }
-expect {
-    CREATE TABLE t (c AS (123), b)
+expect error {
+    Parse error: renaming generated columns is not supported yet
 }
 
 # Add column with a foreign key reference and verify schema SQL

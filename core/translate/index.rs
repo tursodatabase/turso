@@ -5,7 +5,7 @@ use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{Deterministic, Func, ScalarFunc};
 use crate::index_method::IndexMethodConfiguration;
 use crate::numeric::Numeric;
-use crate::schema::{Column, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
+use crate::schema::{Column, GeneratedType, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{
     emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
@@ -19,7 +19,7 @@ use crate::translate::insert::format_unique_violation_desc;
 use crate::translate::plan::{
     ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences,
 };
-use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts};
+use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts, SelfTableContext};
 use crate::vdbe::insn::{to_u16, CmpInsFlags, Cookie};
 use crate::{bail_parse_error, CaptureDataChangesExt, LimboError};
 use crate::{
@@ -565,13 +565,17 @@ pub fn resolve_sorted_columns(
         let unwrapped_expr = unwrap_parens(base_expr)?;
         if let Some((pos, column_name, column)) = resolve_index_column(unwrapped_expr, table) {
             let collation = explicit_collation.or_else(|| column.collation_opt());
+            let expr = match column.generated_type() {
+                GeneratedType::Virtual { resolved, .. } => Some(resolved.clone()),
+                GeneratedType::NotGenerated => None,
+            };
             resolved.push(IndexColumn {
                 name: column_name,
                 order,
                 pos_in_table: pos,
                 collation,
                 default: column.default.clone(),
-                expr: None,
+                expr,
             });
             continue;
         }
@@ -821,7 +825,18 @@ fn emit_index_column_value_from_cursor(
             resolver,
             BindingBehavior::ResultColumnsNotAllowed,
         )?;
-        translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
+        let self_table_context =
+            table_references
+                .joined_tables()
+                .first()
+                .map(|jt| SelfTableContext::ForSelect {
+                    table_ref_id: jt.internal_id,
+                    referenced_tables: table_references.clone(),
+                });
+        program.with_self_table_context(self_table_context.as_ref(), |program, _| {
+            translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
+            Ok(())
+        })?;
     } else {
         program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
     }

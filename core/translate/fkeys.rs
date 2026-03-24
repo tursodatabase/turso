@@ -4,7 +4,7 @@ use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
 use crate::{
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
-    schema::{BTreeTable, ForeignKey, Index, ResolvedFkRef, ROWID_SENTINEL},
+    schema::{BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef, ROWID_SENTINEL},
     translate::{collate::CollationSeq, emitter::Resolver, planner::ROWID_STRS},
     vdbe::{
         builder::{CursorType, QueryMode},
@@ -777,6 +777,7 @@ pub fn emit_fk_child_update_counters(
     updated_cols: &HashSet<usize>,
     database_id: usize,
     resolver: &Resolver,
+    layout: &ColumnLayout,
 ) -> Result<()> {
     // Helper: materialize OLD tuple for this FK; returns (start_reg, ncols, null_skip_label).
     // The null_skip_label is unresolved and must be resolved by the caller after the FK check
@@ -895,7 +896,7 @@ pub fn emit_fk_child_update_counters(
             let src = if col.is_rowid_alias() {
                 new_rowid_reg
             } else {
-                new_start_reg + i
+                layout.to_register(new_start_reg, i)
             };
             program.emit_insn(Insn::IsNull {
                 reg: src,
@@ -914,7 +915,7 @@ pub fn emit_fk_child_update_counters(
             let val_reg = if col_child.is_rowid_alias() {
                 new_rowid_reg
             } else {
-                new_start_reg + i_child
+                layout.to_register(new_start_reg, i_child)
             };
 
             let tmp = program.alloc_register();
@@ -958,7 +959,7 @@ pub fn emit_fk_child_update_counters(
                         src_reg: if col.is_rowid_alias() {
                             new_rowid_reg
                         } else {
-                            new_start_reg + i
+                            layout.to_register(new_start_reg, i)
                         },
                         dst_reg: start + k,
                         extra_amount: 0,

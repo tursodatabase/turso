@@ -2281,36 +2281,34 @@ mod tests {
     macro_rules! test_schema {
         () => {{
             let mut schema = Schema::new();
+            let columns = vec![
+                SchemaColumn::new(
+                    Some("id".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                    None,
+                    Type::Integer,
+                    None,
+                    ColDef {
+                        primary_key: true,
+                        rowid_alias: true,
+                        notnull: true,
+                        ..Default::default()
+                    },
+                ),
+                SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+                SchemaColumn::new_default_integer(
+                    Some("age".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                ),
+            ];
+            let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
             let users_table = BTreeTable {
                 name: "users".to_string(),
                 root_page: 2,
                 primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
-                columns: vec![
-                    SchemaColumn::new(
-                        Some("id".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                        None,
-                        Type::Integer,
-                        None,
-                        ColDef {
-                            primary_key: true,
-                            rowid_alias: true,
-                            notnull: true,
-                            ..Default::default()
-                        },
-                    ),
-                    SchemaColumn::new_default_text(
-                        Some("name".to_string()),
-                        "TEXT".to_string(),
-                        None,
-                    ),
-                    SchemaColumn::new_default_integer(
-                        Some("age".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                    ),
-                ],
+                columns,
                 has_rowid: true,
                 is_strict: false,
                 has_autoincrement: false,
@@ -2318,12 +2316,41 @@ mod tests {
                 foreign_keys: vec![],
                 check_constraints: vec![],
                 rowid_alias_conflict_clause: None,
+                has_virtual_columns: false,
+                logical_to_physical_map,
             };
             schema
                 .add_btree_table(Arc::new(users_table))
                 .expect("Test setup: failed to add users table");
 
             // Add products table for join tests
+            let columns = vec![
+                SchemaColumn::new(
+                    Some("product_id".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                    None,
+                    Type::Integer,
+                    None,
+                    ColDef {
+                        primary_key: true,
+                        rowid_alias: true,
+                        notnull: true,
+                        ..Default::default()
+                    },
+                ),
+                SchemaColumn::new_default_text(
+                    Some("product_name".to_string()),
+                    "TEXT".to_string(),
+                    None,
+                ),
+                SchemaColumn::new_default_integer(
+                    Some("price".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                ),
+            ];
+            let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
             let products_table = BTreeTable {
                 name: "products".to_string(),
                 root_page: 3,
@@ -2331,32 +2358,7 @@ mod tests {
                     "product_id".to_string(),
                     turso_parser::ast::SortOrder::Asc,
                 )],
-                columns: vec![
-                    SchemaColumn::new(
-                        Some("product_id".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                        None,
-                        Type::Integer,
-                        None,
-                        ColDef {
-                            primary_key: true,
-                            rowid_alias: true,
-                            notnull: true,
-                            ..Default::default()
-                        },
-                    ),
-                    SchemaColumn::new_default_text(
-                        Some("product_name".to_string()),
-                        "TEXT".to_string(),
-                        None,
-                    ),
-                    SchemaColumn::new_default_integer(
-                        Some("price".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                    ),
-                ],
+                columns,
                 has_rowid: true,
                 is_strict: false,
                 has_autoincrement: false,
@@ -2364,12 +2366,46 @@ mod tests {
                 foreign_keys: vec![],
                 check_constraints: vec![],
                 rowid_alias_conflict_clause: None,
+                has_virtual_columns: false,
+                logical_to_physical_map,
             };
             schema
                 .add_btree_table(Arc::new(products_table))
                 .expect("Test setup: failed to add products table");
 
             // Add orders table for join tests
+            let columns = vec![
+                SchemaColumn::new(
+                    Some("order_id".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                    None,
+                    Type::Integer,
+                    None,
+                    ColDef {
+                        primary_key: true,
+                        rowid_alias: true,
+                        notnull: true,
+                        ..Default::default()
+                    },
+                ),
+                SchemaColumn::new_default_integer(
+                    Some("user_id".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                ),
+                SchemaColumn::new_default_integer(
+                    Some("product_id".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                ),
+                SchemaColumn::new_default_integer(
+                    Some("quantity".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                ),
+            ];
+            let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
             let orders_table = BTreeTable {
                 name: "orders".to_string(),
                 root_page: 4,
@@ -2377,37 +2413,7 @@ mod tests {
                     "order_id".to_string(),
                     turso_parser::ast::SortOrder::Asc,
                 )],
-                columns: vec![
-                    SchemaColumn::new(
-                        Some("order_id".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                        None,
-                        Type::Integer,
-                        None,
-                        ColDef {
-                            primary_key: true,
-                            rowid_alias: true,
-                            notnull: true,
-                            ..Default::default()
-                        },
-                    ),
-                    SchemaColumn::new_default_integer(
-                        Some("user_id".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                    ),
-                    SchemaColumn::new_default_integer(
-                        Some("product_id".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                    ),
-                    SchemaColumn::new_default_integer(
-                        Some("quantity".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                    ),
-                ],
+                columns,
                 has_rowid: true,
                 has_autoincrement: false,
                 is_strict: false,
@@ -2415,37 +2421,37 @@ mod tests {
                 foreign_keys: vec![],
                 check_constraints: vec![],
                 rowid_alias_conflict_clause: None,
+                has_virtual_columns: false,
+                logical_to_physical_map,
             };
             schema
                 .add_btree_table(Arc::new(orders_table))
                 .expect("Test setup: failed to add orders table");
 
             // Add customers table with id and name for testing column ambiguity
+            let columns = vec![
+                SchemaColumn::new(
+                    Some("id".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                    None,
+                    Type::Integer,
+                    None,
+                    ColDef {
+                        primary_key: true,
+                        rowid_alias: true,
+                        notnull: true,
+                        ..Default::default()
+                    },
+                ),
+                SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+            ];
+            let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
             let customers_table = BTreeTable {
                 name: "customers".to_string(),
                 root_page: 6,
                 primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
-                columns: vec![
-                    SchemaColumn::new(
-                        Some("id".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                        None,
-                        Type::Integer,
-                        None,
-                        ColDef {
-                            primary_key: true,
-                            rowid_alias: true,
-                            notnull: true,
-                            ..Default::default()
-                        },
-                    ),
-                    SchemaColumn::new_default_text(
-                        Some("name".to_string()),
-                        "TEXT".to_string(),
-                        None,
-                    ),
-                ],
+                columns,
                 has_rowid: true,
                 is_strict: false,
                 has_autoincrement: false,
@@ -2453,47 +2459,51 @@ mod tests {
                 foreign_keys: vec![],
                 check_constraints: vec![],
                 rowid_alias_conflict_clause: None,
+                has_virtual_columns: false,
+                logical_to_physical_map,
             };
             schema
                 .add_btree_table(Arc::new(customers_table))
                 .expect("Test setup: failed to add customers table");
 
             // Add purchases table (junction table for three-way join)
+            let columns = vec![
+                SchemaColumn::new(
+                    Some("id".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                    None,
+                    Type::Integer,
+                    None,
+                    ColDef {
+                        primary_key: true,
+                        rowid_alias: true,
+                        notnull: true,
+                        ..Default::default()
+                    },
+                ),
+                SchemaColumn::new_default_integer(
+                    Some("customer_id".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                ),
+                SchemaColumn::new_default_integer(
+                    Some("vendor_id".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                ),
+                SchemaColumn::new_default_integer(
+                    Some("quantity".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                ),
+            ];
+            let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
             let purchases_table = BTreeTable {
                 name: "purchases".to_string(),
                 root_page: 7,
                 primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
-                columns: vec![
-                    SchemaColumn::new(
-                        Some("id".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                        None,
-                        Type::Integer,
-                        None,
-                        ColDef {
-                            primary_key: true,
-                            rowid_alias: true,
-                            notnull: true,
-                            ..Default::default()
-                        },
-                    ),
-                    SchemaColumn::new_default_integer(
-                        Some("customer_id".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                    ),
-                    SchemaColumn::new_default_integer(
-                        Some("vendor_id".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                    ),
-                    SchemaColumn::new_default_integer(
-                        Some("quantity".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                    ),
-                ],
+                columns,
                 has_rowid: true,
                 is_strict: false,
                 has_autoincrement: false,
@@ -2501,42 +2511,42 @@ mod tests {
                 foreign_keys: vec![],
                 check_constraints: vec![],
                 rowid_alias_conflict_clause: None,
+                has_virtual_columns: false,
+                logical_to_physical_map,
             };
             schema
                 .add_btree_table(Arc::new(purchases_table))
                 .expect("Test setup: failed to add purchases table");
 
             // Add vendors table with id, name, and price (ambiguous columns with customers)
+            let columns = vec![
+                SchemaColumn::new(
+                    Some("id".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                    None,
+                    Type::Integer,
+                    None,
+                    ColDef {
+                        primary_key: true,
+                        rowid_alias: true,
+                        notnull: true,
+                        ..Default::default()
+                    },
+                ),
+                SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+                SchemaColumn::new_default_integer(
+                    Some("price".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                ),
+            ];
+            let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
             let vendors_table = BTreeTable {
                 name: "vendors".to_string(),
                 root_page: 8,
                 primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
-                columns: vec![
-                    SchemaColumn::new(
-                        Some("id".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                        None,
-                        Type::Integer,
-                        None,
-                        ColDef {
-                            primary_key: true,
-                            rowid_alias: true,
-                            notnull: true,
-                            ..Default::default()
-                        },
-                    ),
-                    SchemaColumn::new_default_text(
-                        Some("name".to_string()),
-                        "TEXT".to_string(),
-                        None,
-                    ),
-                    SchemaColumn::new_default_integer(
-                        Some("price".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                    ),
-                ],
+                columns,
                 has_rowid: true,
                 is_strict: false,
                 has_autoincrement: false,
@@ -2544,27 +2554,31 @@ mod tests {
                 foreign_keys: vec![],
                 check_constraints: vec![],
                 rowid_alias_conflict_clause: None,
+                has_virtual_columns: false,
+                logical_to_physical_map,
             };
             schema
                 .add_btree_table(Arc::new(vendors_table))
                 .expect("Test setup: failed to add vendors table");
 
+            let columns = vec![
+                SchemaColumn::new_default_integer(
+                    Some("product_id".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                ),
+                SchemaColumn::new_default_integer(
+                    Some("amount".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                ),
+            ];
+            let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
             let sales_table = BTreeTable {
                 name: "sales".to_string(),
                 root_page: 2,
                 primary_key_columns: vec![],
-                columns: vec![
-                    SchemaColumn::new_default_integer(
-                        Some("product_id".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                    ),
-                    SchemaColumn::new_default_integer(
-                        Some("amount".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                    ),
-                ],
+                columns,
                 has_rowid: true,
                 is_strict: false,
                 has_autoincrement: false,
@@ -2572,6 +2586,8 @@ mod tests {
                 foreign_keys: vec![],
                 check_constraints: vec![],
                 rowid_alias_conflict_clause: None,
+                has_virtual_columns: false,
+                logical_to_physical_map,
             };
             schema
                 .add_btree_table(Arc::new(sales_table))

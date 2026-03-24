@@ -1075,10 +1075,13 @@ fn parse_table(
 
         // This is a materialized view with storage - treat it as a regular BTree table
         // Create a BTreeTable from the view's metadata
+        let columns = view_guard.column_schema.flat_columns();
+        let logical_to_physical_map =
+            crate::schema::BTreeTable::build_logical_to_physical_map(&columns);
         let btree_table = Arc::new(crate::schema::BTreeTable {
             name: view_guard.name().to_string(),
             root_page,
-            columns: view_guard.column_schema.flat_columns(),
+            columns,
             primary_key_columns: Vec::new(),
             has_rowid: true,
             is_strict: false,
@@ -1088,6 +1091,8 @@ fn parse_table(
             foreign_keys: vec![],
             check_constraints: vec![],
             rowid_alias_conflict_clause: None,
+            has_virtual_columns: false,
+            logical_to_physical_map,
         });
         drop(view_guard);
 

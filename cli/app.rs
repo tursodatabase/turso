@@ -91,6 +91,8 @@ pub struct Opts {
     pub experimental_autovacuum: bool,
     #[clap(long, help = "Enable experimental attach feature")]
     pub experimental_attach: bool,
+    #[clap(long, help = "Enable experimental generated columns feature")]
+    pub experimental_generated_columns: bool,
     #[cfg(feature = "mvcc_repl")]
     #[clap(long, help = "Start MVCC concurrent transaction harness")]
     pub mvcc: bool,
@@ -230,6 +232,7 @@ impl Limbo {
             .with_index_method(opts.experimental_index_method)
             .with_autovacuum(opts.experimental_autovacuum)
             .with_attach(opts.experimental_attach)
+            .with_generated_columns(opts.experimental_generated_columns)
             .with_unsafe_testing(opts.unsafe_testing);
 
         let db_file = normalize_db_path(db_file);

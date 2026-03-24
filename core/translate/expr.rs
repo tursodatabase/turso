@@ -1,10 +1,10 @@
 use crate::error::{SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_TRIGGER, SQLITE_ERROR};
 use crate::translate::optimizer::constraints::ConstraintOperator;
 use crate::turso_assert;
-
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, ResolveType, SubqueryType, TableInternalId, UnaryOperator};
 
+use super::collate::{get_collseq_from_expr, CollationSeq};
 use super::emitter::Resolver;
 use super::optimizer::Optimizable;
 use super::plan::TableReferences;
@@ -14,7 +14,7 @@ use crate::function::FtsFunc;
 use crate::function::JsonFunc;
 use crate::function::{AggFunc, Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
 use crate::functions::datetime;
-use crate::schema::{ColDef, Column, Table, Type, TypeDef};
+use crate::schema::{ColDef, Column, ColumnLayout, GeneratedType, Table, Type, TypeDef};
 use crate::sync::Arc;
 use crate::translate::expression_index::{
     normalize_expr_for_index_matching, single_table_column_usage,
@@ -23,7 +23,7 @@ use crate::translate::plan::{Operation, ResultSetColumn, Search};
 use crate::translate::planner::parse_row_id;
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
 use crate::vdbe::affinity::Affinity;
-use crate::vdbe::builder::CursorKey;
+use crate::vdbe::builder::{CursorKey, SelfTableContext};
 use crate::vdbe::{
     builder::ProgramBuilder,
     insn::{CmpInsFlags, InsertFlags, Insn},
@@ -31,8 +31,6 @@ use crate::vdbe::{
 };
 use crate::{LimboError, Numeric, Result, Value};
 use std::collections::HashSet;
-
-use super::collate::{get_collseq_from_expr, CollationSeq};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ConditionMetadata {
@@ -2966,6 +2964,65 @@ pub fn translate_expr(
             table: table_ref_id,
             column,
             is_rowid_alias,
+        } if table_ref_id.is_self_table() => {
+            // the table is a SELF_TABLE placeholder (used for generated columns), so we now have
+            // to resolve it to the actual reference id using the SelfTableContext.
+            return program.with_existing_self_table_context(|program, self_table_context| {
+                match self_table_context {
+                    Some(SelfTableContext::ForSelect {
+                        table_ref_id: real_id,
+                        ref referenced_tables,
+                    }) => {
+                        let real_col = Expr::Column {
+                            database: None,
+                            table: *real_id,
+                            column: *column,
+                            is_rowid_alias: *is_rowid_alias,
+                        };
+                        translate_expr(
+                            program,
+                            Some(referenced_tables),
+                            &real_col,
+                            target_register,
+                            resolver,
+                        )
+                    }
+                    Some(SelfTableContext::ForDML(dml_ctx)) => {
+                        let col = &dml_ctx.columns[*column];
+                        match col.generated_type() {
+                            GeneratedType::Virtual {
+                                resolved: gen_expr, ..
+                            } => {
+                                translate_expr(program, None, gen_expr, target_register, resolver)?;
+                                if col.affinity() != Affinity::Blob {
+                                    program.emit_column_affinity(target_register, col.affinity());
+                                }
+                                Ok(target_register)
+                            }
+                            GeneratedType::NotGenerated => {
+                                let src_reg = dml_ctx.to_column_reg(*column);
+                                program.emit_insn(Insn::Copy {
+                                    src_reg,
+                                    dst_reg: target_register,
+                                    extra_amount: 0,
+                                });
+                                Ok(target_register)
+                            }
+                        }
+                    }
+                    None => {
+                        crate::bail_parse_error!(
+                            "SELF_TABLE column reference outside of generated column context"
+                        );
+                    }
+                }
+            });
+        }
+        ast::Expr::Column {
+            database: _,
+            table: table_ref_id,
+            column,
+            is_rowid_alias,
         } => {
             // When a cursor override is active for this table, we bypass all index logic
             // and read directly from the override cursor. This is used during hash join
@@ -3051,115 +3108,144 @@ pub fn translate_expr(
                             *custom_module_column,
                             target_register,
                         );
-                    } else {
-                        if *is_rowid_alias {
-                            if let Some(index_cursor_id) = index_cursor_id {
-                                program.emit_insn(Insn::IdxRowId {
-                                    cursor_id: index_cursor_id,
-                                    dest: target_register,
-                                });
-                            } else if let Some(table_cursor_id) = table_cursor_id {
-                                program.emit_insn(Insn::RowId {
-                                    cursor_id: table_cursor_id,
-                                    dest: target_register,
-                                });
-                            } else {
-                                unreachable!("Either index or table cursor must be opened");
-                            }
-                        } else {
-                            let is_btree_index = index_cursor_id.is_some_and(|cid| {
-                                program.get_cursor_type(cid).is_some_and(|ct| ct.is_index())
+                    } else if *is_rowid_alias {
+                        if let Some(index_cursor_id) = index_cursor_id {
+                            program.emit_insn(Insn::IdxRowId {
+                                cursor_id: index_cursor_id,
+                                dest: target_register,
                             });
-                            // FIXME(https://github.com/tursodatabase/turso/issues/4801):
-                            // This is a defensive workaround for cursor desynchronization.
-                            //
-                            // When `use_covering_index` is false, both table AND index cursors
-                            // are open and positioned at the same row. If we read some columns
-                            // from the index cursor and others from the table cursor, we rely
-                            // on both cursors staying synchronized.
-                            //
-                            // The problem: AFTER triggers can INSERT into the same table,
-                            // which modifies the index btree. This repositions or invalidates
-                            // the parent program's index cursor, while the table cursor remains
-                            // at the correct position. Result: we read a mix of data from
-                            // different rows - corruption.
-                            //
-                            // Why does the table cursor not have this problem? Because it's
-                            // explicitly re-sought by rowid (via NotExists instruction) before
-                            // each use. The rowid is stored in a register and used as a stable
-                            // key. The index cursor, by contrast, just trusts its internal
-                            // position (page + cell index) without re-seeking.
-                            //
-                            // Why not check if the table has triggers and allow the optimization
-                            // when there are none? Several reasons:
-                            // 1. ProgramBuilder.trigger indicates if THIS program is a trigger
-                            //    subprogram, not whether the table has triggers.
-                            // 2. In translate_expr(), we lack context about which table is being
-                            //    modified or whether we're even in an UPDATE/INSERT/DELETE.
-                            // 3. Triggers can be recursive (trigger on T inserts into U, whose
-                            //    trigger inserts back into T).
-                            //
-                            // The proper fix is to implement SQLite's `saveAllCursors()` approach:
-                            // before ANY btree write, find all cursors pointing to that btree
-                            // (by root_page) and save their positions. When those cursors are
-                            // next accessed, they re-seek to their saved position. This could
-                            // be done lazily with a generation number per btree - cursors check
-                            // if the generation changed and re-seek if needed. This would
-                            // require a global cursor registry and significant refactoring.
-                            //
-                            // For now, we only read from the index cursor when `use_covering_index`
-                            // is true, meaning only the index cursor exists (no table cursor to
-                            // get out of sync with). This foregoes the optimization of reading
-                            // individual columns from a non-covering index.
-                            let read_from_index = if is_from_outer_query_scope {
-                                is_btree_index
-                            } else if is_btree_index && use_covering_index {
-                                index.as_ref().is_some_and(|idx| {
-                                    idx.column_table_pos_to_index_pos(*column).is_some()
-                                })
-                            } else {
-                                false
-                            };
-                            let read_cursor = if read_from_index {
-                                index_cursor_id.expect("index cursor should be opened")
-                            } else {
-                                table_cursor_id
-                                    .or(index_cursor_id)
-                                    .expect("cursor should be opened")
-                            };
-                            let column = if read_from_index {
-                                let index = program.resolve_index_for_cursor_id(
-                                    index_cursor_id.expect("index cursor should be opened"),
-                                );
-                                index
-                                    .column_table_pos_to_index_pos(*column)
-                                    .unwrap_or_else(|| {
-                                        panic!(
-                                        "index {} does not contain column number {} of table {}",
-                                        index.name, column, table_ref_id
-                                    )
-                                    })
-                            } else {
-                                *column
-                            };
+                        } else if let Some(table_cursor_id) = table_cursor_id {
+                            program.emit_insn(Insn::RowId {
+                                cursor_id: table_cursor_id,
+                                dest: target_register,
+                            });
+                        } else {
+                            unreachable!("Either index or table cursor must be opened");
+                        }
+                    } else {
+                        let is_btree_index = index_cursor_id.is_some_and(|cid| {
+                            program.get_cursor_type(cid).is_some_and(|ct| ct.is_index())
+                        });
+                        // FIXME(https://github.com/tursodatabase/turso/issues/4801):
+                        // This is a defensive workaround for cursor desynchronization.
+                        //
+                        // When `use_covering_index` is false, both table AND index cursors
+                        // are open and positioned at the same row. If we read some columns
+                        // from the index cursor and others from the table cursor, we rely
+                        // on both cursors staying synchronized.
+                        //
+                        // The problem: AFTER triggers can INSERT into the same table,
+                        // which modifies the index btree. This repositions or invalidates
+                        // the parent program's index cursor, while the table cursor remains
+                        // at the correct position. Result: we read a mix of data from
+                        // different rows - corruption.
+                        //
+                        // Why does the table cursor not have this problem? Because it's
+                        // explicitly re-sought by rowid (via NotExists instruction) before
+                        // each use. The rowid is stored in a register and used as a stable
+                        // key. The index cursor, by contrast, just trusts its internal
+                        // position (page + cell index) without re-seeking.
+                        //
+                        // Why not check if the table has triggers and allow the optimization
+                        // when there are none? Several reasons:
+                        // 1. ProgramBuilder.trigger indicates if THIS program is a trigger
+                        //    subprogram, not whether the table has triggers.
+                        // 2. In translate_expr(), we lack context about which table is being
+                        //    modified or whether we're even in an UPDATE/INSERT/DELETE.
+                        // 3. Triggers can be recursive (trigger on T inserts into U, whose
+                        //    trigger inserts back into T).
+                        //
+                        // The proper fix is to implement SQLite's `saveAllCursors()` approach:
+                        // before ANY btree write, find all cursors pointing to that btree
+                        // (by root_page) and save their positions. When those cursors are
+                        // next accessed, they re-seek to their saved position. This could
+                        // be done lazily with a generation number per btree - cursors check
+                        // if the generation changed and re-seek if needed. This would
+                        // require a global cursor registry and significant refactoring.
+                        //
+                        // For now, we only read from the index cursor when `use_covering_index`
+                        // is true, meaning only the index cursor exists (no table cursor to
+                        // get out of sync with). This foregoes the optimization of reading
+                        // individual columns from a non-covering index.
+                        let read_from_index = if is_from_outer_query_scope {
+                            is_btree_index
+                        } else if is_btree_index && use_covering_index {
+                            index.as_ref().is_some_and(|idx| {
+                                idx.column_table_pos_to_index_pos(*column).is_some()
+                            })
+                        } else {
+                            false
+                        };
 
-                            // For custom type columns with a default, suppress the
-                            // default in the Column instruction so we can encode it
-                            // ourselves. Without this, pre-existing rows (from before
-                            // ALTER TABLE ADD COLUMN) would get the raw un-encoded
-                            // default, causing decode to fail.
-                            let col_ref = table.get_column_at(column);
-                            if let Some(col) = col_ref {
-                                if col.default.is_some()
-                                    && resolver
-                                        .schema()
-                                        .get_type_def(&col.ty_str, table.is_strict())
-                                        .is_some()
-                                {
-                                    program.suppress_column_default = true;
-                                }
+                        let Some(table_column) = table.get_column_at(*column) else {
+                            crate::bail_parse_error!("column index out of bounds");
+                        };
+                        match table_column.generated_type() {
+                            // if we're reading from an index that contains this virtual column,
+                            // the index already has the computed value, so read it from the index
+                            GeneratedType::Virtual { resolved: expr, .. } if !read_from_index => {
+                                program.with_self_table_context(
+                                    Some(&SelfTableContext::ForSelect {
+                                        table_ref_id: *table_ref_id,
+                                        referenced_tables: referenced_tables.unwrap().clone(),
+                                    }),
+                                    |program, _| {
+                                        translate_expr(
+                                            program,
+                                            referenced_tables,
+                                            expr,
+                                            target_register,
+                                            resolver,
+                                        )?;
+                                        Ok(())
+                                    },
+                                )?;
+
+                                program
+                                    .emit_column_affinity(target_register, table_column.affinity());
                             }
-                            program.emit_column_or_rowid(read_cursor, column, target_register);
+                            _ => {
+                                let read_cursor = if read_from_index {
+                                    index_cursor_id.expect("index cursor should be opened")
+                                } else {
+                                    table_cursor_id
+                                        .or(index_cursor_id)
+                                        .expect("cursor should be opened")
+                                };
+                                let column = if read_from_index {
+                                    let index = program.resolve_index_for_cursor_id(
+                                        index_cursor_id.expect("index cursor should be opened"),
+                                    );
+                                    index
+                                        .column_table_pos_to_index_pos(*column)
+                                        .unwrap_or_else(|| {
+                                            panic!(
+                                                "index {} does not contain column number {} of table {}",
+                                                index.name, column, table_ref_id
+                                            )
+                                        })
+                                } else {
+                                    *column
+                                };
+
+                                // For custom type columns with a default, suppress the
+                                // default in the Column instruction so we can encode it
+                                // ourselves. Without this, pre-existing rows (from before
+                                // ALTER TABLE ADD COLUMN) would get the raw un-encoded
+                                // default, causing decode to fail.
+                                let col_ref = table.get_column_at(column);
+                                if let Some(col) = col_ref {
+                                    if col.default.is_some()
+                                        && resolver
+                                            .schema()
+                                            .get_type_def(&col.ty_str, table.is_strict())
+                                            .is_some()
+                                    {
+                                        program.suppress_column_default = true;
+                                    }
+                                }
+                                program.emit_column_or_rowid(read_cursor, column, target_register);
+                            }
                         }
                         let Some(column) = table.get_column_at(*column) else {
                             crate::bail_parse_error!("column index out of bounds");
@@ -3167,10 +3253,16 @@ pub fn translate_expr(
                         // Skip affinity for custom types — the stored value is
                         // already in BASE type format; the custom type name may
                         // produce wrong affinity (e.g. "doubled" → REAL due to "DOUB").
-                        if resolver
-                            .schema()
-                            .get_type_def(&column.ty_str, table.is_strict())
-                            .is_none()
+                        //
+                        // Also skip for virtual columns without a stored index value,
+                        // we already applied affinity for these.
+                        let virtual_already_applied =
+                            table_column.is_virtual_generated() && !read_from_index;
+                        if !(virtual_already_applied
+                            || resolver
+                                .schema()
+                                .get_type_def(&column.ty_str, table.is_strict())
+                                .is_some())
                         {
                             maybe_apply_affinity(column.ty(), target_register, program);
                         }
@@ -6369,6 +6461,7 @@ pub(crate) fn emit_returning_scan_back(program: &mut ProgramBuilder, buf: &Retur
 /// When `returning_buffer` is `Some`, the results are buffered into an ephemeral table
 /// instead of being yielded immediately. A subsequent call to `emit_returning_scan_back`
 /// will drain the buffer and yield the rows to the caller.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_returning_results<'a>(
     program: &mut ProgramBuilder,
     table_references: &TableReferences,
@@ -6377,6 +6470,7 @@ pub(crate) fn emit_returning_results<'a>(
     rowid_reg: usize,
     resolver: &mut Resolver<'a>,
     returning_buffer: Option<&ReturningBufferCtx>,
+    layout: &ColumnLayout,
 ) -> Result<()> {
     if result_columns.is_empty() {
         return Ok(());
@@ -6388,6 +6482,7 @@ pub(crate) fn emit_returning_results<'a>(
         reg_columns_start,
         rowid_reg,
         resolver,
+        layout,
     )?;
 
     let result = (|| {
@@ -6463,6 +6558,7 @@ pub(crate) fn seed_returning_row_image_in_cache<'a>(
     reg_columns_start: usize,
     rowid_reg: usize,
     resolver: &mut Resolver<'a>,
+    layout: &ColumnLayout,
 ) -> Result<ReturningRowImageCacheState> {
     turso_assert!(
         table_references.joined_tables().len() == 1,
@@ -6486,7 +6582,7 @@ pub(crate) fn seed_returning_row_image_in_cache<'a>(
         let raw_reg = if column.is_rowid_alias() {
             rowid_reg
         } else {
-            reg_columns_start + i
+            reg_columns_start + layout.to_reg_offset(i)
         };
         // The write registers hold stored (encoded) values. Produce the
         // user-facing value in a fresh register so RETURNING shows decoded
@@ -7087,6 +7183,7 @@ pub(crate) fn emit_user_facing_column_value(
 ///
 /// This ensures expression indexes on custom type columns evaluate the expression on
 /// **decoded** (user-facing) values, matching what SELECT / CREATE INDEX see.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_custom_type_registers_in_expr(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -7095,6 +7192,7 @@ pub(crate) fn decode_custom_type_registers_in_expr(
     start_reg: usize,
     key_reg: Option<usize>,
     is_strict: bool,
+    layout: &ColumnLayout,
 ) -> Result<()> {
     walk_expr_mut(expr, &mut |e| {
         if let ast::Expr::Register(reg) = e {
@@ -7105,7 +7203,11 @@ pub(crate) fn decode_custom_type_registers_in_expr(
             }
             // Map register back to column index.
             if reg_val >= start_reg {
-                let col_idx = reg_val - start_reg;
+                let col_idx = layout
+                    .column_idx_for_offset(reg_val - start_reg)
+                    .ok_or_else(|| {
+                        LimboError::ParseError("layout should return a col_idx".to_string())
+                    })?;
                 if let Some(column) = columns.get(col_idx) {
                     if let Some(type_def) =
                         resolver.schema().get_type_def(&column.ty_str, is_strict)
@@ -7445,6 +7547,7 @@ pub(crate) fn emit_custom_type_encode_columns(
     start_reg: usize,
     only_columns: Option<&HashSet<usize>>,
     table_name: &str,
+    layout: &ColumnLayout,
 ) -> Result<()> {
     for (i, col) in columns.iter().enumerate() {
         if let Some(filter) = only_columns {
@@ -7453,7 +7556,7 @@ pub(crate) fn emit_custom_type_encode_columns(
             }
         }
 
-        let reg = start_reg + i;
+        let reg = layout.to_register(start_reg, i);
 
         // Handle array columns: encode input (text or blob) -> record blob for storage
         if col.is_array() {
@@ -7503,6 +7606,7 @@ pub(crate) fn emit_custom_type_decode_columns(
     columns: &[Column],
     start_reg: usize,
     only_columns: Option<&HashSet<usize>>,
+    layout: &ColumnLayout,
 ) -> Result<()> {
     for (i, col) in columns.iter().enumerate() {
         if let Some(filter) = only_columns {
@@ -7511,7 +7615,7 @@ pub(crate) fn emit_custom_type_decode_columns(
             }
         }
 
-        let reg = start_reg + i;
+        let reg = layout.to_register(start_reg, i);
 
         // Handle array columns: decode record blob -> JSON text for display
         if col.is_array() {

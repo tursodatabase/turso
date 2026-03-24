@@ -7995,7 +7995,7 @@ pub fn op_function(
                                             &normalized_tbl_name,
                                             &rename_from,
                                             column_def.col_name.as_str(),
-                                        );
+                                        )?;
                                     }
                                 } else {
                                     // This is a different table, check if it has FKs referencing the renamed column
@@ -8037,7 +8037,7 @@ pub fn op_function(
                                             &table,
                                             &rename_from,
                                             column_def.col_name.as_str(),
-                                        );
+                                        )?;
                                         if local_col != *col {
                                             *col = local_col;
                                             fk_updated = true;
@@ -11653,6 +11653,8 @@ pub fn op_drop_column(
 
         let btree = Arc::make_mut(btree);
         btree.columns.remove(*column_index);
+        btree.logical_to_physical_map =
+            crate::schema::BTreeTable::build_logical_to_physical_map(&btree.columns);
         // Remove column-level CHECK constraints for the dropped column
         let col_name = column_name.clone();
         btree.check_constraints.retain(|c| {
@@ -11744,6 +11746,8 @@ pub fn op_add_column(
 
         let btree = Arc::make_mut(btree);
         btree.columns.push((**column).clone());
+        btree.logical_to_physical_map =
+            crate::schema::BTreeTable::build_logical_to_physical_map(&btree.columns);
         // Update CHECK constraints to include any constraints from the new column
         btree.check_constraints.clone_from(check_constraints);
     });

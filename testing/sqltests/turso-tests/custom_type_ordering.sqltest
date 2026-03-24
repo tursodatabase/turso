@@ -25,6 +25,20 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+test expression-index-on-custom-type-decodes-before-eval {
+    CREATE TYPE rev BASE text ENCODE upper(value) DECODE lower(value);
+    CREATE TABLE t_eidx(id INTEGER PRIMARY KEY, val rev) STRICT;
+    CREATE INDEX idx_eidx ON t_eidx(substr(val, 1, 1));
+    INSERT INTO t_eidx VALUES (1, 'hello');
+    -- Index expression must evaluate against the decoded (user-facing) value,
+    -- so substr(val, 1, 1) should be 'h', not 'H'.
+    SELECT * FROM t_eidx WHERE substr(val, 1, 1) = 'h';
+}
+expect {
+    1|hello
+}
+
+@requires strict "uses STRICT tables"
 test expression-index-on-non-orderable-type-allowed {
     CREATE TYPE noorder3 BASE text ENCODE upper(value) DECODE value;
     CREATE TABLE t14(id INTEGER PRIMARY KEY, val noorder3) STRICT;
