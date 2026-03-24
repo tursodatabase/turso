@@ -10212,6 +10212,7 @@ pub struct OpParseSchemaInner {
     dbsp_state_roots: crate::HashMap<String, i64>,
     dbsp_state_index_roots: crate::HashMap<String, i64>,
     materialized_view_info: crate::HashMap<String, (String, i64)>,
+    deferred_foreign_tables: Vec<(String, String)>,
     db: usize,
     previous_auto_commit: bool,
 }
@@ -10299,6 +10300,7 @@ pub fn op_parse_schema(
         dbsp_state_roots: Default::default(),
         dbsp_state_index_roots: Default::default(),
         materialized_view_info: Default::default(),
+        deferred_foreign_tables: Vec::new(),
         db: *db,
         previous_auto_commit,
     }));
@@ -10349,6 +10351,7 @@ fn op_parse_schema_step(
                     &mut inner.dbsp_state_roots,
                     &mut inner.dbsp_state_index_roots,
                     &mut inner.materialized_view_info,
+                    &mut inner.deferred_foreign_tables,
                 )?;
                 continue;
             }
@@ -10362,6 +10365,7 @@ fn op_parse_schema_step(
                     dbsp_state_roots,
                     dbsp_state_index_roots,
                     materialized_view_info,
+                    deferred_foreign_tables,
                     db,
                     previous_auto_commit,
                 } = *state
@@ -10378,6 +10382,9 @@ fn op_parse_schema_step(
                     automatic_indices,
                     mv_store.is_some(),
                 );
+                for (name, sql) in deferred_foreign_tables {
+                    schema.populate_foreign_table(&name, &sql, &syms)?;
+                }
                 let res2 = schema.populate_materialized_views(
                     materialized_view_info,
                     dbsp_state_roots,

@@ -905,11 +905,8 @@ impl Connection {
         let vtab = crate::VirtualTable::new_foreign(name, fdw)?;
         // Add to the database-level shared schema so all connections see it.
         let mut db_schema = self.db.schema.lock();
-        let schema = std::sync::Arc::get_mut(&mut db_schema).ok_or_else(|| {
-            crate::LimboError::InternalError(
-                "Cannot register foreign table: schema has outstanding references".to_string(),
-            )
-        })?;
+        // Fix (clones schema only if needed, always succeeds):
+        let schema = std::sync::Arc::make_mut(&mut db_schema);
         schema.add_virtual_table(vtab)?;
         // Update this connection's schema snapshot.
         *self.schema.write() = db_schema.clone();
@@ -1400,6 +1397,7 @@ impl Connection {
             let mut dbsp_state_roots = HashMap::default();
             let mut dbsp_state_index_roots = HashMap::default();
             let mut materialized_view_info = HashMap::default();
+            let mut deferred_foreign_tables = Vec::new();
 
             for (ty, name, table_name, root_page, sql) in &rows_data {
                 match schema.handle_schema_row(
@@ -1414,6 +1412,7 @@ impl Connection {
                     &mut dbsp_state_roots,
                     &mut dbsp_state_index_roots,
                     &mut materialized_view_info,
+                    &mut deferred_foreign_tables,
                 ) {
                     Ok(()) => {}
                     Err(LimboError::ParseError(msg)) if msg.contains("already exists") => {}
@@ -2535,6 +2534,7 @@ pub struct SymbolTable {
     pub vtabs: HashMap<String, Arc<VirtualTable>>,
     pub vtab_modules: HashMap<String, Arc<crate::ext::VTabImpl>>,
     pub index_methods: HashMap<String, Arc<dyn IndexMethod>>,
+    pub foreign_drivers: HashMap<String, Arc<dyn crate::foreign::ForeignDriverFactory>>,
 }
 
 impl std::fmt::Debug for SymbolTable {
@@ -2574,6 +2574,15 @@ impl SymbolTable {
             vtabs: HashMap::default(),
             vtab_modules: HashMap::default(),
             index_methods: HashMap::default(),
+            foreign_drivers: {
+                let mut drivers: HashMap<String, Arc<dyn crate::foreign::ForeignDriverFactory>> =
+                    HashMap::default();
+                drivers.insert(
+                    "csv".to_string(),
+                    Arc::new(crate::csv_fdw::CsvDriverFactory),
+                );
+                drivers
+            },
         }
     }
     pub fn resolve_function(

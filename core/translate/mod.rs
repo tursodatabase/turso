@@ -59,7 +59,10 @@ use analyze::translate_analyze;
 use index::{translate_create_index, translate_drop_index, translate_optimize};
 use insert::translate_insert;
 use rollback::{translate_release, translate_rollback, translate_savepoint};
-use schema::{translate_create_table, translate_create_virtual_table, translate_drop_table};
+use schema::{
+    translate_create_foreign_table, translate_create_server, translate_create_table,
+    translate_create_virtual_table, translate_drop_server, translate_drop_table,
+};
 use select::translate_select;
 use tracing::{instrument, Level};
 use transaction::{translate_tx_begin, translate_tx_commit};
@@ -157,6 +160,9 @@ pub fn translate_inner(
             | ast::Stmt::Optimize { .. }
             | ast::Stmt::Update { .. }
             | ast::Stmt::Insert { .. }
+            | ast::Stmt::CreateServer(_)
+            | ast::Stmt::CreateForeignTable(_)
+            | ast::Stmt::DropServer { .. }
     );
     let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
 
@@ -373,6 +379,16 @@ pub fn translate_inner(
             program,
             connection,
         )?,
+        ast::Stmt::CreateServer(server) => {
+            translate_create_server(server, resolver, program, connection)?
+        }
+        ast::Stmt::CreateForeignTable(ft) => {
+            translate_create_foreign_table(ft, resolver, program, connection)?
+        }
+        ast::Stmt::DropServer {
+            if_exists,
+            server_name,
+        } => translate_drop_server(&server_name, resolver, if_exists, program)?,
     };
 
     // Indicate write operations so that in the epilogue we can emit the correct type of transaction
