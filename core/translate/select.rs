@@ -651,12 +651,7 @@ fn prepare_one_select_plan(
                 limit.map_or(Ok((None, None)), |l| parse_limit(l, resolver))?;
 
             if !windows.is_empty() {
-                plan_windows(
-                    &mut plan,
-                    resolver,
-                    &mut program.table_reference_counter,
-                    &mut windows,
-                )?;
+                plan_windows(program, &mut plan, resolver, connection, &mut windows)?;
             }
 
             plan_subqueries_from_select_plan(program, &mut plan, resolver, connection)?;
