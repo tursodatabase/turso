@@ -6354,10 +6354,7 @@ pub fn process_returning_clause(
 ) -> Result<Vec<ResultSetColumn>> {
     let mut result_columns = Vec::with_capacity(returning.len());
 
-    let alias_to_string = |alias: &ast::As| match alias {
-        ast::As::Elided(alias) => alias.as_str().to_string(),
-        ast::As::As(alias) => alias.as_str().to_string(),
-    };
+    let alias_to_string = |alias: &ast::As| alias.name().as_str().to_string();
 
     for rc in returning.iter_mut() {
         match rc {
@@ -6381,6 +6378,7 @@ pub fn process_returning_clause(
                 result_columns.push(ResultSetColumn {
                     expr: expr.as_ref().clone(),
                     alias: alias.as_ref().map(alias_to_string),
+                    implicit_column_name: None,
                     contains_aggregates: false,
                 });
             }
@@ -6404,6 +6402,7 @@ pub fn process_returning_clause(
                     result_columns.push(ResultSetColumn {
                         expr: column_expr,
                         alias: column.name.clone(),
+                        implicit_column_name: None,
                         contains_aggregates: false,
                     });
                 }

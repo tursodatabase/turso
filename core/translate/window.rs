@@ -195,6 +195,7 @@ fn prepare_window_subquery(
         subquery_result_columns.push(ResultSetColumn {
             expr: Expr::Literal(Literal::Numeric("0".to_string())),
             alias: None,
+            implicit_column_name: None,
             contains_aggregates: false,
         });
     }
@@ -436,6 +437,7 @@ fn rewrite_expr_as_subquery_column(
         ctx.subquery_result_columns.push(ResultSetColumn {
             expr: subquery_expr,
             alias: None,
+            implicit_column_name: None,
             contains_aggregates,
         });
     }

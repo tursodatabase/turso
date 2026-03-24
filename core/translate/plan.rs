@@ -57,6 +57,11 @@ fn infer_type_from_expr(
 pub struct ResultSetColumn {
     pub expr: ast::Expr,
     pub alias: Option<String>,
+    /// Original SQL expression text for display as column name.
+    /// Only used when there is no explicit alias and the expression is not
+    /// a simple column reference. This preserves the verbatim SQL text
+    /// (e.g. "f1+F2") as the column name, matching SQLite behavior.
+    pub implicit_column_name: Option<String>,
     // TODO: encode which aggregates (e.g. index bitmask of plan.aggregates) are present in this column
     pub contains_aggregates: bool,
 }
@@ -100,7 +105,7 @@ impl ResultSetColumn {
                 // If there is no rowid alias, use "rowid".
                 Some("rowid")
             }
-            _ => None,
+            _ => self.implicit_column_name.as_deref(),
         }
     }
 }
@@ -784,6 +789,7 @@ pub fn select_star(
                 })
                 .map(|(i, col)| ResultSetColumn {
                     alias: None,
+                    implicit_column_name: None,
                     expr: ast::Expr::Column {
                         database: None,
                         table: table.internal_id,

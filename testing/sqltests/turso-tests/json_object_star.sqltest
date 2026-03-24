@@ -145,12 +145,12 @@ expect {
     {"id":1,"name":"Widget","double_price":19.98}
 }
 
-# Test json_object(*) with default column naming (column1, column2, etc.)
+# Test json_object(*) with expression text as column names (matching SQLite)
 test json_object_star_default_column_names {
     SELECT json_object(*) FROM (SELECT 1+1, 2+2 as a, 3+3);
 }
 expect {
-    {"column1":2,"a":4,"column3":6}
+    {"1+1":2,"a":4,"3+3":6}
 }
 
 # Test json_object(*) in materialized view

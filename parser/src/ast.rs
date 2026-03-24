@@ -931,6 +931,25 @@ pub enum As {
     As(Name),
     /// no `AS`
     Elided(Name), // FIXME Ids
+    /// Implicit column name from original SQL text (not serialized to SQL).
+    /// Used to preserve the original expression text as the column name
+    /// for unaliased expressions, matching SQLite behavior.
+    ImplicitColumnName(Name),
+}
+
+impl As {
+    /// Returns the inner `Name` regardless of variant.
+    pub fn name(&self) -> &Name {
+        match self {
+            As::As(name) | As::Elided(name) | As::ImplicitColumnName(name) => name,
+        }
+    }
+
+    /// Returns `true` if this is a user-provided alias (`AS foo` or elided `foo`),
+    /// not a system-generated implicit column name.
+    pub fn is_explicit(&self) -> bool {
+        matches!(self, As::As(_) | As::Elided(_))
+    }
 }
 
 /// `JOIN` clause

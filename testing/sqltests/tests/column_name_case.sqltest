@@ -118,6 +118,45 @@ expect {
     1
 }
 
+@backend cli
+@cross-check-integrity
+test expr_column_name_preserves_original_text {
+    .headers on
+    CREATE TABLE texpr(f1 int, f2 int);
+    INSERT INTO texpr VALUES(11,22);
+    SELECT f1+F2 FROM texpr ORDER BY f2;
+}
+expect {
+    f1+F2
+    33
+}
+
+@backend cli
+@cross-check-integrity
+test expr_column_name_with_spaces {
+    .headers on
+    CREATE TABLE texpr2(a int, b int);
+    INSERT INTO texpr2 VALUES(1,2);
+    SELECT a + b FROM texpr2;
+}
+expect {
+    a + b
+    3
+}
+
+@backend cli
+@cross-check-integrity
+test func_column_name_preserves_original_text {
+    .headers on
+    CREATE TABLE texpr3(x int);
+    INSERT INTO texpr3 VALUES(5);
+    SELECT max(x) FROM texpr3;
+}
+expect {
+    max(x)
+    5
+}
+
 @cross-check-integrity
 test quoted_identifiers {
     CREATE TABLE t12("MixedCase" INT);
