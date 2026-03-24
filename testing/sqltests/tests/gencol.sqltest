@@ -2413,9 +2413,10 @@ expect error {
 # SQLite defers the error to the INSERT for these functions.
 test gencol_error_nondeterministic_datetime {
     CREATE TABLE t5(a INT, b TEXT GENERATED ALWAYS AS (datetime('now')));
-    INSERT INTO t6 DEFAULT VALUES;
+    INSERT INTO t5 DEFAULT VALUES;
 }
 expect error {
+    non-deterministic
 }
 
 test gencol_error_nondeterministic_strftime {
@@ -2423,6 +2424,7 @@ test gencol_error_nondeterministic_strftime {
     INSERT INTO t6 DEFAULT VALUES;
 }
 expect error {
+    non-deterministic
 }
 
 test gencol_error_nondeterministic_unixepoch {
@@ -2430,6 +2432,7 @@ test gencol_error_nondeterministic_unixepoch {
     INSERT INTO t7 DEFAULT VALUES;
 }
 expect error {
+    non-deterministic
 }
 
 # --- Dot operator prohibited ---
