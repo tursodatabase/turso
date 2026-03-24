@@ -899,7 +899,26 @@ fn emit_update_insns<'a>(
     let not_exists_check_required =
         has_user_provided_rowid || iteration_cursor_id != target_table_cursor_id;
 
-    let check_rowid_not_exists_label = if not_exists_check_required {
+    let has_before_triggers_early = target_table
+        .table
+        .btree()
+        .map(|btree_table| {
+            let updated_column_indices = set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
+            resolver.with_schema(target_table.database_id, |schema| {
+                get_relevant_triggers_type_and_time(
+                    schema,
+                    TriggerEvent::Update,
+                    TriggerTime::Before,
+                    Some(updated_column_indices),
+                    &btree_table,
+                )
+                .count()
+                    > 0
+            })
+        })
+        .unwrap_or(false);
+
+    let check_rowid_not_exists_label = if not_exists_check_required || has_before_triggers_early {
         Some(program.allocate_label())
     } else {
         None

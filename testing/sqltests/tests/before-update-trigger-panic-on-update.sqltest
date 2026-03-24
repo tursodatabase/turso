@@ -1,0 +1,12 @@
+@database :memory:
+
+test before-update-trigger-panic-on-update {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+    CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN SELECT 1; END;
+    UPDATE t SET v='b' WHERE '';
+    SELECT count(*) FROM t;
+}
+
+expect {
+    0
+}
