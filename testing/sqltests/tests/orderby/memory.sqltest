@@ -187,3 +187,46 @@ expect {
     y|3
 }
 
+# Negative integer literals in ORDER BY should be rejected as invalid
+# column index references, matching SQLite behavior.
+# Fixes select1-4.10.2 in testing/sqlite3/all.test.
+
+test order-by-negative-1 {
+    CREATE TABLE t12(a, b);
+    INSERT INTO t12 VALUES(1,10),(2,9);
+    SELECT * FROM t12 ORDER BY -1;
+}
+expect error {
+    1st ORDER BY term out of range - should be between 1 and 2
+}
+
+test order-by-negative-100 {
+    CREATE TABLE t13(a, b);
+    INSERT INTO t13 VALUES(1,10),(2,9);
+    SELECT * FROM t13 ORDER BY -100;
+}
+expect error {
+    1st ORDER BY term out of range - should be between 1 and 2
+}
+
+# Positive out-of-range and zero column indices should use SQLite-compatible
+# error messages. Fixes select1-4.10.1 in testing/sqlite3/all.test.
+
+test order-by-out-of-range {
+    CREATE TABLE t14(a, b);
+    INSERT INTO t14 VALUES(1,10),(2,9);
+    SELECT * FROM t14 ORDER BY 3;
+}
+expect error {
+    1st ORDER BY term out of range - should be between 1 and 2
+}
+
+test order-by-zero {
+    CREATE TABLE t15(a, b);
+    INSERT INTO t15 VALUES(1,10),(2,9);
+    SELECT * FROM t15 ORDER BY 0;
+}
+expect error {
+    1st ORDER BY term out of range - should be between 1 and 2
+}
+

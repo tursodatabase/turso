@@ -1044,24 +1044,31 @@ fn replace_column_number_with_copy_of_column_expr(
                 None
             }
         }
+        ast::Expr::Unary(ast::UnaryOperator::Negative, inner) => {
+            if let ast::Expr::Literal(ast::Literal::Numeric(num)) = inner.as_ref() {
+                if num.parse::<usize>().is_ok() {
+                    crate::bail_parse_error!(
+                        "1st ORDER BY term out of range - should be between 1 and {}",
+                        columns.len()
+                    );
+                }
+            }
+            None
+        }
         _ => None,
     };
     if let Some(num) = num_str {
         // Only treat as column reference if it parses as a positive integer.
         // Float literals like "0.5" or "1.0" are valid constant expressions, not column references.
         if let Ok(column_number) = num.parse::<usize>() {
-            if column_number == 0 {
-                crate::bail_parse_error!("invalid column index: {}", column_number);
+            if column_number == 0 || column_number > columns.len() {
+                crate::bail_parse_error!(
+                    "1st ORDER BY term out of range - should be between 1 and {}",
+                    columns.len()
+                );
             }
-            let maybe_result_column = columns.get(column_number - 1);
-            match maybe_result_column {
-                Some(ResultSetColumn { expr, .. }) => {
-                    *order_by_or_group_by_expr = expr.clone();
-                }
-                None => {
-                    crate::bail_parse_error!("invalid column index: {}", column_number)
-                }
-            };
+            let ResultSetColumn { expr, .. } = &columns[column_number - 1];
+            *order_by_or_group_by_expr = expr.clone();
         }
         // Otherwise, leave the expression as-is (constant expression, case 3 per SQLite docs)
     }
