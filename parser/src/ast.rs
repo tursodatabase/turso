@@ -73,6 +73,17 @@ pub struct AlterTable {
     // `ALTER TABLE` body
     pub body: AlterTableBody,
 }
+/// Object type for COMMENT ON statement
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum CommentObjectType {
+    Table,
+    Column,
+    Index,
+    View,
+    Type,
+}
+
 /// SQL statement
 // https://sqlite.org/syntax/sql-stmt.html
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -107,6 +118,17 @@ pub enum Stmt {
         // tx name
         name: Option<Name>,
     }, // TODO distinction between COMMIT and END
+    /// `COMMENT ON`
+    CommentOn {
+        /// object type (TABLE, COLUMN, INDEX, VIEW, TYPE)
+        object_type: CommentObjectType,
+        /// object name
+        object_name: QualifiedName,
+        /// column name for COMMENT ON COLUMN table.column
+        column_name: Option<Name>,
+        /// comment text, None means IS NULL (drop comment)
+        comment: Option<String>,
+    },
     /// `CREATE INDEX`
     CreateIndex {
         /// `UNIQUE`
@@ -1724,6 +1746,8 @@ pub enum PragmaName {
     MvccCheckpointThreshold,
     /// List all available types (built-in and custom)
     ListTypes,
+    /// List comments on database objects
+    CommentList,
 }
 
 /// `CREATE TRIGGER` time

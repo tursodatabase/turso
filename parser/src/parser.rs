@@ -1,15 +1,16 @@
 use crate::ast::{
     check::ColumnCount, AlterTable, AlterTableBody, As, Cmd, ColumnConstraint, ColumnDefinition,
-    CommonTableExpr, CompoundOperator, CompoundSelect, CreateTableBody, CreateTypeBody,
-    CreateVirtualTable, DeferSubclause, Distinctness, Expr, ForeignKeyClause, FrameBound,
-    FrameClause, FrameExclude, FrameMode, FromClause, FunctionTail, GeneratedColumnType, GroupBy,
-    Indexed, IndexedColumn, InitDeferredPred, InsertBody, JoinConstraint, JoinOperator, JoinType,
-    JoinedSelectTable, LikeOperator, Limit, Literal, Materialized, Name, NamedColumnConstraint,
-    NamedTableConstraint, NullsOrder, OneSelect, Operator, Over, PragmaBody, PragmaValue,
-    QualifiedName, RefAct, RefArg, ResolveType, ResultColumn, Select, SelectBody, SelectTable, Set,
-    SortOrder, SortedColumn, Stmt, TableConstraint, TableOptions, TransactionType, TriggerCmd,
-    TriggerEvent, TriggerTime, Type, TypeOperator, TypeParam, TypeSize, UnaryOperator, Update,
-    Upsert, UpsertDo, UpsertIndex, Variable, Window, WindowDef, With,
+    CommentObjectType, CommonTableExpr, CompoundOperator, CompoundSelect, CreateTableBody,
+    CreateTypeBody, CreateVirtualTable, DeferSubclause, Distinctness, Expr, ForeignKeyClause,
+    FrameBound, FrameClause, FrameExclude, FrameMode, FromClause, FunctionTail,
+    GeneratedColumnType, GroupBy, Indexed, IndexedColumn, InitDeferredPred, InsertBody,
+    JoinConstraint, JoinOperator, JoinType, JoinedSelectTable, LikeOperator, Limit, Literal,
+    Materialized, Name, NamedColumnConstraint, NamedTableConstraint, NullsOrder, OneSelect,
+    Operator, Over, PragmaBody, PragmaValue, QualifiedName, RefAct, RefArg, ResolveType,
+    ResultColumn, Select, SelectBody, SelectTable, Set, SortOrder, SortedColumn, Stmt,
+    TableConstraint, TableOptions, TransactionType, TriggerCmd, TriggerEvent, TriggerTime, Type,
+    TypeOperator, TypeParam, TypeSize, UnaryOperator, Update, Upsert, UpsertDo, UpsertIndex,
+    Variable, Window, WindowDef, With,
 };
 use crate::error::Error;
 use crate::lexer::{Lexer, Token};
@@ -641,7 +642,8 @@ impl<'a> Parser<'a> {
             TK_REPLACE,
             TK_UPDATE,
             TK_REINDEX,
-            TK_OPTIMIZE
+            TK_OPTIMIZE,
+            TK_COMMENT
         );
 
         match tok.token_type {
@@ -665,6 +667,7 @@ impl<'a> Parser<'a> {
             TK_UPDATE => self.parse_update(),
             TK_REINDEX => self.parse_reindex(),
             TK_OPTIMIZE => self.parse_optimize(),
+            TK_COMMENT => self.parse_comment_on(),
             _ => unreachable!(),
         }
     }
@@ -4634,6 +4637,94 @@ impl<'a> Parser<'a> {
             },
             _ => Ok(Stmt::Optimize { idx_name: None }),
         }
+    }
+
+    /// Parse `COMMENT ON TABLE|COLUMN|INDEX|VIEW|TYPE <name> IS <string|NULL>`
+    fn parse_comment_on(&mut self) -> Result<Stmt> {
+        eat_assert!(self, TK_COMMENT);
+        eat_expect!(self, TK_ON);
+
+        // COLUMN keyword is context-sensitive — after ON it becomes TK_ID.
+        // Match TABLE, INDEX, VIEW, TYPE as keywords, and COLUMN via TK_ID value.
+        let tok = peek_expect!(self, TK_TABLE, TK_ID, TK_INDEX, TK_VIEW, TK_TYPE);
+        let object_type = match tok.token_type {
+            TK_TABLE => {
+                eat_assert!(self, TK_TABLE);
+                CommentObjectType::Table
+            }
+            TK_ID => {
+                let tok = eat_assert!(self, TK_ID);
+                if tok.value.eq_ignore_ascii_case(b"COLUMN") {
+                    CommentObjectType::Column
+                } else {
+                    let token_text = tok.to_utf8();
+                    return Err(Error::ParseUnexpectedToken {
+                        parsed_offset: (self.offset(), token_text.len()).into(),
+                        expected: &[TK_TABLE, TK_COLUMNKW, TK_INDEX, TK_VIEW, TK_TYPE],
+                        got: TK_ID,
+                        token_text,
+                        offset: self.offset(),
+                        expected_display: "TABLE, COLUMN, INDEX, VIEW, or TYPE".to_string(),
+                    });
+                }
+            }
+            TK_INDEX => {
+                eat_assert!(self, TK_INDEX);
+                CommentObjectType::Index
+            }
+            TK_VIEW => {
+                eat_assert!(self, TK_VIEW);
+                CommentObjectType::View
+            }
+            TK_TYPE => {
+                eat_assert!(self, TK_TYPE);
+                CommentObjectType::Type
+            }
+            _ => unreachable!(),
+        };
+
+        // For COLUMN, parse table_name.column_name (dot is consumed by parse_fullname)
+        // For other types, parse the object name normally
+        let (object_name, column_name) = if matches!(object_type, CommentObjectType::Column) {
+            let tbl_name = self.parse_nm()?;
+            eat_expect!(self, TK_DOT);
+            let col_name = self.parse_nm()?;
+            (
+                QualifiedName {
+                    db_name: None,
+                    name: tbl_name,
+                    alias: None,
+                },
+                Some(col_name),
+            )
+        } else {
+            (self.parse_fullname(false)?, None)
+        };
+
+        eat_expect!(self, TK_IS);
+
+        // Parse string literal or NULL
+        let tok = peek_expect!(self, TK_STRING, TK_NULL);
+        let comment = match tok.token_type {
+            TK_STRING => {
+                let tok = eat_assert!(self, TK_STRING);
+                let s = tok.to_utf8();
+                // Strip surrounding quotes
+                Some(s[1..s.len() - 1].replace("''", "'"))
+            }
+            TK_NULL => {
+                eat_assert!(self, TK_NULL);
+                None
+            }
+            _ => unreachable!(),
+        };
+
+        Ok(Stmt::CommentOn {
+            object_type,
+            object_name,
+            column_name,
+            comment,
+        })
     }
 }
 

@@ -86,7 +86,7 @@ employees
 
 ### .schema
 
-Display the CREATE statement for a table, or all tables if no argument is given.
+Display the CREATE statement for a table, or all tables if no argument is given. CREATE TABLE statements are formatted with one column per line. If comments have been set with [COMMENT ON](/docs/sql-reference/statements/comment-on), they are shown inline using SQL `--` comment syntax.
 
 ```
 .schema [TABLE]
@@ -94,11 +94,36 @@ Display the CREATE statement for a table, or all tables if no argument is given.
 
 ```
 tursodb> .schema employees
-CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT);
+CREATE TABLE employees (
+  id INTEGER PRIMARY KEY,
+  name TEXT
+);
 
 tursodb> .schema
-CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT);
-CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT);
+CREATE TABLE employees (
+  id INTEGER PRIMARY KEY,
+  name TEXT
+);
+CREATE TABLE departments (
+  id INTEGER PRIMARY KEY,
+  name TEXT
+);
+```
+
+With comments:
+
+```sql
+COMMENT ON TABLE employees IS 'Company staff';
+COMMENT ON COLUMN employees.name IS 'Full legal name';
+```
+
+```
+tursodb> .schema employees
+-- Company staff
+CREATE TABLE employees (
+  id INTEGER PRIMARY KEY,
+  name TEXT -- Full legal name
+);
 ```
 
 ### .indexes
@@ -336,7 +361,7 @@ syscall
 
 ### .dump
 
-Output the entire database as SQL statements that can recreate it.
+Output the entire database as SQL statements that can recreate it. If [comments](/docs/sql-reference/statements/comment-on) have been set, they are exported as `COMMENT ON` statements.
 
 ```
 tursodb> .dump
@@ -345,6 +370,8 @@ BEGIN TRANSACTION;
 CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT);
 INSERT INTO "employees" VALUES(1,'Alice');
 INSERT INTO "employees" VALUES(2,'Bob');
+COMMENT ON TABLE employees IS 'Company staff';
+COMMENT ON COLUMN employees.name IS 'Full legal name';
 COMMIT;
 ```
 

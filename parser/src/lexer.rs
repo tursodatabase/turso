@@ -33,6 +33,7 @@ fn keyword_or_id_token(input: &[u8]) -> TokenType {
         b"CHECK" => TokenType::TK_CHECK,
         b"COLLATE" => TokenType::TK_COLLATE,
         b"COLUMN" => TokenType::TK_COLUMNKW,
+        b"COMMENT" => TokenType::TK_COMMENT,
         b"COMMIT" => TokenType::TK_COMMIT,
         b"CONCURRENT" => TokenType::TK_CONCURRENT,
         b"CONFLICT" => TokenType::TK_CONFLICT,

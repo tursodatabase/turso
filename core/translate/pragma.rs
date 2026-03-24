@@ -14,6 +14,7 @@ use super::integrity_check::{
 use crate::function::Func;
 use crate::pragma::pragma_for;
 use crate::schema::Schema;
+use crate::schema::TURSO_COMMENTS_TABLE_NAME;
 use crate::storage::encryption::{CipherMode, EncryptionKey};
 use crate::storage::pager::AutoVacuumMode;
 use crate::storage::pager::Pager;
@@ -21,8 +22,8 @@ use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
 use crate::translate::emitter::{Resolver, TransactionMode};
 use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
-use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
-use crate::vdbe::insn::{Cookie, Insn};
+use crate::vdbe::builder::{CursorType, ProgramBuilder, ProgramBuilderOpts};
+use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn};
 use crate::{bail_parse_error, CaptureDataChangesInfo, LimboError, Numeric, Value};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
@@ -93,7 +94,8 @@ pub fn translate_pragma(
             | PragmaName::TableXinfo
             | PragmaName::IntegrityCheck
             | PragmaName::DatabaseList
-            | PragmaName::QuickCheck => query_pragma(
+            | PragmaName::QuickCheck
+            | PragmaName::CommentList => query_pragma(
                 pragma,
                 resolver,
                 Some(*value),
@@ -511,6 +513,7 @@ fn update_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::ListTypes => bail_parse_error!("list_types cannot be set"),
+        PragmaName::CommentList => bail_parse_error!("comment_list cannot be set"),
         PragmaName::TempStore => {
             use crate::TempStore;
             // Try to parse as a string first (default, file, memory)
@@ -1332,6 +1335,86 @@ fn query_pragma(
                 program.add_pragma_result_column(col_name.to_string());
             }
             Ok(TransactionMode::None)
+        }
+        PragmaName::CommentList => {
+            let filter_name = match value {
+                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
+                _ => None,
+            };
+
+            // If the comments table doesn't exist, return zero rows
+            let comments_table = if let Some(t) = schema.get_btree_table(TURSO_COMMENTS_TABLE_NAME)
+            {
+                t
+            } else {
+                let pragma_meta = pragma_for(&pragma);
+                for col_name in pragma_meta.columns.iter() {
+                    program.add_pragma_result_column(col_name.to_string());
+                }
+                return Ok(TransactionMode::Read);
+            };
+
+            let opts = ProgramBuilderOpts {
+                num_cursors: 1,
+                approx_num_insns: 20,
+                approx_num_labels: 3,
+            };
+            program.extend(&opts);
+
+            let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(comments_table.clone()));
+            program.emit_insn(Insn::OpenRead {
+                cursor_id,
+                root_page: comments_table.root_page,
+                db: 0,
+            });
+
+            let end_label = program.allocate_label();
+            let loop_label = program.allocate_label();
+
+            program.emit_insn(Insn::Rewind {
+                cursor_id,
+                pc_if_empty: end_label,
+            });
+            program.preassign_label_to_next_insn(loop_label);
+
+            let base_reg = register;
+            program.alloc_registers(3); // 4 total (1 already allocated)
+
+            // Read all 4 columns: object_type, object_name, sub_name, description
+            program.emit_column_or_rowid(cursor_id, 0, base_reg);
+            program.emit_column_or_rowid(cursor_id, 1, base_reg + 1);
+            program.emit_column_or_rowid(cursor_id, 2, base_reg + 2);
+            program.emit_column_or_rowid(cursor_id, 3, base_reg + 3);
+
+            if let Some(ref name) = filter_name {
+                // Filter: skip rows where object_name != filter_name
+                let skip_label = program.allocate_label();
+                let filter_reg = program.alloc_register();
+                program.emit_string8(name.clone(), filter_reg);
+                program.emit_insn(Insn::Ne {
+                    lhs: base_reg + 1,
+                    rhs: filter_reg,
+                    target_pc: skip_label,
+                    flags: CmpInsFlags::default(),
+                    collation: program.curr_collation(),
+                });
+                program.emit_result_row(base_reg, 4);
+                program.resolve_label(skip_label, program.offset());
+            } else {
+                program.emit_result_row(base_reg, 4);
+            }
+
+            program.emit_insn(Insn::Next {
+                cursor_id,
+                pc_if_next: loop_label,
+            });
+            program.preassign_label_to_next_insn(end_label);
+
+            let pragma_meta = pragma_for(&pragma);
+            for col_name in pragma_meta.columns.iter() {
+                program.add_pragma_result_column(col_name.to_string());
+            }
+            Ok(TransactionMode::Read)
         }
     }
 }

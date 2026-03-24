@@ -290,6 +290,37 @@ impl ToTokens for Stmt {
                 }
                 Ok(())
             }
+            Self::CommentOn {
+                object_type,
+                object_name,
+                column_name,
+                comment,
+            } => {
+                s.append(TK_COMMENT, None)?;
+                s.append(TK_ON, None)?;
+                match object_type {
+                    super::CommentObjectType::Table => s.append(TK_TABLE, None)?,
+                    super::CommentObjectType::Column => s.append(TK_COLUMNKW, None)?,
+                    super::CommentObjectType::Index => s.append(TK_INDEX, None)?,
+                    super::CommentObjectType::View => s.append(TK_VIEW, None)?,
+                    super::CommentObjectType::Type => s.append(TK_TYPE, None)?,
+                };
+                object_name.to_tokens(s, context)?;
+                if let Some(col) = column_name {
+                    s.append(TK_DOT, None)?;
+                    col.to_tokens(s, context)?;
+                }
+                s.append(TK_IS, None)?;
+                match comment {
+                    Some(text) => {
+                        s.append(TK_STRING, Some(text))?;
+                    }
+                    None => {
+                        s.append(TK_NULL, None)?;
+                    }
+                }
+                Ok(())
+            }
             Self::CreateIndex {
                 unique,
                 if_not_exists,
