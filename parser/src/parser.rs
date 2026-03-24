@@ -1,15 +1,16 @@
 use crate::ast::{
     check::ColumnCount, AlterTable, AlterTableBody, As, Cmd, ColumnConstraint, ColumnDefinition,
-    CommonTableExpr, CompoundOperator, CompoundSelect, CreateTableBody, CreateTypeBody,
-    CreateVirtualTable, DeferSubclause, Distinctness, Expr, ForeignKeyClause, FrameBound,
-    FrameClause, FrameExclude, FrameMode, FromClause, FunctionTail, GeneratedColumnType, GroupBy,
-    Indexed, IndexedColumn, InitDeferredPred, InsertBody, JoinConstraint, JoinOperator, JoinType,
-    JoinedSelectTable, LikeOperator, Limit, Literal, Materialized, Name, NamedColumnConstraint,
-    NamedTableConstraint, NullsOrder, OneSelect, Operator, Over, PragmaBody, PragmaValue,
-    QualifiedName, RefAct, RefArg, ResolveType, ResultColumn, Select, SelectBody, SelectTable, Set,
-    SortOrder, SortedColumn, Stmt, TableConstraint, TableOptions, TransactionType, TriggerCmd,
-    TriggerEvent, TriggerTime, Type, TypeOperator, TypeParam, TypeSize, UnaryOperator, Update,
-    Upsert, UpsertDo, UpsertIndex, Variable, Window, WindowDef, With,
+    CommonTableExpr, CompoundOperator, CompoundSelect, CreateForeignTable, CreateServer,
+    CreateTableBody, CreateTypeBody, CreateVirtualTable, DeferSubclause, Distinctness, Expr,
+    ForeignKeyClause, FrameBound, FrameClause, FrameExclude, FrameMode, FromClause, FunctionTail,
+    GeneratedColumnType, GroupBy, Indexed, IndexedColumn, InitDeferredPred, InsertBody,
+    JoinConstraint, JoinOperator, JoinType, JoinedSelectTable, LikeOperator, Limit, Literal,
+    Materialized, Name, NamedColumnConstraint, NamedTableConstraint, NullsOrder, OneSelect,
+    Operator, Over, PragmaBody, PragmaValue, QualifiedName, RefAct, RefArg, ResolveType,
+    ResultColumn, Select, SelectBody, SelectTable, ServerOption, Set, SortOrder, SortedColumn,
+    Stmt, TableConstraint, TableOptions, TransactionType, TriggerCmd, TriggerEvent, TriggerTime,
+    Type, TypeOperator, TypeParam, TypeSize, UnaryOperator, Update, Upsert, UpsertDo, UpsertIndex,
+    Variable, Window, WindowDef, With,
 };
 use crate::error::Error;
 use crate::lexer::{Lexer, Token};
@@ -885,6 +886,86 @@ impl<'a> Parser<'a> {
         Ok(from_bytes(&self.lexer.input[start_idx..end_idx]))
     }
 
+    fn parse_options(&mut self) -> Result<Vec<ServerOption>> {
+        // Expect: OPTIONS ( key 'value' [, key 'value' ]... )
+        // OPTIONS is a contextual keyword (parsed as TK_ID)
+        let tok = self.peek_no_eof()?;
+        if tok.token_type != TK_ID || !tok.as_bytes().eq_ignore_ascii_case(b"OPTIONS") {
+            return Err(Error::Custom("expected OPTIONS".to_owned()));
+        }
+        self.eat_no_eof()?; // consume OPTIONS
+        eat_expect!(self, TK_LP);
+        let mut options = Vec::new();
+        loop {
+            if self.peek_no_eof()?.token_type == TK_RP {
+                break;
+            }
+            let key = self.parse_nm()?;
+            let value_tok = eat_expect!(self, TK_STRING);
+            let raw = from_bytes(value_tok.as_bytes());
+            // Dequote the string literal
+            let value = if raw.len() >= 2 && (raw.starts_with('\'') || raw.starts_with('"')) {
+                let quote = raw.as_bytes()[0] as char;
+                let inner = &raw[1..raw.len() - 1];
+                let escaped = format!("{quote}{quote}");
+                inner.replace(&escaped, &quote.to_string())
+            } else {
+                raw
+            };
+            options.push(ServerOption { key, value });
+            if self.peek_no_eof()?.token_type == TK_COMMA {
+                eat_assert!(self, TK_COMMA);
+            } else {
+                break;
+            }
+        }
+        eat_expect!(self, TK_RP);
+        Ok(options)
+    }
+
+    fn parse_create_server(&mut self) -> Result<Stmt> {
+        eat_assert!(self, TK_SERVER);
+        let if_not_exists = self.parse_if_not_exists()?;
+        let server_name = self.parse_nm()?;
+        let options = self.parse_options()?;
+        Ok(Stmt::CreateServer(CreateServer {
+            if_not_exists,
+            server_name,
+            options,
+        }))
+    }
+
+    fn parse_create_foreign_table(&mut self) -> Result<Stmt> {
+        eat_assert!(self, TK_FOREIGN);
+        eat_expect!(self, TK_TABLE);
+        let if_not_exists = self.parse_if_not_exists()?;
+        let tbl_name = self.parse_fullname(false)?;
+        eat_expect!(self, TK_LP);
+        let mut columns = Vec::new();
+        loop {
+            if self.peek_no_eof()?.token_type == TK_RP {
+                break;
+            }
+            columns.push(self.parse_column_definition(false)?);
+            if self.peek_no_eof()?.token_type == TK_COMMA {
+                eat_assert!(self, TK_COMMA);
+            } else {
+                break;
+            }
+        }
+        eat_expect!(self, TK_RP);
+        eat_expect!(self, TK_SERVER);
+        let server_name = self.parse_nm()?;
+        let options = self.parse_options()?;
+        Ok(Stmt::CreateForeignTable(CreateForeignTable {
+            if_not_exists,
+            tbl_name,
+            columns,
+            server_name,
+            options,
+        }))
+    }
+
     fn parse_create_virtual(&mut self) -> Result<Stmt> {
         eat_assert!(self, TK_VIRTUAL);
         eat_expect!(self, TK_TABLE);
@@ -941,7 +1022,9 @@ impl<'a> Parser<'a> {
             TK_UNIQUE,
             TK_TRIGGER,
             TK_MATERIALIZED,
-            TK_TYPE
+            TK_TYPE,
+            TK_SERVER,
+            TK_FOREIGN
         );
         let mut temp = false;
         if first_tok.token_type == TK_TEMP {
@@ -956,6 +1039,8 @@ impl<'a> Parser<'a> {
             TK_MATERIALIZED => self.parse_create_materialized_view(),
             TK_TRIGGER => self.parse_create_trigger(temp),
             TK_VIRTUAL => self.parse_create_virtual(),
+            TK_SERVER => self.parse_create_server(),
+            TK_FOREIGN => self.parse_create_foreign_table(),
             TK_INDEX | TK_UNIQUE => self.parse_create_index(),
             TK_TYPE => self.parse_create_type(),
             _ => unreachable!(),
@@ -4469,9 +4554,18 @@ impl<'a> Parser<'a> {
 
     fn parse_drop_stmt(&mut self) -> Result<Stmt> {
         eat_assert!(self, TK_DROP);
-        let tok = peek_expect!(self, TK_TABLE, TK_INDEX, TK_TRIGGER, TK_VIEW, TK_TYPE);
+        let tok = peek_expect!(self, TK_TABLE, TK_INDEX, TK_TRIGGER, TK_VIEW, TK_TYPE, TK_SERVER);
 
         match tok.token_type {
+            TK_SERVER => {
+                eat_assert!(self, TK_SERVER);
+                let if_exists = self.parse_if_exists()?;
+                let server_name = self.parse_nm()?;
+                Ok(Stmt::DropServer {
+                    if_exists,
+                    server_name,
+                })
+            }
             TK_TABLE => {
                 eat_assert!(self, TK_TABLE);
                 let if_exists = self.parse_if_exists()?;
@@ -12233,5 +12327,99 @@ mod tests {
                 assert_eq!(result_str, expected_str[i], "Input: {rstring:?}");
             }
         }
+    }
+
+    #[test]
+    fn test_create_server() {
+        let sql = "CREATE SERVER csv_srv OPTIONS (driver 'csv')";
+        let mut p = Parser::new(sql.as_bytes());
+        let cmd = p.next_cmd().unwrap().unwrap();
+        match cmd {
+            Cmd::Stmt(Stmt::CreateServer(cs)) => {
+                assert!(!cs.if_not_exists);
+                assert_eq!(cs.server_name.as_str(), "csv_srv");
+                assert_eq!(cs.options.len(), 1);
+                assert_eq!(cs.options[0].key.as_str(), "driver");
+                assert_eq!(cs.options[0].value, "csv");
+            }
+            other => panic!("Expected CreateServer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_create_server_if_not_exists() {
+        let sql = "CREATE SERVER IF NOT EXISTS my_srv OPTIONS (driver 'csv', host 'localhost')";
+        let mut p = Parser::new(sql.as_bytes());
+        let cmd = p.next_cmd().unwrap().unwrap();
+        match cmd {
+            Cmd::Stmt(Stmt::CreateServer(cs)) => {
+                assert!(cs.if_not_exists);
+                assert_eq!(cs.server_name.as_str(), "my_srv");
+                assert_eq!(cs.options.len(), 2);
+                assert_eq!(cs.options[0].value, "csv");
+                assert_eq!(cs.options[1].key.as_str(), "host");
+                assert_eq!(cs.options[1].value, "localhost");
+            }
+            other => panic!("Expected CreateServer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_create_foreign_table() {
+        let sql = "CREATE FOREIGN TABLE employees (name TEXT, age TEXT, city TEXT) SERVER csv_srv OPTIONS (path '/data/e.csv', skip_header 'true')";
+        let mut p = Parser::new(sql.as_bytes());
+        let cmd = p.next_cmd().unwrap().unwrap();
+        match cmd {
+            Cmd::Stmt(Stmt::CreateForeignTable(ft)) => {
+                assert!(!ft.if_not_exists);
+                assert_eq!(ft.tbl_name.name.as_str(), "employees");
+                assert_eq!(ft.columns.len(), 3);
+                assert_eq!(ft.columns[0].col_name.as_str(), "name");
+                assert_eq!(ft.server_name.as_str(), "csv_srv");
+                assert_eq!(ft.options.len(), 2);
+                assert_eq!(ft.options[0].key.as_str(), "path");
+                assert_eq!(ft.options[0].value, "/data/e.csv");
+                assert_eq!(ft.options[1].key.as_str(), "skip_header");
+                assert_eq!(ft.options[1].value, "true");
+            }
+            other => panic!("Expected CreateForeignTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_drop_server() {
+        let sql = "DROP SERVER IF EXISTS csv_srv";
+        let mut p = Parser::new(sql.as_bytes());
+        let cmd = p.next_cmd().unwrap().unwrap();
+        match cmd {
+            Cmd::Stmt(Stmt::DropServer {
+                if_exists,
+                server_name,
+            }) => {
+                assert!(if_exists);
+                assert_eq!(server_name.as_str(), "csv_srv");
+            }
+            other => panic!("Expected DropServer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_create_server_roundtrip() {
+        let sql = "CREATE SERVER csv_srv OPTIONS (driver 'csv')";
+        let mut p = Parser::new(sql.as_bytes());
+        let cmd = p.next_cmd().unwrap().unwrap();
+        let s = cmd.to_string();
+        let cmd2 = Parser::new(s.as_bytes()).next_cmd().unwrap().unwrap();
+        assert_eq!(cmd, cmd2);
+    }
+
+    #[test]
+    fn test_create_foreign_table_roundtrip() {
+        let sql = "CREATE FOREIGN TABLE t (a TEXT, b INT) SERVER s OPTIONS (path '/x.csv')";
+        let mut p = Parser::new(sql.as_bytes());
+        let cmd = p.next_cmd().unwrap().unwrap();
+        let s = cmd.to_string();
+        let cmd2 = Parser::new(s.as_bytes()).next_cmd().unwrap().unwrap();
+        assert_eq!(cmd, cmd2);
     }
 }
