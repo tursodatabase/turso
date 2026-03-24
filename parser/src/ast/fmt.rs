@@ -476,6 +476,56 @@ impl ToTokens for Stmt {
                 }
                 s.append(TK_RP, None)
             }
+            Self::CreateServer(CreateServer {
+                if_not_exists,
+                server_name,
+                options,
+            }) => {
+                s.append(TK_CREATE, None)?;
+                s.append(TK_SERVER, None)?;
+                if *if_not_exists {
+                    s.append(TK_IF, None)?;
+                    s.append(TK_NOT, None)?;
+                    s.append(TK_EXISTS, None)?;
+                }
+                server_name.to_tokens(s, context)?;
+                options_to_tokens(options, s, context)
+            }
+            Self::CreateForeignTable(CreateForeignTable {
+                if_not_exists,
+                tbl_name,
+                columns,
+                server_name,
+                options,
+            }) => {
+                s.append(TK_CREATE, None)?;
+                s.append(TK_FOREIGN, None)?;
+                s.append(TK_TABLE, None)?;
+                if *if_not_exists {
+                    s.append(TK_IF, None)?;
+                    s.append(TK_NOT, None)?;
+                    s.append(TK_EXISTS, None)?;
+                }
+                tbl_name.to_tokens(s, context)?;
+                s.append(TK_LP, None)?;
+                comma(columns, s, context)?;
+                s.append(TK_RP, None)?;
+                s.append(TK_SERVER, None)?;
+                server_name.to_tokens(s, context)?;
+                options_to_tokens(options, s, context)
+            }
+            Self::DropServer {
+                if_exists,
+                server_name,
+            } => {
+                s.append(TK_DROP, None)?;
+                s.append(TK_SERVER, None)?;
+                if *if_exists {
+                    s.append(TK_IF, None)?;
+                    s.append(TK_EXISTS, None)?;
+                }
+                server_name.to_tokens(s, context)
+            }
             Self::Delete {
                 with,
                 tbl_name,
@@ -2582,6 +2632,26 @@ impl ToTokens for FrameExclude {
             Self::Ties => s.append(TK_TIES, None),
         }
     }
+}
+
+fn options_to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+    options: &[ServerOption],
+    s: &mut S,
+    context: &C,
+) -> Result<(), S::Error> {
+    if options.is_empty() {
+        return Ok(());
+    }
+    s.append(TK_ID, Some("OPTIONS"))?;
+    s.append(TK_LP, None)?;
+    for (i, opt) in options.iter().enumerate() {
+        if i > 0 {
+            s.append(TK_COMMA, None)?;
+        }
+        opt.key.to_tokens(s, context)?;
+        s.append(TK_STRING, Some(&format!("'{}'", opt.value)))?;
+    }
+    s.append(TK_RP, None)
 }
 
 fn comma<I, S: TokenStream + ?Sized, C: ToSqlContext>(
