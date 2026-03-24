@@ -79,6 +79,8 @@ pub fn emit_query<'a>(
 ) -> Result<usize> {
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
+    let offset_continue_label = program.allocate_label();
+    t_ctx.label_offset_continue = Some(offset_continue_label);
 
     // Evaluate uncorrelated subqueries as early as possible, because even LIMIT can reference a subquery.
     // This must happen before VALUES emission since VALUES expressions may contain scalar subqueries.

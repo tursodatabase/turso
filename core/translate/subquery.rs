@@ -1352,6 +1352,7 @@ pub fn emit_from_clause_subquery(
                     .map(|_| LoopLabels::new(program))
                     .collect(),
                 label_main_loop_end: None,
+                label_offset_continue: None,
                 meta_group_by: None,
                 meta_left_joins: (0..select_plan.joined_tables().len())
                     .map(|_| None)
@@ -1438,6 +1439,7 @@ fn emit_indexed_materialized_subquery(
                     .map(|_| LoopLabels::new(program))
                     .collect(),
                 label_main_loop_end: None,
+                label_offset_continue: None,
                 meta_group_by: None,
                 meta_left_joins: (0..select_plan.joined_tables().len())
                     .map(|_| None)
@@ -1533,6 +1535,7 @@ fn emit_materialized_subquery_table(
                     .map(|_| LoopLabels::new(program))
                     .collect(),
                 label_main_loop_end: None,
+                label_offset_continue: None,
                 meta_group_by: None,
                 meta_left_joins: (0..select_plan.joined_tables().len())
                     .map(|_| None)

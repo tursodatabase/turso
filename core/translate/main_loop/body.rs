@@ -114,12 +114,13 @@ impl<'prog, 'ctx, 'plan> LoopBody<'prog, 'ctx, 'plan> {
 
     /// Emit the loop body once all required entry labels are fixed.
     fn emit(mut self) -> Result<()> {
+        let emit_target = self.select_emit_target();
         self.resolve_anti_join_entry();
         emit_loop_source(
             self.program,
             self.t_ctx,
             self.plan,
-            self.select_emit_target(),
+            emit_target,
         )
     }
 }
@@ -385,11 +386,7 @@ fn emit_loop_source<'a>(
                 plan.aggregates.is_empty(),
                 "QueryResult target should not have aggregates"
             );
-            let offset_jump_to = t_ctx
-                .labels_main_loop
-                .first()
-                .map(|l| l.next)
-                .or(t_ctx.label_main_loop_end);
+            let offset_jump_to = t_ctx.label_offset_continue;
             emit_select_result(
                 program,
                 &t_ctx.resolver,
