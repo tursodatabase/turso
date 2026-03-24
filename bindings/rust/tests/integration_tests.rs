@@ -1,6 +1,25 @@
 use tokio::fs;
 use turso::{Builder, EncryptionOpts, Error, Value};
 
+async fn cache_size(conn: &turso::Connection) -> i64 {
+    let mut rows = conn.query("PRAGMA cache_size", ()).await.unwrap();
+    let row = rows.next().await.unwrap().expect("expected row");
+    row.get(0).unwrap()
+}
+
+#[tokio::test]
+async fn test_connect_pooled_integration_reuses_connection() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+
+    {
+        let conn = db.connect_pooled().unwrap();
+        conn.execute("PRAGMA cache_size = 4321", ()).await.unwrap();
+    }
+
+    let conn = db.connect_pooled().unwrap();
+    assert_eq!(cache_size(&conn).await, 4321);
+}
+
 #[tokio::test]
 async fn test_rows_next() {
     let builder = Builder::new_local(":memory:");
