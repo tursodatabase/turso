@@ -822,6 +822,19 @@ impl TursoConnection {
         self.connection.last_insert_rowid()
     }
 
+    /// Register a foreign data wrapper as a virtual table in this connection's schema.
+    ///
+    /// See [`turso_core::Connection::register_foreign_table`] for details.
+    pub fn register_foreign_table(
+        &self,
+        name: &str,
+        fdw: std::sync::Arc<dyn turso_core::foreign::ForeignDataWrapper>,
+    ) -> Result<(), TursoError> {
+        self.connection
+            .register_foreign_table(name, fdw)
+            .map_err(|e| TursoError::Error(e.to_string()))
+    }
+
     /// prepares single SQL statement
     pub fn prepare_single(&self, sql: impl AsRef<str>) -> Result<Box<TursoStatement>, TursoError> {
         let statement = self.connection.prepare(sql)?;

@@ -5,6 +5,15 @@ use crate::rsapi::TursoError;
 pub mod capi;
 pub mod rsapi;
 
+/// Re-export foreign data wrapper types so downstream crates (e.g. turso bindings)
+/// don't need a direct turso_core dependency.
+pub mod foreign {
+    pub use turso_core::foreign::{
+        ForeignColumnDef, ForeignCursor, ForeignDataWrapper, ForeignDriverFactory, ForeignServer,
+        KeyColumn, PushedConstraint,
+    };
+}
+
 #[macro_export]
 macro_rules! assert_send {
     ($($ty:ty),+ $(,)?) => {
