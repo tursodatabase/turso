@@ -420,7 +420,7 @@ pub fn emit_upsert(
                 dest_end: None,
             });
         } else {
-            program.emit_column_or_rowid(ctx.cursor_id, i, current_start + i);
+            program.emit_column_or_rowid(ctx.cursor_id, i, reg);
         }
     }
 
