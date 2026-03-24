@@ -6,7 +6,9 @@ use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
 use super::emitter::gencol::compute_virtual_columns;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
-use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, ROWID_SENTINEL};
+use crate::schema::{
+    columns_affected_by_update, BTreeTable, ColumnLayout, IndexColumn, ROWID_SENTINEL,
+};
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{
@@ -589,6 +591,15 @@ pub fn emit_upsert(
         }
     }
 
+    // Recompute virtual columns for the new row after SET clauses have modified base columns.
+    // This must happen before CHECK constraints, triggers, and index updates.
+    if ctx.table.has_virtual_columns() {
+        let rowid_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
+        let dml_ctx =
+            DmlColumnContext::layout(&ctx.table.columns, new_start, rowid_reg, layout.clone());
+        compute_virtual_columns(program, &ctx.table.columns, &dml_ctx, resolver)?;
+    }
+
     if let Some(bt) = table.btree() {
         if bt.is_strict {
             // Pre-encode TypeCheck: all columns are decoded (user-facing) at this point.
@@ -664,6 +675,13 @@ pub fn emit_upsert(
     }
 
     let (changed_cols, rowid_changed) = collect_changed_cols(table, set_pairs);
+    // Expand to include virtual columns that transitively depend on SET columns,
+    // so that indexes on virtual columns are correctly updated.
+    let changed_cols = if ctx.table.has_virtual_columns() {
+        columns_affected_by_update(table.columns(), &changed_cols)
+    } else {
+        changed_cols
+    };
 
     // Fire BEFORE UPDATE triggers
     let upsert_database_id = ctx.database_id;
@@ -1180,7 +1198,7 @@ pub fn emit_upsert(
             // INSERT (after)
             let after_rec = if program.capture_data_changes_info().has_after() {
                 Some(emit_cdc_patch_record(
-                    program, table, new_start, record_reg, new_rowid,
+                    program, table, new_start, record_reg, new_rowid, &layout,
                 ))
             } else {
                 None
@@ -1204,6 +1222,7 @@ pub fn emit_upsert(
                     new_start,
                     record_reg,
                     ctx.conflict_rowid_reg,
+                    &layout,
                 ))
             } else {
                 None
