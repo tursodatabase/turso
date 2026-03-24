@@ -2158,7 +2158,9 @@ fn init_source_emission<'a>(
                         key_reg: rowid_reg,
                         record_reg,
                         // since we are not doing an Insn::NewRowid or an Insn::NotExists here, we need to seek to ensure the insertion happens in the correct place.
-                        flag: InsertFlags::new().require_seek(),
+                        flag: InsertFlags::new()
+                            .require_seek()
+                            .is_ephemeral_table_insert(),
                         table_name: "".to_string(),
                     });
                     // loop back
