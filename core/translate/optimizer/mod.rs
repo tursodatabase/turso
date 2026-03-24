@@ -930,7 +930,7 @@ fn add_ephemeral_table_to_update_plan(
         unique_sets: vec![],
         foreign_keys: vec![],
         check_constraints: vec![],
-        pk_conflict_clause: None,
+        rowid_alias_conflict_clause: None,
     });
 
     let temp_cursor_id = program.alloc_cursor_id_keyed(
@@ -1441,7 +1441,8 @@ fn expr_has_null_masking_for_table(expr: &ast::Expr, table_id: ast::TableInterna
     let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
         match e {
             ast::Expr::FunctionCall { name, args, .. } => {
-                if let Ok(func) = crate::function::Func::resolve_function(name.as_str(), args.len())
+                if let Ok(Some(func)) =
+                    crate::function::Func::resolve_function(name.as_str(), args.len())
                 {
                     // IIF(cond, then, else) is like CASE WHEN cond THEN then ELSE else END.
                     // If the condition is a null check on the target table, IIF masks nulls.
@@ -2681,6 +2682,7 @@ impl Optimizable for ast::Expr {
             Expr::Unary(_, expr) => expr.is_nonnull(tables),
             Expr::Variable(..) => false,
             Expr::Register(..) => false, // Register values can be null
+            Expr::Default => false,
             Expr::Array { .. } | Expr::Subscript { .. } => {
                 unreachable!("Array and Subscript are desugared into function calls by the parser")
             }
@@ -2720,8 +2722,20 @@ impl Optimizable for ast::Expr {
             // contain DoublyQualified nodes.
             Expr::DoublyQualified(_, _, _) => false,
             Expr::Exists(_) => false,
-            Expr::FunctionCall { args, name, .. } => {
-                let Some(func) = resolver.resolve_function(name.as_str(), args.len()) else {
+            Expr::FunctionCall {
+                args,
+                name,
+                filter_over,
+                ..
+            } => {
+                if filter_over.over_clause.is_some() {
+                    return false;
+                }
+                let Some(func) = resolver
+                    .resolve_function(name.as_str(), args.len())
+                    .ok()
+                    .flatten()
+                else {
                     return false;
                 };
                 func.is_deterministic() && args.iter().all(|arg| arg.is_constant(resolver))
@@ -2761,6 +2775,7 @@ impl Optimizable for ast::Expr {
             Expr::Unary(_, expr) => expr.is_constant(resolver),
             Expr::Variable(_) => true,
             Expr::Register(_) => false,
+            Expr::Default => true,
             Expr::Array { .. } | Expr::Subscript { .. } => {
                 unreachable!("Array and Subscript are desugared into function calls by the parser")
             }
@@ -3365,16 +3380,6 @@ fn build_seek_def(
             }
         }
     })
-}
-
-pub trait TakeOwnership {
-    fn take_ownership(&mut self) -> Self;
-}
-
-impl TakeOwnership for ast::Expr {
-    fn take_ownership(&mut self) -> Self {
-        std::mem::replace(self, ast::Expr::Literal(ast::Literal::Null))
-    }
 }
 
 #[cfg(test)]

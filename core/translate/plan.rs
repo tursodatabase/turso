@@ -6,7 +6,7 @@ use turso_parser::ast::{
 };
 
 use crate::{
-    function::AggFunc,
+    function::{AggFunc, WindowFunc},
     schema::{BTreeTable, ColDef, Column, FromClauseSubquery, Index, Schema, Table},
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
@@ -300,7 +300,9 @@ pub enum Plan {
         right_most: SelectPlan,
         limit: Option<Box<Expr>>,
         offset: Option<Box<Expr>>,
-        order_by: Option<Vec<(ast::Expr, SortOrder)>>,
+        /// ORDER BY for compound selects. Each entry is (result_column_index, sort_order).
+        /// The column index is 0-based into the result set.
+        order_by: Option<Vec<(usize, SortOrder)>>,
     },
     Delete(DeletePlan),
     Update(UpdatePlan),
@@ -970,6 +972,12 @@ pub struct TableReferences {
     /// Set when a RIGHT JOIN is rewritten as LEFT JOIN by swapping the two tables,
     /// so `select_star` emits columns in the original user-visible order.
     right_join_swapped: bool,
+}
+
+impl Default for TableReferences {
+    fn default() -> Self {
+        Self::new_empty()
+    }
 }
 
 impl TableReferences {
@@ -2444,10 +2452,16 @@ impl Window {
 }
 
 #[derive(Debug, Clone)]
+pub enum WindowFunctionKind {
+    Agg(AggFunc),
+    Window(WindowFunc),
+}
+
+#[derive(Debug, Clone)]
 pub struct WindowFunction {
-    /// The resolved function. Currently, only regular aggregate functions are supported.
-    /// In the future, more specialized window functions such as `RANK()`, `ROW_NUMBER()`, etc. will be added.
-    pub func: AggFunc,
+    /// The resolved function. Aggregate window functions and specialized window
+    /// functions such as ROW_NUMBER() are supported.
+    pub func: WindowFunctionKind,
     /// The expression from which the function was resolved.
     pub original_expr: Expr,
 }

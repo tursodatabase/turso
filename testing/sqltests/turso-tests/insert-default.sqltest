@@ -1,0 +1,75 @@
+@database :memory:
+
+test single-row-all-default {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER DEFAULT 10, b TEXT DEFAULT 'hello', c INTEGER);
+    INSERT INTO t (id, a, b, c) VALUES (1, DEFAULT, DEFAULT, DEFAULT);
+    SELECT * FROM t;
+}
+expect {
+    1|10|hello|
+}
+
+test single-row-mixed-default-and-values {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER DEFAULT 10, b TEXT DEFAULT 'hello', c INTEGER);
+    INSERT INTO t (id, a, b, c) VALUES (2, DEFAULT, 'world', 42);
+    SELECT * FROM t;
+}
+expect {
+    2|10|world|42
+}
+
+test multi-row-different-defaults {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER DEFAULT 10, b TEXT DEFAULT 'hello', c INTEGER);
+    INSERT INTO t (id, a, b, c) VALUES (3, DEFAULT, 'foo', 1), (4, 99, DEFAULT, 2);
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    3|10|foo|1
+    4|99|hello|2
+}
+
+test no-default-resolves-to-null {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER DEFAULT 10, b TEXT DEFAULT 'hello', c INTEGER);
+    INSERT INTO t (id, a, b, c) VALUES (5, DEFAULT, DEFAULT, DEFAULT);
+    SELECT id, a, b, c IS NULL FROM t;
+}
+expect {
+    5|10|hello|1
+}
+
+test default-with-returning {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER DEFAULT 10, b TEXT DEFAULT 'hello', c INTEGER);
+    INSERT INTO t (id, a, b, c) VALUES (6, DEFAULT, DEFAULT, DEFAULT) RETURNING id, a, b;
+}
+expect {
+    6|10|hello
+}
+
+test default-without-column-list {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER DEFAULT 10, b TEXT DEFAULT 'hello');
+    INSERT INTO t VALUES (1, DEFAULT, DEFAULT);
+    SELECT * FROM t;
+}
+expect {
+    1|10|hello
+}
+
+test default-on-not-null-column-without-default-errors {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+    INSERT INTO t (id, name) VALUES (1, DEFAULT);
+}
+expect error {
+}
+
+test default-in-select-errors {
+    SELECT DEFAULT;
+}
+expect error {
+}
+
+test default-in-where-errors {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER DEFAULT 10);
+    SELECT * FROM t WHERE a = DEFAULT;
+}
+expect error {
+}

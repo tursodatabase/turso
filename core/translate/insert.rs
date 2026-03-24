@@ -1,3 +1,4 @@
+use crate::turso_debug_assert;
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{
@@ -13,7 +14,7 @@ use crate::{
         },
         expr::{
             bind_and_rewrite_expr, emit_returning_results, emit_returning_scan_back,
-            process_returning_clause, restore_returning_row_image_in_cache, rewrite_between_expr,
+            process_returning_clause, restore_returning_row_image_in_cache,
             seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
             walk_expr_mut, BindingBehavior, NoConstantOptReason, ReturningBufferCtx, WalkControl,
         },
@@ -28,6 +29,7 @@ use crate::{
         },
         planner::{plan_ctes_as_outer_refs, ROWID_STRS},
         select::translate_select,
+        stmt_journal::{any_index_or_ipk_has_replace, set_insert_stmt_journal_flags},
         subquery::{
             emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery,
             plan_subqueries_from_returning,
@@ -312,6 +314,7 @@ pub fn translate_insert(
         program,
         resolver,
         &table,
+        &columns,
         &mut body,
         on_conflict.unwrap_or(ResolveType::Abort),
         database_id,
@@ -648,6 +651,15 @@ pub fn translate_insert(
         }) = ctx.autoincrement_meta
         {
             turso_assert!(ctx.table.has_autoincrement);
+            reload_autoincrement_state(
+                program,
+                AutoincMeta {
+                    seq_cursor_id,
+                    r_seq,
+                    r_seq_rowid,
+                    table_name_reg,
+                },
+            );
             // Existing sqlite_sequence row: update only when explicit key advances seq.
             let missing_row_label = program.allocate_label();
             let explicit_done_label = program.allocate_label();
@@ -739,6 +751,8 @@ pub fn translate_insert(
         resolver,
         connection,
         ctx.database_id,
+        ctx.table.rowid_alias_conflict_clause,
+        ctx.statement_on_conflict.is_some(),
     );
 
     // We need to separate index handling and insertion into a `preflight` and a
@@ -748,21 +762,24 @@ pub fn translate_insert(
     //
     // REPLACE (whether statement-level OR REPLACE or constraint-level ON CONFLICT REPLACE)
     // inserts eagerly in preflight because it needs to delete-then-insert per index.
-    let any_constraint_replace = ctx.statement_on_conflict.is_none()
+    // When there's no statement-level override (e.g. INSERT OR ...) and no UPSERT,
+    // individual constraints keep their DDL modes. If some use REPLACE and others
+    // don't, the preflight eagerly handles REPLACE indexes (delete+reinsert) while
+    // deferring non-REPLACE indexes to the commit phase (skip_replace_indexes).
+    // This mixed-mode detection is unnecessary when a statement override exists,
+    // because the override applies uniformly to all constraints.
+    let has_ddl_replace = ctx.statement_on_conflict.is_none()
         && upsert_actions.is_empty()
-        && (ctx.table.pk_conflict_clause == Some(ResolveType::Replace)
-            || ctx
-                .table
-                .unique_sets
-                .iter()
-                .any(|us| us.conflict_clause == Some(ResolveType::Replace))
-            || resolver.with_schema(ctx.database_id, |schema| {
+        && resolver.with_schema(ctx.database_id, |schema| {
+            any_index_or_ipk_has_replace(
+                ctx.table.rowid_alias_conflict_clause,
                 schema
                     .get_indices(ctx.table.name.as_str())
-                    .any(|idx| idx.on_conflict == Some(ResolveType::Replace))
-            }));
+                    .map(|idx| idx.on_conflict),
+            )
+        });
     let on_replace = (matches!(ctx.on_conflict, ResolveType::Replace) && upsert_actions.is_empty())
-        || any_constraint_replace;
+        || has_ddl_replace;
     let mut preflight_ctx = PreflightCtx {
         upsert_actions: &upsert_actions,
         on_replace,
@@ -822,8 +839,18 @@ pub fn translate_insert(
     // but didn't insert. This covers UPSERT and non-REPLACE conflict types (ABORT/FAIL/
     // IGNORE/ROLLBACK). REPLACE inserts eagerly in the preflight phase because it needs
     // to delete-then-insert per index.
-    if has_upsert || !on_replace {
-        emit_commit_phase(program, resolver, &insertion, &ctx)?;
+    //
+    // When statement-level REPLACE is active, ALL indexes use REPLACE and are eagerly
+    // inserted in preflight, so the commit phase can be skipped entirely. But when only
+    // some constraints have REPLACE (mixed mode via DDL), non-REPLACE indexes still need
+    // their entries committed here.
+    // Pure statement-level REPLACE (no upsert). When upsert actions exist,
+    // ON CONFLICT DO UPDATE takes precedence over REPLACE for matching
+    // constraints, so we can't skip the commit phase.
+    let statement_replace = matches!(ctx.on_conflict, ResolveType::Replace);
+    let skip_replace_indexes = has_ddl_replace && !statement_replace;
+    if has_upsert || !statement_replace {
+        emit_commit_phase(program, resolver, &insertion, &ctx, skip_replace_indexes)?;
     }
 
     let mut insert_flags = InsertFlags::new();
@@ -831,7 +858,7 @@ pub fn translate_insert(
     // For REPLACE (statement-level or constraint-level), we need to force a seek on the
     // insert, as we may have already deleted the conflicting row and the cursor is not
     // guaranteed to be positioned.
-    if matches!(ctx.on_conflict, ResolveType::Replace) || any_constraint_replace {
+    if matches!(ctx.on_conflict, ResolveType::Replace) || has_ddl_replace {
         insert_flags = insert_flags.require_seek();
     }
     program.emit_insn(Insn::Insert {
@@ -927,6 +954,15 @@ pub fn translate_insert(
         table_name_reg,
     }) = ctx.autoincrement_meta
     {
+        reload_autoincrement_state(
+            program,
+            AutoincMeta {
+                seq_cursor_id,
+                r_seq,
+                r_seq_rowid,
+                table_name_reg,
+            },
+        );
         let no_update_needed_label = program.allocate_label();
         program.emit_insn(Insn::Le {
             lhs: insertion.key_register(),
@@ -1045,24 +1081,30 @@ pub fn translate_insert(
 
     emit_epilogue(program, resolver, &ctx, inserting_multiple_rows)?;
 
-    super::stmt_journal::set_insert_stmt_journal_flags(
-        program,
-        &super::stmt_journal::InsertJournalCtx {
+    {
+        let has_statement_conflict = ctx.statement_on_conflict.is_some();
+        let notnull_col_exists = insertion
+            .col_mappings
+            .iter()
+            .any(|m| m.column.notnull() && !m.column.is_rowid_alias());
+        let has_unique = !constraints.constraints_to_check.is_empty();
+        let has_triggers = has_before_triggers || has_after_triggers;
+        set_insert_stmt_journal_flags(
+            program,
+            resolver,
+            database_id,
+            ctx.table,
+            has_statement_conflict,
+            ctx.on_conflict,
             inserting_multiple_rows,
-            has_triggers: has_before_triggers || has_after_triggers,
+            has_triggers,
             has_fks,
-            is_replace: matches!(ctx.on_conflict, ResolveType::Replace),
             has_upsert,
-            has_autoincrement: btree_table.has_autoincrement,
-            has_abort_resolution: matches!(ctx.on_conflict, ResolveType::Abort),
-            notnull_col_exists: insertion
-                .col_mappings
-                .iter()
-                .any(|m| m.column.notnull() && !m.column.is_rowid_alias()),
-            has_check: !ctx.table.check_constraints.is_empty(),
-            has_unique: !constraints.constraints_to_check.is_empty(),
-        },
-    );
+            btree_table.has_autoincrement,
+            notnull_col_exists,
+            has_unique,
+        );
+    }
 
     program.result_columns = result_columns;
     program.table_references.extend(table_references);
@@ -1140,7 +1182,6 @@ fn emit_partial_index_check(
         return Ok(None);
     };
     let mut where_for_eval = where_clause.as_ref().clone();
-    rewrite_between_expr(&mut where_for_eval);
     rewrite_partial_index_where(&mut where_for_eval, insertion)?;
     let reg = program.alloc_register();
     translate_expr_no_constant_opt(
@@ -1169,11 +1210,18 @@ fn emit_commit_phase(
     resolver: &Resolver,
     insertion: &Insertion,
     ctx: &InsertEmitCtx,
+    skip_replace_indexes: bool,
 ) -> Result<()> {
     let indices: Vec<_> = resolver.with_schema(ctx.database_id, |s| {
         s.get_indices(ctx.table.name.as_str()).cloned().collect()
     });
     for index in &indices {
+        // In mixed mode (some constraints REPLACE, some not), REPLACE indexes
+        // were already eagerly inserted in the preflight phase. Skip them here
+        // to avoid double-insertion.
+        if skip_replace_indexes && index.on_conflict == Some(ResolveType::Replace) {
+            continue;
+        }
         let idx_cursor_id = ctx
             .idx_cursors
             .iter()
@@ -1283,6 +1331,15 @@ fn emit_rowid_generation(
         ..
     }) = ctx.autoincrement_meta
     {
+        reload_autoincrement_state(
+            program,
+            AutoincMeta {
+                seq_cursor_id,
+                r_seq,
+                r_seq_rowid,
+                table_name_reg,
+            },
+        );
         let r_max = program.alloc_register();
 
         let dummy_reg = program.alloc_register();
@@ -1432,6 +1489,20 @@ fn init_autoincrement(
     ctx: &mut InsertEmitCtx,
     resolver: &Resolver,
 ) -> Result<()> {
+    open_autoincrement_state(program, ctx, resolver)?;
+    reload_autoincrement_state(
+        program,
+        ctx.autoincrement_meta
+            .expect("AUTOINCREMENT metadata should be initialized"),
+    );
+    Ok(())
+}
+
+fn open_autoincrement_state(
+    program: &mut ProgramBuilder,
+    ctx: &mut InsertEmitCtx,
+    resolver: &Resolver,
+) -> Result<()> {
     let seq_table = get_valid_sqlite_sequence_table(resolver, ctx.database_id)?;
     let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
     program.emit_insn(Insn::OpenWrite {
@@ -1450,6 +1521,25 @@ fn init_autoincrement(
         r_seq_rowid,
         table_name_reg,
     });
+
+    program.emit_insn(Insn::Integer {
+        dest: r_seq,
+        value: 0,
+    });
+    program.emit_insn(Insn::Null {
+        dest: r_seq_rowid,
+        dest_end: None,
+    });
+    Ok(())
+}
+
+fn reload_autoincrement_state(program: &mut ProgramBuilder, meta: AutoincMeta) {
+    let AutoincMeta {
+        seq_cursor_id,
+        r_seq,
+        r_seq_rowid,
+        table_name_reg,
+    } = meta;
 
     program.emit_insn(Insn::Integer {
         dest: r_seq,
@@ -1495,7 +1585,6 @@ fn init_autoincrement(
         pc_if_next: loop_start_label,
     });
     program.preassign_label_to_next_insn(loop_end_label);
-    Ok(())
 }
 
 fn emit_notnulls(
@@ -1643,10 +1732,48 @@ fn expr_contains_subquery(expr: &Expr) -> bool {
     found_subquery
 }
 
+/// Resolve `Expr::Default` in a VALUES row by replacing it with the column's
+/// default expression from the schema.
+fn resolve_defaults_in_row(
+    row: &mut [Box<Expr>],
+    table: &Table,
+    columns: &[ast::Name],
+    resolver: &Resolver,
+) {
+    let is_strict = table.is_strict();
+    for (i, expr) in row.iter_mut().enumerate() {
+        if !matches!(expr.as_ref(), Expr::Default) {
+            continue;
+        }
+        let col = if columns.is_empty() {
+            // No column list — position maps to non-hidden columns in order
+            table.columns().iter().filter(|c| !c.hidden()).nth(i)
+        } else {
+            // Column list — map by name
+            columns.get(i).and_then(|name| {
+                let name = crate::util::normalize_ident(name.as_str());
+                table.get_column_by_name(&name).map(|(_, col)| col)
+            })
+        };
+        *expr = match col {
+            Some(col) => col.default.clone().unwrap_or_else(|| {
+                if let Some(type_def) = resolver.schema().get_type_def(&col.ty_str, is_strict) {
+                    if let Some(ref default_expr) = type_def.default {
+                        return default_expr.clone();
+                    }
+                }
+                Box::new(ast::Expr::Literal(ast::Literal::Null))
+            }),
+            None => Box::new(ast::Expr::Literal(ast::Literal::Null)),
+        };
+    }
+}
+
 fn bind_insert(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     table: &Table,
+    columns: &[ast::Name],
     body: &mut InsertBody,
     on_conflict: ResolveType,
     database_id: usize,
@@ -1678,6 +1805,19 @@ fn bind_insert(
                 .collect();
         }
         InsertBody::Select(select, upsert_opt) => {
+            // Resolve Expr::Default in all VALUES rows before any compilation.
+            if let OneSelect::Values(values_expr) = &mut select.body.select {
+                for row in values_expr.iter_mut() {
+                    resolve_defaults_in_row(row, table, columns, resolver);
+                }
+            }
+            for compound in select.body.compounds.iter_mut() {
+                if let OneSelect::Values(values_expr) = &mut compound.select {
+                    for row in values_expr.iter_mut() {
+                        resolve_defaults_in_row(row, table, columns, resolver);
+                    }
+                }
+            }
             if select.body.compounds.is_empty() {
                 match &mut select.body.select {
                     // TODO see how to avoid clone
@@ -2034,6 +2174,7 @@ fn init_source_emission<'a>(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
 pub struct AutoincMeta {
     seq_cursor_id: usize,
     r_seq: usize,
@@ -2791,6 +2932,7 @@ fn emit_preflight_constraint_checks(
     constraints: &ConstraintsToCheck,
     preflight: &mut PreflightCtx,
 ) -> Result<()> {
+    let mut seen_replace = false;
     for (constraint, position) in &constraints.constraints_to_check {
         // Compute per-constraint effective conflict resolution:
         // Statement-level OR clause overrides; otherwise use constraint's clause.
@@ -2799,9 +2941,11 @@ fn emit_preflight_constraint_checks(
         } else {
             match constraint {
                 ResolvedUpsertTarget::PrimaryKey => {
-                    // Use pk_conflict_clause from BTreeTable, which is preserved
+                    // Use rowid_alias_conflict_clause from BTreeTable, which is preserved
                     // even for rowid-alias PKs (whose UniqueSet is removed).
-                    ctx.table.pk_conflict_clause.unwrap_or(ResolveType::Abort)
+                    ctx.table
+                        .rowid_alias_conflict_clause
+                        .unwrap_or(ResolveType::Abort)
                 }
                 ResolvedUpsertTarget::Index(index) => {
                     index.on_conflict.unwrap_or(ResolveType::Abort)
@@ -2809,6 +2953,17 @@ fn emit_preflight_constraint_checks(
                 ResolvedUpsertTarget::CatchAll => unreachable!(),
             }
         };
+        // REPLACE constraints must sort after all non-REPLACE ones
+        // (schema.rs:add_index + IPK deferral ensure this).
+        if effective == ResolveType::Replace {
+            seen_replace = true;
+        } else {
+            turso_assert!(
+                !seen_replace,
+                "non-REPLACE constraint after REPLACE constraint — sort order invariant violated"
+            );
+        }
+
         let effective_on_replace =
             matches!(effective, ResolveType::Replace) && preflight.upsert_actions.is_empty();
         preflight.on_replace = effective_on_replace;
@@ -3242,6 +3397,7 @@ struct PreflightCtx<'a, 'b> {
     table_references: &'b mut TableReferences,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_constraints_to_check(
     table_name: &str,
     upsert_actions: &[(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
@@ -3249,6 +3405,8 @@ fn build_constraints_to_check(
     resolver: &Resolver,
     _connection: &Arc<crate::Connection>,
     database_id: usize,
+    rowid_alias_conflict_clause: Option<ResolveType>,
+    has_statement_conflict: bool,
 ) -> ConstraintsToCheck {
     let mut constraints_to_check = Vec::new();
     if has_user_provided_rowid {
@@ -3275,6 +3433,54 @@ fn build_constraints_to_check(
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (None, None) => std::cmp::Ordering::Equal,
     });
+
+    // Defer INTEGER PRIMARY KEY REPLACE to run after all other constraint checks.
+    // When IPK has REPLACE and other
+    // constraints exist with potentially different modes, the IPK check
+    // runs last to avoid premature row deletion before FAIL/IGNORE fires.
+    let defer_ipk_replace_after_other_checks = !has_statement_conflict
+        && rowid_alias_conflict_clause == Some(ResolveType::Replace)
+        && constraints_to_check.len() > 1
+        && !upsert_actions
+            .iter()
+            .any(|(t, ..)| matches!(t, ResolvedUpsertTarget::PrimaryKey));
+    if defer_ipk_replace_after_other_checks {
+        if let Some(pos) = constraints_to_check
+            .iter()
+            .position(|(c, _)| matches!(c, ResolvedUpsertTarget::PrimaryKey))
+        {
+            let pk = constraints_to_check.remove(pos);
+            constraints_to_check.push(pk);
+        }
+    }
+
+    // Post-condition: when no statement-level override exists, all REPLACE
+    // constraints (by DDL mode) must form a contiguous suffix. When a statement
+    // override exists, all constraints get the same effective mode, so the DDL
+    // ordering is irrelevant.
+    turso_debug_assert!(
+        has_statement_conflict || {
+            let mut saw_replace = false;
+            constraints_to_check.iter().all(|(c, _)| {
+                let mode = match c {
+                    ResolvedUpsertTarget::PrimaryKey => {
+                        rowid_alias_conflict_clause.unwrap_or(ResolveType::Abort)
+                    }
+                    ResolvedUpsertTarget::Index(idx) => {
+                        idx.on_conflict.unwrap_or(ResolveType::Abort)
+                    }
+                    ResolvedUpsertTarget::CatchAll => return true,
+                };
+                if mode == ResolveType::Replace {
+                    saw_replace = true;
+                    true
+                } else {
+                    !saw_replace
+                }
+            })
+        },
+        "constraints must have all REPLACE entries at the end"
+    );
 
     let upsert_catch_all_position =
         if let Some((ResolvedUpsertTarget::CatchAll, ..)) = upsert_actions.last() {

@@ -731,6 +731,7 @@ impl Whopper {
                     | turso_core::LimboError::Busy
                     | turso_core::LimboError::BusySnapshot
                     | turso_core::LimboError::WriteWriteConflict
+                    | turso_core::LimboError::CommitDependencyAborted
                     | turso_core::LimboError::InvalidArgument(..) => {
                         if ctx.fiber.state.is_in_tx() && !ctx.fiber.connection.get_auto_commit() {
                             ctx.fiber.current_op = Some(Operation::Rollback);

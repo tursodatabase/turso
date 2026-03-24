@@ -638,9 +638,7 @@ fn get_subquery_parser<'a>(
                 let subquery_id = program.table_reference_counter.next();
                 let outer_query_refs = get_outer_query_refs(referenced_tables);
 
-                let ast::Expr::InSelect { lhs, not, rhs } =
-                    std::mem::replace(expr, ast::Expr::Literal(ast::Literal::Null))
-                else {
+                let ast::Expr::InSelect { lhs, not, rhs } = std::mem::take(expr) else {
                     unreachable!();
                 };
                 let plan = prepare_select_plan(
@@ -1504,7 +1502,7 @@ fn emit_materialized_subquery_table(
         unique_sets: vec![],
         foreign_keys: vec![],
         check_constraints: vec![],
-        pk_conflict_clause: None,
+        rowid_alias_conflict_clause: None,
     });
 
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ephemeral_table.clone()));

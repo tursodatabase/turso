@@ -518,6 +518,8 @@ pub enum Expr {
         /// The type of subquery.
         query_type: SubqueryType,
     },
+    /// `DEFAULT` keyword in INSERT VALUES
+    Default,
     /// `ARRAY[expr, ...]` array literal
     Array {
         /// elements of the array
@@ -530,6 +532,12 @@ pub enum Expr {
         /// index expression
         index: Box<Expr>,
     },
+}
+
+impl Default for Expr {
+    fn default() -> Self {
+        Self::Literal(Literal::Null)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -655,7 +663,7 @@ impl Expr {
 }
 
 /// SQL literal
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Literal {
     /// Number
@@ -668,6 +676,7 @@ pub enum Literal {
     Blob(String),
     /// Keyword
     Keyword(String),
+    #[default]
     /// `NULL`
     Null,
     /// `TRUE` - SQLite boolean literal (equivalent to 1 but semantically distinct for IS TRUE)

@@ -8262,6 +8262,9 @@ pub fn op_function(
         crate::function::Func::Agg(_) => {
             unreachable!("Aggregate functions should not be handled here")
         }
+        crate::function::Func::Window(_) => {
+            unreachable!("Window functions should not be handled here")
+        }
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -14073,17 +14076,77 @@ fn op_vacuum_into_inner(
                         // Prepare SELECT and INSERT statements for this table
                         let table_name = &vacuum_state.table_names[table_idx];
                         let escaped_table_name = table_name.replace('"', "\"\"");
-                        let select_sql = format!("SELECT * FROM \"{escaped_table_name}\"");
+                        let source_btree_table =
+                            program.connection.schema.read().get_btree_table(table_name);
+                        let rowid_alias = source_btree_table
+                            .as_ref()
+                            .filter(|table| table.has_rowid)
+                            .and_then(|table| {
+                                ["rowid", "_rowid_", "oid"]
+                                    .iter()
+                                    .copied()
+                                    .find(|alias| table.get_column(alias).is_none())
+                            });
+                        let rowid_alias_column_index = source_btree_table
+                            .as_ref()
+                            .and_then(|table| table.get_rowid_alias_column().map(|(idx, _)| idx));
+
+                        let mut data_columns: Vec<&str> = vacuum_state
+                            .current_table_columns
+                            .iter()
+                            .map(String::as_str)
+                            .collect();
+                        let mut excluded_rowid_alias_column = false;
+                        if rowid_alias.is_some() {
+                            if let Some(idx) = rowid_alias_column_index {
+                                turso_assert!(
+                                    idx < data_columns.len(),
+                                    "rowid alias column index out of bounds for table columns",
+                                    { "idx": idx, "columns_len": data_columns.len() }
+                                );
+                                data_columns.remove(idx);
+                                excluded_rowid_alias_column = true;
+                            }
+                        }
+                        let column_names = data_columns.join(", ");
+
+                        let select_sql = match rowid_alias {
+                            Some(alias)
+                                if excluded_rowid_alias_column && column_names.is_empty() =>
+                            {
+                                format!("SELECT {alias} FROM \"{escaped_table_name}\"")
+                            }
+                            Some(alias) if excluded_rowid_alias_column => {
+                                format!(
+                                    "SELECT {alias}, {column_names} FROM \"{escaped_table_name}\""
+                                )
+                            }
+                            Some(alias) => {
+                                format!("SELECT {alias}, * FROM \"{escaped_table_name}\"")
+                            }
+                            None => format!("SELECT * FROM \"{escaped_table_name}\""),
+                        };
                         let select_stmt = program.connection.prepare(&select_sql)?;
 
                         // Prepare INSERT statement once per table (reused for all rows)
-                        let column_names = vacuum_state.current_table_columns.join(", ");
-                        let placeholders: String = (0..vacuum_state.current_table_columns.len())
-                            .map(|_| "?")
-                            .collect::<Vec<_>>()
-                            .join(", ");
+                        let bind_count = if rowid_alias.is_some() {
+                            data_columns.len() + 1
+                        } else {
+                            data_columns.len()
+                        };
+                        let placeholders: String =
+                            (0..bind_count).map(|_| "?").collect::<Vec<_>>().join(", ");
+                        let insert_columns = if let Some(alias) = rowid_alias {
+                            if column_names.is_empty() {
+                                alias.to_string()
+                            } else {
+                                format!("{alias}, {column_names}")
+                            }
+                        } else {
+                            column_names
+                        };
                         let insert_sql = format!(
-                            "INSERT INTO \"{escaped_table_name}\" ({column_names}) VALUES ({placeholders})"
+                            "INSERT INTO \"{escaped_table_name}\" ({insert_columns}) VALUES ({placeholders})"
                         );
 
                         // Internal tables need nested mode to bypass "may not

@@ -19,7 +19,6 @@ use crate::sync::Arc;
 use crate::translate::expression_index::{
     normalize_expr_for_index_matching, single_table_column_usage,
 };
-use crate::translate::optimizer::TakeOwnership;
 use crate::translate::plan::{Operation, ResultSetColumn, Search};
 use crate::translate::planner::parse_row_id;
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
@@ -41,6 +40,100 @@ pub struct ConditionMetadata {
     pub jump_target_when_true: BranchOffset,
     pub jump_target_when_false: BranchOffset,
     pub jump_target_when_null: BranchOffset,
+}
+
+fn translate_between_expr(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    mut between_expr: ast::Expr,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
+    let ast::Expr::Between {
+        ref mut lhs,
+        not,
+        ref mut start,
+        ref mut end,
+    } = between_expr
+    else {
+        unreachable!("translate_between_expr expects Expr::Between");
+    };
+
+    let lhs_reg = program.alloc_register();
+    translate_expr(program, referenced_tables, &*lhs, lhs_reg, resolver)?;
+
+    let mut between_resolver = resolver.fork_with_expr_cache();
+    between_resolver.enable_expr_to_reg_cache();
+    #[allow(clippy::or_fun_call)]
+    between_resolver.cache_scalar_expr_reg(
+        std::borrow::Cow::Owned(*lhs.to_owned()),
+        lhs_reg,
+        false,
+        referenced_tables.unwrap_or(&TableReferences::default()),
+    )?;
+
+    let (lower_expr, upper_expr, combine_op) = build_between_terms(
+        std::mem::take(lhs),
+        not,
+        std::mem::take(start),
+        std::mem::take(end),
+    );
+    let lower_reg = program.alloc_register();
+    translate_expr(
+        program,
+        referenced_tables,
+        &lower_expr,
+        lower_reg,
+        &between_resolver,
+    )?;
+    let upper_reg = program.alloc_register();
+    translate_expr(
+        program,
+        referenced_tables,
+        &upper_expr,
+        upper_reg,
+        &between_resolver,
+    )?;
+
+    program.emit_insn(match combine_op {
+        ast::Operator::And => Insn::And {
+            lhs: lower_reg,
+            rhs: upper_reg,
+            dest: target_register,
+        },
+        ast::Operator::Or => Insn::Or {
+            lhs: lower_reg,
+            rhs: upper_reg,
+            dest: target_register,
+        },
+        _ => unreachable!("BETWEEN combine operator must be AND/OR"),
+    });
+
+    Ok(target_register)
+}
+
+fn build_between_terms(
+    lhs: ast::Expr,
+    not: bool,
+    start: ast::Expr,
+    end: ast::Expr,
+) -> (ast::Expr, ast::Expr, ast::Operator) {
+    let (lower_op, upper_op, combine_op) = if not {
+        (
+            ast::Operator::Less,
+            ast::Operator::Greater,
+            ast::Operator::Or,
+        )
+    } else {
+        (
+            ast::Operator::GreaterEquals,
+            ast::Operator::LessEquals,
+            ast::Operator::And,
+        )
+    };
+    let lower_expr = ast::Expr::Binary(Box::new(lhs.clone()), lower_op, Box::new(start));
+    let upper_expr = ast::Expr::Binary(Box::new(lhs), upper_op, Box::new(end));
+    (lower_expr, upper_expr, combine_op)
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -496,7 +589,15 @@ pub fn translate_condition_expr(
             crate::bail_parse_error!("RAISE in WHERE clause is not supported");
         }
         ast::Expr::Between { .. } => {
-            crate::bail_parse_error!("BETWEEN expression should have been rewritten in optmizer")
+            let between_result_reg = program.alloc_register();
+            translate_between_expr(
+                program,
+                Some(referenced_tables),
+                expr.clone(),
+                between_result_reg,
+                resolver,
+            )?;
+            emit_cond_jump(program, condition_metadata, between_result_reg);
         }
         ast::Expr::Variable(_) => {
             crate::bail_parse_error!(
@@ -770,6 +871,9 @@ pub fn translate_condition_expr(
             let expr_reg = program.alloc_register();
             translate_expr(program, Some(referenced_tables), expr, expr_reg, resolver)?;
             emit_cond_jump(program, condition_metadata, expr_reg);
+        }
+        ast::Expr::Default => {
+            crate::bail_parse_error!("DEFAULT is only valid in INSERT VALUES");
         }
         ast::Expr::Array { .. } | ast::Expr::Subscript { .. } => {
             unreachable!("Array and Subscript are desugared into function calls by the parser")
@@ -1147,7 +1251,14 @@ pub fn translate_expr(
             }
         }
         ast::Expr::Between { .. } => {
-            crate::bail_parse_error!("BETWEEN expression should have been rewritten in optmizer")
+            translate_between_expr(
+                program,
+                referenced_tables,
+                expr.clone(),
+                target_register,
+                resolver,
+            )?;
+            Ok(target_register)
         }
         ast::Expr::Binary(e1, op, e2) => {
             // Handle IS TRUE/IS FALSE/IS NOT TRUE/IS NOT FALSE specially.
@@ -1394,10 +1505,10 @@ pub fn translate_expr(
             order_by: _,
         } => {
             let args_count = args.len();
-            let func_type = resolver.resolve_function(name.as_str(), args_count);
+            let func_type = resolver.resolve_function(name.as_str(), args_count)?;
 
             if func_type.is_none() {
-                crate::bail_parse_error!("unknown function {}", name.as_str());
+                crate::bail_parse_error!("no such function: {}", name.as_str());
             }
 
             let func_ctx = FuncCtx {
@@ -1416,6 +1527,9 @@ pub fn translate_expr(
                         },
                         name.as_str()
                     )
+                }
+                Func::Window(_) => {
+                    crate::bail_parse_error!("misuse of window function {}()", name.as_str())
                 }
                 Func::External(_) => {
                     let regs = program.alloc_registers(args_count);
@@ -2716,10 +2830,10 @@ pub fn translate_expr(
             // Handle func(*) syntax as a function call with 0 arguments
             // This is equivalent to func() for functions that accept 0 arguments
             let args_count = 0;
-            let func_type = resolver.resolve_function(name.as_str(), args_count);
+            let func_type = resolver.resolve_function(name.as_str(), args_count)?;
 
             if func_type.is_none() {
-                crate::bail_parse_error!("unknown function {}", name.as_str());
+                crate::bail_parse_error!("no such function: {}", name.as_str());
             }
 
             let func = func_type.unwrap();
@@ -2736,6 +2850,9 @@ pub fn translate_expr(
                         },
                         name.as_str()
                     )
+                }
+                Func::Window(_) => {
+                    crate::bail_parse_error!("misuse of window function {}()", name.as_str())
                 }
                 // For functions that need star expansion (json_object, jsonb_object),
                 // expand the * to all columns from the referenced tables as key-value pairs
@@ -3575,6 +3692,9 @@ pub fn translate_expr(
             });
             Ok(target_register)
         }
+        ast::Expr::Default => {
+            crate::bail_parse_error!("DEFAULT is only valid in INSERT VALUES");
+        }
         ast::Expr::Array { .. } | ast::Expr::Subscript { .. } => {
             unreachable!("Array and Subscript are desugared into function calls by the parser")
         }
@@ -4388,7 +4508,7 @@ pub(crate) fn expr_is_array(expr: &Expr, referenced_tables: Option<&TableReferen
             }
         }
         Expr::FunctionCall { name, args, .. } => {
-            if let Ok(f) = Func::resolve_function(name.as_str(), args.len()) {
+            if let Ok(Some(f)) = Func::resolve_function(name.as_str(), args.len()) {
                 match &f {
                     Func::Scalar(sf) if sf.returns_array_blob() => return true,
                     Func::Agg(AggFunc::ArrayAgg) => return true,
@@ -4889,7 +5009,7 @@ fn translate_like_base(
             if escape.is_some() {
                 crate::bail_parse_error!("wrong number of arguments to function regexp()");
             }
-            let func = resolver.resolve_function("regexp", 2);
+            let func = resolver.resolve_function("regexp", 2)?;
             let Some(func) = func else {
                 crate::bail_parse_error!("no such function: regexp");
             };
@@ -5232,7 +5352,8 @@ where
                 | ast::Expr::Name(_)
                 | ast::Expr::Qualified(..)
                 | ast::Expr::Variable(_)
-                | ast::Expr::Register(_) => {
+                | ast::Expr::Register(_)
+                | ast::Expr::Default => {
                     // No nested expressions
                 }
             }
@@ -5318,31 +5439,6 @@ pub fn bind_and_rewrite_expr<'a>(
         top_level_expr,
         &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
             match expr {
-                ast::Expr::Between {
-                    lhs,
-                    not,
-                    start,
-                    end,
-                } => {
-                    let (lower_op, upper_op) = if *not {
-                        (ast::Operator::Greater, ast::Operator::Greater)
-                    } else {
-                        (ast::Operator::LessEquals, ast::Operator::LessEquals)
-                    };
-                    let start = start.take_ownership();
-                    let lhs_v = lhs.take_ownership();
-                    let end = end.take_ownership();
-
-                    let lower =
-                        ast::Expr::Binary(Box::new(start), lower_op, Box::new(lhs_v.clone()));
-                    let upper = ast::Expr::Binary(Box::new(lhs_v), upper_op, Box::new(end));
-
-                    *expr = if *not {
-                        ast::Expr::Binary(Box::new(lower), ast::Operator::Or, Box::new(upper))
-                    } else {
-                        ast::Expr::Binary(Box::new(lower), ast::Operator::And, Box::new(upper))
-                    };
-                }
                 Expr::Id(id) => {
                     let Some(referenced_tables) = &mut referenced_tables else {
                         if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
@@ -5645,7 +5741,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     // expand the * to all columns from the referenced tables as key-value pairs
                     // This needs to happen during bind/rewrite so WHERE clauses can use these functions
                     if let Some(referenced_tables) = &mut referenced_tables {
-                        if let Ok(func) = Func::resolve_function(name.as_str(), 0) {
+                        if let Ok(Some(func)) = Func::resolve_function(name.as_str(), 0) {
                             if func.needs_star_expansion() {
                                 // Only expand if there are actual tables - otherwise leave as
                                 // FunctionCallStar so translate_expr can generate the error
@@ -5706,39 +5802,6 @@ pub fn bind_and_rewrite_expr<'a>(
         },
     )?;
     Ok(())
-}
-
-/// Rewrite BETWEEN expressions to Binary expressions with AND/OR.
-/// This is a subset of bind_and_rewrite_expr that only handles BETWEEN rewriting.
-pub fn rewrite_between_expr(expr: &mut ast::Expr) {
-    let _ = walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
-        if let ast::Expr::Between {
-            lhs,
-            not,
-            start,
-            end,
-        } = e
-        {
-            let (lower_op, upper_op) = if *not {
-                (ast::Operator::Greater, ast::Operator::Greater)
-            } else {
-                (ast::Operator::LessEquals, ast::Operator::LessEquals)
-            };
-            let start = start.take_ownership();
-            let lhs_v = lhs.take_ownership();
-            let end = end.take_ownership();
-
-            let lower = ast::Expr::Binary(Box::new(start), lower_op, Box::new(lhs_v.clone()));
-            let upper = ast::Expr::Binary(Box::new(lhs_v), upper_op, Box::new(end));
-
-            *e = if *not {
-                ast::Expr::Binary(Box::new(lower), ast::Operator::Or, Box::new(upper))
-            } else {
-                ast::Expr::Binary(Box::new(lower), ast::Operator::And, Box::new(upper))
-            };
-        }
-        Ok(WalkControl::Continue)
-    });
 }
 
 /// Recursively walks a mutable expression, applying a function to each sub-expression.
@@ -5903,7 +5966,8 @@ where
                 | ast::Expr::Name(_)
                 | ast::Expr::Qualified(..)
                 | ast::Expr::Variable(_)
-                | ast::Expr::Register(_) => {
+                | ast::Expr::Register(_)
+                | ast::Expr::Default => {
                     // No nested expressions
                 }
             }
@@ -6640,6 +6704,7 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             SubqueryType::In { .. } => 1,
             SubqueryType::RowValue { num_regs, .. } => *num_regs,
         },
+        Expr::Default => 1,
         Expr::Array { .. } | Expr::Subscript { .. } => {
             unreachable!("Array and Subscript are desugared into function calls by the parser")
         }
@@ -6675,7 +6740,7 @@ fn emit_custom_type_operator(
     resolver: &Resolver,
 ) -> Result<usize> {
     let func = resolver
-        .resolve_function(&resolved.func_name, 2)
+        .resolve_function(&resolved.func_name, 2)?
         .ok_or_else(|| {
             LimboError::InternalError(format!("function not found: {}", resolved.func_name))
         })?;
@@ -7025,14 +7090,14 @@ pub(crate) fn emit_user_facing_column_value(
 pub(crate) fn decode_custom_type_registers_in_expr(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    expr: &mut turso_parser::ast::Expr,
+    expr: &mut ast::Expr,
     columns: &[Column],
     start_reg: usize,
     key_reg: Option<usize>,
     is_strict: bool,
 ) -> Result<()> {
     walk_expr_mut(expr, &mut |e| {
-        if let turso_parser::ast::Expr::Register(reg) = e {
+        if let ast::Expr::Register(reg) = e {
             let reg_val = *reg;
             // Skip the rowid register — it's not a custom type column.
             if key_reg == Some(reg_val) {
@@ -7055,7 +7120,7 @@ pub(crate) fn decode_custom_type_registers_in_expr(
                                 is_strict,
                                 resolver,
                             )?;
-                            *e = turso_parser::ast::Expr::Register(decoded_reg);
+                            *e = ast::Expr::Register(decoded_reg);
                         }
                     }
                 }
@@ -7072,7 +7137,7 @@ pub(crate) fn decode_custom_type_registers_in_expr(
 /// The expression result is written to `dest_reg`.
 pub(crate) fn emit_type_expr(
     program: &mut ProgramBuilder,
-    expr: &turso_parser::ast::Expr,
+    expr: &ast::Expr,
     value_reg: usize,
     dest_reg: usize,
     column: &Column,
@@ -7104,17 +7169,12 @@ pub(crate) fn emit_type_expr(
 
     // Translate body expression only if param setup succeeded
     let result = param_result.and_then(|()| {
-        // Rewrite BETWEEN expressions before translation (the optimizer
-        // normally does this, but type expressions bypass the optimizer).
-        let mut rewritten = expr.clone();
-        rewrite_between_expr(&mut rewritten);
-
         // Translate the expression, disabling constant optimization since
         // the `value` placeholder refers to a register that changes per row.
         translate_expr_no_constant_opt(
             program,
             None,
-            &rewritten,
+            expr,
             dest_reg,
             resolver,
             NoConstantOptReason::RegisterReuse,

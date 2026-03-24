@@ -78,9 +78,12 @@ pub(crate) fn validate_check_expr(
                 if filter_over.over_clause.is_some() {
                     bail_parse_error!("misuse of window function {}()", name.as_str());
                 }
-                if let Some(func) = resolver.resolve_function(name.as_str(), args.len()) {
+                if let Some(func) = resolver.resolve_function(name.as_str(), args.len())? {
                     if matches!(func, Func::Agg(..)) {
                         bail_parse_error!("misuse of aggregate function {}()", name.as_str());
+                    }
+                    if matches!(func, Func::Window(..)) {
+                        bail_parse_error!("misuse of window function {}()", name.as_str());
                     }
                 } else {
                     bail_parse_error!("no such function: {}", name.as_str());
@@ -90,9 +93,12 @@ pub(crate) fn validate_check_expr(
                 if filter_over.over_clause.is_some() {
                     bail_parse_error!("misuse of window function {}()", name.as_str());
                 }
-                if let Some(func) = resolver.resolve_function(name.as_str(), 0) {
+                if let Some(func) = resolver.resolve_function(name.as_str(), 0)? {
                     if matches!(func, Func::Agg(..)) {
                         bail_parse_error!("misuse of aggregate function {}()", name.as_str());
+                    }
+                    if matches!(func, Func::Window(..)) {
+                        bail_parse_error!("misuse of window function {}()", name.as_str());
                     }
                 } else {
                     bail_parse_error!("no such function: {}", name.as_str());
@@ -333,7 +339,7 @@ fn resolve_check_expr_type(
         }
         ast::Expr::NotNull(_) | ast::Expr::IsNull(_) => Ok(CheckExprType::Integer),
         ast::Expr::FunctionCall { name, args, .. } => {
-            if let Some(func) = resolver.resolve_function(name.as_str(), args.len()) {
+            if let Some(func) = resolver.resolve_function(name.as_str(), args.len())? {
                 resolve_func_return_type(&func, name.as_str(), args, columns, resolver)
             } else {
                 bail_parse_error!(
@@ -345,7 +351,7 @@ fn resolve_check_expr_type(
             }
         }
         ast::Expr::FunctionCallStar { name, .. } => {
-            if let Some(func) = resolver.resolve_function(name.as_str(), 0) {
+            if let Some(func) = resolver.resolve_function(name.as_str(), 0)? {
                 resolve_func_return_type(&func, name.as_str(), &[], columns, resolver)
             } else {
                 bail_parse_error!(
@@ -1672,7 +1678,7 @@ pub fn translate_drop_table(
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
-            pk_conflict_clause: None,
+            rowid_alias_conflict_clause: None,
         });
         // cursor id 2
         let ephemeral_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(simple_table_rc));
@@ -1950,7 +1956,7 @@ fn validate_type_expr(expr: &ast::Expr, kind: &str, resolver: &Resolver) -> Resu
                 if filter_over.over_clause.is_some() {
                     bail_parse_error!("window functions prohibited in {kind} expressions");
                 }
-                if let Some(func) = resolver.resolve_function(name.as_str(), args.len()) {
+                if let Some(func) = resolver.resolve_function(name.as_str(), args.len())? {
                     if matches!(func, Func::Agg(..)) {
                         bail_parse_error!(
                             "aggregate functions prohibited in {kind} expressions: {}",

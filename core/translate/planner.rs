@@ -3,7 +3,7 @@ use crate::{turso_assert, turso_assert_greater_than_or_equal, turso_assert_less_
 use std::cmp::PartialEq;
 
 use super::{
-    expr::walk_expr,
+    expr::{walk_expr, walk_expr_mut},
     plan::{
         Aggregate, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
         JoinOrderMember, JoinType as PlanJoinType, JoinedTable, Operation, OuterQueryReference,
@@ -28,7 +28,7 @@ use crate::{
     translate::expr::bind_and_rewrite_expr,
 };
 use crate::{
-    translate::plan::{Window, WindowFunction},
+    translate::plan::{Window, WindowFunction, WindowFunctionKind},
     vdbe::builder::ProgramBuilder,
 };
 use smallvec::SmallVec;
@@ -216,13 +216,13 @@ pub fn resolve_window_and_aggregate_functions(
                 let args_count = args.len();
                 let distinctness = Distinctness::from_ast(distinctness.as_ref());
 
-                match Func::resolve_function(name.as_str(), args_count) {
-                    Ok(Func::Agg(f)) => {
+                match Func::resolve_function(name.as_str(), args_count)? {
+                    Some(Func::Agg(f)) => {
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
                                 windows.as_deref_mut(),
                                 expr,
-                                f,
+                                WindowFunctionKind::Agg(f),
                                 over_clause,
                                 distinctness,
                             )?;
@@ -232,7 +232,21 @@ pub fn resolve_window_and_aggregate_functions(
                         }
                         return Ok(WalkControl::SkipChildren);
                     }
-                    Err(e) => {
+                    Some(Func::Window(f)) => {
+                        if let Some(over_clause) = filter_over.over_clause.as_ref() {
+                            link_with_window(
+                                windows.as_deref_mut(),
+                                expr,
+                                WindowFunctionKind::Window(f),
+                                over_clause,
+                                distinctness,
+                            )?;
+                        } else {
+                            crate::bail_parse_error!("misuse of window function: {}()", f);
+                        }
+                        return Ok(WalkControl::SkipChildren);
+                    }
+                    None => {
                         if let Some(f) = resolver
                             .symbol_table
                             .resolve_function(name.as_str(), args_count)
@@ -243,7 +257,7 @@ pub fn resolve_window_and_aggregate_functions(
                                     link_with_window(
                                         windows.as_deref_mut(),
                                         expr,
-                                        func,
+                                        WindowFunctionKind::Agg(func),
                                         over_clause,
                                         distinctness,
                                     )?;
@@ -259,8 +273,6 @@ pub fn resolve_window_and_aggregate_functions(
                                 }
                                 return Ok(WalkControl::SkipChildren);
                             }
-                        } else {
-                            return Err(e);
                         }
                     }
                     _ => {
@@ -275,13 +287,13 @@ pub fn resolve_window_and_aggregate_functions(
             }
             Expr::FunctionCallStar { name, filter_over } => {
                 validate_aggregate_function_tail(filter_over, &[])?;
-                match Func::resolve_function(name.as_str(), 0) {
-                    Ok(Func::Agg(f)) => {
+                match Func::resolve_function(name.as_str(), 0)? {
+                    Some(Func::Agg(f)) => {
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
                                 windows.as_deref_mut(),
                                 expr,
-                                f,
+                                WindowFunctionKind::Agg(f),
                                 over_clause,
                                 Distinctness::NonDistinct,
                             )?;
@@ -297,7 +309,21 @@ pub fn resolve_window_and_aggregate_functions(
                         }
                         return Ok(WalkControl::SkipChildren);
                     }
-                    Ok(_) => {
+                    Some(Func::Window(f)) => {
+                        if let Some(over_clause) = filter_over.over_clause.as_ref() {
+                            link_with_window(
+                                windows.as_deref_mut(),
+                                expr,
+                                WindowFunctionKind::Window(f),
+                                over_clause,
+                                Distinctness::NonDistinct,
+                            )?;
+                        } else {
+                            crate::bail_parse_error!("misuse of window function: {}()", f);
+                        }
+                        return Ok(WalkControl::SkipChildren);
+                    }
+                    Some(func) => {
                         if filter_over.over_clause.is_some() {
                             crate::bail_parse_error!(
                                 "{} may not be used as a window function",
@@ -306,36 +332,43 @@ pub fn resolve_window_and_aggregate_functions(
                         }
 
                         // Check if the function supports (*) syntax using centralized logic
-                        match crate::function::Func::resolve_function(name.as_str(), 0) {
-                            Ok(func) => {
-                                if func.supports_star_syntax() {
-                                    return Ok(WalkControl::Continue);
-                                } else {
-                                    crate::bail_parse_error!(
-                                        "wrong number of arguments to function {}()",
-                                        name.as_str()
-                                    );
-                                }
-                            }
-                            Err(_) => {
-                                crate::bail_parse_error!(
-                                    "wrong number of arguments to function {}()",
-                                    name.as_str()
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => match e {
-                        crate::LimboError::ParseError(e) => {
-                            crate::bail_parse_error!("{}", e);
-                        }
-                        _ => {
+                        if func.supports_star_syntax() {
+                            return Ok(WalkControl::Continue);
+                        } else {
                             crate::bail_parse_error!(
-                                "Invalid aggregate function: {}",
+                                "wrong number of arguments to function {}()",
                                 name.as_str()
                             );
                         }
-                    },
+                    }
+                    None => {
+                        if let Some(f) = resolver.symbol_table.resolve_function(name.as_str(), 0) {
+                            let func = AggFunc::External(f.func.clone().into());
+                            if let ExtFunc::Aggregate { .. } = f.as_ref().func {
+                                if let Some(over_clause) = filter_over.over_clause.as_ref() {
+                                    link_with_window(
+                                        windows.as_deref_mut(),
+                                        expr,
+                                        WindowFunctionKind::Agg(func),
+                                        over_clause,
+                                        Distinctness::NonDistinct,
+                                    )?;
+                                } else {
+                                    add_aggregate_if_not_exists(
+                                        aggs,
+                                        expr,
+                                        &[],
+                                        Distinctness::NonDistinct,
+                                        func,
+                                    )?;
+                                    contains_aggregates = true;
+                                }
+                                return Ok(WalkControl::SkipChildren);
+                            }
+                        } else {
+                            crate::bail_parse_error!("no such function: {}", name.as_str());
+                        }
+                    }
                 }
             }
             _ => {}
@@ -350,7 +383,7 @@ pub fn resolve_window_and_aggregate_functions(
 fn link_with_window(
     windows: Option<&mut Vec<Window>>,
     expr: &Expr,
-    func: AggFunc,
+    func: WindowFunctionKind,
     over_clause: &Over,
     distinctness: Distinctness,
 ) -> Result<()> {
@@ -365,7 +398,11 @@ fn link_with_window(
             original_expr: expr.clone(),
         });
     } else {
-        crate::bail_parse_error!("misuse of window function: {}()", func.as_str());
+        let func_name = match &func {
+            WindowFunctionKind::Agg(f) => f.as_str().to_string(),
+            WindowFunctionKind::Window(f) => f.to_string(),
+        };
+        crate::bail_parse_error!("misuse of window function: {}()", func_name);
     }
     Ok(())
 }
@@ -1050,7 +1087,7 @@ fn parse_table(
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
-            pk_conflict_clause: None,
+            rowid_alias_conflict_clause: None,
         });
         drop(view_guard);
 
@@ -1334,8 +1371,54 @@ pub fn parse_where(
                 resolver,
                 BindingBehavior::TryCanonicalColumnsFirst,
             )?;
+            let _ = walk_expr_mut(&mut expr.expr, &mut |e: &mut Expr| -> Result<WalkControl> {
+                if let Expr::Between {
+                    lhs,
+                    not,
+                    start,
+                    end,
+                } = e
+                {
+                    let lhs_expr = std::mem::take(lhs.as_mut());
+                    let start_expr = std::mem::take(start.as_mut());
+                    let end_expr = std::mem::take(end.as_mut());
+
+                    let (lower, upper, combine_op) = if *not {
+                        (
+                            Expr::Binary(
+                                Box::new(start_expr),
+                                ast::Operator::Greater,
+                                Box::new(lhs_expr.clone()),
+                            ),
+                            Expr::Binary(
+                                Box::new(lhs_expr),
+                                ast::Operator::Greater,
+                                Box::new(end_expr),
+                            ),
+                            ast::Operator::Or,
+                        )
+                    } else {
+                        (
+                            Expr::Binary(
+                                Box::new(start_expr),
+                                ast::Operator::LessEquals,
+                                Box::new(lhs_expr.clone()),
+                            ),
+                            Expr::Binary(
+                                Box::new(lhs_expr),
+                                ast::Operator::LessEquals,
+                                Box::new(end_expr),
+                            ),
+                            ast::Operator::And,
+                        )
+                    };
+                    *e = Expr::Binary(Box::new(lower), combine_op, Box::new(upper));
+                }
+                Ok(WalkControl::Continue)
+            });
         }
-        // BETWEEN is rewritten to (lhs >= start) AND (lhs <= end) by bind_and_rewrite_expr.
+        // BETWEEN in WHERE is rewritten to binary terms here so each side can be
+        // considered independently by constraint extraction and range planning.
         // Re-break any ANDs that were created so they become separate WhereTerms for
         // constraint extraction.
         let mut i = start_idx;

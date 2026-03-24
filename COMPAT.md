@@ -67,7 +67,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 ### Limitations
 
 * ⛔️ Concurrent access from multiple processes is not supported.
-* ⛔️ Vacuum is not supported.
+* ⛔️ Plain VACUUM is not supported (VACUUM INTO is supported).
 
 ## SQLite query language
 
@@ -83,7 +83,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | CHECK                     | ✅ Yes     |                                                                                   |
 | CREATE INDEX              | ✅ Yes     |                                                                                   |
 | CREATE TABLE              | ✅ Yes     |                                                                                   |
-| CREATE TABLE ... STRICT   | 🚧 Partial | Strict schema mode is experimental.                                               |
+| CREATE TABLE ... STRICT   | ✅ Yes     |                                                                                   |
 | CREATE TRIGGER            | ✅ Yes     |                                                                                   |
 | CREATE VIEW               | ✅ Yes     |                                                                                   |
 | CREATE VIRTUAL TABLE      | ✅ Yes     |                                                                                   |
@@ -95,16 +95,16 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | DROP VIEW                 | ✅ Yes     |                                                                                   |
 | END TRANSACTION           | ✅ Yes     |                                                                                   |
 | EXPLAIN                   | ✅ Yes     |                                                                                   |
-| INDEXED BY                | ❌ No      |                                                                                   |
+| INDEXED BY                | ✅ Yes     |                                                                                   |
 | INSERT                    | ✅ Yes     |                                                                                   |
 | INSERT ... ON CONFLICT (UPSERT) | ✅ Yes |                                                                                   |
 | ON CONFLICT clause        | ✅ Yes     |                                                                                   |
 | REINDEX                   | ❌ No      |                                                                                   |
-| RELEASE SAVEPOINT         | ✅ No      |                                                                                   |
+| RELEASE SAVEPOINT         | ✅ Yes     |                                                                                   |
 | REPLACE                   | ✅ Yes     |                                                                                   |
 | RETURNING clause          | ✅ Yes     |                                                                                   |
 | ROLLBACK TRANSACTION      | ✅ Yes     |                                                                                   |
-| SAVEPOINT                 | ✅ No      |                                                                                   |
+| SAVEPOINT                 | ✅ Yes     |                                                                                   |
 | SELECT                    | ✅ Yes     |                                                                                   |
 | SELECT ... WHERE          | ✅ Yes     |                                                                                   |
 | SELECT ... WHERE ... LIKE | ✅ Yes     |                                                                                   |
@@ -113,15 +113,15 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | SELECT ... GROUP BY       | ✅ Yes     |                                                                                   |
 | SELECT ... HAVING         | ✅ Yes     |                                                                                   |
 | SELECT ... JOIN           | ✅ Yes     |                                                                                   |
-| SELECT ... CROSS JOIN     | ❌ No     | SQLite CROSS JOIN means "do not reorder joins". |
+| SELECT ... CROSS JOIN     | ✅ Yes     |                                                                                   |
 | SELECT ... INNER JOIN     | ✅ Yes     |                                                                                   |
-| SELECT ... OUTER JOIN     | 🚧 Partial | no RIGHT JOIN                                                                     |
+| SELECT ... OUTER JOIN     | ✅ Yes     |                                                                                   |
 | SELECT ... JOIN USING     | ✅ Yes     |                                                                                   |
 | SELECT ... NATURAL JOIN   | ✅ Yes     |                                                                                   |
 | UPDATE                    | ✅ Yes     |                                                                                   |
-| VACUUM                    | ❌ No      |                                                                                   |
+| VACUUM                    | 🚧 Partial | VACUUM INTO supported, plain VACUUM not yet                                       |
 | WITH clause               | 🚧 Partial | ❌ No RECURSIVE, no MATERIALIZED, only SELECT supported in CTEs                      |
-| WINDOW functions             | 🚧 Partial | only default frame definition, no window-specific functions (rank() etc)         |
+| WINDOW functions             | 🚧 Partial | ROW_NUMBER() supported; RANK(), DENSE_RANK(), LAG(), LEAD(), NTILE() not yet     |
 | GENERATED                 | ❌ No      |                                                                                   |
 
 #### [PRAGMA](https://www.sqlite.org/pragma.html)
@@ -214,8 +214,8 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | schema.table.column       | 🚧 Partial | Schemas aren't supported                 |
 | unary operator            | ✅ Yes     |                                          |
 | binary operator           | 🚧 Partial | Only `%`, `!<`, and `!>` are unsupported |
-| agg() FILTER (WHERE ...)  | ❌ No      | Is incorrectly ignored                   |
-| ... OVER (...)            | ❌ No      | Is incorrectly ignored                   |
+| agg() FILTER (WHERE ...)  | ❌ No      |                                          |
+| ... OVER (...)            | 🚧 Partial | Supported for aggregate functions and ROW_NUMBER() |
 | (expr)                    | ✅ Yes     |                                          |
 | CAST (expr AS type)       | ✅ Yes     |                                          |
 | COLLATE                   | 🚧 Partial | Custom Collations not supported          |
@@ -440,7 +440,7 @@ Modifiers:
 | Interface              | Status  | Comment |
 |------------------------|---------|---------|
 | sqlite3_open           | ✅ Yes     |         |
-| sqlite3_open_v2        | 🚧 Partial | Delegates to sqlite3_open, flags/VFS ignored |
+| sqlite3_open_v2        | 🚧 Partial | URI filenames parsed; VFS parameter ignored |
 | sqlite3_open16         | ❌ No      |         |
 | sqlite3_close          | ✅ Yes     |         |
 | sqlite3_close_v2       | ✅ Yes     | Same as sqlite3_close |
@@ -890,7 +890,7 @@ Modifiers:
 | RowSetTest     | ✅ Yes     |         |
 | Rowid          | ✅ Yes    |         |
 | SCopy          | ❌ No     |         |
-| Savepoint      | ✅ No     |         |
+| Savepoint      | ✅ Yes    |         |
 | Seek           | ❌ No     |         |
 | SeekGe         | ✅ Yes    |         |
 | SeekGt         | ✅ Yes    |         |
