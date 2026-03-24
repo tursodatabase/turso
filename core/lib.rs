@@ -64,6 +64,8 @@ mod uuid;
 mod vdbe;
 mod vtab;
 
+pub mod foreign;
+
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub use function::MathFunc;
 
