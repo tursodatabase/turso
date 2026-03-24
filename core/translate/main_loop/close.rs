@@ -23,7 +23,7 @@ impl CloseLoop {
         //     CLOSE t3
         //   CLOSE t2
         // CLOSE t1
-        for join in join_order.iter().rev() {
+        for (rev_idx, join) in join_order.iter().rev().enumerate() {
             let table_index = join.original_idx;
             let table = &tables.joined_tables()[table_index];
             let loop_labels = *t_ctx
@@ -65,6 +65,13 @@ impl CloseLoop {
                 program.resolve_label(loop_labels.next, pc);
                 semi_anti_next_pc = Some(pc);
             };
+            // Also resolve the dedicated offset continue label when closing the first table
+            // (last in the reverse iteration)
+            if rev_idx == join_order.len() - 1 {
+                if let Some(label) = t_ctx.label_offset_continue {
+                    program.resolve_label(label, program.offset());
+                }
+            }
             match &table.op {
                 Operation::Scan(scan) => {
                     resolve_next(program);

@@ -508,6 +508,8 @@ pub struct TranslateCtx<'a> {
     // label for the instruction that jumps to the next phase of the query after the main loop
     // we don't know ahead of time what that is (GROUP BY, ORDER BY, etc.)
     pub label_main_loop_end: Option<BranchOffset>,
+    // Dedicated label for OFFSET continue (avoids label reuse issues with nested emit_query calls)
+    pub label_offset_continue: Option<BranchOffset>,
     // First register of the aggregation results
     pub reg_agg_start: Option<usize>,
     // In non-group-by statements with aggregations (e.g. SELECT foo, bar, sum(baz) FROM t),
@@ -579,6 +581,7 @@ impl<'a> TranslateCtx<'a> {
         TranslateCtx {
             labels_main_loop: (0..table_count).map(|_| LoopLabels::new(program)).collect(),
             label_main_loop_end: None,
+            label_offset_continue: None,
             reg_agg_start: None,
             reg_nonagg_emit_once_flag: None,
             limit_ctx: None,
