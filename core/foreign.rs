@@ -28,6 +28,8 @@
 //!
 //! to translate into a targeted API call rather than fetching all emails.
 
+use std::collections::HashMap;
+
 use crate::sync::{Arc, RwLock};
 use crate::vtab::{InternalVirtualTable, InternalVirtualTableCursor};
 use crate::{Connection, LimboError, Result, Value};
@@ -60,7 +62,11 @@ pub trait ForeignDataWrapper: std::fmt::Debug + Send + Sync {
     ///
     /// Called once per query execution. The cursor will receive `filter()`
     /// with the pushed-down constraint values before iteration begins.
-    fn open_cursor(&self) -> Result<Box<dyn ForeignCursor>>;
+    ///
+    /// `conn` provides access to the local database — useful for writing
+    /// fetched results to cache tables, cross-table lookups, etc.
+    /// FDWs that don't need the connection can ignore the parameter.
+    fn open_cursor(&self, conn: Arc<Connection>) -> Result<Box<dyn ForeignCursor>>;
 }
 
 /// Column-level query pushdown declaration.
@@ -100,6 +106,38 @@ impl KeyColumn {
     fn supports(&self, op: ConstraintOp) -> bool {
         self.operators.contains(&op)
     }
+}
+
+// ============================================================================
+// FDW Driver Factory (SQL/MED integration)
+// ============================================================================
+
+/// Column info passed to the driver factory from CREATE FOREIGN TABLE.
+#[derive(Debug, Clone)]
+pub struct ForeignColumnDef {
+    pub name: String,
+    pub type_name: String,
+}
+
+/// Factory that creates `ForeignDataWrapper` instances from SQL options.
+///
+/// Registered under a driver name (e.g. "csv") and invoked when
+/// `CREATE FOREIGN TABLE ... SERVER <name>` is executed.
+pub trait ForeignDriverFactory: std::fmt::Debug + Send + Sync {
+    fn create_fdw(
+        &self,
+        server_options: &HashMap<String, String>,
+        table_options: &HashMap<String, String>,
+        columns: &[ForeignColumnDef],
+    ) -> Result<Arc<dyn ForeignDataWrapper>>;
+}
+
+/// A foreign server definition persisted in sqlite_schema.
+#[derive(Debug, Clone)]
+pub struct ForeignServer {
+    pub name: String,
+    pub driver: String,
+    pub options: HashMap<String, String>,
 }
 
 /// Cursor for iterating over rows returned by a foreign data source.
@@ -163,8 +201,8 @@ impl InternalVirtualTable for ForeignTableAdapter {
         self.fdw.schema_sql()
     }
 
-    fn open(&self, _conn: Arc<Connection>) -> Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        let cursor = self.fdw.open_cursor()?;
+    fn open(&self, conn: Arc<Connection>) -> Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        let cursor = self.fdw.open_cursor(conn)?;
         Ok(Arc::new(RwLock::new(ForeignCursorAdapter {
             inner: cursor,
         })))
@@ -323,6 +361,13 @@ fn constraint_op_from_u8(v: u8) -> Option<ConstraintOp> {
 mod tests {
     use super::*;
 
+    fn test_conn() -> Arc<Connection> {
+        use crate::MemoryIO;
+        let io = Arc::new(MemoryIO::new());
+        let db = crate::Database::open_file(io, crate::util::MEMORY_PATH).unwrap();
+        db.connect().unwrap()
+    }
+
     /// A trivial FDW that returns static rows, filtering by equality on column 0.
     #[derive(Debug)]
     struct StaticFdw {
@@ -339,7 +384,7 @@ mod tests {
             "CREATE TABLE test_fdw(id TEXT, name TEXT, score INTEGER)".to_string()
         }
 
-        fn open_cursor(&self) -> Result<Box<dyn ForeignCursor>> {
+        fn open_cursor(&self, _conn: Arc<Connection>) -> Result<Box<dyn ForeignCursor>> {
             Ok(Box::new(StaticCursor {
                 rows: self.rows.clone(),
                 index: 0,
@@ -494,7 +539,7 @@ mod tests {
             key_columns: vec![KeyColumn::new("id", 0, vec![ConstraintOp::Eq])],
         };
 
-        let mut cursor = fdw.open_cursor().unwrap();
+        let mut cursor = fdw.open_cursor(test_conn()).unwrap();
         let has_rows = cursor
             .filter(&[PushedConstraint {
                 column_index: 0,
@@ -515,7 +560,7 @@ mod tests {
             key_columns: vec![KeyColumn::new("id", 0, vec![ConstraintOp::Eq])],
         };
 
-        let mut cursor = fdw.open_cursor().unwrap();
+        let mut cursor = fdw.open_cursor(test_conn()).unwrap();
         let has_rows = cursor
             .filter(&[PushedConstraint {
                 column_index: 0,
@@ -534,7 +579,7 @@ mod tests {
             key_columns: vec![],
         };
 
-        let mut cursor = fdw.open_cursor().unwrap();
+        let mut cursor = fdw.open_cursor(test_conn()).unwrap();
         let has_rows = cursor.filter(&[]).unwrap();
         assert!(has_rows);
 
@@ -610,7 +655,7 @@ mod tests {
 
         // Now test that cursor adapter can parse it back
         let mut cursor_adapter = ForeignCursorAdapter {
-            inner: fdw.open_cursor().unwrap(),
+            inner: fdw.open_cursor(test_conn()).unwrap(),
         };
 
         let args = vec![Value::build_text("2"), Value::from_i64(80)];
