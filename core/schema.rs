@@ -2369,9 +2369,9 @@ impl BTreeTable {
                 sql.push_str(&default.to_string());
             }
 
-            if let GeneratedType::Virtual(generated) = &column.generated_type() {
+            if let GeneratedType::Virtual { original_sql, .. } = &column.generated_type() {
                 sql.push_str(" AS (");
-                sql.push_str(&generated.to_string());
+                sql.push_str(original_sql);
                 sql.push(')');
             }
 
@@ -2663,10 +2663,10 @@ pub(crate) fn columns_affected_by_update(
             if affected.contains(&idx) {
                 continue;
             }
-            let GeneratedType::Virtual(ref expr) = col.generated_type() else {
+            let GeneratedType::Virtual { ref resolved, .. } = col.generated_type() else {
                 continue;
             };
-            if expr_refers_one_of(expr, columns, &affected) {
+            if expr_refers_one_of(resolved, columns, &affected) {
                 affected.insert(idx);
                 changed = true;
             }
@@ -2737,11 +2737,11 @@ fn has_transitive_dependency_inner(
         return false;
     };
 
-    let GeneratedType::Virtual(ref gen_expr) = col.generated_type() else {
+    let GeneratedType::Virtual { ref resolved, .. } = col.generated_type() else {
         return false;
     };
 
-    let deps = collect_column_refs(gen_expr);
+    let deps = collect_column_refs(resolved);
 
     if deps.contains(target) {
         return true;
@@ -3618,8 +3618,14 @@ pub struct ColDef {
 
 #[derive(Debug, Clone)]
 pub enum GeneratedType {
-    Virtual(Box<Expr>),
-    // Stored(Box<Expr>),
+    /// `resolved` holds the expression with column references resolved to
+    /// `Expr::Column { table: SELF_TABLE }` for use at compile time.
+    /// `original_sql` preserves the original SQL text for `to_sql()` round-tripping.
+    Virtual {
+        resolved: Box<Expr>,
+        original_sql: String,
+    },
+    // Stored { resolved: Box<Expr>, original_sql: String },
     NotGenerated,
 }
 
@@ -3723,7 +3729,13 @@ impl Column {
         coldef: ColDef,
     ) -> Self {
         let generated_type = match generated {
-            Some(expr) => GeneratedType::Virtual(expr),
+            Some(expr) => {
+                let original_sql = expr.to_string();
+                GeneratedType::Virtual {
+                    resolved: expr,
+                    original_sql,
+                }
+            }
             None => GeneratedType::NotGenerated,
         };
         let mut raw = 0u16;
@@ -3837,13 +3849,13 @@ impl Column {
 
     #[inline]
     pub const fn is_virtual_generated(&self) -> bool {
-        matches!(self.generated_type, GeneratedType::Virtual(_))
+        matches!(self.generated_type, GeneratedType::Virtual { .. })
     }
 
     #[inline]
     pub fn generated_expr(&self) -> Option<&Expr> {
         match &self.generated_type {
-            GeneratedType::Virtual(expr) => Some(expr.as_ref()),
+            GeneratedType::Virtual { resolved, .. } => Some(resolved.as_ref()),
             GeneratedType::NotGenerated => None,
         }
     }
@@ -3851,7 +3863,7 @@ impl Column {
     #[inline]
     pub fn generated_expr_mut(&mut self) -> Option<&mut Expr> {
         match &mut self.generated_type {
-            GeneratedType::Virtual(expr) => Some(expr.as_mut()),
+            GeneratedType::Virtual { resolved, .. } => Some(resolved.as_mut()),
             GeneratedType::NotGenerated => None,
         }
     }

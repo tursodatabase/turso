@@ -421,7 +421,7 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                     .get(col_idx)
                     .map(|c| c.generated_type())
                 {
-                    Some(GeneratedType::Virtual(expr)) => {
+                    Some(GeneratedType::Virtual { resolved: expr, .. }) => {
                         planner.program.with_self_table_context(
                             Some(&SelfTableContext::ForSelect {
                                 table_ref_id: build_table.internal_id,

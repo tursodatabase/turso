@@ -566,7 +566,7 @@ pub fn resolve_sorted_columns(
         if let Some((pos, column_name, column)) = resolve_index_column(unwrapped_expr, table) {
             let collation = explicit_collation.or_else(|| column.collation_opt());
             let expr = match column.generated_type() {
-                GeneratedType::Virtual(expr) => Some(expr.clone()),
+                GeneratedType::Virtual { resolved, .. } => Some(resolved.clone()),
                 GeneratedType::NotGenerated => None,
             };
             resolved.push(IndexColumn {

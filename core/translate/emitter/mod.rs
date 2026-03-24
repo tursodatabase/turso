@@ -702,6 +702,7 @@ pub fn emit_cdc_patch_record(
     columns_reg: usize,
     record_reg: usize,
     rowid_reg: usize,
+    layout: &ColumnLayout,
 ) -> usize {
     let columns = table.columns();
     let rowid_alias_position = columns.iter().position(|x| x.is_rowid_alias());
@@ -709,19 +710,20 @@ pub fn emit_cdc_patch_record(
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::Copy {
             src_reg: rowid_reg,
-            dst_reg: columns_reg + rowid_alias_position,
+            dst_reg: layout.to_register(columns_reg, rowid_alias_position),
             extra_amount: 0,
         });
+        let storable_count = columns.iter().filter(|c| !c.is_virtual_generated()).count();
         let is_strict = table.btree().is_some_and(|btree| btree.is_strict);
-        let affinity_str = table
-            .columns()
+        let affinity_str = columns
             .iter()
+            .filter(|col| !col.is_virtual_generated())
             .map(|col| col.affinity_with_strict(is_strict).aff_mask())
             .collect::<String>();
 
         program.emit_insn(Insn::MakeRecord {
             start_reg: to_u16(columns_reg),
-            count: to_u16(table.columns().len()),
+            count: to_u16(storable_count),
             dest_reg: to_u16(record_reg),
             index_name: None,
             affinity_str: Some(affinity_str),
@@ -766,26 +768,33 @@ pub fn emit_cdc_full_record(
     rowid_reg: usize,
     is_strict: bool,
 ) -> usize {
-    let columns_reg = program.alloc_registers(columns.len() + 1);
+    let storable_count = columns.iter().filter(|c| !c.is_virtual_generated()).count();
+    let columns_reg = program.alloc_registers(storable_count + 1);
+    let mut slot = 0;
     for (i, column) in columns.iter().enumerate() {
+        if column.is_virtual_generated() {
+            continue;
+        }
         if column.is_rowid_alias() {
             program.emit_insn(Insn::Copy {
                 src_reg: rowid_reg,
-                dst_reg: columns_reg + 1 + i,
+                dst_reg: columns_reg + 1 + slot,
                 extra_amount: 0,
             });
         } else {
-            program.emit_column_or_rowid(table_cursor_id, i, columns_reg + 1 + i);
+            program.emit_column_or_rowid(table_cursor_id, i, columns_reg + 1 + slot);
         }
+        slot += 1;
     }
     let affinity_str = columns
         .iter()
+        .filter(|col| !col.is_virtual_generated())
         .map(|col| col.affinity_with_strict(is_strict).aff_mask())
         .collect::<String>();
 
     program.emit_insn(Insn::MakeRecord {
         start_reg: to_u16(columns_reg + 1),
-        count: to_u16(columns.len()),
+        count: to_u16(storable_count),
         dest_reg: to_u16(columns_reg),
         index_name: None,
         affinity_str: Some(affinity_str),
@@ -1478,10 +1487,10 @@ fn emit_index_column_value_new_image(
             .get(idx_col.pos_in_table)
             .expect("column index out of bounds");
         match col_in_table.generated_type() {
-            GeneratedType::Virtual(ref expr) => {
+            GeneratedType::Virtual { ref resolved, .. } => {
                 gencol::emit_gencol_expr_from_registers(
                     program,
-                    expr,
+                    resolved,
                     dest_reg,
                     columns_start_reg,
                     columns,

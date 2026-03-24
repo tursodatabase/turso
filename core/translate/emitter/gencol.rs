@@ -16,7 +16,7 @@ pub fn compute_virtual_columns(
 ) -> Result<()> {
     let ctx = SelfTableContext::ForDML(dml_ctx.clone());
     for (idx, column) in columns.iter().enumerate() {
-        let GeneratedType::Virtual(expr) = column.generated_type() else {
+        let GeneratedType::Virtual { resolved: expr, .. } = column.generated_type() else {
             continue;
         };
         let target_reg = dml_ctx.to_column_reg(idx);

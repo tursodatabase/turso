@@ -1019,6 +1019,7 @@ pub fn translate_insert(
                 insertion.first_col_register(),
                 insertion.record_register(),
                 insertion.key_register(),
+                &ColumnLayout::from_table(&table),
             ))
         } else {
             None
@@ -2083,7 +2084,7 @@ fn init_source_emission<'a>(
                         ctx.table
                             .columns
                             .iter()
-                            .filter(|col| !col.hidden())
+                            .filter(|col| !col.hidden() && !col.is_generated())
                             .map(|col| col.affinity_with_strict(ctx.table.is_strict).aff_mask())
                             .collect::<String>()
                     } else {
@@ -2685,7 +2686,7 @@ pub fn compute_virtual_columns_for_triggers<'a>(
 ) -> Result<()> {
     let ctx = self_table_ctx_from_col_mappings(col_mappings, rowid_alias);
     for col_mapping in col_mappings {
-        if let GeneratedType::Virtual(expr) = col_mapping.column.generated_type() {
+        if let GeneratedType::Virtual { resolved: expr, .. } = col_mapping.column.generated_type() {
             program.with_self_table_context(Some(&ctx), |program, _| {
                 translate_expr(program, None, expr, col_mapping.register, resolver)?;
                 Ok(())

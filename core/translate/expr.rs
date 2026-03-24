@@ -2990,7 +2990,9 @@ pub fn translate_expr(
                     Some(SelfTableContext::ForDML(dml_ctx)) => {
                         let col = &dml_ctx.columns[*column];
                         match col.generated_type() {
-                            GeneratedType::Virtual(gen_expr) => {
+                            GeneratedType::Virtual {
+                                resolved: gen_expr, ..
+                            } => {
                                 translate_expr(program, None, gen_expr, target_register, resolver)?;
                                 if col.affinity() != Affinity::Blob {
                                     program.emit_column_affinity(target_register, col.affinity());
@@ -3181,7 +3183,7 @@ pub fn translate_expr(
                         match table_column.generated_type() {
                             // if we're reading from an index that contains this virtual column,
                             // the index already has the computed value, so read it from the index
-                            GeneratedType::Virtual(expr) if !read_from_index => {
+                            GeneratedType::Virtual { resolved: expr, .. } if !read_from_index => {
                                 program.with_self_table_context(
                                     Some(&SelfTableContext::ForSelect {
                                         table_ref_id: *table_ref_id,

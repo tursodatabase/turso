@@ -2905,7 +2905,7 @@ fn ephemeral_index_build(
         .enumerate()
         .map(|(i, c)| {
             let expr = match c.generated_type() {
-                GeneratedType::Virtual(_) => c.generated_expr().cloned(),
+                GeneratedType::Virtual { .. } => c.generated_expr().cloned(),
                 GeneratedType::NotGenerated => None,
             };
             IndexColumn {

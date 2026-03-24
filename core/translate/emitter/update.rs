@@ -656,7 +656,7 @@ fn emit_update_column_values<'a>(
                         );
                     }
                 }
-                GeneratedType::Virtual(_) => {
+                GeneratedType::Virtual { .. } => {
                     // no-op
                 }
             }
@@ -1112,7 +1112,7 @@ fn emit_update_insns<'a>(
             let new_rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
 
             // Compute virtual columns for NEW values
-            let new_ctx = DmlColumnContext::layout(columns, start, beg, layout.clone());
+            let new_ctx = DmlColumnContext::layout(columns, start, new_rowid_reg, layout.clone());
             compute_virtual_columns(program, columns, &new_ctx, &t_ctx.resolver)?;
 
             // Compute virtual columns for OLD values
@@ -1314,11 +1314,16 @@ fn emit_update_insns<'a>(
         .btree()
         .is_some_and(|bt| bt.has_virtual_columns());
     let has_returning = returning.as_ref().is_some_and(|r| !r.is_empty());
+    let has_check_constraints = target_table
+        .table
+        .btree()
+        .is_some_and(|bt| !bt.check_constraints.is_empty());
     if has_virtual_columns
         && (!indexes_to_update.is_empty()
             || has_before_triggers
             || has_after_triggers
-            || has_returning)
+            || has_returning
+            || has_check_constraints)
     {
         let columns = target_table.table.columns();
         let rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
@@ -2349,6 +2354,7 @@ fn emit_update_insns<'a>(
                     start,
                     record_reg,
                     cdc_rowid_after_reg,
+                    &layout,
                 ))
             } else {
                 None
