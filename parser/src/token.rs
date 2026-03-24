@@ -186,6 +186,7 @@ pub enum TokenType {
     TK_COLON = 191,
     TK_ARRAY_CONTAINS = 192, // @>
     TK_ARRAY_OVERLAP = 193,  // &&
+    TK_SERVER = 194,
     // None token
     TK_NONE = 255,
 }
@@ -357,6 +358,7 @@ impl TokenType {
             TokenType::TK_COLON => Some(":"),
             TokenType::TK_ARRAY_CONTAINS => Some("@>"),
             TokenType::TK_ARRAY_OVERLAP => Some("&&"),
+            TokenType::TK_SERVER => Some("SERVER"),
             _ => None,
         }
     }
@@ -559,6 +561,7 @@ impl Display for TokenType {
             TK_COLON => "TK_COLON",
             TK_ARRAY_CONTAINS => "TK_ARRAY_CONTAINS",
             TK_ARRAY_OVERLAP => "TK_ARRAY_OVERLAP",
+            TK_SERVER => "TK_SERVER",
             // None
             TK_NONE => "TK_NONE",
         };
