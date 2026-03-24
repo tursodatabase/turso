@@ -2116,3 +2116,81 @@ fn test_vacuum_into_with_multiple_strict_tables(tmp_db: TempDatabase) -> anyhow:
 
     Ok(())
 }
+
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_compacts_fragmented_database(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE fragmented_data (id INTEGER PRIMARY KEY, data BLOB)")?;
+
+    for i in 0..100 {
+        conn.execute(format!(
+            "INSERT INTO fragmented_data VALUES ({i}, randomblob(4096))",
+        ))?;
+    }
+
+    conn.execute("DELETE FROM fragmented_data WHERE id < 60")?;
+
+    for i in 60..100 {
+        conn.execute(format!(
+            "UPDATE fragmented_data SET data = randomblob(4096) WHERE id = {i}",
+        ))?;
+
+        conn.execute(format!(
+            "UPDATE fragmented_data SET data = randomblob(8192) WHERE id = {i}",
+        ))?;
+    }
+
+    let count: Vec<(i64,)> = conn.exec_rows("SELECT COUNT(*) FROM fragmented_data");
+    assert_eq!(count[0].0, 40, "Expected 40 rows after deletes");
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    let source_size = std::fs::metadata(&tmp_db.path)?.len();
+    let source_hash = compute_dbhash(&tmp_db);
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(
+        run_integrity_check(&dest_conn),
+        "ok",
+        "Vacuumed database should pass integrity check"
+    );
+
+    if !tmp_db.enable_mvcc {
+        assert_eq!(
+            source_hash.hash,
+            compute_dbhash(&dest_db).hash,
+            "Source and vacuumed database should have same content hash"
+        );
+    }
+
+    let source_pages: Vec<(i64,)> = conn.exec_rows("PRAGMA page_count");
+    let dest_pages: Vec<(i64,)> = dest_conn.exec_rows("PRAGMA page_count");
+
+    assert!(
+        dest_pages[0].0 < source_pages[0].0,
+        "Page count should reduce from {} to {}",
+        source_pages[0].0,
+        dest_pages[0].0
+    );
+
+    let dest_count: Vec<(i64,)> = dest_conn.exec_rows("SELECT COUNT(*) FROM fragmented_data");
+    assert_eq!(dest_count[0].0, 40, "Vacuumed db should have 40 rows");
+
+    let dest_size = std::fs::metadata(&dest_path)?.len();
+    assert!(
+        dest_size < source_size,
+        "VACUUM INTO should reduce file size. Source: {source_size} bytes, Destination: {dest_size} bytes"
+    );
+
+    Ok(())
+}
