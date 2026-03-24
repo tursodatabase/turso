@@ -85,6 +85,28 @@ impl VirtualTable {
         Arc::new(vtab)
     }
 
+    /// Create a VirtualTable wrapping a [`ForeignDataWrapper`] implementation.
+    ///
+    /// The table is registered as a read-only `VirtualTable` (not a
+    /// table-valued function) and participates in the query planner via
+    /// `best_index`/`filter` like any other virtual table.
+    pub fn new_foreign(
+        name: &str,
+        fdw: Arc<dyn crate::foreign::ForeignDataWrapper>,
+    ) -> crate::Result<Arc<VirtualTable>> {
+        let adapter = crate::foreign::ForeignTableAdapter::new(fdw);
+        let schema = adapter.sql();
+        let vtab = VirtualTable {
+            name: name.to_owned(),
+            columns: Self::resolve_columns(schema)?,
+            kind: VTabKind::VirtualTable,
+            vtab_type: VirtualTableType::Internal(Arc::new(RwLock::new(adapter))),
+            vtab_id: VTAB_ID_COUNTER.fetch_add(1, Ordering::Acquire),
+            innocuous: false,
+        };
+        Ok(Arc::new(vtab))
+    }
+
     pub(crate) fn builtin_functions(enable_custom_types: bool) -> Vec<Arc<VirtualTable>> {
         let mut vtables: Vec<Arc<VirtualTable>> = PragmaVirtualTable::functions()
             .into_iter()

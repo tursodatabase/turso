@@ -878,6 +878,35 @@ impl Connection {
         Ok(type_rows)
     }
 
+    /// Register a foreign data wrapper as a virtual table in this connection's schema.
+    ///
+    /// The table becomes queryable immediately via standard SQL, including
+    /// JOINs with local tables. The virtual table is read-only.
+    ///
+    /// # Example
+    /// ```ignore
+    /// conn.register_foreign_table("gmail_email", my_fdw)?;
+    /// // Now: SELECT * FROM gmail_email WHERE from_address = 'alice@example.com'
+    /// ```
+    pub fn register_foreign_table(
+        &self,
+        name: &str,
+        fdw: std::sync::Arc<dyn crate::foreign::ForeignDataWrapper>,
+    ) -> crate::Result<()> {
+        let vtab = crate::VirtualTable::new_foreign(name, fdw)?;
+        // Add to the database-level shared schema so all connections see it.
+        let mut db_schema = self.db.schema.lock();
+        let schema = std::sync::Arc::get_mut(&mut db_schema).ok_or_else(|| {
+            crate::LimboError::InternalError(
+                "Cannot register foreign table: schema has outstanding references".to_string(),
+            )
+        })?;
+        schema.add_virtual_table(vtab)?;
+        // Update this connection's schema snapshot.
+        *self.schema.write() = db_schema.clone();
+        Ok(())
+    }
+
     pub fn maybe_update_schema(&self) {
         let current_schema_version = self.schema.read().schema_version;
         let schema = self.db.schema.lock();
