@@ -47,7 +47,7 @@ addr  opcode         p1  p2  p3  p4   p5  comment
   28  SeekRowid       1   1  49        0  if (r[1]!=cursor 1 for table t2.rowid) goto 49
   29  RowId           1  15   0        0  r[15]=t2.rowid
   30  Column          1   1  16        0  r[16]=t2.name
-  31  Column          1   2  17        0  r[17]=t2.counter
+  31  Column          1   2  17  0     0  r[17]=t2.counter
   32  Copy           15  18   2        0  r[18]=r[15]
   33  Copy           17  21   0        0  r[21]=r[17]
   34  Integer         1  22   0        0  r[22]=1
