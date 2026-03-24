@@ -20,6 +20,16 @@ Opens a new database connection.
 The `path` parameter points to the SQLite database file to open. If the file pointed to by `path` does not exists, it will be created.
 To open an in-memory database, please pass `:memory:` as the `path` parameter.
 
+Supported `options` fields include:
+
+- `timeout`: busy timeout in milliseconds
+- `defaultQueryTimeout`: default maximum query execution time in milliseconds before interruption
+
+Per-query timeout override is available via `queryOptions`, for example:
+
+- `db.exec("SELECT 1", { queryTimeout: 100 })`
+- `stmt.get(undefined, { queryTimeout: 100 })`
+
 The function returns a `Database` object.
 
 ## class Database

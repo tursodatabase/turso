@@ -1,6 +1,6 @@
 import { bindParams } from "./bind.js";
 import { SqliteError } from "./sqlite-error.js";
-import { NativeDatabase, NativeStatement, STEP_IO, STEP_ROW, STEP_DONE } from "./types.js";
+import { NativeDatabase, NativeStatement, QueryOptions, STEP_IO, STEP_ROW, STEP_DONE } from "./types.js";
 
 const convertibleErrorTypes = { TypeError };
 const CONVERTIBLE_ERROR_PREFIX = "[TURSO_CONVERT_TYPE]";
@@ -25,6 +25,33 @@ function createErrorByName(name, message) {
   return new ErrorConstructor(message);
 }
 
+function isQueryOptions(value) {
+  return value != null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && Object.prototype.hasOwnProperty.call(value, "queryTimeout");
+}
+
+function splitBindParameters(bindParameters) {
+  if (bindParameters.length === 0) {
+    return { params: undefined, queryOptions: undefined };
+  }
+  if (bindParameters.length > 1 && isQueryOptions(bindParameters[bindParameters.length - 1])) {
+    return {
+      params: bindParameters.length === 2 ? bindParameters[0] : bindParameters.slice(0, -1),
+      queryOptions: bindParameters[bindParameters.length - 1],
+    };
+  }
+  return { params: bindParameters.length === 1 ? bindParameters[0] : bindParameters, queryOptions: undefined };
+}
+
+function toBindArgs(params) {
+  if (params === undefined) {
+    return [];
+  }
+  return [params];
+}
+
 /**
  * Database represents a connection that can prepare and execute SQL statements.
  */
@@ -47,6 +74,7 @@ class Database {
    * @param {boolean} [opts.readonly=false] - Open the database in read-only mode.
    * @param {boolean} [opts.fileMustExist=false] - If true, throws if database file does not exist.
    * @param {number} [opts.timeout=0] - Timeout duration in milliseconds for database operations. Defaults to 0 (no timeout).
+   * @param {number} [opts.defaultQueryTimeout=0] - Default maximum query execution time in milliseconds before interruption.
    */
   constructor(db: NativeDatabase) {
     this.db = db;
@@ -175,11 +203,11 @@ class Database {
    *
    * @param {string} sql - The string containing SQL statements to execute
    */
-  exec(sql) {
+  exec(sql, queryOptions?: QueryOptions) {
     if (!this.open) {
       throw new TypeError("The database connection is not open");
     }
-    const exec = this.db.executor(sql);
+    const exec = this.db.executor(sql, queryOptions);
     try {
       while (true) {
         const stepResult = exec.stepSync();
@@ -293,8 +321,10 @@ class Statement {
   run(...bindParameters) {
     const totalChangesBefore = this.db.totalChanges();
 
+    const { params, queryOptions } = splitBindParameters(bindParameters);
     this.stmt.reset();
-    bindParams(this.stmt, bindParameters);
+    this.stmt.setQueryTimeout(queryOptions);
+    bindParams(this.stmt, toBindArgs(params));
     for (; ;) {
       const stepResult = this.stmt.stepSync();
       if (stepResult === STEP_IO) {
@@ -322,8 +352,10 @@ class Statement {
    * @param bindParameters - The bind parameters for executing the statement.
    */
   get(...bindParameters) {
+    const { params, queryOptions } = splitBindParameters(bindParameters);
     this.stmt.reset();
-    bindParams(this.stmt, bindParameters);
+    this.stmt.setQueryTimeout(queryOptions);
+    bindParams(this.stmt, toBindArgs(params));
     let row = undefined;
     for (; ;) {
       const stepResult = this.stmt.stepSync();
@@ -347,8 +379,10 @@ class Statement {
    * @param bindParameters - The bind parameters for executing the statement.
    */
   *iterate(...bindParameters) {
+    const { params, queryOptions } = splitBindParameters(bindParameters);
     this.stmt.reset();
-    bindParams(this.stmt, bindParameters);
+    this.stmt.setQueryTimeout(queryOptions);
+    bindParams(this.stmt, toBindArgs(params));
 
     while (true) {
       const stepResult = this.stmt.stepSync();
@@ -371,8 +405,10 @@ class Statement {
    * @param bindParameters - The bind parameters for executing the statement.
    */
   all(...bindParameters) {
+    const { params, queryOptions } = splitBindParameters(bindParameters);
     this.stmt.reset();
-    bindParams(this.stmt, bindParameters);
+    this.stmt.setQueryTimeout(queryOptions);
+    bindParams(this.stmt, toBindArgs(params));
     const rows: any[] = [];
     for (; ;) {
       const stepResult = this.stmt.stepSync();

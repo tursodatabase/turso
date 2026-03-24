@@ -115,6 +115,9 @@ pub struct Connection {
     /// Busy handler for lock contention
     /// Default is BusyHandler::None (return SQLITE_BUSY immediately)
     pub(super) busy_handler: RwLock<BusyHandler>,
+    /// Maximum execution time for a single statement on this connection.
+    /// `Duration::ZERO` means disabled.
+    pub(super) query_timeout_ms: AtomicU64,
     /// Whether this is an internal connection used for MVCC bootstrap
     pub(super) is_mvcc_bootstrap_connection: AtomicBool,
     /// Whether pragma foreign_keys=ON for this connection
@@ -1943,6 +1946,18 @@ impl Connection {
             BusyHandler::Timeout(d) => *d,
             _ => Duration::ZERO,
         }
+    }
+
+    /// Sets the maximum duration a statement is allowed to run.
+    /// `Duration::ZERO` disables query timeout.
+    pub fn set_query_timeout(&self, duration: Duration) {
+        let millis = duration.as_millis().min(u128::from(u64::MAX)) as u64;
+        self.query_timeout_ms.store(millis, Ordering::SeqCst);
+    }
+
+    /// Get the query timeout duration.
+    pub fn get_query_timeout(&self) -> Duration {
+        Duration::from_millis(self.query_timeout_ms.load(Ordering::SeqCst))
     }
 
     /// Get a reference to the busy handler.

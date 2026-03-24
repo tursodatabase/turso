@@ -172,12 +172,19 @@ pub struct EncryptionOpts {
 pub struct DatabaseOpts {
     pub readonly: Option<bool>,
     pub timeout: Option<u32>,
+    pub default_query_timeout: Option<u32>,
     pub file_must_exist: Option<bool>,
     pub tracing: Option<String>,
     /// Experimental features to enable
     pub experimental: Option<Vec<String>>,
     /// Optional encryption configuration for local database encryption
     pub encryption: Option<EncryptionOpts>,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct QueryOptions {
+    pub query_timeout: Option<u32>,
 }
 
 fn step_sync(stmt: &StatementHandle) -> napi::Result<u32> {
@@ -213,6 +220,23 @@ fn create_error(status: napi::Status, message: &str) -> napi::Error {
     Error::new(status, message)
 }
 
+fn query_timeout_duration(timeout_ms: u32) -> Option<std::time::Duration> {
+    if timeout_ms > 0 {
+        Some(std::time::Duration::from_millis(timeout_ms as u64))
+    } else {
+        None
+    }
+}
+
+fn query_timeout_override_from_query_options(
+    query_options: Option<QueryOptions>,
+) -> Option<Option<std::time::Duration>> {
+    match query_options.and_then(|o| o.query_timeout) {
+        Some(timeout_ms) => Some(query_timeout_duration(timeout_ms)),
+        None => None,
+    }
+}
+
 fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
     if db.connect.get().is_some() {
         return Ok(());
@@ -220,6 +244,7 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
 
     let mut flags = turso_core::OpenFlags::Create;
     let mut busy_timeout = None;
+    let mut query_timeout = None;
     let mut core_opts = turso_core::DatabaseOpts::new();
     let mut encryption_opts = None;
     if let Some(opts) = &db.opts {
@@ -232,6 +257,9 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
         }
         if let Some(timeout) = opts.timeout {
             busy_timeout = Some(std::time::Duration::from_millis(timeout as u64));
+        }
+        if let Some(timeout) = opts.default_query_timeout {
+            query_timeout = query_timeout_duration(timeout);
         }
         if let Some(experimental) = &opts.experimental {
             for feature in experimental {
@@ -288,6 +316,9 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
 
     if let Some(busy_timeout) = busy_timeout {
         conn.set_busy_timeout(busy_timeout);
+    }
+    if let Some(query_timeout) = query_timeout {
+        conn.set_query_timeout(query_timeout);
     }
 
     let connect = DatabaseConnect {
@@ -444,12 +475,17 @@ impl Database {
     }
 
     #[napi]
-    pub fn executor(&self, sql: String) -> napi::Result<BatchExecutor> {
+    pub fn executor(
+        &self,
+        sql: String,
+        query_options: Option<QueryOptions>,
+    ) -> napi::Result<BatchExecutor> {
         Ok(BatchExecutor {
             conn: Some(self.conn()?),
             sql,
             position: 0,
             stmt: None,
+            query_timeout_override: query_timeout_override_from_query_options(query_options),
         })
     }
 
@@ -567,6 +603,7 @@ pub struct BatchExecutor {
     sql: String,
     position: usize,
     stmt: Option<StatementHandle>,
+    query_timeout_override: Option<Option<std::time::Duration>>,
 }
 
 #[napi]
@@ -583,7 +620,12 @@ impl BatchExecutor {
                     #[allow(clippy::arc_with_non_send_sync)]
                     Ok(Some((stmt, offset))) => {
                         self.position += offset;
-                        self.stmt = Some(Arc::new(RefCell::new(Some(stmt))));
+                        let stmt: StatementHandle = Arc::new(RefCell::new(Some(stmt)));
+                        stmt.borrow_mut()
+                            .as_mut()
+                            .unwrap()
+                            .set_query_timeout_override(self.query_timeout_override);
+                        self.stmt = Some(stmt);
                     }
                     Ok(None) => return Ok(STEP_DONE),
                     Err(err) => return Err(to_generic_error("failed to consume stmt", err)),
@@ -632,6 +674,17 @@ impl Statement {
             .ok_or_else(|| create_generic_error("statement has been finalized"))?
             .reset()
             .map_err(|e| to_generic_error("reset failed", e))?;
+        Ok(())
+    }
+
+    #[napi(js_name = "setQueryTimeout")]
+    pub fn set_query_timeout(&self, query_options: Option<QueryOptions>) -> Result<()> {
+        let timeout_override = query_timeout_override_from_query_options(query_options);
+        let mut guard = self.statement_handle()?.borrow_mut();
+        guard
+            .as_mut()
+            .ok_or_else(|| create_generic_error("statement has been finalized"))?
+            .set_query_timeout_override(timeout_override);
         Ok(())
     }
 
