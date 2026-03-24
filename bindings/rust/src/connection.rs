@@ -126,6 +126,19 @@ impl Connection {
         }
     }
 
+    /// Register a foreign data wrapper as a virtual table in this connection's schema.
+    ///
+    /// See [`turso_sdk_kit::foreign::ForeignDataWrapper`] for the trait definition.
+    pub fn register_foreign_table(
+        &self,
+        name: &str,
+        fdw: std::sync::Arc<dyn turso_sdk_kit::foreign::ForeignDataWrapper>,
+    ) -> Result<()> {
+        let conn = self.get_inner_connection()?;
+        conn.register_foreign_table(name, fdw)
+            .map_err(|e| Error::Misuse(e.to_string()))
+    }
+
     /// Execute a batch of SQL statements on the database.
     pub async fn execute_batch(&self, sql: impl AsRef<str>) -> Result<()> {
         self.maybe_handle_dangling_tx().await?;
