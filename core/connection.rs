@@ -662,7 +662,13 @@ impl Connection {
         let flags = opts.get_flags()?;
         if opts.path == MEMORY_PATH || matches!(opts.mode, OpenMode::Memory) {
             let io = Arc::new(MemoryIO::new());
-            let db = Database::open_file_with_flags(io.clone(), MEMORY_PATH, flags, db_opts, None)?;
+            let db = Database::open_file_with_flags(
+                io.clone(),
+                MEMORY_PATH,
+                flags | OpenFlags::Create,
+                db_opts,
+                None,
+            )?;
             let conn = db.connect()?;
             return Ok((io, conn));
         }
