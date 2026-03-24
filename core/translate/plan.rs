@@ -16,6 +16,7 @@ use crate::{
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
         planner::determine_where_to_eval_term,
     },
+    types::{default_nulls_order, normalize_nulls_order},
     vdbe::{
         affinity::{self, Affinity},
         builder::{CursorKey, CursorType, ProgramBuilder},
@@ -300,12 +301,46 @@ pub enum Plan {
         right_most: SelectPlan,
         limit: Option<Box<Expr>>,
         offset: Option<Box<Expr>>,
-        /// ORDER BY for compound selects. Each entry is (result_column_index, sort_order).
-        /// The column index is 0-based into the result set.
-        order_by: Option<Vec<(usize, SortOrder)>>,
+        /// ORDER BY for compound selects. Each entry identifies a result column plus
+        /// its requested direction and optional explicit NULL placement.
+        order_by: Option<Vec<CompoundOrderByTerm>>,
     },
     Delete(DeletePlan),
     Update(UpdatePlan),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompoundOrderByTerm {
+    /// 0-based index into the compound SELECT result set.
+    pub result_column_index: usize,
+    pub sort_order: SortOrder,
+    pub nulls_order: Option<ast::NullsOrder>,
+}
+
+impl CompoundOrderByTerm {
+    pub fn normalized_nulls_order(&self) -> ast::NullsOrder {
+        normalize_nulls_order(self.sort_order, self.nulls_order)
+    }
+}
+
+pub fn sorted_column_order(sorted_column: &ast::SortedColumn) -> SortOrder {
+    sorted_column.order.unwrap_or(SortOrder::Asc)
+}
+
+pub fn sorted_column_nulls_order(sorted_column: &ast::SortedColumn) -> ast::NullsOrder {
+    normalize_nulls_order(sorted_column_order(sorted_column), sorted_column.nulls)
+}
+
+fn sorted_column_has_nondefault_explicit_nulls(sorted_column: &ast::SortedColumn) -> bool {
+    sorted_column.nulls.is_some_and(|nulls_order| {
+        nulls_order != default_nulls_order(sorted_column_order(sorted_column))
+    })
+}
+
+pub fn order_by_has_nondefault_explicit_nulls(order_by: &[ast::SortedColumn]) -> bool {
+    order_by
+        .iter()
+        .any(sorted_column_has_nondefault_explicit_nulls)
 }
 
 impl Plan {
@@ -565,7 +600,7 @@ pub struct SelectPlan {
     /// group by clause
     pub group_by: Option<GroupBy>,
     /// order by clause
-    pub order_by: Vec<(Box<ast::Expr>, SortOrder)>,
+    pub order_by: Vec<ast::SortedColumn>,
     /// all the aggregates collected from the result columns, order by, and (TODO) having clauses
     pub aggregates: Vec<Aggregate>,
     /// limit clause

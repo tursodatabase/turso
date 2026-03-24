@@ -22,7 +22,7 @@ use crate::{
 use strum::EnumCount;
 use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
 use turso_macros::Description;
-use turso_parser::ast::{ResolveType, SortOrder};
+use turso_parser::ast::ResolveType;
 
 /// Known custom type comparator functions for sorting and MIN/MAX aggregates.
 /// These replace heap-allocated String names with a compact enum.
@@ -929,8 +929,8 @@ pub enum Insn {
     SorterOpen {
         cursor_id: CursorID, // P1
         columns: usize,      // P2
-        /// Combined order and collation per column (keeps Insn small, and order+collations are always the same length).
-        order_and_collations: Vec<(SortOrder, Option<CollationSeq>)>,
+        /// Per-column sort metadata, including direction, collation, and NULL placement.
+        key_info: Vec<KeyInfo>,
         /// Per-column custom type comparators for ORDER BY sorting.
         /// When present, the comparator is used instead of standard value comparison.
         comparators: Vec<Option<SortComparatorType>>,

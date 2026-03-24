@@ -19,6 +19,7 @@ use crate::translate::insert::format_unique_violation_desc;
 use crate::translate::plan::{
     ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences,
 };
+use crate::types::{default_nulls_order, KeyInfo};
 use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts};
 use crate::vdbe::insn::{to_u16, CmpInsFlags, Cookie};
 use crate::{bail_parse_error, CaptureDataChangesExt, LimboError};
@@ -362,12 +363,20 @@ pub fn translate_create_index(
         program.preassign_label_to_next_insn(loop_end_label);
     } else if index_method.is_none() {
         // determine the order and collation of the columns in the index for the sorter
-        let order_and_collations = idx.columns.iter().map(|c| (c.order, c.collation)).collect();
+        let key_info = idx
+            .columns
+            .iter()
+            .map(|c| KeyInfo {
+                sort_order: c.order,
+                collation: c.collation.unwrap_or_default(),
+                nulls_order: default_nulls_order(c.order),
+            })
+            .collect();
         // open the sorter and the pseudo table
         program.emit_insn(Insn::SorterOpen {
             cursor_id: sorter_cursor_id,
             columns: columns.len(),
-            order_and_collations,
+            key_info,
             comparators: vec![],
         });
         let content_reg = program.alloc_register();

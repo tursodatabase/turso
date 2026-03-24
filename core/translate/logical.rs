@@ -12,7 +12,7 @@ use crate::numeric::Numeric;
 use crate::schema::{Schema, Type};
 use crate::sync::Arc;
 use crate::turso_assert_ne;
-use crate::types::Value;
+use crate::types::{normalize_nulls_order, Value};
 use crate::{LimboError, Result};
 use rustc_hash::FxHashMap as HashMap;
 use std::fmt::{self, Display, Formatter};
@@ -1550,10 +1550,12 @@ impl<'a> LogicalPlanBuilder<'a> {
 
         for sorted_col in exprs {
             let expr = self.build_expr(&sorted_col.expr, input_schema)?;
+            let sort_order = sorted_col.order.unwrap_or(ast::SortOrder::Asc);
             sort_exprs.push(SortExpr {
                 expr,
-                asc: sorted_col.order != Some(ast::SortOrder::Desc),
-                nulls_first: sorted_col.nulls == Some(ast::NullsOrder::First),
+                asc: sort_order != ast::SortOrder::Desc,
+                nulls_first: normalize_nulls_order(sort_order, sorted_col.nulls)
+                    == ast::NullsOrder::First,
             });
         }
 

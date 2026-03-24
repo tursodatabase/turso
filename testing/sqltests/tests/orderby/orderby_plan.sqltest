@@ -5,6 +5,14 @@ setup orderby_plan {
     CREATE TABLE t(a);
 }
 
+setup orderby_plan_nulls {
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        val INTEGER
+    );
+    CREATE INDEX idx_t_val ON t(val);
+}
+
 @setup orderby_plan
 snapshot orderby_a_uses_sorter {
     SELECT * FROM t ORDER BY a;
@@ -23,4 +31,20 @@ snapshot orderby_rowid_no_sorter {
 @setup orderby_plan
 snapshot orderby_rowid_desc_no_sorter {
     SELECT * FROM t ORDER BY rowid DESC;
+}
+
+@setup orderby_plan_nulls
+snapshot-eqp orderby_asc_nulls_first_default_uses_covering_index {
+    SELECT id, val
+    FROM t
+    ORDER BY val ASC NULLS FIRST
+    LIMIT 3;
+}
+
+@setup orderby_plan_nulls
+snapshot-eqp orderby_desc_nulls_last_default_uses_covering_index {
+    SELECT id, val
+    FROM t
+    ORDER BY val DESC NULLS LAST
+    LIMIT 3;
 }

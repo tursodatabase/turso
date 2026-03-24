@@ -5649,7 +5649,7 @@ pub fn op_sorter_open(
         SorterOpen {
             cursor_id,
             columns: _,
-            order_and_collations,
+            key_info,
             comparators,
         },
         insn
@@ -5670,18 +5670,13 @@ pub fn op_sorter_open(
     } else {
         (cache_size as usize) * page_size
     };
-    let (order, collations): (Vec<_>, Vec<_>) = order_and_collations
-        .iter()
-        .map(|(ord, coll)| (*ord, coll.unwrap_or_default()))
-        .unzip();
     let comparators = comparators
         .iter()
         .map(|c| c.as_ref().map(make_sort_comparator))
         .collect();
     let temp_store = program.connection.get_temp_store();
     let cursor = Sorter::new(
-        &order,
-        collations,
+        key_info.clone(),
         comparators,
         max_buffer_size_bytes,
         page_size,

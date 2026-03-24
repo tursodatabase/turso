@@ -4,8 +4,9 @@ use crate::translate::collate::get_collseq_from_expr;
 use crate::translate::emitter::{select::emit_query, LimitCtx, Resolver, TranslateCtx};
 use crate::translate::expr::translate_expr;
 use crate::translate::order_by::{custom_type_comparator, sorter_insert};
-use crate::translate::plan::{Plan, QueryDestination, SelectPlan};
+use crate::translate::plan::{CompoundOrderByTerm, Plan, QueryDestination, SelectPlan};
 use crate::translate::result_row::emit_columns_to_destination;
+use crate::types::{default_nulls_order, KeyInfo};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::Insn;
 use crate::{emit_explain, LimboError};
@@ -781,7 +782,7 @@ fn create_collection_index(
 #[allow(clippy::too_many_arguments)]
 fn emit_compound_order_by(
     program: &mut ProgramBuilder,
-    order_by: &[(usize, SortOrder)],
+    order_by: &[CompoundOrderByTerm],
     collection_cursor_id: usize,
     collection_index: &Index,
     num_result_cols: usize,
@@ -798,21 +799,27 @@ fn emit_compound_order_by(
     // We append a sequence number as an extra sort key after the ORDER BY columns
     // to break ties by insertion order, matching SQLite's merge-based compound SELECT
     // which naturally outputs left-arm rows before right-arm rows for equal keys.
-    let mut order_and_collations: Vec<(
-        SortOrder,
-        Option<crate::translate::collate::CollationSeq>,
-    )> = order_by
+    let mut key_info: Vec<KeyInfo> = order_by
         .iter()
-        .map(|(col_idx, order)| {
+        .map(|order_by_term| {
             let collation = collection_index
                 .columns
-                .get(*col_idx)
-                .and_then(|c| c.collation);
-            (*order, collation)
+                .get(order_by_term.result_column_index)
+                .and_then(|c| c.collation)
+                .unwrap_or_default();
+            KeyInfo {
+                sort_order: order_by_term.sort_order,
+                collation,
+                nulls_order: order_by_term.normalized_nulls_order(),
+            }
         })
         .collect();
     // Sequence tie-breaker: preserves insertion order for rows with equal ORDER BY keys
-    order_and_collations.push((SortOrder::Asc, None));
+    key_info.push(KeyInfo {
+        sort_order: SortOrder::Asc,
+        collation: Default::default(),
+        nulls_order: default_nulls_order(SortOrder::Asc),
+    });
 
     // Compute deduplication remappings: which result columns share a sort key slot.
     // The sorter layout is: [order_by_keys..., sequence, non-dedup data cols...]
@@ -824,7 +831,7 @@ fn emit_compound_order_by(
         if let Some((sort_key_idx, _)) = order_by
             .iter()
             .enumerate()
-            .find(|(_, (ob_col, _))| *ob_col == col_idx)
+            .find(|(_, order_by_term)| order_by_term.result_column_index == col_idx)
         {
             // This result column is also a sort key - deduplicate
             remappings.push((sort_key_idx, true));
@@ -840,22 +847,25 @@ fn emit_compound_order_by(
     // NumericLt to sort correctly instead of default blob/text comparison).
     let mut comparators: Vec<Option<crate::vdbe::insn::SortComparatorType>> = order_by
         .iter()
-        .map(|(col_idx, _)| {
-            program.result_columns.get(*col_idx).and_then(|rc| {
-                custom_type_comparator(
-                    &rc.expr,
-                    &program.table_references,
-                    right_most_ctx.resolver.schema(),
-                )
-            })
+        .map(|order_by_term| {
+            program
+                .result_columns
+                .get(order_by_term.result_column_index)
+                .and_then(|rc| {
+                    custom_type_comparator(
+                        &rc.expr,
+                        &program.table_references,
+                        right_most_ctx.resolver.schema(),
+                    )
+                })
         })
         .collect();
     // No comparator needed for the sequence tie-breaker column
     comparators.push(None);
     program.emit_insn(Insn::SorterOpen {
         cursor_id: sort_cursor,
-        columns: order_and_collations.len(),
-        order_and_collations,
+        columns: key_info.len(),
+        key_info,
         comparators,
     });
 
@@ -892,9 +902,9 @@ fn emit_compound_order_by(
     // Build sorter record: [sort_keys..., sequence, non-dedup result cols...]
     let sorter_regs = program.alloc_registers(sorter_column_count);
     // First emit sort keys
-    for (sort_key_idx, (col_idx, _)) in order_by.iter().enumerate() {
+    for (sort_key_idx, order_by_term) in order_by.iter().enumerate() {
         program.emit_insn(Insn::Copy {
-            src_reg: read_regs + col_idx,
+            src_reg: read_regs + order_by_term.result_column_index,
             dst_reg: sorter_regs + sort_key_idx,
             extra_amount: 0,
         });

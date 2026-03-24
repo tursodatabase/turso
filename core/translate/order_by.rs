@@ -8,8 +8,12 @@ use crate::{
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         group_by::is_orderby_agg_or_const,
-        plan::Aggregate,
+        plan::{
+            order_by_has_nondefault_explicit_nulls, sorted_column_nulls_order, sorted_column_order,
+            Aggregate,
+        },
     },
+    types::{default_nulls_order, KeyInfo},
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
@@ -156,14 +160,15 @@ impl EmitOrderBy {
         program: &mut ProgramBuilder,
         t_ctx: &mut TranslateCtx,
         result_columns: &[ResultSetColumn],
-        order_by: &[(Box<ast::Expr>, SortOrder)],
+        order_by: &[ast::SortedColumn],
         referenced_tables: &TableReferences,
         has_group_by: bool,
         has_distinct: bool,
         aggregates: &[Aggregate],
     ) -> Result<()> {
         // Block ORDER BY on custom type columns without OPERATOR '<'
-        for (expr, _) in order_by.iter() {
+        for sorted_column in order_by.iter() {
+            let expr = sorted_column.expr.as_ref();
             if is_custom_type_without_lt(expr, referenced_tables, t_ctx.resolver.schema()) {
                 if let Some((col, type_def)) =
                     result_column_custom_type_info(expr, referenced_tables, t_ctx.resolver.schema())
@@ -181,11 +186,14 @@ impl EmitOrderBy {
             }
         }
 
-        let only_aggs = order_by
-            .iter()
-            .all(|(e, _)| is_orderby_agg_or_const(&t_ctx.resolver, e, aggregates));
+        let only_aggs = order_by.iter().all(|sorted_column| {
+            is_orderby_agg_or_const(&t_ctx.resolver, &sorted_column.expr, aggregates)
+        });
 
-        let use_heap_sort = !has_distinct && !has_group_by && t_ctx.limit_ctx.is_some();
+        let use_heap_sort = !has_distinct
+            && !has_group_by
+            && t_ctx.limit_ctx.is_some()
+            && !order_by_has_nondefault_explicit_nulls(order_by);
 
         // only emit sequence column if (we have GROUP BY and ORDER BY is not only aggregates or constants) OR (we decided to use heap-sort)
         let has_sequence = (has_group_by && !only_aggs) || use_heap_sort;
@@ -195,12 +203,14 @@ impl EmitOrderBy {
         let sort_cursor = if use_heap_sort {
             let index_name = format!("heap_sort_{}", program.offset().as_offset_int()); // we don't really care about the name that much, just enough that we don't get name collisions
             let mut index_columns = Vec::with_capacity(order_by.len() + result_columns.len());
-            for (column, order) in order_by {
+            for sorted_column in order_by {
+                let column = sorted_column.expr.as_ref();
+                let order = sorted_column_order(sorted_column);
                 let collation = get_collseq_from_expr(column, referenced_tables)?;
                 let pos_in_table = index_columns.len();
                 index_columns.push(IndexColumn {
                     name: pos_in_table.to_string(),
-                    order: *order,
+                    order,
                     pos_in_table,
                     collation,
                     default: None,
@@ -265,11 +275,17 @@ impl EmitOrderBy {
              * then the collating sequence of the column is used to determine sort order.
              * If the expression is not a column and has no COLLATE clause, then the BINARY collating sequence is used.
              */
-            let mut order_and_collations: Vec<(SortOrder, Option<CollationSeq>)> = order_by
+            let mut key_info: Vec<KeyInfo> = order_by
                 .iter()
-                .map(|(expr, dir)| {
-                    let collation = get_collseq_from_expr(expr, referenced_tables)?;
-                    Ok((*dir, collation))
+                .map(|sorted_column| {
+                    let sort_order = sorted_column_order(sorted_column);
+                    let collation = get_collseq_from_expr(&sorted_column.expr, referenced_tables)?
+                        .unwrap_or_default();
+                    Ok(KeyInfo {
+                        sort_order,
+                        collation,
+                        nulls_order: sorted_column_nulls_order(sorted_column),
+                    })
                 })
                 .collect::<Result<Vec<_>>>()?;
 
@@ -277,23 +293,31 @@ impl EmitOrderBy {
             // For types with a `<` operator, the comparator is used for correct sort ordering.
             let mut comparators: Vec<Option<SortComparatorType>> = order_by
                 .iter()
-                .map(|(expr, _)| {
-                    custom_type_comparator(expr, referenced_tables, t_ctx.resolver.schema())
+                .map(|sorted_column| {
+                    custom_type_comparator(
+                        &sorted_column.expr,
+                        referenced_tables,
+                        t_ctx.resolver.schema(),
+                    )
                 })
                 .collect();
 
             if has_sequence {
-                // sequence column: ascending with BINARY collation, no comparator
-                order_and_collations.push((SortOrder::Asc, Some(CollationSeq::default())));
+                // sequence column: ascending with default NULL semantics, no comparator
+                key_info.push(KeyInfo {
+                    sort_order: SortOrder::Asc,
+                    collation: CollationSeq::default(),
+                    nulls_order: default_nulls_order(SortOrder::Asc),
+                });
                 comparators.push(None);
             }
 
-            let key_len = order_and_collations.len();
+            let key_len = key_info.len();
 
             program.emit_insn(Insn::SorterOpen {
                 cursor_id: sort_cursor,
                 columns: key_len,
-                order_and_collations,
+                key_info,
                 comparators,
             });
         }
@@ -470,7 +494,8 @@ impl EmitOrderBy {
                 - result_columns_to_skip_len;
 
         let start_reg = program.alloc_registers(orderby_sorter_column_count);
-        for (i, (expr, _)) in order_by.iter().enumerate() {
+        for (i, sorted_column) in order_by.iter().enumerate() {
+            let expr = sorted_column.expr.as_ref();
             let key_reg = start_reg + i;
 
             // Check if this ORDER BY expression matches a finalized aggregate
@@ -710,7 +735,7 @@ pub struct OrderByRemapping {
 /// If we skip a result column, we need to keep track what index in the ORDER BY sorter the result columns have,
 /// because the result columns should be emitted in the SELECT clause order, not the ORDER BY clause order.
 pub fn order_by_deduplicate_result_columns(
-    order_by: &[(Box<ast::Expr>, SortOrder)],
+    order_by: &[ast::SortedColumn],
     result_columns: &[ResultSetColumn],
     has_sequence: bool,
 ) -> Vec<OrderByRemapping> {
@@ -725,7 +750,7 @@ pub fn order_by_deduplicate_result_columns(
         let found = order_by
             .iter()
             .enumerate()
-            .find(|(_, (expr, _))| exprs_are_equivalent(expr, &rc.expr));
+            .find(|(_, sorted_column)| exprs_are_equivalent(&sorted_column.expr, &rc.expr));
         if let Some((j, _)) = found {
             result_column_remapping.push(OrderByRemapping {
                 orderby_sorter_idx: j,

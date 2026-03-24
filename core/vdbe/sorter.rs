@@ -16,8 +16,7 @@ use crate::{
     error::LimboError,
     io::{Buffer, Completion, CompletionGroup, File, IO},
     storage::sqlite3_ondisk::{read_varint, varint_len, write_varint},
-    translate::collate::CollationSeq,
-    types::{IOResult, ImmutableRecord, KeyInfo, ValueRef},
+    types::{compare_immutable_single, IOResult, ImmutableRecord, KeyInfo, ValueRef},
     Result,
 };
 use crate::{io_yield_one, return_if_io, CompletionError};
@@ -97,30 +96,29 @@ pub struct Sorter {
 
 impl Sorter {
     pub fn new(
-        order: &[SortOrder],
-        collations: Vec<CollationSeq>,
+        key_info: Vec<KeyInfo>,
         comparators: Vec<Option<SortComparator>>,
         max_buffer_size_bytes: usize,
         min_chunk_read_buffer_size_bytes: usize,
         io: Arc<dyn IO>,
         temp_store: crate::TempStore,
     ) -> Self {
-        turso_assert_eq!(order.len(), collations.len());
+        let key_len = key_info.len();
+        let mut comparators = comparators;
+        turso_assert!(
+            comparators.len() <= key_len,
+            "sorter comparator count exceeds key count"
+        );
+        // Many sorter users rely on default comparison for every key column and
+        // therefore omit trailing comparator metadata entirely.
+        comparators.resize(key_len, None);
+
         Self {
             arena: Bump::new(),
             records: Vec::new(),
             current: None,
-            key_len: order.len(),
-            index_key_info: Rc::new(
-                order
-                    .iter()
-                    .zip(collations)
-                    .map(|(order, collation)| KeyInfo {
-                        sort_order: *order,
-                        collation,
-                    })
-                    .collect(),
-            ),
+            key_len,
+            index_key_info: Rc::new(key_info),
             comparators: Rc::new(comparators),
             chunks: Vec::new(),
             chunk_heap: BinaryHeap::new(),
@@ -810,6 +808,36 @@ impl ArenaSortableRecord {
     }
 }
 
+fn compare_sort_values(
+    lhs: ValueRef<'_>,
+    rhs: ValueRef<'_>,
+    key_info: &KeyInfo,
+    comparator: Option<&SortComparator>,
+) -> Ordering {
+    match (lhs, rhs) {
+        (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
+        (ValueRef::Null, _) => match key_info.nulls_order {
+            turso_parser::ast::NullsOrder::First => Ordering::Less,
+            turso_parser::ast::NullsOrder::Last => Ordering::Greater,
+        },
+        (_, ValueRef::Null) => match key_info.nulls_order {
+            turso_parser::ast::NullsOrder::First => Ordering::Greater,
+            turso_parser::ast::NullsOrder::Last => Ordering::Less,
+        },
+        _ => {
+            let cmp = if let Some(comparator) = comparator {
+                comparator(&lhs, &rhs)
+            } else {
+                compare_immutable_single(lhs, rhs, key_info.collation)
+            };
+            match key_info.sort_order {
+                SortOrder::Asc => cmp,
+                SortOrder::Desc => cmp.reverse(),
+            }
+        }
+    }
+}
+
 impl Ord for ArenaSortableRecord {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
@@ -825,21 +853,9 @@ impl Ord for ArenaSortableRecord {
             .zip(index_key_info.iter())
             .enumerate()
         {
-            let cmp = if let Some(Some(comparator)) = comparators.get(i) {
-                comparator(&self_val, &other_val)
-            } else {
-                match (self_val, other_val) {
-                    (ValueRef::Text(left), ValueRef::Text(right)) => {
-                        key_info.collation.compare_strings(&left, &right)
-                    }
-                    _ => self_val.partial_cmp(&other_val).unwrap_or(Ordering::Equal),
-                }
-            };
+            let cmp = compare_sort_values(self_val, other_val, key_info, comparators[i].as_ref());
             if cmp != Ordering::Equal {
-                return match key_info.sort_order {
-                    SortOrder::Asc => cmp,
-                    SortOrder::Desc => cmp.reverse(),
-                };
+                return cmp;
             }
         }
         Ordering::Equal
@@ -927,21 +943,10 @@ impl Ord for BoxedSortableRecord {
             .zip(self.index_key_info.iter())
             .enumerate()
         {
-            let cmp = if let Some(Some(comparator)) = self.comparators.get(i) {
-                comparator(&self_val, &other_val)
-            } else {
-                match (self_val, other_val) {
-                    (ValueRef::Text(left), ValueRef::Text(right)) => {
-                        key_info.collation.compare_strings(&left, &right)
-                    }
-                    _ => self_val.partial_cmp(&other_val).unwrap_or(Ordering::Equal),
-                }
-            };
+            let cmp =
+                compare_sort_values(self_val, other_val, key_info, self.comparators[i].as_ref());
             if cmp != Ordering::Equal {
-                return match key_info.sort_order {
-                    SortOrder::Asc => cmp,
-                    SortOrder::Desc => cmp.reverse(),
-                };
+                return cmp;
             }
         }
         Ordering::Equal
@@ -1008,8 +1013,11 @@ mod tests {
         let attempts = 8;
         for _ in 0..attempts {
             let mut sorter = Sorter::new(
-                &[SortOrder::Asc],
-                vec![CollationSeq::Binary],
+                vec![KeyInfo {
+                    sort_order: SortOrder::Asc,
+                    collation: CollationSeq::Binary,
+                    nulls_order: crate::types::default_nulls_order(SortOrder::Asc),
+                }],
                 vec![None],
                 256,
                 64,

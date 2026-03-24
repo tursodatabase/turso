@@ -21,6 +21,18 @@ setup schema {
     INSERT INTO t3 VALUES (5, 'echo');
 }
 
+setup nullable_compound_orderby {
+    CREATE TABLE n1(a INTEGER, src TEXT);
+    INSERT INTO n1 VALUES (NULL, 'n1-null');
+    INSERT INTO n1 VALUES (2, 'n1-two');
+    INSERT INTO n1 VALUES (1, 'n1-one');
+
+    CREATE TABLE n2(a INTEGER, src TEXT);
+    INSERT INTO n2 VALUES (NULL, 'n2-null');
+    INSERT INTO n2 VALUES (4, 'n2-four');
+    INSERT INTO n2 VALUES (3, 'n2-three');
+}
+
 # ===== UNION ALL + ORDER BY =====
 
 @setup schema
@@ -121,6 +133,38 @@ expect {
     6|fig|60
     7|grape|70
     8|honeydew|80
+}
+
+@setup nullable_compound_orderby
+test union-all-order-by-nulls-last {
+    SELECT a, src FROM n1
+    UNION ALL
+    SELECT a, src FROM n2
+    ORDER BY 1 NULLS LAST, 2;
+}
+expect {
+    1|n1-one
+    2|n1-two
+    3|n2-three
+    4|n2-four
+    |n1-null
+    |n2-null
+}
+
+@setup nullable_compound_orderby
+test union-all-order-by-desc-nulls-first {
+    SELECT a, src FROM n1
+    UNION ALL
+    SELECT a, src FROM n2
+    ORDER BY 1 DESC NULLS FIRST, 2;
+}
+expect {
+    |n1-null
+    |n2-null
+    4|n2-four
+    3|n2-three
+    2|n1-two
+    1|n1-one
 }
 
 # ===== UNION (distinct) + ORDER BY =====

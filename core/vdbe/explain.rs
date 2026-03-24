@@ -1,9 +1,11 @@
 use crate::vdbe::{builder::CursorType, insn::RegisterOrLiteral};
 use crate::HashSet;
-use turso_parser::ast::{ResolveType, SortOrder};
+use turso_parser::ast::{self, ResolveType, SortOrder};
 
 use super::{Insn, InsnReference, PreparedProgram, Value};
 use crate::function::{Func, ScalarFunc};
+use crate::translate::collate::CollationSeq;
+use crate::types::default_nulls_order;
 
 pub const EXPLAIN_COLUMNS: [&str; 8] = ["addr", "opcode", "p1", "p2", "p3", "p4", "p5", "comment"];
 pub const EXPLAIN_COLUMNS_TYPE: [&str; 8] = [
@@ -11,6 +13,14 @@ pub const EXPLAIN_COLUMNS_TYPE: [&str; 8] = [
 ];
 pub const EXPLAIN_QUERY_PLAN_COLUMNS: [&str; 4] = ["id", "parent", "notused", "detail"];
 pub const EXPLAIN_QUERY_PLAN_COLUMNS_TYPE: [&str; 4] = ["INTEGER", "INTEGER", "INTEGER", "TEXT"];
+
+fn sorter_collation_name(collation: CollationSeq) -> &'static str {
+    match collation {
+        CollationSeq::Unset | CollationSeq::Binary => "B",
+        CollationSeq::NoCase => "N",
+        CollationSeq::Rtrim => "R",
+    }
+}
 
 pub fn insn_to_row(
     program: &PreparedProgram,
@@ -1166,21 +1176,26 @@ pub fn insn_to_row(
             Insn::SorterOpen {
                 cursor_id,
                 columns,
-                order_and_collations,
+                key_info,
                 ..
             } => {
-                let to_print: Vec<String> = order_and_collations
+                let to_print: Vec<String> = key_info
                     .iter()
-                    .map(|(order, collation)| {
-                        let sign = match order {
+                    .map(|key_info| {
+                        let sign = match key_info.sort_order {
                             SortOrder::Asc => "",
                             SortOrder::Desc => "-",
                         };
-                        if let Some(coll) = collation {
-                            format!("{sign}{coll}")
+                        let nulls = if key_info.nulls_order == default_nulls_order(key_info.sort_order)
+                        {
+                            ""
                         } else {
-                            format!("{sign}B")
-                        }
+                            match key_info.nulls_order {
+                                ast::NullsOrder::First => "N.",
+                                ast::NullsOrder::Last => "L.",
+                            }
+                        };
+                        format!("{sign}{nulls}{}", sorter_collation_name(key_info.collation))
                     })
                     .collect();
                 (
@@ -1188,7 +1203,7 @@ pub fn insn_to_row(
                     *cursor_id as i64,
                     *columns as i64,
                     0,
-                    Value::build_text(format!("k({},{})", order_and_collations.len(), to_print.join(","))),
+                    Value::build_text(format!("k({},{})", key_info.len(), to_print.join(","))),
                     0,
                     format!("cursor={cursor_id}"),
                 )
