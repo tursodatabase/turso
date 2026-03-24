@@ -472,10 +472,10 @@ impl IncrementalView {
 
                 // Store the alias mapping if there is an alias
                 if let Some(alias_enum) = alias {
-                    let alias_name = match alias_enum {
-                        ast::As::As(name) | ast::As::Elided(name) => name.as_str(),
-                    };
-                    aliases.insert(alias_name.to_string(), table_name.to_string());
+                    aliases.insert(
+                        alias_enum.name().as_str().to_string(),
+                        table_name.to_string(),
+                    );
                 }
             } else {
                 return Err(LimboError::ParseError(format!(

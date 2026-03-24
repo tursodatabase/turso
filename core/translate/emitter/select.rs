@@ -910,6 +910,7 @@ fn build_materialized_build_input_plan(
                 table: build_internal_id,
             },
             alias: None,
+            implicit_column_name: None,
             contains_aggregates: false,
         }],
         MaterializedBuildInputMode::KeyPayload { num_keys, .. } => {
@@ -922,6 +923,7 @@ fn build_materialized_build_input_plan(
                 result_columns.push(ResultSetColumn {
                     expr: expr.clone(),
                     alias: None,
+                    implicit_column_name: None,
                     contains_aggregates: false,
                 });
             }
@@ -945,6 +947,7 @@ fn build_materialized_build_input_plan(
                 result_columns.push(ResultSetColumn {
                     expr,
                     alias: None,
+                    implicit_column_name: None,
                     contains_aggregates: false,
                 });
             }

@@ -604,10 +604,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 }
 
                 // Regular table scan
-                let table_alias = alias.as_ref().map(|a| match a {
-                    ast::As::As(name) => Self::name_to_string(name),
-                    ast::As::Elided(name) => Self::name_to_string(name),
-                });
+                let table_alias = alias.as_ref().map(|a| Self::name_to_string(a.name()));
                 let table_schema = self.get_table_schema(&table_name, table_alias.as_deref())?;
                 Ok(LogicalPlan::TableScan(TableScan {
                     table_name,
@@ -930,10 +927,9 @@ impl<'a> LogicalPlanBuilder<'a> {
             match col {
                 ast::ResultColumn::Expr(expr, alias) => {
                     let logical_expr = self.build_expr(expr, input_schema)?;
-                    let col_name = match alias {
-                        Some(as_alias) => match as_alias {
-                            ast::As::As(name) | ast::As::Elided(name) => Self::name_to_string(name),
-                        },
+                    let explicit_alias = alias.as_ref().filter(|a| a.is_explicit());
+                    let col_name = match explicit_alias {
+                        Some(as_alias) => Self::name_to_string(as_alias.name()),
                         None => Self::expr_to_column_name(expr),
                     };
                     let col_type = Self::infer_expr_type(&logical_expr, input_schema)?;
@@ -946,10 +942,8 @@ impl<'a> LogicalPlanBuilder<'a> {
                         table_alias: None,
                     });
 
-                    if let Some(as_alias) = alias {
-                        let alias_name = match as_alias {
-                            ast::As::As(name) | ast::As::Elided(name) => Self::name_to_string(name),
-                        };
+                    if let Some(as_alias) = explicit_alias {
+                        let alias_name = Self::name_to_string(as_alias.name());
                         proj_exprs.push(LogicalExpr::Alias {
                             expr: Box::new(logical_expr),
                             alias: alias_name,
@@ -1167,11 +1161,8 @@ impl<'a> LogicalPlanBuilder<'a> {
                 let logical_expr = self.build_expr(expr, input_schema)?;
                 select_exprs.push(logical_expr.clone());
 
-                if let Some(alias) = alias {
-                    let alias_name = match alias {
-                        ast::As::As(name) | ast::As::Elided(name) => Self::name_to_string(name),
-                    };
-                    alias_to_expr.insert(alias_name, logical_expr);
+                if let Some(alias) = alias.as_ref().filter(|a| a.is_explicit()) {
+                    alias_to_expr.insert(Self::name_to_string(alias.name()), logical_expr);
                 }
             }
         }
@@ -1257,10 +1248,8 @@ impl<'a> LogicalPlanBuilder<'a> {
                     let logical_expr = self.build_expr(expr, input_schema)?;
 
                     // Determine the column name for this expression
-                    let col_name = match alias {
-                        Some(as_alias) => match as_alias {
-                            ast::As::As(name) | ast::As::Elided(name) => Self::name_to_string(name),
-                        },
+                    let col_name = match alias.as_ref().filter(|a| a.is_explicit()) {
+                        Some(as_alias) => Self::name_to_string(as_alias.name()),
                         None => Self::expr_to_column_name(expr),
                     };
 
@@ -1392,12 +1381,12 @@ impl<'a> LogicalPlanBuilder<'a> {
         for (i, expr) in projection_exprs.iter().enumerate() {
             let col_name = if i < columns.len() {
                 match &columns[i] {
-                    ast::ResultColumn::Expr(e, alias) => match alias {
-                        Some(as_alias) => match as_alias {
-                            ast::As::As(name) | ast::As::Elided(name) => Self::name_to_string(name),
-                        },
-                        None => Self::expr_to_column_name(e),
-                    },
+                    ast::ResultColumn::Expr(e, alias) => {
+                        match alias.as_ref().filter(|a| a.is_explicit()) {
+                            Some(as_alias) => Self::name_to_string(as_alias.name()),
+                            None => Self::expr_to_column_name(e),
+                        }
+                    }
                     _ => format!("col_{i}"),
                 }
             } else {

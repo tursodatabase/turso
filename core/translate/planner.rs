@@ -772,11 +772,7 @@ fn parse_from_clause_table(
             }
             let cur_table_index = table_references.joined_tables().len();
             let identifier = maybe_alias
-                .map(|a| match a {
-                    ast::As::As(id) => id,
-                    ast::As::Elided(id) => id,
-                })
-                .map(|id| normalize_ident(id.as_str()))
+                .map(|a| normalize_ident(a.name().as_str()))
                 .unwrap_or_else(|| format!("subquery_{cur_table_index}"));
             table_references.add_joined_table(JoinedTable::new_subquery_from_plan(
                 identifier,
@@ -845,11 +841,7 @@ fn parse_table(
 
         // If there's an alias provided, update the identifier to use that alias
         if let Some(a) = maybe_alias {
-            let alias = match a {
-                ast::As::As(id) => id,
-                ast::As::Elided(id) => id,
-            };
-            cte_table.identifier = normalize_ident(alias.as_str());
+            cte_table.identifier = normalize_ident(a.name().as_str());
         }
 
         // Mark the pre-planned outer_query_ref as "CTE definition only" so it is
@@ -880,12 +872,7 @@ fn parse_table(
         if let Some(cte_id) = outer_ref.cte_id {
             program.increment_cte_reference(cte_id);
         }
-        let alias = maybe_alias
-            .map(|a| match a {
-                ast::As::As(id) => id,
-                ast::As::Elided(id) => id,
-            })
-            .map(|a| normalize_ident(a.as_str()));
+        let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
         // Clone fields we need before dropping the borrow on table_references.
         let cte_select = outer_ref.cte_select.clone();
         let cte_explicit_columns = outer_ref.cte_explicit_columns.clone();
@@ -967,12 +954,7 @@ fn parse_table(
     let table = resolver.with_schema(database_id, |schema| schema.get_table(table_name.as_str()));
 
     if let Some(table) = table {
-        let alias = maybe_alias
-            .map(|a| match a {
-                ast::As::As(id) => id,
-                ast::As::Elided(id) => id,
-            })
-            .map(|a| normalize_ident(a.as_str()));
+        let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
         let internal_id = program.table_reference_counter.next();
         let tbl_ref = if let Table::Virtual(tbl) = table.as_ref() {
             transform_args_into_where_terms(args, internal_id, vtab_predicates, table.as_ref())?;
@@ -1091,12 +1073,7 @@ fn parse_table(
         });
         drop(view_guard);
 
-        let alias = maybe_alias
-            .map(|a| match a {
-                ast::As::As(id) => id,
-                ast::As::Elided(id) => id,
-            })
-            .map(|a| normalize_ident(a.as_str()));
+        let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
 
         table_references.add_joined_table(JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {

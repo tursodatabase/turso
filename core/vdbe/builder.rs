@@ -774,6 +774,7 @@ impl ProgramBuilder {
         self.result_columns.push(ResultSetColumn {
             expr,
             alias: Some(col_name),
+            implicit_column_name: None,
             contains_aggregates: false,
         });
     }

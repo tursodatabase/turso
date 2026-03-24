@@ -1321,6 +1321,7 @@ impl ToTokens for As {
                 name.to_tokens(s, context)
             }
             Self::Elided(ref name) => name.to_tokens(s, context),
+            Self::ImplicitColumnName(_) => Ok(()),
         }
     }
 }

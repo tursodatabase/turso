@@ -1012,6 +1012,7 @@ fn add_ephemeral_table_to_update_plan(
                 table: rowid_internal_id,
             },
             alias: None,
+            implicit_column_name: None,
             contains_aggregates: false,
         }],
         where_clause: plan.where_clause.drain(..).collect(),
