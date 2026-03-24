@@ -67,23 +67,23 @@ do_test insert2-1.2.2 {
     SELECT * FROM t1 ORDER BY log;
   }
 } {0 1 3 4 4 8 5 4}
-#do_test insert2-1.3.1 {
-#  catch {execsql {DROP TABLE t1}}
-#  execsql {
-#    CREATE TABLE t1 (log int, cnt int);
-#    PRAGMA count_changes=off;
-#    INSERT INTO t1 
-#       SELECT log, count(*) FROM d1 GROUP BY log
-#       INTERSECT SELECT n-1,log FROM d1;
-#  }
-#} {}
+do_test insert2-1.3.1 {
+  catch {execsql {DROP TABLE t1}}
+  execsql {
+    CREATE TABLE t1 (log int, cnt int);
+    PRAGMA count_changes=off;
+    INSERT INTO t1 
+       SELECT log, count(*) FROM d1 GROUP BY log
+       INTERSECT SELECT n-1,log FROM d1;
+  }
+} {}
 do_test insert2-1.3.2 {
   execsql {
     SELECT * FROM t1 ORDER BY log;
   }
 } {1 1 2 2}
 } ;# ifcapable compound
-#execsql {PRAGMA count_changes=off;}
+execsql {PRAGMA count_changes=off;}
 
 do_test insert2-1.4 {
   catch {execsql {DROP TABLE t1}}

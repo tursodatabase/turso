@@ -47,8 +47,7 @@ tclsh select1.test
 - `*.test` — Individual test files organized by SQL feature (e.g., `select1.test`, `insert.test`, `join.test`, `func.test`, `alter.test`).
 
 ## Info on TCL Tests
-- select1: deprecated PRAGMA short_column_names and PRAGMA full_column_names
-- insert2: deprecated PRAGMA count_changes
+- Don't change tests even if deprecated
 - func4: tests totype extension
 - join8: tests series extension
 - selectG: 120 passes but very slow

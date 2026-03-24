@@ -609,10 +609,10 @@ do_test select1-6.9.16 {
 } {test1.f1 11 test2.t1 abc}
 
 
-#db eval {
-#  PRAGMA short_column_names=ON;
-#  PRAGMA full_column_names=OFF;
-#}
+db eval {
+  PRAGMA short_column_names=ON;
+  PRAGMA full_column_names=OFF;
+}
 
 ifcapable compound {
 do_test select1-6.10 {
