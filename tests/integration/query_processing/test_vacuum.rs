@@ -1548,7 +1548,6 @@ fn test_vacuum_into_preserves_reserved_space(tmp_db: TempDatabase) -> anyhow::Re
 }
 
 /// Test VACUUM INTO with partial indexes (CREATE INDEX ... WHERE)
-/// NOTE: There is a bug with partial indexes which fails integrity_check on the destination.
 /// Note: Partial indexes are not supported with MVCC
 #[turso_macros::test]
 fn test_vacuum_into_with_partial_indexes(tmp_db: TempDatabase) -> anyhow::Result<()> {
@@ -1575,6 +1574,8 @@ fn test_vacuum_into_with_partial_indexes(tmp_db: TempDatabase) -> anyhow::Result
     conn.execute("INSERT INTO orders VALUES (4, 'Charlie', 'shipped', 2000.0)")?;
     conn.execute("INSERT INTO orders VALUES (5, 'Bob', 'pending', 100.0)")?;
 
+    assert_eq!(run_integrity_check(&conn), "ok");
+
     let source_hash = compute_dbhash(&tmp_db);
 
     let dest_dir = TempDir::new()?;
@@ -1586,15 +1587,7 @@ fn test_vacuum_into_with_partial_indexes(tmp_db: TempDatabase) -> anyhow::Result
     let dest_db = TempDatabase::new_with_existent(&dest_path);
     let dest_conn = dest_db.connect_limbo();
 
-    // this fails due to existing bug in the integrity_check with partial indexes
-    // ---- query_processing::test_vacuum::test_vacuum_into_with_partial_indexes stdout ----
-    //
-    // thread 'query_processing::test_vacuum::test_vacuum_into_with_partial_indexes' panicked at tests/integration/query_processing/test_vacuum.rs:1220:5:
-    // assertion `left == right` failed
-    //   left: "wrong # of entries in index idx_large_orders\nwrong # of entries in index idx_pending_orders\nrow 1 missing from index idx_large_orders\nrow 2 missing from index idx_large_orders\nrow 2 missing from index idx_pending_orders\nrow 4 missing from index idx_pending_orders\nrow 5 missing from index idx_large_orders"
-    //  right: "ok"
-
-    // assert_eq!(run_integrity_check(&dest_conn), "ok");
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
 
     if !tmp_db.enable_mvcc {
         assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
@@ -1637,6 +1630,114 @@ fn test_vacuum_into_with_partial_indexes(tmp_db: TempDatabase) -> anyhow::Result
             (5, "Bob".to_string(), "pending".to_string(), 100.0)
         ]
     );
+    Ok(())
+}
+
+/// Test VACUUM INTO with mixed index types: normal, unique, partial, expression.
+/// Note: Partial indexes are not supported with MVCC.
+#[turso_macros::test]
+fn test_vacuum_into_with_mixed_index_types(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute(
+        "CREATE TABLE products (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            category TEXT NOT NULL,
+            price REAL NOT NULL,
+            stock INTEGER NOT NULL,
+            discontinued INTEGER NOT NULL DEFAULT 0
+        )",
+    )?;
+
+    conn.execute("CREATE UNIQUE INDEX idx_products_name ON products(name)")?;
+    conn.execute("CREATE INDEX idx_products_category_price ON products(category, price)")?;
+    conn.execute(
+        "CREATE INDEX idx_products_instock ON products(category) WHERE stock > 0 AND discontinued = 0",
+    )?;
+    conn.execute("CREATE INDEX idx_products_name_expr ON products(lower(name), abs(price))")?;
+
+    conn.execute("INSERT INTO products VALUES (1, 'Widget A', 'tools', 10.5, 5, 0)")?;
+    conn.execute("INSERT INTO products VALUES (2, 'Widget B', 'tools', 12.0, 0, 0)")?;
+    conn.execute("INSERT INTO products VALUES (3, 'Gadget C', 'electronics', 99.9, 10, 0)")?;
+    conn.execute("INSERT INTO products VALUES (4, 'Legacy D', 'electronics', 49.5, 3, 1)")?;
+    conn.execute("INSERT INTO products VALUES (5, 'Spare E', 'parts', 4.25, 25, 0)")?;
+
+    assert_eq!(run_integrity_check(&conn), "ok");
+    let source_hash = compute_dbhash(&tmp_db);
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed_mixed_indexes.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+
+    let index_defs: Vec<(String, String)> = dest_conn.exec_rows(
+        "SELECT name, sql FROM sqlite_schema
+         WHERE type = 'index'
+           AND name IN (
+               'idx_products_name',
+               'idx_products_category_price',
+               'idx_products_instock',
+               'idx_products_name_expr'
+           )
+         ORDER BY name",
+    );
+    assert_eq!(index_defs.len(), 4);
+
+    let partial_idx_sql = &index_defs
+        .iter()
+        .find(|(name, _)| name == "idx_products_instock")
+        .expect("partial index should exist")
+        .1;
+    let normalized_partial_sql = partial_idx_sql
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_lowercase();
+    let has_expected_partial_predicate = normalized_partial_sql
+        .contains("wherestock>0anddiscontinued=0")
+        || normalized_partial_sql.contains("wherediscontinued=0andstock>0")
+        || normalized_partial_sql.contains("where(stock>0)and(discontinued=0)")
+        || normalized_partial_sql.contains("where(discontinued=0)and(stock>0)");
+    assert!(
+        has_expected_partial_predicate,
+        "partial index WHERE predicate should be preserved"
+    );
+
+    let expr_idx_sql = &index_defs
+        .iter()
+        .find(|(name, _)| name == "idx_products_name_expr")
+        .expect("expression index should exist")
+        .1;
+    let normalized_expr_sql = expr_idx_sql
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_lowercase();
+    assert!(
+        normalized_expr_sql.contains("lower(name)") && normalized_expr_sql.contains("abs(price)"),
+        "expression index definition should be preserved"
+    );
+
+    let in_stock_products: Vec<(String,)> = dest_conn
+        .exec_rows("SELECT name FROM products WHERE stock > 0 AND discontinued = 0 ORDER BY name");
+    assert_eq!(
+        in_stock_products,
+        vec![
+            ("Gadget C".to_string(),),
+            ("Spare E".to_string(),),
+            ("Widget A".to_string(),)
+        ]
+    );
+
+    let expr_match: Vec<(i64,)> =
+        dest_conn.exec_rows("SELECT id FROM products WHERE lower(name) = 'widget a'");
+    assert_eq!(expr_match, vec![(1,)]);
+
     Ok(())
 }
 
