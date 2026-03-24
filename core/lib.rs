@@ -64,6 +64,7 @@ mod uuid;
 mod vdbe;
 mod vtab;
 
+pub mod csv_fdw;
 pub mod foreign;
 
 #[cfg(any(feature = "fuzz", feature = "bench"))]
