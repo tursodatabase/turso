@@ -2188,3 +2188,18 @@ test fail-drop-column-case-expr-ref {
 expect error {
     error in trigger tr after drop column: no such column:
 }
+
+# Rename table then rename column with trigger present
+# Regression test for https://github.com/tursodatabase/turso/issues/6085
+@cross-check-integrity
+test alter-table-rename-then-rename-column-with-trigger {
+    CREATE TABLE orders(id INT, customer TEXT);
+    CREATE TRIGGER tr AFTER INSERT ON orders BEGIN SELECT 1; END;
+    ALTER TABLE orders RENAME TO purchases;
+    ALTER TABLE purchases RENAME COLUMN customer TO buyer;
+    SELECT type, name, tbl_name FROM sqlite_schema ORDER BY type;
+}
+expect {
+    table|purchases|purchases
+    trigger|tr|purchases
+}
