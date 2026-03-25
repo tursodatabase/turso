@@ -77,6 +77,21 @@ setup rowid_branch_schema {
     INSERT INTO t VALUES (10, 100), (20, 200), (20, 300);
 }
 
+setup short_circuit_residual_schema {
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        a INT,
+        b INT,
+        c TEXT
+    );
+    CREATE INDEX idx_a ON t(a);
+    CREATE INDEX idx_b ON t(b);
+
+    INSERT INTO t VALUES (1, 1, 10, 'x');
+    INSERT INTO t VALUES (2, 2, 20, 'y');
+    INSERT INTO t VALUES (3, 3, 20, 'z');
+}
+
 setup compound_branch_seek_schema {
     CREATE TABLE link(src INT, dst INT);
     CREATE TABLE item(id INT, kind INT, name TEXT);
@@ -267,6 +282,19 @@ test compound-or-mixed-residual {
 expect {
     n2
     n4
+}
+
+@setup short_circuit_residual_schema
+test compound-or-short-circuit-residual-keeps-table-cursor-consistent {
+    SELECT id, a, b, c
+    FROM t
+    WHERE a = 1 OR (b = 20 AND (1 OR c = 'no'))
+    ORDER BY id;
+}
+expect {
+    1|1|10|x
+    2|2|20|y
+    3|3|20|z
 }
 
 # Snapshot EQP: verify multi-index OR is used

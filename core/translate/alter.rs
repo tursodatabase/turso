@@ -1252,10 +1252,12 @@ pub fn translate_alter_table(
                 )));
             };
 
-            if btree.get_column(col_name).is_some() {
-                return Err(LimboError::ParseError(format!(
-                    "duplicate column name: \"{col_name}\""
-                )));
+            if let Some((existing_index, _)) = btree.get_column(col_name) {
+                if existing_index != column_index {
+                    return Err(LimboError::ParseError(format!(
+                        "duplicate column name: \"{col_name}\""
+                    )));
+                }
             };
 
             if definition

@@ -1,6 +1,8 @@
 use garde::Validate;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroU32;
+
 use sql_generation::generation::Opts;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]
@@ -53,6 +55,19 @@ impl Default for QueryProfile {
 }
 
 impl QueryProfile {
+    pub fn expr_index_stress() -> Self {
+        let mut profile = Self::default();
+        profile.gen_opts.table.large_table.enable = false;
+        profile.gen_opts.table.rowid_alias_prob = 0.5;
+        profile.gen_opts.query.insert.min_rows = NonZeroU32::new(10).unwrap();
+        profile.gen_opts.query.insert.max_rows = NonZeroU32::new(60).unwrap();
+        profile.gen_opts.query.update.expr_index_update_prob = 0.95;
+        profile.gen_opts.query.create_index.expr_term_prob = 0.8;
+        profile.create_index_weight = 15;
+        profile.update_weight = 40;
+        profile
+    }
+
     /// Attention: edit this function when another weight is added
     pub fn total_weight(&self) -> u32 {
         self.select_weight
