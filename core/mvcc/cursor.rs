@@ -7,7 +7,11 @@ use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
     create_seek_range, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, SortableIndexKey,
 };
-use crate::mvcc::yield_points::{inject_io_yield, YieldKind, YieldPointMarker};
+use crate::mvcc::yield_points::inject_io_yield;
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+use crate::mvcc::yield_points::{ProvidesYieldContext, YieldContext};
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+use crate::mvcc::yield_points::{YieldKind, YieldPointMarker};
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::sync::Arc;
 use crate::translate::plan::IterationDirection;
@@ -21,10 +25,8 @@ use crate::{return_if_io, Completion, Connection, LimboError, Pager, Result};
 use std::any::Any;
 use std::fmt::Debug;
 use std::ops::Bound;
-use strum::EnumCount;
-
 #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-use crate::mvcc::yield_points::{ProvidesYieldContext, YieldContext};
+use strum::EnumCount;
 
 #[derive(Debug, Clone)]
 enum CursorPosition {
@@ -107,7 +109,7 @@ enum MvccLazyCursorState {
     Seek(SeekState, IterationDirection),
 }
 
-#[allow(dead_code)]
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
 pub(crate) enum CursorYieldPoint {
@@ -122,6 +124,7 @@ pub(crate) enum CursorYieldPoint {
     AdvanceBtreeBackwardProgress,
 }
 
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 impl YieldPointMarker for CursorYieldPoint {
     const KIND: YieldKind = YieldKind::Cursor;
     const POINT_COUNT: u8 = Self::COUNT as u8;
@@ -134,20 +137,22 @@ impl YieldPointMarker for CursorYieldPoint {
 #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 impl<Clock: LogicalClock + 'static> ProvidesYieldContext for MvccLazyCursor<Clock> {
     fn yield_context(&self) -> YieldContext {
-        YieldContext {
-            injector: self.connection.yield_injector(),
-            instance_id: self.yield_instance_id,
-            selection_key: cursor_yield_key(self.tx_id, self.table_id),
-        }
+        YieldContext::new(
+            self.connection.yield_injector(),
+            self.yield_instance_id,
+            cursor_yield_key(self.tx_id, self.table_id),
+        )
     }
 }
 
-const CURSOR_SELECTION_TAG: u64 = 0x4355_5253_4F52_4352; // ASCII-ish "CURSORCR"
-
-#[allow(dead_code)]
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 fn cursor_yield_key(tx_id: u64, table_id: MVTableId) -> u64 {
-    // Mix tx/table identity and add a per-family tag so cursor and commit plans
-    // stay in separate namespaces even if their logical keys overlap.
+    // ASCII-ish "CURSORCR"
+    // any large number will do
+    const CURSOR_SELECTION_TAG: u64 = 0x4355_5253_4F52_4352;
+    // Mix tx/table identity and add a per-family tag (here Cursor tag), so that we get a nice
+    // yield plans
+    // 17 here is arbitrary, any number would do.
     tx_id ^ (i64::from(table_id) as u64).rotate_left(17) ^ CURSOR_SELECTION_TAG
 }
 

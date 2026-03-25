@@ -1,8 +1,10 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
-use crate::mvcc::yield_points::{inject_transition_yield, YieldKind, YieldPointMarker};
+use crate::mvcc::yield_points::inject_transition_yield;
 #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 use crate::mvcc::yield_points::{ProvidesYieldContext, YieldContext};
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+use crate::mvcc::yield_points::{YieldKind, YieldPointMarker};
 use crate::schema::{Schema, Table};
 use crate::state_machine::StateMachine;
 use crate::state_machine::StateTransition;
@@ -45,6 +47,7 @@ use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Bound;
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 use strum::EnumCount;
 use tracing::instrument;
 use tracing::Level;
@@ -896,7 +899,7 @@ impl CommitCoordinator {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
 enum CommitYieldPoint {
@@ -905,6 +908,7 @@ enum CommitYieldPoint {
     LogRecordPrepared,
 }
 
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 impl YieldPointMarker for CommitYieldPoint {
     const KIND: YieldKind = YieldKind::Commit;
     const POINT_COUNT: u8 = Self::COUNT as u8;
@@ -914,20 +918,21 @@ impl YieldPointMarker for CommitYieldPoint {
     }
 }
 
-const COMMIT_SELECTION_TAG: u64 = 0xC011_C011_C011_C011;
-
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 fn commit_yield_key(tx_id: u64) -> u64 {
+    // any large number will do
+    const COMMIT_SELECTION_TAG: u64 = 0xC011_C011_C011_C011;
     tx_id ^ COMMIT_SELECTION_TAG
 }
 
 #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 impl<Clock: LogicalClock> ProvidesYieldContext for CommitStateMachine<Clock> {
     fn yield_context(&self) -> YieldContext {
-        YieldContext {
-            injector: self.connection.yield_injector(),
-            instance_id: self.yield_instance_id,
-            selection_key: commit_yield_key(self.tx_id),
-        }
+        YieldContext::new(
+            self.connection.yield_injector(),
+            self.yield_instance_id,
+            commit_yield_key(self.tx_id),
+        )
     }
 }
 

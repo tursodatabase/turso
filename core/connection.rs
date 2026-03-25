@@ -1,5 +1,6 @@
 use crate::error::io_error;
-use crate::mvcc::yield_points::{YieldInjector, YieldInjectorSlot};
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+use crate::mvcc::yield_points::YieldInjector;
 use crate::storage::journal_mode;
 use crate::sync::{
     atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, Ordering},
@@ -90,8 +91,10 @@ pub struct Connection {
     /// Main DB uses `mv_tx` above for zero-cost hot path access.
     pub(crate) attached_mv_txs:
         RwLock<HashMap<usize, (crate::mvcc::database::TxID, TransactionMode)>>,
-    pub(crate) yield_injector: YieldInjectorSlot,
-    pub(crate) yield_instance_id_counter: AtomicU64,
+    #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+    pub(super) yield_injector: RwLock<Option<Arc<dyn YieldInjector>>>,
+    #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+    pub(super) yield_instance_id_counter: AtomicU64,
 
     /// Per-connection view transaction states for uncommitted changes. This represents
     /// one entry per view that was touched in the transaction.
@@ -1398,6 +1401,7 @@ impl Connection {
         }
     }
 
+    #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
     pub fn set_yield_injector(&self, injector: Option<Arc<dyn YieldInjector>>) {
         let mut slot = self.yield_injector.write();
         match injector {
@@ -1418,11 +1422,12 @@ impl Connection {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
     pub(crate) fn yield_injector(&self) -> Option<Arc<dyn YieldInjector>> {
         self.yield_injector.read().clone()
     }
 
+    #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
     #[inline(always)]
     pub(crate) fn next_yield_instance_id(&self) -> u64 {
         self.yield_instance_id_counter
