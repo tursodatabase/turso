@@ -22,6 +22,7 @@ path = "fuzz/mod.rs"
 anyhow.workspace = true
 env_logger = { workspace = true }
 turso_core = { workspace = true, features = ["conn_raw_api"] }
+turso_sdk_kit = { path = "../sdk-kit" }
 turso = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 rusqlite.workspace = true

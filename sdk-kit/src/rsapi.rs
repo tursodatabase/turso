@@ -1,9 +1,11 @@
 use std::{
-    borrow::Cow,
     collections::HashMap,
     fmt::Display,
     ops::Deref,
-    sync::{Arc, Mutex, Once, RwLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, Once, RwLock, Weak,
+    },
     task::Waker,
     time::Duration,
 };
@@ -789,6 +791,12 @@ pub struct TursoConnection {
     concurrent_guard: Arc<ConcurrentGuard>,
     connection: Arc<Connection>,
     cached_statements: Arc<Mutex<HashMap<String, Arc<CachedStatement>>>>,
+    /// Weak refs to every statement handle created by this connection, keyed
+    /// by a monotonic ID. Statements remove themselves on drop, so this map
+    /// only ever contains live entries. `close()` upgrades each remaining
+    /// handle and sets it to `None` to release `Arc<Connection>` → `Arc<Database>`.
+    stmts: StmtRegistry,
+    next_stmt_id: Arc<AtomicUsize>,
 }
 
 impl TursoConnection {
@@ -798,6 +806,8 @@ impl TursoConnection {
             connection,
             concurrent_guard: Arc::new(ConcurrentGuard::new()),
             cached_statements: Arc::new(Mutex::new(HashMap::new())),
+            stmts: Arc::new(Mutex::new(HashMap::new())),
+            next_stmt_id: Arc::new(AtomicUsize::new(0)),
         })
     }
     /// Set busy timeout for the connection
@@ -814,10 +824,14 @@ impl TursoConnection {
     /// prepares single SQL statement
     pub fn prepare_single(&self, sql: impl AsRef<str>) -> Result<Box<TursoStatement>, TursoError> {
         let statement = self.connection.prepare(sql)?;
+        let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
+        let stmt_id = self.track_stmt(&handle);
         Ok(Box::new(TursoStatement {
             concurrent_guard: self.concurrent_guard.clone(),
             async_io: self.async_io,
-            statement,
+            handle,
+            stmt_id,
+            stmts: self.stmts.clone(),
         }))
     }
 
@@ -834,10 +848,14 @@ impl TursoConnection {
                 );
                 let statement =
                     Statement::new(program, self.connection.get_pager(), cached.query_mode, 0);
+                let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
+                let stmt_id = self.track_stmt(&handle);
                 return Ok(Box::new(TursoStatement {
                     concurrent_guard: self.concurrent_guard.clone(),
                     async_io: self.async_io,
-                    statement,
+                    handle,
+                    stmt_id,
+                    stmts: self.stmts.clone(),
                 }));
             }
         }
@@ -855,10 +873,14 @@ impl TursoConnection {
             .unwrap()
             .insert(sql_str.to_string(), cached);
 
+        let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
+        let stmt_id = self.track_stmt(&handle);
         Ok(Box::new(TursoStatement {
             concurrent_guard: self.concurrent_guard.clone(),
             async_io: self.async_io,
-            statement,
+            handle,
+            stmt_id,
+            stmts: self.stmts.clone(),
         }))
     }
 
@@ -869,14 +891,20 @@ impl TursoConnection {
         sql: impl AsRef<str>,
     ) -> Result<Option<(Box<TursoStatement>, usize)>, TursoError> {
         match self.connection.consume_stmt(sql)? {
-            Some((statement, position)) => Ok(Some((
-                Box::new(TursoStatement {
-                    async_io: self.async_io,
-                    concurrent_guard: Arc::new(ConcurrentGuard::new()),
-                    statement,
-                }),
-                position,
-            ))),
+            Some((statement, position)) => {
+                let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
+                let stmt_id = self.track_stmt(&handle);
+                Ok(Some((
+                    Box::new(TursoStatement {
+                        async_io: self.async_io,
+                        concurrent_guard: Arc::new(ConcurrentGuard::new()),
+                        handle,
+                        stmt_id,
+                        stmts: self.stmts.clone(),
+                    }),
+                    position,
+                )))
+            }
             None => Ok(None),
         }
     }
@@ -884,6 +912,18 @@ impl TursoConnection {
     /// close the connection preventing any further operations executed over it
     /// SAFETY: caller must guarantee that no ongoing operations are running over connection before calling close(...) method
     pub fn close(&self) -> Result<(), TursoError> {
+        // Finalize all outstanding statements to release their Arc chain:
+        // Statement → Program → Arc<Connection> → Arc<Database>.
+        // Without this, un-finalized statements keep the Database alive in
+        // DATABASE_MANAGER, causing stale databases after file renames.
+        let mut stmts = self.stmts.lock().unwrap();
+        for (_id, weak) in stmts.drain() {
+            if let Some(handle) = weak.upgrade() {
+                // Setting to None drops the turso_core::Statement,
+                // releasing Arc<Connection> → Arc<Database>.
+                *handle.lock().unwrap() = None;
+            }
+        }
         self.connection.close()?;
         Ok(())
     }
@@ -927,12 +967,70 @@ impl TursoConnection {
     pub unsafe fn arc_from_capi(value: *const capi::c::turso_connection_t) -> Arc<Self> {
         Arc::from_raw(value as *const Self)
     }
+
+    /// Register a statement handle and return its ID. The statement removes
+    /// itself from the registry on drop via its `stmt_id` + `stmts` ref.
+    fn track_stmt(&self, handle: &StatementHandle) -> usize {
+        let id = self.next_stmt_id.fetch_add(1, Ordering::Relaxed);
+        self.stmts
+            .lock()
+            .unwrap()
+            .insert(id, Arc::downgrade(handle));
+        id
+    }
+}
+
+/// Shared ownership of a `turso_core::Statement` that can be explicitly finalized.
+/// When the inner `Option` is set to `None`, the statement is considered finalized
+/// and all operations on it will return errors / defaults.
+pub(crate) type StatementHandle = Arc<Mutex<Option<Statement>>>;
+type StmtRegistry = Arc<Mutex<HashMap<usize, Weak<Mutex<Option<Statement>>>>>>;
+
+const FINALIZED_ERR: &str = "statement has been finalized";
+
+/// Advance one step of a statement's execution.
+/// Factored out of `TursoStatement` so it can be called while holding
+/// the `StatementHandle` lock without re-entrancy issues.
+fn step_inner(
+    stmt: &mut Statement,
+    async_io: bool,
+    waker: Option<&Waker>,
+) -> Result<TursoStatusCode, TursoError> {
+    loop {
+        let result = if let Some(waker) = waker {
+            stmt.step_with_waker(waker)
+        } else {
+            stmt.step()
+        };
+        return match result? {
+            StepResult::Done => Ok(TursoStatusCode::Done),
+            StepResult::Row => Ok(TursoStatusCode::Row),
+            StepResult::Busy => Err(TursoError::Busy("database is locked".to_string())),
+            StepResult::Interrupt => Err(TursoError::Interrupt("interrupted".to_string())),
+            StepResult::IO => {
+                if async_io {
+                    Ok(TursoStatusCode::Io)
+                } else {
+                    stmt._io().step()?;
+                    continue;
+                }
+            }
+        };
+    }
 }
 
 pub struct TursoStatement {
     async_io: bool,
     concurrent_guard: Arc<ConcurrentGuard>,
-    statement: Statement,
+    pub(crate) handle: StatementHandle,
+    stmt_id: usize,
+    stmts: StmtRegistry,
+}
+
+impl Drop for TursoStatement {
+    fn drop(&mut self) {
+        self.stmts.lock().unwrap().remove(&self.stmt_id);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -944,11 +1042,19 @@ pub struct TursoExecutionResult {
 impl TursoStatement {
     /// return amount of row modifications (insert/delete operations) made by the most recent executed statement
     pub fn n_change(&self) -> i64 {
-        self.statement.n_change()
+        let handle = self.handle.lock().unwrap();
+        match handle.as_ref() {
+            Some(stmt) => stmt.n_change(),
+            None => 0,
+        }
     }
     /// returns parameters count for the statement
     pub fn parameters_count(&self) -> usize {
-        self.statement.parameters_count()
+        let handle = self.handle.lock().unwrap();
+        match handle.as_ref() {
+            Some(stmt) => stmt.parameters_count(),
+            None => 0,
+        }
     }
     /// binds positional parameter at the corresponding index (1-based)
     pub fn bind_positional(
@@ -956,25 +1062,33 @@ impl TursoStatement {
         index: usize,
         value: turso_core::Value,
     ) -> Result<(), TursoError> {
+        let mut handle = self.handle.lock().unwrap();
+        let stmt = handle
+            .as_mut()
+            .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
         let Ok(index) = index.try_into() else {
             return Err(TursoError::Misuse(
                 "bind index must be non-zero".to_string(),
             ));
         };
-        if !self.statement.parameters().has_slot(index) {
+        if !stmt.parameters().has_slot(index) {
             return Err(TursoError::Misuse(format!(
                 "bind index {index} is out of bounds"
             )));
         }
-        self.statement.bind_at(index, value);
+        stmt.bind_at(index, value);
         Ok(())
     }
     /// named parameter position.
     ///
     /// The name must include the SQL placeholder prefix, e.g. `:name`, `@name`, `$name`, or `?1`.
     pub fn named_position(&mut self, name: impl AsRef<str>) -> Result<usize, TursoError> {
+        let handle = self.handle.lock().unwrap();
+        let stmt = handle
+            .as_ref()
+            .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
         let name = name.as_ref();
-        if let Some(index) = self.statement.parameter_index(name) {
+        if let Some(index) = stmt.parameter_index(name) {
             return Ok(index.into());
         }
 
@@ -984,7 +1098,7 @@ impl TursoStatement {
                 .and_then(|value| value.parse::<usize>().ok())
                 .and_then(|value| value.try_into().ok());
             if let Some(index) = maybe_index {
-                if self.statement.parameters().is_indexed(index) {
+                if stmt.parameters().is_indexed(index) {
                     return Ok(index.into());
                 }
             }
@@ -1002,43 +1116,26 @@ impl TursoStatement {
     pub fn step(&mut self, waker: Option<&Waker>) -> Result<TursoStatusCode, TursoError> {
         let guard = self.concurrent_guard.clone();
         let _guard = guard.try_use()?;
-        self.step_no_guard(waker)
+        let mut handle = self.handle.lock().unwrap();
+        let stmt = handle
+            .as_mut()
+            .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
+        step_inner(stmt, self.async_io, waker)
     }
 
-    #[inline]
-    fn step_no_guard(&mut self, waker: Option<&Waker>) -> Result<TursoStatusCode, TursoError> {
-        let async_io = self.async_io;
-        loop {
-            let result = if let Some(waker) = waker {
-                self.statement.step_with_waker(waker)
-            } else {
-                self.statement.step()
-            };
-            return match result? {
-                StepResult::Done => Ok(TursoStatusCode::Done),
-                StepResult::Row => Ok(TursoStatusCode::Row),
-                StepResult::Busy => Err(TursoError::Busy("database is locked".to_string())),
-                StepResult::Interrupt => Err(TursoError::Interrupt("interrupted".to_string())),
-                StepResult::IO => {
-                    if async_io {
-                        Ok(TursoStatusCode::Io)
-                    } else {
-                        self.run_io()?;
-                        continue;
-                    }
-                }
-            };
-        }
-    }
     /// execute statement to completion
     /// method returns [TursoStatusCode::Done] if execution completed
     /// method returns [TursoStatusCode::Io] if async_io was set and execution needs IO in order to make progress
     pub fn execute(&mut self, waker: Option<&Waker>) -> Result<TursoExecutionResult, TursoError> {
         let guard = self.concurrent_guard.clone();
         let _guard = guard.try_use()?;
+        let mut handle = self.handle.lock().unwrap();
+        let stmt = handle
+            .as_mut()
+            .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
 
         loop {
-            let status = self.step_no_guard(waker)?;
+            let status = step_inner(stmt, self.async_io, waker)?;
             if status == TursoStatusCode::Row {
                 continue;
             } else if status == TursoStatusCode::Io {
@@ -1049,7 +1146,7 @@ impl TursoStatement {
             } else if status == TursoStatusCode::Done {
                 return Ok(TursoExecutionResult {
                     status: TursoStatusCode::Done,
-                    rows_changed: self.statement.n_change() as u64,
+                    rows_changed: stmt.n_change() as u64,
                 });
             }
             return Err(TursoError::Error(format!(
@@ -1059,14 +1156,21 @@ impl TursoStatement {
     }
     /// run iteration of the IO backend
     pub fn run_io(&self) -> Result<(), TursoError> {
-        self.statement._io().step()?;
+        let handle = self.handle.lock().unwrap();
+        let stmt = handle
+            .as_ref()
+            .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
+        stmt._io().step()?;
         Ok(())
     }
-    /// get row value reference currently pointed by the statement
-    /// note, that this row will no longer be valid after execution of methods like [Self::step]/[Self::execute]/[Self::finalize]/[Self::reset]
+    /// get row value as an owned Value
     #[inline]
-    pub fn row_value(&self, index: usize) -> Result<turso_core::ValueRef, TursoError> {
-        let Some(row) = self.statement.row() else {
+    pub fn row_value(&self, index: usize) -> Result<turso_core::Value, TursoError> {
+        let handle = self.handle.lock().unwrap();
+        let stmt = handle
+            .as_ref()
+            .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
+        let Some(row) = stmt.row() else {
             return Err(TursoError::Misuse("statement holds no row".to_string()));
         };
         if index >= row.len() {
@@ -1074,45 +1178,62 @@ impl TursoStatement {
                 "attempt to access row value out of bounds".to_string(),
             ));
         }
-        let value = row.get_value(index);
-        Ok(value.as_value_ref())
+        Ok(row.get_value(index).as_value_ref().to_owned())
     }
     /// returns column count
     pub fn column_count(&self) -> usize {
-        self.statement.num_columns()
+        let handle = self.handle.lock().unwrap();
+        match handle.as_ref() {
+            Some(stmt) => stmt.num_columns(),
+            None => 0,
+        }
     }
     /// returns column name
-    pub fn column_name(&self, index: usize) -> Result<Cow<'_, str>, TursoError> {
-        if index >= self.column_count() {
+    pub fn column_name(&self, index: usize) -> Result<String, TursoError> {
+        let handle = self.handle.lock().unwrap();
+        let stmt = handle
+            .as_ref()
+            .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
+        if index >= stmt.num_columns() {
             return Err(TursoError::Misuse("column index out of bounds".to_string()));
         }
-        Ok(self.statement.get_column_name(index))
+        Ok(stmt.get_column_name(index).into_owned())
     }
     /// returns column declared type (e.g. "INTEGER", "TEXT", "DATETIME", etc.)
     pub fn column_decltype(&self, index: usize) -> Option<String> {
-        if index >= self.column_count() {
+        let handle = self.handle.lock().unwrap();
+        let stmt = handle.as_ref()?;
+        if index >= stmt.num_columns() {
             return None;
         }
-        self.statement.get_column_decltype(index)
+        stmt.get_column_decltype(index)
     }
     /// finalize statement execution
     /// this method must be called in the end of statement execution (either successfull or not)
     pub fn finalize(&mut self, waker: Option<&Waker>) -> Result<TursoStatusCode, TursoError> {
         let guard = self.concurrent_guard.clone();
         let _guard = guard.try_use()?;
-
-        while self.statement.execution_state().is_running() {
-            let status = self.step_no_guard(waker)?;
-            if status == TursoStatusCode::Io {
-                return Ok(status);
+        let mut handle = self.handle.lock().unwrap();
+        if let Some(stmt) = handle.as_mut() {
+            while stmt.execution_state().is_running() {
+                let status = step_inner(stmt, self.async_io, waker)?;
+                if status == TursoStatusCode::Io {
+                    return Ok(status);
+                }
             }
         }
+        // Drop the inner statement to release the Arc chain
+        *handle = None;
         Ok(TursoStatusCode::Done)
     }
     /// reset internal statement state and bindings
     pub fn reset(&mut self) -> Result<(), TursoError> {
-        self.statement.reset()?;
-        self.statement.clear_bindings();
+        let mut handle = self.handle.lock().unwrap();
+        let stmt = handle
+            .as_mut()
+            .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
+        stmt.reset()?;
+        stmt.clear_bindings();
         Ok(())
     }
 
@@ -1149,7 +1270,9 @@ impl TursoStatement {
 
 #[cfg(test)]
 mod tests {
-    use crate::rsapi::{TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatusCode};
+    use crate::rsapi::{
+        TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatusCode, FINALIZED_ERR,
+    };
     use turso_core::Value;
 
     #[test]
@@ -1620,7 +1743,6 @@ mod tests {
     #[cfg(feature = "encryption")]
     mod encryption_tests {
         use super::*;
-        use crate::rsapi::ValueRef;
         use tempfile::NamedTempFile;
 
         const TEST_CIPHER: &str = "aes256gcm";
@@ -1636,9 +1758,11 @@ mod tests {
             }
         }
 
-        fn assert_integer(value: ValueRef, expected: i64) {
+        fn assert_integer(value: turso_core::Value, expected: i64) {
             match value {
-                ValueRef::Numeric(turso_core::Numeric::Integer(i)) => assert_eq!(i, expected),
+                turso_core::Value::Numeric(turso_core::Numeric::Integer(i)) => {
+                    assert_eq!(i, expected)
+                }
                 _ => panic!("Expected integer {expected}, got {value:?}"),
             }
         }
@@ -1747,5 +1871,73 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Regression test: connection.close() must finalize all outstanding statements
+    /// to break the Statement → Arc<Connection> → Arc<Database> chain that keeps the
+    /// database alive in DATABASE_MANAGER after a file rename.
+    #[test]
+    pub fn test_close_finalizes_outstanding_statements() {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
+
+        let conn = db.connect().unwrap();
+
+        // Create a statement but do NOT finalize or drop it
+        let mut stmt = conn.prepare_single("SELECT 1").unwrap();
+        assert_eq!(stmt.step(None).unwrap(), TursoStatusCode::Row);
+
+        // close() should finalize the outstanding statement
+        conn.close().unwrap();
+
+        // The statement should now be finalized — using it returns an error
+        let result = stmt.step(None);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            TursoError::Misuse(msg) => assert_eq!(msg, FINALIZED_ERR),
+            other => panic!("expected Misuse error, got: {other:?}"),
+        }
+    }
+
+    /// Test that finalize() sets the statement handle to None, making subsequent
+    /// operations return "statement has been finalized".
+    #[test]
+    pub fn test_finalize_disposes_statement() {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
+
+        let conn = db.connect().unwrap();
+        let mut stmt = conn.prepare_single("SELECT 1").unwrap();
+
+        // Finalize the statement
+        assert_eq!(stmt.finalize(None).unwrap(), TursoStatusCode::Done);
+
+        // All operations should now return "statement has been finalized"
+        assert!(stmt.step(None).is_err());
+        assert!(stmt.execute(None).is_err());
+        assert!(stmt.reset().is_err());
+        assert!(stmt.run_io().is_err());
+        assert!(stmt.bind_positional(1, Value::Null).is_err());
+        assert_eq!(stmt.n_change(), 0);
+        assert_eq!(stmt.column_count(), 0);
+        assert_eq!(stmt.parameters_count(), 0);
     }
 }

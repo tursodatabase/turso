@@ -1117,6 +1117,7 @@ dependencies = [
  "turso_core",
  "turso_macros",
  "turso_parser",
+ "turso_sdk_kit",
  "twox-hash",
  "zerocopy 0.8.26",
 ]
