@@ -108,7 +108,7 @@ use super::{
     CommitState,
 };
 use crate::sync::{Mutex, RwLock};
-use turso_parser::ast::{self, ForeignKeyClause, Name, ResolveType};
+use turso_parser::ast::{self, ForeignKeyClause, Name, QualifiedName, ResolveType};
 use turso_parser::parser::Parser;
 
 use super::sorter::Sorter;
@@ -11489,6 +11489,34 @@ pub fn op_cast(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Regenerate trigger SQL from its in-memory fields to keep trigger.sql
+/// in sync after table/column renames.
+fn regenerate_trigger_sql(trigger: &crate::schema::Trigger) -> String {
+    use crate::translate::trigger::create_trigger_to_sql;
+
+    let trigger_name = QualifiedName {
+        db_name: None,
+        name: Name::from_string(&trigger.name),
+        alias: None,
+    };
+    let tbl_name = QualifiedName {
+        db_name: None,
+        name: Name::from_string(&trigger.table_name),
+        alias: None,
+    };
+    create_trigger_to_sql(
+        trigger.temporary,
+        false, // IF NOT EXISTS is stripped from stored schema SQL
+        &trigger_name,
+        Some(trigger.time),
+        &trigger.event,
+        &tbl_name,
+        trigger.for_each_row,
+        trigger.when_clause.as_ref(),
+        &trigger.commands,
+    )
+}
+
 pub fn op_rename_table(
     program: &Program,
     state: &mut ProgramState,
@@ -11581,6 +11609,8 @@ pub fn op_rename_table(
                 if let Some(ref mut when) = trigger.when_clause {
                     rewrite_check_expr_table_refs(when, &normalized_from, &normalized_to);
                 }
+                // Regenerate trigger.sql to reflect the updated table name and body
+                trigger.sql = regenerate_trigger_sql(trigger);
             }
             schema.triggers.insert(normalized_to.to_owned(), triggers);
         }
@@ -11590,11 +11620,16 @@ pub fn op_rename_table(
         for (_, triggers) in schema.triggers.iter_mut() {
             for trigger_arc in triggers.iter_mut() {
                 let trigger = Arc::make_mut(trigger_arc);
+                let old_sql = trigger.sql.clone();
                 for cmd in &mut trigger.commands {
                     rewrite_trigger_cmd_table_refs(cmd, &normalized_from, &normalized_to);
                 }
                 if let Some(ref mut when) = trigger.when_clause {
                     rewrite_check_expr_table_refs(when, &normalized_from, &normalized_to);
+                }
+                let new_sql = regenerate_trigger_sql(trigger);
+                if new_sql != old_sql {
+                    trigger.sql = new_sql;
                 }
             }
         }
