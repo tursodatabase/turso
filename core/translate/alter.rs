@@ -1412,20 +1412,20 @@ pub fn translate_alter_table(
                 ));
             }
 
-            let replacement_column = if !rename {
-                Some(Column::try_from(&definition)?)
-            } else {
-                None
+            let (rewrites_physical_layout, replacement_column) = match rename {
+                true => (false, None),
+                false => {
+                    let replacement_column = Column::try_from(&definition)?;
+                    let rewrites_physical_layout = !btree.columns[column_index].is_generated()
+                        && replacement_column.is_generated();
+                    (rewrites_physical_layout, Some(replacement_column))
+                }
             };
+
             let is_making_column_generated = definition
                 .constraints
                 .iter()
                 .any(|c| matches!(c.constraint, ast::ColumnConstraint::Generated { .. }));
-            let rewrites_physical_layout = !rename
-                && !btree.columns[column_index].is_generated()
-                && replacement_column
-                    .as_ref()
-                    .is_some_and(|column| column.is_generated());
 
             if is_making_column_generated {
                 let is_stored = definition.constraints.iter().any(|c| {
@@ -1681,19 +1681,17 @@ pub fn translate_alter_table(
                 )?;
             }
 
-            if let Some(ref rewritten_table) = rewritten_table {
+            if let Some(rewritten_table) = rewritten_table {
                 emit_add_virtual_column_validation(
                     program,
-                    rewritten_table,
+                    &rewritten_table,
                     &rewritten_table.columns[column_index],
                     &definition.constraints,
                     resolver,
                     connection,
                     database_id,
                 )?;
-            }
 
-            if let Some(rewritten_table) = rewritten_table {
                 let source_column_by_schema_idx = rewritten_table
                     .columns
                     .iter()
