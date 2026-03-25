@@ -411,25 +411,16 @@ pub fn emit_upsert(
     let layout = ctx.table.column_layout();
 
     let current_start = program.alloc_registers(num_cols);
-    for (i, col) in ctx.table.columns.iter().enumerate() {
+    for i in 0..num_cols {
+        let col = &table.columns()[i];
         let reg = layout.to_register(current_start, i);
         if col.is_virtual_generated() {
             program.emit_insn(Insn::Null {
                 dest: reg,
                 dest_end: None,
             });
-        } else if col.is_rowid_alias() {
-            program.emit_insn(Insn::RowId {
-                cursor_id: ctx.cursor_id,
-                dest: reg,
-            });
         } else {
-            program.emit_insn(Insn::Column {
-                cursor_id: ctx.cursor_id,
-                column: layout.to_reg_offset(i),
-                dest: reg,
-                default: None,
-            });
+            program.emit_column_or_rowid(ctx.cursor_id, i, reg);
         }
     }
 
