@@ -22,13 +22,13 @@ struct InstancePlanKey {
 
 // Simulator-owned policy: picks 0..=4 ordinals deterministically and consumes them once.
 #[derive(Debug, Default)]
-pub struct SimulatorYieldInjector {
+pub(crate) struct SimulatorYieldInjector {
     seed: u64,
     plans: Mutex<HashMap<InstancePlanKey, InstanceYieldPlan>>,
 }
 
 impl SimulatorYieldInjector {
-    pub fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self {
             seed,
             plans: Mutex::new(HashMap::new()),

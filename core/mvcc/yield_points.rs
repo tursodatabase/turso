@@ -1,14 +1,20 @@
-use crate::state_machine::TransitionResult;
-use crate::sync::Arc;
-use crate::sync::RwLock;
-use crate::types::IOCompletions;
-use crate::types::IOResult;
-use crate::Completion;
 use std::fmt::Debug;
 
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+use crate::state_machine::TransitionResult;
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+use crate::sync::Arc;
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+use crate::types::IOCompletions;
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+use crate::types::IOResult;
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+use crate::Completion;
+
 /// The state machines on which we can safely inject yield points
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum YieldKind {
+pub(crate) enum YieldKind {
     Commit,
     Cursor,
 }
@@ -16,11 +22,13 @@ pub enum YieldKind {
 /// YieldPoint is a descriptor for one safe yield boundary in a state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct YieldPoint {
-    pub kind: YieldKind,
+    #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+    kind: YieldKind,
     pub ordinal: u8,
     pub point_count: u8,
 }
 
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 pub(crate) trait YieldPointMarker: Copy + Debug {
     const KIND: YieldKind;
     const POINT_COUNT: u8;
@@ -28,10 +36,18 @@ pub(crate) trait YieldPointMarker: Copy + Debug {
     fn ordinal(self) -> u8;
 
     fn point(self) -> YieldPoint {
-        YieldPoint {
-            kind: Self::KIND,
-            ordinal: self.ordinal(),
-            point_count: Self::POINT_COUNT,
+        YieldPoint::new(Self::KIND, self.ordinal(), Self::POINT_COUNT)
+    }
+}
+
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+impl YieldPoint {
+    pub(crate) fn new(kind: YieldKind, ordinal: u8, point_count: u8) -> Self {
+        Self {
+            #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+            kind,
+            ordinal,
+            point_count,
         }
     }
 }
@@ -45,13 +61,26 @@ pub trait YieldInjector: Debug + Send + Sync {
     fn should_yield(&self, instance_id: u64, selection_key: u64, point: YieldPoint) -> bool;
 }
 
-pub(crate) type YieldInjectorSlot = RwLock<Option<Arc<dyn YieldInjector>>>;
-
 #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 pub(crate) struct YieldContext {
-    pub injector: Option<Arc<dyn YieldInjector>>,
-    pub instance_id: u64,
-    pub selection_key: u64,
+    pub(crate) injector: Option<Arc<dyn YieldInjector>>,
+    pub(crate) instance_id: u64,
+    pub(crate) selection_key: u64,
+}
+
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+impl YieldContext {
+    pub(crate) fn new(
+        injector: Option<Arc<dyn YieldInjector>>,
+        instance_id: u64,
+        selection_key: u64,
+    ) -> Self {
+        Self {
+            injector,
+            instance_id,
+            selection_key,
+        }
+    }
 }
 
 #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
@@ -59,6 +88,7 @@ pub(crate) trait ProvidesYieldContext {
     fn yield_context(&self) -> YieldContext;
 }
 
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 pub(crate) fn maybe_inject_transition_yield<T, P: YieldPointMarker>(
     injector: Option<&Arc<dyn YieldInjector>>,
     instance_id: u64,
@@ -76,6 +106,7 @@ pub(crate) fn maybe_inject_transition_yield<T, P: YieldPointMarker>(
     None
 }
 
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 pub(crate) fn maybe_inject_io_yield<T, P: YieldPointMarker>(
     injector: Option<&Arc<dyn YieldInjector>>,
     instance_id: u64,
@@ -91,6 +122,8 @@ pub(crate) fn maybe_inject_io_yield<T, P: YieldPointMarker>(
     None
 }
 
+// At a safe resumable boundary, ask the active yield injector whether this
+// state machine should return a synthetic TransitionResult::Io yield here.
 macro_rules! inject_transition_yield {
     ($state_machine:expr, $point:expr) => {{
         #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
@@ -111,6 +144,8 @@ macro_rules! inject_transition_yield {
 
 pub(crate) use inject_transition_yield;
 
+// At a safe resumable boundary, ask the active yield injector whether this
+// state machine should return a synthetic IOResult::IO yield here.
 macro_rules! inject_io_yield {
     ($state_machine:expr, $point:expr) => {{
         #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
