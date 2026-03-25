@@ -1,7 +1,7 @@
 use rand::{Rng, SeedableRng, rngs::StdRng, seq::SliceRandom};
 use std::collections::HashMap;
 use std::sync::Mutex;
-use turso_core::mvcc::yield_points::{YieldInjector, YieldKind, YieldSite};
+use turso_core::mvcc::yield_points::{YieldInjector, YieldKind, YieldPoint};
 
 const MAX_YIELDS: usize = 4;
 
@@ -36,25 +36,25 @@ impl SimulatorYieldInjector {
         }
     }
 
-    fn plan_for(&self, key: u64, site: YieldSite) -> InstanceYieldPlan {
-        simulator_yield_plan(self.seed, mix_site_key(key, site.kind), site.point_count)
+    fn plan_for(&self, key: u64, point: YieldPoint) -> InstanceYieldPlan {
+        simulator_yield_plan(self.seed, mix_site_key(key, point.kind), point.point_count)
     }
 }
 
 impl YieldInjector for SimulatorYieldInjector {
-    fn should_yield(&self, instance_id: u64, selection_key: u64, site: YieldSite) -> bool {
+    fn should_yield(&self, instance_id: u64, selection_key: u64, point: YieldPoint) -> bool {
         let plan_key = InstancePlanKey {
             instance_id,
             selection_key,
-            kind: site.kind,
-            point_count: site.point_count,
+            kind: point.kind,
+            point_count: point.point_count,
         };
         let mut plans = self.plans.lock().unwrap();
         let plan = plans
             .entry(plan_key)
-            .or_insert_with(|| self.plan_for(selection_key, site));
+            .or_insert_with(|| self.plan_for(selection_key, point));
         for slot in plan.iter_mut() {
-            if *slot == Some(site.ordinal) {
+            if *slot == Some(point.ordinal) {
                 *slot = None;
                 return true;
             }

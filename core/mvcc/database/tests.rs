@@ -5,7 +5,7 @@ use crate::io::PlatformIO;
 use crate::mvcc::clock::MvccClock;
 use crate::mvcc::cursor::{CursorYieldPoint, MvccCursorType};
 use crate::mvcc::persistent_storage::logical_log::LOG_HDR_SIZE;
-use crate::mvcc::yield_points::{YieldInjector, YieldSite, YieldSiteMarker};
+use crate::mvcc::yield_points::{YieldInjector, YieldPoint, YieldPointMarker};
 use crate::state_machine::{StateTransition, TransitionResult};
 use crate::storage::sqlite3_ondisk::{
     checksum_wal, read_varint, write_varint, DatabaseHeader, WalHeader, WAL_FRAME_HEADER_SIZE,
@@ -34,11 +34,11 @@ pub(crate) struct MvccTestDb {
 
 #[derive(Debug)]
 struct FixedYieldInjector {
-    remaining: Mutex<HashSet<YieldSite>>,
+    remaining: Mutex<HashSet<YieldPoint>>,
 }
 
 impl FixedYieldInjector {
-    fn new(points: impl IntoIterator<Item = YieldSite>) -> Arc<Self> {
+    fn new(points: impl IntoIterator<Item = YieldPoint>) -> Arc<Self> {
         Arc::new(Self {
             remaining: Mutex::new(points.into_iter().collect()),
         })
@@ -46,8 +46,8 @@ impl FixedYieldInjector {
 }
 
 impl YieldInjector for FixedYieldInjector {
-    fn should_yield(&self, _instance_id: u64, _selection_key: u64, site: YieldSite) -> bool {
-        self.remaining.lock().remove(&site)
+    fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+        self.remaining.lock().remove(&point)
     }
 }
 
@@ -2626,7 +2626,7 @@ fn test_mvcc_cursor_next_yields_with_injected_yield() {
         .begin_tx(db.conn.pager.load().clone())
         .unwrap();
     db.conn.set_yield_injector(Some(FixedYieldInjector::new([
-        CursorYieldPoint::NextStart.site()
+        CursorYieldPoint::NextStart.point()
     ])));
 
     let mut cursor = MvccLazyCursor::new(
@@ -6848,7 +6848,7 @@ fn test_abandoned_commit_rolls_back_insert_with_injected_yield() {
     conn.execute("BEGIN CONCURRENT").unwrap();
     conn.execute("INSERT INTO t VALUES (1, 'new')").unwrap();
     conn.set_yield_injector(Some(FixedYieldInjector::new([
-        CommitYieldPoint::LogRecordPrepared.site(),
+        CommitYieldPoint::LogRecordPrepared.point(),
     ])));
 
     let mut stmt = conn.prepare("COMMIT").unwrap();
