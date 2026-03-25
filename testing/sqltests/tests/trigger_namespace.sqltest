@@ -1,0 +1,86 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE t(x);
+    CREATE TABLE log(msg);
+}
+
+@setup schema
+test trigger-same-name-as-table {
+    CREATE TRIGGER t AFTER INSERT ON t BEGIN INSERT INTO log VALUES('fired'); END;
+    INSERT INTO t VALUES(1);
+    SELECT * FROM log;
+}
+expect {
+    fired
+}
+
+@setup schema
+test trigger-same-name-as-other-table {
+    CREATE TABLE other(y);
+    CREATE TRIGGER other AFTER INSERT ON t BEGIN INSERT INTO log VALUES('other_trigger'); END;
+    INSERT INTO t VALUES(1);
+    SELECT * FROM log;
+}
+expect {
+    other_trigger
+}
+
+@setup schema
+test trigger-same-name-as-index {
+    CREATE INDEX idx ON t(x);
+    CREATE TRIGGER idx AFTER INSERT ON t BEGIN INSERT INTO log VALUES('idx_trigger'); END;
+    INSERT INTO t VALUES(1);
+    SELECT * FROM log;
+}
+expect {
+    idx_trigger
+}
+
+@setup schema
+test trigger-if-not-exists-same-name-as-table {
+    CREATE TRIGGER IF NOT EXISTS t AFTER INSERT ON t BEGIN INSERT INTO log VALUES('fired'); END;
+    INSERT INTO t VALUES(1);
+    SELECT * FROM log;
+}
+expect {
+    fired
+}
+
+@setup schema
+test trigger-same-name-as-view {
+    CREATE VIEW v AS SELECT x FROM t;
+    CREATE TRIGGER v AFTER INSERT ON t BEGIN INSERT INTO log VALUES('view_trigger'); END;
+    INSERT INTO t VALUES(1);
+    SELECT * FROM log;
+}
+expect {
+    view_trigger
+}
+
+@setup schema
+test drop-trigger-with-same-name-as-table {
+    CREATE TRIGGER t AFTER INSERT ON t BEGIN INSERT INTO log VALUES('fired'); END;
+    INSERT INTO t VALUES(1);
+    DROP TRIGGER t;
+    DELETE FROM log;
+    INSERT INTO t VALUES(2);
+    SELECT count(*) FROM log;
+}
+expect {
+    0
+}
+
+@setup schema
+test multiple-triggers-sharing-names-with-tables {
+    CREATE TABLE a(v);
+    CREATE TABLE b(v);
+    CREATE TRIGGER a AFTER INSERT ON t BEGIN INSERT INTO log VALUES('trigger_a'); END;
+    CREATE TRIGGER b AFTER INSERT ON t BEGIN INSERT INTO log VALUES('trigger_b'); END;
+    INSERT INTO t VALUES(1);
+    SELECT * FROM log;
+}
+expect unordered {
+    trigger_a
+    trigger_b
+}
