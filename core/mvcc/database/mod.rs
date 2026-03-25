@@ -1,6 +1,8 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
 use crate::mvcc::yield_points::{inject_transition_yield, YieldKind, YieldPointMarker};
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+use crate::mvcc::yield_points::{ProvidesYieldContext, YieldContext};
 use crate::schema::{Schema, Table};
 use crate::state_machine::StateMachine;
 use crate::state_machine::StateTransition;
@@ -912,6 +914,17 @@ impl YieldPointMarker for CommitYieldPoint {
     }
 }
 
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+impl<Clock: LogicalClock> ProvidesYieldContext for CommitStateMachine<Clock> {
+    fn yield_context(&self) -> YieldContext {
+        YieldContext {
+            injector: self.connection.yield_injector(),
+            instance_id: self.yield_instance_id,
+            selection_key: self.tx_id,
+        }
+    }
+}
+
 pub struct CommitStateMachine<Clock: LogicalClock> {
     state: CommitState<Clock>,
     is_finalized: bool,
@@ -1591,12 +1604,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     return Ok(TransitionResult::Done(()));
                 }
                 self.state = CommitState::Commit { end_ts };
-                inject_transition_yield!(
-                    self.connection.yield_injector(),
-                    self.yield_instance_id,
-                    self.tx_id,
-                    CommitYieldPoint::CommitValidation
-                );
+                inject_transition_yield!(self, CommitYieldPoint::CommitValidation);
                 Ok(TransitionResult::Continue)
             }
             CommitState::Commit { end_ts } => {
@@ -1626,12 +1634,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // TxID references until CommitEnd so an abandoned commit can
                 // still be rolled back by matching on TxID(self.tx_id).
                 self.state = CommitState::WaitForDependencies { end_ts: *end_ts };
-                inject_transition_yield!(
-                    self.connection.yield_injector(),
-                    self.yield_instance_id,
-                    self.tx_id,
-                    CommitYieldPoint::WaitForDependencies
-                );
+                inject_transition_yield!(self, CommitYieldPoint::WaitForDependencies);
                 return Ok(TransitionResult::Continue);
             }
             CommitState::WaitForDependencies { end_ts } => {
@@ -1701,12 +1704,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 } else {
                     self.state = CommitState::BeginCommitLogicalLog { end_ts, log_record };
                 }
-                inject_transition_yield!(
-                    self.connection.yield_injector(),
-                    self.yield_instance_id,
-                    self.tx_id,
-                    CommitYieldPoint::LogRecordPrepared
-                );
+                inject_transition_yield!(self, CommitYieldPoint::LogRecordPrepared);
                 return Ok(TransitionResult::Continue);
             }
             CommitState::BeginCommitLogicalLog { end_ts, log_record } => {
