@@ -13,22 +13,22 @@ pub enum YieldKind {
     Cursor,
 }
 
-/// YieldSite is a descriptor which specify the safe yield boundaries in state machines
+/// YieldPoint is a descriptor for one safe yield boundary in a state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct YieldSite {
+pub struct YieldPoint {
     pub kind: YieldKind,
     pub ordinal: u8,
     pub point_count: u8,
 }
 
-pub(crate) trait YieldSiteMarker: Copy + Debug {
+pub(crate) trait YieldPointMarker: Copy + Debug {
     const KIND: YieldKind;
     const POINT_COUNT: u8;
 
     fn ordinal(self) -> u8;
 
-    fn site(self) -> YieldSite {
-        YieldSite {
+    fn point(self) -> YieldPoint {
+        YieldPoint {
             kind: Self::KIND,
             ordinal: self.ordinal(),
             point_count: Self::POINT_COUNT,
@@ -38,23 +38,23 @@ pub(crate) trait YieldSiteMarker: Copy + Debug {
 
 /// External hook consulted at safe state machine boundaries to decide whether to synthesize a yield.
 pub trait YieldInjector: Debug + Send + Sync {
-    /// Returns whether to synthetically yield at the current `YieldSite`.
+    /// Returns whether to synthetically yield at the current `YieldPoint`.
     /// `selection_key` picks the deterministic yield plan for this logical operation.
     /// `instance_id` distinguishes one live state machine/cursor from another so
     /// they do not share yield bookkeeping.
-    fn should_yield(&self, instance_id: u64, selection_key: u64, site: YieldSite) -> bool;
+    fn should_yield(&self, instance_id: u64, selection_key: u64, point: YieldPoint) -> bool;
 }
 
 pub(crate) type YieldInjectorSlot = RwLock<Option<Arc<dyn YieldInjector>>>;
 
-pub(crate) fn maybe_inject_transition_yield<T, P: YieldSiteMarker>(
+pub(crate) fn maybe_inject_transition_yield<T, P: YieldPointMarker>(
     injector: Option<&Arc<dyn YieldInjector>>,
     instance_id: u64,
     selection_key: u64,
     point: P,
 ) -> Option<TransitionResult<T>> {
     let should_yield = injector
-        .is_some_and(|injector| injector.should_yield(instance_id, selection_key, point.site()));
+        .is_some_and(|injector| injector.should_yield(instance_id, selection_key, point.point()));
     if should_yield {
         tracing::debug!(?point, "injecting MVCC yield");
         return Some(TransitionResult::Io(IOCompletions::Single(
@@ -64,14 +64,14 @@ pub(crate) fn maybe_inject_transition_yield<T, P: YieldSiteMarker>(
     None
 }
 
-pub(crate) fn maybe_inject_io_yield<T, P: YieldSiteMarker>(
+pub(crate) fn maybe_inject_io_yield<T, P: YieldPointMarker>(
     injector: Option<&Arc<dyn YieldInjector>>,
     instance_id: u64,
     selection_key: u64,
     point: P,
 ) -> Option<IOResult<T>> {
     let should_yield = injector
-        .is_some_and(|injector| injector.should_yield(instance_id, selection_key, point.site()));
+        .is_some_and(|injector| injector.should_yield(instance_id, selection_key, point.point()));
     if should_yield {
         tracing::debug!(?point, "injecting MVCC yield");
         return Some(IOResult::IO(IOCompletions::Single(Completion::new_yield())));

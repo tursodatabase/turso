@@ -7,7 +7,7 @@ use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
     create_seek_range, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, SortableIndexKey,
 };
-use crate::mvcc::yield_points::{inject_io_yield, YieldKind, YieldSiteMarker};
+use crate::mvcc::yield_points::{inject_io_yield, YieldKind, YieldPointMarker};
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::sync::Arc;
 use crate::translate::plan::IterationDirection;
@@ -122,7 +122,7 @@ pub(crate) enum CursorYieldPoint {
     AdvanceBtreeBackwardProgress,
 }
 
-impl YieldSiteMarker for CursorYieldPoint {
+impl YieldPointMarker for CursorYieldPoint {
     const KIND: YieldKind = YieldKind::Cursor;
     const POINT_COUNT: u8 = Self::COUNT as u8;
 

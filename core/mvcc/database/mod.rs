@@ -1,6 +1,6 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
-use crate::mvcc::yield_points::{inject_transition_yield, YieldKind, YieldSiteMarker};
+use crate::mvcc::yield_points::{inject_transition_yield, YieldKind, YieldPointMarker};
 use crate::schema::{Schema, Table};
 use crate::state_machine::StateMachine;
 use crate::state_machine::StateTransition;
@@ -903,7 +903,7 @@ enum CommitYieldPoint {
     LogRecordPrepared,
 }
 
-impl YieldSiteMarker for CommitYieldPoint {
+impl YieldPointMarker for CommitYieldPoint {
     const KIND: YieldKind = YieldKind::Commit;
     const POINT_COUNT: u8 = Self::COUNT as u8;
 
