@@ -30,8 +30,7 @@ fn main() {
         let git_dir = run_git(&["rev-parse", "--git-dir"]).map(PathBuf::from);
         if let Some(git_dir) = git_dir.as_ref() {
             // Common dir holds refs for worktrees; fall back to git_dir if unavailable.
-            let git_common_dir =
-                run_git(&["rev-parse", "--git-common-dir"]).map(PathBuf::from);
+            let git_common_dir = run_git(&["rev-parse", "--git-common-dir"]).map(PathBuf::from);
             let head_path = git_dir.join("HEAD");
             // HEAD changes on checkout/switch
             println!("cargo::rerun-if-changed={}", head_path.display());
@@ -66,16 +65,12 @@ fn main() {
 
     // Pre-format the timestamp so sqlite_source_id() doesn't need chrono at runtime.
     // Prefer SOURCE_DATE_EPOCH (reproducible builds), then git commit time, and fall back to now.
-    let sqlite_date = format_utc(
-        source_date_epoch
-            .or(git_commit_epoch)
-            .unwrap_or_else(|| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("system clock before epoch")
-                    .as_secs() as i64
-            }),
-    );
+    let sqlite_date = format_utc(source_date_epoch.or(git_commit_epoch).unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_secs() as i64
+    }));
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let built_file = out_dir.join("built.rs");
