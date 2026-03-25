@@ -10,7 +10,7 @@ use crate::{
     function::{AlterTableFunc, Func},
     schema::{CheckConstraint, Column, ForeignKey, Table, RESERVED_TABLE_PREFIXES},
     translate::{
-        emitter::Resolver,
+        emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
         expr::{translate_expr, walk_expr, walk_expr_mut, WalkControl},
         plan::{ColumnUsedMask, OuterQueryReference, TableReferences},
     },
@@ -20,7 +20,7 @@ use crate::{
     },
     vdbe::{
         affinity::Affinity,
-        builder::{CursorType, ProgramBuilder},
+        builder::{CursorType, DmlColumnContext, ProgramBuilder},
         insn::{to_u16, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
     },
     vtab::VirtualTable,
@@ -323,6 +323,146 @@ fn emit_add_column_default_type_validation(
     Ok(())
 }
 
+/// Validate NOT NULL and CHECK constraints for a new virtual generated column
+/// by scanning each row and computing the expression.
+#[allow(clippy::too_many_arguments)]
+fn emit_add_virtual_column_validation(
+    program: &mut ProgramBuilder,
+    table: &BTreeTable,
+    column: &Column,
+    constraints: &[ast::NamedColumnConstraint],
+    resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
+    database_id: usize,
+) -> Result<()> {
+    let has_notnull = column.notnull();
+    let check_constraints: Vec<CheckConstraint> = constraints
+        .iter()
+        .filter_map(|c| {
+            if let ast::ColumnConstraint::Check(expr) = &c.constraint {
+                Some(CheckConstraint::new(
+                    c.name.as_ref(),
+                    expr,
+                    column.name.as_deref(),
+                ))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if !has_notnull && check_constraints.is_empty() {
+        return Ok(());
+    }
+
+    let mut resolved_table = table.clone();
+    resolved_table.prepare_generated_columns()?;
+    let new_column_name = column
+        .name
+        .as_deref()
+        .ok_or_else(|| LimboError::ParseError("generated column name is missing".to_string()))?;
+    let (new_column_idx, _) = resolved_table.get_column(new_column_name).ok_or_else(|| {
+        LimboError::ParseError(format!(
+            "new generated column unexpectedly missing from table {}",
+            resolved_table.name
+        ))
+    })?;
+
+    let mut original_table = table.clone();
+    original_table.columns.retain(|c| !c.is_virtual_generated());
+    original_table.has_virtual_columns = false;
+    original_table.logical_to_physical_map =
+        BTreeTable::build_logical_to_physical_map(&original_table.columns);
+    let original_table = Arc::new(original_table);
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_table.clone()));
+    program.emit_insn(Insn::OpenRead {
+        cursor_id,
+        root_page: original_table.root_page,
+        db: database_id,
+    });
+
+    let skip_label = program.allocate_label();
+    let loop_start = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id,
+        pc_if_empty: skip_label,
+    });
+    program.preassign_label_to_next_insn(loop_start);
+
+    let rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::RowId {
+        cursor_id,
+        dest: rowid_reg,
+    });
+
+    let layout = resolved_table.column_layout();
+    let base_dest_reg = program.alloc_registers(layout.column_count());
+    for (idx, table_column) in resolved_table.columns.iter().enumerate() {
+        if table_column.is_virtual_generated() || table_column.is_rowid_alias() {
+            continue;
+        }
+
+        program.emit_column_or_rowid(
+            cursor_id,
+            layout.to_reg_offset(idx),
+            layout.to_register(base_dest_reg, idx),
+        );
+    }
+
+    let dml_ctx =
+        DmlColumnContext::layout(&resolved_table.columns, base_dest_reg, rowid_reg, layout);
+    compute_virtual_columns(program, &resolved_table.columns, &dml_ctx, resolver)?;
+    let result_reg = dml_ctx.to_column_reg(new_column_idx);
+
+    if !check_constraints.is_empty() {
+        let mut check_resolver = resolver.fork();
+        let skip_row_label = program.allocate_label();
+        emit_check_constraints(
+            program,
+            &check_constraints,
+            &mut check_resolver,
+            resolved_table.name.as_str(),
+            rowid_reg,
+            resolved_table
+                .columns
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, col)| {
+                    col.name
+                        .as_deref()
+                        .map(|name| (name, dml_ctx.to_column_reg(idx)))
+                }),
+            connection,
+            ast::ResolveType::Abort,
+            skip_row_label,
+            None,
+        )?;
+    }
+
+    if has_notnull {
+        let notnull_passed = program.allocate_label();
+        program.emit_insn(Insn::NotNull {
+            reg: result_reg,
+            target_pc: notnull_passed,
+        });
+        program.emit_insn(Insn::Halt {
+            err_code: 1,
+            description: "NOT NULL constraint failed".to_string(),
+            on_error: None,
+            description_reg: None,
+        });
+        program.resolve_label(notnull_passed, program.offset());
+    }
+
+    program.emit_insn(Insn::Next {
+        cursor_id,
+        pc_if_next: loop_start,
+    });
+
+    program.resolve_label(skip_label, program.offset());
+    Ok(())
+}
+
 /// Validate CHECK constraints on a newly added column against the column's DEFAULT value.
 ///
 /// When a table has existing rows, the new column gets the DEFAULT value (or NULL).
@@ -523,12 +663,6 @@ pub fn translate_alter_table(
                 )));
             }
 
-            if btree.columns.iter().any(|c| c.is_generated()) {
-                return Err(LimboError::ParseError(format!(
-                    "cannot drop column \"{column_name}\": DROP COLUMN is not supported on tables with generated columns"
-                )));
-            }
-
             let (dropped_index, column) = btree.get_column(column_name).ok_or_else(|| {
                 LimboError::ParseError(format!("no such column: \"{column_name}\""))
             })?;
@@ -671,7 +805,35 @@ pub fn translate_alter_table(
                 }
             }
 
-            // TODO: check usage in generated column when implemented
+            // Must have at least one non-generated column after the drop
+            {
+                let remaining_non_generated = btree
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, col)| *idx != dropped_index && !col.is_generated())
+                    .count();
+                if remaining_non_generated == 0 {
+                    return Err(LimboError::ParseError(format!(
+                        "error in table {table_name} after drop column: must have at least one non-generated column"
+                    )));
+                }
+            }
+
+            // Check if any virtual column depends on the dropped column
+            {
+                let mut dropped_set = rustc_hash::FxHashSet::default();
+                dropped_set.insert(dropped_index);
+                let affected =
+                    crate::schema::columns_affected_by_update(&btree.columns, &dropped_set);
+                for idx in &affected {
+                    if *idx != dropped_index && btree.columns[*idx].is_virtual_generated() {
+                        return Err(LimboError::ParseError(format!(
+                            "error in table {table_name} after drop column: no such column: {column_name}"
+                        )));
+                    }
+                }
+            }
 
             // References in VIEWs are checked in the VDBE layer op_drop_column instruction.
 
@@ -734,67 +896,29 @@ pub fn translate_alter_table(
                 connection,
                 input,
                 |program| {
-                    let column_count = btree.columns.len();
-                    let root_page = btree.root_page;
                     let table_name = btree.name.clone();
-
-                    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree));
-
-                    program.emit_insn(Insn::OpenWrite {
-                        cursor_id,
-                        root_page: RegisterOrLiteral::Literal(root_page),
-                        db: database_id,
-                    });
-
-                    program.cursor_loop(cursor_id, |program, rowid| {
-                        let first_column = program.alloc_registers(column_count);
-
-                        let mut iter = first_column;
-
-                        for i in 0..(column_count + 1) {
-                            if i == dropped_index {
-                                continue;
+                    let source_column_by_schema_idx = btree
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .map(|(new_idx, column)| {
+                            if column.is_virtual_generated() {
+                                None
+                            } else if new_idx < dropped_index {
+                                Some(new_idx)
+                            } else {
+                                Some(new_idx + 1)
                             }
-
-                            program.emit_column_or_rowid(cursor_id, i, iter);
-
-                            iter += 1;
-                        }
-
-                        let record = program.alloc_register();
-
-                        let affinity_str = btree
-                            .columns
-                            .iter()
-                            .map(|col| col.affinity_with_strict(btree.is_strict).aff_mask())
-                            .collect::<String>();
-
-                        program.emit_insn(Insn::MakeRecord {
-                            start_reg: to_u16(first_column),
-                            count: to_u16(column_count),
-                            dest_reg: to_u16(record),
-                            index_name: None,
-                            affinity_str: Some(affinity_str),
-                        });
-
-                        // In MVCC mode, we need to delete before insert to properly
-                        // end the old version (Hekaton-style UPDATE = DELETE + INSERT)
-                        if connection.mvcc_enabled() {
-                            program.emit_insn(Insn::Delete {
-                                cursor_id,
-                                table_name: table_name.clone(),
-                                is_part_of_update: true,
-                            });
-                        }
-
-                        program.emit_insn(Insn::Insert {
-                            cursor: cursor_id,
-                            key_reg: rowid,
-                            record_reg: record,
-                            flag: crate::vdbe::insn::InsertFlags(0),
-                            table_name: table_name.clone(),
-                        });
-                    });
+                        })
+                        .collect();
+                    emit_rewrite_table_rows(
+                        program,
+                        original_btree.clone(),
+                        &btree,
+                        source_column_by_schema_idx,
+                        connection,
+                        database_id,
+                    );
 
                     program.emit_insn(Insn::SetCookie {
                         db: database_id,
@@ -812,14 +936,30 @@ pub fn translate_alter_table(
             )?
         }
         ast::AlterTableBody::AddColumn(col_def) => {
-            if col_def
+            let is_generated = col_def
                 .constraints
                 .iter()
-                .any(|c| matches!(c.constraint, ast::ColumnConstraint::Generated { .. }))
-            {
+                .any(|c| matches!(c.constraint, ast::ColumnConstraint::Generated { .. }));
+            let is_stored = col_def.constraints.iter().any(|c| {
+                matches!(
+                    c.constraint,
+                    ast::ColumnConstraint::Generated {
+                        typ: Some(ast::GeneratedColumnType::Stored),
+                        ..
+                    }
+                )
+            });
+            if is_stored {
                 return Err(LimboError::ParseError(
-                    "Alter table does not support adding generated columns".to_string(),
+                    "cannot add a STORED column".to_string(),
                 ));
+            }
+            if is_generated {
+                for c in &col_def.constraints {
+                    if let ast::ColumnConstraint::Generated { expr, .. } = &c.constraint {
+                        crate::schema::validate_generated_expr(expr)?;
+                    }
+                }
             }
             let constraints = col_def.constraints.clone();
             let mut column = Column::try_from(&col_def)?;
@@ -827,10 +967,11 @@ pub fn translate_alter_table(
             // SQLite is very strict about what constitutes a "constant" default for
             // ALTER TABLE ADD COLUMN. It only allows literals and signed literals,
             // not arbitrary constant expressions like (5 + 3) or COALESCE(NULL, 5).
-            if column
-                .default
-                .as_ref()
-                .is_some_and(|default| !is_strict_constant_default(default))
+            if !is_generated
+                && column
+                    .default
+                    .as_ref()
+                    .is_some_and(|default| !is_strict_constant_default(default))
             {
                 return Err(LimboError::ParseError(
                     "Cannot add a column with non-constant default".to_string(),
@@ -1001,34 +1142,34 @@ pub fn translate_alter_table(
                 ));
             };
 
-            // Check if we need to verify the table is empty at runtime.
-            // This is required for:
-            // 1. NOT NULL columns without a non-null default (existing rows would get NULL)
-            // 2. Non-deterministic defaults like CURRENT_TIME (can't backfill existing rows)
-            // 3. CHECK constraints on the new column. SQLite evaluates the CHECK against
-            //    all existing rows via pragma_quick_check. We take a stricter approach and
-            //    reject the ALTER if the table has any rows, since we don't yet support
-            //    scanning existing data for constraint validation.
-            // Check if the column has an effective default (column-level or type-level).
-            let effective_default = column.default.as_ref().or_else(|| {
-                resolver
-                    .schema()
-                    .get_type_def(&column.ty_str, btree.is_strict)
-                    .and_then(|td| td.default.as_ref())
-            });
-            let needs_notnull_check = column.notnull()
-                && effective_default.is_none_or(|default| crate::util::expr_contains_null(default));
+            if is_generated {
+                emit_add_virtual_column_validation(
+                    program,
+                    &btree,
+                    &column,
+                    &constraints,
+                    resolver,
+                    connection,
+                    database_id,
+                )?;
+            } else {
+                // Check if we need to verify the table is empty at runtime.
+                let effective_default = column.default.as_ref().or_else(|| {
+                    resolver
+                        .schema()
+                        .get_type_def(&column.ty_str, btree.is_strict)
+                        .and_then(|td| td.default.as_ref())
+                });
+                let needs_notnull_check = column.notnull()
+                    && effective_default
+                        .is_none_or(|default| crate::util::expr_contains_null(default));
 
-            let needs_nondeterministic_check = column
-                .default
-                .as_ref()
-                .is_some_and(|default| default_requires_empty_table(default));
+                let needs_nondeterministic_check = column
+                    .default
+                    .as_ref()
+                    .is_some_and(|default| default_requires_empty_table(default));
 
-            let (needs_empty_table_check, error_message) =
-                if needs_notnull_check && needs_nondeterministic_check {
-                    // Both conditions - use NOT NULL message (more specific)
-                    (true, "Cannot add a NOT NULL column with default value NULL")
-                } else if needs_notnull_check {
+                let (needs_empty_table_check, error_message) = if needs_notnull_check {
                     (true, "Cannot add a NOT NULL column with default value NULL")
                 } else if needs_nondeterministic_check {
                     (true, "Cannot add a column with non-constant default")
@@ -1036,53 +1177,46 @@ pub fn translate_alter_table(
                     (false, "")
                 };
 
-            if needs_empty_table_check {
-                // Emit bytecode to check if the table has any rows.
-                let check_cursor_id =
-                    program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
-                program.emit_insn(Insn::OpenRead {
-                    cursor_id: check_cursor_id,
-                    root_page: original_btree.root_page,
-                    db: database_id,
-                });
+                if needs_empty_table_check {
+                    let check_cursor_id =
+                        program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
+                    program.emit_insn(Insn::OpenRead {
+                        cursor_id: check_cursor_id,
+                        root_page: original_btree.root_page,
+                        db: database_id,
+                    });
 
-                let skip_error_label = program.allocate_label();
-                program.emit_insn(Insn::Rewind {
-                    cursor_id: check_cursor_id,
-                    pc_if_empty: skip_error_label,
-                });
+                    let skip_error_label = program.allocate_label();
+                    program.emit_insn(Insn::Rewind {
+                        cursor_id: check_cursor_id,
+                        pc_if_empty: skip_error_label,
+                    });
 
-                // Table has rows - emit error
-                program.emit_insn(Insn::Halt {
-                    err_code: 1,
-                    description: error_message.to_string(),
-                    on_error: None,
-                    description_reg: None,
-                });
+                    program.emit_insn(Insn::Halt {
+                        err_code: 1,
+                        description: error_message.to_string(),
+                        on_error: None,
+                        description_reg: None,
+                    });
 
-                program.resolve_label(skip_error_label, program.offset());
+                    program.resolve_label(skip_error_label, program.offset());
+                }
+
+                if default_type_mismatch {
+                    emit_add_column_default_type_validation(program, &original_btree)?;
+                }
+
+                emit_add_column_check_validation(
+                    program,
+                    &btree,
+                    &original_btree,
+                    new_column_name,
+                    &column,
+                    &constraints,
+                    resolver,
+                    database_id,
+                )?;
             }
-
-            if default_type_mismatch {
-                emit_add_column_default_type_validation(program, &original_btree)?;
-            }
-
-            // Validate CHECK constraints against the DEFAULT value for existing rows.
-            // When a column with a CHECK constraint is added and the table has rows,
-            // the default value (or NULL if no DEFAULT) must satisfy the CHECK.
-            // We substitute column references in the CHECK expression with the default
-            // value and evaluate it. If the result is false, we reject the ALTER when
-            // the table has rows.
-            emit_add_column_check_validation(
-                program,
-                &btree,
-                &original_btree,
-                new_column_name,
-                &column,
-                &constraints,
-                resolver,
-                database_id,
-            )?;
 
             translate_update_for_schema_change(
                 update,
@@ -1278,12 +1412,43 @@ pub fn translate_alter_table(
                 ));
             }
 
+            let replacement_column = if !rename {
+                Some(Column::try_from(&definition)?)
+            } else {
+                None
+            };
             let is_making_column_generated = definition
                 .constraints
                 .iter()
                 .any(|c| matches!(c.constraint, ast::ColumnConstraint::Generated { .. }));
+            let rewrites_physical_layout = !rename
+                && !btree.columns[column_index].is_generated()
+                && replacement_column
+                    .as_ref()
+                    .is_some_and(|column| column.is_generated());
 
             if is_making_column_generated {
+                let is_stored = definition.constraints.iter().any(|c| {
+                    matches!(
+                        c.constraint,
+                        ast::ColumnConstraint::Generated {
+                            typ: Some(ast::GeneratedColumnType::Stored),
+                            ..
+                        }
+                    )
+                });
+                if is_stored {
+                    return Err(LimboError::ParseError(
+                        "cannot add a STORED column".to_string(),
+                    ));
+                }
+
+                for constraint in &definition.constraints {
+                    if let ast::ColumnConstraint::Generated { expr, .. } = &constraint.constraint {
+                        crate::schema::validate_generated_expr(expr)?;
+                    }
+                }
+
                 let non_generated_count = btree
                     .columns
                     .iter()
@@ -1297,6 +1462,18 @@ pub fn translate_alter_table(
                     ));
                 }
             }
+
+            let rewritten_table = if rewrites_physical_layout {
+                let mut table = btree.clone();
+                table.columns[column_index] =
+                    replacement_column.expect("replacement_column must exist for ALTER COLUMN");
+                table.prepare_generated_columns()?;
+                table.logical_to_physical_map =
+                    BTreeTable::build_logical_to_physical_map(&table.columns);
+                Some(table)
+            } else {
+                None
+            };
 
             // If renaming, rewrite trigger SQL for all triggers that reference this column
             // We'll collect the triggers to rewrite and update them in sqlite_schema
@@ -1504,6 +1681,41 @@ pub fn translate_alter_table(
                 )?;
             }
 
+            if let Some(ref rewritten_table) = rewritten_table {
+                emit_add_virtual_column_validation(
+                    program,
+                    rewritten_table,
+                    &rewritten_table.columns[column_index],
+                    &definition.constraints,
+                    resolver,
+                    connection,
+                    database_id,
+                )?;
+            }
+
+            if let Some(rewritten_table) = rewritten_table {
+                let source_column_by_schema_idx = rewritten_table
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, column)| {
+                        if column.is_virtual_generated() {
+                            None
+                        } else {
+                            Some(idx)
+                        }
+                    })
+                    .collect();
+                emit_rewrite_table_rows(
+                    program,
+                    original_btree.clone(),
+                    &rewritten_table,
+                    source_column_by_schema_idx,
+                    connection,
+                    database_id,
+                );
+            }
+
             program.emit_insn(Insn::SetCookie {
                 db: database_id,
                 cookie: Cookie::SchemaVersion,
@@ -1521,6 +1733,87 @@ pub fn translate_alter_table(
     };
 
     Ok(())
+}
+
+/// Rewrite every row in `original_btree` into the physical layout of `rewritten_table`.
+///
+/// `source_column_by_schema_idx` is indexed by the rewritten table's schema order. Each
+/// entry is either the physical column index to read from the old row image or `None`
+/// for virtual generated columns, which are omitted from the stored record entirely.
+fn emit_rewrite_table_rows(
+    program: &mut ProgramBuilder,
+    original_btree: Arc<BTreeTable>,
+    rewritten_table: &BTreeTable,
+    source_column_by_schema_idx: Vec<Option<usize>>,
+    connection: &Arc<crate::Connection>,
+    database_id: usize,
+) {
+    turso_assert_eq!(
+        source_column_by_schema_idx.len(),
+        rewritten_table.columns.len()
+    );
+
+    let layout = rewritten_table.column_layout();
+    let non_virtual_column_count = layout.num_non_virtual_cols();
+    let root_page = rewritten_table.root_page;
+    let table_name = rewritten_table.name.clone();
+    let affinity_str = non_virtual_affinity_str(rewritten_table);
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree));
+
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id,
+        root_page: RegisterOrLiteral::Literal(root_page),
+        db: database_id,
+    });
+
+    program.cursor_loop(cursor_id, |program, rowid| {
+        let base_dest_reg = program.alloc_registers(non_virtual_column_count);
+        for (schema_idx, source_column_idx) in source_column_by_schema_idx.iter().enumerate() {
+            let Some(source_column_idx) = source_column_idx else {
+                continue;
+            };
+
+            program.emit_column_or_rowid(
+                cursor_id,
+                *source_column_idx,
+                layout.to_register(base_dest_reg, schema_idx),
+            );
+        }
+
+        let record = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u16(base_dest_reg),
+            count: to_u16(non_virtual_column_count),
+            dest_reg: to_u16(record),
+            index_name: None,
+            affinity_str: Some(affinity_str.clone()),
+        });
+
+        if connection.mvcc_enabled() {
+            program.emit_insn(Insn::Delete {
+                cursor_id,
+                table_name: table_name.clone(),
+                is_part_of_update: true,
+            });
+        }
+
+        program.emit_insn(Insn::Insert {
+            cursor: cursor_id,
+            key_reg: rowid,
+            record_reg: record,
+            flag: crate::vdbe::insn::InsertFlags(0),
+            table_name: table_name.clone(),
+        });
+    });
+}
+
+fn non_virtual_affinity_str(table: &BTreeTable) -> String {
+    table
+        .columns
+        .iter()
+        .filter(|col| !col.is_virtual_generated())
+        .map(|col| col.affinity_with_strict(table.is_strict).aff_mask())
+        .collect()
 }
 
 fn translate_rename_virtual_table(

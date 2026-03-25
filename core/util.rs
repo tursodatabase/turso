@@ -7,7 +7,7 @@ use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::plan::{JoinedTable, TableReferences};
 use crate::translate::planner::{parse_row_id, TableMask};
 use crate::types::IOResult;
-use crate::{bail_parse_error, IO};
+use crate::IO;
 use crate::{
     schema::{Column, Schema, Table, Type},
     types::{Value, ValueType},
@@ -3206,13 +3206,29 @@ pub fn rewrite_column_references_if_needed(
             ast::ColumnConstraint::Check(expr) => {
                 rename_identifiers(expr, from, to);
             }
-            ast::ColumnConstraint::Generated { .. } => {
-                bail_parse_error!("renaming generated columns is not supported yet");
+            ast::ColumnConstraint::Generated { expr, .. } => {
+                rename_identifiers(expr, from, to);
             }
             _ => {}
         }
     }
     Ok(())
+}
+
+/// For a column definition like `parent_id REFERENCES parent(old_col)`, update
+/// the referenced parent column names when another table renames
+/// `old_col -> new_col`.
+pub fn rewrite_column_level_fk_parent_columns_if_needed(
+    col: &mut ast::ColumnDefinition,
+    table: &str,
+    from: &str,
+    to: &str,
+) {
+    for cc in &mut col.constraints {
+        if let ast::ColumnConstraint::ForeignKey { clause, .. } = &mut cc.constraint {
+            rewrite_fk_parent_cols_if_self_ref(clause, table, from, to);
+        }
+    }
 }
 
 /// If a FK REFERENCES targets `old_tbl`, change it to `new_tbl`
