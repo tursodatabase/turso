@@ -142,10 +142,13 @@ impl<Clock: LogicalClock + 'static> ProvidesYieldContext for MvccLazyCursor<Cloc
     }
 }
 
+const CURSOR_SELECTION_TAG: u64 = 0x4355_5253_4F52_4352; // ASCII-ish "CURSORCR"
+
 #[allow(dead_code)]
 fn cursor_yield_key(tx_id: u64, table_id: MVTableId) -> u64 {
-    // no reason for 17, any arbitrary number would do, we just want to mix the bits
-    tx_id ^ (i64::from(table_id) as u64).rotate_left(17)
+    // Mix tx/table identity and add a per-family tag so cursor and commit plans
+    // stay in separate namespaces even if their logical keys overlap.
+    tx_id ^ (i64::from(table_id) as u64).rotate_left(17) ^ CURSOR_SELECTION_TAG
 }
 
 /// We read rows from MVCC index or BTree in a dual-cursor approach.

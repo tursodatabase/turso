@@ -1,7 +1,7 @@
 use rand::{Rng, SeedableRng, rngs::StdRng, seq::SliceRandom};
 use std::collections::HashMap;
 use std::sync::Mutex;
-use turso_core::mvcc::yield_points::{YieldInjector, YieldKind, YieldPoint};
+use turso_core::mvcc::yield_points::{YieldInjector, YieldPoint};
 
 const MAX_YIELDS: usize = 4;
 
@@ -12,12 +12,11 @@ pub(crate) fn fiber_yield_seed(seed: u64, fiber_idx: usize) -> u64 {
 // Selected ordinals for one in-flight instance; slots are cleared as yields are consumed.
 type InstanceYieldPlan = [Option<u8>; MAX_YIELDS];
 
-// Namespaces one cached per-instance selection by instance identity and yield-site family.
+// Namespaces one cached per-instance selection by instance identity and logical selection key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct InstancePlanKey {
     instance_id: u64,
     selection_key: u64,
-    kind: YieldKind,
     point_count: u8,
 }
 
@@ -36,8 +35,8 @@ impl SimulatorYieldInjector {
         }
     }
 
-    fn plan_for(&self, key: u64, point: YieldPoint) -> InstanceYieldPlan {
-        simulator_yield_plan(self.seed, mix_site_key(key, point.kind), point.point_count)
+    fn plan_for(&self, selection_key: u64, point_count: u8) -> InstanceYieldPlan {
+        simulator_yield_plan(self.seed, selection_key, point_count)
     }
 }
 
@@ -46,13 +45,12 @@ impl YieldInjector for SimulatorYieldInjector {
         let plan_key = InstancePlanKey {
             instance_id,
             selection_key,
-            kind: point.kind,
             point_count: point.point_count,
         };
         let mut plans = self.plans.lock().unwrap();
         let plan = plans
             .entry(plan_key)
-            .or_insert_with(|| self.plan_for(selection_key, point));
+            .or_insert_with(|| self.plan_for(selection_key, point.point_count));
         for slot in plan.iter_mut() {
             if *slot == Some(point.ordinal) {
                 *slot = None;
@@ -63,34 +61,14 @@ impl YieldInjector for SimulatorYieldInjector {
     }
 }
 
-fn mix_site_key(key: u64, kind: YieldKind) -> u64 {
-    key ^ match kind {
-        // just random constants, anything would do as long as they differ between kinds
-        // to diversify yield plans
-        YieldKind::Commit => 0xC011_C011_C011_C011,
-        YieldKind::Cursor => 0x4355_5253_4F52_4352, // ASCII-ish "CURSORCR"
-    }
-}
-
-// Derive a deterministic pseudo-random seed from the simulator seed and the
-// logical selection key. This is SplitMix64-style mixing: the 64-bit golden-ratio
-// increment spreads nearby inputs apart, and the two multiply/xor rounds avalanche
-// the bits so small key changes produce unrelated plans.
-fn simulator_yield_seed(seed: u64, key: u64) -> u64 {
-    let mut z = key.wrapping_add(seed).wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
-
-fn simulator_yield_plan(seed: u64, key: u64, point_count: u8) -> InstanceYieldPlan {
+fn simulator_yield_plan(seed: u64, selection_key: u64, point_count: u8) -> InstanceYieldPlan {
     let mut plan = [None; MAX_YIELDS];
     if point_count == 0 {
         return plan;
     }
 
     let max_points = usize::min(point_count as usize, MAX_YIELDS);
-    let mut rng = StdRng::seed_from_u64(simulator_yield_seed(seed, key));
+    let mut rng = StdRng::seed_from_u64(seed ^ selection_key);
     let count = rng.random_range(0..=max_points);
     let mut choices = (0..point_count).collect::<Vec<_>>();
     choices.shuffle(&mut rng);
