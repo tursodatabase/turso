@@ -133,8 +133,6 @@ aegis = { version = "0.9.5", features = ["pure-rust"] }
 aegis = "0.9.5"
 
 [build-dependencies]
-chrono = { workspace = true, default-features = false }
-built = { version = "0.7.5", features = ["chrono"] }
 cfg_aliases = "0.2.1"
 
 [target.'cfg(not(target_family = "windows"))'.dev-dependencies]
