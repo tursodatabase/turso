@@ -10,7 +10,10 @@ use std::sync::Arc;
 
 use sha1::{Digest, Sha1};
 use std::num::NonZero;
-use turso_core::{Database, LimboError, PlatformIO, StepResult, Value, IO};
+use turso_core::{
+    Database, DatabaseOpts, EncryptionKey, EncryptionOpts, LimboError, OpenFlags, PlatformIO,
+    StepResult, Value, IO,
+};
 
 pub use encoder::encode_value;
 
@@ -44,13 +47,41 @@ pub struct DbHashResult {
 ///
 /// System tables (sqlite_%), virtual tables, and statistics tables are excluded.
 pub fn hash_database(path: &str, options: &DbHashOptions) -> Result<DbHashResult, LimboError> {
+    hash_database_with_encryption(path, options, None)
+}
+
+/// Compute content hash of a database, optionally using encryption parameters to open it.
+pub fn hash_database_with_encryption(
+    path: &str,
+    options: &DbHashOptions,
+    encryption_opts: Option<EncryptionOpts>,
+) -> Result<DbHashResult, LimboError> {
     assert!(
         !(options.schema_only && options.without_schema),
         "`schema_only` and `without_schema` cannot both be true"
     );
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
-    let db = Database::open_file(io.clone(), path)?;
-    let conn = db.connect()?;
+    let encryption_key = encryption_opts
+        .as_ref()
+        .map(|opts| EncryptionKey::from_hex_string(&opts.hexkey))
+        .transpose()?;
+    let db_opts = if encryption_opts.is_some() {
+        DatabaseOpts::new().with_encryption(true)
+    } else {
+        DatabaseOpts::new()
+    };
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        path,
+        OpenFlags::default(),
+        db_opts,
+        encryption_opts,
+    )?;
+    let conn = if let Some(encryption_key) = encryption_key {
+        db.connect_with_encryption(Some(encryption_key))?
+    } else {
+        db.connect()?
+    };
 
     let mut hasher = Sha1::new();
     let mut tables_hashed = 0;
