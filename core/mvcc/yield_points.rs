@@ -47,6 +47,18 @@ pub trait YieldInjector: Debug + Send + Sync {
 
 pub(crate) type YieldInjectorSlot = RwLock<Option<Arc<dyn YieldInjector>>>;
 
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+pub(crate) struct YieldContext {
+    pub injector: Option<Arc<dyn YieldInjector>>,
+    pub instance_id: u64,
+    pub selection_key: u64,
+}
+
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+pub(crate) trait ProvidesYieldContext {
+    fn yield_context(&self) -> YieldContext;
+}
+
 pub(crate) fn maybe_inject_transition_yield<T, P: YieldPointMarker>(
     injector: Option<&Arc<dyn YieldInjector>>,
     instance_id: u64,
@@ -80,16 +92,15 @@ pub(crate) fn maybe_inject_io_yield<T, P: YieldPointMarker>(
 }
 
 macro_rules! inject_transition_yield {
-    ($injector:expr, $instance_id:expr, $selection_key:expr, $point:expr) => {{
+    ($state_machine:expr, $point:expr) => {{
         #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
         {
-            let injector = $injector;
-            let instance_id = $instance_id;
-            let selection_key = $selection_key;
+            use $crate::mvcc::yield_points::ProvidesYieldContext;
+            let yield_context = $state_machine.yield_context();
             if let Some(result) = crate::mvcc::yield_points::maybe_inject_transition_yield(
-                injector.as_ref(),
-                instance_id,
-                selection_key,
+                yield_context.injector.as_ref(),
+                yield_context.instance_id,
+                yield_context.selection_key,
                 $point,
             ) {
                 return Ok(result);
@@ -101,16 +112,15 @@ macro_rules! inject_transition_yield {
 pub(crate) use inject_transition_yield;
 
 macro_rules! inject_io_yield {
-    ($injector:expr, $instance_id:expr, $selection_key:expr, $point:expr) => {{
+    ($state_machine:expr, $point:expr) => {{
         #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
         {
-            let injector = $injector;
-            let instance_id = $instance_id;
-            let selection_key = $selection_key;
+            use $crate::mvcc::yield_points::ProvidesYieldContext;
+            let yield_context = $state_machine.yield_context();
             if let Some(result) = crate::mvcc::yield_points::maybe_inject_io_yield(
-                injector.as_ref(),
-                instance_id,
-                selection_key,
+                yield_context.injector.as_ref(),
+                yield_context.instance_id,
+                yield_context.selection_key,
                 $point,
             ) {
                 return Ok(result);
