@@ -627,6 +627,66 @@ impl Value {
         }
     }
 
+    pub fn exec_unistr(&self) -> Result<Value> {
+        let text = match self {
+            Value::Text(t) => std::borrow::Cow::Borrowed(t.as_str()),
+            Value::Numeric(_) | Value::Blob(_) => std::borrow::Cow::Owned(self.to_string()),
+            _ => return Ok(Value::Null),
+        };
+        let bytes = text.as_bytes();
+        let len = bytes.len();
+        let mut out = String::with_capacity(len);
+        let mut i = 0;
+
+        while i < len {
+            if bytes[i] != b'\\' {
+                let start = i;
+                while i < len && bytes[i] != b'\\' {
+                    i += 1;
+                }
+                out.push_str(&text[start..i]);
+                continue;
+            }
+
+            let v = match bytes.get(i + 1) {
+                Some(b'\\') => {
+                    out.push('\\');
+                    i += 2;
+                    continue;
+                }
+                Some(b) if b.is_ascii_hexdigit() => {
+                    let v = parse_n_hex(&bytes[i + 1..], 4)?;
+                    i += 5;
+                    v
+                }
+                Some(b'+') => {
+                    let v = parse_n_hex(&bytes[i + 2..], 6)?;
+                    i += 8;
+                    v
+                }
+                Some(b'u') => {
+                    let v = parse_n_hex(&bytes[i + 2..], 4)?;
+                    i += 6;
+                    v
+                }
+                Some(b'U') => {
+                    let v = parse_n_hex(&bytes[i + 2..], 8)?;
+                    i += 10;
+                    v
+                }
+                _ => return Err(LimboError::ParseError("invalid Unicode escape".to_string())),
+            };
+
+            // Reject surrogates and values above U+10FFFF. SQLite encodes
+            // these as raw bytes, but Value::Text requires valid UTF-8.
+            let ch = char::from_u32(v)
+                .ok_or_else(|| LimboError::ParseError("invalid Unicode escape".to_string()))?;
+            out.push(ch);
+        }
+
+        Ok(Value::build_text(out))
+    }
+
     pub fn exec_round(&self, precision: Option<&Value>) -> Value {
         let Some(f) = Numeric::from_value(self).map(|v| v.to_f64()) else {
             return Value::Null;
@@ -1206,6 +1266,24 @@ impl Value {
             .collect();
         Value::build_text(result)
     }
+}
+
+/// Parse exactly `n` hex digits into a u32. Mirrors SQLite's isNHex().
+fn parse_n_hex(bytes: &[u8], n: usize) -> Result<u32> {
+    if bytes.len() < n {
+        return Err(LimboError::ParseError("invalid Unicode escape".to_string()));
+    }
+    let mut v: u32 = 0;
+    for &b in &bytes[..n] {
+        let digit = match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            b'A'..=b'F' => b - b'A' + 10,
+            _ => return Err(LimboError::ParseError("invalid Unicode escape".to_string())),
+        };
+        v = (v << 4) | digit as u32;
+    }
+    Ok(v)
 }
 
 /// Result of LIKE pattern comparison.
@@ -1896,6 +1974,84 @@ mod tests {
             Value::Blob("example".as_bytes().to_vec()).exec_unicode(),
             Value::from_i64(101)
         );
+    }
+
+    #[test]
+    fn test_unistr() {
+        // Each escape form individually
+        assert_eq!(
+            Value::build_text(r"\u0041").exec_unistr().unwrap(),
+            Value::build_text("A")
+        );
+        assert_eq!(
+            Value::build_text(r"\0041").exec_unistr().unwrap(),
+            Value::build_text("A")
+        );
+        assert_eq!(
+            Value::build_text(r"\+01F600").exec_unistr().unwrap(),
+            Value::build_text("😀")
+        );
+        assert_eq!(
+            Value::build_text(r"\U0001F600").exec_unistr().unwrap(),
+            Value::build_text("😀")
+        );
+        // Escaped backslash
+        assert_eq!(
+            Value::build_text(r"a\\b").exec_unistr().unwrap(),
+            Value::build_text(r"a\b")
+        );
+        // Hex is case-insensitive
+        assert_eq!(
+            Value::build_text(r"\u00E4").exec_unistr().unwrap(),
+            Value::build_text("ä")
+        );
+        assert_eq!(
+            Value::build_text(r"\u00e4").exec_unistr().unwrap(),
+            Value::build_text("ä")
+        );
+        // Multiple escapes in one string
+        assert_eq!(
+            Value::build_text(r"\u0048\u0065\u006C\u006C\u006F")
+                .exec_unistr()
+                .unwrap(),
+            Value::build_text("Hello")
+        );
+        // Mixed literal and escape forms
+        assert_eq!(
+            Value::build_text(r"hi \u0041 \U0001F600")
+                .exec_unistr()
+                .unwrap(),
+            Value::build_text("hi A 😀")
+        );
+        // No escapes
+        assert_eq!(
+            Value::build_text("hello").exec_unistr().unwrap(),
+            Value::build_text("hello")
+        );
+        // Empty string
+        assert_eq!(
+            Value::build_text("").exec_unistr().unwrap(),
+            Value::build_text("")
+        );
+        // NULL input
+        assert_eq!(Value::Null.exec_unistr().unwrap(), Value::Null);
+        // NUL codepoint accepted (matches SQLite, which carries NUL via explicit length)
+        assert_eq!(
+            Value::build_text(r"\u0000").exec_unistr().unwrap(),
+            Value::build_text("\0")
+        );
+        // Surrogate rejected (Value::Text requires valid UTF-8)
+        assert!(Value::build_text(r"\uD83D").exec_unistr().is_err());
+        // Above U+10FFFF rejected
+        assert!(Value::build_text(r"\U00110000").exec_unistr().is_err());
+        // Malformed escapes
+        assert!(Value::build_text(r"\q").exec_unistr().is_err());
+        assert!(Value::build_text(r"\u00").exec_unistr().is_err());
+        assert!(Value::build_text("abc\\").exec_unistr().is_err());
+        // Non-hex in fixed-width span
+        assert!(Value::build_text(r"\u00GG").exec_unistr().is_err());
+        assert!(Value::build_text(r"\+01FG00").exec_unistr().is_err());
+        assert!(Value::build_text(r"\U0001F6GG").exec_unistr().is_err());
     }
 
     #[test]

@@ -2122,6 +2122,7 @@ pub fn translate_expr(
                         | ScalarFunc::OctetLength
                         | ScalarFunc::Typeof
                         | ScalarFunc::Unicode
+                        | ScalarFunc::Unistr
                         | ScalarFunc::Quote
                         | ScalarFunc::RandomBlob
                         | ScalarFunc::Sign
