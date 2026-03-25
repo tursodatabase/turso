@@ -2526,6 +2526,58 @@ impl BTreeTable {
         }
         map
     }
+
+    pub fn prepare_generated_columns(&mut self) -> Result<()> {
+        self.has_virtual_columns = self.columns.iter().any(|c| c.is_virtual_generated());
+        if !self.has_virtual_columns {
+            return Ok(());
+        }
+        for i in 0..self.columns.len() {
+            if self.columns[i].is_virtual_generated() {
+                let mut expr = self.columns[i].generated_expr().cloned().unwrap();
+                resolve_gencol_expr_columns(&mut expr, &self.columns)?;
+                *self.columns[i].generated_expr_mut().unwrap() = expr;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn shift_generated_column_indices_after_drop(
+        &mut self,
+        dropped_index: usize,
+    ) -> Result<()> {
+        if !self.has_virtual_columns {
+            return Ok(());
+        }
+
+        for column in &mut self.columns {
+            let Some(expr) = column.generated_expr_mut() else {
+                continue;
+            };
+
+            walk_expr_mut(expr, &mut |e| match e {
+                Expr::Column {
+                    table,
+                    column,
+                    is_rowid_alias: _,
+                    ..
+                } if table.is_self_table() => {
+                    if *column == dropped_index {
+                        return Err(LimboError::InternalError(
+                            "dropped column remained referenced by generated column".to_string(),
+                        ));
+                    }
+                    if *column > dropped_index {
+                        *column -= 1;
+                    }
+                    Ok(WalkControl::Continue)
+                }
+                _ => Ok(WalkControl::Continue),
+            })?;
+        }
+
+        Ok(())
+    }
 }
 
 fn identifier_contains_special_chars(name: &str) -> bool {
@@ -2785,7 +2837,7 @@ pub fn resolve_gencol_expr_columns(gencol_expr: &mut Expr, columns: &[Column]) -
     Ok(())
 }
 
-fn validate_generated_expr(expr: &Expr) -> Result<()> {
+pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
     use ast::Expr;
     match expr {
         Expr::Qualified(_, _) => {
@@ -3398,19 +3450,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         }
     }
 
-    // Pre-resolve generated column names to Expr::Column { table: SELF_TABLE, ... }
-    let mut has_virtual_columns = false;
-    for i in 0..cols.len() {
-        if cols[i].is_virtual_generated() {
-            has_virtual_columns = true;
-            let mut expr = cols[i].generated_expr().cloned().unwrap();
-            resolve_gencol_expr_columns(&mut expr, &cols)?;
-            *cols[i].generated_expr_mut().unwrap() = expr;
-        }
-    }
-
-    let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&cols);
-    Ok(BTreeTable {
+    let mut table = BTreeTable {
         root_page,
         name: table_name,
         has_rowid,
@@ -3462,9 +3502,12 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         },
         check_constraints,
         rowid_alias_conflict_clause,
-        has_virtual_columns,
-        logical_to_physical_map,
-    })
+        has_virtual_columns: false,
+        logical_to_physical_map: Vec::new(),
+    };
+    table.prepare_generated_columns()?;
+    table.logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&table.columns);
+    Ok(table)
 }
 
 /// SQLite treats bare identifiers in DEFAULT clauses as string literals.

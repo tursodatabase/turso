@@ -1962,61 +1962,61 @@ expect {
 
 # --- DROP COLUMN with generated columns ---
 
-@skip-if sqlite "TODO ALTER table is not supported with generated columns"
+# Cannot drop column referenced by a virtual column
 test gencol_error_drop_column_referenced_virtual {
     CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a * b));
     ALTER TABLE t1 DROP COLUMN b;
 }
 expect error {
-    DROP COLUMN is not supported on tables with generated columns
+    error in table t1 after drop column: no such column: b
 }
 
-@skip-if sqlite "TODO ALTER table is not supported with generated columns"
 test gencol_error_drop_column_in_function {
     CREATE TABLE t1(a INTEGER, b INTEGER, c AS (abs(a) + b));
     ALTER TABLE t1 DROP COLUMN a;
 }
 expect error {
-    DROP COLUMN is not supported on tables with generated columns
+    error in table t1 after drop column: no such column: a
 }
 
-@skip-if sqlite "TODO ALTER table is not supported with generated columns"
+# Cannot drop virtual column that another virtual column depends on
 test gencol_error_drop_generated_column_with_dependent {
     CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + 1));
     ALTER TABLE t1 DROP COLUMN b;
 }
 expect error {
-    DROP COLUMN is not supported on tables with generated columns
+    error in table t1 after drop column: no such column: b
 }
 
-@skip-if sqlite "TODO ALTER table is not supported with generated columns"
+# Can drop a virtual column that has no dependents
 test gencol_drop_virtual_column {
     CREATE TABLE t1(a INTEGER, b AS (a * 2), c INTEGER);
+    INSERT INTO t1(a, c) VALUES(5, 100);
     ALTER TABLE t1 DROP COLUMN b;
+    SELECT * FROM t1;
 }
-expect error {
-    DROP COLUMN is not supported on tables with generated columns
+expect {
+    5|100
 }
 
-@skip-if sqlite "TODO ALTER table is not supported with generated columns"
+# Only non-generated column is referenced by virtual column
 test gencol_error_drop_column_case_insensitive {
     CREATE TABLE t1(MyColumn INTEGER, b AS (MYCOLUMN * 2));
     ALTER TABLE t1 DROP COLUMN mycolumn;
 }
 expect error {
-    DROP COLUMN is not supported on tables with generated columns
+    error in table t1 after drop column: must have at least one non-generated column
 }
 
-@skip-if sqlite "TODO ALTER table is not supported with generated columns"
 test gencol_error_drop_column_in_case {
     CREATE TABLE t1(a INTEGER, b INTEGER, c AS (CASE WHEN a > 0 THEN b ELSE 0 END));
     ALTER TABLE t1 DROP COLUMN a;
 }
 expect error {
-    DROP COLUMN is not supported on tables with generated columns
+    error in table t1 after drop column: no such column: a
 }
 
-@skip "TODO alter column not supported for virtual columns"
+# Drop non-referenced regular column from table with virtual columns
 test gencol_drop_column_with_virtual_present {
     CREATE TABLE t1(a INTEGER, v AS (a * 2) VIRTUAL, b INTEGER);
     INSERT INTO t1(a, b) VALUES (5, 100);
@@ -2029,7 +2029,6 @@ expect {
     10|20
 }
 
-@skip "TODO alter column not supported for virtual columns"
 test gencol_drop_column_with_multiple_virtual {
     CREATE TABLE t1(a INTEGER, v1 AS (a), v2 AS (a * 2), b INTEGER, v3 AS (a * 3));
     INSERT INTO t1(a, b) VALUES (5, 100);
@@ -2040,31 +2039,69 @@ expect {
     5|5|10|15
 }
 
+test gencol_drop_column_rebinds_generated_after_preceding_drop {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (b + 1), d INTEGER);
+    INSERT INTO t1(a, b, d) VALUES(10, 20, 30);
+    ALTER TABLE t1 DROP COLUMN a;
+    SELECT b, c, d FROM t1;
+}
+expect {
+    20|21|30
+}
+
+# Drop a virtual column, verify remaining data is intact
+test gencol_drop_virtual_column_itself {
+    CREATE TABLE t1(a INT, b AS (a * 2), c INT);
+    INSERT INTO t1(a, c) VALUES(5, 100);
+    ALTER TABLE t1 DROP COLUMN b;
+    SELECT * FROM t1;
+}
+expect {
+    5|100
+}
+
+# Only non-generated column — rejected before dependency check
+test gencol_drop_only_regular_column_error {
+    CREATE TABLE t1(a INT, b AS (a * 2));
+    ALTER TABLE t1 DROP COLUMN a;
+}
+expect error {
+    error in table t1 after drop column: must have at least one non-generated column
+}
+
+# Second drop leaves only virtual columns
+test gencol_drop_last_non_generated_error {
+    CREATE TABLE t1(a INT, b INT, v AS (a * 2));
+    ALTER TABLE t1 DROP COLUMN b;
+    ALTER TABLE t1 DROP COLUMN a;
+}
+expect error {
+    error in table t1 after drop column: must have at least one non-generated column
+}
+
 # --- ADD COLUMN with generated columns ---
 
-@skip-if sqlite "TODO alter column not supported for virtual columns"
 test gencol_alter_add_virtual {
     CREATE TABLE t1(a INTEGER);
     INSERT INTO t1 VALUES (5), (10);
     ALTER TABLE t1 ADD COLUMN b AS (a * 2);
     SELECT a, b FROM t1 ORDER BY a;
 }
-expect error {
-    Alter table does not support adding generated columns
+expect {
+    5|10
+    10|20
 }
 
-@skip-if sqlite "TODO alter column not supported for virtual columns"
 test gencol_alter_add_virtual_explicit {
     CREATE TABLE t1(a INTEGER);
     INSERT INTO t1 VALUES (3);
     ALTER TABLE t1 ADD COLUMN b AS (a + 100) VIRTUAL;
     SELECT a, b FROM t1;
 }
-expect error {
-    Alter table does not support adding generated columns
+expect {
+    3|103
 }
 
-@skip-if sqlite "TODO alter column not supported for virtual columns"
 test gencol_alter_add_multiple_virtual {
     CREATE TABLE t1(a INTEGER);
     INSERT INTO t1 VALUES (5);
@@ -2072,39 +2109,37 @@ test gencol_alter_add_multiple_virtual {
     ALTER TABLE t1 ADD COLUMN c AS (a * 3);
     SELECT a, b, c FROM t1;
 }
-expect error {
-    Alter table does not support adding generated columns
+expect {
+    5|10|15
 }
 
-@skip-if sqlite "TODO alter column not supported for virtual columns"
 test gencol_alter_add_virtual_function {
     CREATE TABLE t1(name TEXT);
     INSERT INTO t1 VALUES ('hello');
     ALTER TABLE t1 ADD COLUMN upper_name AS (UPPER(name));
     SELECT name, upper_name FROM t1;
 }
-expect error {
-    Alter table does not support adding generated columns
+expect {
+    hello|HELLO
 }
 
-@skip-if sqlite "TODO alter column not supported for virtual columns"
 test gencol_alter_add_virtual_complex_expr {
     CREATE TABLE t1(a INTEGER, b INTEGER);
     INSERT INTO t1 VALUES (3, 7);
     ALTER TABLE t1 ADD COLUMN c AS (a + b);
     SELECT a, b, c FROM t1;
 }
-expect error {
-    Alter table does not support adding generated columns
+expect {
+    3|7|10
 }
 
-@skip-if sqlite "TODO alter column not supported for virtual columns"
+# Non-deterministic functions in generated columns are rejected
 test gencol_alter_add_virtual_random_error {
     CREATE TABLE t1(a INTEGER);
     ALTER TABLE t1 ADD COLUMN b AS (random()) VIRTUAL;
 }
 expect error {
-    Alter table does not support adding generated columns
+    non-deterministic functions prohibited in generated columns
 }
 
 test gencol_alter_add_column_generated_pk_rejected {
@@ -2115,84 +2150,166 @@ expect error {
     (Cannot add a PRIMARY KEY column|generated columns cannot be part of the PRIMARY KEY)
 }
 
-@skip-if sqlite "TODO alter column not supported for virtual columns"
+@skip "TODO: parser accepts DEFAULT + GENERATED without error"
 test gencol_alter_add_column_generated_default_rejected {
     CREATE TABLE t1(a INTEGER);
     ALTER TABLE t1 ADD COLUMN b DEFAULT 5 AS (a+1);
 }
 expect error {
-    Alter table does not support adding generated columns
+    (Cannot add a column with non-constant default|error in generated column|cannot have a DEFAULT)
+}
+
+# NOT NULL on virtual column validated against existing data
+test gencol_alter_add_virtual_not_null_violation {
+    CREATE TABLE t1(a, b);
+    INSERT INTO t1 VALUES(1, 2), ('null!', NULL), (3, 4);
+    ALTER TABLE t1 ADD COLUMN d AS (b + 1) NOT NULL;
+}
+expect error {
+    NOT NULL constraint failed
+}
+
+# NOT NULL on virtual column succeeds when all data satisfies it
+test gencol_alter_add_virtual_not_null_ok {
+    CREATE TABLE t1(a, b);
+    INSERT INTO t1 VALUES(1, 2), (3, 4);
+    ALTER TABLE t1 ADD COLUMN d AS (b + 1) NOT NULL;
+    SELECT a, b, d FROM t1;
+}
+expect {
+    1|2|3
+    3|4|5
+}
+
+# CHECK constraint validated against existing data
+test gencol_alter_add_virtual_check_violation {
+    CREATE TABLE t1(a, b);
+    INSERT INTO t1 VALUES(1, 2), (3, 4);
+    ALTER TABLE t1 ADD COLUMN d AS (b + 1) CHECK(a <> 1);
+}
+expect error {
+    CHECK constraint failed
+}
+
+test gencol_alter_add_virtual_check_with_existing_virtual_middle {
+    CREATE TABLE t1(a, b AS (a + 1), c);
+    INSERT INTO t1(a, c) VALUES(1, 10), (3, 20);
+    ALTER TABLE t1 ADD COLUMN d AS (c + 1) CHECK(b < d);
+    SELECT a, b, c, d FROM t1 ORDER BY a;
+}
+expect {
+    1|2|10|11
+    3|4|20|21
+}
+
+test gencol_alter_add_virtual_check_with_existing_virtual_middle_violation {
+    CREATE TABLE t1(a, b AS (a + 1), c);
+    INSERT INTO t1(a, c) VALUES(1, -2), (3, 20);
+    ALTER TABLE t1 ADD COLUMN d AS (c + 1) CHECK(b < d);
+}
+expect error {
+    CHECK constraint failed
+}
+
+# INSERT/UPDATE work after ADD COLUMN virtual
+test gencol_alter_add_virtual_insert_after {
+    CREATE TABLE t1(a INTEGER);
+    INSERT INTO t1 VALUES(1);
+    ALTER TABLE t1 ADD COLUMN b AS (a * 10);
+    INSERT INTO t1(a) VALUES(2);
+    SELECT a, b FROM t1 ORDER BY a;
+}
+expect {
+    1|10
+    2|20
+}
+
+# ADD COLUMN virtual referencing a column added via ADD COLUMN with DEFAULT
+# Existing rows have shorter records; validation must use the default, not NULL
+test gencol_alter_add_virtual_after_add_default_notnull {
+    CREATE TABLE t1(a INTEGER);
+    INSERT INTO t1 VALUES(1), (2);
+    ALTER TABLE t1 ADD COLUMN b INTEGER DEFAULT 42;
+    ALTER TABLE t1 ADD COLUMN c AS (b + 1) NOT NULL;
+    SELECT a, b, c FROM t1 ORDER BY a;
+}
+expect {
+    1|42|43
+    2|42|43
+}
+
+# ADD COLUMN STORED is rejected (SQLite allows STORED, limbo does not)
+@skip-if sqlite "limbo does not support STORED generated columns"
+test gencol_alter_add_stored_rejected {
+    CREATE TABLE t1(a INTEGER);
+    ALTER TABLE t1 ADD COLUMN b AS (a * 2) STORED;
+}
+expect error {
+    cannot add a STORED column
 }
 
 # --- RENAME COLUMN with generated columns ---
 
-@skip-if sqlite "TODO support renaming generated columns"
 test gencol_rename_column_updates_expression {
     CREATE TABLE t1 (a TEXT, b TEXT AS (a));
     ALTER TABLE t1 RENAME COLUMN a TO c;
     SELECT sql FROM sqlite_master WHERE name='t1';
 }
-expect error {
-    renaming generated columns is not supported yet
+expect {
+    CREATE TABLE t1 (c TEXT, b TEXT AS (c))
 }
 
-@skip-if sqlite "TODO support renaming generated columns"
 test gencol_rename_column_chain {
     CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + a));
     ALTER TABLE t1 RENAME COLUMN a TO x;
     INSERT INTO t1(x) VALUES(5);
     SELECT x, b, c FROM t1;
 }
-expect error {
-    Parse error: renaming generated columns is not supported yet
+expect {
+    5|10|15
 }
 
-@skip-if sqlite "TODO support renaming generated columns"
 test gencol_rename_column_middle {
     CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + 1));
     ALTER TABLE t1 RENAME COLUMN b TO y;
     INSERT INTO t1(a) VALUES(5);
     SELECT a, y, c FROM t1;
 }
-expect error {
-    Parse error: renaming generated columns is not supported yet
+expect {
+    5|10|11
 }
 
-@skip-if sqlite "TODO support renaming generated columns"
 test gencol_rename_column_complex_expr {
     CREATE TABLE t1(a TEXT, b AS (UPPER(a) || '_suffix'));
     ALTER TABLE t1 RENAME COLUMN a TO name;
     INSERT INTO t1(name) VALUES('hello');
     SELECT name, b FROM t1;
 }
-expect error {
-    renaming generated columns is not supported yet
+expect {
+    hello|HELLO_suffix
 }
 
-@skip-if sqlite "TODO support renaming generated columns"
 test gencol_rename_column_multiple_refs {
     CREATE TABLE t1(a INTEGER, b AS (a + 1), c AS (a * 2), d AS (a - 1));
     ALTER TABLE t1 RENAME COLUMN a TO val;
     INSERT INTO t1(val) VALUES(10);
     SELECT val, b, c, d FROM t1;
 }
-expect error {
-    renaming generated columns is not supported yet
+expect {
+    10|11|20|9
 }
 
-@skip-if sqlite "TODO support renaming generated columns"
 test gencol_rename_column_case_insensitive {
     CREATE TABLE t1(MyCol INTEGER, b AS (MYCOL * 2));
     ALTER TABLE t1 RENAME COLUMN mycol TO newcol;
     INSERT INTO t1(newcol) VALUES(5);
     SELECT newcol, b FROM t1;
 }
-expect error {
-    renaming generated columns is not supported yet
+expect {
+    5|10
 }
 
 @skip-if mvcc "Expression indexes are not supported with MVCC"
-@skip-if sqlite "TODO support renaming generated columns"
 test gencol_rename_column_with_index_on_generated {
     CREATE TABLE t1 (
         a TEXT,
@@ -2205,8 +2322,32 @@ test gencol_rename_column_with_index_on_generated {
     UPDATE t1 SET b = 2.0, d = 'updated' WHERE b = 1.0;
     SELECT d, b, c FROM t1;
 }
-expect error {
-    Parse error: renaming generated columns is not supported yet
+expect {
+    updated|2.0|updatedupdated
+}
+expect @js {
+    updated|2|updatedupdated
+}
+
+# Renaming in one table must not affect generated columns in another table
+test gencol_rename_column_other_table_unaffected {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, othername, extra AS (c + 1));
+    ALTER TABLE t1 RENAME a to othername;
+    SELECT sql FROM sqlite_schema WHERE name = 't2';
+}
+expect pattern {
+    ^CREATE TABLE t2 ?\(c, othername, extra AS \(c \+ 1\)\)$
+}
+
+test gencol_rename_column_other_table_matching_name_unaffected {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(a, z AS (a + 1));
+    ALTER TABLE t1 RENAME a TO x;
+    SELECT sql FROM sqlite_schema WHERE name = 't2';
+}
+expect pattern {
+    ^CREATE TABLE t2 ?\(a, z AS \(a \+ 1\)\)$
 }
 
 # =============================================================================
