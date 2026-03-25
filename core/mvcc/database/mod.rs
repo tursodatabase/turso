@@ -914,13 +914,19 @@ impl YieldPointMarker for CommitYieldPoint {
     }
 }
 
+const COMMIT_SELECTION_TAG: u64 = 0xC011_C011_C011_C011;
+
+fn commit_yield_key(tx_id: u64) -> u64 {
+    tx_id ^ COMMIT_SELECTION_TAG
+}
+
 #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 impl<Clock: LogicalClock> ProvidesYieldContext for CommitStateMachine<Clock> {
     fn yield_context(&self) -> YieldContext {
         YieldContext {
             injector: self.connection.yield_injector(),
             instance_id: self.yield_instance_id,
-            selection_key: self.tx_id,
+            selection_key: commit_yield_key(self.tx_id),
         }
     }
 }
