@@ -42,8 +42,8 @@ addr  opcode                    p1  p2  p3  p4                     p5  comment
   16              Move          14   9   1                          0  r[9..9]=r[14..14]
   17              IfPos          8  42   0                          0  r[8]>0 -> r[8]-=0, goto 42; check abort flag
   18              Gosub         16  39   0                          0  ; goto clear accumulator subroutine
-  19              AggStep        0  17  11  count                   0  accum=r[11] step(r[17])
-  20              AggStep        0  15  12  sum                     0  accum=r[12] step(r[15])
+  19              AggStep        0  15  11  sum                     0  accum=r[11] step(r[15])
+  20              AggStep        0  17  12  count                   0  accum=r[12] step(r[17])
   21              If             7  23   0                          0  if r[7] goto 23; don't emit group columns if continuing existing group
   22              Column         1   2  10                          0  r[10]=employees.department
   23              Integer        1   7   0                          0  r[7]=1; indicate data in accumulator
@@ -54,11 +54,11 @@ addr  opcode                    p1  p2  p3  p4                     p5  comment
   28          Return             6   0   0                          0
   29          IfPos              7  31   0                          0  r[7]>0 -> r[7]-=0, goto 31; output group by row subroutine start
   30        Return               6   0   0                          0
-  31        AggFinal             0  11   0  count                   0  accum=r[11]
-  32        AggFinal             0  12   0  sum                     0  accum=r[12]
-  33        Copy                12  18   0                          0  r[18]=r[12]
+  31        AggFinal             0  11   0  sum                     0  accum=r[11]
+  32        AggFinal             0  12   0  count                   0  accum=r[12]
+  33        Copy                11  18   0                          0  r[18]=r[11]
   34        Copy                10  19   0                          0  r[19]=r[10]
-  35        Copy                11  20   0                          0  r[20]=r[11]
+  35        Copy                12  20   0                          0  r[20]=r[12]
   36        MakeRecord          18   3   5                          0  r[5]=mkrec(r[18..20])
   37        SorterInsert         0   5   0  0                       0  key=r[5]
   38      Return                 6   0   0                          0
