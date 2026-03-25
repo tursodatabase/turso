@@ -9,10 +9,6 @@ impl MonotonicInstant {
         MonotonicInstant(std::time::Instant::now())
     }
 
-    pub fn elapsed(&self) -> Duration {
-        self.0.elapsed()
-    }
-
     pub fn duration_since(&self, earlier: MonotonicInstant) -> Duration {
         self.0.duration_since(earlier.0)
     }
