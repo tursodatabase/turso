@@ -572,15 +572,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "built"
-version = "0.7.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56ed6191a7e78c36abdb16ab65341eefd73d64d303fffccdbb00d51e4205967b"
-dependencies = [
- "chrono",
-]
-
-[[package]]
 name = "bumpalo"
 version = "3.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6304,7 +6295,6 @@ dependencies = [
  "bigdecimal",
  "bitflags 2.9.4",
  "branches",
- "built",
  "bumpalo",
  "bytemuck",
  "cfg_block",
