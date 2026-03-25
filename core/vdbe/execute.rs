@@ -6478,6 +6478,7 @@ pub fn op_function(
             | ScalarFunc::OctetLength
             | ScalarFunc::Typeof
             | ScalarFunc::Unicode
+            | ScalarFunc::Unistr
             | ScalarFunc::Quote
             | ScalarFunc::RandomBlob
             | ScalarFunc::Sign
@@ -6493,6 +6494,7 @@ pub fn op_function(
                     ScalarFunc::OctetLength => Some(reg_value.exec_octet_length()),
                     ScalarFunc::Typeof => Some(reg_value.exec_typeof()),
                     ScalarFunc::Unicode => Some(reg_value.exec_unicode()),
+                    ScalarFunc::Unistr => Some(reg_value.exec_unistr()?),
                     ScalarFunc::Quote => Some(reg_value.exec_quote()),
                     ScalarFunc::RandomBlob => {
                         Some(reg_value.exec_randomblob(|dest| pager.io.fill_bytes(dest))?)
