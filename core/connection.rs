@@ -913,6 +913,18 @@ impl Connection {
         Ok(())
     }
 
+    /// Refresh a materialized view by re-running its source query.
+    ///
+    /// This is the programmatic equivalent of `REFRESH MATERIALIZED VIEW <name>`.
+    /// For streaming FDW updates, the caller triggers this when the
+    /// [`crate::foreign::StreamingForeignData`] subscription signals changes.
+    ///
+    /// Must be called on the same thread that owns the connection.
+    pub fn refresh_materialized_view(self: &Arc<Connection>, view_name: &str) -> crate::Result<()> {
+        let escaped = view_name.replace('\'', "''");
+        self.execute(format!("REFRESH MATERIALIZED VIEW {escaped}"))
+    }
+
     pub fn maybe_update_schema(&self) {
         let current_schema_version = self.schema.read().schema_version;
         let schema = self.db.schema.lock();
