@@ -7,6 +7,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+pure-rust-crypto = ["turso_core/pure-rust-crypto", "turso_sdk_kit/pure-rust-crypto"]
+
 [lib]
 doc = false
 crate-type = ["lib", "cdylib", "staticlib"]
