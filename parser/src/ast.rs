@@ -325,6 +325,15 @@ pub enum Stmt {
 /// FIXME: rename this to TableReferenceId.
 pub struct TableInternalId(usize);
 
+impl TableInternalId {
+    /// used in generated columns to signify "the table that the column belongs to"
+    pub const SELF_TABLE: Self = Self(0);
+
+    pub fn is_self_table(&self) -> bool {
+        self.0 == 0
+    }
+}
+
 impl Default for TableInternalId {
     fn default() -> Self {
         Self(1)
@@ -518,6 +527,8 @@ pub enum Expr {
         /// The type of subquery.
         query_type: SubqueryType,
     },
+    /// `DEFAULT` keyword in INSERT VALUES
+    Default,
     /// `ARRAY[expr, ...]` array literal
     Array {
         /// elements of the array
@@ -1344,8 +1355,18 @@ pub enum ColumnConstraint {
         /// expression
         expr: Box<Expr>,
         /// `STORED` / `VIRTUAL`
-        typ: Option<Name>,
+        typ: Option<GeneratedColumnType>,
     },
+}
+
+/// Generated column type
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum GeneratedColumnType {
+    /// `STORED`
+    Stored,
+    /// `VIRTUAL`
+    Virtual,
 }
 
 /// Named table constraint

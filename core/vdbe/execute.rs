@@ -24,10 +24,11 @@ use crate::types::{
 use crate::util::{
     escape_sql_string_literal, normalize_ident, rename_identifiers,
     rename_identifiers_scoped_when_clause, rewrite_check_expr_table_refs,
-    rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
-    rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
-    rewrite_trigger_cmd_column_refs, rewrite_trigger_cmd_table_refs,
-    rewrite_view_sql_for_column_rename, trim_ascii_whitespace, RewrittenView,
+    rewrite_column_level_fk_parent_columns_if_needed, rewrite_column_references_if_needed,
+    rewrite_fk_parent_cols_if_self_ref, rewrite_fk_parent_table_if_needed,
+    rewrite_inline_col_fk_target_if_needed, rewrite_trigger_cmd_column_refs,
+    rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename, trim_ascii_whitespace,
+    RewrittenView,
 };
 use crate::vdbe::affinity::{
     apply_numeric_affinity, try_for_float, Affinity, NumericParseResult, ParsedNumber,
@@ -108,7 +109,7 @@ use super::{
     CommitState,
 };
 use crate::sync::{Mutex, RwLock};
-use turso_parser::ast::{self, ForeignKeyClause, Name, ResolveType};
+use turso_parser::ast::{self, ForeignKeyClause, Name, QualifiedName, ResolveType};
 use turso_parser::parser::Parser;
 
 use super::sorter::Sorter;
@@ -6478,6 +6479,7 @@ pub fn op_function(
             | ScalarFunc::OctetLength
             | ScalarFunc::Typeof
             | ScalarFunc::Unicode
+            | ScalarFunc::Unistr
             | ScalarFunc::Quote
             | ScalarFunc::RandomBlob
             | ScalarFunc::Sign
@@ -6493,6 +6495,7 @@ pub fn op_function(
                     ScalarFunc::OctetLength => Some(reg_value.exec_octet_length()),
                     ScalarFunc::Typeof => Some(reg_value.exec_typeof()),
                     ScalarFunc::Unicode => Some(reg_value.exec_unicode()),
+                    ScalarFunc::Unistr => Some(reg_value.exec_unistr()?),
                     ScalarFunc::Quote => Some(reg_value.exec_quote()),
                     ScalarFunc::RandomBlob => {
                         Some(reg_value.exec_randomblob(|dest| pager.io.fill_bytes(dest))?)
@@ -7995,7 +7998,7 @@ pub fn op_function(
                                             &normalized_tbl_name,
                                             &rename_from,
                                             column_def.col_name.as_str(),
-                                        );
+                                        )?;
                                     }
                                 } else {
                                     // This is a different table, check if it has FKs referencing the renamed column
@@ -8032,7 +8035,7 @@ pub fn op_function(
                                     for col in &mut columns {
                                         let _before = fk_updated;
                                         let mut local_col = col.clone();
-                                        rewrite_column_references_if_needed(
+                                        rewrite_column_level_fk_parent_columns_if_needed(
                                             &mut local_col,
                                             &table,
                                             &rename_from,
@@ -11471,6 +11474,34 @@ pub fn op_cast(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Regenerate trigger SQL from its in-memory fields to keep trigger.sql
+/// in sync after table/column renames.
+fn regenerate_trigger_sql(trigger: &crate::schema::Trigger) -> String {
+    use crate::translate::trigger::create_trigger_to_sql;
+
+    let trigger_name = QualifiedName {
+        db_name: None,
+        name: Name::from_string(&trigger.name),
+        alias: None,
+    };
+    let tbl_name = QualifiedName {
+        db_name: None,
+        name: Name::from_string(&trigger.table_name),
+        alias: None,
+    };
+    create_trigger_to_sql(
+        trigger.temporary,
+        false, // IF NOT EXISTS is stripped from stored schema SQL
+        &trigger_name,
+        Some(trigger.time),
+        &trigger.event,
+        &tbl_name,
+        trigger.for_each_row,
+        trigger.when_clause.as_ref(),
+        &trigger.commands,
+    )
+}
+
 pub fn op_rename_table(
     program: &Program,
     state: &mut ProgramState,
@@ -11563,6 +11594,8 @@ pub fn op_rename_table(
                 if let Some(ref mut when) = trigger.when_clause {
                     rewrite_check_expr_table_refs(when, &normalized_from, &normalized_to);
                 }
+                // Regenerate trigger.sql to reflect the updated table name and body
+                trigger.sql = regenerate_trigger_sql(trigger);
             }
             schema.triggers.insert(normalized_to.to_owned(), triggers);
         }
@@ -11572,11 +11605,16 @@ pub fn op_rename_table(
         for (_, triggers) in schema.triggers.iter_mut() {
             for trigger_arc in triggers.iter_mut() {
                 let trigger = Arc::make_mut(trigger_arc);
+                let old_sql = trigger.sql.clone();
                 for cmd in &mut trigger.commands {
                     rewrite_trigger_cmd_table_refs(cmd, &normalized_from, &normalized_to);
                 }
                 if let Some(ref mut when) = trigger.when_clause {
                     rewrite_check_expr_table_refs(when, &normalized_from, &normalized_to);
+                }
+                let new_sql = regenerate_trigger_sql(trigger);
+                if new_sql != old_sql {
+                    trigger.sql = new_sql;
                 }
             }
         }
@@ -11621,7 +11659,7 @@ pub fn op_drop_column(
             .clone()
     });
 
-    conn.with_database_schema_mut(*db, |schema| {
+    conn.with_database_schema_mut(*db, |schema| -> Result<()> {
         let table = schema
             .tables
             .get_mut(&normalized_table_name)
@@ -11635,6 +11673,8 @@ pub fn op_drop_column(
 
         let btree = Arc::make_mut(btree);
         btree.columns.remove(*column_index);
+        btree.logical_to_physical_map =
+            crate::schema::BTreeTable::build_logical_to_physical_map(&btree.columns);
         // Remove column-level CHECK constraints for the dropped column
         let col_name = column_name.clone();
         btree.check_constraints.retain(|c| {
@@ -11642,7 +11682,11 @@ pub fn op_drop_column(
                 .as_ref()
                 .is_none_or(|col| normalize_ident(col) != normalize_ident(&col_name))
         });
-    });
+
+        btree.has_virtual_columns = btree.columns.iter().any(|c| c.is_virtual_generated());
+        btree.shift_generated_column_indices_after_drop(*column_index)?;
+        Ok(())
+    })?;
 
     conn.with_schema(*db, |schema| -> crate::Result<()> {
         if let Some(indexes) = schema.indexes.get(&normalized_table_name) {
@@ -11712,7 +11756,7 @@ pub fn op_add_column(
     let conn = program.connection.clone();
     let normalized_table_name = normalize_ident(table.as_str());
 
-    conn.with_database_schema_mut(*db, |schema| {
+    conn.with_database_schema_mut(*db, |schema| -> Result<()> {
         let table_ref = schema
             .tables
             .get_mut(&normalized_table_name)
@@ -11726,9 +11770,15 @@ pub fn op_add_column(
 
         let btree = Arc::make_mut(btree);
         btree.columns.push((**column).clone());
+        btree.logical_to_physical_map =
+            crate::schema::BTreeTable::build_logical_to_physical_map(&btree.columns);
         // Update CHECK constraints to include any constraints from the new column
         btree.check_constraints.clone_from(check_constraints);
-    });
+
+        // Resolve generated column expressions and update virtual column metadata
+        btree.prepare_generated_columns()?;
+        Ok(())
+    })?;
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -11797,7 +11847,7 @@ pub fn op_alter_column(
         Vec::new()
     };
 
-    conn.with_database_schema_mut(*db, |schema| {
+    conn.with_database_schema_mut(*db, |schema| -> Result<()> {
         let table_arc = schema
             .tables
             .get_mut(&normalized_table_name)
@@ -11808,19 +11858,22 @@ pub fn op_alter_column(
             panic!("only btree tables can be altered");
         };
         let btree = Arc::make_mut(btree_arc);
-        let col = btree
+        let existing_column_name = btree
             .columns
-            .get_mut(*column_index)
+            .get(*column_index)
             .expect("column being ALTERed should be in schema");
+        let existing_column_name = existing_column_name
+            .name
+            .as_ref()
+            .expect("btree column should be named")
+            .clone();
 
         // Update indexes on THIS table that name the old column (you already had this)
         if let Some(idxs) = schema.indexes.get_mut(&normalized_table_name) {
             for idx in idxs {
                 let idx = Arc::make_mut(idx);
                 for ic in &mut idx.columns {
-                    if ic.name.eq_ignore_ascii_case(
-                        col.name.as_ref().expect("btree column should be named"),
-                    ) {
+                    if ic.name.eq_ignore_ascii_case(&existing_column_name) {
                         ic.name.clone_from(&new_name);
                     }
                 }
@@ -11831,10 +11884,14 @@ pub fn op_alter_column(
             }
         }
         if *rename {
-            col.name = Some(new_name.clone());
+            btree.columns[*column_index].name = Some(new_name.clone());
         } else {
-            *col = new_column.clone();
+            btree.columns[*column_index] = new_column.clone();
         }
+
+        btree.prepare_generated_columns()?;
+        btree.logical_to_physical_map =
+            crate::schema::BTreeTable::build_logical_to_physical_map(&btree.columns);
 
         // Keep primary_key_columns consistent (names may change on rename)
         for (pk_name, _ord) in &mut btree.primary_key_columns {
@@ -11908,7 +11965,8 @@ pub fn op_alter_column(
                 }
             }
         }
-    });
+        Ok(())
+    })?;
 
     if *rename {
         let old_col = old_column_name.clone();

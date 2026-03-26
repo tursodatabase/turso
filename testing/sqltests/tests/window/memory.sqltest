@@ -343,3 +343,231 @@ test window-row-number-in-check-constraint {
 expect error {
     misuse of window function ROW_NUMBER()
 }
+
+# Named windows (WINDOW clause)
+
+setup named_window_data {
+    CREATE TABLE t_nw (a INTEGER, b INTEGER, c TEXT);
+    INSERT INTO t_nw VALUES (1, 10, 'x'), (2, 10, 'y'), (3, 20, 'x'), (4, 20, 'y'), (5, 10, 'x');
+}
+
+@setup named_window_data
+test named-window-multiple-distinct {
+    SELECT a, sum(b) OVER w1, count(*) OVER w2
+    FROM t_nw
+    WINDOW w1 AS (PARTITION BY c), w2 AS (PARTITION BY b)
+    ORDER BY a;
+}
+expect {
+    1|40|3
+    2|30|3
+    3|40|2
+    4|30|2
+    5|40|3
+}
+
+@setup named_window_data
+test named-window-with-order-by {
+    SELECT a, sum(b) OVER w1
+    FROM t_nw
+    WINDOW w1 AS (PARTITION BY c ORDER BY a)
+    ORDER BY a;
+}
+expect {
+    1|10
+    2|10
+    3|30
+    4|30
+    5|40
+}
+
+@setup named_window_data
+test named-window-row-number {
+    SELECT a, row_number() OVER w1
+    FROM t_nw
+    WINDOW w1 AS (PARTITION BY c ORDER BY a)
+    ORDER BY a;
+}
+expect {
+    1|1
+    2|1
+    3|2
+    4|2
+    5|3
+}
+
+setup named_window_rank_data {
+    CREATE TABLE t_nw_rank (a INTEGER, b INTEGER);
+    INSERT INTO t_nw_rank VALUES (1, 10), (2, 10), (3, 20), (4, 20), (5, 30);
+}
+
+@setup named_window_rank_data
+@skip-if sqlite "TODO: rank() and dense_rank() are not yet implemented."
+test named-window-rank-dense-rank {
+    SELECT a, rank() OVER w1, dense_rank() OVER w1
+    FROM t_nw_rank
+    WINDOW w1 AS (ORDER BY b)
+    ORDER BY a;
+}
+expect error {
+    no such function: rank
+}
+
+setup named_window_ntile_data {
+    CREATE TABLE t_nw_ntile (a INTEGER);
+    INSERT INTO t_nw_ntile VALUES (1), (2), (3), (4), (5), (6);
+}
+
+@setup named_window_ntile_data
+@skip-if sqlite "TODO: ntile() is not yet implemented."
+test named-window-ntile {
+    SELECT a, ntile(3) OVER w1
+    FROM t_nw_ntile
+    WINDOW w1 AS (ORDER BY a)
+    ORDER BY a;
+}
+expect error {
+    no such function: ntile
+}
+
+setup named_window_sub_data {
+    CREATE TABLE t_nw_sub (a INTEGER, b TEXT);
+    INSERT INTO t_nw_sub VALUES (1, 'x'), (2, 'x'), (3, 'y'), (4, 'y');
+}
+
+@setup named_window_sub_data
+test named-window-in-subquery {
+    SELECT * FROM (
+        SELECT a, sum(a) OVER w1 AS s
+        FROM t_nw_sub
+        WINDOW w1 AS (PARTITION BY b)
+    ) ORDER BY a;
+}
+expect {
+    1|3
+    2|3
+    3|7
+    4|7
+}
+
+setup named_window_case_data {
+    CREATE TABLE t_nw_case (a INTEGER, b TEXT);
+    INSERT INTO t_nw_case VALUES (1, 'x'), (2, 'x'), (3, 'y');
+}
+
+@setup named_window_case_data
+test named-window-case-insensitive {
+    SELECT a, count(*) OVER W1
+    FROM t_nw_case
+    WINDOW w1 AS (PARTITION BY b)
+    ORDER BY a;
+}
+expect {
+    1|2
+    2|2
+    3|1
+}
+
+@setup named_window_sub_data
+@skip-if sqlite "TODO: lag() and lead() are not yet implemented."
+test named-window-lag-lead {
+    SELECT a, lag(a) OVER w1, lead(a) OVER w1
+    FROM t_nw_sub
+    WINDOW w1 AS (PARTITION BY b ORDER BY a)
+    ORDER BY a;
+}
+expect error {
+    no such function: lag
+}
+
+setup named_window_multi_fn_data {
+    CREATE TABLE t_nw_mfn (a INTEGER, b TEXT, c INTEGER);
+    INSERT INTO t_nw_mfn VALUES (1, 'x', 10), (2, 'x', 20), (3, 'y', 30), (4, 'y', 40);
+}
+
+@setup named_window_multi_fn_data
+test named-window-different-windows-per-function {
+    SELECT a, sum(c) OVER w1, count(*) OVER w2
+    FROM t_nw_mfn
+    WINDOW w1 AS (PARTITION BY b), w2 AS (ORDER BY a)
+    ORDER BY a;
+}
+expect {
+    1|30|1
+    2|30|2
+    3|70|3
+    4|70|4
+}
+
+setup named_window_three_data {
+    CREATE TABLE t_nw_3w (a INTEGER, b TEXT, c INTEGER);
+    INSERT INTO t_nw_3w VALUES (1, 'x', 10), (2, 'x', 20), (3, 'y', 30), (4, 'y', 40), (5, 'x', 50);
+}
+
+@setup named_window_three_data
+test named-window-three-windows {
+    SELECT a, sum(c) OVER w1, count(*) OVER w2, max(c) OVER w3
+    FROM t_nw_3w
+    WINDOW w1 AS (PARTITION BY b), w2 AS (ORDER BY a), w3 AS ()
+    ORDER BY a;
+}
+expect {
+    1|80|1|50
+    2|80|2|50
+    3|70|3|50
+    4|70|4|50
+    5|80|5|50
+}
+
+setup named_window_group_data {
+    CREATE TABLE t_nw_grp (a TEXT, b INTEGER);
+    INSERT INTO t_nw_grp VALUES ('x', 1), ('x', 2), ('y', 3), ('y', 4), ('z', 5);
+}
+
+@setup named_window_group_data
+@skip-if sqlite "TODO: rank() is not yet implemented."
+test named-window-with-group-by {
+    SELECT a, sum(b) AS s, rank() OVER w1
+    FROM t_nw_grp
+    GROUP BY a
+    WINDOW w1 AS (ORDER BY sum(b))
+    ORDER BY a;
+}
+expect error {
+    no such function: rank
+}
+
+@setup named_window_data
+test named-window-reused-by-many-functions {
+    SELECT a, count(*) OVER w1, sum(a) OVER w1, min(a) OVER w1, max(a) OVER w1
+    FROM t_nw
+    WINDOW w1 AS (PARTITION BY c)
+    ORDER BY a;
+}
+expect {
+    1|3|9|1|5
+    2|2|6|2|4
+    3|3|9|1|5
+    4|2|6|2|4
+    5|3|9|1|5
+}
+
+setup named_window_empty_data {
+    CREATE TABLE t_nw_ew (a INTEGER);
+    INSERT INTO t_nw_ew VALUES (1), (2), (3), (4), (5);
+}
+
+@setup named_window_empty_data
+test named-window-empty-spec {
+    SELECT a, sum(a) OVER w1, count(*) OVER w1
+    FROM t_nw_ew
+    WINDOW w1 AS ()
+    ORDER BY a;
+}
+expect {
+    1|15|5
+    2|15|5
+    3|15|5
+    4|15|5
+    5|15|5
+}

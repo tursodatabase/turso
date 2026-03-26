@@ -187,7 +187,9 @@ pub fn translate_create_trigger(
     let escaped_trigger_name = escape_sql_string_literal(&normalized_trigger_name);
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
-        where_clause: Some(format!("name = '{escaped_trigger_name}'")),
+        where_clause: Some(format!(
+            "name = '{escaped_trigger_name}' AND type = 'trigger'"
+        )),
     });
 
     Ok(())

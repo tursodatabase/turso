@@ -141,6 +141,7 @@ pub struct Builder {
     enable_custom_types: bool,
     enable_index_method: bool,
     enable_materialized_views: bool,
+    enable_generated_columns: bool,
     vfs: Option<String>,
     encryption_opts: Option<turso_sdk_kit::rsapi::EncryptionOpts>,
 }
@@ -155,6 +156,7 @@ impl Builder {
             enable_custom_types: false,
             enable_index_method: false,
             enable_materialized_views: false,
+            enable_generated_columns: false,
             vfs: None,
             encryption_opts: None,
         }
@@ -190,6 +192,11 @@ impl Builder {
         self
     }
 
+    pub fn experimental_generated_columns(mut self, gencols_enabled: bool) -> Self {
+        self.enable_generated_columns = gencols_enabled;
+        self
+    }
+
     pub fn experimental_index_method(mut self, index_method_enabled: bool) -> Self {
         self.enable_index_method = index_method_enabled;
         self
@@ -220,6 +227,9 @@ impl Builder {
         }
         if self.enable_materialized_views {
             features.push("views");
+        }
+        if self.enable_generated_columns {
+            features.push("generated_columns");
         }
         if features.is_empty() {
             return None;
@@ -319,7 +329,7 @@ impl Statement {
                     let mut values = Vec::with_capacity(columns);
                     for i in 0..columns {
                         let value = stmt.row_value(i)?;
-                        values.push(value.to_owned());
+                        values.push(value);
                     }
                     Poll::Ready(Ok(Some(Row { values })))
                 } else {
@@ -406,8 +416,7 @@ impl Statement {
         }
         Ok(stmt
             .column_name(idx)
-            .expect("column index must be within valid range")
-            .into_owned())
+            .expect("column index must be within valid range"))
     }
 
     /// Returns the names of all columns in the result set.
@@ -418,7 +427,6 @@ impl Statement {
             .map(|i| {
                 stmt.column_name(i)
                     .expect("column index must be within valid range")
-                    .into_owned()
             })
             .collect()
     }
@@ -431,7 +439,7 @@ impl Statement {
             let col_name = stmt
                 .column_name(i)
                 .expect("column index must be within valid range");
-            if col_name.eq_ignore_ascii_case(name) {
+            if col_name.as_str().eq_ignore_ascii_case(name) {
                 return Ok(i);
             }
         }
@@ -451,8 +459,7 @@ impl Statement {
         for i in 0..n {
             let name = stmt
                 .column_name(i)
-                .expect("column index must be within valid range")
-                .into_owned();
+                .expect("column index must be within valid range");
             let decl_type = stmt.column_decltype(i);
             cols.push(Column { name, decl_type });
         }

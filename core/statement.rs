@@ -1,4 +1,3 @@
-use crate::turso_assert_eq;
 use std::{
     borrow::Cow,
     num::NonZero,
@@ -355,7 +354,7 @@ impl Statement {
             let syms = conn.syms.read();
             let mode = self.query_mode;
             #[cfg(debug_assertions)]
-            turso_assert_eq!(QueryMode::new(&cmd), mode);
+            crate::turso_assert_eq!(QueryMode::new(&cmd), mode);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
             let schema = conn.schema.read().clone();
             translate::translate(

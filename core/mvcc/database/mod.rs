@@ -4417,6 +4417,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             .get(),
                     );
                 let mut fresh = Schema::new();
+                fresh.generated_columns_enabled =
+                    connection.db.experimental_generated_columns_enabled();
                 fresh.schema_version = cookie;
                 let mut from_sql_indexes = Vec::with_capacity(10);
                 let mut automatic_indices: HashMap<String, Vec<(String, i64)>> = HashMap::default();

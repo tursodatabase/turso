@@ -18,7 +18,9 @@ use super::order_by::SortMetadata;
 use super::plan::{HashJoinType, TableReferences};
 use crate::error::SQLITE_CONSTRAINT_CHECK;
 use crate::function::Func;
-use crate::schema::{BTreeTable, CheckConstraint, Column, IndexColumn, Schema, Table};
+use crate::schema::{
+    BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema, Table,
+};
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{
     bind_and_rewrite_expr, translate_expr_no_constant_opt, walk_expr, walk_expr_mut,
@@ -33,16 +35,17 @@ use crate::util::{
     check_expr_references_column, exprs_are_equivalent, normalize_ident, parse_numeric_literal,
 };
 use crate::vdbe::affinity::Affinity;
-use crate::vdbe::builder::{CursorType, ProgramBuilder};
+use crate::vdbe::builder::{CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext};
 use crate::vdbe::insn::{to_u16, InsertFlags};
 use crate::vdbe::{insn::Insn, BranchOffset, CursorID};
 use crate::{bail_parse_error, Database, DatabaseCatalog, LimboError, Result, RwLock, SymbolTable};
 use crate::{CaptureDataChangesExt, Connection};
-use tracing::{instrument, Level};
+use tracing::instrument;
 use turso_parser::ast::{
     self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerTime,
 };
 pub(crate) mod delete;
+pub(crate) mod gencol;
 pub(crate) mod select;
 pub(crate) mod update;
 
@@ -199,13 +202,17 @@ impl<'a> Resolver<'a> {
         });
     }
 
-    pub fn resolve_function(&self, func_name: &str, arg_count: usize) -> Option<Func> {
-        match Func::resolve_function(func_name, arg_count).ok() {
-            Some(func) => Some(func),
-            None => self
+    pub fn resolve_function(
+        &self,
+        func_name: &str,
+        arg_count: usize,
+    ) -> Result<Option<Func>, LimboError> {
+        match Func::resolve_function(func_name, arg_count)? {
+            Some(func) => Ok(Some(func)),
+            None => Ok(self
                 .symbol_table
                 .resolve_function(func_name, arg_count)
-                .map(Func::External),
+                .map(Func::External)),
         }
     }
 
@@ -636,7 +643,7 @@ pub enum TransactionMode {
 
 /// Main entry point for emitting bytecode for a SQL query
 /// Takes a query plan and generates the corresponding bytecode program
-#[instrument(skip_all, level = Level::DEBUG)]
+#[instrument(skip_all, level = tracing::Level::DEBUG)]
 pub fn emit_program(
     connection: &Arc<Connection>,
     resolver: &Resolver,
@@ -695,6 +702,7 @@ pub fn emit_cdc_patch_record(
     columns_reg: usize,
     record_reg: usize,
     rowid_reg: usize,
+    layout: &ColumnLayout,
 ) -> usize {
     let columns = table.columns();
     let rowid_alias_position = columns.iter().position(|x| x.is_rowid_alias());
@@ -702,19 +710,20 @@ pub fn emit_cdc_patch_record(
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::Copy {
             src_reg: rowid_reg,
-            dst_reg: columns_reg + rowid_alias_position,
+            dst_reg: layout.to_register(columns_reg, rowid_alias_position),
             extra_amount: 0,
         });
+        let storable_count = columns.iter().filter(|c| !c.is_virtual_generated()).count();
         let is_strict = table.btree().is_some_and(|btree| btree.is_strict);
-        let affinity_str = table
-            .columns()
+        let affinity_str = columns
             .iter()
+            .filter(|col| !col.is_virtual_generated())
             .map(|col| col.affinity_with_strict(is_strict).aff_mask())
             .collect::<String>();
 
         program.emit_insn(Insn::MakeRecord {
             start_reg: to_u16(columns_reg),
-            count: to_u16(table.columns().len()),
+            count: to_u16(storable_count),
             dest_reg: to_u16(record_reg),
             index_name: None,
             affinity_str: Some(affinity_str),
@@ -725,6 +734,33 @@ pub fn emit_cdc_patch_record(
     }
 }
 
+pub(super) fn emit_make_record<'a>(
+    program: &mut ProgramBuilder,
+    cols: impl IntoIterator<Item = &'a Column>,
+    start_reg: usize,
+    dest_reg: usize,
+    is_strict: bool,
+) {
+    let storable_cols: Vec<&Column> = cols
+        .into_iter()
+        .filter(|c| !c.is_virtual_generated())
+        .collect();
+    let storable_count = storable_cols.len();
+
+    let affinity_str: String = storable_cols
+        .iter()
+        .map(|c| c.affinity_with_strict(is_strict).aff_mask())
+        .collect();
+
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u16(start_reg),
+        count: to_u16(storable_count),
+        dest_reg: to_u16(dest_reg),
+        index_name: None,
+        affinity_str: Some(affinity_str),
+    });
+}
+
 pub fn emit_cdc_full_record(
     program: &mut ProgramBuilder,
     columns: &[Column],
@@ -732,26 +768,33 @@ pub fn emit_cdc_full_record(
     rowid_reg: usize,
     is_strict: bool,
 ) -> usize {
-    let columns_reg = program.alloc_registers(columns.len() + 1);
+    let storable_count = columns.iter().filter(|c| !c.is_virtual_generated()).count();
+    let columns_reg = program.alloc_registers(storable_count + 1);
+    let mut slot = 0;
     for (i, column) in columns.iter().enumerate() {
+        if column.is_virtual_generated() {
+            continue;
+        }
         if column.is_rowid_alias() {
             program.emit_insn(Insn::Copy {
                 src_reg: rowid_reg,
-                dst_reg: columns_reg + 1 + i,
+                dst_reg: columns_reg + 1 + slot,
                 extra_amount: 0,
             });
         } else {
-            program.emit_column_or_rowid(table_cursor_id, i, columns_reg + 1 + i);
+            program.emit_column_or_rowid(table_cursor_id, i, columns_reg + 1 + slot);
         }
+        slot += 1;
     }
     let affinity_str = columns
         .iter()
+        .filter(|col| !col.is_virtual_generated())
         .map(|col| col.affinity_with_strict(is_strict).aff_mask())
         .collect::<String>();
 
     program.emit_insn(Insn::MakeRecord {
         start_reg: to_u16(columns_reg + 1),
-        count: to_u16(columns.len()),
+        count: to_u16(storable_count),
         dest_reg: to_u16(columns_reg),
         index_name: None,
         affinity_str: Some(affinity_str),
@@ -821,7 +864,7 @@ fn emit_cdc_insns_v1(
     });
     program.mark_last_insn_constant();
 
-    let Some(unixepoch_fn) = resolver.resolve_function("unixepoch", 0) else {
+    let Some(unixepoch_fn) = resolver.resolve_function("unixepoch", 0)? else {
         bail_parse_error!("no function {}", "unixepoch");
     };
     let unixepoch_fn_ctx = crate::function::FuncCtx {
@@ -933,7 +976,7 @@ fn emit_cdc_insns_v2(
     program.mark_last_insn_constant();
 
     // change_time = unixepoch()
-    let Some(unixepoch_fn) = resolver.resolve_function("unixepoch", 0) else {
+    let Some(unixepoch_fn) = resolver.resolve_function("unixepoch", 0)? else {
         bail_parse_error!("no function {}", "unixepoch");
     };
     let unixepoch_fn_ctx = crate::function::FuncCtx {
@@ -955,7 +998,7 @@ fn emit_cdc_insns_v2(
         rowid_reg: candidate_reg,
         prev_largest_reg: 0,
     });
-    let Some(conn_txn_id_fn) = resolver.resolve_function("conn_txn_id", 1) else {
+    let Some(conn_txn_id_fn) = resolver.resolve_function("conn_txn_id", 1)? else {
         bail_parse_error!("no function {}", "conn_txn_id");
     };
     let conn_txn_id_fn_ctx = crate::function::FuncCtx {
@@ -1068,7 +1111,7 @@ pub fn emit_cdc_commit_insns(
     program.mark_last_insn_constant();
 
     // reg+1: change_time = unixepoch()
-    let Some(unixepoch_fn) = resolver.resolve_function("unixepoch", 0) else {
+    let Some(unixepoch_fn) = resolver.resolve_function("unixepoch", 0)? else {
         bail_parse_error!("no function {}", "unixepoch");
     };
     let unixepoch_fn_ctx = crate::function::FuncCtx {
@@ -1086,7 +1129,7 @@ pub fn emit_cdc_commit_insns(
     // Pass -1 as candidate: if a txn_id exists, return it; if not, -1 is stored (and will be reset).
     let minus_one_reg = program.alloc_register();
     program.emit_int(-1, minus_one_reg);
-    let Some(conn_txn_id_fn) = resolver.resolve_function("conn_txn_id", 1) else {
+    let Some(conn_txn_id_fn) = resolver.resolve_function("conn_txn_id", 1)? else {
         bail_parse_error!("no function {}", "conn_txn_id");
     };
     let conn_txn_id_fn_ctx = crate::function::FuncCtx {
@@ -1147,7 +1190,7 @@ pub fn emit_cdc_autocommit_commit(
     let cdc_info = program.capture_data_changes_info().as_ref();
     if cdc_info.is_some_and(|info| info.cdc_version().has_commit_record()) {
         // Check if we're in autocommit mode; if so, emit a COMMIT record.
-        let Some(is_autocommit_fn) = resolver.resolve_function("is_autocommit", 0) else {
+        let Some(is_autocommit_fn) = resolver.resolve_function("is_autocommit", 0)? else {
             bail_parse_error!("no function {}", "is_autocommit");
         };
         let is_autocommit_fn_ctx = crate::function::FuncCtx {
@@ -1287,6 +1330,7 @@ fn rewrite_where_for_update_registers(
     columns: &[Column],
     columns_start_reg: usize,
     rowid_reg: usize,
+    layout: &ColumnLayout,
 ) -> Result<WalkControl> {
     walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
         match e {
@@ -1300,7 +1344,7 @@ fn rewrite_where_for_update_registers(
                     if c.is_rowid_alias() {
                         *e = Expr::Register(rowid_reg);
                     } else {
-                        *e = Expr::Register(columns_start_reg + idx);
+                        *e = Expr::Register(layout.to_register(columns_start_reg, idx));
                     }
                 }
             }
@@ -1319,12 +1363,15 @@ fn rewrite_where_for_update_registers(
                     if c.is_rowid_alias() {
                         *e = Expr::Register(rowid_reg);
                     } else {
-                        *e = Expr::Register(columns_start_reg + idx);
+                        *e = Expr::Register(layout.to_register(columns_start_reg, idx));
                     }
                 }
             }
             Expr::RowId { .. } => {
                 *e = Expr::Register(rowid_reg);
+            }
+            Expr::Column { table, .. } if table.is_self_table() => {
+                return Ok(WalkControl::SkipChildren);
             }
             _ => {}
         }
@@ -1351,14 +1398,26 @@ pub(crate) fn emit_index_column_value_old_image(
             resolver,
             BindingBehavior::ResultColumnsNotAllowed,
         )?;
-        translate_expr_no_constant_opt(
-            program,
-            Some(table_references),
-            &expr,
-            dest_reg,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        )?;
+
+        let self_table_context =
+            table_references
+                .joined_tables()
+                .first()
+                .map(|jt| SelfTableContext::ForSelect {
+                    table_ref_id: jt.internal_id,
+                    referenced_tables: table_references.clone(),
+                });
+        program.with_self_table_context(self_table_context.as_ref(), |program, _| {
+            translate_expr_no_constant_opt(
+                program,
+                Some(table_references),
+                &expr,
+                dest_reg,
+                resolver,
+                NoConstantOptReason::RegisterReuse,
+            )?;
+            Ok(())
+        })?;
     } else {
         program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
     }
@@ -1377,10 +1436,17 @@ fn emit_index_column_value_new_image(
     idx_col: &IndexColumn,
     dest_reg: usize,
     is_strict: bool,
+    layout: &ColumnLayout,
 ) -> Result<()> {
     if let Some(expr) = &idx_col.expr {
         let mut expr = expr.as_ref().clone();
-        rewrite_where_for_update_registers(&mut expr, columns, columns_start_reg, rowid_reg)?;
+        rewrite_where_for_update_registers(
+            &mut expr,
+            columns,
+            columns_start_reg,
+            rowid_reg,
+            layout,
+        )?;
         // The caller must have populated resolver.register_affinities so that
         // comparison instructions in the expression get the correct column
         // affinity even though column references have been rewritten to
@@ -1396,29 +1462,57 @@ fn emit_index_column_value_new_image(
             columns_start_reg,
             Some(rowid_reg),
             is_strict,
+            layout,
         )?;
-        translate_expr_no_constant_opt(
-            program,
-            None,
-            &expr,
-            dest_reg,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        )?;
+
+        let ctx = SelfTableContext::ForDML(DmlColumnContext::layout(
+            columns,
+            columns_start_reg,
+            rowid_reg,
+            layout.clone(),
+        ));
+        program.with_self_table_context(Some(&ctx), |program, _| {
+            translate_expr_no_constant_opt(
+                program,
+                None,
+                &expr,
+                dest_reg,
+                resolver,
+                NoConstantOptReason::RegisterReuse,
+            )?;
+            Ok(())
+        })?;
     } else {
         let col_in_table = columns
             .get(idx_col.pos_in_table)
             .expect("column index out of bounds");
-        let src_reg = if col_in_table.is_rowid_alias() {
-            rowid_reg
-        } else {
-            columns_start_reg + idx_col.pos_in_table
-        };
-        program.emit_insn(Insn::Copy {
-            src_reg,
-            dst_reg: dest_reg,
-            extra_amount: 0,
-        });
+        match col_in_table.generated_type() {
+            GeneratedType::Virtual { ref resolved, .. } => {
+                gencol::emit_gencol_expr_from_registers(
+                    program,
+                    resolved,
+                    dest_reg,
+                    columns_start_reg,
+                    columns,
+                    resolver,
+                    rowid_reg,
+                    layout,
+                )?;
+                program.emit_column_affinity(dest_reg, col_in_table.affinity());
+            }
+            GeneratedType::NotGenerated => {
+                let src_reg = if col_in_table.is_rowid_alias() {
+                    rowid_reg
+                } else {
+                    layout.to_register(columns_start_reg, idx_col.pos_in_table)
+                };
+                program.emit_insn(Insn::Copy {
+                    src_reg,
+                    dst_reg: dest_reg,
+                    extra_amount: 0,
+                });
+            }
+        }
     }
     Ok(())
 }

@@ -1152,10 +1152,25 @@ pub struct SelectConfig {
     /// Probability of generating a CTE (WITH clause).
     pub cte_probability: f64,
 
-    // Stubs (not yet implemented, probability 0.0)
     /// Probability of generating a compound SELECT (UNION/INTERSECT/EXCEPT).
     pub compound_probability: f64,
 
+    /// Maximum number of compound arms (each arm is a UNION/INTERSECT/EXCEPT SELECT).
+    pub compound_max_arms: usize,
+
+    /// Probability of generating ORDER BY on a compound SELECT.
+    pub compound_order_by_probability: f64,
+
+    /// Probability of generating LIMIT on a compound SELECT.
+    pub compound_limit_probability: f64,
+
+    /// Probability of generating WHERE on each compound arm.
+    pub compound_where_probability: f64,
+
+    /// Weights for compound operator selection.
+    pub compound_operator_weights: CompoundOperatorWeights,
+
+    // Stubs (not yet implemented, probability 0.0)
     /// Probability of generating a derived table (subquery in FROM).
     pub derived_table_probability: f64,
 }
@@ -1192,8 +1207,13 @@ impl Default for SelectConfig {
             join_config: JoinConfig::default(),
             cte_config: CteConfig::default(),
             cte_probability: 0.15,
+            compound_probability: 0.15,
+            compound_max_arms: 4,
+            compound_order_by_probability: 0.7,
+            compound_limit_probability: 0.3,
+            compound_where_probability: 0.5,
+            compound_operator_weights: CompoundOperatorWeights::default(),
             // Stubs
-            compound_probability: 0.0,
             derived_table_probability: 0.0,
         }
     }
@@ -1215,6 +1235,7 @@ impl SelectConfig {
             subquery_group_by_probability: 0.0,
             subquery_distinct_probability: 0.0,
             cte_probability: 0.0,
+            compound_probability: 0.0,
             ..Default::default()
         }
     }
@@ -1272,6 +1293,26 @@ impl Default for NullsOrderWeights {
             first: 10,
             last: 10,
             unspecified: 80,
+        }
+    }
+}
+
+/// Weights for compound SELECT operator selection (UNION/INTERSECT/EXCEPT).
+#[derive(Debug, Clone)]
+pub struct CompoundOperatorWeights {
+    pub union: u32,
+    pub union_all: u32,
+    pub intersect: u32,
+    pub except: u32,
+}
+
+impl Default for CompoundOperatorWeights {
+    fn default() -> Self {
+        Self {
+            union: 30,
+            union_all: 40,
+            intersect: 15,
+            except: 15,
         }
     }
 }

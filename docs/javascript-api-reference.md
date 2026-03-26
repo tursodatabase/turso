@@ -3,7 +3,7 @@
 This document describes the JavaScript API for Turso. The API is implemented in two different packages:
 
 - [@tursodatabase/database](https://www.npmjs.com/package/@tursodatabase/database) (`bindings/javascript`) - Native bindings for the Turso database.
-- [@tursodatabase/serverless](https://www.npmjs.com/package/@tursodatabase/serverless) (`packages/turso-serverless`) - Serverless driver for Turso Cloud databases.
+- [@tursodatabase/serverless](https://www.npmjs.com/package/@tursodatabase/serverless) (`serverless/javascript`) - Serverless driver for Turso Cloud databases.
 
 The API is compatible with the libSQL promise API, which is an asynchronous variant of the `better-sqlite3` API.
 

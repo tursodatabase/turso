@@ -140,3 +140,93 @@ expect {
     1
 }
 
+# Unary-plus on integer literals should still resolve as column index
+# references, matching SQLite behavior.
+# Fixes select1-4.9.2 in testing/sqlite3/all.test.
+
+test order-by-plus-2 {
+    CREATE TABLE t8(a, b);
+    INSERT INTO t8 VALUES(1,10);
+    INSERT INTO t8 VALUES(2,9);
+    SELECT * FROM t8 ORDER BY +2;
+}
+expect {
+    2|9
+    1|10
+}
+
+test order-by-plus-1 {
+    CREATE TABLE t9(a, b);
+    INSERT INTO t9 VALUES(2,10);
+    INSERT INTO t9 VALUES(1,9);
+    SELECT * FROM t9 ORDER BY +1;
+}
+expect {
+    1|9
+    2|10
+}
+
+test order-by-plus-2-desc {
+    CREATE TABLE t10(a, b);
+    INSERT INTO t10 VALUES(1,10);
+    INSERT INTO t10 VALUES(2,9);
+    SELECT * FROM t10 ORDER BY +2 DESC;
+}
+expect {
+    1|10
+    2|9
+}
+
+test group-by-plus-1 {
+    CREATE TABLE t11(a text, b int);
+    INSERT INTO t11 VALUES('x',1),('x',2),('y',3);
+    SELECT a, sum(b) FROM t11 GROUP BY +1;
+}
+expect {
+    x|3
+    y|3
+}
+
+# Negative integer literals in ORDER BY should be rejected as invalid
+# column index references, matching SQLite behavior.
+# Fixes select1-4.10.2 in testing/sqlite3/all.test.
+
+test order-by-negative-1 {
+    CREATE TABLE t12(a, b);
+    INSERT INTO t12 VALUES(1,10),(2,9);
+    SELECT * FROM t12 ORDER BY -1;
+}
+expect error {
+    1st ORDER BY term out of range - should be between 1 and 2
+}
+
+test order-by-negative-100 {
+    CREATE TABLE t13(a, b);
+    INSERT INTO t13 VALUES(1,10),(2,9);
+    SELECT * FROM t13 ORDER BY -100;
+}
+expect error {
+    1st ORDER BY term out of range - should be between 1 and 2
+}
+
+# Positive out-of-range and zero column indices should use SQLite-compatible
+# error messages. Fixes select1-4.10.1 in testing/sqlite3/all.test.
+
+test order-by-out-of-range {
+    CREATE TABLE t14(a, b);
+    INSERT INTO t14 VALUES(1,10),(2,9);
+    SELECT * FROM t14 ORDER BY 3;
+}
+expect error {
+    1st ORDER BY term out of range - should be between 1 and 2
+}
+
+test order-by-zero {
+    CREATE TABLE t15(a, b);
+    INSERT INTO t15 VALUES(1,10),(2,9);
+    SELECT * FROM t15 ORDER BY 0;
+}
+expect error {
+    1st ORDER BY term out of range - should be between 1 and 2
+}
+

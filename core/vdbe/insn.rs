@@ -544,8 +544,8 @@ pub enum Insn {
     TypeCheck {
         start_reg: usize, // P1
         count: usize,     // P2
-        /// GENERATED ALWAYS AS ... STATIC columns are only checked if P3 is zero.
-        /// When P3 is non-zero, no type checking occurs for static generated columns.
+        /// GENERATED ALWAYS AS ... STORED columns are only checked if P3 is zero.
+        /// When P3 is non-zero, no type checking occurs for stored generated columns.
         check_generated: bool, // P3
         table_reference: Arc<BTreeTable>, // P4
     },

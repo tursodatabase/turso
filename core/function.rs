@@ -470,6 +470,7 @@ pub enum ScalarFunc {
     DateTime,
     Typeof,
     Unicode,
+    Unistr,
     Quote,
     SqliteVersion,
     TursoVersion,
@@ -579,6 +580,7 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::DateTime => false,
             ScalarFunc::Typeof => true,
             ScalarFunc::Unicode => true,
+            ScalarFunc::Unistr => true,
             ScalarFunc::Quote => true,
             ScalarFunc::SqliteVersion => false,
             ScalarFunc::TursoVersion => false,
@@ -707,6 +709,7 @@ impl Display for ScalarFunc {
             Self::TotalChanges => "total_changes",
             Self::Typeof => "typeof",
             Self::Unicode => "unicode",
+            Self::Unistr => "unistr",
             Self::Quote => "quote",
             Self::SqliteVersion => "sqlite_version",
             Self::TursoVersion => "turso_version",
@@ -823,6 +826,7 @@ impl ScalarFunc {
             | Self::Soundex
             | Self::Typeof
             | Self::Unicode
+            | Self::Unistr
             | Self::Upper
             | Self::ZeroBlob
             | Self::Likely
@@ -1173,21 +1177,21 @@ impl Func {
     pub fn needs_star_expansion(&self) -> bool {
         false
     }
-    pub fn resolve_function(name: &str, arg_count: usize) -> Result<Self, LimboError> {
+    pub fn resolve_function(name: &str, arg_count: usize) -> Result<Option<Self>, LimboError> {
         let normalized_name = crate::util::normalize_ident(name);
         match normalized_name.as_str() {
             "avg" => {
                 if arg_count != 1 {
                     crate::bail_parse_error!("wrong number of arguments to function {}()", name)
                 }
-                Ok(Self::Agg(AggFunc::Avg))
+                Ok(Some(Self::Agg(AggFunc::Avg)))
             }
             "count" => {
                 // Handle both COUNT() and COUNT(expr) cases
                 if arg_count == 0 {
-                    Ok(Self::Agg(AggFunc::Count0)) // COUNT() case
+                    Ok(Some(Self::Agg(AggFunc::Count0))) // COUNT() case
                 } else if arg_count == 1 {
-                    Ok(Self::Agg(AggFunc::Count)) // COUNT(expr) case
+                    Ok(Some(Self::Agg(AggFunc::Count))) // COUNT(expr) case
                 } else {
                     crate::bail_parse_error!("wrong number of arguments to function {}()", name)
                 }
@@ -1197,251 +1201,252 @@ impl Func {
                     println!("{arg_count}");
                     crate::bail_parse_error!("wrong number of arguments to function {}()", name)
                 }
-                Ok(Self::Agg(AggFunc::GroupConcat))
+                Ok(Some(Self::Agg(AggFunc::GroupConcat)))
             }
-            "max" if arg_count > 1 => Ok(Self::Scalar(ScalarFunc::Max)),
+            "max" if arg_count > 1 => Ok(Some(Self::Scalar(ScalarFunc::Max))),
             "max" => {
                 if arg_count < 1 {
                     crate::bail_parse_error!("wrong number of arguments to function {}()", name)
                 }
-                Ok(Self::Agg(AggFunc::Max))
+                Ok(Some(Self::Agg(AggFunc::Max)))
             }
-            "min" if arg_count > 1 => Ok(Self::Scalar(ScalarFunc::Min)),
+            "min" if arg_count > 1 => Ok(Some(Self::Scalar(ScalarFunc::Min))),
             "min" => {
                 if arg_count < 1 {
                     crate::bail_parse_error!("wrong number of arguments to function {}()", name)
                 }
-                Ok(Self::Agg(AggFunc::Min))
+                Ok(Some(Self::Agg(AggFunc::Min)))
             }
-            "nullif" if arg_count == 2 => Ok(Self::Scalar(ScalarFunc::Nullif)),
+            "nullif" if arg_count == 2 => Ok(Some(Self::Scalar(ScalarFunc::Nullif))),
             "string_agg" => {
                 if arg_count != 2 {
                     crate::bail_parse_error!("wrong number of arguments to function {}()", name)
                 }
-                Ok(Self::Agg(AggFunc::StringAgg))
+                Ok(Some(Self::Agg(AggFunc::StringAgg)))
             }
             "sum" => {
                 if arg_count != 1 {
                     crate::bail_parse_error!("wrong number of arguments to function {}()", name)
                 }
-                Ok(Self::Agg(AggFunc::Sum))
+                Ok(Some(Self::Agg(AggFunc::Sum)))
             }
             "total" => {
                 if arg_count != 1 {
                     crate::bail_parse_error!("wrong number of arguments to function {}()", name)
                 }
-                Ok(Self::Agg(AggFunc::Total))
+                Ok(Some(Self::Agg(AggFunc::Total)))
             }
             "row_number" => {
                 if arg_count != 0 {
                     crate::bail_parse_error!("wrong number of arguments to function {}()", name)
                 }
-                Ok(Self::Window(WindowFunc::RowNumber))
+                Ok(Some(Self::Window(WindowFunc::RowNumber)))
             }
             "timediff" => {
                 if arg_count != 2 {
                     crate::bail_parse_error!("wrong number of arguments to function {}()", name)
                 }
-                Ok(Self::Scalar(ScalarFunc::TimeDiff))
+                Ok(Some(Self::Scalar(ScalarFunc::TimeDiff)))
             }
-            "array_agg" => Ok(Self::Agg(AggFunc::ArrayAgg)),
+            "array_agg" => Ok(Some(Self::Agg(AggFunc::ArrayAgg))),
             #[cfg(feature = "json")]
-            "jsonb_group_array" => Ok(Self::Agg(AggFunc::JsonbGroupArray)),
+            "jsonb_group_array" => Ok(Some(Self::Agg(AggFunc::JsonbGroupArray))),
             #[cfg(feature = "json")]
-            "json_group_array" => Ok(Self::Agg(AggFunc::JsonGroupArray)),
+            "json_group_array" => Ok(Some(Self::Agg(AggFunc::JsonGroupArray))),
             #[cfg(feature = "json")]
-            "jsonb_group_object" => Ok(Self::Agg(AggFunc::JsonbGroupObject)),
+            "jsonb_group_object" => Ok(Some(Self::Agg(AggFunc::JsonbGroupObject))),
             #[cfg(feature = "json")]
-            "json_group_object" => Ok(Self::Agg(AggFunc::JsonGroupObject)),
-            "char" => Ok(Self::Scalar(ScalarFunc::Char)),
-            "coalesce" => Ok(Self::Scalar(ScalarFunc::Coalesce)),
-            "concat" => Ok(Self::Scalar(ScalarFunc::Concat)),
-            "concat_ws" => Ok(Self::Scalar(ScalarFunc::ConcatWs)),
-            "changes" => Ok(Self::Scalar(ScalarFunc::Changes)),
-            "total_changes" => Ok(Self::Scalar(ScalarFunc::TotalChanges)),
-            "glob" => Ok(Self::Scalar(ScalarFunc::Glob)),
-            "ifnull" => Ok(Self::Scalar(ScalarFunc::IfNull)),
-            "if" | "iif" => Ok(Self::Scalar(ScalarFunc::Iif)),
-            "instr" => Ok(Self::Scalar(ScalarFunc::Instr)),
-            "like" => Ok(Self::Scalar(ScalarFunc::Like)),
-            "abs" => Ok(Self::Scalar(ScalarFunc::Abs)),
-            "upper" => Ok(Self::Scalar(ScalarFunc::Upper)),
-            "lower" => Ok(Self::Scalar(ScalarFunc::Lower)),
-            "random" => Ok(Self::Scalar(ScalarFunc::Random)),
-            "randomblob" => Ok(Self::Scalar(ScalarFunc::RandomBlob)),
-            "trim" => Ok(Self::Scalar(ScalarFunc::Trim)),
-            "ltrim" => Ok(Self::Scalar(ScalarFunc::LTrim)),
-            "rtrim" => Ok(Self::Scalar(ScalarFunc::RTrim)),
-            "round" => Ok(Self::Scalar(ScalarFunc::Round)),
-            "length" => Ok(Self::Scalar(ScalarFunc::Length)),
-            "octet_length" => Ok(Self::Scalar(ScalarFunc::OctetLength)),
-            "sign" => Ok(Self::Scalar(ScalarFunc::Sign)),
-            "substr" => Ok(Self::Scalar(ScalarFunc::Substr)),
-            "substring" => Ok(Self::Scalar(ScalarFunc::Substring)),
-            "date" => Ok(Self::Scalar(ScalarFunc::Date)),
-            "time" => Ok(Self::Scalar(ScalarFunc::Time)),
-            "datetime" => Ok(Self::Scalar(ScalarFunc::DateTime)),
-            "typeof" => Ok(Self::Scalar(ScalarFunc::Typeof)),
-            "last_insert_rowid" => Ok(Self::Scalar(ScalarFunc::LastInsertRowid)),
-            "unicode" => Ok(Self::Scalar(ScalarFunc::Unicode)),
-            "quote" => Ok(Self::Scalar(ScalarFunc::Quote)),
-            "sqlite_version" => Ok(Self::Scalar(ScalarFunc::SqliteVersion)),
-            "turso_version" => Ok(Self::Scalar(ScalarFunc::TursoVersion)),
-            "sqlite_source_id" => Ok(Self::Scalar(ScalarFunc::SqliteSourceId)),
-            "replace" => Ok(Self::Scalar(ScalarFunc::Replace)),
-            "likely" => Ok(Self::Scalar(ScalarFunc::Likely)),
-            "likelihood" => Ok(Self::Scalar(ScalarFunc::Likelihood)),
-            "unlikely" => Ok(Self::Scalar(ScalarFunc::Unlikely)),
+            "json_group_object" => Ok(Some(Self::Agg(AggFunc::JsonGroupObject))),
+            "char" => Ok(Some(Self::Scalar(ScalarFunc::Char))),
+            "coalesce" => Ok(Some(Self::Scalar(ScalarFunc::Coalesce))),
+            "concat" => Ok(Some(Self::Scalar(ScalarFunc::Concat))),
+            "concat_ws" => Ok(Some(Self::Scalar(ScalarFunc::ConcatWs))),
+            "changes" => Ok(Some(Self::Scalar(ScalarFunc::Changes))),
+            "total_changes" => Ok(Some(Self::Scalar(ScalarFunc::TotalChanges))),
+            "glob" => Ok(Some(Self::Scalar(ScalarFunc::Glob))),
+            "ifnull" => Ok(Some(Self::Scalar(ScalarFunc::IfNull))),
+            "if" | "iif" => Ok(Some(Self::Scalar(ScalarFunc::Iif))),
+            "instr" => Ok(Some(Self::Scalar(ScalarFunc::Instr))),
+            "like" => Ok(Some(Self::Scalar(ScalarFunc::Like))),
+            "abs" => Ok(Some(Self::Scalar(ScalarFunc::Abs))),
+            "upper" => Ok(Some(Self::Scalar(ScalarFunc::Upper))),
+            "lower" => Ok(Some(Self::Scalar(ScalarFunc::Lower))),
+            "random" => Ok(Some(Self::Scalar(ScalarFunc::Random))),
+            "randomblob" => Ok(Some(Self::Scalar(ScalarFunc::RandomBlob))),
+            "trim" => Ok(Some(Self::Scalar(ScalarFunc::Trim))),
+            "ltrim" => Ok(Some(Self::Scalar(ScalarFunc::LTrim))),
+            "rtrim" => Ok(Some(Self::Scalar(ScalarFunc::RTrim))),
+            "round" => Ok(Some(Self::Scalar(ScalarFunc::Round))),
+            "length" => Ok(Some(Self::Scalar(ScalarFunc::Length))),
+            "octet_length" => Ok(Some(Self::Scalar(ScalarFunc::OctetLength))),
+            "sign" => Ok(Some(Self::Scalar(ScalarFunc::Sign))),
+            "substr" => Ok(Some(Self::Scalar(ScalarFunc::Substr))),
+            "substring" => Ok(Some(Self::Scalar(ScalarFunc::Substring))),
+            "date" => Ok(Some(Self::Scalar(ScalarFunc::Date))),
+            "time" => Ok(Some(Self::Scalar(ScalarFunc::Time))),
+            "datetime" => Ok(Some(Self::Scalar(ScalarFunc::DateTime))),
+            "typeof" => Ok(Some(Self::Scalar(ScalarFunc::Typeof))),
+            "last_insert_rowid" => Ok(Some(Self::Scalar(ScalarFunc::LastInsertRowid))),
+            "unicode" => Ok(Some(Self::Scalar(ScalarFunc::Unicode))),
+            "unistr" => Ok(Some(Self::Scalar(ScalarFunc::Unistr))),
+            "quote" => Ok(Some(Self::Scalar(ScalarFunc::Quote))),
+            "sqlite_version" => Ok(Some(Self::Scalar(ScalarFunc::SqliteVersion))),
+            "turso_version" => Ok(Some(Self::Scalar(ScalarFunc::TursoVersion))),
+            "sqlite_source_id" => Ok(Some(Self::Scalar(ScalarFunc::SqliteSourceId))),
+            "replace" => Ok(Some(Self::Scalar(ScalarFunc::Replace))),
+            "likely" => Ok(Some(Self::Scalar(ScalarFunc::Likely))),
+            "likelihood" => Ok(Some(Self::Scalar(ScalarFunc::Likelihood))),
+            "unlikely" => Ok(Some(Self::Scalar(ScalarFunc::Unlikely))),
             #[cfg(feature = "json")]
-            "json" => Ok(Self::Json(JsonFunc::Json)),
+            "json" => Ok(Some(Self::Json(JsonFunc::Json))),
             #[cfg(feature = "json")]
-            "jsonb" => Ok(Self::Json(JsonFunc::Jsonb)),
+            "jsonb" => Ok(Some(Self::Json(JsonFunc::Jsonb))),
             #[cfg(feature = "json")]
-            "json_array_length" => Ok(Self::Json(JsonFunc::JsonArrayLength)),
+            "json_array_length" => Ok(Some(Self::Json(JsonFunc::JsonArrayLength))),
             #[cfg(feature = "json")]
-            "json_array" => Ok(Self::Json(JsonFunc::JsonArray)),
+            "json_array" => Ok(Some(Self::Json(JsonFunc::JsonArray))),
             #[cfg(feature = "json")]
-            "jsonb_array" => Ok(Self::Json(JsonFunc::JsonbArray)),
+            "jsonb_array" => Ok(Some(Self::Json(JsonFunc::JsonbArray))),
             #[cfg(feature = "json")]
-            "json_extract" => Ok(Func::Json(JsonFunc::JsonExtract)),
+            "json_extract" => Ok(Some(Func::Json(JsonFunc::JsonExtract))),
             #[cfg(feature = "json")]
-            "jsonb_extract" => Ok(Func::Json(JsonFunc::JsonbExtract)),
+            "jsonb_extract" => Ok(Some(Func::Json(JsonFunc::JsonbExtract))),
             #[cfg(feature = "json")]
-            "json_object" => Ok(Func::Json(JsonFunc::JsonObject)),
+            "json_object" => Ok(Some(Func::Json(JsonFunc::JsonObject))),
             #[cfg(feature = "json")]
-            "jsonb_object" => Ok(Func::Json(JsonFunc::JsonbObject)),
+            "jsonb_object" => Ok(Some(Func::Json(JsonFunc::JsonbObject))),
             #[cfg(feature = "json")]
-            "json_type" => Ok(Func::Json(JsonFunc::JsonType)),
+            "json_type" => Ok(Some(Func::Json(JsonFunc::JsonType))),
             #[cfg(feature = "json")]
-            "json_error_position" => Ok(Self::Json(JsonFunc::JsonErrorPosition)),
+            "json_error_position" => Ok(Some(Self::Json(JsonFunc::JsonErrorPosition))),
             #[cfg(feature = "json")]
-            "json_valid" => Ok(Self::Json(JsonFunc::JsonValid)),
+            "json_valid" => Ok(Some(Self::Json(JsonFunc::JsonValid))),
             #[cfg(feature = "json")]
-            "json_patch" => Ok(Self::Json(JsonFunc::JsonPatch)),
+            "json_patch" => Ok(Some(Self::Json(JsonFunc::JsonPatch))),
             #[cfg(feature = "json")]
-            "json_remove" => Ok(Self::Json(JsonFunc::JsonRemove)),
+            "json_remove" => Ok(Some(Self::Json(JsonFunc::JsonRemove))),
             #[cfg(feature = "json")]
-            "jsonb_remove" => Ok(Self::Json(JsonFunc::JsonbRemove)),
+            "jsonb_remove" => Ok(Some(Self::Json(JsonFunc::JsonbRemove))),
             #[cfg(feature = "json")]
-            "json_replace" => Ok(Self::Json(JsonFunc::JsonReplace)),
+            "json_replace" => Ok(Some(Self::Json(JsonFunc::JsonReplace))),
             #[cfg(feature = "json")]
-            "json_insert" => Ok(Self::Json(JsonFunc::JsonInsert)),
+            "json_insert" => Ok(Some(Self::Json(JsonFunc::JsonInsert))),
             #[cfg(feature = "json")]
-            "jsonb_insert" => Ok(Self::Json(JsonFunc::JsonbInsert)),
+            "jsonb_insert" => Ok(Some(Self::Json(JsonFunc::JsonbInsert))),
             #[cfg(feature = "json")]
-            "jsonb_replace" => Ok(Self::Json(JsonFunc::JsonReplace)),
+            "jsonb_replace" => Ok(Some(Self::Json(JsonFunc::JsonReplace))),
             #[cfg(feature = "json")]
-            "json_pretty" => Ok(Self::Json(JsonFunc::JsonPretty)),
+            "json_pretty" => Ok(Some(Self::Json(JsonFunc::JsonPretty))),
             #[cfg(feature = "json")]
-            "json_set" => Ok(Self::Json(JsonFunc::JsonSet)),
+            "json_set" => Ok(Some(Self::Json(JsonFunc::JsonSet))),
             #[cfg(feature = "json")]
-            "jsonb_set" => Ok(Self::Json(JsonFunc::JsonbSet)),
+            "jsonb_set" => Ok(Some(Self::Json(JsonFunc::JsonbSet))),
             #[cfg(feature = "json")]
-            "json_quote" => Ok(Self::Json(JsonFunc::JsonQuote)),
-            "unixepoch" => Ok(Self::Scalar(ScalarFunc::UnixEpoch)),
-            "julianday" => Ok(Self::Scalar(ScalarFunc::JulianDay)),
-            "hex" => Ok(Self::Scalar(ScalarFunc::Hex)),
-            "unhex" => Ok(Self::Scalar(ScalarFunc::Unhex)),
-            "zeroblob" => Ok(Self::Scalar(ScalarFunc::ZeroBlob)),
-            "soundex" => Ok(Self::Scalar(ScalarFunc::Soundex)),
-            "table_columns_json_array" => Ok(Self::Scalar(ScalarFunc::TableColumnsJsonArray)),
-            "bin_record_json_object" => Ok(Self::Scalar(ScalarFunc::BinRecordJsonObject)),
-            "conn_txn_id" => Ok(Self::Scalar(ScalarFunc::ConnTxnId)),
-            "is_autocommit" => Ok(Self::Scalar(ScalarFunc::IsAutocommit)),
-            "acos" => Ok(Self::Math(MathFunc::Acos)),
-            "acosh" => Ok(Self::Math(MathFunc::Acosh)),
-            "asin" => Ok(Self::Math(MathFunc::Asin)),
-            "asinh" => Ok(Self::Math(MathFunc::Asinh)),
-            "atan" => Ok(Self::Math(MathFunc::Atan)),
-            "atan2" => Ok(Self::Math(MathFunc::Atan2)),
-            "atanh" => Ok(Self::Math(MathFunc::Atanh)),
-            "ceil" => Ok(Self::Math(MathFunc::Ceil)),
-            "ceiling" => Ok(Self::Math(MathFunc::Ceiling)),
-            "cos" => Ok(Self::Math(MathFunc::Cos)),
-            "cosh" => Ok(Self::Math(MathFunc::Cosh)),
-            "degrees" => Ok(Self::Math(MathFunc::Degrees)),
-            "exp" => Ok(Self::Math(MathFunc::Exp)),
-            "floor" => Ok(Self::Math(MathFunc::Floor)),
-            "ln" => Ok(Self::Math(MathFunc::Ln)),
-            "log" => Ok(Self::Math(MathFunc::Log)),
-            "log10" => Ok(Self::Math(MathFunc::Log10)),
-            "log2" => Ok(Self::Math(MathFunc::Log2)),
-            "mod" => Ok(Self::Math(MathFunc::Mod)),
-            "pi" => Ok(Self::Math(MathFunc::Pi)),
-            "pow" => Ok(Self::Math(MathFunc::Pow)),
-            "power" => Ok(Self::Math(MathFunc::Power)),
-            "radians" => Ok(Self::Math(MathFunc::Radians)),
-            "sin" => Ok(Self::Math(MathFunc::Sin)),
-            "sinh" => Ok(Self::Math(MathFunc::Sinh)),
-            "sqrt" => Ok(Self::Math(MathFunc::Sqrt)),
-            "tan" => Ok(Self::Math(MathFunc::Tan)),
-            "tanh" => Ok(Self::Math(MathFunc::Tanh)),
-            "trunc" => Ok(Self::Math(MathFunc::Trunc)),
+            "json_quote" => Ok(Some(Self::Json(JsonFunc::JsonQuote))),
+            "unixepoch" => Ok(Some(Self::Scalar(ScalarFunc::UnixEpoch))),
+            "julianday" => Ok(Some(Self::Scalar(ScalarFunc::JulianDay))),
+            "hex" => Ok(Some(Self::Scalar(ScalarFunc::Hex))),
+            "unhex" => Ok(Some(Self::Scalar(ScalarFunc::Unhex))),
+            "zeroblob" => Ok(Some(Self::Scalar(ScalarFunc::ZeroBlob))),
+            "soundex" => Ok(Some(Self::Scalar(ScalarFunc::Soundex))),
+            "table_columns_json_array" => Ok(Some(Self::Scalar(ScalarFunc::TableColumnsJsonArray))),
+            "bin_record_json_object" => Ok(Some(Self::Scalar(ScalarFunc::BinRecordJsonObject))),
+            "conn_txn_id" => Ok(Some(Self::Scalar(ScalarFunc::ConnTxnId))),
+            "is_autocommit" => Ok(Some(Self::Scalar(ScalarFunc::IsAutocommit))),
+            "acos" => Ok(Some(Self::Math(MathFunc::Acos))),
+            "acosh" => Ok(Some(Self::Math(MathFunc::Acosh))),
+            "asin" => Ok(Some(Self::Math(MathFunc::Asin))),
+            "asinh" => Ok(Some(Self::Math(MathFunc::Asinh))),
+            "atan" => Ok(Some(Self::Math(MathFunc::Atan))),
+            "atan2" => Ok(Some(Self::Math(MathFunc::Atan2))),
+            "atanh" => Ok(Some(Self::Math(MathFunc::Atanh))),
+            "ceil" => Ok(Some(Self::Math(MathFunc::Ceil))),
+            "ceiling" => Ok(Some(Self::Math(MathFunc::Ceiling))),
+            "cos" => Ok(Some(Self::Math(MathFunc::Cos))),
+            "cosh" => Ok(Some(Self::Math(MathFunc::Cosh))),
+            "degrees" => Ok(Some(Self::Math(MathFunc::Degrees))),
+            "exp" => Ok(Some(Self::Math(MathFunc::Exp))),
+            "floor" => Ok(Some(Self::Math(MathFunc::Floor))),
+            "ln" => Ok(Some(Self::Math(MathFunc::Ln))),
+            "log" => Ok(Some(Self::Math(MathFunc::Log))),
+            "log10" => Ok(Some(Self::Math(MathFunc::Log10))),
+            "log2" => Ok(Some(Self::Math(MathFunc::Log2))),
+            "mod" => Ok(Some(Self::Math(MathFunc::Mod))),
+            "pi" => Ok(Some(Self::Math(MathFunc::Pi))),
+            "pow" => Ok(Some(Self::Math(MathFunc::Pow))),
+            "power" => Ok(Some(Self::Math(MathFunc::Power))),
+            "radians" => Ok(Some(Self::Math(MathFunc::Radians))),
+            "sin" => Ok(Some(Self::Math(MathFunc::Sin))),
+            "sinh" => Ok(Some(Self::Math(MathFunc::Sinh))),
+            "sqrt" => Ok(Some(Self::Math(MathFunc::Sqrt))),
+            "tan" => Ok(Some(Self::Math(MathFunc::Tan))),
+            "tanh" => Ok(Some(Self::Math(MathFunc::Tanh))),
+            "trunc" => Ok(Some(Self::Math(MathFunc::Trunc))),
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
-            "load_extension" => Ok(Self::Scalar(ScalarFunc::LoadExtension)),
-            "strftime" => Ok(Self::Scalar(ScalarFunc::StrfTime)),
-            "printf" | "format" => Ok(Self::Scalar(ScalarFunc::Printf)),
-            "vector" => Ok(Self::Vector(VectorFunc::Vector)),
-            "vector32" => Ok(Self::Vector(VectorFunc::Vector32)),
-            "vector32_sparse" => Ok(Self::Vector(VectorFunc::Vector32Sparse)),
-            "vector64" => Ok(Self::Vector(VectorFunc::Vector64)),
-            "vector8" => Ok(Self::Vector(VectorFunc::Vector8)),
-            "vector1bit" => Ok(Self::Vector(VectorFunc::Vector1Bit)),
-            "vector_extract" => Ok(Self::Vector(VectorFunc::VectorExtract)),
-            "vector_distance_cos" => Ok(Self::Vector(VectorFunc::VectorDistanceCos)),
-            "vector_distance_l2" => Ok(Self::Vector(VectorFunc::VectorDistanceL2)),
-            "vector_distance_jaccard" => Ok(Self::Vector(VectorFunc::VectorDistanceJaccard)),
-            "vector_distance_dot" => Ok(Self::Vector(VectorFunc::VectorDistanceDot)),
-            "vector_concat" => Ok(Self::Vector(VectorFunc::VectorConcat)),
-            "vector_slice" => Ok(Self::Vector(VectorFunc::VectorSlice)),
+            "load_extension" => Ok(Some(Self::Scalar(ScalarFunc::LoadExtension))),
+            "strftime" => Ok(Some(Self::Scalar(ScalarFunc::StrfTime))),
+            "printf" | "format" => Ok(Some(Self::Scalar(ScalarFunc::Printf))),
+            "vector" => Ok(Some(Self::Vector(VectorFunc::Vector))),
+            "vector32" => Ok(Some(Self::Vector(VectorFunc::Vector32))),
+            "vector32_sparse" => Ok(Some(Self::Vector(VectorFunc::Vector32Sparse))),
+            "vector64" => Ok(Some(Self::Vector(VectorFunc::Vector64))),
+            "vector8" => Ok(Some(Self::Vector(VectorFunc::Vector8))),
+            "vector1bit" => Ok(Some(Self::Vector(VectorFunc::Vector1Bit))),
+            "vector_extract" => Ok(Some(Self::Vector(VectorFunc::VectorExtract))),
+            "vector_distance_cos" => Ok(Some(Self::Vector(VectorFunc::VectorDistanceCos))),
+            "vector_distance_l2" => Ok(Some(Self::Vector(VectorFunc::VectorDistanceL2))),
+            "vector_distance_jaccard" => Ok(Some(Self::Vector(VectorFunc::VectorDistanceJaccard))),
+            "vector_distance_dot" => Ok(Some(Self::Vector(VectorFunc::VectorDistanceDot))),
+            "vector_concat" => Ok(Some(Self::Vector(VectorFunc::VectorConcat))),
+            "vector_slice" => Ok(Some(Self::Vector(VectorFunc::VectorSlice))),
             // FTS functions
             #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-            "fts_score" => Ok(Self::Fts(FtsFunc::Score)),
+            "fts_score" => Ok(Some(Self::Fts(FtsFunc::Score))),
             #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-            "fts_match" => Ok(Self::Fts(FtsFunc::Match)),
+            "fts_match" => Ok(Some(Self::Fts(FtsFunc::Match))),
             #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-            "fts_highlight" => Ok(Self::Fts(FtsFunc::Highlight)),
+            "fts_highlight" => Ok(Some(Self::Fts(FtsFunc::Highlight))),
             // Test type functions (for custom type system testing)
-            "test_uint_encode" => Ok(Self::Scalar(ScalarFunc::TestUintEncode)),
-            "test_uint_decode" => Ok(Self::Scalar(ScalarFunc::TestUintDecode)),
-            "test_uint_add" => Ok(Self::Scalar(ScalarFunc::TestUintAdd)),
-            "test_uint_sub" => Ok(Self::Scalar(ScalarFunc::TestUintSub)),
-            "test_uint_mul" => Ok(Self::Scalar(ScalarFunc::TestUintMul)),
-            "test_uint_div" => Ok(Self::Scalar(ScalarFunc::TestUintDiv)),
-            "test_uint_lt" => Ok(Self::Scalar(ScalarFunc::TestUintLt)),
-            "test_uint_eq" => Ok(Self::Scalar(ScalarFunc::TestUintEq)),
-            "string_reverse" => Ok(Self::Scalar(ScalarFunc::StringReverse)),
+            "test_uint_encode" => Ok(Some(Self::Scalar(ScalarFunc::TestUintEncode))),
+            "test_uint_decode" => Ok(Some(Self::Scalar(ScalarFunc::TestUintDecode))),
+            "test_uint_add" => Ok(Some(Self::Scalar(ScalarFunc::TestUintAdd))),
+            "test_uint_sub" => Ok(Some(Self::Scalar(ScalarFunc::TestUintSub))),
+            "test_uint_mul" => Ok(Some(Self::Scalar(ScalarFunc::TestUintMul))),
+            "test_uint_div" => Ok(Some(Self::Scalar(ScalarFunc::TestUintDiv))),
+            "test_uint_lt" => Ok(Some(Self::Scalar(ScalarFunc::TestUintLt))),
+            "test_uint_eq" => Ok(Some(Self::Scalar(ScalarFunc::TestUintEq))),
+            "string_reverse" => Ok(Some(Self::Scalar(ScalarFunc::StringReverse))),
             // Built-in type support functions
-            "boolean_to_int" => Ok(Self::Scalar(ScalarFunc::BooleanToInt)),
-            "int_to_boolean" => Ok(Self::Scalar(ScalarFunc::IntToBoolean)),
-            "validate_ipaddr" => Ok(Self::Scalar(ScalarFunc::ValidateIpAddr)),
-            "numeric_encode" => Ok(Self::Scalar(ScalarFunc::NumericEncode)),
-            "numeric_decode" => Ok(Self::Scalar(ScalarFunc::NumericDecode)),
-            "numeric_add" => Ok(Self::Scalar(ScalarFunc::NumericAdd)),
-            "numeric_sub" => Ok(Self::Scalar(ScalarFunc::NumericSub)),
-            "numeric_mul" => Ok(Self::Scalar(ScalarFunc::NumericMul)),
-            "numeric_div" => Ok(Self::Scalar(ScalarFunc::NumericDiv)),
-            "numeric_lt" => Ok(Self::Scalar(ScalarFunc::NumericLt)),
-            "numeric_eq" => Ok(Self::Scalar(ScalarFunc::NumericEq)),
+            "boolean_to_int" => Ok(Some(Self::Scalar(ScalarFunc::BooleanToInt))),
+            "int_to_boolean" => Ok(Some(Self::Scalar(ScalarFunc::IntToBoolean))),
+            "validate_ipaddr" => Ok(Some(Self::Scalar(ScalarFunc::ValidateIpAddr))),
+            "numeric_encode" => Ok(Some(Self::Scalar(ScalarFunc::NumericEncode))),
+            "numeric_decode" => Ok(Some(Self::Scalar(ScalarFunc::NumericDecode))),
+            "numeric_add" => Ok(Some(Self::Scalar(ScalarFunc::NumericAdd))),
+            "numeric_sub" => Ok(Some(Self::Scalar(ScalarFunc::NumericSub))),
+            "numeric_mul" => Ok(Some(Self::Scalar(ScalarFunc::NumericMul))),
+            "numeric_div" => Ok(Some(Self::Scalar(ScalarFunc::NumericDiv))),
+            "numeric_lt" => Ok(Some(Self::Scalar(ScalarFunc::NumericLt))),
+            "numeric_eq" => Ok(Some(Self::Scalar(ScalarFunc::NumericEq))),
             // Array construction / element access (desugared from syntax)
-            "array" => Ok(Self::Scalar(ScalarFunc::Array)),
-            "array_element" => Ok(Self::Scalar(ScalarFunc::ArrayElement)),
-            "array_set_element" => Ok(Self::Scalar(ScalarFunc::ArraySetElement)),
+            "array" => Ok(Some(Self::Scalar(ScalarFunc::Array))),
+            "array_element" => Ok(Some(Self::Scalar(ScalarFunc::ArrayElement))),
+            "array_set_element" => Ok(Some(Self::Scalar(ScalarFunc::ArraySetElement))),
             // Array functions
-            "array_length" => Ok(Self::Scalar(ScalarFunc::ArrayLength)),
-            "array_append" => Ok(Self::Scalar(ScalarFunc::ArrayAppend)),
-            "array_prepend" => Ok(Self::Scalar(ScalarFunc::ArrayPrepend)),
-            "array_cat" => Ok(Self::Scalar(ScalarFunc::ArrayCat)),
-            "array_remove" => Ok(Self::Scalar(ScalarFunc::ArrayRemove)),
-            "array_contains" => Ok(Self::Scalar(ScalarFunc::ArrayContains)),
-            "array_position" => Ok(Self::Scalar(ScalarFunc::ArrayPosition)),
-            "array_slice" => Ok(Self::Scalar(ScalarFunc::ArraySlice)),
-            "string_to_array" => Ok(Self::Scalar(ScalarFunc::StringToArray)),
-            "array_to_string" => Ok(Self::Scalar(ScalarFunc::ArrayToString)),
-            "array_overlap" | "array_overlaps" => Ok(Self::Scalar(ScalarFunc::ArrayOverlap)),
-            "array_contains_all" => Ok(Self::Scalar(ScalarFunc::ArrayContainsAll)),
-            _ => crate::bail_parse_error!("no such function: {}", name),
+            "array_length" => Ok(Some(Self::Scalar(ScalarFunc::ArrayLength))),
+            "array_append" => Ok(Some(Self::Scalar(ScalarFunc::ArrayAppend))),
+            "array_prepend" => Ok(Some(Self::Scalar(ScalarFunc::ArrayPrepend))),
+            "array_cat" => Ok(Some(Self::Scalar(ScalarFunc::ArrayCat))),
+            "array_remove" => Ok(Some(Self::Scalar(ScalarFunc::ArrayRemove))),
+            "array_contains" => Ok(Some(Self::Scalar(ScalarFunc::ArrayContains))),
+            "array_position" => Ok(Some(Self::Scalar(ScalarFunc::ArrayPosition))),
+            "array_slice" => Ok(Some(Self::Scalar(ScalarFunc::ArraySlice))),
+            "string_to_array" => Ok(Some(Self::Scalar(ScalarFunc::StringToArray))),
+            "array_to_string" => Ok(Some(Self::Scalar(ScalarFunc::ArrayToString))),
+            "array_overlap" | "array_overlaps" => Ok(Some(Self::Scalar(ScalarFunc::ArrayOverlap))),
+            "array_contains_all" => Ok(Some(Self::Scalar(ScalarFunc::ArrayContainsAll))),
+            _ => Ok(None),
         }
     }
 

@@ -1,10 +1,24 @@
+use super::{
+    collate::get_collseq_from_expr,
+    emitter::Resolver,
+    plan::{
+        DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinOrderMember, JoinType,
+        JoinedTable, MinMaxDef, MultiIndexBranch, MultiIndexScanOp, Operation, Plan, Search,
+        SeekDef, SeekKey, SelectPlan, SetOperation, SimpleAggregate, TableReferences, UpdatePlan,
+        WhereTerm,
+    },
+    planner::TableMask,
+};
+use crate::schema::GeneratedType;
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::MultiIndexBranchAccess;
 use crate::{
     function::{AggFunc, Deterministic},
     index_method::IndexMethodCostEstimate,
     numeric::Numeric,
-    schema::{BTreeTable, Index, IndexColumn, Schema, Table, ROWID_SENTINEL},
+    schema::{
+        columns_affected_by_update, BTreeTable, Index, IndexColumn, Schema, Table, ROWID_SENTINEL,
+    },
     translate::{
         insert::ROWID_COLUMN,
         optimizer::{
@@ -50,18 +64,6 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
 use turso_parser::ast::{self, Expr, SortOrder, SubqueryType, TriggerEvent};
-
-use super::{
-    collate::get_collseq_from_expr,
-    emitter::Resolver,
-    plan::{
-        DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinOrderMember, JoinType,
-        JoinedTable, MinMaxDef, MultiIndexBranch, MultiIndexScanOp, Operation, Plan, Search,
-        SeekDef, SeekKey, SelectPlan, SetOperation, SimpleAggregate, TableReferences, UpdatePlan,
-        WhereTerm,
-    },
-    planner::TableMask,
-};
 
 pub(crate) mod access_method;
 pub(crate) mod constraints;
@@ -863,10 +865,17 @@ fn first_update_safety_reason(
                     if expr_idx_cols_mask.get(*set_clause_col_idx) {
                         break 'requires Some(DmlSafetyReason::KeyMutation);
                     }
-                } else if c.pos_in_table == *set_clause_col_idx {
-                    break 'requires Some(DmlSafetyReason::KeyMutation);
                 }
             }
+        }
+
+        let affected_cols = columns_affected_by_update(&btree_table.columns, &updated_cols);
+        if index
+            .columns
+            .iter()
+            .any(|c| affected_cols.contains(&c.pos_in_table))
+        {
+            break 'requires Some(DmlSafetyReason::KeyMutation);
         }
         break 'requires None;
     };
@@ -919,18 +928,22 @@ fn add_ephemeral_table_to_update_plan(
     plan: &mut UpdatePlan,
 ) -> Result<()> {
     let internal_id = program.table_reference_counter.next();
+    let columns = vec![(*ROWID_COLUMN).clone()];
+    let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
     let ephemeral_table = Arc::new(BTreeTable {
         root_page: 0, // Not relevant for ephemeral table definition
         name: "ephemeral_scratch".to_string(),
         has_rowid: true,
         has_autoincrement: false,
         primary_key_columns: vec![],
-        columns: vec![(*ROWID_COLUMN).clone()],
+        columns,
         is_strict: false,
         unique_sets: vec![],
         foreign_keys: vec![],
         check_constraints: vec![],
         rowid_alias_conflict_clause: None,
+        has_virtual_columns: false,
+        logical_to_physical_map,
     });
 
     let temp_cursor_id = program.alloc_cursor_id_keyed(
@@ -1441,7 +1454,8 @@ fn expr_has_null_masking_for_table(expr: &ast::Expr, table_id: ast::TableInterna
     let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
         match e {
             ast::Expr::FunctionCall { name, args, .. } => {
-                if let Ok(func) = crate::function::Func::resolve_function(name.as_str(), args.len())
+                if let Ok(Some(func)) =
+                    crate::function::Func::resolve_function(name.as_str(), args.len())
                 {
                     // IIF(cond, then, else) is like CASE WHEN cond THEN then ELSE else END.
                     // If the condition is a null check on the target table, IIF masks nulls.
@@ -2681,6 +2695,7 @@ impl Optimizable for ast::Expr {
             Expr::Unary(_, expr) => expr.is_nonnull(tables),
             Expr::Variable(..) => false,
             Expr::Register(..) => false, // Register values can be null
+            Expr::Default => false,
             Expr::Array { .. } | Expr::Subscript { .. } => {
                 unreachable!("Array and Subscript are desugared into function calls by the parser")
             }
@@ -2729,7 +2744,11 @@ impl Optimizable for ast::Expr {
                 if filter_over.over_clause.is_some() {
                     return false;
                 }
-                let Some(func) = resolver.resolve_function(name.as_str(), args.len()) else {
+                let Some(func) = resolver
+                    .resolve_function(name.as_str(), args.len())
+                    .ok()
+                    .flatten()
+                else {
                     return false;
                 };
                 func.is_deterministic() && args.iter().all(|arg| arg.is_constant(resolver))
@@ -2769,6 +2788,7 @@ impl Optimizable for ast::Expr {
             Expr::Unary(_, expr) => expr.is_constant(resolver),
             Expr::Variable(_) => true,
             Expr::Register(_) => false,
+            Expr::Default => true,
             Expr::Array { .. } | Expr::Subscript { .. } => {
                 unreachable!("Array and Subscript are desugared into function calls by the parser")
             }
@@ -2883,13 +2903,19 @@ fn ephemeral_index_build(
         .columns()
         .iter()
         .enumerate()
-        .map(|(i, c)| IndexColumn {
-            name: c.name.clone().unwrap(),
-            order: SortOrder::Asc,
-            pos_in_table: i,
-            collation: c.collation_opt(),
-            default: c.default.clone(),
-            expr: None,
+        .map(|(i, c)| {
+            let expr = match c.generated_type() {
+                GeneratedType::Virtual { .. } => c.generated_expr().cloned(),
+                GeneratedType::NotGenerated => None,
+            };
+            IndexColumn {
+                name: c.name.clone().unwrap(),
+                order: SortOrder::Asc,
+                pos_in_table: i,
+                collation: c.collation_opt(),
+                default: c.default.clone(),
+                expr: expr.map(Box::new),
+            }
         })
         // only include columns that are used in the query
         .filter(|c| table_reference.column_is_used(c.pos_in_table))

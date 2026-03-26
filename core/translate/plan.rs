@@ -300,7 +300,9 @@ pub enum Plan {
         right_most: SelectPlan,
         limit: Option<Box<Expr>>,
         offset: Option<Box<Expr>>,
-        order_by: Option<Vec<(ast::Expr, SortOrder)>>,
+        /// ORDER BY for compound selects. Each entry is (result_column_index, sort_order).
+        /// The column index is 0-based into the result set.
+        order_by: Option<Vec<(usize, SortOrder)>>,
     },
     Delete(DeletePlan),
     Update(UpdatePlan),
@@ -2074,10 +2076,7 @@ impl JoinedTable {
                 // rowid is always implicitly covered by the index
                 continue;
             }
-            let covered_by_index = index
-                .columns
-                .iter()
-                .any(|c| c.expr.is_none() && c.pos_in_table == required_col);
+            let covered_by_index = index.columns.iter().any(|c| c.pos_in_table == required_col);
             if !covered_by_index {
                 return false;
             }

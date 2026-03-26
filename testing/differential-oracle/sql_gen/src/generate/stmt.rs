@@ -1113,7 +1113,7 @@ fn generate_trigger_body_stmt<C: Capabilities>(
             _ => unreachable!(),
         },
         TriggerBodyStmtKind::Select => match generate_select(generator, ctx)? {
-            Stmt::Select(stmt) => Ok(TriggerStmt::Select(stmt)),
+            Stmt::Select(stmt) => Ok(TriggerStmt::Select(Box::new(stmt))),
             _ => unreachable!(),
         },
     }

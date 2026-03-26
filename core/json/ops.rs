@@ -5,7 +5,7 @@ use super::{
     Conv, JsonCacheCell, OutputVariant,
 };
 use crate::{
-    types::{AsValueRef, Value},
+    types::{AsValueRef, Text, Value},
     ValueRef,
 };
 
@@ -24,6 +24,13 @@ pub fn json_patch(
         (ValueRef::Null, _) | (_, ValueRef::Null) => return Ok(Value::Null),
         (ValueRef::Blob(_), _) | (_, ValueRef::Blob(_)) => {
             crate::bail_constraint_error!("blob is not supported!");
+        }
+        // Explicit handling for the case json_path('{}', 'null') case. If the patch value is
+        // the text null, the result will also be the text null. No extra parsing required.
+        (_, ValueRef::Text(t)) => {
+            if t.value == "null" {
+                return Ok(Value::Text(Text::new("null")));
+            }
         }
         _ => (),
     }

@@ -2113,3 +2113,173 @@ expect error {
 # do_execsql_test soundex-text {
 #  select soundex('Pfister'), soundex('husobee'), soundex('Tymczak'), soundex('Ashcraft'), soundex('Robert'), soundex('Rupert'), soundex('Rubin'), soundex('Kant'), soundex('Knuth'), soundex('x'), soundex('');
 # } {P236|H210|T522|A261|R163|R163|R150|K530|K530|X000|0000}
+
+@skip-if sqlite "unistr not available in CI SQLite build"
+test unistr-u-escape {
+    SELECT unistr('\u0041');
+}
+expect {
+    A
+}
+
+@skip-if sqlite "unistr not available in CI SQLite build"
+test unistr-bare-hex {
+    SELECT unistr('\0041');
+}
+expect {
+    A
+}
+
+@skip-if sqlite "unistr not available in CI SQLite build"
+test unistr-plus-form {
+    SELECT unistr('\+01F600');
+}
+expect {
+    😀
+}
+
+@skip-if sqlite "unistr not available in CI SQLite build"
+test unistr-capital-U {
+    SELECT unistr('\U0001F600');
+}
+expect {
+    😀
+}
+
+@skip-if sqlite "unistr not available in CI SQLite build"
+test unistr-backslash-escape {
+    SELECT unistr('a\\\\b');
+}
+expect {
+    a\b
+}
+
+@skip-if sqlite "unistr not available in CI SQLite build"
+test unistr-case-insensitive-hex {
+    SELECT unistr('\u00E4') = unistr('\u00e4');
+}
+expect {
+    1
+}
+
+@skip-if sqlite "unistr not available in CI SQLite build"
+test unistr-multiple-escapes {
+    SELECT unistr('\u0048\u0065\u006C\u006C\u006F');
+}
+expect {
+    Hello
+}
+
+@skip-if sqlite "unistr not available in CI SQLite build"
+test unistr-mixed {
+    SELECT unistr('hi \u0041 \U0001F600');
+}
+expect {
+    hi A 😀
+}
+
+@skip-if sqlite "unistr not available in CI SQLite build"
+test unistr-no-escapes {
+    SELECT unistr('hello');
+}
+expect {
+    hello
+}
+
+@skip-if sqlite "unistr not available in CI SQLite build"
+test unistr-empty-string {
+    SELECT unistr('');
+}
+expect {
+
+}
+
+@skip-if sqlite "unistr not available in CI SQLite build"
+test unistr-null-input {
+    SELECT unistr(NULL);
+}
+expect {
+}
+
+@skip-if sqlite "unistr not available in CI SQLite build"
+test unistr-nul-codepoint {
+    SELECT hex(unistr('\u0000'));
+}
+expect {
+    00
+}
+
+# Intentional deviation: SQLite's sqlite3AppendOneUtf8Character encodes any u32
+# as raw bytes, but Value::Text requires valid UTF-8 so we reject surrogates
+# (0xD800–0xDFFF) and values above U+10FFFF. This matches Postgres's unistr.
+@skip-if sqlite "SQLite encodes surrogates as raw bytes; we reject them for UTF-8 safety"
+test unistr-surrogate-rejected {
+    SELECT unistr('\uD83D');
+}
+expect error {
+    invalid Unicode escape
+}
+
+@skip-if sqlite "SQLite encodes above-max codepoints as raw bytes; we reject them for UTF-8 safety"
+test unistr-above-max-rejected {
+    SELECT unistr('\U00110000');
+}
+expect error {
+    invalid Unicode escape
+}
+
+@skip-if sqlite "unistr not available in CI SQLite build"
+test unistr-max-valid {
+    SELECT unistr('\U0010FFFF') IS NOT NULL;
+}
+expect {
+    1
+}
+
+@skip-if sqlite "unistr not available in CI SQLite build"
+test unistr-error-invalid-escape {
+    SELECT unistr('\q');
+}
+expect error {
+    invalid Unicode escape
+}
+
+@skip-if sqlite "unistr not available in CI SQLite build"
+test unistr-error-short-hex {
+    SELECT unistr('\u00');
+}
+expect error {
+    invalid Unicode escape
+}
+
+@skip-if sqlite "unistr not available in CI SQLite build"
+test unistr-error-trailing-backslash {
+    SELECT unistr('abc\');
+}
+expect error {
+    invalid Unicode escape
+}
+
+@skip-if sqlite "unistr not available in CI SQLite build"
+test unistr-error-non-hex-u {
+    SELECT unistr('\u00GG');
+}
+expect error {
+    invalid Unicode escape
+}
+
+@skip-if sqlite "unistr not available in CI SQLite build"
+test unistr-error-non-hex-plus {
+    SELECT unistr('\+01FG00');
+}
+expect error {
+    invalid Unicode escape
+}
+
+@skip-if sqlite "unistr not available in CI SQLite build"
+test unistr-error-non-hex-capital-U {
+    SELECT unistr('\U0001F6GG');
+}
+expect error {
+    invalid Unicode escape
+}

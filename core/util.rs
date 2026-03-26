@@ -3197,7 +3197,7 @@ pub fn rewrite_column_references_if_needed(
     table: &str,
     from: &str,
     to: &str,
-) {
+) -> Result<()> {
     for cc in &mut col.constraints {
         match &mut cc.constraint {
             ast::ColumnConstraint::ForeignKey { clause, .. } => {
@@ -3206,7 +3206,27 @@ pub fn rewrite_column_references_if_needed(
             ast::ColumnConstraint::Check(expr) => {
                 rename_identifiers(expr, from, to);
             }
+            ast::ColumnConstraint::Generated { expr, .. } => {
+                rename_identifiers(expr, from, to);
+            }
             _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// For a column definition like `parent_id REFERENCES parent(old_col)`, update
+/// the referenced parent column names when another table renames
+/// `old_col -> new_col`.
+pub fn rewrite_column_level_fk_parent_columns_if_needed(
+    col: &mut ast::ColumnDefinition,
+    table: &str,
+    from: &str,
+    to: &str,
+) {
+    for cc in &mut col.constraints {
+        if let ast::ColumnConstraint::ForeignKey { clause, .. } = &mut cc.constraint {
+            rewrite_fk_parent_cols_if_self_ref(clause, table, from, to);
         }
     }
 }

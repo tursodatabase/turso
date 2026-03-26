@@ -4,9 +4,12 @@ use std::sync::Arc;
 
 use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
+use super::emitter::gencol::compute_virtual_columns;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
-use crate::schema::{BTreeTable, IndexColumn, ROWID_SENTINEL};
-use crate::translate::emitter::{emit_check_constraints, UpdateRowSource};
+use crate::schema::{
+    columns_affected_by_update, BTreeTable, ColumnLayout, IndexColumn, ROWID_SENTINEL,
+};
+use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{
     emit_fk_child_update_counters, emit_parent_key_change_checks, fire_fk_update_actions,
@@ -35,12 +38,11 @@ use crate::{
     util::{exprs_are_equivalent, normalize_ident},
     vdbe::{
         affinity::Affinity,
-        builder::ProgramBuilder,
+        builder::{DmlColumnContext, ProgramBuilder},
         insn::{IdxInsertFlags, InsertFlags, Insn},
     },
 };
 use crate::{CaptureDataChangesExt, Connection};
-
 // The following comment is copied directly from SQLite source and should be used as a guiding light
 // whenever we encounter compatibility bugs related to conflict clause handling:
 
@@ -406,21 +408,30 @@ pub fn emit_upsert(
         target_pc: ctx.loop_labels.row_done,
     });
     let num_cols = ctx.table.columns.len();
+    let layout = ctx.table.column_layout();
+
     let current_start = program.alloc_registers(num_cols);
-    for (i, col) in ctx.table.columns.iter().enumerate() {
-        if col.is_rowid_alias() {
-            program.emit_insn(Insn::RowId {
-                cursor_id: ctx.cursor_id,
-                dest: current_start + i,
+    for i in 0..num_cols {
+        let col = &table.columns()[i];
+        let reg = layout.to_register(current_start, i);
+        if col.is_virtual_generated() {
+            program.emit_insn(Insn::Null {
+                dest: reg,
+                dest_end: None,
             });
         } else {
-            program.emit_insn(Insn::Column {
-                cursor_id: ctx.cursor_id,
-                column: i,
-                dest: current_start + i,
-                default: None,
-            });
+            program.emit_column_or_rowid(ctx.cursor_id, i, reg);
         }
+    }
+
+    if ctx.table.has_virtual_columns() {
+        let dml_ctx = DmlColumnContext::layout(
+            &ctx.table.columns,
+            current_start,
+            ctx.conflict_rowid_reg,
+            layout.clone(),
+        );
+        compute_virtual_columns(program, &ctx.table.columns, &dml_ctx, resolver)?;
     }
 
     // BEFORE for index maintenance / CDC
@@ -466,6 +477,7 @@ pub fn emit_upsert(
                 &bt.columns,
                 decoded_current,
                 None,
+                &layout,
             )?;
             // Decode new_start in-place (was copied from encoded current_start;
             // after SET applies decoded values, we encode ALL columns)
@@ -475,6 +487,7 @@ pub fn emit_upsert(
                 &bt.columns,
                 new_start,
                 None,
+                &layout,
             )?;
             // Create decoded copies of excluded (insertion) registers so that
             // excluded.column references see user-facing values
@@ -490,6 +503,7 @@ pub fn emit_upsert(
                 &bt.columns,
                 decoded_excluded,
                 None,
+                &layout,
             )?;
             (Some(decoded_current), Some(decoded_excluded))
         } else {
@@ -514,6 +528,7 @@ pub fn emit_upsert(
             Some(insertion),
             true,
             excluded_decoded_start,
+            &layout,
         )?;
         let pr = program.alloc_register();
         translate_expr(program, None, pred, pr, resolver)?;
@@ -536,19 +551,20 @@ pub fn emit_upsert(
             Some(insertion),
             true,
             excluded_decoded_start,
+            &layout,
         )?;
         translate_expr_no_constant_opt(
             program,
             None,
             expr,
-            new_start + *col_idx,
+            layout.to_register(new_start, *col_idx),
             resolver,
             NoConstantOptReason::RegisterReuse,
         )?;
         let col = &table.columns()[*col_idx];
         if col.notnull() && !col.is_rowid_alias() {
             program.emit_insn(Insn::HaltIfNull {
-                target_reg: new_start + *col_idx,
+                target_reg: layout.to_register(new_start, *col_idx),
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 description: String::from(table.get_name()) + "." + col.name.as_ref().unwrap(),
             });
@@ -557,7 +573,7 @@ pub fn emit_upsert(
             // Must be integer; remember the NEW rowid value
             let r = program.alloc_register();
             program.emit_insn(Insn::Copy {
-                src_reg: new_start + *col_idx,
+                src_reg: layout.to_register(new_start, *col_idx),
                 dst_reg: r,
                 extra_amount: 0,
             });
@@ -566,12 +582,21 @@ pub fn emit_upsert(
         }
     }
 
+    // Recompute virtual columns for the new row after SET clauses have modified base columns.
+    // This must happen before CHECK constraints, triggers, and index updates.
+    if ctx.table.has_virtual_columns() {
+        let rowid_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
+        let dml_ctx =
+            DmlColumnContext::layout(&ctx.table.columns, new_start, rowid_reg, layout.clone());
+        compute_virtual_columns(program, &ctx.table.columns, &dml_ctx, resolver)?;
+    }
+
     if let Some(bt) = table.btree() {
         if bt.is_strict {
             // Pre-encode TypeCheck: all columns are decoded (user-facing) at this point.
             program.emit_insn(Insn::TypeCheck {
                 start_reg: new_start,
-                count: num_cols,
+                count: layout.num_non_virtual_cols(),
                 check_generated: true,
                 table_reference: BTreeTable::input_type_check_table_ref(
                     &bt,
@@ -590,12 +615,13 @@ pub fn emit_upsert(
                 new_start,
                 None,
                 &bt.name,
+                &layout,
             )?;
 
             // Post-encode TypeCheck: validate encoded values match storage type.
             program.emit_insn(Insn::TypeCheck {
                 start_reg: new_start,
-                count: num_cols,
+                count: layout.num_non_virtual_cols(),
                 check_generated: true,
                 table_reference: BTreeTable::type_check_table_ref(&bt, resolver.schema()),
             });
@@ -603,11 +629,14 @@ pub fn emit_upsert(
             // For non-STRICT tables, apply column affinity to the values.
             // This must happen early so that both index records and the table record
             // use the converted values.
-            let affinity = bt.columns.iter().map(|c| c.affinity());
+            let affinity = bt
+                .columns
+                .iter()
+                .filter(|c| !c.is_virtual_generated())
+                .map(|c| c.affinity());
 
-            // Only emit Affinity if there's meaningful affinity to apply
             if affinity.clone().any(|a| a != Affinity::Blob) {
-                if let Ok(count) = std::num::NonZeroUsize::try_from(num_cols) {
+                if let Ok(count) = NonZeroUsize::try_from(layout.num_non_virtual_cols()) {
                     program.emit_insn(Insn::Affinity {
                         start_reg: new_start,
                         count,
@@ -624,10 +653,11 @@ pub fn emit_upsert(
             resolver,
             &bt.name,
             new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
-            bt.columns
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, col)| col.name.as_deref().map(|n| (n, new_start + idx))),
+            bt.columns.iter().enumerate().filter_map(|(idx, col)| {
+                col.name
+                    .as_deref()
+                    .map(|n| (n, layout.to_register(new_start, idx)))
+            }),
             connection,
             ast::ResolveType::Abort,
             ctx.loop_labels.row_done,
@@ -636,6 +666,13 @@ pub fn emit_upsert(
     }
 
     let (changed_cols, rowid_changed) = collect_changed_cols(table, set_pairs);
+    // Expand to include virtual columns that transitively depend on SET columns,
+    // so that indexes on virtual columns are correctly updated.
+    let changed_cols = if ctx.table.has_virtual_columns() {
+        columns_affected_by_update(table.columns(), &changed_cols)
+    } else {
+        changed_cols
+    };
 
     // Fire BEFORE UPDATE triggers
     let upsert_database_id = ctx.database_id;
@@ -655,7 +692,7 @@ pub fn emit_upsert(
             });
         // OLD row values are in current_start registers
         let old_registers: Vec<usize> = (0..num_cols)
-            .map(|i| current_start + i)
+            .map(|i| layout.to_register(current_start, i))
             .chain(std::iter::once(ctx.conflict_rowid_reg))
             .collect();
         if !relevant_before_update_triggers.is_empty() {
@@ -664,7 +701,7 @@ pub fn emit_upsert(
             // so fire_trigger's decode_trigger_registers will decode them.
             let new_rowid_for_trigger = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
             let new_registers: Vec<usize> = (0..num_cols)
-                .map(|i| new_start + i)
+                .map(|i| layout.to_register(new_start, i))
                 .chain(std::iter::once(new_rowid_for_trigger))
                 .collect();
 
@@ -779,6 +816,7 @@ pub fn emit_upsert(
                     &changed_cols,
                     upsert_database_id,
                     resolver,
+                    &layout,
                 )?;
             }
             let upsert_indices: Vec<_> = resolver.with_schema(upsert_database_id, |s| {
@@ -823,10 +861,11 @@ pub fn emit_upsert(
                 before,
                 ctx.conflict_rowid_reg,
                 resolver,
+                &layout,
             );
             let new_rowid = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
             let new_pred_reg = eval_partial_pred_for_row_image(
-                program, table, &idx_meta, new_start, new_rowid, resolver,
+                program, table, &idx_meta, new_start, new_rowid, resolver, &layout,
             );
 
             // Skip delete if BEFORE predicate false/NULL
@@ -854,6 +893,7 @@ pub fn emit_upsert(
                         None,
                         false,
                         None,
+                        &layout,
                     )?;
                     translate_expr_no_constant_opt(
                         program,
@@ -866,7 +906,7 @@ pub fn emit_upsert(
                 } else {
                     let (ci, _) = table.get_column_by_name(&ic.name).unwrap();
                     program.emit_insn(Insn::Copy {
-                        src_reg: before + ci,
+                        src_reg: layout.to_register(before, ci),
                         dst_reg: del + i,
                         extra_amount: 0,
                     });
@@ -912,6 +952,7 @@ pub fn emit_upsert(
                         None,
                         false,
                         None,
+                        &layout,
                     )?;
                     translate_expr_no_constant_opt(
                         program,
@@ -924,7 +965,7 @@ pub fn emit_upsert(
                 } else {
                     let (ci, _) = table.get_column_by_name(&ic.name).unwrap();
                     program.emit_insn(Insn::Copy {
-                        src_reg: new_start + ci,
+                        src_reg: layout.to_register(new_start, ci),
                         dst_reg: ins + i,
                         extra_amount: 0,
                     });
@@ -1016,20 +1057,14 @@ pub fn emit_upsert(
     }
 
     // Build NEW table payload
-    let rec = program.alloc_register();
-    let is_strict = table.btree().is_some_and(|btree| btree.is_strict);
-    let affinity_str = table
-        .columns()
-        .iter()
-        .map(|c| c.affinity_with_strict(is_strict).aff_mask())
-        .collect::<String>();
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(new_start),
-        count: to_u16(num_cols),
-        dest_reg: to_u16(rec),
-        index_name: None,
-        affinity_str: Some(affinity_str),
-    });
+    let record_reg = program.alloc_register();
+    emit_make_record(
+        program,
+        table.columns().iter(),
+        new_start,
+        record_reg,
+        table.btree().is_some_and(|bt| bt.is_strict),
+    );
 
     // If rowid changed, first ensure no other row owns it, then delete+insert
     if let Some(rnew) = new_rowid_reg {
@@ -1084,7 +1119,7 @@ pub fn emit_upsert(
         program.emit_insn(Insn::Insert {
             cursor: ctx.cursor_id,
             key_reg: rnew,
-            record_reg: rec,
+            record_reg,
             flag: InsertFlags::new()
                 .require_seek()
                 .update_rowid_change()
@@ -1095,7 +1130,7 @@ pub fn emit_upsert(
         program.emit_insn(Insn::Insert {
             cursor: ctx.cursor_id,
             key_reg: ctx.conflict_rowid_reg,
-            record_reg: rec,
+            record_reg,
             flag: InsertFlags::new().skip_last_rowid(),
             table_name: table.get_name().to_string(),
         });
@@ -1154,7 +1189,7 @@ pub fn emit_upsert(
             // INSERT (after)
             let after_rec = if program.capture_data_changes_info().has_after() {
                 Some(emit_cdc_patch_record(
-                    program, table, new_start, rec, new_rowid,
+                    program, table, new_start, record_reg, new_rowid, &layout,
                 ))
             } else {
                 None
@@ -1176,8 +1211,9 @@ pub fn emit_upsert(
                     program,
                     table,
                     new_start,
-                    rec,
+                    record_reg,
                     ctx.conflict_rowid_reg,
+                    &layout,
                 ))
             } else {
                 None
@@ -1224,7 +1260,7 @@ pub fn emit_upsert(
         if !relevant_triggers.is_empty() {
             let new_rowid_for_trigger = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
             let new_registers_after: Vec<usize> = (0..num_cols)
-                .map(|i| new_start + i)
+                .map(|i| layout.to_register(new_start, i))
                 .chain(std::iter::once(new_rowid_for_trigger))
                 .collect();
 
@@ -1256,6 +1292,14 @@ pub fn emit_upsert(
         }
     }
 
+    // Compute virtual columns for RETURNING (if any virtual columns exist)
+    if !returning.is_empty() && ctx.table.has_virtual_columns() {
+        let rowid_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
+        let dml_ctx =
+            DmlColumnContext::layout(&ctx.table.columns, new_start, rowid_reg, layout.clone());
+        compute_virtual_columns(program, &ctx.table.columns, &dml_ctx, resolver)?;
+    }
+
     // RETURNING from NEW image + final rowid
     if !returning.is_empty() {
         emit_returning_results(
@@ -1266,6 +1310,7 @@ pub fn emit_upsert(
             new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
             resolver,
             ctx.returning_buffer.as_ref(),
+            &layout,
         )?;
     }
 
@@ -1309,6 +1354,8 @@ pub fn collect_set_clauses_for_upsert(
             let Some(idx) = lookup.get(&normalize_ident(cn.as_str())) else {
                 bail_parse_error!("no such column: {}", cn);
             };
+            // cannot upsert generated column
+            table.columns()[*idx].ensure_not_generated("UPDATE", cn.as_str())?;
             if let Some(existing) = out.iter_mut().find(|(i, _)| *i == *idx) {
                 existing.1 = e;
             } else {
@@ -1326,6 +1373,7 @@ fn eval_partial_pred_for_row_image(
     row_start: usize, // base of CURRENT or NEW image
     rowid_reg: usize, // rowid for that image
     resolver: &Resolver,
+    layout: &ColumnLayout,
 ) -> Option<usize> {
     let Some(where_expr) = &idx.where_clause else {
         return None;
@@ -1336,6 +1384,7 @@ fn eval_partial_pred_for_row_image(
         None,  // insertion
         false, // dont allow EXCLUDED
         None,  // no decoded excluded
+        layout,
     )
     .ok()?;
     let r = prg.alloc_register();
@@ -1373,6 +1422,7 @@ fn rewrite_expr_to_registers(
     insertion: Option<&Insertion>,
     allow_excluded: bool,
     excluded_decoded_start: Option<usize>,
+    layout: &ColumnLayout,
 ) -> crate::Result<WalkControl> {
     use ast::Expr;
     let table_name_norm = table_name.map(normalize_ident);
@@ -1386,7 +1436,7 @@ fn rewrite_expr_to_registers(
         if c.is_rowid_alias() {
             Some(rowid_reg)
         } else {
-            Some(base_start + idx)
+            Some(base_start + layout.to_reg_offset(idx))
         }
     };
 
@@ -1408,7 +1458,9 @@ fn rewrite_expr_to_registers(
                                 if let Some(decoded_start) = excluded_decoded_start {
                                     let (col_idx, _) =
                                         table.get_column_by_name(&c).expect("column exists");
-                                    *expr = Expr::Register(decoded_start + col_idx);
+                                    *expr = Expr::Register(
+                                        decoded_start + layout.to_reg_offset(col_idx),
+                                    );
                                 } else {
                                     *expr = Expr::Register(cm.register);
                                 }

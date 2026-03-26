@@ -1,3 +1,4 @@
+use crate::schema::{ColumnLayout, GeneratedType};
 use crate::turso_debug_assert;
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
@@ -10,7 +11,7 @@ use crate::{
         emitter::{
             delete::emit_fk_child_decrement_on_delete, emit_cdc_autocommit_commit,
             emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, emit_check_constraints,
-            prepare_cdc_if_necessary, OperationMode, Resolver,
+            emit_make_record, prepare_cdc_if_necessary, OperationMode, Resolver,
         },
         expr::{
             bind_and_rewrite_expr, emit_returning_results, emit_returning_scan_back,
@@ -46,7 +47,10 @@ use crate::{
     util::normalize_ident,
     vdbe::{
         affinity::Affinity,
-        builder::{CursorKey, CursorType, ProgramBuilder, ProgramBuilderOpts},
+        builder::{
+            CursorKey, CursorType, DmlColumnContext, ProgramBuilder, ProgramBuilderOpts,
+            SelfTableContext,
+        },
         insn::{to_u16, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
         BranchOffset,
     },
@@ -314,6 +318,7 @@ pub fn translate_insert(
         program,
         resolver,
         &table,
+        &columns,
         &mut body,
         on_conflict.unwrap_or(ResolveType::Abort),
         database_id,
@@ -468,6 +473,13 @@ pub fn translate_insert(
 
     let has_before_triggers = !relevant_before_triggers.is_empty();
     if has_before_triggers {
+        compute_virtual_columns_for_triggers(
+            program,
+            &insertion.col_mappings,
+            insertion.rowid_alias_mapping(),
+            resolver,
+        )?;
+
         // In SQLite, NEW.<rowid_alias> returns -1 in BEFORE INSERT triggers when the rowid
         // hasn't been assigned yet (i.e., it's NULL). We need to temporarily set the key
         // register to -1 so the trigger sees the correct value.
@@ -595,7 +607,7 @@ pub fn translate_insert(
         // be silently converted by the encode expression.
         program.emit_insn(Insn::TypeCheck {
             start_reg: insertion.first_col_register(),
-            count: insertion.col_mappings.len(),
+            count: insertion.num_non_virtual_cols,
             check_generated: true,
             table_reference: BTreeTable::input_type_check_table_ref(
                 ctx.table,
@@ -611,7 +623,7 @@ pub fn translate_insert(
         // storage type (BASE).
         program.emit_insn(Insn::TypeCheck {
             start_reg: insertion.first_col_register(),
-            count: insertion.col_mappings.len(),
+            count: insertion.num_non_virtual_cols,
             check_generated: true,
             table_reference: BTreeTable::type_check_table_ref(ctx.table, resolver.schema()),
         });
@@ -623,12 +635,13 @@ pub fn translate_insert(
         let affinity = insertion
             .col_mappings
             .iter()
+            .filter(|cm| !cm.column.is_virtual_generated())
             .map(|col_mapping| col_mapping.column.affinity());
 
         // Only emit Affinity if there's meaningful affinity to apply
         // (i.e., not all BLOB/NONE affinity)
         if affinity.clone().any(|a| a != Affinity::Blob) {
-            if let Ok(count) = std::num::NonZeroUsize::try_from(insertion.col_mappings.len()) {
+            if let Ok(count) = NonZeroUsize::try_from(insertion.num_non_virtual_cols) {
                 program.emit_insn(Insn::Affinity {
                     start_reg: insertion.first_col_register(),
                     count,
@@ -786,6 +799,17 @@ pub fn translate_insert(
         connection,
         table_references: &mut table_references,
     };
+    // Compute virtual column values before NOT NULL constraint checking,
+    // so that things like `b AS (COALESCE(a, 0)) NOT NULL` pass validation.
+    if insertion.has_virtual_columns() {
+        compute_virtual_columns_for_triggers(
+            program,
+            &insertion.col_mappings,
+            insertion.rowid_alias_mapping(),
+            resolver,
+        )?;
+    }
+
     // NOT NULL default substitution must happen before index key registers are
     // copied in preflight constraint checks. Otherwise the index entry gets NULL
     // while the table row gets the default value, causing integrity_check failures.
@@ -801,29 +825,19 @@ pub fn translate_insert(
     )?;
 
     // Create and insert the record
-    let affinity_str = insertion
-        .col_mappings
-        .iter()
-        .map(|col_mapping| {
-            col_mapping
-                .column
-                .affinity_with_strict(ctx.table.is_strict)
-                .aff_mask()
-        })
-        .collect::<String>();
-
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(insertion.first_col_register()),
-        count: to_u16(insertion.col_mappings.len()),
-        dest_reg: to_u16(insertion.record_register()),
-        index_name: None,
-        affinity_str: Some(affinity_str),
-    });
+    emit_make_record(
+        program,
+        insertion.col_mappings.iter().map(|m| m.column),
+        insertion.base_reg,
+        insertion.record_register(),
+        ctx.table.is_strict,
+    );
 
     if has_fks {
         // Child-side FK check must run before any writes (IdxInsert / Insert).
         // For immediate FKs this emits a direct Halt, so no index entry is written
         // when the parent is missing — matching SQLite's bytecode order.
+        let fk_layout = btree_table.column_layout();
         emit_fk_child_insert_checks(
             program,
             &btree_table,
@@ -831,6 +845,7 @@ pub fn translate_insert(
             insertion.key_register(),
             resolver,
             database_id,
+            &fk_layout,
         )?;
     }
 
@@ -881,6 +896,13 @@ pub fn translate_insert(
     });
     let has_after_triggers = !relevant_after_triggers.is_empty();
     if has_after_triggers {
+        compute_virtual_columns_for_triggers(
+            program,
+            &insertion.col_mappings,
+            insertion.rowid_alias_mapping(),
+            resolver,
+        )?;
+
         // Build raw NEW registers for AFTER triggers. Values are encoded at this point;
         // fire_trigger will decode them via decode_trigger_registers.
         let key_reg = insertion.key_register();
@@ -997,6 +1019,7 @@ pub fn translate_insert(
                 insertion.first_col_register(),
                 insertion.record_register(),
                 insertion.key_register(),
+                &ColumnLayout::from_table(&table),
             ))
         } else {
             None
@@ -1025,6 +1048,7 @@ pub fn translate_insert(
             insertion.first_col_register(),
             insertion.key_register(),
             resolver,
+            &btree_table.column_layout(),
         )?;
         let result: Result<()> = (|| {
             for subquery in returning_subqueries
@@ -1059,6 +1083,7 @@ pub fn translate_insert(
             insertion.key_register(),
             resolver,
             ctx.returning_buffer.as_ref(),
+            &btree_table.column_layout(),
         )?;
     }
     program.emit_insn(Insn::Goto {
@@ -1731,10 +1756,48 @@ fn expr_contains_subquery(expr: &Expr) -> bool {
     found_subquery
 }
 
+/// Resolve `Expr::Default` in a VALUES row by replacing it with the column's
+/// default expression from the schema.
+fn resolve_defaults_in_row(
+    row: &mut [Box<Expr>],
+    table: &Table,
+    columns: &[ast::Name],
+    resolver: &Resolver,
+) {
+    let is_strict = table.is_strict();
+    for (i, expr) in row.iter_mut().enumerate() {
+        if !matches!(expr.as_ref(), Expr::Default) {
+            continue;
+        }
+        let col = if columns.is_empty() {
+            // No column list — position maps to non-hidden columns in order
+            table.columns().iter().filter(|c| !c.hidden()).nth(i)
+        } else {
+            // Column list — map by name
+            columns.get(i).and_then(|name| {
+                let name = crate::util::normalize_ident(name.as_str());
+                table.get_column_by_name(&name).map(|(_, col)| col)
+            })
+        };
+        *expr = match col {
+            Some(col) => col.default.clone().unwrap_or_else(|| {
+                if let Some(type_def) = resolver.schema().get_type_def(&col.ty_str, is_strict) {
+                    if let Some(ref default_expr) = type_def.default {
+                        return default_expr.clone();
+                    }
+                }
+                Box::new(ast::Expr::Literal(ast::Literal::Null))
+            }),
+            None => Box::new(ast::Expr::Literal(ast::Literal::Null)),
+        };
+    }
+}
+
 fn bind_insert(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     table: &Table,
+    columns: &[ast::Name],
     body: &mut InsertBody,
     on_conflict: ResolveType,
     database_id: usize,
@@ -1751,7 +1814,7 @@ fn bind_insert(
             values = table
                 .columns()
                 .iter()
-                .filter(|c| !c.hidden())
+                .filter(|c| !c.hidden() && !c.is_generated())
                 .map(|c| {
                     c.default.clone().unwrap_or_else(|| {
                         if let Some(type_def) = resolver.schema().get_type_def(&c.ty_str, is_strict)
@@ -1766,6 +1829,19 @@ fn bind_insert(
                 .collect();
         }
         InsertBody::Select(select, upsert_opt) => {
+            // Resolve Expr::Default in all VALUES rows before any compilation.
+            if let OneSelect::Values(values_expr) = &mut select.body.select {
+                for row in values_expr.iter_mut() {
+                    resolve_defaults_in_row(row, table, columns, resolver);
+                }
+            }
+            for compound in select.body.compounds.iter_mut() {
+                if let OneSelect::Values(values_expr) = &mut compound.select {
+                    for row in values_expr.iter_mut() {
+                        resolve_defaults_in_row(row, table, columns, resolver);
+                    }
+                }
+            }
             if select.body.compounds.is_empty() {
                 match &mut select.body.select {
                     // TODO see how to avoid clone
@@ -1902,7 +1978,7 @@ fn init_source_emission<'a>(
     database_id: usize,
 ) -> Result<()> {
     let required_column_count = if columns.is_empty() {
-        table.columns().len()
+        table.columns().iter().filter(|c| !c.is_generated()).count()
     } else {
         columns.len()
     };
@@ -2008,7 +2084,7 @@ fn init_source_emission<'a>(
                         ctx.table
                             .columns
                             .iter()
-                            .filter(|col| !col.hidden())
+                            .filter(|col| !col.hidden() && !col.is_generated())
                             .map(|col| col.affinity_with_strict(ctx.table.is_strict).aff_mask())
                             .collect::<String>()
                     } else {
@@ -2096,9 +2172,14 @@ fn init_source_emission<'a>(
             }
         }
         InsertBody::DefaultValues => {
-            let num_values = table.columns().len();
+            let storable_columns: Vec<_> = table
+                .columns()
+                .iter()
+                .filter(|c| !c.is_generated())
+                .collect();
+            let num_values = storable_columns.len();
             let is_strict = table.is_strict();
-            values.extend(table.columns().iter().map(|c| {
+            values.extend(storable_columns.iter().map(|c| {
                 c.default.clone().unwrap_or_else(|| {
                     if let Some(type_def) = resolver.schema().get_type_def(&c.ty_str, is_strict) {
                         if let Some(ref default_expr) = type_def.default {
@@ -2160,6 +2241,11 @@ pub struct Insertion<'a> {
     col_mappings: Vec<ColMapping<'a>>,
     /// The register that will contain the record built using the MakeRecord instruction.
     record_reg: usize,
+    /// Base register of the contiguous column block. Non-virtual columns occupy
+    /// `base_reg..base_reg + non_virtual_col_count`, virtual columns follow after.
+    base_reg: usize,
+    /// Number of non-virtual (storable) columns.
+    num_non_virtual_cols: usize,
 }
 
 impl<'a> Insertion<'a> {
@@ -2168,18 +2254,17 @@ impl<'a> Insertion<'a> {
         self.key.register()
     }
 
-    /// Return the first register of the values that used to build the record
-    /// for the main table insert.
     pub fn first_col_register(&self) -> usize {
-        self.col_mappings
-            .first()
-            .expect("columns must be present")
-            .register
+        self.base_reg
     }
 
     /// Return the register that contains the record built using the MakeRecord instruction.
     pub fn record_register(&self) -> usize {
         self.record_reg
+    }
+
+    fn has_virtual_columns(&self) -> bool {
+        self.col_mappings.len() - self.num_non_virtual_cols > 0
     }
 
     /// Returns the column mapping for a given column name.
@@ -2203,6 +2288,13 @@ impl<'a> Insertion<'a> {
                 .as_ref()
                 .is_some_and(|n| n.eq_ignore_ascii_case(name))
         })
+    }
+
+    fn rowid_alias_mapping(&self) -> Option<&ColMapping<'a>> {
+        match &self.key {
+            InsertionKey::RowidAlias(mapping) => Some(mapping),
+            _ => None,
+        }
     }
 }
 
@@ -2272,34 +2364,47 @@ fn build_insertion<'a>(
     num_values: usize,
 ) -> Result<Insertion<'a>> {
     let table_columns = table.columns();
+    let num_cols = table_columns.len();
     let rowid_register = program.alloc_register();
     let mut insertion_key = InsertionKey::Autogenerated {
         register: rowid_register,
     };
-    let mut column_mappings = table
-        .columns()
+    let layout = table
+        .btree()
+        .map(|bt| bt.column_layout())
+        .unwrap_or(ColumnLayout::Identity {
+            column_count: num_cols,
+        });
+
+    let base_reg = program.alloc_registers(num_cols);
+    let mut column_mappings = table_columns
         .iter()
-        .map(|c| ColMapping {
+        .enumerate()
+        .map(|(i, c)| ColMapping {
             column: c,
             value_index: None,
-            register: program.alloc_register(),
+            register: layout.to_register(base_reg, i),
         })
         .collect::<Vec<_>>();
 
     if columns.is_empty() {
         // Case 1: No columns specified - map values to columns in order
-        if num_values != table_columns.iter().filter(|c| !c.hidden()).count() {
+        let num_storable_columns = table_columns
+            .iter()
+            .filter(|c| !c.hidden() && !c.is_generated())
+            .count();
+        if num_values != num_storable_columns {
             crate::bail_parse_error!(
                 "table {} has {} columns but {} values were supplied",
                 &table.get_name(),
-                table_columns.len(),
+                num_storable_columns,
                 num_values
             );
         }
         let mut value_idx = 0;
         for (i, col) in table_columns.iter().enumerate() {
-            if col.hidden() {
-                // Hidden columns are not taken into account.
+            if col.hidden() || col.is_generated() {
+                // Hidden and generated columns are not taken into account.
                 continue;
             }
             if col.is_rowid_alias() {
@@ -2319,6 +2424,8 @@ fn build_insertion<'a>(
         for (value_index, column_name) in columns.iter().enumerate() {
             let column_name = normalize_ident(column_name.as_str());
             if let Some((idx_in_table, col_in_table)) = table.get_column_by_name(&column_name) {
+                // Generated columns cannot be written to directly
+                col_in_table.ensure_not_generated("INSERT into", &column_name)?;
                 // Named column
                 if col_in_table.is_rowid_alias() {
                     insertion_key = InsertionKey::RowidAlias(ColMapping {
@@ -2360,6 +2467,8 @@ fn build_insertion<'a>(
         key: insertion_key,
         col_mappings: column_mappings,
         record_reg: program.alloc_register(),
+        base_reg,
+        num_non_virtual_cols: layout.num_non_virtual_cols(),
     })
 }
 
@@ -2512,8 +2621,8 @@ fn translate_column(
         program.emit_insn(Insn::SoftNull {
             reg: column_register,
         });
-    } else if column.hidden() {
-        // Emit NULL for not-explicitly-mentioned hidden columns, even ignoring DEFAULT.
+    } else if column.hidden() || column.is_virtual_generated() {
+        // Emit NULL for not-explicitly-mentioned hidden or virtual columns, even ignoring DEFAULT.
         program.emit_insn(Insn::Null {
             dest: column_register,
             dest_end: None,
@@ -2546,6 +2655,48 @@ fn translate_column(
             dest_end: None,
         });
     }
+    Ok(())
+}
+
+fn self_table_ctx_from_col_mappings<'a>(
+    col_mappings: &[ColMapping<'a>],
+    rowid_alias: Option<&ColMapping<'a>>,
+) -> SelfTableContext {
+    let columns: Vec<_> = col_mappings.iter().map(|cm| cm.column.clone()).collect();
+    let column_regs = col_mappings
+        .iter()
+        .map(|cm| {
+            if cm.column.is_rowid_alias() {
+                if let Some(ra) = rowid_alias {
+                    return ra.register;
+                }
+            }
+            cm.register
+        })
+        .collect();
+
+    SelfTableContext::ForDML(DmlColumnContext::indexed(columns, column_regs))
+}
+
+pub fn compute_virtual_columns_for_triggers<'a>(
+    program: &mut ProgramBuilder,
+    col_mappings: &[ColMapping<'a>],
+    rowid_alias: Option<&ColMapping<'a>>,
+    resolver: &Resolver,
+) -> Result<()> {
+    let ctx = self_table_ctx_from_col_mappings(col_mappings, rowid_alias);
+    for col_mapping in col_mappings {
+        if let GeneratedType::Virtual { resolved: expr, .. } = col_mapping.column.generated_type() {
+            program.with_self_table_context(Some(&ctx), |program, _| {
+                translate_expr(program, None, expr, col_mapping.register, resolver)?;
+                Ok(())
+            })?;
+            if col_mapping.column.affinity() != Affinity::Blob {
+                program.emit_column_affinity(col_mapping.register, col_mapping.column.affinity());
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -2590,15 +2741,9 @@ fn emit_pk_uniqueness_check(
             });
             break 'emit_halt;
         }
-        if matches!(preflight.effective_on_conflict, ResolveType::Ignore) {
-            // IGNORE: skip this row entirely on PK conflict
-            program.emit_insn(Insn::Goto {
-                target_pc: ctx.loop_labels.row_done,
-            });
-            break 'emit_halt;
-        }
         if let Some(position) = position.or(upsert_catch_all) {
-            // PK conflict: the conflicting rowid is exactly the attempted key
+            // PK conflict: the conflicting rowid is exactly the attempted key.
+            // Upsert clause takes precedence over column-level ON CONFLICT.
             program.emit_insn(Insn::Copy {
                 src_reg: insertion.key_register(),
                 dst_reg: ctx.conflict_rowid_reg,
@@ -2606,6 +2751,13 @@ fn emit_pk_uniqueness_check(
             });
             program.emit_insn(Insn::Goto {
                 target_pc: preflight.upsert_actions[position].1,
+            });
+            break 'emit_halt;
+        }
+        if matches!(preflight.effective_on_conflict, ResolveType::Ignore) {
+            // IGNORE: skip this row entirely on PK conflict
+            program.emit_insn(Insn::Goto {
+                target_pc: ctx.loop_labels.row_done,
             });
             break 'emit_halt;
         }
@@ -3216,60 +3368,6 @@ pub fn rewrite_partial_index_where(
     )
 }
 
-/// For an index expression, rewrite column references to use the insertion registers.
-fn rewrite_index_expr_for_insertion(expr: &mut ast::Expr, insertion: &Insertion) -> Result<()> {
-    let mut missing_column = None;
-    let col_reg = |name: &str| -> Option<usize> {
-        if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name)) {
-            Some(insertion.key_register())
-        } else if let Some(c) = insertion.get_col_mapping_by_name(name) {
-            if c.column.is_rowid_alias() {
-                Some(insertion.key_register())
-            } else {
-                Some(c.register)
-            }
-        } else {
-            None
-        }
-    };
-    walk_expr_mut(
-        expr,
-        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
-            match e {
-                Expr::Id(name) | Expr::Name(name) => {
-                    let normalized = normalize_ident(name.as_str());
-                    if let Some(reg) = col_reg(&normalized) {
-                        *e = Expr::Register(reg);
-                    } else {
-                        missing_column = Some(normalized);
-                    }
-                }
-                Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
-                    let normalized = normalize_ident(col.as_str());
-                    if let Some(reg) = col_reg(&normalized) {
-                        *e = Expr::Register(reg);
-                    } else {
-                        missing_column = Some(normalized);
-                    }
-                }
-                _ => {}
-            }
-            Ok(if missing_column.is_some() {
-                WalkControl::SkipChildren
-            } else {
-                WalkControl::Continue
-            })
-        },
-    )?;
-
-    if let Some(col) = missing_column {
-        return Err(LimboError::PlanningError(format!(
-            "Column not found in INSERT: {col}"
-        )));
-    }
-    Ok(())
-}
-
 fn emit_index_column_value_for_insert(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -3280,27 +3378,55 @@ fn emit_index_column_value_for_insert(
 ) -> Result<()> {
     if let Some(expr) = &idx_col.expr {
         let mut expr = expr.as_ref().clone();
-        rewrite_index_expr_for_insertion(&mut expr, insertion)?;
-        // After rewrite, Expr::Register nodes reference encoded column registers.
-        // Decode custom type registers so the expression evaluates on user-facing
-        // values, matching what SELECT / CREATE INDEX see.
-        crate::translate::expr::decode_custom_type_registers_in_expr(
-            program,
-            resolver,
-            &mut expr,
-            &table.columns,
-            insertion.first_col_register(),
-            Some(insertion.key_register()),
-            table.is_strict,
-        )?;
-        translate_expr_no_constant_opt(
-            program,
-            Some(&TableReferences::new_empty()),
-            &expr,
-            dest_reg,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        )?;
+        let columns: Vec<Column> = insertion
+            .col_mappings
+            .iter()
+            .map(|cm| cm.column.clone())
+            .collect();
+        schema::resolve_gencol_expr_columns(&mut expr, &columns)?;
+
+        // After rewrite, column registers hold encoded custom-type values.
+        // Decode them into temp registers so the expression evaluates on
+        // user-facing values, matching what SELECT / CREATE INDEX see.
+        let rowid_alias = insertion.rowid_alias_mapping();
+        let is_strict = table.is_strict;
+        let mut column_regs: Vec<usize> = insertion
+            .col_mappings
+            .iter()
+            .map(|cm| {
+                if cm.column.is_rowid_alias() {
+                    if let Some(ra) = rowid_alias {
+                        return ra.register;
+                    }
+                }
+                cm.register
+            })
+            .collect();
+        for (i, cm) in insertion.col_mappings.iter().enumerate() {
+            if cm.column.is_rowid_alias() {
+                continue;
+            }
+            if let Some(type_def) = resolver.schema().get_type_def(&cm.column.ty_str, is_strict) {
+                if type_def.decode.is_some() {
+                    let tmp = program.alloc_register();
+                    crate::translate::expr::emit_user_facing_column_value(
+                        program,
+                        cm.register,
+                        tmp,
+                        cm.column,
+                        is_strict,
+                        resolver,
+                    )?;
+                    column_regs[i] = tmp;
+                }
+            }
+        }
+        let ctx = SelfTableContext::ForDML(DmlColumnContext::indexed(columns, column_regs));
+
+        program.with_self_table_context(Some(&ctx), |program, _| {
+            translate_expr(program, None, &expr, dest_reg, resolver)?;
+            Ok(())
+        })?;
     } else {
         let Some(cm) = insertion.get_col_mapping_by_name(&idx_col.name) else {
             return Err(LimboError::PlanningError(
@@ -3687,6 +3813,7 @@ pub fn emit_fk_child_insert_checks(
     new_rowid_reg: usize,
     resolver: &Resolver,
     database_id: usize,
+    layout: &ColumnLayout,
 ) -> crate::Result<()> {
     for fk_ref in
         resolver.with_schema(database_id, |s| s.resolved_fks_for_child(&child_tbl.name))?
@@ -3700,7 +3827,7 @@ pub fn emit_fk_child_insert_checks(
             let src = if col.is_rowid_alias() {
                 new_rowid_reg
             } else {
-                new_start_reg + i
+                layout.to_register(new_start_reg, i)
             };
             program.emit_insn(Insn::IsNull {
                 reg: src,
@@ -3718,7 +3845,7 @@ pub fn emit_fk_child_insert_checks(
             let val_reg = if col_child.is_rowid_alias() {
                 new_rowid_reg
             } else {
-                new_start_reg + i_child
+                layout.to_register(new_start_reg, i_child)
             };
 
             // Normalize rowid to integer for both the probe and the same-row fast path.
@@ -3777,7 +3904,7 @@ pub fn emit_fk_child_insert_checks(
                         src_reg: if col.is_rowid_alias() {
                             new_rowid_reg
                         } else {
-                            new_start_reg + i
+                            layout.to_register(new_start_reg, i)
                         },
                         dst_reg: start + k,
                         extra_amount: 0,
@@ -4089,6 +4216,7 @@ fn emit_custom_type_encode(
         .iter()
         .map(|m| m.column.clone())
         .collect();
+    let layout = ColumnLayout::from_columns(&columns);
     crate::translate::expr::emit_custom_type_encode_columns(
         program,
         resolver,
@@ -4096,5 +4224,6 @@ fn emit_custom_type_encode(
         insertion.first_col_register(),
         None, // INSERT: encode all columns
         table_name,
+        &layout,
     )
 }
