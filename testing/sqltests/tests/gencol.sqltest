@@ -1156,6 +1156,74 @@ expect {
     5|20|25
 }
 
+test gencol_delete_where_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    INSERT INTO t1(a) VALUES(1), (2), (3), (4), (5);
+    DELETE FROM t1 WHERE b > 6;
+    SELECT a, b FROM t1;
+}
+expect {
+    1|2
+    2|4
+    3|6
+}
+
+test gencol_delete_multiple_verify_remaining {
+    CREATE TABLE t1(a INTEGER, b TEXT, c AS (a || '-' || b));
+    INSERT INTO t1(a, b) VALUES(1, 'x'), (2, 'y'), (3, 'z'), (4, 'w');
+    DELETE FROM t1 WHERE a IN (2, 4);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    1|x|1-x
+    3|z|3-z
+}
+
+test gencol_replace_into {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c AS (b || '!'));
+    INSERT INTO t1(a, b) VALUES(1, 'hello');
+    REPLACE INTO t1(a, b) VALUES(1, 'world');
+    SELECT a, b, c FROM t1;
+}
+expect {
+    1|world|world!
+}
+
+test gencol_insert_or_replace {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER, c AS (b * 10));
+    INSERT INTO t1(a, b) VALUES(1, 5);
+    INSERT OR REPLACE INTO t1(a, b) VALUES(1, 9);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    1|9|90
+}
+
+test gencol_insert_or_ignore {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER, c AS (b + 100));
+    INSERT INTO t1(a, b) VALUES(1, 5);
+    INSERT OR IGNORE INTO t1(a, b) VALUES(1, 9);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    1|5|105
+}
+
+@skip "TODO: INSERT OR REPLACE with virtual column index triggers SELF_TABLE parse error"
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_insert_or_replace_with_index {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER, c AS (b * 2));
+    CREATE INDEX idx1 ON t1(c);
+    INSERT INTO t1(a, b) VALUES(1, 5);
+    INSERT OR REPLACE INTO t1(a, b) VALUES(1, 20);
+    SELECT a, b, c FROM t1;
+    PRAGMA integrity_check;
+}
+expect {
+    1|20|40
+    ok
+}
+
 # =============================================================================
 # 9. Queries (WHERE, ORDER BY, GROUP BY, JOINs, window functions)
 # =============================================================================
@@ -1266,6 +1334,153 @@ expect {
     5|1|9
 }
 
+test gencol_cte_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    WITH cte AS (SELECT a, b FROM t1 WHERE b > 2) SELECT * FROM cte;
+}
+expect {
+    2|4
+    3|6
+}
+
+test gencol_view_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 3));
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    CREATE VIEW v1 AS SELECT a, b FROM t1;
+    SELECT * FROM v1;
+}
+expect {
+    1|3
+    2|6
+    3|9
+}
+
+test gencol_union_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE TABLE t2(x INTEGER, y AS (x * 3));
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    INSERT INTO t2(x) VALUES(2), (3), (4);
+    SELECT b FROM t1 UNION SELECT y FROM t2 ORDER BY 1;
+}
+expect {
+    2
+    4
+    6
+    9
+    12
+}
+
+test gencol_intersect_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE TABLE t2(x INTEGER, y AS (x * 2));
+    INSERT INTO t1(a) VALUES(1), (2), (3), (4);
+    INSERT INTO t2(x) VALUES(3), (4), (5);
+    SELECT b FROM t1 INTERSECT SELECT y FROM t2 ORDER BY 1;
+}
+expect {
+    6
+    8
+}
+
+test gencol_except_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE TABLE t2(x INTEGER, y AS (x * 2));
+    INSERT INTO t1(a) VALUES(1), (2), (3), (4);
+    INSERT INTO t2(x) VALUES(3), (4), (5);
+    SELECT b FROM t1 EXCEPT SELECT y FROM t2 ORDER BY 1;
+}
+expect {
+    2
+    4
+}
+
+test gencol_distinct_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a % 3));
+    INSERT INTO t1(a) VALUES(1), (2), (3), (4), (5), (6);
+    SELECT DISTINCT b FROM t1 ORDER BY b;
+}
+expect {
+    0
+    1
+    2
+}
+
+test gencol_limit_offset_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 10));
+    INSERT INTO t1(a) VALUES(1), (2), (3), (4), (5);
+    SELECT a, b FROM t1 ORDER BY b LIMIT 3 OFFSET 1;
+}
+expect {
+    2|20
+    3|30
+    4|40
+}
+
+test gencol_left_join_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE TABLE t2(x INTEGER, y INTEGER);
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    INSERT INTO t2(x, y) VALUES(2, 20), (4, 40);
+    SELECT t1.a, t1.b, t2.y FROM t1 LEFT JOIN t2 ON t1.a = t2.x ORDER BY t1.a;
+}
+expect {
+    1|2|
+    2|4|20
+    3|6|
+}
+
+test gencol_correlated_subquery_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE TABLE t2(x INTEGER, val TEXT);
+    INSERT INTO t1(a) VALUES(1), (2), (3), (4);
+    INSERT INTO t2(x, val) VALUES(4, 'yes'), (6, 'yes');
+    SELECT a, b, (SELECT val FROM t2 WHERE t2.x = t1.b) FROM t1 ORDER BY a;
+}
+expect {
+    1|2|
+    2|4|yes
+    3|6|yes
+    4|8|
+}
+
+test gencol_having_multiple_aggregates {
+    CREATE TABLE t1(a INTEGER, cat TEXT, b AS (a * 2));
+    INSERT INTO t1(a, cat) VALUES(1, 'x'), (2, 'x'), (5, 'y'), (10, 'y'), (15, 'y');
+    SELECT cat, SUM(b), AVG(b), MAX(b) FROM t1 GROUP BY cat HAVING SUM(b) > 10 ORDER BY cat;
+}
+expect {
+    y|60|20.0|30
+}
+expect @js {
+    y|60|20|30
+}
+
+test gencol_window_functions_multiple {
+    CREATE TABLE t1(a INTEGER, grp TEXT, b AS (a * 2));
+    INSERT INTO t1(a, grp) VALUES(1, 'A'), (2, 'A'), (3, 'B'), (4, 'B'), (5, 'B');
+    SELECT a, b, grp,
+           AVG(b) OVER (PARTITION BY grp) as avg_b,
+           MIN(b) OVER (PARTITION BY grp) as min_b,
+           MAX(b) OVER (PARTITION BY grp) as max_b,
+           COUNT(b) OVER (PARTITION BY grp) as cnt_b
+    FROM t1 ORDER BY a;
+}
+expect {
+    1|2|A|3.0|2|4|2
+    2|4|A|3.0|2|4|2
+    3|6|B|8.0|6|10|3
+    4|8|B|8.0|6|10|3
+    5|10|B|8.0|6|10|3
+}
+expect @js {
+    1|2|A|3|2|4|2
+    2|4|A|3|2|4|2
+    3|6|B|8|6|10|3
+    4|8|B|8|6|10|3
+    5|10|B|8|6|10|3
+}
+
 # =============================================================================
 # 10. Constraints
 # =============================================================================
@@ -1331,6 +1546,192 @@ test gencol_strict_update_type_check {
 }
 expect error {
     cannot store TEXT value in INTEGER column
+}
+
+test gencol_check_on_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) CHECK(b > 0));
+    INSERT INTO t1(a) VALUES(5);
+    SELECT a, b FROM t1;
+}
+expect {
+    5|10
+}
+
+test gencol_check_on_virtual_violation {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) CHECK(b > 0));
+    INSERT INTO t1(a) VALUES(-1);
+}
+expect error {
+    CHECK constraint failed
+}
+
+test gencol_check_table_level_referencing_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), CHECK(b < 100));
+    INSERT INTO t1(a) VALUES(10);
+    SELECT a, b FROM t1;
+}
+expect {
+    10|20
+}
+
+test gencol_check_table_level_referencing_virtual_violation {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), CHECK(b < 100));
+    INSERT INTO t1(a) VALUES(50);
+}
+expect error {
+    CHECK constraint failed
+}
+
+test gencol_check_update_virtual_violation {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) CHECK(b > 0));
+    INSERT INTO t1(a) VALUES(5);
+    UPDATE t1 SET a = -1;
+}
+expect error {
+    CHECK constraint failed
+}
+
+test gencol_check_update_virtual_success {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) CHECK(b > 0));
+    INSERT INTO t1(a) VALUES(5);
+    UPDATE t1 SET a = 3;
+    SELECT a, b FROM t1;
+}
+expect {
+    3|6
+}
+
+test gencol_check_update_virtual_chain {
+    CREATE TABLE t1(a INTEGER, b AS (a+1), c AS (b+1), CHECK(c > 0));
+    INSERT INTO t1(a) VALUES(5);
+    UPDATE t1 SET a = -3;
+}
+expect error {
+    CHECK constraint failed
+}
+
+test gencol_check_update_virtual_chain_success {
+    CREATE TABLE t1(a INTEGER, b AS (a+1), c AS (b+1), CHECK(c > 0));
+    INSERT INTO t1(a) VALUES(5);
+    UPDATE t1 SET a = -1;
+    SELECT a, b, c FROM t1;
+}
+expect {
+    -1|0|1
+}
+
+test gencol_check_multiple_virtual {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a * 2), d AS (b * 3), CHECK(c + d > 0));
+    INSERT INTO t1(a, b) VALUES(1, 1);
+    SELECT a, b, c, d FROM t1;
+}
+expect {
+    1|1|2|3
+}
+
+test gencol_check_multiple_virtual_violation {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a * 2), d AS (b * 3), CHECK(c + d > 0));
+    INSERT INTO t1(a, b) VALUES(-5, 1);
+}
+expect error {
+    CHECK constraint failed
+}
+
+test gencol_check_virtual_null_passes {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) CHECK(b > 0));
+    INSERT INTO t1(a) VALUES(NULL);
+    SELECT a, b FROM t1;
+}
+expect {
+    |
+}
+
+test gencol_check_virtual_coalesce {
+    CREATE TABLE t1(a INTEGER, b AS (COALESCE(a, 0)) CHECK(b >= 0));
+    INSERT INTO t1(a) VALUES(5);
+    SELECT a, b FROM t1;
+}
+expect {
+    5|5
+}
+
+test gencol_check_virtual_coalesce_violation {
+    CREATE TABLE t1(a INTEGER, b AS (COALESCE(a, 0)) CHECK(b >= 0));
+    INSERT INTO t1(a) VALUES(-1);
+}
+expect error {
+    CHECK constraint failed
+}
+
+test gencol_check_virtual_function {
+    CREATE TABLE t1(first TEXT, last TEXT, full_name AS (first || ' ' || last), CHECK(LENGTH(full_name) < 20));
+    INSERT INTO t1(first, last) VALUES('John', 'Doe');
+    SELECT first, last, full_name FROM t1;
+}
+expect {
+    John|Doe|John Doe
+}
+
+test gencol_check_virtual_function_violation {
+    CREATE TABLE t1(first TEXT, last TEXT, full_name AS (first || ' ' || last), CHECK(LENGTH(full_name) < 20));
+    INSERT INTO t1(first, last) VALUES('Bartholomew', 'Konstantinopoulos');
+}
+expect error {
+    CHECK constraint failed
+}
+
+test gencol_check_insert_or_ignore {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) CHECK(b > 0));
+    INSERT OR IGNORE INTO t1(a) VALUES(5), (-1), (3);
+    SELECT a, b FROM t1;
+}
+expect {
+    5|10
+    3|6
+}
+
+test gencol_check_update_or_ignore {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b AS (a * 2) CHECK(b > 0));
+    INSERT INTO t1(a) VALUES(1), (2);
+    UPDATE OR IGNORE t1 SET a = -1 WHERE a = 1;
+    SELECT a, b FROM t1;
+}
+expect {
+    1|2
+    2|4
+}
+
+test gencol_glob_in_expression {
+    CREATE TABLE t1(a TEXT, b AS (a GLOB 'h*'));
+    INSERT INTO t1(a) VALUES('hello'), ('world'), ('hi');
+    SELECT a, b FROM t1;
+}
+expect {
+    hello|1
+    world|0
+    hi|1
+}
+
+test gencol_is_null_operator {
+    CREATE TABLE t1(a, b AS (a IS NULL));
+    INSERT INTO t1(a) VALUES(1), (NULL), (0);
+    SELECT a, b FROM t1;
+}
+expect {
+    1|0
+    |1
+    0|0
+}
+
+test gencol_is_not_null_operator {
+    CREATE TABLE t1(a, b AS (a IS NOT NULL));
+    INSERT INTO t1(a) VALUES(1), (NULL), (0);
+    SELECT a, b FROM t1;
+}
+expect {
+    1|1
+    |0
+    0|1
 }
 
 # =============================================================================
@@ -2401,7 +2802,89 @@ expect {
 }
 
 # =============================================================================
-# 16. Error Cases: CREATE TABLE Validation
+# 16. Schema Operations
+# =============================================================================
+
+# --- VACUUM ---
+
+@skip "TODO: VACUUM is not supported yet"
+test gencol_vacuum_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    INSERT INTO t1(a) VALUES(1), (2), (3), (4), (5);
+    DELETE FROM t1 WHERE a IN (2, 4);
+    VACUUM;
+    SELECT a, b FROM t1;
+}
+expect {
+    1|2
+    3|6
+    5|10
+}
+
+@skip "TODO: VACUUM is not supported yet"
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_vacuum_virtual_with_index {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE INDEX idx1 ON t1(b);
+    INSERT INTO t1(a) VALUES(1), (2), (3), (4), (5);
+    DELETE FROM t1 WHERE a IN (2, 4);
+    VACUUM;
+    SELECT a, b FROM t1;
+    PRAGMA integrity_check;
+}
+expect {
+    1|2
+    3|6
+    5|10
+    ok
+}
+
+# --- PRAGMA table_info hides virtual columns ---
+
+test gencol_pragma_table_info_hides_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c TEXT);
+    PRAGMA table_info(t1);
+}
+expect {
+    0|a|INTEGER|0||0
+    1|c|TEXT|0||0
+}
+
+# =============================================================================
+# 17. Edge Cases
+# =============================================================================
+
+test gencol_null_concat {
+    CREATE TABLE t1(a TEXT, b TEXT, c AS (a || b));
+    INSERT INTO t1(a, b) VALUES('hello', NULL), (NULL, 'world'), (NULL, NULL);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    hello||
+    |world|
+    ||
+}
+
+test gencol_deep_dependency_chain {
+    CREATE TABLE t1(a INTEGER, b AS (a+1), c AS (b+1), d AS (c+1), e AS (d+1), f AS (e+1));
+    INSERT INTO t1(a) VALUES(1);
+    SELECT a, b, c, d, e, f FROM t1;
+}
+expect {
+    1|2|3|4|5|6
+}
+
+test gencol_default_value_with_virtual {
+    CREATE TABLE t1(a INTEGER DEFAULT 42, b AS (a * 2));
+    INSERT INTO t1 DEFAULT VALUES;
+    SELECT a, b FROM t1;
+}
+expect {
+    42|84
+}
+
+# =============================================================================
+# 18. Error Cases: CREATE TABLE Validation
 # =============================================================================
 
 # --- Cannot UPDATE/INSERT generated columns ---
@@ -2427,6 +2910,13 @@ expect error {
 
 test gencol_error_primary_key_virtual {
     CREATE TABLE t1(a INTEGER, b AS (a*2) PRIMARY KEY);
+}
+expect error {
+    generated column.*cannot be part of the PRIMARY KEY
+}
+
+test gencol_error_composite_pk_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), PRIMARY KEY(a, b));
 }
 expect error {
     generated column.*cannot be part of the PRIMARY KEY
