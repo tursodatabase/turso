@@ -1,6 +1,6 @@
 use crate::vdbe::builder::SelfTableContext;
 use crate::{
-    schema::{Index, Schema, Table},
+    schema::{GeneratedType, Index, Schema, Table},
     translate::{
         emitter::Resolver,
         expr::{
@@ -267,8 +267,20 @@ fn translate_integrity_check_impl(
                         )?)));
                         unique_nullable.push(true);
                     } else {
-                        columns.push(BoundIndexColumn::Column(col.pos_in_table));
-                        unique_nullable.push(!btree_table.columns[col.pos_in_table].notnull());
+                        let table_col = &btree_table.columns[col.pos_in_table];
+                        if let GeneratedType::Virtual { resolved: expr, .. } =
+                            table_col.generated_type()
+                        {
+                            columns.push(BoundIndexColumn::Expr(Box::new(bind_expr_for_table(
+                                expr,
+                                &mut table_references,
+                                resolver,
+                            )?)));
+                            unique_nullable.push(!table_col.notnull());
+                        } else {
+                            columns.push(BoundIndexColumn::Column(col.pos_in_table));
+                            unique_nullable.push(!table_col.notnull());
+                        }
                     }
                 }
 
@@ -297,7 +309,7 @@ fn translate_integrity_check_impl(
             .iter()
             .enumerate()
             .filter_map(|(idx, col)| {
-                if col.notnull() && !col.is_rowid_alias() {
+                if col.notnull() && !col.is_rowid_alias() && !col.is_virtual_generated() {
                     Some((
                         idx,
                         col.name.clone().unwrap_or_else(|| format!("column{idx}")),

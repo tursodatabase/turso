@@ -1128,7 +1128,13 @@ impl Schema {
             let mut pk_index_added = false;
             for unique_set in &table.unique_sets {
                 if unique_set.is_primary_key {
-                    assert!(table.primary_key_columns.len() == unique_set.columns.len(), "trying to add a {}-column primary key index for table {}, but the table has {} primary key columns", unique_set.columns.len(), table.name, table.primary_key_columns.len());
+                    assert!(
+                        table.primary_key_columns.len() == unique_set.columns.len(),
+                        "trying to add a {}-column primary key index for table {}, but the table has {} primary key columns",
+                        unique_set.columns.len(),
+                        table.name,
+                        table.primary_key_columns.len()
+                    );
                     // Add composite primary key index
                     assert!(
                         !pk_index_added,
@@ -1204,7 +1210,11 @@ impl Schema {
             // In MVCC mode during recovery, not all automatic index schema rows might be visible yet
             // during incremental schema reparsing, so we may have extra entries
             if !mvcc_enabled {
-                assert!(automatic_indexes.is_empty(), "all automatic indexes parsed from sqlite_schema should have been consumed, but {} remain", automatic_indexes.len());
+                assert!(
+                    automatic_indexes.is_empty(),
+                    "all automatic indexes parsed from sqlite_schema should have been consumed, but {} remain",
+                    automatic_indexes.len()
+                );
             }
         }
         Ok(())
@@ -1362,7 +1372,9 @@ impl Schema {
                                     // This will cause populate_materialized_views to skip this view
                                     tracing::warn!(
                                         "Skipping materialized view '{}' - has version {} but current version is {}. DROP and recreate the view to use it.",
-                                        view_name, stored_version, DBSP_CIRCUIT_VERSION
+                                        view_name,
+                                        stored_version,
+                                        DBSP_CIRCUIT_VERSION
                                     );
                                     // We can't track incompatible views here since we're in handle_schema_row
                                     // which doesn't have mutable access to self
@@ -4258,13 +4270,17 @@ impl Index {
                 )));
             };
             let (_, column) = table.get_column(col_name).unwrap();
+            let expr = match column.generated_type() {
+                GeneratedType::Virtual { resolved, .. } => Some(resolved.clone()),
+                GeneratedType::NotGenerated => None,
+            };
             primary_keys.push(IndexColumn {
                 name: normalize_ident(col_name),
                 order: *order,
                 pos_in_table,
                 collation: column.collation_opt(),
                 default: column.default.clone(),
-                expr: None,
+                expr,
             });
         }
 
@@ -4305,13 +4321,17 @@ impl Index {
                     table.name
                 )));
             };
+            let expr = match col.generated_type() {
+                GeneratedType::Virtual { resolved, .. } => Some(resolved.clone()),
+                GeneratedType::NotGenerated => None,
+            };
             unique_cols.push(IndexColumn {
                 name: normalize_ident(col.name.as_ref().unwrap()),
                 order: *sort_order,
                 pos_in_table,
                 collation: col.collation_opt(),
                 default: col.default.clone(),
-                expr: None,
+                expr,
             });
         }
 
