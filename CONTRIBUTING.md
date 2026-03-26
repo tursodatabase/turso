@@ -404,3 +404,30 @@ When you want to add third party dependencies, please follow these steps:
 
 By following these steps, you ensure that all third-party dependencies are properly documented and their licenses are
 included in the project.
+
+## Making Releases
+
+Releases are made using the `scripts/update-version.py` script, which updates version numbers across all `Cargo.toml`, `package.json`, `package-lock.json`, and `gradle.properties` files in the workspace, creates a git commit, and adds a version tag.
+
+The process is:
+
+1. Run the version update script with the desired version number.
+2. Push the commit and tag to the remote.
+
+### Pre-releases
+
+Pre-releases use a version suffix such as `-pre.N`:
+
+```console
+./scripts/update-version.py 0.6.0-pre.9
+git push origin main v0.6.0-pre.9
+```
+
+### Releases
+
+Releases use a plain version number:
+
+```console
+./scripts/update-version.py 0.6.0
+git push origin main v0.6.0
+```
