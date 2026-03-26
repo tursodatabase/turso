@@ -1,28 +1,35 @@
+use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// A monotonic instant in time, backed by `std::time::Instant`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct MonotonicInstant(std::time::Instant);
+pub struct MonotonicInstant(u128);
 
 impl MonotonicInstant {
-    pub fn now() -> Self {
-        MonotonicInstant(std::time::Instant::now())
+    pub const fn from_nanos(nanos: u128) -> Self {
+        MonotonicInstant(nanos)
     }
 
-    pub fn elapsed(&self) -> Duration {
-        self.0.elapsed()
+    pub fn now() -> Self {
+        static EPOCH: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+        let elapsed = EPOCH.elapsed();
+        MonotonicInstant(elapsed.as_nanos())
     }
 
     pub fn duration_since(&self, earlier: MonotonicInstant) -> Duration {
-        self.0.duration_since(earlier.0)
+        Duration::from_nanos(self.0.saturating_sub(earlier.0) as u64)
     }
 
     pub fn checked_add(&self, duration: Duration) -> Option<MonotonicInstant> {
-        self.0.checked_add(duration).map(MonotonicInstant)
+        self.0
+            .checked_add(duration.as_nanos())
+            .map(MonotonicInstant)
     }
 
     pub fn checked_sub(&self, duration: Duration) -> Option<MonotonicInstant> {
-        self.0.checked_sub(duration).map(MonotonicInstant)
+        self.0
+            .checked_sub(duration.as_nanos())
+            .map(MonotonicInstant)
     }
 }
 
@@ -30,7 +37,7 @@ impl std::ops::Add<Duration> for MonotonicInstant {
     type Output = MonotonicInstant;
 
     fn add(self, rhs: Duration) -> Self::Output {
-        MonotonicInstant(self.0 + rhs)
+        MonotonicInstant(self.0 + rhs.as_nanos())
     }
 }
 
@@ -38,7 +45,7 @@ impl std::ops::Sub<Duration> for MonotonicInstant {
     type Output = MonotonicInstant;
 
     fn sub(self, rhs: Duration) -> Self::Output {
-        MonotonicInstant(self.0 - rhs)
+        MonotonicInstant(self.0 - rhs.as_nanos())
     }
 }
 
