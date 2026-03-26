@@ -25,6 +25,9 @@ This document is a quick helper to get you going.
   - [Fault injection with unreliable libc](#fault-injection-with-unreliable-libc)
   - [Antithesis](#antithesis)
   - [Adding Third Party Dependencies](#adding-third-party-dependencies)
+  - [Making Releases](#making-releases)
+    - [Pre-releases](#pre-releases)
+    - [Releases](#releases)
 <!--toc:end-->
 
 ## Getting Started
