@@ -6,6 +6,7 @@ use crossbeam_skiplist::SkipMap;
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
     create_seek_range, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, SortableIndexKey,
+    SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::sync::Arc;
@@ -16,7 +17,8 @@ use crate::types::{
 };
 use crate::vdbe::make_record;
 use crate::vdbe::Register;
-use crate::{return_if_io, Completion, LimboError, Pager, Result};
+use crate::Numeric;
+use crate::{return_if_io, Completion, LimboError, Pager, Result, ValueRef};
 use std::any::Any;
 use std::fmt::Debug;
 use std::ops::Bound;
@@ -33,6 +35,11 @@ enum CursorPosition {
     },
     /// We have reached the end of the table.
     End,
+}
+
+enum ProjectedPayload<'a> {
+    Borrowed(&'a [u8]),
+    Owned(ImmutableRecord),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -336,6 +343,11 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     let Some(row) = self.read_mvcc_current_row()? else {
                         return Ok(IOResult::Done(None));
                     };
+                    let payload = self.project_sqlite_schema_payload(&row)?;
+                    let payload = match &payload {
+                        ProjectedPayload::Borrowed(payload) => *payload,
+                        ProjectedPayload::Owned(record) => record.as_blob(),
+                    };
                     {
                         let mut record = self.get_immutable_record_or_create();
                         let record = record.as_mut().ok_or_else(|| {
@@ -344,7 +356,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                             )
                         })?;
                         record.invalidate();
-                        record.start_serialization(row.payload());
+                        record.start_serialization(payload);
                     }
 
                     let record_ref = self.reusable_immutable_record.as_ref().ok_or_else(|| {
@@ -372,6 +384,38 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         };
         self.db
             .read_from_table_or_index(self.tx_id, row_id, maybe_index_id)
+    }
+
+    fn project_sqlite_schema_payload<'a>(&self, row: &'a Row) -> Result<ProjectedPayload<'a>> {
+        if !matches!(self.mv_cursor_type, MvccCursorType::Table)
+            || row.id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID
+            || row.is_index_row()
+        {
+            return Ok(ProjectedPayload::Borrowed(row.payload()));
+        }
+
+        let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
+        let Ok((ValueRef::Text(row_type), ValueRef::Numeric(Numeric::Integer(root_page)))) =
+            record.get_two_values(0, 3)
+        else {
+            return Ok(ProjectedPayload::Borrowed(row.payload()));
+        };
+        if row_type.as_str() != "table" && row_type.as_str() != "index" {
+            return Ok(ProjectedPayload::Borrowed(row.payload()));
+        }
+        if root_page >= 0 {
+            return Ok(ProjectedPayload::Borrowed(row.payload()));
+        }
+
+        let physical_root_page = self.db.get_real_table_id(root_page);
+        if physical_root_page == root_page {
+            return Ok(ProjectedPayload::Borrowed(row.payload()));
+        }
+
+        let mut values = record.get_values_owned()?;
+        values[3] = Value::from_i64(physical_root_page);
+        let record = ImmutableRecord::from_values(&values, values.len());
+        Ok(ProjectedPayload::Owned(record))
     }
 
     pub fn close(self) -> Result<()> {

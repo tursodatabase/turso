@@ -106,9 +106,9 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
     delete_row_state_machine: Option<StateMachine<DeleteRowStateMachine>>,
     /// Cursors for the B-trees
     cursors: HashMap<u64, Arc<RwLock<BTreeCursor>>>,
-    /// Tables or indexes that were created in this checkpoint
-    /// key is the rowid in the sqlite_schema table
-    created_btrees: HashMap<i64, (MVTableId, RowVersion)>,
+    /// Tables or indexes that were created in this checkpoint.
+    /// Key is the rowid in sqlite_schema; value is the stable MVCC table/index id.
+    created_btrees: HashMap<i64, MVTableId>,
     /// Tables that were destroyed in this checkpoint
     destroyed_tables: HashSet<MVTableId>,
     /// Indexes that were destroyed in this checkpoint
@@ -941,8 +941,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     })
                 };
 
-                // If a table was created, it now has a real root page allocated for it, but the 'root_page' field in the sqlite_schema record is still the table id.
-                // So we need to rewrite the row version to use the real root page.
+                // If a table was created, it now has a real root page allocated for it, but the
+                // sqlite_schema payload queued for pager write still holds the negative MV table
+                // id. Patch the checkpoint-local write-set copy only; the MVCC version chain
+                // remains immutable and is projected through table_id_to_rootpage on reads.
                 if let Some(SpecialWrite::BTreeCreate {
                     table_id,
                     sqlite_schema_rowid,
@@ -958,25 +960,23 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             .value()
                             .expect("Table ID does not have a root page")
                     };
-                    let row_version = {
-                        let (row_version, _) = self
-                            .get_current_row_version_mut(write_set_index)
-                            .ok_or_else(|| {
-                                LimboError::InternalError(
-                                    "row version not found in write set".to_string(),
-                                )
-                            })?;
-                        let record =
-                            ImmutableRecord::from_bin_record(row_version.row.payload().to_vec());
 
-                        let mut values = record.get_values_owned()?;
-                        values[3] = Value::from_i64(root_page as i64);
-                        let record = ImmutableRecord::from_values(&values, values.len());
-                        row_version.row.data = Some(record.get_payload().to_owned());
-                        row_version.clone()
-                    };
-                    self.created_btrees
-                        .insert(sqlite_schema_rowid, (table_id, row_version));
+                    let (row_version, _) = self
+                        .get_current_row_version_mut(write_set_index)
+                        .ok_or_else(|| {
+                            LimboError::InternalError(
+                                "row version not found in write set".to_string(),
+                            )
+                        })?;
+                    let record =
+                        ImmutableRecord::from_bin_record(row_version.row.payload().to_vec());
+
+                    let mut values = record.get_values_owned()?;
+                    values[3] = Value::from_i64(root_page as i64);
+                    let record = ImmutableRecord::from_values(&values, values.len());
+                    row_version.row.data = Some(record.get_payload().to_owned());
+
+                    self.created_btrees.insert(sqlite_schema_rowid, table_id);
                 } else if let Some(SpecialWrite::BTreeCreateIndex {
                     index_id,
                     sqlite_schema_rowid,
@@ -993,25 +993,22 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             .value()
                             .expect("Index ID does not have a root page")
                     };
-                    let row_version = {
-                        let (row_version, _) = self
-                            .get_current_row_version_mut(write_set_index)
-                            .ok_or_else(|| {
-                                LimboError::InternalError(
-                                    "row version not found in write set".to_string(),
-                                )
-                            })?;
-                        let record =
-                            ImmutableRecord::from_bin_record(row_version.row.payload().to_vec());
-                        let mut values = record.get_values_owned()?;
-                        values[3] = Value::from_i64(root_page as i64);
-                        let record = ImmutableRecord::from_values(&values, values.len());
-                        row_version.row.data = Some(record.get_payload().to_owned());
-                        row_version.clone()
-                    };
 
-                    self.created_btrees
-                        .insert(sqlite_schema_rowid, (index_id, row_version));
+                    let (row_version, _) = self
+                        .get_current_row_version_mut(write_set_index)
+                        .ok_or_else(|| {
+                            LimboError::InternalError(
+                                "row version not found in write set".to_string(),
+                            )
+                        })?;
+                    let record =
+                        ImmutableRecord::from_bin_record(row_version.row.payload().to_vec());
+                    let mut values = record.get_values_owned()?;
+                    values[3] = Value::from_i64(root_page as i64);
+                    let record = ImmutableRecord::from_values(&values, values.len());
+                    row_version.row.data = Some(record.get_payload().to_owned());
+
+                    self.created_btrees.insert(sqlite_schema_rowid, index_id);
                 }
 
                 // Get or create cursor for this table
@@ -1041,7 +1038,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     if self
                         .created_btrees
                         .values()
-                        .any(|(table_id, _)| *table_id == row_version.row.id.table_id)
+                        .any(|table_id| *table_id == row_version.row.id.table_id)
                     {
                         self.state = CheckpointState::WriteRow {
                             write_set_index: write_set_index + 1,
@@ -1172,7 +1169,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     if self
                         .created_btrees
                         .values()
-                        .any(|(table_id, _)| *table_id == row_version.row.id.table_id)
+                        .any(|table_id| *table_id == row_version.row.id.table_id)
                     {
                         self.state = CheckpointState::WriteIndexRow {
                             index_write_set_index: index_write_set_index + 1,
@@ -1408,36 +1405,6 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
             CheckpointState::Finalize => {
                 tracing::debug!("Releasing blocking checkpoint lock");
-                // Patch sqlite_schema in MV Store to contain positive rootpages instead of negative ones
-                // for tables and indexes that were flushed to the physical database
-                for (sqlite_schema_rowid, (_, row_version)) in self.created_btrees.drain() {
-                    let key = RowID {
-                        table_id: SQLITE_SCHEMA_MVCC_TABLE_ID,
-                        row_id: RowKey::Int(sqlite_schema_rowid),
-                    };
-                    let sqlite_schema_row = self
-                        .mvstore
-                        .rows
-                        .get(&key)
-                        .expect("sqlite_schema row not found");
-                    let mut row_versions = sqlite_schema_row.value().write();
-                    // row_version is a clone of the original with only the root
-                    // page column patched, so it shares the same version id. We
-                    // must replace the original in-place rather than append,
-                    // otherwise the version chain ends up with two entries that
-                    // have identical (id, begin, end). A later DELETE only marks
-                    // one of them as ended (it returns after the first match),
-                    // leaving the other as a phantom current version that causes
-                    // spurious write-write conflicts at commit time.
-                    let vid = row_version.id;
-                    if let Some(existing) = row_versions.iter_mut().find(|rv| rv.id == vid) {
-                        *existing = row_version;
-                    } else {
-                        self.mvstore
-                            .insert_version_raw(&mut row_versions, row_version);
-                    }
-                }
-
                 // Patch in-memory schema to do the same
                 self.connection.db.with_schema_mut(|schema| {
                     for table in schema.tables.values_mut() {
