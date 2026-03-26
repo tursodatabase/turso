@@ -2324,6 +2324,20 @@ expect {
     10|20
 }
 
+# DELETE on table with UNIQUE auto-index on virtual column
+test gencol_delete_unique_virtual_col {
+    CREATE TABLE t1(a INTEGER, b TEXT UNIQUE AS (a || '_v'));
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    DELETE FROM t1 WHERE a = 2;
+    SELECT a, b FROM t1 ORDER BY a;
+    PRAGMA integrity_check;
+}
+expect {
+    1|1_v
+    3|3_v
+    ok
+}
+
 @cross-check-integrity
 @skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_virtual_delete {
