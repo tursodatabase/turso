@@ -163,6 +163,7 @@ pub fn translate_inner(
             | ast::Stmt::CreateServer(_)
             | ast::Stmt::CreateForeignTable(_)
             | ast::Stmt::DropServer { .. }
+            | ast::Stmt::RefreshMaterializedView { .. }
     );
     let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
 
@@ -256,6 +257,14 @@ pub fn translate_inner(
             connection.clone(),
             program,
         )?,
+        ast::Stmt::RefreshMaterializedView { view_name } => {
+            view::translate_refresh_materialized_view(
+                &view_name,
+                resolver,
+                connection.clone(),
+                program,
+            )?
+        }
         ast::Stmt::CreateVirtualTable(vtab) => {
             translate_create_virtual_table(vtab, resolver, program, connection)?
         }

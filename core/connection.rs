@@ -1879,6 +1879,15 @@ impl Connection {
                 Err(LimboError::ExtensionError(msg)) => eprintln!("Warning: {msg}"),
                 Err(e) => return Err(e),
             }
+            // Foreign tables before matviews — matviews may reference foreign tables
+            for (name, sql) in deferred_foreign_tables {
+                match schema.populate_foreign_table(&name, &sql, &syms) {
+                    Ok(()) => {}
+                    Err(LimboError::ParseError(msg)) if msg.contains("already exists") => {}
+                    Err(LimboError::ExtensionError(msg)) => eprintln!("Warning: {msg}"),
+                    Err(e) => return Err(e),
+                }
+            }
             match schema.populate_materialized_views(
                 materialized_view_info,
                 dbsp_state_roots,

@@ -4630,6 +4630,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     automatic_indices,
                     mv_store.is_some(),
                 )?;
+                // Foreign tables before matviews — matviews may reference foreign tables
+                for (name, sql) in deferred_foreign_tables {
+                    fresh.populate_foreign_table(&name, &sql, &syms)?;
+                }
                 fresh.populate_materialized_views(
                     materialized_view_info,
                     dbsp_state_roots,

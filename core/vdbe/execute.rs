@@ -11480,6 +11480,8 @@ pub fn op_populate_materialized_views(
                 }
             };
 
+            // Reset populate state (needed for REFRESH — after initial CREATE it's already Start)
+            view.reset_populate_state();
             // Now populate it with the cursor for writing
             return_if_io!(view.populate_from_table(&conn, pager, btree_cursor.as_mut()));
         }

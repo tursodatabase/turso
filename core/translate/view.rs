@@ -262,6 +262,104 @@ pub fn translate_create_materialized_view(
     Ok(())
 }
 
+pub fn translate_refresh_materialized_view(
+    view_name: &ast::QualifiedName,
+    resolver: &Resolver,
+    connection: Arc<Connection>,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    if !connection.experimental_views_enabled() {
+        return Err(crate::LimboError::ParseError(
+            "REFRESH MATERIALIZED VIEW is an experimental feature. Enable with --experimental-views flag"
+                .to_string(),
+        ));
+    }
+
+    let database_id = resolver.resolve_database_id(view_name)?;
+    let normalized_view_name = normalize_ident(view_name.name.as_str());
+
+    // Verify the matview exists
+    let table = resolver
+        .with_schema(database_id, |s| s.get_table(&normalized_view_name))
+        .ok_or_else(|| {
+            crate::LimboError::ParseError(format!(
+                "no such materialized view: {normalized_view_name}"
+            ))
+        })?;
+    let btree_table = table.btree().ok_or_else(|| {
+        crate::LimboError::ParseError(format!("{normalized_view_name} is not a materialized view"))
+    })?;
+
+    if !resolver.with_schema(database_id, |s| {
+        s.is_materialized_view(&normalized_view_name)
+    }) {
+        return Err(crate::LimboError::ParseError(format!(
+            "{normalized_view_name} is not a materialized view"
+        )));
+    }
+
+    // Open the matview's btree cursor
+    let root_page = btree_table.root_page;
+    let view_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(btree_table));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: view_cursor_id,
+        root_page: root_page.into(),
+        db: database_id,
+    });
+
+    // Clear matview data
+    emit_clear_btree(program, view_cursor_id, &normalized_view_name);
+
+    // Clear DBSP operator state
+    use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+    let dbsp_table_name =
+        format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{normalized_view_name}");
+    if let Some(dbsp_table) =
+        resolver.with_schema(database_id, |s| s.get_btree_table(&dbsp_table_name))
+    {
+        let dbsp_root_page = dbsp_table.root_page;
+        let dbsp_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(dbsp_table));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: dbsp_cursor_id,
+            root_page: dbsp_root_page.into(),
+            db: database_id,
+        });
+        emit_clear_btree(program, dbsp_cursor_id, &dbsp_table_name);
+    }
+
+    // Repopulate
+    let cursor_info = vec![(normalized_view_name, view_cursor_id)];
+    program.emit_insn(Insn::PopulateMaterializedViews {
+        cursors: cursor_info,
+    });
+
+    program.epilogue(resolver.schema());
+    Ok(())
+}
+
+fn emit_clear_btree(program: &mut ProgramBuilder, cursor_id: usize, table_name: &str) {
+    let clear_loop_label = program.allocate_label();
+    let clear_done_label = program.allocate_label();
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id,
+        pc_if_empty: clear_done_label,
+    });
+
+    program.preassign_label_to_next_insn(clear_loop_label);
+    program.emit_insn(Insn::Delete {
+        cursor_id,
+        table_name: table_name.to_string(),
+        is_part_of_update: false,
+    });
+    program.emit_insn(Insn::Next {
+        cursor_id,
+        pc_if_next: clear_loop_label,
+    });
+
+    program.preassign_label_to_next_insn(clear_done_label);
+}
+
 fn create_materialized_view_to_str(view_name: &str, select_stmt: &ast::Select) -> String {
     format!("CREATE MATERIALIZED VIEW {view_name} AS {select_stmt}")
 }
