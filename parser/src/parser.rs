@@ -647,6 +647,7 @@ impl<'a> Parser<'a> {
             TK_REPLACE,
             TK_UPDATE,
             TK_REINDEX,
+            TK_REFRESH,
             TK_OPTIMIZE
         );
 
@@ -670,6 +671,7 @@ impl<'a> Parser<'a> {
             TK_INSERT | TK_REPLACE => self.parse_insert(),
             TK_UPDATE => self.parse_update(),
             TK_REINDEX => self.parse_reindex(),
+            TK_REFRESH => self.parse_refresh(),
             TK_OPTIMIZE => self.parse_optimize(),
             _ => unreachable!(),
         }
@@ -4938,6 +4940,14 @@ impl<'a> Parser<'a> {
     fn parse_update(&mut self) -> Result<Stmt> {
         let with = self.parse_with()?;
         self.parse_update_without_cte(with)
+    }
+
+    fn parse_refresh(&mut self) -> Result<Stmt> {
+        eat_assert!(self, TK_REFRESH);
+        eat_expect!(self, TK_MATERIALIZED);
+        eat_expect!(self, TK_VIEW);
+        let view_name = self.parse_fullname(false)?;
+        Ok(Stmt::RefreshMaterializedView { view_name })
     }
 
     fn parse_reindex(&mut self) -> Result<Stmt> {

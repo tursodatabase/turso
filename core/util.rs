@@ -210,16 +210,16 @@ pub fn parse_schema_rows(
         automatic_indices,
         mv_store.is_some(),
     )?;
+    // Process deferred foreign tables before matviews — matviews may reference foreign tables
+    for (name, sql) in deferred_foreign_tables {
+        schema.populate_foreign_table(&name, &sql, syms)?;
+    }
+
     schema.populate_materialized_views(
         materialized_view_info,
         dbsp_state_roots,
         dbsp_state_index_roots,
     )?;
-
-    // Process deferred foreign tables (servers are now loaded)
-    for (name, sql) in deferred_foreign_tables {
-        schema.populate_foreign_table(&name, &sql, syms)?;
-    }
 
     Ok(())
 }
