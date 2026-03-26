@@ -10,10 +10,15 @@ runs:
       shell: bash
       run: |
         export SCCACHE_GHA_ENABLED=true
-        if sccache -s >/dev/null 2>&1; then
+        # Start the sccache server explicitly to verify it can connect to
+        # the cache backend. `sccache -s` alone doesn't test connectivity —
+        # a DNS or network failure only surfaces on the first real rustc
+        # invocation, which kills the entire build.
+        if sccache --start-server 2>/dev/null && sccache -s >/dev/null 2>&1; then
           echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
           echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-          echo "sccache is available and configured"
+          echo "sccache server started and configured"
         else
+          sccache --stop-server 2>/dev/null || true
           echo "::warning::sccache cache service is unavailable, building without cache"
         fi
