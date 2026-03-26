@@ -20,6 +20,25 @@ use super::plan::{
     SelectPlan, SetOperation, UpdatePlan,
 };
 
+fn fmt_order_by_item(
+    f: &mut fmt::Formatter<'_>,
+    expr: &impl fmt::Display,
+    dir: SortOrder,
+    nulls: Option<turso_parser::ast::NullsOrder>,
+) -> fmt::Result {
+    let dir_str = match dir {
+        SortOrder::Asc => "ASC",
+        SortOrder::Desc => "DESC",
+    };
+    match nulls {
+        Some(turso_parser::ast::NullsOrder::First) => {
+            writeln!(f, "  - {expr} {dir_str} NULLS FIRST")
+        }
+        Some(turso_parser::ast::NullsOrder::Last) => writeln!(f, "  - {expr} {dir_str} NULLS LAST"),
+        None => writeln!(f, "  - {expr} {dir_str}"),
+    }
+}
+
 /// Format the EXPLAIN QUERY PLAN detail string for a table operation.
 /// Used by DELETE/UPDATE emitters to emit EQP annotations.
 pub(crate) fn format_eqp_detail(table: &JoinedTable) -> String {
@@ -203,17 +222,8 @@ impl Display for Plan {
                 }
                 if let Some(order_by) = order_by {
                     writeln!(f, "ORDER BY:")?;
-                    for (expr, dir) in order_by {
-                        writeln!(
-                            f,
-                            "  - {} {}",
-                            expr,
-                            if *dir == SortOrder::Asc {
-                                "ASC"
-                            } else {
-                                "DESC"
-                            }
-                        )?;
+                    for (expr, dir, nulls) in order_by {
+                        fmt_order_by_item(f, expr, *dir, *nulls)?;
                     }
                 }
                 Ok(())
@@ -579,17 +589,8 @@ impl fmt::Display for UpdatePlan {
         }
         if !self.order_by.is_empty() {
             writeln!(f, "ORDER BY:")?;
-            for (expr, dir) in &self.order_by {
-                writeln!(
-                    f,
-                    "  - {} {}",
-                    expr,
-                    if *dir == SortOrder::Asc {
-                        "ASC"
-                    } else {
-                        "DESC"
-                    }
-                )?;
+            for (expr, dir, nulls) in &self.order_by {
+                fmt_order_by_item(f, expr, *dir, *nulls)?;
             }
         }
         if let Some(limit) = self.limit.as_ref() {
@@ -672,13 +673,15 @@ impl ToTokens for Plan {
                     s.append(TokenType::TK_BY, None)?;
 
                     s.comma(
-                        order_by.iter().map(|(col_idx, order)| ast::SortedColumn {
-                            expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric(
-                                (col_idx + 1).to_string(),
-                            ))),
-                            order: Some(*order),
-                            nulls: None,
-                        }),
+                        order_by
+                            .iter()
+                            .map(|(col_idx, order, nulls)| ast::SortedColumn {
+                                expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric(
+                                    (col_idx + 1).to_string(),
+                                ))),
+                                order: Some(*order),
+                                nulls: *nulls,
+                            }),
                         context,
                     )?;
                 }
@@ -842,10 +845,10 @@ impl ToTokens for SelectPlan {
                         window
                             .order_by
                             .iter()
-                            .map(|(expr, order)| ast::SortedColumn {
+                            .map(|(expr, order, nulls)| ast::SortedColumn {
                                 expr: Box::new(expr.clone()),
                                 order: Some(*order),
-                                nulls: None,
+                                nulls: *nulls,
                             }),
                         context,
                     )?;
@@ -860,11 +863,13 @@ impl ToTokens for SelectPlan {
             s.append(TokenType::TK_BY, None)?;
 
             s.comma(
-                self.order_by.iter().map(|(expr, order)| ast::SortedColumn {
-                    expr: expr.clone(),
-                    order: Some(*order),
-                    nulls: None,
-                }),
+                self.order_by
+                    .iter()
+                    .map(|(expr, order, nulls)| ast::SortedColumn {
+                        expr: expr.clone(),
+                        order: Some(*order),
+                        nulls: *nulls,
+                    }),
                 context,
             )?;
         }
@@ -922,11 +927,13 @@ impl ToTokens for DeletePlan {
             s.append(TokenType::TK_BY, None)?;
 
             s.comma(
-                self.order_by.iter().map(|(expr, order)| ast::SortedColumn {
-                    expr: expr.clone(),
-                    order: Some(*order),
-                    nulls: None,
-                }),
+                self.order_by
+                    .iter()
+                    .map(|(expr, order, nulls)| ast::SortedColumn {
+                        expr: expr.clone(),
+                        order: Some(*order),
+                        nulls: *nulls,
+                    }),
                 context,
             )?;
         }
@@ -1003,11 +1010,13 @@ impl ToTokens for UpdatePlan {
             s.append(TokenType::TK_BY, None)?;
 
             s.comma(
-                self.order_by.iter().map(|(expr, order)| ast::SortedColumn {
-                    expr: expr.clone(),
-                    order: Some(*order),
-                    nulls: None,
-                }),
+                self.order_by
+                    .iter()
+                    .map(|(expr, order, nulls)| ast::SortedColumn {
+                        expr: expr.clone(),
+                        order: Some(*order),
+                        nulls: *nulls,
+                    }),
                 context,
             )?;
         }

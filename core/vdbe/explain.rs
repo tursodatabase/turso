@@ -1166,20 +1166,25 @@ pub fn insn_to_row(
             Insn::SorterOpen {
                 cursor_id,
                 columns,
-                order_and_collations,
+                order_collations_nulls,
                 ..
             } => {
-                let to_print: Vec<String> = order_and_collations
+                let to_print: Vec<String> = order_collations_nulls
                     .iter()
-                    .map(|(order, collation)| {
+                    .map(|(order, collation, nulls)| {
                         let sign = match order {
                             SortOrder::Asc => "",
                             SortOrder::Desc => "-",
                         };
-                        if let Some(coll) = collation {
+                        let coll_str = if let Some(coll) = collation {
                             format!("{sign}{coll}")
                         } else {
                             format!("{sign}B")
+                        };
+                        match nulls {
+                            Some(turso_parser::ast::NullsOrder::First) => format!("{coll_str} NF"),
+                            Some(turso_parser::ast::NullsOrder::Last) => format!("{coll_str} NL"),
+                            None => coll_str,
                         }
                     })
                     .collect();
@@ -1188,7 +1193,7 @@ pub fn insn_to_row(
                     *cursor_id as i64,
                     *columns as i64,
                     0,
-                    Value::build_text(format!("k({},{})", order_and_collations.len(), to_print.join(","))),
+                    Value::build_text(format!("k({},{})", order_collations_nulls.len(), to_print.join(","))),
                     0,
                     format!("cursor={cursor_id}"),
                 )

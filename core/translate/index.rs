@@ -361,13 +361,17 @@ pub fn translate_create_index(
         });
         program.preassign_label_to_next_insn(loop_end_label);
     } else if index_method.is_none() {
-        // determine the order and collation of the columns in the index for the sorter
-        let order_and_collations = idx.columns.iter().map(|c| (c.order, c.collation)).collect();
+        // determine the order, collation, and nulls ordering of the columns in the index for the sorter
+        let order_collations_nulls = idx
+            .columns
+            .iter()
+            .map(|c| (c.order, c.collation, None))
+            .collect();
         // open the sorter and the pseudo table
         program.emit_insn(Insn::SorterOpen {
             cursor_id: sorter_cursor_id,
             columns: columns.len(),
-            order_and_collations,
+            order_collations_nulls,
             comparators: vec![],
         });
         let content_reg = program.alloc_register();
