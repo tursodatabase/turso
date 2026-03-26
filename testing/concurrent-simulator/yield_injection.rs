@@ -1,15 +1,18 @@
-use rand::{Rng, SeedableRng, rngs::StdRng, seq::SliceRandom};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use turso_core::mvcc::yield_points::{YieldInjector, YieldPoint};
 
-const MAX_YIELDS: usize = 4;
+/// Following specifies the max number of yields per instance. 20 here is arbitrary, smaller means
+/// less interleaving but having large number can slow down the execution.
+const MAX_YIELDS: usize = 20;
 
 pub(crate) fn fiber_yield_seed(seed: u64, fiber_idx: usize) -> u64 {
     seed.wrapping_add(fiber_idx as u64)
 }
 
 // Selected ordinals for one in-flight instance; slots are cleared as yields are consumed.
+// Ordinals may repeat so the same yield point can fire multiple times in one statement.
 type InstanceYieldPlan = [Option<u8>; MAX_YIELDS];
 
 // Namespaces one cached per-instance selection by instance identity and logical selection key.
@@ -67,13 +70,12 @@ fn simulator_yield_plan(seed: u64, selection_key: u64, point_count: u8) -> Insta
         return plan;
     }
 
-    let max_points = usize::min(point_count as usize, MAX_YIELDS);
     let mut rng = StdRng::seed_from_u64(seed ^ selection_key);
-    let count = rng.random_range(0..=max_points);
-    let mut choices = (0..point_count).collect::<Vec<_>>();
-    choices.shuffle(&mut rng);
-    for (dst, point) in plan.iter_mut().zip(choices.into_iter().take(count)) {
-        *dst = Some(point);
+    // randomly select total yield counts for this plan, upto MAX_YIELDS
+    let count = rng.random_range(0..=MAX_YIELDS);
+    // select the array slots upto `count` and fill them with the yield point ordinals
+    for dst in plan.iter_mut().take(count) {
+        *dst = Some(rng.random_range(0..point_count));
     }
     plan
 }
@@ -100,6 +102,17 @@ mod tests {
                 .iter()
                 .all(|plan| plan.iter().flatten().count() <= MAX_YIELDS),
             "expected plans to stay within the fixed yield cap",
+        );
+    }
+
+    #[test]
+    fn test_seeded_plan_can_repeat_same_yield_point() {
+        let plans = (0..4096_u64)
+            .map(|seed| simulator_yield_plan(seed, 42, 1))
+            .collect::<Vec<_>>();
+        assert!(
+            plans.iter().any(|plan| plan.iter().flatten().count() > 1),
+            "expected at least one seed to repeat the same yield point",
         );
     }
 }
