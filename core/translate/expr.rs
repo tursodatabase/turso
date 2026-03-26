@@ -5692,6 +5692,20 @@ pub fn bind_and_rewrite_expr<'a>(
                         );
                     };
                     let normalized_table_name = normalize_ident(tbl.as_str());
+                    // Check for duplicate table aliases — if multiple joined tables
+                    // share the same identifier, the qualified column ref is ambiguous.
+                    let duplicate_count = referenced_tables
+                        .joined_tables()
+                        .iter()
+                        .filter(|t| t.identifier == normalized_table_name)
+                        .count();
+                    if duplicate_count > 1 {
+                        crate::bail_parse_error!(
+                            "ambiguous column name: {}.{}",
+                            tbl.as_str(),
+                            id.as_str()
+                        );
+                    }
                     let matching_tbl = referenced_tables
                         .find_table_and_internal_id_by_identifier(&normalized_table_name);
                     if matching_tbl.is_none() {
