@@ -1114,15 +1114,16 @@ impl Schema {
                             acc.automatic_indices,
                             mv_cursor.is_some(),
                         )?;
+                        // Foreign tables before matviews — matviews may reference foreign tables
+                        for (name, sql) in acc.deferred_foreign_tables {
+                            self.populate_foreign_table(&name, &sql, syms)?;
+                        }
+
                         self.populate_materialized_views(
                             acc.materialized_view_info,
                             acc.dbsp_state_roots,
                             acc.dbsp_state_index_roots,
                         )?;
-
-                        for (name, sql) in acc.deferred_foreign_tables {
-                            self.populate_foreign_table(&name, &sql, syms)?;
-                        }
 
                         state.cursor = None;
                         state.phase = MakeFromBtreePhase::Done;
@@ -5310,6 +5311,7 @@ mod tests {
             &mut HashMap::default(),
             &mut HashMap::default(),
             &mut HashMap::default(),
+            &mut Vec::new(),
         );
         assert!(result
             .unwrap_err()

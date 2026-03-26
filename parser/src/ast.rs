@@ -221,6 +221,12 @@ pub enum Stmt {
         select: Select,
     },
 
+    /// `REFRESH MATERIALIZED VIEW`
+    RefreshMaterializedView {
+        /// view name
+        view_name: QualifiedName,
+    },
+
     /// `CREATE VIRTUAL TABLE`
     CreateVirtualTable(CreateVirtualTable),
     /// `CREATE SERVER`
