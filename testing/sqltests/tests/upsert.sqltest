@@ -772,3 +772,39 @@ test upsert-check-excluded-ref-valid {
 expect {
     1|80|two
 }
+
+@cross-check-integrity
+test upsert-overrides-pk-on-conflict-ignore {
+    CREATE TABLE t(id INTEGER PRIMARY KEY ON CONFLICT IGNORE, v INT);
+    INSERT INTO t VALUES (1, 100);
+    INSERT INTO t VALUES (1, 200) ON CONFLICT(id) DO UPDATE SET v=excluded.v;
+    SELECT id, v FROM t;
+}
+expect {
+    1|200
+}
+
+@cross-check-integrity
+test upsert-overrides-unique-on-conflict-ignore {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT UNIQUE ON CONFLICT IGNORE, v INT);
+    INSERT INTO t VALUES (1, 'a', 100);
+    INSERT INTO t VALUES (2, 'a', 200) ON CONFLICT(k) DO UPDATE SET v=excluded.v;
+    SELECT id, k, v FROM t;
+}
+expect {
+    1|a|200
+}
+
+@cross-check-integrity
+test upsert-overrides-pk-on-conflict-ignore-deferred-fk {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY ON CONFLICT IGNORE, pid INT, FOREIGN KEY(pid) REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1);
+    BEGIN;
+    INSERT INTO child VALUES (1, 999) ON CONFLICT(id) DO UPDATE SET pid=excluded.pid;
+    COMMIT;
+}
+expect error {
+}
