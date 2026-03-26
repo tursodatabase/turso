@@ -746,7 +746,7 @@ pub fn select_star(
     tables: &[JoinedTable],
     out_columns: &mut Vec<ResultSetColumn>,
     right_join_swapped: bool,
-) {
+) -> crate::Result<()> {
     // RIGHT JOIN swapped tables; iterate in reverse to restore original column order.
     let table_iter: Vec<&JoinedTable> = if right_join_swapped {
         tables.iter().rev().collect()
@@ -762,6 +762,36 @@ pub fn select_star(
             .is_some_and(|ji| ji.is_semi_or_anti())
         {
             continue;
+        }
+        // If this table's identifier appears more than once in the FROM clause,
+        // expanding * would produce ambiguous column references (matches SQLite).
+        // However, columns deduplicated by USING/NATURAL are not ambiguous.
+        let has_duplicate_identifier = tables
+            .iter()
+            .filter(|t| t.identifier == table.identifier)
+            .count()
+            > 1;
+        if has_duplicate_identifier {
+            // Collect all USING columns from duplicate tables (both this table's
+            // own join_info and the join_info of other tables with the same identifier).
+            let using_cols: Vec<&str> = tables
+                .iter()
+                .filter(|t| t.identifier == table.identifier)
+                .filter_map(|t| t.join_info.as_ref())
+                .flat_map(|ji| ji.using.iter().map(|u| u.as_str()))
+                .collect();
+            for col in table.columns().iter().filter(|c| !c.hidden()) {
+                if let Some(col_name) = &col.name {
+                    let in_using = using_cols.iter().any(|u| u.eq_ignore_ascii_case(col_name));
+                    if !in_using {
+                        crate::bail_parse_error!(
+                            "ambiguous column name: {}.{}",
+                            table.identifier,
+                            col_name
+                        );
+                    }
+                }
+            }
         }
         out_columns.extend(
             table
@@ -794,6 +824,7 @@ pub fn select_star(
                 }),
         );
     }
+    Ok(())
 }
 
 /// The type of join between two tables.

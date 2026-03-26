@@ -400,7 +400,7 @@ fn prepare_one_select_plan(
                             plan.table_references.joined_tables(),
                             &mut plan.result_columns,
                             plan.table_references.right_join_swapped(),
-                        );
+                        )?;
                         for table in plan.table_references.joined_tables_mut() {
                             for idx in 0..table.columns().len() {
                                 let column = &table.columns()[idx];
@@ -413,6 +413,34 @@ fn prepare_one_select_plan(
                     }
                     ResultColumn::TableStar(name) => {
                         let name_normalized = normalize_ident(name.as_str());
+                        // If this table identifier appears more than once in the FROM
+                        // clause, `A.*` is ambiguous (matches SQLite behavior).
+                        let dup_count = plan
+                            .table_references
+                            .joined_tables()
+                            .iter()
+                            .filter(|t| t.identifier == name_normalized)
+                            .count();
+                        if dup_count > 1 {
+                            let first_tbl = plan
+                                .table_references
+                                .joined_tables()
+                                .iter()
+                                .find(|t| t.identifier == name_normalized)
+                                .unwrap(); // safe: dup_count > 1 guarantees a match
+                            let col_name = first_tbl
+                                .columns()
+                                .iter()
+                                .find(|c| !c.hidden())
+                                .and_then(|c| c.name.as_ref())
+                                .map(|n| n.as_str())
+                                .unwrap_or("?");
+                            crate::bail_parse_error!(
+                                "ambiguous column name: {}.{}",
+                                name.as_str(),
+                                col_name
+                            );
+                        }
                         let referenced_table = plan
                             .table_references
                             .joined_tables_mut()
