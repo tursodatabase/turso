@@ -1,9 +1,14 @@
+use cfg_aliases::cfg_aliases;
 use chrono::{TimeZone, Utc};
 use std::path::PathBuf;
 use std::process::Command;
 use std::{env, fs};
 
 fn main() {
+    cfg_aliases! {
+        injected_yields: { any(feature = "test_helper", feature = "simulator") },
+    }
+
     // Ensure Cargo reruns when this script or the reproducibility seed changes.
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-env-changed=SOURCE_DATE_EPOCH");

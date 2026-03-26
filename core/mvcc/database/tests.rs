@@ -5,7 +5,8 @@ use crate::io::PlatformIO;
 use crate::mvcc::clock::MvccClock;
 use crate::mvcc::cursor::{CursorYieldPoint, MvccCursorType};
 use crate::mvcc::persistent_storage::logical_log::LOG_HDR_SIZE;
-use crate::mvcc::yield_points::{YieldInjector, YieldPoint, YieldPointMarker};
+use crate::mvcc::yield_hooks::YieldPointMarker;
+use crate::mvcc::yield_points::{YieldInjector, YieldPoint};
 use crate::state_machine::{StateTransition, TransitionResult};
 use crate::storage::sqlite3_ondisk::{
     checksum_wal, read_varint, write_varint, DatabaseHeader, WalHeader, WAL_FRAME_HEADER_SIZE,

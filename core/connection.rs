@@ -1,5 +1,5 @@
 use crate::error::io_error;
-#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+#[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::YieldInjector;
 use crate::storage::journal_mode;
 use crate::sync::{
@@ -91,9 +91,9 @@ pub struct Connection {
     /// Main DB uses `mv_tx` above for zero-cost hot path access.
     pub(crate) attached_mv_txs:
         RwLock<HashMap<usize, (crate::mvcc::database::TxID, TransactionMode)>>,
-    #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+    #[cfg(any(test, injected_yields))]
     pub(super) yield_injector: RwLock<Option<Arc<dyn YieldInjector>>>,
-    #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+    #[cfg(any(test, injected_yields))]
     pub(super) yield_instance_id_counter: AtomicU64,
 
     /// Per-connection view transaction states for uncommitted changes. This represents
@@ -1401,7 +1401,7 @@ impl Connection {
         }
     }
 
-    #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+    #[cfg(any(test, injected_yields))]
     pub fn set_yield_injector(&self, injector: Option<Arc<dyn YieldInjector>>) {
         let mut slot = self.yield_injector.write();
         match injector {
@@ -1422,12 +1422,12 @@ impl Connection {
         }
     }
 
-    #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+    #[cfg(any(test, injected_yields))]
     pub(crate) fn yield_injector(&self) -> Option<Arc<dyn YieldInjector>> {
         self.yield_injector.read().clone()
     }
 
-    #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+    #[cfg(any(test, injected_yields))]
     #[inline(always)]
     pub(crate) fn next_yield_instance_id(&self) -> u64 {
         self.yield_instance_id_counter

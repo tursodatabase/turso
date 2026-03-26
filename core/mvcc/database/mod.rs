@@ -1,10 +1,8 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
+#[cfg(any(test, injected_yields))]
+use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::inject_transition_yield;
-#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-use crate::mvcc::yield_points::{ProvidesYieldContext, YieldContext};
-#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-use crate::mvcc::yield_points::YieldPointMarker;
 use crate::schema::{Schema, Table};
 use crate::state_machine::StateMachine;
 use crate::state_machine::StateTransition;
@@ -47,7 +45,7 @@ use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Bound;
-#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+#[cfg(any(test, injected_yields))]
 use strum::EnumCount;
 use tracing::instrument;
 use tracing::Level;
@@ -899,7 +897,7 @@ impl CommitCoordinator {
     }
 }
 
-#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+#[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
 enum CommitYieldPoint {
@@ -908,7 +906,7 @@ enum CommitYieldPoint {
     LogRecordPrepared,
 }
 
-#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+#[cfg(any(test, injected_yields))]
 impl YieldPointMarker for CommitYieldPoint {
     const POINT_COUNT: u8 = Self::COUNT as u8;
 
@@ -917,14 +915,14 @@ impl YieldPointMarker for CommitYieldPoint {
     }
 }
 
-#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+#[cfg(any(test, injected_yields))]
 fn commit_yield_key(tx_id: u64) -> u64 {
     // any large number will do
     const COMMIT_SELECTION_TAG: u64 = 0xC011_C011_C011_C011;
     tx_id ^ COMMIT_SELECTION_TAG
 }
 
-#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+#[cfg(any(test, injected_yields))]
 impl<Clock: LogicalClock> ProvidesYieldContext for CommitStateMachine<Clock> {
     fn yield_context(&self) -> YieldContext {
         YieldContext::new(
@@ -938,7 +936,7 @@ impl<Clock: LogicalClock> ProvidesYieldContext for CommitStateMachine<Clock> {
 pub struct CommitStateMachine<Clock: LogicalClock> {
     state: CommitState<Clock>,
     is_finalized: bool,
-    #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+    #[cfg(any(test, injected_yields))]
     yield_instance_id: u64,
     did_commit_schema_change: bool,
     tx_id: TxID,
@@ -1003,7 +1001,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         Self {
             state,
             is_finalized: false,
-            #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+            #[cfg(any(test, injected_yields))]
             yield_instance_id: connection.next_yield_instance_id(),
             did_commit_schema_change: false,
             tx_id,

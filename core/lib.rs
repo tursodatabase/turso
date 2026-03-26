@@ -1331,9 +1331,9 @@ impl Database {
             dml_require_where: AtomicBool::new(false),
             mv_tx: RwLock::new(None),
             attached_mv_txs: RwLock::new(HashMap::default()),
-            #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+            #[cfg(any(test, injected_yields))]
             yield_injector: RwLock::new(None),
-            #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+            #[cfg(any(test, injected_yields))]
             yield_instance_id_counter: AtomicU64::new(1),
             view_transaction_states: AllViewsTxState::new(),
             metrics: RwLock::new(ConnectionMetrics::new()),
