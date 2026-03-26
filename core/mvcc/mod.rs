@@ -35,6 +35,8 @@ pub mod clock;
 pub mod cursor;
 pub mod database;
 pub mod persistent_storage;
+#[cfg(any(test, injected_yields))]
+pub(crate) mod yield_hooks;
 pub mod yield_points;
 
 pub use clock::MvccClock;
