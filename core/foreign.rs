@@ -172,6 +172,51 @@ pub struct PushedConstraint {
 }
 
 // ============================================================================
+// Streaming FDW (opt-in capability for live matview updates)
+// ============================================================================
+
+/// A row-level change from a streaming foreign data source.
+///
+/// Each change carries the full row values and a DBSP weight:
+/// +1 = insert, -1 = delete. An update is represented as a delete of the
+/// old values followed by an insert of the new values.
+#[derive(Debug, Clone)]
+pub struct FdwChange {
+    pub values: Vec<Value>,
+    pub weight: i64,
+}
+
+/// Opt-in extension to [`ForeignDataWrapper`] for sources that support
+/// change notifications (e.g., MCP resource subscriptions).
+///
+/// When a materialized view is created on a streaming FDW, the caller
+/// receives a [`std::sync::mpsc::Receiver`] of changes. The caller is
+/// responsible for draining the receiver and injecting deltas into the
+/// matview via [`Connection::inject_view_delta`].
+///
+/// # Baseline implementation
+///
+/// For sources that only support "resource changed" notifications (not
+/// item-level deltas), the implementation can re-fetch via `xFilter`
+/// and diff against the previous snapshot:
+/// - Rows in new but not old → `FdwChange { values, weight: 1 }`
+/// - Rows in old but not new → `FdwChange { values, weight: -1 }`
+/// - Rows changed → weight -1 (old) then weight +1 (new)
+pub trait StreamingForeignData: ForeignDataWrapper {
+    /// Subscribe to changes matching the given constraints.
+    ///
+    /// Returns a receiver that emits row-level changes. The subscription
+    /// is active until the receiver is dropped.
+    ///
+    /// `constraints` are the same pushed-down constraints that were passed
+    /// to `ForeignCursor::filter()` during the initial snapshot.
+    fn subscribe(
+        &self,
+        constraints: &[PushedConstraint],
+    ) -> Result<std::sync::mpsc::Receiver<FdwChange>>;
+}
+
+// ============================================================================
 // ForeignTableAdapter: bridges FDW → InternalVirtualTable
 // ============================================================================
 
