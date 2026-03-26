@@ -21,7 +21,6 @@ COPY ./cli ./cli/
 COPY ./core ./core/
 COPY ./extensions ./extensions/
 COPY ./macros ./macros/
-COPY ./packages ./packages/
 COPY ./parser ./parser/
 COPY ./perf/encryption ./perf/encryption
 COPY ./perf/throughput/rusqlite ./perf/throughput/rusqlite/
@@ -68,7 +67,6 @@ COPY --from=planner /app/cli ./cli/
 COPY --from=planner /app/core ./core/
 COPY --from=planner /app/extensions ./extensions/
 COPY --from=planner /app/macros ./macros/
-COPY --from=planner /app/packages ./packages/
 COPY --from=planner /app/parser ./parser/
 COPY --from=planner /app/perf/encryption ./perf/encryption
 COPY --from=planner /app/perf/throughput/rusqlite ./perf/throughput/rusqlite/
