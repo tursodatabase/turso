@@ -1796,6 +1796,7 @@ impl<'a> Ord for ValueRef<'a> {
 pub struct KeyInfo {
     pub sort_order: SortOrder,
     pub collation: CollationSeq,
+    pub nulls_order: Option<turso_parser::ast::NullsOrder>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1836,12 +1837,14 @@ impl IndexInfo {
                     .map(|c| KeyInfo {
                         sort_order: c.order,
                         collation: c.collation.unwrap_or_default(),
+                        nulls_order: None,
                     })
                     .collect();
                 if index.has_rowid {
                     key_info.push(KeyInfo {
                         sort_order: SortOrder::Asc,
                         collation: CollationSeq::Binary,
+                        nulls_order: None,
                     });
                 }
                 key_info
@@ -3166,6 +3169,7 @@ mod tests {
                 .map(|(sort_order, collation)| KeyInfo {
                     sort_order,
                     collation,
+                    nulls_order: None,
                 })
                 .collect(),
             has_rowid: false,

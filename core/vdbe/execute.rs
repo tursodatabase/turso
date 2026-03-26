@@ -5650,7 +5650,7 @@ pub fn op_sorter_open(
         SorterOpen {
             cursor_id,
             columns: _,
-            order_and_collations,
+            order_collations_nulls,
             comparators,
         },
         insn
@@ -5671,10 +5671,14 @@ pub fn op_sorter_open(
     } else {
         (cache_size as usize) * page_size
     };
-    let (order, collations): (Vec<_>, Vec<_>) = order_and_collations
-        .iter()
-        .map(|(ord, coll)| (*ord, coll.unwrap_or_default()))
-        .unzip();
+    let mut order = Vec::with_capacity(order_collations_nulls.len());
+    let mut collations = Vec::with_capacity(order_collations_nulls.len());
+    let mut nulls_orders = Vec::with_capacity(order_collations_nulls.len());
+    for (ord, coll, nulls) in order_collations_nulls.iter() {
+        order.push(*ord);
+        collations.push(coll.unwrap_or_default());
+        nulls_orders.push(*nulls);
+    }
     let comparators = comparators
         .iter()
         .map(|c| c.as_ref().map(make_sort_comparator))
@@ -5683,6 +5687,7 @@ pub fn op_sorter_open(
     let cursor = Sorter::new(
         &order,
         collations,
+        nulls_orders,
         comparators,
         max_buffer_size_bytes,
         page_size,

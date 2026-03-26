@@ -929,8 +929,12 @@ pub enum Insn {
     SorterOpen {
         cursor_id: CursorID, // P1
         columns: usize,      // P2
-        /// Combined order and collation per column (keeps Insn small, and order+collations are always the same length).
-        order_and_collations: Vec<(SortOrder, Option<CollationSeq>)>,
+        /// Combined order, collation, and nulls ordering per column.
+        order_collations_nulls: Vec<(
+            SortOrder,
+            Option<CollationSeq>,
+            Option<turso_parser::ast::NullsOrder>,
+        )>,
         /// Per-column custom type comparators for ORDER BY sorting.
         /// When present, the comparator is used instead of standard value comparison.
         comparators: Vec<Option<SortComparatorType>>,

@@ -1,0 +1,854 @@
+@database :memory:
+
+# ===== Basic NULLS FIRST / NULLS LAST with integers =====
+
+setup base-table {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INT);
+    INSERT INTO t VALUES (1, NULL), (2, 3), (3, 1), (4, NULL), (5, 2);
+}
+
+# Default ASC: NULLs come first (SQLite default behavior)
+@setup base-table
+test asc-default-nulls-first {
+    SELECT id, val FROM t ORDER BY val, id;
+}
+expect {
+    1|
+    4|
+    3|1
+    5|2
+    2|3
+}
+
+# Default DESC: NULLs come last (SQLite default behavior)
+@setup base-table
+test desc-default-nulls-last {
+    SELECT id, val FROM t ORDER BY val DESC, id;
+}
+expect {
+    2|3
+    5|2
+    3|1
+    1|
+    4|
+}
+
+# ASC NULLS FIRST — same as default ASC
+@setup base-table
+test asc-nulls-first {
+    SELECT id, val FROM t ORDER BY val ASC NULLS FIRST, id;
+}
+expect {
+    1|
+    4|
+    3|1
+    5|2
+    2|3
+}
+
+# ASC NULLS LAST — overrides default, NULLs at end
+@setup base-table
+test asc-nulls-last {
+    SELECT id, val FROM t ORDER BY val ASC NULLS LAST, id;
+}
+expect {
+    3|1
+    5|2
+    2|3
+    1|
+    4|
+}
+
+# DESC NULLS FIRST — overrides default, NULLs at start
+@setup base-table
+test desc-nulls-first {
+    SELECT id, val FROM t ORDER BY val DESC NULLS FIRST, id;
+}
+expect {
+    1|
+    4|
+    2|3
+    5|2
+    3|1
+}
+
+# DESC NULLS LAST — same as default DESC
+@setup base-table
+test desc-nulls-last {
+    SELECT id, val FROM t ORDER BY val DESC NULLS LAST, id;
+}
+expect {
+    2|3
+    5|2
+    3|1
+    1|
+    4|
+}
+
+# ===== Implicit ASC with NULLS =====
+
+# Implicit ASC (no ASC keyword) with NULLS LAST
+@setup base-table
+test implicit-asc-nulls-last {
+    SELECT id, val FROM t ORDER BY val NULLS LAST, id;
+}
+expect {
+    3|1
+    5|2
+    2|3
+    1|
+    4|
+}
+
+# Implicit ASC (no ASC keyword) with NULLS FIRST
+@setup base-table
+test implicit-asc-nulls-first {
+    SELECT id, val FROM t ORDER BY val NULLS FIRST, id;
+}
+expect {
+    1|
+    4|
+    3|1
+    5|2
+    2|3
+}
+
+# ===== TEXT values =====
+
+setup text-table {
+    CREATE TABLE t_text(id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO t_text VALUES (1, NULL), (2, 'banana'), (3, 'apple'), (4, NULL), (5, 'cherry');
+}
+
+@setup text-table
+test text-asc-nulls-last {
+    SELECT id, name FROM t_text ORDER BY name ASC NULLS LAST, id;
+}
+expect {
+    3|apple
+    2|banana
+    5|cherry
+    1|
+    4|
+}
+
+@setup text-table
+test text-desc-nulls-first {
+    SELECT id, name FROM t_text ORDER BY name DESC NULLS FIRST, id;
+}
+expect {
+    1|
+    4|
+    5|cherry
+    2|banana
+    3|apple
+}
+
+@setup text-table
+test text-asc-nulls-first {
+    SELECT id, name FROM t_text ORDER BY name ASC NULLS FIRST, id;
+}
+expect {
+    1|
+    4|
+    3|apple
+    2|banana
+    5|cherry
+}
+
+@setup text-table
+test text-desc-nulls-last {
+    SELECT id, name FROM t_text ORDER BY name DESC NULLS LAST, id;
+}
+expect {
+    5|cherry
+    2|banana
+    3|apple
+    1|
+    4|
+}
+
+# ===== REAL values =====
+
+setup real-table {
+    CREATE TABLE t_real(id INTEGER PRIMARY KEY, val REAL);
+    INSERT INTO t_real VALUES (1, NULL), (2, 3.14), (3, 1.5), (4, NULL), (5, 2.7);
+}
+
+@setup real-table
+test real-asc-nulls-last {
+    SELECT id, val FROM t_real ORDER BY val ASC NULLS LAST, id;
+}
+expect {
+    3|1.5
+    5|2.7
+    2|3.14
+    1|
+    4|
+}
+
+@setup real-table
+test real-desc-nulls-first {
+    SELECT id, val FROM t_real ORDER BY val DESC NULLS FIRST, id;
+}
+expect {
+    1|
+    4|
+    2|3.14
+    5|2.7
+    3|1.5
+}
+
+# ===== Multiple sort keys with NULLS =====
+
+setup multi-key-table {
+    CREATE TABLE t_multi(id INTEGER PRIMARY KEY, a INT, b INT);
+    INSERT INTO t_multi VALUES (1, NULL, 10), (2, 1, NULL), (3, NULL, 20), (4, 1, 30), (5, 2, NULL);
+}
+
+@setup multi-key-table
+test multi-key-nulls-last-nulls-first {
+    SELECT id, a, b FROM t_multi ORDER BY a ASC NULLS LAST, b DESC NULLS FIRST;
+}
+expect {
+    2|1|
+    4|1|30
+    5|2|
+    3||20
+    1||10
+}
+
+@setup multi-key-table
+test multi-key-nulls-first-nulls-last {
+    SELECT id, a, b FROM t_multi ORDER BY a DESC NULLS FIRST, b ASC NULLS LAST;
+}
+expect {
+    1||10
+    3||20
+    5|2|
+    4|1|30
+    2|1|
+}
+
+@setup multi-key-table
+test multi-key-both-nulls-last {
+    SELECT id, a, b FROM t_multi ORDER BY a ASC NULLS LAST, b ASC NULLS LAST;
+}
+expect {
+    4|1|30
+    2|1|
+    5|2|
+    1||10
+    3||20
+}
+
+@setup multi-key-table
+test multi-key-both-nulls-first {
+    SELECT id, a, b FROM t_multi ORDER BY a ASC NULLS FIRST, b ASC NULLS FIRST;
+}
+expect {
+    1||10
+    3||20
+    2|1|
+    4|1|30
+    5|2|
+}
+
+# ===== NULLS with LIMIT =====
+
+@setup base-table
+test asc-nulls-last-limit {
+    SELECT id, val FROM t ORDER BY val ASC NULLS LAST LIMIT 3;
+}
+expect {
+    3|1
+    5|2
+    2|3
+}
+
+@setup base-table
+test desc-nulls-first-limit {
+    SELECT id, val FROM t ORDER BY val DESC NULLS FIRST LIMIT 3;
+}
+expect {
+    1|
+    4|
+    2|3
+}
+
+# ===== NULLS with LIMIT and OFFSET =====
+
+@setup base-table
+test asc-nulls-last-limit-offset {
+    SELECT id, val FROM t ORDER BY val ASC NULLS LAST LIMIT 2 OFFSET 1;
+}
+expect {
+    5|2
+    2|3
+}
+
+@setup base-table
+test desc-nulls-first-limit-offset {
+    SELECT id, val FROM t ORDER BY val DESC NULLS FIRST LIMIT 2 OFFSET 1;
+}
+expect {
+    4|
+    2|3
+}
+
+# ===== All NULLs =====
+
+setup all-nulls-table {
+    CREATE TABLE t_allnull(id INTEGER PRIMARY KEY, val INT);
+    INSERT INTO t_allnull VALUES (1, NULL), (2, NULL), (3, NULL);
+}
+
+@setup all-nulls-table
+test all-nulls-asc-nulls-last {
+    SELECT id, val FROM t_allnull ORDER BY val ASC NULLS LAST, id;
+}
+expect {
+    1|
+    2|
+    3|
+}
+
+@setup all-nulls-table
+test all-nulls-desc-nulls-first {
+    SELECT id, val FROM t_allnull ORDER BY val DESC NULLS FIRST, id;
+}
+expect {
+    1|
+    2|
+    3|
+}
+
+@setup all-nulls-table
+test all-nulls-asc-nulls-first {
+    SELECT id, val FROM t_allnull ORDER BY val ASC NULLS FIRST, id;
+}
+expect {
+    1|
+    2|
+    3|
+}
+
+@setup all-nulls-table
+test all-nulls-desc-nulls-last {
+    SELECT id, val FROM t_allnull ORDER BY val DESC NULLS LAST, id;
+}
+expect {
+    1|
+    2|
+    3|
+}
+
+# ===== No NULLs (NULLS FIRST/LAST should be no-op) =====
+
+setup no-nulls-table {
+    CREATE TABLE t_nonull(id INTEGER PRIMARY KEY, val INT);
+    INSERT INTO t_nonull VALUES (1, 3), (2, 1), (3, 2);
+}
+
+@setup no-nulls-table
+test no-nulls-asc-nulls-last {
+    SELECT id, val FROM t_nonull ORDER BY val ASC NULLS LAST;
+}
+expect {
+    2|1
+    3|2
+    1|3
+}
+
+@setup no-nulls-table
+test no-nulls-desc-nulls-first {
+    SELECT id, val FROM t_nonull ORDER BY val DESC NULLS FIRST;
+}
+expect {
+    1|3
+    3|2
+    2|1
+}
+
+# ===== Empty table =====
+
+setup empty-table {
+    CREATE TABLE t_empty(id INTEGER PRIMARY KEY, val INT);
+}
+
+@setup empty-table
+test empty-table-asc-nulls-last {
+    SELECT id, val FROM t_empty ORDER BY val ASC NULLS LAST;
+}
+expect {
+}
+
+@setup empty-table
+test empty-table-desc-nulls-first {
+    SELECT id, val FROM t_empty ORDER BY val DESC NULLS FIRST;
+}
+expect {
+}
+
+# ===== Single row with NULL =====
+
+setup single-null-table {
+    CREATE TABLE t_single(id INTEGER PRIMARY KEY, val INT);
+    INSERT INTO t_single VALUES (1, NULL);
+}
+
+@setup single-null-table
+test single-null-asc-nulls-last {
+    SELECT id, val FROM t_single ORDER BY val ASC NULLS LAST;
+}
+expect {
+    1|
+}
+
+@setup single-null-table
+test single-null-desc-nulls-first {
+    SELECT id, val FROM t_single ORDER BY val DESC NULLS FIRST;
+}
+expect {
+    1|
+}
+
+# ===== Expression in ORDER BY =====
+
+@setup base-table
+test expression-asc-nulls-last {
+    SELECT id, val FROM t ORDER BY val+0 ASC NULLS LAST, id;
+}
+expect {
+    3|1
+    5|2
+    2|3
+    1|
+    4|
+}
+
+@setup base-table
+test expression-desc-nulls-first {
+    SELECT id, val FROM t ORDER BY val+0 DESC NULLS FIRST, id;
+}
+expect {
+    1|
+    4|
+    2|3
+    5|2
+    3|1
+}
+
+# ===== GROUP BY with ORDER BY NULLS =====
+
+setup group-table {
+    CREATE TABLE t_group(grp TEXT, val INT);
+    INSERT INTO t_group VALUES ('a', 1), ('a', NULL), ('b', 3), ('b', NULL), (NULL, 5), (NULL, 6);
+}
+
+@setup group-table
+test group-by-nulls-last {
+    SELECT grp, sum(val) FROM t_group GROUP BY grp ORDER BY grp ASC NULLS LAST;
+}
+expect {
+    a|1
+    b|3
+    |11
+}
+
+@setup group-table
+test group-by-desc-nulls-first {
+    SELECT grp, sum(val) FROM t_group GROUP BY grp ORDER BY grp DESC NULLS FIRST;
+}
+expect {
+    |11
+    b|3
+    a|1
+}
+
+# ===== Subquery with ORDER BY NULLS =====
+
+@setup base-table
+test subquery-nulls-last {
+    SELECT * FROM (SELECT id, val FROM t) ORDER BY val ASC NULLS LAST, id;
+}
+expect {
+    3|1
+    5|2
+    2|3
+    1|
+    4|
+}
+
+@setup base-table
+test subquery-nulls-first-desc {
+    SELECT * FROM (SELECT id, val FROM t) ORDER BY val DESC NULLS FIRST, id;
+}
+expect {
+    1|
+    4|
+    2|3
+    5|2
+    3|1
+}
+
+# ===== UNION ALL with ORDER BY NULLS =====
+
+@setup base-table
+test union-all-nulls-last {
+    SELECT val FROM t WHERE id <= 3
+    UNION ALL
+    SELECT val FROM t WHERE id > 3
+    ORDER BY val ASC NULLS LAST;
+}
+expect {
+    1
+    2
+    3
+
+
+}
+
+@setup base-table
+test union-all-desc-nulls-first {
+    SELECT val FROM t WHERE id <= 3
+    UNION ALL
+    SELECT val FROM t WHERE id > 3
+    ORDER BY val DESC NULLS FIRST;
+}
+expect {
+
+
+    3
+    2
+    1
+}
+
+# ===== DISTINCT with NULLS =====
+
+setup distinct-table {
+    CREATE TABLE t_dist(id INTEGER PRIMARY KEY, val INT);
+    INSERT INTO t_dist VALUES (1, NULL), (2, 3), (3, 1), (4, NULL), (5, 2), (6, 3), (7, NULL);
+}
+
+@setup distinct-table
+test distinct-nulls-last {
+    SELECT DISTINCT val FROM t_dist ORDER BY val ASC NULLS LAST;
+}
+expect {
+    1
+    2
+    3
+
+}
+
+@setup distinct-table
+test distinct-desc-nulls-first {
+    SELECT DISTINCT val FROM t_dist ORDER BY val DESC NULLS FIRST;
+}
+expect {
+
+    3
+    2
+    1
+}
+
+# ===== Window functions with NULLS in ORDER BY =====
+
+@setup base-table
+test window-row-number-nulls-last {
+    SELECT id, val, row_number() OVER (ORDER BY val ASC NULLS LAST) as rn FROM t ORDER BY rn;
+}
+expect {
+    3|1|1
+    5|2|2
+    2|3|3
+    1||4
+    4||5
+}
+
+@setup base-table
+test window-row-number-desc-nulls-first {
+    SELECT id, val, row_number() OVER (ORDER BY val DESC NULLS FIRST) as rn FROM t ORDER BY rn;
+}
+expect {
+    1||1
+    4||2
+    2|3|3
+    5|2|4
+    3|1|5
+}
+
+# ===== NULLS with indexed column =====
+
+setup indexed-table {
+    CREATE TABLE t_idx(id INTEGER PRIMARY KEY, val INT);
+    CREATE INDEX idx_val ON t_idx(val);
+    INSERT INTO t_idx VALUES (1, NULL), (2, 3), (3, 1), (4, NULL), (5, 2);
+}
+
+@setup indexed-table
+test indexed-asc-nulls-last {
+    SELECT id, val FROM t_idx ORDER BY val ASC NULLS LAST, id;
+}
+expect {
+    3|1
+    5|2
+    2|3
+    1|
+    4|
+}
+
+@setup indexed-table
+test indexed-desc-nulls-first {
+    SELECT id, val FROM t_idx ORDER BY val DESC NULLS FIRST, id;
+}
+expect {
+    1|
+    4|
+    2|3
+    5|2
+    3|1
+}
+
+@setup indexed-table
+test indexed-asc-nulls-first {
+    SELECT id, val FROM t_idx ORDER BY val ASC NULLS FIRST, id;
+}
+expect {
+    1|
+    4|
+    3|1
+    5|2
+    2|3
+}
+
+@setup indexed-table
+test indexed-desc-nulls-last {
+    SELECT id, val FROM t_idx ORDER BY val DESC NULLS LAST, id;
+}
+expect {
+    2|3
+    5|2
+    3|1
+    1|
+    4|
+}
+
+# ===== Composite index with NULLS (sort elision edge cases) =====
+
+setup composite-index-table {
+    CREATE TABLE t_comp(id INTEGER PRIMARY KEY, a INT, b INT);
+    CREATE INDEX idx_ab ON t_comp(a, b);
+    INSERT INTO t_comp VALUES (1, NULL, 10), (2, 1, NULL), (3, NULL, 20), (4, 1, 30), (5, 2, NULL), (6, 2, 5);
+}
+
+# Leading column NULLS LAST — cannot use simple index scan
+@setup composite-index-table
+test composite-idx-a-nulls-last-b-asc {
+    SELECT id, a, b FROM t_comp ORDER BY a ASC NULLS LAST, b ASC;
+}
+expect {
+    2|1|
+    4|1|30
+    5|2|
+    6|2|5
+    1||10
+    3||20
+}
+
+# Second column NULLS LAST — partial sort needed
+@setup composite-index-table
+test composite-idx-a-asc-b-nulls-last {
+    SELECT id, a, b FROM t_comp ORDER BY a ASC, b ASC NULLS LAST;
+}
+expect {
+    1||10
+    3||20
+    4|1|30
+    2|1|
+    6|2|5
+    5|2|
+}
+
+# Both columns DESC with NULLS FIRST
+@setup composite-index-table
+test composite-idx-a-desc-nulls-first-b-desc {
+    SELECT id, a, b FROM t_comp ORDER BY a DESC NULLS FIRST, b DESC;
+}
+expect {
+    3||20
+    1||10
+    6|2|5
+    5|2|
+    4|1|30
+    2|1|
+}
+
+# Equality prefix + NULLS LAST on remaining column
+@setup composite-index-table
+test composite-idx-where-eq-nulls-last {
+    SELECT id, a, b FROM t_comp WHERE a = 1 ORDER BY b ASC NULLS LAST;
+}
+expect {
+    4|1|30
+    2|1|
+}
+
+# Equality prefix + NULLS FIRST on remaining column (matches default)
+@setup composite-index-table
+test composite-idx-where-eq-nulls-first {
+    SELECT id, a, b FROM t_comp WHERE a = 2 ORDER BY b ASC NULLS FIRST;
+}
+expect {
+    5|2|
+    6|2|5
+}
+
+# Index with NULLS LAST + LIMIT (optimizer must not elide sort incorrectly)
+@setup composite-index-table
+test composite-idx-nulls-last-limit {
+    SELECT id, a, b FROM t_comp ORDER BY a ASC NULLS LAST, b ASC LIMIT 3;
+}
+expect {
+    2|1|
+    4|1|30
+    5|2|
+}
+
+# ===== Multiple columns, some with NULLS directives, some without =====
+
+setup mixed-directive-table {
+    CREATE TABLE t_mixed(id INTEGER PRIMARY KEY, a INT, b TEXT);
+    INSERT INTO t_mixed VALUES (1, NULL, 'x'), (2, 1, NULL), (3, NULL, 'y'), (4, 1, 'z'), (5, 2, NULL);
+}
+
+@setup mixed-directive-table
+test mixed-first-col-nulls-last-second-default {
+    SELECT id, a, b FROM t_mixed ORDER BY a ASC NULLS LAST, b ASC, id;
+}
+expect {
+    2|1|
+    4|1|z
+    5|2|
+    1||x
+    3||y
+}
+
+@setup mixed-directive-table
+test mixed-first-default-second-nulls-last {
+    SELECT id, a, b FROM t_mixed ORDER BY a ASC, b ASC NULLS LAST, id;
+}
+expect {
+    1||x
+    3||y
+    4|1|z
+    2|1|
+    5|2|
+}
+
+# ===== NULLS with CASE expression =====
+
+@setup base-table
+test case-expr-nulls-last {
+    SELECT id, val FROM t ORDER BY CASE WHEN val IS NULL THEN val ELSE val END ASC NULLS LAST, id;
+}
+expect {
+    3|1
+    5|2
+    2|3
+    1|
+    4|
+}
+
+# ===== NULLS with negative values =====
+
+setup negative-table {
+    CREATE TABLE t_neg(id INTEGER PRIMARY KEY, val INT);
+    INSERT INTO t_neg VALUES (1, NULL), (2, -3), (3, 1), (4, NULL), (5, -1), (6, 0);
+}
+
+@setup negative-table
+test negative-asc-nulls-last {
+    SELECT id, val FROM t_neg ORDER BY val ASC NULLS LAST, id;
+}
+expect {
+    2|-3
+    5|-1
+    6|0
+    3|1
+    1|
+    4|
+}
+
+@setup negative-table
+test negative-desc-nulls-first {
+    SELECT id, val FROM t_neg ORDER BY val DESC NULLS FIRST, id;
+}
+expect {
+    1|
+    4|
+    3|1
+    6|0
+    5|-1
+    2|-3
+}
+
+# ===== NULLS in compound SELECT with UNION =====
+
+setup compound-tables {
+    CREATE TABLE t_a(val INT);
+    INSERT INTO t_a VALUES (NULL), (1), (3);
+    CREATE TABLE t_b(val INT);
+    INSERT INTO t_b VALUES (NULL), (2), (4);
+}
+
+@setup compound-tables
+test union-nulls-last {
+    SELECT val FROM t_a
+    UNION
+    SELECT val FROM t_b
+    ORDER BY val ASC NULLS LAST;
+}
+expect {
+    1
+    2
+    3
+    4
+
+}
+
+@setup compound-tables
+test union-desc-nulls-first {
+    SELECT val FROM t_a
+    UNION
+    SELECT val FROM t_b
+    ORDER BY val DESC NULLS FIRST;
+}
+expect {
+
+    4
+    3
+    2
+    1
+}
+
+# ===== Window functions with different NULLS orderings in same query =====
+
+# Two windows with different NULLS orderings must produce different row numbers.
+# This tests that window equivalence correctly distinguishes NULLS ordering,
+# preventing the optimizer from merging windows with different NULLS clauses.
+@setup base-table
+test window-two-different-nulls-orderings {
+    SELECT id, val,
+        ROW_NUMBER() OVER (ORDER BY val ASC NULLS FIRST) as rn_first,
+        ROW_NUMBER() OVER (ORDER BY val ASC NULLS LAST) as rn_last
+    FROM t;
+}
+expect {
+    1||1|4
+    4||2|5
+    3|1|3|1
+    5|2|4|2
+    2|3|5|3
+}

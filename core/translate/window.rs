@@ -31,7 +31,7 @@ const SUBQUERY_DATABASE_ID: usize = 0;
 
 struct WindowSubqueryContext<'a> {
     resolver: &'a Resolver<'a>,
-    subquery_order_by: &'a mut Vec<(Box<Expr>, SortOrder)>,
+    subquery_order_by: &'a mut Vec<(Box<Expr>, SortOrder, Option<turso_parser::ast::NullsOrder>)>,
     subquery_result_columns: &'a mut Vec<ResultSetColumn>,
     subquery_id: &'a TableInternalId,
 }
@@ -161,11 +161,11 @@ fn prepare_window_subquery(
     // columns with its ORDER BY columns.This ensures that rows in the subquery are returned
     // in the correct order for partitioning and window function evaluation.
     for expr in current_window.partition_by.iter_mut() {
-        append_order_by(outer_plan, expr, &SortOrder::Asc, &mut ctx)?;
+        append_order_by(outer_plan, expr, &SortOrder::Asc, None, &mut ctx)?;
         current_window.deduplicated_partition_by_len = Some(ctx.subquery_result_columns.len())
     }
-    for (expr, order) in current_window.order_by.iter_mut() {
-        append_order_by(outer_plan, expr, order, &mut ctx)?;
+    for (expr, order, nulls) in current_window.order_by.iter_mut() {
+        append_order_by(outer_plan, expr, order, *nulls, &mut ctx)?;
     }
 
     // Rewrite expressions from the outer query’s result columns and ORDER BY clause so that
@@ -179,7 +179,7 @@ fn prepare_window_subquery(
             &mut ctx,
         )?;
     }
-    for (expr, _) in outer_plan.order_by.iter_mut() {
+    for (expr, _, _) in outer_plan.order_by.iter_mut() {
         rewrite_terminal_expr(
             &mut outer_plan.aggregates,
             expr,
@@ -265,6 +265,7 @@ fn append_order_by(
     plan: &mut SelectPlan,
     expr: &mut Expr,
     sort_order: &SortOrder,
+    nulls_order: Option<turso_parser::ast::NullsOrder>,
     ctx: &mut WindowSubqueryContext,
 ) -> crate::Result<()> {
     // Deduplicate: if an equivalent expression already exists in the subquery ORDER BY,
@@ -274,10 +275,10 @@ fn append_order_by(
     let already_exists = ctx
         .subquery_order_by
         .iter()
-        .any(|(existing, _)| exprs_are_equivalent(existing, expr));
+        .any(|(existing, _, _)| exprs_are_equivalent(existing, expr));
     if !already_exists {
         ctx.subquery_order_by
-            .push((Box::new(expr.clone()), *sort_order));
+            .push((Box::new(expr.clone()), *sort_order, nulls_order));
     }
 
     let contains_aggregates =
@@ -509,7 +510,7 @@ impl EmitWindow {
         window: &'a Window,
         plan: &SelectPlan,
         result_columns: &'a [ResultSetColumn],
-        order_by: &'a [(Box<Expr>, SortOrder)],
+        order_by: &'a [(Box<Expr>, SortOrder, Option<turso_parser::ast::NullsOrder>)],
     ) -> crate::Result<()> {
         let joined_tables = &plan.joined_tables();
         turso_assert_eq!(joined_tables.len(), 1, "expected only one joined table");
@@ -692,7 +693,7 @@ fn alloc_optional_registers(program: &mut ProgramBuilder, count: usize) -> Optio
 
 fn collect_expressions_referencing_subquery<'a>(
     result_columns: &'a [ResultSetColumn],
-    order_by: &'a [(Box<Expr>, SortOrder)],
+    order_by: &'a [(Box<Expr>, SortOrder, Option<turso_parser::ast::NullsOrder>)],
     subquery_id: &TableInternalId,
 ) -> crate::Result<Vec<(&'a Expr, usize)>> {
     let mut expressions_referencing_subquery: Vec<(&'a Expr, usize)> = Vec::new();
@@ -700,7 +701,7 @@ fn collect_expressions_referencing_subquery<'a>(
     for root_expr in result_columns
         .iter()
         .map(|col| &col.expr)
-        .chain(order_by.iter().map(|(e, _)| e.as_ref()))
+        .chain(order_by.iter().map(|(e, _, _)| e.as_ref()))
     {
         walk_expr(
             root_expr,
@@ -760,6 +761,7 @@ fn emit_flush_buffer_if_new_partition(
             .map(|_| KeyInfo {
                 sort_order: SortOrder::Asc,
                 collation: CollationSeq::default(),
+                nulls_order: None,
             })
             .collect::<Vec<_>>();
         for (i, c) in compare_key_info
@@ -877,6 +879,7 @@ fn emit_flush_buffer_if_not_peer(
             .map(|_| KeyInfo {
                 sort_order: SortOrder::Asc,
                 collation: CollationSeq::default(),
+                nulls_order: None,
             })
             .collect::<Vec<_>>();
         for (i, c) in compare_key_info
@@ -927,7 +930,7 @@ fn emit_load_order_by_columns(
         // Source columns are deduplicated and may appear in a different order than
         // the ORDER BY terms. Therefore, we must restore the original ORDER BY layout
         // here by copying the values into an array of registers.
-        for (i, (expr, _)) in window.order_by.iter().enumerate() {
+        for (i, (expr, _, _)) in window.order_by.iter().enumerate() {
             match expr {
                 Expr::Column { column, .. } => {
                     program.emit_insn(Insn::Copy {
