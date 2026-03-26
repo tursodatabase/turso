@@ -315,3 +315,55 @@ fn test_fdw_matview_survives_reopen() {
         conn.close().unwrap();
     }
 }
+
+#[turso_macros::test(views)]
+fn test_refresh_materialized_view_api(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    let csv_path = tmp_db.path.parent().unwrap().join("api_refresh.csv");
+    {
+        let mut f = std::fs::File::create(&csv_path)?;
+        writeln!(f, "id,val")?;
+        writeln!(f, "1,v1")?;
+    }
+
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE SERVER csv_srv OPTIONS (driver 'csv')",
+    )?;
+    common::run_query(
+        &tmp_db,
+        &conn,
+        &format!(
+            "CREATE FOREIGN TABLE api_data (id TEXT, val TEXT) \
+             SERVER csv_srv OPTIONS (path '{}', skip_header 'true')",
+            csv_path.display()
+        ),
+    )?;
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv_api AS SELECT * FROM api_data",
+    )?;
+
+    let rows: Vec<(String, String)> = conn.exec_rows("SELECT id, val FROM mv_api");
+    assert_eq!(rows.len(), 1);
+
+    // Update CSV
+    {
+        let mut f = std::fs::File::create(&csv_path)?;
+        writeln!(f, "id,val")?;
+        writeln!(f, "1,v1")?;
+        writeln!(f, "2,v2")?;
+    }
+
+    // Programmatic refresh via Connection API
+    conn.refresh_materialized_view("mv_api")?;
+
+    let rows: Vec<(String, String)> = conn.exec_rows("SELECT id, val FROM mv_api ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1], ("2".to_string(), "v2".to_string()));
+
+    Ok(())
+}
