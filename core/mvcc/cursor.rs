@@ -11,7 +11,7 @@ use crate::mvcc::yield_points::inject_io_yield;
 #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 use crate::mvcc::yield_points::{ProvidesYieldContext, YieldContext};
 #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-use crate::mvcc::yield_points::{YieldKind, YieldPointMarker};
+use crate::mvcc::yield_points::YieldPointMarker;
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::sync::Arc;
 use crate::translate::plan::IterationDirection;
@@ -126,7 +126,6 @@ pub(crate) enum CursorYieldPoint {
 
 #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 impl YieldPointMarker for CursorYieldPoint {
-    const KIND: YieldKind = YieldKind::Cursor;
     const POINT_COUNT: u8 = Self::COUNT as u8;
 
     fn ordinal(self) -> u8 {

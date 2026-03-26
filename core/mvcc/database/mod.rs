@@ -4,7 +4,7 @@ use crate::mvcc::yield_points::inject_transition_yield;
 #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 use crate::mvcc::yield_points::{ProvidesYieldContext, YieldContext};
 #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-use crate::mvcc::yield_points::{YieldKind, YieldPointMarker};
+use crate::mvcc::yield_points::YieldPointMarker;
 use crate::schema::{Schema, Table};
 use crate::state_machine::StateMachine;
 use crate::state_machine::StateTransition;
@@ -910,7 +910,6 @@ enum CommitYieldPoint {
 
 #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 impl YieldPointMarker for CommitYieldPoint {
-    const KIND: YieldKind = YieldKind::Commit;
     const POINT_COUNT: u8 = Self::COUNT as u8;
 
     fn ordinal(self) -> u8 {

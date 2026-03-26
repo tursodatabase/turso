@@ -11,44 +11,28 @@ use crate::types::IOResult;
 #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 use crate::Completion;
 
-/// The state machines on which we can safely inject yield points
-#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum YieldKind {
-    Commit,
-    Cursor,
-}
-
 /// YieldPoint is a descriptor for one safe yield boundary in a state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct YieldPoint {
-    #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-    kind: YieldKind,
     pub ordinal: u8,
     pub point_count: u8,
 }
 
 #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 pub(crate) trait YieldPointMarker: Copy + Debug {
-    const KIND: YieldKind;
     const POINT_COUNT: u8;
 
     fn ordinal(self) -> u8;
 
     fn point(self) -> YieldPoint {
-        YieldPoint::new(Self::KIND, self.ordinal(), Self::POINT_COUNT)
+        YieldPoint::new(self.ordinal(), Self::POINT_COUNT)
     }
 }
 
 #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 impl YieldPoint {
-    pub(crate) fn new(kind: YieldKind, ordinal: u8, point_count: u8) -> Self {
-        Self {
-            #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-            kind,
-            ordinal,
-            point_count,
-        }
+    pub(crate) fn new(ordinal: u8, point_count: u8) -> Self {
+        Self { ordinal, point_count }
     }
 }
 
