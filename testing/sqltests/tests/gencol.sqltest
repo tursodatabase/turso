@@ -628,6 +628,17 @@ expect {
     10
 }
 
+test gencol_glob_pattern_column {
+    CREATE TABLE t1(a TEXT, b AS (a GLOB '[0-9]*'));
+    INSERT INTO t1(a) VALUES('123abc'), ('abc123'), ('456');
+    SELECT a, b FROM t1;
+}
+expect {
+    123abc|1
+    abc123|0
+    456|1
+}
+
 # =============================================================================
 # 4. Column Dependency Chains
 # =============================================================================
@@ -837,6 +848,42 @@ expect {
     B
     a
     b
+}
+
+test gencol_type_mismatch_text_in_integer {
+    CREATE TABLE t1(a TEXT, b INTEGER AS (a));
+    INSERT INTO t1(a) VALUES('hello');
+    SELECT typeof(b), b FROM t1;
+}
+expect {
+    text|hello
+}
+
+test gencol_type_mismatch_int_in_text {
+    CREATE TABLE t1(a INTEGER, b TEXT AS (a));
+    INSERT INTO t1(a) VALUES(42);
+    SELECT typeof(b), b FROM t1;
+}
+expect {
+    text|42
+}
+
+test gencol_type_mismatch_real_in_integer {
+    CREATE TABLE t1(a REAL, b INTEGER AS (a));
+    INSERT INTO t1(a) VALUES(3.7);
+    SELECT typeof(b), b FROM t1;
+}
+expect {
+    real|3.7
+}
+
+test gencol_type_mismatch_blob_in_text {
+    CREATE TABLE t1(a BLOB, b TEXT AS (a));
+    INSERT INTO t1(a) VALUES(x'DEADBEEF');
+    SELECT typeof(b), quote(b) FROM t1;
+}
+expect {
+    blob|X'DEADBEEF'
 }
 
 # =============================================================================
@@ -1224,6 +1271,158 @@ expect {
     ok
 }
 
+test gencol_delete_basic {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    DELETE FROM t1 WHERE a = 2;
+    SELECT a, b FROM t1 ORDER BY a;
+}
+expect {
+    1|2
+    3|6
+}
+
+test gencol_delete_all {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    DELETE FROM t1;
+    SELECT COUNT(*) FROM t1;
+}
+expect {
+    0
+}
+
+# DELETE with virtual column in middle of table
+test gencol_delete_virtual_middle {
+    CREATE TABLE t1(a INTEGER, v AS (a * 2), c INTEGER);
+    INSERT INTO t1(a, c) VALUES(1, 10), (2, 20), (3, 30);
+    DELETE FROM t1 WHERE v = 4;
+    SELECT a, v, c FROM t1 ORDER BY a;
+}
+expect {
+    1|2|10
+    3|6|30
+}
+
+# DELETE with chained virtual columns
+test gencol_delete_chained_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + 1));
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    DELETE FROM t1 WHERE c > 5;
+    SELECT a, b, c FROM t1 ORDER BY a;
+}
+expect {
+    1|2|3
+    2|4|5
+}
+
+test gencol_insert_or_replace_multiple {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER, c AS (b * 3));
+    INSERT INTO t1(a, b) VALUES(1, 10), (2, 20), (3, 30);
+    INSERT OR REPLACE INTO t1(a, b) VALUES(2, 200), (4, 40);
+    SELECT a, b, c FROM t1 ORDER BY a;
+}
+expect {
+    1|10|30
+    2|200|600
+    3|30|90
+    4|40|120
+}
+
+test gencol_replace_virtual_first_col {
+    CREATE TABLE t1(v AS (b * 2) VIRTUAL, a INTEGER PRIMARY KEY, b INTEGER);
+    INSERT INTO t1(a, b) VALUES(1, 5);
+    REPLACE INTO t1(a, b) VALUES(1, 15);
+    SELECT * FROM t1;
+}
+expect {
+    30|1|15
+}
+
+test gencol_insert_or_ignore_notnull_violation {
+    CREATE TABLE t1(a INTEGER NOT NULL, b AS (a * 2));
+    INSERT OR IGNORE INTO t1(a) VALUES(5);
+    INSERT OR IGNORE INTO t1(a) VALUES(NULL);
+    SELECT a, b FROM t1;
+}
+expect {
+    5|10
+}
+
+test gencol_insert_select_basic {
+    CREATE TABLE src(x INTEGER);
+    INSERT INTO src VALUES(1), (2), (3);
+    CREATE TABLE dst(a INTEGER, b AS (a * 2));
+    INSERT INTO dst(a) SELECT x FROM src;
+    SELECT a, b FROM dst ORDER BY a;
+}
+expect {
+    1|2
+    2|4
+    3|6
+}
+
+test gencol_insert_select_with_transform {
+    CREATE TABLE src(x INTEGER, y INTEGER);
+    INSERT INTO src VALUES(1, 10), (2, 20);
+    CREATE TABLE dst(a INTEGER, b INTEGER, c AS (a + b));
+    INSERT INTO dst(a, b) SELECT x, y FROM src;
+    SELECT a, b, c FROM dst ORDER BY a;
+}
+expect {
+    1|10|11
+    2|20|22
+}
+
+test gencol_insert_select_from_gencol_table {
+    CREATE TABLE src(a INTEGER, b AS (a * 2));
+    INSERT INTO src(a) VALUES(5), (10);
+    CREATE TABLE dst(x INTEGER, y AS (x * 3));
+    INSERT INTO dst(x) SELECT b FROM src;
+    SELECT x, y FROM dst ORDER BY x;
+}
+expect {
+    10|30
+    20|60
+}
+
+test gencol_insert_select_virtual_middle {
+    CREATE TABLE src(x INTEGER);
+    INSERT INTO src VALUES(1), (2), (3);
+    CREATE TABLE dst(a INTEGER, v AS (a * 10), c INTEGER DEFAULT 99);
+    INSERT INTO dst(a) SELECT x FROM src;
+    SELECT a, v, c FROM dst ORDER BY a;
+}
+expect {
+    1|10|99
+    2|20|99
+    3|30|99
+}
+
+test gencol_update_fanout {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (a * 3), d AS (a + 100));
+    INSERT INTO t1(a) VALUES(5);
+    SELECT a, b, c, d FROM t1;
+    UPDATE t1 SET a = 10;
+    SELECT a, b, c, d FROM t1;
+}
+expect {
+    5|10|15|105
+    10|20|30|110
+}
+
+test gencol_update_fanout_multiple_rows {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a INTEGER, b AS (a * 2), c AS (a + 100));
+    INSERT INTO t1(id, a) VALUES(1, 5), (2, 10), (3, 15);
+    UPDATE t1 SET a = a + 1;
+    SELECT id, a, b, c FROM t1 ORDER BY id;
+}
+expect {
+    1|6|12|106
+    2|11|22|111
+    3|16|32|116
+}
+
 # =============================================================================
 # 9. Queries (WHERE, ORDER BY, GROUP BY, JOINs, window functions)
 # =============================================================================
@@ -1479,6 +1678,62 @@ expect @js {
     3|6|B|8|6|10|3
     4|8|B|8|6|10|3
     5|10|B|8|6|10|3
+}
+
+test gencol_distinct_virtual_with_base {
+    CREATE TABLE t1(a INTEGER, b TEXT, c AS (LENGTH(b)));
+    INSERT INTO t1(a, b) VALUES(1, 'hi'), (2, 'hey'), (3, 'hi'), (4, 'hey');
+    SELECT DISTINCT c FROM t1 ORDER BY c;
+}
+expect {
+    2
+    3
+}
+
+test gencol_union_all_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE TABLE t2(x INTEGER, y AS (x * 2));
+    INSERT INTO t1(a) VALUES(1), (2);
+    INSERT INTO t2(x) VALUES(2), (3);
+    SELECT b FROM t1 UNION ALL SELECT y FROM t2 ORDER BY 1;
+}
+expect {
+    2
+    4
+    4
+    6
+}
+
+test gencol_cte_insert_into_gencol {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    WITH vals(x) AS (VALUES(10), (20), (30))
+    INSERT INTO t1(a) SELECT x FROM vals;
+    SELECT a, b FROM t1 ORDER BY a;
+}
+expect {
+    10|20
+    20|40
+    30|60
+}
+
+test gencol_offset_past_end {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    SELECT a, b FROM t1 ORDER BY a LIMIT 10 OFFSET 5;
+}
+expect {
+}
+
+test gencol_scalar_subquery_in_select {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE TABLE t2(x INTEGER);
+    INSERT INTO t1(a) VALUES(5), (10);
+    INSERT INTO t2 VALUES(100);
+    SELECT a, b, (SELECT x FROM t2) AS sub FROM t1 ORDER BY a;
+}
+expect {
+    5|10|100
+    10|20|100
 }
 
 # =============================================================================
@@ -2122,6 +2377,73 @@ test gencol_update_indexed_virtual_col {
 }
 expect {
     20|40|10
+}
+
+# --- Multiple indexes updated simultaneously ---
+
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_multiple_indexes_insert {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c INTEGER);
+    CREATE INDEX idx_b ON t1(b);
+    CREATE INDEX idx_c ON t1(c);
+    INSERT INTO t1(a, c) VALUES(1, 10), (2, 20), (3, 30);
+    SELECT a, b, c FROM t1 ORDER BY b;
+    PRAGMA integrity_check;
+}
+expect {
+    1|2|10
+    2|4|20
+    3|6|30
+    ok
+}
+
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_multiple_indexes_update {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c INTEGER);
+    CREATE INDEX idx_b ON t1(b);
+    CREATE INDEX idx_c ON t1(c);
+    INSERT INTO t1(a, c) VALUES(1, 10), (2, 20);
+    UPDATE t1 SET a = 100, c = 200 WHERE a = 1;
+    SELECT a, b, c FROM t1 ORDER BY a;
+    PRAGMA integrity_check;
+}
+expect {
+    2|4|20
+    100|200|200
+    ok
+}
+
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_multiple_indexes_delete {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c INTEGER);
+    CREATE INDEX idx_b ON t1(b);
+    CREATE INDEX idx_c ON t1(c);
+    INSERT INTO t1(a, c) VALUES(1, 10), (2, 20), (3, 30);
+    DELETE FROM t1 WHERE a = 2;
+    SELECT a, b, c FROM t1 ORDER BY a;
+    PRAGMA integrity_check;
+}
+expect {
+    1|2|10
+    3|6|30
+    ok
+}
+
+# Two indexes on two different virtual columns
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_two_virtual_indexes {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (a * 3));
+    CREATE INDEX idx_b ON t1(b);
+    CREATE INDEX idx_c ON t1(c);
+    INSERT INTO t1(a) VALUES(5), (10);
+    UPDATE t1 SET a = 15 WHERE a = 5;
+    SELECT a, b, c FROM t1 ORDER BY a;
+    PRAGMA integrity_check;
+}
+expect {
+    10|20|30
+    15|30|45
+    ok
 }
 
 # =============================================================================
@@ -2881,6 +3203,78 @@ test gencol_default_value_with_virtual {
 }
 expect {
     42|84
+}
+
+# --- STRICT tables with virtual columns ---
+
+test gencol_strict_basic {
+    CREATE TABLE t1(a INTEGER, b INTEGER AS (a * 2)) STRICT;
+    INSERT INTO t1(a) VALUES(5);
+    SELECT a, b FROM t1;
+}
+expect {
+    5|10
+}
+
+test gencol_strict_type_enforcement {
+    CREATE TABLE t1(a INTEGER, b TEXT AS (a || 'x')) STRICT;
+    INSERT INTO t1(a) VALUES(5);
+    SELECT a, typeof(b), b FROM t1;
+}
+expect {
+    5|text|5x
+}
+
+test gencol_strict_insert_type_violation {
+    CREATE TABLE t1(a INTEGER, b INTEGER AS (a * 2)) STRICT;
+    INSERT INTO t1(a) VALUES('not_a_number');
+}
+expect error {
+    cannot store TEXT value in INTEGER column
+}
+
+test gencol_strict_multiple_virtual {
+    CREATE TABLE t1(a INTEGER, b INTEGER AS (a * 2), c TEXT AS (a || '!')) STRICT;
+    INSERT INTO t1(a) VALUES(7);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    7|14|7!
+}
+
+# --- Large row counts (100+ rows) ---
+
+test gencol_large_row_count {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    INSERT INTO t1(a) SELECT value FROM generate_series(1, 150);
+    SELECT COUNT(*) FROM t1;
+    SELECT MIN(b), MAX(b) FROM t1;
+    SELECT a, b FROM t1 WHERE a = 100;
+}
+expect {
+    150
+    2|300
+    100|200
+}
+
+test gencol_large_row_update {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    INSERT INTO t1(a) SELECT value FROM generate_series(1, 100);
+    UPDATE t1 SET a = a + 1000 WHERE a > 50;
+    SELECT COUNT(*) FROM t1 WHERE b > 2000;
+}
+expect {
+    50
+}
+
+test gencol_large_row_delete {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    INSERT INTO t1(a) SELECT value FROM generate_series(1, 200);
+    DELETE FROM t1 WHERE b > 100;
+    SELECT COUNT(*) FROM t1;
+}
+expect {
+    50
 }
 
 # =============================================================================
