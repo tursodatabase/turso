@@ -2213,6 +2213,107 @@ enum ParsedOp {
 }
 
 #[cfg(test)]
+impl PartialEq for ParsedOp {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::UpsertTable {
+                    table_id: left_table_id,
+                    rowid: left_rowid,
+                    record_bytes: left_record_bytes,
+                    commit_ts: left_commit_ts,
+                    btree_resident: left_btree_resident,
+                },
+                Self::UpsertTable {
+                    table_id: right_table_id,
+                    rowid: right_rowid,
+                    record_bytes: right_record_bytes,
+                    commit_ts: right_commit_ts,
+                    btree_resident: right_btree_resident,
+                },
+            ) => {
+                left_table_id == right_table_id
+                    && left_rowid == right_rowid
+                    && left_record_bytes == right_record_bytes
+                    && left_commit_ts == right_commit_ts
+                    && left_btree_resident == right_btree_resident
+            }
+            (
+                Self::DeleteTable {
+                    rowid: left_rowid,
+                    commit_ts: left_commit_ts,
+                    btree_resident: left_btree_resident,
+                },
+                Self::DeleteTable {
+                    rowid: right_rowid,
+                    commit_ts: right_commit_ts,
+                    btree_resident: right_btree_resident,
+                },
+            ) => {
+                left_rowid == right_rowid
+                    && left_commit_ts == right_commit_ts
+                    && left_btree_resident == right_btree_resident
+            }
+            (
+                Self::UpsertIndex {
+                    table_id: left_table_id,
+                    payload: left_payload,
+                    commit_ts: left_commit_ts,
+                    btree_resident: left_btree_resident,
+                },
+                Self::UpsertIndex {
+                    table_id: right_table_id,
+                    payload: right_payload,
+                    commit_ts: right_commit_ts,
+                    btree_resident: right_btree_resident,
+                },
+            ) => {
+                left_table_id == right_table_id
+                    && left_payload == right_payload
+                    && left_commit_ts == right_commit_ts
+                    && left_btree_resident == right_btree_resident
+            }
+            (
+                Self::DeleteIndex {
+                    table_id: left_table_id,
+                    payload: left_payload,
+                    commit_ts: left_commit_ts,
+                    btree_resident: left_btree_resident,
+                },
+                Self::DeleteIndex {
+                    table_id: right_table_id,
+                    payload: right_payload,
+                    commit_ts: right_commit_ts,
+                    btree_resident: right_btree_resident,
+                },
+            ) => {
+                left_table_id == right_table_id
+                    && left_payload == right_payload
+                    && left_commit_ts == right_commit_ts
+                    && left_btree_resident == right_btree_resident
+            }
+            (
+                Self::UpdateHeader {
+                    header: left_header,
+                    commit_ts: left_commit_ts,
+                },
+                Self::UpdateHeader {
+                    header: right_header,
+                    commit_ts: right_commit_ts,
+                },
+            ) => {
+                left_commit_ts == right_commit_ts
+                    && bytemuck::bytes_of(left_header) == bytemuck::bytes_of(right_header)
+            }
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Eq for ParsedOp {}
+
+#[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
     use std::sync::Once;
@@ -4429,6 +4530,26 @@ mod tests {
         file
     }
 
+    fn write_encrypted_txs_with_chunk_size_for_test(
+        io: &Arc<dyn crate::IO>,
+        file_name: &str,
+        enc_ctx: &crate::storage::encryption::EncryptionContext,
+        encrypted_payload_chunk_size: usize,
+        txs: &[crate::mvcc::database::LogRecord],
+    ) -> Arc<dyn crate::File> {
+        let file = open_test_file(io, file_name);
+        let mut log = LogicalLog::new_with_payload_chunk_size(
+            file.clone(),
+            io.clone(),
+            Some(enc_ctx.clone()),
+            encrypted_payload_chunk_size,
+        );
+        for tx in txs {
+            append_encrypted_tx(&mut log, io, tx);
+        }
+        file
+    }
+
     fn parse_only_encrypted_tx_ops(
         file: Arc<dyn crate::File>,
         io: &Arc<dyn crate::IO>,
@@ -4468,6 +4589,38 @@ mod tests {
             ParseResult::Eof
         ));
         ops
+    }
+
+    fn parse_all_encrypted_tx_ops_with_chunk_size_for_test(
+        file: Arc<dyn crate::File>,
+        io: &Arc<dyn crate::IO>,
+        enc_ctx: &crate::storage::encryption::EncryptionContext,
+        encrypted_payload_chunk_size: usize,
+    ) -> std::result::Result<Vec<Vec<ParsedOp>>, String> {
+        let mut reader = StreamingLogicalLogReader::new_with_payload_chunk_size(
+            file,
+            Some(enc_ctx.clone()),
+            encrypted_payload_chunk_size,
+        );
+        reader
+            .read_header(io)
+            .map_err(|e| format!("failed to read fuzz log header: {e}"))?;
+        let mut frames = Vec::new();
+        let mut tx_index = 0usize;
+        loop {
+            match reader
+                .parse_next_transaction(io)
+                .map_err(|e| format!("failed to parse fuzz frame {tx_index}: {e}"))?
+            {
+                ParseResult::Ops(ops) => frames.push(ops),
+                ParseResult::Eof => break,
+                ParseResult::InvalidFrame => {
+                    return Err(format!("invalid fuzz frame at tx_index={tx_index}"));
+                }
+            }
+            tx_index += 1;
+        }
+        Ok(frames)
     }
 
     fn assert_upsert_table_op(
@@ -4532,6 +4685,236 @@ mod tests {
             }
             other => panic!("expected UpdateHeader, got {other:?}"),
         }
+    }
+
+    // Generate one record-bytes length from buckets that bias heavily toward
+    // chunk boundaries, while still mixing in smaller values.
+    fn encrypted_carry_fuzz_record_bytes_len(
+        rng: &mut ChaCha8Rng,
+        rowid: i64,
+        chunk_size: usize,
+    ) -> usize {
+        // Sometimes force the whole serialized upsert op to land exactly on a chunk multiple.
+        if rng.random_range(0..4) == 0 {
+            let exact_op_size = rng.random_range(1..=3) * chunk_size;
+            if let Some(record_bytes_len) =
+                try_record_bytes_len_for_upsert_table_op_size(rowid, exact_op_size)
+            {
+                return record_bytes_len;
+            }
+        }
+
+        let jitter = rng.random_range(0..=16) as isize - 8;
+        let base = match rng.random_range(0..15) {
+            0 => 1usize,
+            1 => 16usize,
+            2 => chunk_size,
+            3 => chunk_size + 1,
+            4 => chunk_size - 1,
+            5 => 2 * chunk_size,
+            6 => 2 * chunk_size + 1,
+            7 => 2 * chunk_size - 1,
+            8 => 3 * chunk_size,
+            9 => 3 * chunk_size + 1,
+            10 => chunk_size / 2,
+            11 => chunk_size + chunk_size / 2,
+            12 => 2 * chunk_size + chunk_size / 2,
+            13 => random_range(1..=16usize) + random_range(0..=chunk_size),
+            14 => random_range(1..=chunk_size),
+            _ => rng.random_range(1..=3) * chunk_size,
+        } as isize;
+        (base + jitter).max(1) as usize
+    }
+
+    fn expected_upsert_table_fuzz_op(
+        row_version: &crate::mvcc::database::RowVersion,
+        rowid: i64,
+        commit_ts: u64,
+    ) -> ParsedOp {
+        ParsedOp::UpsertTable {
+            table_id: (-2).into(),
+            rowid: RowID::new((-2).into(), RowKey::Int(rowid)),
+            record_bytes: row_version.row.payload().to_vec(),
+            commit_ts,
+            btree_resident: false,
+        }
+    }
+
+    fn assert_forced_upsert_carry_prefix_layout(
+        short_filler: &crate::mvcc::database::RowVersion,
+        short_upsert: &crate::mvcc::database::RowVersion,
+        long_upsert: &crate::mvcc::database::RowVersion,
+        chunk_size: usize,
+    ) {
+        let mut filler_buf = Vec::new();
+        serialize_op_entry(&mut filler_buf, short_filler).unwrap();
+        let mut short_upsert_buf = Vec::new();
+        serialize_op_entry(&mut short_upsert_buf, short_upsert).unwrap();
+        let mut long_upsert_buf = Vec::new();
+        serialize_op_entry(&mut long_upsert_buf, long_upsert).unwrap();
+
+        turso_assert_less_than!(
+            filler_buf.len(),
+            chunk_size,
+            "forced short-carry filler upsert must fit before the first chunk boundary"
+        );
+        let short_split_offset = chunk_size - filler_buf.len();
+        turso_assert!(
+            short_split_offset > 0 && short_split_offset < short_upsert_buf.len(),
+            "forced short carry must end the first chunk inside the short upsert"
+        );
+        turso_assert_less_than!(
+            short_upsert_buf.len(),
+            StreamingLogicalLogReader::MAX_SERIALIZED_OP_PREFIX_LEN,
+            "forced short carry upsert must remain below MAX_SERIALIZED_OP_PREFIX_LEN"
+        );
+
+        let long_start_offset = (filler_buf.len() + short_upsert_buf.len()) % chunk_size;
+        turso_assert!(
+            long_start_offset > 0,
+            "forced long carry upsert must begin inside a chunk, not on a chunk boundary"
+        );
+        turso_assert!(
+            long_upsert_buf.len() > 2 * chunk_size,
+            "forced long carry upsert must span more than two chunk widths"
+        );
+    }
+
+    fn append_forced_upsert_carry_prefix(
+        rng: &mut ChaCha8Rng,
+        chunk_size: usize,
+        commit_ts: u64,
+        row_versions: &mut Vec<crate::mvcc::database::RowVersion>,
+        expected_ops: &mut Vec<ParsedOp>,
+    ) {
+        // Every forced case starts with:
+        // 1. an upsert filler that lands the chunk boundary inside the next upsert
+        // 2. a short carried upsert whose total size is below MAX_SERIALIZED_OP_PREFIX_LEN
+        // 3. a long carried upsert that spans more than two later chunks
+        let short_rowid = 0i64;
+        let short_record_bytes = vec![0x11];
+        let short_upsert = make_test_raw_table_row_version(
+            (-2).into(),
+            short_rowid,
+            short_record_bytes,
+            commit_ts,
+            false,
+        );
+        let mut short_upsert_buf = Vec::new();
+        serialize_op_entry(&mut short_upsert_buf, &short_upsert).unwrap();
+        turso_assert_less_than!(
+            short_upsert_buf.len(),
+            StreamingLogicalLogReader::MAX_SERIALIZED_OP_PREFIX_LEN,
+            "forced short carry upsert must remain below MAX_SERIALIZED_OP_PREFIX_LEN"
+        );
+
+        let split_offset = rng.random_range(1..short_upsert_buf.len());
+        let filler_op_size = chunk_size - split_offset;
+        let filler_record_bytes_len =
+            try_record_bytes_len_for_upsert_table_op_size(1, filler_op_size)
+                .expect("forced filler upsert size must map to a valid record_bytes length");
+        let short_filler = make_test_raw_table_row_version(
+            (-2).into(),
+            1,
+            vec![0x22; filler_record_bytes_len],
+            commit_ts,
+            false,
+        );
+        let long_upsert = make_test_raw_table_row_version(
+            (-2).into(),
+            2,
+            vec![0x5A; 2 * chunk_size + rng.random_range(64..=256)],
+            commit_ts,
+            false,
+        );
+        assert_forced_upsert_carry_prefix_layout(
+            &short_filler,
+            &short_upsert,
+            &long_upsert,
+            chunk_size,
+        );
+
+        expected_ops.push(expected_upsert_table_fuzz_op(&short_filler, 1, commit_ts));
+        row_versions.push(short_filler);
+
+        expected_ops.push(expected_upsert_table_fuzz_op(
+            &short_upsert,
+            short_rowid,
+            commit_ts,
+        ));
+        row_versions.push(short_upsert);
+
+        expected_ops.push(expected_upsert_table_fuzz_op(&long_upsert, 2, commit_ts));
+        row_versions.push(long_upsert);
+    }
+
+    fn generate_random_encrypted_carry_fuzz_upsert(
+        rng: &mut ChaCha8Rng,
+        rowid: i64,
+        chunk_size: usize,
+        commit_ts: u64,
+    ) -> (crate::mvcc::database::RowVersion, ParsedOp) {
+        // first generate a random payload size
+        let record_bytes_len = encrypted_carry_fuzz_record_bytes_len(rng, rowid, chunk_size);
+        let row_version = make_test_raw_table_row_version(
+            (-2).into(),
+            rowid,
+            vec![(rowid as u8).wrapping_add(1); record_bytes_len],
+            commit_ts,
+            false,
+        );
+        let expected = expected_upsert_table_fuzz_op(&row_version, rowid, commit_ts);
+        (row_version, expected)
+    }
+
+    /// given a seed, generate fuzz plan with all kinds of random payload sizes.
+    fn generate_encrypted_carry_fuzz_case(
+        case_seed: u64,
+        chunk_size: usize,
+        include_forced_prefix: bool,
+    ) -> (Vec<crate::mvcc::database::LogRecord>, Vec<Vec<ParsedOp>>) {
+        let mut rng = ChaCha8Rng::seed_from_u64(case_seed);
+        let tx_count = rng.random_range(1..=3);
+        let mut txs = Vec::with_capacity(tx_count);
+        let mut expected_frames = Vec::with_capacity(tx_count);
+
+        for tx_index in 0..tx_count {
+            let commit_ts = 1_000 + (rng.next_u64() % 1_000_000) + tx_index as u64;
+            let op_count = rng.random_range(1..=20);
+
+            let mut row_versions = Vec::with_capacity(op_count);
+            let mut expected_ops = Vec::with_capacity(op_count);
+            // When requested, the first tx begins with two deliberate upsert carry scenarios:
+            // - a short carried upsert that ends the first chunk inside a sub-15-byte op
+            // - a long carried upsert that starts mid-chunk and spans more than two later chunks
+            if tx_index == 0 && include_forced_prefix {
+                append_forced_upsert_carry_prefix(
+                    &mut rng,
+                    chunk_size,
+                    commit_ts,
+                    &mut row_versions,
+                    &mut expected_ops,
+                );
+            }
+
+            while row_versions.len() < op_count {
+                let rowid = (row_versions.len() + 1) as i64;
+                let (row_version, expected_op) = generate_random_encrypted_carry_fuzz_upsert(
+                    &mut rng, rowid, chunk_size, commit_ts,
+                );
+                row_versions.push(row_version);
+                expected_ops.push(expected_op);
+            }
+
+            txs.push(crate::mvcc::database::LogRecord {
+                tx_timestamp: commit_ts,
+                row_versions,
+                header: None,
+            });
+            expected_frames.push(expected_ops);
+        }
+
+        (txs, expected_frames)
     }
 
     // Returns the byte ranges of each encrypted chunk within a frame's payload blob,
@@ -4711,6 +5094,62 @@ mod tests {
         );
         assert_eq!(ops.len(), 1);
         assert_upsert_table_op(&ops[0], (-2).into(), 1, &expected_record_bytes, 100);
+    }
+
+    /// Random fuzzer to test encrypted chunking logic, especially carry.
+    /// We create a plan from a seed, then generate ops, write to ecnrypted log file and read it back
+    #[test]
+    fn test_encrypted_log_carry_fuzz() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let enc_ctx = test_enc_ctx();
+        const TEST_CHUNK_SIZE: usize = 2 * 1024;
+
+        let seed = std::env::var("TURSO_ENCRYPTED_CARRY_FUZZ_SEED")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_else(|| rng().random::<u64>());
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let case_count = rng.random_range(1..=8);
+        let forced_case_index = rng.random_range(0..case_count);
+        eprintln!(
+            "encrypted carry fuzz root_seed={seed} case_count={case_count} forced_case_index={forced_case_index} test_chunk_size={TEST_CHUNK_SIZE}"
+        );
+
+        for case_index in 0..case_count {
+            let case_seed = rng.next_u64();
+            let include_forced_prefix = case_index == forced_case_index;
+            let (txs, expected_frames) = generate_encrypted_carry_fuzz_case(
+                case_seed,
+                TEST_CHUNK_SIZE,
+                include_forced_prefix,
+            );
+
+            let file = write_encrypted_txs_with_chunk_size_for_test(
+                &io,
+                &format!("enc-carry-fuzz-{seed}-{case_index}.db-log"),
+                &enc_ctx,
+                TEST_CHUNK_SIZE,
+                &txs,
+            );
+            let actual_frames = parse_all_encrypted_tx_ops_with_chunk_size_for_test(
+                file,
+                &io,
+                &enc_ctx,
+                TEST_CHUNK_SIZE,
+            )
+            .unwrap_or_else(|err| {
+                panic!(
+                    "encrypted carry fuzz failed while parsing frames: root_seed={seed} case_index={case_index} forced_case_index={forced_case_index} include_forced_prefix={include_forced_prefix} case_seed={case_seed} err={err}"
+                )
+            });
+
+            assert_eq!(
+                actual_frames,
+                expected_frames,
+                "encrypted carry fuzz failed: root_seed={seed} case_index={case_index} forced_case_index={forced_case_index} include_forced_prefix={include_forced_prefix} case_seed={case_seed}"
+            );
+        }
     }
 
     #[test]
