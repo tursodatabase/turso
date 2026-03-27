@@ -926,7 +926,7 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
     let parsed_op = match tag {
         OP_UPSERT_TABLE => {
             let table_id = table_id.expect("table op must have table_id");
-            let (rowid_u64, rowid_len) = read_varint(&payload)
+            let (rowid_u64, rowid_len) = read_varint(payload)
                 .map_err(|_| LimboError::Corrupt("Bad rowid varint in UPSERT_TABLE".into()))?;
             if rowid_len > payload.len() {
                 return Err(LimboError::Corrupt("rowid_len > payload".into()));
@@ -943,7 +943,7 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
         }
         OP_DELETE_TABLE => {
             let table_id = table_id.expect("table op must have table_id");
-            let (rowid_u64, rowid_len) = read_varint(&payload)
+            let (rowid_u64, rowid_len) = read_varint(payload)
                 .map_err(|_| LimboError::Corrupt("Bad rowid varint in DELETE_TABLE".into()))?;
             if rowid_len != payload.len() {
                 return Err(LimboError::Corrupt(
@@ -976,7 +976,7 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
                 ));
             }
             let mut bytes = [0u8; DatabaseHeader::SIZE];
-            bytes.copy_from_slice(&payload);
+            bytes.copy_from_slice(payload);
             let header = *bytemuck::from_bytes::<DatabaseHeader>(&bytes);
             if header.magic != *b"SQLite format 3\0" {
                 return Err(LimboError::Corrupt("UPDATE_HEADER bad SQLite magic".into()));
@@ -1277,38 +1277,39 @@ impl StreamingLogicalLogReader {
     fn read_and_decrypt_encrypted_chunk(
         &mut self,
         io: &Arc<dyn crate::IO>,
-        payload_size: usize,
-        op_count: u32,
-        commit_ts: u64,
-        salt: u64,
+        payload_ctx: &EncryptedPayloadReadContext,
         chunk_index: usize,
         running_crc: u32,
-        nonce_size: usize,
-        tag_size: usize,
     ) -> Result<EncryptedChunkReadResult> {
         // first we gotta figure out, how many bytes to read off the disk, its either
         // `self.encrypted_payload_chunk_size` or the remainder in the last chunk
         let plaintext_len = match encrypted_chunk_plaintext_len(
-            payload_size,
+            payload_ctx.payload_size,
             chunk_index,
             self.encrypted_payload_chunk_size,
         ) {
             Some(len) => len,
             None => return Ok(EncryptedChunkReadResult::InvalidFrame),
         };
-        let on_disk_size = match encrypted_chunk_blob_size(plaintext_len, tag_size, nonce_size) {
+        let on_disk_size = match encrypted_chunk_blob_size(
+            plaintext_len,
+            payload_ctx.tag_size,
+            payload_ctx.nonce_size,
+        ) {
             Some(size) => size,
             None => return Ok(EncryptedChunkReadResult::InvalidFrame),
         };
-        let chunk_count =
-            encrypted_payload_chunk_count(payload_size, self.encrypted_payload_chunk_size);
+        let chunk_count = encrypted_payload_chunk_count(
+            payload_ctx.payload_size,
+            self.encrypted_payload_chunk_size,
+        );
         let is_last_chunk = chunk_index + 1 == chunk_count;
 
         let aad = build_encrypted_chunk_aad(
-            salt,
-            is_last_chunk.then_some(payload_size as u64),
-            op_count,
-            commit_ts,
+            payload_ctx.salt,
+            is_last_chunk.then_some(payload_ctx.payload_size as u64),
+            payload_ctx.op_count,
+            payload_ctx.commit_ts,
             u32::try_from(chunk_index).map_err(|_| {
                 LimboError::Corrupt("encrypted payload chunk index exceeds u32".to_string())
             })?,
@@ -1330,8 +1331,8 @@ impl StreamingLogicalLogReader {
             let buffer = self.buffer.read();
             let blob = &buffer[start..end];
             let next_crc = crc32c::crc32c_append(running_crc, blob);
-            let ciphertext = &blob[..plaintext_len + tag_size];
-            let nonce = &blob[plaintext_len + tag_size..];
+            let ciphertext = &blob[..plaintext_len + payload_ctx.tag_size];
+            let nonce = &blob[plaintext_len + payload_ctx.tag_size..];
             match encryption_ctx.decrypt_chunk_into(ciphertext, nonce, &aad, decrypt_scratch) {
                 Ok(()) => {}
                 Err(e) => {
@@ -1475,6 +1476,14 @@ impl StreamingLogicalLogReader {
             .as_ref()
             .expect("log header must be read before parsing")
             .salt;
+        let payload_ctx = EncryptedPayloadReadContext {
+            payload_size,
+            op_count,
+            commit_ts,
+            salt,
+            nonce_size,
+            tag_size,
+        };
         let mut running_crc = running_crc;
         // carry contains the payload from previous chunk.
         // it is possible that op might split between two chunks (or even multiple), in that case
@@ -1491,14 +1500,9 @@ impl StreamingLogicalLogReader {
             // lets decrypt the log file, chunk by chunk
             running_crc = match self.read_and_decrypt_encrypted_chunk(
                 io,
-                payload_size,
-                op_count,
-                commit_ts,
-                salt,
+                &payload_ctx,
                 chunk_index,
                 running_crc,
-                nonce_size,
-                tag_size,
             )? {
                 EncryptedChunkReadResult::Ok { running_crc } => running_crc,
                 EncryptedChunkReadResult::Eof => return Ok(PayloadParseResult::Eof),
@@ -1549,7 +1553,7 @@ impl StreamingLogicalLogReader {
 
             // we don't have any carry bytes, so lets just parse the plaintext
             let consumed = match Self::parse_decrypted_chunk_ops(
-                &plaintext,
+                plaintext,
                 plaintext_start,
                 &mut parsed_ops,
                 op_count,
@@ -2146,6 +2150,16 @@ impl StreamingLogicalLogReader {
     fn bytes_can_read(&self) -> usize {
         self.buffer.read().len().saturating_sub(self.buffer_offset)
     }
+}
+
+/// Metadata shared by every encrypted chunk in the current frame.
+struct EncryptedPayloadReadContext {
+    payload_size: usize,
+    op_count: u32,
+    commit_ts: u64,
+    salt: u64,
+    nonce_size: usize,
+    tag_size: usize,
 }
 
 /// Result of parsing just the payload portion of a transaction frame.
@@ -4396,12 +4410,9 @@ mod tests {
         rowid: i64,
         target_op_size: usize,
     ) -> Option<usize> {
-        for text_len in 0..=target_op_size {
-            if single_upsert_table_op_size_for_text_len(rowid, text_len) == target_op_size {
-                return Some(text_len);
-            }
-        }
-        None
+        (0..=target_op_size).find(|&text_len| {
+            single_upsert_table_op_size_for_text_len(rowid, text_len) == target_op_size
+        })
     }
 
     fn text_len_for_single_upsert_table_op_size(target_op_size: usize) -> usize {
@@ -5220,8 +5231,16 @@ mod tests {
         assert_eq!(enc_ctx.nonce_size(), 12);
 
         for (payload_size, expected_chunk_ranges, expected_file_size) in [
-            (32_767usize, vec![0..32_795], 32_883usize),
-            (32_768usize, vec![0..32_796], 32_884usize),
+            (
+                32_767usize,
+                std::iter::once(0..32_795).collect::<Vec<_>>(),
+                32_883usize,
+            ),
+            (
+                32_768usize,
+                std::iter::once(0..32_796).collect::<Vec<_>>(),
+                32_884usize,
+            ),
             (32_769usize, vec![0..32_796, 32_796..32_825], 32_913usize),
             (65_536usize, vec![0..32_796, 32_796..65_592], 65_680usize),
             (
@@ -5857,7 +5876,7 @@ mod tests {
 
         // Duplicate chunk 1 over chunk 2.
         {
-            let mut bytes = base_bytes.clone();
+            let mut bytes = base_bytes;
             let first = chunk_ranges[0].clone();
             let second = chunk_ranges[1].clone();
             let first_bytes =
