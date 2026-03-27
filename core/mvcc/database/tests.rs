@@ -6553,6 +6553,43 @@ fn test_checkpoint_drop_table() {
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
 
+/// After a DROP TABLE frees pages and a CREATE INDEX reuses one of those
+/// freed pages as its new root, a subsequent checkpoint must not use the
+/// stale table cursor (which lacks index_info) when writing index rows.
+#[test]
+fn test_checkpoint_drop_table_then_create_index_page_reuse() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE a(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE b(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO a VALUES(1,'x')").unwrap();
+    conn.execute("INSERT INTO b VALUES(1,'y')").unwrap();
+    // First checkpoint writes both tables to the B-tree.
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    // DROP TABLE a frees its root page; CREATE INDEX may reuse it.
+    conn.execute("DROP TABLE a").unwrap();
+    conn.execute("CREATE INDEX new_b_v ON b(v)").unwrap();
+    // Second checkpoint must handle the page reuse without panicking.
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    drop(conn);
+
+    db.restart();
+
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT * FROM b");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].to_string(), "1");
+    assert_eq!(rows[0][1].to_string(), "y");
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
 /// Test that inserting a duplicate primary key fails when the existing row
 /// was committed before this transaction started (and thus is visible).
 #[test]
