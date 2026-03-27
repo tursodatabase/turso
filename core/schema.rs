@@ -2337,15 +2337,8 @@ impl BTreeTable {
                 sql.push_str(", ");
             }
 
-            // we need to wrap the column name in square brackets if it contains special characters
             let column_name = column.name.as_ref().expect("column name is None");
-            if identifier_contains_special_chars(column_name) {
-                sql.push('[');
-                sql.push_str(column_name);
-                sql.push(']');
-            } else {
-                sql.push_str(column_name);
-            }
+            sql.push_str(&quote_ident(column_name));
 
             if !column.ty_str.is_empty() {
                 sql.push(' ');
@@ -2482,13 +2475,7 @@ impl BTreeTable {
                 if i > 0 {
                     sql.push_str(", ");
                 }
-                if identifier_contains_special_chars(col_name) {
-                    sql.push('[');
-                    sql.push_str(col_name);
-                    sql.push(']');
-                } else {
-                    sql.push_str(col_name);
-                }
+                sql.push_str(&quote_ident(col_name));
             }
             sql.push(')');
         }
@@ -2578,10 +2565,6 @@ impl BTreeTable {
 
         Ok(())
     }
-}
-
-fn identifier_contains_special_chars(name: &str) -> bool {
-    name.chars().any(|c| !c.is_ascii_alphanumeric() && c != '_')
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -4778,14 +4761,14 @@ mod tests {
     pub fn test_special_column_names() -> Result<()> {
         let tests = [
             ("foobar", "CREATE TABLE t (foobar TEXT)"),
-            ("_table_name3", "CREATE TABLE t (_table_name3 TEXT)"),
-            ("special name", "CREATE TABLE t ([special name] TEXT)"),
-            ("foo&bar", "CREATE TABLE t ([foo&bar] TEXT)"),
-            (" name", "CREATE TABLE t ([ name] TEXT)"),
+            ("_table_name3", r#"CREATE TABLE t (_table_name3 TEXT)"#),
+            ("special name", r#"CREATE TABLE t ("special name" TEXT)"#),
+            ("foo&bar", r#"CREATE TABLE t ("foo&bar" TEXT)"#),
+            (" name", r#"CREATE TABLE t (" name" TEXT)"#),
         ];
 
         for (input_column_name, expected_sql) in tests {
-            let sql = format!("CREATE TABLE t ([{input_column_name}] TEXT)");
+            let sql = format!(r#"CREATE TABLE t ("{input_column_name}" TEXT)"#);
             let actual = BTreeTable::from_sql(&sql, 0)?.to_sql();
             assert_eq!(expected_sql, actual);
         }
