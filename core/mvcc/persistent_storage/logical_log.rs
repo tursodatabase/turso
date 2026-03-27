@@ -43,8 +43,9 @@
 //!     │    op entries serialized directly       │
 //!     │                                         │
 //!     │  Encrypted:                             │
-//!     │    ciphertext(plain_len + tag_size)     │
-//!     │    nonce(nonce_size)                    │
+//!     │    chunk_0(ciphertext+tag | nonce)      │
+//!     │    chunk_1(ciphertext+tag | nonce)      │
+//!     │    ...                                  │
 //!     ├─────────────────────────────────────────┤
 //!     │       TX Trailer (8 bytes)              │
 //!     │  crc32c(4) | end_magic(4)               │
@@ -53,7 +54,7 @@
 //!
 //! When encryption is enabled, only the payload is encrypted. The log header,
 //! TX header, and TX trailer are always written in plaintext. The log header's salt and TX header
-//! fields (payload_size, op_count, commit_ts) are bound to the ciphertext
+//! fields (op_count, commit_ts, and the final chunk's payload_size) are bound to the ciphertext
 //! as AEAD additional data, so tampering with them will cause decryption to fail.
 //! The CRC in the trailer covers the TX header and the payload as written on disk
 //! (i.e. the ciphertext when encrypted).
@@ -80,8 +81,13 @@
 //!   - `table_id: i32` (must be negative)
 //!   - `payload_len: sqlite varint`
 //!   - `payload: [u8; payload_len]`
-//! - When **encrypted**: `ciphertext(payload_size + tag_size) | nonce(nonce_size)`
-//!   - AEAD additional data: `salt(8) || payload_size(8) || op_count(4) || commit_ts(8)`
+//! - When **encrypted**: payload is split into fixed-size plaintext chunks
+//!   (`ENCRYPTED_PAYLOAD_CHUNK_SIZE`, except the final remainder chunk)
+//!   - each chunk is written as `ciphertext(chunk_plain_len + tag_size) | nonce(nonce_size)`
+//!   - AEAD additional data:
+//!     `salt(8) || payload_size_or_zero(8) || op_count(4) || commit_ts(8) || chunk_index(4)`
+//!     where the payload-size slot is zero for non-final chunks and carries the real payload size
+//!     only in the final chunk
 //!
 //! ### TX Trailer (`TX_TRAILER_SIZE = 8`)
 //! - `crc32c: u32` (chained CRC32C: `crc32c_append(prev_frame_crc, tx_header || payload)`;
@@ -178,6 +184,12 @@ const LOG_HDR_RESERVED_SIZE: usize = LOG_HDR_CRC_START - LOG_HDR_RESERVED_START;
 pub(crate) const FRAME_MAGIC: u32 = 0x5854564D; // "MVTX" in LE
 const END_MAGIC: u32 = 0x4554564D; // "MVTE" in LE
 
+// Size of each chunk before encryption (i.e. before tag/nonce overhead is added)
+pub(crate) const ENCRYPTED_PAYLOAD_CHUNK_SIZE: usize = 32 * 1024;
+// Fixed AAD width for one encrypted chunk:
+// salt(8) + payload_size_or_zero(8) + op_count(4) + commit_ts(8) + chunk_index(4).
+const ENCRYPTED_CHUNK_AAD_SIZE: usize = 32;
+
 const OP_UPSERT_TABLE: u8 = 0;
 const OP_DELETE_TABLE: u8 = 1;
 const OP_UPSERT_INDEX: u8 = 2;
@@ -190,6 +202,79 @@ const OP_FLAG_BTREE_RESIDENT: u8 = 1 << 0;
 const TX_HEADER_SIZE: usize = 24; // FRAME_MAGIC(4) + payload_size(8) + op_count(4) + commit_ts(8)
 const TX_TRAILER_SIZE: usize = 8; // crc32c(4) + END_MAGIC(4)
 const TX_MIN_FRAME_SIZE: usize = TX_HEADER_SIZE + TX_TRAILER_SIZE; // 32
+
+fn encrypted_payload_chunk_count(payload_size: usize, chunk_size: usize) -> usize {
+    if payload_size == 0 {
+        0
+    } else {
+        payload_size.div_ceil(chunk_size)
+    }
+}
+
+fn encrypted_chunk_plaintext_len(
+    payload_size: usize,
+    chunk_index: usize,
+    chunk_size: usize,
+) -> Option<usize> {
+    // Returns how many plaintext bytes belong to chunk_index before encryption.
+    // Full chunks use chunk_size; the final chunk carries the remainder.
+    let chunk_start = chunk_index.checked_mul(chunk_size)?;
+    if chunk_start >= payload_size {
+        return None;
+    }
+    Some((payload_size - chunk_start).min(chunk_size))
+}
+
+fn encrypted_chunk_blob_size(
+    plaintext_len: usize,
+    tag_size: usize,
+    nonce_size: usize,
+) -> Option<usize> {
+    // Returns the on-disk size of one encrypted chunk:
+    // plaintext bytes plus the AEAD tag and per-chunk nonce.
+    plaintext_len
+        .checked_add(tag_size)
+        .and_then(|size| size.checked_add(nonce_size))
+}
+
+fn encrypted_payload_blob_size(
+    payload_size: usize,
+    chunk_size: usize,
+    tag_size: usize,
+    nonce_size: usize,
+) -> Option<usize> {
+    // Returns the total on-disk size of an encrypted payload after splitting it
+    // into fixed-size plaintext chunks and adding tag+nonce overhead to each chunk.
+    let chunk_count = encrypted_payload_chunk_count(payload_size, chunk_size);
+    if chunk_count == 0 {
+        return Some(0);
+    }
+
+    let full_chunk_on_disk = encrypted_chunk_blob_size(chunk_size, tag_size, nonce_size)?;
+    let full_chunks_total = full_chunk_on_disk.checked_mul(chunk_count.saturating_sub(1))?;
+    let last_plaintext_len =
+        encrypted_chunk_plaintext_len(payload_size, chunk_count - 1, chunk_size)?;
+    let last_chunk_on_disk = encrypted_chunk_blob_size(last_plaintext_len, tag_size, nonce_size)?;
+    full_chunks_total.checked_add(last_chunk_on_disk)
+}
+
+fn build_encrypted_chunk_aad(
+    salt: u64,
+    payload_size_in_aad: Option<u64>,
+    op_count: u32,
+    commit_ts: u64,
+    chunk_index: u32,
+) -> [u8; ENCRYPTED_CHUNK_AAD_SIZE] {
+    let mut aad = [0u8; ENCRYPTED_CHUNK_AAD_SIZE];
+    aad[..8].copy_from_slice(&salt.to_le_bytes());
+    if let Some(payload_size) = payload_size_in_aad {
+        aad[8..16].copy_from_slice(&payload_size.to_le_bytes());
+    }
+    aad[16..20].copy_from_slice(&op_count.to_le_bytes());
+    aad[20..28].copy_from_slice(&commit_ts.to_le_bytes());
+    aad[28..32].copy_from_slice(&chunk_index.to_le_bytes());
+    aad
+}
 
 /// Log's Header, the first 56 bytes of any logical log file.
 #[derive(Clone, Debug)]
@@ -329,15 +414,19 @@ pub struct LogicalLog {
     /// doesn't corrupt the chain.
     pending_running_crc: Option<u32>,
     encryption_ctx: Option<EncryptionContext>,
+    /// Plaintext bytes per encrypted payload chunk. Production uses the fixed format constant;
+    /// tests may override via `new_with_encrypted_payload_chunk_size_for_test`.
+    encrypted_payload_chunk_size: usize,
     /// Reusable scratch buffer for ops serialization on the encrypted write path.
     encryption_scratch_buffer: Vec<u8>,
 }
 
 impl LogicalLog {
-    pub fn new(
+    fn new_internal(
         file: Arc<dyn File>,
         io: Arc<dyn crate::IO>,
         encryption_ctx: Option<EncryptionContext>,
+        encrypted_payload_chunk_size: usize,
     ) -> Self {
         Self {
             file,
@@ -348,8 +437,27 @@ impl LogicalLog {
             running_crc: 0,
             pending_running_crc: None,
             encryption_ctx,
+            encrypted_payload_chunk_size,
             encryption_scratch_buffer: Vec::new(),
         }
+    }
+
+    pub fn new(
+        file: Arc<dyn File>,
+        io: Arc<dyn crate::IO>,
+        encryption_ctx: Option<EncryptionContext>,
+    ) -> Self {
+        Self::new_internal(file, io, encryption_ctx, ENCRYPTED_PAYLOAD_CHUNK_SIZE)
+    }
+
+    #[cfg(test)]
+    fn new_with_payload_chunk_size(
+        file: Arc<dyn File>,
+        io: Arc<dyn crate::IO>,
+        encryption_ctx: Option<EncryptionContext>,
+        encrypted_payload_chunk_size: usize,
+    ) -> Self {
+        Self::new_internal(file, io, encryption_ctx, encrypted_payload_chunk_size)
     }
 
     pub(crate) fn set_header(&mut self, header: LogHeader) {
@@ -462,7 +570,8 @@ impl LogicalLog {
     /// Serializes ops into `write_buf`, encrypting if an encryption context is set.
     /// Returns the plaintext payload size (used in the TX header's `payload_size` field).
     ///
-    /// Encrypted on-disk blob layout: ciphertext(plaintext_len + tag_size) | nonce(nonce_size)
+    /// Encrypted on-disk payload layout: repeated
+    /// `ciphertext(chunk_plain_len + tag_size) | nonce(nonce_size)` chunks.
     fn serialize_ops_into_write_buf(
         &mut self,
         tx: &LogRecord,
@@ -479,35 +588,57 @@ impl LogicalLog {
             }
             let payload_size = self.encryption_scratch_buffer.len() as u64;
 
-            // AAD = salt(8 LE) || payload_size(8 LE) || op_count(4 LE) || commit_ts(8 LE)
-            // Binds ciphertext to this specific frame so payloads cannot be swapped
-            // between transactions.
             let salt = self
                 .header
                 .as_ref()
                 .expect("log header must be set before writing")
                 .salt;
-            let mut aad = [0u8; 28];
-            aad[..8].copy_from_slice(&salt.to_le_bytes());
-            aad[8..16].copy_from_slice(&payload_size.to_le_bytes());
-            aad[16..20].copy_from_slice(&op_count.to_le_bytes());
-            aad[20..28].copy_from_slice(&commit_ts.to_le_bytes());
-
-            let (ciphertext, nonce) =
-                enc_ctx.encrypt_chunk(&self.encryption_scratch_buffer, &aad)?;
-            // encrypt_chunk returns ciphertext with the auth tag appended, so its
-            // length must be exactly plaintext_len + tag_size.  The read path
-            // relies on this to split the on-disk blob back into (ciphertext+tag, nonce).
-            debug_assert_eq!(
-                ciphertext.len(),
-                self.encryption_scratch_buffer.len() + enc_ctx.tag_size(),
-                "encrypt_chunk output size mismatch: expected plaintext({}) + tag({}), got {}",
-                self.encryption_scratch_buffer.len(),
+            if let Some(total_on_disk_size) = encrypted_payload_blob_size(
+                payload_size as usize,
+                self.encrypted_payload_chunk_size,
                 enc_ctx.tag_size(),
-                ciphertext.len(),
+                enc_ctx.nonce_size(),
+            ) {
+                self.write_buf.reserve(total_on_disk_size);
+            }
+            let chunk_count = encrypted_payload_chunk_count(
+                payload_size as usize,
+                self.encrypted_payload_chunk_size,
             );
-            self.write_buf.extend_from_slice(&ciphertext);
-            self.write_buf.extend_from_slice(&nonce);
+
+            for (chunk_index, plaintext_chunk) in self
+                .encryption_scratch_buffer
+                .chunks(self.encrypted_payload_chunk_size)
+                .enumerate()
+            {
+                let is_last_chunk = chunk_index + 1 == chunk_count;
+                let aad = build_encrypted_chunk_aad(
+                    salt,
+                    is_last_chunk.then_some(payload_size),
+                    op_count,
+                    commit_ts,
+                    u32::try_from(chunk_index).map_err(|_| {
+                        LimboError::InternalError(
+                            "encrypted payload chunk index exceeds u32".to_string(),
+                        )
+                    })?,
+                );
+
+                let (ciphertext, nonce) = enc_ctx.encrypt_chunk(plaintext_chunk, &aad)?;
+                // encrypt_chunk returns ciphertext with the auth tag appended, so its
+                // length must be exactly plaintext_len + tag_size. The read path relies
+                // on this to split each chunk back into (ciphertext+tag, nonce).
+                debug_assert_eq!(
+                    ciphertext.len(),
+                    plaintext_chunk.len() + enc_ctx.tag_size(),
+                    "encrypt_chunk output size mismatch: expected plaintext({}) + tag({}), got {}",
+                    plaintext_chunk.len(),
+                    enc_ctx.tag_size(),
+                    ciphertext.len(),
+                );
+                self.write_buf.extend_from_slice(&ciphertext);
+                self.write_buf.extend_from_slice(&nonce);
+            }
             Ok(payload_size)
         } else {
             let payload_start = self.write_buf.len();
@@ -790,7 +921,7 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
         return Ok(None);
     }
 
-    let payload = buf[fixed..total].to_vec();
+    let payload = &buf[fixed..total];
 
     let parsed_op = match tag {
         OP_UPSERT_TABLE => {
@@ -800,8 +931,7 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
             if rowid_len > payload.len() {
                 return Err(LimboError::Corrupt("rowid_len > payload".into()));
             }
-            let mut p = payload;
-            let record_bytes = p.split_off(rowid_len);
+            let record_bytes = payload[rowid_len..].to_vec();
             let rowid = RowID::new(table_id, RowKey::Int(rowid_u64 as i64));
             ParsedOp::UpsertTable {
                 table_id,
@@ -829,13 +959,13 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
         }
         OP_UPSERT_INDEX => ParsedOp::UpsertIndex {
             table_id: table_id.expect("index op must have table_id"),
-            payload,
+            payload: payload.to_vec(),
             commit_ts,
             btree_resident,
         },
         OP_DELETE_INDEX => ParsedOp::DeleteIndex {
             table_id: table_id.expect("index op must have table_id"),
-            payload,
+            payload: payload.to_vec(),
             commit_ts,
             btree_resident,
         },
@@ -929,11 +1059,25 @@ pub struct StreamingLogicalLogReader {
     /// updated after each successfully validated frame.
     running_crc: u32,
     encryption_ctx: Option<EncryptionContext>,
+    /// Plaintext bytes per encrypted payload chunk. Production uses the fixed format constant;
+    /// tests may override via `new_with_encrypted_payload_chunk_size_for_test`.
+    encrypted_payload_chunk_size: usize,
+    // Reused scratch buffer for decrypted chunk plaintext. Kept on the reader so encrypted
+    // recovery can reuse the allocation across chunks and transaction frames.
+    decrypt_scratch: Vec<u8>,
 }
 
 impl StreamingLogicalLogReader {
-    pub fn new(file: Arc<dyn File>, encryption_ctx: Option<EncryptionContext>) -> Self {
+    fn new_internal(
+        file: Arc<dyn File>,
+        encryption_ctx: Option<EncryptionContext>,
+        encrypted_payload_chunk_size: usize,
+    ) -> Self {
         let file_size = file.size().expect("failed to get file size") as usize;
+        let decrypt_scratch = encryption_ctx
+            .as_ref()
+            .map(|enc_ctx| Vec::with_capacity(encrypted_payload_chunk_size + enc_ctx.tag_size()))
+            .unwrap_or_default();
         Self {
             file,
             offset: 0,
@@ -946,7 +1090,22 @@ impl StreamingLogicalLogReader {
             last_valid_offset: 0,
             running_crc: 0,
             encryption_ctx,
+            encrypted_payload_chunk_size,
+            decrypt_scratch,
         }
+    }
+
+    pub fn new(file: Arc<dyn File>, encryption_ctx: Option<EncryptionContext>) -> Self {
+        Self::new_internal(file, encryption_ctx, ENCRYPTED_PAYLOAD_CHUNK_SIZE)
+    }
+
+    #[cfg(test)]
+    fn new_with_payload_chunk_size(
+        file: Arc<dyn File>,
+        encryption_ctx: Option<EncryptionContext>,
+        encrypted_payload_chunk_size: usize,
+    ) -> Self {
+        Self::new_internal(file, encryption_ctx, encrypted_payload_chunk_size)
     }
 
     pub(crate) fn header(&self) -> Option<&LogHeader> {
@@ -1059,8 +1218,243 @@ impl StreamingLogicalLogReader {
         self.remaining_bytes() == 0
     }
 
-    /// Parse an encrypted payload: read the single AEAD blob, decrypt, then parse ops from plaintext.
-    /// Encrypted on-disk blob layout: ciphertext(plaintext_len + tag_size) | nonce(nonce_size)
+    /// Parse as many complete ops as possible from decrypted plaintext, starting at `start`.
+    /// Returns how many plaintext bytes were fully consumed into `parsed_ops`.
+    fn parse_decrypted_chunk_ops(
+        buf: &[u8],
+        start: usize,
+        parsed_ops: &mut Vec<ParsedOp>,
+        op_count: u32,
+        commit_ts: u64,
+    ) -> Result<usize> {
+        let mut consumed = 0usize;
+        while parsed_ops.len() < op_count as usize {
+            match try_parse_one_op_from_buf(&buf[start + consumed..], commit_ts)? {
+                Some((op, bytes_consumed)) => {
+                    consumed += bytes_consumed;
+                    parsed_ops.push(op);
+                }
+                None => break,
+            }
+        }
+        Ok(consumed)
+    }
+
+    fn carried_op_total_len_if_known(buf: &[u8]) -> Result<Option<usize>> {
+        // we need minimum of 6 bytes to read the length field
+        // 1 byte op tag + 1 byte flags + 4 bytes table id
+        if buf.len() < 6 {
+            return Ok(None);
+        }
+
+        match buf[0] {
+            OP_UPSERT_TABLE | OP_DELETE_TABLE | OP_UPSERT_INDEX | OP_DELETE_INDEX
+            | OP_UPDATE_HEADER => {}
+            tag => return Err(LimboError::Corrupt(format!("Unknown op tag: {tag}"))),
+        }
+
+        let Some((payload_len_u64, varint_bytes)) = read_varint_partial(&buf[6..])? else {
+            // we don't have enough data to read the varint
+            return Ok(None);
+        };
+        let payload_len = usize::try_from(payload_len_u64)
+            .map_err(|_| LimboError::Corrupt("payload_len overflows usize".into()))?;
+        let fixed = 6usize
+            .checked_add(varint_bytes)
+            .ok_or_else(|| LimboError::Corrupt("op header length overflow".into()))?;
+        let total = fixed
+            .checked_add(payload_len)
+            .ok_or_else(|| LimboError::Corrupt("op payload length overflow".into()))?;
+        Ok(Some(total))
+    }
+
+    // fixed 6-byte prelude + max 9-byte varint (payload_len)
+    // (prelude = 1 byte op tag + 1 byte flags + 4 bytes table_id)
+    // This is the maximum prefix length needed to determine total_len for a partial op.
+    const MAX_SERIALIZED_OP_PREFIX_LEN: usize = 15;
+
+    /// given the chunk index, read the chunk off the disk and decrypt it
+    fn read_and_decrypt_encrypted_chunk(
+        &mut self,
+        io: &Arc<dyn crate::IO>,
+        payload_size: usize,
+        op_count: u32,
+        commit_ts: u64,
+        salt: u64,
+        chunk_index: usize,
+        running_crc: u32,
+        nonce_size: usize,
+        tag_size: usize,
+    ) -> Result<EncryptedChunkReadResult> {
+        // first we gotta figure out, how many bytes to read off the disk, its either
+        // `self.encrypted_payload_chunk_size` or the remainder in the last chunk
+        let plaintext_len = match encrypted_chunk_plaintext_len(
+            payload_size,
+            chunk_index,
+            self.encrypted_payload_chunk_size,
+        ) {
+            Some(len) => len,
+            None => return Ok(EncryptedChunkReadResult::InvalidFrame),
+        };
+        let on_disk_size = match encrypted_chunk_blob_size(plaintext_len, tag_size, nonce_size) {
+            Some(size) => size,
+            None => return Ok(EncryptedChunkReadResult::InvalidFrame),
+        };
+        let chunk_count =
+            encrypted_payload_chunk_count(payload_size, self.encrypted_payload_chunk_size);
+        let is_last_chunk = chunk_index + 1 == chunk_count;
+
+        let aad = build_encrypted_chunk_aad(
+            salt,
+            is_last_chunk.then_some(payload_size as u64),
+            op_count,
+            commit_ts,
+            u32::try_from(chunk_index).map_err(|_| {
+                LimboError::Corrupt("encrypted payload chunk index exceeds u32".to_string())
+            })?,
+        );
+
+        if self.remaining_bytes() < on_disk_size {
+            return Ok(EncryptedChunkReadResult::Eof);
+        }
+        self.read_more_data(io, on_disk_size)?;
+        let start = self.buffer_offset;
+        let end = start + on_disk_size;
+
+        let (next_crc, decrypted_plaintext_len) = {
+            let encryption_ctx = self
+                .encryption_ctx
+                .as_ref()
+                .expect("encryption_ctx must be set for encrypted payload");
+            let decrypt_scratch = &mut self.decrypt_scratch;
+            let buffer = self.buffer.read();
+            let blob = &buffer[start..end];
+            let next_crc = crc32c::crc32c_append(running_crc, blob);
+            let ciphertext = &blob[..plaintext_len + tag_size];
+            let nonce = &blob[plaintext_len + tag_size..];
+            match encryption_ctx.decrypt_chunk_into(ciphertext, nonce, &aad, decrypt_scratch) {
+                Ok(()) => {}
+                Err(e) => {
+                    tracing::warn!("decrypt_chunk failed for chunk {chunk_index}: {e}");
+                    return Ok(EncryptedChunkReadResult::InvalidFrame);
+                }
+            }
+            (next_crc, decrypt_scratch.len())
+        };
+
+        self.buffer_offset = end;
+        if decrypted_plaintext_len != plaintext_len {
+            tracing::warn!(
+                "decrypted chunk length mismatch: expected {plaintext_len}, got {}",
+                decrypted_plaintext_len
+            );
+            return Ok(EncryptedChunkReadResult::InvalidFrame);
+        }
+
+        Ok(EncryptedChunkReadResult::Ok {
+            running_crc: next_crc,
+        })
+    }
+
+    /// Extend the carried partial op with enough bytes from the current plaintext chunk to decode
+    /// its total serialized length. Returns `Ok(None)` if this chunk still does not provide enough
+    /// prefix bytes and the caller must continue with the next chunk.
+    fn try_resolve_carried_encrypted_op_total_len(
+        carry: &mut Vec<u8>,
+        plaintext: &[u8],
+        plaintext_start: &mut usize,
+    ) -> Result<Option<usize>> {
+        loop {
+            if let Some(total_len) = Self::carried_op_total_len_if_known(carry)? {
+                return Ok(Some(total_len));
+            }
+
+            let available = plaintext.len().saturating_sub(*plaintext_start);
+            if available == 0 {
+                // i.e. no more bytes left in the current plaintext chunk to read more.
+                return Ok(None);
+            }
+
+            if carry.len() >= Self::MAX_SERIALIZED_OP_PREFIX_LEN {
+                return Err(LimboError::Corrupt(
+                    "carried encrypted op prefix could not resolve total length".into(),
+                ));
+            }
+
+            carry.push(plaintext[*plaintext_start]);
+            *plaintext_start += 1;
+        }
+    }
+
+    /// This is part of decryption of a chunk when reading the log file. `carry` contains the
+    /// partial op suffix from the previous chunk and `plaintext` is the current decrypted chunk.
+    /// Return `Ok(true)` when the carried op is completed and parsed; `Ok(false)` when more
+    /// chunk bytes are still needed.
+    fn try_finish_carried_encrypted_op(
+        carry: &mut Vec<u8>,
+        plaintext: &[u8],
+        plaintext_start: &mut usize,
+        parsed_ops: &mut Vec<ParsedOp>,
+        op_count: u32,
+        commit_ts: u64,
+    ) -> Result<bool> {
+        turso_assert!(!carry.is_empty());
+        turso_assert!(parsed_ops.len() < op_count as usize);
+
+        // lets try to parse the length of this op
+        let Some(carried_op_total_len) =
+            Self::try_resolve_carried_encrypted_op_total_len(carry, plaintext, plaintext_start)?
+        else {
+            return Ok(false);
+        };
+
+        // carry buffer must never have more than the op total length. it carries bytes from a
+        // previous chunk which is incomplete.
+        if carry.len() > carried_op_total_len {
+            return Err(LimboError::Corrupt(format!(
+                "carried encrypted op exceeded computed length: len={} total={carried_op_total_len}",
+                carry.len()
+            )));
+        }
+        // if the carry does not have enough bytes right now, then we consume from plaintext
+        // and try to parse. if not, we return so that next chunk can be read and decrypted.
+        // this scenario can happen when carry contains the prefix, but the op spans over current
+        // chunk and then on multiple chunks.
+        if carry.len() < carried_op_total_len {
+            let available = plaintext.len().saturating_sub(*plaintext_start);
+            if available == 0 {
+                return Ok(false);
+            }
+            let take = (carried_op_total_len - carry.len()).min(available);
+            carry.extend_from_slice(&plaintext[*plaintext_start..*plaintext_start + take]);
+            *plaintext_start += take;
+            if carry.len() < carried_op_total_len {
+                return Ok(false);
+            }
+        }
+
+        // carry must have the total data now and then we can parse
+        turso_assert!(carry.len() == carried_op_total_len);
+        match try_parse_one_op_from_buf(carry, commit_ts)? {
+            Some((op, bytes_consumed)) if bytes_consumed == carry.len() => {
+                parsed_ops.push(op);
+                carry.clear();
+                Ok(true)
+            }
+            Some((_, bytes_consumed)) => Err(LimboError::Corrupt(format!(
+                "carried encrypted op consumed {bytes_consumed} bytes but carry holds {}",
+                carry.len()
+            ))),
+            None => Err(LimboError::Corrupt(
+                "carried encrypted op remained incomplete after reaching computed length".into(),
+            )),
+        }
+    }
+
+    /// Parse an encrypted payload by reading and decrypting fixed-size plaintext chunks,
+    /// then incrementally parsing ops from the resulting plaintext.
+    /// Encrypted on-disk payload layout is a concatenation of chunk blobs:
+    /// ciphertext(chunk_plain_len + tag_size) | nonce(nonce_size), one blob per chunk.
     fn parse_encrypted_payload(
         &mut self,
         io: &Arc<dyn crate::IO>,
@@ -1069,62 +1463,132 @@ impl StreamingLogicalLogReader {
         commit_ts: u64,
         running_crc: u32,
     ) -> Result<PayloadParseResult> {
-        let enc = self
-            .encryption_ctx
-            .as_ref()
-            .expect("encryption_ctx must be set for encrypted payload");
-        let nonce_size = enc.nonce_size();
-        let tag_size = enc.tag_size();
-
-        let on_disk_size = match payload_size
-            .checked_add(tag_size)
-            .and_then(|s| s.checked_add(nonce_size))
-        {
-            Some(s) => s,
-            None => return Ok(PayloadParseResult::InvalidFrame),
+        let (nonce_size, tag_size) = {
+            let enc = self
+                .encryption_ctx
+                .as_ref()
+                .expect("encryption_ctx must be set for encrypted payload");
+            (enc.nonce_size(), enc.tag_size())
         };
-
-        let blob = match self.try_consume_bytes(io, on_disk_size)? {
-            Some(b) => b,
-            None => return Ok(PayloadParseResult::Eof),
-        };
-        let running_crc = crc32c::crc32c_append(running_crc, &blob);
-
-        // AAD = salt(8 LE) || payload_size(8 LE) || op_count(4 LE) || commit_ts(8 LE)
-        // Must match the write path exactly.
         let salt = self
             .header
             .as_ref()
             .expect("log header must be read before parsing")
             .salt;
-        let mut aad = [0u8; 28];
-        aad[..8].copy_from_slice(&salt.to_le_bytes());
-        aad[8..16].copy_from_slice(&(payload_size as u64).to_le_bytes());
-        aad[16..20].copy_from_slice(&op_count.to_le_bytes());
-        aad[20..28].copy_from_slice(&commit_ts.to_le_bytes());
+        let mut running_crc = running_crc;
+        // carry contains the payload from previous chunk.
+        // it is possible that op might split between two chunks (or even multiple), in that case
+        // we need to keep the previous payload, then decrypt the next chunk. Only when we have the
+        // full payload, we parse it.
+        let mut carry = Vec::with_capacity(self.encrypted_payload_chunk_size);
+        // we allocate some space to keep a vector of parsed ops, we set the 1024 as upper bound
+        // size and extend the vector as required.
+        let mut parsed_ops = Vec::with_capacity((op_count as usize).min(1024));
+        let chunk_count =
+            encrypted_payload_chunk_count(payload_size, self.encrypted_payload_chunk_size);
 
-        let ciphertext = &blob[..payload_size + tag_size];
-        let nonce = &blob[payload_size + tag_size..];
+        for chunk_index in 0..chunk_count {
+            // lets decrypt the log file, chunk by chunk
+            running_crc = match self.read_and_decrypt_encrypted_chunk(
+                io,
+                payload_size,
+                op_count,
+                commit_ts,
+                salt,
+                chunk_index,
+                running_crc,
+                nonce_size,
+                tag_size,
+            )? {
+                EncryptedChunkReadResult::Ok { running_crc } => running_crc,
+                EncryptedChunkReadResult::Eof => return Ok(PayloadParseResult::Eof),
+                EncryptedChunkReadResult::InvalidFrame => {
+                    return Ok(PayloadParseResult::InvalidFrame);
+                }
+            };
 
-        let enc_ctx = self
-            .encryption_ctx
-            .as_ref()
-            .expect("encryption_ctx must be set for encrypted payload");
-        let plaintext = match enc_ctx.decrypt_chunk(ciphertext, nonce, &aad) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("decrypt_chunk failed: {e}");
-                return Ok(PayloadParseResult::InvalidFrame);
+            let mut plaintext_start = 0usize;
+            let plaintext = self.decrypt_scratch.as_slice();
+
+            turso_assert!(
+                parsed_ops.len() <= op_count as usize,
+                "parsed_ops.len() exceeded declared op_count"
+            );
+            if !carry.is_empty() {
+                if parsed_ops.len() == op_count as usize {
+                    tracing::warn!(
+                        "encrypted payload has trailing carried bytes after parsing all {op_count} ops"
+                    );
+                    return Ok(PayloadParseResult::InvalidFrame);
+                }
+                // carry holds the prefix of an op that was split by the previous chunk boundary.
+                // Try to finish that carried op using bytes from the current decrypted chunk.
+                // If this chunk still does not complete the op, keep it in carry and continue
+                // with the next chunk
+                match Self::try_finish_carried_encrypted_op(
+                    &mut carry,
+                    plaintext,
+                    &mut plaintext_start,
+                    &mut parsed_ops,
+                    op_count,
+                    commit_ts,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(e) => {
+                        tracing::warn!("encrypted carried-op parse error: {e}");
+                        return Ok(PayloadParseResult::InvalidFrame);
+                    }
+                }
             }
-        };
+            // if we are here, then we have successfully emptied the carry
+            turso_assert!(
+                carry.is_empty(),
+                "carry must be empty before parsing fresh ops from the current decrypted chunk"
+            );
 
-        match parse_ops_from_plaintext(&plaintext, payload_size, op_count, commit_ts) {
-            Ok(ops) => Ok(PayloadParseResult::Ok(ops, running_crc)),
-            Err(e) => {
-                tracing::warn!("encrypted frame parse error: {e}");
-                Ok(PayloadParseResult::InvalidFrame)
+            // we don't have any carry bytes, so lets just parse the plaintext
+            let consumed = match Self::parse_decrypted_chunk_ops(
+                &plaintext,
+                plaintext_start,
+                &mut parsed_ops,
+                op_count,
+                commit_ts,
+            ) {
+                Ok(consumed) => consumed,
+                Err(e) => {
+                    tracing::warn!("encrypted chunk parse error: {e}");
+                    return Ok(PayloadParseResult::InvalidFrame);
+                }
+            };
+            plaintext_start += consumed;
+            if plaintext_start < plaintext.len() {
+                // IOW we still have some bytes left over, so lets add that to carry so that
+                // in the next iteration it is parsed.
+                // it is safe to add it to carry buffer since we have already ass
+                carry.extend_from_slice(&plaintext[plaintext_start..]);
             }
         }
+
+        // at this point, we must have parsed the full payload
+        if parsed_ops.len() != op_count as usize {
+            tracing::warn!(
+                "encrypted payload ended after {} parsed ops, expected {op_count}",
+                parsed_ops.len()
+            );
+            return Ok(PayloadParseResult::InvalidFrame);
+        }
+
+        // once we have parsed the full payload, carry must be empty
+        if !carry.is_empty() {
+            tracing::warn!(
+                "encrypted payload has {} trailing plaintext bytes after parsing all ops",
+                carry.len()
+            );
+            return Ok(PayloadParseResult::InvalidFrame);
+        }
+
+        Ok(PayloadParseResult::Ok(parsed_ops, running_crc))
     }
 
     /// Parse an unencrypted payload via field-by-field streaming IO reads.
@@ -1693,6 +2157,13 @@ enum PayloadParseResult {
     /// Not enough bytes to complete the payload.
     Eof,
     /// Payload data is structurally invalid.
+    InvalidFrame,
+}
+
+/// Result of reading and decrypting one encrypted chunk into `decrypt_scratch`.
+enum EncryptedChunkReadResult {
+    Ok { running_crc: u32 },
+    Eof,
     InvalidFrame,
 }
 

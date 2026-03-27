@@ -8,7 +8,7 @@ use aegis::aegis256::Aegis256;
 use aegis::aegis256x2::Aegis256X2;
 use aegis::aegis256x4::Aegis256X4;
 use aes_gcm::{
-    aead::{Aead, AeadCore, KeyInit, OsRng},
+    aead::{Aead, AeadCore, AeadInPlace, KeyInit, OsRng},
     Aes128Gcm, Aes256Gcm, Key, Nonce,
 };
 use turso_macros::{match_ignore_ascii_case, AtomicEnum};
@@ -200,6 +200,18 @@ macro_rules! define_aegis_cipher {
             }
 
             fn decrypt(&self, ciphertext: &[u8], nonce: &[u8; $nonce_size], ad: &[u8]) -> Result<Vec<u8>> {
+                let mut out = Vec::with_capacity(ciphertext.len().saturating_sub(Self::TAG_SIZE));
+                self.decrypt_into(ciphertext, nonce, ad, &mut out)?;
+                Ok(out)
+            }
+
+            fn decrypt_into(
+                &self,
+                ciphertext: &[u8],
+                nonce: &[u8; $nonce_size],
+                ad: &[u8],
+                out: &mut Vec<u8>,
+            ) -> Result<()> {
                 if ciphertext.len() < Self::TAG_SIZE {
                     return Err(LimboError::from(CipherError::CiphertextTooShort { cipher: $name }));
                 }
@@ -208,8 +220,10 @@ macro_rules! define_aegis_cipher {
 
                 let key_bytes = self.key.$key_method()
                     .ok_or_else(|| -> LimboError { CipherError::InvalidKeySize { cipher: $name, expected: $key_size }.into() })?;
+                out.clear();
+                out.extend_from_slice(ct);
                 <$cipher_type>::new(key_bytes, nonce)
-                    .decrypt(ct, &tag_array, ad)
+                    .decrypt_in_place(out.as_mut_slice(), &tag_array, ad)
                     .map_err(|_| -> LimboError { CipherError::DecryptionFailed { cipher: $name }.into() })
             }
         }
@@ -264,12 +278,23 @@ macro_rules! define_aes_gcm_cipher {
             }
 
             fn decrypt(&self, ciphertext: &[u8], nonce: &[u8; 12], ad: &[u8]) -> Result<Vec<u8>> {
+                let mut out = Vec::with_capacity(ciphertext.len().saturating_sub(Self::TAG_SIZE));
+                self.decrypt_into(ciphertext, nonce, ad, &mut out)?;
+                Ok(out)
+            }
+
+            fn decrypt_into(
+                &self,
+                ciphertext: &[u8],
+                nonce: &[u8; 12],
+                ad: &[u8],
+                out: &mut Vec<u8>,
+            ) -> Result<()> {
                 let nonce = Nonce::from_slice(nonce);
+                out.clear();
+                out.extend_from_slice(ciphertext);
                 self.cipher
-                    .decrypt(nonce, aes_gcm::aead::Payload {
-                        msg: ciphertext,
-                        aad: ad,
-                    })
+                    .decrypt_in_place(nonce, ad, out)
                     .map_err(|_| -> LimboError { CipherError::DecryptionFailed { cipher: $name }.into() })
             }
         }
@@ -538,6 +563,16 @@ impl EncryptionContext {
 
     pub fn decrypt_chunk(&self, ciphertext: &[u8], nonce: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         self.decrypt_raw_with_ad(ciphertext, nonce, aad)
+    }
+
+    pub fn decrypt_chunk_into(
+        &self,
+        ciphertext: &[u8],
+        nonce: &[u8],
+        aad: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        self.decrypt_raw_with_ad_into(ciphertext, nonce, aad, out)
     }
 
     pub fn nonce_size(&self) -> usize {
@@ -853,6 +888,18 @@ impl EncryptionContext {
     }
 
     fn decrypt_raw_with_ad(&self, ciphertext: &[u8], nonce: &[u8], ad: &[u8]) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(ciphertext.len().saturating_sub(self.tag_size()));
+        self.decrypt_raw_with_ad_into(ciphertext, nonce, ad, &mut out)?;
+        Ok(out)
+    }
+
+    fn decrypt_raw_with_ad_into(
+        &self,
+        ciphertext: &[u8],
+        nonce: &[u8],
+        ad: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
         macro_rules! decrypt_with_nonce {
             ($cipher:expr, $nonce_size:literal, $name:literal) => {{
                 let nonce_array: [u8; $nonce_size] = nonce.try_into().map_err(|_| {
@@ -863,7 +910,7 @@ impl EncryptionContext {
                         nonce.len()
                     ))
                 })?;
-                $cipher.decrypt(ciphertext, &nonce_array, ad)
+                $cipher.decrypt_into(ciphertext, &nonce_array, ad, out)
             }};
         }
 
