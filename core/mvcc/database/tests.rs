@@ -4,7 +4,9 @@ use super::*;
 use crate::io::PlatformIO;
 use crate::mvcc::clock::MvccClock;
 use crate::mvcc::cursor::{CursorYieldPoint, MvccCursorType};
-use crate::mvcc::persistent_storage::logical_log::{FRAME_MAGIC, LOG_HDR_SIZE};
+use crate::mvcc::persistent_storage::logical_log::{
+    ENCRYPTED_PAYLOAD_CHUNK_SIZE, FRAME_MAGIC, LOG_HDR_SIZE,
+};
 use crate::mvcc::yield_hooks::YieldPointMarker;
 use crate::mvcc::yield_points::{YieldInjector, YieldPoint};
 use crate::state_machine::{StateTransition, TransitionResult};
@@ -20,6 +22,10 @@ use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+
+const TX_HEADER_SIZE: usize = 24;
+const TX_TRAILER_SIZE: usize = 8;
+
 pub(crate) struct MvccTestDbNoConn {
     pub(crate) db: Option<Arc<Database>>,
     path: Option<String>,
@@ -8184,6 +8190,91 @@ fn test_mvcc_encrypted_restart_without_key_fails_before_recovery() {
     );
 }
 
+#[test]
+fn test_encrypted_recovery_large_payload_multi_chunk() {
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let large_value = "x".repeat(ENCRYPTED_PAYLOAD_CHUNK_SIZE * 3);
+    let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
+
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute(format!("INSERT INTO t VALUES (1, '{large_value}')"))
+            .unwrap();
+    }
+
+    let log_path = std::path::PathBuf::from(db.path.as_ref().unwrap()).with_extension("db-log");
+    assert!(log_path.exists(), "db-log should exist before restart");
+    assert_log_payloads_decrypt(
+        &log_path,
+        hex_key,
+        crate::storage::encryption::CipherMode::Aes256Gcm,
+    );
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(
+        &conn,
+        "SELECT id, length(v), substr(v, 1, 16), substr(v, length(v) - 15, 16) FROM t",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].as_int().unwrap(), large_value.len() as i64);
+    assert_eq!(rows[0][2].to_string(), "xxxxxxxxxxxxxxxx");
+    assert_eq!(rows[0][3].to_string(), "xxxxxxxxxxxxxxxx");
+}
+
+#[test]
+fn test_encrypted_recovery_corrupted_later_chunk_keeps_checkpointed_prefix() {
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let large_value = "z".repeat(ENCRYPTED_PAYLOAD_CHUNK_SIZE * 3);
+    let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
+    let log_path = std::path::PathBuf::from(db.path.as_ref().unwrap()).with_extension("db-log");
+
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'survives')")
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute(format!("INSERT INTO t VALUES (2, '{large_value}')"))
+            .unwrap();
+    }
+
+    let mut log_bytes = std::fs::read(&log_path).expect("db-log should exist");
+    let payload_size = u64::from_le_bytes(
+        log_bytes[LOG_HDR_SIZE + 4..LOG_HDR_SIZE + 12]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let chunk_count = payload_size.div_ceil(ENCRYPTED_PAYLOAD_CHUNK_SIZE);
+    assert!(
+        chunk_count >= 3,
+        "expected multi-chunk encrypted recovery tail"
+    );
+
+    let enc_ctx = crate::storage::encryption::EncryptionContext::new(
+        crate::storage::encryption::CipherMode::Aes256Gcm,
+        &EncryptionKey::from_hex_string(hex_key).unwrap(),
+        4096,
+    )
+    .unwrap();
+    let first_chunk_on_disk_size =
+        ENCRYPTED_PAYLOAD_CHUNK_SIZE + enc_ctx.tag_size() + enc_ctx.nonce_size();
+    let corrupt_offset = LOG_HDR_SIZE + TX_HEADER_SIZE + first_chunk_on_disk_size + 1;
+    log_bytes[corrupt_offset] ^= 0xFF;
+    std::fs::write(&log_path, &log_bytes).unwrap();
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "survives");
+}
+
 /// Read the raw db-log file and verify every TX frame payload can be decrypted.
 /// Panics if the file is missing, has no frames, or any payload fails to decrypt.
 fn assert_log_payloads_decrypt(
@@ -8210,8 +8301,7 @@ fn assert_log_payloads_decrypt(
     let mut offset = LOG_HDR_SIZE;
     let mut frame_count = 0;
 
-    // 24 = TX_HEADER_SIZE, 8 = TX_TRAILER_SIZE — minimum bytes for a frame
-    while offset + 24 + 8 <= log_bytes.len() {
+    while offset + TX_HEADER_SIZE + TX_TRAILER_SIZE <= log_bytes.len() {
         // TX Header: frame_magic(4) | payload_size(8) | op_count(4) | commit_ts(8)
         let frame_magic = u32::from_le_bytes(log_bytes[offset..offset + 4].try_into().unwrap());
         if frame_magic != FRAME_MAGIC {
@@ -8222,31 +8312,52 @@ fn assert_log_payloads_decrypt(
         let op_count = u32::from_le_bytes(log_bytes[offset + 12..offset + 16].try_into().unwrap());
         let commit_ts = u64::from_le_bytes(log_bytes[offset + 16..offset + 24].try_into().unwrap());
 
-        let payload_offset = offset + 24;
-        let on_disk_size = payload_size + tag_size + nonce_size;
-        if payload_offset + on_disk_size + 8 > log_bytes.len() {
-            break; // truncated frame
+        let mut payload_offset = offset + TX_HEADER_SIZE;
+        let chunk_count = if payload_size == 0 {
+            0
+        } else {
+            payload_size.div_ceil(ENCRYPTED_PAYLOAD_CHUNK_SIZE)
+        };
+
+        let mut frame_complete = true;
+        for chunk_index in 0..chunk_count {
+            let chunk_plaintext_len = (payload_size - chunk_index * ENCRYPTED_PAYLOAD_CHUNK_SIZE)
+                .min(ENCRYPTED_PAYLOAD_CHUNK_SIZE);
+            let chunk_on_disk_size = chunk_plaintext_len + tag_size + nonce_size;
+            if payload_offset + chunk_on_disk_size + TX_TRAILER_SIZE > log_bytes.len() {
+                frame_complete = false;
+                break;
+            }
+
+            let blob = &log_bytes[payload_offset..payload_offset + chunk_on_disk_size];
+            let ciphertext = &blob[..chunk_plaintext_len + tag_size];
+            let nonce = &blob[chunk_plaintext_len + tag_size..];
+
+            let mut aad = [0u8; 32];
+            aad[..8].copy_from_slice(&salt.to_le_bytes());
+            if chunk_index + 1 == chunk_count {
+                aad[8..16].copy_from_slice(&(payload_size as u64).to_le_bytes());
+            }
+            aad[16..20].copy_from_slice(&op_count.to_le_bytes());
+            aad[20..28].copy_from_slice(&commit_ts.to_le_bytes());
+            aad[28..32].copy_from_slice(&(chunk_index as u32).to_le_bytes());
+
+            enc_ctx
+                .decrypt_chunk(ciphertext, nonce, &aad)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "failed to decrypt frame {frame_count} chunk {chunk_index} at offset {offset}: {e}"
+                    )
+                });
+
+            payload_offset += chunk_on_disk_size;
+        }
+        if !frame_complete {
+            break;
         }
 
-        let blob = &log_bytes[payload_offset..payload_offset + on_disk_size];
-        let ciphertext = &blob[..payload_size + tag_size];
-        let nonce = &blob[payload_size + tag_size..];
-
-        // AAD must match the write path: salt(8) || payload_size(8) || op_count(4) || commit_ts(8)
-        let mut aad = [0u8; 28];
-        aad[..8].copy_from_slice(&salt.to_le_bytes());
-        aad[8..16].copy_from_slice(&(payload_size as u64).to_le_bytes());
-        aad[16..20].copy_from_slice(&op_count.to_le_bytes());
-        aad[20..28].copy_from_slice(&commit_ts.to_le_bytes());
-
-        enc_ctx
-            .decrypt_chunk(ciphertext, nonce, &aad)
-            .unwrap_or_else(|e| {
-                panic!("failed to decrypt frame {frame_count} at offset {offset}: {e}")
-            });
-
         frame_count += 1;
-        offset = payload_offset + on_disk_size + 8; // skip trailer
+        offset = payload_offset + TX_TRAILER_SIZE; // skip trailer
     }
 
     assert!(

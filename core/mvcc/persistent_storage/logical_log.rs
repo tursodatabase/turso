@@ -2218,7 +2218,7 @@ mod tests {
     use std::sync::Once;
 
     use quickcheck_macros::quickcheck;
-    use rand::{rng, Rng};
+    use rand::{random_range, rng, Rng};
     use rand_chacha::{
         rand_core::{RngCore, SeedableRng},
         ChaCha8Rng,
@@ -2232,17 +2232,23 @@ mod tests {
             MVTableId, Row, RowID, RowKey, SortableIndexKey,
         },
         schema::Table,
-        storage::sqlite3_ondisk::{read_varint, varint_len, write_varint, DatabaseHeader},
+        storage::sqlite3_ondisk::{
+            read_varint, read_varint_partial, varint_len, write_varint, DatabaseHeader,
+        },
         types::{ImmutableRecord, IndexInfo, Text},
         Buffer, Completion, LimboError, Value, ValueRef,
     };
 
     use super::{
-        HeaderReadResult, LogHeader, LogicalLog, FRAME_MAGIC, LOG_HDR_CRC_START,
-        LOG_HDR_RESERVED_START, LOG_HDR_SIZE, TX_HEADER_SIZE, TX_TRAILER_SIZE,
+        build_encrypted_chunk_aad, encrypted_chunk_blob_size, encrypted_chunk_plaintext_len,
+        encrypted_payload_blob_size, encrypted_payload_chunk_count, serialize_header_entry,
+        serialize_op_entry, HeaderReadResult, LogHeader, LogicalLog, ParseResult, ParsedOp,
+        StreamingLogicalLogReader, StreamingResult, ENCRYPTED_CHUNK_AAD_SIZE,
+        ENCRYPTED_PAYLOAD_CHUNK_SIZE, END_MAGIC, FRAME_MAGIC, LOG_HDR_CRC_START,
+        LOG_HDR_RESERVED_START, LOG_HDR_SIZE, LOG_VERSION, TX_HEADER_SIZE, TX_TRAILER_SIZE,
     };
-    use super::{ParseResult, StreamingLogicalLogReader, StreamingResult};
     use crate::OpenFlags;
+    use crate::{turso_assert, turso_assert_less_than};
     use tracing_subscriber::EnvFilter;
 
     fn init_tracing() {
@@ -2747,7 +2753,7 @@ mod tests {
             let index_row_opt = mvcc_store
                 .read_from_table_or_index(tx, &index_rowid, Some(index_id))
                 .unwrap_or_else(|e| {
-                    panic!("Failed to read index row for ({}, {}): {:?}. Index ID: {:?}, root_page: {}", 
+                    panic!("Failed to read index row for ({}, {}): {:?}. Index ID: {:?}, root_page: {}",
                            data_value, row_id, e, index_id, index.root_page)
                 });
 
@@ -4183,23 +4189,409 @@ mod tests {
         }
     }
 
+    fn make_test_index_row_version(
+        table_id: MVTableId,
+        rowid: i64,
+        value: &str,
+        commit_ts: u64,
+    ) -> crate::mvcc::database::RowVersion {
+        let key_record = ImmutableRecord::from_values(
+            &[
+                Value::Text(Text::new(value.to_string())),
+                Value::from_i64(rowid),
+            ],
+            2,
+        );
+        let sortable_key = SortableIndexKey::new_from_record(
+            key_record,
+            Arc::new(IndexInfo {
+                has_rowid: true,
+                num_cols: 2,
+                is_unique: false,
+                ..Default::default()
+            }),
+        );
+        let row_id = RowID::new(table_id, RowKey::Record(sortable_key));
+        let row = Row::new_index_row(row_id, 2);
+        crate::mvcc::database::RowVersion {
+            id: rowid as u64,
+            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts)),
+            end: None,
+            row,
+            btree_resident: false,
+        }
+    }
+
+    fn test_index_info() -> Arc<IndexInfo> {
+        Arc::new(IndexInfo {
+            has_rowid: true,
+            num_cols: 2,
+            is_unique: false,
+            ..Default::default()
+        })
+    }
+
+    fn make_test_raw_table_row_version(
+        table_id: MVTableId,
+        rowid: i64,
+        record_bytes: Vec<u8>,
+        commit_ts: u64,
+        is_delete: bool,
+    ) -> crate::mvcc::database::RowVersion {
+        let row = Row::new_table_row(RowID::new(table_id, RowKey::Int(rowid)), record_bytes, 1);
+        crate::mvcc::database::RowVersion {
+            id: rowid as u64,
+            begin: if is_delete {
+                None
+            } else {
+                Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
+            },
+            end: if is_delete {
+                Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
+            } else {
+                None
+            },
+            row,
+            btree_resident: false,
+        }
+    }
+
+    fn make_test_raw_index_row_version(
+        table_id: MVTableId,
+        rowid: i64,
+        payload_bytes: Vec<u8>,
+        commit_ts: u64,
+        is_delete: bool,
+    ) -> crate::mvcc::database::RowVersion {
+        let sortable_key = SortableIndexKey::new_from_bytes(payload_bytes, test_index_info());
+        let row_id = RowID::new(table_id, RowKey::Record(sortable_key));
+        let row = Row::new_index_row(row_id, 2);
+        crate::mvcc::database::RowVersion {
+            id: rowid as u64,
+            begin: if is_delete {
+                None
+            } else {
+                Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
+            },
+            end: if is_delete {
+                Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
+            } else {
+                None
+            },
+            row,
+            btree_resident: false,
+        }
+    }
+
+    fn single_upsert_table_op_size_for_text_len(rowid: i64, text_len: usize) -> usize {
+        let mut encoded = Vec::new();
+        let value = "x".repeat(text_len);
+        let row_version = make_test_row_version((-2).into(), rowid, &value, 100);
+        serialize_op_entry(&mut encoded, &row_version).unwrap();
+        encoded.len()
+    }
+
+    fn try_text_len_for_single_upsert_table_op_size(
+        rowid: i64,
+        target_op_size: usize,
+    ) -> Option<usize> {
+        for text_len in 0..=target_op_size {
+            if single_upsert_table_op_size_for_text_len(rowid, text_len) == target_op_size {
+                return Some(text_len);
+            }
+        }
+        None
+    }
+
+    fn text_len_for_single_upsert_table_op_size(target_op_size: usize) -> usize {
+        if let Some(text_len) = try_text_len_for_single_upsert_table_op_size(1, target_op_size) {
+            return text_len;
+        }
+        panic!("could not find text length for op size {target_op_size}");
+    }
+
+    fn try_record_bytes_len_for_upsert_table_op_size(
+        rowid: i64,
+        target_op_size: usize,
+    ) -> Option<usize> {
+        let rowid_len = varint_len(rowid as u64);
+        for payload_len_varint_len in 1..=9usize {
+            let record_bytes_len =
+                target_op_size.checked_sub(6 + payload_len_varint_len + rowid_len)?;
+            let payload_len = rowid_len + record_bytes_len;
+            if varint_len(payload_len as u64) == payload_len_varint_len {
+                return Some(record_bytes_len);
+            }
+        }
+        None
+    }
+
+    fn read_file_bytes(file: Arc<dyn crate::File>, io: &Arc<dyn crate::IO>) -> Vec<u8> {
+        let file_size = file.size().unwrap() as usize;
+        if file_size == 0 {
+            return Vec::new();
+        }
+        let reader = StreamingLogicalLogReader::new(file, None);
+        reader.read_exact_at(io, 0, file_size).unwrap()
+    }
+
+    fn overwrite_file_bytes(file: Arc<dyn crate::File>, io: &Arc<dyn crate::IO>, bytes: &[u8]) {
+        let c = file.truncate(0, Completion::new_trunc(|_| {})).unwrap();
+        io.wait_for_completion(c).unwrap();
+        if bytes.is_empty() {
+            return;
+        }
+        let c = file
+            .pwrite(
+                0,
+                Arc::new(Buffer::new(bytes.to_vec())),
+                Completion::new_write(|_| {}),
+            )
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+    }
+
+    fn open_test_file(io: &Arc<dyn crate::IO>, file_name: &str) -> Arc<dyn crate::File> {
+        io.open_file(file_name, OpenFlags::Create, false).unwrap()
+    }
+
+    fn append_encrypted_tx(
+        log: &mut LogicalLog,
+        io: &Arc<dyn crate::IO>,
+        tx: &crate::mvcc::database::LogRecord,
+    ) {
+        let c = log.log_tx(tx).unwrap();
+        io.wait_for_completion(c).unwrap();
+    }
+
+    fn write_first_encrypted_tx(
+        file: Arc<dyn crate::File>,
+        io: &Arc<dyn crate::IO>,
+        enc_ctx: &crate::storage::encryption::EncryptionContext,
+        tx: &crate::mvcc::database::LogRecord,
+    ) {
+        assert_eq!(
+            file.size().unwrap(),
+            0,
+            "write_first_encrypted_tx only supports writing the first frame to a fresh file"
+        );
+        let mut log = LogicalLog::new(file, io.clone(), Some(enc_ctx.clone()));
+        append_encrypted_tx(&mut log, io, tx);
+    }
+
+    fn write_first_encrypted_tx_with_chunk_size_for_test(
+        file: Arc<dyn crate::File>,
+        io: &Arc<dyn crate::IO>,
+        enc_ctx: &crate::storage::encryption::EncryptionContext,
+        encrypted_payload_chunk_size: usize,
+        tx: &crate::mvcc::database::LogRecord,
+    ) {
+        assert_eq!(
+            file.size().unwrap(),
+            0,
+            "write_first_encrypted_tx_with_chunk_size_for_test only supports writing the first frame to a fresh file"
+        );
+        let mut log = LogicalLog::new_with_payload_chunk_size(
+            file,
+            io.clone(),
+            Some(enc_ctx.clone()),
+            encrypted_payload_chunk_size,
+        );
+        append_encrypted_tx(&mut log, io, tx);
+    }
+
+    fn write_single_encrypted_tx(
+        io: &Arc<dyn crate::IO>,
+        file_name: &str,
+        enc_ctx: &crate::storage::encryption::EncryptionContext,
+        tx: &crate::mvcc::database::LogRecord,
+    ) -> Arc<dyn crate::File> {
+        let file = open_test_file(io, file_name);
+        write_first_encrypted_tx(file.clone(), io, enc_ctx, tx);
+        file
+    }
+
+    fn write_single_encrypted_tx_with_chunk_size_for_test(
+        io: &Arc<dyn crate::IO>,
+        file_name: &str,
+        enc_ctx: &crate::storage::encryption::EncryptionContext,
+        encrypted_payload_chunk_size: usize,
+        tx: &crate::mvcc::database::LogRecord,
+    ) -> Arc<dyn crate::File> {
+        let file = open_test_file(io, file_name);
+        write_first_encrypted_tx_with_chunk_size_for_test(
+            file.clone(),
+            io,
+            enc_ctx,
+            encrypted_payload_chunk_size,
+            tx,
+        );
+        file
+    }
+
+    fn parse_only_encrypted_tx_ops(
+        file: Arc<dyn crate::File>,
+        io: &Arc<dyn crate::IO>,
+        enc_ctx: &crate::storage::encryption::EncryptionContext,
+    ) -> Vec<ParsedOp> {
+        let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx.clone()));
+        reader.read_header(io).unwrap();
+        let ops = match reader.parse_next_transaction(io).unwrap() {
+            ParseResult::Ops(ops) => ops,
+            other => panic!("expected Ops, got {other:?}"),
+        };
+        assert!(matches!(
+            reader.parse_next_transaction(io).unwrap(),
+            ParseResult::Eof
+        ));
+        ops
+    }
+
+    fn parse_only_encrypted_tx_ops_with_chunk_size_for_test(
+        file: Arc<dyn crate::File>,
+        io: &Arc<dyn crate::IO>,
+        enc_ctx: &crate::storage::encryption::EncryptionContext,
+        encrypted_payload_chunk_size: usize,
+    ) -> Vec<ParsedOp> {
+        let mut reader = StreamingLogicalLogReader::new_with_payload_chunk_size(
+            file,
+            Some(enc_ctx.clone()),
+            encrypted_payload_chunk_size,
+        );
+        reader.read_header(io).unwrap();
+        let ops = match reader.parse_next_transaction(io).unwrap() {
+            ParseResult::Ops(ops) => ops,
+            other => panic!("expected Ops, got {other:?}"),
+        };
+        assert!(matches!(
+            reader.parse_next_transaction(io).unwrap(),
+            ParseResult::Eof
+        ));
+        ops
+    }
+
+    fn assert_upsert_table_op(
+        op: &ParsedOp,
+        expected_table_id: MVTableId,
+        expected_rowid: i64,
+        expected_record_bytes: &[u8],
+        expected_commit_ts: u64,
+    ) {
+        match op {
+            ParsedOp::UpsertTable {
+                table_id,
+                rowid,
+                record_bytes,
+                commit_ts,
+                btree_resident,
+            } => {
+                assert_eq!(*table_id, expected_table_id);
+                assert_eq!(rowid.row_id, RowKey::Int(expected_rowid));
+                assert_eq!(record_bytes, expected_record_bytes);
+                assert_eq!(*commit_ts, expected_commit_ts);
+                assert!(!btree_resident);
+            }
+            other => panic!("expected UpsertTable, got {other:?}"),
+        }
+    }
+
+    fn assert_upsert_index_op(
+        op: &ParsedOp,
+        expected_table_id: MVTableId,
+        expected_payload: &[u8],
+        expected_commit_ts: u64,
+    ) {
+        match op {
+            ParsedOp::UpsertIndex {
+                table_id,
+                payload,
+                commit_ts,
+                btree_resident,
+            } => {
+                assert_eq!(*table_id, expected_table_id);
+                assert_eq!(payload, expected_payload);
+                assert_eq!(*commit_ts, expected_commit_ts);
+                assert!(!btree_resident);
+            }
+            other => panic!("expected UpsertIndex, got {other:?}"),
+        }
+    }
+
+    fn assert_update_header_op(
+        op: &ParsedOp,
+        expected_header: &DatabaseHeader,
+        expected_commit_ts: u64,
+    ) {
+        match op {
+            ParsedOp::UpdateHeader { header, commit_ts } => {
+                assert_eq!(*commit_ts, expected_commit_ts);
+                assert_eq!(
+                    bytemuck::bytes_of(header),
+                    bytemuck::bytes_of(expected_header)
+                );
+            }
+            other => panic!("expected UpdateHeader, got {other:?}"),
+        }
+    }
+
+    // Returns the byte ranges of each encrypted chunk within a frame's payload blob,
+    // where every chunk occupies plaintext_len + tag_size + nonce_size bytes on disk.
+    fn encrypted_chunk_ranges(
+        payload_size: usize,
+        tag_size: usize,
+        nonce_size: usize,
+    ) -> Vec<std::ops::Range<usize>> {
+        let mut ranges = Vec::new();
+        let mut offset = 0usize;
+        for chunk_index in
+            0..encrypted_payload_chunk_count(payload_size, ENCRYPTED_PAYLOAD_CHUNK_SIZE)
+        {
+            let plaintext_len = encrypted_chunk_plaintext_len(
+                payload_size,
+                chunk_index,
+                ENCRYPTED_PAYLOAD_CHUNK_SIZE,
+            )
+            .unwrap();
+            let chunk_len = encrypted_chunk_blob_size(plaintext_len, tag_size, nonce_size).unwrap();
+            ranges.push(offset..offset + chunk_len);
+            offset += chunk_len;
+        }
+        ranges
+    }
+
+    fn assert_single_frame_invalid(
+        file: Arc<dyn crate::File>,
+        io: &Arc<dyn crate::IO>,
+        enc_ctx: crate::storage::encryption::EncryptionContext,
+    ) {
+        let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
+        reader.read_header(io).unwrap();
+        match reader.parse_next_transaction(io).unwrap() {
+            ParseResult::InvalidFrame => {}
+            other => panic!("expected InvalidFrame, got {other:?}"),
+        }
+    }
+
     /// Write an encrypted frame, verify the on-disk layout invariant
-    /// (blob = plaintext + tag_size + nonce_size), then read back and
+    /// (`plaintext + per-chunk tag/nonce metadata`), then read back and
     /// verify roundtrip correctness with multiple ops.
     #[test]
     fn test_encrypted_log_roundtrip_and_layout() {
         init_tracing();
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
-        let file = io
-            .open_file("enc-roundtrip.db-log", OpenFlags::Create, false)
-            .unwrap();
+        let file = open_test_file(&io, "enc-roundtrip.db-log");
         let table_id: MVTableId = (-2).into();
         let enc_ctx = test_enc_ctx();
         let tag_size = enc_ctx.tag_size();
         let nonce_size = enc_ctx.nonce_size();
+        let expected_hello_record_bytes = generate_simple_string_row(table_id, 1, "hello")
+            .payload()
+            .to_vec();
+        let expected_world_record_bytes = generate_simple_string_row(table_id, 2, "world")
+            .payload()
+            .to_vec();
 
         // Write one encrypted frame with 2 ops.
-        let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
         let tx = crate::mvcc::database::LogRecord {
             tx_timestamp: 100,
             row_versions: vec![
@@ -4208,8 +4600,7 @@ mod tests {
             ],
             header: None,
         };
-        let c = log.log_tx(&tx).unwrap();
-        io.wait_for_completion(c).unwrap();
+        write_first_encrypted_tx(file.clone(), &io, &enc_ctx, &tx);
 
         // ── Layout invariant check ──
         // Read the raw TX header to extract payload_size.
@@ -4235,11 +4626,17 @@ mod tests {
 
         let file_size = file.size().unwrap() as usize;
         let encrypted_blob_size = file_size - LOG_HDR_SIZE - TX_HEADER_SIZE - TX_TRAILER_SIZE;
+        let expected_blob_size = encrypted_payload_blob_size(
+            payload_size,
+            ENCRYPTED_PAYLOAD_CHUNK_SIZE,
+            tag_size,
+            nonce_size,
+        )
+        .unwrap();
         assert_eq!(
             encrypted_blob_size,
-            payload_size + tag_size + nonce_size,
-            "on-disk blob size ({encrypted_blob_size}) != \
-             payload_size({payload_size}) + tag_size({tag_size}) + nonce_size({nonce_size})"
+            expected_blob_size,
+            "on-disk blob size ({encrypted_blob_size}) != expected chunked encrypted size({expected_blob_size})"
         );
 
         // ── Roundtrip read ──
@@ -4251,19 +4648,8 @@ mod tests {
             other => panic!("expected Ops, got {other:?}"),
         };
         assert_eq!(ops.len(), 2);
-
-        match &ops[0] {
-            super::ParsedOp::UpsertTable { rowid, .. } => {
-                assert_eq!(rowid.row_id, RowKey::Int(1));
-            }
-            other => panic!("expected UpsertTable, got {other:?}"),
-        }
-        match &ops[1] {
-            super::ParsedOp::UpsertTable { rowid, .. } => {
-                assert_eq!(rowid.row_id, RowKey::Int(2));
-            }
-            other => panic!("expected UpsertTable, got {other:?}"),
-        }
+        assert_upsert_table_op(&ops[0], table_id, 1, &expected_hello_record_bytes, 100);
+        assert_upsert_table_op(&ops[1], table_id, 2, &expected_world_record_bytes, 100);
 
         assert!(matches!(
             reader.parse_next_transaction(&io).unwrap(),
@@ -4271,6 +4657,469 @@ mod tests {
         ));
     }
 
+    /// What this test checks: Test-only chunk-size overrides affect both encrypted writing and
+    /// streaming recovery, so fuzz tests can exercise smaller chunk boundaries without changing
+    /// the production format constant.
+    #[test]
+    fn test_encrypted_log_roundtrip_with_test_chunk_size_override() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let enc_ctx = test_enc_ctx();
+        const TEST_CHUNK_SIZE: usize = 2 * 1024;
+
+        let target_op_size = TEST_CHUNK_SIZE + 257;
+        let text_len = text_len_for_single_upsert_table_op_size(target_op_size);
+        let value = "t".repeat(text_len);
+        let row_version = make_test_row_version((-2).into(), 1, &value, 100);
+        let expected_record_bytes = row_version.row.payload().to_vec();
+        let tx = crate::mvcc::database::LogRecord {
+            tx_timestamp: 100,
+            row_versions: vec![row_version],
+            header: None,
+        };
+
+        let file = write_single_encrypted_tx_with_chunk_size_for_test(
+            &io,
+            "enc-roundtrip-test-chunk-size.db-log",
+            &enc_ctx,
+            TEST_CHUNK_SIZE,
+            &tx,
+        );
+
+        assert_eq!(
+            encrypted_payload_chunk_count(target_op_size, TEST_CHUNK_SIZE),
+            2,
+            "test payload should span exactly two test-sized chunks"
+        );
+        let expected_blob_size = encrypted_payload_blob_size(
+            target_op_size,
+            TEST_CHUNK_SIZE,
+            enc_ctx.tag_size(),
+            enc_ctx.nonce_size(),
+        )
+        .unwrap();
+        assert_eq!(
+            file.size().unwrap() as usize,
+            LOG_HDR_SIZE + TX_HEADER_SIZE + expected_blob_size + TX_TRAILER_SIZE
+        );
+
+        let ops = parse_only_encrypted_tx_ops_with_chunk_size_for_test(
+            file,
+            &io,
+            &enc_ctx,
+            TEST_CHUNK_SIZE,
+        );
+        assert_eq!(ops.len(), 1);
+        assert_upsert_table_op(&ops[0], (-2).into(), 1, &expected_record_bytes, 100);
+    }
+
+    #[test]
+    fn test_encrypted_log_format_assumptions_are_pinned() {
+        assert_eq!(LOG_VERSION, 2);
+        assert_eq!(LOG_HDR_SIZE, 56);
+        assert_eq!(ENCRYPTED_PAYLOAD_CHUNK_SIZE, 32 * 1024);
+        assert_eq!(ENCRYPTED_CHUNK_AAD_SIZE, 32);
+        assert_eq!(FRAME_MAGIC, 0x5854_564D);
+        assert_eq!(END_MAGIC, 0x4554_564D);
+        assert_eq!(TX_HEADER_SIZE, 24);
+        assert_eq!(TX_TRAILER_SIZE, 8);
+    }
+
+    #[test]
+    fn test_encrypted_chunk_aad_layout_is_pinned() {
+        let non_last_aad = build_encrypted_chunk_aad(
+            0x0102_0304_0506_0708,
+            None,
+            0x2122_2324,
+            0x3132_3334_3536_3738,
+            0x4142_4344,
+        );
+        assert_eq!(
+            non_last_aad,
+            [
+                0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // salt
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, // payload_size omitted for non-final chunk
+                0x24, 0x23, 0x22, 0x21, // op_count
+                0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31, // commit_ts
+                0x44, 0x43, 0x42, 0x41, // chunk_index
+            ]
+        );
+
+        let last_aad = build_encrypted_chunk_aad(
+            0x0102_0304_0506_0708,
+            Some(0x1112_1314_1516_1718),
+            0x2122_2324,
+            0x3132_3334_3536_3738,
+            0x4142_4344,
+        );
+
+        assert_eq!(
+            last_aad,
+            [
+                0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // salt
+                0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12,
+                0x11, // payload_size (final chunk only)
+                0x24, 0x23, 0x22, 0x21, // op_count
+                0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31, // commit_ts
+                0x44, 0x43, 0x42, 0x41, // chunk_index
+            ]
+        );
+    }
+
+    #[test]
+    fn test_encrypted_log_aes128_chunk_layout_assumptions_are_pinned() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let enc_ctx = test_enc_ctx();
+
+        assert_eq!(
+            enc_ctx.cipher_mode(),
+            crate::storage::encryption::CipherMode::Aes128Gcm
+        );
+        assert_eq!(enc_ctx.tag_size(), 16);
+        assert_eq!(enc_ctx.nonce_size(), 12);
+
+        for (payload_size, expected_chunk_ranges, expected_file_size) in [
+            (32_767usize, vec![0..32_795], 32_883usize),
+            (32_768usize, vec![0..32_796], 32_884usize),
+            (32_769usize, vec![0..32_796, 32_796..32_825], 32_913usize),
+            (65_536usize, vec![0..32_796, 32_796..65_592], 65_680usize),
+            (
+                65_537usize,
+                vec![0..32_796, 32_796..65_592, 65_592..65_621],
+                65_709usize,
+            ),
+        ] {
+            let text_len = text_len_for_single_upsert_table_op_size(payload_size);
+            let value = "p".repeat(text_len);
+            let tx = crate::mvcc::database::LogRecord {
+                tx_timestamp: 100,
+                row_versions: vec![make_test_row_version((-2).into(), 1, &value, 100)],
+                header: None,
+            };
+            let file = write_single_encrypted_tx(
+                &io,
+                &format!("enc-layout-pinned-{payload_size}.db-log"),
+                &enc_ctx,
+                &tx,
+            );
+
+            let frame_bytes = read_file_bytes(file.clone(), &io);
+            let actual_payload_size = u64::from_le_bytes(
+                frame_bytes[LOG_HDR_SIZE + 4..LOG_HDR_SIZE + 12]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            assert_eq!(actual_payload_size, payload_size);
+            assert_eq!(file.size().unwrap() as usize, expected_file_size);
+            assert_eq!(
+                encrypted_chunk_ranges(payload_size, 16, 12),
+                expected_chunk_ranges
+            );
+        }
+    }
+
+    // Verifies the final chunk authenticates payload_size: tampering the TX header's
+    // payload_size field must still reject the encrypted frame.
+    #[test]
+    fn test_encrypted_log_payload_size_tamper_rejected() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("enc-payload-size-tamper.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let enc_ctx = test_enc_ctx();
+        let table_id: MVTableId = (-2).into();
+        let text_len =
+            text_len_for_single_upsert_table_op_size(2 * ENCRYPTED_PAYLOAD_CHUNK_SIZE + 257);
+        let value = "s".repeat(text_len);
+
+        let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
+        let tx = crate::mvcc::database::LogRecord {
+            tx_timestamp: 444,
+            row_versions: vec![make_test_row_version(table_id, 1, &value, 444)],
+            header: None,
+        };
+        append_encrypted_tx(&mut log, &io, &tx);
+
+        let frame_bytes = read_file_bytes(file.clone(), &io);
+        let payload_size = u64::from_le_bytes(
+            frame_bytes[LOG_HDR_SIZE + 4..LOG_HDR_SIZE + 12]
+                .try_into()
+                .unwrap(),
+        );
+        let bad_payload_size = Arc::new(Buffer::new((payload_size + 1).to_le_bytes().to_vec()));
+        let c = Completion::new_write(|_| {});
+        io.wait_for_completion(
+            file.pwrite((LOG_HDR_SIZE + 4) as u64, bad_payload_size, c)
+                .unwrap(),
+        )
+        .unwrap();
+
+        let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
+        reader.read_header(&io).unwrap();
+        match reader.parse_next_transaction(&io).unwrap() {
+            ParseResult::InvalidFrame => {}
+            other => panic!("expected InvalidFrame after payload_size tamper, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_encrypted_log_chunk_layout_boundaries() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let enc_ctx = test_enc_ctx();
+        let tag_size = enc_ctx.tag_size();
+        let nonce_size = enc_ctx.nonce_size();
+
+        for target_op_size in [
+            ENCRYPTED_PAYLOAD_CHUNK_SIZE - 1,
+            ENCRYPTED_PAYLOAD_CHUNK_SIZE,
+            ENCRYPTED_PAYLOAD_CHUNK_SIZE + 1,
+            2 * ENCRYPTED_PAYLOAD_CHUNK_SIZE,
+            2 * ENCRYPTED_PAYLOAD_CHUNK_SIZE + 1,
+        ] {
+            let text_len = text_len_for_single_upsert_table_op_size(target_op_size);
+            let value = "x".repeat(text_len);
+            let row_version = make_test_row_version((-2).into(), 1, &value, 100);
+            let expected_record_bytes = row_version.row.payload().to_vec();
+            let tx = crate::mvcc::database::LogRecord {
+                tx_timestamp: 100,
+                row_versions: vec![row_version],
+                header: None,
+            };
+            let file = write_single_encrypted_tx(
+                &io,
+                &format!("enc-layout-{target_op_size}.db-log"),
+                &enc_ctx,
+                &tx,
+            );
+
+            let frame_hdr = read_file_bytes(file.clone(), &io);
+            let payload_size = u64::from_le_bytes(
+                frame_hdr[LOG_HDR_SIZE + 4..LOG_HDR_SIZE + 12]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            assert_eq!(payload_size, target_op_size);
+
+            let file_size = file.size().unwrap() as usize;
+            let encrypted_blob_size = file_size - LOG_HDR_SIZE - TX_HEADER_SIZE - TX_TRAILER_SIZE;
+            let expected_blob_size = encrypted_payload_blob_size(
+                payload_size,
+                ENCRYPTED_PAYLOAD_CHUNK_SIZE,
+                tag_size,
+                nonce_size,
+            )
+            .unwrap();
+            assert_eq!(encrypted_blob_size, expected_blob_size);
+
+            let ops = parse_only_encrypted_tx_ops(file, &io, &enc_ctx);
+            assert_eq!(ops.len(), 1);
+            assert_upsert_table_op(&ops[0], (-2).into(), 1, &expected_record_bytes, 100);
+        }
+    }
+
+    #[test]
+    fn test_encrypted_log_single_op_crosses_chunk_boundary() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let enc_ctx = test_enc_ctx();
+        let target_op_size = ENCRYPTED_PAYLOAD_CHUNK_SIZE + 257;
+        let text_len = text_len_for_single_upsert_table_op_size(target_op_size);
+        let value = "x".repeat(text_len);
+        let row_version = make_test_row_version((-2).into(), 1, &value, 100);
+        let expected_record_bytes = row_version.row.payload().to_vec();
+
+        let tx = crate::mvcc::database::LogRecord {
+            tx_timestamp: 100,
+            row_versions: vec![row_version],
+            header: None,
+        };
+        let file = write_single_encrypted_tx(&io, "enc-cross-boundary.db-log", &enc_ctx, &tx);
+        let ops = parse_only_encrypted_tx_ops(file, &io, &enc_ctx);
+        assert_eq!(ops.len(), 1);
+        assert_upsert_table_op(&ops[0], (-2).into(), 1, &expected_record_bytes, 100);
+    }
+
+    // Verifies the reader can reconstruct a payload_len varint that is split across
+    // two encrypted chunks, without changing either row payload.
+    #[test]
+    fn test_encrypted_log_varint_crosses_chunk_boundary() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("enc-varint-boundary.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let enc_ctx = test_enc_ctx();
+        // Keep the first op 7 bytes short of a full chunk so the second op begins with:
+        // 6-byte op prelude (tag + flags + table_id) and then 1 byte of payload_len varint.
+        // That places the chunk boundary immediately after the first varint byte.
+        let filler_len = text_len_for_single_upsert_table_op_size(ENCRYPTED_PAYLOAD_CHUNK_SIZE - 7);
+        let filler_value = "a".repeat(filler_len);
+        let second_value = "b".repeat(200);
+        let filler = make_test_row_version((-2).into(), 1, &filler_value, 100);
+        let second = make_test_row_version((-2).into(), 2, &second_value, 100);
+        let expected_filler_record_bytes = filler.row.payload().to_vec();
+        let expected_second_record_bytes = second.row.payload().to_vec();
+
+        let mut filler_buf = Vec::new();
+        serialize_op_entry(&mut filler_buf, &filler).unwrap();
+        assert_eq!(filler_buf.len(), ENCRYPTED_PAYLOAD_CHUNK_SIZE - 7);
+
+        let mut second_buf = Vec::new();
+        serialize_op_entry(&mut second_buf, &second).unwrap();
+        // Table ops begin with a fixed 6-byte prelude:
+        // 1 byte op tag + 1 byte flags + 4 bytes table_id.
+        // The payload_len varint begins immediately after that prefix.
+        let (_, varint_bytes) = read_varint_partial(&second_buf[6..]).unwrap().unwrap();
+        assert!(
+            varint_bytes >= 2,
+            "second op payload_len must use a multi-byte varint so the chunk boundary can split it"
+        );
+        // filler_buf.len() consumes the prefix of the chunk, then the second op contributes:
+        // 6 bytes of fixed prelude + exactly 1 byte of payload_len varint before the boundary.
+        // That forces the remaining varint bytes into the next encrypted chunk.
+        assert_eq!(
+            filler_buf.len() + 6 + 1,
+            ENCRYPTED_PAYLOAD_CHUNK_SIZE,
+            "chunk boundary should fall after the first payload_len varint byte"
+        );
+
+        let tx = crate::mvcc::database::LogRecord {
+            tx_timestamp: 100,
+            row_versions: vec![filler, second],
+            header: None,
+        };
+        write_first_encrypted_tx(file.clone(), &io, &enc_ctx, &tx);
+        let ops = parse_only_encrypted_tx_ops(file, &io, &enc_ctx);
+        assert_eq!(ops.len(), 2);
+        assert_upsert_table_op(&ops[0], (-2).into(), 1, &expected_filler_record_bytes, 100);
+        assert_upsert_table_op(&ops[1], (-2).into(), 2, &expected_second_record_bytes, 100);
+    }
+
+    // Verifies a transaction header update still round-trips when the OP_UPDATE_HEADER
+    // entry itself is split across an encrypted chunk boundary.
+    #[test]
+    fn test_encrypted_log_header_op_crosses_chunk_boundary() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("enc-header-boundary.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let enc_ctx = test_enc_ctx();
+        let mut header_buf = Vec::new();
+        let mut header = DatabaseHeader::default();
+        header.database_size = 123.into();
+        header.schema_cookie = 456.into();
+        serialize_header_entry(&mut header_buf, &header);
+
+        let filler_payload_size = ENCRYPTED_PAYLOAD_CHUNK_SIZE - (header_buf.len() - 1);
+        let filler_len = text_len_for_single_upsert_table_op_size(filler_payload_size);
+        let filler_value = "h".repeat(filler_len);
+        let filler = make_test_row_version((-2).into(), 1, &filler_value, 100);
+        let expected_filler_record_bytes = filler.row.payload().to_vec();
+
+        let mut filler_buf = Vec::new();
+        serialize_op_entry(&mut filler_buf, &filler).unwrap();
+        assert_eq!(filler_buf.len(), filler_payload_size);
+        assert_eq!(
+            filler_buf.len() + header_buf.len() - 1,
+            ENCRYPTED_PAYLOAD_CHUNK_SIZE,
+            "chunk boundary should split the header op after its first byte"
+        );
+
+        let tx = crate::mvcc::database::LogRecord {
+            tx_timestamp: 100,
+            row_versions: vec![filler],
+            header: Some(header),
+        };
+        write_first_encrypted_tx(file.clone(), &io, &enc_ctx, &tx);
+        let ops = parse_only_encrypted_tx_ops(file, &io, &enc_ctx);
+        assert_eq!(ops.len(), 2);
+        assert_upsert_table_op(&ops[0], (-2).into(), 1, &expected_filler_record_bytes, 100);
+        assert_update_header_op(&ops[1], &header, 100);
+    }
+
+    // Verifies the chunked reader can walk a long sequence of table upserts whose
+    // boundaries land both between ops and in the middle of serialized row payloads.
+    #[test]
+    fn test_encrypted_log_many_ops_cross_chunk_boundaries() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("enc-many-ops.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let enc_ctx = test_enc_ctx();
+        let table_id: MVTableId = (-2).into();
+
+        let row_versions = (0..96)
+            .map(|rowid| {
+                let value = format!("row-{rowid}-{}", "x".repeat(900));
+                make_test_row_version(table_id, rowid + 1, &value, 200)
+            })
+            .collect::<Vec<_>>();
+        let expected_record_bytes = row_versions
+            .iter()
+            .map(|row_version| row_version.row.payload().to_vec())
+            .collect::<Vec<_>>();
+        let tx = crate::mvcc::database::LogRecord {
+            tx_timestamp: 200,
+            row_versions,
+            header: None,
+        };
+        write_first_encrypted_tx(file.clone(), &io, &enc_ctx, &tx);
+        let ops = parse_only_encrypted_tx_ops(file, &io, &enc_ctx);
+        assert_eq!(ops.len(), 96);
+        for (idx, op) in ops.iter().enumerate() {
+            assert_upsert_table_op(
+                op,
+                table_id,
+                (idx + 1) as i64,
+                &expected_record_bytes[idx],
+                200,
+            );
+        }
+    }
+
+    // Verifies a large index-key payload is chunked, decrypted, and parsed back as an
+    // UpsertIndex op without changing the serialized key bytes.
+    #[test]
+    fn test_encrypted_log_upsert_index_crosses_chunk_boundary() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let enc_ctx = test_enc_ctx();
+        let index_id: MVTableId = (-3).into();
+        let value = "i".repeat(ENCRYPTED_PAYLOAD_CHUNK_SIZE * 2);
+        let row_version = make_test_index_row_version(index_id, 42, &value, 250);
+        let expected_payload = row_version.row.payload().to_vec();
+
+        let tx = crate::mvcc::database::LogRecord {
+            tx_timestamp: 250,
+            row_versions: vec![row_version],
+            header: None,
+        };
+        let file = write_single_encrypted_tx(&io, "enc-index-boundary.db-log", &enc_ctx, &tx);
+
+        let frame_bytes = read_file_bytes(file.clone(), &io);
+        let payload_size = u64::from_le_bytes(
+            frame_bytes[LOG_HDR_SIZE + 4..LOG_HDR_SIZE + 12]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        assert!(
+            payload_size > ENCRYPTED_PAYLOAD_CHUNK_SIZE,
+            "index payload should span multiple encrypted chunks"
+        );
+
+        let ops = parse_only_encrypted_tx_ops(file, &io, &enc_ctx);
+        assert_eq!(ops.len(), 1);
+        assert_upsert_index_op(&ops[0], index_id, &expected_payload, 250);
+    }
+
+    // Verifies CRC chaining across multiple encrypted frames while still preserving the
+    // exact row payload bytes in every successfully parsed frame.
     #[test]
     fn test_encrypted_log_multiple_frames_crc_chain() {
         init_tracing();
@@ -4280,6 +5129,10 @@ mod tests {
             .unwrap();
         let table_id: MVTableId = (-2).into();
         let enc_ctx = test_enc_ctx();
+        let expected_record_bytes = (0..5u64)
+            .map(|i| generate_simple_string_row(table_id, i as i64, &format!("val_{i}")))
+            .map(|row| row.payload().to_vec())
+            .collect::<Vec<_>>();
 
         let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
         for i in 0..5u64 {
@@ -4293,8 +5146,7 @@ mod tests {
                 )],
                 header: None,
             };
-            let c = log.log_tx(&tx).unwrap();
-            io.wait_for_completion(c).unwrap();
+            append_encrypted_tx(&mut log, &io, &tx);
         }
 
         let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
@@ -4306,15 +5158,13 @@ mod tests {
                 other => panic!("frame {i}: expected Ops, got {other:?}"),
             };
             assert_eq!(ops.len(), 1, "frame {i}");
-            match &ops[0] {
-                super::ParsedOp::UpsertTable {
-                    rowid, commit_ts, ..
-                } => {
-                    assert_eq!(rowid.row_id, RowKey::Int(i as i64));
-                    assert_eq!(*commit_ts, 100 + i);
-                }
-                other => panic!("frame {i}: expected UpsertTable, got {other:?}"),
-            }
+            assert_upsert_table_op(
+                &ops[0],
+                table_id,
+                i as i64,
+                &expected_record_bytes[i as usize],
+                100 + i,
+            );
         }
 
         assert!(matches!(
@@ -4343,8 +5193,7 @@ mod tests {
                 row_versions: vec![make_test_row_version(table_id, 1, "secret", 100)],
                 header: None,
             };
-            let c = log.log_tx(&tx).unwrap();
-            io.wait_for_completion(c).unwrap();
+            append_encrypted_tx(&mut log, &io, &tx);
 
             let mut reader = StreamingLogicalLogReader::new(file, Some(wrong_key_enc_ctx()));
             reader.read_header(&io).unwrap();
@@ -4370,8 +5219,7 @@ mod tests {
                 row_versions: vec![make_test_row_version(table_id, 1, "hdr_tamper", 100)],
                 header: None,
             };
-            let c = log.log_tx(&tx).unwrap();
-            io.wait_for_completion(c).unwrap();
+            append_encrypted_tx(&mut log, &io, &tx);
 
             // Flip a byte in the commit_ts field (TX header offset 16..24, file offset = LOG_HDR + 16).
             let corrupt_offset = (LOG_HDR_SIZE + 16) as u64;
@@ -4402,8 +5250,7 @@ mod tests {
                 row_versions: vec![make_test_row_version(table_id, 1, "tamper_me", 100)],
                 header: None,
             };
-            let c = log.log_tx(&tx).unwrap();
-            io.wait_for_completion(c).unwrap();
+            append_encrypted_tx(&mut log, &io, &tx);
 
             // Flip a byte in the ciphertext (after log header + TX header).
             let corrupt_offset = (LOG_HDR_SIZE + TX_HEADER_SIZE + 1) as u64;
@@ -4422,27 +5269,32 @@ mod tests {
         }
     }
 
+    // Verifies a torn final frame is ignored while the last fully written prefix frame
+    // still decrypts to the exact bytes that were committed before the tear.
     #[test]
     fn test_encrypted_log_torn_tail_rejected() {
         init_tracing();
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
-        let file = io
-            .open_file("enc-torn.db-log", OpenFlags::Create, false)
-            .unwrap();
+        let file = open_test_file(&io, "enc-torn.db-log");
         let table_id: MVTableId = (-2).into();
         let enc_ctx = test_enc_ctx();
+        let first_row_version = make_test_row_version(table_id, 0, "data", 100);
+        let expected_first_record_bytes = first_row_version.row.payload().to_vec();
 
         // Write 2 frames.
         let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
-        for i in 0..2u64 {
-            let tx = crate::mvcc::database::LogRecord {
-                tx_timestamp: 100 + i,
-                row_versions: vec![make_test_row_version(table_id, i as i64, "data", 100 + i)],
-                header: None,
-            };
-            let c = log.log_tx(&tx).unwrap();
-            io.wait_for_completion(c).unwrap();
-        }
+        let first_tx = crate::mvcc::database::LogRecord {
+            tx_timestamp: 100,
+            row_versions: vec![first_row_version],
+            header: None,
+        };
+        append_encrypted_tx(&mut log, &io, &first_tx);
+        let second_tx = crate::mvcc::database::LogRecord {
+            tx_timestamp: 101,
+            row_versions: vec![make_test_row_version(table_id, 1, "data", 101)],
+            header: None,
+        };
+        append_encrypted_tx(&mut log, &io, &second_tx);
 
         // Truncate mid-way through the second frame.
         let file_size = file.size().unwrap();
@@ -4456,7 +5308,10 @@ mod tests {
 
         // First frame should parse fine.
         match reader.parse_next_transaction(&io).unwrap() {
-            ParseResult::Ops(ops) => assert_eq!(ops.len(), 1),
+            ParseResult::Ops(ops) => {
+                assert_eq!(ops.len(), 1);
+                assert_upsert_table_op(&ops[0], (-2).into(), 0, &expected_first_record_bytes, 100);
+            }
             other => panic!("expected Ops for frame 1, got {other:?}"),
         }
 
@@ -4465,5 +5320,233 @@ mod tests {
             ParseResult::Eof => {}
             other => panic!("expected Eof for torn frame 2, got {other:?}"),
         }
+    }
+
+    // Verifies chunk-level tampering is rejected: any corruption, reorder, drop, or
+    // duplicate in the encrypted chunk stream must fail closed instead of replaying data.
+    #[test]
+    fn test_encrypted_log_chunk_integrity_rejection() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let enc_ctx = test_enc_ctx();
+        let text_len =
+            text_len_for_single_upsert_table_op_size(2 * ENCRYPTED_PAYLOAD_CHUNK_SIZE + 257);
+        let value = "z".repeat(text_len);
+
+        let base_file = open_test_file(&io, "enc-chunk-integrity-base.db-log");
+        let row_version = make_test_row_version((-2).into(), 1, &value, 333);
+        let expected_record_bytes = row_version.row.payload().to_vec();
+        let tx = crate::mvcc::database::LogRecord {
+            tx_timestamp: 333,
+            row_versions: vec![row_version],
+            header: None,
+        };
+        write_first_encrypted_tx(base_file.clone(), &io, &enc_ctx, &tx);
+        let base_ops = parse_only_encrypted_tx_ops(base_file.clone(), &io, &enc_ctx);
+        assert_eq!(base_ops.len(), 1);
+        assert_upsert_table_op(&base_ops[0], (-2).into(), 1, &expected_record_bytes, 333);
+
+        let base_bytes = read_file_bytes(base_file, &io);
+        let payload_size = u64::from_le_bytes(
+            base_bytes[LOG_HDR_SIZE + 4..LOG_HDR_SIZE + 12]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let chunk_ranges =
+            encrypted_chunk_ranges(payload_size, enc_ctx.tag_size(), enc_ctx.nonce_size());
+        assert!(
+            chunk_ranges.len() >= 3,
+            "expected at least 3 encrypted chunks for corruption coverage"
+        );
+        let frame_payload_start = LOG_HDR_SIZE + TX_HEADER_SIZE;
+        let full_chunk_plaintext_len =
+            encrypted_chunk_plaintext_len(payload_size, 1, ENCRYPTED_PAYLOAD_CHUNK_SIZE).unwrap();
+
+        let mut cases: Vec<(&str, Vec<u8>, bool)> = Vec::new();
+
+        // Corrupt ciphertext in chunk 2.
+        {
+            let mut bytes = base_bytes.clone();
+            let offset = frame_payload_start + chunk_ranges[1].start + 1;
+            bytes[offset] ^= 0xFF;
+            cases.push(("ciphertext", bytes, false));
+        }
+
+        // Corrupt tag in chunk 2.
+        {
+            let mut bytes = base_bytes.clone();
+            let offset = frame_payload_start + chunk_ranges[1].start + full_chunk_plaintext_len + 1;
+            bytes[offset] ^= 0xFF;
+            cases.push(("tag", bytes, false));
+        }
+
+        // Corrupt nonce in chunk 2.
+        {
+            let mut bytes = base_bytes.clone();
+            let offset = frame_payload_start
+                + chunk_ranges[1].start
+                + full_chunk_plaintext_len
+                + enc_ctx.tag_size();
+            bytes[offset] ^= 0xFF;
+            cases.push(("nonce", bytes, false));
+        }
+
+        // Reorder the first two full-size chunks.
+        {
+            let mut bytes = base_bytes.clone();
+            let first = chunk_ranges[0].clone();
+            let second = chunk_ranges[1].clone();
+            let first_bytes =
+                bytes[frame_payload_start + first.start..frame_payload_start + first.end].to_vec();
+            let second_bytes = bytes
+                [frame_payload_start + second.start..frame_payload_start + second.end]
+                .to_vec();
+            bytes[frame_payload_start + first.start..frame_payload_start + first.end]
+                .copy_from_slice(&second_bytes);
+            bytes[frame_payload_start + second.start..frame_payload_start + second.end]
+                .copy_from_slice(&first_bytes);
+            cases.push(("reorder", bytes, false));
+        }
+
+        // Drop the middle chunk entirely.
+        {
+            let mut bytes = base_bytes.clone();
+            let second = chunk_ranges[1].clone();
+            bytes.drain(frame_payload_start + second.start..frame_payload_start + second.end);
+            cases.push(("drop", bytes, true));
+        }
+
+        // Duplicate chunk 1 over chunk 2.
+        {
+            let mut bytes = base_bytes.clone();
+            let first = chunk_ranges[0].clone();
+            let second = chunk_ranges[1].clone();
+            let first_bytes =
+                bytes[frame_payload_start + first.start..frame_payload_start + first.end].to_vec();
+            bytes[frame_payload_start + second.start..frame_payload_start + second.end]
+                .copy_from_slice(&first_bytes);
+            cases.push(("duplicate", bytes, false));
+        }
+
+        for (label, bytes, allow_eof) in cases {
+            let file = io
+                .open_file(
+                    &format!("enc-chunk-integrity-{label}.db-log"),
+                    OpenFlags::Create,
+                    false,
+                )
+                .unwrap();
+            overwrite_file_bytes(file.clone(), &io, &bytes);
+            if allow_eof {
+                let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx.clone()));
+                reader.read_header(&io).unwrap();
+                match reader.parse_next_transaction(&io).unwrap() {
+                    ParseResult::InvalidFrame | ParseResult::Eof => {}
+                    other => panic!("expected rejection for {label}, got {other:?}"),
+                }
+            } else {
+                assert_single_frame_invalid(file, &io, enc_ctx.clone());
+            }
+        }
+    }
+
+    // Verifies a torn multi-chunk tail is ignored without losing the last fully written
+    // prefix frame that appears before the truncation point.
+    #[test]
+    fn test_encrypted_log_chunk_torn_tail_rejected() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("enc-chunk-torn-tail.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let enc_ctx = test_enc_ctx();
+        let table_id: MVTableId = (-2).into();
+        let text_len =
+            text_len_for_single_upsert_table_op_size(2 * ENCRYPTED_PAYLOAD_CHUNK_SIZE + 257);
+        let value = "q".repeat(text_len);
+
+        let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
+        let first_row_version = make_test_row_version(table_id, 1, "prefix", 500);
+        let expected_prefix_record_bytes = first_row_version.row.payload().to_vec();
+        let first_tx = crate::mvcc::database::LogRecord {
+            tx_timestamp: 500,
+            row_versions: vec![first_row_version],
+            header: None,
+        };
+        let c = log.log_tx(&first_tx).unwrap();
+        io.wait_for_completion(c).unwrap();
+        let second_frame_start = log.offset as usize;
+
+        let second_tx = crate::mvcc::database::LogRecord {
+            tx_timestamp: 600,
+            row_versions: vec![make_test_row_version(table_id, 2, &value, 600)],
+            header: None,
+        };
+        let c = log.log_tx(&second_tx).unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        let base_bytes = read_file_bytes(file.clone(), &io);
+        let second_payload_size = u64::from_le_bytes(
+            base_bytes[second_frame_start + 4..second_frame_start + 12]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let chunk_ranges = encrypted_chunk_ranges(
+            second_payload_size,
+            enc_ctx.tag_size(),
+            enc_ctx.nonce_size(),
+        );
+        assert!(chunk_ranges.len() >= 3);
+        let second_payload_start = second_frame_start + TX_HEADER_SIZE;
+        let second_chunk_plaintext_len =
+            encrypted_chunk_plaintext_len(second_payload_size, 1, ENCRYPTED_PAYLOAD_CHUNK_SIZE)
+                .unwrap();
+        let second_chunk = chunk_ranges[1].clone();
+        let last_chunk = chunk_ranges.last().unwrap().clone();
+        let second_frame_end = base_bytes.len();
+
+        let cuts = [
+            second_payload_start + second_chunk.start + 17,
+            second_payload_start
+                + second_chunk.start
+                + second_chunk_plaintext_len
+                + enc_ctx.tag_size(),
+            second_payload_start + second_chunk.end,
+            second_frame_end - TX_TRAILER_SIZE + 3,
+        ];
+
+        for (idx, cut) in cuts.into_iter().enumerate() {
+            let file = io
+                .open_file(
+                    &format!("enc-chunk-torn-tail-{idx}.db-log"),
+                    OpenFlags::Create,
+                    false,
+                )
+                .unwrap();
+            overwrite_file_bytes(file.clone(), &io, &base_bytes[..cut]);
+
+            let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx.clone()));
+            reader.read_header(&io).unwrap();
+            match reader.parse_next_transaction(&io).unwrap() {
+                ParseResult::Ops(ops) => {
+                    assert_eq!(ops.len(), 1);
+                    assert_upsert_table_op(
+                        &ops[0],
+                        (-2).into(),
+                        1,
+                        &expected_prefix_record_bytes,
+                        500,
+                    );
+                }
+                other => panic!("expected prefix frame to survive, got {other:?}"),
+            }
+            match reader.parse_next_transaction(&io).unwrap() {
+                ParseResult::Eof => {}
+                other => panic!("expected Eof for torn multi-chunk frame, got {other:?}"),
+            }
+        }
+
+        // Keep the last chunk variable used so the compiler notices if the range math changes.
+        assert!(last_chunk.end > last_chunk.start);
     }
 }
