@@ -48,8 +48,19 @@ def parse_args():
     # Version argument
     parser.add_argument("version", help="The new version to set (e.g., 0.1.0)")
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    validate_version(args.version)
+    return args
 
+def validate_version(version):
+    pattern = r'^\d+\.\d+\.\d+(-[a-zA-Z0-9]+(\.[a-zA-Z0-9]+)*)?$'
+    if not re.match(pattern, version):
+        print(f"Error: invalid version format '{version}'", file=sys.stderr)
+        print("Expected format: MAJOR.MINOR.PATCH[-pre.RELEASE] (e.g., 0.6.0, 0.6.0-pre.123)", file=sys.stderr)
+        sys.exit(1)
+    if version.startswith("v"):
+        print("Error: version should not start with 'v' (e.g., use 0.6.0, not v0.6.0)", file=sys.stderr)
+        sys.exit(1)
 
 def extract_current_version(content):
     """Extract the current version from Cargo.toml content."""
