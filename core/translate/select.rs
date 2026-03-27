@@ -437,6 +437,7 @@ fn prepare_one_select_plan(
                                     is_rowid_alias: column.is_rowid_alias(),
                                 },
                                 alias: None,
+                                implicit_column_name: None,
                                 contains_aggregates: false,
                             });
                             table.mark_column_used(idx);
@@ -456,11 +457,18 @@ fn prepare_one_select_plan(
                             &mut aggregate_expressions,
                             Some(&mut windows),
                         )?;
+                        let (alias, implicit_column_name) = match &maybe_alias {
+                            Some(ast::As::As(name)) | Some(ast::As::Elided(name)) => {
+                                (Some(name.as_str().to_string()), None)
+                            }
+                            Some(ast::As::ImplicitColumnName(name)) => {
+                                (None, Some(name.as_str().to_string()))
+                            }
+                            None => (None, None),
+                        };
                         plan.result_columns.push(ResultSetColumn {
-                            alias: maybe_alias.as_ref().map(|alias| match alias {
-                                ast::As::Elided(alias) => alias.as_str().to_string(),
-                                ast::As::As(alias) => alias.as_str().to_string(),
-                            }),
+                            alias,
+                            implicit_column_name,
                             expr: *expr,
                             contains_aggregates,
                         });
@@ -680,6 +688,7 @@ fn prepare_one_select_plan(
                     // these result_columns work as placeholders for the values, so the expr doesn't matter
                     expr: ast::Expr::Literal(ast::Literal::Numeric(i.to_string())),
                     alias: Some(format!("column{}", i + 1)),
+                    implicit_column_name: None,
                     contains_aggregates: false,
                 });
             }
