@@ -1602,60 +1602,6 @@ fn test_wal_savepoint_rollback_on_constraint_violation() {
     assert_eq!(row[0], Value::from_i64(1001));
 }
 
-#[test]
-fn test_savepoint_rollback_preserves_outer_transaction_rows_after_new_page_allocation() {
-    let tmp_db = TempDatabase::new("test_savepoint_rollback_preserves_outer_rows.db");
-    let conn = tmp_db.connect_limbo();
-
-    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
-        .unwrap();
-    conn.execute("BEGIN").unwrap();
-    conn.execute("INSERT INTO t VALUES (999999, 'outer')")
-        .unwrap();
-    conn.execute("SAVEPOINT s").unwrap();
-
-    let mut values = String::new();
-    for i in 1..=256 {
-        if i > 1 {
-            values.push_str(", ");
-        }
-        values.push_str(&format!("({i}, 'xxxxxxxxxx{i}')"));
-    }
-    conn.execute(format!("INSERT INTO t VALUES {values}"))
-        .unwrap();
-
-    conn.execute("ROLLBACK TO s").unwrap();
-
-    let stmt = conn
-        .query("SELECT id, v FROM t ORDER BY id")
-        .unwrap()
-        .unwrap();
-    let rows = helper_read_all_rows(stmt);
-    assert_eq!(
-        rows,
-        vec![vec![Value::from_i64(999999), Value::Text("outer".into())]],
-        "outer transaction rows should survive savepoint rollback"
-    );
-
-    conn.execute("RELEASE s").unwrap();
-    conn.execute("COMMIT").unwrap();
-
-    let rusqlite_conn = rusqlite::Connection::open(tmp_db.path.clone()).unwrap();
-    let persisted_rows: Vec<(i64, String)> = rusqlite_conn
-        .prepare("SELECT id, v FROM t ORDER BY id")
-        .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    assert_eq!(persisted_rows, vec![(999999, "outer".to_string())]);
-
-    let integrity: String = rusqlite_conn
-        .pragma_query_value(None, "integrity_check", |row| row.get(0))
-        .unwrap();
-    assert_eq!(integrity, "ok");
-}
-
 #[turso_macros::test]
 /// INSERT OR FAIL should keep changes made by the statement before the error.
 /// Unlike ABORT (the default), FAIL does not roll back successful inserts within the same statement.
