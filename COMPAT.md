@@ -1,11 +1,18 @@
-# Turso compatibility with SQLite
+# Turso SQLite Compatibility
 
-This document describes the compatibility of Turso with SQLite.
+Turso is a re-implementation of SQLite in Rust. This document describes the
+current state of compatibility between the two. Any deviation from SQLite
+behavior that is not explicitly documented as an opt-in extension is
+considered a bug.
+
+Compatibility is validated through differential testing against SQLite and
+ongoing work to pass the full SQLite TCL test suite.
 
 ## Table of contents
 
-- [Turso compatibility with SQLite](#turso-compatibility-with-sqlite)
+- [Turso SQLite Compatibility](#turso-sqlite-compatibility)
   - [Table of contents](#table-of-contents)
+  - [Guarantees](#guarantees)
   - [Overview](#overview)
     - [Features](#features)
     - [Limitations](#limitations)
@@ -54,9 +61,14 @@ This document describes the compatibility of Turso with SQLite.
     - [Table-Valued Functions](#table-valued-functions)
     - [Internal Virtual Tables](#internal-virtual-tables)
 
-## Overview
+## Guarantees
 
-Turso aims to be fully compatible with SQLite, with opt-in features not supported by SQLite.
+1. You should always be able to go back to SQLite if you want to.
+2. You should be able to access a database created with SQLite in Turso.
+3. You need to opt in to any incompatible Turso feature, but even then we provide a migration path back to SQLite when possible.
+4. We don't support mixed SQLite and Turso in multi-process scenarios.
+
+## Overview
 
 ### Features
 
