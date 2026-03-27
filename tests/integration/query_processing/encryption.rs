@@ -1251,6 +1251,93 @@ fn test_encrypted_db_then_enable_mvcc(_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[turso_macros::test]
+fn test_encrypted_db_then_enable_mvcc_large_payload_chunked(
+    _db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir
+        .path()
+        .join(format!("test-enc-mvcc-large-{}.db", rng().next_u32()));
+    let db_path_str = db_path.to_str().unwrap();
+
+    let hex_key = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+    let large_value = "x".repeat(100_000);
+    let io = Arc::new(PlatformIO::new()?);
+    let opts = DatabaseOpts::new().with_encryption(true);
+    let enc_opts = Some(EncryptionOpts {
+        cipher: "aes256gcm".to_string(),
+        hexkey: hex_key.to_string(),
+    });
+
+    {
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path_str,
+            OpenFlags::Create,
+            opts,
+            enc_opts.clone(),
+        )?;
+        let key = EncryptionKey::from_hex_string(hex_key)?;
+        let conn = db.connect_with_encryption(Some(key))?;
+        conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+        conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")?;
+        conn.execute(format!("INSERT INTO test (value) VALUES ('{large_value}')"))?;
+        for c in conn.cacheflush()? {
+            io.wait_for_completion(c)?;
+        }
+    }
+
+    let log_path = db_path.with_extension("db-log");
+    let log_bytes = std::fs::read(&log_path)?;
+    assert!(
+        log_bytes.len() > 64 * 1024,
+        "multi-chunk encrypted MVCC log should exceed 64 KiB"
+    );
+
+    {
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path_str,
+            OpenFlags::default(),
+            opts,
+            enc_opts,
+        )?;
+        let key = EncryptionKey::from_hex_string(hex_key)?;
+        let conn = db.connect_with_encryption(Some(key))?;
+
+        let rows = conn.query(
+            "SELECT id, length(value), substr(value, 1, 16), substr(value, length(value) - 15, 16) FROM test",
+        )?;
+        let mut seen = false;
+        if let Some(mut rows) = rows {
+            loop {
+                match rows.step()? {
+                    turso_core::StepResult::Row => {
+                        let row = rows.row().unwrap();
+                        assert_eq!(row.get::<i64>(0).unwrap(), 1);
+                        assert_eq!(row.get::<i64>(1).unwrap(), large_value.len() as i64);
+                        assert_eq!(row.get::<String>(2).unwrap(), "xxxxxxxxxxxxxxxx");
+                        assert_eq!(row.get::<String>(3).unwrap(), "xxxxxxxxxxxxxxxx");
+                        seen = true;
+                    }
+                    turso_core::StepResult::Done => break,
+                    turso_core::StepResult::Interrupt => break,
+                    turso_core::StepResult::Busy | turso_core::StepResult::IO => continue,
+                }
+            }
+        }
+        assert!(
+            seen,
+            "Should recover multi-chunk MVCC payload after restart"
+        );
+    }
+
+    Ok(())
+}
+
 /// Create an encrypted database with existing data, then switch to MVCC mode.
 /// Verifies that pre-existing rows survive the journal mode switch and that
 /// new MVCC writes produce an encrypted log.
