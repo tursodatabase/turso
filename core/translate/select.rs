@@ -213,14 +213,6 @@ pub fn prepare_select_plan(
             let order_by = if select.order_by.is_empty() {
                 None
             } else {
-                if select
-                    .order_by
-                    .iter()
-                    .filter_map(|o| o.nulls)
-                    .any(|n| n == ast::NullsOrder::Last)
-                {
-                    crate::bail_parse_error!("NULLS LAST is not supported yet in ORDER BY");
-                }
                 let mut key = Vec::with_capacity(select.order_by.len());
                 for o in &select.order_by {
                     let col_idx = resolve_compound_order_by_expr(
@@ -228,7 +220,7 @@ pub fn prepare_select_plan(
                         leftmost_result_columns,
                         leftmost_table_refs,
                     )?;
-                    key.push((col_idx, o.order.unwrap_or(ast::SortOrder::Asc)));
+                    key.push((col_idx, o.order.unwrap_or(ast::SortOrder::Asc), o.nulls));
                 }
                 Some(key)
             };
@@ -256,13 +248,6 @@ fn prepare_one_select_plan(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<SelectPlan> {
-    if order_by
-        .iter()
-        .filter_map(|o| o.nulls)
-        .any(|n| n == ast::NullsOrder::Last)
-    {
-        crate::bail_parse_error!("NULLS LAST is not supported yet in ORDER BY");
-    }
     match select {
         ast::OneSelect::Select {
             columns,
@@ -379,7 +364,7 @@ fn prepare_one_select_plan(
                         BindingBehavior::ResultColumnsNotAllowed,
                     )?;
                 }
-                for (expr, _) in window.order_by.iter_mut() {
+                for (expr, _, _) in window.order_by.iter_mut() {
                     bind_and_rewrite_expr(
                         expr,
                         Some(&mut plan.table_references),
@@ -551,6 +536,7 @@ fn prepare_one_select_plan(
 
                     plan.group_by = Some(GroupBy {
                         sort_order: Vec::new(),
+                        nulls_order: Vec::new(),
                         sort_elided: false,
                         exprs: group_by.exprs.iter().map(|expr| *expr.clone()).collect(),
                         having: having_predicates,
@@ -559,6 +545,7 @@ fn prepare_one_select_plan(
                     // HAVING without GROUP BY: treat as ungrouped aggregation with filter
                     plan.group_by = Some(GroupBy {
                         sort_order: Vec::new(),
+                        nulls_order: Vec::new(),
                         sort_elided: false,
                         exprs: vec![],
                         having: having_predicates,
@@ -614,7 +601,7 @@ fn prepare_one_select_plan(
                     crate::bail_parse_error!("misuse of aggregate: {}()", agg.func);
                 }
 
-                key.push((o.expr, o.order.unwrap_or(ast::SortOrder::Asc)));
+                key.push((o.expr, o.order.unwrap_or(ast::SortOrder::Asc), o.nulls));
             }
             // Remove duplicate ORDER BY expressions, keeping the first occurrence.
             // Duplicates are semantically redundant.
@@ -622,7 +609,7 @@ fn prepare_one_select_plan(
             while i < key.len() {
                 if key[..i]
                     .iter()
-                    .any(|(prev, _)| exprs_are_equivalent(prev, &key[i].0))
+                    .any(|(prev, _, _)| exprs_are_equivalent(prev, &key[i].0))
                 {
                     key.remove(i);
                 } else {
@@ -669,7 +656,7 @@ fn prepare_one_select_plan(
             if let Some(group_by) = &mut plan.group_by {
                 // now that we have resolved the ORDER BY expressions and aggregates, we can
                 // compute the necessary sort order for the GROUP BY clause
-                group_by.sort_order = compute_group_by_sort_order(
+                (group_by.sort_order, group_by.nulls_order) = compute_group_by_sort_order(
                     &group_by.exprs,
                     &plan.order_by,
                     &plan.aggregates,
@@ -791,7 +778,7 @@ fn validate_expr_correct_column_counts(plan: &SelectPlan) -> Result<()> {
             crate::bail_parse_error!("result column must return 1 value, got {}", vec_size);
         }
     }
-    for (expr, _) in plan.order_by.iter() {
+    for (expr, _, _) in plan.order_by.iter() {
         let vec_size = expr_vector_size(expr)?;
         if vec_size != 1 {
             crate::bail_parse_error!("order by expression must return 1 value, got {}", vec_size);

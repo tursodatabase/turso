@@ -117,6 +117,9 @@ pub struct GroupBy {
     /// `compute_group_by_sort_order` has run; the outer optimizer reads
     /// this to derive the materialized CTE's output order.
     pub sort_order: Vec<SortOrder>,
+    /// NULLS ordering for each GROUP BY key column. Populated when ORDER BY
+    /// with explicit NULLS FIRST/LAST is merged into GROUP BY.
+    pub nulls_order: Vec<Option<ast::NullsOrder>>,
     /// When true the scan already provides the GROUP BY order and no
     /// sorter is emitted. The `sort_order` is kept so that the outer
     /// query can still read the effective output order.
@@ -305,9 +308,9 @@ pub enum Plan {
         right_most: SelectPlan,
         limit: Option<Box<Expr>>,
         offset: Option<Box<Expr>>,
-        /// ORDER BY for compound selects. Each entry is (result_column_index, sort_order).
+        /// ORDER BY for compound selects. Each entry is (result_column_index, sort_order, nulls_order).
         /// The column index is 0-based into the result set.
-        order_by: Option<Vec<(usize, SortOrder)>>,
+        order_by: Option<Vec<(usize, SortOrder, Option<ast::NullsOrder>)>>,
     },
     Delete(DeletePlan),
     Update(UpdatePlan),
@@ -570,7 +573,7 @@ pub struct SelectPlan {
     /// group by clause
     pub group_by: Option<GroupBy>,
     /// order by clause
-    pub order_by: Vec<(Box<ast::Expr>, SortOrder)>,
+    pub order_by: Vec<(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)>,
     /// all the aggregates collected from the result columns, order by, and (TODO) having clauses
     pub aggregates: Vec<Aggregate>,
     /// limit clause
@@ -692,7 +695,7 @@ pub struct DeletePlan {
     /// where clause split into a vec at 'AND' boundaries.
     pub where_clause: Vec<WhereTerm>,
     /// order by clause
-    pub order_by: Vec<(Box<ast::Expr>, SortOrder)>,
+    pub order_by: Vec<(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)>,
     /// limit clause
     pub limit: Option<Box<Expr>>,
     /// offset clause
@@ -719,7 +722,7 @@ pub struct UpdatePlan {
     // (column index, new value) pairs
     pub set_clauses: Vec<(usize, Box<ast::Expr>)>,
     pub where_clause: Vec<WhereTerm>,
-    pub order_by: Vec<(Box<ast::Expr>, SortOrder)>,
+    pub order_by: Vec<(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)>,
     pub limit: Option<Box<Expr>>,
     pub offset: Option<Box<Expr>>,
     // TODO: optional RETURNING clause
@@ -2398,7 +2401,7 @@ pub struct Window {
     /// the leftmost columns in the subquery output make up the partition key.
     pub deduplicated_partition_by_len: Option<usize>,
     /// Expressions from the ORDER BY clause.
-    pub order_by: Vec<(Expr, SortOrder)>,
+    pub order_by: Vec<(Expr, SortOrder, Option<ast::NullsOrder>)>,
     /// All window functions associated with this window.
     pub functions: Vec<WindowFunction>,
 }
@@ -2422,6 +2425,7 @@ impl Window {
                     (
                         *col.expr.clone(),
                         col.order.unwrap_or(Self::DEFAULT_SORT_ORDER),
+                        col.nulls,
                     )
                 })
                 .collect(),
@@ -2452,9 +2456,10 @@ impl Window {
         self.order_by
             .iter()
             .zip(&ast.order_by)
-            .all(|((expr_a, order_a), col_b)| {
+            .all(|((expr_a, order_a, nulls_a), col_b)| {
                 exprs_are_equivalent(expr_a, &col_b.expr)
                     && *order_a == col_b.order.unwrap_or(Self::DEFAULT_SORT_ORDER)
+                    && *nulls_a == col_b.nulls
             })
     }
 
