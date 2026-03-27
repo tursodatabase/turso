@@ -1,0 +1,165 @@
+---
+title: COMMENT ON
+description: Attach descriptive comments to tables, columns, indexes, views, and types
+sidebarTitle: COMMENT ON
+---
+
+# COMMENT ON
+
+<Info>
+**Turso Extension**: COMMENT ON is a Turso-specific statement not available in standard SQLite.
+</Info>
+
+The COMMENT ON statement attaches a human-readable description to a database object. Comments are stored in an internal metadata table and can be viewed with `PRAGMA comment_list` or inline in `.schema` output.
+
+## Syntax
+
+```sql
+COMMENT ON TABLE table-name IS 'description';
+COMMENT ON COLUMN table-name.column-name IS 'description';
+COMMENT ON INDEX index-name IS 'description';
+COMMENT ON VIEW view-name IS 'description';
+COMMENT ON TYPE type-name IS 'description';
+
+-- Remove a comment
+COMMENT ON TABLE table-name IS NULL;
+```
+
+## Description
+
+Comments provide documentation for database objects directly within the database itself. They are useful for:
+
+- Documenting the purpose of tables, columns, and indexes
+- Providing context for other developers working with the schema
+- Self-documenting database designs that travel with the data
+
+Comments are stored in an internal table (`__turso_internal_comments`) that is created lazily on first use. This table is hidden from `.schema` and `.tables` output but is included in `.dump` as `COMMENT ON` statements, so comments survive backup and restore cycles.
+
+### Supported Object Types
+
+| Object Type | Syntax | Description |
+|-------------|--------|-------------|
+| Table | `COMMENT ON TABLE name IS ...` | Comment on a table |
+| Column | `COMMENT ON COLUMN table.column IS ...` | Comment on a specific column within a table |
+| Index | `COMMENT ON INDEX name IS ...` | Comment on an index |
+| View | `COMMENT ON VIEW name IS ...` | Comment on a view |
+| Type | `COMMENT ON TYPE name IS ...` | Comment on a custom type |
+
+### Updating and Removing Comments
+
+Setting a new comment on an object that already has one replaces the existing comment. Setting the comment to `NULL` removes it entirely.
+
+```sql
+-- Set a comment
+COMMENT ON TABLE users IS 'Original description';
+
+-- Replace it
+COMMENT ON TABLE users IS 'Updated description';
+
+-- Remove it
+COMMENT ON TABLE users IS NULL;
+```
+
+### Validation
+
+The target object must exist when the comment is created. Attempting to comment on a nonexistent table, column, index, view, or type produces a parse error.
+
+```sql
+COMMENT ON TABLE nonexistent IS 'fails';
+-- Error: no such table: nonexistent
+
+COMMENT ON COLUMN users.nonexistent IS 'fails';
+-- Error: no such column: users.nonexistent
+```
+
+## Viewing Comments
+
+### PRAGMA comment_list
+
+Lists all comments, or comments filtered by object name. See [PRAGMAs](/docs/sql-reference/pragmas#comment_list) for details.
+
+```sql
+PRAGMA comment_list;
+PRAGMA comment_list(users);
+```
+
+### .schema
+
+The `.schema` shell command displays comments inline using SQL `--` comment syntax:
+
+```
+tursodb> .schema
+-- Main user table
+CREATE TABLE users (
+  id INTEGER PRIMARY KEY,
+  name TEXT, -- Full display name
+  email TEXT
+);
+-- Fast email lookups
+CREATE INDEX idx_email ON users (email);
+```
+
+### .dump
+
+The `.dump` command exports comments as `COMMENT ON` statements, ensuring they can be restored into a new database:
+
+```
+tursodb> .dump
+PRAGMA foreign_keys=OFF;
+BEGIN TRANSACTION;
+CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT);
+CREATE INDEX idx_email ON users (email);
+COMMENT ON TABLE users IS 'Main user table';
+COMMENT ON COLUMN users.name IS 'Full display name';
+COMMENT ON INDEX idx_email IS 'Fast email lookups';
+COMMIT;
+```
+
+## Examples
+
+### Documenting a Schema
+
+```sql
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    email TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_users_email ON users(email);
+
+COMMENT ON TABLE users IS 'Core user accounts';
+COMMENT ON COLUMN users.name IS 'Full display name';
+COMMENT ON COLUMN users.email IS 'Primary email, used for login';
+COMMENT ON COLUMN users.created_at IS 'Account creation timestamp (UTC)';
+COMMENT ON INDEX idx_users_email IS 'Unique email lookup for authentication';
+```
+
+### Viewing All Comments
+
+```sql
+PRAGMA comment_list;
+-- object_type | object_name     | sub_name   | description
+-- table       | users           |            | Core user accounts
+-- column      | users           | name       | Full display name
+-- column      | users           | email      | Primary email, used for login
+-- column      | users           | created_at | Account creation timestamp (UTC)
+-- index       | idx_users_email |            | Unique email lookup for authentication
+```
+
+### Filtering Comments by Object
+
+```sql
+PRAGMA comment_list(users);
+-- object_type | object_name | sub_name   | description
+-- table       | users       |            | Core user accounts
+-- column      | users       | name       | Full display name
+-- column      | users       | email      | Primary email, used for login
+-- column      | users       | created_at | Account creation timestamp (UTC)
+```
+
+## See Also
+
+- [PRAGMAs](/docs/sql-reference/pragmas#comment_list) for the `comment_list` pragma
+- [CREATE TABLE](/docs/sql-reference/statements/create-table) for table definitions
+- [CREATE INDEX](/docs/sql-reference/statements/create-index) for index definitions
