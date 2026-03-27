@@ -681,26 +681,19 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a bracket-quoted identifier like `[name]` or `[ multi word name]`.
-    /// Captures the raw bytes between `[` and `]` so whitespace is preserved
-    /// verbatim (the lexer discards inter-token whitespace, so we can't
-    /// reassemble from tokens without losing e.g. leading spaces).
     fn parse_bracket_quoted_name(&mut self) -> Result<Name> {
         eat_assert!(self, TK_LBRACKET);
-        // Byte offset right after the `[` token
         let start = self.lexer.offset;
-        loop {
-            let tok = match self.eat()? {
-                Some(t) => t,
-                None => return Err(Error::ParseUnexpectedEOF),
-            };
-            if tok.token_type == TK_RBRACKET {
-                // tok.value points to `]`; its start is the end of our content
-                let end = tok.value.as_ptr() as usize - self.lexer.input.as_ptr() as usize;
-                let raw = &self.lexer.input[start..end];
-                let name = String::from_utf8_lossy(raw).into_owned();
-                return Ok(Name::exact(name));
-            }
-        }
+        let rest = &self.lexer.input[start..];
+        let end_pos = rest
+            .iter()
+            .position(|&b| b == b']')
+            .ok_or(Error::ParseUnexpectedEOF)?;
+        let raw = &self.lexer.input[start..start + end_pos];
+        let name = String::from_utf8_lossy(raw).into_owned();
+        // Advance lexer past the closing `]`
+        self.lexer.offset = start + end_pos + 1;
+        Ok(Name::exact(name))
     }
 
     fn parse_transopt(&mut self) -> Result<Option<Name>> {
