@@ -1341,6 +1341,9 @@ pub struct Pager {
     /// Only stored on Apple platforms; on others, always returns Fsync.
     #[cfg(target_vendor = "apple")]
     sync_type: AtomicFileSyncType,
+    /// True for ephemeral pagers. Skips disk I/O in allocate_page1() so that
+    /// small ephemeral tables never touch the filesystem.
+    temp_file: AtomicBool,
 }
 
 assert_send_sync!(Pager);
@@ -1509,6 +1512,7 @@ impl Pager {
             init_page_1,
             #[cfg(target_vendor = "apple")]
             sync_type: AtomicFileSyncType::new(FileSyncType::Fsync),
+            temp_file: AtomicBool::new(false),
         })
     }
 
@@ -1538,6 +1542,10 @@ impl Pager {
     #[cfg(not(target_vendor = "apple"))]
     pub fn set_sync_type(&self, _value: FileSyncType) {
         // No-op: FullFsync only has effect on Apple platforms
+    }
+
+    pub fn set_temp_file(&self, value: bool) {
+        self.temp_file.store(value, Ordering::SeqCst);
     }
 
     pub fn init_page_1(&self) -> Arc<ArcSwapOption<Page>> {
@@ -4376,6 +4384,27 @@ impl Pager {
                     (default_header.page_size.get() - default_header.reserved_space as u32)
                         as usize,
                 );
+
+                if self.temp_file.load(Ordering::SeqCst) {
+                    // Ephemeral pager: skip disk write, insert page 1 directly
+                    // into cache as dirty. The LazyFile will create the actual
+                    // file only if the cache spills to disk later.
+                    let page_key = PageCacheKey::new(page1.get().id);
+                    self.page_cache
+                        .write()
+                        .insert(page_key, page1.clone())
+                        .map_err(|e| {
+                            LimboError::InternalError(format!(
+                                "Failed to insert page 1 into cache: {e:?}"
+                            ))
+                        })?;
+                    page1.set_dirty();
+                    self.dirty_pages.write().insert(1);
+                    self.init_page_1.store(None);
+                    *self.allocate_page1_state.write() = AllocatePage1State::Done;
+                    return Ok(IOResult::Done(page1));
+                }
+
                 let c = begin_write_btree_page(self, &page1)?;
 
                 // Pin page1 to prevent eviction while stored in state machine

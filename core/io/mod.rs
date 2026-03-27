@@ -128,6 +128,114 @@ pub trait File: Send + Sync {
     }
 }
 
+/// A file that defers actual filesystem creation until the first write.
+/// Used for ephemeral tables so that small tables (e.g. IN lists) never
+/// touch the filesystem — all pages stay in the page cache.
+/// When dropped, the temp directory (and file inside it) is automatically removed.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) struct LazyFile {
+    io: Arc<dyn IO>,
+    inner: crate::sync::Mutex<Option<OpenedLazyFile>>,
+}
+
+#[cfg(not(target_family = "wasm"))]
+struct OpenedLazyFile {
+    /// Dropping this removes the temp directory and the file inside it.
+    _temp_dir: tempfile::TempDir,
+    file: Arc<dyn File>,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl LazyFile {
+    pub fn new(io: Arc<dyn IO>) -> Self {
+        Self {
+            io,
+            inner: crate::sync::Mutex::new(None),
+        }
+    }
+
+    fn ensure_open(&self) -> Result<Arc<dyn File>> {
+        let mut inner = self.inner.lock();
+        if let Some(ref opened) = *inner {
+            return Ok(opened.file.clone());
+        }
+        let temp_dir =
+            tempfile::tempdir().map_err(|e| crate::error::io_error(e, "ephemeral tempdir"))?;
+        let path = temp_dir.as_ref().join("tursodb_ephemeral");
+        let path_str = path.to_str().ok_or_else(|| {
+            crate::LimboError::InternalError(
+                "Failed to convert ephemeral path to string".to_string(),
+            )
+        })?;
+        let file = self.io.open_file(path_str, OpenFlags::Create, false)?;
+        *inner = Some(OpenedLazyFile {
+            _temp_dir: temp_dir,
+            file: file.clone(),
+        });
+        Ok(file)
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl File for LazyFile {
+    fn lock_file(&self, _exclusive: bool) -> Result<()> {
+        Ok(())
+    }
+
+    fn unlock_file(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+        let inner = self.inner.lock();
+        if let Some(ref opened) = *inner {
+            return opened.file.pread(pos, c);
+        }
+        drop(inner);
+        // No file yet — complete with 0 bytes read (no data on disk)
+        c.complete(0);
+        Ok(c)
+    }
+
+    fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+        let file = self.ensure_open()?;
+        file.pwrite(pos, buffer, c)
+    }
+
+    fn pwritev(&self, pos: u64, buffers: Vec<Arc<Buffer>>, c: Completion) -> Result<Completion> {
+        let file = self.ensure_open()?;
+        file.pwritev(pos, buffers, c)
+    }
+
+    fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {
+        let inner = self.inner.lock();
+        if let Some(ref opened) = *inner {
+            return opened.file.sync(c, sync_type);
+        }
+        drop(inner);
+        c.complete(0);
+        Ok(c)
+    }
+
+    fn size(&self) -> Result<u64> {
+        let inner = self.inner.lock();
+        if let Some(ref opened) = *inner {
+            return opened.file.size();
+        }
+        Ok(0)
+    }
+
+    fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+        let inner = self.inner.lock();
+        if let Some(ref opened) = *inner {
+            return opened.file.truncate(len, c);
+        }
+        drop(inner);
+        c.complete(0);
+        Ok(c)
+    }
+}
+
 pub struct TempFile {
     /// When temp_dir is dropped the folder is deleted
     /// set to None if tempfile allocated in memory (for example, in case of WASM target)
