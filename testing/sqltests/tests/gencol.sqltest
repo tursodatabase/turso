@@ -2819,3 +2819,123 @@ expect {
     2|210
     3|310
 }
+
+# ─── FK on virtual generated columns backed by UNIQUE INDEX ───
+
+# Parent UPDATE with default NO ACTION should fail when gen-col FK changes
+@cross-check-integrity
+test fk-gencol-unique-idx-update-no-action {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER, b INTEGER GENERATED ALWAYS AS (a*2) VIRTUAL);
+    CREATE UNIQUE INDEX idx_p_b ON p(b);
+    CREATE TABLE c(x INTEGER REFERENCES p(b));
+    INSERT INTO p(a) VALUES(1);
+    INSERT INTO c(x) VALUES(2);
+    UPDATE p SET a=3 WHERE a=1;
+}
+expect error {
+}
+
+# ON DELETE CASCADE should remove child rows
+@cross-check-integrity
+test fk-gencol-unique-idx-delete-cascade {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER, b INTEGER GENERATED ALWAYS AS (a*2) VIRTUAL);
+    CREATE UNIQUE INDEX idx_p_b ON p(b);
+    CREATE TABLE c(x INTEGER REFERENCES p(b) ON DELETE CASCADE);
+    INSERT INTO p(a) VALUES(10);
+    INSERT INTO c(x) VALUES(20);
+    DELETE FROM p WHERE a=10;
+    SELECT count(*) FROM c;
+}
+expect {
+    0
+}
+
+# ON DELETE SET NULL should null-out child FK column
+@cross-check-integrity
+test fk-gencol-unique-idx-delete-set-null {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER, b INTEGER GENERATED ALWAYS AS (a*2) VIRTUAL);
+    CREATE UNIQUE INDEX idx_p_b ON p(b);
+    CREATE TABLE c(x INTEGER REFERENCES p(b) ON DELETE SET NULL);
+    INSERT INTO p(a) VALUES(100);
+    INSERT INTO c(x) VALUES(200);
+    DELETE FROM p WHERE a=100;
+    SELECT typeof(x), x FROM c;
+}
+expect {
+    null|
+}
+
+# ON UPDATE CASCADE should propagate new generated value
+@cross-check-integrity
+test fk-gencol-unique-idx-update-cascade {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER, b INTEGER GENERATED ALWAYS AS (a*2) VIRTUAL);
+    CREATE UNIQUE INDEX idx_p_b ON p(b);
+    CREATE TABLE c(x INTEGER REFERENCES p(b) ON UPDATE CASCADE);
+    INSERT INTO p(a) VALUES(1000);
+    INSERT INTO c(x) VALUES(2000);
+    UPDATE p SET a=1001 WHERE a=1000;
+    SELECT * FROM c;
+}
+expect {
+    2002
+}
+
+# DROP TABLE should fail with default NO ACTION when child rows exist
+@cross-check-integrity
+test fk-gencol-unique-idx-drop-table {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p2(a INTEGER, b INTEGER GENERATED ALWAYS AS (a*2) VIRTUAL);
+    CREATE UNIQUE INDEX idx_p2_b ON p2(b);
+    CREATE TABLE c5(x INTEGER REFERENCES p2(b));
+    INSERT INTO p2(a) VALUES(1);
+    INSERT INTO c5(x) VALUES(2);
+    DROP TABLE p2;
+}
+expect error {
+}
+
+# Child insert validation should still work (sanity check)
+@cross-check-integrity
+test fk-gencol-unique-idx-child-insert-reject {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER, b INTEGER GENERATED ALWAYS AS (a*2) VIRTUAL);
+    CREATE UNIQUE INDEX idx_p_b ON p(b);
+    CREATE TABLE c(x INTEGER REFERENCES p(b));
+    INSERT INTO p(a) VALUES(1);
+    INSERT INTO c(x) VALUES(3);
+}
+expect error {
+}
+
+# Virtual column NOT at end of schema -- tests physical column index mapping
+@cross-check-integrity
+test fk-gencol-unique-idx-mid-schema-delete-cascade {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER, b INTEGER GENERATED ALWAYS AS (a*2) VIRTUAL, c TEXT);
+    CREATE UNIQUE INDEX idx_p_b ON p(b);
+    CREATE TABLE c(x INTEGER REFERENCES p(b) ON DELETE CASCADE);
+    INSERT INTO p(a, c) VALUES(10, 'hello');
+    INSERT INTO c(x) VALUES(20);
+    DELETE FROM p WHERE a=10;
+    SELECT count(*) FROM c;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-gencol-unique-idx-mid-schema-update-no-action {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER, b INTEGER GENERATED ALWAYS AS (a*2) VIRTUAL, c TEXT);
+    CREATE UNIQUE INDEX idx_p_b ON p(b);
+    CREATE TABLE c(x INTEGER REFERENCES p(b));
+    INSERT INTO p(a, c) VALUES(1, 'hi');
+    INSERT INTO c(x) VALUES(2);
+    UPDATE p SET a=3 WHERE a=1;
+}
+expect error {
+}

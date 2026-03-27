@@ -3609,9 +3609,19 @@ impl ResolvedFkRef {
             // Without a rowid alias, a direct rowid update is represented separately with ROWID_SENTINEL
             return true;
         }
-        self.parent_pos
-            .iter()
-            .any(|p| updated_parent_positions.contains(p))
+        self.parent_pos.iter().any(|p| {
+            if updated_parent_positions.contains(p) {
+                return true;
+            }
+            // If this FK column is a virtual generated column, it changes whenever
+            // any column it depends on changes. Conservatively return true if any
+            // non-generated column is being updated, since the expression could
+            // reference any of them.
+            parent_tbl
+                .columns
+                .get(*p)
+                .is_some_and(|c| c.is_virtual_generated() && !updated_parent_positions.is_empty())
+        })
     }
 
     /// Returns if any child column of this FK is in `updated_child_positions`

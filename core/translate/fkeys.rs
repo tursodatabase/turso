@@ -5,9 +5,13 @@ use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
 use crate::{
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
     schema::{BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef, ROWID_SENTINEL},
-    translate::{collate::CollationSeq, emitter::Resolver, planner::ROWID_STRS},
+    translate::{
+        collate::CollationSeq,
+        emitter::{gencol::compute_virtual_columns, Resolver},
+        planner::ROWID_STRS,
+    },
     vdbe::{
-        builder::{CursorType, QueryMode},
+        builder::{CursorType, DmlColumnContext, QueryMode},
         insn::{CmpInsFlags, Insn},
         BranchOffset,
     },
@@ -433,26 +437,65 @@ pub fn emit_parent_index_key_change_checks(
     }
 
     let idx_len = index.columns.len();
+    let layout = table_btree.column_layout();
+    let has_virtual_in_index = index
+        .columns
+        .iter()
+        .any(|ic| table_btree.columns[ic.pos_in_table].is_virtual_generated());
 
+    // Build OLD key from cursor. When any index column is a virtual generated
+    // column we must load the whole row and compute virtual columns, since
+    // virtual columns are not stored in the physical record.
     let old_key = program.alloc_registers(idx_len);
-    for (i, index_col) in index.columns.iter().enumerate() {
-        let pos_in_table = index_col.pos_in_table;
-        let column = &table_btree.columns[pos_in_table];
-        if column.is_rowid_alias() {
+    if has_virtual_in_index {
+        let ncols = table_btree.columns.len();
+        let tmp_base = program.alloc_registers(ncols);
+        for (ci, col) in table_btree.columns.iter().enumerate() {
+            let reg = layout.to_register(tmp_base, ci);
+            if col.is_virtual_generated() {
+                program.emit_null(reg, None);
+            } else if col.is_rowid_alias() {
+                program.emit_insn(Insn::Copy {
+                    src_reg: old_rowid_reg,
+                    dst_reg: reg,
+                    extra_amount: 0,
+                });
+            } else {
+                program.emit_column_or_rowid(cursor_id, ci, reg);
+            }
+        }
+        let dml_ctx = DmlColumnContext::layout(
+            &table_btree.columns,
+            tmp_base,
+            old_rowid_reg,
+            layout.clone(),
+        );
+        compute_virtual_columns(program, &table_btree.columns, &dml_ctx, resolver)?;
+        for (i, index_col) in index.columns.iter().enumerate() {
+            let src = dml_ctx.to_column_reg(index_col.pos_in_table);
             program.emit_insn(Insn::Copy {
-                src_reg: old_rowid_reg,
+                src_reg: src,
                 dst_reg: old_key + i,
                 extra_amount: 0,
             });
-        } else {
-            program.emit_insn(Insn::Column {
-                cursor_id,
-                column: pos_in_table,
-                dest: old_key + i,
-                default: None,
-            });
+        }
+    } else {
+        for (i, index_col) in index.columns.iter().enumerate() {
+            let pos_in_table = index_col.pos_in_table;
+            let column = &table_btree.columns[pos_in_table];
+            if column.is_rowid_alias() {
+                program.emit_insn(Insn::Copy {
+                    src_reg: old_rowid_reg,
+                    dst_reg: old_key + i,
+                    extra_amount: 0,
+                });
+            } else {
+                program.emit_column_or_rowid(cursor_id, pos_in_table, old_key + i);
+            }
         }
     }
+
+    // Build NEW key from the new-values registers (which use ColumnLayout).
     let new_key = program.alloc_registers(idx_len);
     for (i, index_col) in index.columns.iter().enumerate() {
         let pos_in_table = index_col.pos_in_table;
@@ -460,7 +503,7 @@ pub fn emit_parent_index_key_change_checks(
         let src = if column.is_rowid_alias() {
             new_rowid_reg
         } else {
-            new_values_start + pos_in_table
+            layout.to_register(new_values_start, pos_in_table)
         };
         program.emit_insn(Insn::Copy {
             src_reg: src,
@@ -733,7 +776,67 @@ fn build_parent_key(
     parent_cursor_id: usize,
     parent_rowid_reg: usize,
     dest_start: usize,
+    resolver: &Resolver,
 ) -> Result<()> {
+    let has_virtual = parent_cols.iter().any(|pcol| {
+        parent_bt
+            .get_column(pcol)
+            .is_some_and(|(_, c)| c.is_virtual_generated())
+    });
+
+    // When any FK column is a virtual generated column, we must evaluate its
+    // expression from the other columns. Load all non-virtual columns from the
+    // cursor into temp registers, compute virtual columns, then copy the FK
+    // columns out.
+    if has_virtual {
+        let layout = parent_bt.column_layout();
+        let ncols = parent_bt.columns.len();
+        let tmp_base = program.alloc_registers(ncols);
+        for (idx, col) in parent_bt.columns.iter().enumerate() {
+            let reg = layout.to_register(tmp_base, idx);
+            if col.is_virtual_generated() {
+                program.emit_null(reg, None);
+            } else if col.is_rowid_alias() {
+                program.emit_insn(Insn::Copy {
+                    src_reg: parent_rowid_reg,
+                    dst_reg: reg,
+                    extra_amount: 0,
+                });
+            } else {
+                program.emit_column_or_rowid(parent_cursor_id, idx, reg);
+            }
+        }
+        let dml_ctx = DmlColumnContext::layout(
+            &parent_bt.columns,
+            tmp_base,
+            parent_rowid_reg,
+            layout,
+        );
+        compute_virtual_columns(program, &parent_bt.columns, &dml_ctx, resolver)?;
+
+        // Copy just the FK columns to dest registers
+        for (i, pcol) in parent_cols.iter().enumerate() {
+            let src = if ROWID_STRS.iter().any(|s| pcol.eq_ignore_ascii_case(s)) {
+                parent_rowid_reg
+            } else {
+                let (pos, col) = parent_bt
+                    .get_column(pcol)
+                    .ok_or_else(|| LimboError::InternalError(format!("col {pcol} missing")))?;
+                if col.is_rowid_alias() {
+                    parent_rowid_reg
+                } else {
+                    dml_ctx.to_column_reg(pos)
+                }
+            };
+            program.emit_insn(Insn::Copy {
+                src_reg: src,
+                dst_reg: dest_start + i,
+                extra_amount: 0,
+            });
+        }
+        return Ok(());
+    }
+
     for (i, pcol) in parent_cols.iter().enumerate() {
         let src = if ROWID_STRS.iter().any(|s| pcol.eq_ignore_ascii_case(s)) {
             parent_rowid_reg
@@ -1040,6 +1143,7 @@ fn emit_fk_delete_parent_existence_check_single(
         parent_cursor_id,
         parent_rowid_reg,
         parent_key_start,
+        resolver,
     )?;
 
     let child_cols = &fk_ref.fk.child_columns;
@@ -1777,6 +1881,7 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
                 parent_cursor_id,
                 parent_rowid_reg,
                 key_regs_start,
+                resolver,
             )?;
 
             match fk_ref.fk.on_delete {
@@ -2084,6 +2189,7 @@ pub fn emit_fk_drop_table_check(
             parent_write_cur,
             current_rowid_reg,
             key_regs_start,
+            resolver,
         )?;
 
         // Decode encoded values so they match the subprogram's decoded column reads
@@ -2126,6 +2232,7 @@ pub fn emit_fk_drop_table_check(
             parent_write_cur,
             current_rowid_reg,
             parent_key_start,
+            resolver,
         )?;
 
         // Scan child table for matching rows
