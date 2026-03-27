@@ -53,7 +53,7 @@ def parse_args():
     return args
 
 def validate_version(version):
-    pattern = r'^\d+\.\d+\.\d+(-[a-zA-Z0-9]+(\.[a-zA-Z0-9]+)*)?$'
+    pattern = r"^\d+\.\d+\.\d+(-[a-zA-Z0-9]+(\.[a-zA-Z0-9]+)*)?$"
     if not re.match(pattern, version):
         print(f"Error: invalid version format '{version}'", file=sys.stderr)
         print("Expected format: MAJOR.MINOR.PATCH[-pre.RELEASE] (e.g., 0.6.0, 0.6.0-pre.123)", file=sys.stderr)
