@@ -32,6 +32,7 @@ simulator = ["fuzz", "serde"]
 serde = ["dep:serde"]
 series = []
 encryption = []
+pure-rust-crypto = ["aegis/pure-rust"]
 checksum = []
 cli_only = []
 test_helper = []
@@ -125,16 +126,15 @@ loom = { workspace = true }
 [target.'cfg(shuttle)'.dependencies]
 shuttle = { workspace = true }
 
-# Use pure-rust for Android and MacOS to avoid C cross-compilation issues
+# Use pure-rust for Android and MacOS to avoid C cross-compilation issues.
+# Other targets can opt in via the `pure-rust-crypto` feature.
 [target.'cfg(any(target_os = "android", target_os = "macos"))'.dependencies]
 aegis = { version = "0.9.5", features = ["pure-rust"] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "macos")))'.dependencies]
-aegis = "0.9.5"
+aegis = { version = "0.9.5" }
 
 [build-dependencies]
-chrono = { workspace = true, default-features = false }
-built = { version = "0.7.5", features = ["chrono"] }
 
 [target.'cfg(not(target_family = "windows"))'.dev-dependencies]
 pprof = { version = "0.14.0", features = ["criterion", "flamegraph"] }
