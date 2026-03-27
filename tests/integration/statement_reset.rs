@@ -92,6 +92,28 @@ fn returning_delete_drop_after_partial_read_commits(tmp_db: TempDatabase) -> any
     Ok(())
 }
 
+/// Reproduces https://github.com/tursodatabase/turso/issues/5930
+/// When a prepared statement is stepped after DDL runs inside an explicit
+/// BEGIN...COMMIT transaction, reprepare() overwrites the connection schema
+/// with the stale shared DB schema, causing an infinite SchemaUpdated loop.
+#[turso_macros::test(init_sql = "CREATE TABLE t0 (c0 TEXT);")]
+fn reprepare_loop_during_explicit_txn(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    // Pre-prepare INSERT (caches schema cookie from before the DDL)
+    let mut insert_stmt = conn.prepare("INSERT INTO t0 VALUES ('hello')")?;
+
+    // Explicit transaction with DDL that advances the schema cookie
+    conn.execute("BEGIN")?;
+    conn.execute("CREATE TABLE t1 (c0 TEXT)")?;
+
+    // Step the stale prepared statement — triggers SchemaUpdated → reprepare
+    insert_stmt.run_ignore_rows()?;
+
+    conn.execute("COMMIT")?;
+    Ok(())
+}
+
 /// Plain INSERT (no RETURNING): runs to completion via step(), then drop.
 /// This is the normal case — Halt commits the transaction.
 #[turso_macros::test(init_sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);")]
