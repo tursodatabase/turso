@@ -2931,12 +2931,15 @@ fn begin_mvcc_tx(
     pager: &Arc<Pager>,
     mode: &TransactionMode,
     existing_tx_id: Option<u64>,
+    allow_speculative_override: bool,
 ) -> Result<u64> {
     match mode {
         TransactionMode::None | TransactionMode::Read | TransactionMode::Concurrent => {
             mv_store.begin_tx(pager.clone())
         }
-        TransactionMode::Write => mv_store.begin_exclusive_tx(pager.clone(), existing_tx_id),
+        TransactionMode::Write => {
+            mv_store.begin_exclusive_tx(pager.clone(), existing_tx_id, allow_speculative_override)
+        }
     }
 }
 
@@ -3049,12 +3052,21 @@ pub fn op_transaction_inner(
                                         .to_string(),
                                 ));
                             }
+                            let allow_speculative_override =
+                                matches!(tx_mode, TransactionMode::Write)
+                                    && !conn_has_executed_begin_deferred;
                             // Use the same tx_mode as the main DB's active
                             // transaction when available, so BEGIN CONCURRENT
                             // applies to all databases uniformly.
                             let effective_mode =
                                 conn.get_mv_tx().map(|(_, mode)| mode).unwrap_or(*tx_mode);
-                            match begin_mvcc_tx(mv_store, &pager, &effective_mode, None) {
+                            match begin_mvcc_tx(
+                                mv_store,
+                                &pager,
+                                &effective_mode,
+                                None,
+                                allow_speculative_override,
+                            ) {
                                 Ok(tx_id) => {
                                     conn.set_mv_tx_for_db(*db, Some((tx_id, effective_mode)));
                                 }
@@ -3072,7 +3084,7 @@ pub fn op_transaction_inner(
                                 && matches!(tx_mode, TransactionMode::Write)
                             {
                                 if let Err(err) =
-                                    begin_mvcc_tx(mv_store, &pager, tx_mode, Some(tx_id))
+                                    begin_mvcc_tx(mv_store, &pager, tx_mode, Some(tx_id), false)
                                 {
                                     pager.end_read_tx();
                                     return Err(err);
@@ -3113,7 +3125,16 @@ pub fn op_transaction_inner(
                         }
 
                         if !has_existing_mv_tx {
-                            match begin_mvcc_tx(mv_store, &pager, tx_mode, None) {
+                            let allow_speculative_override =
+                                matches!(tx_mode, TransactionMode::Write)
+                                    && !conn_has_executed_begin_deferred;
+                            match begin_mvcc_tx(
+                                mv_store,
+                                &pager,
+                                tx_mode,
+                                None,
+                                allow_speculative_override,
+                            ) {
                                 Ok(tx_id) => {
                                     program
                                         .connection
@@ -3140,9 +3161,13 @@ pub fn op_transaction_inner(
                             if matches!(new_transaction_state, TransactionState::Write { .. })
                                 && matches!(actual_tx_mode, TransactionMode::Write)
                             {
-                                if let Err(err) =
-                                    begin_mvcc_tx(mv_store, &pager, &actual_tx_mode, Some(tx_id))
-                                {
+                                if let Err(err) = begin_mvcc_tx(
+                                    mv_store,
+                                    &pager,
+                                    &actual_tx_mode,
+                                    Some(tx_id),
+                                    false,
+                                ) {
                                     if started_read_tx {
                                         pager.end_read_tx();
                                         conn.set_tx_state(TransactionState::None);
