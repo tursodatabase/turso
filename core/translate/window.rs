@@ -1038,7 +1038,11 @@ fn emit_aggregation_step(
 
         // If a FILTER clause is present, only accumulate when the condition is true.
         // NULL is treated as false (jump_if_null: true skips the AggStep on NULL).
-        let label_filter_skip = filter_clause.map(|_| program.allocate_label());
+        let label_filter_skip = if filter_clause.is_some() {
+            Some(program.allocate_label())
+        } else {
+            None
+        };
         if let (Some(filter_expr), Some(label)) = (filter_clause, label_filter_skip) {
             let filter_reg =
                 resolve_expr(program, Some(&plan.table_references), filter_expr, resolver)?;
