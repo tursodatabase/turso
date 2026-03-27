@@ -122,7 +122,7 @@ pub const DEFAULT_LOG_CHECKPOINT_THRESHOLD: i64 = 4120 * 1000;
 
 /// Optional callback invoked after serialization with a zero-copy reference to
 /// the serialized frame bytes and the running CRC, before the disk write.
-pub type OnSerializationComplete<'a> = Option<&'a dyn Fn(&[u8], u32)>;
+pub type OnSerializationComplete<'a> = Option<&'a dyn Fn(&[u8], u32) -> crate::Result<()>>;
 
 const LOG_MAGIC: u32 = 0x4C4D4C32; // "LML2" in LE
 const LOG_VERSION: u8 = 2;
@@ -383,7 +383,7 @@ impl LogicalLog {
 
         // 6. Call observer before writing — zero-copy reference into write_buf.
         if let Some(cb) = on_serialization_complete {
-            cb(&self.write_buf, crc);
+            cb(&self.write_buf, crc)?;
         }
 
         // 7. Copy write_buf into an I/O buffer and pwrite. write_buf keeps its allocation.
