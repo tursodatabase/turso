@@ -186,7 +186,7 @@ fn update_pragma(
             };
             let busy_timeout_ms = busy_timeout_ms.max(0);
             connection.set_busy_timeout(std::time::Duration::from_millis(busy_timeout_ms as u64));
-            Ok(TransactionMode::Write)
+            Ok(TransactionMode::None)
         }
         PragmaName::CacheSize => {
             let cache_size = match parse_signed_number(&value)? {
