@@ -1600,13 +1600,13 @@ impl Connection {
         // A fresh :memory: DB defaults to WAL, so when main is MVCC we need to
         // create an MvStore for the attached DB so it runs in the same mode.
         if is_memory_db && self.mvcc_enabled() && !db.mvcc_enabled() {
-            // todo(v): pass required encryption ctx to enable encryption with mvcc
+            let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
             let mv_store = journal_mode::open_mv_store(
                 db.io.clone(),
                 &db.path,
                 db.open_flags,
                 db.durable_storage.clone(),
-                None,
+                enc_ctx,
             )?;
             db.mv_store.store(Some(mv_store.clone()));
             let bootstrap_conn = db._connect(true, Some(pager.clone()), encryption_key)?;
@@ -1910,6 +1910,7 @@ impl Connection {
 
     pub fn set_encryption_key(&self, key: EncryptionKey) -> Result<()> {
         tracing::trace!("setting encryption key for connection");
+        self.ensure_can_change_encryption_settings()?;
         *self.encryption_key.write() = Some(key);
         self.bump_prepare_context_generation();
         self.set_encryption_context()
@@ -1917,6 +1918,7 @@ impl Connection {
 
     pub fn set_encryption_cipher(&self, cipher_mode: CipherMode) -> Result<()> {
         tracing::trace!("setting encryption cipher for connection");
+        self.ensure_can_change_encryption_settings()?;
         self.encryption_cipher_mode.set(cipher_mode);
         self.bump_prepare_context_generation();
         self.set_encryption_context()
@@ -1942,6 +1944,22 @@ impl Connection {
         }
     }
 
+    fn ensure_can_change_encryption_settings(&self) -> Result<()> {
+        let pager = self.pager.load();
+        if pager.is_encryption_ctx_set() {
+            return Err(LimboError::InvalidArgument(
+                "cannot reset encryption attributes if already set in the session".to_string(),
+            ));
+        }
+        if self.db.get_mv_store().is_some() {
+            return Err(LimboError::InvalidArgument(
+                "cannot enable encryption after MVCC is active; configure encryption before PRAGMA journal_mode='mvcc'"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     // if both key and cipher are set, set encryption context on pager
     fn set_encryption_context(&self) -> Result<()> {
         let key_guard = self.encryption_key.read();
@@ -1954,11 +1972,6 @@ impl Connection {
         };
         tracing::trace!("setting encryption ctx for connection");
         let pager = self.pager.load();
-        if pager.is_encryption_ctx_set() {
-            return Err(LimboError::InvalidArgument(
-                "cannot reset encryption attributes if already set in the session".to_string(),
-            ));
-        }
         pager.set_encryption_context(cipher_mode, key)
     }
 
