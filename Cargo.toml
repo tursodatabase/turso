@@ -34,6 +34,7 @@ members = [
     "perf/throughput/turso",
     "perf/throughput/rusqlite",
     "perf/encryption",
+    "perf/memory",
     "tools/dbhash",
     "sdk-kit",
     "sdk-kit-macros", 
