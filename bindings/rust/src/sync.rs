@@ -10,6 +10,9 @@ use std::{
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{header::AUTHORIZATION, Request};
+#[cfg(feature = "sync-rustls")]
+use hyper_rustls::HttpsConnector;
+#[cfg(feature = "sync")]
 use hyper_tls::HttpsConnector;
 use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
@@ -494,9 +497,19 @@ impl IoWorker {
         wakers: Arc<Mutex<Vec<Waker>>>,
     ) {
         // Create HTTPS-capable Hyper client.
-        let mut http_connector = HttpConnector::new();
-        http_connector.enforce_http(false);
-        let https: HttpsConnector<HttpConnector> = HttpsConnector::new();
+        #[cfg(feature = "sync")]
+        let https: HttpsConnector<HttpConnector> = {
+            let mut http = HttpConnector::new();
+            http.enforce_http(false);
+            HttpsConnector::new()
+        };
+        #[cfg(feature = "sync-rustls")]
+        let https: HttpsConnector<HttpConnector> = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_native_roots()
+            .expect("failed to load native TLS root certificates")
+            .https_or_http()
+            .enable_http1()
+            .build();
         let client: Client<HttpsConnector<HttpConnector>, Full<Bytes>> =
             Client::builder(TokioExecutor::new()).build::<_, Full<Bytes>>(https);
 
