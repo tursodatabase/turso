@@ -2055,6 +2055,26 @@ impl Program {
                 }
             }
         }
+        // If a MVCC commit was in progress, rollback_current_txn already cleaned
+        // up the store-level state. Mark the state machine as finalized so it
+        // doesn't panic on drop (its Drop impl asserts finalization).
+        match std::mem::replace(&mut state.commit_state, CommitState::Ready) {
+            CommitState::CommittingMvcc { mut state_machine } => {
+                if let Some(mv_store) = self.connection.mv_store().as_ref() {
+                    let _ = state_machine.finalize(mv_store);
+                }
+            }
+            CommitState::CommittingAttachedMvcc {
+                mut state_machine,
+                mv_store,
+                ..
+            } => {
+                let _ = state_machine.finalize(&mv_store);
+            }
+            other => {
+                state.commit_state = other;
+            }
+        }
         if state.uses_subjournal {
             pager.stop_use_subjournal();
             state.uses_subjournal = false;

@@ -988,6 +988,22 @@ pub struct DeleteRowStateMachine {
     cursor: Arc<RwLock<BTreeCursor>>,
 }
 
+impl<Clock: LogicalClock> Drop for CommitStateMachine<Clock> {
+    fn drop(&mut self) {
+        // Dropping a CommitStateMachine that progressed past Initial without
+        // finalizing leaks the transaction in Preparing state, holds commit
+        // locks, and poisons dependent transactions. Crash rather than corrupt.
+        if !matches!(self.state, CommitState::Initial) {
+            assert!(
+                self.is_finalized,
+                "CommitStateMachine dropped without being finalized (state={:?}). \
+                 This leaks locks and leaves the transaction in a broken state.",
+                self.state
+            );
+        }
+    }
+}
+
 impl<Clock: LogicalClock> CommitStateMachine<Clock> {
     fn new(
         state: CommitState<Clock>,
