@@ -2189,6 +2189,114 @@ expect error {
     error in trigger tr after drop column: no such column:
 }
 
+# Trigger SELECTs from a third table; drop column on unrelated table
+@cross-check-integrity
+test drop-column-unrelated-table-trigger-select-from-other {
+    CREATE TABLE some_data_table (id INTEGER PRIMARY KEY, scalar_column TEXT, other_col TEXT);
+    CREATE TABLE some_trigger_table (id INTEGER PRIMARY KEY, column_type TEXT, test_metadata TEXT);
+    CREATE TABLE metadata_table (id INTEGER PRIMARY KEY, test_column TEXT, is_deleted INTEGER);
+    CREATE TRIGGER _do_something_trigger
+        BEFORE INSERT ON some_trigger_table
+        WHEN NEW.column_type = 'Test'
+        BEGIN
+          SELECT CASE
+            WHEN COALESCE(
+              (SELECT test_column
+               FROM metadata_table
+               WHERE is_deleted = false
+            ), '') <> NEW.test_metadata
+            THEN RAISE(ROLLBACK, 'SomeError')
+          END;
+        END;
+    ALTER TABLE some_data_table DROP COLUMN scalar_column;
+    SELECT sql FROM sqlite_schema WHERE name = 'some_data_table';
+}
+expect {
+    CREATE TABLE some_data_table (id INTEGER PRIMARY KEY, other_col TEXT)
+}
+
+# Simpler case: trigger SELECT with bare column from FROM table, drop on unrelated table
+@cross-check-integrity
+test drop-column-unrelated-table-trigger-simple-select {
+    CREATE TABLE t1 (a, b, c);
+    CREATE TABLE t2 (x, y);
+    CREATE TABLE t3 (p, q);
+    CREATE TRIGGER tr BEFORE INSERT ON t2 BEGIN
+        SELECT p FROM t3 WHERE q = NEW.x;
+    END;
+    ALTER TABLE t1 DROP COLUMN c;
+    SELECT name FROM pragma_table_info('t1');
+}
+expect {
+    a
+    b
+}
+
+# Trigger with subquery in INSERT VALUES referencing third table columns
+@cross-check-integrity
+test drop-column-unrelated-table-trigger-insert-subquery {
+    CREATE TABLE t1 (a, b, c);
+    CREATE TABLE t2 (x);
+    CREATE TABLE t3 (m, n);
+    CREATE TRIGGER tr BEFORE INSERT ON t2 BEGIN
+        INSERT INTO t2(x) VALUES ((SELECT m FROM t3 WHERE n = 1));
+    END;
+    ALTER TABLE t1 DROP COLUMN c;
+    SELECT name FROM pragma_table_info('t1');
+}
+expect {
+    a
+    b
+}
+
+# Trigger UPDATE WHERE with subquery referencing third table columns
+@cross-check-integrity
+test drop-column-unrelated-table-trigger-update-subquery {
+    CREATE TABLE t1 (a, b, c);
+    CREATE TABLE t2 (x, y);
+    CREATE TABLE t3 (m, n);
+    CREATE TRIGGER tr BEFORE INSERT ON t2 BEGIN
+        UPDATE t2 SET x = 1 WHERE y IN (SELECT m FROM t3 WHERE n > 0);
+    END;
+    ALTER TABLE t1 DROP COLUMN c;
+    SELECT name FROM pragma_table_info('t1');
+}
+expect {
+    a
+    b
+}
+
+# Trigger DELETE WHERE with subquery referencing third table columns
+@cross-check-integrity
+test drop-column-unrelated-table-trigger-delete-subquery {
+    CREATE TABLE t1 (a, b, c);
+    CREATE TABLE t2 (x, y);
+    CREATE TABLE t3 (m, n);
+    CREATE TRIGGER tr BEFORE INSERT ON t2 BEGIN
+        DELETE FROM t2 WHERE y = (SELECT m FROM t3 WHERE n = 1);
+    END;
+    ALTER TABLE t1 DROP COLUMN c;
+    SELECT name FROM pragma_table_info('t1');
+}
+expect {
+    a
+    b
+}
+
+# Should still fail: trigger subquery references the DROPPED column from the altered table
+@cross-check-integrity
+test fail-drop-column-trigger-subquery-refs-dropped-col {
+    CREATE TABLE t1 (a, b, c);
+    CREATE TABLE t2 (x);
+    CREATE TRIGGER tr BEFORE INSERT ON t2 BEGIN
+        SELECT (SELECT c FROM t1);
+    END;
+    ALTER TABLE t1 DROP COLUMN c;
+}
+expect error {
+    error in trigger tr after drop column: no such column:
+}
+
 # Rename table then rename column with trigger present
 # Regression test for https://github.com/tursodatabase/turso/issues/6085
 @cross-check-integrity

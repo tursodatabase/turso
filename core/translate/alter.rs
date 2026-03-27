@@ -3118,66 +3118,18 @@ fn validate_trigger_columns_after_drop(
         })
     };
 
-    // Helper: walk an expression (including subqueries) and find bad column refs
-    let find_bad_in_expr = |expr: &ast::Expr,
-                            valid_columns: &[String],
-                            owning_cols: &Option<Vec<String>>|
-     -> Result<Option<String>> {
-        let mut bad: Option<String> = None;
-        crate::util::walk_expr_with_subqueries(expr, &mut |e: &ast::Expr| {
-            if bad.is_some() {
-                return Ok(WalkControl::SkipChildren);
-            }
-            bad = check_column_ref_valid(
-                e,
-                valid_columns,
-                owning_cols,
-                altered_table_norm,
-                post_drop_table,
-                resolver,
-                database_id,
-            );
-            if bad.is_some() {
-                Ok(WalkControl::SkipChildren)
-            } else {
-                Ok(WalkControl::Continue)
-            }
-        })?;
-        Ok(bad)
-    };
-
-    // Helper: walk a SELECT (including subqueries) and find bad column refs
-    let find_bad_in_select = |select: &ast::Select,
-                              valid_columns: &[String],
-                              owning_cols: &Option<Vec<String>>|
-     -> Result<Option<String>> {
-        let mut bad: Option<String> = None;
-        crate::util::walk_select_expressions(select, &mut |e: &ast::Expr| {
-            if bad.is_some() {
-                return Ok(WalkControl::SkipChildren);
-            }
-            bad = check_column_ref_valid(
-                e,
-                valid_columns,
-                owning_cols,
-                altered_table_norm,
-                post_drop_table,
-                resolver,
-                database_id,
-            );
-            if bad.is_some() {
-                Ok(WalkControl::SkipChildren)
-            } else {
-                Ok(WalkControl::Continue)
-            }
-        })?;
-        Ok(bad)
+    let ctx = DropColumnValidationCtx {
+        owning_table_columns: &owning_table_columns,
+        altered_table_norm,
+        post_drop_table,
+        resolver,
+        database_id,
     };
 
     // Validate WHEN clause — NEW/OLD refs resolve against the trigger's owning table
     if let Some(ref when_expr) = trigger.when_clause {
         if let Some(ref cols) = owning_table_columns {
-            if let Some(bad) = find_bad_in_expr(when_expr, cols, &owning_table_columns)? {
+            if let Some(bad) = find_bad_in_expr_scoped(when_expr, cols, &ctx)? {
                 return Ok(Some(bad));
             }
         }
@@ -3205,16 +3157,12 @@ fn validate_trigger_columns_after_drop(
                 // that validation to trigger execution time.
                 let all_cols = merge_cols(&cmd_table_cols, &owning_table_columns);
                 for set in sets {
-                    if let Some(bad) =
-                        find_bad_in_expr(&set.expr, &all_cols, &owning_table_columns)?
-                    {
+                    if let Some(bad) = find_bad_in_expr_scoped(&set.expr, &all_cols, &ctx)? {
                         return Ok(Some(bad));
                     }
                 }
                 if let Some(ref where_expr) = where_clause {
-                    if let Some(bad) =
-                        find_bad_in_expr(where_expr, &all_cols, &owning_table_columns)?
-                    {
+                    if let Some(bad) = find_bad_in_expr_scoped(where_expr, &all_cols, &ctx)? {
                         return Ok(Some(bad));
                     }
                 }
@@ -3224,7 +3172,7 @@ fn validate_trigger_columns_after_drop(
             // INSERT ... VALUES and INSERT ... SELECT are checked.
             ast::TriggerCmd::Insert { select, .. } => {
                 let all_cols = merge_cols(&owning_table_columns, &None);
-                if let Some(bad) = find_bad_in_select(select, &all_cols, &owning_table_columns)? {
+                if let Some(bad) = find_bad_in_select_scoped(select, &all_cols, &ctx)? {
                     return Ok(Some(bad));
                 }
             }
@@ -3243,16 +3191,14 @@ fn validate_trigger_columns_after_drop(
                 );
                 if let Some(ref where_expr) = where_clause {
                     let all_cols = merge_cols(&cmd_table_cols, &owning_table_columns);
-                    if let Some(bad) =
-                        find_bad_in_expr(where_expr, &all_cols, &owning_table_columns)?
-                    {
+                    if let Some(bad) = find_bad_in_expr_scoped(where_expr, &all_cols, &ctx)? {
                         return Ok(Some(bad));
                     }
                 }
             }
             ast::TriggerCmd::Select(select) => {
                 let all_cols = merge_cols(&owning_table_columns, &None);
-                if let Some(bad) = find_bad_in_select(select, &all_cols, &owning_table_columns)? {
+                if let Some(bad) = find_bad_in_select_scoped(select, &all_cols, &ctx)? {
                     return Ok(Some(bad));
                 }
             }
@@ -3260,6 +3206,263 @@ fn validate_trigger_columns_after_drop(
     }
 
     Ok(None)
+}
+
+/// Shared context for drop-column validation to reduce parameter passing.
+struct DropColumnValidationCtx<'a> {
+    owning_table_columns: &'a Option<Vec<String>>,
+    altered_table_norm: &'a str,
+    post_drop_table: &'a BTreeTable,
+    resolver: &'a Resolver<'a>,
+    database_id: usize,
+}
+
+/// Scope-aware validation of a SELECT for invalid column references after DROP COLUMN.
+/// Collects columns from FROM-clause tables so bare column references from those tables
+/// are not incorrectly rejected.
+fn find_bad_in_select_scoped(
+    select: &ast::Select,
+    parent_valid_cols: &[String],
+    ctx: &DropColumnValidationCtx,
+) -> Result<Option<String>> {
+    if let Some(with) = &select.with {
+        for cte in &with.ctes {
+            if let Some(bad) = find_bad_in_select_scoped(&cte.select, parent_valid_cols, ctx)? {
+                return Ok(Some(bad));
+            }
+        }
+    }
+
+    if let Some(bad) = find_bad_in_one_select_scoped(&select.body.select, parent_valid_cols, ctx)? {
+        return Ok(Some(bad));
+    }
+    for compound in &select.body.compounds {
+        if let Some(bad) = find_bad_in_one_select_scoped(&compound.select, parent_valid_cols, ctx)?
+        {
+            return Ok(Some(bad));
+        }
+    }
+
+    // ORDER BY and LIMIT share the same scope as the body's main SELECT
+    let scope_cols = match &select.body.select {
+        ast::OneSelect::Select { from, .. } => {
+            enrich_with_from_cols(parent_valid_cols, from.as_ref(), ctx)
+        }
+        ast::OneSelect::Values(_) => parent_valid_cols.to_vec(),
+    };
+    for sorted_col in &select.order_by {
+        if let Some(bad) = find_bad_in_expr_scoped(&sorted_col.expr, &scope_cols, ctx)? {
+            return Ok(Some(bad));
+        }
+    }
+    if let Some(limit) = &select.limit {
+        if let Some(bad) = find_bad_in_expr_scoped(&limit.expr, &scope_cols, ctx)? {
+            return Ok(Some(bad));
+        }
+        if let Some(offset) = &limit.offset {
+            if let Some(bad) = find_bad_in_expr_scoped(offset, &scope_cols, ctx)? {
+                return Ok(Some(bad));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn find_bad_in_one_select_scoped(
+    one_select: &ast::OneSelect,
+    parent_valid_cols: &[String],
+    ctx: &DropColumnValidationCtx,
+) -> Result<Option<String>> {
+    match one_select {
+        ast::OneSelect::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            ..
+        } => {
+            let scope_cols = enrich_with_from_cols(parent_valid_cols, from.as_ref(), ctx);
+
+            for col in columns {
+                if let ast::ResultColumn::Expr(expr, _) = col {
+                    if let Some(bad) = find_bad_in_expr_scoped(expr, &scope_cols, ctx)? {
+                        return Ok(Some(bad));
+                    }
+                }
+            }
+
+            // Walk FROM-clause subqueries and JOIN ON expressions
+            if let Some(from) = from {
+                if let Some(bad) = find_bad_in_from_clause(from, &scope_cols, ctx)? {
+                    return Ok(Some(bad));
+                }
+            }
+
+            if let Some(where_expr) = where_clause {
+                if let Some(bad) = find_bad_in_expr_scoped(where_expr, &scope_cols, ctx)? {
+                    return Ok(Some(bad));
+                }
+            }
+
+            if let Some(group_by) = group_by {
+                for expr in &group_by.exprs {
+                    if let Some(bad) = find_bad_in_expr_scoped(expr, &scope_cols, ctx)? {
+                        return Ok(Some(bad));
+                    }
+                }
+                if let Some(having) = &group_by.having {
+                    if let Some(bad) = find_bad_in_expr_scoped(having, &scope_cols, ctx)? {
+                        return Ok(Some(bad));
+                    }
+                }
+            }
+        }
+        ast::OneSelect::Values(values) => {
+            for row in values {
+                for expr in row {
+                    if let Some(bad) = find_bad_in_expr_scoped(expr, parent_valid_cols, ctx)? {
+                        return Ok(Some(bad));
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Enrich valid columns with columns from tables in a FROM clause.
+fn enrich_with_from_cols(
+    parent_valid_cols: &[String],
+    from: Option<&ast::FromClause>,
+    ctx: &DropColumnValidationCtx,
+) -> Vec<String> {
+    let mut scope_cols = parent_valid_cols.to_vec();
+    if let Some(from) = from {
+        collect_select_table_columns(&from.select, &mut scope_cols, ctx);
+        for join in &from.joins {
+            collect_select_table_columns(&join.table, &mut scope_cols, ctx);
+        }
+    }
+    scope_cols
+}
+
+fn collect_select_table_columns(
+    select_table: &ast::SelectTable,
+    cols: &mut Vec<String>,
+    ctx: &DropColumnValidationCtx,
+) {
+    match select_table {
+        ast::SelectTable::Table(name, _, _) | ast::SelectTable::TableCall(name, _, _) => {
+            let table_name = normalize_ident(name.name.as_str());
+            if let Some(table_cols) = get_table_columns(
+                &table_name,
+                ctx.altered_table_norm,
+                ctx.post_drop_table,
+                ctx.resolver,
+                ctx.database_id,
+            ) {
+                for c in table_cols {
+                    if !cols.contains(&c) {
+                        cols.push(c);
+                    }
+                }
+            }
+        }
+        // Subquery-derived tables have their own scope; their columns are validated
+        // when we recurse into the subquery itself.
+        ast::SelectTable::Select(_, _) | ast::SelectTable::Sub(_, _) => {}
+    }
+}
+
+fn find_bad_in_from_clause(
+    from: &ast::FromClause,
+    scope_cols: &[String],
+    ctx: &DropColumnValidationCtx,
+) -> Result<Option<String>> {
+    if let Some(bad) = find_bad_in_select_table(&from.select, scope_cols, ctx)? {
+        return Ok(Some(bad));
+    }
+    for join in &from.joins {
+        if let Some(bad) = find_bad_in_select_table(&join.table, scope_cols, ctx)? {
+            return Ok(Some(bad));
+        }
+        if let Some(ast::JoinConstraint::On(expr)) = &join.constraint {
+            if let Some(bad) = find_bad_in_expr_scoped(expr, scope_cols, ctx)? {
+                return Ok(Some(bad));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn find_bad_in_select_table(
+    select_table: &ast::SelectTable,
+    scope_cols: &[String],
+    ctx: &DropColumnValidationCtx,
+) -> Result<Option<String>> {
+    match select_table {
+        ast::SelectTable::Select(select, _) => find_bad_in_select_scoped(select, scope_cols, ctx),
+        ast::SelectTable::Sub(from_clause, _) => {
+            let sub_scope = enrich_with_from_cols(scope_cols, Some(from_clause), ctx);
+            find_bad_in_from_clause(from_clause, &sub_scope, ctx)
+        }
+        ast::SelectTable::TableCall(_, args, _) => {
+            for arg in args {
+                if let Some(bad) = find_bad_in_expr_scoped(arg, scope_cols, ctx)? {
+                    return Ok(Some(bad));
+                }
+            }
+            Ok(None)
+        }
+        ast::SelectTable::Table(_, _, _) => Ok(None),
+    }
+}
+
+/// Scope-aware expression validation. Uses [walk_expr] which does NOT auto-traverse
+/// into subqueries. Instead, subqueries are handled here by recursing into
+/// [find_bad_in_select_scoped] which enriches the valid columns with FROM-clause tables.
+fn find_bad_in_expr_scoped(
+    expr: &ast::Expr,
+    valid_cols: &[String],
+    ctx: &DropColumnValidationCtx,
+) -> Result<Option<String>> {
+    let mut bad: Option<String> = None;
+    walk_expr(expr, &mut |e: &ast::Expr| {
+        if bad.is_some() {
+            return Ok(WalkControl::SkipChildren);
+        }
+        // Handle subqueries: validate them with scope enrichment, then skip
+        match e {
+            ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
+                bad = find_bad_in_select_scoped(select, valid_cols, ctx)?;
+                return Ok(WalkControl::SkipChildren);
+            }
+            ast::Expr::InSelect { lhs, rhs, .. } => {
+                bad = find_bad_in_expr_scoped(lhs, valid_cols, ctx)?;
+                if bad.is_none() {
+                    bad = find_bad_in_select_scoped(rhs, valid_cols, ctx)?;
+                }
+                return Ok(WalkControl::SkipChildren);
+            }
+            _ => {}
+        }
+        bad = check_column_ref_valid(
+            e,
+            valid_cols,
+            ctx.owning_table_columns,
+            ctx.altered_table_norm,
+            ctx.post_drop_table,
+            ctx.resolver,
+            ctx.database_id,
+        );
+        if bad.is_some() {
+            Ok(WalkControl::SkipChildren)
+        } else {
+            Ok(WalkControl::Continue)
+        }
+    })?;
+    Ok(bad)
 }
 
 /// Check a single expression node for invalid column references after a DROP COLUMN.
