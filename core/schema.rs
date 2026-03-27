@@ -3592,9 +3592,8 @@ impl ResolvedFkRef {
             // Without a rowid alias, a direct rowid update is represented separately with ROWID_SENTINEL
             return true;
         }
-        self.parent_pos
-            .iter()
-            .any(|p| updated_parent_positions.contains(p))
+        let affected = columns_affected_by_update(&parent_tbl.columns, updated_parent_positions);
+        self.parent_pos.iter().any(|p| affected.contains(p))
     }
 
     /// Returns if any child column of this FK is in `updated_child_positions`

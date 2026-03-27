@@ -23,7 +23,7 @@ use crate::translate::plan::{Operation, ResultSetColumn, Search};
 use crate::translate::planner::parse_row_id;
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
 use crate::vdbe::affinity::Affinity;
-use crate::vdbe::builder::{CursorKey, SelfTableContext};
+use crate::vdbe::builder::{CursorKey, DmlColumnContext, SelfTableContext};
 use crate::vdbe::{
     builder::ProgramBuilder,
     insn::{CmpInsFlags, InsertFlags, Insn},
@@ -5210,24 +5210,62 @@ pub fn emit_table_column(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<()> {
+    do_emit_table_column(
+        program,
+        cursor_id,
+        &SelfTableContext::ForSelect {
+            table_ref_id,
+            referenced_tables: referenced_tables.clone(),
+        },
+        Some(referenced_tables),
+        column,
+        column_index,
+        target_register,
+        resolver,
+    )
+}
+
+/// Equivalent of [emit_table_column] for when registers are laid out for DML.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_table_column_for_dml(
+    program: &mut ProgramBuilder,
+    cursor_id: CursorID,
+    dml_column_context: DmlColumnContext,
+    column: &Column,
+    column_index: usize,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    do_emit_table_column(
+        program,
+        cursor_id,
+        &SelfTableContext::ForDML(dml_column_context),
+        None,
+        column,
+        column_index,
+        target_register,
+        resolver,
+    )
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn do_emit_table_column(
+    program: &mut ProgramBuilder,
+    cursor_id: CursorID,
+    self_table_context: &SelfTableContext,
+    referenced_tables: Option<&TableReferences>,
+    column: &Column,
+    column_index: usize,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<()> {
     match column.generated_type() {
         GeneratedType::Virtual { resolved: expr, .. } => {
-            program.with_self_table_context(
-                Some(&SelfTableContext::ForSelect {
-                    table_ref_id,
-                    referenced_tables: referenced_tables.clone(),
-                }),
-                |program, _| {
-                    translate_expr(
-                        program,
-                        Some(referenced_tables),
-                        expr,
-                        target_register,
-                        resolver,
-                    )?;
-                    Ok(())
-                },
-            )?;
+            program.with_self_table_context(Some(self_table_context), |program, _| {
+                translate_expr(program, referenced_tables, expr, target_register, resolver)?;
+                Ok(())
+            })?;
             program.emit_column_affinity(target_register, column.affinity());
         }
         _ => {
