@@ -4,7 +4,7 @@ use crate::sync::Arc;
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
 use crate::translate::collate::{get_collseq_from_expr, CollationSeq};
 use crate::translate::emitter::{Resolver, TranslateCtx};
-use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
+use crate::translate::expr::{resolve_expr, walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::order_by::EmitOrderBy;
 use crate::translate::plan::{
     Aggregate, Distinctness, JoinOrderMember, JoinedTable, QueryDestination, ResultSetColumn,
@@ -362,19 +362,11 @@ fn rewrite_expr_referencing_current_window(
     expr: &mut Expr,
 ) -> crate::Result<()> {
     fn normalize_over_clause(filter_over: &mut FunctionTail, window_name: &str) {
-        // FILTER clause is not supported yet. Proper checks elsewhere return appropriate
-        // error messages, and this ensures that nothing slips through unnoticed.
-        turso_assert!(
-            filter_over.filter_clause.is_none(),
-            "FILTER in window functions is not supported"
-        );
-
         // Replace inline OVER clause with a reference to the named window.
         // The window name may be user-provided or planner-generated.
-        *filter_over = FunctionTail {
-            filter_clause: None,
-            over_clause: Some(Over::Name(Name::exact(window_name.to_string()))),
-        };
+        // The filter_clause (if any) has already been rewritten to reference subquery columns
+        // and is preserved here for use during bytecode emission.
+        filter_over.over_clause = Some(Over::Name(Name::exact(window_name.to_string())));
     }
 
     match expr {
@@ -394,16 +386,54 @@ fn rewrite_expr_referencing_current_window(
                 order_by.is_empty(),
                 "ORDER BY in window functions is not supported"
             );
+            if let Some(filter_expr) = filter_over.filter_clause.as_deref_mut() {
+                rewrite_filter_clause_exprs(filter_expr, ctx)?;
+            }
             normalize_over_clause(filter_over, &window_name);
         }
         Expr::FunctionCallStar {
             filter_over,
             name: _,
         } => {
+            if let Some(filter_expr) = filter_over.filter_clause.as_deref_mut() {
+                rewrite_filter_clause_exprs(filter_expr, ctx)?;
+            }
             normalize_over_clause(filter_over, &window_name);
         }
         _ => unreachable!("only functions can reference windows"),
     }
+    Ok(())
+}
+
+/// Rewrites column references within a FILTER clause expression to reference
+/// the window's source subquery columns instead of the original table columns.
+///
+/// This mirrors the rewriting done for window function arguments, ensuring that
+/// during bytecode emission the filter condition reads from the same subquery
+/// cursor that provides the aggregate function's input.
+fn rewrite_filter_clause_exprs(
+    filter_expr: &mut Expr,
+    ctx: &mut WindowSubqueryContext,
+) -> crate::Result<()> {
+    walk_expr_mut(
+        filter_expr,
+        &mut |expr: &mut Expr| -> crate::Result<WalkControl> {
+            match expr {
+                Expr::RowId { .. } | Expr::Column { .. } => {
+                    rewrite_expr_as_subquery_column(expr, ctx, false);
+                }
+                Expr::SubqueryResult { .. }
+                | Expr::Exists(..)
+                | Expr::InSelect { .. }
+                | Expr::Subquery(..) => {
+                    rewrite_expr_as_subquery_column(expr, ctx, false);
+                    return Ok(WalkControl::SkipChildren);
+                }
+                _ => {}
+            }
+            Ok(WalkControl::Continue)
+        },
+    )?;
     Ok(())
 }
 
@@ -991,15 +1021,34 @@ fn emit_aggregation_step(
         // The aggregation step is performed incrementally as each row from the subquery is
         // processed. Therefore, we don’t need to access the buffer table and can obtain argument
         // values directly by evaluating the expressions that reference the subquery result columns.
-        let args = match &func.original_expr {
-            Expr::FunctionCall { args, .. } => args.iter().map(|a| (**a).clone()).collect(),
-            Expr::FunctionCallStar { .. } => vec![],
+        let (args, filter_clause) = match &func.original_expr {
+            Expr::FunctionCall { args, filter_over, .. } => (
+                args.iter().map(|a| (**a).clone()).collect::<Vec<_>>(),
+                filter_over.filter_clause.as_deref(),
+            ),
+            Expr::FunctionCallStar { filter_over, .. } => {
+                (vec![], filter_over.filter_clause.as_deref())
+            }
             _ => unreachable!(
                 "All window functions should be either FunctionCall or FunctionCallStar expressions"
             ),
         };
 
         let reg_acc_start = registers.acc_start + i;
+
+        // If a FILTER clause is present, only accumulate when the condition is true.
+        // NULL is treated as false (jump_if_null: true skips the AggStep on NULL).
+        let label_filter_skip = filter_clause.map(|_| program.allocate_label());
+        if let (Some(filter_expr), Some(label)) = (filter_clause, label_filter_skip) {
+            let filter_reg =
+                resolve_expr(program, Some(&plan.table_references), filter_expr, resolver)?;
+            program.emit_insn(Insn::IfNot {
+                reg: filter_reg,
+                target_pc: label,
+                jump_if_null: true,
+            });
+        }
+
         translate_aggregation_step(
             program,
             &plan.table_references,
@@ -1007,6 +1056,10 @@ fn emit_aggregation_step(
             reg_acc_start,
             resolver,
         )?;
+
+        if let Some(label) = label_filter_skip {
+            program.preassign_label_to_next_insn(label);
+        }
     }
 
     Ok(())

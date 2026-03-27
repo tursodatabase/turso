@@ -130,3 +130,94 @@ expect {
     3
 }
 
+
+@cross-check-integrity
+test window-filter-basic {
+    CREATE TABLE t_filter (grp TEXT, val INT, active INT);
+    INSERT INTO t_filter VALUES ('a', 10, 1), ('a', 20, 0), ('b', 30, 1), ('b', 40, 1);
+    SELECT grp, val, SUM(val) FILTER (WHERE active = 1) OVER (PARTITION BY grp) AS filtered_sum
+    FROM t_filter ORDER BY grp, val;
+}
+expect {
+    a|10|10
+    a|20|10
+    b|30|70
+    b|40|70
+}
+
+@cross-check-integrity
+test window-filter-no-partition {
+    CREATE TABLE t_filter2 (val INT);
+    INSERT INTO t_filter2 VALUES (1), (2), (3), (4), (5);
+    SELECT val, SUM(val) FILTER (WHERE val > 2) OVER () AS filtered_sum
+    FROM t_filter2 ORDER BY val;
+}
+expect {
+    1|12
+    2|12
+    3|12
+    4|12
+    5|12
+}
+
+@cross-check-integrity
+test window-filter-count-star {
+    CREATE TABLE t_filter3 (grp TEXT, val INT);
+    INSERT INTO t_filter3 VALUES ('a', 1), ('a', 2), ('a', 3), ('b', 1), ('b', 2);
+    SELECT grp, val, COUNT(*) FILTER (WHERE val > 1) OVER (PARTITION BY grp) AS cnt
+    FROM t_filter3 ORDER BY grp, val;
+}
+expect {
+    a|1|2
+    a|2|2
+    a|3|2
+    b|1|1
+    b|2|1
+}
+
+@cross-check-integrity
+test window-filter-null-treated-as-false {
+    CREATE TABLE t_filter4 (val INT, cond INT);
+    INSERT INTO t_filter4 VALUES (1, 1), (2, NULL), (3, 0), (4, 1);
+    SELECT val, SUM(val) FILTER (WHERE cond) OVER () AS filtered_sum
+    FROM t_filter4 ORDER BY val;
+}
+expect {
+    1|5
+    2|5
+    3|5
+    4|5
+}
+
+@cross-check-integrity
+test window-filter-named-window {
+    CREATE TABLE t_filter5 (grp TEXT, val INT);
+    INSERT INTO t_filter5 VALUES ('a', 1), ('a', 2), ('b', 3), ('b', 4);
+    SELECT grp, val, SUM(val) FILTER (WHERE val > 1) OVER w AS filtered_sum
+    FROM t_filter5
+    WINDOW w AS (PARTITION BY grp)
+    ORDER BY grp, val;
+}
+expect {
+    a|1|2
+    a|2|2
+    b|3|7
+    b|4|7
+}
+
+@cross-check-integrity
+test window-filter-multiple-functions {
+    CREATE TABLE t_filter6 (grp TEXT, val INT);
+    INSERT INTO t_filter6 VALUES ('a', 1), ('a', 2), ('a', 3), ('b', 4), ('b', 5);
+    SELECT grp, val,
+           SUM(val) FILTER (WHERE val > 1) OVER (PARTITION BY grp) AS filtered_sum,
+           COUNT(*) FILTER (WHERE val > 2) OVER (PARTITION BY grp) AS filtered_cnt
+    FROM t_filter6 ORDER BY grp, val;
+}
+expect {
+    a|1|5|1
+    a|2|5|1
+    a|3|5|1
+    b|4|9|2
+    b|5|9|2
+}
