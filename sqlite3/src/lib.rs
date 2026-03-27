@@ -1124,6 +1124,10 @@ fn split_sql_statements(sql: &str) -> Vec<&str> {
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_reset(stmt: *mut sqlite3_stmt) -> ffi::c_int {
+    if stmt.is_null() {
+        // sqlite3 returns SQLITE_OK if( pStmt==0 ){
+        return SQLITE_OK;
+    }
     let stmt = &mut *stmt;
     // first, finalize any execution if it was unfinished
     // (for example, many drivers can consume just one row and finalize statement after that, while there still can be work to do)
