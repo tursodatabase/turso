@@ -6307,6 +6307,7 @@ dependencies = [
  "built",
  "bumpalo",
  "bytemuck",
+ "cfg_aliases",
  "cfg_block",
  "chrono",
  "codspeed-criterion-compat",

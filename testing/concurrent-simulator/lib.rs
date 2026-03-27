@@ -24,6 +24,7 @@ mod io;
 mod operations;
 pub mod properties;
 pub mod workloads;
+mod yield_injection;
 
 use crate::{
     chaotic_elle::{ChaoticWorkload, ChaoticWorkloadProfile},
@@ -33,6 +34,27 @@ use crate::{
 };
 pub use io::{IOFaultConfig, SimulatorIO};
 pub use operations::{FiberState, OpContext, OpResult, Operation, TxMode};
+use yield_injection::{SimulatorYieldInjector, fiber_yield_seed};
+
+struct InstalledYieldInjector<'a> {
+    connection: &'a Arc<Connection>,
+}
+
+impl Drop for InstalledYieldInjector<'_> {
+    fn drop(&mut self) {
+        self.connection.set_yield_injector(None);
+    }
+}
+
+fn step_stmt_with_injected_yield(
+    connection: &Arc<Connection>,
+    yield_injector: Arc<SimulatorYieldInjector>,
+    stmt: &mut Statement,
+) -> turso_core::Result<turso_core::StepResult> {
+    connection.set_yield_injector(Some(yield_injector));
+    let _guard = InstalledYieldInjector { connection };
+    stmt.step()
+}
 
 /// A bounded container for sampling values with reservoir sampling.
 #[derive(Debug, Clone)]
@@ -344,6 +366,7 @@ pub enum StepResult {
 
 pub struct SimulatorFiber {
     connection: Arc<Connection>,
+    yield_injector: Arc<SimulatorYieldInjector>,
     state: FiberState,
     statement: RefCell<Option<Statement>>,
     rows: Vec<Vec<Value>>,
@@ -610,6 +633,8 @@ impl Whopper {
 
         // If we have a statement, step it.
         let step_result = {
+            let connection = self.context.fibers[fiber_idx].connection.clone();
+            let yield_injector = self.context.fibers[fiber_idx].yield_injector.clone();
             let mut stmt_borrow = self.context.fibers[fiber_idx].statement.borrow_mut();
             if let Some(stmt) = stmt_borrow.as_mut() {
                 let span = tracing::debug_span!(
@@ -620,8 +645,7 @@ impl Whopper {
                     txn_id = txn_id
                 );
                 let _enter = span.enter();
-
-                let step_result = stmt.step();
+                let step_result = step_stmt_with_injected_yield(&connection, yield_injector, stmt);
                 match step_result {
                     Ok(result) => {
                         trace!("{:?}", result);
@@ -813,6 +837,9 @@ impl Whopper {
                 rng: &mut self.rng,
             };
             debug!("prepare operation: op={:?}", op);
+            ctx.fiber.yield_injector = Arc::new(SimulatorYieldInjector::new(fiber_yield_seed(
+                self.seed, fiber_idx,
+            )));
             if let Err(e) = op.init_op(&mut ctx) {
                 let err = e.to_string().to_lowercase();
                 // Allow "no such table/index" and "already exists" errors
@@ -950,10 +977,14 @@ impl Whopper {
                             fiber = fiber_idx
                         );
                         let _enter = span.enter();
+                        let connection = fiber.connection.clone();
+                        let yield_injector = fiber.yield_injector.clone();
 
                         let mut stmt_borrow = fiber.statement.borrow_mut();
                         if let Some(stmt) = stmt_borrow.as_mut() {
-                            match stmt.step() {
+                            let step_result =
+                                step_stmt_with_injected_yield(&connection, yield_injector, stmt);
+                            match step_result {
                                 Ok(result) => match result {
                                     turso_core::StepResult::Row => {
                                         if let Some(row) = stmt.row() {
@@ -1036,6 +1067,9 @@ impl Whopper {
             let conn = may_be_set_encryption(conn, &self.encryption_opts)?;
             self.context.fibers.push(SimulatorFiber {
                 connection: conn,
+                yield_injector: Arc::new(SimulatorYieldInjector::new(fiber_yield_seed(
+                    self.seed, i,
+                ))),
                 state: FiberState::Idle,
                 statement: RefCell::new(None),
                 rows: vec![],

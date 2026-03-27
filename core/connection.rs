@@ -1,4 +1,6 @@
 use crate::error::io_error;
+#[cfg(any(test, injected_yields))]
+use crate::mvcc::yield_points::YieldInjector;
 use crate::storage::journal_mode;
 use crate::sync::{
     atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, Ordering},
@@ -89,6 +91,10 @@ pub struct Connection {
     /// Main DB uses `mv_tx` above for zero-cost hot path access.
     pub(crate) attached_mv_txs:
         RwLock<HashMap<usize, (crate::mvcc::database::TxID, TransactionMode)>>,
+    #[cfg(any(test, injected_yields))]
+    pub(super) yield_injector: RwLock<Option<Arc<dyn YieldInjector>>>,
+    #[cfg(any(test, injected_yields))]
+    pub(super) yield_instance_id_counter: AtomicU64,
 
     /// Per-connection view transaction states for uncommitted changes. This represents
     /// one entry per view that was touched in the transaction.
@@ -1398,6 +1404,39 @@ impl Connection {
         } else {
             either::Right(TransparentWrapper(None))
         }
+    }
+
+    #[cfg(any(test, injected_yields))]
+    pub fn set_yield_injector(&self, injector: Option<Arc<dyn YieldInjector>>) {
+        let mut slot = self.yield_injector.write();
+        match injector {
+            Some(injector) => {
+                turso_assert!(
+                    slot.is_none(),
+                    "yield injector should be empty before installing a new one"
+                );
+                *slot = Some(injector);
+            }
+            None => {
+                turso_assert!(
+                    slot.is_some(),
+                    "yield injector should be installed before it is cleared"
+                );
+                *slot = None;
+            }
+        }
+    }
+
+    #[cfg(any(test, injected_yields))]
+    pub(crate) fn yield_injector(&self) -> Option<Arc<dyn YieldInjector>> {
+        self.yield_injector.read().clone()
+    }
+
+    #[cfg(any(test, injected_yields))]
+    #[inline(always)]
+    pub(crate) fn next_yield_instance_id(&self) -> u64 {
+        self.yield_instance_id_counter
+            .fetch_add(1, Ordering::Relaxed)
     }
 
     /// Query the current value(s) of `pragma_name` associated to

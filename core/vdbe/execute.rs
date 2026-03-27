@@ -1110,6 +1110,7 @@ pub fn op_open_read(
                 .clone();
             Ok(Box::new(MvCursor::new(
                 mv_store,
+                &program.connection,
                 tx_id,
                 *root_page,
                 mv_cursor_type,
@@ -9661,6 +9662,7 @@ pub fn op_open_write(
                     .clone();
                 Ok(Box::new(MvCursor::new(
                     mv_store,
+                    &program.connection,
                     tx_id,
                     root_page,
                     mv_cursor_type,
@@ -11100,6 +11102,7 @@ pub fn op_open_dup(
                         .clone();
                     Box::new(MvCursor::new(
                         mv_store,
+                        &program.connection,
                         tx_id,
                         root_page,
                         MvccCursorType::Table,
