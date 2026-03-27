@@ -1,0 +1,125 @@
+@database :memory:
+
+# =============================================================================
+# Regression tests for ungrouped aggregation NullRow bug
+# Bug: When no rows match WHERE clause in an aggregate-without-GROUP BY query,
+# non-aggregate columns should return NULL (via NullRow), not stale values
+# from the last cursor position.
+# =============================================================================
+
+# The original bug: IdxRowId didn't check null_flag, and the aggregate codegen
+# didn't emit NullRow for btree cursors in the empty-result path.
+
+# --- Core reproducer: DESC index, no matching rows ---
+
+test ungrouped-agg-desc-index-no-match {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val REAL);
+    CREATE INDEX idx1 ON t1(val DESC);
+    INSERT INTO t1 VALUES (79, NULL);
+    SELECT IFNULL(id, 9999), COUNT(1) FROM t1 WHERE val IS NULL AND val <= 0.5;
+}
+expect {
+    9999|0
+}
+
+# --- Variant: ASC index ---
+
+test ungrouped-agg-asc-index-no-match {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val REAL);
+    CREATE INDEX idx1 ON t1(val);
+    INSERT INTO t1 VALUES (79, NULL);
+    SELECT IFNULL(id, 9999), COUNT(1) FROM t1 WHERE val IS NULL AND val <= 0.5;
+}
+expect {
+    9999|0
+}
+
+# --- Variant: no index at all ---
+
+test ungrouped-agg-no-index-no-match {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val REAL);
+    INSERT INTO t1 VALUES (79, NULL);
+    SELECT IFNULL(id, 9999), COUNT(1) FROM t1 WHERE val IS NULL AND val <= 0.5;
+}
+expect {
+    9999|0
+}
+
+# --- Variant: multiple rows, none matching ---
+
+test ungrouped-agg-multiple-rows-no-match {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val REAL);
+    CREATE INDEX idx1 ON t1(val DESC);
+    INSERT INTO t1 VALUES (1, 10.0);
+    INSERT INTO t1 VALUES (2, 20.0);
+    INSERT INTO t1 VALUES (3, NULL);
+    SELECT IFNULL(id, 9999), COUNT(1) FROM t1 WHERE val < 0;
+}
+expect {
+    9999|0
+}
+
+# --- Variant: some rows match (should return actual data, not NULL) ---
+
+test ungrouped-agg-some-match {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val REAL);
+    CREATE INDEX idx1 ON t1(val DESC);
+    INSERT INTO t1 VALUES (1, 10.0);
+    INSERT INTO t1 VALUES (2, 20.0);
+    INSERT INTO t1 VALUES (3, 5.0);
+    SELECT id, COUNT(1), SUM(val) FROM t1 WHERE val > 7;
+}
+expect {
+    2|2|30.0
+}
+# JS Number.isInteger(30.0) is true, so whole-number floats lose the .0 suffix
+expect @js {
+    2|2|30
+}
+
+# --- Variant: empty table ---
+
+test ungrouped-agg-empty-table {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val REAL);
+    CREATE INDEX idx1 ON t1(val DESC);
+    SELECT IFNULL(id, 9999), COUNT(1) FROM t1;
+}
+expect {
+    9999|0
+}
+
+# --- Variant: multi-column non-aggregate expressions ---
+
+test ungrouped-agg-multi-nonagg-cols {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a TEXT, b REAL);
+    CREATE INDEX idx1 ON t1(b DESC);
+    INSERT INTO t1 VALUES (1, 'hello', 3.14);
+    SELECT IFNULL(id, -1), IFNULL(a, 'none'), COUNT(1) FROM t1 WHERE b > 100;
+}
+expect {
+    -1|none|0
+}
+
+# --- Variant: with HAVING that filters out the result ---
+
+test ungrouped-agg-having-filters {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val REAL);
+    CREATE INDEX idx1 ON t1(val DESC);
+    INSERT INTO t1 VALUES (1, 10.0);
+    INSERT INTO t1 VALUES (2, 20.0);
+    SELECT id, COUNT(1) FROM t1 HAVING COUNT(1) > 100;
+}
+expect {
+}
+
+# --- Variant: aggregate with expression on non-aggregate column ---
+
+test ungrouped-agg-expr-on-nonagg {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val REAL);
+    CREATE INDEX idx1 ON t1(val DESC);
+    INSERT INTO t1 VALUES (42, NULL);
+    SELECT COALESCE(id + 1, 0), COUNT(*) FROM t1 WHERE val = 999;
+}
+expect {
+    0|0
+}
