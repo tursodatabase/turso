@@ -13441,13 +13441,13 @@ fn op_journal_mode_inner(
                         ));
                     }
                     let db_path = program.connection.get_database_canonical_path();
-                    // todo(v): pass required encryption ctx to enable encryption with mvcc
+                    let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
                     let mv_store = journal_mode::open_mv_store(
                         pager.io.clone(),
                         &db_path,
                         program.connection.db.open_flags,
                         program.connection.db.durable_storage.clone(),
-                        None,
+                        enc_ctx,
                     )?;
                     program.connection.db.mv_store.store(Some(mv_store.clone()));
                     program.connection.demote_to_mvcc_connection();

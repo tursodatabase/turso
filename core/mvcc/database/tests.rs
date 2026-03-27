@@ -4,7 +4,9 @@ use super::*;
 use crate::io::PlatformIO;
 use crate::mvcc::clock::MvccClock;
 use crate::mvcc::cursor::{CursorYieldPoint, MvccCursorType};
-use crate::mvcc::persistent_storage::logical_log::LOG_HDR_SIZE;
+use crate::mvcc::persistent_storage::logical_log::{
+    ENCRYPTED_PAYLOAD_CHUNK_SIZE, FRAME_MAGIC, LOG_HDR_SIZE,
+};
 use crate::mvcc::yield_hooks::YieldPointMarker;
 use crate::mvcc::yield_points::{YieldInjector, YieldPoint};
 use crate::state_machine::{StateTransition, TransitionResult};
@@ -15,15 +17,20 @@ use crate::storage::sqlite3_ondisk::{
 use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::Mutex;
 use crate::sync::RwLock;
-use crate::{Buffer, Completion, DatabaseOpts, OpenFlags};
+use crate::{Buffer, Completion, DatabaseOpts, EncryptionKey, LimboError, OpenFlags};
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+
+const TX_HEADER_SIZE: usize = 24;
+const TX_TRAILER_SIZE: usize = 8;
+
 pub(crate) struct MvccTestDbNoConn {
     pub(crate) db: Option<Arc<Database>>,
     path: Option<String>,
     opts: DatabaseOpts,
+    enc_opts: Option<crate::EncryptionOpts>,
     // Stored mainly to not drop the temp dir before the test is done.
     _temp_dir: Option<tempfile::TempDir>,
 }
@@ -82,6 +89,7 @@ impl MvccTestDbNoConn {
             db: Some(db),
             path: None,
             opts,
+            enc_opts: None,
             _temp_dir: None,
         }
     }
@@ -116,25 +124,71 @@ impl MvccTestDbNoConn {
             db: Some(db),
             path: Some(path.to_str().unwrap().to_string()),
             opts,
+            enc_opts: None,
+            _temp_dir: Some(temp_dir),
+        }
+    }
+
+    /// Opens a file-backed encrypted database with the given hex key.
+    pub fn new_encrypted(hex_key: &str) -> Self {
+        let opts = DatabaseOpts::new().with_encryption(true);
+        let enc_opts = crate::EncryptionOpts {
+            cipher: "aes256gcm".to_string(),
+            hexkey: hex_key.to_string(),
+        };
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir
+            .path()
+            .join(format!("test_{}", rand::random::<u64>()));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            path.as_os_str().to_str().unwrap(),
+            OpenFlags::default(),
+            opts,
+            Some(enc_opts.clone()),
+        )
+        .unwrap();
+        let encryption_key = EncryptionKey::from_hex_string(hex_key).unwrap();
+        let conn = db.connect_with_encryption(Some(encryption_key)).unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.close().unwrap();
+        Self {
+            db: Some(db),
+            path: Some(path.to_str().unwrap().to_string()),
+            opts,
+            enc_opts: Some(enc_opts),
             _temp_dir: Some(temp_dir),
         }
     }
 
     /// Restarts the database, make sure there is no connection to the database open before calling this!
     pub fn restart(&mut self) {
+        self.restart_result().unwrap();
+    }
+
+    /// Like `restart`, but returns the error instead of panicking.
+    /// Useful for testing wrong-key scenarios.
+    pub fn restart_result(&mut self) -> crate::Result<()> {
         // First let's clear any entries in database manager in order to force restart.
         // If not, we will load the same database instance again.
         {
             let mut manager = DATABASE_MANAGER.lock();
             manager.clear();
         }
-
         // Now open again.
         let io = Arc::new(PlatformIO::new().unwrap());
         let path = self.path.as_ref().unwrap();
-        let db = Database::open_file_with_flags(io, path, OpenFlags::default(), self.opts, None)
-            .unwrap();
+        let db = Database::open_file_with_flags(
+            io,
+            path,
+            OpenFlags::default(),
+            self.opts,
+            self.enc_opts.clone(),
+        )?;
         self.db.replace(db);
+        Ok(())
     }
 
     /// Asumes there is a database open
@@ -143,7 +197,11 @@ impl MvccTestDbNoConn {
     }
 
     pub fn connect(&self) -> Arc<Connection> {
-        self.get_db().connect().unwrap()
+        let enc_key = self
+            .enc_opts
+            .as_ref()
+            .map(|e| EncryptionKey::from_hex_string(&e.hexkey).unwrap());
+        self.get_db().connect_with_encryption(enc_key).unwrap()
     }
 
     pub fn get_mvcc_store(&self) -> Arc<MvStore<MvccClock>> {
@@ -7955,4 +8013,487 @@ fn test_committed_update_version_conflict() {
         "Expected WriteWriteConflict, got: {result:?}. \
          Td's committed update must be detected via Td's new version."
     );
+}
+
+/// Encrypted MVCC: write rows, restart with same key, verify recovery replays them.
+/// Then swap to a wrong key and verify that restart fails.
+#[test]
+fn test_mvcc_encrypted_log_recovery_and_wrong_key() {
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
+
+    // --- Write phase (identical to test_restart, just on an encrypted DB) ---
+    {
+        let conn = db.connect();
+        let mvcc_store = db.get_mvcc_store();
+        let max_root_page = get_rows(
+            &conn,
+            "SELECT COALESCE(MAX(rootpage), 0) FROM sqlite_schema WHERE rootpage > 0",
+        )[0][0]
+            .as_int()
+            .unwrap();
+        let next_schema_rowid = get_rows(
+            &conn,
+            "SELECT COALESCE(MAX(rowid), 0) + 1 FROM sqlite_schema",
+        )[0][0]
+            .as_int()
+            .unwrap();
+        let synthetic_root = -(max_root_page + 100);
+        let synthetic_table_id = MVTableId::new(synthetic_root);
+        let tx_id = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
+        let data = ImmutableRecord::from_values(
+            &[
+                Value::Text(Text::new("table")),
+                Value::Text(Text::new("test")),
+                Value::Text(Text::new("test")),
+                Value::from_i64(synthetic_root),
+                Value::Text(Text::new(
+                    "CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)",
+                )),
+            ],
+            5,
+        );
+        mvcc_store
+            .insert(
+                tx_id,
+                Row::new_table_row(
+                    RowID::new((-1).into(), RowKey::Int(next_schema_rowid)),
+                    data.as_blob().to_vec(),
+                    5,
+                ),
+            )
+            .unwrap();
+        let row = generate_simple_string_row(synthetic_table_id, 1, "encrypted_value");
+        mvcc_store.insert(tx_id, row).unwrap();
+        commit_tx(mvcc_store, &conn, tx_id).unwrap();
+        // Do NOT checkpoint — row lives only in the encrypted logical log.
+        conn.close().unwrap();
+    }
+
+    // --- Verify the raw log file is encrypted (no plaintext leakage) ---
+    {
+        let log_path = std::path::PathBuf::from(db.path.as_ref().unwrap()).with_extension("db-log");
+        let log_bytes = std::fs::read(&log_path).expect("MVCC log file should exist");
+        assert!(
+            log_bytes.len() > 56,
+            "MVCC log should contain data beyond the header"
+        );
+        let plaintext = b"encrypted_value";
+        assert!(
+            !log_bytes.windows(plaintext.len()).any(|w| w == plaintext),
+            "MVCC log must not contain plaintext data when encryption is enabled"
+        );
+    }
+
+    // --- Restart with correct key: recovery should replay the encrypted log ---
+    db.restart();
+    {
+        let conn = db.connect();
+        let mvcc_store = db.get_mvcc_store();
+        let max_root_page = get_rows(
+            &conn,
+            "SELECT COALESCE(MAX(rootpage), 0) FROM sqlite_schema WHERE rootpage > 0",
+        )[0][0]
+            .as_int()
+            .unwrap();
+        let synthetic_table_id = MVTableId::new(-(max_root_page + 100));
+        let tx_id = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
+        let row = mvcc_store
+            .read(tx_id, &RowID::new(synthetic_table_id, RowKey::Int(1)))
+            .unwrap()
+            .unwrap();
+        let record = get_record_value(&row);
+        match record.get_value(0).unwrap() {
+            ValueRef::Text(text) => assert_eq!(text.as_str(), "encrypted_value"),
+            other => panic!("Expected Text, got {other:?}"),
+        }
+        conn.close().unwrap();
+    }
+
+    // --- Restart with wrong key: should fail ---
+    let wrong_key = "ff0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    db.enc_opts = Some(crate::EncryptionOpts {
+        cipher: "aes256gcm".to_string(),
+        hexkey: wrong_key.to_string(),
+    });
+    assert!(
+        db.restart_result().is_err(),
+        "Expected error when reopening encrypted MVCC DB with wrong key"
+    );
+}
+
+/// Enabling MVCC on a file-backed database must still bootstrap durable MVCC
+/// metadata even if encryption has only been opted-in and no key/cipher exists yet.
+#[test]
+fn test_mvcc_late_encryption_setup_keeps_metadata_bootstrapped() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir
+        .path()
+        .join(format!("test_{}", rand::random::<u64>()));
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let opts = DatabaseOpts::new().with_encryption(true);
+    let db = Database::open_file_with_flags(
+        io,
+        path.as_os_str().to_str().unwrap(),
+        OpenFlags::default(),
+        opts,
+        None,
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+
+    // Reproduce the deferred-key flow: encryption is enabled as a feature, but
+    // the session has not configured any key/cipher when MVCC bootstrap runs.
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+
+    let metadata_root = metadata_root_page(&conn);
+    assert!(
+        metadata_root > 0,
+        "metadata table must be present after enabling MVCC on a file-backed db",
+    );
+
+    let meta = get_rows(
+        &conn,
+        "SELECT k, v FROM __turso_internal_mvcc_meta ORDER BY rowid",
+    );
+    assert_eq!(meta.len(), 1);
+    assert_eq!(meta[0][0].to_string(), "persistent_tx_ts_max");
+    assert_eq!(meta[0][1].as_int().unwrap(), 0);
+}
+
+/// Reopening an encrypted MVCC database without any key material must fail before
+/// logical-log recovery, even if there is an outstanding MVCC log tail on disk.
+#[test]
+fn test_mvcc_encrypted_restart_without_key_fails_before_recovery() {
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
+    let log_path = std::path::PathBuf::from(db.path.as_ref().unwrap()).with_extension("db-log");
+
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'secret')").unwrap();
+        conn.close().unwrap();
+    }
+
+    let log_bytes = std::fs::read(&log_path).expect("db-log should exist after MVCC writes");
+    assert!(
+        log_bytes.len() > LOG_HDR_SIZE,
+        "db-log should contain at least one frame before restart"
+    );
+
+    db.enc_opts = None;
+    assert!(
+        matches!(db.restart_result(), Err(LimboError::NotADB)),
+        "reopening an encrypted MVCC database without a key must fail during db open, before recovery",
+    );
+}
+
+#[test]
+fn test_encrypted_recovery_large_payload_multi_chunk() {
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let large_value = "x".repeat(ENCRYPTED_PAYLOAD_CHUNK_SIZE * 3);
+    let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
+
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute(format!("INSERT INTO t VALUES (1, '{large_value}')"))
+            .unwrap();
+    }
+
+    let log_path = std::path::PathBuf::from(db.path.as_ref().unwrap()).with_extension("db-log");
+    assert!(log_path.exists(), "db-log should exist before restart");
+    assert_log_payloads_decrypt(
+        &log_path,
+        hex_key,
+        crate::storage::encryption::CipherMode::Aes256Gcm,
+    );
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(
+        &conn,
+        "SELECT id, length(v), substr(v, 1, 16), substr(v, length(v) - 15, 16) FROM t",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].as_int().unwrap(), large_value.len() as i64);
+    assert_eq!(rows[0][2].to_string(), "xxxxxxxxxxxxxxxx");
+    assert_eq!(rows[0][3].to_string(), "xxxxxxxxxxxxxxxx");
+}
+
+#[test]
+fn test_encrypted_recovery_corrupted_later_chunk_keeps_checkpointed_prefix() {
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let large_value = "z".repeat(ENCRYPTED_PAYLOAD_CHUNK_SIZE * 3);
+    let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
+    let log_path = std::path::PathBuf::from(db.path.as_ref().unwrap()).with_extension("db-log");
+
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'survives')")
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute(format!("INSERT INTO t VALUES (2, '{large_value}')"))
+            .unwrap();
+    }
+
+    let mut log_bytes = std::fs::read(&log_path).expect("db-log should exist");
+    let payload_size = u64::from_le_bytes(
+        log_bytes[LOG_HDR_SIZE + 4..LOG_HDR_SIZE + 12]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let chunk_count = payload_size.div_ceil(ENCRYPTED_PAYLOAD_CHUNK_SIZE);
+    assert!(
+        chunk_count >= 3,
+        "expected multi-chunk encrypted recovery tail"
+    );
+
+    let enc_ctx = crate::storage::encryption::EncryptionContext::new(
+        crate::storage::encryption::CipherMode::Aes256Gcm,
+        &EncryptionKey::from_hex_string(hex_key).unwrap(),
+        4096,
+    )
+    .unwrap();
+    let first_chunk_on_disk_size =
+        ENCRYPTED_PAYLOAD_CHUNK_SIZE + enc_ctx.tag_size() + enc_ctx.nonce_size();
+    let corrupt_offset = LOG_HDR_SIZE + TX_HEADER_SIZE + first_chunk_on_disk_size + 1;
+    log_bytes[corrupt_offset] ^= 0xFF;
+    std::fs::write(&log_path, &log_bytes).unwrap();
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "survives");
+}
+
+/// Read the raw db-log file and verify every TX frame payload can be decrypted.
+/// Panics if the file is missing, has no frames, or any payload fails to decrypt.
+fn assert_log_payloads_decrypt(
+    log_path: &std::path::Path,
+    hex_key: &str,
+    cipher: crate::storage::encryption::CipherMode,
+) {
+    use crate::storage::encryption::EncryptionContext;
+
+    let log_bytes = std::fs::read(log_path).expect("db-log file should exist");
+    assert!(
+        log_bytes.len() > LOG_HDR_SIZE,
+        "db-log should contain data beyond the header"
+    );
+
+    let key = EncryptionKey::from_hex_string(hex_key).unwrap();
+    let enc_ctx = EncryptionContext::new(cipher, &key, 4096).unwrap();
+    let nonce_size = enc_ctx.nonce_size();
+    let tag_size = enc_ctx.tag_size();
+
+    // Parse salt from log header (bytes 8..16, little-endian u64)
+    let salt = u64::from_le_bytes(log_bytes[8..16].try_into().unwrap());
+
+    let mut offset = LOG_HDR_SIZE;
+    let mut frame_count = 0;
+
+    while offset + TX_HEADER_SIZE + TX_TRAILER_SIZE <= log_bytes.len() {
+        // TX Header: frame_magic(4) | payload_size(8) | op_count(4) | commit_ts(8)
+        let frame_magic = u32::from_le_bytes(log_bytes[offset..offset + 4].try_into().unwrap());
+        if frame_magic != FRAME_MAGIC {
+            break; // not a valid frame
+        }
+        let payload_size =
+            u64::from_le_bytes(log_bytes[offset + 4..offset + 12].try_into().unwrap()) as usize;
+        let op_count = u32::from_le_bytes(log_bytes[offset + 12..offset + 16].try_into().unwrap());
+        let commit_ts = u64::from_le_bytes(log_bytes[offset + 16..offset + 24].try_into().unwrap());
+
+        let mut payload_offset = offset + TX_HEADER_SIZE;
+        let chunk_count = if payload_size == 0 {
+            0
+        } else {
+            payload_size.div_ceil(ENCRYPTED_PAYLOAD_CHUNK_SIZE)
+        };
+
+        let mut frame_complete = true;
+        for chunk_index in 0..chunk_count {
+            let chunk_plaintext_len = (payload_size - chunk_index * ENCRYPTED_PAYLOAD_CHUNK_SIZE)
+                .min(ENCRYPTED_PAYLOAD_CHUNK_SIZE);
+            let chunk_on_disk_size = chunk_plaintext_len + tag_size + nonce_size;
+            if payload_offset + chunk_on_disk_size + TX_TRAILER_SIZE > log_bytes.len() {
+                frame_complete = false;
+                break;
+            }
+
+            let blob = &log_bytes[payload_offset..payload_offset + chunk_on_disk_size];
+            let ciphertext = &blob[..chunk_plaintext_len + tag_size];
+            let nonce = &blob[chunk_plaintext_len + tag_size..];
+
+            let mut aad = [0u8; 32];
+            aad[..8].copy_from_slice(&salt.to_le_bytes());
+            if chunk_index + 1 == chunk_count {
+                aad[8..16].copy_from_slice(&(payload_size as u64).to_le_bytes());
+            }
+            aad[16..20].copy_from_slice(&op_count.to_le_bytes());
+            aad[20..28].copy_from_slice(&commit_ts.to_le_bytes());
+            aad[28..32].copy_from_slice(&(chunk_index as u32).to_le_bytes());
+
+            enc_ctx
+                .decrypt_chunk(ciphertext, nonce, &aad)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "failed to decrypt frame {frame_count} chunk {chunk_index} at offset {offset}: {e}"
+                    )
+                });
+
+            payload_offset += chunk_on_disk_size;
+        }
+        if !frame_complete {
+            break;
+        }
+
+        frame_count += 1;
+        offset = payload_offset + TX_TRAILER_SIZE; // skip trailer
+    }
+
+    assert!(
+        frame_count > 0,
+        "db-log should contain at least one TX frame"
+    );
+}
+
+/// Encrypted version of test_recovery_checkpoint_then_more_writes.
+/// Checkpoint some rows, write more without checkpointing, restart, verify all rows survive.
+#[test]
+fn test_encrypted_recovery_checkpoint_then_more_writes() {
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'c')").unwrap();
+    }
+
+    let log_path = std::path::PathBuf::from(db.path.as_ref().unwrap()).with_extension("db-log");
+    assert!(log_path.exists(), "db-log file should exist before restart");
+    assert_log_payloads_decrypt(
+        &log_path,
+        hex_key,
+        crate::storage::encryption::CipherMode::Aes256Gcm,
+    );
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "a");
+    assert_eq!(rows[1][0].as_int().unwrap(), 2);
+    assert_eq!(rows[1][1].to_string(), "b");
+    assert_eq!(rows[2][0].as_int().unwrap(), 3);
+    assert_eq!(rows[2][1].to_string(), "c");
+}
+
+/// Write, restart, write more, restart again, verify all data accumulates correctly.
+#[test]
+fn test_encrypted_recovery_multiple_restart_cycles() {
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
+    let log_path = std::path::PathBuf::from(db.path.as_ref().unwrap()).with_extension("db-log");
+
+    // Cycle 1: create table + insert
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'first')").unwrap();
+    }
+
+    assert!(log_path.exists(), "db-log file should exist after cycle 1");
+    assert_log_payloads_decrypt(
+        &log_path,
+        hex_key,
+        crate::storage::encryption::CipherMode::Aes256Gcm,
+    );
+    db.restart();
+
+    // Cycle 2: insert more rows
+    {
+        let conn = db.connect();
+        conn.execute("INSERT INTO t VALUES (2, 'second')").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'third')").unwrap();
+    }
+
+    db.restart();
+
+    // Verify all rows survived two restart cycles
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][1].to_string(), "first");
+    assert_eq!(rows[1][1].to_string(), "second");
+    assert_eq!(rows[2][1].to_string(), "third");
+}
+
+/// Corrupt ciphertext bytes in the encrypted log payload. Recovery should treat the
+/// corrupted frame as a torn tail and stop cleanly without losing earlier valid frames.
+#[test]
+fn test_encrypted_recovery_corrupted_ciphertext() {
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
+    let log_path = std::path::PathBuf::from(db.path.as_ref().unwrap()).with_extension("db-log");
+
+    // Write two transactions: checkpoint the first, leave the second only in the log.
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'survives')")
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'corrupted')")
+            .unwrap();
+    }
+
+    assert!(
+        log_path.exists(),
+        "db-log file should exist before corruption"
+    );
+    assert_log_payloads_decrypt(
+        &log_path,
+        hex_key,
+        crate::storage::encryption::CipherMode::Aes256Gcm,
+    );
+
+    // Corrupt the payload of the second (non-checkpointed) frame in the log file.
+    // The log header is 56 bytes, then the TX header is 24 bytes. Flip a byte
+    // in the encrypted payload area right after that.
+    {
+        let mut log_bytes = std::fs::read(&log_path).expect("log file should exist");
+        assert!(
+            log_bytes.len() > 56 + 24 + 1,
+            "log should have data beyond header + tx header"
+        );
+        // Flip a byte in the encrypted payload region
+        let corrupt_offset = 56 + 24 + 1;
+        log_bytes[corrupt_offset] ^= 0xFF;
+        std::fs::write(&log_path, &log_bytes).unwrap();
+    }
+
+    // Restart: recovery should discard the corrupted frame but the checkpointed
+    // row (id=1) must survive because it's already in the DB file.
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "survives");
 }
