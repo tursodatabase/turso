@@ -1608,6 +1608,19 @@ pub fn insn_to_row(
                 0,
                 format!("DROP TRIGGER {trigger_name}"),
             ),
+            Insn::CreateTrigger {
+                db,
+                trigger,
+                table_name,
+            } => (
+                "CreateTrigger",
+                *db as i64,
+                0,
+                0,
+                Value::build_text(trigger.name.clone()),
+                0,
+                format!("CREATE TEMP TRIGGER {} ON {table_name}", trigger.name),
+            ),
             Insn::DropType { db, type_name } => (
                 "DropType",
                 *db as i64,

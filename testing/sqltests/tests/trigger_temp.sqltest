@@ -1,0 +1,90 @@
+@database :memory:
+@requires-file trigger "trigger_temp tests require trigger support"
+
+# Basic CREATE TEMP TRIGGER fires on INSERT
+@cross-check-integrity
+test trigger-temp-basic-insert {
+    CREATE TABLE t1 (x INTEGER, y TEXT);
+    CREATE TEMP TRIGGER tt1 AFTER INSERT ON t1 BEGIN INSERT INTO t1 VALUES (99, 'temp-triggered'); END;
+    INSERT INTO t1 VALUES (1, 'hello');
+    SELECT * FROM t1 ORDER BY rowid;
+}
+expect {
+    1|hello
+    99|temp-triggered
+}
+
+# TEMP TRIGGER using TEMPORARY keyword
+@cross-check-integrity
+test trigger-temp-keyword-temporary {
+    CREATE TABLE t2 (x INTEGER);
+    CREATE TEMPORARY TRIGGER tt2 AFTER INSERT ON t2 BEGIN INSERT INTO t2 VALUES (42); END;
+    INSERT INTO t2 VALUES (1);
+    SELECT * FROM t2 ORDER BY rowid;
+}
+expect {
+    1
+    42
+}
+
+# TEMP TRIGGER is not stored in sqlite_schema
+@cross-check-integrity
+test trigger-temp-not-in-schema {
+    CREATE TABLE t3 (x INTEGER);
+    CREATE TEMP TRIGGER tt3 AFTER INSERT ON t3 BEGIN SELECT 1; END;
+    SELECT name FROM sqlite_schema WHERE type='trigger' AND name='tt3';
+}
+expect {
+}
+
+# TEMP TRIGGER IF NOT EXISTS
+@cross-check-integrity
+test trigger-temp-if-not-exists {
+    CREATE TABLE t4 (x INTEGER);
+    CREATE TEMP TRIGGER IF NOT EXISTS tt4 AFTER INSERT ON t4 BEGIN SELECT 1; END;
+    CREATE TEMP TRIGGER IF NOT EXISTS tt4 AFTER INSERT ON t4 BEGIN SELECT 1; END;
+    SELECT name FROM sqlite_schema WHERE type='trigger' AND name='tt4';
+}
+expect {
+}
+
+# TEMP TRIGGER BEFORE INSERT
+@cross-check-integrity
+test trigger-temp-before-insert {
+    CREATE TABLE t5 (x INTEGER);
+    CREATE TEMP TRIGGER tt5 BEFORE INSERT ON t5 BEGIN INSERT INTO t5 VALUES (0); END;
+    INSERT INTO t5 VALUES (1);
+    SELECT * FROM t5 ORDER BY rowid;
+}
+expect {
+    0
+    1
+}
+
+# DROP TEMP TRIGGER
+@cross-check-integrity
+test trigger-temp-drop {
+    CREATE TABLE t6 (x INTEGER);
+    CREATE TEMP TRIGGER tt6 AFTER INSERT ON t6 BEGIN INSERT INTO t6 VALUES (99); END;
+    DROP TRIGGER tt6;
+    INSERT INTO t6 VALUES (1);
+    SELECT * FROM t6 ORDER BY rowid;
+}
+expect {
+    1
+}
+
+# TEMP TRIGGER AFTER DELETE
+@cross-check-integrity
+test trigger-temp-after-delete {
+    CREATE TABLE t7 (x INTEGER);
+    INSERT INTO t7 VALUES (1);
+    INSERT INTO t7 VALUES (2);
+    CREATE TEMP TRIGGER tt7 AFTER DELETE ON t7 BEGIN INSERT INTO t7 VALUES (99); END;
+    DELETE FROM t7 WHERE x = 1;
+    SELECT * FROM t7 ORDER BY rowid;
+}
+expect {
+    2
+    99
+}

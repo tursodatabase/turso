@@ -97,6 +97,7 @@ ongoing work to pass the full SQLite TCL test suite.
 | CREATE TABLE              | ✅ Yes     |                                                                                   |
 | CREATE TABLE ... STRICT   | ✅ Yes     |                                                                                   |
 | CREATE TRIGGER            | ✅ Yes     |                                                                                   |
+| CREATE TEMP TRIGGER       | ✅ Yes     | Stored in-memory only; dropped when connection closes                             |
 | CREATE VIEW               | ✅ Yes     |                                                                                   |
 | CREATE VIRTUAL TABLE      | ✅ Yes     |                                                                                   |
 | DELETE                    | ✅ Yes     |                                                                                   |

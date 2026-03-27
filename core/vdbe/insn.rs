@@ -12,7 +12,7 @@ pub fn to_u16(v: usize) -> u16 {
 
 use super::{execute, AggFunc, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
 use crate::{
-    schema::{BTreeTable, CheckConstraint, Column, Index},
+    schema::{BTreeTable, CheckConstraint, Column, Index, Trigger},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
     translate::{collate::CollationSeq, emitter::TransactionMode},
     types::KeyInfo,
@@ -1217,6 +1217,17 @@ pub enum Insn {
         /// The name of the trigger being dropped
         trigger_name: String,
     },
+    /// Create a trigger directly in the in-memory schema (used for TEMP triggers
+    /// which are not persisted to sqlite_schema on disk).
+    CreateTrigger {
+        /// The database within which this trigger is created (P1). For TEMP
+        /// triggers this will be TEMP_DB_ID (1).
+        db: usize,
+        /// The trigger to add to the in-memory schema.
+        trigger: Arc<Trigger>,
+        /// The name of the table the trigger is associated with.
+        table_name: String,
+    },
     /// Drop a custom type from the in-memory schema
     DropType {
         /// The database within which this type needs to be dropped
@@ -1836,6 +1847,7 @@ impl InsnVariants {
             InsnVariants::ResetSorter => execute::op_reset_sorter,
             InsnVariants::DropTable => execute::op_drop_table,
             InsnVariants::DropTrigger => execute::op_drop_trigger,
+            InsnVariants::CreateTrigger => execute::op_create_trigger,
             InsnVariants::DropType => execute::op_drop_type,
             InsnVariants::AddType => execute::op_add_type,
             InsnVariants::DropView => execute::op_drop_view,

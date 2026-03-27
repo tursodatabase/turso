@@ -10114,6 +10114,31 @@ pub fn op_drop_trigger(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_create_trigger(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        CreateTrigger {
+            db,
+            trigger,
+            table_name
+        },
+        insn
+    );
+
+    let conn = program.connection.clone();
+    // Deref Arc<Trigger> to get the inner Trigger value, then clone it.
+    let trigger_clone = (**trigger).clone();
+    conn.with_database_schema_mut(*db, |schema| {
+        schema.add_trigger(trigger_clone, table_name)
+    })?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_close(
     _program: &Program,
     state: &mut ProgramState,

@@ -229,6 +229,8 @@ pub fn translate_inner(
                 sql,
                 &commands,
                 when_clause.as_deref(),
+                event,
+                for_each_row,
             )?
         }
         ast::Stmt::CreateView {
