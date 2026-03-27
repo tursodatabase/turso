@@ -97,11 +97,10 @@ jobs:
 
       # https://learn.microsoft.com/en-us/nuget/nuget-org/publish-a-package
       - name: Publish to nuget
-        if: false # TODO: Get nuget api key and publish packages
         run: |
-          dotnet nuget push ${{ env.working-directory }}/src/Turso.Raw/bin/Release/Turso.Raw.*.nupkg --api-key ... --source https://api.nuget.org/v3/index.json
+          dotnet nuget push ${{ env.working-directory }}/src/Turso.Raw/bin/Release/Turso.Raw.*.nupkg --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json
 
-          dotnet nuget push ${{ env.working-directory }}/src/Turso/bin/Release/Turso.*.nupkg --api-key ... --source https://api.nuget.org/v3/index.json
+          dotnet nuget push ${{ env.working-directory }}/src/Turso/bin/Release/Turso.*.nupkg --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json
 
       - name: Upload Turso.Raw to artifacts
         uses: actions/upload-artifact@v4
