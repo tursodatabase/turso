@@ -1659,6 +1659,118 @@ fn walk_frame_bound_scoped<V: ScopedExprVisitor>(
     }
 }
 
+/// Macro that generates the Expr child-matching block shared by all expression walkers.
+/// Used by `walk_expr_scoped` (util.rs), `walk_expr_mut` and `walk_expr` (expr.rs).
+/// `$recurse` is the function to call recursively on child expressions.
+/// `$walk_window` is the function to call for window clauses.
+/// `$expr` is the expression being matched.
+/// `$($extra_args),*` are additional arguments passed to each recursive call.
+macro_rules! walk_expr_children {
+    ($expr:expr, $recurse:path, $walk_window:path $(, $extra:expr)*) => {
+        match $expr {
+            ast::Expr::SubqueryResult { lhs, .. } => {
+                if let Some(lhs) = lhs {
+                    return $recurse(lhs $(, $extra)*);
+                }
+            }
+            ast::Expr::Between { lhs, start, end, .. } => {
+                if $recurse(lhs $(, $extra)*)?.is_stop() { return Ok(WalkControl::Stop); }
+                if $recurse(start $(, $extra)*)?.is_stop() { return Ok(WalkControl::Stop); }
+                if $recurse(end $(, $extra)*)?.is_stop() { return Ok(WalkControl::Stop); }
+            }
+            ast::Expr::Binary(lhs, _, rhs) => {
+                if $recurse(lhs $(, $extra)*)?.is_stop() { return Ok(WalkControl::Stop); }
+                if $recurse(rhs $(, $extra)*)?.is_stop() { return Ok(WalkControl::Stop); }
+            }
+            ast::Expr::Case { base, when_then_pairs, else_expr } => {
+                if let Some(base) = base {
+                    if $recurse(base $(, $extra)*)?.is_stop() { return Ok(WalkControl::Stop); }
+                }
+                for (when_expr, then_expr) in when_then_pairs {
+                    if $recurse(when_expr $(, $extra)*)?.is_stop() { return Ok(WalkControl::Stop); }
+                    if $recurse(then_expr $(, $extra)*)?.is_stop() { return Ok(WalkControl::Stop); }
+                }
+                if let Some(else_expr) = else_expr {
+                    if $recurse(else_expr $(, $extra)*)?.is_stop() { return Ok(WalkControl::Stop); }
+                }
+            }
+            ast::Expr::Cast { expr, .. } => {
+                if $recurse(expr $(, $extra)*)?.is_stop() { return Ok(WalkControl::Stop); }
+            }
+            ast::Expr::Collate(expr, _) => {
+                if $recurse(expr $(, $extra)*)?.is_stop() { return Ok(WalkControl::Stop); }
+            }
+            ast::Expr::FunctionCall { args, order_by, filter_over, .. } => {
+                for arg in args {
+                    if $recurse(arg $(, $extra)*)?.is_stop() { return Ok(WalkControl::Stop); }
+                }
+                for sort_col in order_by {
+                    if $recurse(&mut sort_col.expr $(, $extra)*)?.is_stop() { return Ok(WalkControl::Stop); }
+                }
+                if let Some(ref mut filter) = filter_over.filter_clause {
+                    if $recurse(filter $(, $extra)*)?.is_stop() { return Ok(WalkControl::Stop); }
+                }
+                if let Some(ast::Over::Window(ref mut window)) = filter_over.over_clause {
+                    return $walk_window(window $(, $extra)*);
+                }
+            }
+            ast::Expr::FunctionCallStar { filter_over, .. } => {
+                if let Some(ref mut filter) = filter_over.filter_clause {
+                    if $recurse(filter $(, $extra)*)?.is_stop() { return Ok(WalkControl::Stop); }
+                }
+                if let Some(ast::Over::Window(ref mut window)) = filter_over.over_clause {
+                    return $walk_window(window $(, $extra)*);
+                }
+            }
+            ast::Expr::InList { lhs, rhs, .. } => {
+                if $recurse(lhs $(, $extra)*)?.is_stop() { return Ok(WalkControl::Stop); }
+                for expr in rhs {
+                    if $recurse(expr $(, $extra)*)?.is_stop() { return Ok(WalkControl::Stop); }
+                }
+            }
+            ast::Expr::InTable { lhs, args, .. } => {
+                if $recurse(lhs $(, $extra)*)?.is_stop() { return Ok(WalkControl::Stop); }
+                for expr in args {
+                    if $recurse(expr $(, $extra)*)?.is_stop() { return Ok(WalkControl::Stop); }
+                }
+            }
+            ast::Expr::IsNull(expr) | ast::Expr::NotNull(expr) => {
+                return $recurse(expr $(, $extra)*);
+            }
+            ast::Expr::Like { lhs, rhs, escape, .. } => {
+                if $recurse(lhs $(, $extra)*)?.is_stop() { return Ok(WalkControl::Stop); }
+                if $recurse(rhs $(, $extra)*)?.is_stop() { return Ok(WalkControl::Stop); }
+                if let Some(esc) = escape {
+                    return $recurse(esc $(, $extra)*);
+                }
+            }
+            ast::Expr::Parenthesized(exprs) => {
+                for expr in exprs {
+                    if $recurse(expr $(, $extra)*)?.is_stop() { return Ok(WalkControl::Stop); }
+                }
+            }
+            ast::Expr::Raise(_, expr) => {
+                if let Some(raise_expr) = expr {
+                    return $recurse(raise_expr $(, $extra)*);
+                }
+            }
+            ast::Expr::Unary(_, expr) => {
+                return $recurse(expr $(, $extra)*);
+            }
+            ast::Expr::Array { .. } | ast::Expr::Subscript { .. } => {
+                unreachable!("Array and Subscript are desugared into function calls by the parser")
+            }
+            // Subqueries are handled by the caller before invoking this macro
+            ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. } => {}
+            // Leaf nodes
+            ast::Expr::Id(_) | ast::Expr::Column { .. } | ast::Expr::RowId { .. }
+            | ast::Expr::Literal(_) | ast::Expr::DoublyQualified(..) | ast::Expr::Name(_)
+            | ast::Expr::Qualified(..) | ast::Expr::Variable(_) | ast::Expr::Register(_)
+            | ast::Expr::Default => {}
+        }
+    };
+}
+
 pub(crate) fn walk_expr_scoped<V: ScopedExprVisitor>(
     expr: &mut ast::Expr,
     scope: &mut V::Scope,
@@ -1670,6 +1782,7 @@ pub(crate) fn walk_expr_scoped<V: ScopedExprVisitor>(
         WalkControl::Continue => {}
     }
 
+    // Handle subqueries: recurse into their SELECT bodies
     match expr {
         ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
             return walk_select(select, scope, visitor);
@@ -1680,166 +1793,10 @@ pub(crate) fn walk_expr_scoped<V: ScopedExprVisitor>(
             }
             return walk_select(rhs, scope, visitor);
         }
-        ast::Expr::SubqueryResult { lhs, .. } => {
-            if let Some(lhs) = lhs {
-                return walk_expr_scoped(lhs, scope, visitor);
-            }
-        }
-        ast::Expr::Between {
-            lhs, start, end, ..
-        } => {
-            if walk_expr_scoped(lhs, scope, visitor)?.is_stop() {
-                return Ok(WalkControl::Stop);
-            }
-            if walk_expr_scoped(start, scope, visitor)?.is_stop() {
-                return Ok(WalkControl::Stop);
-            }
-            if walk_expr_scoped(end, scope, visitor)?.is_stop() {
-                return Ok(WalkControl::Stop);
-            }
-        }
-        ast::Expr::Binary(lhs, _, rhs) => {
-            if walk_expr_scoped(lhs, scope, visitor)?.is_stop() {
-                return Ok(WalkControl::Stop);
-            }
-            if walk_expr_scoped(rhs, scope, visitor)?.is_stop() {
-                return Ok(WalkControl::Stop);
-            }
-        }
-        ast::Expr::Case {
-            base,
-            when_then_pairs,
-            else_expr,
-        } => {
-            if let Some(base) = base {
-                if walk_expr_scoped(base, scope, visitor)?.is_stop() {
-                    return Ok(WalkControl::Stop);
-                }
-            }
-            for (when_expr, then_expr) in when_then_pairs {
-                if walk_expr_scoped(when_expr, scope, visitor)?.is_stop() {
-                    return Ok(WalkControl::Stop);
-                }
-                if walk_expr_scoped(then_expr, scope, visitor)?.is_stop() {
-                    return Ok(WalkControl::Stop);
-                }
-            }
-            if let Some(else_expr) = else_expr {
-                if walk_expr_scoped(else_expr, scope, visitor)?.is_stop() {
-                    return Ok(WalkControl::Stop);
-                }
-            }
-        }
-        ast::Expr::Cast { expr, .. } => {
-            if walk_expr_scoped(expr, scope, visitor)?.is_stop() {
-                return Ok(WalkControl::Stop);
-            }
-        }
-        ast::Expr::Collate(expr, _) => {
-            if walk_expr_scoped(expr, scope, visitor)?.is_stop() {
-                return Ok(WalkControl::Stop);
-            }
-        }
-        ast::Expr::FunctionCall {
-            args,
-            order_by,
-            filter_over,
-            ..
-        } => {
-            for arg in args {
-                if walk_expr_scoped(arg, scope, visitor)?.is_stop() {
-                    return Ok(WalkControl::Stop);
-                }
-            }
-            for sort_col in order_by {
-                if walk_expr_scoped(&mut sort_col.expr, scope, visitor)?.is_stop() {
-                    return Ok(WalkControl::Stop);
-                }
-            }
-            if let Some(ref mut filter) = filter_over.filter_clause {
-                if walk_expr_scoped(filter, scope, visitor)?.is_stop() {
-                    return Ok(WalkControl::Stop);
-                }
-            }
-            if let Some(ast::Over::Window(ref mut window)) = filter_over.over_clause {
-                return walk_window_scoped_expressions(window, scope, visitor);
-            }
-        }
-        ast::Expr::FunctionCallStar { filter_over, .. } => {
-            if let Some(ref mut filter) = filter_over.filter_clause {
-                if walk_expr_scoped(filter, scope, visitor)?.is_stop() {
-                    return Ok(WalkControl::Stop);
-                }
-            }
-            if let Some(ast::Over::Window(ref mut window)) = filter_over.over_clause {
-                return walk_window_scoped_expressions(window, scope, visitor);
-            }
-        }
-        ast::Expr::InList { lhs, rhs, .. } => {
-            if walk_expr_scoped(lhs, scope, visitor)?.is_stop() {
-                return Ok(WalkControl::Stop);
-            }
-            for expr in rhs {
-                if walk_expr_scoped(expr, scope, visitor)?.is_stop() {
-                    return Ok(WalkControl::Stop);
-                }
-            }
-        }
-        ast::Expr::InTable { lhs, args, .. } => {
-            if walk_expr_scoped(lhs, scope, visitor)?.is_stop() {
-                return Ok(WalkControl::Stop);
-            }
-            for expr in args {
-                if walk_expr_scoped(expr, scope, visitor)?.is_stop() {
-                    return Ok(WalkControl::Stop);
-                }
-            }
-        }
-        ast::Expr::IsNull(expr) | ast::Expr::NotNull(expr) => {
-            return walk_expr_scoped(expr, scope, visitor);
-        }
-        ast::Expr::Like {
-            lhs, rhs, escape, ..
-        } => {
-            if walk_expr_scoped(lhs, scope, visitor)?.is_stop() {
-                return Ok(WalkControl::Stop);
-            }
-            if walk_expr_scoped(rhs, scope, visitor)?.is_stop() {
-                return Ok(WalkControl::Stop);
-            }
-            if let Some(esc) = escape {
-                return walk_expr_scoped(esc, scope, visitor);
-            }
-        }
-        ast::Expr::Parenthesized(exprs) => {
-            for expr in exprs {
-                if walk_expr_scoped(expr, scope, visitor)?.is_stop() {
-                    return Ok(WalkControl::Stop);
-                }
-            }
-        }
-        ast::Expr::Raise(_, expr) => {
-            if let Some(raise_expr) = expr {
-                return walk_expr_scoped(raise_expr, scope, visitor);
-            }
-        }
-        ast::Expr::Unary(_, expr) => {
-            return walk_expr_scoped(expr, scope, visitor);
-        }
-        ast::Expr::Array { .. } | ast::Expr::Subscript { .. } => {
-            unreachable!("Array and Subscript are desugared into function calls by the parser")
-        }
-        ast::Expr::Id(_)
-        | ast::Expr::Column { .. }
-        | ast::Expr::RowId { .. }
-        | ast::Expr::Literal(_)
-        | ast::Expr::DoublyQualified(..)
-        | ast::Expr::Name(_)
-        | ast::Expr::Qualified(..)
-        | ast::Expr::Variable(_)
-        | ast::Expr::Register(_)
-        | ast::Expr::Default => {}
+        _ => {}
     }
+
+    walk_expr_children!(expr, walk_expr_scoped, walk_window_scoped_expressions, scope, visitor);
     Ok(WalkControl::Continue)
 }
 
@@ -1862,7 +1819,7 @@ where
     F: FnMut(&ast::Expr) -> Result<WalkControl>,
 {
     let mut visitor = FlatExprVisitor(|expr: &mut ast::Expr| func(&*expr));
-    let mut select = select.clone();
+    let mut select = select.clone(); //TODO get rid of this clone
     walk_select(&mut select, &mut (), &mut visitor)?;
     Ok(())
 }

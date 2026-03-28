@@ -48,8 +48,9 @@ mod stats;
 #[allow(dead_code)]
 #[cfg(feature = "time")]
 mod time;
-mod translate;
+#[macro_use]
 mod util;
+mod translate;
 #[cfg(feature = "uuid")]
 mod uuid;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
