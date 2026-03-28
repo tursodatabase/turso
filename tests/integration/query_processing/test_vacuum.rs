@@ -98,7 +98,8 @@ fn test_vacuum_into_basic(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Test VACUUM INTO error cases: plain VACUUM, existing file, within transaction
+/// Test VACUUM INTO error cases: plain VACUUM, existing file, within
+/// transaction, and query_only mode.
 #[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER);")]
 fn test_vacuum_into_error_cases(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
@@ -143,9 +144,39 @@ fn test_vacuum_into_error_cases(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let rows: Vec<(i64,)> = conn.exec_rows("SELECT a FROM t");
     assert_eq!(rows, vec![(1,)]);
 
+    // 4. VACUUM / VACUUM INTO should fail in query_only mode with a
+    // VACUUM-specific error message.
+    conn.set_query_only(true);
+    let query_only_path = dest_dir.path().join("query-only.db");
+    let escaped_query_only_path = escape_sqlite_string_literal(query_only_path.to_str().unwrap());
+    let result = conn.execute(format!("VACUUM INTO '{escaped_query_only_path}'"));
+    assert!(
+        result.is_err(),
+        "VACUUM INTO should fail in query_only mode"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("VACUUM") && err_msg.contains("query_only"),
+        "Error should mention VACUUM and query_only, got: {err_msg}"
+    );
+    assert!(
+        !query_only_path.exists(),
+        "File should not be created in query_only mode"
+    );
+    conn.set_query_only(false);
+
     Ok(())
 }
 
+/// Active-statement accounting matrix for VACUUM INTO:
+///
+/// - active other statement, no reprepare -> reject
+/// - active other statement, with reprepare -> still reject
+/// Active-statement accounting for VACUUM INTO:
+///
+/// - active other statement, no reprepare -> reject
+/// - active other statement, with reprepare -> still reject
+///
 /// SQLite-compatible behavior: VACUUM INTO must reject if another statement is
 /// still active on the same connection.
 #[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER);")]
@@ -171,6 +202,66 @@ fn test_vacuum_into_rejects_active_select_on_same_connection(
     let err = conn
         .execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))
         .expect_err("VACUUM INTO should reject same-connection active statements");
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("SQL statements in progress"),
+        "error should mention active statements, got: {err_msg}"
+    );
+    assert!(
+        !dest_path.exists(),
+        "destination file should not be created on failure"
+    );
+
+    let mut seen = vec![1];
+    loop {
+        match select_stmt.step()? {
+            StepResult::Row => {
+                let row = select_stmt.row().expect("row should be present");
+                match row.get_values().next() {
+                    Some(v) => seen.push(v.as_int().expect("expected integer row value")),
+                    other => panic!("unexpected row value after VACUUM INTO: {other:?}"),
+                }
+            }
+            StepResult::Done => break,
+            StepResult::IO => select_stmt.get_pager().io.step()?,
+            StepResult::Busy => anyhow::bail!("unexpected Busy while draining SELECT"),
+            StepResult::Interrupt => anyhow::bail!("unexpected Interrupt while draining SELECT"),
+        }
+    }
+
+    assert_eq!(seen, vec![1, 2, 3]);
+    Ok(())
+}
+
+/// Reprepared active root statements must remain counted so VACUUM INTO still
+/// rejects them as "SQL statements in progress".
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER);")]
+fn test_vacuum_into_rejects_reprepared_active_select_on_same_connection(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)")?;
+
+    let mut select_stmt = conn.prepare("SELECT a FROM t ORDER BY a")?;
+    conn.execute("PRAGMA foreign_keys = ON")?;
+
+    assert!(
+        matches!(select_stmt.step()?, StepResult::Row),
+        "SELECT should remain active after reprepare and first row"
+    );
+    assert_eq!(
+        select_stmt.row().unwrap().get_values().next(),
+        Some(&Value::from_i64(1))
+    );
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir
+        .path()
+        .join("reprepared-active-select-vacuum-into.db");
+
+    let err = conn
+        .execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))
+        .expect_err("VACUUM INTO should reject re-prepared active statements");
     let err_msg = err.to_string();
     assert!(
         err_msg.contains("SQL statements in progress"),

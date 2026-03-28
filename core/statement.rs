@@ -57,6 +57,12 @@ pub(crate) enum StatementOrigin {
     Subprogram,
 }
 
+impl StatementOrigin {
+    pub(crate) const fn needs_nested_guard(self) -> bool {
+        matches!(self, Self::InternalHelper)
+    }
+}
+
 pub struct Statement {
     pub(crate) program: vdbe::Program,
     state: vdbe::ProgramState,
@@ -110,6 +116,7 @@ impl Statement {
             query_mode,
             tail_offset,
             StatementOrigin::Root,
+            false,
         )
     }
 
@@ -119,6 +126,7 @@ impl Statement {
         query_mode: QueryMode,
         tail_offset: usize,
         origin: StatementOrigin,
+        nested_guard_active: bool,
     ) -> Self {
         let (max_registers, cursor_count) = match query_mode {
             QueryMode::Normal => (program.max_registers, program.cursor_ref.len()),
@@ -126,12 +134,6 @@ impl Statement {
             QueryMode::ExplainQueryPlan => (EXPLAIN_QUERY_PLAN_COLUMNS.len(), 0),
         };
         let state = vdbe::ProgramState::new(max_registers, cursor_count);
-        // Only separately prepared internal helper SQL needs a connection-level
-        // nestedness guard for its full Statement lifetime.
-        let nested_guard_active = matches!(origin, StatementOrigin::InternalHelper);
-        if nested_guard_active {
-            program.connection.start_nested();
-        }
         Self {
             program,
             state,
@@ -242,6 +244,16 @@ impl Statement {
         }
     }
 
+    fn release_active_root_if_counted(&mut self) {
+        if self.counted_as_active_root {
+            self.program
+                .connection
+                .n_active_root_statements
+                .fetch_sub(1, Ordering::SeqCst);
+            self.counted_as_active_root = false;
+        }
+    }
+
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
         if !self.counted_as_active_root && matches!(self.origin, StatementOrigin::Root) {
             self.program
@@ -256,7 +268,10 @@ impl Statement {
                 .prepare_context
                 .matches_connection(&self.program.connection)
         {
-            self.reprepare()?;
+            if let Err(err) = self.reprepare() {
+                self.release_active_root_if_counted();
+                return Err(err);
+            }
         }
 
         self.arm_query_timeout_if_needed();
@@ -283,7 +298,10 @@ impl Statement {
                 break;
             }
             tracing::debug!("reprepare: attempt={}", attempt);
-            self.reprepare()?;
+            if let Err(err) = self.reprepare() {
+                self.release_active_root_if_counted();
+                return Err(err);
+            }
             res = self
                 .program
                 .step(&mut self.state, &self.pager, self.query_mode, waker);
@@ -345,11 +363,7 @@ impl Statement {
         if self.counted_as_active_root
             && (matches!(res, Ok(StepResult::Done | StepResult::Interrupt)) || res.is_err())
         {
-            self.program
-                .connection
-                .n_active_root_statements
-                .fetch_sub(1, Ordering::SeqCst);
-            self.counted_as_active_root = false;
+            self.release_active_root_if_counted();
         }
 
         res
@@ -503,7 +517,13 @@ impl Statement {
             QueryMode::Explain => (EXPLAIN_COLUMNS.len(), 0),
             QueryMode::ExplainQueryPlan => (EXPLAIN_QUERY_PLAN_COLUMNS.len(), 0),
         };
-        self.reset_internal(Some(max_registers), Some(cursor_count))?;
+        // Repreparing a root statement must not make it disappear from
+        // `n_active_root_statements` while it is still logically in progress.
+        self.reset_internal(
+            Some(max_registers),
+            Some(cursor_count),
+            self.counted_as_active_root,
+        )?;
         // Load the parameters back into the state
         self.state.parameters = parameters;
         Ok(())
@@ -677,7 +697,7 @@ impl Statement {
     }
 
     pub fn reset(&mut self) -> Result<()> {
-        self.reset_internal(None, None)
+        self.reset_internal(None, None, false)
     }
 
     pub fn reset_best_effort(&mut self) {
@@ -696,6 +716,7 @@ impl Statement {
         &mut self,
         max_registers: Option<usize>,
         max_cursors: Option<usize>,
+        preserve_active_root_count: bool,
     ) -> Result<()> {
         fn capture_reset_error(
             reset_error: &mut Option<LimboError>,
@@ -820,12 +841,8 @@ impl Statement {
                 .fetch_sub(1, Ordering::SeqCst);
             self.state.is_active_write = false;
         }
-        if self.counted_as_active_root {
-            self.program
-                .connection
-                .n_active_root_statements
-                .fetch_sub(1, Ordering::SeqCst);
-            self.counted_as_active_root = false;
+        if self.counted_as_active_root && !preserve_active_root_count {
+            self.release_active_root_if_counted();
         }
         self.state.reset(max_registers, max_cursors);
         self.state.n_change.store(0, Ordering::SeqCst);

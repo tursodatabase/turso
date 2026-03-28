@@ -310,47 +310,58 @@ impl Connection {
             ));
         }
 
-        let sql = sql.as_ref();
-        tracing::debug!("Preparing: {}", sql);
-        let mut parser = Parser::new(sql.as_bytes());
-        let cmd = match parser.next_cmd()? {
-            Some(cmd) => cmd,
-            None => {
-                return Err(LimboError::InvalidArgument(
-                    "The supplied SQL string contains no statements".to_string(),
-                ));
-            }
-        };
-        let syms = self.syms.read();
-        let byte_offset_end = parser.offset();
-        let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
-            .unwrap()
-            .trim();
-        self.maybe_update_schema();
-        let pager = self.pager.load().clone();
-        let mode = QueryMode::new(&cmd);
-        let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+        let needs_nested_guard = origin.needs_nested_guard();
+        if needs_nested_guard {
+            self.start_nested();
+        }
+        let result = (|| {
+            let sql = sql.as_ref();
+            tracing::debug!("Preparing: {}", sql);
+            let mut parser = Parser::new(sql.as_bytes());
+            let cmd = match parser.next_cmd()? {
+                Some(cmd) => cmd,
+                None => {
+                    return Err(LimboError::InvalidArgument(
+                        "The supplied SQL string contains no statements".to_string(),
+                    ));
+                }
+            };
+            let syms = self.syms.read();
+            let byte_offset_end = parser.offset();
+            let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
+                .unwrap()
+                .trim();
+            self.maybe_update_schema();
+            let pager = self.pager.load().clone();
+            let mode = QueryMode::new(&cmd);
+            let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
 
-        // Read lock + Arc::Clone the schema here to avoid a possible recursive read lock in `op_parse_schema`,
-        // where we try to read the schema again there
-        let schema = self.schema.read().clone();
+            // Read lock + Arc::Clone the schema here to avoid a possible recursive read lock in `op_parse_schema`,
+            // where we try to read the schema again there
+            let schema = self.schema.read().clone();
 
-        let program = translate::translate(
-            &schema,
-            stmt,
-            pager.clone(),
-            self.clone(),
-            &syms,
-            mode,
-            input,
-        )?;
-        Ok(Statement::new_with_origin(
-            program,
-            pager,
-            mode,
-            byte_offset_end,
-            origin,
-        ))
+            let program = translate::translate(
+                &schema,
+                stmt,
+                pager.clone(),
+                self.clone(),
+                &syms,
+                mode,
+                input,
+            )?;
+            Ok(Statement::new_with_origin(
+                program,
+                pager,
+                mode,
+                byte_offset_end,
+                origin,
+                needs_nested_guard,
+            ))
+        })();
+        if result.is_err() && needs_nested_guard {
+            self.end_nested();
+        }
+        result
     }
 
     /// Prepare a statement from an AST node directly, skipping SQL parsing.
@@ -367,21 +378,38 @@ impl Connection {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        self.maybe_update_schema();
-        let syms = self.syms.read();
-        let pager = self.pager.load().clone();
-        let mode = QueryMode::Normal;
-        let schema = self.schema.read().clone();
-        let program = translate::translate(
-            &schema,
-            stmt,
-            pager.clone(),
-            self.clone(),
-            &syms,
-            mode,
-            "<ast>", // No SQL input string available
-        )?;
-        Ok(Statement::new_with_origin(program, pager, mode, 0, origin))
+        let needs_nested_guard = origin.needs_nested_guard();
+        if needs_nested_guard {
+            self.start_nested();
+        }
+        let result = (|| {
+            self.maybe_update_schema();
+            let syms = self.syms.read();
+            let pager = self.pager.load().clone();
+            let mode = QueryMode::Normal;
+            let schema = self.schema.read().clone();
+            let program = translate::translate(
+                &schema,
+                stmt,
+                pager.clone(),
+                self.clone(),
+                &syms,
+                mode,
+                "<ast>", // No SQL input string available
+            )?;
+            Ok(Statement::new_with_origin(
+                program,
+                pager,
+                mode,
+                0,
+                origin,
+                needs_nested_guard,
+            ))
+        })();
+        if result.is_err() && needs_nested_guard {
+            self.end_nested();
+        }
+        result
     }
 
     /// Whether this is an internal connection used for MVCC bootstrap
