@@ -1,5 +1,6 @@
 //! Translation of VACUUM statements to VDBE bytecode.
 
+use crate::translate::emitter::Resolver;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::Insn;
 use crate::{bail_parse_error, Result};
@@ -12,26 +13,47 @@ use turso_parser::ast::{Expr, Literal, Name};
 ///
 /// # Arguments
 /// * `program` - The program builder to emit instructions to
-/// * `schema_name` - Optional schema/database name (not yet supported)
+/// * `resolver` - The resolver for looking up attached databases
+/// * `schema_name` - Optional schema/database name
 /// * `into` - Optional destination path for VACUUM INTO
 ///
 /// # Returns
 /// The modified program builder on success
 pub fn translate_vacuum(
     program: &mut ProgramBuilder,
+    resolver: &Resolver,
     schema_name: Option<&Name>,
     into: Option<&Expr>,
 ) -> Result<()> {
-    // Schema name support (for attached databases) is not yet implemented
-    if schema_name.is_some() {
-        bail_parse_error!("VACUUM with schema name is not supported yet");
-    }
+    // Resolve schema name to database ID
+    let db_id = match schema_name {
+        None => crate::MAIN_DB_ID,
+        Some(name) => {
+            let name_str = name.as_str();
+            match name_str {
+                "main" => crate::MAIN_DB_ID,
+                "temp" => bail_parse_error!("VACUUM on temp database is not supported"),
+                alias => {
+                    // Look up attached database by name
+                    resolver
+                        .get_attached_database(alias)
+                        .map(|(id, _)| id)
+                        .ok_or_else(|| {
+                            crate::LimboError::InvalidArgument(format!("no such database: {alias}"))
+                        })?
+                }
+            }
+        }
+    };
 
     match into {
         Some(dest_expr) => {
             // VACUUM INTO 'path' - create compacted copy at destination
             let dest_path = extract_path_from_expr(dest_expr)?;
-            program.emit_insn(Insn::VacuumInto { dest_path });
+            program.emit_insn(Insn::VacuumInto {
+                db: db_id,
+                dest_path,
+            });
             Ok(())
         }
         None => {
