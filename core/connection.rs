@@ -1568,10 +1568,12 @@ impl Connection {
 
         let use_views = self.db.experimental_views_enabled();
         let use_custom_types = self.db.experimental_custom_types_enabled();
+        let use_generated_columns = self.db.experimental_generated_columns_enabled();
 
         let db_opts = DatabaseOpts::new()
             .with_views(use_views)
-            .with_custom_types(use_custom_types);
+            .with_custom_types(use_custom_types)
+            .with_generated_columns(use_generated_columns);
         // Select the IO layer for the attached database:
         // - :memory: databases always get a fresh MemoryIO
         // - File-based databases reuse the parent's IO when the parent is also

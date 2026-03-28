@@ -4,6 +4,9 @@ use anyhow::Context;
 use bitflags::bitflags;
 use indexmap::IndexSet;
 use serde::{Deserialize, Serialize};
+use sql_generation::generation::generated_expr::rename_column_refs_in_expr;
+use sql_generation::generation::generated_expr::rename_column_refs_in_expr;
+use sql_generation::model::query::predicate::expr_to_value;
 use sql_generation::model::query::select::SelectTable;
 use sql_generation::model::{
     query::{
@@ -18,7 +21,7 @@ use sql_generation::model::{
 };
 use turso_core::Value;
 use turso_core::turso_assert_eq;
-use turso_parser::ast::Distinctness;
+use turso_parser::ast::{ColumnConstraint, Distinctness};
 
 use crate::runner::env::TransactionMode;
 use crate::{generation::Shadow, runner::env::ShadowTablesMut};
@@ -289,6 +292,7 @@ impl Query {
             Query::Create(_) => IndexSet::new(),
             Query::Insert(Insert::Select { table, .. })
             | Query::Insert(Insert::Values { table, .. })
+            | Query::Insert(Insert::ValuesWithColumns { table, .. })
             | Query::Delete(Delete { table, .. })
             | Query::Update(Update { table, .. })
             | Query::Drop(Drop { table, .. })
@@ -316,6 +320,7 @@ impl Query {
             Query::Select(select) => select.dependencies().into_iter().collect(),
             Query::Insert(Insert::Select { table, .. })
             | Query::Insert(Insert::Values { table, .. })
+            | Query::Insert(Insert::ValuesWithColumns { table, .. })
             | Query::Delete(Delete { table, .. })
             | Query::Update(Update { table, .. })
             | Query::Drop(Drop { table, .. })
@@ -581,6 +586,49 @@ impl Shadow for Drop {
     }
 }
 
+/// Expand partial insert values into a full-width row.
+///
+/// Maps the inserted values (which only cover non-generated columns) to their
+/// correct positions. Virtual generated column values are computed from their
+/// expressions so that UNIQUE constraint checks see the actual values.
+pub(crate) fn expand_to_full_row(
+    table: &Table,
+    insert_columns: Option<&[String]>,
+    insert_values: &[SimValue],
+) -> Vec<SimValue> {
+    let mut full_row = vec![SimValue::NULL; table.columns.len()];
+
+    if let Some(cols) = insert_columns {
+        for (i, col_name) in cols.iter().enumerate() {
+            if let Some(pos) = table.columns.iter().position(|c| &c.name == col_name) {
+                if i < insert_values.len() {
+                    full_row[pos] = insert_values[i].clone();
+                }
+            }
+        }
+    } else {
+        let mut idx = 0;
+        for (col_idx, col) in table.columns.iter().enumerate() {
+            if !col.is_generated() && idx < insert_values.len() {
+                full_row[col_idx] = insert_values[idx].clone();
+                idx += 1;
+            }
+        }
+    }
+
+    // Evaluate virtual generated column expressions so that UNIQUE constraint
+    // checks see the real computed values instead of NULL.
+    for (col_idx, col) in table.columns.iter().enumerate() {
+        if let Some(expr) = col.generated_expr() {
+            if let Some(value) = expr_to_value(expr, &full_row, table) {
+                full_row[col_idx] = value.apply_affinity(col.column_type);
+            }
+        }
+    }
+
+    full_row
+}
+
 impl Shadow for Insert {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
@@ -606,6 +654,40 @@ impl Shadow for Insert {
                 tables[table_pos].rows.extend(rows);
                 Ok(vec![])
             }
+            Insert::ValuesWithColumns {
+                table,
+                columns: insert_columns,
+                values,
+            } => {
+                let table_name = table.clone();
+
+                let table_pos = tables
+                    .iter()
+                    .position(|t| t.name == table_name)
+                    .ok_or_else(|| anyhow::anyhow!("Table {} does not exist", table_name))?;
+
+                let table_ref = tables[table_pos].clone();
+
+                // Expand partial rows to full width (NULLs for virtual columns)
+                let full_rows: Vec<Vec<SimValue>> = values
+                    .iter()
+                    .map(|row| expand_to_full_row(&table_ref, Some(insert_columns), row))
+                    .collect();
+
+                let columns = tables[table_pos].columns.clone();
+                let rows = prepare_insert_rows(
+                    &table_name,
+                    &columns,
+                    &tables[table_pos].rows,
+                    &full_rows,
+                )?;
+
+                for row in &rows {
+                    tables.record_insert(table_name.clone(), row.clone());
+                }
+                tables[table_pos].rows.extend(rows);
+                Ok(vec![])
+            }
             Insert::Values {
                 table,
                 values,
@@ -620,13 +702,25 @@ impl Shadow for Insert {
 
                 let columns = tables[table_pos].columns.clone();
 
+                // Expand rows to full width if table has virtual generated columns
+                let has_generated = columns.iter().any(|c| c.is_generated());
+                let effective_values: Vec<Vec<SimValue>> = if has_generated {
+                    let table_ref = tables[table_pos].clone();
+                    values
+                        .iter()
+                        .map(|row| expand_to_full_row(&table_ref, None, row))
+                        .collect()
+                } else {
+                    values.clone()
+                };
+
                 match on_conflict {
                     None => {
                         let new_rows = prepare_insert_rows(
                             &table_name,
                             &columns,
                             &tables[table_pos].rows,
-                            values,
+                            &effective_values,
                         )?;
 
                         for row in &new_rows {
@@ -679,7 +773,7 @@ impl Shadow for Insert {
                         }
                         let mut staged_ops: Vec<StagedOp> = Vec::new();
 
-                        for raw_row in values.iter() {
+                        for raw_row in effective_values.iter() {
                             ensure_row_width(&table_name, &columns, raw_row)?;
 
                             let excluded_row = if let (Some(pk_idx), Some(alloc)) =
@@ -1043,6 +1137,14 @@ impl Shadow for Update {
                             }
                         }
                     }
+                    // Recompute virtual generated columns after SET assignments
+                    for (col_idx, col) in columns.iter().enumerate() {
+                        if let Some(expr) = col.generated_expr() {
+                            if let Some(value) = expr_to_value(expr, &new_row, &t2) {
+                                new_row[col_idx] = value.apply_affinity(col.column_type);
+                            }
+                        }
+                    }
                     (row_idx, old_row.clone(), new_row)
                 })
                 .collect();
@@ -1175,6 +1277,7 @@ impl Shadow for AlterTable {
             }
             AlterTableType::AddColumn { column } => {
                 table.columns.push(column.clone());
+                // Virtual generated columns are computed on-the-fly; just add NULL placeholder
                 table.rows.iter_mut().for_each(|row| {
                     row.push(SimValue(turso_core::Value::Null));
                 });
@@ -1191,8 +1294,19 @@ impl Shadow for AlterTable {
                 });
             }
             AlterTableType::RenameColumn { old, new } => {
+                // Rename the column itself
                 let col = table.columns.iter_mut().find(|c| c.name == *old).unwrap();
                 col.name.clone_from(new);
+
+                // Update generated column expressions that reference the old column name
+                for col in &mut table.columns {
+                    for constraint in &mut col.constraints {
+                        if let ColumnConstraint::Generated { expr, .. } = constraint {
+                            rename_column_refs_in_expr(expr, old, new);
+                        }
+                    }
+                }
+
                 table.indexes.iter_mut().for_each(|index| {
                     index.columns.iter_mut().for_each(|(col_name, _)| {
                         if col_name == old {
