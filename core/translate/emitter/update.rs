@@ -2196,9 +2196,32 @@ fn emit_update_insns<'a>(
             {
                 let new_rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
                 // OLD column values are stored in preserved_old_registers (contiguous registers)
-                let old_values_start = preserved_old_registers
+                let old_regs = preserved_old_registers
                     .as_ref()
-                    .expect("FK check requires OLD values")[0];
+                    .expect("FK check requires OLD values");
+                let old_values_start = old_regs[0];
+
+                // Compute virtual generated columns for OLD values (they were
+                // initialized to NULL when the registers were allocated). The
+                // before-trigger path already computes them, but when there are
+                // no before triggers we must do it here so that
+                // fire_fk_update_actions sees the real OLD key values.
+                if !has_before_triggers {
+                    let columns = target_table.table.columns();
+                    if columns.iter().any(|c| c.is_virtual_generated()) {
+                        let old_ctx = DmlColumnContext::indexed(
+                            columns.clone(),
+                            old_regs.clone(),
+                        );
+                        compute_virtual_columns(
+                            program,
+                            columns,
+                            &old_ctx,
+                            &t_ctx.resolver,
+                        )?;
+                    }
+                }
+
                 fire_fk_update_actions(
                     program,
                     &mut t_ctx.resolver,
