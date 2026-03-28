@@ -1978,8 +1978,8 @@ mod trigger_col_rename {
             )));
         };
 
-    let old_col_norm = normalize_ident(old_column_name);
-    let new_col_norm = normalize_ident(new_column_name);
+        let old_col_norm = normalize_ident(old_column_name);
+        let new_col_norm = normalize_ident(new_column_name);
 
         // Get the trigger's owning table to check unqualified column references
         let trigger_table_name_raw = tbl_name.name.as_str();
@@ -1992,82 +1992,82 @@ mod trigger_col_rename {
                 LimboError::ParseError(format!("trigger table not found: {trigger_table_name}"))
             })?;
 
-    let target_table_name = normalize_ident(table_name);
+        let target_table_name = normalize_ident(table_name);
 
-    // Rewrite UPDATE OF column list if renaming a column in the trigger's owning table
-    let is_renaming_trigger_table = trigger_table_name == target_table_name;
-    let new_event = if is_renaming_trigger_table {
-        match event {
-            ast::TriggerEvent::UpdateOf(mut cols) => {
-                // Rewrite column names in UPDATE OF list
-                for col in &mut cols {
-                    let col_norm = normalize_ident(col.as_str());
-                    if col_norm == old_col_norm {
-                        *col = ast::Name::from_string(new_col_norm.clone());
-                    }
-                }
-                ast::TriggerEvent::UpdateOf(cols)
-            }
-            other => other,
-        }
-    } else {
-        event
-    };
-
-    // Rewrite WHEN clause column references if present.
-    // In WHEN clauses, only NEW.col / OLD.col qualified references are valid;
-    // bare column names are not valid in trigger WHEN clauses per SQLite semantics,
-    // so we only rewrite qualified NEW/OLD references here.
-    let new_when_clause = when_clause
-        .map(|e| {
-            let mut expr = *e;
-            walk_expr_mut(
-                &mut expr,
-                &mut |ex: &mut ast::Expr| -> Result<WalkControl> {
-                    if let ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) =
-                        ex
-                    {
-                        let ns_norm = normalize_ident(ns.as_str());
+        // Rewrite UPDATE OF column list if renaming a column in the trigger's owning table
+        let is_renaming_trigger_table = trigger_table_name == target_table_name;
+        let new_event = if is_renaming_trigger_table {
+            match event {
+                ast::TriggerEvent::UpdateOf(mut cols) => {
+                    // Rewrite column names in UPDATE OF list
+                    for col in &mut cols {
                         let col_norm = normalize_ident(col.as_str());
-                        if (ns_norm.eq_ignore_ascii_case("new")
-                            || ns_norm.eq_ignore_ascii_case("old"))
-                            && col_norm == *old_col_norm
-                            && is_renaming_trigger_table
-                            && trigger_table.get_column(&col_norm).is_some()
+                        if col_norm == old_col_norm {
+                            *col = ast::Name::from_string(new_col_norm.clone());
+                        }
+                    }
+                    ast::TriggerEvent::UpdateOf(cols)
+                }
+                other => other,
+            }
+        } else {
+            event
+        };
+
+        // Rewrite WHEN clause column references if present.
+        // In WHEN clauses, only NEW.col / OLD.col qualified references are valid;
+        // bare column names are not valid in trigger WHEN clauses per SQLite semantics,
+        // so we only rewrite qualified NEW/OLD references here.
+        let new_when_clause = when_clause
+            .map(|e| {
+                let mut expr = *e;
+                walk_expr_mut(
+                    &mut expr,
+                    &mut |ex: &mut ast::Expr| -> Result<WalkControl> {
+                        if let ast::Expr::Qualified(ns, col)
+                        | ast::Expr::DoublyQualified(_, ns, col) = ex
                         {
-                            *col = ast::Name::from_string(&*new_col_norm);
+                            let ns_norm = normalize_ident(ns.as_str());
+                            let col_norm = normalize_ident(col.as_str());
+                            if (ns_norm.eq_ignore_ascii_case("new")
+                                || ns_norm.eq_ignore_ascii_case("old"))
+                                && col_norm == *old_col_norm
+                                && is_renaming_trigger_table
+                                && trigger_table.get_column(&col_norm).is_some()
+                            {
+                                *col = ast::Name::from_string(&*new_col_norm);
+                            }
+                        }
+                        Ok(WalkControl::Continue)
+                    },
+                )?;
+                Ok::<Box<ast::Expr>, LimboError>(Box::new(expr))
+            })
+            .transpose()?;
+
+        // Validate: if the WHEN clause still contains a bare reference to the old column,
+        // SQLite would error with "no such column". We must do the same.
+        if let Some(ref when_expr) = new_when_clause {
+            let mut has_bare_old_col = false;
+            let _ = walk_expr_mut(
+                &mut when_expr.clone(),
+                &mut |ex: &mut ast::Expr| -> Result<WalkControl> {
+                    if let ast::Expr::Id(ref name) | ast::Expr::Name(ref name) = ex {
+                        if normalize_ident(name.as_str()) == *old_col_norm {
+                            has_bare_old_col = true;
                         }
                     }
                     Ok(WalkControl::Continue)
                 },
-            )?;
-            Ok::<Box<ast::Expr>, LimboError>(Box::new(expr))
-        })
-        .transpose()?;
-
-    // Validate: if the WHEN clause still contains a bare reference to the old column,
-    // SQLite would error with "no such column". We must do the same.
-    if let Some(ref when_expr) = new_when_clause {
-        let mut has_bare_old_col = false;
-        let _ = walk_expr_mut(
-            &mut when_expr.clone(),
-            &mut |ex: &mut ast::Expr| -> Result<WalkControl> {
-                if let ast::Expr::Id(ref name) | ast::Expr::Name(ref name) = ex {
-                    if normalize_ident(name.as_str()) == *old_col_norm {
-                        has_bare_old_col = true;
-                    }
-                }
-                Ok(WalkControl::Continue)
-            },
-        );
-        if has_bare_old_col {
-            return Err(LimboError::ParseError(format!(
-                "error in trigger {}: no such column: {}",
-                trigger_name.name.as_str(),
-                old_col_norm
-            )));
+            );
+            if has_bare_old_col {
+                return Err(LimboError::ParseError(format!(
+                    "error in trigger {}: no such column: {}",
+                    trigger_name.name.as_str(),
+                    old_col_norm
+                )));
+            }
         }
-    }
 
         let trigger_table_name_norm = normalize_ident(trigger_table_name_raw);
         let is_renaming_trigger_table = trigger_table_name_norm == target_table_name;

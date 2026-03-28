@@ -5301,7 +5301,10 @@ where
             ast::Expr::InSelect { lhs, .. } => {
                 walk_expr(lhs, func)?;
             }
-        }
+            _ => {
+                crate::walk_expr_children!(expr, walk_expr, walk_expr_window, func);
+            }
+        },
         WalkControl::SkipChildren => return Ok(WalkControl::Continue),
         WalkControl::Stop => return Ok(WalkControl::Stop),
     };
