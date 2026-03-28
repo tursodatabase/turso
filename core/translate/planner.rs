@@ -233,6 +233,12 @@ pub fn resolve_window_and_aggregate_functions(
                         return Ok(WalkControl::SkipChildren);
                     }
                     Some(Func::Window(f)) => {
+                        if filter_over.filter_clause.is_some() {
+                            crate::bail_parse_error!(
+                                "FILTER clause is not supported for {}()",
+                                f
+                            );
+                        }
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
                                 windows.as_deref_mut(),

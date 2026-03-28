@@ -1443,7 +1443,7 @@ pub fn validate_aggregate_function_tail(
     filter_over: &ast::FunctionTail,
     order_by: &[ast::SortedColumn],
 ) -> Result<()> {
-    if filter_over.filter_clause.is_some() {
+    if filter_over.filter_clause.is_some() && filter_over.over_clause.is_none() {
         crate::bail_parse_error!("FILTER clause is not supported yet in aggregate functions");
     }
 

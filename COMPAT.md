@@ -227,6 +227,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | unary operator            | ✅ Yes     |                                          |
 | binary operator           | 🚧 Partial | Only `%`, `!<`, and `!>` are unsupported |
 | agg() FILTER (WHERE ...)  | ❌ No      |                                          |
+| agg() FILTER (WHERE ...) OVER (...) | ✅ Yes  |                                     |
 | ... OVER (...)            | 🚧 Partial | Supported for aggregate functions and ROW_NUMBER() |
 | (expr)                    | ✅ Yes     |                                          |
 | CAST (expr AS type)       | ✅ Yes     |                                          |
