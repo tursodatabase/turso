@@ -236,6 +236,11 @@ async fn async_main(args: Args) -> Result<()> {
             let size = file_size(&wal_path);
             if size > 0 { Some(size) } else { None }
         },
+        log_file_bytes: {
+            let log_path = format!("{db_path}-log");
+            let size = file_size(&log_path);
+            if size > 0 { Some(size) } else { None }
+        },
     };
 
     match args.format {

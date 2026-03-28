@@ -2,6 +2,10 @@ use serde::Serialize;
 use std::path::Path;
 use std::time::Instant;
 
+const KB: f64 = 1024.0;
+const MB: f64 = 1024.0 * KB;
+const GB: f64 = 1024.0 * MB;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MemorySnapshot {
     pub rss_bytes: usize,
@@ -43,6 +47,8 @@ pub struct MemoryReport {
     pub db_file_bytes: u64,
     /// Size of the .db-wal file (WAL mode); None if absent or empty
     pub wal_file_bytes: Option<u64>,
+    /// Size of the .db-log file (MVCC logical log); None if absent or empty
+    pub log_file_bytes: Option<u64>,
 }
 
 pub fn take_snapshot(start: Instant, phase: &str) -> MemorySnapshot {
@@ -103,6 +109,9 @@ impl MemoryReport {
         if let Some(wal) = self.wal_file_bytes {
             println!("WAL file:    {}", format_bytes(wal as usize));
         }
+        if let Some(log) = self.log_file_bytes {
+            println!("Log file:    {}", format_bytes(log as usize));
+        }
     }
 
     pub fn print_json(&self) {
@@ -113,38 +122,42 @@ impl MemoryReport {
     }
 
     pub fn print_csv_header() {
-        println!("mode,workload,iterations,batch_size,connections,baseline_mb,rss_peak_mb,rss_final_mb,rss_growth_mb,heap_current_mb,heap_peak_mb,total_allocs,total_bytes_mb,db_mb,wal_mb");
+        println!(
+            "mode,workload,iterations,batch_size,connections,baseline_mb,rss_peak_mb,rss_final_mb,rss_growth_mb,heap_current_mb,heap_peak_mb,total_allocs,total_bytes_mb,db_mb,wal_mb,log_mb"
+        );
     }
 
     pub fn print_csv(&self) {
         println!(
-            "{},{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{:.2},{:.2},{:.2}",
+            "{},{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{:.2},{:.2},{:.2},{:.2}",
             self.mode,
             self.workload,
             self.iterations,
             self.batch_size,
             self.connections,
-            self.baseline_bytes as f64 / 1_048_576.0,
-            self.peak_bytes as f64 / 1_048_576.0,
-            self.final_bytes as f64 / 1_048_576.0,
-            self.net_growth_bytes as f64 / 1_048_576.0,
-            self.heap_current_bytes as f64 / 1_048_576.0,
-            self.heap_peak_bytes as f64 / 1_048_576.0,
+            self.baseline_bytes as f64 / MB,
+            self.peak_bytes as f64 / MB,
+            self.final_bytes as f64 / MB,
+            self.net_growth_bytes as f64 / MB,
+            self.heap_current_bytes as f64 / MB,
+            self.heap_peak_bytes as f64 / MB,
             self.total_allocs,
-            self.total_bytes_allocated as f64 / 1_048_576.0,
-            self.db_file_bytes as f64 / 1_048_576.0,
-            self.wal_file_bytes.unwrap_or(0) as f64 / 1_048_576.0,
+            self.total_bytes_allocated as f64 / MB,
+            self.db_file_bytes as f64 / MB,
+            self.wal_file_bytes.unwrap_or(0) as f64 / MB,
+            self.log_file_bytes.unwrap_or(0) as f64 / MB,
         );
     }
 }
 
 fn format_bytes(bytes: usize) -> String {
-    if bytes >= 1_073_741_824 {
-        format!("{:.2} GB", bytes as f64 / 1_073_741_824.0)
-    } else if bytes >= 1_048_576 {
-        format!("{:.2} MB", bytes as f64 / 1_048_576.0)
-    } else if bytes >= 1024 {
-        format!("{:.2} KB", bytes as f64 / 1024.0)
+    let bytes_f = bytes as f64;
+    if bytes_f >= GB {
+        format!("{:.2} GB", bytes_f / GB)
+    } else if bytes_f >= MB {
+        format!("{:.2} MB", bytes_f / MB)
+    } else if bytes_f >= KB {
+        format!("{:.2} KB", bytes_f / KB)
     } else {
         format!("{bytes} B")
     }
