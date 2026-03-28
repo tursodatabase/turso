@@ -1661,12 +1661,18 @@ fn walk_frame_bound_scoped<V: ScopedExprVisitor>(
 
 /// Macro that generates the Expr child-matching block shared by all expression walkers.
 /// Used by `walk_expr_scoped` (util.rs), `walk_expr_mut` and `walk_expr` (expr.rs).
-/// `$recurse` is the function to call recursively on child expressions.
-/// `$walk_window` is the function to call for window clauses.
-/// `$expr` is the expression being matched.
-/// `$($extra_args),*` are additional arguments passed to each recursive call.
+///
+/// Pass `@mut` before extra args for mutable traversal (`&mut` refs),
+/// or omit it for immutable traversal (`&` refs).
+#[macro_export]
 macro_rules! walk_expr_children {
+    ($expr:expr, $recurse:path, $walk_window:path, @mut $(, $extra:expr)*) => {
+        $crate::walk_expr_children!(@impl $expr, $recurse, $walk_window ; mut ; $($extra),*)
+    };
     ($expr:expr, $recurse:path, $walk_window:path $(, $extra:expr)*) => {
+        $crate::walk_expr_children!(@impl $expr, $recurse, $walk_window ; ; $($extra),*)
+    };
+    (@impl $expr:expr, $recurse:path, $walk_window:path ; $($borrow:ident)? ; $($extra:expr),*) => {
         match $expr {
             ast::Expr::SubqueryResult { lhs, .. } => {
                 if let Some(lhs) = lhs {
@@ -1705,20 +1711,20 @@ macro_rules! walk_expr_children {
                     if $recurse(arg $(, $extra)*)?.is_stop() { return Ok(WalkControl::Stop); }
                 }
                 for sort_col in order_by {
-                    if $recurse(&mut sort_col.expr $(, $extra)*)?.is_stop() { return Ok(WalkControl::Stop); }
+                    if $recurse(& $($borrow)? sort_col.expr $(, $extra)*)?.is_stop() { return Ok(WalkControl::Stop); }
                 }
-                if let Some(ref mut filter) = filter_over.filter_clause {
+                if let Some(ref $($borrow)? filter) = filter_over.filter_clause {
                     if $recurse(filter $(, $extra)*)?.is_stop() { return Ok(WalkControl::Stop); }
                 }
-                if let Some(ast::Over::Window(ref mut window)) = filter_over.over_clause {
+                if let Some(ast::Over::Window(ref $($borrow)? window)) = filter_over.over_clause {
                     return $walk_window(window $(, $extra)*);
                 }
             }
             ast::Expr::FunctionCallStar { filter_over, .. } => {
-                if let Some(ref mut filter) = filter_over.filter_clause {
+                if let Some(ref $($borrow)? filter) = filter_over.filter_clause {
                     if $recurse(filter $(, $extra)*)?.is_stop() { return Ok(WalkControl::Stop); }
                 }
-                if let Some(ast::Over::Window(ref mut window)) = filter_over.over_clause {
+                if let Some(ast::Over::Window(ref $($borrow)? window)) = filter_over.over_clause {
                     return $walk_window(window $(, $extra)*);
                 }
             }
@@ -1796,7 +1802,7 @@ pub(crate) fn walk_expr_scoped<V: ScopedExprVisitor>(
         _ => {}
     }
 
-    walk_expr_children!(expr, walk_expr_scoped, walk_window_scoped_expressions, scope, visitor);
+    crate::walk_expr_children!(expr, walk_expr_scoped, walk_window_scoped_expressions, @mut, scope, visitor);
     Ok(WalkControl::Continue)
 }
 
