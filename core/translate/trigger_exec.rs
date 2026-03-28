@@ -6,7 +6,7 @@ use crate::translate::subquery::{
 };
 use crate::translate::{
     emitter::Resolver,
-    expr::{self, translate_expr},
+    expr::{self, translate_expr, walk_expr_mut},
     planner::ROWID_STRS,
     translate_inner, ProgramBuilder, ProgramBuilderOpts,
 };
@@ -894,11 +894,10 @@ fn rewrite_trigger_expr_for_when_clause(
     table: &BTreeTable,
     ctx: &TriggerContext,
 ) -> Result<()> {
-    let mut visitor = FlatExprVisitor(|e: &mut ast::Expr| {
+    walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
         rewrite_trigger_expr_single_for_when_clause(e, table, ctx, false)?;
         Ok(WalkControl::Continue)
-    });
-    walk_expr_scoped(expr, &mut (), &mut visitor)?;
+    })?;
     Ok(())
 }
 
@@ -918,6 +917,14 @@ fn rewrite_trigger_expr_single_for_when_clause(
             {
                 crate::bail_parse_error!("no such column: {}", ident);
             }
+            return Ok(());
+        }
+        Expr::Exists(select) | Expr::Subquery(select) => {
+            let mut visitor = FlatExprVisitor(|e: &mut ast::Expr| {
+                rewrite_trigger_expr_single_for_when_clause(e, table, ctx, true)?;
+                Ok(WalkControl::Continue)
+            });
+            walk_select(select, &mut (), &mut visitor)?;
             return Ok(());
         }
         Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
