@@ -3774,6 +3774,7 @@ pub fn op_program(
                     QueryMode::Normal,
                     0,
                     crate::statement::StatementOrigin::Subprogram,
+                    false,
                 );
                 statement.reset()?;
 
@@ -13702,6 +13703,9 @@ fn op_vacuum_into_inner(
                     .load(Ordering::SeqCst)
                     != 1
                 {
+                    // This VACUUM INTO statement itself is the one active root
+                    // statement. Any count other than 1 means some other
+                    // top-level statement on the same connection is still active.
                     return Err(LimboError::TxError(
                         "cannot VACUUM - SQL statements in progress".to_string(),
                     ));
