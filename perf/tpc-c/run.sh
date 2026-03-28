@@ -8,7 +8,7 @@ TPCC_REPO="https://github.com/PThorpe92/tpcc-turso.git"
 
 if [ ! -d "$TPCC_DIR" ]; then
     echo "==> Cloning tpcc-turso benchmark..."
-    git clone "$TPCC_REPO" "$TPCC_DIR"
+    git clone "$TPCC_REPO" "$TPCC_DIR" --depth 1
 fi
 
 echo "==> Running TPC-C benchmark (turso root: $TURSO_ROOT)"
