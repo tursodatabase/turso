@@ -5278,9 +5278,11 @@ pub fn unwrap_parens_owned(expr: ast::Expr) -> Result<(ast::Expr, usize)> {
     }
 }
 
+#[derive(PartialEq, Eq)]
 pub enum WalkControl {
     Continue,     // Visit children
     SkipChildren, // Skip children but continue walking siblings
+    Stop,         // Halt traversal entirely
 }
 
 /// Recursively walks an immutable expression, applying a function to each sub-expression.
@@ -5329,7 +5331,7 @@ where
                 ast::Expr::Collate(expr, _) => {
                     walk_expr(expr, func)?;
                 }
-                ast::Expr::Exists(_select) | ast::Expr::Subquery(_select) => {
+                ast::Expr::Exists(_) | ast::Expr::Subquery(_) => {
                     // TODO: Walk through select statements if needed
                 }
                 ast::Expr::FunctionCall {
@@ -5452,6 +5454,7 @@ where
             }
         }
         WalkControl::SkipChildren => return Ok(WalkControl::Continue),
+        WalkControl::Stop => return Ok(WalkControl::Stop),
     };
     Ok(WalkControl::Continue)
 }
@@ -6086,6 +6089,7 @@ where
             }
         }
         WalkControl::SkipChildren => return Ok(WalkControl::Continue),
+        WalkControl::Stop => return Ok(WalkControl::Stop),
     };
     Ok(WalkControl::Continue)
 }
