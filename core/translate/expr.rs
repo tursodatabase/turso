@@ -5278,7 +5278,6 @@ pub fn unwrap_parens_owned(expr: ast::Expr) -> Result<(ast::Expr, usize)> {
     }
 }
 
-#[derive(PartialEq, Eq)]
 pub enum WalkControl {
     Continue,     // Visit children
     SkipChildren, // Skip children but continue walking siblings
@@ -5286,7 +5285,7 @@ pub enum WalkControl {
 }
 
 impl WalkControl {
-    pub fn is_stop(&self) -> bool{
+    pub fn is_stop(&self) -> bool {
         matches!(self, Self::Stop)
     }
 }
@@ -5927,18 +5926,13 @@ pub fn bind_and_rewrite_expr<'a>(
 }
 
 /// Recursively walks a mutable expression, applying a function to each sub-expression.
-/// Does NOT recurse into subqueries (`Subquery`/`Exists`/`InSelect`'s rhs) —
-/// use [`walk_expr_scoped`](crate::util::walk_expr_scoped) for that.
-/// Delegates to `walk_expr_scoped` with a visitor that returns `SkipChildren`
-/// for subquery nodes to preserve legacy behavior.
+/// Does not recurse into subqueries (`Subquery`/`Exists`/`InSelect`'s rhs).
 pub fn walk_expr_mut<F>(expr: &mut ast::Expr, func: &mut F) -> Result<WalkControl>
 where
     F: FnMut(&mut ast::Expr) -> Result<WalkControl>,
 {
     use crate::util::{walk_expr_scoped, ScopedExprVisitor};
 
-    /// Adapter that preserves `walk_expr_mut`'s legacy behavior of not
-    /// entering subqueries, while delegating child enumeration to `walk_expr_scoped`.
     struct NoSubqueryVisitor<'a, F>(&'a mut F);
 
     impl<F: FnMut(&mut ast::Expr) -> Result<WalkControl>> ScopedExprVisitor
@@ -5950,16 +5944,14 @@ where
         fn pop_scope(&mut self, _: &mut (), _: ()) {}
         fn visit_expr(&mut self, expr: &mut ast::Expr, _scope: &()) -> Result<WalkControl> {
             let result = (self.0)(expr)?;
-            if result == WalkControl::SkipChildren || result == WalkControl::Stop {
+            if matches!(result, WalkControl::SkipChildren | WalkControl::Stop) {
                 return Ok(result);
             }
-            // Don't enter subqueries — matches the old walk_expr_mut behavior.
-            // For InSelect, walk lhs (the expression side) but skip rhs (the SELECT).
             match expr {
                 ast::Expr::Subquery(_) | ast::Expr::Exists(_) => {
                     return Ok(WalkControl::SkipChildren);
                 }
-                ast::Expr::InSelect { lhs, .. } => {
+                ast::Expr::InSelect { lhs, rhs: _, .. } => {
                     walk_expr_scoped(lhs, &mut (), self)?;
                     return Ok(WalkControl::SkipChildren);
                 }
