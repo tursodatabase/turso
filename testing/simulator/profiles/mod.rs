@@ -169,6 +169,26 @@ impl Profile {
         profile
     }
 
+    pub fn checkpoint_fault() -> Self {
+        let profile = Profile {
+            io: IOProfile {
+                fault: FaultProfile {
+                    enable: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            query: QueryProfile {
+                select_weight: 0,
+                insert_weight: 100,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        profile.validate().unwrap();
+        profile
+    }
+
     pub fn parse_from_type(profile_type: ProfileType) -> anyhow::Result<Self> {
         let profile = match profile_type {
             ProfileType::Default => Self::default(),
@@ -177,6 +197,7 @@ impl Profile {
             ProfileType::Faultless => Self::faultless(),
             ProfileType::SimpleMvcc => Self::simple_mvcc(),
             ProfileType::WriteStress => Self::write_stress(),
+            ProfileType::CheckpointFault => Self::checkpoint_fault(),
             ProfileType::Custom(path) => {
                 Self::parse(path).with_context(|| "failed to parse JSON profile")?
             }
@@ -218,6 +239,7 @@ pub enum ProfileType {
     Faultless,
     SimpleMvcc,
     WriteStress,
+    CheckpointFault,
     #[strum(disabled)]
     Custom(PathBuf),
 }
