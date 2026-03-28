@@ -2295,3 +2295,142 @@ fn test_vacuum_into_compacts_fragmented_database(tmp_db: TempDatabase) -> anyhow
 
     Ok(())
 }
+
+#[cfg_attr(feature = "checksum", ignore)]
+#[turso_macros::test(init_sql = "CREATE TABLE main_table(x INTEGER);")]
+fn test_vacuum_into_attached_database(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("INSERT INTO main_table VALUES (1), (2), (3)")?;
+
+    // Attach a database
+    let attached_path = tmp_db.path.with_file_name("attached.db");
+    conn.execute(format!(
+        "ATTACH DATABASE '{}' AS attached",
+        attached_path.display()
+    ))?;
+
+    // Create table and insert data in attached database
+    conn.execute("CREATE TABLE attached.attached_table(y TEXT)")?;
+    conn.execute("INSERT INTO attached.attached_table VALUES ('a'), ('b'), ('c')")?;
+
+    // Vacuum the attached database
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("attached_vacuumed.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM attached INTO '{dest_path_str}'"))?;
+
+    // Verify destination file exists
+    assert!(dest_path.exists(), "Destination file should exist");
+
+    // Open the vacuumed database and verify it has the attached table data
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    // Verify integrity of vacuumed database
+    let integrity_result = run_integrity_check(&dest_conn);
+    assert_eq!(
+        integrity_result, "ok",
+        "Vacuumed attached database should pass integrity check"
+    );
+
+    // The vacuumed database should have attached_table, not main_table
+    let rows: Vec<(String,)> = dest_conn.exec_rows("SELECT y FROM attached_table ORDER BY y");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].0, "a");
+    assert_eq!(rows[1].0, "b");
+    assert_eq!(rows[2].0, "c");
+
+    // Verify main_table does NOT exist in vacuumed database
+    let result = dest_conn.execute("SELECT * FROM main_table");
+    assert!(
+        result.is_err(),
+        "main_table should not exist in vacuumed attached database"
+    );
+
+    Ok(())
+}
+
+#[cfg_attr(feature = "checksum", ignore)]
+#[turso_macros::test(init_sql = "CREATE TABLE main_table(x INTEGER);")]
+fn test_vacuum_into_explicit_main(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("INSERT INTO main_table VALUES (10), (20), (30)")?;
+
+    let attached_path = tmp_db.path.with_file_name("attached2.db");
+    conn.execute(format!(
+        "ATTACH DATABASE '{}' AS attached",
+        attached_path.display()
+    ))?;
+
+    conn.execute("CREATE TABLE attached.other_table(z INTEGER)")?;
+    conn.execute("INSERT INTO attached.other_table VALUES (100)")?;
+
+    // Vacuum main database explicitly
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("main_vacuumed.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM main INTO '{dest_path_str}'"))?;
+
+    // Open the vacuumed database
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    // Verify integrity of vacuumed database
+    let integrity_result = run_integrity_check(&dest_conn);
+    assert_eq!(
+        integrity_result, "ok",
+        "Vacuumed main database should pass integrity check"
+    );
+
+    // Should have main_table data
+    let rows: Vec<(i64,)> = dest_conn.exec_rows("SELECT x FROM main_table ORDER BY x");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].0, 10);
+    assert_eq!(rows[1].0, 20);
+    assert_eq!(rows[2].0, 30);
+
+    // Should NOT have attached table
+    let result = dest_conn.execute("SELECT * FROM other_table");
+    assert!(
+        result.is_err(),
+        "other_table should not exist in vacuumed main database"
+    );
+
+    Ok(())
+}
+
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_nonexistent_database_error(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    let result = conn.execute("VACUUM nonexistent INTO 'out.db'");
+
+    assert!(result.is_err(), "Should error on non-existent database");
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("no such database: nonexistent"),
+        "Error should indicate database not found: {err_msg}"
+    );
+
+    Ok(())
+}
+
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_temp_not_supported_error(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    let result = conn.execute("VACUUM temp INTO 'temp_out.db'");
+
+    assert!(result.is_err(), "Should error on temp database");
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("VACUUM on temp database is not supported"),
+        "Error should indicate temp not supported: {err_msg}"
+    );
+
+    Ok(())
+}

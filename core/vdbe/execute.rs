@@ -13692,7 +13692,20 @@ fn op_vacuum_into_inner(
     state: &mut ProgramState,
     insn: &Insn,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(VacuumInto { dest_path }, insn);
+    load_insn!(VacuumInto { db, dest_path }, insn);
+
+    // Get the source connection based on database ID
+    // For main database (0), use program.connection
+    // For attached databases (2+), look up the attached database and connect
+    let source_conn: Arc<Connection> = if *db == 0 {
+        program.connection.clone()
+    } else {
+        let attached_dbs = program.connection.attached_databases.read();
+        let db_arc = attached_dbs
+            .get_database_by_index(*db)
+            .ok_or_else(|| LimboError::InternalError("attached database not found".to_string()))?;
+        db_arc.connect()?
+    };
 
     let vacuum_state = state
         .op_vacuum_into_state
@@ -13705,7 +13718,7 @@ fn op_vacuum_into_inner(
             OpVacuumIntoSubState::Init => {
                 // Check if we're in a transaction
                 // as vacuum cannot be run inside a transaction
-                if !program.connection.auto_commit.load(Ordering::SeqCst) {
+                if !source_conn.auto_commit.load(Ordering::SeqCst) {
                     return Err(LimboError::TxError(
                         "cannot VACUUM INTO from within a transaction".to_string(),
                     ));
@@ -13722,29 +13735,25 @@ fn op_vacuum_into_inner(
                 // Always use PlatformIO for the destination file, even if source is in-memory.
                 // This ensures VACUUM INTO actually writes to disk.
                 let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
-                let source_db = &program.connection.db;
+                let source_db = &source_conn.db;
                 let dest_opts = crate::DatabaseOpts::new()
                     .with_views(source_db.experimental_views_enabled())
                     .with_index_method(source_db.experimental_index_method_enabled());
 
-                program.connection.execute("BEGIN")?;
+                source_conn.execute("BEGIN")?;
                 // lets set the same meta values as source db
-                let user_version: i32 = extract_pragma_int(
-                    &program.connection.pragma_query("user_version")?,
-                    "user_version",
-                )?;
+                let user_version: i32 =
+                    extract_pragma_int(&source_conn.pragma_query("user_version")?, "user_version")?;
                 let application_id: i32 = extract_pragma_int(
-                    &program.connection.pragma_query("application_id")?,
+                    &source_conn.pragma_query("application_id")?,
                     "application_id",
                 )?;
-                let page_size: u32 = extract_pragma_int(
-                    &program.connection.pragma_query("page_size")?,
-                    "page_size",
-                )?;
+                let page_size: u32 =
+                    extract_pragma_int(&source_conn.pragma_query("page_size")?, "page_size")?;
 
                 let reserved_space = {
-                    let pager = program.connection.pager.load();
-                    let reserved_space: u8 = match program.connection.get_reserved_bytes() {
+                    let pager = source_conn.pager.load();
+                    let reserved_space: u8 = match source_conn.get_reserved_bytes() {
                         Some(val) => val,
                         None => io.block(|| pager.with_header(|header| header.reserved_space))?,
                     };
@@ -13767,7 +13776,7 @@ fn op_vacuum_into_inner(
 
                 // Enable MVCC on destination if source has it enabled
                 // Must be done before any schema operations to ensure the log file is created
-                if program.connection.db.mvcc_enabled() {
+                if source_conn.db.mvcc_enabled() {
                     dest_conn.execute("PRAGMA journal_mode = 'mvcc'")?;
                 }
 
@@ -13789,7 +13798,7 @@ fn op_vacuum_into_inner(
                     "SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE sql IS NOT NULL AND name <> '{}' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'index' THEN 2 WHEN 'trigger' THEN 3 WHEN 'view' THEN 4 ELSE 5 END",
                     crate::mvcc::database::MVCC_META_TABLE_NAME
                 );
-                let schema_stmt = program.connection.prepare(schema_sql.as_str())?;
+                let schema_stmt = source_conn.prepare(schema_sql.as_str())?;
 
                 vacuum_state.dest_db = Some(dest_db);
                 vacuum_state.source_user_version = user_version;
@@ -13965,7 +13974,7 @@ fn op_vacuum_into_inner(
                     if matches!(&row[1], Value::Text(n) if n.as_str() == crate::schema::TURSO_TYPES_TABLE_NAME)
                     {
                         let source_types: Vec<(String, std::sync::Arc<crate::schema::TypeDef>)> = {
-                            let source_schema = program.connection.schema.read();
+                            let source_schema = source_conn.schema.read();
                             source_schema
                                 .type_registry
                                 .iter()
@@ -14022,7 +14031,7 @@ fn op_vacuum_into_inner(
                 // Escape double quotes in table name for safe SQL
                 let escaped_table_name = table_name.replace('"', "\"\"");
                 let pragma_sql = format!("PRAGMA table_info(\"{escaped_table_name}\")");
-                let column_stmt = program.connection.prepare(&pragma_sql)?;
+                let column_stmt = source_conn.prepare(&pragma_sql)?;
                 vacuum_state.current_table_columns.clear();
                 vacuum_state.sub_state = OpVacuumIntoSubState::CollectColumnInfo {
                     dest_conn,
@@ -14068,7 +14077,7 @@ fn op_vacuum_into_inner(
                         let table_name = &vacuum_state.table_names[table_idx];
                         let escaped_table_name = table_name.replace('"', "\"\"");
                         let source_btree_table =
-                            program.connection.schema.read().get_btree_table(table_name);
+                            source_conn.schema.read().get_btree_table(table_name);
                         let rowid_alias = source_btree_table
                             .as_ref()
                             .filter(|table| table.has_rowid)
@@ -14117,7 +14126,7 @@ fn op_vacuum_into_inner(
                             }
                             None => format!("SELECT * FROM \"{escaped_table_name}\""),
                         };
-                        let select_stmt = program.connection.prepare(&select_sql)?;
+                        let select_stmt = source_conn.prepare(&select_sql)?;
 
                         // Prepare INSERT statement once per table (reused for all rows)
                         let bind_count = if rowid_alias.is_some() {
@@ -14361,7 +14370,7 @@ fn op_vacuum_into_inner(
             OpVacuumIntoSubState::Done { dest_conn } => {
                 // Commit the transaction that was started in Init state
                 dest_conn.execute("COMMIT")?;
-                program.connection.execute("COMMIT")?;
+                source_conn.execute("COMMIT")?;
 
                 state.pc += 1;
                 return Ok(InsnFunctionStepResult::Step);
