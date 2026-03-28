@@ -5796,7 +5796,7 @@ pub fn bind_and_rewrite_expr<'a>(
 }
 
 /// Recursively walks a mutable expression, applying a function to each sub-expression.
-/// Does not recurse into subqueries (`Subquery`/`Exists`/`InSelect`'s rhs).
+/// Does not recurse into subqueries (`Subquery`/`Exists`) or in the rhs of `InSelect`.
 pub fn walk_expr_mut<F>(expr: &mut ast::Expr, func: &mut F) -> Result<WalkControl>
 where
     F: FnMut(&mut ast::Expr) -> Result<WalkControl>,

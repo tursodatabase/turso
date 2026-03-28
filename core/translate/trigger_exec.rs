@@ -927,6 +927,15 @@ fn rewrite_trigger_expr_single_for_when_clause(
             walk_select(select, &mut (), &mut visitor)?;
             return Ok(());
         }
+        Expr::InSelect { rhs, .. } => {
+            let mut visitor = FlatExprVisitor(|e: &mut ast::Expr| {
+                rewrite_trigger_expr_single_for_when_clause(e, table, ctx, true)?;
+                Ok(WalkControl::Continue)
+            });
+            walk_select(rhs, &mut (), &mut visitor)?;
+            // don't walk lhs, it's walked by walk_expr_mut
+            return Ok(());
+        }
         Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
             let ns = normalize_ident(ns.as_str());
             let col = normalize_ident(col.as_str());

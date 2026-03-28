@@ -2242,7 +2242,6 @@ mod trigger_col_rename {
         ///   1. If `self.context_table` is provided (UPDATE/DELETE WHERE clauses), check the context table first
         ///   2. Otherwise, check the trigger's owning table
         ///   3. If `scope.from_target` is provided (FROM clause has target table), rename the column
-        ///
         fn rename_cols_in_expr(&self, e: &mut ast::Expr, scope: &RenameScope) -> Result<()> {
             let context_table = scope
                 .context
@@ -2301,7 +2300,7 @@ mod trigger_col_rename {
                         }
                         // Check if it's a qualified reference to a FROM clause table that is the
                         // rename target (e.g., src.b in SELECT src.b FROM src)
-                        if let Some(target_name) = scope.from_target.as_deref() {
+                        if let Some(ref target_name) = scope.from_target {
                             if ns_norm == *target_name {
                                 *col = ast::Name::from_string(self.new_col_norm);
                             }
@@ -2520,7 +2519,7 @@ mod trigger_col_rename {
                 if normalize_ident(name.name.as_str()) == *target_table_name
         )
     }
-} // mod trigger_col_rename
+}
 
 /// Validate all column references in a trigger after a DROP COLUMN operation.
 /// Like SQLite, this re-validates the entire trigger — any unresolvable column
