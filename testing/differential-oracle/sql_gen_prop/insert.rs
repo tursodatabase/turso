@@ -21,6 +21,10 @@ pub struct InsertProfile {
     pub allow_aggregates: bool,
     /// Expression profile for value expressions.
     pub expression_profile: ExpressionProfile,
+    /// Probability (0-100) of including generated columns in INSERT.
+    /// This tests that both DBs reject the invalid INSERT consistently.
+    /// Default is 1 (1%).
+    pub include_generated_probability: u8,
 }
 
 impl Default for InsertProfile {
@@ -29,6 +33,7 @@ impl Default for InsertProfile {
             expression_max_depth: 2,
             allow_aggregates: false,
             expression_profile: ExpressionProfile::default(),
+            include_generated_probability: 1,
         }
     }
 }
@@ -49,6 +54,12 @@ impl InsertProfile {
     /// Builder method to set expression profile.
     pub fn with_expression_profile(mut self, profile: ExpressionProfile) -> Self {
         self.expression_profile = profile;
+        self
+    }
+
+    /// Builder method to set probability of including generated columns.
+    pub fn with_include_generated_probability(mut self, probability: u8) -> Self {
+        self.include_generated_probability = probability.min(100);
         self
     }
 }
@@ -78,57 +89,95 @@ impl fmt::Display for InsertStatement {
 }
 
 /// Generate an INSERT statement for a table with profile.
+///
+/// By default, generated columns are excluded from the INSERT statement since
+/// SQLite/Turso will reject attempts to set them. With `include_generated_probability`,
+/// we occasionally include them to test that both databases reject consistently.
 pub fn insert_for_table(
     table: &TableRef,
     schema: &Schema,
     profile: &StatementProfile,
 ) -> BoxedStrategy<InsertStatement> {
     let table_name = table.qualified_name();
-    let columns = table.columns.clone();
+    let all_columns = table.columns.clone();
     let is_strict = table.strict;
     let functions = builtin_functions();
+    let schema = schema.clone();
 
     // Extract profile values from the InsertProfile
     let insert_profile = profile.insert_profile();
     let expression_max_depth = insert_profile.expression_max_depth;
     let allow_aggregates = insert_profile.allow_aggregates;
-
-    let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
-
-    // Build expression context (no column refs or subqueries for INSERT values)
-    let expr_profile = ExpressionProfile::default().with_subqueries_disabled();
-    let ctx = ExpressionContext::new(functions, schema.clone())
-        .with_max_depth(expression_max_depth)
-        .with_aggregates(allow_aggregates)
-        .with_profile(expr_profile);
-
+    let include_generated_prob = insert_profile.include_generated_probability;
     let profile_clone = profile.clone();
-    let value_strategies: Vec<BoxedStrategy<Expression>> = columns
-        .iter()
-        .map(|c| {
-            if is_strict {
-                // For STRICT tables, use only literal values. expression_for_type
-                // targets a type via SQL affinity rules, but STRICT tables enforce
-                // runtime type checking that rejects values whose storage class doesn't
-                // match (e.g., `1 + 0.5` yields REAL for an INTEGER column, or
-                // `CAST('abc' AS INTEGER)` yields 0). Literal values guarantee the
-                // storage class matches the column type.
-                crate::value::value_for_type(&c.data_type, c.nullable, &profile_clone)
-                    .prop_map(Expression::Value)
-                    .boxed()
-            } else {
-                crate::expression::expression_for_type(Some(&c.data_type), &ctx)
-            }
-        })
-        .collect();
 
-    value_strategies
-        .into_iter()
-        .collect::<Vec<_>>()
-        .prop_map(move |values| InsertStatement {
-            table: table_name.clone(),
-            columns: col_names.clone(),
-            values,
+    // Decide whether to include generated columns (for error testing)
+    (0u8..100)
+        .prop_flat_map(move |roll| {
+            let include_generated = roll < include_generated_prob;
+
+            // Select columns based on whether we're including generated columns
+            let columns: Vec<_> = if include_generated {
+                // Include all columns (will cause an error for generated columns)
+                all_columns.clone()
+            } else {
+                // Exclude generated columns (normal case)
+                all_columns
+                    .iter()
+                    .filter(|c| !c.is_generated())
+                    .cloned()
+                    .collect()
+            };
+
+            // Handle case where all columns are generated (rare but possible)
+            if columns.is_empty() {
+                return Just(InsertStatement {
+                    table: table_name.clone(),
+                    columns: vec![],
+                    values: vec![],
+                })
+                .boxed();
+            }
+
+            let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+
+            // Build expression context (no column refs or subqueries for INSERT values)
+            let expr_profile = ExpressionProfile::default().with_subqueries_disabled();
+            let ctx = ExpressionContext::new(functions.clone(), schema.clone())
+                .with_max_depth(expression_max_depth)
+                .with_aggregates(allow_aggregates)
+                .with_profile(expr_profile);
+
+            let profile_for_strict = profile_clone.clone();
+            let value_strategies: Vec<BoxedStrategy<Expression>> = columns
+                .iter()
+                .map(|c| {
+                    if is_strict {
+                        // For STRICT tables, use only literal values. expression_for_type
+                        // targets a type via SQL affinity rules, but STRICT tables enforce
+                        // runtime type checking that rejects values whose storage class doesn't
+                        // match (e.g., `1 + 0.5` yields REAL for an INTEGER column, or
+                        // `CAST('abc' AS INTEGER)` yields 0). Literal values guarantee the
+                        // storage class matches the column type.
+                        crate::value::value_for_type(&c.data_type, c.nullable, &profile_for_strict)
+                            .prop_map(Expression::Value)
+                            .boxed()
+                    } else {
+                        crate::expression::expression_for_type(Some(&c.data_type), &ctx)
+                    }
+                })
+                .collect();
+
+            let table_name = table_name.clone();
+            value_strategies
+                .into_iter()
+                .collect::<Vec<_>>()
+                .prop_map(move |values| InsertStatement {
+                    table: table_name.clone(),
+                    columns: col_names.clone(),
+                    values,
+                })
+                .boxed()
         })
         .boxed()
 }
