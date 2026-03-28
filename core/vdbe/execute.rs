@@ -13692,7 +13692,16 @@ fn op_vacuum_into_inner(
     state: &mut ProgramState,
     insn: &Insn,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(VacuumInto { dest_path }, insn);
+    load_insn!(
+        VacuumInto {
+            schema_name,
+            dest_path
+        },
+        insn
+    );
+
+    let escaped_schema_name = schema_name.replace('"', "\"\"");
+    let database_id = program.connection.get_database_id_by_name(schema_name)?;
 
     let vacuum_state = state
         .op_vacuum_into_state
@@ -13722,33 +13731,47 @@ fn op_vacuum_into_inner(
                 // Always use PlatformIO for the destination file, even if source is in-memory.
                 // This ensures VACUUM INTO actually writes to disk.
                 let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
-                let source_db = &program.connection.db;
+                let source_db = program.connection.get_source_database(database_id);
                 let dest_opts = crate::DatabaseOpts::new()
                     .with_views(source_db.experimental_views_enabled())
                     .with_index_method(source_db.experimental_index_method_enabled());
 
                 program.connection.execute("BEGIN")?;
-                // lets set the same meta values as source db
+                // Set the same meta values from the source db (schema)
                 let user_version: i32 = extract_pragma_int(
-                    &program.connection.pragma_query("user_version")?,
+                    &program
+                        .connection
+                        .pragma_query(&format!("{schema_name}.user_version"))?,
                     "user_version",
                 )?;
                 let application_id: i32 = extract_pragma_int(
-                    &program.connection.pragma_query("application_id")?,
+                    &program
+                        .connection
+                        .pragma_query(&format!("{schema_name}.application_id"))?,
                     "application_id",
                 )?;
                 let page_size: u32 = extract_pragma_int(
-                    &program.connection.pragma_query("page_size")?,
+                    &program
+                        .connection
+                        .pragma_query(&format!("{schema_name}.page_size"))?,
                     "page_size",
                 )?;
 
-                let reserved_space = {
-                    let pager = program.connection.pager.load();
-                    let reserved_space: u8 = match program.connection.get_reserved_bytes() {
+                let reserved_space: u8 = if !crate::is_attached_db(database_id) {
+                    // For main or temp db prefer cached value to avoid blocking I/O
+                    match program.connection.get_reserved_bytes() {
                         Some(val) => val,
-                        None => io.block(|| pager.with_header(|header| header.reserved_space))?,
-                    };
-                    reserved_space
+                        None => {
+                            let pager = program.connection.pager.load();
+                            io.block(|| pager.with_header(|header| header.reserved_space))?
+                        }
+                    }
+                } else {
+                    // For attached db read from its own pager
+                    let pager = program
+                        .connection
+                        .get_pager_from_database_index(&database_id);
+                    io.block(|| pager.with_header(|header| header.reserved_space))?
                 };
 
                 let dest_db = crate::Database::open_file_with_flags(
@@ -13767,7 +13790,7 @@ fn op_vacuum_into_inner(
 
                 // Enable MVCC on destination if source has it enabled
                 // Must be done before any schema operations to ensure the log file is created
-                if program.connection.db.mvcc_enabled() {
+                if source_db.mvcc_enabled() {
                     dest_conn.execute("PRAGMA journal_mode = 'mvcc'")?;
                 }
 
@@ -13786,7 +13809,7 @@ fn op_vacuum_into_inner(
                 // internal artifact of mvcc mode and must not appear in a
                 // standalone SQLite file produced by VACUUM INTO.
                 let schema_sql = format!(
-                    "SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE sql IS NOT NULL AND name <> '{}' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'index' THEN 2 WHEN 'trigger' THEN 3 WHEN 'view' THEN 4 ELSE 5 END",
+                    "SELECT type, name, tbl_name, sql FROM \"{escaped_schema_name}\".sqlite_schema WHERE sql IS NOT NULL AND name <> '{}' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'index' THEN 2 WHEN 'trigger' THEN 3 WHEN 'view' THEN 4 ELSE 5 END",
                     crate::mvcc::database::MVCC_META_TABLE_NAME
                 );
                 let schema_stmt = program.connection.prepare(schema_sql.as_str())?;
@@ -13964,15 +13987,17 @@ fn op_vacuum_into_inner(
                     let row = &vacuum_state.schema_rows[idx];
                     if matches!(&row[1], Value::Text(n) if n.as_str() == crate::schema::TURSO_TYPES_TABLE_NAME)
                     {
-                        let source_types: Vec<(String, std::sync::Arc<crate::schema::TypeDef>)> = {
-                            let source_schema = program.connection.schema.read();
-                            source_schema
-                                .type_registry
-                                .iter()
-                                .filter(|(_, td)| !td.is_builtin)
-                                .map(|(name, td)| (name.clone(), td.clone()))
-                                .collect()
-                        };
+                        let source_types: Vec<(String, std::sync::Arc<crate::schema::TypeDef>)> =
+                            program
+                                .connection
+                                .with_schema(database_id, |source_schema| {
+                                    source_schema
+                                        .type_registry
+                                        .iter()
+                                        .filter(|(_, td)| !td.is_builtin)
+                                        .map(|(name, td)| (name.clone(), td.clone()))
+                                        .collect()
+                                });
                         dest_conn.with_schema_mut(|dest_schema| {
                             for (name, td) in source_types {
                                 dest_schema.type_registry.insert(name, td);
@@ -14021,7 +14046,8 @@ fn op_vacuum_into_inner(
                 let table_name = &vacuum_state.table_names[table_idx];
                 // Escape double quotes in table name for safe SQL
                 let escaped_table_name = table_name.replace('"', "\"\"");
-                let pragma_sql = format!("PRAGMA table_info(\"{escaped_table_name}\")");
+                let pragma_sql =
+                    format!("PRAGMA {schema_name}.table_info(\"{escaped_table_name}\")");
                 let column_stmt = program.connection.prepare(&pragma_sql)?;
                 vacuum_state.current_table_columns.clear();
                 vacuum_state.sub_state = OpVacuumIntoSubState::CollectColumnInfo {
@@ -14067,8 +14093,9 @@ fn op_vacuum_into_inner(
                         // Prepare SELECT and INSERT statements for this table
                         let table_name = &vacuum_state.table_names[table_idx];
                         let escaped_table_name = table_name.replace('"', "\"\"");
-                        let source_btree_table =
-                            program.connection.schema.read().get_btree_table(table_name);
+                        let source_btree_table = program
+                            .connection
+                            .with_schema(database_id, |s| s.get_btree_table(table_name));
                         let rowid_alias = source_btree_table
                             .as_ref()
                             .filter(|table| table.has_rowid)
@@ -14101,21 +14128,21 @@ fn op_vacuum_into_inner(
                         }
                         let column_names = data_columns.join(", ");
 
+                        let qualified_table =
+                            format!("\"{escaped_schema_name}\".\"{escaped_table_name}\"");
                         let select_sql = match rowid_alias {
                             Some(alias)
                                 if excluded_rowid_alias_column && column_names.is_empty() =>
                             {
-                                format!("SELECT {alias} FROM \"{escaped_table_name}\"")
+                                format!("SELECT {alias} FROM {qualified_table}")
                             }
                             Some(alias) if excluded_rowid_alias_column => {
-                                format!(
-                                    "SELECT {alias}, {column_names} FROM \"{escaped_table_name}\""
-                                )
+                                format!("SELECT {alias}, {column_names} FROM {qualified_table}")
                             }
                             Some(alias) => {
-                                format!("SELECT {alias}, * FROM \"{escaped_table_name}\"")
+                                format!("SELECT {alias}, * FROM {qualified_table}")
                             }
-                            None => format!("SELECT * FROM \"{escaped_table_name}\""),
+                            None => format!("SELECT * FROM {qualified_table}"),
                         };
                         let select_stmt = program.connection.prepare(&select_sql)?;
 
