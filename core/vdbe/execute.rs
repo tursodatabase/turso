@@ -13697,13 +13697,15 @@ fn op_vacuum_into_inner(
     // Get the source connection based on database ID
     // For main database (0), use program.connection
     // For attached databases (2+), look up the attached database and connect
-    let source_conn: Arc<Connection> = if *db == 0 {
+    let source_conn: Arc<Connection> = if *db == crate::MAIN_DB_ID {
         program.connection.clone()
     } else {
-        let attached_dbs = program.connection.attached_databases.read();
-        let db_arc = attached_dbs
-            .get_database_by_index(*db)
-            .ok_or_else(|| LimboError::InternalError("attached database not found".to_string()))?;
+        let db_arc = {
+            let attached_dbs = program.connection.attached_databases.read();
+            attached_dbs.get_database_by_index(*db).ok_or_else(|| {
+                LimboError::InternalError("attached database not found".to_string())
+            })?
+        };
         db_arc.connect()?
     };
 
