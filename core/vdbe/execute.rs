@@ -13818,6 +13818,16 @@ fn op_vacuum_into_inner(
                         "cannot VACUUM INTO from within a transaction".to_string(),
                     ));
                 }
+                if program
+                    .connection
+                    .n_active_root_statements
+                    .load(Ordering::SeqCst)
+                    != 1
+                {
+                    return Err(LimboError::TxError(
+                        "cannot VACUUM - SQL statements in progress".to_string(),
+                    ));
+                }
 
                 // we always vacuum into a new file, so check if it exists
                 if std::path::Path::new(dest_path).exists() {

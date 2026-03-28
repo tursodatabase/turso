@@ -157,8 +157,9 @@ pub fn translate_inner(
             | ast::Stmt::Update { .. }
             | ast::Stmt::Insert { .. }
     );
+    let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
 
-    if is_write && connection.get_query_only() {
+    if (is_write || is_vacuum) && connection.get_query_only() {
         bail_parse_error!("Cannot execute write statement in query_only mode")
     }
 
