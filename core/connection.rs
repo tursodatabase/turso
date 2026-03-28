@@ -1600,6 +1600,33 @@ impl Connection {
         }
     }
 
+    /// Get the database id for a schema name ("main", "temp", or an attached db alias).
+    pub(crate) fn get_database_id_by_name(&self, name: &str) -> Result<usize> {
+        let normalized: String = crate::util::normalize_ident(name);
+        match normalized.as_str() {
+            "main" => Ok(crate::MAIN_DB_ID),
+            "temp" => Ok(1),
+            _ => self
+                .attached_databases
+                .read()
+                .get_database_by_name(&normalized)
+                .map(|(idx, _)| idx)
+                .ok_or_else(|| LimboError::InvalidArgument(format!("no such database: {name}"))),
+        }
+    }
+
+    /// Get the Database object for a given database id.
+    pub(crate) fn get_source_database(&self, database_id: usize) -> Arc<Database> {
+        if !crate::is_attached_db(database_id) {
+            self.db.clone()
+        } else {
+            self.attached_databases
+                .read()
+                .get_database_by_index(database_id)
+                .expect("database index should be valid")
+        }
+    }
+
     fn is_attached(&self, alias: &str) -> bool {
         self.attached_databases
             .read()
