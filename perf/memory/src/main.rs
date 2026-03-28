@@ -1,12 +1,12 @@
 mod measure;
 mod profile;
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use profile::{
-    insert::InsertHeavy, mixed::Mixed, read::ReadHeavy, scan::ScanHeavy, Phase, Profile,
+    Phase, Profile, WorkItem, insert::InsertHeavy, mixed::Mixed, read::ReadHeavy, scan::ScanHeavy,
 };
 use turso::Connection;
 use turso::params::Params;
@@ -81,9 +81,13 @@ struct Args {
     #[arg(long = "cache-size")]
     cache_size: Option<i64>,
 
-    /// Number of connections
+    /// Number of concurrent connections
     #[arg(long = "connections", default_value = "1")]
     connections: usize,
+
+    /// Busy timeout in milliseconds
+    #[arg(long = "timeout", default_value = "30000")]
+    timeout: u64,
 
     /// Output format
     #[arg(long = "format", default_value = "human")]
@@ -111,6 +115,7 @@ async fn async_main(args: Args) -> Result<()> {
     clean_db_files(db_path);
 
     let mut profile = create_profile(args.workload, args.iterations, args.batch_size);
+    let timeout = Duration::from_millis(args.timeout);
 
     let start = Instant::now();
     let mut snapshots: Vec<MemorySnapshot> = Vec::new();
@@ -119,18 +124,20 @@ async fn async_main(args: Args) -> Result<()> {
     snapshots.push(take_snapshot(start, "baseline"));
 
     let db = turso::Builder::new_local(db_path).build().await?;
-    let conn = db.connect()?;
 
-    // Set journal mode
+    // Setup connection for schema/seeding and journal mode
+    let setup_conn = db.connect()?;
+    setup_conn.busy_timeout(timeout)?;
+
     let mode_str = match args.mode {
         JournalMode::Wal => "'wal'",
         JournalMode::Mvcc => "'mvcc'",
     };
-    conn.pragma_update("journal_mode", mode_str).await?;
+    setup_conn.pragma_update("journal_mode", mode_str).await?;
 
-    // Set cache size if specified
     if let Some(cache_size) = args.cache_size {
-        conn.pragma_update("cache_size", &cache_size.to_string())
+        setup_conn
+            .pragma_update("cache_size", &cache_size.to_string())
             .await?;
     }
 
@@ -143,7 +150,7 @@ async fn async_main(args: Args) -> Result<()> {
     let mut peak_bytes = snapshots[0].rss_bytes;
 
     loop {
-        let (phase, items) = profile.next_batch();
+        let (phase, batches) = profile.next_batch(args.connections);
 
         if phase == Phase::Done {
             break;
@@ -160,37 +167,39 @@ async fn async_main(args: Args) -> Result<()> {
             last_phase = Some(phase);
         }
 
-        if items.is_empty() {
+        if batches.is_empty() {
             continue;
         }
 
-        // Execute batch in a transaction
-        // Use BEGIN CONCURRENT only during run phase for MVCC; setup needs exclusive txn
-        let txn_begin = if phase == Phase::Setup {
-            "BEGIN"
+        if phase == Phase::Setup {
+            // Setup runs sequentially on a single connection
+            let items = batches.into_iter().next().unwrap_or_default();
+            if !items.is_empty() {
+                setup_conn.execute("BEGIN", ()).await?;
+                execute_items(&setup_conn, items).await?;
+                setup_conn.execute("COMMIT", ()).await?;
+            }
         } else {
-            begin_stmt
-        };
-        conn.execute(txn_begin, ()).await?;
-        for item in items {
-            let is_query = item
-                .sql
-                .trim_start()
-                .get(..6)
-                .is_some_and(|s| s.eq_ignore_ascii_case("SELECT"));
-            if is_query {
-                let mut rows = conn
-                    .query(&item.sql, Params::Positional(item.params))
-                    .await?;
-                while rows.next().await?.is_some() {}
-            } else if item.params.is_empty() {
-                conn.execute(&item.sql, ()).await?;
-            } else {
-                let mut stmt = conn.prepare(&item.sql).await?;
-                stmt.execute(Params::Positional(item.params)).await?;
+            // Run phase: dispatch batches concurrently across connections
+            let mut handles = Vec::with_capacity(batches.len());
+            for items in batches {
+                if items.is_empty() {
+                    continue;
+                }
+                let conn = db.connect()?;
+                conn.busy_timeout(timeout)?;
+                let begin = begin_stmt.to_string();
+                handles.push(tokio::spawn(async move {
+                    conn.execute(&begin, ()).await?;
+                    execute_items(&conn, items).await?;
+                    conn.execute("COMMIT", ()).await?;
+                    Ok::<_, turso::Error>(())
+                }));
+            }
+            for handle in handles {
+                handle.await??;
             }
         }
-        conn.execute("COMMIT", ()).await?;
 
         // Track peak
         let current = take_snapshot(start, "periodic");
@@ -238,6 +247,28 @@ async fn async_main(args: Args) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+async fn execute_items(conn: &Connection, items: Vec<WorkItem>) -> Result<(), turso::Error> {
+    for item in items {
+        let is_query = item
+            .sql
+            .trim_start()
+            .get(..6)
+            .is_some_and(|s| s.eq_ignore_ascii_case("SELECT"));
+        if is_query {
+            let mut rows = conn
+                .query(&item.sql, Params::Positional(item.params))
+                .await?;
+            while rows.next().await?.is_some() {}
+        } else if item.params.is_empty() {
+            conn.execute(&item.sql, ()).await?;
+        } else {
+            let mut stmt = conn.prepare(&item.sql).await?;
+            stmt.execute(Params::Positional(item.params)).await?;
+        }
+    }
     Ok(())
 }
 

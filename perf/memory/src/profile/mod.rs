@@ -23,13 +23,14 @@ pub struct WorkItem {
 /// Trait that workload profiles implement to generate SQL workloads.
 ///
 /// The benchmark engine calls `next_batch()` repeatedly. Each call returns
-/// the current phase and a batch of SQL statements to execute within a
-/// single transaction. When the phase changes, the engine takes a memory
-/// snapshot. Returning `Phase::Done` signals completion.
+/// the current phase and a vec of batches — one per connection. During Setup,
+/// typically only one batch is returned (executed on a single connection).
+/// During Run, `connections` batches are returned for concurrent execution.
+/// Returning `Phase::Done` signals completion.
 pub trait Profile {
     /// Human-readable name for reports.
     fn name(&self) -> &str;
 
-    /// Returns the current phase and a batch of work items to execute.
-    fn next_batch(&mut self) -> (Phase, Vec<WorkItem>);
+    /// Returns the current phase and batches of work items (one per connection).
+    fn next_batch(&mut self, connections: usize) -> (Phase, Vec<Vec<WorkItem>>);
 }

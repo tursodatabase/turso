@@ -33,16 +33,16 @@ impl Profile for ScanHeavy {
         "scan-heavy"
     }
 
-    fn next_batch(&mut self) -> (Phase, Vec<WorkItem>) {
+    fn next_batch(&mut self, connections: usize) -> (Phase, Vec<Vec<WorkItem>>) {
         match self.phase {
             InternalPhase::CreateTable => {
                 self.phase = InternalPhase::Seed;
                 (
                     Phase::Setup,
-                    vec![WorkItem {
+                    vec![vec![WorkItem {
                         sql: "CREATE TABLE IF NOT EXISTS bench (id INTEGER PRIMARY KEY, data TEXT NOT NULL, value REAL)".to_string(),
                         params: vec![],
-                    }],
+                    }]],
                 )
             }
             InternalPhase::Seed => {
@@ -64,24 +64,28 @@ impl Profile for ScanHeavy {
                 if self.seed_offset >= SEED_ROWS {
                     self.phase = InternalPhase::Run;
                 }
-                (Phase::Setup, items)
+                (Phase::Setup, vec![items])
             }
             InternalPhase::Run => {
                 if self.current_iteration >= self.iterations {
                     return (Phase::Done, vec![]);
                 }
 
-                let mut items = Vec::with_capacity(self.batch_size);
-                for _ in 0..self.batch_size {
-                    let pattern = format!("seed_{}", self.current_iteration % SEED_ROWS);
-                    items.push(WorkItem {
-                        sql: "SELECT * FROM bench WHERE data LIKE ?".to_string(),
-                        params: vec![turso::Value::Text(format!("%{pattern}%"))],
-                    });
+                let mut batches = Vec::with_capacity(connections);
+                for _ in 0..connections {
+                    let mut items = Vec::with_capacity(self.batch_size);
+                    for _ in 0..self.batch_size {
+                        let pattern = format!("seed_{}", self.current_iteration % SEED_ROWS);
+                        items.push(WorkItem {
+                            sql: "SELECT * FROM bench WHERE data LIKE ?".to_string(),
+                            params: vec![turso::Value::Text(format!("%{pattern}%"))],
+                        });
+                    }
+                    batches.push(items);
                 }
 
                 self.current_iteration += 1;
-                (Phase::Run, items)
+                (Phase::Run, batches)
             }
         }
     }

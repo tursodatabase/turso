@@ -39,16 +39,16 @@ impl Profile for ReadHeavy {
         "read-heavy"
     }
 
-    fn next_batch(&mut self) -> (Phase, Vec<WorkItem>) {
+    fn next_batch(&mut self, connections: usize) -> (Phase, Vec<Vec<WorkItem>>) {
         match self.phase {
             InternalPhase::CreateTable => {
                 self.phase = InternalPhase::Seed;
                 (
                     Phase::Setup,
-                    vec![WorkItem {
+                    vec![vec![WorkItem {
                         sql: "CREATE TABLE IF NOT EXISTS bench (id INTEGER PRIMARY KEY, data TEXT NOT NULL, value REAL)".to_string(),
                         params: vec![],
-                    }],
+                    }]],
                 )
             }
             InternalPhase::Seed => {
@@ -70,7 +70,7 @@ impl Profile for ReadHeavy {
                 if self.seed_offset >= SEED_ROWS {
                     self.phase = InternalPhase::Run;
                 }
-                (Phase::Setup, items)
+                (Phase::Setup, vec![items])
             }
             InternalPhase::Run => {
                 if self.current_iteration >= self.iterations {
@@ -78,31 +78,36 @@ impl Profile for ReadHeavy {
                 }
 
                 let mut rng = rand::rng();
-                let mut items = Vec::with_capacity(self.batch_size);
-                for _ in 0..self.batch_size {
-                    // 90% reads, 10% writes
-                    if rng.random_range(0..10) < 9 {
-                        let id = rng.random_range(0..self.total_rows as i64);
-                        items.push(WorkItem {
-                            sql: "SELECT * FROM bench WHERE id = ?".to_string(),
-                            params: vec![turso::Value::Integer(id)],
-                        });
-                    } else {
-                        items.push(WorkItem {
-                            sql: "INSERT INTO bench (id, data, value) VALUES (?, ?, ?)".to_string(),
-                            params: vec![
-                                turso::Value::Integer(self.insert_id as i64),
-                                turso::Value::Text(format!("new_{}", self.insert_id)),
-                                turso::Value::Real(self.insert_id as f64 * 1.1),
-                            ],
-                        });
-                        self.insert_id += 1;
-                        self.total_rows += 1;
+                let mut batches = Vec::with_capacity(connections);
+                for _ in 0..connections {
+                    let mut items = Vec::with_capacity(self.batch_size);
+                    for _ in 0..self.batch_size {
+                        // 90% reads, 10% writes
+                        if rng.random_range(0..10) < 9 {
+                            let id = rng.random_range(0..self.total_rows as i64);
+                            items.push(WorkItem {
+                                sql: "SELECT * FROM bench WHERE id = ?".to_string(),
+                                params: vec![turso::Value::Integer(id)],
+                            });
+                        } else {
+                            items.push(WorkItem {
+                                sql: "INSERT INTO bench (id, data, value) VALUES (?, ?, ?)"
+                                    .to_string(),
+                                params: vec![
+                                    turso::Value::Integer(self.insert_id as i64),
+                                    turso::Value::Text(format!("new_{}", self.insert_id)),
+                                    turso::Value::Real(self.insert_id as f64 * 1.1),
+                                ],
+                            });
+                            self.insert_id += 1;
+                            self.total_rows += 1;
+                        }
                     }
+                    batches.push(items);
                 }
 
                 self.current_iteration += 1;
-                (Phase::Run, items)
+                (Phase::Run, batches)
             }
         }
     }
