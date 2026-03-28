@@ -1333,6 +1333,29 @@ expect error {
     cannot store TEXT value in INTEGER column
 }
 
+# UNIQUE constraint on virtual generated column with integrity_check
+test gencol_constraint_unique_virtual_integrity {
+    CREATE TABLE t1(a INTEGER, b TEXT, c TEXT UNIQUE AS (b));
+    INSERT INTO t1(a, b) VALUES(1, 'hello'), (2, 'world');
+    SELECT a, c FROM t1 ORDER BY a;
+    PRAGMA integrity_check;
+}
+expect {
+    1|hello
+    2|world
+    ok
+}
+
+# UNIQUE on virtual column must reject duplicates
+test gencol_constraint_unique_virtual_violation {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c INTEGER UNIQUE AS (b * 2));
+    INSERT INTO t1(a, b) VALUES(1, 5);
+    INSERT INTO t1(a, b) VALUES(2, 5);
+}
+expect error {
+    UNIQUE constraint failed
+}
+
 # =============================================================================
 # 11. Indexes
 # =============================================================================
@@ -1666,6 +1689,20 @@ test gencol_expr_index_virtual_update {
 }
 expect {
     10|20
+}
+
+# DELETE on table with UNIQUE auto-index on virtual column
+test gencol_delete_unique_virtual_col {
+    CREATE TABLE t1(a INTEGER, b TEXT UNIQUE AS (a || '_v'));
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    DELETE FROM t1 WHERE a = 2;
+    SELECT a, b FROM t1 ORDER BY a;
+    PRAGMA integrity_check;
+}
+expect {
+    1|1_v
+    3|3_v
+    ok
 }
 
 @cross-check-integrity
