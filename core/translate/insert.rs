@@ -177,6 +177,8 @@ pub struct InsertEmitCtx<'a> {
     /// When present, RETURNING rows are buffered into an ephemeral table during the DML loop,
     /// then scanned back and yielded to the caller after all DML is complete.
     pub returning_buffer: Option<ReturningBufferCtx>,
+    /// Original table name spelling
+    pub original_table_name: &'a str,
 }
 
 impl<'a> InsertEmitCtx<'a> {
@@ -191,6 +193,7 @@ impl<'a> InsertEmitCtx<'a> {
         temp_table_ctx: Option<TempTableCtx>,
         database_id: usize,
         _connection: &Arc<crate::Connection>,
+        original_table_name: &'a str,
     ) -> Result<Self> {
         // allocate cursor id's for each btree index cursor we'll need to populate the indexes
         let indices: Vec<_> = resolver.with_schema(database_id, |s| {
@@ -231,6 +234,7 @@ impl<'a> InsertEmitCtx<'a> {
             autoincrement_meta: None,
             database_id,
             returning_buffer: None,
+            original_table_name,
         })
     }
 }
@@ -325,7 +329,7 @@ pub fn translate_insert(
     )?;
 
     if inserting_multiple_rows && btree_table.has_autoincrement {
-        ensure_sequence_initialized(program, resolver, &btree_table, database_id)?;
+        ensure_sequence_initialized(program, resolver, tbl_name.name.as_str(), database_id)?;
     }
 
     let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), table.get_name())?;
@@ -395,6 +399,7 @@ pub fn translate_insert(
         None,
         database_id,
         connection,
+        tbl_name.name.as_str(),
     )?;
     program.has_statement_conflict = on_conflict.is_some();
 
@@ -1535,7 +1540,7 @@ fn open_autoincrement_state(
         db: ctx.database_id,
     });
 
-    let table_name_reg = program.emit_string8_new_reg(ctx.table.name.clone());
+    let table_name_reg = program.emit_string8_new_reg(ctx.original_table_name.into());
     let r_seq = program.alloc_register();
     let r_seq_rowid = program.alloc_register();
 
@@ -3176,7 +3181,7 @@ fn translate_virtual_table_insert(
 fn ensure_sequence_initialized(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    table: &schema::BTreeTable,
+    original_table_name: &str,
     database_id: usize,
 ) -> Result<()> {
     let seq_table = get_valid_sqlite_sequence_table(resolver, database_id)?;
@@ -3189,7 +3194,7 @@ fn ensure_sequence_initialized(
         db: database_id,
     });
 
-    let table_name_reg = program.emit_string8_new_reg(table.name.clone());
+    let table_name_reg = program.emit_string8_new_reg(original_table_name.to_string());
 
     let loop_start_label = program.allocate_label();
     let entry_exists_label = program.allocate_label();
