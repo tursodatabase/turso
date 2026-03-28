@@ -78,6 +78,7 @@ use execute::{
 };
 use turso_parser::ast::ResolveType;
 
+use crate::io::TempFile;
 use crate::vdbe::bloom_filter::BloomFilter;
 use crate::vdbe::rowset::RowSet;
 use explain::{insn_to_row_with_comment, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS};
@@ -483,6 +484,9 @@ pub struct ProgramState {
     /// Scratch buffer for [Insn::HashDistinct] to avoid per-row allocations.
     distinct_key_values: Vec<Value>,
     hash_tables: HashMap<usize, HashTable>,
+    /// TempFile handles for ephemeral cursors, keyed by cursor_id.
+    /// Dropping removes the temp file from disk.
+    ephemeral_temp_files: HashMap<usize, TempFile>,
     uses_subjournal: bool,
     /// Whether this statement is an active write inside an explicit transaction.
     pub(crate) is_active_write: bool,
@@ -576,6 +580,7 @@ impl ProgramState {
             rowsets: HashMap::default(),
             bloom_filters: HashMap::default(),
             hash_tables: HashMap::default(),
+            ephemeral_temp_files: HashMap::default(),
             uses_subjournal: false,
             is_active_write: false,
             has_stmt_transaction: false,
@@ -708,6 +713,7 @@ impl ProgramState {
         self.rowsets.clear();
         self.bloom_filters.clear();
         self.hash_tables.clear();
+        self.ephemeral_temp_files.clear();
         self.op_hash_build_state = None;
         self.op_hash_probe_state = None;
         self.uses_subjournal = false;

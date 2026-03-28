@@ -1,5 +1,6 @@
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::AlterTableFunc;
+use crate::io::TempFile;
 use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
 use crate::mvcc::database::CheckpointStateMachine;
 use crate::mvcc::MvccClock;
@@ -72,7 +73,6 @@ use branches::{mark_unlikely, unlikely};
 use either::Either;
 use smallvec::SmallVec;
 use std::any::Any;
-use std::env::temp_dir;
 use std::str::FromStr;
 use std::{
     borrow::BorrowMut,
@@ -10129,6 +10129,7 @@ pub fn op_close(
     if let Some(deferred_seek) = state.deferred_seeks.get_mut(*cursor_id) {
         deferred_seek.take();
     }
+    state.ephemeral_temp_files.remove(cursor_id);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -10830,14 +10831,17 @@ pub enum OpOpenEphemeralState {
     // Slow path states for creating new ephemeral cursor
     StartingTxn {
         pager: Arc<Pager>,
+        temp_file: Option<TempFile>,
     },
     CreateBtree {
         pager: Arc<Pager>,
+        temp_file: Option<TempFile>,
     },
     // clippy complains this variant is too big when compared to the rest of the variants
     // so it says we need to box it here
     Rewind {
         cursor: Box<dyn CursorTrait>,
+        temp_file: Option<TempFile>,
     },
 }
 pub fn op_open_ephemeral(
@@ -10876,44 +10880,11 @@ pub fn op_open_ephemeral(
             ));
             let conn = program.connection.clone();
             let io = conn.pager.load().io.clone();
-            let rand_num = io.generate_random_number();
-            let db_file: Arc<dyn DatabaseStorage>;
-            let db_file_io: Arc<dyn crate::IO>;
-
-            // we support OPFS in WASM - but it require files to be pre-opened in the browser before use
-            // we can fix this if we will make open_file interface async
-            // but for now for simplicity we use MemoryIO for all intermediate calculations
-            #[cfg(target_family = "wasm")]
-            {
-                use crate::MemoryIO;
-
-                db_file_io = Arc::new(MemoryIO::new());
-                let file = db_file_io.open_file("temp-file", OpenFlags::Create, false)?;
-                db_file = Arc::new(DatabaseFile::new(file));
-            }
-            #[cfg(not(target_family = "wasm"))]
-            {
-                let temp_store = conn.get_temp_store();
-                if matches!(temp_store, crate::TempStore::Memory) {
-                    // When temp_store=memory, use in-memory storage for ephemeral tables
-                    use crate::MemoryIO;
-                    db_file_io = Arc::new(MemoryIO::new());
-                    let file = db_file_io.open_file("temp-file", OpenFlags::Create, false)?;
-                    db_file = Arc::new(DatabaseFile::new(file));
-                } else {
-                    let temp_dir = temp_dir();
-                    let rand_path = std::path::Path::new(&temp_dir)
-                        .join(format!("tursodb-ephemeral-{rand_num}"));
-                    let Some(rand_path_str) = rand_path.to_str() else {
-                        return Err(LimboError::InternalError(
-                            "Failed to convert path to string".to_string(),
-                        ));
-                    };
-                    let file = io.open_file(rand_path_str, OpenFlags::Create, false)?;
-                    db_file = Arc::new(DatabaseFile::new(file));
-                    db_file_io = io;
-                }
-            }
+            let temp_store = conn.get_temp_store();
+            let temp_file = TempFile::with_temp_store(&io, temp_store)?;
+            let db_file: Arc<dyn DatabaseStorage> =
+                Arc::new(DatabaseFile::new(temp_file.file.clone()));
+            let db_file_io: Arc<dyn crate::IO> = io;
 
             let buffer_pool = program.connection.db.buffer_pool.clone();
 
@@ -10933,7 +10904,10 @@ pub fn op_open_ephemeral(
 
             pager.set_page_size(page_size);
 
-            state.op_open_ephemeral_state = OpOpenEphemeralState::StartingTxn { pager };
+            state.op_open_ephemeral_state = OpOpenEphemeralState::StartingTxn {
+                pager,
+                temp_file: Some(temp_file),
+            };
         }
         OpOpenEphemeralState::ClearExisting => {
             tracing::trace!("ClearExisting");
@@ -10964,7 +10938,7 @@ pub fn op_open_ephemeral(
             state.pc += 1;
             state.op_open_ephemeral_state = OpOpenEphemeralState::Start;
         }
-        OpOpenEphemeralState::StartingTxn { pager } => {
+        OpOpenEphemeralState::StartingTxn { pager, temp_file } => {
             tracing::trace!("StartingTxn");
             pager
                 .begin_read_tx() // we have to begin a read tx before beginning a write
@@ -10972,9 +10946,10 @@ pub fn op_open_ephemeral(
             return_if_io!(pager.begin_write_tx());
             state.op_open_ephemeral_state = OpOpenEphemeralState::CreateBtree {
                 pager: pager.clone(),
+                temp_file: temp_file.take(),
             };
         }
-        OpOpenEphemeralState::CreateBtree { pager } => {
+        OpOpenEphemeralState::CreateBtree { pager, temp_file } => {
             tracing::trace!("CreateBtree");
             // FIXME: handle page cache is full
             let flag = if is_table {
@@ -11002,9 +10977,13 @@ pub fn op_open_ephemeral(
             };
             state.op_open_ephemeral_state = OpOpenEphemeralState::Rewind {
                 cursor: Box::new(cursor),
+                temp_file: temp_file.take(),
             };
         }
-        OpOpenEphemeralState::Rewind { cursor } => {
+        OpOpenEphemeralState::Rewind {
+            cursor,
+            temp_file: _,
+        } => {
             return_if_io!(cursor.rewind());
 
             let cursors = &mut state.cursors;
@@ -11014,11 +10993,14 @@ pub fn op_open_ephemeral(
                 .get(cursor_id)
                 .expect("cursor_id should exist in cursor_ref");
 
-            let OpOpenEphemeralState::Rewind { cursor } =
+            let OpOpenEphemeralState::Rewind { cursor, temp_file } =
                 std::mem::take(&mut state.op_open_ephemeral_state)
             else {
                 unreachable!()
             };
+
+            let tf = temp_file.expect("temp_file must be present in Rewind state");
+            state.ephemeral_temp_files.insert(cursor_id, tf);
 
             // Table content is erased if the cursor already exists
             match cursor_type {
