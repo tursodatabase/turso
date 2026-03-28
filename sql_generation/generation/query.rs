@@ -5,8 +5,8 @@ use crate::generation::{
 use crate::model::query::alter_table::{AlterTable, AlterTableType, AlterTableTypeDiscriminants};
 use crate::model::query::predicate::Predicate;
 use crate::model::query::select::{
-    CompoundOperator, CompoundSelect, Distinctness, FromClause, OrderBy, ResultColumn, SelectBody,
-    SelectInner, SelectTable,
+    AggFunc, AggregateExpr, CompoundOperator, CompoundSelect, Distinctness, FromClause,
+    GroupByClause, OrderBy, ResultColumn, SelectBody, SelectInner, SelectTable,
 };
 use crate::model::query::update::{SetValue, Update};
 use crate::model::query::{
@@ -125,6 +125,7 @@ impl Arbitrary for SelectInner {
             from: Some(from),
             where_clause: Predicate::arbitrary_from(rng, env, &join_table),
             order_by,
+            group_by: None,
         }
     }
 }
@@ -241,6 +242,112 @@ impl Arbitrary for Select {
     }
 }
 
+/// Generate a SELECT with GROUP BY and aggregate functions.
+/// Picks a single table, chooses 1-2 columns for GROUP BY,
+/// and 1-2 aggregate functions on other columns.
+pub fn gen_group_by_select<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, env: &C) -> Select {
+    let table = pick(env.tables(), rng);
+
+    // Pick 1-2 columns for GROUP BY (prefer non-unique columns for interesting grouping)
+    let non_unique_cols: Vec<&Column> = table
+        .columns
+        .iter()
+        .filter(|c| !c.has_unique_or_pk())
+        .collect();
+
+    let group_by_source = if non_unique_cols.is_empty() {
+        &table.columns
+    } else {
+        // We'll use the non_unique_cols but we need a &[Column] reference
+        // Just pick from full columns but prefer non-unique
+        &table.columns
+    };
+
+    let num_group_cols = rng.random_range(1..=group_by_source.len().min(2));
+    let group_by_cols: Vec<String> = pick_unique(group_by_source, num_group_cols, rng)
+        .map(|c| format!("{}.{}", table.name, c.name))
+        .collect();
+
+    // Pick columns for aggregates (any column works)
+    let agg_funcs = [
+        AggFunc::Count,
+        AggFunc::CountStar,
+        AggFunc::Sum,
+        AggFunc::Min,
+        AggFunc::Max,
+    ];
+    let num_aggs = rng.random_range(1..=2usize);
+
+    let mut result_columns: Vec<ResultColumn> = group_by_cols
+        .iter()
+        .map(|c| ResultColumn::Column(c.clone()))
+        .collect();
+
+    for _ in 0..num_aggs {
+        let func = pick(&agg_funcs, rng).clone();
+        let agg = match func {
+            AggFunc::CountStar => AggregateExpr {
+                func: AggFunc::CountStar,
+                column: None,
+            },
+            _ => {
+                let col = pick(&table.columns, rng);
+                AggregateExpr {
+                    func,
+                    column: Some(format!("{}.{}", table.name, col.name)),
+                }
+            }
+        };
+        result_columns.push(ResultColumn::Aggregate(agg));
+    }
+
+    // Optionally add a HAVING clause (30% chance)
+    let having = if rng.random_bool(0.3) {
+        // HAVING with a simple aggregate comparison: COUNT(*) > 0
+        let having_expr = Expr::Binary(
+            Box::new(Expr::FunctionCallStar {
+                name: turso_parser::ast::Name::exact("COUNT".to_string()),
+                filter_over: turso_parser::ast::FunctionTail {
+                    filter_clause: None,
+                    over_clause: None,
+                },
+            }),
+            turso_parser::ast::Operator::Greater,
+            Box::new(Expr::Literal(turso_parser::ast::Literal::Numeric(
+                rng.random_range(0..=3).to_string(),
+            ))),
+        );
+        Some(Predicate(having_expr))
+    } else {
+        None
+    };
+
+    let from = FromClause {
+        table: SelectTable::Table(table.name.clone()),
+        joins: Vec::new(),
+    };
+
+    let where_clause = Predicate::arbitrary_from(rng, env, table);
+
+    Select {
+        body: SelectBody {
+            select: Box::new(SelectInner {
+                distinctness: Distinctness::All,
+                columns: result_columns,
+                from: Some(from),
+                where_clause,
+                order_by: None,
+                group_by: Some(GroupByClause {
+                    columns: group_by_cols,
+                    having,
+                }),
+            }),
+            compounds: Vec::new(),
+        },
+        limit: None,
+    }
+}
+
 impl Arbitrary for Insert {
     fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, env: &C) -> Self {
         let insert_opts = &env.opts().query.insert;
@@ -281,6 +388,7 @@ impl Arbitrary for Insert {
                             }),
                             where_clause: Predicate::true_(),
                             order_by: None,
+                            group_by: None,
                         }),
                         compounds: Vec::new(),
                     },
