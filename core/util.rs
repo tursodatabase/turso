@@ -2294,32 +2294,46 @@ fn rename_identifiers_scoped_inner(
     let trigger_normalized = normalize_ident(trigger_table);
     let is_renaming_trigger_table = target_normalized == trigger_normalized;
 
-    let mut visitor = FlatExprVisitor(|e: &mut ast::Expr| -> crate::Result<WalkControl> {
-        match e {
-            ast::Expr::Id(ref name) | ast::Expr::Name(ref name)
-                if rename_unqualified && normalize_ident(name.as_str()) == from_normalized =>
-            {
-                *e = ast::Expr::Id(ast::Name::exact(to.to_owned()));
-            }
-            ast::Expr::Qualified(ref tbl, ref col_name)
-                if normalize_ident(col_name.as_str()) == from_normalized =>
-            {
-                let tbl_norm = normalize_ident(tbl.as_str());
-                let should_rename = if tbl_norm == "new" || tbl_norm == "old" {
-                    is_renaming_trigger_table
-                } else {
-                    tbl_norm == target_normalized
-                };
-                if should_rename {
-                    let tbl = tbl.clone();
-                    *e = ast::Expr::Qualified(tbl, ast::Name::exact(to.to_owned()));
+    let _ = walk_expr_mut(
+        expr,
+        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
+            match e {
+                ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
+                    rewrite_select_column_refs_scoped(
+                        select,
+                        target_table,
+                        trigger_table,
+                        from,
+                        to,
+                    );
                 }
+                ast::Expr::InSelect { rhs, .. } => {
+                    rewrite_select_column_refs_scoped(rhs, target_table, trigger_table, from, to);
+                }
+                ast::Expr::Id(ref name) | ast::Expr::Name(ref name)
+                    if rename_unqualified && normalize_ident(name.as_str()) == from_normalized =>
+                {
+                    *e = ast::Expr::Id(ast::Name::exact(to.to_owned()));
+                }
+                ast::Expr::Qualified(ref tbl, ref col_name)
+                    if normalize_ident(col_name.as_str()) == from_normalized =>
+                {
+                    let tbl_norm = normalize_ident(tbl.as_str());
+                    let should_rename = if tbl_norm == "new" || tbl_norm == "old" {
+                        is_renaming_trigger_table
+                    } else {
+                        tbl_norm == target_normalized
+                    };
+                    if should_rename {
+                        let tbl = tbl.clone();
+                        *e = ast::Expr::Qualified(tbl, ast::Name::exact(to.to_owned()));
+                    }
+                }
+                _ => {}
             }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    });
-    let _ = walk_expr_scoped(expr, &mut (), &mut visitor);
+            Ok(WalkControl::Continue)
+        },
+    );
 }
 
 mod rename_column_view {
