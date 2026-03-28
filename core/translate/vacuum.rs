@@ -12,7 +12,7 @@ use turso_parser::ast::{Expr, Literal, Name};
 ///
 /// # Arguments
 /// * `program` - The program builder to emit instructions to
-/// * `schema_name` - Optional schema/database name (not yet supported)
+/// * `schema_name` - Optional schema/database name to vacuum (defaults to "main" if None)
 /// * `into` - Optional destination path for VACUUM INTO
 ///
 /// # Returns
@@ -22,16 +22,15 @@ pub fn translate_vacuum(
     schema_name: Option<&Name>,
     into: Option<&Expr>,
 ) -> Result<()> {
-    // Schema name support (for attached databases) is not yet implemented
-    if schema_name.is_some() {
-        bail_parse_error!("VACUUM with schema name is not supported yet");
-    }
-
+    let schema_name = schema_name.map_or_else(|| "main".to_string(), |n| n.as_str().to_string());
     match into {
         Some(dest_expr) => {
             // VACUUM INTO 'path' - create compacted copy at destination
             let dest_path = extract_path_from_expr(dest_expr)?;
-            program.emit_insn(Insn::VacuumInto { dest_path });
+            program.emit_insn(Insn::VacuumInto {
+                schema_name,
+                dest_path,
+            });
             Ok(())
         }
         None => {
