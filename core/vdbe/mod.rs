@@ -2054,6 +2054,21 @@ impl Program {
                     }
                 }
             }
+
+            if let Some(last_change) = match err {
+                Some(LimboError::Constraint(_)) => Some(match self.resolve_type {
+                    ResolveType::Fail => state.n_change.load(Ordering::SeqCst),
+                    _ => 0,
+                }),
+                Some(LimboError::Raise(resolve_type, _)) => Some(match resolve_type {
+                    ResolveType::Fail => state.n_change.load(Ordering::SeqCst),
+                    _ => 0,
+                }),
+                Some(LimboError::ForeignKeyConstraint(_)) => Some(0),
+                _ => None,
+            } {
+                self.connection.set_last_change(last_change);
+            }
         }
         if state.uses_subjournal {
             pager.stop_use_subjournal();

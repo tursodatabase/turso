@@ -2012,3 +2012,125 @@ fn test_trigger_upsert_clause_persists_after_rename() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[turso_macros::test()]
+fn test_changes_after_trigger_abort_resets_to_zero(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE seed(x)").unwrap();
+    conn.execute("INSERT INTO seed VALUES (1), (2)").unwrap();
+    conn.execute("CREATE TABLE t(a)").unwrap();
+    conn.execute("CREATE TABLE log(msg)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER tr AFTER INSERT ON t BEGIN
+         INSERT INTO log VALUES ('x');
+         SELECT RAISE(ABORT, 'boom');
+        END",
+    )
+    .unwrap();
+
+    let err = conn.execute("INSERT INTO t VALUES (1)").unwrap_err();
+    assert!(err.to_string().contains("boom"));
+
+    let changes: Vec<(i64,)> = conn.exec_rows("SELECT changes()");
+    assert_eq!(changes, vec![(0,)]);
+
+    let total_changes: Vec<(i64,)> = conn.exec_rows("SELECT total_changes()");
+    assert_eq!(total_changes, vec![(3,)]);
+}
+
+#[turso_macros::test()]
+fn test_changes_after_trigger_fail_keeps_direct_row_count(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE seed(x)").unwrap();
+    conn.execute("INSERT INTO seed VALUES (1), (2)").unwrap();
+    conn.execute("CREATE TABLE t(a)").unwrap();
+    conn.execute("CREATE TABLE log(msg)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER tr AFTER INSERT ON t BEGIN
+         INSERT INTO log VALUES ('x');
+         SELECT RAISE(FAIL, 'boom');
+        END",
+    )
+    .unwrap();
+
+    let err = conn.execute("INSERT INTO t VALUES (1)").unwrap_err();
+    assert!(err.to_string().contains("boom"));
+
+    let changes: Vec<(i64,)> = conn.exec_rows("SELECT changes()");
+    assert_eq!(changes, vec![(1,)]);
+
+    let total_changes: Vec<(i64,)> = conn.exec_rows("SELECT total_changes()");
+    assert_eq!(total_changes, vec![(4,)]);
+}
+
+#[turso_macros::test()]
+fn test_changes_after_trigger_rollback_resets_to_zero(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE seed(x)").unwrap();
+    conn.execute("INSERT INTO seed VALUES (1), (2)").unwrap();
+    conn.execute("CREATE TABLE t(a)").unwrap();
+    conn.execute("CREATE TABLE log(msg)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER tr AFTER INSERT ON t BEGIN
+         INSERT INTO log VALUES ('x');
+         SELECT RAISE(ROLLBACK, 'boom');
+        END",
+    )
+    .unwrap();
+
+    let err = conn.execute("INSERT INTO t VALUES (1)").unwrap_err();
+    assert!(err.to_string().contains("boom"));
+
+    let changes: Vec<(i64,)> = conn.exec_rows("SELECT changes()");
+    assert_eq!(changes, vec![(0,)]);
+
+    let total_changes: Vec<(i64,)> = conn.exec_rows("SELECT total_changes()");
+    assert_eq!(total_changes, vec![(3,)]);
+}
+
+#[turso_macros::test()]
+fn test_changes_after_trigger_ignore_preserves_outer_and_trigger_counts(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE t(a)").unwrap();
+    conn.execute("CREATE TABLE log(msg)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER tr AFTER INSERT ON t BEGIN
+         INSERT INTO log VALUES ('x');
+         SELECT RAISE(IGNORE);
+        END",
+    )
+    .unwrap();
+
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let changes: Vec<(i64,)> = conn.exec_rows("SELECT changes()");
+    assert_eq!(changes, vec![(1,)]);
+
+    let total_changes: Vec<(i64,)> = conn.exec_rows("SELECT total_changes()");
+    assert_eq!(total_changes, vec![(2,)]);
+}
+
+#[turso_macros::test()]
+fn test_changes_after_foreign_key_failure_reset_to_zero(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE seed(x)").unwrap();
+    conn.execute("INSERT INTO seed VALUES (1), (2)").unwrap();
+    conn.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn.execute("CREATE TABLE p(id PRIMARY KEY)").unwrap();
+    conn.execute("CREATE TABLE c(pid REFERENCES p(id))")
+        .unwrap();
+
+    let err = conn.execute("INSERT INTO c VALUES (1)").unwrap_err();
+    assert!(err.to_string().contains("FOREIGN KEY constraint failed"));
+
+    let changes: Vec<(i64,)> = conn.exec_rows("SELECT changes()");
+    assert_eq!(changes, vec![(0,)]);
+
+    let total_changes: Vec<(i64,)> = conn.exec_rows("SELECT total_changes()");
+    assert_eq!(total_changes, vec![(2,)]);
+}
