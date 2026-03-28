@@ -3060,19 +3060,11 @@ mod rename_column_view {
                     )? {
                         *changed = true;
                     }
+                    //TODO walk subqueries
                     return Ok(WalkControl::SkipChildren);
                 }
-                ast::Expr::InSelect { lhs, rhs, .. } => {
-                    // Walk lhs with current scope
-                    rewrite_expr_in_scope(
-                        lhs,
-                        sources,
-                        outer_scopes,
-                        ctx,
-                        changed,
-                        visiting_views,
-                    )?;
-                    // Walk rhs (SELECT) with its own scope
+                //TODO walk lhs
+                ast::Expr::InSelect { rhs, .. } => {
                     if rewrite_view_select_for_column_rename(
                         rhs,
                         ctx,
@@ -3081,7 +3073,6 @@ mod rename_column_view {
                     )? {
                         *changed = true;
                     }
-                    return Ok(WalkControl::SkipChildren);
                 }
                 _ => {}
             }
