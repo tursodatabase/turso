@@ -164,6 +164,8 @@ pub fn parse_schema_rows(
     let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
     // Store materialized view info (SQL and root page) for later creation
     let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::default();
+    // Foreign tables deferred until servers are loaded
+    let mut deferred_foreign_tables: Vec<(String, String)> = Vec::new();
 
     // TODO: How do we ensure that the I/O we submitted to
     // read the schema is actually complete?
@@ -185,6 +187,7 @@ pub fn parse_schema_rows(
             &mut dbsp_state_roots,
             &mut dbsp_state_index_roots,
             &mut materialized_view_info,
+            &mut deferred_foreign_tables,
         )
     })?;
 
@@ -199,6 +202,11 @@ pub fn parse_schema_rows(
         dbsp_state_roots,
         dbsp_state_index_roots,
     )?;
+
+    // Process deferred foreign tables (servers are now loaded)
+    for (name, sql) in deferred_foreign_tables {
+        schema.populate_foreign_table(&name, &sql, syms)?;
+    }
 
     Ok(())
 }

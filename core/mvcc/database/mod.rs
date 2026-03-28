@@ -4473,6 +4473,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
                 let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
                 let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::default();
+                let mut deferred_foreign_tables: Vec<(String, String)> = Vec::new();
                 let syms = connection.syms.read();
                 let mv_store = connection.db.get_mv_store().clone();
 
@@ -4525,6 +4526,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         &mut dbsp_state_roots,
                         &mut dbsp_state_index_roots,
                         &mut materialized_view_info,
+                        &mut deferred_foreign_tables,
                     )?;
                 }
                 fresh.populate_indices(
