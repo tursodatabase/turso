@@ -267,6 +267,42 @@ test('concurrent-actions-consistency', async () => {
     await Promise.all([pull(100), push(100), run(200)]);
 })
 
+test('named parameters with $', async () => {
+    const db = new Database({ path: ':memory:' });
+    await db.exec("CREATE TABLE users(name TEXT, age INTEGER)");
+    await db.exec("INSERT INTO users VALUES ('Alice', 30), ('Bob', 25), ('Carol', 35)");
+    const stmt = db.prepare("SELECT * FROM users WHERE name = $name AND age = $age");
+    const row = await stmt.get({ name: 'Alice', age: 30 });
+    expect(row).toEqual({ name: 'Alice', age: 30 });
+})
+
+test('named parameters with :', async () => {
+    const db = new Database({ path: ':memory:' });
+    await db.exec("CREATE TABLE t(x, y)");
+    await db.exec("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+    const stmt = db.prepare("SELECT * FROM t WHERE x = :x");
+    const rows = await stmt.all({ x: 2 });
+    expect(rows).toEqual([{ x: 2, y: 'b' }]);
+})
+
+test('named parameters with @', async () => {
+    const db = new Database({ path: ':memory:' });
+    await db.exec("CREATE TABLE t(x)");
+    await db.exec("INSERT INTO t VALUES (10), (20), (30)");
+    const stmt = db.prepare("SELECT * FROM t WHERE x = @val");
+    const row = await stmt.get({ val: 20 });
+    expect(row).toEqual({ x: 20 });
+})
+
+test('named parameters with mixed prefixes', async () => {
+    const db = new Database({ path: ':memory:' });
+    await db.exec("CREATE TABLE t(a, b, c)");
+    await db.exec("INSERT INTO t VALUES (1, 2, 3)");
+    const stmt = db.prepare("SELECT * FROM t WHERE a = $a AND b = :b AND c = @c");
+    const row = await stmt.get({ a: 1, b: 2, c: 3 });
+    expect(row).toEqual({ a: 1, b: 2, c: 3 });
+})
+
 test('simple-db', async () => {
     const db = new Database({ path: ':memory:' });
     expect(await db.prepare("SELECT 1 as x").all()).toEqual([{ x: 1 }])
