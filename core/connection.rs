@@ -1,6 +1,7 @@
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::YieldInjector;
+use crate::statement::StatementOrigin;
 use crate::storage::journal_mode;
 use crate::sync::{
     atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, Ordering},
@@ -131,6 +132,11 @@ pub struct Connection {
     pub(crate) fk_deferred_violations: AtomicIsize,
     /// Number of active write statements on this connection.
     pub(crate) n_active_writes: AtomicI32,
+    /// Number of active root statements currently executing on this connection.
+    /// This is Turso's equivalent of SQLite's top-level active-VDBE count
+    /// (`db->nVdbeActive`) for user statements, excluding internal helpers and
+    /// subprogram execution.
+    pub(crate) n_active_root_statements: AtomicI32,
     /// Whether pragma ignore_check_constraints=ON for this connection
     pub(super) check_constraints_pragma: AtomicBool,
     /// Track when each virtual table instance is currently in transaction.
@@ -278,8 +284,23 @@ impl Connection {
         self._prepare(sql)
     }
 
+    pub(crate) fn prepare_internal(
+        self: &Arc<Connection>,
+        sql: impl AsRef<str>,
+    ) -> Result<Statement> {
+        self.prepare_with_origin(sql, StatementOrigin::InternalHelper)
+    }
+
     #[instrument(skip_all, level = Level::INFO)]
     pub fn _prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
+        self.prepare_with_origin(sql, StatementOrigin::Root)
+    }
+
+    fn prepare_with_origin(
+        self: &Arc<Connection>,
+        sql: impl AsRef<str>,
+        origin: StatementOrigin,
+    ) -> Result<Statement> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
@@ -323,12 +344,26 @@ impl Connection {
             mode,
             input,
         )?;
-        Ok(Statement::new(program, pager, mode, byte_offset_end))
+        Ok(Statement::new_with_origin(
+            program,
+            pager,
+            mode,
+            byte_offset_end,
+            origin,
+        ))
     }
 
     /// Prepare a statement from an AST node directly, skipping SQL parsing.
     /// This is more efficient when AST is already available or constructed programmatically.
     pub fn prepare_stmt(self: &Arc<Connection>, stmt: ast::Stmt) -> Result<Statement> {
+        self.prepare_stmt_with_origin(stmt, StatementOrigin::Root)
+    }
+
+    fn prepare_stmt_with_origin(
+        self: &Arc<Connection>,
+        stmt: ast::Stmt,
+        origin: StatementOrigin,
+    ) -> Result<Statement> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
@@ -346,7 +381,7 @@ impl Connection {
             mode,
             "<ast>", // No SQL input string available
         )?;
-        Ok(Statement::new(program, pager, mode, 0))
+        Ok(Statement::new_with_origin(program, pager, mode, 0, origin))
     }
 
     /// Whether this is an internal connection used for MVCC bootstrap
