@@ -1431,24 +1431,24 @@ impl ViewColumnSchema {
     }
 }
 
-/// Walk all expressions in a SELECT statement, including subqueries.
+/// Trait to walk an expression node with correct scoping.
 pub(crate) trait ScopedExprVisitor {
     type Scope;
     /// Saved state returned by [`push_scope`] for restoration in [`pop_scope`].
     type ScopeGuard;
 
-    /// Enter a new SELECT scope. Mutates `scope` in-place, returns state needed by [`pop_scope`] to
-    /// restore it. `from` is the FROM clause of the SELECT being entered.
+    /// Enter a new SELECT scope. Mutates `scope` in-place. `from` is the FROM clause of the SELECT
+    /// being entered. Returns the state needed by [`pop_scope`] to restore the scope.
     fn push_scope(
         &mut self,
         scope: &mut Self::Scope,
         from: Option<&ast::FromClause>,
     ) -> Self::ScopeGuard;
 
-    /// Restore scope after leaving a SELECT level. `guard` is the value returned by the matching [`push_scope`].
+    /// Restore the scope after leaving a SELECT level. `guard` is the value returned by the matching [`push_scope`].
     fn pop_scope(&mut self, scope: &mut Self::Scope, guard: Self::ScopeGuard);
 
-    /// Visit an expression node. Return [`WalkControl::Stop`] to halt traversal.
+    /// Visit an expression node.
     fn visit_expr(&mut self, expr: &mut ast::Expr, scope: &Self::Scope) -> Result<WalkControl>;
 }
 
@@ -1459,17 +1459,17 @@ pub(crate) fn walk_select<V: ScopedExprVisitor>(
 ) -> Result<WalkControl> {
     if let Some(ref mut with_clause) = select.with {
         for cte in &mut with_clause.ctes {
-            if walk_select(&mut cte.select, scope, visitor)? == WalkControl::Stop {
+            if walk_select(&mut cte.select, scope, visitor)?.is_stop() {
                 return Ok(WalkControl::Stop);
             }
         }
     }
 
-    if walk_one_select(&mut select.body.select, scope, visitor)? == WalkControl::Stop {
+    if walk_one_select(&mut select.body.select, scope, visitor)?.is_stop() {
         return Ok(WalkControl::Stop);
     }
     for compound in &mut select.body.compounds {
-        if walk_one_select(&mut compound.select, scope, visitor)? == WalkControl::Stop {
+        if walk_one_select(&mut compound.select, scope, visitor)?.is_stop() {
             return Ok(WalkControl::Stop);
         }
     }
@@ -1482,16 +1482,16 @@ pub(crate) fn walk_select<V: ScopedExprVisitor>(
     let guard = visitor.push_scope(scope, from_ref);
     let result = (|| {
         for sorted_col in &mut select.order_by {
-            if walk_expr_scoped(&mut sorted_col.expr, scope, visitor)? == WalkControl::Stop {
+            if walk_expr_scoped(&mut sorted_col.expr, scope, visitor)?.is_stop() {
                 return Ok(WalkControl::Stop);
             }
         }
         if let Some(ref mut limit) = select.limit {
-            if walk_expr_scoped(&mut limit.expr, scope, visitor)? == WalkControl::Stop {
+            if walk_expr_scoped(&mut limit.expr, scope, visitor)?.is_stop() {
                 return Ok(WalkControl::Stop);
             }
             if let Some(ref mut offset) = limit.offset {
-                if walk_expr_scoped(offset, scope, visitor)? == WalkControl::Stop {
+                if walk_expr_scoped(offset, scope, visitor)?.is_stop() {
                     return Ok(WalkControl::Stop);
                 }
             }
@@ -1520,38 +1520,36 @@ fn walk_one_select<V: ScopedExprVisitor>(
             let result = (|| {
                 for col in columns.iter_mut() {
                     if let ast::ResultColumn::Expr(expr, _) = col {
-                        if walk_expr_scoped(expr, scope, visitor)? == WalkControl::Stop {
+                        if walk_expr_scoped(expr, scope, visitor)?.is_stop() {
                             return Ok(WalkControl::Stop);
                         }
                     }
                 }
                 if let Some(ref mut from_clause) = from {
-                    if walk_from_clause_expressions(from_clause, scope, visitor)?
-                        == WalkControl::Stop
-                    {
+                    if walk_from_clause_expressions(from_clause, scope, visitor)?.is_stop() {
                         return Ok(WalkControl::Stop);
                     }
                 }
                 if let Some(ref mut where_expr) = where_clause {
-                    if walk_expr_scoped(where_expr, scope, visitor)? == WalkControl::Stop {
+                    if walk_expr_scoped(where_expr, scope, visitor)?.is_stop() {
                         return Ok(WalkControl::Stop);
                     }
                 }
                 if let Some(ref mut gb) = group_by {
                     for expr in &mut gb.exprs {
-                        if walk_expr_scoped(expr, scope, visitor)? == WalkControl::Stop {
+                        if walk_expr_scoped(expr, scope, visitor)?.is_stop() {
                             return Ok(WalkControl::Stop);
                         }
                     }
                     if let Some(ref mut having) = gb.having {
-                        if walk_expr_scoped(having, scope, visitor)? == WalkControl::Stop {
+                        if walk_expr_scoped(having, scope, visitor)?.is_stop() {
                             return Ok(WalkControl::Stop);
                         }
                     }
                 }
                 for window_def in window_clause.iter_mut() {
                     if walk_window_scoped_expressions(&mut window_def.window, scope, visitor)?
-                        == WalkControl::Stop
+                        .is_stop()
                     {
                         return Ok(WalkControl::Stop);
                     }
@@ -1564,7 +1562,7 @@ fn walk_one_select<V: ScopedExprVisitor>(
         ast::OneSelect::Values(values) => {
             for row in values {
                 for expr in row {
-                    if walk_expr_scoped(expr, scope, visitor)? == WalkControl::Stop {
+                    if walk_expr_scoped(expr, scope, visitor)?.is_stop() {
                         return Ok(WalkControl::Stop);
                     }
                 }
@@ -1579,15 +1577,15 @@ pub(crate) fn walk_from_clause_expressions<V: ScopedExprVisitor>(
     scope: &mut V::Scope,
     visitor: &mut V,
 ) -> Result<WalkControl> {
-    if walk_select_table_expressions(&mut from.select, scope, visitor)? == WalkControl::Stop {
+    if walk_select_table_expressions(&mut from.select, scope, visitor)?.is_stop() {
         return Ok(WalkControl::Stop);
     }
     for join in &mut from.joins {
-        if walk_select_table_expressions(&mut join.table, scope, visitor)? == WalkControl::Stop {
+        if walk_select_table_expressions(&mut join.table, scope, visitor)?.is_stop() {
             return Ok(WalkControl::Stop);
         }
         if let Some(ast::JoinConstraint::On(ref mut expr)) = join.constraint {
-            if walk_expr_scoped(expr, scope, visitor)? == WalkControl::Stop {
+            if walk_expr_scoped(expr, scope, visitor)?.is_stop() {
                 return Ok(WalkControl::Stop);
             }
         }
@@ -1610,7 +1608,7 @@ fn walk_select_table_expressions<V: ScopedExprVisitor>(
         }
         ast::SelectTable::TableCall(_, args, _) => {
             for arg in args {
-                if walk_expr_scoped(arg, scope, visitor)? == WalkControl::Stop {
+                if walk_expr_scoped(arg, scope, visitor)?.is_stop() {
                     return Ok(WalkControl::Stop);
                 }
             }
@@ -1626,21 +1624,21 @@ fn walk_window_scoped_expressions<V: ScopedExprVisitor>(
     visitor: &mut V,
 ) -> Result<WalkControl> {
     for expr in &mut window.partition_by {
-        if walk_expr_scoped(expr, scope, visitor)? == WalkControl::Stop {
+        if walk_expr_scoped(expr, scope, visitor)?.is_stop() {
             return Ok(WalkControl::Stop);
         }
     }
     for sorted_col in &mut window.order_by {
-        if walk_expr_scoped(&mut sorted_col.expr, scope, visitor)? == WalkControl::Stop {
+        if walk_expr_scoped(&mut sorted_col.expr, scope, visitor)?.is_stop() {
             return Ok(WalkControl::Stop);
         }
     }
     if let Some(ref mut frame) = window.frame_clause {
-        if walk_frame_bound_scoped(&mut frame.start, scope, visitor)? == WalkControl::Stop {
+        if walk_frame_bound_scoped(&mut frame.start, scope, visitor)?.is_stop() {
             return Ok(WalkControl::Stop);
         }
         if let Some(ref mut end) = frame.end {
-            if walk_frame_bound_scoped(end, scope, visitor)? == WalkControl::Stop {
+            if walk_frame_bound_scoped(end, scope, visitor)?.is_stop() {
                 return Ok(WalkControl::Stop);
             }
         }
@@ -1677,36 +1675,34 @@ pub(crate) fn walk_expr_scoped<V: ScopedExprVisitor>(
             return walk_select(select, scope, visitor);
         }
         ast::Expr::InSelect { lhs, rhs, .. } => {
-            if walk_expr_scoped(lhs, scope, visitor)? == WalkControl::Stop {
+            if walk_expr_scoped(lhs, scope, visitor)?.is_stop() {
                 return Ok(WalkControl::Stop);
             }
             return walk_select(rhs, scope, visitor);
         }
         ast::Expr::SubqueryResult { lhs, .. } => {
             if let Some(lhs) = lhs {
-                if walk_expr_scoped(lhs, scope, visitor)? == WalkControl::Stop {
-                    return Ok(WalkControl::Stop);
-                }
+                return walk_expr_scoped(lhs, scope, visitor);
             }
         }
         ast::Expr::Between {
             lhs, start, end, ..
         } => {
-            if walk_expr_scoped(lhs, scope, visitor)? == WalkControl::Stop {
+            if walk_expr_scoped(lhs, scope, visitor)?.is_stop() {
                 return Ok(WalkControl::Stop);
             }
-            if walk_expr_scoped(start, scope, visitor)? == WalkControl::Stop {
+            if walk_expr_scoped(start, scope, visitor)?.is_stop() {
                 return Ok(WalkControl::Stop);
             }
-            if walk_expr_scoped(end, scope, visitor)? == WalkControl::Stop {
+            if walk_expr_scoped(end, scope, visitor)?.is_stop() {
                 return Ok(WalkControl::Stop);
             }
         }
         ast::Expr::Binary(lhs, _, rhs) => {
-            if walk_expr_scoped(lhs, scope, visitor)? == WalkControl::Stop {
+            if walk_expr_scoped(lhs, scope, visitor)?.is_stop() {
                 return Ok(WalkControl::Stop);
             }
-            if walk_expr_scoped(rhs, scope, visitor)? == WalkControl::Stop {
+            if walk_expr_scoped(rhs, scope, visitor)?.is_stop() {
                 return Ok(WalkControl::Stop);
             }
         }
@@ -1716,31 +1712,31 @@ pub(crate) fn walk_expr_scoped<V: ScopedExprVisitor>(
             else_expr,
         } => {
             if let Some(base) = base {
-                if walk_expr_scoped(base, scope, visitor)? == WalkControl::Stop {
+                if walk_expr_scoped(base, scope, visitor)?.is_stop() {
                     return Ok(WalkControl::Stop);
                 }
             }
             for (when_expr, then_expr) in when_then_pairs {
-                if walk_expr_scoped(when_expr, scope, visitor)? == WalkControl::Stop {
+                if walk_expr_scoped(when_expr, scope, visitor)?.is_stop() {
                     return Ok(WalkControl::Stop);
                 }
-                if walk_expr_scoped(then_expr, scope, visitor)? == WalkControl::Stop {
+                if walk_expr_scoped(then_expr, scope, visitor)?.is_stop() {
                     return Ok(WalkControl::Stop);
                 }
             }
             if let Some(else_expr) = else_expr {
-                if walk_expr_scoped(else_expr, scope, visitor)? == WalkControl::Stop {
+                if walk_expr_scoped(else_expr, scope, visitor)?.is_stop() {
                     return Ok(WalkControl::Stop);
                 }
             }
         }
         ast::Expr::Cast { expr, .. } => {
-            if walk_expr_scoped(expr, scope, visitor)? == WalkControl::Stop {
+            if walk_expr_scoped(expr, scope, visitor)?.is_stop() {
                 return Ok(WalkControl::Stop);
             }
         }
         ast::Expr::Collate(expr, _) => {
-            if walk_expr_scoped(expr, scope, visitor)? == WalkControl::Stop {
+            if walk_expr_scoped(expr, scope, visitor)?.is_stop() {
                 return Ok(WalkControl::Stop);
             }
         }
@@ -1751,96 +1747,84 @@ pub(crate) fn walk_expr_scoped<V: ScopedExprVisitor>(
             ..
         } => {
             for arg in args {
-                if walk_expr_scoped(arg, scope, visitor)? == WalkControl::Stop {
+                if walk_expr_scoped(arg, scope, visitor)?.is_stop() {
                     return Ok(WalkControl::Stop);
                 }
             }
             for sort_col in order_by {
-                if walk_expr_scoped(&mut sort_col.expr, scope, visitor)? == WalkControl::Stop {
+                if walk_expr_scoped(&mut sort_col.expr, scope, visitor)?.is_stop() {
                     return Ok(WalkControl::Stop);
                 }
             }
             if let Some(ref mut filter) = filter_over.filter_clause {
-                if walk_expr_scoped(filter, scope, visitor)? == WalkControl::Stop {
+                if walk_expr_scoped(filter, scope, visitor)?.is_stop() {
                     return Ok(WalkControl::Stop);
                 }
             }
             if let Some(ast::Over::Window(ref mut window)) = filter_over.over_clause {
-                if walk_window_scoped_expressions(window, scope, visitor)? == WalkControl::Stop {
-                    return Ok(WalkControl::Stop);
-                }
+                return walk_window_scoped_expressions(window, scope, visitor);
             }
         }
         ast::Expr::FunctionCallStar { filter_over, .. } => {
             if let Some(ref mut filter) = filter_over.filter_clause {
-                if walk_expr_scoped(filter, scope, visitor)? == WalkControl::Stop {
+                if walk_expr_scoped(filter, scope, visitor)?.is_stop() {
                     return Ok(WalkControl::Stop);
                 }
             }
             if let Some(ast::Over::Window(ref mut window)) = filter_over.over_clause {
-                if walk_window_scoped_expressions(window, scope, visitor)? == WalkControl::Stop {
-                    return Ok(WalkControl::Stop);
-                }
+                return walk_window_scoped_expressions(window, scope, visitor);
             }
         }
         ast::Expr::InList { lhs, rhs, .. } => {
-            if walk_expr_scoped(lhs, scope, visitor)? == WalkControl::Stop {
+            if walk_expr_scoped(lhs, scope, visitor)?.is_stop() {
                 return Ok(WalkControl::Stop);
             }
             for expr in rhs {
-                if walk_expr_scoped(expr, scope, visitor)? == WalkControl::Stop {
+                if walk_expr_scoped(expr, scope, visitor)?.is_stop() {
                     return Ok(WalkControl::Stop);
                 }
             }
         }
         ast::Expr::InTable { lhs, args, .. } => {
-            if walk_expr_scoped(lhs, scope, visitor)? == WalkControl::Stop {
+            if walk_expr_scoped(lhs, scope, visitor)?.is_stop() {
                 return Ok(WalkControl::Stop);
             }
             for expr in args {
-                if walk_expr_scoped(expr, scope, visitor)? == WalkControl::Stop {
+                if walk_expr_scoped(expr, scope, visitor)?.is_stop() {
                     return Ok(WalkControl::Stop);
                 }
             }
         }
         ast::Expr::IsNull(expr) | ast::Expr::NotNull(expr) => {
-            if walk_expr_scoped(expr, scope, visitor)? == WalkControl::Stop {
-                return Ok(WalkControl::Stop);
-            }
+            return walk_expr_scoped(expr, scope, visitor);
         }
         ast::Expr::Like {
             lhs, rhs, escape, ..
         } => {
-            if walk_expr_scoped(lhs, scope, visitor)? == WalkControl::Stop {
+            if walk_expr_scoped(lhs, scope, visitor)?.is_stop() {
                 return Ok(WalkControl::Stop);
             }
-            if walk_expr_scoped(rhs, scope, visitor)? == WalkControl::Stop {
+            if walk_expr_scoped(rhs, scope, visitor)?.is_stop() {
                 return Ok(WalkControl::Stop);
             }
             if let Some(esc) = escape {
-                if walk_expr_scoped(esc, scope, visitor)? == WalkControl::Stop {
-                    return Ok(WalkControl::Stop);
-                }
+                return walk_expr_scoped(esc, scope, visitor);
             }
         }
         ast::Expr::Parenthesized(exprs) => {
             for expr in exprs {
-                if walk_expr_scoped(expr, scope, visitor)? == WalkControl::Stop {
+                if walk_expr_scoped(expr, scope, visitor)?.is_stop() {
                     return Ok(WalkControl::Stop);
                 }
             }
         }
         ast::Expr::Raise(_, expr) => {
             if let Some(raise_expr) = expr {
-                if walk_expr_scoped(raise_expr, scope, visitor)? == WalkControl::Stop {
-                    return Ok(WalkControl::Stop);
-                }
+                return walk_expr_scoped(raise_expr, scope, visitor);
             }
         }
         ast::Expr::Unary(_, expr) => {
-            if walk_expr_scoped(expr, scope, visitor)? == WalkControl::Stop {
-                return Ok(WalkControl::Stop);
-            }
+            return walk_expr_scoped(expr, scope, visitor);
         }
         ast::Expr::Array { .. } | ast::Expr::Subscript { .. } => {
             unreachable!("Array and Subscript are desugared into function calls by the parser")
@@ -3080,7 +3064,14 @@ mod rename_column_view {
                 }
                 ast::Expr::InSelect { lhs, rhs, .. } => {
                     // Walk lhs with current scope
-                    rewrite_expr_in_scope(lhs, sources, outer_scopes, ctx, changed, visiting_views)?;
+                    rewrite_expr_in_scope(
+                        lhs,
+                        sources,
+                        outer_scopes,
+                        ctx,
+                        changed,
+                        visiting_views,
+                    )?;
                     // Walk rhs (SELECT) with its own scope
                     if rewrite_view_select_for_column_rename(
                         rhs,

@@ -5285,6 +5285,12 @@ pub enum WalkControl {
     Stop,         // Halt traversal entirely
 }
 
+impl WalkControl {
+    pub fn is_stop(&self) -> bool{
+        matches!(self, Self::Stop)
+    }
+}
+
 /// Recursively walks an immutable expression, applying a function to each sub-expression.
 pub fn walk_expr<'a, F>(expr: &'a ast::Expr, func: &mut F) -> Result<WalkControl>
 where
