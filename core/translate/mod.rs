@@ -53,6 +53,7 @@ use crate::translate::delete::translate_delete;
 use crate::translate::emitter::Resolver;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use crate::vdbe::Program;
+use crate::LimboError;
 use crate::{bail_parse_error, Connection, Result, SymbolTable};
 use alter::translate_alter_table;
 use analyze::translate_analyze;
@@ -159,6 +160,9 @@ pub fn translate_inner(
     );
 
     if is_write && connection.get_query_only() {
+        if connection.is_readonly(0) {
+            return Err(LimboError::ReadOnly);
+        }
         bail_parse_error!("Cannot execute write statement in query_only mode")
     }
 
