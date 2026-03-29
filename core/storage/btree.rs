@@ -16,7 +16,7 @@ use crate::{
     io_yield_one,
     schema::Index,
     storage::{
-        pager::{BtreePageAllocMode, Pager},
+        pager::{AutoVacuumMode, BtreePageAllocMode, Pager},
         sqlite3_ondisk::{
             payload_overflows, read_u32, read_varint, write_varint, BTreeCell, DatabaseHeader,
             PageContent, PageSize, PageType, TableInteriorCell, TableLeafCell, CELL_PTR_SIZE_BYTES,
@@ -40,6 +40,7 @@ use crate::{
     vdbe::Register,
     Completion, MvStore,
 };
+use crate::storage::pager::ptrmap::PtrmapType;
 use crate::{
     numeric::Numeric,
     return_corrupt, return_if_io,
@@ -230,6 +231,7 @@ struct BalanceContext {
     sibling_count_new: usize,
     cell_array: CellArray,
     old_cell_count_per_page_cumulative: [u16; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE],
+    parent_page_id: u32,
     #[cfg(debug_assertions)]
     cells_debug: Vec<Vec<u8>>,
 }
@@ -2582,6 +2584,14 @@ impl BTreeCursor {
             .get_page_at_level(self.stack.current() - 1)
             .expect("parent page should be on the stack");
         self.pager.add_dirty(parent)?;
+        #[cfg(not(feature = "omit_autovacuum"))]
+        if self.pager.get_auto_vacuum_mode() != AutoVacuumMode::None {
+            return_if_io!(self.pager.ptrmap_put(
+                new_rightmost_leaf.get().id as u32,
+                PtrmapType::BTreeNode,
+                parent.get().id as u32,
+            ));
+        }
         let parent_contents = parent.get_contents();
         let rightmost_pointer = parent_contents
             .rightmost_pointer()?
@@ -3419,6 +3429,7 @@ impl BTreeCursor {
                             sibling_count_new,
                             cell_array,
                             old_cell_count_per_page_cumulative,
+                            parent_page_id: parent_page.get().id as u32,
                             #[cfg(debug_assertions)]
                             cells_debug,
                         }),
@@ -3430,6 +3441,7 @@ impl BTreeCursor {
                         old_cell_count_per_page_cumulative,
                         cell_array,
                         sibling_count_new,
+                        parent_page_id,
                         ..
                     } = context.as_mut().unwrap();
                     let pager = self.pager.clone();
@@ -3450,6 +3462,14 @@ impl BTreeCursor {
                             0,
                             BtreePageAllocMode::Any
                         ));
+                        #[cfg(not(feature = "omit_autovacuum"))]
+                        if pager.get_auto_vacuum_mode() != AutoVacuumMode::None {
+                            return_if_io!(pager.ptrmap_put(
+                                page.get().id as u32,
+                                PtrmapType::BTreeNode,
+                                *parent_page_id,
+                            ));
+                        }
                         pages_to_balance_new[*i].replace(PinGuard::new(page));
                         // Since this page didn't exist before, we can set it to cells length as it
                         // marks them as empty since it is a prefix sum of cells.
@@ -3472,6 +3492,7 @@ impl BTreeCursor {
                             sibling_count_new,
                             cell_array,
                             old_cell_count_per_page_cumulative,
+                            parent_page_id: _,
                             #[cfg(debug_assertions)]
                             cells_debug,
                         },
@@ -4397,6 +4418,14 @@ impl BTreeCursor {
             0,
             BtreePageAllocMode::Any
         ));
+        #[cfg(not(feature = "omit_autovacuum"))]
+        if self.pager.get_auto_vacuum_mode() != AutoVacuumMode::None {
+            return_if_io!(self.pager.ptrmap_put(
+                child.get().id as u32,
+                PtrmapType::BTreeNode,
+                root.get().id as u32,
+            ));
+        }
 
         let is_page_1 = root.get().id == 1;
         let offset = if is_page_1 { DatabaseHeader::SIZE } else { 0 };
