@@ -8,6 +8,7 @@ use crate::storage::pager::Pager;
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::translate_expr;
+use crate::translate::fk_compile::FkCompileContext;
 use crate::types::Text;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::Insn;
@@ -15,6 +16,7 @@ use crate::vdbe::{Program, ProgramState, Register};
 use crate::{Connection, QueryMode, Result, Value};
 use crate::{DatabaseCatalog, RwLock, SymbolTable};
 use rustc_hash::FxHashMap as HashMap;
+use std::cell::RefCell;
 use turso_parser::ast::{Expr, Literal, Operator};
 
 // Transform an expression to replace column references with Register expressions Why do we want to
@@ -328,7 +330,15 @@ impl CompiledExpression {
         // Create a resolver for translate_expr
         let database_schemas = RwLock::new(HashMap::default());
         let attached_databases = RwLock::new(DatabaseCatalog::new());
-        let resolver = Resolver::new(schema, &database_schemas, &attached_databases, syms, true);
+        let fk_compile_ctx = RefCell::new(FkCompileContext::new());
+        let resolver = Resolver::new(
+            schema,
+            &database_schemas,
+            &attached_databases,
+            &fk_compile_ctx,
+            syms,
+            true,
+        );
 
         // Translate the transformed expression to bytecode
         translate_expr(
@@ -411,6 +421,11 @@ impl CompiledExpression {
                         }
                         crate::vdbe::execute::InsnFunctionStepResult::Step => {
                             pc = state.pc as usize;
+                        }
+                        crate::vdbe::execute::InsnFunctionStepResult::SpawnedSubprogram(_) => {
+                            return Err(crate::LimboError::InternalError(
+                                "Expression evaluation spawned unexpected subprogram".to_string(),
+                            ));
                         }
                     }
                 }

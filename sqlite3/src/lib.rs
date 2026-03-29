@@ -2867,6 +2867,8 @@ fn limbo_err_code(err: &LimboError) -> i32 {
         LimboError::ReadOnly => SQLITE_READONLY,
         LimboError::Busy => SQLITE_BUSY,
         LimboError::SchemaUpdated | LimboError::SchemaConflict => SQLITE_SCHEMA,
+        LimboError::TooManyLevelsOfTriggerRecursion => SQLITE_ERROR,
+        LimboError::FkActionCompileDepthExceeded => SQLITE_ERROR,
         _ => SQLITE_ERROR,
     }
 }
@@ -2937,5 +2939,27 @@ mod tests {
             assert_eq!(sqlite3_limit(db, -12345, -1), -1);
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
+    }
+
+    #[test]
+    fn trigger_recursion_error_maps_to_sqlite_error() {
+        assert_eq!(
+            handle_limbo_err(
+                LimboError::TooManyLevelsOfTriggerRecursion,
+                std::ptr::null_mut()
+            ),
+            SQLITE_ERROR
+        );
+    }
+
+    #[test]
+    fn fk_compile_depth_error_maps_to_sqlite_error() {
+        assert_eq!(
+            handle_limbo_err(
+                LimboError::FkActionCompileDepthExceeded,
+                std::ptr::null_mut()
+            ),
+            SQLITE_ERROR
+        );
     }
 }

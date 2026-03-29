@@ -3,6 +3,39 @@ use std::{
     sync::Arc,
 };
 
+pub(crate) type SubprogramBackpatch = Arc<std::sync::OnceLock<std::sync::Weak<PreparedProgram>>>;
+
+/// A reference to a compiled subprogram used in `Insn::Program`.
+///
+/// `Ready` is the normal case where the subprogram is available at compile time.
+/// `Backpatch` is used for recursive FK action graphs discovered during a
+/// single prepare pass. Translation emits a handle first and fills it after the
+/// target subprogram finishes building. The handle stores a `Weak` reference so
+/// cycles do not create `Arc` leaks.
+#[derive(Debug, Clone)]
+pub enum SubprogramRef {
+    Ready(Arc<PreparedProgram>),
+    Backpatch(SubprogramBackpatch),
+}
+
+impl SubprogramRef {
+    pub fn resolve(&self) -> crate::Result<Arc<PreparedProgram>> {
+        match self {
+            SubprogramRef::Ready(p) => Ok(p.clone()),
+            SubprogramRef::Backpatch(handle) => {
+                let weak = handle.get().ok_or_else(|| {
+                    crate::LimboError::InternalError("subprogram backpatch not initialized".into())
+                })?;
+                weak.upgrade().ok_or_else(|| {
+                    crate::LimboError::InternalError(
+                        "subprogram backpatch expired (parent dropped)".into(),
+                    )
+                })
+            }
+        }
+    }
+}
+
 /// Convert a usize to u16 for instruction fields (registers, counts).
 /// Panics if the value exceeds u16::MAX.
 #[inline]
@@ -731,7 +764,7 @@ pub enum Insn {
     /// is used by subprograms to access content in registers of the calling bytecode program."
     Program {
         params: Vec<Value>,
-        program: Arc<PreparedProgram>,
+        program: SubprogramRef,
         /// Jump target when RAISE(IGNORE) fires in the subprogram.
         /// Points to the "skip this row" address in the parent program.
         ignore_jump_target: BranchOffset,
@@ -1944,7 +1977,18 @@ pub enum Cookie {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+
     use strum::VariantArray;
+
+    use crate::{
+        parameters::Parameters,
+        storage::database::DatabaseFile,
+        sync::{Arc, OnceLock},
+        translate::plan::TableReferences,
+        Database, LimboError, MemoryIO, OpenFlags, PrepareContext,
+    };
+    use turso_parser::ast::ResolveType;
 
     #[test]
     fn test_make_sure_correct_insn_table() {
@@ -1957,5 +2001,45 @@ mod tests {
                 variant, *variant as usize
             );
         }
+    }
+
+    #[test]
+    fn backpatch_resolve_reports_expired_target() {
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io.open_file(":memory:", OpenFlags::Create, true).unwrap();
+        let db = Database::open(io, ":memory:", Arc::new(DatabaseFile::new(file))).unwrap();
+        let conn = db.connect().unwrap();
+
+        let prepared = Arc::new(super::PreparedProgram {
+            max_registers: 0,
+            insns: Vec::new(),
+            cursor_ref: Vec::new(),
+            comments: Vec::new(),
+            parameters: Parameters::new(),
+            change_cnt_on: false,
+            result_columns: Vec::new(),
+            table_references: TableReferences::new_empty(),
+            sql: String::new(),
+            needs_stmt_subtransactions: Arc::new(AtomicBool::new(false)),
+            trigger: None,
+            is_subprogram: true,
+            contains_trigger_subprograms: false,
+            resolve_type: ResolveType::Abort,
+            prepare_context: PrepareContext::from_connection(&conn),
+            write_databases: crate::HashSet::default(),
+            read_databases: crate::HashSet::default(),
+        });
+
+        let backpatch = Arc::new(OnceLock::new());
+        backpatch
+            .set(Arc::downgrade(&prepared))
+            .expect("backpatch should only be filled once");
+        drop(prepared);
+
+        let result = super::SubprogramRef::Backpatch(backpatch).resolve();
+        assert!(
+            matches!(result, Err(LimboError::InternalError(ref msg)) if msg.contains("subprogram backpatch expired")),
+            "expected expired backpatch error, got {result:?}"
+        );
     }
 }
