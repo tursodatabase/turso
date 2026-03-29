@@ -2533,7 +2533,7 @@ fn validate_trigger_columns_after_drop(
     resolver: &Resolver,
     database_id: usize,
 ) -> Result<Option<String>> {
-    use crate::util::{walk_expr_scoped, walk_select, ScopedExprVisitor};
+    use crate::util::{walk_expr_scoped_ref, walk_select_ref, ScopedExprRefVisitor};
 
     let trigger_table_norm = normalize_ident(&trigger.table_name);
 
@@ -2568,7 +2568,7 @@ fn validate_trigger_columns_after_drop(
         bad_ref: Option<String>,
     }
 
-    impl ScopedExprVisitor for DropColumnVisitor<'_> {
+    impl ScopedExprRefVisitor for DropColumnVisitor<'_> {
         type Scope = Vec<String>;
         type ScopeGuard = usize;
 
@@ -2587,7 +2587,7 @@ fn validate_trigger_columns_after_drop(
             scope.truncate(guard);
         }
 
-        fn visit_expr(&mut self, expr: &mut ast::Expr, scope: &Vec<String>) -> Result<WalkControl> {
+        fn visit_expr(&mut self, expr: &ast::Expr, scope: &Vec<String>) -> Result<WalkControl> {
             if self.bad_ref.is_some() {
                 return Ok(WalkControl::Stop);
             }
@@ -2645,22 +2645,18 @@ fn validate_trigger_columns_after_drop(
         bad_ref: None,
     };
 
-    // Clone trigger data so we can pass &mut to the walker
-    let mut when_clause = trigger.when_clause.clone();
-    let mut commands = trigger.commands.clone();
-
     // Validate WHEN clause — NEW/OLD refs resolve against the trigger's owning table
-    if let Some(ref mut when_expr) = when_clause {
+    if let Some(ref when_expr) = trigger.when_clause {
         if let Some(ref cols) = owning_table_columns {
             let mut scope = cols.clone();
-            walk_expr_scoped(when_expr, &mut scope, &mut visitor)?;
+            walk_expr_scoped_ref(when_expr, &mut scope, &mut visitor)?;
             if let Some(bad) = visitor.bad_ref.take() {
                 return Ok(Some(bad));
             }
         }
     }
 
-    for cmd in &mut commands {
+    for cmd in &trigger.commands {
         match cmd {
             ast::TriggerCmd::Update {
                 tbl_name,
@@ -2682,13 +2678,13 @@ fn validate_trigger_columns_after_drop(
                 // that validation to trigger execution time.
                 let mut scope = merge_cols(&cmd_table_cols, &owning_table_columns);
                 for set in sets {
-                    walk_expr_scoped(&mut set.expr, &mut scope, &mut visitor)?;
+                    walk_expr_scoped_ref(&set.expr, &mut scope, &mut visitor)?;
                     if let Some(bad) = visitor.bad_ref.take() {
                         return Ok(Some(bad));
                     }
                 }
-                if let Some(ref mut where_expr) = where_clause {
-                    walk_expr_scoped(where_expr, &mut scope, &mut visitor)?;
+                if let Some(ref where_expr) = where_clause {
+                    walk_expr_scoped_ref(where_expr, &mut scope, &mut visitor)?;
                     if let Some(bad) = visitor.bad_ref.take() {
                         return Ok(Some(bad));
                     }
@@ -2699,7 +2695,7 @@ fn validate_trigger_columns_after_drop(
             // INSERT ... VALUES and INSERT ... SELECT are checked.
             ast::TriggerCmd::Insert { select, .. } => {
                 let mut scope = merge_cols(&owning_table_columns, &None);
-                walk_select(select, &mut scope, &mut visitor)?;
+                walk_select_ref(select, &mut scope, &mut visitor)?;
                 if let Some(bad) = visitor.bad_ref.take() {
                     return Ok(Some(bad));
                 }
@@ -2717,9 +2713,9 @@ fn validate_trigger_columns_after_drop(
                     resolver,
                     database_id,
                 );
-                if let Some(ref mut where_expr) = where_clause {
+                if let Some(ref where_expr) = where_clause {
                     let mut scope = merge_cols(&cmd_table_cols, &owning_table_columns);
-                    walk_expr_scoped(where_expr, &mut scope, &mut visitor)?;
+                    walk_expr_scoped_ref(where_expr, &mut scope, &mut visitor)?;
                     if let Some(bad) = visitor.bad_ref.take() {
                         return Ok(Some(bad));
                     }
@@ -2727,7 +2723,7 @@ fn validate_trigger_columns_after_drop(
             }
             ast::TriggerCmd::Select(select) => {
                 let mut scope = merge_cols(&owning_table_columns, &None);
-                walk_select(select, &mut scope, &mut visitor)?;
+                walk_select_ref(select, &mut scope, &mut visitor)?;
                 if let Some(bad) = visitor.bad_ref.take() {
                     return Ok(Some(bad));
                 }
