@@ -10,7 +10,7 @@ use crate::translate::{
     planner::ROWID_STRS,
     translate_inner, ProgramBuilder, ProgramBuilderOpts,
 };
-use crate::util::{normalize_ident, walk_expr_scoped, walk_select, FlatExprVisitor};
+use crate::util::{normalize_ident, walk_expr_scoped_mut, walk_select_mut, FlatExprVisitorMut};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::insn::Insn;
 use crate::vdbe::BranchOffset;
@@ -168,11 +168,11 @@ fn rewrite_trigger_expr_for_subprogram(
     expr: &mut ast::Expr,
     ctx: &TriggerSubprogramContext,
 ) -> Result<()> {
-    let mut visitor = FlatExprVisitor(|e: &mut ast::Expr| {
+    let mut visitor = FlatExprVisitorMut(|e: &mut ast::Expr| {
         rewrite_trigger_expr_single_for_subprogram(e, ctx)?;
         Ok(WalkControl::Continue)
     });
-    walk_expr_scoped(expr, &mut (), &mut visitor)?;
+    walk_expr_scoped_mut(expr, &mut (), &mut visitor)?;
     Ok(())
 }
 
@@ -322,11 +322,11 @@ fn rewrite_expressions_in_select_for_subprogram(
     select: &mut ast::Select,
     ctx: &TriggerSubprogramContext,
 ) -> Result<()> {
-    let mut visitor = FlatExprVisitor(|e: &mut ast::Expr| {
+    let mut visitor = FlatExprVisitorMut(|e: &mut ast::Expr| {
         rewrite_trigger_expr_single_for_subprogram(e, ctx)?;
         Ok(WalkControl::Continue)
     });
-    walk_select(select, &mut (), &mut visitor)?;
+    walk_select_mut(select, &mut (), &mut visitor)?;
     Ok(())
 }
 
@@ -920,19 +920,19 @@ fn rewrite_trigger_expr_single_for_when_clause(
             return Ok(());
         }
         Expr::Exists(select) | Expr::Subquery(select) => {
-            let mut visitor = FlatExprVisitor(|e: &mut ast::Expr| {
+            let mut visitor = FlatExprVisitorMut(|e: &mut ast::Expr| {
                 rewrite_trigger_expr_single_for_when_clause(e, table, ctx, true)?;
                 Ok(WalkControl::Continue)
             });
-            walk_select(select, &mut (), &mut visitor)?;
+            walk_select_mut(select, &mut (), &mut visitor)?;
             return Ok(());
         }
         Expr::InSelect { rhs, .. } => {
-            let mut visitor = FlatExprVisitor(|e: &mut ast::Expr| {
+            let mut visitor = FlatExprVisitorMut(|e: &mut ast::Expr| {
                 rewrite_trigger_expr_single_for_when_clause(e, table, ctx, true)?;
                 Ok(WalkControl::Continue)
             });
-            walk_select(rhs, &mut (), &mut visitor)?;
+            walk_select_mut(rhs, &mut (), &mut visitor)?;
             // don't walk lhs, it's walked by walk_expr_mut
             return Ok(());
         }

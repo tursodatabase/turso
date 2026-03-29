@@ -1935,8 +1935,8 @@ mod trigger_col_rename {
     use crate::schema::BTreeTable;
     use crate::translate::emitter::Resolver;
     use crate::util::{
-        normalize_ident, walk_expr_scoped, walk_from_clause_expressions, walk_select,
-        ScopedExprVisitor,
+        normalize_ident, walk_expr_scoped_mut, walk_from_clause_mut, walk_select_mut,
+        ScopedExprVisitorMut,
     };
     use crate::Result;
     use crate::{walk_expr_mut, LimboError, WalkControl};
@@ -2162,15 +2162,15 @@ mod trigger_col_rename {
                         context,
                     };
                     for set in sets.iter_mut() {
-                        walk_expr_scoped(&mut set.expr, &mut scope, self)?;
+                        walk_expr_scoped_mut(&mut set.expr, &mut scope, self)?;
                     }
                     if let Some(ref mut where_expr) = where_clause {
-                        walk_expr_scoped(where_expr, &mut scope, self)?;
+                        walk_expr_scoped_mut(where_expr, &mut scope, self)?;
                     }
                     if let Some(ref mut from_clause) = from {
                         scope.context = None;
                         scope.from_target = None;
-                        walk_from_clause_expressions(from_clause, &mut scope, self)?;
+                        walk_from_clause_mut(from_clause, &mut scope, self)?;
                     }
                 }
                 ast::TriggerCmd::Insert {
@@ -2193,7 +2193,7 @@ mod trigger_col_rename {
                         from_target: None,
                         context: None,
                     };
-                    walk_select(select, &mut scope, self)?;
+                    walk_select_mut(select, &mut scope, self)?;
                     if let Some(ref mut upsert_box) = upsert {
                         self.rewrite_cols_in_upsert(
                             upsert_box,
@@ -2219,7 +2219,7 @@ mod trigger_col_rename {
                             from_target: None,
                             context,
                         };
-                        walk_expr_scoped(where_expr, &mut scope, self)?;
+                        walk_expr_scoped_mut(where_expr, &mut scope, self)?;
                     }
                 }
                 ast::TriggerCmd::Select(select) => {
@@ -2227,7 +2227,7 @@ mod trigger_col_rename {
                         from_target: None,
                         context: None,
                     };
-                    walk_select(select, &mut scope, self)?;
+                    walk_select_mut(select, &mut scope, self)?;
                 }
             }
             Ok(())
@@ -2360,13 +2360,13 @@ mod trigger_col_rename {
 
             if let Some(index) = &mut upsert.index {
                 for target in &mut index.targets {
-                    walk_expr_scoped(&mut target.expr, &mut scope, self)?;
+                    walk_expr_scoped_mut(&mut target.expr, &mut scope, self)?;
                     if insert_targets_renamed_table {
                         rename_excluded_column_refs(&mut target.expr, old_col_norm, new_col_norm)?;
                     }
                 }
                 if let Some(where_clause) = &mut index.where_clause {
-                    walk_expr_scoped(where_clause, &mut scope, self)?;
+                    walk_expr_scoped_mut(where_clause, &mut scope, self)?;
                     if insert_targets_renamed_table {
                         rename_excluded_column_refs(where_clause, old_col_norm, new_col_norm)?;
                     }
@@ -2382,13 +2382,13 @@ mod trigger_col_rename {
                             }
                         }
                     }
-                    walk_expr_scoped(&mut set.expr, &mut scope, self)?;
+                    walk_expr_scoped_mut(&mut set.expr, &mut scope, self)?;
                     if insert_targets_renamed_table {
                         rename_excluded_column_refs(&mut set.expr, old_col_norm, new_col_norm)?;
                     }
                 }
                 if let Some(expr) = where_clause {
-                    walk_expr_scoped(expr, &mut scope, self)?;
+                    walk_expr_scoped_mut(expr, &mut scope, self)?;
                     if insert_targets_renamed_table {
                         rename_excluded_column_refs(expr, old_col_norm, new_col_norm)?;
                     }
@@ -2418,7 +2418,7 @@ mod trigger_col_rename {
         is_renaming: bool,
     }
 
-    impl ScopedExprVisitor for RenameColumnOperation<'_> {
+    impl ScopedExprVisitorMut for RenameColumnOperation<'_> {
         type Scope = RenameScope;
         type ScopeGuard = RenameScope;
 
@@ -2533,7 +2533,7 @@ fn validate_trigger_columns_after_drop(
     resolver: &Resolver,
     database_id: usize,
 ) -> Result<Option<String>> {
-    use crate::util::{walk_expr_scoped_ref, walk_select_ref, ScopedExprRefVisitor};
+    use crate::util::{walk_expr_scoped, walk_select, ScopedExprVisitor};
 
     let trigger_table_norm = normalize_ident(&trigger.table_name);
 
@@ -2568,7 +2568,7 @@ fn validate_trigger_columns_after_drop(
         bad_ref: Option<String>,
     }
 
-    impl ScopedExprRefVisitor for DropColumnVisitor<'_> {
+    impl ScopedExprVisitor for DropColumnVisitor<'_> {
         type Scope = Vec<String>;
         type ScopeGuard = usize;
 
@@ -2649,7 +2649,7 @@ fn validate_trigger_columns_after_drop(
     if let Some(ref when_expr) = trigger.when_clause {
         if let Some(ref cols) = owning_table_columns {
             let mut scope = cols.clone();
-            walk_expr_scoped_ref(when_expr, &mut scope, &mut visitor)?;
+            walk_expr_scoped(when_expr, &mut scope, &mut visitor)?;
             if let Some(bad) = visitor.bad_ref.take() {
                 return Ok(Some(bad));
             }
@@ -2678,13 +2678,13 @@ fn validate_trigger_columns_after_drop(
                 // that validation to trigger execution time.
                 let mut scope = merge_cols(&cmd_table_cols, &owning_table_columns);
                 for set in sets {
-                    walk_expr_scoped_ref(&set.expr, &mut scope, &mut visitor)?;
+                    walk_expr_scoped(&set.expr, &mut scope, &mut visitor)?;
                     if let Some(bad) = visitor.bad_ref.take() {
                         return Ok(Some(bad));
                     }
                 }
                 if let Some(ref where_expr) = where_clause {
-                    walk_expr_scoped_ref(where_expr, &mut scope, &mut visitor)?;
+                    walk_expr_scoped(where_expr, &mut scope, &mut visitor)?;
                     if let Some(bad) = visitor.bad_ref.take() {
                         return Ok(Some(bad));
                     }
@@ -2695,7 +2695,7 @@ fn validate_trigger_columns_after_drop(
             // INSERT ... VALUES and INSERT ... SELECT are checked.
             ast::TriggerCmd::Insert { select, .. } => {
                 let mut scope = merge_cols(&owning_table_columns, &None);
-                walk_select_ref(select, &mut scope, &mut visitor)?;
+                walk_select(select, &mut scope, &mut visitor)?;
                 if let Some(bad) = visitor.bad_ref.take() {
                     return Ok(Some(bad));
                 }
@@ -2715,7 +2715,7 @@ fn validate_trigger_columns_after_drop(
                 );
                 if let Some(ref where_expr) = where_clause {
                     let mut scope = merge_cols(&cmd_table_cols, &owning_table_columns);
-                    walk_expr_scoped_ref(where_expr, &mut scope, &mut visitor)?;
+                    walk_expr_scoped(where_expr, &mut scope, &mut visitor)?;
                     if let Some(bad) = visitor.bad_ref.take() {
                         return Ok(Some(bad));
                     }
@@ -2723,7 +2723,7 @@ fn validate_trigger_columns_after_drop(
             }
             ast::TriggerCmd::Select(select) => {
                 let mut scope = merge_cols(&owning_table_columns, &None);
-                walk_select_ref(select, &mut scope, &mut visitor)?;
+                walk_select(select, &mut scope, &mut visitor)?;
                 if let Some(bad) = visitor.bad_ref.take() {
                     return Ok(Some(bad));
                 }
