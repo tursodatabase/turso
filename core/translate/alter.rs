@@ -2570,21 +2570,13 @@ fn validate_trigger_columns_after_drop(
 
     impl ScopedExprVisitor for DropColumnVisitor<'_> {
         type Scope = Vec<String>;
-        type ScopeGuard = usize;
+        type ScopeGuard = ();
 
-        fn push_scope(&mut self, scope: &mut Vec<String>, from: Option<&ast::FromClause>) -> usize {
-            let saved_len = scope.len();
-            if let Some(from) = from {
-                self.collect_from_clause_columns(&from.select, scope);
-                for join in &from.joins {
-                    self.collect_from_clause_columns(&join.table, scope);
-                }
-            }
-            saved_len
+        fn push_scope(&mut self, _scope: &mut Vec<String>, _from: Option<&ast::FromClause>) {
+            //TODO identifier scoping
         }
-
-        fn pop_scope(&mut self, scope: &mut Vec<String>, guard: usize) {
-            scope.truncate(guard);
+        fn pop_scope(&mut self, _scope: &mut Vec<String>, _guard: ()) {
+            //TODO identifier scoping
         }
 
         fn visit_expr(&mut self, expr: &ast::Expr, scope: &Vec<String>) -> Result<WalkControl> {
@@ -2604,34 +2596,6 @@ fn validate_trigger_columns_after_drop(
                 Ok(WalkControl::Stop)
             } else {
                 Ok(WalkControl::Continue)
-            }
-        }
-    }
-
-    impl DropColumnVisitor<'_> {
-        fn collect_from_clause_columns(
-            &self,
-            select_table: &ast::SelectTable,
-            cols: &mut Vec<String>,
-        ) {
-            match select_table {
-                ast::SelectTable::Table(name, _, _) | ast::SelectTable::TableCall(name, _, _) => {
-                    let table_name = normalize_ident(name.name.as_str());
-                    if let Some(table_cols) = get_table_columns(
-                        &table_name,
-                        self.altered_table_norm,
-                        self.post_drop_table,
-                        self.resolver,
-                        self.database_id,
-                    ) {
-                        for c in table_cols {
-                            if !cols.contains(&c) {
-                                cols.push(c);
-                            }
-                        }
-                    }
-                }
-                ast::SelectTable::Select(_, _) | ast::SelectTable::Sub(_, _) => {}
             }
         }
     }
