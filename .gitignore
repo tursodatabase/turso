@@ -34,7 +34,6 @@ dist/
 perf/mobibench/plot/results.csv
 perf/mobibench/plot/mobibench.pdf
 perf/mobibench/plot/uv.lock
-perf/tpc-c/tpcc-turso
 
 # OS
 .DS_Store
