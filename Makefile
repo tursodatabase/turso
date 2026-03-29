@@ -185,7 +185,7 @@ docker-cli-run:
 	docker run -it -v ./:/app turso-cli
 
 bench-tpc-c:
-	@cd perf/tpc-c && ./run.sh
+	@cd perf/tpc-c/tpcc-turso && ./run_bench.sh
 .PHONY: bench-tpc-c
 
 merge-pr:
