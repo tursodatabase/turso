@@ -1326,7 +1326,7 @@ impl Program {
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
             if matches!(state.execution_state, ProgramExecutionState::Interrupting) {
-                self.abort(&pager, None, state)?;
+                self.abort(pager, None, state)?;
                 return Ok(FrameStepResult::Statement(StepResult::Interrupt));
             }
 

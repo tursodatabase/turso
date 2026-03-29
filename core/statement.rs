@@ -35,7 +35,7 @@ pub struct Statement {
     pub(crate) program: vdbe::Program,
     state: vdbe::ProgramState,
     pager: Arc<Pager>,
-    subprogram_stack: Vec<Box<Statement>>,
+    subprogram_stack: Vec<Statement>,
     /// indicates if the statement is a NORMAL/EXPLAIN/EXPLAIN QUERY PLAN
     query_mode: QueryMode,
     /// Flag to show if the statement was busy
@@ -268,7 +268,7 @@ impl Statement {
             let is_nested = !self.subprogram_stack.is_empty();
             let result = match self.step_current_frame(waker) {
                 Ok(FrameStepResult::SpawnedSubprogram(statement)) => {
-                    self.subprogram_stack.push(statement);
+                    self.subprogram_stack.push(*statement);
                     continue;
                 }
                 other => other,

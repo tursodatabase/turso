@@ -1977,14 +1977,12 @@ pub enum Cookie {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicBool;
-
     use strum::VariantArray;
 
     use crate::{
         parameters::Parameters,
         storage::database::DatabaseFile,
-        sync::{Arc, OnceLock},
+        sync::{atomic::AtomicBool, Arc, OnceLock},
         translate::plan::TableReferences,
         Database, LimboError, MemoryIO, OpenFlags, PrepareContext,
     };
