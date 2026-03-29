@@ -1384,6 +1384,7 @@ impl Database {
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
             n_active_writes: AtomicI32::new(0),
+            n_active_root_statements: AtomicI32::new(0),
             check_constraints_pragma: AtomicBool::new(false),
             vtab_txn_states: RwLock::new(HashSet::default()),
             prepare_context_generation: AtomicU64::new(0),
