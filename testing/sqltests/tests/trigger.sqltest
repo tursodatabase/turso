@@ -2239,6 +2239,23 @@ expect {
     exceeded limit for id 2: 60
 }
 
+# WHEN clause with NEW ref inside NOT IN (SELECT NEW.col ...)
+@cross-check-integrity
+test trigger-when-in-select-new-ref {
+    CREATE TABLE t_is(a INTEGER PRIMARY KEY, b INTEGER);
+    CREATE TABLE t_is_log(v);
+    INSERT INTO t_is VALUES (1, 10);
+    CREATE TRIGGER tr_is AFTER INSERT ON t_is
+        WHEN NEW.b NOT IN (SELECT NEW.b FROM t_is)
+    BEGIN
+        INSERT INTO t_is_log VALUES(NEW.b);
+    END;
+    INSERT INTO t_is VALUES (2, 20);
+    SELECT * FROM t_is_log;
+}
+expect {
+}
+
 # https://github.com/tursodatabase/turso/issues/3985
 # NEW.rowid_alias in BEFORE INSERT trigger should be -1 when auto-generated
 test trigger-before-insert-rowid-alias-auto-neg1 {
