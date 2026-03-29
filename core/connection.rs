@@ -1605,7 +1605,7 @@ impl Connection {
         let normalized: String = crate::util::normalize_ident(name);
         match normalized.as_str() {
             "main" => Ok(crate::MAIN_DB_ID),
-            "temp" => Ok(1),
+            "temp" => Ok(crate::TEMP_DB_ID),
             _ => self
                 .attached_databases
                 .read()
