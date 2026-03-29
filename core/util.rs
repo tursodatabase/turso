@@ -1661,7 +1661,13 @@ fn walk_frame_bound_mut<V: ScopedExprVisitorMut>(
 ///
 /// Pass `@mut` before extra args for mutable traversal (`&mut` refs),
 /// or omit it for immutable traversal (`&` refs).
-/// TODO add this as an exmplae: walk_expr_children!(expr, walk_expr_scoped_mut, walk_window_mut, @mut, scope, visitor)
+///
+/// ```ignore
+/// // Mutable:
+/// walk_expr_children!(expr, walk_expr_scoped_mut, walk_window_mut, @mut, scope, visitor);
+/// // Immutable:
+/// walk_expr_children!(expr, walk_expr_scoped, walk_window, scope, visitor);
+/// ```
 #[macro_export]
 macro_rules! walk_expr_children {
     ($expr:expr, $recurse:path, $walk_window:path, @mut $(, $extra:expr)*) => {
