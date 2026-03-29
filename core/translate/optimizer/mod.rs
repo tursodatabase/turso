@@ -3431,17 +3431,27 @@ fn build_seek_def(
 mod tests {
     use super::{where_term_is_null_rejecting_for_table, Optimizable};
     use crate::translate::emitter::Resolver;
+    use crate::translate::fk_compile::FkCompileContext;
     use crate::{schema::Schema, DatabaseCatalog, RwLock, SymbolTable};
     use rustc_hash::FxHashMap as HashMap;
+    use std::cell::RefCell;
     use turso_parser::ast::{self, Expr, FunctionTail, Name, TableInternalId};
 
     fn empty_resolver<'a>(
         schema: &'a Schema,
         database_schemas: &'a RwLock<HashMap<usize, crate::sync::Arc<Schema>>>,
         attached_databases: &'a RwLock<DatabaseCatalog>,
+        fk_compile_ctx: &'a RefCell<FkCompileContext>,
         syms: &'a SymbolTable,
     ) -> Resolver<'a> {
-        Resolver::new(schema, database_schemas, attached_databases, syms, true)
+        Resolver::new(
+            schema,
+            database_schemas,
+            attached_databases,
+            fk_compile_ctx,
+            syms,
+            true,
+        )
     }
 
     fn no_tail() -> FunctionTail {
@@ -3467,7 +3477,14 @@ mod tests {
         let syms = SymbolTable::new();
         let database_schemas = RwLock::new(HashMap::default());
         let attached_databases = RwLock::new(DatabaseCatalog::new());
-        let resolver = empty_resolver(&schema, &database_schemas, &attached_databases, &syms);
+        let fk_compile_ctx = RefCell::new(FkCompileContext::new());
+        let resolver = empty_resolver(
+            &schema,
+            &database_schemas,
+            &attached_databases,
+            &fk_compile_ctx,
+            &syms,
+        );
 
         let expr = fn_call(
             "coalesce",
@@ -3496,7 +3513,14 @@ mod tests {
         let syms = SymbolTable::new();
         let database_schemas = RwLock::new(HashMap::default());
         let attached_databases = RwLock::new(DatabaseCatalog::new());
-        let resolver = empty_resolver(&schema, &database_schemas, &attached_databases, &syms);
+        let fk_compile_ctx = RefCell::new(FkCompileContext::new());
+        let resolver = empty_resolver(
+            &schema,
+            &database_schemas,
+            &attached_databases,
+            &fk_compile_ctx,
+            &syms,
+        );
 
         let expr = fn_call(
             "quote",

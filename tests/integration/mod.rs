@@ -3,6 +3,7 @@ mod common;
 mod conflict_resolution;
 mod custom_types;
 mod database;
+mod foreign_keys;
 mod functions;
 mod fuzz_transaction;
 mod index_method;
@@ -13,6 +14,7 @@ mod query_processing;
 mod statement_reset;
 mod stmt_journal;
 mod storage;
+mod subprograms;
 mod trigger;
 mod wal;
 

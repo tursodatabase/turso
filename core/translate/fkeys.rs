@@ -5,10 +5,15 @@ use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
 use crate::{
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
     schema::{BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef, ROWID_SENTINEL},
-    translate::{collate::CollationSeq, emitter::Resolver, planner::ROWID_STRS},
+    translate::{
+        collate::CollationSeq,
+        emitter::Resolver,
+        fk_compile::{FkActionCompileKey, FkCompilationStart},
+        planner::ROWID_STRS,
+    },
     vdbe::{
         builder::{CursorType, QueryMode},
-        insn::{CmpInsFlags, Insn},
+        insn::{CmpInsFlags, Insn, SubprogramRef},
         BranchOffset,
     },
     Connection, LimboError, Result, Value,
@@ -1382,33 +1387,17 @@ const FK_SUBPROGRAM_OPTS: ProgramBuilderOpts = ProgramBuilderOpts {
     approx_num_labels: 4,
 };
 
-/// Compile and emit an FK action as a sub-program.
-/// This is the common implementation for CASCADE DELETE, SET NULL, SET DEFAULT, and CASCADE UPDATE.
-fn emit_fk_action_subprogram(
-    program: &mut ProgramBuilder,
-    resolver: &mut Resolver,
-    connection: &Arc<Connection>,
-    stmt: ast::Stmt,
-    ctx: &FkActionContext,
-    description: &'static str,
-) -> Result<()> {
-    let mut subprogram_builder = ProgramBuilder::new_for_subprogram(
-        QueryMode::Normal,
-        program.capture_data_changes_info().clone(),
-        FK_SUBPROGRAM_OPTS,
-    );
-    subprogram_builder.prologue();
-    translate_inner(
-        stmt,
-        resolver,
-        &mut subprogram_builder,
-        connection,
-        description,
-    )?;
-    subprogram_builder.epilogue(resolver.schema());
-    let built_subprogram = subprogram_builder.build(connection.clone(), true, description)?;
+type FkActionCompileKeyCtor = fn(usize) -> FkActionCompileKey;
 
-    // Build params: OLD key register indices, then optionally NEW key register indices
+fn fk_action_compile_key(
+    fk_ref: &ResolvedFkRef,
+    key_ctor: FkActionCompileKeyCtor,
+) -> FkActionCompileKey {
+    key_ctor(Arc::as_ptr(&fk_ref.fk) as usize)
+}
+
+/// Build the params vector from an FK action context.
+fn build_fk_action_params(ctx: &FkActionContext) -> Vec<Value> {
     let mut params: Vec<Value> = ctx
         .old_key_registers
         .iter()
@@ -1424,13 +1413,75 @@ fn emit_fk_action_subprogram(
                 .map(|reg_idx| Value::from_i64(reg_idx as i64)),
         );
     }
+    params
+}
+
+/// Compile and emit an FK action as a sub-program.
+/// This is the common implementation for CASCADE DELETE, SET NULL, SET DEFAULT, and CASCADE UPDATE.
+fn emit_fk_action_subprogram(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    connection: &Arc<Connection>,
+    stmt: ast::Stmt,
+    compile_key: FkActionCompileKey,
+    ctx: &FkActionContext,
+    description: &'static str,
+) -> Result<()> {
+    match resolver.start_fk_action_compilation(compile_key)? {
+        FkCompilationStart::CycleDetected(backpatch) => {
+            // Stop recursive compilation here, but still emit a Program edge so
+            // execution can recurse through the FK action graph later.
+            let params = build_fk_action_params(ctx);
+            let ignore_jump_target = program.allocate_label();
+            program.emit_insn(Insn::Program {
+                params,
+                program: SubprogramRef::Backpatch(backpatch),
+                ignore_jump_target,
+            });
+            program.preassign_label_to_next_insn(ignore_jump_target);
+            return Ok(());
+        }
+        FkCompilationStart::Proceed => {}
+    }
+
+    let build_subprogram_result = (|| -> Result<_> {
+        let mut subprogram_builder = ProgramBuilder::new_for_subprogram(
+            QueryMode::Normal,
+            program.capture_data_changes_info().clone(),
+            FK_SUBPROGRAM_OPTS,
+        );
+        let mut subprogram_resolver = resolver.fork();
+        subprogram_builder.prologue();
+        translate_inner(
+            stmt,
+            &mut subprogram_resolver,
+            &mut subprogram_builder,
+            connection,
+            description,
+        )?;
+        subprogram_builder.epilogue(subprogram_resolver.schema());
+        subprogram_builder.build(connection.clone(), true, description)
+    })();
+
+    let backpatch = resolver.end_fk_action_compilation(compile_key);
+
+    let built_subprogram = build_subprogram_result?;
+
+    // Patch any recursive references to this in-flight subprogram now that the
+    // final prepared program exists. Use a Weak reference so mutually recursive
+    // FK action graphs do not create strong Arc cycles.
+    backpatch
+        .set(Arc::downgrade(built_subprogram.prepared()))
+        .expect("FK subprogram backpatch already filled");
+
+    let params = build_fk_action_params(ctx);
 
     // FK action subprograms can't contain RAISE(IGNORE), so ignore_jump_target
     // is a no-op that resolves to the next instruction (just falls through).
     let ignore_jump_target = program.allocate_label();
     program.emit_insn(Insn::Program {
         params,
-        program: built_subprogram.prepared().clone(),
+        program: SubprogramRef::Ready(built_subprogram.prepared().clone()),
         ignore_jump_target,
     });
     program.preassign_label_to_next_insn(ignore_jump_target);
@@ -1631,11 +1682,13 @@ fn fire_fk_cascade_delete(
         &subprog_ctx,
         db_name.as_deref(),
     );
+    let compile_key = fk_action_compile_key(fk_ref, FkActionCompileKey::DeleteCascade);
     emit_fk_action_subprogram(
         program,
         resolver,
         connection,
         stmt,
+        compile_key,
         ctx,
         "fk cascade delete",
     )
@@ -1650,6 +1703,7 @@ fn fire_fk_set_null(
     connection: &Arc<Connection>,
     ctx: &FkActionContext,
     database_id: usize,
+    action_key_ctor: FkActionCompileKeyCtor,
 ) -> Result<()> {
     let db_name = if database_id != crate::MAIN_DB_ID {
         resolver.get_database_name_by_index(database_id)
@@ -1664,7 +1718,16 @@ fn fire_fk_set_null(
         &subprog_ctx,
         db_name.as_deref(),
     );
-    emit_fk_action_subprogram(program, resolver, connection, stmt, ctx, "fk set null")
+    let compile_key = fk_action_compile_key(fk_ref, action_key_ctor);
+    emit_fk_action_subprogram(
+        program,
+        resolver,
+        connection,
+        stmt,
+        compile_key,
+        ctx,
+        "fk set null",
+    )
 }
 
 /// Compile and emit an FK SET DEFAULT action as a sub-program.
@@ -1676,6 +1739,7 @@ fn fire_fk_set_default(
     connection: &Arc<Connection>,
     ctx: &FkActionContext,
     database_id: usize,
+    action_key_ctor: FkActionCompileKeyCtor,
 ) -> Result<()> {
     let db_name = if database_id != crate::MAIN_DB_ID {
         resolver.get_database_name_by_index(database_id)
@@ -1690,7 +1754,16 @@ fn fire_fk_set_default(
         &subprog_ctx,
         db_name.as_deref(),
     );
-    emit_fk_action_subprogram(program, resolver, connection, stmt, ctx, "fk set default")
+    let compile_key = fk_action_compile_key(fk_ref, action_key_ctor);
+    emit_fk_action_subprogram(
+        program,
+        resolver,
+        connection,
+        stmt,
+        compile_key,
+        ctx,
+        "fk set default",
+    )
 }
 
 /// Compile and emit an FK CASCADE UPDATE action as a sub-program.
@@ -1717,11 +1790,13 @@ fn fire_fk_cascade_update(
         &subprog_ctx,
         db_name.as_deref(),
     );
+    let compile_key = fk_action_compile_key(fk_ref, FkActionCompileKey::UpdateCascade);
     emit_fk_action_subprogram(
         program,
         resolver,
         connection,
         stmt,
+        compile_key,
         ctx,
         "fk cascade update",
     )
@@ -1845,6 +1920,7 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
                         connection,
                         &action.ctx,
                         database_id,
+                        FkActionCompileKey::DeleteSetNull,
                     )?;
                 }
                 RefAct::SetDefault => {
@@ -1855,6 +1931,7 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
                         connection,
                         &action.ctx,
                         database_id,
+                        FkActionCompileKey::DeleteSetDefault,
                     )?;
                 }
                 _ => unreachable!(),
@@ -1943,10 +2020,26 @@ pub fn fire_fk_update_actions(
                 fire_fk_cascade_update(program, resolver, &fk_ref, connection, &ctx, database_id)?;
             }
             RefAct::SetNull => {
-                fire_fk_set_null(program, resolver, &fk_ref, connection, &ctx, database_id)?;
+                fire_fk_set_null(
+                    program,
+                    resolver,
+                    &fk_ref,
+                    connection,
+                    &ctx,
+                    database_id,
+                    FkActionCompileKey::UpdateSetNull,
+                )?;
             }
             RefAct::SetDefault => {
-                fire_fk_set_default(program, resolver, &fk_ref, connection, &ctx, database_id)?;
+                fire_fk_set_default(
+                    program,
+                    resolver,
+                    &fk_ref,
+                    connection,
+                    &ctx,
+                    database_id,
+                    FkActionCompileKey::UpdateSetDefault,
+                )?;
             }
         }
 
@@ -2097,10 +2190,26 @@ pub fn emit_fk_drop_table_check(
                 fire_fk_cascade_delete(program, resolver, fk_ref, connection, &ctx, database_id)?;
             }
             RefAct::SetNull => {
-                fire_fk_set_null(program, resolver, fk_ref, connection, &ctx, database_id)?;
+                fire_fk_set_null(
+                    program,
+                    resolver,
+                    fk_ref,
+                    connection,
+                    &ctx,
+                    database_id,
+                    FkActionCompileKey::DeleteSetNull,
+                )?;
             }
             RefAct::SetDefault => {
-                fire_fk_set_default(program, resolver, fk_ref, connection, &ctx, database_id)?;
+                fire_fk_set_default(
+                    program,
+                    resolver,
+                    fk_ref,
+                    connection,
+                    &ctx,
+                    database_id,
+                    FkActionCompileKey::DeleteSetDefault,
+                )?;
             }
             RefAct::NoAction | RefAct::Restrict => {
                 // These are handled below in the check_fk_refs loop

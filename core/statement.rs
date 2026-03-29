@@ -27,6 +27,7 @@ use crate::{
 };
 
 type ProgramExecutionState = vdbe::ProgramExecutionState;
+type FrameStepResult = vdbe::FrameStepResult;
 type Row = vdbe::Row;
 type StepResult = vdbe::StepResult;
 
@@ -34,6 +35,7 @@ pub struct Statement {
     pub(crate) program: vdbe::Program,
     state: vdbe::ProgramState,
     pager: Arc<Pager>,
+    subprogram_stack: Vec<Statement>,
     /// indicates if the statement is a NORMAL/EXPLAIN/EXPLAIN QUERY PLAN
     query_mode: QueryMode,
     /// Flag to show if the statement was busy
@@ -81,6 +83,7 @@ impl Statement {
             program,
             state,
             pager,
+            subprogram_stack: Vec::new(),
             query_mode,
             busy: false,
             busy_handler_state: None,
@@ -140,10 +143,16 @@ impl Statement {
     /// Returns None if no IO is pending.
     /// This is used by async state machines that need to yield the completions.
     pub fn take_io_completions(&mut self) -> Option<crate::types::IOCompletions> {
-        self.state.io_completions.take()
+        if let Some(frame) = self.subprogram_stack.last_mut() {
+            frame
+                .take_io_completions()
+                .or_else(|| self.state.io_completions.take())
+        } else {
+            self.state.io_completions.take()
+        }
     }
 
-    fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+    fn step_single_frame(&mut self, waker: Option<&Waker>) -> Result<FrameStepResult> {
         if matches!(self.state.execution_state, ProgramExecutionState::Init)
             && !self
                 .program
@@ -159,7 +168,7 @@ impl Statement {
                 if let Some(waker) = waker {
                     waker.wake_by_ref();
                 }
-                return Ok(StepResult::IO);
+                return Ok(FrameStepResult::Statement(StepResult::IO));
             }
         }
 
@@ -180,7 +189,7 @@ impl Statement {
         }
 
         // Aggregate metrics when statement completes
-        if matches!(res, Ok(StepResult::Done)) {
+        if matches!(res, Ok(FrameStepResult::Statement(StepResult::Done))) {
             self.program
                 .connection
                 .metrics
@@ -199,7 +208,7 @@ impl Statement {
         }
 
         // Handle busy result by invoking the busy handler
-        if matches!(res, Ok(StepResult::Busy)) {
+        if matches!(res, Ok(FrameStepResult::Statement(StepResult::Busy))) {
             let now = self.pager.io.current_time_monotonic();
             let handler = self.program.connection.get_busy_handler();
 
@@ -214,7 +223,7 @@ impl Statement {
                 if let Some(waker) = waker {
                     waker.wake_by_ref();
                 }
-                res = Ok(StepResult::IO);
+                res = Ok(FrameStepResult::Statement(StepResult::IO));
                 #[cfg(shuttle)]
                 crate::thread::spin_loop();
             }
@@ -223,7 +232,7 @@ impl Statement {
 
         // Track when a write statement yields its first Row. With ephemeral-buffered
         // RETURNING, this proves all DML completed — only the scan-back remains.
-        if matches!(res, Ok(StepResult::Row))
+        if matches!(res, Ok(FrameStepResult::Statement(StepResult::Row)))
             && self.query_mode == QueryMode::Normal
             && self.program.change_cnt_on
             && !self.program.result_columns.is_empty()
@@ -234,7 +243,79 @@ impl Statement {
         res
     }
 
-    #[inline]
+    fn step_current_frame(&mut self, waker: Option<&Waker>) -> Result<FrameStepResult> {
+        if let Some(frame) = self.subprogram_stack.last_mut() {
+            frame.step_single_frame(waker)
+        } else {
+            self.step_single_frame(waker)
+        }
+    }
+
+    fn finish_current_subprogram(&mut self, outcome: vdbe::execute::SubprogramOutcome) -> bool {
+        let Some(_) = self.subprogram_stack.pop() else {
+            return false;
+        };
+
+        if let Some(parent) = self.subprogram_stack.last_mut() {
+            parent.state.finish_active_subprogram(outcome)
+        } else {
+            self.state.finish_active_subprogram(outcome)
+        }
+    }
+
+    fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        loop {
+            let is_nested = !self.subprogram_stack.is_empty();
+            let result = match self.step_current_frame(waker) {
+                Ok(FrameStepResult::SpawnedSubprogram(statement)) => {
+                    self.subprogram_stack.push(*statement);
+                    continue;
+                }
+                other => other,
+            };
+
+            if !is_nested {
+                return match result {
+                    Ok(FrameStepResult::Statement(result)) => Ok(result),
+                    Ok(FrameStepResult::SpawnedSubprogram(_)) => {
+                        unreachable!("root subprogram spawn should have continued already")
+                    }
+                    Err(err) => Err(err),
+                };
+            }
+
+            match result {
+                Ok(FrameStepResult::Statement(StepResult::Done)) => {
+                    let finished =
+                        self.finish_current_subprogram(vdbe::execute::SubprogramOutcome::Done);
+                    debug_assert!(
+                        finished,
+                        "nested done child was not promoted to parent state"
+                    );
+                    continue;
+                }
+                Ok(FrameStepResult::Statement(StepResult::Row)) => continue,
+                Ok(FrameStepResult::Statement(StepResult::IO)) => {
+                    self.busy = true;
+                    return Ok(StepResult::IO);
+                }
+                Ok(FrameStepResult::Statement(StepResult::Busy | StepResult::Interrupt)) => {
+                    self.busy = true;
+                    return Ok(StepResult::Busy);
+                }
+                Err(err) => {
+                    let finished = self
+                        .finish_current_subprogram(vdbe::execute::SubprogramOutcome::Error(err));
+                    debug_assert!(
+                        finished,
+                        "nested failed child was not promoted to parent state"
+                    );
+                    continue;
+                }
+                Ok(FrameStepResult::SpawnedSubprogram(_)) => continue,
+            }
+        }
+    }
     pub fn step(&mut self) -> Result<StepResult> {
         self._step(None)
     }
@@ -582,7 +663,7 @@ impl Statement {
 
         let mut reset_error: Option<LimboError> = None;
 
-        if let Some(io) = self.state.io_completions.take() {
+        while let Some(io) = self.take_io_completions() {
             if let Err(err) = io.wait(self.pager.io.as_ref()) {
                 capture_reset_error(
                     &mut reset_error,
@@ -634,7 +715,8 @@ impl Statement {
                             break;
                         }
                         Ok(vdbe::execute::InsnFunctionStepResult::Row)
-                        | Ok(vdbe::execute::InsnFunctionStepResult::Step) => {
+                        | Ok(vdbe::execute::InsnFunctionStepResult::Step)
+                        | Ok(vdbe::execute::InsnFunctionStepResult::SpawnedSubprogram(_)) => {
                             capture_reset_error(
                                 &mut reset_error,
                                 LimboError::InternalError(
@@ -682,6 +764,7 @@ impl Statement {
                 );
             }
         }
+        self.subprogram_stack.clear();
         // Safety net: if end_statement wasn't reached (e.g. statement dropped
         // mid-execution), ensure n_active_writes is decremented before reset
         // clears the flag.
@@ -697,7 +780,6 @@ impl Statement {
         self.busy = false;
         self.busy_handler_state = None;
         self.has_returned_row = false;
-
         if let Some(err) = reset_error {
             return Err(err);
         }

@@ -40,7 +40,7 @@ use crate::vdbe::metrics::HashJoinMetrics;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::{
     registers_to_ref_values, DeferredSeekState, EndStatement, OpHashBuildState, OpHashProbeState,
-    StepResult, TxnCleanup,
+    TxnCleanup,
 };
 use crate::vector::{
     vector1bit, vector32, vector32_sparse, vector64, vector8, vector_concat, vector_distance_cos,
@@ -64,8 +64,8 @@ use crate::{
     translate::emitter::TransactionMode,
 };
 use crate::{
-    get_cursor, CaptureDataChangesInfo, CheckpointMode, Completion, Connection, DatabaseStorage,
-    IOExt, MvCursor, NonNan, QueryMode,
+    get_cursor, CaptureDataChangesInfo, CheckpointMode, Connection, DatabaseStorage, IOExt,
+    MvCursor, NonNan, QueryMode,
 };
 use crate::{CdcVersion, Statement};
 use branches::{mark_unlikely, unlikely};
@@ -318,6 +318,7 @@ pub enum InsnFunctionStepResult {
     IO(IOCompletions),
     Row,
     Step,
+    SpawnedSubprogram(Box<Statement>),
 }
 
 impl<T> From<IOResult<T>> for InsnFunctionStepResult {
@@ -3737,16 +3738,92 @@ pub fn op_integer(
     Ok(InsnFunctionStepResult::Step)
 }
 
-pub enum OpProgramState {
+#[derive(Debug)]
+pub(crate) enum SubprogramOutcome {
+    Done,
+    Error(LimboError),
+}
+
+pub(crate) enum OpProgramState {
     Start,
-    /// Step state tracks whether we're executing a trigger subprogram (vs FK action subprogram)
-    Step {
+    /// Running state tracks whether we're executing a trigger subprogram (vs FK action subprogram)
+    Running {
         is_trigger: bool,
-        statement: Box<Statement>,
         /// Saved last_insert_rowid to restore after trigger subprogram completes.
         /// Per SQLite docs, trigger-body INSERTs must not overwrite the top-level rowid.
         saved_last_insert_rowid: Option<i64>,
+        execution_guard: SubprogramExecutionGuard,
     },
+    /// Finished state retains the recursion guard until the parent consumes the
+    /// terminal outcome and advances its own Program opcode.
+    Finished {
+        is_trigger: bool,
+        outcome: SubprogramOutcome,
+        /// Saved last_insert_rowid to restore after trigger subprogram completes.
+        /// Per SQLite docs, trigger-body INSERTs must not overwrite the top-level rowid.
+        saved_last_insert_rowid: Option<i64>,
+        execution_guard: SubprogramExecutionGuard,
+    },
+}
+
+/// Tracks one active nested Program invocation across yields/retries.
+///
+/// The recursion limit must count nested subprogram invocations, not individual
+/// `statement.step()` calls. Holding the guard in `OpProgramState::Running` and
+/// `OpProgramState::Finished` keeps the depth active until the subprogram
+/// finishes or the state is dropped during reset/abort cleanup.
+pub(crate) struct SubprogramExecutionGuard {
+    connection: Arc<Connection>,
+}
+
+impl SubprogramExecutionGuard {
+    fn enter(connection: &Arc<Connection>) -> Result<Self> {
+        connection.start_subprogram_execution()?;
+        Ok(Self {
+            connection: connection.clone(),
+        })
+    }
+}
+
+impl Drop for SubprogramExecutionGuard {
+    fn drop(&mut self) {
+        self.connection.end_subprogram_execution();
+    }
+}
+
+fn finish_subprogram_outcome(
+    program: &Program,
+    state: &mut ProgramState,
+    is_trigger: bool,
+    outcome: SubprogramOutcome,
+    saved_last_insert_rowid: Option<i64>,
+    ignore_jump_pc: u32,
+) -> Result<InsnFunctionStepResult> {
+    if is_trigger {
+        program.connection.end_trigger_execution();
+    }
+    if let Some(rowid) = saved_last_insert_rowid {
+        program.connection.update_last_rowid(rowid);
+    }
+
+    match outcome {
+        SubprogramOutcome::Done => {
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        SubprogramOutcome::Error(LimboError::Constraint(constraint_err)) => {
+            if program.resolve_type != ResolveType::Ignore {
+                return Err(LimboError::Constraint(constraint_err));
+            }
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        SubprogramOutcome::Error(LimboError::RaiseIgnore) => {
+            state.pc = ignore_jump_pc;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        SubprogramOutcome::Error(err) => Err(err),
+    }
 }
 
 /// Execute a subprogram (Program opcode).
@@ -3765,126 +3842,86 @@ pub fn op_program(
         },
         insn
     );
-    loop {
-        match &mut state.op_program_state {
-            OpProgramState::Start => {
-                let mut statement = Statement::new(
-                    Program::from_prepared(subprogram.clone(), program.connection.clone()),
-                    pager.clone(),
-                    QueryMode::Normal,
-                    0,
-                );
-                statement.reset()?;
+    match std::mem::replace(&mut state.op_program_state, OpProgramState::Start) {
+        OpProgramState::Start => {
+            let mut statement = Statement::new(
+                Program::from_prepared(subprogram.resolve()?, program.connection.clone()),
+                pager.clone(),
+                QueryMode::Normal,
+                0,
+            );
+            statement.reset()?;
 
-                // Check if this is a trigger subprogram - if so, track execution
-                // and save last_insert_rowid so it can be restored after the trigger finishes.
-                let (is_trigger, saved_last_insert_rowid) =
-                    if let Some(ref trigger) = statement.get_trigger() {
-                        program.connection.start_trigger_execution(trigger.clone());
-                        (true, Some(program.connection.last_insert_rowid()))
-                    } else {
-                        (false, None)
-                    };
+            let trigger = statement.get_trigger();
 
-                // Extract register values from params (which contain register indices encoded as negative integers)
-                // and bind them to the subprogram's parameters
-                for (param_idx, param_value) in params.iter().enumerate() {
-                    if let Value::Numeric(Numeric::Integer(reg_idx)) = param_value {
-                        let reg_idx = *reg_idx as usize;
-                        if reg_idx < state.registers.len() {
-                            let value = state.registers[reg_idx].get_value().clone();
-                            let param_index = NonZero::<usize>::new(param_idx + 1)
-                                .expect("param_idx + 1 should be non-zero");
-                            statement.bind_at(param_index, value);
-                        } else {
-                            crate::bail_corrupt_error!(
-                                "Register index {} out of bounds (len={})",
-                                reg_idx,
-                                state.registers.len()
-                            );
-                        }
+            for (param_idx, param_value) in params.iter().enumerate() {
+                if let Value::Numeric(Numeric::Integer(reg_idx)) = param_value {
+                    let reg_idx = *reg_idx as usize;
+                    if reg_idx < state.registers.len() {
+                        let value = state.registers[reg_idx].get_value().clone();
+                        let param_index = NonZero::<usize>::new(param_idx + 1)
+                            .expect("param_idx + 1 should be non-zero");
+                        statement.bind_at(param_index, value);
                     } else {
-                        crate::bail_parse_error!(
-                            "Subprogram parameters should be integers, got {:?}",
-                            param_value
+                        crate::bail_corrupt_error!(
+                            "Register index {} out of bounds (len={})",
+                            reg_idx,
+                            state.registers.len()
                         );
                     }
-                }
-
-                state.op_program_state = OpProgramState::Step {
-                    is_trigger,
-                    statement: Box::new(statement),
-                    saved_last_insert_rowid,
-                };
-            }
-            OpProgramState::Step {
-                is_trigger,
-                statement,
-                saved_last_insert_rowid,
-            } => {
-                let is_trigger = *is_trigger;
-                let saved_last_insert_rowid = *saved_last_insert_rowid;
-                let mut raise_ignore = false;
-                // Track whether the subprogram aborted with an error. When abort()
-                // runs inside the subprogram, it already calls end_trigger_execution(),
-                // so we must not call it again after the loop.
-                let mut subprogram_aborted = false;
-                loop {
-                    let res = statement.step();
-                    match res {
-                        Ok(step_result) => match step_result {
-                            StepResult::Done => break,
-                            StepResult::IO => {
-                                let io = statement.take_io_completions().unwrap_or_else(|| {
-                                    IOCompletions::Single(Completion::new_yield())
-                                });
-                                return Ok(InsnFunctionStepResult::IO(io));
-                            }
-                            StepResult::Row => continue,
-                            StepResult::Interrupt | StepResult::Busy => {
-                                return Err(LimboError::Busy);
-                            }
-                        },
-                        Err(LimboError::Constraint(constraint_err)) => {
-                            if program.resolve_type != ResolveType::Ignore {
-                                return Err(LimboError::Constraint(constraint_err));
-                            }
-                            subprogram_aborted = true;
-                            break;
-                        }
-                        Err(LimboError::RaiseIgnore) => {
-                            raise_ignore = true;
-                            subprogram_aborted = true;
-                            break;
-                        }
-                        Err(err) => {
-                            return Err(err);
-                        }
-                    }
-                }
-
-                // Only end trigger execution for normal completion. Error paths
-                // already called end_trigger_execution() via abort() in the subprogram.
-                if is_trigger && !subprogram_aborted {
-                    program.connection.end_trigger_execution();
-                }
-
-                // Restore last_insert_rowid after trigger execution, per SQLite semantics:
-                // trigger-body INSERTs must not overwrite the top-level rowid.
-                if let Some(rowid) = saved_last_insert_rowid {
-                    program.connection.update_last_rowid(rowid);
-                }
-
-                state.op_program_state = OpProgramState::Start;
-                if raise_ignore {
-                    // RAISE(IGNORE) — skip the current row by jumping to ignore_jump_target
-                    state.pc = ignore_jump_target.as_offset_int();
                 } else {
-                    state.pc += 1;
+                    crate::bail_parse_error!(
+                        "Subprogram parameters should be integers, got {:?}",
+                        param_value
+                    );
                 }
-                return Ok(InsnFunctionStepResult::Step);
             }
+
+            let execution_guard = SubprogramExecutionGuard::enter(&program.connection)?;
+            let (is_trigger, saved_last_insert_rowid) = if let Some(trigger) = trigger {
+                let saved_last_insert_rowid = program.connection.last_insert_rowid();
+                program.connection.start_trigger_execution(trigger);
+                (true, Some(saved_last_insert_rowid))
+            } else {
+                (false, None)
+            };
+
+            state.op_program_state = OpProgramState::Running {
+                is_trigger,
+                saved_last_insert_rowid,
+                execution_guard,
+            };
+            Ok(InsnFunctionStepResult::SpawnedSubprogram(Box::new(
+                statement,
+            )))
         }
+        OpProgramState::Running {
+            is_trigger,
+            saved_last_insert_rowid,
+            execution_guard,
+        } => {
+            state.op_program_state = OpProgramState::Running {
+                is_trigger,
+                saved_last_insert_rowid,
+                execution_guard,
+            };
+            Err(LimboError::InternalError(
+                "Program parent stepped before child finished".to_string(),
+            ))
+        }
+        OpProgramState::Finished {
+            is_trigger,
+            outcome,
+            saved_last_insert_rowid,
+            execution_guard: _execution_guard,
+        } => finish_subprogram_outcome(
+            program,
+            state,
+            is_trigger,
+            outcome,
+            saved_last_insert_rowid,
+            ignore_jump_target.as_offset_int(),
+        ),
     }
 }
 
@@ -13678,6 +13715,9 @@ pub fn op_vacuum_into(
         }
         Ok(InsnFunctionStepResult::Done | InsnFunctionStepResult::Row) => {
             unreachable!("op_vacuum_into_inner only returns Step or IO")
+        }
+        Ok(InsnFunctionStepResult::SpawnedSubprogram(_)) => {
+            unreachable!("op_vacuum_into_inner never spawns subprograms")
         }
         Err(err) => {
             // Reset state on error

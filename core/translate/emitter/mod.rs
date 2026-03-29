@@ -9,6 +9,7 @@ use crate::translate::main_loop::SemiAntiJoinMetadata;
 use crate::sync::Arc;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
+use std::cell::RefCell;
 use turso_macros::match_ignore_ascii_case;
 
 use super::expr::translate_expr;
@@ -26,6 +27,7 @@ use crate::translate::expr::{
     bind_and_rewrite_expr, translate_expr_no_constant_opt, walk_expr, walk_expr_mut,
     BindingBehavior, NoConstantOptReason, WalkControl,
 };
+use crate::translate::fk_compile::{FkActionCompileKey, FkCompilationStart, FkCompileContext};
 use crate::translate::plan::{JoinedTable, NonFromClauseSubquery, Plan, ResultSetColumn};
 use crate::translate::planner::TableMask;
 use crate::translate::planner::ROWID_STRS;
@@ -102,6 +104,7 @@ pub struct Resolver<'a> {
     schema: &'a Schema,
     database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
     attached_databases: &'a RwLock<DatabaseCatalog>,
+    fk_compile_ctx: &'a RefCell<FkCompileContext>,
     pub symbol_table: &'a SymbolTable,
     pub expr_to_reg_cache_enabled: bool,
     /// Cache entries for previously translated expressions.
@@ -139,6 +142,7 @@ impl<'a> Resolver<'a> {
         schema: &'a Schema,
         database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
         attached_databases: &'a RwLock<DatabaseCatalog>,
+        fk_compile_ctx: &'a RefCell<FkCompileContext>,
         symbol_table: &'a SymbolTable,
         enable_custom_types: bool,
     ) -> Self {
@@ -146,6 +150,7 @@ impl<'a> Resolver<'a> {
             schema,
             database_schemas,
             attached_databases,
+            fk_compile_ctx,
             symbol_table,
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
@@ -164,6 +169,7 @@ impl<'a> Resolver<'a> {
             schema: self.schema,
             database_schemas: self.database_schemas,
             attached_databases: self.attached_databases,
+            fk_compile_ctx: self.fk_compile_ctx,
             symbol_table: self.symbol_table,
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
@@ -178,6 +184,7 @@ impl<'a> Resolver<'a> {
             schema: self.schema,
             database_schemas: self.database_schemas,
             attached_databases: self.attached_databases,
+            fk_compile_ctx: self.fk_compile_ctx,
             symbol_table: self.symbol_table,
             expr_to_reg_cache_enabled: self.expr_to_reg_cache_enabled,
             expr_to_reg_cache: self.expr_to_reg_cache.clone(),
@@ -218,6 +225,24 @@ impl<'a> Resolver<'a> {
 
     pub(crate) fn enable_expr_to_reg_cache(&mut self) {
         self.expr_to_reg_cache_enabled = true;
+    }
+
+    pub(crate) fn start_fk_action_compilation(
+        &self,
+        key: FkActionCompileKey,
+    ) -> Result<FkCompilationStart> {
+        self.fk_compile_ctx
+            .borrow_mut()
+            .start_action_compilation(key)
+    }
+
+    pub(crate) fn end_fk_action_compilation(
+        &self,
+        expected_key: FkActionCompileKey,
+    ) -> crate::vdbe::insn::SubprogramBackpatch {
+        self.fk_compile_ctx
+            .borrow_mut()
+            .end_action_compilation(expected_key)
     }
 
     pub fn cache_expr_reg(

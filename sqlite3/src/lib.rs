@@ -59,6 +59,7 @@ pub const SQLITE_CHECKPOINT_PASSIVE: ffi::c_int = 0;
 pub const SQLITE_CHECKPOINT_FULL: ffi::c_int = 1;
 pub const SQLITE_CHECKPOINT_RESTART: ffi::c_int = 2;
 pub const SQLITE_CHECKPOINT_TRUNCATE: ffi::c_int = 3;
+pub const SQLITE_LIMIT_TRIGGER_DEPTH: ffi::c_int = 10;
 
 pub const SQLITE_INTEGER: ffi::c_int = 1;
 pub const SQLITE_FLOAT: ffi::c_int = 2;
@@ -1259,11 +1260,32 @@ pub unsafe extern "C" fn sqlite3_sleep(_ms: ffi::c_int) {
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_limit(
-    _db: *mut sqlite3,
-    _id: ffi::c_int,
-    _new_value: ffi::c_int,
+    db: *mut sqlite3,
+    id: ffi::c_int,
+    new_value: ffi::c_int,
 ) -> ffi::c_int {
-    stub!();
+    trace!("sqlite3_limit");
+
+    if db.is_null() {
+        return -1;
+    }
+
+    let db: &mut sqlite3 = &mut *db;
+    let inner = db.inner.lock().unwrap();
+    if !sqlite3_safety_check_sick_or_ok(&inner) {
+        return -1;
+    }
+
+    match id {
+        SQLITE_LIMIT_TRIGGER_DEPTH => {
+            let previous_limit = inner.conn.get_trigger_recursion_limit();
+            if new_value >= 0 {
+                inner.conn.set_trigger_recursion_limit(new_value);
+            }
+            previous_limit
+        }
+        _ => -1,
+    }
 }
 
 #[no_mangle]
@@ -2845,6 +2867,8 @@ fn limbo_err_code(err: &LimboError) -> i32 {
         LimboError::ReadOnly => SQLITE_READONLY,
         LimboError::Busy => SQLITE_BUSY,
         LimboError::SchemaUpdated | LimboError::SchemaConflict => SQLITE_SCHEMA,
+        LimboError::TooManyLevelsOfTriggerRecursion => SQLITE_ERROR,
+        LimboError::FkActionCompileDepthExceeded => SQLITE_ERROR,
         _ => SQLITE_ERROR,
     }
 }
@@ -2868,4 +2892,74 @@ unsafe fn set_db_err(db: &mut sqlite3Inner, err: LimboError) -> i32 {
     db.p_err = CString::new(err_msg).unwrap().into_raw() as *mut ffi::c_void;
     db.err_code = code;
     code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    unsafe fn open_memory_db() -> *mut sqlite3 {
+        let filename = CString::new(":memory:").unwrap();
+        let mut db: *mut sqlite3 = std::ptr::null_mut();
+        assert_eq!(sqlite3_open(filename.as_ptr(), &mut db), SQLITE_OK);
+        assert!(!db.is_null());
+        db
+    }
+
+    #[test]
+    fn sqlite3_limit_trigger_depth_roundtrip_and_clamp() {
+        unsafe {
+            let db = open_memory_db();
+            let default_limit = sqlite3_limit(db, SQLITE_LIMIT_TRIGGER_DEPTH, -1);
+            assert_eq!(
+                default_limit,
+                turso_core::Connection::MAX_TRIGGER_RECURSION_DEPTH
+            );
+
+            assert_eq!(
+                sqlite3_limit(db, SQLITE_LIMIT_TRIGGER_DEPTH, 3),
+                default_limit
+            );
+            assert_eq!(sqlite3_limit(db, SQLITE_LIMIT_TRIGGER_DEPTH, -1), 3);
+
+            assert_eq!(sqlite3_limit(db, SQLITE_LIMIT_TRIGGER_DEPTH, i32::MAX), 3);
+            assert_eq!(
+                sqlite3_limit(db, SQLITE_LIMIT_TRIGGER_DEPTH, -1),
+                turso_core::Connection::MAX_TRIGGER_RECURSION_DEPTH
+            );
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn sqlite3_limit_unknown_id_returns_minus_one() {
+        unsafe {
+            let db = open_memory_db();
+            assert_eq!(sqlite3_limit(db, -12345, -1), -1);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn trigger_recursion_error_maps_to_sqlite_error() {
+        assert_eq!(
+            handle_limbo_err(
+                LimboError::TooManyLevelsOfTriggerRecursion,
+                std::ptr::null_mut()
+            ),
+            SQLITE_ERROR
+        );
+    }
+
+    #[test]
+    fn fk_compile_depth_error_maps_to_sqlite_error() {
+        assert_eq!(
+            handle_limbo_err(
+                LimboError::FkActionCompileDepthExceeded,
+                std::ptr::null_mut()
+            ),
+            SQLITE_ERROR
+        );
+    }
 }

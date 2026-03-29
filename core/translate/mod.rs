@@ -18,6 +18,7 @@ pub(crate) mod display;
 pub(crate) mod emitter;
 pub(crate) mod expr;
 pub(crate) mod expression_index;
+pub(crate) mod fk_compile;
 pub(crate) mod fkeys;
 pub(crate) mod group_by;
 pub(crate) mod index;
@@ -51,6 +52,7 @@ use crate::storage::pager::Pager;
 use crate::sync::Arc;
 use crate::translate::delete::translate_delete;
 use crate::translate::emitter::Resolver;
+use crate::translate::fk_compile::FkCompileContext;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use crate::vdbe::Program;
 use crate::{bail_parse_error, Connection, Result, SymbolTable};
@@ -61,6 +63,7 @@ use insert::translate_insert;
 use rollback::{translate_release, translate_rollback, translate_savepoint};
 use schema::{translate_create_table, translate_create_virtual_table, translate_drop_table};
 use select::translate_select;
+use std::cell::RefCell;
 use tracing::{instrument, Level};
 use transaction::{translate_tx_begin, translate_tx_commit};
 use turso_parser::ast;
@@ -98,10 +101,12 @@ pub fn translate(
     );
 
     program.prologue();
+    let fk_compile_ctx = RefCell::new(FkCompileContext::new());
     let mut resolver = Resolver::new(
         schema,
         connection.database_schemas(),
         connection.attached_databases(),
+        &fk_compile_ctx,
         syms,
         connection.experimental_custom_types_enabled(),
     );

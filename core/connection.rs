@@ -51,9 +51,9 @@ pub(crate) enum TransactionState {
 
 /// Database connection handle.
 ///
-/// If you add a setting that affects SQL compilation or execution, call
-/// `bump_prepare_context_generation()` in its setter so cached prepared
-/// statements know they need to be reprepared.
+/// If you add a setting that changes compiled bytecode or prepared-statement
+/// cache compatibility, call `bump_prepare_context_generation()` in its setter
+/// so cached prepared statements know they need to be reprepared.
 pub struct Connection {
     pub(crate) db: Arc<Database>,
     pub(crate) pager: ArcSwap<Pager>,
@@ -113,6 +113,10 @@ pub struct Connection {
     /// Stack of currently executing triggers to prevent recursive trigger execution
     /// Only prevents the same trigger from firing again, allowing different triggers on the same table to fire
     pub(super) executing_triggers: RwLock<Vec<Arc<Trigger>>>,
+    /// Current depth of nested Program opcode execution (trigger/FK subprogram calls).
+    pub(super) executing_subprogram_depth: AtomicI32,
+    /// Per-connection recursion limit for trigger/FK subprogram calls.
+    pub(super) trigger_recursion_limit: AtomicI32,
     pub(crate) encryption_key: RwLock<Option<EncryptionKey>>,
     pub(super) encryption_cipher_mode: AtomicCipherMode,
     pub(super) sync_mode: AtomicSyncMode,
@@ -224,6 +228,57 @@ impl Connection {
     /// ends nested program execution
     pub fn end_nested(&self) {
         self.nestedness.fetch_add(-1, Ordering::SeqCst);
+    }
+
+    /// Hard user-visible recursion limit for nested trigger/FK execution.
+    ///
+    /// This only applies while `Program` opcodes are running. FK action
+    /// compilation uses a separate prepare-scoped safety guard.
+    pub const MAX_TRIGGER_RECURSION_DEPTH: i32 = 1000;
+
+    #[inline]
+    pub const fn default_trigger_recursion_limit() -> i32 {
+        Self::MAX_TRIGGER_RECURSION_DEPTH
+    }
+
+    pub fn get_trigger_recursion_limit(&self) -> i32 {
+        self.trigger_recursion_limit.load(Ordering::SeqCst)
+    }
+
+    pub fn set_trigger_recursion_limit(&self, limit: i32) {
+        self.trigger_recursion_limit.store(
+            limit.clamp(0, Self::MAX_TRIGGER_RECURSION_DEPTH),
+            Ordering::SeqCst,
+        );
+    }
+
+    /// Enforce the user-visible trigger/FK execution depth limit while nested
+    /// subprograms are actually running.
+    pub(crate) fn start_subprogram_execution(&self) -> Result<()> {
+        let depth = self
+            .executing_subprogram_depth
+            .fetch_add(1, Ordering::SeqCst)
+            + 1;
+        let limit = self.get_trigger_recursion_limit();
+
+        if depth > limit {
+            self.executing_subprogram_depth
+                .fetch_sub(1, Ordering::SeqCst);
+            return Err(LimboError::TooManyLevelsOfTriggerRecursion);
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn end_subprogram_execution(&self) {
+        let prev = self
+            .executing_subprogram_depth
+            .fetch_sub(1, Ordering::SeqCst);
+
+        debug_assert!(
+            prev > 0,
+            "end_subprogram_execution called without matching start"
+        );
     }
 
     /// Check if a specific trigger is currently compiling (for recursive trigger prevention)

@@ -548,7 +548,7 @@ fn execute_trigger_commands(
 
     program.emit_insn(Insn::Program {
         params,
-        program: built_subprogram.prepared().clone(),
+        program: crate::vdbe::insn::SubprogramRef::Ready(built_subprogram.prepared().clone()),
         ignore_jump_target,
     });
     connection.end_trigger_compilation();
