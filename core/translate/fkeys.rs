@@ -1920,6 +1920,7 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
                         connection,
                         &action.ctx,
                         database_id,
+                        FkActionCompileKey::DeleteSetNull,
                     )?;
                 }
                 RefAct::SetDefault => {
@@ -1930,6 +1931,7 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
                         connection,
                         &action.ctx,
                         database_id,
+                        FkActionCompileKey::DeleteSetDefault,
                     )?;
                 }
                 _ => unreachable!(),

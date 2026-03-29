@@ -1328,7 +1328,6 @@ impl Program {
             if matches!(state.execution_state, ProgramExecutionState::Interrupting) {
                 self.abort(&pager, None, state)?;
                 return Ok(FrameStepResult::Statement(StepResult::Interrupt));
-                return Ok(FrameStepResult::Statement(StepResult::Interrupt));
             }
 
             if let Some(io) = &state.io_completions {
