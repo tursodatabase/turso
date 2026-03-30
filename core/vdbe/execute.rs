@@ -10318,7 +10318,10 @@ fn op_parse_schema_step(
                 return Ok(InsnFunctionStepResult::IO(io));
             }
             StepResult::Row => {
-                let inner = state.op_parse_schema_state.as_mut().unwrap();
+                let inner = state
+                    .op_parse_schema_state
+                    .as_mut()
+                    .expect("parse schema state should exist");
                 let row = inner.stmt.row().expect("row should be present");
                 let ty = row.get::<&str>(0)?;
                 let name = row.get::<&str>(1)?;
@@ -10344,23 +10347,26 @@ fn op_parse_schema_step(
             }
             StepResult::Done => {
                 // Take the state to finalize
-                let inner = state.op_parse_schema_state.take().unwrap();
+                let inner = state
+                    .op_parse_schema_state
+                    .take()
+                    .expect("parse schema state should exist");
                 let mut schema_arc = inner.schema_arc;
                 let schema = Arc::make_mut(&mut schema_arc);
                 let mv_store = inner.stmt.mv_store();
                 let syms = conn.syms.read();
 
-                schema.populate_indices(
+                let res1 = schema.populate_indices(
                     &syms,
                     inner.from_sql_indexes,
                     inner.automatic_indices,
                     mv_store.is_some(),
-                )?;
-                schema.populate_materialized_views(
+                );
+                let res2 = schema.populate_materialized_views(
                     inner.materialized_view_info,
                     inner.dbsp_state_roots,
                     inner.dbsp_state_index_roots,
-                )?;
+                );
 
                 // Store the modified schema back
                 if crate::is_attached_db(inner.db) {
@@ -10371,19 +10377,26 @@ fn op_parse_schema_step(
                 conn.end_nested();
                 conn.auto_commit
                     .store(inner.previous_auto_commit, Ordering::SeqCst);
+                let _ = (res1?, res2?);
 
                 state.pc += 1;
                 return Ok(InsnFunctionStepResult::Step);
             }
             StepResult::Interrupt => {
-                let inner = state.op_parse_schema_state.take().unwrap();
+                let inner = state
+                    .op_parse_schema_state
+                    .take()
+                    .expect("parse schema state should exist");
                 conn.end_nested();
                 conn.auto_commit
                     .store(inner.previous_auto_commit, Ordering::SeqCst);
                 return Err(LimboError::Interrupt);
             }
             StepResult::Busy => {
-                let inner = state.op_parse_schema_state.take().unwrap();
+                let inner = state
+                    .op_parse_schema_state
+                    .take()
+                    .expect("parse schema state should exist");
                 conn.end_nested();
                 conn.auto_commit
                     .store(inner.previous_auto_commit, Ordering::SeqCst);
