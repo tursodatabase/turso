@@ -95,7 +95,7 @@ test('attach', () => {
 
         const stmt = db1.prepare("SELECT * FROM t UNION ALL SELECT * FROM secondary.q");
         expect(stmt.columns()).toEqual([{ name: "x", column: null, database: null, table: null, type: null }]);
-        const rows = stmt.all([1]);
+        const rows = stmt.all();
         expect(rows).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }, { x: 4 }, { x: 5 }, { x: 6 }]);
     } finally {
         unlinkSync(path1);
@@ -103,6 +103,42 @@ test('attach', () => {
         unlinkSync(path2);
         unlinkSync(`${path2}-wal`);
     }
+})
+
+test('named parameters with $', () => {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE users(name TEXT, age INTEGER)");
+    db.exec("INSERT INTO users VALUES ('Alice', 30), ('Bob', 25), ('Carol', 35)");
+    const stmt = db.prepare("SELECT * FROM users WHERE name = $name AND age = $age");
+    const row = stmt.get({ name: 'Alice', age: 30 });
+    expect(row).toEqual({ name: 'Alice', age: 30 });
+})
+
+test('named parameters with :', () => {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE t(x, y)");
+    db.exec("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+    const stmt = db.prepare("SELECT * FROM t WHERE x = :x");
+    const rows = stmt.all({ x: 2 });
+    expect(rows).toEqual([{ x: 2, y: 'b' }]);
+})
+
+test('named parameters with @', () => {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE t(x)");
+    db.exec("INSERT INTO t VALUES (10), (20), (30)");
+    const stmt = db.prepare("SELECT * FROM t WHERE x = @val");
+    const row = stmt.get({ val: 20 });
+    expect(row).toEqual({ x: 20 });
+})
+
+test('named parameters with mixed prefixes', () => {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE t(a, b, c)");
+    db.exec("INSERT INTO t VALUES (1, 2, 3)");
+    const stmt = db.prepare("SELECT * FROM t WHERE a = $a AND b = :b AND c = @c");
+    const row = stmt.get({ a: 1, b: 2, c: 3 });
+    expect(row).toEqual({ a: 1, b: 2, c: 3 });
 })
 
 test('blobs', () => {
