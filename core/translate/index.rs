@@ -35,13 +35,26 @@ use turso_parser::ast::{self, Expr, QualifiedName, SortOrder, SortedColumn};
 
 use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 
+fn canonical_create_index_sql(stmt: &ast::Stmt) -> String {
+    let mut canonical_stmt = stmt.clone();
+    let ast::Stmt::CreateIndex { idx_name, .. } = &mut canonical_stmt else {
+        unreachable!("canonical_create_index_sql requires a CREATE INDEX statement");
+    };
+    // Attached db's index names may have a connection-local schema alias like `aux.idx1`.
+    // Strip that qualifier before storing SQL in sqlite_schema so the schema text remains valid
+    // when the same database is reopened or attached under a different alias.
+    // e.g. CREATE INDEX aux.idx1 ON t1 (name) -> CREATE INDEX idx1 ON t1 (name)
+    idx_name.db_name = None;
+    canonical_stmt.to_string()
+}
+
 pub fn translate_create_index(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
     resolver: &Resolver,
     stmt: ast::Stmt,
 ) -> crate::Result<()> {
-    let sql = stmt.to_string();
+    let sql = canonical_create_index_sql(&stmt);
     let ast::Stmt::CreateIndex {
         unique,
         if_not_exists,
@@ -1166,4 +1179,35 @@ pub fn translate_optimize(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonical_create_index_sql;
+    use turso_parser::{ast, parser::Parser};
+
+    #[test]
+    fn canonical_create_index_sql_drops_schema_qualifier_from_index_name_only() {
+        let mut parser = Parser::new(b"CREATE INDEX aux.idx1 ON t1(name);");
+        let stmt = match parser.next_cmd().unwrap().unwrap() {
+            ast::Cmd::Stmt(stmt) => stmt,
+            other => panic!("expected statement, got {other:?}"),
+        };
+
+        // let's confirm that the stmt does carry `aux`
+        let ast::Stmt::CreateIndex { idx_name, .. } = &stmt else {
+            panic!("expected CREATE INDEX statement");
+        };
+        assert_eq!(
+            idx_name
+                .db_name
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("aux")
+        );
+
+        let canonical_sql = canonical_create_index_sql(&stmt);
+        assert_eq!(canonical_sql, "CREATE INDEX idx1 ON t1 (name)");
+    }
 }
