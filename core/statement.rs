@@ -397,7 +397,14 @@ impl Statement {
             }
         }
 
-        *conn.schema.write() = conn.db.clone_schema();
+        // if current connection is within a transaction which changed schema - we must use its schema version instead of DB schema version
+        // see test_prepared_stmt_reprepare_ddl_change_txn (plus test_sync_pull_after_local_ddl_and_remote_writes)
+        {
+            let mut conn_schema = conn.schema.write();
+            if conn_schema.schema_version < conn.db.schema.lock().schema_version {
+                *conn_schema = conn.db.clone_schema();
+            }
+        }
         self.program = {
             let mut parser = Parser::new(self.program.sql.as_bytes());
             let cmd = parser.next_cmd()?;
