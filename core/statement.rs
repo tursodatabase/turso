@@ -463,12 +463,65 @@ impl Statement {
         match self.query_mode {
             QueryMode::Normal => {
                 let column = &self.program.result_columns.get(idx).expect("No column");
-                match column.name(&self.program.table_references) {
-                    Some(name) => Cow::Borrowed(name),
-                    None => {
-                        let tables = [&self.program.table_references];
-                        let ctx = PlanContext(&tables);
-                        Cow::Owned(column.expr.displayer(&ctx).to_string())
+
+                // 1. Explicit alias (AS clause) or SELECT * expansion always wins.
+                if let Some(alias) = &column.alias {
+                    return Cow::Borrowed(alias);
+                }
+
+                let full = self.program.connection.get_full_column_names();
+                let short = self.program.connection.get_short_column_names();
+
+                // 2. For column references, apply full/short column name logic.
+                match &column.expr {
+                    turso_parser::ast::Expr::Column {
+                        table,
+                        column: col_idx,
+                        ..
+                    } => {
+                        if full {
+                            // full_column_names=ON: use REAL_TABLE_NAME.COLUMN
+                            if let Some((_, table_ref)) = self
+                                .program
+                                .table_references
+                                .find_table_by_internal_id(*table)
+                            {
+                                let col_name = table_ref
+                                    .get_column_at(*col_idx)
+                                    .and_then(|c| c.name.as_deref())
+                                    .unwrap_or("?");
+                                return Cow::Owned(format!(
+                                    "{}.{}",
+                                    table_ref.get_name(),
+                                    col_name
+                                ));
+                            }
+                        }
+                        if short || full {
+                            // short_column_names=ON: use just COLUMN
+                            if let Some(name) = column.name(&self.program.table_references) {
+                                return Cow::Borrowed(name);
+                            }
+                        }
+                        // Both OFF: use original expression text
+                        if let Some(name) = &column.implicit_column_name {
+                            Cow::Borrowed(name.as_str())
+                        } else {
+                            let tables = [&self.program.table_references];
+                            let ctx = PlanContext(&tables);
+                            Cow::Owned(column.expr.displayer(&ctx).to_string())
+                        }
+                    }
+                    _ => {
+                        // Non-column-ref: use implicit_column_name or displayer
+                        match column.name(&self.program.table_references) {
+                            Some(name) => Cow::Borrowed(name),
+                            None => {
+                                let tables = [&self.program.table_references];
+                                let ctx = PlanContext(&tables);
+                                Cow::Owned(column.expr.displayer(&ctx).to_string())
+                            }
+                        }
                     }
                 }
             }

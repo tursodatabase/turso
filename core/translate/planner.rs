@@ -773,7 +773,7 @@ fn parse_from_clause_table(
             let cur_table_index = table_references.joined_tables().len();
             let identifier = maybe_alias
                 .map(|a| normalize_ident(a.name().as_str()))
-                .unwrap_or_else(|| format!("subquery_{cur_table_index}"));
+                .unwrap_or_else(|| format!("(subquery-{cur_table_index})"));
             table_references.add_joined_table(JoinedTable::new_subquery_from_plan(
                 identifier,
                 subplan,

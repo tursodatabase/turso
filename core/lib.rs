@@ -1382,6 +1382,8 @@ impl Database {
             busy_handler: RwLock::new(BusyHandler::None),
             query_timeout_ms: AtomicU64::new(0),
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
+            full_column_names: AtomicBool::new(false),
+            short_column_names: AtomicBool::new(true),
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
             n_active_writes: AtomicI32::new(0),

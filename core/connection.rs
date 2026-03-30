@@ -86,6 +86,10 @@ pub struct Connection {
     pub(super) query_only: AtomicBool,
     /// If enabled, the UPDATE/DELETE statements must have a WHERE clause
     pub(super) dml_require_where: AtomicBool,
+    /// Deprecated pragma: when ON, column names include table prefix (TABLE.COLUMN)
+    pub(super) full_column_names: AtomicBool,
+    /// Deprecated pragma: when ON (default), column refs use just the column name
+    pub(super) short_column_names: AtomicBool,
     pub(crate) mv_tx: RwLock<Option<(crate::mvcc::database::TxID, TransactionMode)>>,
     /// Per-attached-database MVCC transactions.
     /// Main DB uses `mv_tx` above for zero-cost hot path access.
@@ -1845,6 +1849,24 @@ impl Connection {
 
     pub fn set_dml_require_where(&self, value: bool) {
         self.dml_require_where.store(value, Ordering::SeqCst);
+    }
+
+    pub fn get_full_column_names(&self) -> bool {
+        self.full_column_names.load(Ordering::SeqCst)
+    }
+
+    pub fn set_full_column_names(&self, value: bool) {
+        self.full_column_names.store(value, Ordering::SeqCst);
+        self.bump_prepare_context_generation();
+    }
+
+    pub fn get_short_column_names(&self) -> bool {
+        self.short_column_names.load(Ordering::SeqCst)
+    }
+
+    pub fn set_short_column_names(&self, value: bool) {
+        self.short_column_names.store(value, Ordering::SeqCst);
+        self.bump_prepare_context_generation();
     }
 
     pub fn get_sync_mode(&self) -> SyncMode {

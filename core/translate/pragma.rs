@@ -226,6 +226,16 @@ fn update_pragma(
             program.add_pragma_result_column("journal_mode".into());
             Ok(TransactionMode::None)
         }
+        PragmaName::FullColumnNames => {
+            let enabled = parse_pragma_enabled(&value);
+            connection.set_full_column_names(enabled);
+            Ok(TransactionMode::None)
+        }
+        PragmaName::ShortColumnNames => {
+            let enabled = parse_pragma_enabled(&value);
+            connection.set_short_column_names(enabled);
+            Ok(TransactionMode::None)
+        }
         PragmaName::LegacyFileFormat => Ok(TransactionMode::None),
         PragmaName::WalCheckpoint => query_pragma(
             PragmaName::WalCheckpoint,
@@ -636,6 +646,22 @@ fn query_pragma(
                 dest: register,
                 new_mode: None,
             });
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::FullColumnNames => {
+            let enabled = connection.get_full_column_names();
+            let register = program.alloc_register();
+            program.emit_int(enabled as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::ShortColumnNames => {
+            let enabled = connection.get_short_column_names();
+            let register = program.alloc_register();
+            program.emit_int(enabled as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)

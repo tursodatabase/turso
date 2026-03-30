@@ -377,6 +377,8 @@ fn prepare_one_select_plan(
                 windows.push(window);
             }
 
+            let long_names =
+                connection.get_full_column_names() && !connection.get_short_column_names();
             let mut aggregate_expressions = Vec::new();
             for column in columns.into_iter() {
                 match column {
@@ -385,6 +387,7 @@ fn prepare_one_select_plan(
                             plan.table_references.joined_tables(),
                             &mut plan.result_columns,
                             plan.table_references.right_join_swapped(),
+                            long_names,
                         )?;
                         for table in plan.table_references.joined_tables_mut() {
                             for idx in 0..table.columns().len() {
@@ -442,6 +445,13 @@ fn prepare_one_select_plan(
                             if column.hidden() {
                                 continue;
                             }
+                            let alias = column.name.as_ref().map(|col_name| {
+                                if long_names {
+                                    format!("{}.{}", table.identifier, col_name)
+                                } else {
+                                    col_name.clone()
+                                }
+                            });
                             plan.result_columns.push(ResultSetColumn {
                                 expr: ast::Expr::Column {
                                     database: None, // TODO: support different databases
@@ -449,7 +459,7 @@ fn prepare_one_select_plan(
                                     column: idx,
                                     is_rowid_alias: column.is_rowid_alias(),
                                 },
-                                alias: None,
+                                alias,
                                 implicit_column_name: None,
                                 contains_aggregates: false,
                             });
