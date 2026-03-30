@@ -200,7 +200,7 @@ impl core::ops::Deref for TempFile {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct OpenFlags(i32);
 
 // OpenFlags is a newtype over i32, which is inherently Send+Sync.
@@ -212,6 +212,26 @@ bitflags! {
         const None = 0b00000000;
         const Create = 0b0000001;
         const ReadOnly = 0b0000010;
+    }
+}
+
+impl OpenFlags {
+    /// Returns a version of the flags with transient permissions masked out.
+    ///
+    /// This is used by the process-wide `DATABASE_MANAGER` registry to identify compatible
+    /// database instances. We mask-out flags like `Create` because they only matter during
+    /// the initial file opening. Once a file is open, a database opened with `Create` and
+    /// one opened without it are operationally identical and should share the same cache
+    /// to avoid data inconsistency and redundant memory usage.
+    ///
+    /// Conversely, fundamental modes like `ReadOnly` are preserved because they require
+    /// strict isolation between instances.
+    pub fn normalize(&self) -> Self {
+        let mut normalized = *self;
+        // Create is a transient permission; once the file exists, the operational mode
+        // depends only on whether it is ReadOnly or ReadWrite.
+        normalized.remove(OpenFlags::Create);
+        normalized
     }
 }
 
