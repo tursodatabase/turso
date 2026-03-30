@@ -95,8 +95,8 @@ use crate::{
     },
 };
 
-use crate::TEMP_DB_ID;
 use crate::{connection::Row, info, turso_assert, OpenFlags, TransactionState, ValueRef};
+use crate::{is_attached_db, MAIN_DB_ID, TEMP_DB_ID};
 
 use super::{
     array::{
@@ -2745,12 +2745,7 @@ pub fn halt(
                 vtab_rollback_all(&program.connection)?;
                 if let Some(mv_store) = mv_store.as_ref() {
                     if let Some(tx_id) = program.connection.get_mv_tx_id() {
-                        mv_store.rollback_tx(
-                            tx_id,
-                            pager.clone(),
-                            &program.connection,
-                            crate::MAIN_DB_ID,
-                        );
+                        mv_store.rollback_tx(tx_id, pager.clone(), &program.connection, MAIN_DB_ID);
                     }
                     pager.end_read_tx();
                 } else {
@@ -2976,7 +2971,7 @@ pub fn op_transaction_inner(
 
                 // 1. We try to upgrade current version
                 let current_state = conn.get_tx_state();
-                let is_attached = crate::is_attached_db(*db);
+                let is_attached = is_attached_db(*db);
                 let (new_transaction_state, updated) = if conn.is_nested_stmt() {
                     (current_state, false)
                 } else if is_attached {
@@ -3167,7 +3162,7 @@ pub fn op_transaction_inner(
                     // For attached databases without MVCC, always start read/write
                     // transactions on the attached pager, since the connection-level
                     // transaction state may already be Read/Write from the main database.
-                    let is_attached = crate::is_attached_db(*db);
+                    let is_attached = is_attached_db(*db);
                     if is_attached {
                         // If the pager already holds a read lock (e.g., after
                         // SchemaUpdated reprepare or prior write tx), skip
@@ -3291,13 +3286,13 @@ pub fn op_transaction_inner(
             }
             OpTransactionState::BeginStatement => {
                 let needs_stmt_journal = program.needs_stmt_subtransactions.load(Ordering::Relaxed);
-                if *db == crate::MAIN_DB_ID && needs_stmt_journal {
+                if *db == MAIN_DB_ID && needs_stmt_journal {
                     let write = matches!(tx_mode, TransactionMode::Write);
                     let res = state.begin_statement(&program.connection, &pager, write)?;
                     if let IOResult::IO(io) = res {
                         return Ok(InsnFunctionStepResult::IO(io));
                     }
-                } else if crate::is_attached_db(*db)
+                } else if is_attached_db(*db)
                     && matches!(tx_mode, TransactionMode::Write)
                     && needs_stmt_journal
                 {
@@ -3321,7 +3316,7 @@ pub fn op_transaction_inner(
                     }
                 }
 
-                if *db == crate::MAIN_DB_ID
+                if *db == MAIN_DB_ID
                     && matches!(tx_mode, TransactionMode::Write)
                     && !program.connection.auto_commit.load(Ordering::SeqCst)
                 {
@@ -3408,7 +3403,7 @@ pub fn op_auto_commit(
             // ROLLBACK transition
             if let Some(mv_store) = mv_store.as_ref() {
                 if let Some(tx_id) = conn.get_mv_tx_id() {
-                    mv_store.rollback_tx(tx_id, pager.clone(), &conn, crate::MAIN_DB_ID);
+                    mv_store.rollback_tx(tx_id, pager.clone(), &conn, MAIN_DB_ID);
                 }
                 pager.end_read_tx();
                 conn.rollback_attached_mvcc_txs(true);
@@ -9931,7 +9926,7 @@ pub fn op_destroy(
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    let destroy_pager = if *db != crate::MAIN_DB_ID {
+    let destroy_pager = if *db != MAIN_DB_ID {
         program.get_pager_from_database_index(db)
     } else {
         pager.clone()
@@ -10240,7 +10235,7 @@ pub fn op_parse_schema(
     conn.auto_commit.store(false, Ordering::SeqCst);
 
     // For attached databases, qualify the sqlite_schema table with the database name
-    let schema_table = if crate::is_attached_db(*db) {
+    let schema_table = if is_attached_db(*db) {
         let db_name = conn
             .get_database_name_by_index(*db)
             .unwrap_or_else(|| "main".to_string());
@@ -10260,7 +10255,7 @@ pub fn op_parse_schema(
     // which also acquires the schema / database_schemas write lock, so holding
     // it here would deadlock on the same thread (parking_lot RwLock is not
     // re-entrant).
-    let schema_arc = if crate::is_attached_db(*db) {
+    let schema_arc = if is_attached_db(*db) {
         // Fetch the fallback schema from attached_databases BEFORE acquiring
         // database_schemas.write() to avoid a nested lock ordering dependency
         // (database_schemas.write -> attached_databases.read).
@@ -10386,7 +10381,7 @@ fn op_parse_schema_step(
                 );
 
                 // Store the modified schema back
-                if crate::is_attached_db(db) {
+                if is_attached_db(db) {
                     conn.database_schemas().write().insert(db, schema_arc);
                 } else {
                     *conn.schema.write() = schema_arc;
@@ -10719,7 +10714,7 @@ pub fn op_set_cookie(
                 Cookie::SchemaVersion => {
                     // Only mark schema_did_change on connection for main database (db 0).
                     // Attached databases track their schema independently.
-                    if *db == crate::MAIN_DB_ID {
+                    if *db == MAIN_DB_ID {
                         match program.connection.get_tx_state() {
                             TransactionState::Write { .. } => {
                                 program.connection.set_tx_state(TransactionState::Write { schema_did_change: true });
@@ -11463,7 +11458,7 @@ pub fn op_integrity_check(
 
     let mv_store = program.connection.mv_store_for_db(*db);
     // Use the correct pager for the target database (main or attached)
-    let target_pager = if *db == crate::MAIN_DB_ID {
+    let target_pager = if *db == MAIN_DB_ID {
         pager.clone()
     } else {
         program.get_pager_from_database_index(db)
@@ -12165,7 +12160,7 @@ pub fn op_alter_column(
             Ok(())
         })?;
 
-        if !crate::is_attached_db(*db) {
+        if !is_attached_db(*db) {
             conn.with_schema(*db, |schema| -> crate::Result<()> {
                 let table = schema
                     .tables
@@ -13899,7 +13894,7 @@ fn op_vacuum_into_inner(
                     "page_size",
                 )?;
 
-                let reserved_space: u8 = if !crate::is_attached_db(database_id) {
+                let reserved_space: u8 = if !is_attached_db(database_id) {
                     // For main or temp db prefer cached value to avoid blocking I/O
                     match program.connection.get_reserved_bytes() {
                         Some(val) => val,
