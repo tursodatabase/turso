@@ -198,6 +198,18 @@ impl Operation {
     /// Called when an operation finishes execution.
     /// Applies state changes based on operation type and result.
     pub fn finish_op(&self, ctx: &mut OpContext, result: &OpResult) {
+        self.apply_state_changes(ctx.sim_state, ctx.stats, ctx.rng, result);
+    }
+
+    /// Apply state changes without requiring a SimulatorFiber/Connection.
+    /// Used by both in-process fibers and multiprocess workers.
+    pub fn apply_state_changes(
+        &self,
+        sim_state: &mut SimulatorState,
+        stats: &mut Stats,
+        rng: &mut ChaCha8Rng,
+        result: &OpResult,
+    ) {
         // Only apply state changes on success
         if result.is_err() {
             return;
@@ -205,30 +217,30 @@ impl Operation {
 
         match self {
             Operation::CreateSimpleTable { table_name } => {
-                ctx.sim_state.simple_tables.insert(table_name.clone(), ());
+                sim_state.simple_tables.insert(table_name.clone(), ());
             }
             Operation::SimpleInsert {
                 table_name, key, ..
             } => {
                 let table_name = table_name.clone();
-                let keys = &mut ctx.sim_state.simple_tables_keys;
+                let keys = &mut sim_state.simple_tables_keys;
                 let container = keys
                     .entry(table_name)
                     .or_insert_with(|| SamplesContainer::new(MAX_SAMPLE_KEYS_PER_TABLE));
-                container.add(key.clone(), ctx.rng);
-                ctx.stats.inserts += 1;
+                container.add(key.clone(), rng);
+                stats.inserts += 1;
             }
             Operation::Insert { .. } => {
-                ctx.stats.inserts += 1;
+                stats.inserts += 1;
             }
             Operation::Delete { .. } => {
-                ctx.stats.deletes += 1;
+                stats.deletes += 1;
             }
             Operation::Update { .. } => {
-                ctx.stats.updates += 1;
+                stats.updates += 1;
             }
             Operation::IntegrityCheck => {
-                ctx.stats.integrity_checks += 1;
+                stats.integrity_checks += 1;
             }
             Operation::CreateIndex {
                 index_name,
@@ -237,19 +249,19 @@ impl Operation {
             } => {
                 let index_name = index_name.clone();
                 let table_name = table_name.clone();
-                ctx.sim_state.indexes.insert(index_name, table_name);
+                sim_state.indexes.insert(index_name, table_name);
             }
             Operation::DropIndex { index_name, .. } => {
-                ctx.sim_state.indexes.remove(index_name);
+                sim_state.indexes.remove(index_name);
             }
             Operation::CreateElleTable { table_name } => {
-                ctx.sim_state.elle_tables.insert(table_name.clone(), ());
+                sim_state.elle_tables.insert(table_name.clone(), ());
             }
             Operation::ElleAppend { .. } | Operation::ElleRwWrite { .. } => {
-                ctx.stats.elle_writes += 1;
+                stats.elle_writes += 1;
             }
             Operation::ElleRead { .. } | Operation::ElleRwRead { .. } => {
-                ctx.stats.elle_reads += 1;
+                stats.elle_reads += 1;
             }
             _ => {}
         }
