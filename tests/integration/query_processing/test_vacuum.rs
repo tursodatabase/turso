@@ -28,6 +28,43 @@ fn escape_sqlite_string_literal(text: &str) -> String {
     text.replace('\'', "''")
 }
 
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);")]
+fn test_vacuum_into_restores_connection_state(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute("INSERT INTO t VALUES (1, 'hello'), (2, 'world')")?;
+
+    let before_databases: Vec<(i64, String, String)> = conn.exec_rows("PRAGMA database_list");
+    let before_fk: Vec<(i64,)> = conn.exec_rows("PRAGMA foreign_keys");
+    assert_eq!(before_fk, vec![(1,)]);
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed_state.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let after_databases: Vec<(i64, String, String)> = conn.exec_rows("PRAGMA database_list");
+    assert_eq!(
+        after_databases, before_databases,
+        "VACUUM INTO should not leak its temporary attached destination"
+    );
+
+    let after_fk: Vec<(i64,)> = conn.exec_rows("PRAGMA foreign_keys");
+    assert_eq!(
+        after_fk, before_fk,
+        "VACUUM INTO should restore the connection foreign_keys setting"
+    );
+
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, v FROM t ORDER BY id");
+    assert_eq!(
+        rows,
+        vec![(1, "hello".to_string()), (2, "world".to_string())]
+    );
+
+    Ok(())
+}
+
 #[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER, b TEXT, c BLOB);")]
 fn test_vacuum_into_basic(tmp_db: TempDatabase) -> anyhow::Result<()> {
