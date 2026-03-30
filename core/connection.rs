@@ -14,11 +14,10 @@ use crate::types::{WalFrameInfo, WalState};
 use crate::util::{OpenMode, OpenOptions};
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::Page;
-use crate::MAIN_DB_ID;
 use crate::{
     ast, function,
     io::{MemoryIO, IO},
-    parse_schema_rows, refresh_analyze_stats, translate,
+    is_attached_db, parse_schema_rows, refresh_analyze_stats, translate,
     util::IOExt,
     vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler,
     BusyHandlerCallback, CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd,
@@ -27,6 +26,7 @@ use crate::{
     Parser, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode, Trigger,
     Value, VirtualTable,
 };
+use crate::{MAIN_DB_ID, TEMP_DB_ID};
 use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
@@ -1266,7 +1266,7 @@ impl Connection {
 
     /// Check if a specific attached database is read only or not, by its index
     pub fn is_readonly(&self, index: usize) -> bool {
-        if index <= 1 {
+        if !is_attached_db(index) {
             self.db.is_readonly()
         } else {
             let db = self.attached_databases.read().get_database_by_index(index);
@@ -1555,7 +1555,7 @@ impl Connection {
         database_id: usize,
         f: impl FnOnce(&mut Schema) -> T,
     ) -> T {
-        if !crate::is_attached_db(database_id) {
+        if !is_attached_db(database_id) {
             self.with_schema_mut(f)
         } else {
             // For attached databases, update a connection-local copy of the schema.
@@ -1583,7 +1583,7 @@ impl Connection {
     }
 
     pub(crate) fn get_pager_from_database_index(&self, index: &usize) -> Arc<Pager> {
-        if *index < 2 {
+        if !is_attached_db(*index) {
             self.pager.load().clone()
         } else {
             self.attached_databases.read().get_pager_by_index(index)
@@ -1594,8 +1594,8 @@ impl Connection {
     /// Returns "main" for index 0, "temp" for index 1, and the alias for attached databases.
     pub(crate) fn get_database_name_by_index(&self, index: usize) -> Option<String> {
         match index {
-            0 => Some("main".to_string()),
-            1 => Some("temp".to_string()),
+            MAIN_DB_ID => Some("main".to_string()),
+            TEMP_DB_ID => Some("temp".to_string()),
             _ => self.attached_databases.read().get_name_by_index(index),
         }
     }
@@ -1604,8 +1604,8 @@ impl Connection {
     pub(crate) fn get_database_id_by_name(&self, name: &str) -> Result<usize> {
         let normalized: String = crate::util::normalize_ident(name);
         match normalized.as_str() {
-            "main" => Ok(crate::MAIN_DB_ID),
-            "temp" => Ok(crate::TEMP_DB_ID),
+            "main" => Ok(MAIN_DB_ID),
+            "temp" => Ok(TEMP_DB_ID),
             _ => self
                 .attached_databases
                 .read()
@@ -1617,7 +1617,7 @@ impl Connection {
 
     /// Get the Database object for a given database id.
     pub(crate) fn get_source_database(&self, database_id: usize) -> Arc<Database> {
-        if !crate::is_attached_db(database_id) {
+        if !is_attached_db(database_id) {
             self.db.clone()
         } else {
             self.attached_databases
@@ -2021,7 +2021,7 @@ impl Connection {
     /// Access schema for a database using a closure pattern to avoid cloning
     pub(crate) fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
         match database_id {
-            crate::MAIN_DB_ID | crate::TEMP_DB_ID => {
+            MAIN_DB_ID | TEMP_DB_ID => {
                 // Main database - use connection's schema which should be kept in sync
                 // NOTE: for Temp databases, for now they can use the connection-local schema
                 // but this will change in the future
@@ -2071,7 +2071,7 @@ impl Connection {
 
         // Add main database (always seq=0, name="main")
         let main_path = Self::get_canonical_path_for_database(&self.db);
-        databases.push((0, "main".to_string(), main_path));
+        databases.push((MAIN_DB_ID, "main".to_string(), main_path));
 
         // Add attached databases
         let attached_dbs = self.attached_databases.read();
@@ -2335,7 +2335,7 @@ impl Connection {
     /// Get MVCC transaction ID for a specific database.
     /// Uses fast path for main DB, O(1) HashMap lookup for attached DBs.
     pub(crate) fn get_mv_tx_id_for_db(&self, db: usize) -> Option<u64> {
-        if !crate::is_attached_db(db) {
+        if !is_attached_db(db) {
             self.get_mv_tx_id()
         } else {
             self.attached_mv_txs
@@ -2347,7 +2347,7 @@ impl Connection {
 
     /// Get MVCC transaction ID and mode for a specific database.
     pub(crate) fn get_mv_tx_for_db(&self, db: usize) -> Option<(u64, TransactionMode)> {
-        if !crate::is_attached_db(db) {
+        if !is_attached_db(db) {
             self.get_mv_tx()
         } else {
             self.attached_mv_txs.read().get(&db).copied()
@@ -2356,7 +2356,7 @@ impl Connection {
 
     /// Set MVCC transaction for a specific database.
     pub(crate) fn set_mv_tx_for_db(&self, db: usize, val: Option<(u64, TransactionMode)>) {
-        if !crate::is_attached_db(db) {
+        if !is_attached_db(db) {
             self.set_mv_tx(val);
         } else {
             let mut txs = self.attached_mv_txs.write();
@@ -2444,7 +2444,7 @@ impl Connection {
         if self.is_mvcc_bootstrap_connection() {
             return None;
         }
-        if !crate::is_attached_db(db) {
+        if !is_attached_db(db) {
             self.db.get_mv_store().as_ref().cloned()
         } else {
             let catalog = self.attached_databases.read();
