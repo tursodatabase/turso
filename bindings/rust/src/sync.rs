@@ -1456,4 +1456,130 @@ mod tests {
             stats.main_wal_size as f64 / 1024.0
         );
     }
+
+    /// Reproducer for schema-divergence during sync.
+    ///
+    /// 1. Bootstrap a local client from the remote (table `t` with some rows).
+    /// 2. Push + pull so both sides are even.
+    /// 3. Locally: insert more rows, CREATE two new tables, insert into all three tables.
+    /// 4. Add data on the remote side (simulating another client).
+    /// 5. Push the local changes so the remote has the new schema too.
+    /// 6. Pull into the local client – this must succeed despite the schema having changed.
+    #[tokio::test]
+    pub async fn test_sync_pull_after_local_ddl_and_remote_writes() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server = TursoServer::new().await.unwrap();
+
+        server
+            .db_sql("CREATE TABLE t(x TEXT PRIMARY KEY, y)")
+            .await
+            .unwrap();
+        server
+            .db_sql("INSERT INTO t VALUES ('a', '1'), ('b', '2'), ('c', '3')")
+            .await
+            .unwrap();
+
+        let db = crate::sync::Builder::new_remote(":memory:")
+            .with_remote_url(server.db_url())
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().await.unwrap();
+
+        let rows = all_rows(conn.query("SELECT * FROM t", ()).await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+
+        db.push().await.unwrap();
+        db.pull().await.unwrap();
+
+        conn.execute(
+            "INSERT INTO t VALUES ('d', '4-local'), ('e', '5-local')",
+            (),
+        )
+        .await
+        .unwrap();
+
+        conn.execute("CREATE TABLE t2(y INTEGER, z TEXT)", ())
+            .await
+            .unwrap();
+        conn.execute("CREATE TABLE t3(id INTEGER PRIMARY KEY, payload TEXT)", ())
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO t2 VALUES (1, 'hello'), (2, 'world')", ())
+            .await
+            .unwrap();
+        conn.execute(
+            "INSERT INTO t3 VALUES (100, 'payload1'), (200, 'payload2')",
+            (),
+        )
+        .await
+        .unwrap();
+
+        server
+            .db_sql("INSERT INTO t VALUES ('e', '5-remote'), ('f', '6-remote')")
+            .await
+            .unwrap();
+
+        db.pull().await.unwrap();
+
+        let rows_t = all_rows(
+            conn.query("SELECT x, y FROM t ORDER BY x", ())
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rows_t,
+            vec![
+                vec![Value::Text("a".to_string()), Value::Text("1".to_string())],
+                vec![Value::Text("b".to_string()), Value::Text("2".to_string())],
+                vec![Value::Text("c".to_string()), Value::Text("3".to_string())],
+                vec![
+                    Value::Text("d".to_string()),
+                    Value::Text("4-local".to_string())
+                ],
+                vec![
+                    Value::Text("e".to_string()),
+                    Value::Text("5-local".to_string())
+                ],
+                vec![
+                    Value::Text("f".to_string()),
+                    Value::Text("6-remote".to_string())
+                ],
+            ]
+        );
+
+        let rows_t2 = all_rows(
+            conn.query("SELECT y, z FROM t2 ORDER BY y", ())
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rows_t2,
+            vec![
+                vec![Value::Integer(1), Value::Text("hello".to_string())],
+                vec![Value::Integer(2), Value::Text("world".to_string())],
+            ]
+        );
+
+        let rows_t3 = all_rows(
+            conn.query("SELECT id, payload FROM t3 ORDER BY id", ())
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rows_t3,
+            vec![
+                vec![Value::Integer(100), Value::Text("payload1".to_string())],
+                vec![Value::Integer(200), Value::Text("payload2".to_string())],
+            ]
+        );
+    }
 }
