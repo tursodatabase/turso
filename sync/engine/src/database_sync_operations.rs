@@ -949,7 +949,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
             cond: Box::new(BatchCond::IsAutocommit {}),
         }),
     };
-    let mut ddl_step_indices = std::collections::HashSet::new();
+    let mut add_column_step_indices = std::collections::HashSet::new();
     let mut sql_over_http_requests = vec![
         BatchStep {
             stmt: Stmt {
@@ -1094,7 +1094,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
                     }
                 }
                 if is_alter_add_column {
-                    ddl_step_indices.insert(sql_over_http_requests.len() - 1);
+                    add_column_step_indices.insert(sql_over_http_requests.len() - 1);
                 }
             }
         }
@@ -1134,7 +1134,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
         .into(),
     };
 
-    let _ = sql_execute_http(ctx, replay_hrana_request, &ddl_step_indices).await?;
+    let _ = sql_execute_http(ctx, replay_hrana_request, &add_column_step_indices).await?;
     tracing::info!("push_logical_changes: rows_changed={:?}", rows_changed);
     Ok((source_pull_gen, last_change_id.unwrap_or(0)))
 }
