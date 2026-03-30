@@ -80,9 +80,17 @@ fn query_rows(conn: &Arc<Connection>, io: &MemorySimIO) -> Result<Vec<(i64, Stri
 #[test]
 fn sim_abandon_during_dml_rolls_back() -> Result<()> {
     let (conn, io) = make_conn(1)?;
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")?;
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)")?;
+    // Minimum page cache is 200 pages; large blobs exceed that, forcing
+    // cache spills which produce async IO.
+    conn.execute("PRAGMA cache_size=2")?;
 
-    let mut stmt = conn.prepare("INSERT INTO t VALUES (1, 'a'), (2, 'b') RETURNING id")?;
+    let values = (1..=250)
+        .map(|id| format!("({id}, zeroblob(4000))"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("INSERT INTO t VALUES {values} RETURNING id");
+    let mut stmt = conn.prepare(&sql)?;
     let first = stmt.step()?;
     assert!(
         matches!(first, StepResult::IO),
@@ -100,10 +108,16 @@ fn sim_abandon_during_dml_rolls_back() -> Result<()> {
 #[test]
 fn sim_abandon_after_first_returning_row_commits() -> Result<()> {
     let (conn, io) = make_conn(2)?;
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")?;
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)")?;
+    conn.execute("PRAGMA cache_size=2")?;
 
-    let mut stmt =
-        conn.prepare("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c') RETURNING id")?;
+    let n_rows: i64 = 250;
+    let values = (1..=n_rows)
+        .map(|id| format!("({id}, zeroblob(4000))"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("INSERT INTO t VALUES {values} RETURNING id");
+    let mut stmt = conn.prepare(&sql)?;
     let mut saw_io = false;
     loop {
         match stmt.step()? {
@@ -124,7 +138,7 @@ fn sim_abandon_after_first_returning_row_commits() -> Result<()> {
     // Abandon after scan-back has started; DML is already complete.
     drop(stmt);
 
-    assert_eq!(query_count(&conn, io.as_ref())?, 3);
+    assert_eq!(query_count(&conn, io.as_ref())?, n_rows);
     Ok(())
 }
 
