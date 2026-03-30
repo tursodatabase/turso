@@ -23,7 +23,7 @@ use crate::{
         self,
         explain::{EXPLAIN_COLUMNS_TYPE, EXPLAIN_QUERY_PLAN_COLUMNS_TYPE},
     },
-    LimboError, MvStore, Pager, QueryMode, Result, Value, EXPLAIN_COLUMNS,
+    LimboError, MvStore, Pager, QueryMode, Result, TransactionState, Value, EXPLAIN_COLUMNS,
     EXPLAIN_QUERY_PLAN_COLUMNS,
 };
 
@@ -323,6 +323,18 @@ impl Statement {
             if !matches!(res, Err(LimboError::SchemaUpdated)) {
                 break;
             }
+            // Read transactions can safely reprepare inside an explicit
+            // transaction, but write transactions cannot refresh schema from
+            // disk mid-transaction. Surface SchemaUpdated in that case so the
+            // caller can roll back and retry from a fresh transaction.
+            if !self.program.connection.get_auto_commit()
+                && matches!(
+                    self.program.connection.get_tx_state(),
+                    TransactionState::Write { .. } | TransactionState::PendingUpgrade { .. }
+                )
+            {
+                break;
+            }
             tracing::debug!("reprepare: attempt={}", attempt);
             if let Err(err) = self.reprepare() {
                 self.release_active_root_if_counted();
@@ -490,6 +502,31 @@ impl Statement {
     fn reprepare(&mut self) -> Result<()> {
         tracing::trace!("repreparing statement");
         let conn = self.program.connection.clone();
+        let main_pager = conn.pager.load().clone();
+
+        // SchemaUpdated bypasses the normal abort rollback path, so in
+        // autocommit mode we must unwind any implicit transaction state here
+        // before reparsing. This must clear both pager locks and MVCC tx ids;
+        // otherwise the retried statement can stack a fresh snapshot on top of
+        // leaked transaction state from the failed attempt.
+        let attached_leaked = conn
+            .get_all_attached_pagers_with_index()
+            .into_iter()
+            .any(|(_, pager)| pager.holds_write_lock() || pager.holds_read_lock());
+        let has_implicit_txn_state = main_pager.holds_write_lock()
+            || main_pager.holds_read_lock()
+            || conn.get_tx_state() != TransactionState::None
+            || conn.get_mv_tx().is_some()
+            || conn.next_attached_mv_tx().is_some()
+            || attached_leaked
+            || self.state.auto_txn_cleanup != vdbe::TxnCleanup::None;
+        if conn.get_auto_commit() && has_implicit_txn_state {
+            conn.rollback_current_txn_state(&main_pager, true);
+            self.state.auto_txn_cleanup = vdbe::TxnCleanup::None;
+        }
+        if conn.get_auto_commit() {
+            conn.maybe_reparse_schema()?;
+        }
 
         // End transactions on attached database pagers so they get a fresh view
         // of the database. Without this, the pager would still see the old page 1
@@ -525,7 +562,7 @@ impl Statement {
                 *conn_schema = conn.db.clone_schema();
             }
         }
-        self.program = {
+        let new_program = {
             let mut parser = Parser::new(self.program.sql.as_bytes());
             let cmd = parser.next_cmd()?;
             let cmd = cmd.expect("Same SQL string should be able to be parsed");
@@ -550,7 +587,7 @@ impl Statement {
         // Save parameters before they are reset
         let parameters = std::mem::take(&mut self.state.parameters);
         let (max_registers, cursor_count) = match self.query_mode {
-            QueryMode::Normal => (self.program.max_registers, self.program.cursor_ref.len()),
+            QueryMode::Normal => (new_program.max_registers, new_program.cursor_ref.len()),
             QueryMode::Explain => (EXPLAIN_COLUMNS.len(), 0),
             QueryMode::ExplainQueryPlan => (EXPLAIN_QUERY_PLAN_COLUMNS.len(), 0),
         };
@@ -562,6 +599,7 @@ impl Statement {
             self.counted_as_active_root,
         )?;
         self.state.metrics.reprepares = self.state.metrics.reprepares.saturating_add(1);
+        self.program = new_program;
         // Load the parameters back into the state
         self.state.parameters = parameters;
         Ok(())

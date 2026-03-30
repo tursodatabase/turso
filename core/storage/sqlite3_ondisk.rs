@@ -51,7 +51,7 @@ use tracing::{instrument, Level};
 
 use super::pager::PageRef;
 pub use super::pager::{PageContent, PageInner};
-use super::wal::TursoRwLock;
+use super::wal::{TursoRwLock, WalSharedMetadata, WalSharedRuntime};
 use crate::error::LimboError;
 use crate::fast_lock::SpinLock;
 use crate::io::{Buffer, Completion, FileSyncType, ReadComplete};
@@ -1429,25 +1429,34 @@ pub fn build_shared_wal(
     }
 
     let wal_file_shared = Arc::new(RwLock::new(WalFileShared {
-        enabled: AtomicBool::new(true),
-        wal_header: header.clone(),
-        min_frame: AtomicU64::new(0),
-        max_frame: AtomicU64::new(0),
-        nbackfills: AtomicU64::new(0),
-        transaction_count: AtomicU64::new(0),
-        frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
-        last_checksum: (0, 0),
-        file: Some(file.clone()),
-        read_locks,
-        write_lock: TursoRwLock::new(),
-        loaded: AtomicBool::new(false),
-        checkpoint_lock: TursoRwLock::new(),
-        initialized: AtomicBool::new(false),
-        epoch: AtomicU32::new(0),
+        metadata: WalSharedMetadata {
+            enabled: AtomicBool::new(true),
+            wal_header: header.clone(),
+            min_frame: AtomicU64::new(0),
+            max_frame: AtomicU64::new(0),
+            nbackfills: AtomicU64::new(0),
+            transaction_count: AtomicU64::new(0),
+            last_checksum: (0, 0),
+            loaded: AtomicBool::new(false),
+            loaded_from_disk_scan: AtomicBool::new(true),
+            initialized: AtomicBool::new(false),
+        },
+        runtime: WalSharedRuntime {
+            frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
+            file: Some(file.clone()),
+            read_locks,
+            write_lock: TursoRwLock::new(),
+            checkpoint_lock: TursoRwLock::new(),
+            epoch: AtomicU32::new(0),
+        },
     }));
 
     if size < WAL_HEADER_SIZE as u64 {
-        wal_file_shared.write().loaded.store(true, Ordering::SeqCst);
+        wal_file_shared
+            .write()
+            .metadata
+            .loaded
+            .store(true, Ordering::SeqCst);
         return Ok(wal_file_shared);
     }
 
@@ -1721,7 +1730,7 @@ impl StreamingWalReader {
         }
         let wfs = self.wal_shared.read();
         {
-            let mut frame_cache = wfs.frame_cache.lock();
+            let mut frame_cache = wfs.runtime.frame_cache.lock();
             for (page, mut frames) in state.pending_frames.drain() {
                 // Only include frames up to last valid commit
                 frames.retain(|&f| f <= state.last_valid_frame);
@@ -1730,7 +1739,8 @@ impl StreamingWalReader {
                 }
             }
         }
-        wfs.max_frame
+        wfs.metadata
+            .max_frame
             .store(state.last_valid_frame, Ordering::Release);
     }
 
@@ -1741,21 +1751,21 @@ impl StreamingWalReader {
 
         let max_frame = st.last_valid_frame;
         if max_frame > 0 {
-            let mut frame_cache = wfs.frame_cache.lock();
+            let mut frame_cache = wfs.runtime.frame_cache.lock();
             for frames in frame_cache.values_mut() {
                 frames.retain(|&f| f <= max_frame);
             }
             frame_cache.retain(|_, frames| !frames.is_empty());
         }
 
-        wfs.max_frame.store(max_frame, Ordering::SeqCst);
+        wfs.metadata.max_frame.store(max_frame, Ordering::SeqCst);
         // use checksum of last valid commit frame, not necessarily the last frame
-        wfs.last_checksum = st.last_valid_checksum;
+        wfs.metadata.last_checksum = st.last_valid_checksum;
         if st.header_valid {
-            wfs.initialized.store(true, Ordering::SeqCst);
+            wfs.metadata.initialized.store(true, Ordering::SeqCst);
         }
-        wfs.nbackfills.store(0, Ordering::SeqCst);
-        wfs.loaded.store(true, Ordering::SeqCst);
+        wfs.metadata.nbackfills.store(0, Ordering::SeqCst);
+        wfs.metadata.loaded.store(true, Ordering::SeqCst);
 
         self.done.store(true, Ordering::Release);
         tracing::debug!(
@@ -2259,13 +2269,13 @@ mod tests {
 
         let shared = build_shared_wal(&file, &io).unwrap();
         let guard = shared.read();
-        assert_eq!(guard.max_frame.load(Ordering::Acquire), 1);
-        assert_eq!(guard.last_checksum, commit_checksum);
+        assert_eq!(guard.metadata.max_frame.load(Ordering::Acquire), 1);
+        assert_eq!(guard.metadata.last_checksum, commit_checksum);
 
         // checksum should only include committed frame.
-        assert_ne!(guard.last_checksum, after_frame3_checksum);
+        assert_ne!(guard.metadata.last_checksum, after_frame3_checksum);
 
-        let frame_cache = guard.frame_cache.lock();
+        let frame_cache = guard.runtime.frame_cache.lock();
         assert_eq!(frame_cache.get(&1), Some(&vec![1u64]));
         assert!(frame_cache.get(&2).is_none());
     }

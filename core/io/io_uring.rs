@@ -1,7 +1,13 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
-use super::{common, Completion, CompletionInner, File, OpenFlags, IO};
+use super::{
+    common, Completion, CompletionInner, File, OpenFlags, SharedWalLockKind,
+    SharedWalMappedRegion, IO,
+};
 use crate::io::clock::{Clock, DefaultClock, MonotonicInstant, WallClockInstant};
+use crate::io::unix::{
+    unix_shared_wal_lock_byte, unix_shared_wal_map, unix_shared_wal_unlock_byte,
+};
 use crate::storage::wal::CKPT_BATCH_PAGES;
 use crate::sync::Mutex;
 use crate::turso_assert;
@@ -484,6 +490,10 @@ impl WrappedIOUring {
 }
 
 impl IO for UringIO {
+    fn supports_shared_wal_coordination(&self) -> bool {
+        true
+    }
+
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
         trace!("open_file(path = {})", path);
         let mut file = std::fs::File::options();
@@ -858,6 +868,38 @@ impl File for UringFile {
                 Err(e) => Err(io_error(e, "truncate")),
             }
         }
+    }
+
+    fn shared_wal_lock_byte(
+        &self,
+        offset: u64,
+        exclusive: bool,
+        kind: SharedWalLockKind,
+    ) -> Result<()> {
+        unix_shared_wal_lock_byte(self.file.as_raw_fd(), offset, exclusive, true, kind).map(|_| ())
+    }
+
+    fn shared_wal_try_lock_byte(
+        &self,
+        offset: u64,
+        exclusive: bool,
+        kind: SharedWalLockKind,
+    ) -> Result<bool> {
+        unix_shared_wal_lock_byte(self.file.as_raw_fd(), offset, exclusive, false, kind)
+    }
+
+    fn shared_wal_unlock_byte(&self, offset: u64, kind: SharedWalLockKind) -> Result<()> {
+        unix_shared_wal_unlock_byte(self.file.as_raw_fd(), offset, kind)
+    }
+
+    fn shared_wal_set_len(&self, len: u64) -> Result<()> {
+        self.file
+            .set_len(len)
+            .map_err(|err| io_error(err, "resize shared WAL coordination file"))
+    }
+
+    fn shared_wal_map(&self, offset: u64, len: usize) -> Result<Box<dyn SharedWalMappedRegion>> {
+        unix_shared_wal_map(offset, len, self.file.as_raw_fd())
     }
 }
 
