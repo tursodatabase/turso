@@ -473,7 +473,7 @@ pub fn translate_insert(
 
     let has_before_triggers = !relevant_before_triggers.is_empty();
     if has_before_triggers {
-        compute_virtual_columns_for_triggers(
+        compute_virtual_columns(
             program,
             &insertion.col_mappings,
             insertion.rowid_alias_mapping(),
@@ -729,6 +729,16 @@ pub fn translate_insert(
         }
     }
 
+    // Make computed virtual columns accessible to CHECK and NOT NULL constraint evaluation
+    if insertion.has_virtual_columns() {
+        compute_virtual_columns(
+            program,
+            &insertion.col_mappings,
+            insertion.rowid_alias_mapping(),
+            resolver,
+        )?;
+    }
+
     // Evaluate CHECK constraints after type affinity/TypeCheck but before other constraints
     emit_check_constraints(
         program,
@@ -799,17 +809,6 @@ pub fn translate_insert(
         connection,
         table_references: &mut table_references,
     };
-    // Compute virtual column values before NOT NULL constraint checking,
-    // so that things like `b AS (COALESCE(a, 0)) NOT NULL` pass validation.
-    if insertion.has_virtual_columns() {
-        compute_virtual_columns_for_triggers(
-            program,
-            &insertion.col_mappings,
-            insertion.rowid_alias_mapping(),
-            resolver,
-        )?;
-    }
-
     // NOT NULL default substitution must happen before index key registers are
     // copied in preflight constraint checks. Otherwise the index entry gets NULL
     // while the table row gets the default value, causing integrity_check failures.
@@ -896,7 +895,7 @@ pub fn translate_insert(
     });
     let has_after_triggers = !relevant_after_triggers.is_empty();
     if has_after_triggers {
-        compute_virtual_columns_for_triggers(
+        compute_virtual_columns(
             program,
             &insertion.col_mappings,
             insertion.rowid_alias_mapping(),
@@ -2678,7 +2677,7 @@ fn self_table_ctx_from_col_mappings<'a>(
     SelfTableContext::ForDML(DmlColumnContext::indexed(columns, column_regs))
 }
 
-pub fn compute_virtual_columns_for_triggers<'a>(
+pub fn compute_virtual_columns<'a>(
     program: &mut ProgramBuilder,
     col_mappings: &[ColMapping<'a>],
     rowid_alias: Option<&ColMapping<'a>>,
