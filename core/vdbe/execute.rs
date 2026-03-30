@@ -4,7 +4,7 @@ use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
 use crate::mvcc::database::CheckpointStateMachine;
 use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
-use crate::schema::{Schema, Table, SQLITE_SEQUENCE_TABLE_NAME};
+use crate::schema::{Schema, Table, SCHEMA_TABLE_NAME, SQLITE_SEQUENCE_TABLE_NAME};
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
     integrity_check, CursorTrait, IntegrityCheckError, IntegrityCheckState, PageCategory,
@@ -88,7 +88,7 @@ use crate::storage::btree::{BTreeCursor, BTreeKey};
 use crate::{
     storage::wal::CheckpointResult,
     types::{AggContext, Cursor, ExternalAggState, SeekKey, SeekOp, SumAggState, Value, ValueType},
-    util::{cast_real_to_integer, checked_cast_text_to_numeric, parse_schema_rows},
+    util::{cast_real_to_integer, checked_cast_text_to_numeric},
     vdbe::{
         builder::CursorType,
         insn::{IdxInsertFlags, Insn, SavepointOp},
@@ -10191,6 +10191,24 @@ pub fn op_page_count(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// State for the async ParseSchema instruction state machine.
+/// Stored in `ProgramState::op_parse_schema_state` so that when the inner
+/// schema query yields IO, we can return control to the outer caller and
+/// resume later without losing intermediate parsing state.
+pub struct OpParseSchemaInner {
+    stmt: crate::Statement,
+    schema_arc: Arc<Schema>,
+    from_sql_indexes: Vec<crate::util::UnparsedFromSqlIndex>,
+    automatic_indices: crate::HashMap<String, Vec<(String, i64)>>,
+    dbsp_state_roots: crate::HashMap<String, i64>,
+    dbsp_state_index_roots: crate::HashMap<String, i64>,
+    materialized_view_info: crate::HashMap<String, (String, i64)>,
+    db: usize,
+    previous_auto_commit: bool,
+}
+
+pub type OpParseSchemaState = Option<Box<OpParseSchemaInner>>;
+
 pub fn op_parse_schema(
     program: &Program,
     state: &mut ProgramState,
@@ -10200,6 +10218,12 @@ pub fn op_parse_schema(
     load_insn!(ParseSchema { db, where_clause }, insn);
 
     let conn = program.connection.clone();
+
+    // If we have in-progress state, resume stepping through schema rows.
+    if state.op_parse_schema_state.is_some() {
+        return op_parse_schema_step(state, &conn);
+    }
+
     // set auto commit to false in order for parse schema to not commit changes as transaction state is stored in connection,
     // and we use the same connection for nested query.
     let previous_auto_commit = conn.auto_commit.load(Ordering::SeqCst);
@@ -10212,21 +10236,21 @@ pub fn op_parse_schema(
             .unwrap_or_else(|| "main".to_string());
         format!("{db_name}.sqlite_schema")
     } else {
-        "sqlite_schema".to_string()
+        SCHEMA_TABLE_NAME.to_string()
     };
     let sql = if let Some(where_clause) = where_clause {
         format!("SELECT * FROM {schema_table} WHERE {where_clause}")
     } else {
         format!("SELECT * FROM {schema_table}")
     };
-    let stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare(sql)?;
 
     // Get a mutable schema clone *without* holding the schema lock during
     // nested statement execution.  The nested Statement may call reprepare()
     // which also acquires the schema / database_schemas write lock, so holding
     // it here would deadlock on the same thread (parking_lot RwLock is not
     // re-entrant).
-    let mut schema_arc = if crate::is_attached_db(*db) {
+    let schema_arc = if crate::is_attached_db(*db) {
         // Fetch the fallback schema from attached_databases BEFORE acquiring
         // database_schemas.write() to avoid a nested lock ordering dependency
         // (database_schemas.write -> attached_databases.read).
@@ -10238,9 +10262,8 @@ pub fn op_parse_schema(
                 .map(|(db_inst, _pager)| db_inst.schema.lock().clone())
         };
         let Some(fallback_schema) = fallback_schema else {
-            // The db index refers to a database that was detached after this
-            // program was compiled. The schema cookie check should have caught
-            // this, but defensively return an error instead of panicking.
+            conn.auto_commit
+                .store(previous_auto_commit, Ordering::SeqCst);
             return Err(LimboError::InternalError(format!(
                 "stale reference to detached database (index {db})"
             )));
@@ -10254,37 +10277,133 @@ pub fn op_parse_schema(
         conn.schema.read().clone()
     };
 
-    let schema = Arc::make_mut(&mut schema_arc);
-    // TODO: This function below is synchronous, make it async
-    let existing_views = schema.incremental_views.clone();
+    // Set up MVCC transaction for the nested statement
+    let mv_tx = program.connection.get_mv_tx();
+    stmt.set_mv_tx(mv_tx);
+
     conn.start_nested();
-    let maybe_nested_stmt_err = parse_schema_rows(
+
+    // Store state for resumption across IO boundaries
+    state.op_parse_schema_state = Some(Box::new(OpParseSchemaInner {
         stmt,
-        schema,
-        &conn.syms.read(),
-        // NOTE: We always pass the main DB's mv_tx here because
-        // Statement::set_mv_tx() writes to connection.mv_tx (main DB field).
-        // Passing an attached DB's tx would corrupt the main DB's transaction
-        // state.  The nested statement's opcodes use get_mv_tx_id_for_db(db)
-        // to read the correct per-database tx, so the attached DB case works
-        // correctly without setting mv_tx.
-        program.connection.get_mv_tx(),
-        existing_views,
-    );
+        schema_arc,
+        from_sql_indexes: Vec::with_capacity(10),
+        automatic_indices: Default::default(),
+        dbsp_state_roots: Default::default(),
+        dbsp_state_index_roots: Default::default(),
+        materialized_view_info: Default::default(),
+        db: *db,
+        previous_auto_commit,
+    }));
 
-    // Store the modified schema back
-    if crate::is_attached_db(*db) {
-        conn.database_schemas().write().insert(*db, schema_arc);
-    } else {
-        *conn.schema.write() = schema_arc;
+    // Now begin stepping through the schema rows
+    op_parse_schema_step(state, &conn)
+}
+
+/// Drive the inner schema statement one step at a time.
+/// Returns IO to the outer VDBE loop when the inner statement needs it,
+/// preserving all intermediate parsing state for resumption.
+fn op_parse_schema_step(
+    state: &mut ProgramState,
+    conn: &Arc<Connection>,
+) -> Result<InsnFunctionStepResult> {
+    loop {
+        let inner = state.op_parse_schema_state.as_mut().unwrap();
+        match inner.stmt.step()? {
+            StepResult::IO => {
+                let io = inner
+                    .stmt
+                    .take_io_completions()
+                    .expect("IO returned but no completions");
+                return Ok(InsnFunctionStepResult::IO(io));
+            }
+            StepResult::Row => {
+                let inner = state
+                    .op_parse_schema_state
+                    .as_mut()
+                    .expect("parse schema state should exist");
+                let row = inner.stmt.row().expect("row should be present");
+                let ty = row.get::<&str>(0)?;
+                let name = row.get::<&str>(1)?;
+                let table_name = row.get::<&str>(2)?;
+                let root_page = row.get::<i64>(3)?;
+                let sql = row.get::<&str>(4).ok();
+                let schema = Arc::make_mut(&mut inner.schema_arc);
+                let syms = conn.syms.read();
+                schema.handle_schema_row(
+                    ty,
+                    name,
+                    table_name,
+                    root_page,
+                    sql,
+                    &syms,
+                    &mut inner.from_sql_indexes,
+                    &mut inner.automatic_indices,
+                    &mut inner.dbsp_state_roots,
+                    &mut inner.dbsp_state_index_roots,
+                    &mut inner.materialized_view_info,
+                )?;
+                continue;
+            }
+            StepResult::Done => {
+                // Take the state to finalize
+                let inner = state
+                    .op_parse_schema_state
+                    .take()
+                    .expect("parse schema state should exist");
+                let mut schema_arc = inner.schema_arc;
+                let schema = Arc::make_mut(&mut schema_arc);
+                let mv_store = inner.stmt.mv_store();
+                let syms = conn.syms.read();
+
+                let res1 = schema.populate_indices(
+                    &syms,
+                    inner.from_sql_indexes,
+                    inner.automatic_indices,
+                    mv_store.is_some(),
+                );
+                let res2 = schema.populate_materialized_views(
+                    inner.materialized_view_info,
+                    inner.dbsp_state_roots,
+                    inner.dbsp_state_index_roots,
+                );
+
+                // Store the modified schema back
+                if crate::is_attached_db(inner.db) {
+                    conn.database_schemas().write().insert(inner.db, schema_arc);
+                } else {
+                    *conn.schema.write() = schema_arc;
+                }
+                conn.end_nested();
+                conn.auto_commit
+                    .store(inner.previous_auto_commit, Ordering::SeqCst);
+                let _ = (res1?, res2?);
+
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+            StepResult::Interrupt => {
+                let inner = state
+                    .op_parse_schema_state
+                    .take()
+                    .expect("parse schema state should exist");
+                conn.end_nested();
+                conn.auto_commit
+                    .store(inner.previous_auto_commit, Ordering::SeqCst);
+                return Err(LimboError::Interrupt);
+            }
+            StepResult::Busy => {
+                let inner = state
+                    .op_parse_schema_state
+                    .take()
+                    .expect("parse schema state should exist");
+                conn.end_nested();
+                conn.auto_commit
+                    .store(inner.previous_auto_commit, Ordering::SeqCst);
+                return Err(LimboError::Busy);
+            }
+        }
     }
-    conn.end_nested();
-    conn.auto_commit
-        .store(previous_auto_commit, Ordering::SeqCst);
-    maybe_nested_stmt_err?;
-
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
 }
 
 pub fn op_init_cdc_version(
