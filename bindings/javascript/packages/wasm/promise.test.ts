@@ -16,6 +16,23 @@ afterAll(() => {
     console.log('[afterAll] MainWorker terminated');
 })
 
+test('big schema test', async () => {
+    {
+        const db = await connect("local.db");
+        for (let i = 0; i < 1024; i++) {
+            const stmt = db.prepare(`CREATE TABLE t_${i} (x)`)
+            await stmt.all();
+            await stmt.close();
+        }
+        await db.close();
+    }
+    {
+        const db = await connect("local.db");
+        const rows = await db.prepare("SELECT * FROM sqlite_master").all();
+        console.info(rows);
+    }
+})
+
 test('vector-test', async () => {
     const db = await connect(":memory:");
     const v1 = new Array(1024).fill(0).map((_, i) => i);
