@@ -1462,8 +1462,8 @@ mod tests {
     /// 1. Bootstrap a local client from the remote (table `t` with some rows).
     /// 2. Push + pull so both sides are even.
     /// 3. Locally: insert more rows, CREATE two new tables, insert into all three tables.
-    /// 4. Push the local changes so the remote has the new schema too.
-    /// 5. Add data on the remote side (simulating another client).
+    /// 4. Add data on the remote side (simulating another client).
+    /// 5. Push the local changes so the remote has the new schema too.
     /// 6. Pull into the local client – this must succeed despite the schema having changed.
     #[tokio::test]
     pub async fn test_sync_pull_after_local_ddl_and_remote_writes() {
@@ -1524,7 +1524,6 @@ mod tests {
 
         db.pull().await.unwrap();
 
-        // Verify all data arrived
         let rows_t = all_rows(
             conn.query("SELECT x, y FROM t ORDER BY x", ())
                 .await
