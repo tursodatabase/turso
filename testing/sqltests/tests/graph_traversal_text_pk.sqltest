@@ -1,0 +1,168 @@
+# Graph traversal queries with TEXT primary keys.
+# Anonymized version of a real customer workload: a knowledge graph with text UUID
+# primary keys and CTE-driven neighbor lookups using OR-based multi-index scans.
+#
+# Key patterns tested:
+# - CTE with small seed set → multi-index OR on edges → multi-index OR on nodes
+# - TEXT PK (autoindex) used on both sides of the OR
+# - Optimizer should reorder CTE to outer position despite being listed last in FROM
+
+@database :memory:
+
+setup schema {
+    CREATE TABLE article (
+        id TEXT PRIMARY KEY NOT NULL,
+        title TEXT NOT NULL DEFAULT '',
+        category TEXT DEFAULT 'general',
+        body TEXT DEFAULT '',
+        created_at REAL,
+        updated_at REAL
+    );
+    CREATE TABLE link (
+        id TEXT PRIMARY KEY NOT NULL,
+        source_id TEXT NOT NULL DEFAULT '',
+        target_id TEXT NOT NULL DEFAULT '',
+        kind TEXT NOT NULL DEFAULT '',
+        created_at REAL
+    );
+    CREATE INDEX idx_link_source ON link(source_id);
+    CREATE INDEX idx_link_target ON link(target_id);
+
+    -- 15 articles
+    INSERT INTO article VALUES ('a01', 'Intro to SQL',       'database', '', 1.0, 1.0);
+    INSERT INTO article VALUES ('a02', 'Advanced Joins',     'database', '', 2.0, 2.0);
+    INSERT INTO article VALUES ('a03', 'Index Tuning',       'database', '', 3.0, 3.0);
+    INSERT INTO article VALUES ('a04', 'Query Planning',     'database', '', 4.0, 4.0);
+    INSERT INTO article VALUES ('a05', 'B-Tree Internals',   'storage',  '', 5.0, 5.0);
+    INSERT INTO article VALUES ('a06', 'WAL Overview',       'storage',  '', 6.0, 6.0);
+    INSERT INTO article VALUES ('a07', 'MVCC Basics',        'concurrency', '', 7.0, 7.0);
+    INSERT INTO article VALUES ('a08', 'Lock Managers',      'concurrency', '', 8.0, 8.0);
+    INSERT INTO article VALUES ('a09', 'Cost Models',        'optimizer', '', 9.0, 9.0);
+    INSERT INTO article VALUES ('a10', 'Join Ordering',      'optimizer', '', 10.0, 10.0);
+    INSERT INTO article VALUES ('a11', 'Subquery Flattening','optimizer', '', 11.0, 11.0);
+    INSERT INTO article VALUES ('a12', 'Parsing SQL',        'frontend',  '', 12.0, 12.0);
+    INSERT INTO article VALUES ('a13', 'Type Checking',      'frontend',  '', 13.0, 13.0);
+    INSERT INTO article VALUES ('a14', 'Error Recovery',     'frontend',  '', 14.0, 14.0);
+    INSERT INTO article VALUES ('a15', 'Benchmarking',       'testing',   '', 15.0, 15.0);
+
+    -- 25 links (bidirectional graph relationships)
+    INSERT INTO link VALUES ('e01', 'a01', 'a02', 'related',    1.0);
+    INSERT INTO link VALUES ('e02', 'a02', 'a03', 'related',    2.0);
+    INSERT INTO link VALUES ('e03', 'a03', 'a04', 'related',    3.0);
+    INSERT INTO link VALUES ('e04', 'a04', 'a09', 'related',    4.0);
+    INSERT INTO link VALUES ('e05', 'a04', 'a10', 'related',    5.0);
+    INSERT INTO link VALUES ('e06', 'a05', 'a06', 'related',    6.0);
+    INSERT INTO link VALUES ('e07', 'a07', 'a08', 'related',    7.0);
+    INSERT INTO link VALUES ('e08', 'a09', 'a10', 'similar',    8.0);
+    INSERT INTO link VALUES ('e09', 'a09', 'a11', 'similar',    9.0);
+    INSERT INTO link VALUES ('e10', 'a10', 'a11', 'similar',   10.0);
+    INSERT INTO link VALUES ('e11', 'a12', 'a13', 'related',   11.0);
+    INSERT INTO link VALUES ('e12', 'a13', 'a14', 'related',   12.0);
+    INSERT INTO link VALUES ('e13', 'a01', 'a12', 'cross',     13.0);
+    INSERT INTO link VALUES ('e14', 'a03', 'a05', 'cross',     14.0);
+    INSERT INTO link VALUES ('e15', 'a06', 'a07', 'cross',     15.0);
+    INSERT INTO link VALUES ('e16', 'a08', 'a15', 'cross',     16.0);
+    INSERT INTO link VALUES ('e17', 'a11', 'a15', 'cross',     17.0);
+    INSERT INTO link VALUES ('e18', 'a02', 'a10', 'supplement', 18.0);
+    INSERT INTO link VALUES ('e19', 'a05', 'a09', 'supplement', 19.0);
+    INSERT INTO link VALUES ('e20', 'a01', 'a04', 'supplement', 20.0);
+    INSERT INTO link VALUES ('e21', 'a14', 'a15', 'cross',     21.0);
+    INSERT INTO link VALUES ('e22', 'a01', 'a09', 'cross',     22.0);
+    INSERT INTO link VALUES ('e23', 'a02', 'a04', 'supplement', 23.0);
+    INSERT INTO link VALUES ('e24', 'a07', 'a09', 'cross',     24.0);
+    INSERT INTO link VALUES ('e25', 'a03', 'a10', 'cross',     25.0);
+}
+
+# CTE graph neighbor traversal with TEXT PKs (anonymized customer query pattern).
+# The CTE selects a small seed set, then the main query finds all neighbors
+# connected via links using OR conditions on both link and article tables.
+# CTE is listed LAST in FROM; optimizer should reorder it to outer.
+@setup schema
+snapshot-eqp cte-neighbor-traversal-text-pk {
+    WITH seed_articles AS (
+        SELECT a.id
+        FROM article a
+        WHERE a.id IN ('a01', 'a02', 'a03')
+    )
+    SELECT s.id AS seed_id,
+           l.kind,
+           l.source_id,
+           l.target_id,
+           a.id AS neighbor_id,
+           a.title AS neighbor_title
+    FROM link l
+    JOIN article a ON (l.source_id = a.id OR l.target_id = a.id)
+    JOIN seed_articles s ON (l.source_id = s.id OR l.target_id = s.id) AND a.id != s.id;
+}
+
+# Correctness test: verify the neighbor traversal produces correct results.
+@setup schema
+test cte-neighbor-traversal-correctness {
+    WITH seed_articles AS (
+        SELECT a.id
+        FROM article a
+        WHERE a.id IN ('a01', 'a02')
+    )
+    SELECT s.id AS seed_id,
+           l.source_id,
+           l.target_id,
+           a.id AS neighbor_id
+    FROM link l
+    JOIN article a ON (l.source_id = a.id OR l.target_id = a.id)
+    JOIN seed_articles s ON (l.source_id = s.id OR l.target_id = s.id) AND a.id != s.id
+    ORDER BY s.id, l.source_id, l.target_id, a.id;
+}
+expect {
+    a01|a01|a02|a02
+    a01|a01|a04|a04
+    a01|a01|a09|a09
+    a01|a01|a12|a12
+    a02|a01|a02|a01
+    a02|a02|a03|a03
+    a02|a02|a04|a04
+    a02|a02|a10|a10
+}
+
+# Larger seed set: 5 seed articles
+@setup schema
+test cte-neighbor-traversal-5-seeds {
+    WITH seed_articles AS (
+        SELECT a.id
+        FROM article a
+        WHERE a.id IN ('a01', 'a02', 'a03', 'a09', 'a10')
+    )
+    SELECT s.id AS seed_id,
+           l.source_id,
+           l.target_id,
+           a.id AS neighbor_id
+    FROM link l
+    JOIN article a ON (l.source_id = a.id OR l.target_id = a.id)
+    JOIN seed_articles s ON (l.source_id = s.id OR l.target_id = s.id) AND a.id != s.id
+    ORDER BY s.id, l.source_id, l.target_id, a.id;
+}
+expect {
+    a01|a01|a02|a02
+    a01|a01|a04|a04
+    a01|a01|a09|a09
+    a01|a01|a12|a12
+    a02|a01|a02|a01
+    a02|a02|a03|a03
+    a02|a02|a04|a04
+    a02|a02|a10|a10
+    a03|a02|a03|a02
+    a03|a03|a04|a04
+    a03|a03|a05|a05
+    a03|a03|a10|a10
+    a09|a01|a09|a01
+    a09|a04|a09|a04
+    a09|a05|a09|a05
+    a09|a07|a09|a07
+    a09|a09|a10|a10
+    a09|a09|a11|a11
+    a10|a02|a10|a02
+    a10|a03|a10|a03
+    a10|a04|a10|a04
+    a10|a09|a10|a09
+    a10|a10|a11|a11
+}
+

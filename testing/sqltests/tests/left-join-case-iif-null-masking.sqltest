@@ -1,0 +1,79 @@
+@database :memory:
+
+setup tables {
+    CREATE TABLE t1(id INT);
+    CREATE TABLE t2(id INT, val INT);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (1, 10), (3, 30);
+}
+
+@setup tables
+test left-join-case-when-is-null-not-rejecting {
+    SELECT t1.id, t2.val FROM t1 LEFT JOIN t2 ON t1.id = t2.id
+    WHERE CASE WHEN t2.val IS NULL THEN 1 ELSE t2.val END > 0
+    ORDER BY t1.id;
+}
+expect {
+    1|10
+    2|
+    3|30
+}
+
+@setup tables
+test left-join-iif-is-null-not-rejecting {
+    SELECT t1.id, t2.val FROM t1 LEFT JOIN t2 ON t1.id = t2.id
+    WHERE IIF(t2.val IS NULL, 1, t2.val) > 0
+    ORDER BY t1.id;
+}
+expect {
+    1|10
+    2|
+    3|30
+}
+
+@setup tables
+test left-join-case-when-is-not-null-not-rejecting {
+    SELECT t1.id, t2.val FROM t1 LEFT JOIN t2 ON t1.id = t2.id
+    WHERE CASE WHEN t2.val IS NOT NULL THEN t2.val ELSE 1 END > 0
+    ORDER BY t1.id;
+}
+expect {
+    1|10
+    2|
+    3|30
+}
+
+@setup tables
+test left-join-case-without-null-check-is-rejecting {
+    SELECT t1.id, t2.val FROM t1 LEFT JOIN t2 ON t1.id = t2.id
+    WHERE CASE WHEN t2.val > 5 THEN t2.val ELSE 0 END > 0
+    ORDER BY t1.id;
+}
+expect {
+    1|10
+    3|30
+}
+
+@setup tables
+test left-join-iif-is-not-null-not-rejecting {
+    SELECT t1.id, t2.val FROM t1 LEFT JOIN t2 ON t1.id = t2.id
+    WHERE IIF(t2.val IS NOT NULL, t2.val, 1) > 0
+    ORDER BY t1.id;
+}
+expect {
+    1|10
+    2|
+    3|30
+}
+
+@setup tables
+test left-join-case-multiple-when-branches {
+    SELECT t1.id, t2.val FROM t1 LEFT JOIN t2 ON t1.id = t2.id
+    WHERE CASE WHEN t2.val > 20 THEN 100 WHEN t2.val IS NULL THEN 50 ELSE t2.val END > 0
+    ORDER BY t1.id;
+}
+expect {
+    1|10
+    2|
+    3|30
+}

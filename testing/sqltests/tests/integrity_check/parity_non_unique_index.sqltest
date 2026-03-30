@@ -1,0 +1,18 @@
+@database database/integrity_non_unique_index_entry.db readonly
+
+@skip-file-if mvcc "not supported in MVCC mode"
+
+test integrity-check-non-unique-index-entry {
+    PRAGMA integrity_check;
+}
+expect unordered {
+    non-unique entry in index idx_u
+    row 3 missing from index idx_u
+}
+
+test quick-check-non-unique-index-entry {
+    PRAGMA quick_check;
+}
+expect {
+    ok
+}

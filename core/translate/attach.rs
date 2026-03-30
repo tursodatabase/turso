@@ -4,7 +4,9 @@ use crate::translate::expr::{sanitize_string, translate_expr};
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::util::normalize_ident;
 use crate::vdbe::insn::Insn;
+use crate::Connection;
 use crate::Result;
+use std::sync::Arc;
 use turso_parser::ast::{Expr, Literal};
 
 /// Translate ATTACH statement
@@ -14,8 +16,14 @@ pub fn translate_attach(
     resolver: &Resolver,
     db_name: &Expr,
     key: &Option<Box<Expr>>,
-    mut program: ProgramBuilder,
-) -> Result<ProgramBuilder> {
+    program: &mut ProgramBuilder,
+    connection: Arc<Connection>,
+) -> Result<()> {
+    if !connection.experimental_attach_enabled() {
+        return Err(crate::LimboError::ParseError(
+            "ATTACH is an experimental feature. Enable with --experimental-attach flag".to_string(),
+        ));
+    }
     // SQLite treats ATTACH as a function call to sqlite_attach(filename, dbname, key)
     // We'll allocate registers for the arguments and call the function
 
@@ -54,7 +62,7 @@ pub fn translate_attach(
             });
         }
         _ => {
-            translate_expr(&mut program, None, expr, arg_reg, resolver)?;
+            translate_expr(program, None, expr, arg_reg, resolver)?;
         }
     }
 
@@ -85,13 +93,13 @@ pub fn translate_attach(
             });
         }
         _ => {
-            translate_expr(&mut program, None, db_name, arg_reg + 1, resolver)?;
+            translate_expr(program, None, db_name, arg_reg + 1, resolver)?;
         }
     }
 
     // Load key argument (NULL if not provided)
     if let Some(key_expr) = key {
-        translate_expr(&mut program, None, key_expr, arg_reg + 2, resolver)?;
+        translate_expr(program, None, key_expr, arg_reg + 2, resolver)?;
     } else {
         program.emit_insn(Insn::Null {
             dest: arg_reg + 2,
@@ -110,7 +118,7 @@ pub fn translate_attach(
         },
     });
 
-    Ok(program)
+    Ok(())
 }
 
 /// Translate DETACH statement
@@ -118,8 +126,14 @@ pub fn translate_attach(
 pub fn translate_detach(
     expr: &Expr,
     resolver: &Resolver,
-    mut program: ProgramBuilder,
-) -> Result<ProgramBuilder> {
+    program: &mut ProgramBuilder,
+    connection: Arc<Connection>,
+) -> Result<()> {
+    if !connection.experimental_attach_enabled() {
+        return Err(crate::LimboError::ParseError(
+            "DETACH is an experimental feature. Enable with --experimental-attach flag".to_string(),
+        ));
+    }
     // SQLite treats DETACH as a function call to sqlite_detach(dbname)
 
     program.extend(&ProgramBuilderOpts {
@@ -157,7 +171,7 @@ pub fn translate_detach(
             });
         }
         _ => {
-            translate_expr(&mut program, None, expr, arg_reg, resolver)?;
+            translate_expr(program, None, expr, arg_reg, resolver)?;
         }
     }
 
@@ -172,5 +186,5 @@ pub fn translate_detach(
         },
     });
 
-    Ok(program)
+    Ok(())
 }

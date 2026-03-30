@@ -1,5 +1,4 @@
 use rand::{seq::SliceRandom as _, Rng};
-use turso_parser::ast::{self, Expr};
 
 use crate::{
     generation::GenerationContext,
@@ -118,120 +117,40 @@ impl ArbitraryFrom<(&Table, &Vec<SimValue>)> for Predicate {
             // T or T
             // T and T
 
+            // Prepare a vector of the predicates in context
+            let ctx_preds: Vec<Predicate> = context.iter().map(|(_, p)| p.clone()).collect();
+
             result = one_of(
                 vec![
                     // T or (X1 or X2 or ... or Xn)
                     Box::new(|_| {
-                        Predicate(Expr::Binary(
-                            Box::new(result.0.clone()),
-                            ast::Operator::Or,
-                            Box::new(
-                                context
-                                    .iter()
-                                    .map(|(_, p)| p.clone())
-                                    .reduce(|accum, curr| {
-                                        Predicate(Expr::Binary(
-                                            Box::new(accum.0),
-                                            ast::Operator::Or,
-                                            Box::new(curr.0),
-                                        ))
-                                    })
-                                    .unwrap_or(Predicate::false_())
-                                    .0,
-                            ),
-                        ))
+                        let or_expr = Predicate::or(ctx_preds.clone());
+                        Predicate::or(vec![result.clone(), or_expr])
                     }),
                     // T or (T1 and T2 and ... and Tn)
                     Box::new(|_| {
-                        Predicate(Expr::Binary(
-                            Box::new(result.0.clone()),
-                            ast::Operator::Or,
-                            Box::new(
-                                context
-                                    .iter()
-                                    .map(|(_, p)| p.clone())
-                                    .reduce(|accum, curr| {
-                                        Predicate(Expr::Binary(
-                                            Box::new(accum.0),
-                                            ast::Operator::And,
-                                            Box::new(curr.0),
-                                        ))
-                                    })
-                                    .unwrap_or(Predicate::true_())
-                                    .0,
-                            ),
-                        ))
+                        let and_expr = Predicate::and(ctx_preds.clone());
+                        Predicate::or(vec![result.clone(), and_expr])
                     }),
                     // T and T
                     Box::new(|_| {
                         // Check if all the predicates in the context are true
                         if context.iter().all(|(b, _)| *b) {
-                            // T and (X1 or X2 or ... or Xn)
-                            Predicate(Expr::Binary(
-                                Box::new(result.0.clone()),
-                                ast::Operator::And,
-                                Box::new(
-                                    context
-                                        .iter()
-                                        .map(|(_, p)| p.clone())
-                                        .reduce(|accum, curr| {
-                                            Predicate(Expr::Binary(
-                                                Box::new(accum.0),
-                                                ast::Operator::And,
-                                                Box::new(curr.0),
-                                            ))
-                                        })
-                                        .unwrap_or(Predicate::true_())
-                                        .0,
-                                ),
-                            ))
+                            // T and (X1 and X2 and ... and Xn)
+                            let and_expr = Predicate::and(ctx_preds.clone());
+                            Predicate::and(vec![result.clone(), and_expr])
                         }
                         // Check if there is at least one true predicate
                         else if context.iter().any(|(b, _)| *b) {
                             // T and (X1 or X2 or ... or Xn)
-                            Predicate(Expr::Binary(
-                                Box::new(result.0.clone()),
-                                ast::Operator::And,
-                                Box::new(
-                                    context
-                                        .iter()
-                                        .map(|(_, p)| p.clone())
-                                        .reduce(|accum, curr| {
-                                            Predicate(Expr::Binary(
-                                                Box::new(accum.0),
-                                                ast::Operator::Or,
-                                                Box::new(curr.0),
-                                            ))
-                                        })
-                                        .unwrap_or(Predicate::false_())
-                                        .0,
-                                ),
-                            ))
-                            // Predicate::And(vec![
-                            //     result.clone(),
-                            //     Predicate::Or(context.iter().map(|(_, p)| p.clone()).collect()),
-                            // ])
+                            let or_expr = Predicate::or(ctx_preds.clone());
+                            Predicate::and(vec![result.clone(), or_expr])
                         } else {
                             // T and (X1 or X2 or ... or Xn or TRUE)
-                            Predicate(Expr::Binary(
-                                Box::new(result.0.clone()),
-                                ast::Operator::And,
-                                Box::new(
-                                    context
-                                        .iter()
-                                        .map(|(_, p)| p.clone())
-                                        .chain(std::iter::once(Predicate::true_()))
-                                        .reduce(|accum, curr| {
-                                            Predicate(Expr::Binary(
-                                                Box::new(accum.0),
-                                                ast::Operator::Or,
-                                                Box::new(curr.0),
-                                            ))
-                                        })
-                                        .unwrap() // Chain guarantees at least one value
-                                        .0,
-                                ),
-                            ))
+                            let mut preds = ctx_preds.clone();
+                            preds.push(Predicate::true_());
+                            let or_expr = Predicate::or(preds);
+                            Predicate::and(vec![result.clone(), or_expr])
                         }
                     }),
                 ],

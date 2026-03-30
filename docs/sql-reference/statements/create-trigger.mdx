@@ -1,0 +1,231 @@
+---
+title: CREATE TRIGGER
+description: Create a trigger that executes statements automatically in response to table changes
+sidebarTitle: CREATE TRIGGER
+---
+
+# CREATE TRIGGER
+
+<Info>
+This feature is experimental and must be [enabled before use](/docs/sql-reference/experimental-features).
+</Info>
+
+Create a trigger that automatically executes one or more SQL statements when a row is inserted into, updated in, or deleted from a table.
+
+## Syntax
+
+```sql
+CREATE [TEMPORARY] TRIGGER [IF NOT EXISTS] [schema-name.]trigger-name
+    [BEFORE | AFTER | INSTEAD OF]
+    {INSERT | UPDATE [OF column-name, ...] | DELETE}
+    ON table-name
+    [FOR EACH ROW]
+    [WHEN expression]
+BEGIN
+    statement;
+    [statement; ...]
+END;
+```
+
+## Description
+
+A trigger defines a set of SQL statements that run automatically when a specified data modification event occurs on a table or view. Triggers execute within the same transaction as the statement that fired them -- if the transaction is rolled back, the trigger's effects are also rolled back.
+
+### Parameters
+
+| Parameter | Description |
+|-----------|-------------|
+| `TEMPORARY` | Creates the trigger in a temporary database. The trigger is visible only to the current connection and is dropped when the connection closes. `TEMP` is accepted as a synonym. |
+| `IF NOT EXISTS` | Prevents an error if a trigger with the same name already exists. |
+| `schema-name` | The name of the attached database containing the trigger. Defaults to the main database if omitted. Cannot be used with `TEMPORARY`. |
+| `trigger-name` | A unique name for the trigger within the database. |
+| `BEFORE` / `AFTER` / `INSTEAD OF` | When the trigger fires relative to the triggering event. Default is `BEFORE`. |
+| `INSERT` / `UPDATE` / `DELETE` | The data modification event that fires the trigger. |
+| `OF column-name, ...` | For UPDATE triggers only. Restricts the trigger to fire only when the specified columns are modified. |
+| `table-name` | The table (or view, for INSTEAD OF triggers) that the trigger monitors. |
+| `FOR EACH ROW` | The trigger fires once per modified row. This is the only supported mode and is the default even if omitted. |
+| `WHEN expression` | An optional condition. The trigger body executes only for rows where the expression evaluates to true. |
+
+## Trigger Timing
+
+### BEFORE Triggers
+
+A `BEFORE` trigger fires before the triggering statement modifies the row. Use BEFORE triggers to validate or transform data before it is written.
+
+- The `NEW` row reference contains the values that are about to be written. For INSERT triggers, `NEW` is the row being inserted. For UPDATE triggers, `NEW` contains the updated values.
+- The `OLD` row reference is available in UPDATE and DELETE triggers and contains the current values before modification.
+- If a BEFORE trigger raises an error, the triggering operation is aborted for that row.
+
+### AFTER Triggers
+
+An `AFTER` trigger fires after the triggering statement has modified the row. Use AFTER triggers for logging, auditing, or cascading changes to other tables.
+
+- The `NEW` and `OLD` row references are available with the same semantics as BEFORE triggers.
+- The row has already been written when the trigger body executes.
+
+### INSTEAD OF Triggers
+
+An `INSTEAD OF` trigger can only be created on a view. It fires in place of the triggering INSERT, UPDATE, or DELETE, allowing you to make views writable.
+
+- The actual INSERT, UPDATE, or DELETE on the view does not execute. The trigger body is responsible for performing the desired changes on the underlying tables.
+
+## Row References
+
+Inside a trigger body, `NEW` and `OLD` are special row references that provide access to column values.
+
+| Reference | INSERT | UPDATE | DELETE |
+|-----------|--------|--------|--------|
+| `NEW.column` | Value being inserted | Updated value | Not available |
+| `OLD.column` | Not available | Value before update | Value being deleted |
+
+```sql
+-- Access individual columns
+NEW.email
+OLD.status
+```
+
+## WHEN Clause
+
+The optional `WHEN` clause filters which rows cause the trigger body to execute. The expression can reference `NEW` and `OLD` columns.
+
+```sql
+-- Only fire when the status column actually changes
+CREATE TRIGGER log_status_change
+    AFTER UPDATE OF status ON orders
+    WHEN OLD.status != NEW.status
+BEGIN
+    INSERT INTO order_log (order_id, old_status, new_status, changed_at)
+    VALUES (NEW.id, OLD.status, NEW.status, datetime('now'));
+END;
+```
+
+## UPDATE OF Columns
+
+For UPDATE triggers, you can restrict the trigger to fire only when specific columns are modified. Without the `OF` clause, the trigger fires on any UPDATE to the table.
+
+```sql
+-- Only fires when price or quantity changes, not when name changes
+CREATE TRIGGER recalc_total
+    BEFORE UPDATE OF price, quantity ON line_items
+BEGIN
+    UPDATE line_items SET total = NEW.price * NEW.quantity WHERE id = NEW.id;
+END;
+```
+
+## RAISE Function
+
+The `RAISE` function is used inside trigger bodies (and other contexts) to interrupt execution and signal an error. It takes one of four forms:
+
+| Form | Behavior |
+|------|----------|
+| `RAISE(IGNORE)` | Skips the remainder of the trigger body and the triggering statement for the current row. Processing continues with the next row. |
+| `RAISE(ABORT, message)` | Aborts the current statement and rolls back any changes made by that statement, but preserves prior changes in the transaction. This is the default error handling behavior. |
+| `RAISE(ROLLBACK, message)` | Aborts the current statement and rolls back the entire transaction. |
+| `RAISE(FAIL, message)` | Aborts the current statement. Changes already made by the statement (previous rows) are preserved, but the current row and subsequent rows are not processed. |
+
+```sql
+CREATE TRIGGER validate_age
+    BEFORE INSERT ON users
+BEGIN
+    SELECT RAISE(ABORT, 'age must be positive')
+    WHERE NEW.age <= 0;
+END;
+```
+
+## Multiple Statements
+
+A trigger body can contain multiple SQL statements separated by semicolons. The statements execute in order within the same transaction.
+
+```sql
+CREATE TRIGGER on_user_delete
+    AFTER DELETE ON users
+BEGIN
+    DELETE FROM user_preferences WHERE user_id = OLD.id;
+    DELETE FROM user_sessions WHERE user_id = OLD.id;
+    INSERT INTO audit_log (action, entity, entity_id, performed_at)
+    VALUES ('delete', 'user', OLD.id, datetime('now'));
+END;
+```
+
+## Examples
+
+### Audit Logging Trigger
+
+Track all changes to a table with an audit log.
+
+```sql
+CREATE TABLE accounts (
+    id INTEGER PRIMARY KEY,
+    owner TEXT NOT NULL,
+    balance REAL NOT NULL DEFAULT 0
+);
+
+CREATE TABLE account_audit (
+    id INTEGER PRIMARY KEY,
+    account_id INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    old_balance REAL,
+    new_balance REAL,
+    changed_at TEXT NOT NULL
+);
+
+CREATE TRIGGER audit_balance_change
+    AFTER UPDATE OF balance ON accounts
+BEGIN
+    INSERT INTO account_audit (account_id, action, old_balance, new_balance, changed_at)
+    VALUES (NEW.id, 'update', OLD.balance, NEW.balance, datetime('now'));
+END;
+
+-- This UPDATE automatically creates an audit row
+UPDATE accounts SET balance = balance + 100 WHERE id = 1;
+```
+
+### Validation Trigger
+
+Enforce business rules before data is written.
+
+```sql
+CREATE TABLE reservations (
+    id INTEGER PRIMARY KEY,
+    room_id INTEGER NOT NULL,
+    check_in TEXT NOT NULL,
+    check_out TEXT NOT NULL
+);
+
+CREATE TRIGGER validate_reservation
+    BEFORE INSERT ON reservations
+BEGIN
+    SELECT RAISE(ABORT, 'check_out must be after check_in')
+    WHERE NEW.check_out <= NEW.check_in;
+END;
+```
+
+### Cascading Update Trigger
+
+Propagate changes to related tables.
+
+```sql
+CREATE TABLE products (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    category_id INTEGER
+);
+
+CREATE TABLE categories (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL
+);
+
+-- When a category is deleted, unset the category on all associated products
+CREATE TRIGGER clear_product_category
+    BEFORE DELETE ON categories
+BEGIN
+    UPDATE products SET category_id = NULL WHERE category_id = OLD.id;
+END;
+```
+
+## See Also
+
+- [DROP TRIGGER](/docs/sql-reference/statements/drop-trigger) for removing triggers
+- [CREATE VIEW](/docs/sql-reference/statements/create-view) for views that can use INSTEAD OF triggers
+- [INSERT](/docs/sql-reference/statements/insert), [UPDATE](/docs/sql-reference/statements/update), [DELETE](/docs/sql-reference/statements/delete) for the statements that fire triggers

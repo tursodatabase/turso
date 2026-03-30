@@ -1,0 +1,163 @@
+@database :memory:
+
+# Regression tests for row value (tuple) IN expression.
+# Previously crashed with "insufficient registers allocated for expression vector write".
+
+setup schema {
+    CREATE TABLE t(a INT, b INT, c TEXT);
+    INSERT INTO t VALUES (1,10,'x'),(2,20,'y'),(1,20,'z'),(3,30,'w');
+}
+
+test row-value-in-literal {
+    SELECT (1,2) IN ((1,2),(3,4));
+}
+expect {
+    1
+}
+
+test row-value-in-literal-no-match {
+    SELECT (1,2) IN ((3,4),(5,6));
+}
+expect {
+    0
+}
+
+@setup schema
+test row-value-in-where-clause {
+    SELECT * FROM t WHERE (a, b) IN ((1,10),(2,20)) ORDER BY a, b;
+}
+expect {
+    1|10|x
+    2|20|y
+}
+
+@setup schema
+test row-value-in-where-no-match {
+    SELECT * FROM t WHERE (a, b) IN ((9,9),(8,8)) ORDER BY a, b;
+}
+expect {
+}
+
+@setup schema
+test row-value-in-single-element-list {
+    SELECT * FROM t WHERE (a, b) IN ((1,10)) ORDER BY a, b;
+}
+expect {
+    1|10|x
+}
+
+@setup schema
+test row-value-not-in {
+    SELECT * FROM t WHERE (a, b) NOT IN ((1,10),(2,20)) ORDER BY a, b;
+}
+expect {
+    1|20|z
+    3|30|w
+}
+
+test row-value-in-three-columns {
+    SELECT (1,2,3) IN ((1,2,3),(4,5,6));
+}
+expect {
+    1
+}
+
+test row-value-in-three-columns-no-match {
+    SELECT (1,2,3) IN ((1,2,4),(4,5,6));
+}
+expect {
+    0
+}
+
+@setup schema
+test row-value-in-or-condition {
+    SELECT * FROM t WHERE (a, b) IN ((1,10)) OR c = 'w' ORDER BY a, b;
+}
+expect {
+    1|10|x
+    3|30|w
+}
+
+setup row_value_subquery_schema {
+    CREATE TABLE t(a INT, b INT, g INT, c TEXT);
+    CREATE TABLE s(x INT, y INT, g INT);
+    INSERT INTO t VALUES
+        (1, 10, 1, 'm1'),
+        (1, 20, 1, 'm2'),
+        (2, 20, 2, 'm3'),
+        (NULL, 20, 2, 'm4'),
+        (3, NULL, 3, 'm5'),
+        (NULL, NULL, 3, 'm6');
+    INSERT INTO s VALUES
+        (1, 10, 1),
+        (1, 10, 1),
+        (1, NULL, 1),
+        (2, 20, 2),
+        (NULL, 20, 2),
+        (3, NULL, 3),
+        (NULL, NULL, 3);
+}
+
+@setup row_value_subquery_schema
+test row-value-correlated-subquery-in {
+    SELECT c
+    FROM t
+    WHERE (a, b) IN (SELECT x, y FROM s WHERE s.g = t.g)
+    ORDER BY c;
+}
+expect {
+    m1
+    m3
+}
+
+@setup row_value_subquery_schema
+test row-value-correlated-subquery-not-in {
+    SELECT c
+    FROM t
+    WHERE (a, b) NOT IN (SELECT x, y FROM s WHERE s.g = t.g)
+    ORDER BY c;
+}
+expect {
+}
+
+@setup row_value_subquery_schema
+test row-value-left-join-correlated-subquery-in {
+    CREATE TABLE u(id INT, a INT, b INT);
+    INSERT INTO u VALUES (1, 1, 10), (2, 2, 20), (3, 9, 9);
+    SELECT t.c, coalesce(u.id, -1)
+    FROM t
+    LEFT JOIN u
+      ON (t.a, t.b) IN (SELECT x, y FROM s WHERE s.g = t.g)
+     AND t.a = u.a
+     AND t.b = u.b
+    ORDER BY t.c, u.id;
+}
+expect {
+    m1|1
+    m2|-1
+    m3|2
+    m4|-1
+    m5|-1
+    m6|-1
+}
+
+@setup row_value_subquery_schema
+test row-value-left-join-correlated-subquery-not-in {
+    CREATE TABLE u(id INT, a INT, b INT);
+    INSERT INTO u VALUES (1, 1, 10), (2, 2, 20), (3, 9, 9);
+    SELECT t.c, coalesce(u.id, -1)
+    FROM t
+    LEFT JOIN u
+      ON (t.a, t.b) NOT IN (SELECT x, y FROM s WHERE s.g = t.g)
+     AND t.a = u.a
+     AND t.b = u.b
+    ORDER BY t.c, u.id;
+}
+expect {
+    m1|-1
+    m2|-1
+    m3|-1
+    m4|-1
+    m5|-1
+    m6|-1
+}

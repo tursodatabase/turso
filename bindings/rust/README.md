@@ -11,6 +11,7 @@ The next evolution of SQLite: A high-performance, SQLite-compatible database lib
 - **Cross-Platform**: Supports Linux, macOS, and Windows
 - **Transaction Support**: Full ACID transactions with rollback support
 - **Prepared Statements**: Optimized query execution with parameter binding
+- **Cloud Sync**: Sync with Turso Cloud using `Builder::new_remote()` (optional `sync` feature)
 
 ## Installation
 
@@ -18,7 +19,15 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-turso = "0.2"
+turso = "0.4.3"
+tokio = { version = "1.0", features = ["full"] }
+```
+
+For cloud sync capabilities, enable the `sync` feature:
+
+```toml
+[dependencies]
+turso = { version = "0.4.3", features = ["sync"] }
 tokio = { version = "1.0", features = ["full"] }
 ```
 
@@ -55,7 +64,7 @@ async fn main() -> turso::Result<()> {
     // Query data
     let mut rows = conn.query("SELECT * FROM users", ()).await?;
     
-    while let Some(row) = rows.try_next().await? {
+    while let Some(row) = rows.next().await? {
         let id = row.get_value(0)?;
         let name = row.get_value(1)?;
         let email = row.get_value(2)?;
@@ -104,6 +113,45 @@ async fn main() -> turso::Result<()> {
 }
 ```
 
+### Synced Database
+
+Sync your local database with Turso Cloud:
+
+```rust
+use turso::sync::Builder;
+
+#[tokio::main]
+async fn main() -> turso::Result<()> {
+    // Create a synced database
+    let db = Builder::new_remote("local.db")
+        .with_remote_url("libsql://your-database.turso.io")
+        .with_auth_token("your-token")
+        .build()
+        .await?;
+
+    let conn = db.connect().await?;
+
+    // Create a table and insert data
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, content TEXT)",
+        ()
+    ).await?;
+
+    conn.execute(
+        "INSERT INTO notes (content) VALUES (?1)",
+        ["My first synced note"]
+    ).await?;
+
+    // Push local changes to remote
+    db.push().await?;
+
+    // Pull remote changes to local
+    db.pull().await?;
+
+    Ok(())
+}
+```
+
 ## API Reference
 
 ### Builder
@@ -146,6 +194,45 @@ while let Some(row) = rows.try_next().await? {
     let email = row.get_value(1)?.as_text().unwrap_or(&"".to_string());
     println!("{}: {}", name, email);
 }
+```
+
+### Sync API Reference
+
+#### sync::Builder
+
+Create a synced database that synchronizes with Turso Cloud:
+
+```rust
+use turso::sync::Builder;
+
+let db = Builder::new_remote("local.db")       // Local database path (or ":memory:")
+    .with_remote_url("libsql://db.turso.io")   // Remote URL (https://, http://, or libsql://)
+    .with_auth_token("your-token")              // Authorization token
+    .bootstrap_if_empty(true)                   // Download schema on first sync (default: true)
+    .with_remote_encryption("base64-encoded-key", RemoteEncryptionCipher::Aes256Gcm) // Optional remote encryption
+    .build()
+    .await?;
+```
+
+#### sync::Database
+
+Operations for synced databases:
+
+```rust
+// Push local changes to remote
+db.push().await?;
+
+// Pull remote changes (returns true if changes were applied)
+let had_changes = db.pull().await?;
+
+// Force WAL checkpoint
+db.checkpoint().await?;
+
+// Get sync statistics
+let stats = db.stats().await?;
+println!("Received: {} bytes", stats.network_received_bytes);
+println!("Sent: {} bytes", stats.network_sent_bytes);
+println!("WAL size: {} bytes", stats.main_wal_size);
 ```
 
 ## License

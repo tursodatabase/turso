@@ -1,0 +1,30 @@
+---
+source: cte_cardinality.sqltest
+expression: |-
+  WITH seed_ids AS (
+          SELECT id FROM items LIMIT 3
+      )
+      SELECT s.id AS seed_id,
+             l.kind,
+             l.src_id,
+             l.dst_id,
+             i.id AS neighbor_id,
+             i.name AS neighbor_name
+      FROM links l
+      JOIN items i ON (l.src_id = i.id OR l.dst_id = i.id)
+      JOIN seed_ids s ON (l.src_id = s.id OR l.dst_id = s.id) AND i.id != s.id;
+info:
+  statement_type: WITH (CTE)
+  tables:
+  - items
+  - links
+  - seed_ids
+  setup_blocks:
+  - tables
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN seed_ids AS s
+|  `--SCAN items
+|--MULTI-INDEX OR l (idx_links_src, idx_links_dst)
+`--MULTI-INDEX OR i (PRIMARY KEY, PRIMARY KEY)

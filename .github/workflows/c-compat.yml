@@ -11,6 +11,14 @@ on:
     branches:
       - main
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: 10
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -23,12 +31,23 @@ jobs:
       - name: Install Rust(stable)
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+
+      - uses: "./.github/shared/setup-sccache"
+
       - name: Build Turso C bindings
-        run: cargo build -p turso_sqlite3 --features capi
+        run: cargo build -p turso_sqlite3 --features capi --locked
 
       - name: Run C compat tests from Rust
         working-directory: sqlite3
-        run: cargo test
+        run: cargo test --locked
 
       - name: Run C compat C tests linking against real SQLite
         working-directory: sqlite3/tests

@@ -1,0 +1,17 @@
+---
+source: indexes.sqltest
+expression: |-
+  SELECT warehouse_id, SUM(quantity) as total_qty
+      FROM inventory
+      WHERE warehouse_id = 1
+      GROUP BY warehouse_id;
+info:
+  statement_type: SELECT
+  tables:
+  - inventory
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+`--SEARCH inventory USING INDEX idx_inventory_covering (warehouse_id=?)

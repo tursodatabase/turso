@@ -1,0 +1,211 @@
+@database :memory:
+@skip-file-if mvcc "btree_dump reads physical btree pages, not available for uncheckpointed MVCC data"
+@skip-file-if sqlite "btree_dump is a turso-specific virtual table"
+
+# Dump an index with data
+@backend cli
+test btree-dump-index {
+    CREATE TABLE t1 (a INTEGER, b TEXT);
+    INSERT INTO t1 VALUES (1, 'hello');
+    INSERT INTO t1 VALUES (2, 'world');
+    INSERT INTO t1 VALUES (3, 'foo');
+    CREATE INDEX idx1 ON t1(b);
+    SELECT count(*) FROM btree_dump('idx1');
+}
+expect {
+    3
+}
+
+# Dump an empty index
+@backend cli
+test btree-dump-empty-index {
+    CREATE TABLE t2 (a INTEGER, b TEXT);
+    CREATE INDEX idx2 ON t2(b);
+    SELECT count(*) FROM btree_dump('idx2');
+}
+expect {
+    0
+}
+
+# Dump a nonexistent name returns an error
+@backend cli
+test btree-dump-nonexistent {
+    SELECT count(*) FROM btree_dump('nonexistent');
+}
+expect error {
+    btree_dump: no such table or index: 'nonexistent'
+}
+
+# Dump a table
+@backend cli
+test btree-dump-table {
+    CREATE TABLE t3 (a INTEGER, b TEXT);
+    INSERT INTO t3 VALUES (10, 'alpha');
+    INSERT INTO t3 VALUES (20, 'beta');
+    SELECT count(*) FROM btree_dump('t3');
+}
+expect {
+    2
+}
+
+# Record column returns a blob (non-null)
+@backend cli
+test btree-dump-record-not-null {
+    CREATE TABLE t4 (x INTEGER);
+    INSERT INTO t4 VALUES (42);
+    CREATE INDEX idx4 ON t4(x);
+    SELECT typeof(record) FROM btree_dump('idx4');
+}
+expect {
+    blob
+}
+
+# Parse single-column index records with bin_record_json_object
+# Index on (name) stores [name, rowid] - results are in index key order (alphabetical by name)
+@backend cli
+test btree-dump-bin-record-single-col {
+    CREATE TABLE t5 (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO t5 VALUES (1, 'alice');
+    INSERT INTO t5 VALUES (2, 'bob');
+    INSERT INTO t5 VALUES (3, 'charlie');
+    CREATE INDEX idx5 ON t5(name);
+    SELECT bin_record_json_object('["name","rowid"]', record) FROM btree_dump('idx5');
+}
+expect {
+    {"name":"alice","rowid":1}
+    {"name":"bob","rowid":2}
+    {"name":"charlie","rowid":3}
+}
+
+# Parse multi-column index records with bin_record_json_object
+# Index on (last, first) stores [last, first, rowid] - sorted by last then first
+@backend cli
+test btree-dump-bin-record-multi-col {
+    CREATE TABLE t6 (id INTEGER PRIMARY KEY, first TEXT, last TEXT);
+    INSERT INTO t6 VALUES (1, 'John', 'Doe');
+    INSERT INTO t6 VALUES (2, 'Jane', 'Doe');
+    INSERT INTO t6 VALUES (3, 'Alice', 'Smith');
+    CREATE INDEX idx6 ON t6(last, first);
+    SELECT bin_record_json_object('["last","first","rowid"]', record) FROM btree_dump('idx6');
+}
+expect {
+    {"last":"Doe","first":"Jane","rowid":2}
+    {"last":"Doe","first":"John","rowid":1}
+    {"last":"Smith","first":"Alice","rowid":3}
+}
+
+# Parse table records with bin_record_json_object
+@backend cli
+test btree-dump-bin-record-table {
+    CREATE TABLE t7 (a INTEGER, b REAL, c TEXT);
+    INSERT INTO t7 VALUES (100, 3.14, 'pi');
+    INSERT INTO t7 VALUES (200, 2.72, 'e');
+    SELECT bin_record_json_object('["a","b","c"]', record) FROM btree_dump('t7');
+}
+expect {
+    {"a":100,"b":3.14,"c":"pi"}
+    {"a":200,"b":2.72,"c":"e"}
+}
+
+# Index with null values - nulls sort first in index order
+@backend cli
+test btree-dump-index-with-nulls {
+    CREATE TABLE t8 (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t8 VALUES (1, NULL);
+    INSERT INTO t8 VALUES (2, 'hello');
+    INSERT INTO t8 VALUES (3, NULL);
+    CREATE INDEX idx8 ON t8(val);
+    SELECT bin_record_json_object('["val","rowid"]', record) FROM btree_dump('idx8');
+}
+expect {
+    {"val":null,"rowid":1}
+    {"val":null,"rowid":3}
+    {"val":"hello","rowid":2}
+}
+
+# Index with integer values - sorted numerically
+@backend cli
+test btree-dump-integer-index {
+    CREATE TABLE t9 (id INTEGER PRIMARY KEY, score INTEGER);
+    INSERT INTO t9 VALUES (1, 100);
+    INSERT INTO t9 VALUES (2, 50);
+    INSERT INTO t9 VALUES (3, 75);
+    CREATE INDEX idx9 ON t9(score);
+    SELECT bin_record_json_object('["score","rowid"]', record) FROM btree_dump('idx9');
+}
+expect {
+    {"score":50,"rowid":2}
+    {"score":75,"rowid":3}
+    {"score":100,"rowid":1}
+}
+
+# Multiple calls to btree_dump in same query
+@backend cli
+test btree-dump-multiple-calls {
+    CREATE TABLE t10 (a INTEGER, b TEXT);
+    INSERT INTO t10 VALUES (1, 'x');
+    INSERT INTO t10 VALUES (2, 'y');
+    CREATE INDEX idx10a ON t10(a);
+    CREATE INDEX idx10b ON t10(b);
+    SELECT (SELECT count(*) FROM btree_dump('idx10a')), (SELECT count(*) FROM btree_dump('idx10b'));
+}
+expect {
+    2|2
+}
+
+# Unique index inspection
+@backend cli
+test btree-dump-unique-index {
+    CREATE TABLE t11 (id INTEGER PRIMARY KEY, email TEXT UNIQUE);
+    INSERT INTO t11 VALUES (1, 'a@b.com');
+    INSERT INTO t11 VALUES (2, 'c@d.com');
+    CREATE UNIQUE INDEX idx11 ON t11(email);
+    SELECT bin_record_json_object('["email","rowid"]', record) FROM btree_dump('idx11');
+}
+expect {
+    {"email":"a@b.com","rowid":1}
+    {"email":"c@d.com","rowid":2}
+}
+
+# Dump after deletes - only remaining rows appear
+@backend cli
+test btree-dump-after-delete {
+    CREATE TABLE t12 (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t12 VALUES (1, 'keep');
+    INSERT INTO t12 VALUES (2, 'remove');
+    INSERT INTO t12 VALUES (3, 'keep');
+    CREATE INDEX idx12 ON t12(val);
+    DELETE FROM t12 WHERE id = 2;
+    SELECT bin_record_json_object('["val","rowid"]', record) FROM btree_dump('idx12');
+}
+expect {
+    {"val":"keep","rowid":1}
+    {"val":"keep","rowid":3}
+}
+
+# Dump after update - reflects updated values
+@backend cli
+test btree-dump-after-update {
+    CREATE TABLE t13 (id INTEGER PRIMARY KEY, val INTEGER);
+    INSERT INTO t13 VALUES (1, 10);
+    INSERT INTO t13 VALUES (2, 20);
+    CREATE INDEX idx13 ON t13(val);
+    UPDATE t13 SET val = 5 WHERE id = 2;
+    SELECT bin_record_json_object('["val","rowid"]', record) FROM btree_dump('idx13');
+}
+expect {
+    {"val":5,"rowid":2}
+    {"val":10,"rowid":1}
+}
+
+# Index on mixed types
+@backend cli
+test btree-dump-mixed-types {
+    CREATE TABLE t14 (id INTEGER PRIMARY KEY, a INTEGER, b REAL, c TEXT);
+    INSERT INTO t14 VALUES (1, 42, 3.14, 'hello');
+    CREATE INDEX idx14 ON t14(a, b, c);
+    SELECT bin_record_json_object('["a","b","c","rowid"]', record) FROM btree_dump('idx14');
+}
+expect {
+    {"a":42,"b":3.14,"c":"hello","rowid":1}
+}

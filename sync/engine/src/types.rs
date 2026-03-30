@@ -9,28 +9,52 @@ use crate::{database_sync_operations::MutexSlot, errors::Error, Result};
 
 pub struct Coro<Ctx> {
     pub ctx: Mutex<Ctx>,
-    gen: genawaiter::sync::Co<ProtocolCommand, Result<Ctx>>,
+    gen: genawaiter::sync::Co<SyncEngineIoResult, Result<Ctx>>,
 }
 
 impl<Ctx> Coro<Ctx> {
-    pub fn new(ctx: Ctx, gen: genawaiter::sync::Co<ProtocolCommand, Result<Ctx>>) -> Self {
+    pub fn new(ctx: Ctx, gen: genawaiter::sync::Co<SyncEngineIoResult, Result<Ctx>>) -> Self {
         Self {
             ctx: Mutex::new(ctx),
             gen,
         }
     }
-    pub async fn yield_(&self, value: ProtocolCommand) -> Result<()> {
+    pub async fn yield_(&self, value: SyncEngineIoResult) -> Result<()> {
         let ctx = self.gen.yield_(value).await?;
         *self.ctx.lock().unwrap() = ctx;
         Ok(())
     }
 }
 
-impl From<genawaiter::sync::Co<ProtocolCommand, Result<()>>> for Coro<()> {
-    fn from(value: genawaiter::sync::Co<ProtocolCommand, Result<()>>) -> Self {
+impl From<genawaiter::sync::Co<SyncEngineIoResult, Result<()>>> for Coro<()> {
+    fn from(value: genawaiter::sync::Co<SyncEngineIoResult, Result<()>>) -> Self {
         Self {
             gen: value,
             ctx: Mutex::new(()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PartialBootstrapStrategy {
+    Prefix { length: usize },
+    Query { query: String },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PartialSyncOpts {
+    pub bootstrap_strategy: Option<PartialBootstrapStrategy>,
+    pub segment_size: usize,
+    pub prefetch: bool,
+}
+
+impl PartialSyncOpts {
+    pub fn segment_size(&self) -> usize {
+        if self.segment_size == 0 {
+            128 * 1024
+        } else {
+            self.segment_size
         }
     }
 }
@@ -49,7 +73,7 @@ pub struct DbSyncStatus {
 }
 
 pub struct DbChangesStatus {
-    pub time: turso_core::Instant,
+    pub time: turso_core::WallClockInstant,
     pub revision: DatabasePullRevision,
     pub file_slot: Option<MutexSlot<Arc<dyn turso_core::File>>>,
 }
@@ -64,6 +88,7 @@ impl std::fmt::Debug for DbChangesStatus {
     }
 }
 
+#[derive(Debug, Serialize)]
 pub struct SyncEngineStats {
     pub cdc_operations: i64,
     pub main_wal_size: u64,
@@ -80,6 +105,7 @@ pub enum DatabaseChangeType {
     Delete,
     Update,
     Insert,
+    Commit,
 }
 
 pub const DATABASE_METADATA_VERSION: &str = "v1";
@@ -101,6 +127,16 @@ pub struct DatabaseMetadata {
     pub last_pushed_pull_gen_hint: i64,
     pub last_pushed_change_id_hint: i64,
     pub partial_bootstrap_server_revision: Option<DatabasePullRevision>,
+    /// optional saved configuration
+    /// this will be used by sync engine if some parameters were omitted
+    pub saved_configuration: Option<DatabaseSavedConfiguration>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct DatabaseSavedConfiguration {
+    pub remote_url: Option<String>,
+    pub partial_sync_prefetch: Option<bool>,
+    pub partial_sync_segment_size: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -122,9 +158,68 @@ pub enum DatabaseSyncEngineProtocolVersion {
 }
 
 impl DatabaseMetadata {
+    pub fn remote_url(&self) -> Option<String> {
+        self.saved_configuration
+            .as_ref()
+            .and_then(|x| x.remote_url.as_deref())
+            .map(|x| x.to_string())
+    }
+    pub fn partial_sync_opts(&self) -> Option<PartialSyncOpts> {
+        if self.partial_bootstrap_server_revision.is_none() {
+            None
+        } else {
+            let partial_sync_opts = PartialSyncOpts {
+                bootstrap_strategy: None,
+                segment_size: self
+                    .saved_configuration
+                    .as_ref()
+                    .and_then(|x| x.partial_sync_segment_size)
+                    .unwrap_or(128 * 1024),
+                prefetch: self
+                    .saved_configuration
+                    .as_ref()
+                    .and_then(|x| x.partial_sync_prefetch)
+                    .unwrap_or_default(),
+            };
+            Some(partial_sync_opts)
+        }
+    }
+    pub fn update_configuration(&mut self, configuration: DatabaseSavedConfiguration) -> bool {
+        let Some(saved_configuration) = &mut self.saved_configuration else {
+            self.saved_configuration = Some(configuration);
+            return true;
+        };
+        let mut changed = false;
+        if let Some(remote_url) = configuration.remote_url {
+            saved_configuration.remote_url = Some(remote_url);
+            changed |= true;
+        }
+        if let Some(partial_sync_prefetch) = configuration.partial_sync_prefetch {
+            saved_configuration.partial_sync_prefetch = Some(partial_sync_prefetch);
+            changed |= true;
+        }
+        if let Some(partial_sync_segment_size) = configuration.partial_sync_segment_size {
+            saved_configuration.partial_sync_segment_size = Some(partial_sync_segment_size);
+            changed |= true;
+        }
+        changed
+    }
     pub fn load(data: &[u8]) -> Result<Self> {
-        let meta = serde_json::from_slice::<DatabaseMetadata>(data)?;
-        Ok(meta)
+        let value: serde_json::Value = serde_json::from_slice(data)?;
+
+        // detect version field presence and type separately in order to provide nicer error message when user accidentally tried to run tursodb sync on top of the libsql sync metadata file
+        match value.get("version").and_then(serde_json::Value::as_str) {
+            Some(version) => {
+                let version = version.to_string();
+                let meta: DatabaseMetadata = serde_json::from_value(value).map_err(|err|
+                    Error::JsonDecode(format!("unable to parse metadata file with version {version}: {err}"))
+                )?;
+                Ok(meta)
+            }
+            None => Err(Error::JsonDecode(
+                "unexpected metadata file format, 'version' field must be present and have string type".to_string(),
+            )),
+        }
     }
     pub fn dump(&self) -> Result<Vec<u8>> {
         let data = serde_json::to_string(self)?;
@@ -140,6 +235,8 @@ pub struct DatabaseChange {
     pub change_id: i64,
     /// Unix timestamp of the change (not guaranteed to be strictly monotonic as host clocks can drift)
     pub change_time: u64,
+    /// CDC v2: transaction ID for grouping CDC records by transaction. None for v1.
+    pub change_txn_id: Option<i64>,
     /// Type of the change
     pub change_type: DatabaseChangeType,
     /// Table of the change
@@ -185,6 +282,11 @@ impl DatabaseChange {
                     )
                 })?)?,
             },
+            DatabaseChangeType::Commit => {
+                return Err(Error::DatabaseTapeError(
+                    "Commit changes cannot be converted to row changes".to_string(),
+                ))
+            }
         };
         Ok(DatabaseTapeRowChange {
             change_id: self.change_id,
@@ -222,6 +324,11 @@ impl DatabaseChange {
                     )
                 })?)?,
             },
+            DatabaseChangeType::Commit => {
+                return Err(Error::DatabaseTapeError(
+                    "Commit changes cannot be converted to row changes".to_string(),
+                ))
+            }
         };
         Ok(DatabaseTapeRowChange {
             change_id: self.change_id,
@@ -238,6 +345,7 @@ impl std::fmt::Debug for DatabaseChange {
         f.debug_struct("DatabaseChange")
             .field("change_id", &self.change_id)
             .field("change_time", &self.change_time)
+            .field("change_txn_id", &self.change_txn_id)
             .field("change_type", &self.change_type)
             .field("table_name", &self.table_name)
             .field("id", &self.id)
@@ -250,7 +358,27 @@ impl std::fmt::Debug for DatabaseChange {
 impl TryFrom<&turso_core::Row> for DatabaseChange {
     type Error = Error;
 
+    /// Parse a CDC row using v1 layout (8 columns, no change_txn_id).
     fn try_from(row: &turso_core::Row) -> Result<Self> {
+        Self::from_row_v1(row)
+    }
+}
+
+fn parse_change_type(value: i64) -> Result<DatabaseChangeType> {
+    match value {
+        -1 => Ok(DatabaseChangeType::Delete),
+        0 => Ok(DatabaseChangeType::Update),
+        1 => Ok(DatabaseChangeType::Insert),
+        2 => Ok(DatabaseChangeType::Commit),
+        v => Err(Error::DatabaseTapeError(format!(
+            "unexpected change type: expected -1|0|1|2, got '{v:?}'"
+        ))),
+    }
+}
+
+impl DatabaseChange {
+    /// Parse a CDC row using v1 layout (8 columns, no change_txn_id).
+    pub fn from_row_v1(row: &turso_core::Row) -> Result<Self> {
         let change_id = get_core_value_i64(row, 0)?;
         let change_time = get_core_value_i64(row, 1)? as u64;
         let change_type = get_core_value_i64(row, 2)?;
@@ -259,20 +387,11 @@ impl TryFrom<&turso_core::Row> for DatabaseChange {
         let before = get_core_value_blob_or_null(row, 5)?;
         let after = get_core_value_blob_or_null(row, 6)?;
         let updates = get_core_value_blob_or_null(row, 7)?;
-
-        let change_type = match change_type {
-            -1 => DatabaseChangeType::Delete,
-            0 => DatabaseChangeType::Update,
-            1 => DatabaseChangeType::Insert,
-            v => {
-                return Err(Error::DatabaseTapeError(format!(
-                    "unexpected change type: expected -1|0|1, got '{v:?}'"
-                )))
-            }
-        };
+        let change_type = parse_change_type(change_type)?;
         Ok(Self {
             change_id,
             change_time,
+            change_txn_id: None,
             change_type,
             table_name,
             id,
@@ -280,6 +399,39 @@ impl TryFrom<&turso_core::Row> for DatabaseChange {
             after,
             updates,
         })
+    }
+
+    /// Parse a CDC row using v2 layout (9 columns, with change_txn_id).
+    pub fn from_row_v2(row: &turso_core::Row) -> Result<Self> {
+        let change_id = get_core_value_i64(row, 0)?;
+        let change_time = get_core_value_i64(row, 1)? as u64;
+        let change_txn_id = get_core_value_i64_or_null(row, 2)?;
+        let change_type = get_core_value_i64(row, 3)?;
+        let change_type = parse_change_type(change_type)?;
+        // COMMIT records have NULL for table_name and id
+        let table_name = get_core_value_text_or_null(row, 4)?.unwrap_or_default();
+        let id = get_core_value_i64_or_null(row, 5)?.unwrap_or(0);
+        let before = get_core_value_blob_or_null(row, 6)?;
+        let after = get_core_value_blob_or_null(row, 7)?;
+        let updates = get_core_value_blob_or_null(row, 8)?;
+        Ok(Self {
+            change_id,
+            change_time,
+            change_txn_id,
+            change_type,
+            table_name,
+            id,
+            before,
+            after,
+            updates,
+        })
+    }
+
+    pub fn from_row(row: &turso_core::Row, cdc_version: turso_core::CdcVersion) -> Result<Self> {
+        match cdc_version {
+            turso_core::CdcVersion::V2 => Self::from_row_v2(row),
+            turso_core::CdcVersion::V1 => Self::from_row_v1(row),
+        }
     }
 }
 
@@ -379,9 +531,19 @@ impl std::fmt::Debug for DatabaseTapeRowChangeType {
 
 fn get_core_value_i64(row: &turso_core::Row, index: usize) -> Result<i64> {
     match row.get_value(index) {
-        turso_core::Value::Integer(v) => Ok(*v),
+        turso_core::Value::Numeric(turso_core::Numeric::Integer(v)) => Ok(*v),
         v => Err(Error::DatabaseTapeError(format!(
             "column {index} type mismatch: expected integer, got '{v:?}'"
+        ))),
+    }
+}
+
+fn get_core_value_i64_or_null(row: &turso_core::Row, index: usize) -> Result<Option<i64>> {
+    match row.get_value(index) {
+        turso_core::Value::Numeric(turso_core::Numeric::Integer(v)) => Ok(Some(*v)),
+        turso_core::Value::Null => Ok(None),
+        v => Err(Error::DatabaseTapeError(format!(
+            "column {index} type mismatch: expected integer or null, got '{v:?}'"
         ))),
     }
 }
@@ -391,6 +553,16 @@ fn get_core_value_text(row: &turso_core::Row, index: usize) -> Result<String> {
         turso_core::Value::Text(x) => Ok(x.to_string()),
         v => Err(Error::DatabaseTapeError(format!(
             "column {index} type mismatch: expected string, got '{v:?}'"
+        ))),
+    }
+}
+
+fn get_core_value_text_or_null(row: &turso_core::Row, index: usize) -> Result<Option<String>> {
+    match row.get_value(index) {
+        turso_core::Value::Text(x) => Ok(Some(x.to_string())),
+        turso_core::Value::Null => Ok(None),
+        v => Err(Error::DatabaseTapeError(format!(
+            "column {index} type mismatch: expected string or null, got '{v:?}'"
         ))),
     }
 }
@@ -405,19 +577,16 @@ fn get_core_value_blob_or_null(row: &turso_core::Row, index: usize) -> Result<Op
     }
 }
 
-pub enum ProtocolCommand {
+pub enum SyncEngineIoResult {
     // Protocol waits for some IO - caller must spin turso-db IO event loop and also drive ProtocolIO
     IO,
 }
 
 pub fn parse_bin_record(bin_record: Vec<u8>) -> Result<Vec<turso_core::Value>> {
-    let record = turso_core::types::ImmutableRecord::from_bin_record(bin_record);
-    let mut cursor = turso_core::types::RecordCursor::new();
-    let columns = cursor.count(&record);
-    let mut values = Vec::with_capacity(columns);
-    for i in 0..columns {
-        let value = cursor.get_value(&record, i)?;
-        values.push(value.to_owned());
+    match turso_core::types::ImmutableRecord::from_bin_record(bin_record).get_values_owned() {
+        Ok(values) => Ok(values),
+        Err(err) => Err(Error::DatabaseTapeError(format!(
+            "unable to parse bin record: {err}"
+        ))),
     }
-    Ok(values)
 }

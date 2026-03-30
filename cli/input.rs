@@ -5,7 +5,7 @@ use std::{
     io::{self, Write},
     sync::Arc,
 };
-use turso_core::{LimboError, StepResult};
+use turso_core::LimboError;
 
 #[derive(Copy, Clone)]
 pub enum DbLocation {
@@ -19,6 +19,8 @@ pub enum Io {
     Syscall,
     #[cfg(all(target_os = "linux", feature = "io_uring"))]
     IoUring,
+    #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
+    WindowsIOCP,
     External(String),
     Memory,
 }
@@ -30,6 +32,8 @@ impl Display for Io {
             Io::Syscall => write!(f, "syscall"),
             #[cfg(all(target_os = "linux", feature = "io_uring"))]
             Io::IoUring => write!(f, "io_uring"),
+            #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
+            Io::WindowsIOCP => write!(f, "experimental_win_iocp"),
             Io::External(str) => write!(f, "{str}"),
         }
     }
@@ -86,6 +90,7 @@ pub struct Settings {
     pub timer: bool,
     pub headers: bool,
     pub mcp: bool,
+    pub sync_server_address: Option<String>,
     pub stats: bool,
 }
 
@@ -106,12 +111,15 @@ impl From<Opts> for Settings {
                 "syscall" => Io::Syscall,
                 #[cfg(all(target_os = "linux", feature = "io_uring"))]
                 "io_uring" => Io::IoUring,
+                #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
+                "experimental_win_iocp" => Io::WindowsIOCP,
                 "" => Io::default(),
                 vfs => Io::External(vfs.to_string()),
             },
             timer: false,
             headers: false,
             mcp: opts.mcp,
+            sync_server_address: opts.sync_server,
             stats: false,
         }
     }
@@ -176,6 +184,8 @@ pub fn get_io(db_location: DbLocation, io_choice: &str) -> anyhow::Result<Arc<dy
                 // We are building for Linux and io_uring backend has been selected
                 #[cfg(all(target_os = "linux", feature = "io_uring"))]
                 "io_uring" => Arc::new(turso_core::UringIO::new()?),
+                #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
+                "experimental_win_iocp" => Arc::new(turso_core::WindowsIOCP::new()?),
                 _ => Arc::new(turso_core::PlatformIO::new()?),
             }
         }
@@ -256,16 +266,9 @@ impl<'a> ApplyWriter<'a> {
 
     fn exec_stmt(&self, sql: &str) -> Result<(), LimboError> {
         match self.target.query(sql) {
-            Ok(Some(mut rows)) => loop {
-                match rows.step()? {
-                    StepResult::Row => {}
-                    StepResult::IO => rows.run_once()?,
-                    StepResult::Done | StepResult::Interrupt => break,
-                    StepResult::Busy => {
-                        return Err(LimboError::InternalError("target database is busy".into()))
-                    }
-                }
-            },
+            Ok(Some(mut rows)) => {
+                rows.run_with_row_callback(|_| Ok(()))?;
+            }
             Ok(None) => {}
             Err(e) => return Err(e),
         }
@@ -364,6 +367,11 @@ pub const AFTER_HELP_MSG: &str = r#"Usage Examples:
 19. To view manual pages for features:
    .manual mcp    # View MCP server documentation
    .man           # List all available manuals
+
+20. To bind parameters for subsequent SQL statements:
+   .parameter set :name alice
+   .parameter list
+   .parameter clear :name
 
 Note:
 - All SQL commands must end with a semicolon (;).

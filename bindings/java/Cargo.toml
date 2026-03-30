@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
+
+[lints]
+workspace = true
+
 [features]
 tracing_release = ["turso_core/tracing_release"]
 [lib]

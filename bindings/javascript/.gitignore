@@ -205,3 +205,5 @@ bundle
 *.db-changes
 *.db-wal-revert
 *.db-info
+
+__screenshots__

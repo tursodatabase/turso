@@ -1,0 +1,172 @@
+#!/bin/bash
+set -e
+
+# Run the Whopper simulator with Elle consistency checking, then analyze with elle-cli
+# Usage: ./bin/run-elle [--max-steps N] [--mode MODE] [--mvcc] [--skip-analysis] [--clean]
+#
+# Options:
+#   --max-steps N     Number of simulation steps (default: 100000)
+#   --mode MODE       Simulation mode: fast, chaos, ragnarok (default: fast)
+#   --mvcc            Enable MVCC (Multi-Version Concurrency Control)
+#   --skip-analysis   Only run simulation, don't analyze with elle-cli
+#   --clean           Re-clone and rebuild elle-cli
+#
+# Prerequisites: Java 11+
+# Leiningen will be downloaded automatically if not found
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKING_DIR="$(pwd)"
+ELLE_REPO="https://github.com/ligurio/elle-cli.git"
+ELLE_DIR="/tmp/elle-cli"
+LEIN_VERSION="2.11.2"
+LEIN_DIR="/tmp/lein"
+OUTPUT_FILE="$WORKING_DIR/elle-history.edn"
+SKIP_ANALYSIS=0
+CLEAN=0
+ENABLE_MVCC=0
+ARGS=()
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --skip-analysis) SKIP_ANALYSIS=1; shift ;;
+        --clean) CLEAN=1; shift ;;
+        --mvcc) ENABLE_MVCC=1; shift ;;
+        --elle-output)
+            # Convert to absolute path
+            if [[ "$2" = /* ]]; then
+                OUTPUT_FILE="$2"
+            else
+                OUTPUT_FILE="$WORKING_DIR/$2"
+            fi
+            ARGS+=("$1" "$OUTPUT_FILE")
+            shift 2
+            ;;
+        *)
+            ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# Step 1: Run whopper simulation
+if [[ "$ENABLE_MVCC" -eq 1 ]]; then
+    echo "=== Running Whopper with Elle enabled (MVCC mode) ==="
+else
+    echo "=== Running Whopper with Elle enabled ==="
+fi
+cargo build -p turso_whopper
+
+WHOPPER_ARGS=(--elle list-append --elle-output "$OUTPUT_FILE" --dump-db)
+if [[ "$ENABLE_MVCC" -eq 1 ]]; then
+    WHOPPER_ARGS+=(--enable-mvcc)
+fi
+WHOPPER_ARGS+=("${ARGS[@]}")
+
+time RUST_BACKTRACE=full ./target/debug/turso_whopper "${WHOPPER_ARGS[@]}"
+
+if [[ "$SKIP_ANALYSIS" -eq 1 ]]; then
+    echo ""
+    echo "Skipping analysis. History saved to: $OUTPUT_FILE"
+    exit 0
+fi
+
+# Step 2: Setup elle-cli
+
+# Check Java
+if ! command -v java &> /dev/null; then
+    echo ""
+    echo "Warning: Java not found, skipping elle-cli analysis."
+    echo "Install Java 11+ to enable analysis:"
+    echo "  brew install openjdk   # macOS"
+    echo "  sudo apt install default-jdk   # Debian/Ubuntu"
+    echo ""
+    echo "History saved to: $OUTPUT_FILE"
+    exit 0
+fi
+
+# Setup Leiningen - download if not available
+setup_lein() {
+    if command -v lein &> /dev/null; then
+        LEIN="lein"
+        return
+    fi
+
+    if [[ -x "$LEIN_DIR/lein" ]]; then
+        LEIN="$LEIN_DIR/lein"
+        return
+    fi
+
+    echo "Leiningen not found, downloading..."
+    mkdir -p "$LEIN_DIR"
+    LEIN_URL="https://raw.githubusercontent.com/technomancy/leiningen/$LEIN_VERSION/bin/lein"
+
+    if command -v curl &> /dev/null; then
+        curl -sL "$LEIN_URL" -o "$LEIN_DIR/lein"
+    elif command -v wget &> /dev/null; then
+        wget -q "$LEIN_URL" -O "$LEIN_DIR/lein"
+    else
+        echo "Error: curl or wget required to download Leiningen"
+        exit 1
+    fi
+
+    chmod +x "$LEIN_DIR/lein"
+    LEIN="$LEIN_DIR/lein"
+
+    # Run lein once to self-install
+    echo "Installing Leiningen..."
+    "$LEIN" version
+}
+
+setup_lein
+
+# Clean if requested
+if [[ "$CLEAN" -eq 1 ]] && [[ -d "$ELLE_DIR" ]]; then
+    echo "Cleaning elle-cli directory..."
+    rm -rf "$ELLE_DIR"
+fi
+
+# Clone if needed
+if [[ ! -d "$ELLE_DIR" ]]; then
+    echo "Cloning elle-cli..."
+    git clone --depth 1 "$ELLE_REPO" "$ELLE_DIR"
+fi
+
+# Build if needed
+ELLE_JAR=$(ls -t "$ELLE_DIR"/target/*-standalone.jar 2>/dev/null | head -1)
+if [[ -z "$ELLE_JAR" ]]; then
+    echo "Building elle-cli..."
+    cd "$ELLE_DIR"
+    "$LEIN" uberjar
+    ELLE_JAR=$(ls -t "$ELLE_DIR"/target/*-standalone.jar 2>/dev/null | head -1)
+fi
+
+if [[ -z "$ELLE_JAR" ]]; then
+    echo "Error: Failed to build elle-cli"
+    exit 1
+fi
+
+# Step 3: Run elle-cli analysis
+ELLE_OUTPUT_DIR="${OUTPUT_FILE%.edn}-results"
+mkdir -p "$ELLE_OUTPUT_DIR"
+
+echo ""
+echo "=== Running elle-cli analysis ==="
+echo "JAR: $ELLE_JAR"
+echo "History: $OUTPUT_FILE"
+echo "Results: $ELLE_OUTPUT_DIR"
+echo ""
+ELLE_ARGS=(--model list-append --verbose --directory "$ELLE_OUTPUT_DIR")
+if [[ "$ENABLE_MVCC" -eq 1 ]]; then
+    ELLE_ARGS+=(--consistency-models snapshot-isolation)
+else 
+	ELLE_ARGS+=(--consistency-models serializable)
+fi
+java -jar "$ELLE_JAR" "${ELLE_ARGS[@]}" "$OUTPUT_FILE"
+
+# Show results summary
+if [ -d "$ELLE_OUTPUT_DIR" ]; then
+    echo ""
+    echo "=== Results ==="
+    ls -la "$ELLE_OUTPUT_DIR"
+fi

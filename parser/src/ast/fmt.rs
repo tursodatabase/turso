@@ -69,7 +69,7 @@ impl<T: Write> TokenStream for WriteTokenStream<'_, T> {
     fn append(&mut self, ty: TokenType, value: Option<&str>) -> fmt::Result {
         if !self.spaced {
             match ty {
-                TK_COMMA | TK_SEMI | TK_RP | TK_DOT => {}
+                TK_COMMA | TK_SEMI | TK_RP | TK_DOT | TK_LBRACKET | TK_RBRACKET => {}
                 _ => {
                     self.write.write_char(' ')?;
                     self.spaced = true;
@@ -90,7 +90,8 @@ impl<T: Write> TokenStream for WriteTokenStream<'_, T> {
             (_, ty_str, value) => {
                 if let Some(str) = ty_str {
                     self.write.write_str(str)?;
-                    self.spaced = ty == TK_LP || ty == TK_DOT; // str should not be whitespace
+                    self.spaced = ty == TK_LP || ty == TK_DOT || ty == TK_LBRACKET;
+                    // str should not be whitespace
                 }
 
                 if let Some(str) = value {
@@ -612,6 +613,14 @@ impl ToTokens for Stmt {
                 }
                 Ok(())
             }
+            Self::Optimize { idx_name } => {
+                s.append(TK_OPTIMIZE, None)?;
+                s.append(TK_INDEX, None)?;
+                if let Some(name) = idx_name {
+                    name.to_tokens(s, context)?;
+                }
+                Ok(())
+            }
             Self::Release { name } => {
                 s.append(TK_RELEASE, None)?;
                 name.to_tokens(s, context)
@@ -693,6 +702,74 @@ impl ToTokens for Stmt {
                     s.append(TK_INTO, None)?;
                     into.to_tokens(s, context)?;
                 }
+                Ok(())
+            }
+            Self::CreateType {
+                if_not_exists,
+                type_name,
+                body,
+            } => {
+                s.append(TK_CREATE, None)?;
+                s.append(TK_TYPE, None)?;
+                if *if_not_exists {
+                    s.append(TK_IF, None)?;
+                    s.append(TK_NOT, None)?;
+                    s.append(TK_EXISTS, None)?;
+                }
+                s.append(TK_ID, Some(type_name))?;
+                // Parameters
+                if !body.params.is_empty() {
+                    s.append(TK_LP, None)?;
+                    for (i, param) in body.params.iter().enumerate() {
+                        if i > 0 {
+                            s.append(TK_COMMA, None)?;
+                        }
+                        s.append(TK_ID, Some(&param.name))?;
+                        if let Some(ref ty) = param.ty {
+                            s.append(TK_ID, Some(ty))?;
+                        }
+                    }
+                    s.append(TK_RP, None)?;
+                }
+                // BASE
+                s.append(TK_ID, Some("BASE"))?;
+                s.append(TK_ID, Some(&body.base))?;
+                // ENCODE
+                if let Some(ref encode) = body.encode {
+                    s.append(TK_ID, Some("ENCODE"))?;
+                    encode.to_tokens(s, context)?;
+                }
+                // DECODE
+                if let Some(ref decode) = body.decode {
+                    s.append(TK_ID, Some("DECODE"))?;
+                    decode.to_tokens(s, context)?;
+                }
+                // DEFAULT
+                if let Some(ref default) = body.default {
+                    s.append(TK_ID, Some("DEFAULT"))?;
+                    default.to_tokens(s, context)?;
+                }
+                // OPERATOR clauses
+                for op in &body.operators {
+                    s.append(TK_ID, Some("OPERATOR"))?;
+                    s.append(TK_STRING, Some(&format!("'{}'", op.op)))?;
+                    if let Some(ref func_name) = op.func_name {
+                        s.append(TK_ID, Some(func_name))?;
+                    }
+                }
+                Ok(())
+            }
+            Self::DropType {
+                if_exists,
+                type_name,
+            } => {
+                s.append(TK_DROP, None)?;
+                s.append(TK_TYPE, None)?;
+                if *if_exists {
+                    s.append(TK_IF, None)?;
+                    s.append(TK_EXISTS, None)?;
+                }
+                s.append(TK_ID, Some(type_name))?;
                 Ok(())
             }
         }
@@ -924,13 +1001,27 @@ impl ToTokens for Expr {
                 op.to_tokens(s, context)?;
                 sub_expr.to_tokens(s, context)
             }
-            Self::Variable(var) => match var.chars().next() {
-                Some(c) if c == '$' || c == '@' || c == '#' || c == ':' => {
-                    s.append(TK_VARIABLE, Some(var))
+            Self::Variable(var) => {
+                if let Some(name) = var.name.as_deref() {
+                    return s.append(TK_VARIABLE, Some(name));
                 }
-                Some(_) => s.append(TK_VARIABLE, Some(&("?".to_owned() + var))),
-                None => s.append(TK_VARIABLE, Some("?")),
-            },
+
+                let indexed = format!("?{}", var.index.get());
+                s.append(TK_VARIABLE, Some(indexed.as_str()))
+            }
+            Self::Default => s.append(TK_DEFAULT, None),
+            Self::Array { elements } => {
+                s.append(TK_ID, Some("ARRAY"))?;
+                s.append(TK_LBRACKET, None)?;
+                comma(elements, s, context)?;
+                s.append(TK_RBRACKET, None)
+            }
+            Self::Subscript { base, index } => {
+                base.to_tokens(s, context)?;
+                s.append(TK_LBRACKET, None)?;
+                index.to_tokens(s, context)?;
+                s.append(TK_RBRACKET, None)
+            }
         }
     }
 }
@@ -948,6 +1039,8 @@ impl ToTokens for Literal {
             Self::Blob(ref blob) => s.append(TK_BLOB, Some(blob)),
             Self::Keyword(ref str) => s.append(TK_ID, Some(str)), // TODO Validate TK_ID
             Self::Null => s.append(TK_NULL, None),
+            Self::True => s.append(TK_ID, Some("TRUE")),
+            Self::False => s.append(TK_ID, Some("FALSE")),
             Self::CurrentDate => s.append(TK_CTIME_KW, Some("CURRENT_DATE")),
             Self::CurrentTime => s.append(TK_CTIME_KW, Some("CURRENT_TIME")),
             Self::CurrentTimestamp => s.append(TK_CTIME_KW, Some("CURRENT_TIMESTAMP")),
@@ -1008,6 +1101,8 @@ impl ToTokens for Operator {
             Self::Or => s.append(TK_OR, None),
             Self::RightShift => s.append(TK_RSHIFT, None),
             Self::Subtract => s.append(TK_MINUS, None),
+            Self::ArrayContains => s.append(TK_ARRAY_CONTAINS, None),
+            Self::ArrayOverlap => s.append(TK_ARRAY_OVERLAP, None),
         }
     }
 }
@@ -1226,6 +1321,7 @@ impl ToTokens for As {
                 name.to_tokens(s, context)
             }
             Self::Elided(ref name) => name.to_tokens(s, context),
+            Self::ImplicitColumnName(_) => Ok(()),
         }
     }
 }
@@ -1377,9 +1473,11 @@ impl ToTokens for GroupBy {
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
-        s.append(TK_GROUP, None)?;
-        s.append(TK_BY, None)?;
-        comma(&self.exprs, s, context)?;
+        if !self.exprs.is_empty() {
+            s.append(TK_GROUP, None)?;
+            s.append(TK_BY, None)?;
+            comma(&self.exprs, s, context)?;
+        }
         if let Some(ref having) = self.having {
             s.append(TK_HAVING, None)?;
             having.to_tokens(s, context)?;
@@ -1480,12 +1578,17 @@ impl ToTokens for CreateTableBody {
                     comma(constraints, s, context)?;
                 }
                 s.append(TK_RP, None)?;
-                if options.contains(TableOptions::WITHOUT_ROWID) {
-                    s.append(TK_WITHOUT, None)?;
-                    s.append(TK_ID, Some("ROWID"))?;
+                // Use the original text if available
+                if let Some(ref without_rowid) = options.without_rowid_text {
+                    // Split "WITHOUT ROWID" back into tokens
+                    let parts: Vec<&str> = without_rowid.split_whitespace().collect();
+                    if parts.len() == 2 {
+                        s.append(TK_WITHOUT, None)?;
+                        s.append(TK_ID, Some(parts[1]))?;
+                    }
                 }
-                if options.contains(TableOptions::STRICT) {
-                    s.append(TK_ID, Some("STRICT"))?;
+                if let Some(ref strict) = options.strict_text {
+                    s.append(TK_ID, Some(strict))?;
                 }
                 Ok(())
             }
@@ -1613,7 +1716,10 @@ impl ToTokens for ColumnConstraint {
                 expr.to_tokens(s, context)?;
                 s.append(TK_RP, None)?;
                 if let Some(typ) = typ {
-                    typ.to_tokens(s, context)?;
+                    match typ {
+                        GeneratedColumnType::Virtual => s.append(TK_VIRTUAL, None)?,
+                        GeneratedColumnType::Stored => s.append(TK_ID, Some("STORED"))?,
+                    }
                 }
                 Ok(())
             }
@@ -2188,14 +2294,19 @@ impl ToTokens for Type {
         context: &C,
     ) -> Result<(), S::Error> {
         match self.size {
-            None => s.append(TK_ID, Some(&self.name)),
+            None => s.append(TK_ID, Some(&self.name))?,
             Some(ref size) => {
                 s.append(TK_ID, Some(&self.name))?; // TODO check there is no forbidden chars
                 s.append(TK_LP, None)?;
                 size.to_tokens(s, context)?;
-                s.append(TK_RP, None)
+                s.append(TK_RP, None)?;
             }
         }
+        for _ in 0..self.array_dimensions {
+            s.append(TK_LBRACKET, None)?;
+            s.append(TK_RBRACKET, None)?;
+        }
+        Ok(())
     }
 }
 

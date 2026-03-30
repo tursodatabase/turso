@@ -123,9 +123,10 @@ pub(crate) fn derive_atomic_enum_inner(input: TokenStream) -> TokenStream {
                     }
                 }
             }
-            Fields::Unnamed(_) => {
+            Fields::Unnamed(fields) => {
                 // same strategy as above, but for tuple variants like `Write(bool)`
-                if is_bool_type(&variant.fields.iter().next().unwrap().ty) {
+                let field = &fields.unnamed[0];
+                if is_bool_type(&field.ty) {
                     if use_u16 {
                         quote! {
                             #name::#var_name(ref val) => {
@@ -186,8 +187,9 @@ pub(crate) fn derive_atomic_enum_inner(input: TokenStream) -> TokenStream {
                     }
                 }
             }
-            Fields::Unnamed(_) => {
-                if is_bool_type(&variant.fields.iter().next().unwrap().ty) {
+            Fields::Unnamed(fields) => {
+                let field = &fields.unnamed[0];
+                if is_bool_type(&field.ty) {
                     if use_u16 {
                         quote! { #disc => #name::#var_name((val >> 8) != 0) }
                     } else {

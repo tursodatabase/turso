@@ -1,0 +1,107 @@
+---
+title: CREATE VIRTUAL TABLE
+description: Create a virtual table backed by a module that provides custom data access
+sidebarTitle: CREATE VIRTUAL TABLE
+---
+
+# CREATE VIRTUAL TABLE
+
+The CREATE VIRTUAL TABLE statement creates a table whose contents are computed on-the-fly by a module rather than stored in the database file. Virtual tables provide a SQL interface over external data sources, custom generators, and table-valued functions.
+
+## Syntax
+
+```sql
+CREATE VIRTUAL TABLE [IF NOT EXISTS] [schema-name.]table-name
+    USING module-name [(module-arguments)];
+```
+
+## Description
+
+A virtual table delegates row storage and retrieval to a module. The module determines what columns the table has, what data it returns, and how queries against it are optimized. Virtual tables can be queried with SELECT just like regular tables, but they cannot be targets of INSERT, UPDATE, or DELETE unless the module implements write support.
+
+### Clauses
+
+| Clause | Description |
+|--------|-------------|
+| `IF NOT EXISTS` | Suppresses the error that would occur if a table with the same name already exists. |
+| `schema-name` | The name of the attached database in which to create the virtual table. Defaults to `main`. |
+| `table-name` | The name for the new virtual table. |
+| `module-name` | The name of the module that provides the virtual table implementation. |
+| `module-arguments` | Comma-separated arguments passed to the module. The format and meaning of these arguments are module-specific. |
+
+## Available Modules
+
+### csv
+
+The `csv` module reads data from a CSV file and exposes its contents as a read-only table. Load the csv extension first with `load_extension('csv')`.
+
+| Argument | Description |
+|----------|-------------|
+| `filename` | Path to the CSV file to read. |
+| `header` | Set to `yes` if the first row contains column names. Defaults to `no`. |
+| `columns` | Number of columns to expect when `header` is `no`. |
+| `schema` | Explicit CREATE TABLE schema for column names and types. |
+
+### generate_series
+
+The `generate_series` module is a built-in table-valued function that produces a sequence of integer values. It does not require an extension to be loaded.
+
+| Argument | Description |
+|----------|-------------|
+| `start` | The first value in the sequence (inclusive). |
+| `stop` | The last value in the sequence (inclusive). |
+| `step` | The increment between values. Defaults to `1`. |
+
+The `generate_series` module can be used either as a virtual table or as a table-valued function in the FROM clause.
+
+## Examples
+
+### Read a CSV File
+
+```sql
+-- Load the csv extension
+SELECT load_extension('csv');
+
+-- Create a virtual table from a CSV file with a header row
+CREATE VIRTUAL TABLE employees USING csv(
+    filename='employees.csv',
+    header=yes
+);
+
+-- Query the CSV data with SQL
+SELECT * FROM employees WHERE department = 'Engineering';
+```
+
+### Generate a Sequence of Integers
+
+```sql
+-- Use generate_series as a table-valued function
+SELECT value FROM generate_series(1, 10);
+-- value
+-- 1
+-- 2
+-- ...
+-- 10
+
+-- Use with a step argument
+SELECT value FROM generate_series(0, 100, 10);
+-- value
+-- 0
+-- 10
+-- 20
+-- ...
+-- 100
+```
+
+### Generate a Date Series with generate_series
+
+```sql
+-- Generate dates for the next 7 days
+SELECT date('now', '+' || value || ' days') AS day
+FROM generate_series(0, 6);
+```
+
+## See Also
+
+- [SELECT](/docs/sql-reference/statements/select) for querying virtual tables
+- [Compatibility](/docs/sql-reference/compatibility) for the full list of supported modules

@@ -1,0 +1,19 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+
+# Reproducer: CREATE MATERIALIZED VIEW fails with "no such table" when the
+# source table was created in the same transaction.
+# The IVM populate code created a new connection that couldn't see uncommitted schema.
+test matview-create-same-txn-as-table {
+    BEGIN;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t1 VALUES (1, 'hello'), (2, 'world');
+    CREATE MATERIALIZED VIEW v AS SELECT val, COUNT(*) as cnt FROM t1 GROUP BY val;
+    COMMIT;
+    SELECT * FROM v ORDER BY val;
+}
+expect {
+    hello|1
+    world|1
+}

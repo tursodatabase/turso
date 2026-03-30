@@ -1,9 +1,10 @@
 use super::{Completion, File, OpenFlags, IO};
-use crate::error::LimboError;
-use crate::io::clock::{Clock, DefaultClock, Instant};
+use crate::error::{io_error, CompletionError, LimboError};
+use crate::io::clock::{Clock, DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::common;
+use crate::io::FileSyncType;
 use crate::Result;
-use parking_lot::Mutex;
+use crate::sync::Mutex;
 use rustix::{
     fd::{AsFd, AsRawFd},
     fs::{self, FlockOperation},
@@ -26,8 +27,12 @@ impl UnixIO {
 }
 
 impl Clock for UnixIO {
-    fn now(&self) -> Instant {
-        DefaultClock.now()
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        DefaultClock.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        DefaultClock.current_time_wall_clock()
     }
 }
 
@@ -66,17 +71,18 @@ fn try_pwritev_raw(
             iov_len: len,
         });
     }
+    // On Android, off_t is i32. Cast to libc::off_t instead of hardcoding i64 for portability.
     let n = if iov.len().eq(&1) {
         unsafe {
             libc::pwrite(
                 fd,
                 iov[0].iov_base as *const libc::c_void,
                 iov[0].iov_len,
-                off as i64,
+                off as libc::off_t,
             )
         }
     } else {
-        unsafe { libc::pwritev(fd, iov.as_ptr(), iov.len() as i32, off as i64) }
+        unsafe { libc::pwritev(fd, iov.as_ptr(), iov.len() as i32, off as libc::off_t) }
     };
     if n < 0 {
         Err(std::io::Error::last_os_error())
@@ -96,20 +102,22 @@ impl IO for UnixIO {
             file.create(flags.contains(OpenFlags::Create));
         }
 
-        let file = file.open(path)?;
+        let file = file.open(path).map_err(|e| io_error(e, "open"))?;
 
         #[allow(clippy::arc_with_non_send_sync)]
         let unix_file = Arc::new(UnixFile {
             file: Arc::new(Mutex::new(file)),
         });
-        if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err() {
-            unix_file.lock_file(!flags.contains(OpenFlags::ReadOnly))?;
+        if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
+            && !flags.contains(OpenFlags::ReadOnly)
+        {
+            unix_file.lock_file(true)?;
         }
         Ok(unix_file)
     }
 
     fn remove_file(&self, path: &str) -> Result<()> {
-        std::fs::remove_file(path)?;
+        std::fs::remove_file(path).map_err(|e| io_error(e, "remove_file"))?;
         Ok(())
     }
 
@@ -179,7 +187,7 @@ impl File for UnixFile {
         };
         if result == -1 {
             let e = std::io::Error::last_os_error();
-            Err(e.into())
+            Err(io_error(e, "pread"))
         } else {
             trace!("pread n: {}", result);
             // Read succeeded immediately
@@ -213,16 +221,15 @@ impl File for UnixFile {
                     // EINTR, retry without advancing
                     continue;
                 }
-                return Err(e.into());
+                return Err(io_error(e, "pwrite"));
             }
             let written = result as usize;
             if written == 0 {
                 // Unexpected EOF for regular files
-                return Err(std::io::Error::new(
+                return Err(LimboError::CompletionError(CompletionError::IOError(
                     ErrorKind::UnexpectedEof,
-                    "pwrite returned 0 bytes written",
-                )
-                .into());
+                    "pwrite",
+                )));
             }
 
             total_written += written;
@@ -258,11 +265,10 @@ impl File for UnixFile {
                 Ok(written) => {
                     if written == 0 {
                         // Unexpected EOF
-                        return Err(std::io::Error::new(
+                        return Err(LimboError::CompletionError(CompletionError::IOError(
                             ErrorKind::UnexpectedEof,
-                            "pwritev returned 0 bytes written",
-                        )
-                        .into());
+                            "pwritev",
+                        )));
                     }
                     total_written += written;
                     current_pos += written as u64;
@@ -292,7 +298,7 @@ impl File for UnixFile {
                     continue;
                 }
                 Err(e) => {
-                    return Err(e.into());
+                    return Err(io_error(e, "pwritev"));
                 }
             }
         }
@@ -302,30 +308,36 @@ impl File for UnixFile {
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn sync(&self, c: Completion) -> Result<Completion> {
+    fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {
         let file = self.file.lock();
 
         let result = unsafe {
-            #[cfg(not(target_vendor = "apple"))]
-            {
-                libc::fsync(file.as_raw_fd())
-            }
-
             #[cfg(target_vendor = "apple")]
             {
-                libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC)
+                match sync_type {
+                    FileSyncType::Fsync => libc::fsync(file.as_raw_fd()),
+                    FileSyncType::FullFsync => libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC),
+                }
+            }
+            #[cfg(not(target_vendor = "apple"))]
+            {
+                // FullFsync has no effect on non-Apple platforms
+                let _ = sync_type;
+                libc::fsync(file.as_raw_fd())
             }
         };
 
         if result == -1 {
             let e = std::io::Error::last_os_error();
-            Err(e.into())
+            Err(io_error(e, "sync"))
         } else {
+            #[cfg(target_vendor = "apple")]
+            match sync_type {
+                FileSyncType::FullFsync => trace!("fcntl(F_FULLFSYNC)"),
+                FileSyncType::Fsync => trace!("fsync"),
+            }
             #[cfg(not(target_vendor = "apple"))]
             trace!("fsync");
-
-            #[cfg(target_vendor = "apple")]
-            trace!("fcntl(F_FULLSYNC)");
 
             c.complete(0);
             Ok(c)
@@ -335,7 +347,7 @@ impl File for UnixFile {
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn size(&self) -> Result<u64> {
         let file = self.file.lock();
-        Ok(file.metadata()?.len())
+        Ok(file.metadata().map_err(|e| io_error(e, "metadata"))?.len())
     }
 
     #[instrument(err, skip_all, level = Level::INFO)]
@@ -348,7 +360,7 @@ impl File for UnixFile {
                 c.complete(0);
                 Ok(c)
             }
-            Err(e) => Err(e.into()),
+            Err(e) => Err(io_error(e, "truncate")),
         }
     }
 }

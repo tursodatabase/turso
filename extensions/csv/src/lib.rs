@@ -223,7 +223,7 @@ impl VTabModule for CsvVTabModule {
             schema = Some(sql);
         }
 
-        Ok((schema.unwrap(), table))
+        Ok((schema.ok_or(ResultCode::Error)?, table))
     }
 }
 

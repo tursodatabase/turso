@@ -1,42 +1,46 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use crate::sync::Arc;
+use rustc_hash::FxHashMap as HashMap;
 
-use crate::bail_parse_error;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
+use crate::function::{Deterministic, Func, ScalarFunc};
 use crate::index_method::IndexMethodConfiguration;
 use crate::numeric::Numeric;
-use crate::schema::{Table, RESERVED_TABLE_PREFIXES};
+use crate::schema::{Column, GeneratedType, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
+use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{
-    emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
+    emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
+    OperationMode, Resolver,
 };
-use crate::translate::expr::{translate_condition_expr, ConditionMetadata};
+use crate::translate::expr::{
+    bind_and_rewrite_expr, translate_condition_expr, translate_expr, unwrap_parens, walk_expr,
+    BindingBehavior, ConditionMetadata, WalkControl,
+};
 use crate::translate::insert::format_unique_violation_desc;
 use crate::translate::plan::{
     ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences,
 };
-use crate::vdbe::builder::CursorKey;
-use crate::vdbe::insn::{CmpInsFlags, Cookie};
-use crate::vdbe::BranchOffset;
+use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts, SelfTableContext};
+use crate::vdbe::insn::{to_u16, CmpInsFlags, Cookie};
+use crate::{bail_parse_error, CaptureDataChangesExt, LimboError};
 use crate::{
     schema::{BTreeTable, Index, IndexColumn, PseudoCursorType},
     storage::pager::CreateBTreeFlags,
-    util::normalize_ident,
+    util::{escape_sql_string_literal, normalize_ident},
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::{IdxInsertFlags, Insn, RegisterOrLiteral},
     },
 };
-use turso_parser::ast::{self, Expr, SortOrder, SortedColumn};
+use turso_parser::ast::{self, Expr, QualifiedName, SortOrder, SortedColumn};
 
 use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 
-#[allow(clippy::too_many_arguments)]
 pub fn translate_create_index(
-    mut program: ProgramBuilder,
+    program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
     resolver: &Resolver,
     stmt: ast::Stmt,
-) -> crate::Result<ProgramBuilder> {
+) -> crate::Result<()> {
     let sql = stmt.to_string();
     let ast::Stmt::CreateIndex {
         unique,
@@ -60,59 +64,82 @@ pub fn translate_create_index(
         )
     }
 
+    if connection.mvcc_enabled() && using.is_some() {
+        bail_parse_error!("Custom index modules are not supported in MVCC mode");
+    }
+
     let original_idx_name = idx_name;
+    let database_id = resolver.resolve_database_id(&original_idx_name)?;
     let idx_name = normalize_ident(original_idx_name.name.as_str());
     let tbl_name = normalize_ident(tbl_name.as_str());
 
     if tbl_name.eq_ignore_ascii_case("sqlite_sequence") {
         crate::bail_parse_error!("table sqlite_sequence may not be indexed");
     }
-    if connection.mvcc_enabled() {
-        crate::bail_parse_error!("CREATE INDEX is currently not supported when MVCC is enabled.");
-    }
-    if !resolver.schema.indexes_enabled() {
-        crate::bail_parse_error!(
-            "CREATE INDEX is disabled by default. Run with `--experimental-indexes` to enable this feature."
-        );
-    }
     if RESERVED_TABLE_PREFIXES
         .iter()
-        .any(|prefix| idx_name.starts_with(prefix))
+        .any(|prefix| idx_name.starts_with(prefix) || tbl_name.starts_with(prefix))
+        && !connection.is_nested_stmt()
     {
         bail_parse_error!(
             "Object name reserved for internal use: {}",
             original_idx_name
         );
     }
-    if RESERVED_TABLE_PREFIXES
-        .iter()
-        .any(|prefix| tbl_name.starts_with(prefix))
-    {
-        bail_parse_error!("Object name reserved for internal use: {}", tbl_name);
-    }
-    let opts = crate::vdbe::builder::ProgramBuilderOpts {
+    let opts = ProgramBuilderOpts {
         num_cursors: 5,
         approx_num_insns: 40,
         approx_num_labels: 5,
     };
     program.extend(&opts);
 
+    if crate::is_attached_db(database_id) {
+        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+        program.begin_write_on_database(database_id, schema_cookie);
+    }
+
     // Check if the index is being created on a valid btree table and
     // the name is globally unique in the schema.
-    if !resolver.schema.is_unique_idx_name(&idx_name) {
+    let schema_unique = resolver.with_schema(database_id, |s| s.is_unique_idx_name(&idx_name));
+    if !schema_unique {
         // If IF NOT EXISTS is specified, silently return without error
         if if_not_exists {
-            return Ok(program);
+            return Ok(());
         }
         crate::bail_parse_error!("Error: index with name '{idx_name}' already exists.");
     }
-    let Some(table) = resolver.schema.tables.get(&tbl_name) else {
+    let table = resolver.with_schema(database_id, |s| s.get_table(&tbl_name));
+    let Some(table) = table else {
         crate::bail_parse_error!("Error: table '{tbl_name}' does not exist.");
     };
     let Some(tbl) = table.btree() else {
         crate::bail_parse_error!("Error: table '{tbl_name}' is not a b-tree table.");
     };
     let columns = resolve_sorted_columns(&tbl, &columns)?;
+
+    // Block CREATE INDEX on non-orderable custom type columns
+    for col in &columns {
+        if col.expr.is_none() {
+            // Simple column reference (not expression index)
+            if let Some(column) = tbl.columns.get(col.pos_in_table) {
+                if let Some(type_def) = resolver
+                    .schema()
+                    .get_type_def(&column.ty_str, tbl.is_strict)
+                {
+                    if type_def.decode.is_some()
+                        && !type_def.operators.iter().any(|op| op.op == "<")
+                    {
+                        bail_parse_error!(
+                            "cannot create index on column '{}' of type '{}': type does not declare OPERATOR '<'",
+                            col.name,
+                            type_def.name
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     if !with_clause.is_empty() && using.is_none() {
         crate::bail_parse_error!(
             "Error: additional parameters are allowed only for custom module indices: '{idx_name}' is not custom module index"
@@ -133,7 +160,7 @@ pub fn translate_create_index(
                 table_name: tbl.name.clone(),
                 index_name: idx_name.clone(),
                 columns: columns.clone(),
-                parameters: parameters.clone(),
+                parameters,
             })?);
         }
     }
@@ -149,9 +176,10 @@ pub fn translate_create_index(
         // before translating, and it cannot reference a table alias
         where_clause: where_clause.clone(),
         index_method: index_method.clone(),
+        on_conflict: None,
     });
 
-    if !idx.validate_where_expr(table) {
+    if !idx.validate_where_expr(&table, resolver) {
         crate::bail_parse_error!(
             "Error: cannot use aggregate, window functions or reference other tables in WHERE clause of CREATE INDEX:\n {}",
             where_clause
@@ -168,7 +196,7 @@ pub fn translate_create_index(
     // 3. table_cursor_id         - table we are creating the index on
     // 4. sorter_cursor_id        - sorter
     // 5. pseudo_cursor_id        - pseudo table to store the sorted index values
-    let sqlite_table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let sqlite_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id =
         program.alloc_cursor_id(CursorType::BTreeTable(sqlite_table.clone()));
     let table_ref = program.table_reference_counter.next();
@@ -193,24 +221,27 @@ pub fn translate_create_index(
             internal_id: table_ref,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
             database_id: 0,
+            indexed: None,
         }],
         vec![],
     );
-    let where_clause = idx.bind_where_expr(Some(&mut table_references), connection);
+    let where_clause = idx.bind_where_expr(Some(&mut table_references), resolver);
 
     // Create a new B-Tree and store the root page index in a register
     let root_page_reg = program.alloc_register();
     if idx.index_method.is_some() && !idx.is_backing_btree_index() {
         program.emit_insn(Insn::IndexMethodCreate {
-            db: 0,
+            db: database_id,
             cursor_id: index_cursor_id,
         });
         // index method sqlite_schema row always has root_page equals to zero in the schema (same as virtual tables)
         program.emit_int(0, root_page_reg);
     } else {
         program.emit_insn(Insn::CreateBtree {
-            db: 0,
+            db: database_id,
             root: root_page_reg,
             flags: CreateBTreeFlags::new_index(),
         });
@@ -220,11 +251,11 @@ pub fn translate_create_index(
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: RegisterOrLiteral::Literal(sqlite_table.root_page),
-        db: 0,
+        db: database_id,
     });
-    let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, SQLITE_TABLEID)?;
+    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), SQLITE_TABLEID)?;
     emit_schema_entry(
-        &mut program,
+        program,
         resolver,
         sqlite_schema_cursor_id,
         cdc_table.map(|x| x.0),
@@ -243,7 +274,7 @@ pub fn translate_create_index(
         program.emit_insn(Insn::OpenRead {
             cursor_id: table_cursor_id,
             root_page: tbl.root_page,
-            db: 0,
+            db: database_id,
         });
 
         // Open the index btree we created for writing to insert the
@@ -251,7 +282,7 @@ pub fn translate_create_index(
         program.emit_insn(Insn::OpenWrite {
             cursor_id: index_cursor_id,
             root_page: RegisterOrLiteral::Register(root_page_reg),
-            db: 0,
+            db: database_id,
         });
 
         let loop_start_label = program.allocate_label();
@@ -270,24 +301,33 @@ pub fn translate_create_index(
         let mut skip_row_label = None;
         if let Some(where_clause) = where_clause {
             let label = program.allocate_label();
+            let condition_true_label = program.allocate_label();
             translate_condition_expr(
-                &mut program,
+                program,
                 &table_references,
                 &where_clause,
                 ConditionMetadata {
                     jump_if_condition_is_true: false,
                     jump_target_when_false: label,
-                    jump_target_when_true: BranchOffset::Placeholder,
+                    jump_target_when_true: condition_true_label,
                     jump_target_when_null: label,
                 },
                 resolver,
             )?;
+            program.preassign_label_to_next_insn(condition_true_label);
             skip_row_label = Some(label);
         }
 
         let start_reg = program.alloc_registers(columns.len() + 1);
         for (i, col) in columns.iter().enumerate() {
-            program.emit_column_or_rowid(table_cursor_id, col.pos_in_table, start_reg + i);
+            emit_index_column_value_from_cursor(
+                program,
+                resolver,
+                &mut table_references,
+                table_cursor_id,
+                col,
+                start_reg + i,
+            )?;
         }
         let rowid_reg = start_reg + columns.len();
         program.emit_insn(Insn::RowId {
@@ -296,9 +336,9 @@ pub fn translate_create_index(
         });
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
-            start_reg,
-            count: columns.len() + 1,
-            dest_reg: record_reg,
+            start_reg: to_u16(start_reg),
+            count: to_u16(columns.len() + 1),
+            dest_reg: to_u16(record_reg),
             index_name: Some(idx_name.clone()),
             affinity_str: None,
         });
@@ -321,14 +361,18 @@ pub fn translate_create_index(
         });
         program.preassign_label_to_next_insn(loop_end_label);
     } else if index_method.is_none() {
-        // determine the order of the columns in the index for the sorter
-        let order = idx.columns.iter().map(|c| c.order).collect();
+        // determine the order, collation, and nulls ordering of the columns in the index for the sorter
+        let order_collations_nulls = idx
+            .columns
+            .iter()
+            .map(|c| (c.order, c.collation, None))
+            .collect();
         // open the sorter and the pseudo table
         program.emit_insn(Insn::SorterOpen {
             cursor_id: sorter_cursor_id,
             columns: columns.len(),
-            order,
-            collations: idx.columns.iter().map(|c| c.collation).collect(),
+            order_collations_nulls,
+            comparators: vec![],
         });
         let content_reg = program.alloc_register();
         program.emit_insn(Insn::OpenPseudo {
@@ -341,7 +385,7 @@ pub fn translate_create_index(
         program.emit_insn(Insn::OpenRead {
             cursor_id: table_cursor_id,
             root_page: tbl.root_page,
-            db: 0,
+            db: database_id,
         });
 
         let loop_start_label = program.allocate_label();
@@ -360,24 +404,33 @@ pub fn translate_create_index(
         let mut skip_row_label = None;
         if let Some(where_clause) = where_clause {
             let label = program.allocate_label();
+            let condition_true_label = program.allocate_label();
             translate_condition_expr(
-                &mut program,
+                program,
                 &table_references,
                 &where_clause,
                 ConditionMetadata {
                     jump_if_condition_is_true: false,
                     jump_target_when_false: label,
-                    jump_target_when_true: BranchOffset::Placeholder,
+                    jump_target_when_true: condition_true_label,
                     jump_target_when_null: label,
                 },
                 resolver,
             )?;
+            program.preassign_label_to_next_insn(condition_true_label);
             skip_row_label = Some(label);
         }
 
         let start_reg = program.alloc_registers(columns.len() + 1);
         for (i, col) in columns.iter().enumerate() {
-            program.emit_column_or_rowid(table_cursor_id, col.pos_in_table, start_reg + i);
+            emit_index_column_value_from_cursor(
+                program,
+                resolver,
+                &mut table_references,
+                table_cursor_id,
+                col,
+                start_reg + i,
+            )?;
         }
         let rowid_reg = start_reg + columns.len();
         program.emit_insn(Insn::RowId {
@@ -386,9 +439,9 @@ pub fn translate_create_index(
         });
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
-            start_reg,
-            count: columns.len() + 1,
-            dest_reg: record_reg,
+            start_reg: to_u16(start_reg),
+            count: to_u16(columns.len() + 1),
+            dest_reg: to_u16(record_reg),
             index_name: Some(idx_name.clone()),
             affinity_str: None,
         });
@@ -411,7 +464,7 @@ pub fn translate_create_index(
         program.emit_insn(Insn::OpenWrite {
             cursor_id: index_cursor_id,
             root_page: RegisterOrLiteral::Register(root_page_reg),
-            db: 0,
+            db: database_id,
         });
 
         let sorted_loop_start = program.allocate_label();
@@ -444,6 +497,8 @@ pub fn translate_create_index(
             program.emit_insn(Insn::Halt {
                 err_code: SQLITE_CONSTRAINT_UNIQUE,
                 description: format_unique_violation_desc(tbl_name.as_str(), &idx),
+                on_error: None,
+                description_reg: None,
             });
             program.preassign_label_to_next_insn(label_after_sorter_compare);
         } else {
@@ -480,16 +535,18 @@ pub fn translate_create_index(
     // Keep schema table open to emit ParseSchema, close the other cursors.
     program.close_cursors(&[sorter_cursor_id, table_cursor_id, index_cursor_id]);
 
+    let current_schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
-        db: 0,
+        db: database_id,
         cookie: Cookie::SchemaVersion,
-        value: resolver.schema.schema_version as i32 + 1,
+        value: current_schema_version as i32 + 1,
         p5: 0,
     });
     // Parse the schema table to get the index root page and add new index to Schema
-    let parse_schema_where_clause = format!("name = '{idx_name}' AND type = 'index'");
+    let escaped_idx_name = escape_sql_string_literal(&idx_name);
+    let parse_schema_where_clause = format!("name = '{escaped_idx_name}' AND type = 'index'");
     program.emit_insn(Insn::ParseSchema {
-        db: sqlite_schema_cursor_id,
+        db: database_id,
         where_clause: Some(parse_schema_where_clause),
     });
     // Close the final sqlite_schema cursor
@@ -497,7 +554,7 @@ pub fn translate_create_index(
         cursor_id: sqlite_schema_cursor_id,
     });
 
-    Ok(program)
+    Ok(())
 }
 
 pub fn resolve_sorted_columns(
@@ -506,40 +563,300 @@ pub fn resolve_sorted_columns(
 ) -> crate::Result<Vec<IndexColumn>> {
     let mut resolved = Vec::with_capacity(cols.len());
     for sc in cols {
-        let ident = match sc.expr.as_ref() {
-            // SQLite supports indexes on arbitrary expressions, but we don't (yet).
-            // See "How to use indexes on expressions" in https://www.sqlite.org/expridx.html
-            Expr::Id(col_name) | Expr::Name(col_name) => col_name.as_str(),
-            _ => crate::bail_parse_error!("Error: cannot use expressions in CREATE INDEX"),
-        };
-        let Some(col) = table.get_column(ident) else {
-            crate::bail_parse_error!(
-                "Error: column '{ident}' does not exist in table '{}'",
-                table.name
-            );
-        };
+        let order = sc.order.unwrap_or(SortOrder::Asc);
+        let (explicit_collation, base_expr) = extract_collation(sc.expr.as_ref())?;
+        // Unwrap parentheses for column resolution (SQLite treats (('col')) same as 'col')
+        let unwrapped_expr = unwrap_parens(base_expr)?;
+        if let Some((pos, column_name, column)) = resolve_index_column(unwrapped_expr, table) {
+            let collation = explicit_collation.or_else(|| column.collation_opt());
+            let expr = match column.generated_type() {
+                GeneratedType::Virtual { resolved, .. } => Some(resolved.clone()),
+                GeneratedType::NotGenerated => None,
+            };
+            resolved.push(IndexColumn {
+                name: column_name,
+                order,
+                pos_in_table: pos,
+                collation,
+                default: column.default.clone(),
+                expr,
+            });
+            continue;
+        }
+        if !validate_index_expression(unwrapped_expr, table) {
+            crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
+        }
         resolved.push(IndexColumn {
-            name: col.1.name.as_ref().unwrap().clone(),
-            order: sc.order.unwrap_or(SortOrder::Asc),
-            pos_in_table: col.0,
-            collation: col.1.collation_opt(),
-            default: col.1.default.clone(),
+            name: sc.expr.to_string(),
+            order,
+            pos_in_table: EXPR_INDEX_SENTINEL,
+            collation: explicit_collation,
+            default: None,
+            expr: Some(sc.expr.clone()),
         });
     }
     Ok(resolved)
 }
 
+/// Extracts collation sequence from an expression if it is a Collate expression.
+/// Given the example: `col1 COLLATE NOCASE` / Expr::Collation(Expr::Id(col1), CollationSeq)
+/// returns (Some(CollationSeq), Expr::Id(col1))
+fn extract_collation(expr: &Expr) -> crate::Result<(Option<CollationSeq>, &Expr)> {
+    let mut current = expr;
+    let mut coll = None;
+    while let Expr::Collate(inner, seq) = current {
+        coll = Some(CollationSeq::new(seq.as_str())?);
+        current = inner.as_ref();
+    }
+    Ok((coll, current))
+}
+
+/// For a given Index Expression, attempts to resolve it to a column position in the table.
+/// Returning (position_in_table, column_name, column_reference).
+/// This is needed to support Collated indexes, where the ast node is not simply the column name,
+/// but isn't treated like an arbitrary expression either.
+fn resolve_index_column<'a>(
+    expr: &'a Expr,
+    table: &'a BTreeTable,
+) -> Option<(usize, String, &'a Column)> {
+    let (pos, column) = match expr {
+        Expr::Id(col_name) | Expr::Name(col_name) => table.get_column(col_name.as_str())?,
+        // SQLite interprets single-quoted strings as column names in index expressions
+        // (backwards compatibility quirk). We do the same. The string includes quotes.
+        Expr::Literal(ast::Literal::String(col_name)) => {
+            let unquoted = col_name.trim_matches('\'');
+            table.get_column(unquoted)?
+        }
+        Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
+            table.get_column(col.as_str())?
+        }
+        Expr::RowId { .. } => table.get_rowid_alias_column()?,
+        _ => return None,
+    };
+    let column_name = column
+        .name
+        .as_ref()
+        .expect("column name must exist for indexed column")
+        .clone();
+    Some((pos, column_name, column))
+}
+
+/// Validates that an index expression only contains allowed constructs.
+///
+/// https://sqlite.org/expridx.html
+/// There are certain reasonable restrictions on expressions that appear in CREATE INDEX statements:
+/// Expressions in CREATE INDEX statements may only refer to columns of the table being indexed, not to columns in other tables.
+/// Expressions in CREATE INDEX statements may contain function calls, but only to functions whose output is always determined completely by its input parameters
+/// (a.k.a.: deterministic functions). Obviously, functions like random() will not work well in an index. But also functions like sqlite_version(), though they
+/// are constant across any one database connection, are not constant across the life of the underlying database file, and hence may not be used in a CREATE INDEX statement.
+/// Expressions in CREATE INDEX statements may not use subqueries.
+/// Additionally, a standalone string literal is interpreted as a column name (for backwards
+/// compatibility with SQLite), not as a string literal. It is rejected if no such column exists.
+fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
+    // A top-level string literal would have been handled by resolve_index_column().
+    // If we get here with a string literal, it means the column doesn't exist.
+    // (SQLite interprets standalone string literals as column names for backwards compat.)
+    // Note: extract_collation already unwraps parentheses, so we check the unwrapped expr.
+    if matches!(expr, Expr::Literal(ast::Literal::String(_))) {
+        return false;
+    }
+
+    let tbl_norm = normalize_ident(table.name.as_str());
+    let has_col = |name: &str| {
+        let n = normalize_ident(name);
+        table
+            .columns
+            .iter()
+            .any(|c| c.name.as_ref().is_some_and(|cn| normalize_ident(cn) == n))
+    };
+    let is_tbl = |ns: &str| normalize_ident(ns).eq_ignore_ascii_case(&tbl_norm);
+    let is_deterministic_fn = |name: &str, args: &[Box<Expr>]| {
+        let n = normalize_ident(name);
+        Func::resolve_function(&n, args.len())
+            .is_ok_and(|f| f.is_some_and(|f| is_valid_index_function_call(&f, args)))
+    };
+
+    let mut ok = true;
+    let _ = walk_expr(expr, &mut |e: &Expr| -> crate::Result<WalkControl> {
+        if !ok {
+            return Ok(WalkControl::SkipChildren);
+        }
+        match e {
+            // String literals inside expressions are allowed (e.g., `c0 || 'suffix'`).
+            // Standalone string literals are handled by resolve_index_column() which interprets
+            // them as column names (SQLite backwards compat quirk).
+            Expr::Literal(
+                ast::Literal::CurrentDate
+                | ast::Literal::CurrentTime
+                | ast::Literal::CurrentTimestamp,
+            ) => {
+                ok = false;
+            }
+            Expr::Literal(_) | Expr::RowId { .. } => {}
+            // must be a column of the target table
+            Expr::Id(n) | Expr::Name(n) => {
+                if !has_col(n.as_str()) {
+                    ok = false;
+                }
+            }
+            // Qualified: qualifier must match this index's table, column must exist
+            Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
+                if !is_tbl(ns.as_str()) || !has_col(col.as_str()) {
+                    ok = false;
+                }
+            }
+            Expr::FunctionCall {
+                name, filter_over, ..
+            }
+            | Expr::FunctionCallStar {
+                name, filter_over, ..
+            } => {
+                // reject windowed
+                if filter_over.over_clause.is_some() {
+                    ok = false;
+                } else {
+                    let argc = match e {
+                        Expr::FunctionCall { args, .. } => args.as_slice(),
+                        Expr::FunctionCallStar { .. } => &[] as &[Box<Expr>],
+                        _ => unreachable!(),
+                    };
+                    if !is_deterministic_fn(name.as_str(), argc) {
+                        ok = false;
+                    }
+                }
+            }
+            // Explicitly disallowed constructs
+            Expr::Exists(_)
+            | Expr::InSelect { .. }
+            | Expr::Subquery(_)
+            | Expr::Raise { .. }
+            | Expr::Variable(_) => {
+                ok = false;
+            }
+            _ => {}
+        }
+        Ok(if ok {
+            WalkControl::Continue
+        } else {
+            WalkControl::SkipChildren
+        })
+    });
+    ok
+}
+
+fn is_valid_index_function_call(func: &Func, args: &[Box<Expr>]) -> bool {
+    match func {
+        Func::Scalar(
+            ScalarFunc::Date
+            | ScalarFunc::Time
+            | ScalarFunc::DateTime
+            | ScalarFunc::UnixEpoch
+            | ScalarFunc::JulianDay
+            | ScalarFunc::StrfTime
+            | ScalarFunc::TimeDiff,
+        ) => is_deterministic_datetime_index_call(func, args),
+        _ => func.is_deterministic(),
+    }
+}
+
+// SQLite allows date/time functions in expression indexes only when they do not
+// depend on the current clock or local timezone.
+fn is_deterministic_datetime_index_call(func: &Func, args: &[Box<Expr>]) -> bool {
+    match func {
+        Func::Scalar(ScalarFunc::Date)
+        | Func::Scalar(ScalarFunc::Time)
+        | Func::Scalar(ScalarFunc::DateTime)
+        | Func::Scalar(ScalarFunc::UnixEpoch)
+        | Func::Scalar(ScalarFunc::JulianDay) => {
+            !args.is_empty()
+                && !is_current_time_expr(args[0].as_ref())
+                && !args[1..]
+                    .iter()
+                    .any(|arg| is_unsafe_datetime_modifier(arg.as_ref()))
+        }
+        Func::Scalar(ScalarFunc::StrfTime) => {
+            args.len() >= 2
+                && !is_current_time_expr(args[1].as_ref())
+                && !args[2..]
+                    .iter()
+                    .any(|arg| is_unsafe_datetime_modifier(arg.as_ref()))
+        }
+        Func::Scalar(ScalarFunc::TimeDiff) => {
+            !args.iter().any(|arg| is_current_time_expr(arg.as_ref()))
+        }
+        _ => unreachable!("non-datetime function passed to datetime index validator"),
+    }
+}
+
+fn is_current_time_expr(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Literal(ast::Literal::String(value)) if string_literal_eq(value, "now")
+    ) || matches!(
+        expr,
+        Expr::Literal(
+            ast::Literal::CurrentDate | ast::Literal::CurrentTime | ast::Literal::CurrentTimestamp
+        )
+    )
+}
+
+fn is_unsafe_datetime_modifier(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Literal(ast::Literal::String(value))
+            if string_literal_eq(value, "localtime") || string_literal_eq(value, "utc")
+    ) || is_current_time_expr(expr)
+}
+
+fn string_literal_eq(value: &str, expected: &str) -> bool {
+    value.trim_matches('\'').eq_ignore_ascii_case(expected)
+}
+
+fn emit_index_column_value_from_cursor(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    table_references: &mut TableReferences,
+    table_cursor_id: usize,
+    idx_col: &IndexColumn,
+    dest_reg: usize,
+) -> crate::Result<()> {
+    if let Some(expr) = &idx_col.expr {
+        let mut expr = expr.as_ref().clone();
+        bind_and_rewrite_expr(
+            &mut expr,
+            Some(table_references),
+            None,
+            resolver,
+            BindingBehavior::ResultColumnsNotAllowed,
+        )?;
+        let self_table_context =
+            table_references
+                .joined_tables()
+                .first()
+                .map(|jt| SelfTableContext::ForSelect {
+                    table_ref_id: jt.internal_id,
+                    referenced_tables: table_references.clone(),
+                });
+        program.with_self_table_context(self_table_context.as_ref(), |program, _| {
+            translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
+            Ok(())
+        })?;
+    } else {
+        program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
+    }
+    Ok(())
+}
+
 pub fn resolve_index_method_parameters(
     parameters: Vec<(turso_parser::ast::Name, Box<Expr>)>,
 ) -> crate::Result<HashMap<String, crate::Value>> {
-    let mut resolved = HashMap::new();
+    let mut resolved = HashMap::default();
     for (key, value) in parameters {
         let value = match *value {
             Expr::Literal(literal) => match literal {
                 ast::Literal::Numeric(s) => match Numeric::from(s) {
-                    Numeric::Null => crate::Value::Null,
-                    Numeric::Integer(v) => crate::Value::Integer(v),
-                    Numeric::Float(v) => crate::Value::Float(v.into()),
+                    Numeric::Integer(v) => crate::Value::Numeric(Numeric::Integer(v)),
+                    Numeric::Float(v) => crate::Value::Numeric(Numeric::Float(v)),
                 },
                 ast::Literal::Null => crate::Value::Null,
                 ast::Literal::String(s) => crate::Value::Text(s.into()),
@@ -564,43 +881,44 @@ pub fn resolve_index_method_parameters(
 }
 
 pub fn translate_drop_index(
-    idx_name: &str,
+    qualified_name: &QualifiedName,
     resolver: &Resolver,
     if_exists: bool,
-    mut program: ProgramBuilder,
-) -> crate::Result<ProgramBuilder> {
-    if !resolver.schema.indexes_enabled() {
-        crate::bail_parse_error!(
-            "DROP INDEX is disabled by default. Run with `--experimental-indexes` to enable this feature."
-        );
-    }
-    let idx_name = normalize_ident(idx_name);
-    let opts = crate::vdbe::builder::ProgramBuilderOpts {
+    program: &mut ProgramBuilder,
+) -> crate::Result<()> {
+    let database_id = resolver.resolve_database_id(qualified_name)?;
+    let idx_name = normalize_ident(qualified_name.name.as_str());
+    let opts = ProgramBuilderOpts {
         num_cursors: 5,
         approx_num_insns: 40,
         approx_num_labels: 5,
     };
     program.extend(&opts);
 
+    if crate::is_attached_db(database_id) {
+        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+        program.begin_write_on_database(database_id, schema_cookie);
+    }
+
     // Find the index in Schema
     let mut maybe_index = None;
-    for val in resolver.schema.indexes.values() {
-        if maybe_index.is_some() {
-            break;
-        }
-        for idx in val {
-            if idx.name == idx_name {
-                maybe_index = Some(idx);
-                break;
-            }
-        }
+    let indexes: Vec<_> = resolver.with_schema(database_id, |s| {
+        s.indexes
+            .values()
+            .flat_map(|v| v.iter())
+            .filter(|idx| idx.name == idx_name)
+            .cloned()
+            .collect()
+    });
+    if let Some(idx) = indexes.first() {
+        maybe_index = Some(idx.clone());
     }
 
     // If there's no index if_exist is true,
     // then return normaly, otherwise show an error.
     if maybe_index.is_none() {
         if if_exists {
-            return Ok(program);
+            return Ok(());
         } else {
             return Err(crate::error::LimboError::InvalidArgument(format!(
                 "No such index: {}",
@@ -609,7 +927,7 @@ pub fn translate_drop_index(
         }
     }
     // Return an error if the index is associated with a unique or primary key constraint.
-    if let Some(idx) = maybe_index {
+    if let Some(ref idx) = maybe_index {
         if idx.unique {
             return Err(crate::error::LimboError::InvalidArgument(
                 "index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped"
@@ -618,7 +936,7 @@ pub fn translate_drop_index(
         }
     }
 
-    let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, SQLITE_TABLEID)?;
+    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), SQLITE_TABLEID)?;
 
     // According to sqlite should emit Null instruction
     // but why?
@@ -626,7 +944,7 @@ pub fn translate_drop_index(
     program.emit_null(null_reg, None);
 
     // String8; r[3] = 'some idx name'
-    let index_name_reg = program.emit_string8_new_reg(idx_name.to_string());
+    let index_name_reg = program.emit_string8_new_reg(idx_name);
     // String8; r[4] = 'index'
     let index_str_reg = program.emit_string8_new_reg("index".to_string());
 
@@ -634,15 +952,15 @@ pub fn translate_drop_index(
     let row_id_reg = program.alloc_register();
 
     // We're going to use this cursor to search through sqlite_schema
-    let sqlite_table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let sqlite_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id =
         program.alloc_cursor_id(CursorType::BTreeTable(sqlite_table.clone()));
 
-    // Open root=1 iDb=0; sqlite_schema for writing
+    // Open sqlite_schema for writing
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: RegisterOrLiteral::Literal(sqlite_table.root_page),
-        db: 0,
+        db: database_id,
     });
 
     let loop_start_label = program.allocate_label();
@@ -692,18 +1010,19 @@ pub fn translate_drop_index(
     program.resolve_label(label_once_end, program.offset());
 
     if let Some((cdc_cursor_id, _)) = cdc_table {
-        let before_record_reg = if program.capture_data_changes_mode().has_before() {
+        let before_record_reg = if program.capture_data_changes_info().has_before() {
             Some(emit_cdc_full_record(
-                &mut program,
+                program,
                 &sqlite_table.columns,
                 sqlite_schema_cursor_id,
                 row_id_reg,
+                sqlite_table.is_strict,
             ))
         } else {
             None
         };
         emit_cdc_insns(
-            &mut program,
+            program,
             resolver,
             OperationMode::DELETE,
             cdc_cursor_id,
@@ -728,21 +1047,29 @@ pub fn translate_drop_index(
     });
 
     program.resolve_label(loop_end_label, program.offset());
+    if let Some((cdc_cursor_id, _)) = cdc_table {
+        emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
+    }
 
+    let current_schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
-        db: 0,
+        db: database_id,
         cookie: Cookie::SchemaVersion,
-        value: resolver.schema.schema_version as i32 + 1,
+        value: current_schema_version as i32 + 1,
         p5: 0,
     });
 
     let index = maybe_index.unwrap();
     if index.index_method.is_some() && !index.is_backing_btree_index() {
-        let cursor_id = program.alloc_cursor_index(None, index)?;
-        program.emit_insn(Insn::IndexMethodDestroy { db: 0, cursor_id });
+        let cursor_id = program.alloc_cursor_index(None, &index)?;
+        program.emit_insn(Insn::IndexMethodDestroy {
+            db: database_id,
+            cursor_id,
+        });
     } else {
         // Destroy index btree
         program.emit_insn(Insn::Destroy {
+            db: database_id,
             root: index.root_page,
             former_root_reg: 0,
             is_temp: 0,
@@ -752,8 +1079,91 @@ pub fn translate_drop_index(
     // Remove from the Schema any mention of the index
     program.emit_insn(Insn::DropIndex {
         index: index.clone(),
-        db: 0,
+        db: database_id,
     });
 
-    Ok(program)
+    Ok(())
+}
+
+/// Translate `OPTIMIZE INDEX [idx_name]` statement.
+/// If idx_name is provided, optimize that specific index.
+/// If idx_name is None, optimize all index method indexes.
+pub fn translate_optimize(
+    idx_name: Option<ast::QualifiedName>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+) -> crate::Result<()> {
+    if !connection.experimental_index_method_enabled() {
+        crate::bail_parse_error!(
+            "OPTIMIZE INDEX requires experimental index method feature. Enable with --experimental-index-method flag"
+        )
+    }
+
+    let opts = ProgramBuilderOpts {
+        num_cursors: 5,
+        approx_num_insns: 20,
+        approx_num_labels: 2,
+    };
+    program.extend(&opts);
+
+    let mut indexes_to_optimize = Vec::new();
+
+    if let Some(name) = idx_name {
+        // Optimize a specific index
+        let idx_name = normalize_ident(name.name.as_str());
+        let mut found = false;
+
+        for val in resolver.schema().indexes.values() {
+            for idx in val {
+                if idx.name == idx_name {
+                    if idx.index_method.is_some() && !idx.is_backing_btree_index() {
+                        indexes_to_optimize.push(idx.clone());
+                    } else {
+                        // Not an index method index - nothing to optimize
+                        tracing::debug!(
+                            "OPTIMIZE INDEX: {} is not an index method index, nothing to optimize",
+                            idx_name
+                        );
+                    }
+                    found = true;
+                    break;
+                }
+            }
+            if found {
+                break;
+            }
+        }
+
+        if !found {
+            return Err(LimboError::InvalidArgument(format!(
+                "No such index: {idx_name}"
+            )));
+        }
+    } else {
+        // Optimize all index method indexes
+        for val in resolver.schema().indexes.values() {
+            for idx in val {
+                if idx.index_method.is_some() && !idx.is_backing_btree_index() {
+                    indexes_to_optimize.push(idx.clone());
+                }
+            }
+        }
+
+        if indexes_to_optimize.is_empty() {
+            tracing::debug!("OPTIMIZE INDEX: no index method indexes found to optimize");
+            return Ok(());
+        }
+    }
+
+    // Emit optimize instructions for each index method index
+    for idx in &indexes_to_optimize {
+        let cursor_id = program.alloc_cursor_index(None, idx)?;
+        program.emit_insn(Insn::IndexMethodOptimize {
+            db: crate::MAIN_DB_ID,
+            cursor_id,
+        });
+    }
+
+    Ok(())
 }

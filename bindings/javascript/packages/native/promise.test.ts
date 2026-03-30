@@ -118,9 +118,20 @@ test('avg-bug', async () => {
         'value 6', null, null, 150,
     );
 
-    expect(await db.prepare(`select avg("a") from "aggregate_table";`).get()).toEqual({ 'avg (aggregate_table.a)': 24 });
-    expect(await db.prepare(`select avg("null_only") from "aggregate_table";`).get()).toEqual({ 'avg (aggregate_table.null_only)': null });
-    expect(await db.prepare(`select avg(distinct "b") from "aggregate_table";`).get()).toEqual({ 'avg (DISTINCT aggregate_table.b)': 42.5 });
+    expect(await db.prepare(`select avg("a") from "aggregate_table";`).get()).toEqual({ 'avg("a")': 24 });
+    expect(await db.prepare(`select avg("null_only") from "aggregate_table";`).get()).toEqual({ 'avg("null_only")': null });
+    expect(await db.prepare(`select avg(distinct "b") from "aggregate_table";`).get()).toEqual({ 'avg(distinct "b")': 42.5 });
+})
+
+test('insert returning test', async () => {
+    const db = await connect(':memory:');
+    await db.prepare(`create table t (x);`).run();
+    const x1 = await db.prepare(`insert into t values (1), (2) returning x`).get();
+    const x2 = await db.prepare(`insert into t values (3), (4) returning x`).get();
+    expect(x1).toEqual({ x: 1 });
+    expect(x2).toEqual({ x: 3 });
+    const all = await db.prepare(`select * from t`).all();
+    expect(all).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }, { x: 4 }])
 })
 
 test('offset-bug', async () => {
@@ -196,10 +207,10 @@ test('attach', async () => {
     const path1 = `test-${(Math.random() * 10000) | 0}.db`;
     const path2 = `test-${(Math.random() * 10000) | 0}.db`;
     try {
-        const db1 = await connect(path1);
+        const db1 = await connect(path1, { experimental: ["attach"] });
         await db1.exec("CREATE TABLE t(x)");
         await db1.exec("INSERT INTO t VALUES (1), (2), (3)");
-        const db2 = await connect(path2);
+        const db2 = await connect(path2, { experimental: ["attach"] });
         await db2.exec("CREATE TABLE q(x)");
         await db2.exec("INSERT INTO q VALUES (4), (5), (6)");
 
@@ -215,6 +226,42 @@ test('attach', async () => {
         unlinkSync(path2);
         unlinkSync(`${path2}-wal`);
     }
+})
+
+test('fts', async () => {
+    const db = await connect(":memory:", { experimental: ["index_method"] });
+    await db.exec(`
+        CREATE TABLE documents (id INTEGER PRIMARY KEY, title TEXT, body TEXT);
+        INSERT INTO documents VALUES (1, 'Introduction to Rust', 'Rust is a systems programming language focused on safety and performance');
+        INSERT INTO documents VALUES (2, 'JavaScript Guide', 'JavaScript is a dynamic programming language used for web development');
+        INSERT INTO documents VALUES (3, 'Database Internals', 'Understanding how databases store and retrieve data efficiently');
+        CREATE INDEX documents_fts ON documents USING fts (title, body);
+    `);
+
+    // fts_match search
+    const matchResults = await db.prepare(
+        "SELECT id, title, fts_score(title, body, 'programming language') as score FROM documents WHERE fts_match(title, body, 'programming language')"
+    ).all();
+    expect(matchResults.length).toBe(2);
+    expect(matchResults.map(r => r.id).sort()).toEqual([1, 2]);
+    for (const row of matchResults) {
+        expect(row.score).toBeGreaterThan(0);
+    }
+
+    // fts_highlight
+    const highlightResults = await db.prepare(
+        "SELECT id, fts_highlight(title, '<b>', '</b>', 'Rust') as highlighted FROM documents WHERE fts_match(title, body, 'Rust')"
+    ).all();
+    expect(highlightResults.length).toBe(1);
+    expect(highlightResults[0].id).toBe(1);
+    expect(highlightResults[0].highlighted).toContain('<b>');
+    expect(highlightResults[0].highlighted).toContain('Rust');
+
+    // no match
+    const noResults = await db.prepare(
+        "SELECT * FROM documents WHERE fts_match(title, body, 'nonexistentterm')"
+    ).all();
+    expect(noResults.length).toBe(0);
 })
 
 test('blobs', async () => {

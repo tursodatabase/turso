@@ -1,0 +1,317 @@
+---
+title: Extensions
+description: Built-in and loadable extensions for additional SQL functions and virtual tables
+sidebarTitle: Extensions
+---
+
+# Extensions
+
+Turso provides several built-in extensions that add specialized SQL functions and virtual tables. Extensions can be loaded at runtime using the `load_extension()` function.
+
+## Loading Extensions
+
+```sql
+SELECT load_extension('extension_name');
+```
+
+Turso supports loading Turso-native extensions. SQLite `.so`/`.dll` loadable extensions are not supported.
+
+## UUID Extension
+
+The UUID extension provides functions for generating and working with UUIDs. UUIDs are stored as 16-byte BLOBs by default.
+
+### Functions
+
+| Function | Parameters | Return Type | Description |
+|----------|-----------|-------------|-------------|
+| `uuid4()` | none | BLOB | Generate a random UUID v4 |
+| `uuid4_str()` | none | TEXT | Generate a random UUID v4 as string. Alias: `gen_random_uuid()` |
+| `uuid7()` | none | BLOB | Generate a time-ordered UUID v7 |
+| `uuid7(seconds)` | INTEGER | BLOB | Generate a UUID v7 with specified seconds since epoch |
+| `uuid7_timestamp_ms(uuid)` | BLOB | INTEGER | Extract milliseconds since epoch from a UUID v7 |
+| `uuid_str(uuid)` | BLOB | TEXT | Convert a UUID blob to string representation |
+| `uuid_blob(uuid)` | TEXT | BLOB | Convert a UUID string to blob representation |
+
+### Examples
+
+```sql
+-- Generate UUIDs
+SELECT uuid4_str();
+-- '550e8400-e29b-41d4-a716-446655440000'
+
+SELECT uuid_str(uuid4());
+-- 'f47ac10b-58cc-4372-a567-0e02b2c3d479'
+
+-- UUID v7 is time-ordered (good for primary keys)
+SELECT uuid_str(uuid7());
+-- '0190a5c0-1234-7abc-8def-0123456789ab'
+
+-- Extract timestamp from UUID v7
+SELECT uuid7_timestamp_ms(uuid7());
+-- 1720000000000
+
+-- Use in a table
+CREATE TABLE documents (
+    id BLOB PRIMARY KEY DEFAULT (uuid7()),
+    title TEXT
+);
+INSERT INTO documents (title) VALUES ('My Document');
+SELECT uuid_str(id), title FROM documents;
+```
+
+## Regexp Extension
+
+The regexp extension provides regular expression functions compatible with [sqlean-regexp](https://github.com/nalgeon/sqlean/blob/main/docs/regexp.md).
+
+### Functions
+
+| Function | Parameters | Return Type | Description |
+|----------|-----------|-------------|-------------|
+| `regexp(pattern, source)` | TEXT, TEXT | INTEGER | Returns 1 if source matches pattern |
+| `regexp_like(source, pattern)` | TEXT, TEXT | INTEGER | Returns 1 if source matches pattern (argument order reversed) |
+| `regexp_substr(source, pattern)` | TEXT, TEXT | TEXT | Returns the first substring matching pattern, or NULL |
+| `regexp_capture(source, pattern)` | TEXT, TEXT | TEXT | Returns the first capture group match |
+| `regexp_capture(source, pattern, n)` | TEXT, TEXT, INTEGER | TEXT | Returns the n-th capture group match |
+| `regexp_replace(source, pattern, replacement)` | TEXT, TEXT, TEXT | TEXT | Replace matches with replacement string |
+
+### Examples
+
+```sql
+-- Pattern matching
+SELECT regexp('[0-9]+', 'abc123def');
+-- 1
+
+-- The REGEXP operator uses this extension
+SELECT 'hello123' REGEXP '[a-z]+[0-9]+';
+-- 1
+
+-- Extract matching substring
+SELECT regexp_substr('Price: $42.50', '[0-9]+\.[0-9]+');
+-- '42.50'
+
+-- Capture groups
+SELECT regexp_capture('2025-03-15', '(\d{4})-(\d{2})-(\d{2})', 1);
+-- '2025'
+
+-- Replace
+SELECT regexp_replace('Hello World', '[aeiou]', '*');
+-- 'H*ll* W*rld'
+```
+
+## Vector Extension
+
+<Info>
+**Turso Extension**: Native vector search for similarity search and semantic search applications.
+</Info>
+
+The vector extension provides functions for creating, storing, and searching vector embeddings. Vectors are stored as BLOBs.
+
+For the complete function reference, see [Vector Functions](/docs/sql-reference/functions/vector).
+
+### Quick Reference
+
+| Function | Description |
+|----------|-------------|
+| `vector32(json)` | Create a 32-bit float vector |
+| `vector64(json)` | Create a 64-bit float vector |
+| `vector_distance_cos(v1, v2)` | Cosine distance |
+| `vector_distance_l2(v1, v2)` | Euclidean distance |
+| `vector_extract(v)` | Convert vector to JSON |
+| `vector_concat(v1, v2)` | Concatenate vectors |
+| `vector_slice(v, start, end)` | Extract vector slice |
+
+### Example
+
+```sql
+CREATE TABLE docs (
+    id INTEGER PRIMARY KEY,
+    content TEXT,
+    embedding BLOB
+);
+
+INSERT INTO docs VALUES (1, 'database systems', vector32('[0.1, 0.2, 0.3]'));
+INSERT INTO docs VALUES (2, 'machine learning', vector32('[0.4, 0.5, 0.6]'));
+
+-- Find similar documents
+SELECT content, vector_distance_cos(embedding, vector32('[0.1, 0.25, 0.35]')) AS dist
+FROM docs
+ORDER BY dist
+LIMIT 5;
+```
+
+## Time Extension
+
+The time extension is compatible with [sqlean-time](https://github.com/nalgeon/sqlean/blob/main/docs/time.md) and provides advanced time manipulation functions.
+
+### Key Functions
+
+| Function | Parameters | Return Type | Description |
+|----------|-----------|-------------|-------------|
+| `time_now()` | none | INTEGER | Current time as Unix nanoseconds |
+| `time_date(y,m,d,...)` | INTEGER... | INTEGER | Create time from components |
+| `time_unix(sec)` | INTEGER | INTEGER | Create time from Unix seconds |
+| `time_milli(ms)` | INTEGER | INTEGER | Create time from milliseconds |
+| `time_micro(us)` | INTEGER | INTEGER | Create time from microseconds |
+| `time_nano(ns)` | INTEGER | INTEGER | Create time from nanoseconds |
+| `time_to_unix(t)` | INTEGER | INTEGER | Convert to Unix seconds |
+| `time_to_milli(t)` | INTEGER | INTEGER | Convert to milliseconds |
+| `time_to_micro(t)` | INTEGER | INTEGER | Convert to microseconds |
+| `time_to_nano(t)` | INTEGER | INTEGER | Convert to nanoseconds |
+| `time_get_year(t)` | INTEGER | INTEGER | Extract year |
+| `time_get_month(t)` | INTEGER | INTEGER | Extract month (1-12) |
+| `time_get_day(t)` | INTEGER | INTEGER | Extract day (1-31) |
+| `time_get_hour(t)` | INTEGER | INTEGER | Extract hour (0-23) |
+| `time_get_minute(t)` | INTEGER | INTEGER | Extract minute (0-59) |
+| `time_get_second(t)` | INTEGER | INTEGER | Extract second (0-59) |
+| `time_get_weekday(t)` | INTEGER | INTEGER | Day of week (0=Sunday) |
+| `time_get(t, field)` | INTEGER, TEXT | INTEGER | Extract named field |
+| `time_add(t, d)` | INTEGER, INTEGER | INTEGER | Add duration |
+| `time_add_date(t, y, m, d)` | INTEGER... | INTEGER | Add years/months/days |
+| `time_sub(t, u)` | INTEGER, INTEGER | INTEGER | Difference between times |
+| `time_since(t)` | INTEGER | INTEGER | Duration since time |
+| `time_until(t)` | INTEGER | INTEGER | Duration until time |
+| `time_trunc(t, field)` | INTEGER, TEXT | INTEGER | Truncate to field |
+| `time_after(t, u)` | INTEGER, INTEGER | INTEGER | 1 if t is after u |
+| `time_before(t, u)` | INTEGER, INTEGER | INTEGER | 1 if t is before u |
+| `time_compare(t, u)` | INTEGER, INTEGER | INTEGER | -1, 0, or 1 |
+| `time_equal(t, u)` | INTEGER, INTEGER | INTEGER | 1 if equal |
+| `time_fmt_iso(t)` | INTEGER | TEXT | Format as ISO 8601 |
+| `time_fmt_datetime(t)` | INTEGER | TEXT | Format as datetime |
+| `time_fmt_date(t)` | INTEGER | TEXT | Format as date |
+| `time_fmt_time(t)` | INTEGER | TEXT | Format as time |
+| `time_parse(s)` | TEXT | INTEGER | Parse time string |
+
+#### Duration Constants
+
+| Function | Value |
+|----------|-------|
+| `dur_ns()` | 1 nanosecond |
+| `dur_us()` | 1 microsecond |
+| `dur_ms()` | 1 millisecond |
+| `dur_s()` | 1 second |
+| `dur_m()` | 1 minute |
+| `dur_h()` | 1 hour |
+
+### Example
+
+```sql
+-- Current time formatted
+SELECT time_fmt_iso(time_now());
+-- '2025-03-15T10:30:00Z'
+
+-- Date arithmetic
+SELECT time_fmt_date(time_add_date(time_now(), 0, 1, 0));
+-- add 1 month to today
+
+-- Duration since a timestamp
+SELECT time_since(time_date(2025, 1, 1, 0, 0, 0)) / dur_h();
+-- hours since Jan 1, 2025
+```
+
+## Full-Text Search (FTS)
+
+<Info>
+**Turso Extension**: Full-text search powered by Tantivy, replacing SQLite's FTS3/FTS4/FTS5.
+</Info>
+
+Turso provides full-text search through the FTS index method. For the complete reference including query syntax, tokenizers, and scoring, see [FTS Functions](/docs/sql-reference/functions/fts).
+
+### Quick Reference
+
+```sql
+-- Create an FTS index
+CREATE INDEX idx ON articles USING fts (title, body);
+
+-- Search
+SELECT title, fts_score('idx') AS score
+FROM articles
+WHERE fts_match('idx', 'database search')
+ORDER BY score;
+
+-- Highlighted results
+SELECT fts_highlight('idx', 0, '<b>', '</b>') AS title
+FROM articles
+WHERE fts_match('idx', 'database');
+```
+
+## CSV Extension
+
+The CSV extension provides a virtual table for reading CSV files.
+
+### Usage
+
+```sql
+CREATE VIRTUAL TABLE temp.csv_data USING csv(
+    filename='/path/to/data.csv',
+    header=yes
+);
+
+SELECT * FROM csv_data;
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `filename` | Path to the CSV file |
+| `header` | `yes` if the first row contains column names |
+
+## Percentile Extension
+
+Statistical aggregate functions for computing percentiles.
+
+### Functions
+
+| Function | Parameters | Return Type | Description |
+|----------|-----------|-------------|-------------|
+| `median(X)` | column | REAL | Median value (50th percentile) |
+| `percentile(Y, P)` | column, REAL | REAL | P-th percentile of Y (P between 0 and 100) |
+| `percentile_cont(Y, P)` | column, REAL | REAL | Continuous percentile (interpolated) |
+| `percentile_disc(Y, P)` | column, REAL | REAL | Discrete percentile (nearest value) |
+
+### Examples
+
+```sql
+CREATE TABLE scores (value REAL);
+INSERT INTO scores VALUES (10), (20), (30), (40), (50);
+
+SELECT median(value) FROM scores;
+-- 30.0
+
+SELECT percentile(value, 75) FROM scores;
+-- 40.0
+
+SELECT percentile_cont(value, 0.25) FROM scores;
+-- 20.0
+```
+
+## generate_series
+
+The `generate_series` table-valued function generates a sequence of integers.
+
+```sql
+SELECT value FROM generate_series(start, stop);
+SELECT value FROM generate_series(start, stop, step);
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| start | INTEGER | Starting value (inclusive) |
+| stop | INTEGER | Ending value (inclusive) |
+| step | INTEGER | Step increment (default: 1) |
+
+```sql
+SELECT value FROM generate_series(1, 5);
+-- 1, 2, 3, 4, 5
+
+SELECT value FROM generate_series(0, 10, 2);
+-- 0, 2, 4, 6, 8, 10
+
+SELECT value FROM generate_series(10, 1, -3);
+-- 10, 7, 4, 1
+```
+
+## See Also
+
+- [Vector Functions](/docs/sql-reference/functions/vector) for detailed vector function reference
+- [FTS Functions](/docs/sql-reference/functions/fts) for full-text search function reference
+- [Aggregate Functions](/docs/sql-reference/functions/aggregate) for percentile functions used with GROUP BY
+- [Compatibility](/docs/sql-reference/compatibility) for extension support status

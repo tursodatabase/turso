@@ -18,7 +18,7 @@ env:
 jobs:
   bench:
     runs-on: nyrkio_perf_server_4cpu_ubuntu2404
-    timeout-minutes: 30
+    timeout-minutes: 45 # FIXME: make this run faster
     steps:
       - uses: actions/checkout@v3
       - uses: useblacksmith/setup-node@v5
@@ -27,6 +27,12 @@ jobs:
       #     cache: 'npm'
       # - name: Install dependencies
       #   run: npm install && npm run build
+
+      - name: Generate graph-queries DB
+        run: |
+          python3 perf/graph-queries/generate_seed.py | sqlite3 perf/graph-queries/graph-queries.db
+          cp perf/graph-queries/graph-queries.db perf/graph-queries/graph-queries-analyzed.db
+          sqlite3 perf/graph-queries/graph-queries-analyzed.db "ANALYZE;"
 
       - name: Bench
         run: make bench-exclude-tpc-h  2>&1 | tee output.txt
@@ -122,9 +128,10 @@ jobs:
       DB_FILE: "perf/tpc-h/TPC-H.db"
     steps:
       - uses: actions/checkout@v3
-      - uses: useblacksmith/rust-cache@v3
+      - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust" # can be updated if we need to reset caches due to non-trivial change in the dependencies (for example, custom env var were set for single workspace project)
+          prefix-key: "v1-rust"
+          cache-on-failure: true
 
       - name: Cache TPC-H
         id: cache-primes
@@ -169,4 +176,5 @@ jobs:
           # Smaller p-value = less change points found. Larger p-value = more, but also more false positives.
           nyrkio-settings-pvalue: 0.00001
           nyrkio-settings-threshold: 0%
+
 

@@ -26,7 +26,7 @@ async function process(opts: RunOpts, io: ProtocolIo, request: any) {
     const requestType = request.request();
     const completion = request.completion();
     if (requestType.type == 'Http') {
-        let url: string | null = null;
+        let url: string | null = requestType.url;
         if (typeof opts.url == "function") {
             url = opts.url();
         } else {

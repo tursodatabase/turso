@@ -8,14 +8,12 @@ display_name: "Change Data Capture"
 
 Change Data Capture (CDC) allows you to track and capture all data changes (inserts, updates, deletes) made to your database tables. This is useful for building reactive applications, syncing data between systems, replication, auditing, and more.
 
-**Note:** This feature is currently marked as unstable, meaning the API is subject to change in future versions. The functionality itself is reliable for use.
-
 ## Enabling CDC
 
 CDC is enabled per connection using the PRAGMA command:
 
 ```sql
-PRAGMA unstable_capture_data_changes_conn('<mode>[,<table_name>]');
+PRAGMA capture_data_changes_conn('<mode>[,<table_name>]');
 ```
 
 ### Parameters
@@ -37,38 +35,38 @@ PRAGMA unstable_capture_data_changes_conn('<mode>[,<table_name>]');
 
 Enable CDC with ID mode (captures primary keys only):
 ```sql
-PRAGMA unstable_capture_data_changes_conn('id');
+PRAGMA capture_data_changes_conn('id');
 ```
 
 ### Using Different Modes
 
 Capture the state before changes:
 ```sql
-PRAGMA unstable_capture_data_changes_conn('before');
+PRAGMA capture_data_changes_conn('before');
 ```
 
 Capture the state after changes:
 ```sql
-PRAGMA unstable_capture_data_changes_conn('after');
+PRAGMA capture_data_changes_conn('after');
 ```
 
 Capture complete change information:
 ```sql
-PRAGMA unstable_capture_data_changes_conn('full');
+PRAGMA capture_data_changes_conn('full');
 ```
 
 ### Custom CDC Table
 
 Store changes in a custom table instead of the default `turso_cdc`:
 ```sql
-PRAGMA unstable_capture_data_changes_conn('full,my_changes_table');
+PRAGMA capture_data_changes_conn('full,my_changes_table');
 ```
 
 ### Disable CDC
 
 Turn off CDC for the current connection:
 ```sql
-PRAGMA unstable_capture_data_changes_conn('off');
+PRAGMA capture_data_changes_conn('off');
 ```
 
 ## CDC Table Structure
@@ -122,7 +120,7 @@ CREATE TABLE users (
 );
 
 -- Enable full CDC
-PRAGMA unstable_capture_data_changes_conn('full');
+PRAGMA capture_data_changes_conn('full');
 
 -- Make some changes
 INSERT INTO users VALUES (1, 'Alice', 'alice@example.com');
@@ -147,10 +145,10 @@ Each connection can have its own CDC configuration:
 
 ```sql
 -- Connection 1: Capture to 'audit_log' table
-PRAGMA unstable_capture_data_changes_conn('full,audit_log');
+PRAGMA capture_data_changes_conn('full,audit_log');
 
 -- Connection 2: Capture to 'sync_queue' table
-PRAGMA unstable_capture_data_changes_conn('id,sync_queue');
+PRAGMA capture_data_changes_conn('id,sync_queue');
 
 -- Changes from Connection 1 go to 'audit_log'
 -- Changes from Connection 2 go to 'sync_queue'
@@ -177,7 +175,7 @@ If a transaction rolls back, no CDC entries are created for those changes.
 CDC also tracks schema changes when using full mode:
 
 ```sql
-PRAGMA unstable_capture_data_changes_conn('full');
+PRAGMA capture_data_changes_conn('full');
 
 CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT);
 -- Recorded in CDC as change to sqlite_schema

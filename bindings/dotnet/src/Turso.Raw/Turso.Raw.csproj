@@ -1,0 +1,74 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net9.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+        <PackageId>Turso.Raw</PackageId>
+        <Description>Dotnet bindings for turso database</Description>
+        <Version>0.0.1</Version>
+    </PropertyGroup>
+
+    <ItemGroup Condition="'$(Configuration)'=='Debug'">
+        <None Include="..\..\rs_compiled\x86_64-pc-windows-msvc\debug\turso_dotnet.dll" 
+              Visible="false" 
+              Condition="Exists('..\..\rs_compiled\x86_64-pc-windows-msvc\debug\turso_dotnet.dll')">
+            <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+            <TargetPath>runtimes\win-x64\native\turso_dotnet.dll</TargetPath>
+        </None>
+        <None Include="..\..\rs_compiled\x86_64-unknown-linux-gnu\debug\libturso_dotnet.so"
+              Visible="false"
+              Condition="Exists('..\..\rs_compiled\x86_64-unknown-linux-gnu\debug\libturso_dotnet.so')">
+            <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+            <TargetPath>runtimes\linux-x64\native\turso_dotnet.so</TargetPath>
+        </None>
+        <None Include="..\..\rs_compiled\x86_64-apple-darwin\debug\libturso_dotnet.dylib"
+              Visible="false"
+              Condition="Exists('..\..\rs_compiled\x86_64-apple-darwin\debug\libturso_dotnet.dylib')">
+            <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+            <TargetPath>runtimes\osx-x64\native\turso_dotnet.dylib</TargetPath>
+        </None>
+        <None Include="..\..\rs_compiled\aarch64-apple-darwin\debug\libturso_dotnet.dylib"
+              Visible="false"
+              Condition="Exists('..\..\rs_compiled\aarch64-apple-darwin\debug\libturso_dotnet.dylib')">
+            <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+            <TargetPath>runtimes\osx-arm\native\turso_dotnet.dylib</TargetPath>
+        </None>
+    </ItemGroup>
+    <ItemGroup Condition="'$(Configuration)'=='Release'">
+        <None Include="..\..\rs_compiled\x86_64-pc-windows-msvc\release\turso_dotnet.dll"
+              Visible="false"
+              Condition="Exists('..\..\rs_compiled\x86_64-pc-windows-msvc\release\turso_dotnet.dll')">
+            <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+            <TargetPath>runtimes\win-x64\native\turso_dotnet.dll</TargetPath>
+            <Pack>true</Pack>
+            <PackagePath>runtimes\win-x64\native\turso_dotnet.dll</PackagePath>
+        </None>
+        <None Include="..\..\rs_compiled\x86_64-unknown-linux-gnu\release\libturso_dotnet.so"
+              Visible="false"
+              Condition="Exists('..\..\rs_compiled\x86_64-unknown-linux-gnu\release\libturso_dotnet.so')">
+            <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+            <TargetPath>runtimes\linux-x64\native\turso_dotnet.so</TargetPath>
+            <Pack>true</Pack>
+            <PackagePath>runtimes\linux-x64\native\turso_dotnet.so</PackagePath>
+        </None>
+        <None Include="..\..\rs_compiled\x86_64-apple-darwin\release\libturso_dotnet.dylib"
+              Visible="false"
+              Condition="Exists('..\..\rs_compiled\x86_64-apple-darwin\release\libturso_dotnet.dylib')">
+            <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+            <TargetPath>runtimes\osx-x64\native\turso_dotnet.dylib</TargetPath>
+            <Pack>true</Pack>
+            <PackagePath>runtimes\osx-x64\native\turso_dotnet.dylib</PackagePath>
+        </None>
+        <None Include="..\..\rs_compiled\aarch64-apple-darwin\release\libturso_dotnet.dylib"
+              Visible="false"
+              Condition="Exists('..\..\rs_compiled\aarch64-apple-darwin\release\libturso_dotnet.dylib')">
+            <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+            <TargetPath>runtimes\osx-arm64\native\turso_dotnet.dylib</TargetPath>
+            <Pack>true</Pack>
+            <PackagePath>runtimes\osx-arm64\native\turso_dotnet.dylib</PackagePath>
+        </None>
+    </ItemGroup>
+</Project>

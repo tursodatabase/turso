@@ -1,0 +1,20 @@
+---
+source: indexes.sqltest
+expression: |-
+  SELECT p.name, o.order_date
+      FROM products p
+      JOIN orders o INDEXED BY idx_orders_customer_date ON p.id = o.customer_id
+      WHERE o.customer_id = 42;
+info:
+  statement_type: SELECT
+  tables:
+  - orders
+  - p.id
+  - products
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SEARCH o USING INDEX idx_orders_customer_date (customer_id=?)
+`--SEARCH p USING INTEGER PRIMARY KEY (rowid=?)

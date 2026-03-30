@@ -1,0 +1,22 @@
+@database :memory:
+
+test sum-large-float-infinity {
+    SELECT sum(x) FROM (SELECT 1e308 x UNION ALL SELECT 1e308 UNION ALL SELECT 0);
+}
+expect {
+    Inf
+}
+
+test total-large-float-infinity {
+    SELECT total(x) FROM (SELECT 1e308 x UNION ALL SELECT 1e308 UNION ALL SELECT 0);
+}
+expect {
+    Inf
+}
+
+test avg-large-float-infinity {
+    SELECT avg(x) FROM (SELECT 1e308 x UNION ALL SELECT 1e308 UNION ALL SELECT 0);
+}
+expect {
+    Inf
+}

@@ -1,5 +1,6 @@
 #![allow(non_camel_case_types)]
 #![allow(dead_code)]
+#![allow(unused_imports)]
 use std::ptr;
 
 #[repr(C)]
@@ -12,6 +13,12 @@ struct sqlite3_stmt {
     _private: [u8; 0],
 }
 
+// Windows: This entire compat test is excluded because Windows has no system SQLite library
+// (unlike Linux which has libsqlite3-dev pre-installed). The sqlite3 feature links against
+// native libsqlite3 for comparison testing, which isn't available on Windows without complex
+// setup (generating .lib from .def using VS tooling). Since SQLite behavior is platform-
+// independent, running these tests on Linux/macOS provides sufficient coverage.
+#[cfg(not(target_os = "windows"))]
 #[cfg_attr(not(feature = "sqlite3"), link(name = "turso_sqlite3"))]
 #[cfg_attr(feature = "sqlite3", link(name = "sqlite3"))]
 extern "C" {
@@ -106,14 +113,72 @@ extern "C" {
         p_primary_key: *mut libc::c_int,
         p_autoinc: *mut libc::c_int,
     ) -> i32;
+    fn sqlite3_busy_handler(
+        db: *mut sqlite3,
+        callback: Option<unsafe extern "C" fn(*mut libc::c_void, i32) -> i32>,
+        arg: *mut libc::c_void,
+    ) -> i32;
+    fn sqlite3_busy_timeout(db: *mut sqlite3, ms: i32) -> i32;
+    fn sqlite3_get_table(
+        db: *mut sqlite3,
+        sql: *const libc::c_char,
+        paz_result: *mut *mut *mut libc::c_char,
+        pn_row: *mut libc::c_int,
+        pn_column: *mut libc::c_int,
+        pz_err_msg: *mut *mut libc::c_char,
+    ) -> i32;
+    fn sqlite3_free_table(az_result: *mut *mut libc::c_char);
+    fn sqlite3_bind_null(stmt: *mut sqlite3_stmt, idx: i32) -> i32;
+    fn sqlite3_value_type(value: *mut libc::c_void) -> i32;
+    fn sqlite3_value_blob(value: *mut libc::c_void) -> *const libc::c_void;
+    fn sqlite3_value_bytes(value: *mut libc::c_void) -> i32;
+    fn sqlite3_result_int64(context: *mut libc::c_void, val: i64);
+    fn sqlite3_create_function_v2(
+        db: *mut sqlite3,
+        name: *const libc::c_char,
+        n_args: i32,
+        enc: i32,
+        context: *mut libc::c_void,
+        func: Option<unsafe extern "C" fn(*mut libc::c_void, i32, *mut *mut libc::c_void)>,
+        step: Option<unsafe extern "C" fn()>,
+        final_: Option<unsafe extern "C" fn()>,
+        destroy: Option<unsafe extern "C" fn(*mut libc::c_void)>,
+    ) -> i32;
+    fn sqlite3_prepare_v3(
+        db: *mut sqlite3,
+        sql: *const libc::c_char,
+        n_bytes: i32,
+        prep_flags: u32,
+        stmt: *mut *mut sqlite3_stmt,
+        tail: *mut *const libc::c_char,
+    ) -> i32;
+    fn sqlite3_db_handle(stmt: *mut sqlite3_stmt) -> *mut sqlite3;
+    fn sqlite3_value_int(value: *mut libc::c_void) -> i32;
+    fn sqlite3_result_int(context: *mut libc::c_void, val: i32);
+    fn sqlite3_initialize() -> i32;
+    fn sqlite3_open_v2(
+        filename: *const libc::c_char,
+        db: *mut *mut sqlite3,
+        flags: i32,
+        z_vfs: *const libc::c_char,
+    ) -> i32;
+    fn sqlite3_column_value(stmt: *mut sqlite3_stmt, idx: i32) -> *mut libc::c_void;
+    fn sqlite3_value_int64(value: *mut libc::c_void) -> i64;
+    fn sqlite3_value_double(value: *mut libc::c_void) -> f64;
+    fn sqlite3_value_text(value: *mut libc::c_void) -> *const libc::c_char;
+    fn sqlite3_value_dup(value: *mut libc::c_void) -> *mut libc::c_void;
+    fn sqlite3_value_free(value: *mut libc::c_void);
+    fn sqlite3_context_db_handle(context: *mut libc::c_void) -> *mut libc::c_void;
 }
 
 const SQLITE_OK: i32 = 0;
 const SQLITE_ERROR: i32 = 1;
 const SQLITE_MISUSE: i32 = 21;
+const SQLITE_RANGE: i32 = 25;
 const SQLITE_CANTOPEN: i32 = 14;
 const SQLITE_ROW: i32 = 100;
 const SQLITE_DONE: i32 = 101;
+const SQLITE_PREPARE_PERSISTENT: u32 = 0x01;
 
 const SQLITE_CHECKPOINT_PASSIVE: i32 = 0;
 const SQLITE_CHECKPOINT_FULL: i32 = 1;
@@ -126,6 +191,10 @@ const SQLITE_TEXT: i32 = 3;
 const SQLITE3_TEXT: i32 = 3;
 const SQLITE_BLOB: i32 = 4;
 const SQLITE_NULL: i32 = 5;
+const SQLITE_UTF8: i32 = 1;
+const SQLITE_OPEN_READWRITE: i32 = 0x00000002;
+const SQLITE_OPEN_CREATE: i32 = 0x00000004;
+const SQLITE_OPEN_URI: i32 = 0x00000040;
 
 #[cfg(not(target_os = "windows"))]
 mod tests {
@@ -163,7 +232,7 @@ mod tests {
         unsafe {
             let mut db = ptr::null_mut();
             assert_eq!(
-                sqlite3_open(c"../testing/testing_clone.db".as_ptr(), &mut db),
+                sqlite3_open(c"../testing/system/testing_clone.db".as_ptr(), &mut db),
                 SQLITE_OK
             );
             assert_eq!(sqlite3_close(db), SQLITE_OK);
@@ -249,6 +318,28 @@ mod tests {
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
     }
+
+    #[test]
+    fn test_sqlite3_bind_int_range_checks() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(db, c"SELECT ?1".as_ptr(), -1, &mut stmt, ptr::null_mut()),
+                SQLITE_OK
+            );
+
+            assert_eq!(sqlite3_bind_int(stmt, 0, 1), SQLITE_RANGE);
+            assert_eq!(sqlite3_bind_int(stmt, 2, 1), SQLITE_RANGE);
+            assert_eq!(sqlite3_bind_int(stmt, 1, 7), SQLITE_OK);
+
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
     #[test]
     fn test_sqlite3_bind_parameter_name_and_count() {
         unsafe {
@@ -299,6 +390,40 @@ mod tests {
 
             let invalid_name = sqlite3_bind_parameter_name(stmt, 99);
             assert!(invalid_name.is_null());
+
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_bind_parameter_count_sparse_positional() {
+        unsafe {
+            let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+            let path = std::ffi::CString::new(temp_file.path().to_str().unwrap()).unwrap();
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(db, c"SELECT ?3".as_ptr(), -1, &mut stmt, ptr::null_mut(),),
+                SQLITE_OK
+            );
+
+            assert_eq!(sqlite3_bind_parameter_count(stmt), 3);
+            assert!(sqlite3_bind_parameter_name(stmt, 1).is_null());
+            assert!(sqlite3_bind_parameter_name(stmt, 2).is_null());
+
+            let name3 = sqlite3_bind_parameter_name(stmt, 3);
+            assert!(!name3.is_null());
+            let name3 = std::ffi::CStr::from_ptr(name3).to_str().unwrap();
+            assert_eq!(name3, "?3");
+
+            assert_eq!(sqlite3_bind_int(stmt, 1, 1), SQLITE_OK);
+            assert_eq!(sqlite3_bind_int(stmt, 3, 9), SQLITE_OK);
+
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int(stmt, 0), 9);
 
             assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
             assert_eq!(sqlite3_close(db), SQLITE_OK);
@@ -434,7 +559,7 @@ mod tests {
         unsafe {
             let mut db = std::ptr::null_mut();
             assert_eq!(
-                sqlite3_open(c"../testing/testing.db".as_ptr(), &mut db),
+                sqlite3_open(c"../testing/system/testing.db".as_ptr(), &mut db),
                 SQLITE_OK
             );
             let mut stmt = std::ptr::null_mut();
@@ -1902,11 +2027,11 @@ mod tests {
                 );
                 assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
                 let count = sqlite3_column_int64(stmt, 0);
-                // with a sane `should_checkpoint` method we have no garuantee that all 2000 rows are present, as the checkpoint was
+                // with a sane `should_checkpoint` method we have no guarantee that all 2000 rows are present, as the checkpoint was
                 // triggered by cacheflush on insertions. the pattern will trigger a checkpoint when the wal has > 1000 frames,
                 // so it will be triggered but will no longer be triggered on each consecutive
                 // write. here we can assert that we have > 1500 rows.
-                assert!(count > 1500);
+                assert!(count > 1500, "count: {count}");
                 assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
                 assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
             }
@@ -2356,6 +2481,1007 @@ mod tests {
             assert_eq!(primary_key5, 1); // rowid is primary key
             assert_eq!(not_null5, 0);
             assert_eq!(autoinc5, 0);
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_busy_timeout() {
+        unsafe {
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            // Test setting a positive timeout
+            assert_eq!(sqlite3_busy_timeout(db, 1000), SQLITE_OK);
+
+            // Test setting a zero timeout (disables busy handler)
+            assert_eq!(sqlite3_busy_timeout(db, 0), SQLITE_OK);
+
+            // Test setting a negative timeout (also disables busy handler)
+            assert_eq!(sqlite3_busy_timeout(db, -1), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    /// Busy handler callback that retries up to N times
+    unsafe extern "C" fn busy_handler_retry_n(data: *mut libc::c_void, count: i32) -> i32 {
+        if data.is_null() {
+            return 0;
+        }
+        let max_retries = *(data as *const i32);
+        if count < max_retries {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Busy handler callback that never retries
+    unsafe extern "C" fn busy_handler_never_retry(_data: *mut libc::c_void, _count: i32) -> i32 {
+        0
+    }
+
+    /// Busy handler callback that always retries (with safety limit)
+    unsafe extern "C" fn busy_handler_always_retry(_data: *mut libc::c_void, count: i32) -> i32 {
+        if count < 1000 {
+            1
+        } else {
+            0
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_busy_handler() {
+        unsafe {
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            // Test setting a custom busy handler with context
+            let mut max_retries: i32 = 3;
+            assert_eq!(
+                sqlite3_busy_handler(
+                    db,
+                    Some(busy_handler_retry_n),
+                    &mut max_retries as *mut i32 as *mut libc::c_void
+                ),
+                SQLITE_OK
+            );
+
+            // Test clearing the busy handler by passing NULL callback
+            assert_eq!(sqlite3_busy_handler(db, None, ptr::null_mut()), SQLITE_OK);
+
+            // Test setting busy handler that never retries
+            assert_eq!(
+                sqlite3_busy_handler(db, Some(busy_handler_never_retry), ptr::null_mut()),
+                SQLITE_OK
+            );
+
+            // Test setting busy handler that always retries
+            assert_eq!(
+                sqlite3_busy_handler(db, Some(busy_handler_always_retry), ptr::null_mut()),
+                SQLITE_OK
+            );
+
+            // Test that busy_timeout clears a previously set busy_handler
+            assert_eq!(
+                sqlite3_busy_handler(
+                    db,
+                    Some(busy_handler_retry_n),
+                    &mut max_retries as *mut i32 as *mut libc::c_void
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_busy_timeout(db, 500), SQLITE_OK);
+
+            // Test that busy_handler clears a previously set busy_timeout
+            assert_eq!(sqlite3_busy_timeout(db, 1000), SQLITE_OK);
+            assert_eq!(
+                sqlite3_busy_handler(
+                    db,
+                    Some(busy_handler_retry_n),
+                    &mut max_retries as *mut i32 as *mut libc::c_void
+                ),
+                SQLITE_OK
+            );
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_get_table() {
+        unsafe {
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            // Create and populate a table
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE t1(id INTEGER, name TEXT)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"INSERT INTO t1 VALUES(1, 'alice')".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"INSERT INTO t1 VALUES(2, 'bob')".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+
+            // Query via sqlite3_get_table
+            let mut result: *mut *mut libc::c_char = ptr::null_mut();
+            let mut n_row: libc::c_int = 0;
+            let mut n_col: libc::c_int = 0;
+            let mut err_msg: *mut libc::c_char = ptr::null_mut();
+            assert_eq!(
+                sqlite3_get_table(
+                    db,
+                    c"SELECT id, name FROM t1 ORDER BY id".as_ptr(),
+                    &mut result,
+                    &mut n_row,
+                    &mut n_col,
+                    &mut err_msg,
+                ),
+                SQLITE_OK
+            );
+
+            assert_eq!(n_row, 2);
+            assert_eq!(n_col, 2);
+
+            // result layout: [col0_name, col1_name, row0_val0, row0_val1, row1_val0, row1_val1]
+            let col0 = std::ffi::CStr::from_ptr(*result.add(0));
+            let col1 = std::ffi::CStr::from_ptr(*result.add(1));
+            assert_eq!(col0.to_str().unwrap(), "id");
+            assert_eq!(col1.to_str().unwrap(), "name");
+
+            let r0v0 = std::ffi::CStr::from_ptr(*result.add(2));
+            let r0v1 = std::ffi::CStr::from_ptr(*result.add(3));
+            assert_eq!(r0v0.to_str().unwrap(), "1");
+            assert_eq!(r0v1.to_str().unwrap(), "alice");
+
+            let r1v0 = std::ffi::CStr::from_ptr(*result.add(4));
+            let r1v1 = std::ffi::CStr::from_ptr(*result.add(5));
+            assert_eq!(r1v0.to_str().unwrap(), "2");
+            assert_eq!(r1v1.to_str().unwrap(), "bob");
+
+            sqlite3_free_table(result);
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_get_table_empty_result() {
+        unsafe {
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE t1(id INTEGER)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+
+            let mut result: *mut *mut libc::c_char = ptr::null_mut();
+            let mut n_row: libc::c_int = 0;
+            let mut n_col: libc::c_int = 0;
+            assert_eq!(
+                sqlite3_get_table(
+                    db,
+                    c"SELECT id FROM t1".as_ptr(),
+                    &mut result,
+                    &mut n_row,
+                    &mut n_col,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+
+            assert_eq!(n_row, 0);
+            assert_eq!(n_col, 0);
+
+            sqlite3_free_table(result);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_free_table_null() {
+        unsafe {
+            // Passing null should not crash
+            sqlite3_free_table(ptr::null_mut());
+        }
+    }
+
+    /// Regression test: sqlite3_value_blob returns a dangling pointer (use-after-free).
+    ///
+    /// The internal `ExtValue::to_blob()` returns `Option<Vec<u8>>`, so
+    /// `sqlite3_value_blob` calls `.as_ptr()` on a temporary Vec that is
+    /// immediately dropped, leaving the returned pointer dangling.
+    ///
+    /// This test creates a scalar function that receives a BLOB argument,
+    /// reads it via `sqlite3_value_blob` + `sqlite3_value_bytes`, and
+    /// verifies the data is correct. On the buggy version, the blob data
+    /// is corrupted (reads freed memory).
+    #[test]
+    fn test_sqlite3_value_blob_use_after_free() {
+        /// Scalar function callback: verifies that the first argument is a BLOB
+        /// with the expected content [0xDE, 0xAD, 0xBE, 0xEF].
+        /// Returns 1 if the blob matches, 0 otherwise.
+        unsafe extern "C" fn check_blob_fn(
+            ctx: *mut libc::c_void,
+            argc: i32,
+            argv: *mut *mut libc::c_void,
+        ) {
+            assert_eq!(argc, 1);
+            let value = *argv.add(0);
+            assert!(!value.is_null());
+
+            let vtype = sqlite3_value_type(value);
+            if vtype != SQLITE_BLOB {
+                sqlite3_result_int64(ctx, -1); // wrong type
+                return;
+            }
+
+            let blob_ptr = sqlite3_value_blob(value);
+            let blob_len = sqlite3_value_bytes(value);
+
+            if blob_ptr.is_null() || blob_len != 4 {
+                sqlite3_result_int64(ctx, -2); // null ptr or wrong length
+                return;
+            }
+
+            // Read the blob data
+            let data = std::slice::from_raw_parts(blob_ptr as *const u8, blob_len as usize);
+            let expected: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
+            if data == expected {
+                sqlite3_result_int64(ctx, 1); // match
+            } else {
+                // Print actual bytes for debugging
+                eprintln!("blob mismatch: expected {expected:?}, got {data:?}");
+                sqlite3_result_int64(ctx, 0); // corrupted data
+            }
+        }
+
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("test_value_blob.db");
+            let path_cstr = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(path_cstr.as_ptr(), &mut db), SQLITE_OK);
+
+            // Register the scalar function
+            assert_eq!(
+                sqlite3_create_function_v2(
+                    db,
+                    c"check_blob".as_ptr(),
+                    1,
+                    SQLITE_UTF8,
+                    ptr::null_mut(),
+                    Some(check_blob_fn),
+                    None,
+                    None,
+                    None,
+                ),
+                SQLITE_OK,
+                "create function failed"
+            );
+
+            // Create table and insert a row with a known BLOB
+            let mut errmsg: *mut libc::c_char = ptr::null_mut();
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg,
+                ),
+                SQLITE_OK
+            );
+
+            // Insert using prepared statement with bound BLOB
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"INSERT INTO t (id, data) VALUES (1, ?1)".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            let blob_data: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
+            assert_eq!(
+                sqlite3_bind_blob(stmt, 1, blob_data.as_ptr() as *const libc::c_void, 4, None,),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            // Call check_blob(data) via SELECT — this triggers sqlite3_value_blob
+            // on the ExtValue passed to the scalar function
+            let mut stmt2: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT check_blob(data) FROM t WHERE id = 1".as_ptr(),
+                    -1,
+                    &mut stmt2,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK,
+                "prepare SELECT with check_blob"
+            );
+            let rc = sqlite3_step(stmt2);
+            assert_eq!(rc, SQLITE_ROW, "expected SQLITE_ROW, got {rc}");
+
+            let result = sqlite3_column_int(stmt2, 0);
+            assert_eq!(
+                result, 1,
+                "check_blob returned {result}: blob data was corrupted (use-after-free in sqlite3_value_blob)"
+            );
+
+            assert_eq!(sqlite3_finalize(stmt2), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_prepare_v3() {
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("test.db");
+            let path_cstr = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(path_cstr.as_ptr(), &mut db), SQLITE_OK);
+
+            let mut errmsg: *mut libc::c_char = ptr::null_mut();
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg,
+                ),
+                SQLITE_OK
+            );
+
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v3(
+                    db,
+                    c"INSERT INTO t1 VALUES (?1, ?2)".as_ptr(),
+                    -1,
+                    SQLITE_PREPARE_PERSISTENT,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert!(!stmt.is_null());
+
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_db_handle() {
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("test.db");
+            let path_cstr = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(path_cstr.as_ptr(), &mut db), SQLITE_OK);
+
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(db, c"SELECT 1".as_ptr(), -1, &mut stmt, ptr::null_mut()),
+                SQLITE_OK
+            );
+            assert!(!stmt.is_null());
+
+            let returned_db = sqlite3_db_handle(stmt);
+            assert_eq!(returned_db, db);
+
+            let null_db = sqlite3_db_handle(ptr::null_mut());
+            assert!(null_db.is_null());
+
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    /// Test: sqlite3_initialize must not panic when a global tracing subscriber
+    /// is already installed.
+    #[test]
+    fn test_sqlite3_initialize_no_panic_with_existing_subscriber() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        unsafe {
+            let rc = sqlite3_initialize();
+            assert_eq!(rc, SQLITE_OK);
+
+            let rc2 = sqlite3_initialize();
+            assert_eq!(rc2, SQLITE_OK);
+        }
+    }
+
+    /// Test: URI filename with mode=memory should create an in-memory database.
+    #[test]
+    fn test_uri_mode_memory() {
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("memtest.db");
+            let uri = format!("file:{}?mode=memory&cache=shared", db_path.display());
+            let uri_cstr = std::ffi::CString::new(uri).unwrap();
+
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            let rc = sqlite3_open_v2(
+                uri_cstr.as_ptr(),
+                &mut db,
+                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
+                ptr::null(),
+            );
+            assert_eq!(rc, SQLITE_OK, "open_v2 with URI mode=memory failed rc={rc}");
+            assert!(!db.is_null());
+
+            let mut errmsg: *mut libc::c_char = ptr::null_mut();
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg
+                ),
+                SQLITE_OK,
+                "CREATE TABLE in memory DB failed"
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"INSERT INTO t1 VALUES (1, 'hello')".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg
+                ),
+                SQLITE_OK,
+                "INSERT in memory DB failed"
+            );
+
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT val FROM t1 WHERE id = 1".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            let text = sqlite3_column_text(stmt, 0);
+            assert!(!text.is_null());
+            assert_eq!(std::ffi::CStr::from_ptr(text).to_str().unwrap(), "hello");
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+
+            assert!(
+                !db_path.exists(),
+                "URI mode=memory should NOT create a file on disk"
+            );
+        }
+    }
+
+    /// Test: file::memory: URI should behave like :memory:
+    #[test]
+    fn test_uri_file_colon_memory() {
+        unsafe {
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            let rc = sqlite3_open_v2(
+                c"file::memory:".as_ptr(),
+                &mut db,
+                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
+                ptr::null(),
+            );
+            assert_eq!(rc, SQLITE_OK, "open_v2 with file::memory: failed rc={rc}");
+
+            let mut errmsg: *mut libc::c_char = ptr::null_mut();
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE t1 (id INTEGER PRIMARY KEY)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"INSERT INTO t1 VALUES (42)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+
+            let mut db2: *mut sqlite3 = ptr::null_mut();
+            let rc = sqlite3_open_v2(
+                c"file::memory:".as_ptr(),
+                &mut db2,
+                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
+                ptr::null(),
+            );
+            assert_eq!(rc, SQLITE_OK);
+
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            let rc = sqlite3_prepare_v2(
+                db2,
+                c"SELECT id FROM t1".as_ptr(),
+                -1,
+                &mut stmt,
+                ptr::null_mut(),
+            );
+            assert_eq!(
+                rc, SQLITE_ERROR,
+                "file::memory: data persisted — not truly in-memory (rc={rc})"
+            );
+            assert_eq!(sqlite3_close(db2), SQLITE_OK);
+        }
+    }
+
+    /// Test: URI with file: prefix and no query params should open a real file.
+    #[test]
+    fn test_uri_file_path() {
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("uri_test.db");
+            let uri = format!("file:{}", db_path.to_str().unwrap());
+            let uri_cstr = std::ffi::CString::new(uri).unwrap();
+
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            let rc = sqlite3_open_v2(
+                uri_cstr.as_ptr(),
+                &mut db,
+                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
+                ptr::null(),
+            );
+            assert_eq!(rc, SQLITE_OK, "open_v2 with file: URI path failed rc={rc}");
+
+            let mut errmsg: *mut libc::c_char = ptr::null_mut();
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE t1 (id INTEGER PRIMARY KEY)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+
+            assert!(
+                db_path.exists(),
+                "file: URI with path should create a real database file"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "sqlite3"))]
+    fn test_shared_memory_uri_connections() {
+        unsafe {
+            let uri = c"file:shared_mem_test?mode=memory&cache=shared";
+            let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI;
+
+            let mut db1: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(
+                sqlite3_open_v2(uri.as_ptr(), &mut db1, flags, ptr::null()),
+                SQLITE_OK,
+                "first open failed"
+            );
+
+            let mut errmsg: *mut libc::c_char = ptr::null_mut();
+            assert_eq!(
+                sqlite3_exec(
+                    db1,
+                    c"CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg,
+                ),
+                SQLITE_OK,
+                "CREATE TABLE failed"
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    db1,
+                    c"INSERT INTO t1 VALUES (1, 'from_conn1')".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg,
+                ),
+                SQLITE_OK,
+                "INSERT failed"
+            );
+
+            // Second connection to the same URI must see shared state
+            let mut db2: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(
+                sqlite3_open_v2(uri.as_ptr(), &mut db2, flags, ptr::null()),
+                SQLITE_OK,
+                "second open failed"
+            );
+
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db2,
+                    c"SELECT val FROM t1 WHERE id = 1".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK,
+                "SELECT on connection 2 failed — table not shared"
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            let text = sqlite3_column_text(stmt, 0);
+            assert!(!text.is_null());
+            let val = std::ffi::CStr::from_ptr(text).to_str().unwrap();
+            assert_eq!(val, "from_conn1");
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            assert_eq!(sqlite3_close(db2), SQLITE_OK);
+            assert_eq!(sqlite3_close(db1), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "sqlite3"))]
+    fn test_different_named_memory_dbs_are_independent() {
+        unsafe {
+            let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI;
+
+            // Open db "alpha"
+            let mut db1: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(
+                sqlite3_open_v2(
+                    c"file:alpha_iso?mode=memory&cache=shared".as_ptr(),
+                    &mut db1,
+                    flags,
+                    ptr::null(),
+                ),
+                SQLITE_OK
+            );
+            let mut errmsg: *mut libc::c_char = ptr::null_mut();
+            assert_eq!(
+                sqlite3_exec(
+                    db1,
+                    c"CREATE TABLE t1 (id INTEGER PRIMARY KEY)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg,
+                ),
+                SQLITE_OK
+            );
+
+            // Open db "beta" — should NOT see t1
+            let mut db2: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(
+                sqlite3_open_v2(
+                    c"file:beta_iso?mode=memory&cache=shared".as_ptr(),
+                    &mut db2,
+                    flags,
+                    ptr::null(),
+                ),
+                SQLITE_OK
+            );
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            let rc = sqlite3_prepare_v2(
+                db2,
+                c"SELECT * FROM t1".as_ptr(),
+                -1,
+                &mut stmt,
+                ptr::null_mut(),
+            );
+            // t1 only exists in "alpha", not "beta"
+            assert_eq!(rc, SQLITE_ERROR);
+
+            assert_eq!(sqlite3_close(db2), SQLITE_OK);
+            assert_eq!(sqlite3_close(db1), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "sqlite3"))]
+    fn test_plain_memory_stays_independent() {
+        unsafe {
+            let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI;
+
+            let mut db1: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(
+                sqlite3_open_v2(c"file::memory:".as_ptr(), &mut db1, flags, ptr::null(),),
+                SQLITE_OK
+            );
+            let mut errmsg: *mut libc::c_char = ptr::null_mut();
+            assert_eq!(
+                sqlite3_exec(
+                    db1,
+                    c"CREATE TABLE t1 (id INTEGER PRIMARY KEY)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg,
+                ),
+                SQLITE_OK
+            );
+
+            // Unnamed :memory: must remain independent
+            let mut db2: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(
+                sqlite3_open_v2(c"file::memory:".as_ptr(), &mut db2, flags, ptr::null(),),
+                SQLITE_OK
+            );
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            let rc = sqlite3_prepare_v2(
+                db2,
+                c"SELECT * FROM t1".as_ptr(),
+                -1,
+                &mut stmt,
+                ptr::null_mut(),
+            );
+            assert_eq!(rc, SQLITE_ERROR, "plain :memory: should not share state");
+
+            assert_eq!(sqlite3_close(db2), SQLITE_OK);
+            assert_eq!(sqlite3_close(db1), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "sqlite3"))]
+    fn test_unnamed_memory_cache_shared() {
+        unsafe {
+            let uri = c"file::memory:?cache=shared";
+            let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI;
+
+            let mut db1: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(
+                sqlite3_open_v2(uri.as_ptr(), &mut db1, flags, ptr::null()),
+                SQLITE_OK,
+            );
+            let mut errmsg: *mut libc::c_char = ptr::null_mut();
+            assert_eq!(
+                sqlite3_exec(
+                    db1,
+                    c"CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg,
+                ),
+                SQLITE_OK,
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    db1,
+                    c"INSERT INTO t1 VALUES (1, 'shared')".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg,
+                ),
+                SQLITE_OK,
+            );
+
+            // Same URI must share the database
+            let mut db2: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(
+                sqlite3_open_v2(uri.as_ptr(), &mut db2, flags, ptr::null()),
+                SQLITE_OK,
+            );
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db2,
+                    c"SELECT val FROM t1 WHERE id = 1".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK,
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            let text = sqlite3_column_text(stmt, 0);
+            assert!(!text.is_null());
+            let val = std::ffi::CStr::from_ptr(text).to_str().unwrap();
+            assert_eq!(val, "shared");
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            assert_eq!(sqlite3_close(db2), SQLITE_OK);
+            assert_eq!(sqlite3_close(db1), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "sqlite3"))]
+    fn test_sqlite3_column_value_and_value_dup_free() {
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("test.db");
+            let path_cstr = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(path_cstr.as_ptr(), &mut db), SQLITE_OK);
+
+            let mut errmsg: *mut libc::c_char = ptr::null_mut();
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE t2 (i INTEGER, f REAL, t TEXT, b BLOB);".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg,
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"INSERT INTO t2 VALUES (42, 1.5, 'hello', X'DEADBEEF');".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg,
+                ),
+                SQLITE_OK
+            );
+
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT i, f, t, b FROM t2".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+
+            let val0 = sqlite3_column_value(stmt, 0);
+            assert!(!val0.is_null());
+            assert_eq!(sqlite3_value_type(val0), SQLITE_INTEGER);
+            assert_eq!(sqlite3_value_int64(val0), 42);
+
+            let val1 = sqlite3_column_value(stmt, 1);
+            assert!(!val1.is_null());
+            assert_eq!(sqlite3_value_type(val1), SQLITE_FLOAT);
+            assert!((sqlite3_value_double(val1) - 1.5).abs() < 0.001);
+
+            let val2 = sqlite3_column_value(stmt, 2);
+            assert!(!val2.is_null());
+            assert_eq!(sqlite3_value_type(val2), SQLITE_TEXT);
+            let text_ptr = sqlite3_value_text(val2);
+            assert!(!text_ptr.is_null());
+            let text_len = sqlite3_value_bytes(val2) as usize;
+            let text =
+                std::str::from_utf8(std::slice::from_raw_parts(text_ptr as *const u8, text_len))
+                    .unwrap();
+            assert_eq!(text, "hello");
+
+            let val3 = sqlite3_column_value(stmt, 3);
+            assert!(!val3.is_null());
+            assert_eq!(sqlite3_value_type(val3), SQLITE_BLOB);
+            assert_eq!(sqlite3_value_bytes(val3), 4);
+
+            let dup = sqlite3_value_dup(val0);
+            assert!(!dup.is_null());
+            assert_eq!(sqlite3_value_type(dup), SQLITE_INTEGER);
+            assert_eq!(sqlite3_value_int64(dup), 42);
+
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_value_int64(dup), 42);
+
+            sqlite3_value_free(dup);
+
+            sqlite3_value_free(ptr::null_mut());
+            let null_dup = sqlite3_value_dup(ptr::null_mut());
+            assert!(null_dup.is_null());
+
+            let null_val = sqlite3_column_value(ptr::null_mut(), 0);
+            assert!(null_val.is_null());
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "sqlite3"))]
+    fn test_sqlite3_context_db_handle() {
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("test.db");
+            let path_cstr = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(path_cstr.as_ptr(), &mut db), SQLITE_OK);
+
+            use std::sync::atomic::{AtomicPtr, Ordering};
+            static CAPTURED_DB: AtomicPtr<libc::c_void> = AtomicPtr::new(ptr::null_mut());
+
+            unsafe extern "C" fn test_func(
+                ctx: *mut libc::c_void,
+                _argc: i32,
+                _argv: *mut *mut libc::c_void,
+            ) {
+                CAPTURED_DB.store(sqlite3_context_db_handle(ctx), Ordering::SeqCst);
+                sqlite3_result_int(ctx, 1);
+            }
+
+            assert_eq!(
+                sqlite3_create_function_v2(
+                    db,
+                    c"test_db_handle".as_ptr(),
+                    0,
+                    SQLITE_UTF8,
+                    ptr::null_mut(),
+                    Some(test_func),
+                    None,
+                    None,
+                    None,
+                ),
+                SQLITE_OK
+            );
+
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT test_db_handle()".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+
+            assert_eq!(CAPTURED_DB.load(Ordering::SeqCst), db as *mut libc::c_void);
+
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            let null_handle = sqlite3_context_db_handle(ptr::null_mut());
+            assert!(null_handle.is_null());
 
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }

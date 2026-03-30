@@ -1,0 +1,183 @@
+@database :memory:
+
+@skip-file-if mvcc "not supported in MVCC mode"
+
+# Test basic integrity_check on empty database
+test integrity-check-empty {
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+# Test basic quick_check on empty database
+test quick-check-empty {
+    PRAGMA quick_check;
+}
+expect {
+    ok
+}
+
+# Test integrity_check with a simple table
+@cross-check-integrity
+test integrity-check-simple-table {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO t1 VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+# Test integrity_check with indexes
+@cross-check-integrity
+test integrity-check-with-index {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO t1 VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
+    CREATE INDEX idx_t1_name ON t1(name);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+# Test integrity_check with NOT NULL columns (valid data)
+@cross-check-integrity
+test integrity-check-not-null-valid {
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, value INTEGER NOT NULL);
+    INSERT INTO t2 VALUES (1, 100), (2, 200);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+# Test quick_check with table and index
+@cross-check-integrity
+test quick-check-with-index {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE INDEX idx_t1_name ON t1(name);
+    INSERT INTO t1 VALUES (1, 'test');
+    PRAGMA quick_check;
+}
+expect {
+    ok
+}
+
+# Test integrity_check with multiple indexes on same table
+@cross-check-integrity
+test integrity-check-multi-index {
+    CREATE TABLE t3(a INTEGER PRIMARY KEY, b TEXT, c REAL);
+    CREATE INDEX idx_t3_b ON t3(b);
+    CREATE INDEX idx_t3_c ON t3(c);
+    INSERT INTO t3 VALUES (1, 'x', 1.1), (2, 'y', 2.2), (3, 'z', 3.3);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+# Test integrity_check with configurable max errors
+@cross-check-integrity
+test integrity-check-max-errors {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY);
+    PRAGMA integrity_check(10);
+}
+expect {
+    ok
+}
+
+# Test quick_check skips index validation (should still return ok)
+@cross-check-integrity
+test quick-check-skips-index {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE INDEX idx_t1_name ON t1(name);
+    INSERT INTO t1 VALUES (1, 'a'), (2, 'b');
+    PRAGMA quick_check;
+}
+expect {
+    ok
+}
+
+# Test integrity_check with INTEGER PRIMARY KEY NOT NULL (rowid alias)
+# The INTEGER PRIMARY KEY column is an alias for the rowid and is stored
+# separately from the record payload. The NOT NULL check should not report
+# a false positive for this column.
+@cross-check-integrity
+test integrity-check-ipk-not-null {
+    CREATE TABLE t4(
+    col1 INTEGER,
+    col2 INTEGER NOT NULL PRIMARY KEY,
+    col3 TEXT NOT NULL
+    );
+    INSERT INTO t4 VALUES (1, 100, 'a'), (2, 200, 'b'), (NULL, 300, 'c');
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+# Test integrity_check with INTEGER PRIMARY KEY NOT NULL and multiple NOT NULL columns
+@cross-check-integrity
+test integrity-check-ipk-not-null-multi {
+    CREATE TABLE t5(
+    a INTEGER,
+    b INTEGER NOT NULL PRIMARY KEY,
+    c NUMERIC NOT NULL,
+    d TEXT,
+    e TEXT NOT NULL
+    );
+    INSERT INTO t5 VALUES (1, 10, 100, 'x', 'y');
+    INSERT INTO t5 VALUES (NULL, 20, 200, NULL, 'z');
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+# Test integrity_check after ALTER TABLE ADD COLUMN with type-mismatched default
+# and CREATE INDEX. Rows inserted before ADD COLUMN have the raw default value
+# (integer 0) while the column affinity is TEXT. The integrity check must not
+# apply affinity to the column values when verifying index membership, matching
+# SQLite's behavior.
+@cross-check-integrity
+test integrity-check-alter-table-default-index {
+    CREATE TABLE t6(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t6 VALUES (1, 'x'), (2, 'y'), (3, 'z');
+    ALTER TABLE t6 ADD COLUMN c TEXT DEFAULT 0;
+    CREATE INDEX idx_t6_c ON t6(c);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+# Same test but with a composite index including DESC ordering
+@cross-check-integrity
+test integrity-check-alter-table-default-desc-index {
+    CREATE TABLE t7(a INTEGER PRIMARY KEY, b TEXT, c NUMERIC NOT NULL);
+    INSERT INTO t7 VALUES (1, 'x', 10), (2, 'y', 20), (3, 'z', 30);
+    ALTER TABLE t7 ADD COLUMN d TEXT DEFAULT 0;
+    CREATE INDEX idx_t7_composite ON t7(b, c DESC, d DESC);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+# Test with rows inserted both before and after ALTER TABLE ADD COLUMN
+@cross-check-integrity
+test integrity-check-alter-table-mixed-rows {
+    CREATE TABLE t8(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t8 VALUES (1, 'old1'), (2, 'old2');
+    ALTER TABLE t8 ADD COLUMN c TEXT DEFAULT 0;
+    INSERT INTO t8 VALUES (3, 'new1', 'hello');
+    INSERT INTO t8 VALUES (4, 'new2', NULL);
+    INSERT INTO t8(a, b) VALUES (5, 'new3');
+    CREATE INDEX idx_t8_c ON t8(c);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+

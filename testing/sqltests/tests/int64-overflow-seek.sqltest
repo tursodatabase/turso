@@ -1,0 +1,68 @@
+@database :memory:
+
+# Regression: WHERE clause returns wrong result when comparing INTEGER PRIMARY
+# KEY against an overflowed float. INT64_MAX + 1 overflows to float
+# 9.223372036854776e18 which is greater than INT64_MAX, so no row should match
+# `v1 >= (INT64_MAX + 1)`. Before the fix the SeekGE path failed to detect that
+# the float exceeded i64::MAX because `i64::MAX as f64` loses precision.
+# See https://github.com/tursodatabase/turso/issues/5244
+
+setup schema {
+    CREATE TABLE v0 (v1 INTEGER PRIMARY KEY);
+    INSERT INTO v0 VALUES (9223372036854775807);
+    INSERT INTO v0 VALUES (-9223372036854775808);
+    INSERT INTO v0 VALUES (0);
+}
+
+@setup schema
+test int64-max-overflow-ge {
+    SELECT * FROM v0 WHERE v1 >= (9223372036854775807 + 1);
+}
+expect {
+}
+
+@setup schema
+test int64-max-overflow-ge-expr {
+    SELECT v1 >= (9223372036854775807 + 1) FROM v0 WHERE v1 = 9223372036854775807;
+}
+expect {
+    0
+}
+
+@setup schema
+test int64-max-gt {
+    SELECT * FROM v0 WHERE v1 > 9223372036854775807;
+}
+expect {
+}
+
+@setup schema
+test int64-max-ge {
+    SELECT * FROM v0 WHERE v1 >= 9223372036854775807;
+}
+expect {
+    9223372036854775807
+}
+
+@setup schema
+test int64-min-overflow-le {
+    SELECT * FROM v0 WHERE v1 <= (-9223372036854775808 - 1);
+}
+expect {
+    -9223372036854775808
+}
+
+@setup schema
+test int64-min-le {
+    SELECT * FROM v0 WHERE v1 <= -9223372036854775808;
+}
+expect {
+    -9223372036854775808
+}
+
+@setup schema
+test int64-min-lt {
+    SELECT * FROM v0 WHERE v1 < -9223372036854775808;
+}
+expect {
+}

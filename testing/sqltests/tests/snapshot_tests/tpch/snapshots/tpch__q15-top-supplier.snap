@@ -1,0 +1,63 @@
+---
+source: tpch.sqltest
+expression: |-
+  select
+          s_suppkey,
+          s_name,
+          s_address,
+          s_phone,
+          total_revenue
+      from
+          supplier,
+          (
+              select
+                  l_suppkey as supplier_no,
+                  sum(l_extendedprice * (1 - l_discount)) as total_revenue
+              from
+                  lineitem
+              where
+                  l_shipdate >= '1993-01-01'
+                  and l_shipdate < '1993-04-01'
+              group by
+                  l_suppkey
+          ) as revenue
+      where
+          s_suppkey = supplier_no
+          and total_revenue = (
+              select
+                  max(total_revenue)
+              from
+                  (
+                      select
+                          l_suppkey as supplier_no,
+                          sum(l_extendedprice * (1 - l_discount)) as total_revenue
+                      from
+                          lineitem
+                      where
+                          l_shipdate >= '1993-01-01'
+                          and l_shipdate < '1993-04-01'
+                      group by
+                          l_suppkey
+                  )
+          )
+      order by
+          s_suppkey;
+info:
+  statement_type: SELECT
+  tables:
+  - lineitem
+  - supplier
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCALAR SUBQUERY 1
+|  `--SCAN subquery_0
+|     |--SCAN lineitem
+|     `--USE SORTER FOR GROUP BY
+|--SCAN revenue
+|  |--SCAN lineitem
+|  `--USE SORTER FOR GROUP BY
+|--SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)
+`--USE SORTER FOR ORDER BY

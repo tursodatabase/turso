@@ -1,0 +1,27 @@
+---
+source: joins.sqltest
+expression: |-
+  SELECT
+          c.customer_id,
+          c.name,
+          o.order_id,
+          o.total_amount
+      FROM
+          customers c
+      INNER JOIN orders o ON c.customer_id = o.customer_id
+      WHERE
+          o.status = 'completed'
+          AND o.total_amount > 100;
+info:
+  statement_type: SELECT
+  tables:
+  - c.customer_id
+  - customers
+  - orders
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN orders AS o
+`--SEARCH c USING INTEGER PRIMARY KEY (rowid=?)

@@ -13,9 +13,13 @@ use napi::bindgen_prelude::{AsyncTask, Either5, Null};
 use napi_derive::napi;
 use turso_node::{DatabaseOpts, IoLoopTask};
 use turso_sync_engine::{
-    database_sync_engine::{DatabaseSyncEngine, DatabaseSyncEngineOpts, PartialBootstrapStrategy},
-    protocol_io::ProtocolIO,
-    types::{Coro, DatabaseChangeType, DatabaseSyncEngineProtocolVersion},
+    database_sync_engine::{DatabaseSyncEngine, DatabaseSyncEngineOpts},
+    database_sync_engine_io::SyncEngineIo,
+    database_sync_operations::SyncEngineIoStats,
+    types::{
+        Coro, DatabaseChangeType, DatabaseSyncEngineProtocolVersion, PartialBootstrapStrategy,
+        PartialSyncOpts,
+    },
 };
 
 use crate::{
@@ -45,18 +49,19 @@ pub enum SyncEngineProtocolVersion {
     V1,
 }
 
-fn core_change_type_to_js(value: DatabaseChangeType) -> DatabaseChangeTypeJs {
+fn core_change_type_to_js(value: DatabaseChangeType) -> Option<DatabaseChangeTypeJs> {
     match value {
-        DatabaseChangeType::Delete => DatabaseChangeTypeJs::Delete,
-        DatabaseChangeType::Update => DatabaseChangeTypeJs::Update,
-        DatabaseChangeType::Insert => DatabaseChangeTypeJs::Insert,
+        DatabaseChangeType::Delete => Some(DatabaseChangeTypeJs::Delete),
+        DatabaseChangeType::Update => Some(DatabaseChangeTypeJs::Update),
+        DatabaseChangeType::Insert => Some(DatabaseChangeTypeJs::Insert),
+        DatabaseChangeType::Commit => None,
     }
 }
 fn js_value_to_core(value: Either5<Null, i64, f64, String, Vec<u8>>) -> turso_core::Value {
     match value {
         Either5::A(_) => turso_core::Value::Null,
-        Either5::B(value) => turso_core::Value::Integer(value),
-        Either5::C(value) => turso_core::Value::Float(value),
+        Either5::B(value) => turso_core::Value::from_i64(value),
+        Either5::C(value) => turso_core::Value::from_f64(value),
         Either5::D(value) => turso_core::Value::Text(turso_core::types::Text::new(value)),
         Either5::E(value) => turso_core::Value::Blob(value),
     }
@@ -64,8 +69,12 @@ fn js_value_to_core(value: Either5<Null, i64, f64, String, Vec<u8>>) -> turso_co
 fn core_value_to_js(value: turso_core::Value) -> Either5<Null, i64, f64, String, Vec<u8>> {
     match value {
         turso_core::Value::Null => Either5::<Null, i64, f64, String, Vec<u8>>::A(Null),
-        turso_core::Value::Integer(value) => Either5::<Null, i64, f64, String, Vec<u8>>::B(value),
-        turso_core::Value::Float(value) => Either5::<Null, i64, f64, String, Vec<u8>>::C(value),
+        turso_core::Value::Numeric(turso_core::Numeric::Integer(value)) => {
+            Either5::<Null, i64, f64, String, Vec<u8>>::B(value)
+        }
+        turso_core::Value::Numeric(turso_core::Numeric::Float(value)) => {
+            Either5::<Null, i64, f64, String, Vec<u8>>::C(f64::from(value))
+        }
         turso_core::Value::Text(value) => {
             Either5::<Null, i64, f64, String, Vec<u8>>::D(value.as_str().to_string())
         }
@@ -115,9 +124,17 @@ pub enum JsPartialBootstrapStrategy {
     Query { query: String },
 }
 
+#[napi(object)]
+pub struct JsPartialSyncOpts {
+    pub bootstrap_strategy: JsPartialBootstrapStrategy,
+    pub segment_size: Option<i64>,
+    pub prefetch: Option<bool>,
+}
+
 #[napi(object, object_to_js = false)]
 pub struct SyncEngineOpts {
     pub path: String,
+    pub remote_url: Option<String>,
     pub client_name: Option<String>,
     pub wal_pull_batch_size: Option<u32>,
     pub long_poll_timeout_ms: Option<u32>,
@@ -126,12 +143,17 @@ pub struct SyncEngineOpts {
     pub use_transform: bool,
     pub protocol_version: Option<SyncEngineProtocolVersion>,
     pub bootstrap_if_empty: bool,
-    pub remote_encryption: Option<String>,
-    pub partial_boostrap_strategy: Option<JsPartialBootstrapStrategy>,
+    /// Encryption cipher for the Turso Cloud database.
+    pub remote_encryption_cipher: Option<String>,
+    /// Base64-encoded encryption key for the Turso Cloud database.
+    /// Must match the key used when creating the encrypted database.
+    pub remote_encryption_key: Option<String>,
+    pub partial_sync_opts: Option<JsPartialSyncOpts>,
 }
 
 struct SyncEngineOptsFilled {
     pub path: String,
+    pub remote_url: Option<String>,
     pub client_name: String,
     pub wal_pull_batch_size: u32,
     pub long_poll_timeout: Option<std::time::Duration>,
@@ -139,36 +161,33 @@ struct SyncEngineOptsFilled {
     pub use_transform: bool,
     pub protocol_version: DatabaseSyncEngineProtocolVersion,
     pub bootstrap_if_empty: bool,
-    pub remote_encryption: Option<CipherMode>,
-    pub partial_boostrap_strategy: Option<PartialBootstrapStrategy>,
+    pub remote_encryption_cipher: Option<CipherMode>,
+    pub remote_encryption_key: Option<String>,
+    pub partial_sync_opts: Option<PartialSyncOpts>,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum CipherMode {
-    Aes256Gcm = 1,
-    Aes128Gcm = 2,
-    ChaCha20Poly1305 = 3,
-    Aegis256 = 4,
+    Aes256Gcm,
+    Aes128Gcm,
+    ChaCha20Poly1305,
+    Aegis128L,
+    Aegis128X2,
+    Aegis128X4,
+    Aegis256,
+    Aegis256X2,
+    Aegis256X4,
 }
 
 impl CipherMode {
-    /// Returns the nonce size for this cipher mode.
-    pub fn required_nonce_size(&self) -> usize {
-        match self {
-            CipherMode::Aes256Gcm | CipherMode::Aes128Gcm | CipherMode::ChaCha20Poly1305 => 12,
-            CipherMode::Aegis256 => 32,
-        }
-    }
-
-    /// Returns the tag size for this cipher mode.
-    pub fn required_tag_size(&self) -> usize {
-        // All supported ciphers use 16-byte tags
-        16
-    }
-
     /// Returns the total metadata size (nonce + tag) for this cipher mode.
+    /// These values match the Turso Cloud encryption settings.
     fn required_metadata_size(&self) -> usize {
-        self.required_nonce_size() + self.required_tag_size()
+        match self {
+            CipherMode::Aes256Gcm | CipherMode::Aes128Gcm | CipherMode::ChaCha20Poly1305 => 28,
+            CipherMode::Aegis128L | CipherMode::Aegis128X2 | CipherMode::Aegis128X4 => 32,
+            CipherMode::Aegis256 | CipherMode::Aegis256X2 | CipherMode::Aegis256X4 => 48,
+        }
     }
 }
 
@@ -182,7 +201,7 @@ impl SyncEngine {
         } else {
             #[cfg(all(target_os = "linux", not(feature = "browser")))]
             {
-                if opts.partial_boostrap_strategy.is_none() {
+                if opts.partial_sync_opts.is_none() {
                     Arc::new(turso_core::PlatformIO::new().map_err(|e| {
                         napi::Error::new(
                             napi::Status::GenericFailure,
@@ -223,11 +242,16 @@ impl SyncEngine {
                 readonly: None,
                 timeout: None,
                 tracing: opts.tracing.clone(),
+                experimental: None,
+                encryption: None, // Local encryption not supported in sync mode
             }),
         )?));
         let opts_filled = SyncEngineOptsFilled {
             path: opts.path,
-            client_name: opts.client_name.unwrap_or("turso-sync-js".to_string()),
+            remote_url: opts.remote_url,
+            client_name: opts
+                .client_name
+                .unwrap_or_else(|| "turso-sync-js".to_string()),
             wal_pull_batch_size: opts.wal_pull_batch_size.unwrap_or(100),
             long_poll_timeout: opts
                 .long_poll_timeout_ms
@@ -241,27 +265,46 @@ impl SyncEngine {
                 _ => DatabaseSyncEngineProtocolVersion::V1,
             },
             bootstrap_if_empty: opts.bootstrap_if_empty,
-            remote_encryption: match opts.remote_encryption.as_deref() {
-                Some("aes256gcm") => Some(CipherMode::Aes256Gcm),
-                Some("aes128gcm") => Some(CipherMode::Aes128Gcm),
-                Some("chacha20poly1305") => Some(CipherMode::ChaCha20Poly1305),
-                Some("aegis256") => Some(CipherMode::Aegis256),
+            remote_encryption_cipher: match opts.remote_encryption_cipher.as_deref() {
+                Some("aes256gcm") | Some("aes-256-gcm") => Some(CipherMode::Aes256Gcm),
+                Some("aes128gcm") | Some("aes-128-gcm") => Some(CipherMode::Aes128Gcm),
+                Some("chacha20poly1305") | Some("chacha20-poly1305") => {
+                    Some(CipherMode::ChaCha20Poly1305)
+                }
+                Some("aegis128l") | Some("aegis-128l") => Some(CipherMode::Aegis128L),
+                Some("aegis128x2") | Some("aegis-128x2") => Some(CipherMode::Aegis128X2),
+                Some("aegis128x4") | Some("aegis-128x4") => Some(CipherMode::Aegis128X4),
+                Some("aegis256") | Some("aegis-256") => Some(CipherMode::Aegis256),
+                Some("aegis256x2") | Some("aegis-256x2") => Some(CipherMode::Aegis256X2),
+                Some("aegis256x4") | Some("aegis-256x4") => Some(CipherMode::Aegis256X4),
                 None => None,
                 _ => {
                     return Err(napi::Error::new(
                         napi::Status::GenericFailure,
-                        "unsupported remote cipher",
+                        "unsupported remote cipher. Supported: aes256gcm, aes128gcm, \
+                         chacha20poly1305, aegis128l, aegis128x2, aegis128x4, aegis256, \
+                         aegis256x2, aegis256x4",
                     ))
                 }
             },
-            partial_boostrap_strategy: opts.partial_boostrap_strategy.map(|s| match s {
-                JsPartialBootstrapStrategy::Prefix { length } => PartialBootstrapStrategy::Prefix {
-                    length: length as usize,
+            partial_sync_opts: match opts.partial_sync_opts {
+                Some(partial_sync_opts) => match partial_sync_opts.bootstrap_strategy {
+                    JsPartialBootstrapStrategy::Prefix { length } => Some(PartialSyncOpts {
+                        bootstrap_strategy: Some(PartialBootstrapStrategy::Prefix {
+                            length: length as usize,
+                        }),
+                        segment_size: partial_sync_opts.segment_size.unwrap_or(0) as usize,
+                        prefetch: partial_sync_opts.prefetch.unwrap_or(false),
+                    }),
+                    JsPartialBootstrapStrategy::Query { query } => Some(PartialSyncOpts {
+                        bootstrap_strategy: Some(PartialBootstrapStrategy::Query { query }),
+                        segment_size: partial_sync_opts.segment_size.unwrap_or(0) as usize,
+                        prefetch: partial_sync_opts.prefetch.unwrap_or(false),
+                    }),
                 },
-                JsPartialBootstrapStrategy::Query { query } => {
-                    PartialBootstrapStrategy::Query { query }
-                }
-            }),
+                None => None,
+            },
+            remote_encryption_key: opts.remote_encryption_key.clone(),
         };
         Ok(SyncEngine {
             opts: opts_filled,
@@ -278,6 +321,7 @@ impl SyncEngine {
     pub fn connect(&mut self) -> napi::Result<GeneratorHolder> {
         let opts = DatabaseSyncEngineOpts {
             client_name: self.opts.client_name.clone(),
+            remote_url: self.opts.remote_url.clone(),
             wal_pull_batch_size: self.opts.wal_pull_batch_size as u64,
             long_poll_timeout: self.opts.long_poll_timeout,
             tables_ignore: self.opts.tables_ignore.clone(),
@@ -286,10 +330,11 @@ impl SyncEngine {
             bootstrap_if_empty: self.opts.bootstrap_if_empty,
             reserved_bytes: self
                 .opts
-                .remote_encryption
+                .remote_encryption_cipher
                 .map(|x| x.required_metadata_size())
                 .unwrap_or(0),
-            partial_bootstrap_strategy: self.opts.partial_boostrap_strategy.clone(),
+            partial_sync_opts: self.opts.partial_sync_opts.clone(),
+            remote_encryption_key: self.opts.remote_encryption_key.clone(),
         };
 
         let io = self.io()?;
@@ -299,8 +344,14 @@ impl SyncEngine {
         let path = self.opts.path.clone();
         let generator = genawaiter::sync::Gen::new(|coro| async move {
             let coro = Coro::new((), coro);
-            let initialized =
-                DatabaseSyncEngine::new(&coro, io.clone(), protocol, &path, opts).await?;
+            let initialized = DatabaseSyncEngine::create_db(
+                &coro,
+                io.clone(),
+                SyncEngineIoStats::new(protocol),
+                &path,
+                opts,
+            )
+            .await?;
             let connection = initialized.connect_rw(&coro).await?;
 
             db.lock().unwrap().set_connected(connection).map_err(|e| {
@@ -341,7 +392,7 @@ impl SyncEngine {
 
     #[napi]
     pub fn protocol_io_step(&self) -> napi::Result<()> {
-        self.protocol()?.step_work();
+        self.protocol()?.step_io_callbacks();
         Ok(())
     }
 
@@ -362,9 +413,9 @@ impl SyncEngine {
             let sync_engine = try_unwrap(&sync_engine)?;
             let stats = sync_engine.stats(coro).await?;
             Ok(Some(GeneratorResponse::SyncEngineStats {
-                operations: stats.cdc_operations,
-                main_wal: stats.main_wal_size as i64,
-                revert_wal: stats.revert_wal_size as i64,
+                cdc_operations: stats.cdc_operations,
+                main_wal_size: stats.main_wal_size as i64,
+                revert_wal_size: stats.revert_wal_size as i64,
                 last_pull_unix_time: stats.last_pull_unix_time,
                 last_push_unix_time: stats.last_push_unix_time,
                 revision: stats.revision,

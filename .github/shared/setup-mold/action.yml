@@ -1,0 +1,39 @@
+name: "Setup mold linker"
+description: "Installs mold linker with retry logic to handle transient GitHub download failures"
+
+inputs:
+  mold-version:
+    description: "Version of mold to install"
+    required: false
+    default: "2.40.4"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install mold linker
+      shell: bash
+      run: |
+        MOLD_VERSION="${{ inputs.mold-version }}"
+        ARCH="$(uname -m)"
+        URL="https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/mold-${MOLD_VERSION}-${ARCH}-linux.tar.gz"
+        TMPFILE="/tmp/mold.tar.gz"
+
+        MAX_RETRIES=5
+        for i in $(seq 1 $MAX_RETRIES); do
+          echo "Downloading mold v${MOLD_VERSION} (attempt $i/$MAX_RETRIES)..."
+          if curl -fsSL --retry 3 --retry-delay 5 -o "$TMPFILE" "$URL"; then
+            echo "Download succeeded."
+            break
+          fi
+          if [ "$i" -eq "$MAX_RETRIES" ]; then
+            echo "::warning::Failed to download mold after $MAX_RETRIES attempts. Building without mold."
+            exit 0
+          fi
+          SLEEP=$((i * 5))
+          echo "Download failed. Retrying in ${SLEEP}s..."
+          sleep "$SLEEP"
+        done
+
+        sudo tar -C /usr/local --strip-components=1 --no-overwrite-dir -xzf "$TMPFILE"
+        rm -f "$TMPFILE"
+        echo "mold $(mold --version) installed successfully."

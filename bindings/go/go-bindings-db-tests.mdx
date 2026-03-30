@@ -1,0 +1,42 @@
+---
+name: 2025-11-26-go-bindings-test
+---
+
+<Output path="./bindings_db_test.go">
+
+<Code model="openai/gpt-5" language="go">
+
+Generate tests for Go functions bindings for the Turso - SQLite-compatible embedded database written in Rust.
+
+# Bindings
+
+You must generate tests for the bindings translated from C interface defined in turso.h file:
+
+<File path="../../sdk-kit/turso.h" />
+
+<File path="./bindings_db.go" />
+
+# Implemention
+
+- Assert conditions with "github.com/stretchr/testify"
+- Make tests short, concise and independent. Explicitly assert results - do not create any "mocks"
+- Prefer to use ":memory:" db in order to not manage files
+
+# Test cases
+
+Generate tests which will cover generic use of SQL. 
+**Non exhaustive** list of things to check:
+- Subqueries
+- INSERT ... RETURNING ...
+    * Make additional test case for scenario, where multiple values were inserted, but only one row were fetch
+    * Make sure that in this case transaction will be properly commited even when not all rows were consumed
+- CONFLICT clauses (and how driver inform caller about conflict)
+- Basic DDL statements (CREATE/DELETE)
+- More complex DDL statements (ALTER TABLE)
+- Builtin virtual tables (generate_series)
+- JOIN
+- JSON functions
+
+</Code>
+
+</Output>

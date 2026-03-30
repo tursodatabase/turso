@@ -89,6 +89,8 @@ export declare class Database {
   ioLoopSync(): void
   /** Runs the I/O loop asynchronously, returning a Promise. */
   ioLoopAsync(): Promise<void>
+  /** Classify SQL statement. Returns "read", "write", "begin", "commit", or "rollback". */
+  classifySql(sql: string): string
 }
 
 /** A prepared statement. */
@@ -148,4 +150,27 @@ export interface DatabaseOpts {
   timeout?: number
   fileMustExist?: boolean
   tracing?: string
+  /** Experimental features to enable */
+  experimental?: Array<string>
+  /** Optional encryption configuration for local database encryption */
+  encryption?: EncryptionOpts
+}
+
+/** Supported encryption ciphers for local database encryption. */
+export declare const enum EncryptionCipher {
+  Aes128Gcm = 0,
+  Aes256Gcm = 1,
+  Aegis256 = 2,
+  Aegis256x2 = 3,
+  Aegis128l = 4,
+  Aegis128x2 = 5,
+  Aegis128x4 = 6
+}
+
+/** Encryption configuration for local database encryption. */
+export interface EncryptionOpts {
+  /** The cipher to use for encryption */
+  cipher: EncryptionCipher
+  /** The hex-encoded encryption key */
+  hexkey: string
 }

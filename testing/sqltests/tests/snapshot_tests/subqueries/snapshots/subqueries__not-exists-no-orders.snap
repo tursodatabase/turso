@@ -1,0 +1,22 @@
+---
+source: subqueries.sqltest
+expression: |-
+  SELECT c.id, c.name, c.email
+      FROM customers c
+      WHERE NOT EXISTS (
+          SELECT 1
+          FROM orders o
+          WHERE o.customer_id = c.id
+      );
+info:
+  statement_type: SELECT
+  tables:
+  - customers
+  - orders
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN customers AS c
+`--SEARCH o USING INDEX idx_orders_customer (customer_id=?)

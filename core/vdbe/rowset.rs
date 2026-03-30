@@ -25,9 +25,10 @@
 //! When `test()` is called with a different batch number than the current `i_batch`, all
 //! values in the fresh list are consolidated into the consolidated set.
 
-use std::collections::BTreeSet;
+use branches::mark_unlikely;
 
 use crate::turso_assert;
+use std::collections::BTreeSet;
 
 /// The mode of usage for a RowSet.
 /// Test: the rowset will be used for set membership tests.
@@ -53,6 +54,12 @@ pub struct RowSet {
     fresh: Vec<i64>,
     /// The mode of usage for the RowSet.
     mode: RowSetMode,
+}
+
+impl Default for RowSet {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RowSet {
@@ -101,6 +108,7 @@ impl RowSet {
             };
         }
         let RowSetMode::Test { set, batch_number } = &mut self.mode else {
+            mark_unlikely();
             unreachable!()
         };
 
@@ -140,6 +148,7 @@ impl RowSet {
             self.mode = RowSetMode::Smallest { sorted_vec: v };
         }
         let RowSetMode::Smallest { sorted_vec } = &mut self.mode else {
+            mark_unlikely();
             unreachable!()
         };
 
@@ -447,7 +456,7 @@ mod tests {
 
             // Verify they're in sorted order
             let mut sorted_inserted: Vec<i64> = inserted.iter().copied().collect();
-            sorted_inserted.sort();
+            sorted_inserted.sort_unstable();
             assert_eq!(extracted, sorted_inserted);
         }
     }

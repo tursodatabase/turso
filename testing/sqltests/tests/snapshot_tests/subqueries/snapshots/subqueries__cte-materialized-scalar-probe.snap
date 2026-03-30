@@ -1,0 +1,79 @@
+---
+source: subqueries.sqltest
+expression: |-
+  WITH ordered_points AS (
+          SELECT DISTINCT point_value AS point_key
+          FROM sample_points
+          ORDER BY point_key
+      ),
+      previous_points AS (
+          SELECT point_key,
+                 (
+                     SELECT MAX(p2.point_key)
+                     FROM ordered_points p2
+                     WHERE p2.point_key < p1.point_key
+                 ) AS previous_point
+          FROM ordered_points p1
+      ),
+      run_markers AS (
+          SELECT point_key,
+                 previous_point,
+                 CASE
+                     WHEN point_key - previous_point = 1 THEN 0
+                     ELSE 1
+                 END AS run_start
+          FROM previous_points
+      ),
+      run_ids AS (
+          SELECT point_key,
+                 SUM(run_start) OVER (ORDER BY point_key) AS run_id
+          FROM run_markers
+      ),
+      run_lengths AS (
+          SELECT run_id,
+                 MIN(point_key) AS start_key,
+                 MAX(point_key) AS end_key,
+                 COUNT(*) AS run_length
+          FROM run_ids
+          GROUP BY run_id
+      )
+      SELECT start_key, end_key, run_length
+      FROM run_lengths
+      WHERE run_id = (
+          SELECT run_id
+          FROM run_ids
+          WHERE point_key = (
+              SELECT MAX(point_key)
+              FROM ordered_points
+          )
+      );
+info:
+  statement_type: WITH (CTE)
+  tables:
+  - ordered_points
+  - previous_points
+  - run_ids
+  - run_lengths
+  - run_markers
+  - sample_points
+  setup_blocks:
+  - sequence_points_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--CORRELATED SCALAR SUBQUERY 1
+|  |--SCALAR SUBQUERY 2
+|  |  |--SCAN sample_points
+|  |  |--USE HASH TABLE FOR DISTINCT
+|  |  |--USE SORTER FOR ORDER BY
+|  |  `--SCAN ordered_points
+|  |--SCAN ordered_points AS p1
+|  |--CORRELATED SCALAR SUBQUERY 3
+|  |  `--SCAN ordered_points AS p2
+|  |--SCAN previous_points
+|  |--SCAN window_subquery_0
+|  |  `--SCAN run_markers
+|  `--SEARCH run_ids USING INDEX ephemeral_subquery_t63 (point_key=?)
+`--SCAN run_lengths
+   |--SCAN run_ids
+   `--USE SORTER FOR GROUP BY

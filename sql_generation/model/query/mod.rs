@@ -3,7 +3,7 @@ pub use create_index::CreateIndex;
 pub use delete::Delete;
 pub use drop::Drop;
 pub use drop_index::DropIndex;
-pub use insert::Insert;
+pub use insert::{Insert, OnConflict, UpdateSetItem};
 pub use select::Select;
 
 pub mod alter_table;

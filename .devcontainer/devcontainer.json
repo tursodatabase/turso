@@ -1,0 +1,48 @@
+{
+  "name": "tursodb sandbox",
+  "dockerComposeFile": ["docker-compose.yml"],
+  "service": "tursodb",
+  "remoteUser": "node",
+  "workspaceFolder": "/workspace",
+  "waitFor": "postStartCommand",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "anthropic.claude-code",
+        "eamodio.gitlens",
+
+        // Rust
+        "rust-lang.rust-analyzer",
+
+        // Go
+        "golang.Go",
+
+        // Python
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+
+        // JavaScript / TypeScript
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "ms-vscode.vscode-typescript-next"
+      ],
+      "settings": {
+        "editor.formatOnSave": true,
+        "editor.defaultFormatter": "esbenp.prettier-vscode",
+        "editor.codeActionsOnSave": {
+          "source.fixAll.eslint": "explicit"
+        },
+        "terminal.integrated.defaultProfile.linux": "zsh",
+        "terminal.integrated.profiles.linux": {
+          "bash": {
+            "path": "bash",
+            "icon": "terminal-bash"
+          },
+          "zsh": {
+            "path": "zsh"
+          }
+        }
+      }
+    }
+  }
+}

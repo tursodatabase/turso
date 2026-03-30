@@ -4,9 +4,8 @@ use turso_core::{Statement, StepResult};
 
 use crate::common::{maybe_setup_tracing, TempDatabase};
 
-#[test]
-fn test_schema_reprepare() {
-    let tmp_db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_schema_reprepare(tmp_db: TempDatabase) {
     let conn1 = tmp_db.connect_limbo();
     conn1.execute("CREATE TABLE t(x, y, z)").unwrap();
     conn1
@@ -28,34 +27,32 @@ fn test_schema_reprepare() {
     }
 
     let mut rows = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Done => {
-                break;
-            }
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                rows.push((row.get::<i64>(0).unwrap(), row.get::<i64>(1).unwrap()));
-            }
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            step => panic!("unexpected step result {step:?}"),
-        }
-    }
+    stmt.run_with_row_callback(|row| {
+        rows.push((row.get::<i64>(0).unwrap(), row.get::<i64>(1).unwrap()));
+        Ok(())
+    })
+    .unwrap();
+
     let row = rows[0];
     assert_eq!(row, (2, 3));
     let row = rows[1];
     assert_eq!(row, (20, 30));
 }
 
-#[test]
+#[turso_macros::test(mvcc)]
 #[ignore]
-fn test_create_multiple_connections() -> anyhow::Result<()> {
+fn test_create_multiple_connections(tmp_db: TempDatabase) -> anyhow::Result<()> {
     maybe_setup_tracing();
     let tries = 1;
+    let opts = tmp_db.db_opts;
+    let flags = tmp_db.db_flags;
     for _ in 0..tries {
-        let tmp_db = Arc::new(TempDatabase::new_empty());
+        let tmp_db = Arc::new(
+            TempDatabase::builder()
+                .with_flags(flags)
+                .with_opts(opts)
+                .build(),
+        );
         {
             let conn = tmp_db.connect_limbo();
             conn.execute("CREATE TABLE t (x)").unwrap();
@@ -77,7 +74,7 @@ fn test_create_multiple_connections() -> anyhow::Result<()> {
                                 panic!("unexpected row result");
                             }
                             StepResult::IO => {
-                                stmt.run_once().unwrap();
+                                stmt._io().step().unwrap();
                             }
                             StepResult::Done => {
                                 tracing::info!("inserted row {}", i);
@@ -103,38 +100,31 @@ fn test_create_multiple_connections() -> anyhow::Result<()> {
         let conn = tmp_db.connect_limbo();
         let mut stmt = conn.prepare("SELECT * FROM t").unwrap();
         let mut rows = Vec::new();
-        loop {
-            match stmt.step().unwrap() {
-                StepResult::Row => {
-                    let row = stmt.row().unwrap();
-                    rows.push(row.get::<i64>(0).unwrap());
-                }
-                StepResult::IO => {
-                    stmt.run_once().unwrap();
-                }
-                StepResult::Done => {
-                    break;
-                }
-                StepResult::Interrupt => {
-                    panic!("unexpected step result");
-                }
-                StepResult::Busy => {
-                    panic!("unexpected busy result on select");
-                }
-            }
-        }
+        stmt.run_with_row_callback(|row| {
+            rows.push(row.get::<i64>(0).unwrap());
+            Ok(())
+        })
+        .unwrap();
+
         rows.sort();
         assert_eq!(rows, (0..10).collect::<Vec<_>>());
     }
     Ok(())
 }
 
-#[test]
+#[turso_macros::test(mvcc)]
 #[ignore]
-fn test_reader_writer() -> anyhow::Result<()> {
+fn test_reader_writer(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let tries = 10;
+    let opts = tmp_db.db_opts;
+    let flags = tmp_db.db_flags;
     for _ in 0..tries {
-        let tmp_db = Arc::new(TempDatabase::new_empty());
+        let tmp_db = Arc::new(
+            TempDatabase::builder()
+                .with_flags(flags)
+                .with_opts(opts)
+                .build(),
+        );
         {
             let conn = tmp_db.connect_limbo();
             conn.execute("CREATE TABLE t (x)").unwrap();
@@ -167,31 +157,18 @@ fn test_reader_writer() -> anyhow::Result<()> {
                     }
                     let mut stmt = conn.prepare("SELECT * FROM t").unwrap();
                     let mut rows = Vec::new();
-                    loop {
-                        match stmt.step().unwrap() {
-                            StepResult::Row => {
-                                let row = stmt.row().unwrap();
-                                let x = row.get::<i64>(0).unwrap();
-                                rows.push(x);
-                            }
-                            StepResult::IO => {
-                                stmt.run_once().unwrap();
-                            }
-                            StepResult::Done => {
-                                rows.sort();
-                                for i in 0..current_written_rows {
-                                    let i = i as i64;
-                                    assert!(
-                                        rows.contains(&i),
-                                        "row {i} not found in {rows:?}. current_written_rows: {current_written_rows}",
-                                    );
-                                }
-                                break;
-                            }
-                            StepResult::Interrupt | StepResult::Busy => {
-                                panic!("unexpected step result");
-                            }
-                        }
+                    stmt.run_with_row_callback(|row| {
+                        let x = row.get::<i64>(0).unwrap();
+                        rows.push(x);
+                        Ok(())
+                    }).unwrap();
+                    rows.sort();
+                    for i in 0..current_written_rows {
+                        let i = i as i64;
+                        assert!(
+                            rows.contains(&i),
+                            "row {i} not found in {rows:?}. current_written_rows: {current_written_rows}",
+                        );
                     }
                 }
             }));
@@ -203,10 +180,9 @@ fn test_reader_writer() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_schema_reprepare_write() {
+#[turso_macros::test(mvcc)]
+fn test_schema_reprepare_write(tmp_db: TempDatabase) {
     maybe_setup_tracing();
-    let tmp_db = TempDatabase::new_empty();
     let conn1 = tmp_db.connect_limbo();
     conn1.execute("CREATE TABLE t(x, y, z)").unwrap();
     let conn2 = tmp_db.connect_limbo();
@@ -215,45 +191,28 @@ fn test_schema_reprepare_write() {
     conn1.execute("ALTER TABLE t DROP COLUMN x").unwrap();
 
     tracing::info!("Executing Stmt 1");
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Done => {
-                break;
-            }
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            step => panic!("unexpected step result {step:?}"),
-        }
-    }
+    stmt.run_with_row_callback(|_| panic!("unexpected row"))
+        .unwrap();
 
     tracing::info!("Executing Stmt 2");
-    loop {
-        match stmt2.step().unwrap() {
-            turso_core::StepResult::Done => {
-                break;
-            }
-            turso_core::StepResult::IO => {
-                stmt2.run_once().unwrap();
-            }
-            step => panic!("unexpected step result {step:?}"),
-        }
-    }
+    stmt2
+        .run_with_row_callback(|_| panic!("unexpected row"))
+        .unwrap();
 }
 
 fn advance(stmt: &mut Statement) -> anyhow::Result<()> {
     tracing::info!("Advancing statement: {:?}", stmt.get_sql());
     while matches!(stmt.step()?, StepResult::IO) {
-        stmt.run_once()?;
+        stmt._io().step()?;
     }
     Ok(())
 }
 
 /// Regression test detected by whopper
-#[test]
-fn test_interleaved_transactions() -> anyhow::Result<()> {
+// TODO: cannot run with mvcc as we don't support indexes
+#[turso_macros::test]
+fn test_interleaved_transactions(tmp_db: TempDatabase) -> anyhow::Result<()> {
     maybe_setup_tracing();
-    let tmp_db = TempDatabase::new_empty();
     {
         let bootstrap_conn = tmp_db.connect_limbo();
         bootstrap_conn.execute("CREATE TABLE table_0 (id INTEGER,col_1 REAL,col_2 INTEGER,col_3 REAL,col_4 TEXT,col_5 REAL,col_6 TEXT)")?;

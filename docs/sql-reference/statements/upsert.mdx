@@ -1,0 +1,179 @@
+---
+title: INSERT ... ON CONFLICT (Upsert)
+description: Insert rows with automatic conflict resolution using DO NOTHING or DO UPDATE
+sidebarTitle: Upsert
+---
+
+# INSERT ... ON CONFLICT (Upsert)
+
+The upsert clause is an extension to `INSERT` that specifies what to do when the insert would violate a `UNIQUE` or `PRIMARY KEY` constraint. Instead of failing with an error, the statement can either skip the conflicting row or update it.
+
+## Syntax
+
+```sql
+INSERT INTO table-name [(column-name [, column-name ...])]
+VALUES (expression [, expression ...]) [, ...]
+ON CONFLICT [(conflict-target)] DO NOTHING
+[ON CONFLICT [(conflict-target)] DO NOTHING | DO UPDATE ...]
+
+INSERT INTO table-name [(column-name [, column-name ...])]
+VALUES (expression [, expression ...]) [, ...]
+ON CONFLICT [(conflict-target)] DO UPDATE
+    SET column-name = expression [, column-name = expression ...]
+    [WHERE expression]
+[ON CONFLICT [(conflict-target)] DO NOTHING | DO UPDATE ...]
+```
+
+Where `conflict-target` is:
+
+```sql
+(column-name [, column-name ...]) [WHERE expression]
+```
+
+## Description
+
+An upsert clause is added to the end of an `INSERT` statement to handle constraint violations gracefully. There are two actions: `DO NOTHING` silently skips the conflicting row, and `DO UPDATE` modifies the existing row in place.
+
+### DO NOTHING
+
+`DO NOTHING` causes the `INSERT` to silently skip any row that would violate the specified constraint. No error is raised and the existing row is left unchanged.
+
+When a conflict target is specified, only violations on that particular constraint trigger the skip. When no conflict target is specified, any constraint violation triggers the skip.
+
+```sql
+INSERT INTO users (id, name) VALUES (1, 'Alice')
+ON CONFLICT DO NOTHING;
+```
+
+### DO UPDATE
+
+`DO UPDATE` causes the `INSERT` to update the existing row when a constraint violation occurs. The `SET` clause specifies which columns to update and what values to assign. A conflict target is required for `DO UPDATE`.
+
+```sql
+INSERT INTO counters (name, value) VALUES ('hits', 1)
+ON CONFLICT (name) DO UPDATE
+    SET value = counters.value + 1;
+```
+
+### Conflict Target
+
+The conflict target identifies which `UNIQUE` or `PRIMARY KEY` constraint the clause applies to. It is a parenthesized list of column names that must exactly match the columns of an existing unique constraint on the table.
+
+For partial unique indexes (indexes with a `WHERE` clause), the conflict target must also include a `WHERE` clause that matches the index's condition.
+
+```sql
+-- Given: CREATE UNIQUE INDEX idx ON t(a, b) WHERE c > 0
+INSERT INTO t VALUES (1, 2, 3)
+ON CONFLICT (a, b) WHERE c > 0 DO NOTHING;
+```
+
+### The `excluded` Table
+
+Inside the `SET` and `WHERE` clauses of `DO UPDATE`, the special `excluded` table contains the values that were proposed for insertion. This allows the update expression to reference both the existing row (using the table name) and the proposed new row (using `excluded`).
+
+| Reference | Meaning |
+|-----------|---------|
+| `table-name.column` | The current value of the column in the existing row |
+| `excluded.column` | The value that was proposed for insertion but caused the conflict |
+
+```sql
+INSERT INTO products (sku, name, price) VALUES ('A001', 'Widget', 12.99)
+ON CONFLICT (sku) DO UPDATE
+    SET name = excluded.name,
+        price = excluded.price;
+```
+
+### WHERE Clause on DO UPDATE
+
+The `DO UPDATE` clause can include a `WHERE` expression that further restricts when the update occurs. If the `WHERE` condition evaluates to false for a conflicting row, that row is left unchanged (the insert is silently skipped, as with `DO NOTHING`).
+
+```sql
+INSERT INTO products (sku, name, price) VALUES ('A001', 'Widget', 8.99)
+ON CONFLICT (sku) DO UPDATE
+    SET price = excluded.price
+    WHERE excluded.price < products.price;
+```
+
+In this example, the price is only updated if the new price is lower than the existing price.
+
+### Multiple ON CONFLICT Clauses
+
+An `INSERT` statement can have multiple `ON CONFLICT` clauses, each targeting a different constraint. The clauses are evaluated in order. When a constraint violation occurs, the first matching clause is used.
+
+```sql
+INSERT INTO users (id, email, name) VALUES (1, 'alice@example.com', 'Alice')
+ON CONFLICT (id) DO UPDATE SET name = excluded.name, email = excluded.email
+ON CONFLICT (email) DO NOTHING;
+```
+
+<Info>
+At most one `ON CONFLICT` clause can omit the conflict target. A clause without a conflict target acts as a catch-all and must appear last. Only `DO NOTHING` is allowed without a conflict target.
+</Info>
+
+## Examples
+
+### Upsert a counter
+
+```sql
+CREATE TABLE counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL DEFAULT 0);
+
+-- First insert creates the row
+INSERT INTO counters (name, value) VALUES ('logins', 1)
+ON CONFLICT (name) DO UPDATE SET value = counters.value + excluded.value;
+
+SELECT * FROM counters;
+-- logins|1
+
+-- Subsequent inserts increment the counter
+INSERT INTO counters (name, value) VALUES ('logins', 1)
+ON CONFLICT (name) DO UPDATE SET value = counters.value + excluded.value;
+
+SELECT * FROM counters;
+-- logins|2
+```
+
+### Bulk insert, skipping duplicates
+
+```sql
+CREATE TABLE tags (id INTEGER PRIMARY KEY, label TEXT UNIQUE);
+INSERT INTO tags VALUES (1, 'rust');
+INSERT INTO tags VALUES (2, 'sql');
+
+-- Insert several tags, skipping any that already exist
+INSERT INTO tags VALUES (2, 'sql'), (3, 'wasm'), (4, 'database')
+ON CONFLICT DO NOTHING;
+
+SELECT * FROM tags;
+-- 1|rust
+-- 2|sql
+-- 3|wasm
+-- 4|database
+```
+
+### Conditional update with excluded
+
+```sql
+CREATE TABLE prices (
+    product_id INTEGER PRIMARY KEY,
+    price REAL NOT NULL,
+    updated_at TEXT NOT NULL
+);
+INSERT INTO prices VALUES (1, 29.99, '2025-01-01');
+
+-- Only update the price if the new timestamp is more recent
+INSERT INTO prices (product_id, price, updated_at) VALUES (1, 24.99, '2025-06-15')
+ON CONFLICT (product_id) DO UPDATE
+    SET price = excluded.price,
+        updated_at = excluded.updated_at
+    WHERE excluded.updated_at > prices.updated_at;
+
+SELECT * FROM prices;
+-- 1|24.99|2025-06-15
+```
+
+## See Also
+
+- [INSERT](/docs/sql-reference/statements/insert) for standard insert operations
+- [REPLACE](/docs/sql-reference/statements/replace) for delete-and-reinsert conflict resolution
+- [UPDATE](/docs/sql-reference/statements/update) for modifying existing rows directly
+- [CREATE TABLE](/docs/sql-reference/statements/create-table) for defining `UNIQUE` and `PRIMARY KEY` constraints

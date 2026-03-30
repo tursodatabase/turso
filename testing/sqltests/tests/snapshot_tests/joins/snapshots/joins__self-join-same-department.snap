@@ -1,0 +1,24 @@
+---
+source: joins.sqltest
+expression: |-
+  SELECT
+          e1.name AS employee1,
+          e2.name AS employee2,
+          e1.department
+      FROM
+          employees e1,
+          employees e2
+      WHERE
+          e1.department = e2.department
+          AND e1.employee_id < e2.employee_id;
+info:
+  statement_type: SELECT
+  tables:
+  - employees
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN employees AS e1
+`--SEARCH e2 USING INTEGER PRIMARY KEY (rowid=?)

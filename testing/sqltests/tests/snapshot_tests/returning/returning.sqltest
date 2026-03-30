@@ -1,0 +1,73 @@
+# RETURNING Clause Bytecode Snapshots
+# These snapshots verify that RETURNING uses ephemeral table buffering:
+# all DML completes before any RETURNING rows are yielded to the caller.
+
+@database :memory:
+@skip-file-if mvcc "mvcc has slightly different cursor ids, so skipping it for now"
+
+setup schema {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, name TEXT, value REAL);
+    CREATE INDEX idx_t1_name ON t1(name);
+}
+
+setup data {
+    INSERT INTO t1 VALUES (1, 'alice', 10.0);
+    INSERT INTO t1 VALUES (2, 'bob', 20.0);
+    INSERT INTO t1 VALUES (3, 'charlie', 30.0);
+}
+
+# INSERT ... RETURNING *
+# Expect: DML loop buffers into ephemeral table, scan-back yields rows after
+@setup schema
+snapshot insert-returning-star {
+    INSERT INTO t1 VALUES (1, 'alice', 10.0), (2, 'bob', 20.0) RETURNING *;
+}
+
+# INSERT ... RETURNING expression
+@setup schema
+snapshot insert-returning-expr {
+    INSERT INTO t1 VALUES (1, 'alice', 10.0) RETURNING id, upper(name), value * 2;
+}
+
+# UPDATE ... RETURNING *
+@setup schema
+@setup data
+snapshot update-returning-star {
+    UPDATE t1 SET value = value + 1 WHERE name = 'alice' RETURNING *;
+}
+
+# UPDATE ... RETURNING expression
+@setup schema
+@setup data
+snapshot update-returning-expr {
+    UPDATE t1 SET value = value * 2 RETURNING id, name || '-updated', value;
+}
+
+# DELETE ... RETURNING *
+@setup schema
+@setup data
+snapshot delete-returning-star {
+    DELETE FROM t1 WHERE id = 2 RETURNING *;
+}
+
+# DELETE ... RETURNING expression
+@setup schema
+@setup data
+snapshot delete-returning-expr {
+    DELETE FROM t1 WHERE value > 15.0 RETURNING id, name;
+}
+
+# INSERT ... ON CONFLICT DO UPDATE ... RETURNING
+setup upsert_schema {
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, name TEXT, counter INTEGER DEFAULT 0);
+}
+
+setup upsert_data {
+    INSERT INTO t2 VALUES (1, 'existing', 5);
+}
+
+@setup upsert_schema
+@setup upsert_data
+snapshot upsert-returning {
+    INSERT INTO t2 VALUES (1, 'new', 0) ON CONFLICT(id) DO UPDATE SET counter = counter + 1 RETURNING *;
+}

@@ -8,12 +8,14 @@
 //! The main entry point is `LogicalPlanBuilder` which constructs logical plans
 //! from SQL AST nodes.
 use crate::function::AggFunc;
+use crate::numeric::Numeric;
 use crate::schema::{Schema, Type};
+use crate::sync::Arc;
+use crate::turso_assert_ne;
 use crate::types::Value;
 use crate::{LimboError, Result};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::fmt::{self, Display, Formatter};
-use std::sync::Arc;
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast;
 
@@ -415,7 +417,7 @@ impl<'a> LogicalPlanBuilder<'a> {
     pub fn new(schema: &'a Schema) -> Self {
         Self {
             schema,
-            ctes: HashMap::new(),
+            ctes: HashMap::default(),
         }
     }
 
@@ -450,7 +452,7 @@ impl<'a> LogicalPlanBuilder<'a> {
 
     // Build WITH CTE
     fn build_with_cte(&mut self, with: &ast::With, select: &ast::Select) -> Result<LogicalPlan> {
-        let mut cte_plans = HashMap::new();
+        let mut cte_plans = HashMap::default();
 
         // Build each CTE
         for cte in &with.ctes {
@@ -602,14 +604,11 @@ impl<'a> LogicalPlanBuilder<'a> {
                 }
 
                 // Regular table scan
-                let table_alias = alias.as_ref().map(|a| match a {
-                    ast::As::As(name) => Self::name_to_string(name),
-                    ast::As::Elided(name) => Self::name_to_string(name),
-                });
+                let table_alias = alias.as_ref().map(|a| Self::name_to_string(a.name()));
                 let table_schema = self.get_table_schema(&table_name, table_alias.as_deref())?;
                 Ok(LogicalPlan::TableScan(TableScan {
                     table_name,
-                    alias: table_alias.clone(),
+                    alias: table_alias,
                     schema: table_schema,
                     projection: None,
                 }))
@@ -928,10 +927,9 @@ impl<'a> LogicalPlanBuilder<'a> {
             match col {
                 ast::ResultColumn::Expr(expr, alias) => {
                     let logical_expr = self.build_expr(expr, input_schema)?;
-                    let col_name = match alias {
-                        Some(as_alias) => match as_alias {
-                            ast::As::As(name) | ast::As::Elided(name) => Self::name_to_string(name),
-                        },
+                    let explicit_alias = alias.as_ref().filter(|a| a.is_explicit());
+                    let col_name = match explicit_alias {
+                        Some(as_alias) => Self::name_to_string(as_alias.name()),
                         None => Self::expr_to_column_name(expr),
                     };
                     let col_type = Self::infer_expr_type(&logical_expr, input_schema)?;
@@ -944,10 +942,8 @@ impl<'a> LogicalPlanBuilder<'a> {
                         table_alias: None,
                     });
 
-                    if let Some(as_alias) = alias {
-                        let alias_name = match as_alias {
-                            ast::As::As(name) | ast::As::Elided(name) => Self::name_to_string(name),
-                        };
+                    if let Some(as_alias) = explicit_alias {
+                        let alias_name = Self::name_to_string(as_alias.name());
                         proj_exprs.push(LogicalExpr::Alias {
                             expr: Box::new(logical_expr),
                             alias: alias_name,
@@ -1158,18 +1154,15 @@ impl<'a> LogicalPlanBuilder<'a> {
         // and a vector of SELECT expressions for positional references
         // This allows GROUP BY to reference SELECT aliases (e.g., GROUP BY year)
         // or positions (e.g., GROUP BY 1)
-        let mut alias_to_expr = HashMap::new();
+        let mut alias_to_expr = HashMap::default();
         let mut select_exprs = Vec::new();
         for col in columns {
             if let ast::ResultColumn::Expr(expr, alias) = col {
                 let logical_expr = self.build_expr(expr, input_schema)?;
                 select_exprs.push(logical_expr.clone());
 
-                if let Some(alias) = alias {
-                    let alias_name = match alias {
-                        ast::As::As(name) | ast::As::Elided(name) => Self::name_to_string(name),
-                    };
-                    alias_to_expr.insert(alias_name, logical_expr);
+                if let Some(alias) = alias.as_ref().filter(|a| a.is_explicit()) {
+                    alias_to_expr.insert(Self::name_to_string(alias.name()), logical_expr);
                 }
             }
         }
@@ -1180,7 +1173,10 @@ impl<'a> LogicalPlanBuilder<'a> {
             .into_iter()
             .map(|expr| {
                 // Check for positional reference (integer literal)
-                if let LogicalExpr::Literal(crate::types::Value::Integer(pos)) = &expr {
+                if let LogicalExpr::Literal(crate::types::Value::Numeric(
+                    crate::Numeric::Integer(pos),
+                )) = &expr
+                {
                     // SQLite uses 1-based indexing
                     if *pos > 0 && (*pos as usize) <= select_exprs.len() {
                         return select_exprs[(*pos as usize) - 1].clone();
@@ -1244,7 +1240,7 @@ impl<'a> LogicalPlanBuilder<'a> {
         }
 
         // Track aggregates we've already seen to avoid duplicates
-        let mut aggregate_map: HashMap<String, String> = HashMap::new();
+        let mut aggregate_map: HashMap<String, String> = HashMap::default();
 
         for col in columns {
             match col {
@@ -1252,10 +1248,8 @@ impl<'a> LogicalPlanBuilder<'a> {
                     let logical_expr = self.build_expr(expr, input_schema)?;
 
                     // Determine the column name for this expression
-                    let col_name = match alias {
-                        Some(as_alias) => match as_alias {
-                            ast::As::As(name) | ast::As::Elided(name) => Self::name_to_string(name),
-                        },
+                    let col_name = match alias.as_ref().filter(|a| a.is_explicit()) {
+                        Some(as_alias) => Self::name_to_string(as_alias.name()),
                         None => Self::expr_to_column_name(expr),
                     };
 
@@ -1387,12 +1381,12 @@ impl<'a> LogicalPlanBuilder<'a> {
         for (i, expr) in projection_exprs.iter().enumerate() {
             let col_name = if i < columns.len() {
                 match &columns[i] {
-                    ast::ResultColumn::Expr(e, alias) => match alias {
-                        Some(as_alias) => match as_alias {
-                            ast::As::As(name) | ast::As::Elided(name) => Self::name_to_string(name),
-                        },
-                        None => Self::expr_to_column_name(e),
-                    },
+                    ast::ResultColumn::Expr(e, alias) => {
+                        match alias.as_ref().filter(|a| a.is_explicit()) {
+                            Some(as_alias) => Self::name_to_string(as_alias.name()),
+                            None => Self::expr_to_column_name(e),
+                        }
+                    }
                     _ => format!("col_{i}"),
                 }
             } else {
@@ -1565,7 +1559,7 @@ impl<'a> LogicalPlanBuilder<'a> {
             _ => {
                 return Err(LimboError::ParseError(
                     "LIMIT must be a literal integer".to_string(),
-                ))
+                ));
             }
         };
 
@@ -1575,7 +1569,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 _ => {
                     return Err(LimboError::ParseError(
                         "OFFSET must be a literal integer".to_string(),
-                    ))
+                    ));
                 }
             }
         } else {
@@ -1723,6 +1717,30 @@ impl<'a> LogicalPlanBuilder<'a> {
                         args: vec![],
                         distinct: false,
                     })
+                } else if let Ok(Some(func)) =
+                    crate::function::Func::resolve_function(&func_name, 0)
+                {
+                    // Check if this function supports star expansion (e.g., json_object, jsonb_object)
+                    if func.needs_star_expansion() {
+                        // Expand * to all columns as alternating key-value pairs
+                        let mut args = Vec::new();
+                        for col in &_schema.columns {
+                            // Add column name as string literal
+                            args.push(LogicalExpr::Literal(crate::types::Value::Text(
+                                col.name.clone().into(),
+                            )));
+                            // Add column reference
+                            args.push(LogicalExpr::Column(Column::new(col.name.clone())));
+                        }
+                        Ok(LogicalExpr::ScalarFunction {
+                            fun: func_name,
+                            args,
+                        })
+                    } else {
+                        Err(LimboError::ParseError(format!(
+                            "Function {func_name}(*) is not supported"
+                        )))
+                    }
                 } else {
                     Err(LimboError::ParseError(format!(
                         "Function {func_name}(*) is not supported"
@@ -1860,7 +1878,7 @@ impl<'a> LogicalPlanBuilder<'a> {
             ast::Expr::Parenthesized(exprs) => {
                 // the assumption is that there is at least one parenthesis here.
                 // If this is not true, then I don't understand this code and can't be trusted.
-                assert!(!exprs.is_empty());
+                turso_assert_ne!(exprs.len(), 0);
                 // Multiple expressions in parentheses is unusual but handle it
                 // by building the first one (SQLite behavior)
                 self.build_expr(&exprs[0], _schema)
@@ -1884,19 +1902,21 @@ impl<'a> LogicalPlanBuilder<'a> {
     fn build_literal(lit: &ast::Literal) -> Result<Value> {
         match lit {
             ast::Literal::Null => Ok(Value::Null),
+            ast::Literal::True => Ok(Value::from_i64(1)),
+            ast::Literal::False => Ok(Value::from_i64(0)),
             ast::Literal::Keyword(k) => {
                 let k_bytes = k.as_bytes();
                 match_ignore_ascii_case!(match k_bytes {
-                    b"true" => Ok(Value::Integer(1)),  // SQLite uses int for bool
-                    b"false" => Ok(Value::Integer(0)), // SQLite uses int for bool
+                    b"true" => Ok(Value::from_i64(1)),  // SQLite uses int for bool
+                    b"false" => Ok(Value::from_i64(0)), // SQLite uses int for bool
                     _ => Ok(Value::Text(k.clone().into())),
                 })
             }
             ast::Literal::Numeric(s) => {
                 if let Ok(i) = s.parse::<i64>() {
-                    Ok(Value::Integer(i))
+                    Ok(Value::from_i64(i))
                 } else if let Ok(f) = s.parse::<f64>() {
-                    Ok(Value::Float(f))
+                    Ok(Value::from_f64(f))
                 } else {
                     Ok(Value::Text(s.clone().into()))
                 }
@@ -1934,6 +1954,7 @@ impl<'a> LogicalPlanBuilder<'a> {
             b"GROUP_CONCAT" => Some(AggFunc::GroupConcat),
             b"STRING_AGG" => Some(AggFunc::StringAgg),
             b"TOTAL" => Some(AggFunc::Total),
+            b"ARRAY_AGG" => Some(AggFunc::ArrayAgg),
             _ => None,
         })
     }
@@ -2294,8 +2315,8 @@ impl<'a> LogicalPlanBuilder<'a> {
                     Ok(Type::Text)
                 }
             }
-            LogicalExpr::Literal(Value::Integer(_)) => Ok(Type::Integer),
-            LogicalExpr::Literal(Value::Float(_)) => Ok(Type::Real),
+            LogicalExpr::Literal(Value::Numeric(Numeric::Integer(_))) => Ok(Type::Integer),
+            LogicalExpr::Literal(Value::Numeric(Numeric::Float(_))) => Ok(Type::Real),
             LogicalExpr::Literal(Value::Text(_)) => Ok(Type::Text),
             LogicalExpr::Literal(Value::Null) => Ok(Type::Null),
             LogicalExpr::Literal(Value::Blob(_)) => Ok(Type::Blob),
@@ -2357,6 +2378,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 AggFunc::Sum | AggFunc::Avg | AggFunc::Total => Ok(Type::Real),
                 AggFunc::Min | AggFunc::Max => Ok(Type::Text),
                 AggFunc::GroupConcat | AggFunc::StringAgg => Ok(Type::Text),
+                AggFunc::ArrayAgg => Ok(Type::Blob),
                 #[cfg(feature = "json")]
                 AggFunc::JsonbGroupArray
                 | AggFunc::JsonGroupArray
@@ -2378,141 +2400,151 @@ impl<'a> LogicalPlanBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{BTreeTable, Column as SchemaColumn, Schema, Type};
+    use crate::schema::{BTreeTable, ColDef, Column as SchemaColumn, Schema, Type};
     use turso_parser::parser::Parser;
 
     fn create_test_schema() -> Schema {
-        let mut schema = Schema::new(false);
+        let mut schema = Schema::new();
 
         // Create users table
+        let columns = vec![
+            SchemaColumn::new(
+                Some("id".to_string()),
+                "INTEGER".to_string(),
+                None,
+                None,
+                Type::Integer,
+                None,
+                ColDef {
+                    primary_key: true,
+                    rowid_alias: true,
+                    notnull: true,
+                    ..Default::default()
+                },
+            ),
+            SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+            SchemaColumn::new_default_integer(Some("age".to_string()), "INTEGER".to_string(), None),
+            SchemaColumn::new_default_text(Some("email".to_string()), "TEXT".to_string(), None),
+        ];
+        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let users_table = BTreeTable {
             name: "users".to_string(),
             root_page: 2,
             primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
             foreign_keys: vec![],
-            columns: vec![
-                SchemaColumn::new(
-                    Some("id".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                    Type::Integer,
-                    None,
-                    true,
-                    true,
-                    true,
-                    false,
-                    false,
-                ),
-                SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
-                SchemaColumn::new_default_integer(
-                    Some("age".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                ),
-                SchemaColumn::new_default_text(Some("email".to_string()), "TEXT".to_string(), None),
-            ],
+            check_constraints: vec![],
+            rowid_alias_conflict_clause: None,
+            columns,
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,
             unique_sets: vec![],
+            has_virtual_columns: false,
+            logical_to_physical_map,
         };
         schema
             .add_btree_table(Arc::new(users_table))
             .expect("Test setup: failed to add users table");
 
         // Create orders table
+        let columns = vec![
+            SchemaColumn::new(
+                Some("id".to_string()),
+                "INTEGER".to_string(),
+                None,
+                None,
+                Type::Integer,
+                None,
+                ColDef {
+                    primary_key: true,
+                    rowid_alias: true,
+                    notnull: true,
+                    ..Default::default()
+                },
+            ),
+            SchemaColumn::new_default_integer(
+                Some("user_id".to_string()),
+                "INTEGER".to_string(),
+                None,
+            ),
+            SchemaColumn::new_default_text(Some("product".to_string()), "TEXT".to_string(), None),
+            SchemaColumn::new(
+                Some("amount".to_string()),
+                "REAL".to_string(),
+                None,
+                None,
+                Type::Real,
+                None,
+                ColDef::default(),
+            ),
+        ];
+        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let orders_table = BTreeTable {
             name: "orders".to_string(),
             root_page: 3,
             primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
-            columns: vec![
-                SchemaColumn::new(
-                    Some("id".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                    Type::Integer,
-                    None,
-                    true,
-                    true,
-                    true,
-                    false,
-                    false,
-                ),
-                SchemaColumn::new_default_integer(
-                    Some("user_id".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                ),
-                SchemaColumn::new_default_text(
-                    Some("product".to_string()),
-                    "TEXT".to_string(),
-                    None,
-                ),
-                SchemaColumn::new(
-                    Some("amount".to_string()),
-                    "REAL".to_string(),
-                    None,
-                    Type::Real,
-                    None,
-                    false,
-                    false,
-                    false,
-                    false,
-                    false,
-                ),
-            ],
+            columns,
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,
             unique_sets: vec![],
             foreign_keys: vec![],
+            check_constraints: vec![],
+            rowid_alias_conflict_clause: None,
+            has_virtual_columns: false,
+            logical_to_physical_map,
         };
         schema
             .add_btree_table(Arc::new(orders_table))
             .expect("Test setup: failed to add orders table");
 
         // Create products table
+        let columns = vec![
+            SchemaColumn::new(
+                Some("id".to_string()),
+                "INTEGER".to_string(),
+                None,
+                None,
+                Type::Integer,
+                None,
+                ColDef {
+                    primary_key: true,
+                    rowid_alias: true,
+                    notnull: true,
+                    ..Default::default()
+                },
+            ),
+            SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+            SchemaColumn::new(
+                Some("price".to_string()),
+                "REAL".to_string(),
+                None,
+                None,
+                Type::Real,
+                None,
+                ColDef::default(),
+            ),
+            SchemaColumn::new_default_integer(
+                Some("product_id".to_string()),
+                "INTEGER".to_string(),
+                None,
+            ),
+        ];
+        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let products_table = BTreeTable {
             name: "products".to_string(),
             root_page: 4,
             primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
-            columns: vec![
-                SchemaColumn::new(
-                    Some("id".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                    Type::Integer,
-                    None,
-                    true,
-                    true,
-                    true,
-                    false,
-                    false,
-                ),
-                SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
-                SchemaColumn::new(
-                    Some("price".to_string()),
-                    "REAL".to_string(),
-                    None,
-                    Type::Real,
-                    None,
-                    false,
-                    false,
-                    false,
-                    false,
-                    false,
-                ),
-                SchemaColumn::new_default_integer(
-                    Some("product_id".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                ),
-            ],
+            columns,
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,
             unique_sets: vec![],
             foreign_keys: vec![],
+            check_constraints: vec![],
+            rowid_alias_conflict_clause: None,
+            has_virtual_columns: false,
+            logical_to_physical_map,
         };
         schema
             .add_btree_table(Arc::new(products_table))
@@ -3030,7 +3062,10 @@ mod tests {
                                     LogicalExpr::Column(col) => {
                                         assert!(col.name.starts_with("__agg_arg_proj_"));
                                     }
-                                    _ => panic!("Expected Column reference to projected expression in aggregate args, got {:?}", args[0]),
+                                    _ => panic!(
+                                        "Expected Column reference to projected expression in aggregate args, got {:?}",
+                                        args[0]
+                                    ),
                                 }
                             }
                             _ => panic!("Expected AggregateFunction"),
@@ -3243,21 +3278,24 @@ mod tests {
 
                 assert!(matches!(
                     proj.exprs[0],
-                    LogicalExpr::Literal(Value::Integer(25))
+                    LogicalExpr::Literal(Value::Numeric(Numeric::Integer(25)))
                 ));
 
                 match &proj.exprs[1] {
                     LogicalExpr::BinaryExpr { left, op, right } => {
                         assert_eq!(*op, BinaryOperator::Divide);
                         assert!(matches!(&**left, LogicalExpr::Column(_)));
-                        assert!(matches!(&**right, LogicalExpr::Literal(Value::Integer(3))));
+                        assert!(matches!(
+                            &**right,
+                            LogicalExpr::Literal(Value::Numeric(Numeric::Integer(3)))
+                        ));
                     }
                     _ => panic!("Expected BinaryExpr for (MAX(id) / 3)"),
                 }
 
                 assert!(matches!(
                     proj.exprs[2],
-                    LogicalExpr::Literal(Value::Integer(39))
+                    LogicalExpr::Literal(Value::Numeric(Numeric::Integer(39)))
                 ));
 
                 match &*proj.input {
@@ -3304,7 +3342,7 @@ mod tests {
                         }
                         assert!(matches!(
                             &**right,
-                            LogicalExpr::Literal(Value::Integer(225))
+                            LogicalExpr::Literal(Value::Numeric(Numeric::Integer(225)))
                         ));
                     }
                     _ => panic!("Expected BinaryExpr for (COUNT(*) - 225)"),
@@ -3312,7 +3350,7 @@ mod tests {
 
                 assert!(matches!(
                     proj.exprs[1],
-                    LogicalExpr::Literal(Value::Integer(30))
+                    LogicalExpr::Literal(Value::Numeric(Numeric::Integer(30)))
                 ));
 
                 match &proj.exprs[2] {
@@ -3554,7 +3592,9 @@ mod tests {
                         match &args[0] {
                             LogicalExpr::Column(_) => {}
                             LogicalExpr::AggregateFunction { .. } => {
-                                panic!("Aggregate function should not be embedded in projection! It should be in a separate Aggregate operator");
+                                panic!(
+                                    "Aggregate function should not be embedded in projection! It should be in a separate Aggregate operator"
+                                );
                             }
                             _ => panic!(
                                 "Expected column reference as argument to HEX, got: {:?}",
@@ -3587,22 +3627,38 @@ mod tests {
                                 match &args[0] {
                                     LogicalExpr::Column(col) => {
                                         // When aggregate arguments are complex, they get pre-projected
-                                        assert!(col.name.starts_with("__agg_arg_proj_"), 
-                                               "Should reference pre-projected column, got: {}", col.name);
+                                        assert!(
+                                            col.name.starts_with("__agg_arg_proj_"),
+                                            "Should reference pre-projected column, got: {}",
+                                            col.name
+                                        );
                                     }
                                     LogicalExpr::BinaryExpr { left, op, right } => {
                                         // Simple case without pre-projection (shouldn't happen with current implementation)
                                         assert_eq!(*op, ast::Operator::Add, "Should be addition");
 
                                         match (&**left, &**right) {
-                                            (LogicalExpr::Column(col), LogicalExpr::Literal(val)) => {
-                                                assert_eq!(col.name, "age", "Should reference age column");
-                                                assert_eq!(*val, Value::Integer(2), "Should add 2");
+                                            (
+                                                LogicalExpr::Column(col),
+                                                LogicalExpr::Literal(val),
+                                            ) => {
+                                                assert_eq!(
+                                                    col.name, "age",
+                                                    "Should reference age column"
+                                                );
+                                                assert_eq!(
+                                                    *val,
+                                                    Value::from_i64(2),
+                                                    "Should add 2"
+                                                );
                                             }
                                             _ => panic!("Expected age + 2"),
                                         }
                                     }
-                                    _ => panic!("Expected Column reference or BinaryExpr for aggregate argument, got: {:?}", args[0]),
+                                    _ => panic!(
+                                        "Expected Column reference or BinaryExpr for aggregate argument, got: {:?}",
+                                        args[0]
+                                    ),
                                 }
                             }
                             _ => panic!("Expected AggregateFunction"),
@@ -4030,7 +4086,7 @@ mod tests {
 
     #[test]
     fn test_strip_alias_literal() {
-        let expr = LogicalExpr::Literal(Value::Integer(42));
+        let expr = LogicalExpr::Literal(Value::from_i64(42));
         let stripped = strip_alias(&expr);
         assert_eq!(stripped, &expr);
     }
@@ -4041,8 +4097,8 @@ mod tests {
             fun: "substr".to_string(),
             args: vec![
                 LogicalExpr::Column(Column::new("name")),
-                LogicalExpr::Literal(Value::Integer(1)),
-                LogicalExpr::Literal(Value::Integer(4)),
+                LogicalExpr::Literal(Value::from_i64(1)),
+                LogicalExpr::Literal(Value::from_i64(4)),
             ],
         };
         let stripped = strip_alias(&expr);
@@ -4077,8 +4133,8 @@ mod tests {
             fun: "substr".to_string(),
             args: vec![
                 LogicalExpr::Column(Column::new("orderdate")),
-                LogicalExpr::Literal(Value::Integer(1)),
-                LogicalExpr::Literal(Value::Integer(4)),
+                LogicalExpr::Literal(Value::from_i64(1)),
+                LogicalExpr::Literal(Value::from_i64(4)),
             ],
         };
 
@@ -4100,7 +4156,7 @@ mod tests {
         let expr = LogicalExpr::BinaryExpr {
             left: Box::new(LogicalExpr::Column(Column::new("a"))),
             op: BinaryOperator::Add,
-            right: Box::new(LogicalExpr::Literal(Value::Integer(1))),
+            right: Box::new(LogicalExpr::Literal(Value::from_i64(1))),
         };
         let stripped = strip_alias(&expr);
         assert_eq!(stripped, &expr);
@@ -4125,8 +4181,8 @@ mod tests {
             fun: "substr".to_string(),
             args: vec![
                 LogicalExpr::Column(Column::new("b")),
-                LogicalExpr::Literal(Value::Integer(1)),
-                LogicalExpr::Literal(Value::Integer(4)),
+                LogicalExpr::Literal(Value::from_i64(1)),
+                LogicalExpr::Literal(Value::from_i64(4)),
             ],
         };
 
@@ -4140,7 +4196,7 @@ mod tests {
         };
 
         let select_exprs = [aliased1, aliased2];
-        let group_exprs = [expr1.clone(), expr2.clone()];
+        let group_exprs = [expr1, expr2];
 
         // Verify that stripping aliases allows matching
         for (select_expr, group_expr) in select_exprs.iter().zip(group_exprs.iter()) {

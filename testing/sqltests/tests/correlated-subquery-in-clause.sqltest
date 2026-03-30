@@ -1,0 +1,36 @@
+@database :memory:
+
+# Regression test for #5213: correlated subquery in IN clause
+# referencing outer table alias should not panic.
+
+setup schema {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES(1);
+    INSERT INTO t VALUES(2);
+    INSERT INTO t VALUES(NULL);
+}
+
+@setup schema
+test correlated-in-outer-alias {
+    SELECT * FROM t AS a WHERE a.x IN (SELECT a.x FROM t);
+}
+expect {
+    1
+    2
+}
+
+@setup schema
+test correlated-in-outer-alias-with-where {
+    SELECT * FROM t AS a WHERE a.x IN (SELECT a.x FROM t AS b WHERE b.x = a.x);
+}
+expect {
+    1
+    2
+}
+
+@setup schema
+test correlated-in-outer-alias-no-match {
+    SELECT * FROM t AS a WHERE a.x IN (SELECT a.x FROM t WHERE 0);
+}
+expect {
+}

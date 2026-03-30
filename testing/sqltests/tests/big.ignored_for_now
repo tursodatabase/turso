@@ -1,0 +1,18 @@
+@database iso.db
+@skip-file-if sqlite "run heavy test only on tursodb"
+
+@backend cli
+test big-db {
+    DROP TABLE IF EXISTS t;
+    CREATE TABLE t (x);
+    INSERT INTO t SELECT randomblob(1500) FROM generate_series(1, 2 * 1024 * 1024);
+    PRAGMA wal_checkpoint(TRUNCATE);
+    INSERT INTO t SELECT randomblob(1500) FROM generate_series(1, 2 * 1024 * 1024);
+    PRAGMA wal_checkpoint(TRUNCATE);
+    SELECT COUNT(*) FROM t;
+}
+expect {
+   0|0|0
+   0|0|0
+   4194304
+}

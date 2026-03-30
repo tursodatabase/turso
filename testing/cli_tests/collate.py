@@ -17,7 +17,7 @@ class CollateTest(BaseModel):
         c COLLATE RTRIM,   /* collating sequence RTRIM  */
         d COLLATE NOCASE   /* collating sequence NOCASE */
     );"""
-    db_path: str = "testing/collate.db"
+    db_path: str = "testing/system/collate.db"
 
     def init_db(self):
         with TestTursoShell(

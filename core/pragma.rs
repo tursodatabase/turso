@@ -1,6 +1,6 @@
+use crate::sync::Arc;
 use crate::{Connection, LimboError, Statement, StepResult, Value};
 use bitflags::bitflags;
-use std::sync::Arc;
 use strum::IntoEnumIterator;
 use turso_ext::{ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo, ResultCode};
 use turso_parser::ast::PragmaName;
@@ -89,9 +89,41 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["synchronous"],
         ),
+        TempStore => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["temp_store"],
+        ),
+        IndexInfo => Pragma::new(
+            PragmaFlags::NeedSchema | PragmaFlags::Result1 | PragmaFlags::SchemaOpt,
+            &["seqno", "cid", "name"],
+        ),
+        IndexXinfo => Pragma::new(
+            PragmaFlags::NeedSchema | PragmaFlags::Result1 | PragmaFlags::SchemaOpt,
+            &["seqno", "cid", "name", "desc", "coll", "key"],
+        ),
+        IndexList => Pragma::new(
+            PragmaFlags::NeedSchema | PragmaFlags::Result1 | PragmaFlags::SchemaOpt,
+            &["seq", "name", "unique", "origin", "partial"],
+        ),
+        TableList => Pragma::new(
+            PragmaFlags::NeedSchema | PragmaFlags::Result0 | PragmaFlags::Result1,
+            &["schema", "name", "type", "ncol", "wr", "strict"],
+        ),
         TableInfo => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::Result1 | PragmaFlags::SchemaOpt,
             &["cid", "name", "type", "notnull", "dflt_value", "pk"],
+        ),
+        TableXinfo => Pragma::new(
+            PragmaFlags::NeedSchema | PragmaFlags::Result1 | PragmaFlags::SchemaOpt,
+            &[
+                "cid",
+                "name",
+                "type",
+                "notnull",
+                "dflt_value",
+                "pk",
+                "hidden",
+            ],
         ),
         UserVersion => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
@@ -110,13 +142,21 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NeedSchema | PragmaFlags::ReadOnly | PragmaFlags::Result0,
             &["message"],
         ),
-        UnstableCaptureDataChangesConn => Pragma::new(
+        QuickCheck => Pragma::new(
+            PragmaFlags::NeedSchema | PragmaFlags::ReadOnly | PragmaFlags::Result0,
+            &["message"],
+        ),
+        CaptureDataChangesConn | UnstableCaptureDataChangesConn => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::Result0 | PragmaFlags::SchemaReq,
-            &["mode", "table"],
+            &["mode", "table", "version"],
         ),
         QueryOnly => Pragma::new(
             PragmaFlags::Result0 | PragmaFlags::NoColumns1,
             &["query_only"],
+        ),
+        IAmADummy | RequireWhere => Pragma::new(
+            PragmaFlags::Result0 | PragmaFlags::NoColumns1,
+            &["require_where"],
         ),
         FreelistCount => Pragma::new(PragmaFlags::Result0, &["freelist_count"]),
         EncryptionKey => Pragma::new(
@@ -134,6 +174,27 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
         ForeignKeys => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["foreign_keys"],
+        ),
+        FunctionList => Pragma::new(
+            PragmaFlags::Result0,
+            &["name", "builtin", "type", "enc", "narg", "flags"],
+        ),
+        PragmaName::CacheSpill => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["cache_spill"],
+        ),
+        #[cfg(target_vendor = "apple")]
+        PragmaName::Fullfsync => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["fullfsync"],
+        ),
+        IgnoreCheckConstraints => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["ignore_check_constraints"],
+        ),
+        ListTypes => Pragma::new(
+            PragmaFlags::Result0,
+            &["type", "parent", "encode", "decode", "default", "operators"],
         ),
     }
 }

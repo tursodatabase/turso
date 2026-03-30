@@ -1,0 +1,25 @@
+---
+source: multi_index_or_compound.sqltest
+expression: |-
+  SELECT DISTINCT n.id
+      FROM node n
+      JOIN edge e
+        ON (
+          (e.fromId = 'n1' AND e.toId = n.id AND e.label = 'knows')
+          OR
+          (e.toId = 'n1' AND e.fromId = n.id AND e.label = 'knows')
+        )
+      WHERE n.type = 'entity';
+info:
+  statement_type: SELECT
+  tables:
+  - edge
+  - node
+  setup_blocks:
+  - benchmark_shape_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SEARCH e USING INDEX idx_edge_label (label=?)
+|--MULTI-INDEX OR n (sqlite_autoindex_node_1, sqlite_autoindex_node_1)
+`--USE HASH TABLE FOR DISTINCT

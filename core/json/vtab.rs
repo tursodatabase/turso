@@ -1,6 +1,6 @@
-use parking_lot::RwLock;
+use crate::sync::{Arc, RwLock};
 use std::iter::successors;
-use std::{result::Result, sync::Arc};
+use std::result::Result;
 
 use turso_ext::{ConstraintOp, ConstraintUsage, ResultCode};
 
@@ -72,7 +72,7 @@ impl InternalVirtualTable for JsonVirtualTable {
     fn open(
         &self,
         _conn: Arc<Connection>,
-    ) -> crate::Result<std::sync::Arc<RwLock<dyn InternalVirtualTableCursor + 'static>>> {
+    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor + 'static>>> {
         Ok(Arc::new(RwLock::new(JsonEachCursor::empty(
             self.traversal_mode.clone(),
         ))))
@@ -93,15 +93,37 @@ impl InternalVirtualTable for JsonVirtualTable {
 
         let mut json_idx: Option<usize> = None;
         let mut path_idx: Option<usize> = None;
+        let mut has_json_eq_constraint = false;
+        let mut has_root_eq_constraint = false;
         for (i, c) in constraints.iter().enumerate() {
-            if !c.usable || c.op != ConstraintOp::Eq {
+            if c.op != ConstraintOp::Eq {
                 continue;
             }
             match c.column_index as usize {
-                COL_JSON => json_idx = Some(i),
-                COL_ROOT => path_idx = Some(i),
+                COL_JSON => {
+                    has_json_eq_constraint = true;
+                    if c.usable {
+                        json_idx = Some(i);
+                    }
+                }
+                COL_ROOT => {
+                    has_root_eq_constraint = true;
+                    if c.usable {
+                        path_idx = Some(i);
+                    }
+                }
                 _ => {}
             }
+        }
+
+        // Hidden arguments supplied in SQL must be usable in the chosen loop.
+        // If they are present but unusable, reject this access shape so the
+        // optimizer can pick a join order where argument registers are available.
+        if has_json_eq_constraint && json_idx.is_none() {
+            return Err(ResultCode::ConstraintViolation);
+        }
+        if has_root_eq_constraint && path_idx.is_none() {
+            return Err(ResultCode::ConstraintViolation);
         }
 
         let argc = match (json_idx, path_idx) {
@@ -111,13 +133,15 @@ impl InternalVirtualTable for JsonVirtualTable {
         };
 
         if argc >= 1 {
-            usages[json_idx.unwrap()] = ConstraintUsage {
+            let idx = json_idx.expect("json_idx should be Some when argc >= 1");
+            usages[idx] = ConstraintUsage {
                 argv_index: Some(1),
                 omit: true,
             };
         }
         if argc == 2 {
-            usages[path_idx.unwrap()] = ConstraintUsage {
+            let idx = path_idx.expect("path_idx should be Some when argc == 2");
+            usages[idx] = ConstraintUsage {
                 argv_index: Some(2),
                 omit: true,
             };
@@ -226,6 +250,9 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         _idx_str: Option<String>,
         _idx_num: i32,
     ) -> Result<bool, LimboError> {
+        self.traversal_states.clear();
+        self.rowid = 0;
+
         if args.is_empty() {
             return Ok(false);
         }
@@ -282,10 +309,10 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         match self.traversal_mode {
             JsonTraversalMode::Each => self.next(),
             JsonTraversalMode::Tree => {
-                if matches!(
-                    self.peek_state().unwrap().iterator_state,
-                    IteratorState::Primitive(_)
-                ) {
+                let state = self.peek_state().ok_or_else(|| {
+                    crate::LimboError::InternalError("state stack should not be empty".to_string())
+                })?;
+                if matches!(state.iterator_state, IteratorState::Primitive(_)) {
                     self.next()
                 } else {
                     self.columns = Columns::new(
@@ -368,7 +395,8 @@ impl InternalVirtualTableCursor for JsonEachCursor {
                     IteratorState::Object(new_state),
                     self.path_to_current_value.cursor(),
                 );
-                self.path_to_current_value.push_object_key(&key.to_string());
+                self.path_to_current_value
+                    .push_object_key(&key.to_string()?)?;
                 let recursing = matches!(self.traversal_mode, JsonTraversalMode::Tree)
                     && self
                         .json
@@ -422,7 +450,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
             COL_VALUE => self.columns.value()?,
             COL_TYPE => self.columns.ttype(),
             COL_ATOM => self.columns.atom()?,
-            COL_ID => Value::Integer(self.rowid),
+            COL_ID => Value::from_i64(self.rowid),
             COL_PARENT => self.columns.parent(),
             COL_FULLKEY => self.columns.fullkey(),
             COL_PATH => self.columns.path(),
@@ -500,7 +528,7 @@ mod columns {
 
         fn key_representation(&self) -> Value {
             match self {
-                Key::Integer(ref i) => Value::Integer(*i),
+                Key::Integer(ref i) => Value::from_i64(*i),
                 Key::String(ref s) => Value::Text(Text::new(s.to_owned().replace("\\\"", "\""))),
                 Key::None => Value::Null,
             }
@@ -566,8 +594,8 @@ mod columns {
             let element_type = value.element_type().expect("invalid value");
             let string: Result<Value, LimboError> = match element_type {
                 jsonb::ElementType::NULL => Ok(Value::Null),
-                jsonb::ElementType::TRUE => Ok(Value::Integer(1)),
-                jsonb::ElementType::FALSE => Ok(Value::Integer(0)),
+                jsonb::ElementType::TRUE => Ok(Value::from_i64(1)),
+                jsonb::ElementType::FALSE => Ok(Value::from_i64(0)),
                 jsonb::ElementType::INT | jsonb::ElementType::INT5 => Self::jsonb_to_integer(value),
                 jsonb::ElementType::FLOAT | jsonb::ElementType::FLOAT5 => {
                     Self::jsonb_to_float(value)
@@ -576,9 +604,13 @@ mod columns {
                 | jsonb::ElementType::TEXTJ
                 | jsonb::ElementType::TEXT5
                 | jsonb::ElementType::TEXTRAW => {
-                    let s = value.to_string();
-                    let s = (s[1..s.len() - 1]).to_string();
-                    Ok(Value::Text(Text::new(s)))
+                    let s = value.to_string()?;
+                    // Text values must be properly quoted
+                    let unquoted = s
+                        .strip_prefix('"')
+                        .and_then(|s| s.strip_suffix('"'))
+                        .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
+                    Ok(Value::Text(Text::new(unquoted.to_string())))
                 }
                 jsonb::ElementType::ARRAY => Ok(Value::Null),
                 jsonb::ElementType::OBJECT => Ok(Value::Null),
@@ -591,17 +623,17 @@ mod columns {
         }
 
         fn jsonb_to_integer(value: &Jsonb) -> Result<Value, LimboError> {
-            let string = value.to_string();
+            let string = value.to_string()?;
             let int = string.parse::<i64>()?;
 
-            Ok(Value::Integer(int))
+            Ok(Value::from_i64(int))
         }
 
         fn jsonb_to_float(value: &Jsonb) -> Result<Value, LimboError> {
-            let string = value.to_string();
+            let string = value.to_string()?;
             let float = string.parse::<f64>()?;
 
-            Ok(Value::Float(float))
+            Ok(Value::from_f64(float))
         }
 
         pub(super) fn fullkey(&self) -> Value {
@@ -614,7 +646,7 @@ mod columns {
 
         pub(super) fn parent(&self) -> Value {
             match self.parent_id {
-                Some(id) => Value::Integer(id),
+                Some(id) => Value::from_i64(id),
                 None => Value::Null,
             }
         }
@@ -673,20 +705,26 @@ impl InPlaceJsonPath {
         self.push(format!("[{idx}]"));
     }
 
-    fn push_object_key(&mut self, key: &str) {
+    fn push_object_key(&mut self, key: &str) -> crate::Result<()> {
         // This follows SQLite's current quoting scheme, but it is not part of the stable API.
         // See https://sqlite.org/forum/forumpost?udc=1&name=be212a295ed8df4c
-        let unquoted_if_necessary = if (key[1..key.len() - 1])
+        // Keys must be properly quoted strings
+        let inner = key
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .ok_or_else(|| crate::LimboError::ParseError("malformed JSON".to_string()))?;
+
+        let unquoted_if_necessary = if inner
             .chars()
             .any(|c| c == '.' || c == ' ' || c == '"' || c == '_')
         {
             key
         } else {
-            &key[1..key.len() - 1]
+            inner
         };
-        let always_unquoted = &key[1..key.len() - 1];
-        self.last_element = Key::String(always_unquoted.to_owned());
+        self.last_element = Key::String(inner.to_owned());
         self.push(format!(".{unquoted_if_necessary}"));
+        Ok(())
     }
 
     fn push(&mut self, element: String) {
@@ -731,7 +769,7 @@ impl InPlaceJsonPath {
             .collect();
 
         Self {
-            string: path.to_owned(),
+            string: path,
             element_lengths,
             last_element,
         }
@@ -754,7 +792,11 @@ impl InPlaceJsonPath {
         if self.element_lengths.len() == 1 {
             self.cursor()
         } else {
-            self.cursor() - self.element_lengths.last().unwrap()
+            self.cursor()
+                - self
+                    .element_lengths
+                    .last()
+                    .expect("element_lengths should not be empty in else branch")
         }
     }
 

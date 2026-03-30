@@ -1,0 +1,80 @@
+---
+title: CREATE VIEW
+description: Create a named view based on a SELECT statement
+sidebarTitle: CREATE VIEW
+---
+
+# CREATE VIEW
+
+Create a named view that encapsulates a SELECT statement.
+
+## Syntax
+
+```sql
+CREATE [TEMPORARY] VIEW [IF NOT EXISTS] [schema-name.]view-name
+    AS select-statement;
+```
+
+## Description
+
+A view is a virtual table defined by a SELECT statement. It does not store data on disk -- every time you query the view, Turso executes the underlying SELECT. Views simplify complex queries, provide a stable interface over evolving table schemas, and restrict which columns or rows are visible.
+
+### Parameters
+
+| Parameter | Description |
+|-----------|-------------|
+| `TEMPORARY` | Creates the view in a temporary database. The view is visible only to the current connection and is dropped when the connection closes. `TEMP` is accepted as a synonym. |
+| `IF NOT EXISTS` | Prevents an error if a view with the same name already exists. The statement is a no-op when the view is present. |
+| `schema-name` | The name of the attached database in which to create the view. Defaults to the main database if omitted. Cannot be used with `TEMPORARY`. |
+| `view-name` | A unique name for the view within the database. |
+| `select-statement` | The SELECT query that defines the view's contents. |
+
+### Behavior
+
+- Views are read-only. INSERT, UPDATE, and DELETE on a view are not supported unless an INSTEAD OF trigger is defined on the view.
+- The SELECT statement is stored in the `sqlite_schema` table and parsed each time the view is referenced.
+- If a table referenced by the view is dropped or altered in an incompatible way, queries against the view produce an error.
+
+## Examples
+
+### Simplify a Common Query
+
+```sql
+CREATE VIEW active_users AS
+SELECT id, name, email
+FROM users
+WHERE status = 'active';
+
+-- Use the view like a table
+SELECT * FROM active_users WHERE name LIKE 'A%';
+```
+
+### Aggregate View
+
+```sql
+CREATE VIEW department_stats AS
+SELECT
+    department,
+    COUNT(*) AS employee_count,
+    AVG(salary) AS avg_salary
+FROM employees
+GROUP BY department;
+
+SELECT * FROM department_stats ORDER BY avg_salary DESC;
+```
+
+### Temporary View for a Session
+
+```sql
+CREATE TEMP VIEW my_tasks AS
+SELECT id, title, due_date
+FROM tasks
+WHERE assignee = 'alice';
+```
+
+## See Also
+
+- [CREATE MATERIALIZED VIEW](/docs/sql-reference/statements/create-materialized-view) for views that store precomputed results on disk
+- [DROP VIEW](/docs/sql-reference/statements/drop-view) for removing views
+- [SELECT](/docs/sql-reference/statements/select) for the query syntax used in view definitions
+- [CREATE TRIGGER](/docs/sql-reference/statements/create-trigger) for INSTEAD OF triggers that make views writable

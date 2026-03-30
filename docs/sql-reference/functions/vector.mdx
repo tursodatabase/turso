@@ -1,0 +1,399 @@
+---
+title: Vector Functions
+description: Create, compare, and manipulate vector embeddings
+sidebarTitle: Vector
+---
+
+# Vector Functions
+
+<Info>
+**Turso Extension**: Vector functions are a Turso-specific feature for working with vector embeddings directly in SQL. These functions are not part of the SQLite standard.
+</Info>
+
+Turso provides built-in functions for storing and querying vector embeddings. Vectors are stored as BLOBs in a compact binary format and can be compared using distance functions for similarity search.
+
+---
+
+## Vector Creation
+
+### vector32
+
+Creates a 32-bit floating-point vector from a JSON array of numbers.
+
+```sql
+vector32(json_array)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `json_array` | TEXT | A JSON array of numbers, e.g. `'[1.0, 2.0, 3.0]'` |
+
+**Returns:** BLOB -- the vector in 32-bit float binary format.
+
+This is the most common vector format and offers a good balance of precision and storage efficiency. Each dimension uses 4 bytes.
+
+```sql
+SELECT vector32('[1.0, 2.0, 3.0]');
+-- (BLOB: 12 bytes)
+
+-- Store embeddings in a table
+CREATE TABLE documents (
+    id INTEGER PRIMARY KEY,
+    content TEXT,
+    embedding BLOB
+);
+
+INSERT INTO documents VALUES (1, 'Introduction to databases', vector32('[0.1, 0.3, 0.5, 0.7]'));
+```
+
+### vector64
+
+Creates a 64-bit floating-point vector from a JSON array of numbers.
+
+```sql
+vector64(json_array)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `json_array` | TEXT | A JSON array of numbers, e.g. `'[1.0, 2.0, 3.0]'` |
+
+**Returns:** BLOB -- the vector in 64-bit float binary format.
+
+Use this format when you need higher precision. Each dimension uses 8 bytes.
+
+```sql
+SELECT vector64('[1.0, 2.0, 3.0]');
+-- (BLOB: 24 bytes)
+```
+
+### vector
+
+Creates a vector using the default format (32-bit float).
+
+```sql
+vector(json_array)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `json_array` | TEXT | A JSON array of numbers |
+
+**Returns:** BLOB -- the vector in default (32-bit float) binary format.
+
+```sql
+SELECT vector('[1.0, 2.0, 3.0]');
+```
+
+### vector8
+
+Creates an 8-bit quantized vector from a JSON array of numbers.
+
+```sql
+vector8(json_array)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `json_array` | TEXT | A JSON array of integer values (0-255) |
+
+**Returns:** BLOB -- the vector in 8-bit integer binary format.
+
+Use this format for storage-efficient approximate representations. Each dimension uses 1 byte.
+
+```sql
+SELECT vector8('[128, 64, 255, 0]');
+```
+
+### vector1bit
+
+Creates a 1-bit binary vector from a JSON array.
+
+```sql
+vector1bit(json_array)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `json_array` | TEXT | A JSON array of 0s and 1s |
+
+**Returns:** BLOB -- the vector in 1-bit binary format.
+
+Use this format for extremely compact representations. Eight dimensions are packed into a single byte.
+
+```sql
+SELECT vector1bit('[1, 0, 1, 1, 0, 0, 1, 0]');
+```
+
+---
+
+## Distance Functions
+
+Distance functions compute the distance between two vectors. Smaller values indicate more similar vectors.
+
+### vector_distance_cos
+
+Computes the cosine distance between two vectors, defined as `1 - cosine_similarity`. A result of 0 means the vectors are identical in direction; a result of 1 means they are orthogonal.
+
+```sql
+vector_distance_cos(v1, v2)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `v1` | BLOB | First vector |
+| `v2` | BLOB | Second vector (must have the same number of dimensions as `v1`) |
+
+**Returns:** REAL -- the cosine distance between the two vectors.
+
+```sql
+SELECT vector_distance_cos(
+    vector32('[1.0, 0.0, 0.0]'),
+    vector32('[0.0, 1.0, 0.0]')
+);
+-- 1.0 (orthogonal vectors)
+
+SELECT vector_distance_cos(
+    vector32('[1.0, 0.0]'),
+    vector32('[1.0, 0.0]')
+);
+-- 0.0 (identical vectors)
+```
+
+### vector_distance_l2
+
+Computes the Euclidean (L2) distance between two vectors. A result of 0 means the vectors are identical.
+
+```sql
+vector_distance_l2(v1, v2)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `v1` | BLOB | First vector |
+| `v2` | BLOB | Second vector (must have the same number of dimensions as `v1`) |
+
+**Returns:** REAL -- the Euclidean distance between the two vectors.
+
+```sql
+SELECT vector_distance_l2(
+    vector32('[1.0, 0.0, 0.0]'),
+    vector32('[0.0, 1.0, 0.0]')
+);
+-- 1.4142135623730951
+
+SELECT vector_distance_l2(
+    vector32('[3.0, 4.0]'),
+    vector32('[0.0, 0.0]')
+);
+-- 5.0
+```
+
+### vector_distance_dot
+
+Computes the negative dot product distance between two vectors. The result is the negation of the dot product, so smaller (more negative) values indicate higher similarity.
+
+```sql
+vector_distance_dot(v1, v2)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `v1` | BLOB | First vector |
+| `v2` | BLOB | Second vector (must have the same number of dimensions as `v1`) |
+
+**Returns:** REAL -- the negative dot product of the two vectors.
+
+```sql
+SELECT vector_distance_dot(
+    vector32('[1.0, 2.0, 3.0]'),
+    vector32('[4.0, 5.0, 6.0]')
+);
+-- -32.0 (dot product is 32)
+```
+
+### vector_distance_jaccard
+
+Computes the Jaccard distance between two binary vectors. Best suited for use with `vector1bit` vectors.
+
+```sql
+vector_distance_jaccard(v1, v2)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `v1` | BLOB | First vector |
+| `v2` | BLOB | Second vector (must have the same number of dimensions as `v1`) |
+
+**Returns:** REAL -- the Jaccard distance between the two vectors.
+
+---
+
+## Utility Functions
+
+### vector_extract
+
+Converts a vector BLOB back to a JSON text representation.
+
+```sql
+vector_extract(vector_blob)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `vector_blob` | BLOB | A vector created by `vector32`, `vector64`, or another vector function |
+
+**Returns:** TEXT -- a JSON array string of the vector's components.
+
+```sql
+SELECT vector_extract(vector32('[1.5, 2.5, 3.5]'));
+-- [1.500000,2.500000,3.500000]
+```
+
+### vector_concat
+
+Concatenates two or more vectors into a single vector.
+
+```sql
+vector_concat(v1, v2, ...)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `v1, v2, ...` | BLOB | Two or more vectors to concatenate. All vectors must be the same type. |
+
+**Returns:** BLOB -- a new vector containing the dimensions of all input vectors in order.
+
+```sql
+SELECT vector_extract(
+    vector_concat(
+        vector32('[1.0, 2.0]'),
+        vector32('[3.0, 4.0]')
+    )
+);
+-- [1.000000,2.000000,3.000000,4.000000]
+```
+
+### vector_slice
+
+Extracts a contiguous portion of a vector.
+
+```sql
+vector_slice(vector_blob, start, end)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `vector_blob` | BLOB | The source vector |
+| `start` | INTEGER | Start index (zero-based, inclusive) |
+| `end` | INTEGER | End index (exclusive) |
+
+**Returns:** BLOB -- a new vector containing dimensions from `start` to `end - 1`.
+
+```sql
+SELECT vector_extract(
+    vector_slice(vector32('[10.0, 20.0, 30.0, 40.0, 50.0]'), 1, 4)
+);
+-- [20.000000,30.000000,40.000000]
+```
+
+---
+
+## Examples
+
+### Creating a table with vector embeddings
+
+```sql
+CREATE TABLE articles (
+    id INTEGER PRIMARY KEY,
+    title TEXT NOT NULL,
+    content TEXT,
+    embedding BLOB
+);
+
+INSERT INTO articles VALUES (
+    1,
+    'Introduction to Machine Learning',
+    'Machine learning is a subset of artificial intelligence...',
+    vector32('[0.12, -0.34, 0.56, 0.78, -0.11, 0.45, -0.23, 0.67]')
+);
+
+INSERT INTO articles VALUES (
+    2,
+    'Database Design Patterns',
+    'Relational databases organize data into tables...',
+    vector32('[0.82, 0.15, -0.44, 0.23, 0.61, -0.33, 0.09, 0.77]')
+);
+
+INSERT INTO articles VALUES (
+    3,
+    'Neural Networks Explained',
+    'Neural networks are computing systems inspired by biological neural networks...',
+    vector32('[0.14, -0.28, 0.62, 0.71, -0.09, 0.51, -0.18, 0.59]')
+);
+```
+
+### Similarity search with ORDER BY distance
+
+```sql
+-- Find articles most similar to a query embedding using cosine distance
+SELECT
+    id,
+    title,
+    vector_distance_cos(embedding, vector32('[0.1, -0.3, 0.5, 0.8, -0.1, 0.4, -0.2, 0.6]')) AS distance
+FROM articles
+ORDER BY distance ASC
+LIMIT 5;
+```
+
+### Cosine distance vs. L2 distance
+
+Cosine distance measures the angle between two vectors, ignoring magnitude. L2 distance measures the absolute distance in space.
+
+```sql
+-- Cosine distance: direction matters, not magnitude
+SELECT vector_distance_cos(
+    vector32('[1.0, 0.0]'),
+    vector32('[100.0, 0.0]')
+);
+-- 0.0 (same direction, cosine distance is 0)
+
+-- L2 distance: magnitude matters
+SELECT vector_distance_l2(
+    vector32('[1.0, 0.0]'),
+    vector32('[100.0, 0.0]')
+);
+-- 99.0 (very far apart in absolute terms)
+```
+
+Use cosine distance when you care about the direction of the vector (e.g., semantic similarity of text embeddings). Use L2 distance when absolute position matters (e.g., geospatial coordinates or image feature vectors).
+
+### Working with vector data
+
+```sql
+-- Inspect the contents of a stored vector
+SELECT vector_extract(embedding) FROM articles WHERE id = 1;
+
+-- Concatenate vectors from two different models
+SELECT vector_extract(
+    vector_concat(
+        (SELECT embedding FROM articles WHERE id = 1),
+        (SELECT embedding FROM articles WHERE id = 2)
+    )
+);
+
+-- Extract the first 4 dimensions of an embedding
+SELECT vector_extract(
+    vector_slice(embedding, 0, 4)
+) FROM articles WHERE id = 1;
+-- [0.120000,-0.340000,0.560000,0.780000]
+```
+
+<Note>
+Vector indexes are not yet supported. All similarity searches use a linear scan over the table. For large datasets, consider limiting search to a subset of rows with a WHERE clause.
+</Note>
+
+## See Also
+
+- [CREATE INDEX](/docs/sql-reference/statements/create-index) for index types including FTS
+- [Data Types](/docs/sql-reference/data-types) for how BLOBs are handled in Turso

@@ -31,6 +31,7 @@ pub struct VfsMod {
 
 unsafe impl Send for VfsMod {}
 unsafe impl Sync for VfsMod {}
+crate::assert::assert_send_sync!(VfsMod);
 
 impl Connection {
     #[cfg(not(target_family = "wasm"))]
@@ -59,7 +60,7 @@ impl Connection {
                 })?
                 .push((Arc::new(lib), api_ref));
             if self.is_db_initialized() {
-                self.parse_schema_rows()?;
+                self.reparse_schema_after_extension_load()?;
             }
             Ok(())
         } else {

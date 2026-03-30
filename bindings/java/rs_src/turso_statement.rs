@@ -6,7 +6,7 @@ use jni::objects::{JByteArray, JObject, JObjectArray, JString, JValue};
 use jni::sys::{jdouble, jint, jlong};
 use jni::JNIEnv;
 use std::num::NonZero;
-use turso_core::{Statement, StepResult, Value};
+use turso_core::{LimboError, Statement, Value};
 
 pub const STEP_RESULT_ID_ROW: i32 = 10;
 #[allow(dead_code)]
@@ -53,39 +53,35 @@ pub extern "system" fn Java_tech_turso_core_TursoStatement_step<'local>(
     let stmt = match to_turso_statement(stmt_ptr) {
         Ok(stmt) => stmt,
         Err(e) => {
-            set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e.to_string());
-            return to_turso_step_result(&mut env, STEP_RESULT_ID_ERROR, None);
+            let err_msg = e.to_string();
+            set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, err_msg.clone());
+            return to_turso_step_result_error(&mut env, &err_msg);
         }
     };
 
-    loop {
-        let step_result = match stmt.stmt.step() {
-            Ok(result) => result,
-            Err(_) => return to_turso_step_result(&mut env, STEP_RESULT_ID_ERROR, None),
-        };
+    let result = stmt.stmt.run_one_step_blocking(|| Ok(()), || Ok(()));
 
-        match step_result {
-            StepResult::Row => {
-                let row = stmt.stmt.row().unwrap();
-                return match row_to_obj_array(&mut env, row) {
-                    Ok(row) => to_turso_step_result(&mut env, STEP_RESULT_ID_ROW, Some(row)),
-                    Err(e) => {
-                        set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e.to_string());
-                        to_turso_step_result(&mut env, STEP_RESULT_ID_ERROR, None)
-                    }
-                };
+    match result {
+        Ok(Some(row)) => match row_to_obj_array(&mut env, row) {
+            Ok(row) => to_turso_step_result(&mut env, STEP_RESULT_ID_ROW, Some(row)),
+            Err(e) => {
+                let err_msg = e.to_string();
+                set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, err_msg.clone());
+                to_turso_step_result_error(&mut env, &err_msg)
             }
-            StepResult::IO => {
-                if let Err(e) = stmt.stmt.run_once() {
-                    set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e.to_string());
-                    return to_turso_step_result(&mut env, STEP_RESULT_ID_ERROR, None);
-                }
-            }
-            StepResult::Done => return to_turso_step_result(&mut env, STEP_RESULT_ID_DONE, None),
-            StepResult::Interrupt => {
-                return to_turso_step_result(&mut env, STEP_RESULT_ID_INTERRUPT, None)
-            }
-            StepResult::Busy => return to_turso_step_result(&mut env, STEP_RESULT_ID_BUSY, None),
+        },
+        Ok(None) => {
+            // Done
+            to_turso_step_result(&mut env, STEP_RESULT_ID_DONE, None)
+        }
+        Err(LimboError::Interrupt) => {
+            to_turso_step_result(&mut env, STEP_RESULT_ID_INTERRUPT, None)
+        }
+        Err(LimboError::Busy) => to_turso_step_result(&mut env, STEP_RESULT_ID_BUSY, None),
+        Err(err) => {
+            let err_msg = err.to_string();
+            set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, err_msg.clone());
+            to_turso_step_result_error(&mut env, &err_msg)
         }
     }
 }
@@ -108,11 +104,11 @@ fn row_to_obj_array<'local>(
     for (i, value) in row.get_values().enumerate() {
         let obj = match value {
             turso_core::Value::Null => JObject::null(),
-            turso_core::Value::Integer(i) => {
+            turso_core::Value::Numeric(turso_core::Numeric::Integer(i)) => {
                 env.new_object("java/lang/Long", "(J)V", &[JValue::Long(*i)])?
             }
-            turso_core::Value::Float(f) => {
-                env.new_object("java/lang/Double", "(D)V", &[JValue::Double(*f)])?
+            turso_core::Value::Numeric(turso_core::Numeric::Float(f)) => {
+                env.new_object("java/lang/Double", "(D)V", &[JValue::Double(f64::from(*f))])?
             }
             turso_core::Value::Text(s) => env.new_string(s.as_str())?.into(),
             turso_core::Value::Blob(b) => env.byte_array_from_slice(b.as_slice())?.into(),
@@ -185,7 +181,7 @@ pub extern "system" fn Java_tech_turso_core_TursoStatement_bindLong<'local>(
 
     stmt.stmt.bind_at(
         NonZero::new(position as usize).unwrap(),
-        Value::Integer(value),
+        Value::from_i64(value),
     );
     SQLITE_OK
 }
@@ -208,7 +204,7 @@ pub extern "system" fn Java_tech_turso_core_TursoStatement_bindDouble<'local>(
 
     stmt.stmt.bind_at(
         NonZero::new(position as usize).unwrap(),
-        Value::Float(value),
+        Value::from_f64(value),
     );
     SQLITE_OK
 }
@@ -301,6 +297,46 @@ pub extern "system" fn Java_tech_turso_core_TursoStatement_changes<'local>(
     stmt.connection.conn.changes()
 }
 
+#[no_mangle]
+pub extern "system" fn Java_tech_turso_core_TursoStatement_parameterCount<'local>(
+    mut env: JNIEnv<'local>,
+    obj: JObject<'local>,
+    stmt_ptr: jlong,
+) -> jint {
+    let stmt = match to_turso_statement(stmt_ptr) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            set_err_msg_and_throw_exception(&mut env, obj, SQLITE_ERROR, e.to_string());
+            return -1;
+        }
+    };
+
+    stmt.stmt.parameters_count() as jint
+}
+
+#[no_mangle]
+pub extern "system" fn Java_tech_turso_core_TursoStatement_reset<'local>(
+    mut env: JNIEnv<'local>,
+    obj: JObject<'local>,
+    stmt_ptr: jlong,
+) -> jint {
+    let stmt = match to_turso_statement(stmt_ptr) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            set_err_msg_and_throw_exception(&mut env, obj, SQLITE_ERROR, e.to_string());
+            return -1;
+        }
+    };
+
+    match stmt.stmt.reset() {
+        Ok(_) => 0,
+        Err(e) => {
+            set_err_msg_and_throw_exception(&mut env, obj, SQLITE_ERROR, e.to_string());
+            -1
+        }
+    }
+}
+
 /// Converts an optional `JObject` into Java's `TursoStepResult`.
 ///
 /// This function takes an optional `JObject` and converts it into a Java object
@@ -333,5 +369,33 @@ fn to_turso_step_result<'local>(
     } else {
         env.new_object("tech/turso/core/TursoStepResult", "(I)V", &ctor_args)
     }
+    .unwrap_or_else(|_| JObject::null())
+}
+
+/// Creates an error `TursoStepResult` with an error message.
+fn to_turso_step_result_error<'local>(
+    env: &mut JNIEnv<'local>,
+    error_message: &str,
+) -> JObject<'local> {
+    // Clear any pending exception first, as JNI calls won't work with a pending exception.
+    // This can happen if set_err_msg_and_throw_exception was called before this function.
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_clear();
+    }
+
+    let error_str = match env.new_string(error_message) {
+        Ok(s) => s,
+        Err(_) => return JObject::null(),
+    };
+    let error_obj: JObject = error_str.into();
+    let ctor_args = vec![
+        JValue::Int(STEP_RESULT_ID_ERROR),
+        JValue::Object(&error_obj),
+    ];
+    env.new_object(
+        "tech/turso/core/TursoStepResult",
+        "(ILjava/lang/String;)V",
+        &ctor_args,
+    )
     .unwrap_or_else(|_| JObject::null())
 }

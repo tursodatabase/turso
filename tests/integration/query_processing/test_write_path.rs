@@ -1,12 +1,13 @@
-use crate::common::{self, limbo_exec_rows, maybe_setup_tracing, rusqlite_integrity_check};
+use crate::common::{
+    self, compute_dbhash, limbo_exec_rows, maybe_setup_tracing, rusqlite_integrity_check, ExecRows,
+};
 use crate::common::{compare_string, do_flush, TempDatabase};
 use log::debug;
+use rusqlite::types::Value as RValue;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
-use turso_core::{
-    CheckpointMode, Connection, Database, DatabaseOpts, LimboError, Row, Statement, StepResult,
-    Value,
-};
+use turso_core::vdbe::StepResult;
+use turso_core::{CheckpointMode, Connection, LimboError, Numeric, Row, Statement, Value};
 
 const WAL_HEADER_SIZE: usize = 32;
 const WAL_FRAME_HEADER_SIZE: usize = 24;
@@ -23,12 +24,10 @@ macro_rules! change_state {
     };
 }
 
-#[test]
+#[turso_macros::test(init_sql = "CREATE TABLE test (x INTEGER PRIMARY KEY, t TEXT);")]
 #[ignore]
-fn test_simple_overflow_page() -> anyhow::Result<()> {
+fn test_simple_overflow_page(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db =
-        TempDatabase::new_with_rusqlite("CREATE TABLE test (x INTEGER PRIMARY KEY, t TEXT);");
     let conn = tmp_db.connect_limbo();
 
     let mut huge_text = String::new();
@@ -38,59 +37,32 @@ fn test_simple_overflow_page() -> anyhow::Result<()> {
 
     let list_query = "SELECT * FROM test LIMIT 1";
     let insert_query = format!("INSERT INTO test VALUES (1, '{}')", huge_text.as_str());
-
-    match conn.query(insert_query) {
-        Ok(Some(ref mut rows)) => loop {
-            match rows.step()? {
-                StepResult::IO => {
-                    rows.run_once()?;
-                }
-                StepResult::Done => break,
-                _ => unreachable!(),
-            }
-        },
-        Ok(None) => {}
-        Err(err) => {
-            eprintln!("{err}");
-        }
-    };
+    conn.execute(&insert_query).unwrap();
 
     // this flush helped to review hex of test.db
     do_flush(&conn, &tmp_db)?;
 
     match conn.query(list_query) {
-        Ok(Some(ref mut rows)) => loop {
-            match rows.step()? {
-                StepResult::Row => {
-                    let row = rows.row().unwrap();
-                    let id = row.get::<i64>(0).unwrap();
-                    let text = row.get::<&str>(0).unwrap();
-                    assert_eq!(1, id);
-                    compare_string(&huge_text, text);
-                }
-                StepResult::IO => {
-                    rows.run_once()?;
-                }
-                StepResult::Interrupt => break,
-                StepResult::Done => break,
-                StepResult::Busy => unreachable!(),
-            }
-        },
-        Ok(None) => {}
-        Err(err) => {
-            eprintln!("{err}");
+        Ok(Some(ref mut rows)) => {
+            rows.run_with_row_callback(|row| {
+                let id = row.get::<i64>(0).unwrap();
+                let text = row.get::<&str>(0).unwrap();
+                assert_eq!(1, id);
+                compare_string(&huge_text, text);
+                Ok(())
+            })?;
         }
+        Ok(None) => {}
+        Err(err) => return Err(anyhow::anyhow!(err)),
     }
     do_flush(&conn, &tmp_db)?;
     Ok(())
 }
 
-#[test]
-fn test_sequential_overflow_page() -> anyhow::Result<()> {
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE test (x INTEGER PRIMARY KEY, t TEXT);")]
+fn test_sequential_overflow_page(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     maybe_setup_tracing();
-    let tmp_db =
-        TempDatabase::new_with_rusqlite("CREATE TABLE test (x INTEGER PRIMARY KEY, t TEXT);");
     let conn = tmp_db.connect_limbo();
     let iterations = 10_usize;
 
@@ -105,61 +77,38 @@ fn test_sequential_overflow_page() -> anyhow::Result<()> {
 
     for (i, huge_text) in huge_texts.iter().enumerate().take(iterations) {
         let insert_query = format!("INSERT INTO test VALUES ({}, '{}')", i, huge_text.as_str());
-        match conn.query(insert_query) {
-            Ok(Some(ref mut rows)) => loop {
-                match rows.step()? {
-                    StepResult::IO => {
-                        rows.run_once()?;
-                    }
-                    StepResult::Done => break,
-                    _ => unreachable!(),
-                }
-            },
-            Ok(None) => {}
-            Err(err) => {
-                eprintln!("{err}");
-            }
-        };
+        conn.execute(&insert_query)?;
     }
 
     let list_query = "SELECT * FROM test LIMIT 1";
     let mut current_index = 0;
     match conn.query(list_query) {
-        Ok(Some(ref mut rows)) => loop {
-            match rows.step()? {
-                StepResult::Row => {
-                    let row = rows.row().unwrap();
-                    let id = row.get::<i64>(0).unwrap();
-                    let text = row.get::<String>(1).unwrap();
-                    let huge_text = &huge_texts[current_index];
-                    compare_string(huge_text, text);
-                    assert_eq!(current_index, id as usize);
-                    current_index += 1;
-                }
-                StepResult::IO => {
-                    rows.run_once()?;
-                }
-                StepResult::Interrupt => break,
-                StepResult::Done => break,
-                StepResult::Busy => unreachable!(),
-            }
-        },
+        Ok(Some(ref mut rows)) => {
+            rows.run_with_row_callback(|row| {
+                let id = row.get::<i64>(0).unwrap();
+                let text = row.get::<String>(1).unwrap();
+                let huge_text = &huge_texts[current_index];
+                compare_string(huge_text, text);
+                assert_eq!(current_index, id as usize);
+                current_index += 1;
+                Ok(())
+            })?;
+        }
         Ok(None) => {}
         Err(err) => {
-            eprintln!("{err}");
+            return Err(anyhow::anyhow!(err));
         }
     }
     do_flush(&conn, &tmp_db)?;
     Ok(())
 }
 
-#[test_log::test]
+#[turso_macros::test(init_sql = "CREATE TABLE test (x INTEGER PRIMARY KEY);")]
 #[ignore = "this takes too long :)"]
-fn test_sequential_write() -> anyhow::Result<()> {
+fn test_sequential_write(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     maybe_setup_tracing();
 
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (x INTEGER PRIMARY KEY);");
     let conn = tmp_db.connect_limbo();
 
     let list_query = "SELECT * FROM test";
@@ -177,8 +126,8 @@ fn test_sequential_write() -> anyhow::Result<()> {
         common::run_query_on_row(&tmp_db, &conn, list_query, |row: &Row| {
             let first_value = row.get::<&Value>(0).expect("missing id");
             let id = match first_value {
-                turso_core::Value::Integer(i) => *i as i32,
-                turso_core::Value::Float(f) => *f as i32,
+                turso_core::Value::Numeric(Numeric::Integer(i)) => *i as i32,
+                turso_core::Value::Numeric(Numeric::Float(f)) => f64::from(*f) as i32,
                 _ => unreachable!(),
             };
             assert_eq!(current_read_index, id);
@@ -189,12 +138,11 @@ fn test_sequential_write() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
+#[turso_macros::test(init_sql = "CREATE TABLE test (x REAL);")]
 /// There was a regression with inserting multiple rows with a column containing an unary operator :)
 /// https://github.com/tursodatabase/turso/pull/679
-fn test_regression_multi_row_insert() -> anyhow::Result<()> {
+fn test_regression_multi_row_insert(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (x REAL);");
     let conn = tmp_db.connect_limbo();
 
     let insert_query = "INSERT INTO test VALUES (-2), (-3), (-1)";
@@ -210,7 +158,7 @@ fn test_regression_multi_row_insert() -> anyhow::Result<()> {
     common::run_query_on_row(&tmp_db, &conn, list_query, |row: &Row| {
         let first_value = row.get::<&Value>(0).expect("missing id");
         let id = match first_value {
-            Value::Float(f) => *f as i32,
+            Value::Numeric(Numeric::Float(f)) => f64::from(*f) as i32,
             _ => panic!("expected float"),
         };
         actual_ids.push(id);
@@ -224,33 +172,31 @@ fn test_regression_multi_row_insert() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_statement_reset() -> anyhow::Result<()> {
+#[turso_macros::test(init_sql = "create table test (i integer);")]
+fn test_statement_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("create table test (i integer);");
     let conn = tmp_db.connect_limbo();
 
     conn.execute("insert into test values (1)")?;
     conn.execute("insert into test values (2)")?;
 
     let mut stmt = conn.prepare("select * from test")?;
-
     loop {
         match stmt.step()? {
             StepResult::Row => {
                 let row = stmt.row().unwrap();
                 assert_eq!(
                     *row.get::<&Value>(0).unwrap(),
-                    turso_core::Value::Integer(1)
+                    turso_core::Value::from_i64(1)
                 );
                 break;
             }
-            StepResult::IO => stmt.run_once()?,
+            StepResult::IO => stmt._io().step()?,
             _ => break,
         }
     }
 
-    stmt.reset();
+    stmt.reset()?;
 
     loop {
         match stmt.step()? {
@@ -258,11 +204,11 @@ fn test_statement_reset() -> anyhow::Result<()> {
                 let row = stmt.row().unwrap();
                 assert_eq!(
                     *row.get::<&Value>(0).unwrap(),
-                    turso_core::Value::Integer(1)
+                    turso_core::Value::from_i64(1)
                 );
                 break;
             }
-            StepResult::IO => stmt.run_once()?,
+            StepResult::IO => stmt._io().step()?,
             _ => break,
         }
     }
@@ -270,10 +216,9 @@ fn test_statement_reset() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_wal_checkpoint() -> anyhow::Result<()> {
+#[turso_macros::test(init_sql = "CREATE TABLE test (x INTEGER PRIMARY KEY);")]
+fn test_wal_checkpoint(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (x INTEGER PRIMARY KEY);");
     // threshold is 1000 by default
     let iterations = 1001_usize;
     let conn = tmp_db.connect_limbo();
@@ -282,13 +227,18 @@ fn test_wal_checkpoint() -> anyhow::Result<()> {
         log::info!("iteration #{i}");
         let insert_query = format!("INSERT INTO test VALUES ({i})");
         do_flush(&conn, &tmp_db)?;
+        let hash_before = compute_dbhash(&tmp_db);
         conn.checkpoint(CheckpointMode::Passive {
             upper_bound_inclusive: None,
         })?;
+        let hash_after = compute_dbhash(&tmp_db);
+        assert_eq!(
+            hash_before.hash, hash_after.hash,
+            "checkpoint changed database content!!!!!!"
+        );
         common::run_query(&tmp_db, &conn, &insert_query)?;
     }
 
-    do_flush(&conn, &tmp_db)?;
     let list_query = "SELECT * FROM test LIMIT 1";
     let mut current_index = 0;
     common::run_query_on_row(&tmp_db, &conn, list_query, |row: &Row| {
@@ -300,10 +250,9 @@ fn test_wal_checkpoint() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_wal_restart() -> anyhow::Result<()> {
+#[turso_macros::test(init_sql = "CREATE TABLE test (x INTEGER PRIMARY KEY);")]
+fn test_wal_restart(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (x INTEGER PRIMARY KEY);");
     // threshold is 1000 by default
 
     fn insert(i: usize, conn: &Arc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<()> {
@@ -345,10 +294,9 @@ fn test_wal_restart() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_insert_after_big_blob() -> anyhow::Result<()> {
+#[turso_macros::test(init_sql = "CREATE TABLE temp (t1 BLOB, t2 INTEGER)")]
+fn test_insert_after_big_blob(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE temp (t1 BLOB, t2 INTEGER)");
     let conn = tmp_db.connect_limbo();
 
     conn.execute("insert into temp(t1) values (zeroblob (262144))")?;
@@ -357,14 +305,13 @@ fn test_insert_after_big_blob() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test_log::test]
+#[turso_macros::test(init_sql = "CREATE TABLE test (x PRIMARY KEY);")]
 #[ignore = "this takes too long :)"]
-fn test_write_delete_with_index() -> anyhow::Result<()> {
+fn test_write_delete_with_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
 
     maybe_setup_tracing();
 
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (x PRIMARY KEY);");
     let conn = tmp_db.connect_limbo();
 
     let list_query = "SELECT * FROM test";
@@ -383,8 +330,8 @@ fn test_write_delete_with_index() -> anyhow::Result<()> {
         common::run_query_on_row(&tmp_db, &conn, list_query, |row: &Row| {
             let first_value = row.get::<&Value>(0).expect("missing id");
             let id = match first_value {
-                turso_core::Value::Integer(i) => *i as i32,
-                turso_core::Value::Float(f) => *f as i32,
+                turso_core::Value::Numeric(Numeric::Integer(i)) => *i as i32,
+                turso_core::Value::Numeric(Numeric::Float(f)) => f64::from(*f) as i32,
                 _ => unreachable!(),
             };
             assert_eq!(current_read_index, id);
@@ -399,8 +346,8 @@ fn test_write_delete_with_index() -> anyhow::Result<()> {
                 |row| {
                     let first_value = row.get::<&Value>(0).expect("missing id");
                     let id = match first_value {
-                        turso_core::Value::Integer(i) => *i as i32,
-                        turso_core::Value::Float(f) => *f as i32,
+                        turso_core::Value::Numeric(Numeric::Integer(i)) => *i as i32,
+                        turso_core::Value::Numeric(Numeric::Float(f)) => f64::from(*f) as i32,
                         _ => unreachable!(),
                     };
                     assert_eq!(i, id);
@@ -412,13 +359,12 @@ fn test_write_delete_with_index() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_update_with_index() -> anyhow::Result<()> {
+#[turso_macros::test(init_sql = "CREATE TABLE test (x REAL PRIMARY KEY, y TEXT);")]
+fn test_update_with_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
 
     maybe_setup_tracing();
 
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (x REAL PRIMARY KEY, y TEXT);");
     let conn = tmp_db.connect_limbo();
 
     common::run_query(&tmp_db, &conn, "INSERT INTO test VALUES (1.0, 'foo')")?;
@@ -448,13 +394,12 @@ fn test_update_with_index() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_delete_with_index() -> anyhow::Result<()> {
+#[turso_macros::test(init_sql = "CREATE TABLE t (x UNIQUE)")]
+fn test_delete_with_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
 
     maybe_setup_tracing();
 
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t (x UNIQUE)");
     let conn = tmp_db.connect_limbo();
 
     common::run_query(&tmp_db, &conn, "INSERT INTO t VALUES (1), (2)")?;
@@ -467,10 +412,11 @@ fn test_delete_with_index() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_update_regression() -> anyhow::Result<()> {
+#[turso_macros::test(
+    init_sql = "CREATE TABLE imaginative_baroja (blithesome_hall BLOB,remarkable_lester INTEGER,generous_balagun TEXT,ample_earth INTEGER,marvelous_khadzhiev BLOB,glowing_parissi TEXT,insightful_ryner BLOB)"
+)]
+fn test_update_regression(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE imaginative_baroja (blithesome_hall BLOB,remarkable_lester INTEGER,generous_balagun TEXT,ample_earth INTEGER,marvelous_khadzhiev BLOB,glowing_parissi TEXT,insightful_ryner BLOB)");
     let conn = tmp_db.connect_limbo();
 
     conn.execute("INSERT INTO imaginative_baroja VALUES (X'617070726F61636861626C655F6F6D6164', 5581285929211692372, 'approachable_podur', -4145754929970306534, X'666F72747569746F75735F7368617270', 'sensible_amesly', X'636F6D70657469746976655F6669746368'), (X'6D6972746866756C5F686F6673746565', -8554670009677647372, 'shimmering_modkraftdk', 4993627046425025026, X'636F6E73696465726174655F63616765', 'breathtaking_boggs', X'616D617A696E675F73696D6F6E65'), (X'7669766163696F75735F7363687761727A', 5860599187854155616, 'sparkling_aurora', 3757552048117668067, X'756E697175655F6769617A', 'lovely_leroy', X'68617264776F726B696E675F6D696C6C6572'), (X'677265676172696F75735F7061657065', -488992130149088413, 'focused_brinker', 4503849242092922100, X'66756E6E795F6A616B736963', 'competitive_communications', X'657863656C6C656E745F7873696C656E74'), (X'7374756E6E696E675F74616E6E656E6261756D', -5634782647279946253, 'fabulous_crute', -3978009805517476564, X'72656C617865645F63617272796F7574', 'spellbinding_erkan', X'66756E6E795F646F626273'), (X'696D6167696E61746976655F746F6C6F6B6F6E6E696B6F7661', 4236471363502323025, 'excellent_wolke', 7606168469334609395, X'736C65656B5F6D6361666565', 'magnificent_riley', X'616D6961626C655F706173736164616B6973'), (X'77696C6C696E675F736872657665', 5048296470820985219, 'ambitious_jeppesen', 6961857167361512834, X'70617469656E745F6272696E6B6572', 'giving_kramm', X'726573706F6E7369626C655F7363686D696474'), (X'73656E7369626C655F6D757865726573', -5519194136843846790, 'frank_ruggero', 4354855935194921345, X'76697669645F63617365', 'focused_lovecruft', X'6D61676E69666963656E745F736B79')")?;
@@ -501,19 +447,13 @@ fn test_update_regression() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
+#[turso_macros::test(init_sql = "CREATE TABLE t(x UNIQUE)")]
 /// Test that a large insert statement containing a UNIQUE constraint violation
 /// is properly rolled back so that the database size is also shrunk to the size
 /// before that statement is executed.
-fn test_rollback_on_unique_constraint_violation() -> anyhow::Result<()> {
+fn test_rollback_on_unique_constraint_violation(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_opts(
-        "big_statement_rollback.db",
-        DatabaseOpts::new().with_indexes(true),
-    );
     let conn = tmp_db.connect_limbo();
-
-    conn.execute("CREATE TABLE t(x UNIQUE)")?;
 
     conn.execute("BEGIN")?;
     conn.execute("INSERT INTO t VALUES (10000)")?;
@@ -549,15 +489,11 @@ fn test_rollback_on_unique_constraint_violation() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
+#[turso_macros::test]
 /// Test that a large delete statement containing a foreign key constraint violation
 /// is properly rolled back.
-fn test_rollback_on_foreign_key_constraint_violation() -> anyhow::Result<()> {
+fn test_rollback_on_foreign_key_constraint_violation(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_opts(
-        "big_delete_rollback.db",
-        DatabaseOpts::new().with_indexes(true),
-    );
     let conn = tmp_db.connect_limbo();
 
     // Enable foreign keys
@@ -624,10 +560,9 @@ fn test_rollback_on_foreign_key_constraint_violation() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_multiple_statements() -> anyhow::Result<()> {
+#[turso_macros::test(init_sql = "CREATE TABLE t (x)")]
+fn test_multiple_statements(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t (x)");
     let conn = tmp_db.connect_limbo();
 
     conn.execute("INSERT INTO t values(1); insert into t values(2);")?;
@@ -715,13 +650,12 @@ impl ConnectionPlan {
     }
 }
 
-#[test]
-fn test_write_concurrent_connections() -> anyhow::Result<()> {
+#[turso_macros::test(init_sql = "CREATE TABLE t (x)")]
+fn test_write_concurrent_connections(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
 
     maybe_setup_tracing();
 
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t (x)");
     let num_connections = 4;
     let num_inserts_per_connection = 100;
     let mut connections = vec![];
@@ -767,12 +701,13 @@ fn test_write_concurrent_connections() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_wal_bad_frame() -> anyhow::Result<()> {
+#[turso_macros::test(init_sql = "CREATE TABLE t1 (x)")]
+fn test_wal_bad_frame(tmp_db: TempDatabase) -> anyhow::Result<()> {
     maybe_setup_tracing();
     let _ = env_logger::try_init();
+    let db_opts = tmp_db.db_opts;
     let db_path = {
-        let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t1 (x)");
+        let tmp_db = tmp_db;
         let db_path = tmp_db.path.clone();
         let conn = tmp_db.connect_limbo();
         conn.execute("BEGIN")?;
@@ -817,20 +752,10 @@ fn test_wal_bad_frame() -> anyhow::Result<()> {
     };
     {
         let result = {
-            let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-            let db = Database::open_file_with_flags(
-                io.clone(),
-                db_path.to_str().unwrap(),
-                turso_core::OpenFlags::default(),
-                turso_core::DatabaseOpts::new().with_indexes(false),
-                None,
-            )
-            .unwrap();
-            let tmp_db = TempDatabase {
-                path: db_path,
-                io,
-                db,
-            };
+            let tmp_db = TempDatabase::builder()
+                .with_db_path(db_path)
+                .with_opts(db_opts)
+                .build();
             let conn = tmp_db.connect_limbo();
             common::run_query_on_row(&tmp_db, &conn, "SELECT count(1) from t2", |row| {
                 let x = row.get::<i64>(0).unwrap();
@@ -859,25 +784,26 @@ fn test_wal_bad_frame() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_read_wal_dumb_no_frames() -> anyhow::Result<()> {
+#[turso_macros::test]
+fn test_read_wal_dumb_no_frames(tmp_db: TempDatabase) -> anyhow::Result<()> {
     maybe_setup_tracing();
     let _ = env_logger::try_init();
+    let opts = tmp_db.db_opts;
     let db_path = {
-        let tmp_db = TempDatabase::new_empty();
+        let tmp_db = tmp_db;
         let conn = tmp_db.connect_limbo();
         conn.close()?;
         tmp_db.path.clone()
     };
     // Second connection must recover from the WAL file. Last checksum should be filled correctly.
     {
-        let tmp_db = TempDatabase::new_with_existent(&db_path);
+        let tmp_db = TempDatabase::new_with_existent_with_opts(&db_path, opts);
         let conn = tmp_db.connect_limbo();
         conn.execute("CREATE TABLE t0 (x)")?;
         conn.close()?;
     }
     {
-        let tmp_db = TempDatabase::new_with_existent(&db_path);
+        let tmp_db = TempDatabase::new_with_existent_with_opts(&db_path, opts);
         let conn = tmp_db.connect_limbo();
         conn.execute("INSERT INTO t0(x) VALUES (1)")?;
         conn.close()?;
@@ -886,9 +812,8 @@ fn test_read_wal_dumb_no_frames() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_insert_with_column_names() -> anyhow::Result<()> {
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE a(z)");
+#[turso_macros::test(init_sql = "CREATE TABLE a(z)")]
+fn test_insert_with_column_names(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
     let result = conn.execute("INSERT INTO a VALUES (b.x)");
 
@@ -907,9 +832,8 @@ fn test_insert_with_column_names() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-pub fn delete_search_op_ignore_nulls() {
-    let limbo = TempDatabase::new_empty();
+#[turso_macros::test()]
+pub fn delete_search_op_ignore_nulls(limbo: TempDatabase) {
     let conn = limbo.db.connect().unwrap();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, c INT);",
@@ -924,13 +848,12 @@ pub fn delete_search_op_ignore_nulls() {
             rusqlite::types::Value::Integer(1),
             rusqlite::types::Value::Null
         ]],
-        limbo_exec_rows(&limbo, &conn, "SELECT * FROM t ORDER BY id")
+        limbo_exec_rows(&conn, "SELECT * FROM t ORDER BY id")
     );
 }
 
-#[test]
-pub fn delete_eq_correct() {
-    let limbo = TempDatabase::new_empty();
+#[turso_macros::test]
+pub fn delete_eq_correct(limbo: TempDatabase) {
     let conn = limbo.db.connect().unwrap();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, c INT);",
@@ -952,13 +875,12 @@ pub fn delete_eq_correct() {
                 rusqlite::types::Value::Integer(-2),
             ]
         ],
-        limbo_exec_rows(&limbo, &conn, "SELECT * FROM t ORDER BY id")
+        limbo_exec_rows(&conn, "SELECT * FROM t ORDER BY id")
     );
 }
 
-#[test]
-pub fn upsert_conflict() {
-    let limbo = TempDatabase::new_empty();
+#[turso_macros::test]
+pub fn upsert_conflict(limbo: TempDatabase) {
     let conn = limbo.db.connect().unwrap();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, c INT UNIQUE, value INT);",
@@ -967,12 +889,908 @@ pub fn upsert_conflict() {
     ] {
         conn.execute(sql).unwrap();
     }
+    let rows: Vec<(i64, i64, i64)> = conn.exec_rows("SELECT * FROM t");
+    assert_eq!(rows, vec![(1, 2, 42)]);
+}
+
+#[turso_macros::test]
+pub fn concurrent_writes_over_single_connection(limbo: TempDatabase) {
+    const COUNT: usize = 16;
+    let conn = limbo.db.connect().unwrap();
+    conn.execute("CREATE TABLE t (x);").unwrap();
+    let mut stmts = Vec::new();
+    for _ in 0..COUNT {
+        stmts.push(Some(
+            conn.prepare("INSERT INTO t VALUES (1), (2) RETURNING x")
+                .unwrap(),
+        ));
+    }
+    let (mut errors, mut oks) = (0, 0);
+    let mut iteration = 0;
+    while stmts.iter().any(|x| x.is_some()) {
+        for (stmt_idx, stmt_opt) in stmts.iter_mut().enumerate() {
+            log::info!("it: {iteration}, stmt: {stmt_idx}");
+            let Some(stmt) = stmt_opt else {
+                continue;
+            };
+            match stmt.step() {
+                Ok(StepResult::Done) => {
+                    *stmt_opt = None;
+                    oks += 1;
+                }
+                Err(err) => {
+                    println!("err: {err:?}");
+                    *stmt_opt = None;
+                    errors += 1;
+                }
+                _ => {}
+            }
+        }
+        iteration += 1;
+    }
+    println!("errors: {errors}, oks: {oks}");
+
+    // all statement will be executed successfully - because turso return Busy error for all except one running statement
+    // and later retry operation for the failed statements
+    assert_eq!((oks, errors), (COUNT, 0));
+}
+
+#[turso_macros::test]
+pub fn concurrent_ddl_over_single_connection(limbo: TempDatabase) {
+    const COUNT: usize = 16;
+    let conn = limbo.db.connect().unwrap();
+    conn.execute("CREATE TABLE t (x);").unwrap();
+    let mut stmts = Vec::new();
+    for i in 0..COUNT {
+        stmts.push(Some(
+            conn.prepare(format!("CREATE TABLE t{i} (x)")).unwrap(),
+        ));
+    }
+    let (mut errors, mut oks) = (0, 0);
+    let mut iteration = 0;
+    while stmts.iter().any(|x| x.is_some()) {
+        for (stmt_idx, stmt_opt) in stmts.iter_mut().enumerate() {
+            log::info!("it: {iteration}, stmt: {stmt_idx}");
+            let Some(stmt) = stmt_opt else {
+                continue;
+            };
+            match stmt.step() {
+                Ok(StepResult::Done) => {
+                    *stmt_opt = None;
+                    oks += 1;
+                }
+                Err(err) => {
+                    println!("err: {err:?}");
+                    *stmt_opt = None;
+                    errors += 1;
+                }
+                _ => {}
+            }
+        }
+        iteration += 1;
+    }
+    println!("errors: {errors}, oks: {oks}");
+
+    // all statement will be executed successfully - because turso return Busy error for all except one running statement
+    // and later retry operation for the failed statements
+    assert_eq!((oks, errors), (COUNT, 0));
+}
+
+#[turso_macros::test]
+pub fn concurrent_reads_over_single_connection(limbo: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn1 = limbo.db.connect().unwrap();
+    conn1.execute("CREATE TABLE t (x);").unwrap();
+    conn1.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+
+    let mut stmt1 = conn1.prepare("SELECT * FROM t").unwrap();
+    loop {
+        match stmt1.step().unwrap() {
+            StepResult::Row => {
+                let mut stmt2 = conn1.prepare("SELECT * FROM t").unwrap();
+                let mut rows = 0;
+                loop {
+                    match stmt2.step().unwrap() {
+                        StepResult::Row => rows += 1,
+                        StepResult::Done => break,
+                        StepResult::IO => stmt2._io().step().unwrap(),
+                        r => panic!("unexpected step result: {r:?}"),
+                    }
+                }
+                assert_eq!(rows, 3);
+            }
+            StepResult::Done => break,
+            StepResult::IO => stmt1._io().step().unwrap(),
+            r => panic!("unexpected step result: {r:?}"),
+        }
+    }
+}
+
+#[turso_macros::test]
+pub fn concurrent_commit_and_insert_over_single_connection(limbo: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn1 = limbo.db.connect().unwrap();
+    conn1.execute("CREATE TABLE t (x);").unwrap();
+
+    conn1.execute("BEGIN").unwrap();
+    let mut stmt1 = conn1
+        .prepare("INSERT INTO t VALUES (1), (2), (3) RETURNING x")
+        .unwrap();
+    loop {
+        match stmt1.step().unwrap() {
+            StepResult::Row => {
+                let mut stmt2 = conn1.prepare("COMMIT").unwrap();
+                let mut busy = false;
+                loop {
+                    match stmt2.step() {
+                        Ok(StepResult::Done) => break,
+                        Ok(StepResult::IO) => stmt2._io().step().unwrap(),
+                        Ok(StepResult::Busy) => {
+                            busy = true;
+                            break;
+                        }
+                        r => panic!("unexpected step result: {r:?}"),
+                    }
+                }
+                assert!(busy);
+            }
+            StepResult::Done => break,
+            StepResult::IO => stmt1._io().step().unwrap(),
+            r => panic!("unexpected step result: {r:?}"),
+        }
+    }
+    let rows: Vec<(i64,)> = conn1.exec_rows("SELECT * FROM t");
+    assert_eq!(rows, vec![(1,), (2,), (3,)]);
+    conn1.execute("ROLLBACK").unwrap();
+    let rows: Vec<(i64,)> = conn1.exec_rows("SELECT * FROM t");
+    assert!(rows.is_empty());
+}
+
+#[turso_macros::test]
+pub fn concurrent_rollback_and_insert_over_single_connection(limbo: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn1 = limbo.db.connect().unwrap();
+    conn1.execute("CREATE TABLE t (x);").unwrap();
+
+    conn1.execute("BEGIN").unwrap();
+    let mut stmt1 = conn1
+        .prepare("INSERT INTO t VALUES (1), (2), (3) RETURNING x")
+        .unwrap();
+    loop {
+        match stmt1.step().unwrap() {
+            StepResult::Row => {
+                let mut stmt2 = conn1.prepare("ROLLBACK").unwrap();
+                let mut busy = false;
+                loop {
+                    match stmt2.step() {
+                        Ok(StepResult::Done) => break,
+                        Ok(StepResult::IO) => stmt2._io().step().unwrap(),
+                        Ok(StepResult::Busy) => {
+                            busy = true;
+                            break;
+                        }
+                        r => panic!("unexpected step result: {r:?}"),
+                    }
+                }
+                assert!(busy);
+            }
+            StepResult::Done => break,
+            StepResult::IO => stmt1._io().step().unwrap(),
+            r => panic!("unexpected step result: {r:?}"),
+        }
+    }
+    let rows: Vec<(i64,)> = conn1.exec_rows("SELECT * FROM t");
+    assert_eq!(rows, vec![(1,), (2,), (3,)]);
+    conn1.execute("COMMIT").unwrap();
+    let rows: Vec<(i64,)> = conn1.exec_rows("SELECT * FROM t");
+    assert_eq!(rows, vec![(1,), (2,), (3,)]);
+}
+
+#[test]
+fn test_unique_complex_key() {
+    let _ = env_logger::try_init();
+    let db_path = tempfile::NamedTempFile::new().unwrap();
+    {
+        let connection = rusqlite::Connection::open(db_path.path()).unwrap();
+        connection
+            .execute("CREATE TABLE t(a, b, c, UNIQUE (b, a));", ())
+            .unwrap();
+        connection
+            .execute("INSERT INTO t VALUES ('1', '2', 'a'), ('3', '4', 'b');", ())
+            .unwrap();
+    }
+
+    let tmp_db = TempDatabase::builder().with_db_path(db_path.path()).build();
+    let conn = tmp_db.connect_limbo();
+
+    let rows: Vec<(String, String, String)> = conn.exec_rows("SELECT * FROM t");
     assert_eq!(
-        vec![vec![
-            rusqlite::types::Value::Integer(1),
-            rusqlite::types::Value::Integer(2),
-            rusqlite::types::Value::Integer(42),
-        ]],
-        limbo_exec_rows(&limbo, &conn, "SELECT * FROM t")
+        rows,
+        vec![
+            ("1".to_string(), "2".to_string(), "a".to_string()),
+            ("3".to_string(), "4".to_string(), "b".to_string()),
+        ]
     );
+    let rows: Vec<(String, String)> = conn.exec_rows("SELECT a, b FROM t");
+    assert_eq!(
+        rows,
+        vec![
+            ("1".to_string(), "2".to_string()),
+            ("3".to_string(), "4".to_string()),
+        ]
+    );
+
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT a FROM t");
+    assert_eq!(rows, vec![("1".to_string(),), ("3".to_string(),)]);
+
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT b FROM t");
+    assert_eq!(rows, vec![("2".to_string(),), ("4".to_string(),)]);
+}
+
+#[turso_macros::test]
+pub fn test_conflict_autocommit(limbo: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn1 = limbo.db.connect().unwrap();
+    let conn2 = limbo.db.connect().unwrap();
+    conn1
+        .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y);")
+        .unwrap();
+    conn1.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    assert!(matches!(
+        conn1.execute("INSERT INTO t VALUES (1, 0)").unwrap_err(),
+        LimboError::Constraint(_)
+    ));
+    conn2.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    assert_eq!(
+        vec![
+            vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Integer(10),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(2),
+                rusqlite::types::Value::Integer(20),
+            ],
+        ],
+        limbo_exec_rows(&conn1, "SELECT * FROM t")
+    );
+    assert_eq!(
+        vec![
+            vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Integer(10),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(2),
+                rusqlite::types::Value::Integer(20),
+            ],
+        ],
+        limbo_exec_rows(&conn2, "SELECT * FROM t")
+    );
+}
+
+#[turso_macros::test]
+pub fn test_conflict_multi_insert_autocommit(limbo: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn1 = limbo.db.connect().unwrap();
+    let conn2 = limbo.db.connect().unwrap();
+    conn1
+        .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y);")
+        .unwrap();
+    conn1.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    assert!(matches!(
+        conn1
+            .execute("INSERT INTO t VALUES (2, 20), (1, 0), (3, 30)")
+            .unwrap_err(),
+        LimboError::Constraint(_)
+    ));
+    conn2.execute("INSERT INTO t VALUES (4, 40)").unwrap();
+    assert_eq!(
+        vec![
+            vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Integer(10),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(4),
+                rusqlite::types::Value::Integer(40),
+            ],
+        ],
+        limbo_exec_rows(&conn1, "SELECT * FROM t")
+    );
+    assert_eq!(
+        vec![
+            vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Integer(10),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(4),
+                rusqlite::types::Value::Integer(40),
+            ],
+        ],
+        limbo_exec_rows(&conn2, "SELECT * FROM t")
+    );
+}
+
+#[turso_macros::test]
+pub fn test_conflict_inside_txn(limbo: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn1 = limbo.db.connect().unwrap();
+    let conn2 = limbo.db.connect().unwrap();
+    conn1
+        .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y);")
+        .unwrap();
+    conn1.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    conn1.execute("BEGIN").unwrap();
+    conn1.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    assert!(matches!(
+        conn1.execute("INSERT INTO t VALUES (1, 0)").unwrap_err(),
+        LimboError::Constraint(_)
+    ));
+    conn1.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+    conn1.execute("COMMIT").unwrap();
+    conn2.execute("INSERT INTO t VALUES (4, 40)").unwrap();
+    assert_eq!(
+        vec![
+            vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Integer(10),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(2),
+                rusqlite::types::Value::Integer(20),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(3),
+                rusqlite::types::Value::Integer(30),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(4),
+                rusqlite::types::Value::Integer(40),
+            ]
+        ],
+        limbo_exec_rows(&conn1, "SELECT * FROM t")
+    );
+    assert_eq!(
+        vec![
+            vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Integer(10),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(2),
+                rusqlite::types::Value::Integer(20),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(3),
+                rusqlite::types::Value::Integer(30),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(4),
+                rusqlite::types::Value::Integer(40),
+            ]
+        ],
+        limbo_exec_rows(&conn2, "SELECT * FROM t")
+    );
+}
+
+#[test]
+pub fn test_reopen_database_wal_restart() {
+    let _ = env_logger::try_init();
+    let db_path = tempfile::NamedTempFile::new().unwrap();
+    let (_file, db_path) = db_path.keep().unwrap();
+    tracing::info!("path: {:?}", db_path);
+    {
+        let tmp_db = TempDatabase::builder().with_db_path(&db_path).build();
+        let conn1 = tmp_db.connect_limbo();
+        conn1.execute("CREATE TABLE t (x);").unwrap();
+        conn1
+            .execute("INSERT INTO t VALUES (randomblob(1000000))")
+            .unwrap();
+        conn1
+            .execute("INSERT INTO t VALUES (randomblob(1000000))")
+            .unwrap();
+        conn1
+            .execute("INSERT INTO t VALUES (randomblob(1000000))")
+            .unwrap();
+        conn1
+            .execute("INSERT INTO t VALUES (randomblob(2000000))")
+            .unwrap();
+
+        conn1.execute("PRAGMA wal_checkpoint(RESTART)").unwrap();
+
+        conn1.execute("CREATE TABLE q(x)").unwrap();
+        println!(
+            "create table err: {:?}",
+            conn1.execute("CREATE TABLE q(x)").unwrap_err()
+        );
+    }
+    // reopen database
+    {
+        let tmp_db = TempDatabase::builder().with_db_path(&db_path).build();
+        let conn2 = tmp_db.connect_limbo();
+        println!("rows: {:?}", limbo_exec_rows(&conn2, "SELECT * FROM q"));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+/// Test for a bug found by whopper
+/// It is slightly fragile and can be removed if it will be unclear how to maintain it
+///
+/// Here, we simulate BusySnapshot condition when during IO in between of begin_read_tx and begin_write_tx, another connection commited some change
+pub fn test_busy_snapshot_immediate() {
+    let _ = env_logger::try_init();
+    let db_path = tempfile::NamedTempFile::new().unwrap();
+    let (_file, db_path) = db_path.keep().unwrap();
+    tracing::info!("path: {:?}", db_path);
+    let tmp_db = TempDatabase::builder()
+        .with_db_path(&db_path)
+        .with_io_uring(true)
+        .build();
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+    let mut stmt1 = conn1.prepare("CREATE TABLE t1(x)").unwrap();
+    let mut stmt2 = conn2.prepare("CREATE TABLE t2(x)").unwrap();
+
+    // stmt1 will yield with IO as it needs to allocate first page
+    let result = stmt1.step();
+    assert!(matches!(result, Ok(StepResult::IO)));
+
+    // run stmt2 to completion and commit changes
+    loop {
+        tmp_db.io.step().unwrap();
+        let result = stmt2.step();
+        match result {
+            Ok(StepResult::IO) => continue,
+            Ok(StepResult::Done) => break,
+            result => panic!("unexpected result: {result:?}"),
+        }
+    }
+    drop(stmt2);
+
+    // stmt1 WAL view is stale - so it is return Busy error
+    // (as we didn't have any transaction started before - turso return Busy result so top-level executor will retry statement implicitly)
+    let result = stmt1.step();
+    assert!(matches!(result, Ok(StepResult::Busy)));
+    drop(stmt1);
+
+    conn1.execute("CREATE TABLE t1(x)").unwrap();
+
+    let rows = limbo_exec_rows(&conn1, "SELECT name FROM sqlite_master");
+    assert_eq!(
+        rows,
+        vec![
+            vec![rusqlite::types::Value::Text("t2".to_string())],
+            vec![rusqlite::types::Value::Text("t1".to_string())],
+        ]
+    );
+}
+
+#[test]
+/// Test for a bug found by whopper
+/// It is slightly fragile and can be removed if it will be unclear how to maintain it
+///
+/// Here, we simulate BusySnapshot condition when transaction upgraded in the middle, but since its started another connection commited changes
+pub fn test_busy_snapshot_txn_upgrade() {
+    let _ = env_logger::try_init();
+    let db_path = tempfile::NamedTempFile::new().unwrap();
+    let (_file, db_path) = db_path.keep().unwrap();
+    tracing::info!("path: {:?}", db_path);
+    let tmp_db = TempDatabase::builder().with_db_path(&db_path).build();
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+    conn1.execute("CREATE TABLE t(x)").unwrap();
+    conn1.execute("BEGIN").unwrap();
+    conn1.execute("SELECT * FROM t").unwrap();
+    let mut stmt1 = conn1.prepare("INSERT INTO t VALUES (1)").unwrap();
+    let mut stmt2 = conn2.prepare("INSERT INTO t VALUES (2)").unwrap();
+
+    loop {
+        let result = stmt2.step();
+        match result {
+            Ok(StepResult::IO) => continue,
+            Ok(StepResult::Done) => break,
+            result => panic!("unexpected result: {result:?}"),
+        }
+    }
+    drop(stmt2);
+
+    // stmt1 WAL view is stale - so it is return Busy error
+    let result = stmt1.step();
+    println!("result: {result:?}");
+    assert!(matches!(result, Err(LimboError::BusySnapshot)));
+    drop(stmt1);
+}
+
+#[test]
+/// Test for a bug found by whopper
+/// It is slightly fragile and can be removed if it will be unclear how to maintain it
+///
+/// Here, we check that page cache will not be reused for last checkpoint because it is stale (insert happened since last statement over connection)
+/// The tricky part is that auto-checkpoint happens in between which can result in reuse of a page if checkpoint epoch do not properly incremented during auto-checkpoint
+pub fn test_auto_checkpoint_restart() {
+    let _ = env_logger::try_init();
+    let db_path = tempfile::NamedTempFile::new().unwrap();
+    let (_file, db_path) = db_path.keep().unwrap();
+    tracing::info!("path: {:?}", db_path);
+    let tmp_db = TempDatabase::builder().with_db_path(&db_path).build();
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+
+    tracing::info!("conn: 1: create_new_table_1");
+    conn1.execute("CREATE TABLE t1(x)").unwrap();
+
+    tracing::info!("conn: 1: insert");
+    conn1.execute("INSERT INTO t1 VALUES (1)").unwrap();
+
+    tracing::info!("conn: 2: select_sqlite_master");
+    let mut stmt = conn2.prepare("SELECT * FROM sqlite_master").unwrap();
+    loop {
+        match stmt.step() {
+            Ok(StepResult::Row) => break,
+            _ => continue,
+        }
+    }
+
+    tracing::info!("conn: 1: checkpoint");
+    conn1.execute("PRAGMA wal_checkpoint(RESTART)").unwrap();
+
+    loop {
+        match stmt.step() {
+            Ok(StepResult::Done) => break,
+            _ => continue,
+        }
+    }
+
+    tracing::info!("conn: 1: insert");
+    conn1.execute("CREATE TABLE t2(x)").unwrap();
+
+    tracing::info!("conn: 2: checkpoint");
+    conn2.execute("PRAGMA wal_checkpoint(RESTART)").unwrap();
+}
+
+#[test]
+pub fn test_wal_truncate_checkpoint() {
+    let mut stop = false;
+    for interrupt_at in 1.. {
+        tracing::info!("interrupt_at: {}", interrupt_at);
+        if stop {
+            break;
+        }
+        let _ = env_logger::try_init();
+        let db_path = tempfile::NamedTempFile::new().unwrap();
+        let (_file, db_path) = db_path.keep().unwrap();
+        tracing::info!("path: {:?}", db_path);
+        let tmp_db = TempDatabase::builder().with_db_path(&db_path).build();
+        let conn1 = tmp_db.connect_limbo();
+        let conn2 = tmp_db.connect_limbo();
+
+        tracing::info!("conn: 1: create_new_table_1");
+        conn1.execute("CREATE TABLE t1(x)").unwrap();
+
+        tracing::info!("conn: 1: insert");
+        conn1.execute("INSERT INTO t1 VALUES (1)").unwrap();
+        conn1.execute("INSERT INTO t1 VALUES (2)").unwrap();
+        conn1.execute("INSERT INTO t1 VALUES (3)").unwrap();
+
+        tracing::info!("conn: 1: wal truncate: start");
+        let mut stmt = conn1.prepare("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        for _ in 0..interrupt_at {
+            let result = stmt.step().unwrap();
+            if matches!(result, StepResult::Done) {
+                stop = true;
+                break;
+            }
+        }
+
+        tracing::info!("conn: 2: insert");
+        let _ = conn2.execute("INSERT INTO t1 VALUES (4)");
+        let _ = conn2.execute("INSERT INTO t1 VALUES (5)");
+        let _ = conn2.execute("INSERT INTO t1 VALUES (6)");
+
+        tracing::info!("conn: 1: wal truncate: finish");
+        loop {
+            match stmt.step() {
+                Ok(StepResult::Done) | Err(_) => break,
+                _ => continue,
+            }
+        }
+
+        tracing::info!("conn: 1: integrity check");
+        conn1.execute("PRAGMA integrity_check").unwrap();
+    }
+}
+
+#[test]
+pub fn test_empty_wal_truncate_checkpoint() {
+    let mut stop = false;
+    for interrupt_at in 1.. {
+        tracing::info!("interrupt_at: {}", interrupt_at);
+        if stop {
+            break;
+        }
+        let _ = env_logger::try_init();
+        let db_path = tempfile::NamedTempFile::new().unwrap();
+        let (_file, db_path) = db_path.keep().unwrap();
+        tracing::info!("path: {:?}", db_path);
+        let tmp_db = TempDatabase::builder().with_db_path(&db_path).build();
+        let conn1 = tmp_db.connect_limbo();
+        let conn2 = tmp_db.connect_limbo();
+
+        tracing::info!("conn: 1: create_new_table_1");
+        conn1.execute("CREATE TABLE t1(x)").unwrap();
+
+        tracing::info!("conn: 1: make sure wal is empty");
+        conn1.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        tracing::info!("conn: 1: wal truncate: start");
+        let mut stmt = conn1.prepare("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        for _ in 0..interrupt_at {
+            let result = stmt.step().unwrap();
+            if matches!(result, StepResult::Done) {
+                stop = true;
+                break;
+            }
+        }
+
+        tracing::info!("conn: 2: insert");
+        let _ = conn2.execute("INSERT INTO t1 VALUES (4)");
+        let _ = conn2.execute("INSERT INTO t1 VALUES (5)");
+        let _ = conn2.execute("INSERT INTO t1 VALUES (6)");
+
+        tracing::info!("conn: 1: wal truncate: finish");
+        loop {
+            match stmt.step() {
+                Ok(StepResult::Done) | Err(_) => break,
+                _ => continue,
+            }
+        }
+
+        tracing::info!("conn: 1: integrity check");
+        conn1.execute("PRAGMA integrity_check").unwrap();
+    }
+}
+
+#[test]
+pub fn test_mvcc_stale_snapshot_after_schema_updated() {
+    let _ = env_logger::try_init();
+    let db_path = tempfile::NamedTempFile::new().unwrap();
+    let (_file, db_path) = db_path.keep().unwrap();
+    tracing::info!("path: {:?}", db_path);
+    let tmp_db = TempDatabase::builder()
+        .with_db_path(&db_path)
+        .with_mvcc(true)
+        .build();
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+    // Setup: create initial table
+    conn1
+        .execute("CREATE TABLE t (key TEXT PRIMARY KEY, value TEXT)")
+        .unwrap();
+    // conn1: Start a CONCURRENT transaction
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    // Do something to establish the MVCC snapshot
+    conn1.execute("SELECT * FROM t").unwrap();
+    // conn2: Modify schema while conn1's CONCURRENT transaction is active
+    conn2.execute("CREATE TABLE t2 (x)").unwrap();
+    // conn1: Try to COMMIT - should fail with SchemaConflict
+    let commit_result = conn1.execute("COMMIT");
+    assert!(matches!(commit_result, Err(LimboError::SchemaConflict)));
+
+    // conn2: Insert a row and commit (this happens AFTER conn1's original snapshot)
+    conn2
+        .execute("INSERT INTO t VALUES ('test_key', 'test_value')")
+        .unwrap();
+
+    // conn1: Start a new CONCURRENT transaction
+    // BUG: This should get a fresh MVCC snapshot, but it reuses the old one
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+
+    // conn1: SELECT should see the row inserted by conn2
+    // BUG: Due to stale snapshot, this returns empty result
+    let rows: Vec<(String, String)> = conn1.exec_rows("SELECT * FROM t WHERE key = 'test_key'");
+
+    assert_eq!(
+        rows,
+        vec![("test_key".to_string(), "test_value".to_string())]
+    );
+
+    conn1.execute("COMMIT").unwrap();
+}
+
+/// Test materialized view population with enough rows to trigger btree page splits.
+///
+/// This test exposes a bug where the matview code doesn't properly handle
+/// btree operations during page splits, causing rows to be silently lost.
+/// The bug triggers around row 193 with 500-byte content - the matview stops
+/// accepting new rows and freezes at 192.
+///
+/// Key conditions:
+/// - TEXT PRIMARY KEY (not INTEGER)
+/// - 500+ byte content column
+/// - Each INSERT in a separate connection (simulating CLI usage)
+#[turso_macros::test(views)]
+fn test_matview_row_loss_during_btree_split(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    // Create table with TEXT PRIMARY KEY and content column
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE TABLE t (id TEXT PRIMARY KEY, title TEXT, content TEXT)",
+    )?;
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW v AS SELECT id, title FROM t",
+    )?;
+
+    // Insert 250 rows with 500-byte content
+    // Each insert uses a fresh connection to simulate CLI behavior
+    let content = "x".repeat(500);
+    for i in 1..=250 {
+        let insert_conn = tmp_db.connect_limbo();
+        let insert_sql = format!("INSERT INTO t VALUES ('id{i}', 'title {i}', '{content}')");
+        common::run_query(&tmp_db, &insert_conn, &insert_sql)?;
+    }
+
+    // Check counts with fresh connection
+    let check_conn = tmp_db.connect_limbo();
+
+    let mut table_count = 0i64;
+    match check_conn.query("SELECT COUNT(*) FROM t") {
+        Ok(Some(ref mut rows)) => loop {
+            match rows.step()? {
+                StepResult::Row => {
+                    table_count = rows.row().unwrap().get::<i64>(0).unwrap();
+                }
+                StepResult::IO => rows._io().step()?,
+                StepResult::Done => break,
+                _ => {}
+            }
+        },
+        Ok(None) => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    let mut view_count = 0i64;
+    match check_conn.query("SELECT COUNT(*) FROM v") {
+        Ok(Some(ref mut rows)) => loop {
+            match rows.step()? {
+                StepResult::Row => {
+                    view_count = rows.row().unwrap().get::<i64>(0).unwrap();
+                }
+                StepResult::IO => rows._io().step()?,
+                StepResult::Done => break,
+                _ => {}
+            }
+        },
+        Ok(None) => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    assert_eq!(
+        table_count, view_count,
+        "Materialized view row count ({view_count}) doesn't match table row count ({table_count}). \
+         Rows were lost during btree page splits.",
+    );
+
+    Ok(())
+}
+
+/// Regression test for simulator seed 867: UPDATE on an attached database table
+/// that changes the primary key (rowid) while a UNIQUE index exists would use
+/// the wrong database_id (0 instead of the attached db) for OpenWrite cursors,
+/// causing "short read on page" or "IdxDelete: no matching index entry found".
+#[turso_macros::test]
+fn test_update_pk_on_attached_table_with_unique_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    let aux_path = tmp_db
+        .path
+        .parent()
+        .unwrap()
+        .join("aux_update.db")
+        .to_string_lossy()
+        .to_string();
+    conn.execute(format!("ATTACH '{aux_path}' AS aux1"))?;
+    conn.execute("CREATE TABLE aux1.t1 (pk INTEGER PRIMARY KEY, extra TEXT UNIQUE)")?;
+    conn.execute("INSERT INTO aux1.t1 VALUES (1, 'a'), (2, 'b')")?;
+    conn.execute("UPDATE aux1.t1 SET pk = 100 WHERE pk = 2")?;
+
+    let rows = limbo_exec_rows(&conn, "SELECT pk, extra FROM aux1.t1 ORDER BY pk");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], vec![RValue::Integer(1), RValue::Text("a".into())]);
+    assert_eq!(
+        rows[1],
+        vec![RValue::Integer(100), RValue::Text("b".into())]
+    );
+
+    Ok(())
+}
+
+/// Regression test: UPDATE t SET v=v in MVCC mode should not delete rows.
+/// When UPDATE sets a column to its own value (a no-op update), the row count
+/// should remain unchanged. Previously this caused count(*) to return 0.
+/// The bug reproduces when MVCC is enabled *after* table creation and inserts.
+#[test]
+pub fn test_mvcc_update_set_self_does_not_delete_rows() {
+    let _ = env_logger::try_init();
+    let db_path = tempfile::NamedTempFile::new().unwrap();
+    let (_file, db_path) = db_path.keep().unwrap();
+    let tmp_db = TempDatabase::builder().with_db_path(&db_path).build();
+    let conn = tmp_db.connect_limbo();
+
+    // Create table and insert data BEFORE enabling MVCC
+    conn.execute("CREATE TABLE t(v)").unwrap();
+    conn.execute("INSERT INTO t VALUES('hello')").unwrap();
+
+    // Switch to MVCC journal mode after data exists
+    conn.pragma_update("journal_mode", "'mvcc'")
+        .expect("enable mvcc");
+
+    // Self-update: SET v=v should be a no-op
+    conn.execute("UPDATE t SET v=v").unwrap();
+
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, 1, "UPDATE t SET v=v should not delete the row");
+
+    // Also verify the actual data is intact
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT v FROM t");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "hello");
+}
+
+/// Regression test: when a statement writes to the main DB and reads from an
+/// attached DB, the attached pager's read lock must be released after commit.
+/// Without the fix, the stale read lock would cause subsequent statements on
+/// the attached DB to use a stale WAL snapshot, missing data committed by
+/// other connections.
+#[turso_macros::test]
+fn test_attached_read_lock_released_after_main_write(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let aux_path = tmp_db
+        .path
+        .parent()
+        .unwrap()
+        .join("aux_readlock.db")
+        .to_string_lossy()
+        .to_string();
+
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+
+    // Set up: conn1 creates a main table and an attached table with initial data.
+    conn1.execute("CREATE TABLE main_t (id INTEGER PRIMARY KEY, val TEXT)")?;
+    conn1.execute(format!("ATTACH '{aux_path}' AS aux1"))?;
+    conn1.execute("CREATE TABLE aux1.t1 (x INTEGER)")?;
+    conn1.execute("INSERT INTO aux1.t1 VALUES (1)")?;
+
+    // conn2 attaches the same DB file.
+    conn2.execute(format!("ATTACH '{aux_path}' AS aux1"))?;
+
+    // conn2 writes to main DB and reads from attached DB in the same statement.
+    // This gives main pager a Write lock and attached pager a Read lock.
+    // After auto-commit, the attached Read lock must be released.
+    conn2.execute(
+        "INSERT INTO main_t (id, val) VALUES (1, (SELECT CAST(x AS TEXT) FROM aux1.t1 LIMIT 1))",
+    )?;
+
+    // conn1 inserts more data into the attached table.
+    conn1.execute("INSERT INTO aux1.t1 VALUES (2)")?;
+
+    // conn2 reads from the attached table. With the bug, it would use a stale
+    // snapshot and only see 1 row instead of 2.
+    let rows = limbo_exec_rows(&conn2, "SELECT x FROM aux1.t1 ORDER BY x");
+    assert_eq!(
+        rows.len(),
+        2,
+        "conn2 should see both rows after conn1's commit"
+    );
+    assert_eq!(rows[0], vec![RValue::Integer(1)]);
+    assert_eq!(rows[1], vec![RValue::Integer(2)]);
+
+    Ok(())
 }

@@ -51,7 +51,7 @@ await db.sync(); // pull & push changes
 
 ## License
 
-This project is licensed under the [MIT license](../../LICENSE.md).
+This project is licensed under the [MIT license](https://github.com/tursodatabase/turso/blob/main/LICENSE.md).
 
 ## Support
 

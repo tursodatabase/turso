@@ -93,6 +93,12 @@ void *sqlite3_context_db_handle(void *_context);
 
 int sqlite3_prepare_v2(sqlite3 *db, const char *sql, int _len, sqlite3_stmt **out_stmt, const char **_tail);
 
+int sqlite3_prepare_v3(sqlite3 *db, const char *sql, int _len, unsigned int _prep_flags, sqlite3_stmt **out_stmt, const char **_tail);
+
+#define SQLITE_PREPARE_PERSISTENT 0x01
+#define SQLITE_PREPARE_NORMALIZE  0x02
+#define SQLITE_PREPARE_NO_VTAB    0x04
+
 int sqlite3_finalize(sqlite3_stmt *stmt);
 
 int sqlite3_step(sqlite3_stmt *stmt);
@@ -189,9 +195,13 @@ const void *sqlite3_column_blob(sqlite3_stmt *_stmt, int _idx);
 
 int sqlite3_column_bytes(sqlite3_stmt *_stmt, int _idx);
 
+void *sqlite3_column_value(sqlite3_stmt *_stmt, int _idx);
+
 int sqlite3_value_type(void *value);
 
 int64_t sqlite3_value_int64(void *value);
+
+int sqlite3_value_int(void *value);
 
 double sqlite3_value_double(void *value);
 
@@ -201,17 +211,23 @@ const void *sqlite3_value_blob(void *value);
 
 int sqlite3_value_bytes(void *value);
 
+void *sqlite3_value_dup(void *value);
+
+void sqlite3_value_free(void *value);
+
 const unsigned char *sqlite3_column_text(sqlite3_stmt *stmt, int idx);
 
 int sqlite_get_table_cb(void *context, int n_column, char **argv, char **colv);
 
 int sqlite3_get_table(sqlite3 *db, const char *sql, char ***paz_result, int *pn_row, int *pn_column, char **pz_err_msg);
 
-void sqlite3_free_table(char ***paz_result);
+void sqlite3_free_table(char **az_result);
 
 void sqlite3_result_null(void *_context);
 
 void sqlite3_result_int64(void *_context, int64_t _val);
+
+void sqlite3_result_int(void *_context, int _val);
 
 void sqlite3_result_double(void *_context, double _val);
 

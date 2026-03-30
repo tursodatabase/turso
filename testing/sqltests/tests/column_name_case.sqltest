@@ -1,0 +1,168 @@
+@database :memory:
+
+# Column names should preserve their original case from CREATE TABLE
+
+@cross-check-integrity
+test basic_case_preservation {
+    CREATE TABLE t1(aAa);
+    SELECT name FROM pragma_table_info('t1');
+}
+expect {
+    aAa
+}
+
+@cross-check-integrity
+test select_star_headers {
+    CREATE TABLE t2(FooBar INT);
+    INSERT INTO t2 VALUES (42);
+    SELECT * FROM t2;
+}
+expect {
+    42
+}
+
+@cross-check-integrity
+test multiple_mixed_case_columns {
+    CREATE TABLE t3(aAa, bBb, cCc);
+    SELECT name FROM pragma_table_info('t3') ORDER BY cid;
+}
+expect {
+    aAa
+    bBb
+    cCc
+}
+
+@cross-check-integrity
+test case_insensitive_column_reference {
+    CREATE TABLE t4(FooBar INT);
+    INSERT INTO t4 VALUES (1);
+    SELECT foobar FROM t4;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test insert_with_mixed_case_column_names {
+    CREATE TABLE t5(Foo INT);
+    INSERT INTO t5(fOo) VALUES (1);
+    SELECT * FROM t5;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test update_with_mixed_case_column_names {
+    CREATE TABLE t6(FoO INT);
+    INSERT INTO t6 VALUES (1);
+    UPDATE t6 SET fOo = 2;
+    SELECT * FROM t6;
+}
+expect {
+    2
+}
+
+@cross-check-integrity
+test primary_key_with_mixed_case {
+    CREATE TABLE t7(FooBar INTEGER PRIMARY KEY);
+    INSERT INTO t7 VALUES (1);
+    SELECT name FROM pragma_table_info('t7');
+}
+expect {
+    FooBar
+}
+
+@cross-check-integrity
+test table_level_primary_key {
+    CREATE TABLE t8(aAa, bBb, PRIMARY KEY(aaa));
+    INSERT INTO t8 VALUES (1, 2);
+    SELECT name FROM pragma_table_info('t8') ORDER BY cid;
+}
+expect {
+    aAa
+    bBb
+}
+
+@cross-check-integrity
+test unique_constraint_with_mixed_case {
+    CREATE TABLE t9(FooBar UNIQUE);
+    INSERT INTO t9 VALUES (1);
+    SELECT name FROM pragma_table_info('t9');
+}
+expect {
+    FooBar
+}
+
+@cross-check-integrity
+test foreign_key_with_mixed_case {
+    CREATE TABLE parent(ParentId INTEGER PRIMARY KEY);
+    INSERT INTO parent VALUES (1);
+    CREATE TABLE child(ChildId INTEGER PRIMARY KEY, ParRef INTEGER REFERENCES parent(parentid));
+    INSERT INTO child VALUES (1, 1);
+    SELECT name FROM pragma_table_info('child') ORDER BY cid;
+}
+expect {
+    ChildId
+    ParRef
+}
+
+@cross-check-integrity
+test create_index_on_mixed_case_column {
+    CREATE TABLE t10(FooBar INT);
+    CREATE INDEX idx10 ON t10(foobar);
+    INSERT INTO t10 VALUES (1);
+    SELECT * FROM t10;
+}
+expect {
+    1
+}
+
+@backend cli
+@cross-check-integrity
+test expr_column_name_preserves_original_text {
+    .headers on
+    CREATE TABLE texpr(f1 int, f2 int);
+    INSERT INTO texpr VALUES(11,22);
+    SELECT f1+F2 FROM texpr ORDER BY f2;
+}
+expect {
+    f1+F2
+    33
+}
+
+@backend cli
+@cross-check-integrity
+test expr_column_name_with_spaces {
+    .headers on
+    CREATE TABLE texpr2(a int, b int);
+    INSERT INTO texpr2 VALUES(1,2);
+    SELECT a + b FROM texpr2;
+}
+expect {
+    a + b
+    3
+}
+
+@backend cli
+@cross-check-integrity
+test func_column_name_preserves_original_text {
+    .headers on
+    CREATE TABLE texpr3(x int);
+    INSERT INTO texpr3 VALUES(5);
+    SELECT max(x) FROM texpr3;
+}
+expect {
+    max(x)
+    5
+}
+
+@cross-check-integrity
+test quoted_identifiers {
+    CREATE TABLE t12("MixedCase" INT);
+    INSERT INTO t12 VALUES (1);
+    SELECT name FROM pragma_table_info('t12');
+}
+expect {
+    MixedCase
+}

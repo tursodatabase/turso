@@ -1,7 +1,7 @@
 use turso_ext::{register_extension, AggFunc, AggregateDerive, Value};
 
 register_extension! {
-    aggregates: { Median, Percentile, PercentileCont, PercentileDisc }
+    aggregates: { Median, Percentile, PercentileCont, PercentileDisc, StandardDeviation }
 }
 
 #[derive(AggregateDerive)]
@@ -25,7 +25,7 @@ impl AggFunc for Median {
         }
 
         let mut sorted = state;
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        sorted.sort_by(|a, b| a.total_cmp(b));
 
         let len = sorted.len();
         if len % 2 == 1 {
@@ -82,8 +82,8 @@ impl AggFunc for Percentile {
             return Ok(Value::from_float(values[0]));
         }
 
-        let p = p_value.unwrap();
-        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p = p_value.ok_or("percentile value must be provided")?;
+        values.sort_by(|a, b| a.total_cmp(b));
         let n = values.len() as f64;
         let index = p * (n - 1.0) / 100.0;
         let lower = index.floor() as usize;
@@ -144,8 +144,8 @@ impl AggFunc for PercentileCont {
             return Ok(Value::from_float(values[0]));
         }
 
-        let p = p_value.unwrap();
-        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p = p_value.ok_or("percentile value must be provided")?;
+        values.sort_by(|a, b| a.total_cmp(b));
         let n = values.len() as f64;
         let index = p * (n - 1.0);
         let lower = index.floor() as usize;
@@ -184,10 +184,56 @@ impl AggFunc for PercentileDisc {
             return Err(err);
         }
 
-        let p = p_value.unwrap();
-        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p = p_value.ok_or("percentile value must be provided")?;
+        values.sort_by(|a, b| a.total_cmp(b));
         let n = values.len() as f64;
         let index = (p * (n - 1.0)).floor() as usize;
         Ok(Value::from_float(values[index]))
+    }
+}
+
+/// Standard Deviation implementation using Welford's algorithm
+/// Formula:
+///
+/// ```text
+///     s = sqrt( M2 / (n - 1) )
+/// ```
+///
+/// Where:
+/// - `n` = number of observations
+/// - `M2` = sum of squared deviations
+#[derive(AggregateDerive)]
+struct StandardDeviation;
+
+impl AggFunc for StandardDeviation {
+    type State = (u64, f64, f64); // Tracks the count, mean and sum of squared differences from the mean
+    type Error = &'static str;
+    const NAME: &'static str = "stddev";
+    const ARGS: i32 = 1;
+
+    fn step(state: &mut Self::State, args: &[Value]) {
+        let (count, mean, m2) = state;
+
+        if let Some(x) = args.first().and_then(Value::to_float) {
+            *count += 1;
+
+            // compute deviation from old mean
+            let delta = x - *mean;
+            *mean += delta / *count as f64;
+
+            // update sum of squared differences
+            let delta_2 = x - *mean;
+            *m2 += delta * delta_2;
+        }
+    }
+
+    fn finalize(state: Self::State) -> Result<Value, Self::Error> {
+        let (count, _mean, m2) = state;
+        if count < 2 {
+            return Ok(Value::null());
+        }
+
+        let variance = m2 / (count - 1) as f64;
+        Ok(Value::from_float(variance.sqrt()))
     }
 }

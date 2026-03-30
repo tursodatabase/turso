@@ -338,93 +338,97 @@ You can use the `Rc<Connection>` to query the same underlying connection that cr
 **NOTE**: Requires 'vfs' feature enabled.
 
 ```rust
-use turso_ext::{ExtResult as Result, VfsDerive, VfsExtension, VfsFile};
+use turso_ext::{ExtResult, VfsDerive, VfsExtension, VfsFile, Callback};
 
 /// Your struct must also impl Default
 #[derive(VfsDerive, Default)]
-struct ExampleFS;
-
-
-struct ExampleFile {
-    file: std::fs::File,
+pub struct TestFS {
+    callbacks: CallbackQueue,
 }
 
-impl VfsExtension for ExampleFS {
-    /// The name of your vfs module
-    const NAME: &'static str = "example";
+impl VfsExtension for TestFS {
+    const NAME: &'static str = "testvfs";
+    type File = TestFile;
+    fn run_once(&self) -> ExtResult<()> {
+        log::debug!("running once with testing VFS");
+        self.callbacks.process_all();
+        Ok(())
+    }
 
-    type File = ExampleFile;
-
-    fn open(&self, path: &str, flags: i32, _direct: bool) -> Result<Self::File> {
+    fn open_file(&self, path: &str, flags: i32, _direct: bool) -> ExtResult<Self::File> {
+        let _ = env_logger::try_init();
+        log::debug!("opening file with testing VFS: {path} flags: {flags}");
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(flags & 1 != 0)
             .open(path)
             .map_err(|_| ResultCode::Error)?;
-        Ok(TestFile { file })
+        Ok(TestFile {
+            file,
+            io: self.callbacks.clone(),
+        })
     }
 
-    fn run_once(&self) -> Result<()> {
-    // (optional) method to cycle/advance IO, if your extension is asynchronous
-        Ok(())
-    }
-
-    fn close(&self, file: Self::File) -> Result<()> {
-    // (optional) method to close or drop the file
-        Ok(())
-    }
-
-    fn generate_random_number(&self) -> i64 {
-    // (optional) method to generate random number. Used for testing
-        let mut buf = [0u8; 8];
-        getrandom::fill(&mut buf).unwrap();
-        i64::from_ne_bytes(buf)
-    }
-
-   fn get_current_time(&self) -> String {
-    // (optional) method to generate random number. Used for testing
-        chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+    fn remove_file(&self, path: &str) -> ExtResult<()> {
+        let _ = env_logger::try_init();
+        log::debug!("remove file with testing VFS: {path}");
+        std::fs::remove_file(path).map_err(|_| ResultCode::Error)
     }
 }
 
-impl VfsFile for ExampleFile {
-    fn read(
-        &mut self,
-        buf: &mut [u8],
-        count: usize,
-        offset: i64,
-    ) -> Result<i32> {
-        if file.file.seek(SeekFrom::Start(offset as u64)).is_err() {
-            return Err(ResultCode::Error);
-        }
-        file.file
-            .read(&mut buf[..count])
-            .map_err(|_| ResultCode::Error)
-            .map(|n| n as i32)
-    }
-
-    fn write(&mut self, buf: &[u8], count: usize, offset: i64) -> Result<i32> {
+impl VfsFile for TestFile {
+    fn read(&mut self, mut buf: BufferRef, offset: i64, cb: Callback) -> ExtResult<()> {
+        log::debug!(
+            "reading file with testing VFS: bytes: {} offset: {}",
+            buf.len(),
+            offset
+        );
         if self.file.seek(SeekFrom::Start(offset as u64)).is_err() {
             return Err(ResultCode::Error);
         }
-        self.file
-            .write(&buf[..count])
+        let len = buf.len();
+        let buf = buf.as_mut_slice();
+        let res = self
+            .file
+            .read(&mut buf[..len])
             .map_err(|_| ResultCode::Error)
-            .map(|n| n as i32)
-    }
-
-    fn sync(&self) -> Result<()> {
-        self.file.sync_all().map_err(|_| ResultCode::Error)
-    }
-
-    fn lock(&self, _exclusive: bool) -> Result<()> {
-        // (optional) method to lock the file
+            .map(|n| n as i32)?;
+        self.io.enqueue(cb, res);
         Ok(())
     }
 
-    fn unlock(&self) -> Result<()> {
-       // (optional) method to lock the file
+    fn write(&mut self, buf: turso_ext::BufferRef, offset: i64, cb: Callback) -> ExtResult<()> {
+        log::debug!(
+            "writing to file with testing VFS: bytes: {} offset: {offset}",
+            buf.len()
+        );
+        if self.file.seek(SeekFrom::Start(offset as u64)).is_err() {
+            return Err(ResultCode::Error);
+        }
+        let len = buf.len();
+        let n = self
+            .file
+            .write(&buf[..len])
+            .map_err(|_| ResultCode::Error)
+            .map(|n| n as i32)?;
+        self.io.enqueue(cb, n);
+        Ok(())
+    }
+
+    fn sync(&self, cb: Callback) -> ExtResult<()> {
+        log::debug!("syncing file with testing VFS");
+        self.file.sync_all().map_err(|_| ResultCode::Error)?;
+        self.io.enqueue(cb, 0);
+        Ok(())
+    }
+
+    fn truncate(&self, len: i64, cb: Callback) -> ExtResult<()> {
+        log::debug!("truncating file with testing VFS to length: {len}");
+        self.file
+            .set_len(len as u64)
+            .map_err(|_| ResultCode::Error)?;
+        self.io.enqueue(cb, 0);
         Ok(())
     }
 

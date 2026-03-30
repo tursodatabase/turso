@@ -8,7 +8,7 @@ use std::{
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use turso_sync_engine::{
-    protocol_io::{DataCompletion, DataPollResult, ProtocolIO},
+    database_sync_engine_io::{DataCompletion, DataPollResult, SyncEngineIo},
     types::{DatabaseRowTransformResult, DatabaseStatementReplay},
 };
 
@@ -20,6 +20,7 @@ use crate::{
 #[napi]
 pub enum JsProtocolRequest {
     Http {
+        url: Option<String>,
         method: String,
         path: String,
         body: Option<Vec<u8>>,
@@ -183,18 +184,20 @@ impl JsProtocolRequestBytes {
     }
 }
 
-impl ProtocolIO for JsProtocolIo {
+impl SyncEngineIo for JsProtocolIo {
     type DataCompletionBytes = JsDataCompletion;
     type DataCompletionTransform = JsDataCompletion;
 
     fn http(
         &self,
+        url: Option<&str>,
         method: &str,
         path: &str,
         body: Option<Vec<u8>>,
         headers: &[(&str, &str)],
     ) -> turso_sync_engine::Result<JsDataCompletion> {
         Ok(self.add_request(JsProtocolRequest::Http {
+            url: url.map(|x| x.to_string()),
             method: method.to_string(),
             path: path.to_string(),
             body,
@@ -229,25 +232,28 @@ impl ProtocolIO for JsProtocolIo {
         Ok(self.add_request(JsProtocolRequest::Transform {
             mutations: mutations
                 .into_iter()
-                .map(|mutation| DatabaseRowMutationJs {
-                    change_time: mutation.change_time as i64,
-                    table_name: mutation.table_name,
-                    id: mutation.id,
-                    change_type: core_change_type_to_js(mutation.change_type),
-                    before: mutation.before.map(core_values_map_to_js),
-                    after: mutation.after.map(core_values_map_to_js),
-                    updates: mutation.updates.map(core_values_map_to_js),
+                .filter_map(|mutation| {
+                    let change_type = core_change_type_to_js(mutation.change_type)?;
+                    Some(DatabaseRowMutationJs {
+                        change_time: mutation.change_time as i64,
+                        table_name: mutation.table_name,
+                        id: mutation.id,
+                        change_type,
+                        before: mutation.before.map(core_values_map_to_js),
+                        after: mutation.after.map(core_values_map_to_js),
+                        updates: mutation.updates.map(core_values_map_to_js),
+                    })
                 })
                 .collect(),
         }))
     }
 
-    fn add_work(&self, callback: Box<dyn FnMut() -> bool + Send>) {
+    fn add_io_callback(&self, callback: Box<dyn FnMut() -> bool + Send>) {
         let mut work = self.work.lock().unwrap();
         work.push_back(callback);
     }
 
-    fn step_work(&self) {
+    fn step_io_callbacks(&self) {
         let mut items = {
             let mut work = self.work.lock().unwrap();
             work.drain(..).collect::<VecDeque<_>>()

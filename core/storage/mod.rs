@@ -15,12 +15,13 @@ pub(crate) mod buffer_pool;
 pub(crate) mod checksum;
 pub mod database;
 pub(crate) mod encryption;
+pub(crate) mod journal_mode;
 pub(crate) mod page_cache;
 #[allow(clippy::arc_with_non_send_sync)]
 pub(crate) mod pager;
 #[allow(dead_code)]
 pub(super) mod slot_bitmap;
-pub(crate) mod sqlite3_ondisk;
+pub mod sqlite3_ondisk;
 mod state_machines;
 pub(crate) mod subjournal;
 #[allow(clippy::arc_with_non_send_sync)]
@@ -28,7 +29,7 @@ pub(crate) mod wal;
 
 #[macro_export]
 macro_rules! return_corrupt {
-    ($msg:expr) => {
-        return Err(LimboError::Corrupt($msg.into()));
+    ($($arg:tt)*) => {
+        return Err(LimboError::Corrupt(format!($($arg)*)));
     };
 }

@@ -1,0 +1,16 @@
+# Regression test for MVCC LEFT JOIN NullRow bug.
+# MvccLazyCursor::rowid() was not checking null_flag, so after NullRow
+# it returned the stale rowid of the last seeked row instead of NULL.
+
+@database :memory:
+
+test mvcc-left-join-null-row {
+    CREATE TABLE t1(x INTEGER PRIMARY KEY);
+    CREATE TABLE t2(x INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t1 VALUES (1);
+    INSERT INTO t2 VALUES (1, 'hello');
+    SELECT t1.x, t2.x FROM t1 LEFT JOIN t2 ON t1.x = t2.x AND t2.v = 'nonexistent';
+}
+expect {
+    1|
+}

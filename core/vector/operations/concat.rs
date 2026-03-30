@@ -25,6 +25,11 @@ pub fn vector_concat(v1: &Vector, v2: &Vector) -> Result<Vector<'static>> {
             data.extend_from_slice(&v2.bin_data()[v2.bin_len() / 2..]);
             data
         }
+        VectorType::Float1Bit | VectorType::Float8 => {
+            return Err(LimboError::ConversionError(
+                "vector_concat is not supported for float1bit/float8 vectors".to_string(),
+            ));
+        }
     };
 
     Ok(Vector {

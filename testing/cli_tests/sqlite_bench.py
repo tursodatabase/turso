@@ -16,13 +16,16 @@ from faker import Faker
 
 # for now, use debug for the debug assertions
 LIMBO_BIN = Path("./target/release/tursodb")
-DB_FILE = Path("testing/temp.db")
+DB_FILE = Path("testing/system/temp.db")
 
 SQLITE_BIN = "sqlite3"
 
 vfs_list = ["syscall", "sqlite"]
 if platform.system() == "Linux":
     vfs_list.append("io_uring")
+
+if platform.system() == "Windows":
+    vfs_list.append("experimental_win_iocp")
 
 
 def append_time(i, times, start, perf_counter):
@@ -81,7 +84,7 @@ def setup_temp_db() -> None:
     # make sure we start fresh, otherwise we could end up with
     # one having to checkpoint the others from the previous run
     cleanup_temp_db()
-    cmd = ["sqlite3", "testing/testing.db", ".clone testing/temp.db"]
+    cmd = ["sqlite3", "testing/system/testing.db", ".clone testing/system/temp.db"]
     proc = subprocess.run(cmd, check=True)
     proc.check_returncode()
     sleep(0.3)  # make sure it's finished

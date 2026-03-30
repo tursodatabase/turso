@@ -1,5 +1,6 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
+use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast;
 
 use crate::{
@@ -11,6 +12,8 @@ use crate::{
 };
 
 pub mod backing_btree;
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+pub mod fts;
 pub mod toy_vector_sparse_ivf;
 
 pub const BACKING_BTREE_INDEX_METHOD_NAME: &str = "backing_btree";
@@ -57,6 +60,22 @@ pub struct IndexMethodDefinition<'a> {
     pub patterns: &'a [ast::Select],
     /// special marker which forces tursodb core to treat index method as backing btree - so it will allocate real btree on disk for that index method
     pub backing_btree: bool,
+    /// Whether `query_start()` materializes all matching rowids up front (e.g. into a Vec/VecDeque).
+    /// When `true`, the cursor is safe to use during DML because it does not lazily stream from
+    /// a live data structure that writes could invalidate.
+    /// When `false`, the emitter will collect rowids into a RowSet/ephemeral table before writing.
+    pub results_materialized: bool,
+}
+
+/// Cost estimate returned by custom index methods for optimizer integration.
+/// This enables the optimizer to make cost-based decisions when choosing between
+/// custom index methods and traditional BTree indexes.
+#[derive(Debug, Clone, Copy)]
+pub struct IndexMethodCostEstimate {
+    /// Estimated CPU/IO cost (lower is better, comparable to optimizer Cost values)
+    pub estimated_cost: f64,
+    /// Estimated number of rows returned by the query
+    pub estimated_rows: u64,
 }
 
 /// cursor opened for index method and capable of executing DML/DDL/DQL queries for the index method over fixed table
@@ -113,6 +132,30 @@ pub trait IndexMethodCursor {
     /// enrich its result with name, comment, rating columns from original table accessing original row by its rowid
     /// returned from query_rowid(...) method
     fn query_rowid(&mut self) -> Result<IOResult<Option<i64>>>;
+
+    /// Called before transaction commit to flush any pending writes.
+    /// This ensures index method writes are persisted as part of the transaction.
+    fn pre_commit(&mut self) -> Result<IOResult<()>> {
+        Ok(IOResult::Done(()))
+    }
+
+    /// Optimize the index by merging segments or performing other maintenance.
+    fn optimize(&mut self, _connection: &Arc<Connection>) -> Result<IOResult<()>> {
+        Ok(IOResult::Done(()))
+    }
+
+    /// Estimate the cost of executing a query with the given pattern.
+    ///
+    /// This method enables the optimizer to make cost-based decisions when choosing
+    /// between custom index methods and traditional BTree indexes.
+    fn estimate_cost(
+        &self,
+        pattern_idx: usize,
+        base_table_rows: f64,
+    ) -> Option<IndexMethodCostEstimate> {
+        let _ = (pattern_idx, base_table_rows);
+        None
+    }
 }
 
 /// helper method to open table BTree cursor in the index method implementation
@@ -124,7 +167,7 @@ pub(crate) fn open_table_cursor(connection: &Connection, table: &str) -> Result<
             "table {table} not found",
         )));
     };
-    let cursor = BTreeCursor::new_table(pager, table.get_root_page(), table.columns().len());
+    let cursor = BTreeCursor::new_table(pager, table.get_root_page()?, table.columns().len());
     Ok(cursor)
 }
 
@@ -143,11 +186,12 @@ pub(crate) fn open_index_cursor(
         )));
     };
     let mut cursor = BTreeCursor::new(pager, scratch.root_page, keys.len());
-    cursor.index_info = Some(IndexInfo {
+    cursor.index_info = Some(Arc::new(IndexInfo {
         has_rowid: false,
         num_cols: keys.len(),
         key_info: keys,
-    });
+        is_unique: scratch.unique,
+    }));
     Ok(cursor)
 }
 

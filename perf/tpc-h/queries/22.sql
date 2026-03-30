@@ -1,4 +1,4 @@
--- LIMBO_SKIP: query 22 is slow as hell in both Turso and Sqlite
+-- SQLITE_SKIP: SQLite doesn't unnest correlated NOT EXISTS, so it's slow here (multiple minutes).
 
 
 select

@@ -1,0 +1,134 @@
+@database :memory:
+
+# Regression tests for IN/NOT IN with NULL in list combined with OR.
+# When IN/NOT IN evaluates to NULL (due to NULL in the list and no match),
+# the OR right-hand side must still be evaluated.
+
+setup in_null_or {
+    CREATE TABLE t1 (a INTEGER PRIMARY KEY, b INTEGER);
+    INSERT INTO t1 VALUES(1, 1);
+    INSERT INTO t1 VALUES(2, 0);
+    INSERT INTO t1 VALUES(3, NULL);
+}
+
+@setup in_null_or
+test in-null-or-truthy {
+    SELECT a FROM t1 WHERE 5 IN (NULL, 3) OR b ORDER BY a;
+}
+expect {
+    1
+}
+
+@setup in_null_or
+test in-null-or-falsy {
+    SELECT a FROM t1 WHERE 5 IN (NULL, 3) OR 0;
+}
+expect {
+}
+
+@setup in_null_or
+test not-in-null-or-truthy {
+    SELECT a FROM t1 WHERE 5 NOT IN (NULL, 3) OR b ORDER BY a;
+}
+expect {
+    1
+}
+
+@setup in_null_or
+test in-null-or-column-multiple-rows {
+    SELECT a FROM t1 WHERE 5 IN (NULL, 3) OR a > 1 ORDER BY a;
+}
+expect {
+    2
+    3
+}
+
+@setup in_null_or
+test in-null-or-subquery {
+    SELECT a FROM t1 WHERE 5 IN (NULL, 3) OR (SELECT 1) ORDER BY a;
+}
+expect {
+    1
+    2
+    3
+}
+
+@setup in_null_or
+test in-null-or-with-offset {
+    SELECT a FROM t1 WHERE 5 IN (NULL, 3) OR 1 ORDER BY a LIMIT 10 OFFSET 2;
+}
+expect {
+    3
+}
+
+@setup in_null_or
+test in-match-or-null {
+    SELECT a FROM t1 WHERE 3 IN (NULL, 3) OR b ORDER BY a;
+}
+expect {
+    1
+    2
+    3
+}
+
+@setup in_null_or
+test in-null-column-or {
+    SELECT a FROM t1 WHERE a IN (NULL, 99) OR b ORDER BY a;
+}
+expect {
+    1
+}
+
+setup in_or_indexed {
+    CREATE TABLE t (
+        id INTEGER PRIMARY KEY,
+        a INTEGER,
+        b INTEGER,
+        c INTEGER
+    );
+    CREATE INDEX idx_t_a ON t(a);
+    CREATE INDEX idx_t_b ON t(b);
+    INSERT INTO t VALUES
+        (1, 10, 100, 1),
+        (2, 20, 200, 1),
+        (3, 30, 300, 2),
+        (4, 40, 400, 2),
+        (5, NULL, 500, 3),
+        (6, 60, NULL, 3);
+    CREATE TABLE sa(v INTEGER);
+    CREATE TABLE sb(v INTEGER);
+    INSERT INTO sa VALUES (10), (30), (NULL);
+    INSERT INTO sb VALUES (200), (500), (NULL);
+}
+
+@setup in_or_indexed
+test in-subquery-or-in-subquery-indexed {
+    SELECT id
+    FROM t
+    WHERE a IN (SELECT v FROM sa) OR b IN (SELECT v FROM sb)
+    ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    5
+}
+
+@setup in_or_indexed
+test in-subquery-or-in-list-left-join {
+    CREATE TABLE u(id INTEGER PRIMARY KEY, tag INTEGER);
+    INSERT INTO u VALUES (1, 1), (2, 2), (3, 3);
+    SELECT t.id, coalesce(u.id, -1)
+    FROM t
+    LEFT JOIN u ON t.c = u.tag AND (a IN (SELECT v FROM sa) OR b IN (200, 500))
+    ORDER BY 1, 2;
+}
+expect {
+    1|1
+    2|1
+    3|2
+    4|-1
+    5|3
+    6|-1
+}

@@ -33,15 +33,18 @@ import tech.turso.core.TursoResultSet;
 public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
 
   private final TursoResultSet resultSet;
+  @Nullable private final Statement statement;
   private boolean wasNull = false;
 
   /**
    * Creates a new JDBC4ResultSet.
    *
    * @param resultSet the underlying Turso result set
+   * @param statement the statement that created this result set
    */
-  public JDBC4ResultSet(TursoResultSet resultSet) {
+  public JDBC4ResultSet(TursoResultSet resultSet, @Nullable Statement statement) {
     this.resultSet = resultSet;
+    this.statement = statement;
   }
 
   @Override
@@ -812,9 +815,9 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   }
 
   @Override
-  @SkipNullableCheck
+  @Nullable
   public Statement getStatement() throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return statement;
   }
 
   @Override

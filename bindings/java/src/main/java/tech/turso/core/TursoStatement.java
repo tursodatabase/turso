@@ -14,13 +14,13 @@ import tech.turso.utils.TursoExceptionUtils;
  * objects. All execution method in the <code>TursoStatement</code> implicitly close the current
  * <code>resultSet</code> object of the statement if an open one exists.
  */
-public final class TursoStatement {
+public final class TursoStatement implements AutoCloseable {
 
   private static final Logger log = LoggerFactory.getLogger(TursoStatement.class);
 
   private final String sql;
   private final long statementPointer;
-  private final TursoResultSet resultSet;
+  private TursoResultSet resultSet;
 
   private boolean closed;
 
@@ -215,6 +215,32 @@ public final class TursoStatement {
   private native int bindBlob(long statementPointer, int position, byte[] value)
       throws SQLException;
 
+  public void bindObject(int parameterIndex, Object x) throws SQLException {
+    if (x == null) {
+      this.bindNull(parameterIndex);
+      return;
+    }
+    if (x instanceof Byte) {
+      this.bindInt(parameterIndex, (Byte) x);
+    } else if (x instanceof Short) {
+      this.bindInt(parameterIndex, (Short) x);
+    } else if (x instanceof Integer) {
+      this.bindInt(parameterIndex, (Integer) x);
+    } else if (x instanceof Long) {
+      this.bindLong(parameterIndex, (Long) x);
+    } else if (x instanceof String) {
+      bindText(parameterIndex, (String) x);
+    } else if (x instanceof Float) {
+      bindDouble(parameterIndex, (Float) x);
+    } else if (x instanceof Double) {
+      bindDouble(parameterIndex, (Double) x);
+    } else if (x instanceof byte[]) {
+      bindBlob(parameterIndex, (byte[]) x);
+    } else {
+      throw new SQLException("Unsupported object type in bindObject: " + x.getClass().getName());
+    }
+  }
+
   /**
    * Returns total number of changes.
    *
@@ -246,6 +272,34 @@ public final class TursoStatement {
   }
 
   private native long changes(long statementPointer) throws SQLException;
+
+  /**
+   * Returns the number of parameters in this statement. Parameters are the `?`'s that get replaced
+   * by the provided arguments.
+   *
+   * @throws SQLException If a database access error occurs
+   */
+  public int parameterCount() throws SQLException {
+    final int result = parameterCount(statementPointer);
+    if (result == -1) {
+      throw new SQLException("Exception while retrieving parameter count");
+    }
+
+    return result;
+  }
+
+  private native int parameterCount(long statementPointer) throws SQLException;
+
+  /** Resets this statement so it's ready for re-execution */
+  public void reset() throws SQLException {
+    final int result = reset(statementPointer);
+    if (result == -1) {
+      throw new SQLException("Exception while resetting statement");
+    }
+    this.resultSet = TursoResultSet.of(this);
+  }
+
+  private native int reset(long statementPointer) throws SQLException;
 
   /**
    * Checks if the statement is closed.

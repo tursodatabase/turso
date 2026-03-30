@@ -196,8 +196,8 @@ fn handle_in_key<'a>(
                 bail_parse_error!("Bad json path: {}", path)
             }
         }
-        (_, '"') => {
-            handle_quoted_key(parser_state, key_start, path_components, path_iter, path)?;
+        (idx, '"') => {
+            handle_quoted_key(parser_state, idx, path_components, path_iter, path)?;
         }
         (_, _) => (),
     }
@@ -206,19 +206,22 @@ fn handle_in_key<'a>(
 
 fn handle_quoted_key<'a>(
     parser_state: &mut PPState,
-    key_start: &mut usize,
+    quote_start: usize,
     path_components: &mut Vec<PathElement<'a>>,
     path_iter: &mut std::str::CharIndices,
     path: &'a str,
 ) -> crate::Result<()> {
+    // quote_start is the byte index of the opening '"'
+    // The key content starts after the opening quote (1 byte for '"')
+    let key_content_start = quote_start + 1;
     while let Some((idx, ch)) = path_iter.next() {
         match ch {
             '\\' => {
                 path_iter.next();
             }
             '"' => {
-                if *key_start < idx {
-                    let key = &path[*key_start + 1..idx];
+                if key_content_start <= idx {
+                    let key = &path[key_content_start..idx];
                     path_components.push(PathElement::Key(Cow::Borrowed(key), true));
                     *parser_state = PPState::ExpectDotOrBracket;
                     return Ok(());
@@ -244,7 +247,9 @@ fn handle_array_index(
             *index_state = ArrayIndexState::AfterHash;
         }
         (ArrayIndexState::Start, '0'..='9') => {
-            *index_buffer = ch.1.to_digit(10).unwrap() as i128;
+            *index_buffer = ch.1.to_digit(10).ok_or_else(|| {
+                crate::LimboError::ParseError(format!("failed to parse digit: {ch}", ch = ch.1))
+            })? as i128;
             *index_state = ArrayIndexState::CollectingNumbers;
         }
         (ArrayIndexState::AfterHash, '-') => {
@@ -257,7 +262,9 @@ fn handle_array_index(
         (ArrayIndexState::CollectingNumbers, '0'..='9') => {
             let (new_num, is_max) = collect_num(
                 *index_buffer,
-                ch.1.to_digit(10).unwrap() as i128,
+                ch.1.to_digit(10).ok_or_else(|| {
+                    crate::LimboError::ParseError(format!("failed to parse digit: {ch}", ch = ch.1))
+                })? as i128,
                 *index_buffer < 0,
             );
             if is_max {
@@ -283,7 +290,9 @@ fn handle_negative_index(
 ) -> crate::Result<()> {
     if let Some((_, next_c)) = path_iter.next() {
         if next_c.is_ascii_digit() {
-            *index_buffer = -(next_c.to_digit(10).unwrap() as i128);
+            *index_buffer = -(next_c.to_digit(10).ok_or_else(|| {
+                crate::LimboError::ParseError(format!("failed to parse digit: {next_c}"))
+            })? as i128);
             *index_state = ArrayIndexState::CollectingNumbers;
             Ok(())
         } else {
@@ -494,5 +503,28 @@ mod tests {
     #[test]
     fn test_empty_quoted_key() {
         assert!(json_path(r#"$."""#).is_ok());
+    }
+
+    #[test]
+    fn test_quoted_key_after_multibyte_utf8_chars() {
+        // Regression test for issue #5028
+        // The path contains multi-byte UTF-8 chars before a quoted key.
+        // This should not panic with "byte index is not a char boundary".
+        // '՜' is a 2-byte UTF-8 character (bytes 2-3 in the path).
+        // The important thing is that it doesn't panic - the result
+        // (valid parse or parse error) is less important.
+        let _ = json_path(r#"$.՜O'"R"RE"#);
+
+        // Also test a simpler case where UTF-8 chars appear before a quoted key
+        // $.世界"key" - Chinese characters followed by a quoted key
+        let _ = json_path(r#"$.世界"key""#);
+
+        // Test with a valid quoted key containing UTF-8 chars
+        let path = json_path(r#"$."世界""#).unwrap();
+        assert_eq!(path.elements.len(), 2);
+        assert_eq!(
+            path.elements[1],
+            PathElement::Key(Cow::Borrowed("世界"), true)
+        );
     }
 }

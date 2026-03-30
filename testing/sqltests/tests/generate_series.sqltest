@@ -1,0 +1,43 @@
+@database :memory:
+
+test generate-series-single-arg-default-stop {
+    SELECT count(*), max(value) FROM generate_series(4294967290);
+}
+expect {
+    6|4294967295
+}
+
+test generate-series-single-arg-via-where {
+    SELECT count(*), max(value) FROM generate_series WHERE start = 4294967290;
+}
+expect {
+    6|4294967295
+}
+
+test generate-series-two-args {
+    SELECT * FROM generate_series(1, 5);
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+}
+
+test generate-series-three-args {
+    SELECT * FROM generate_series(1, 10, 3);
+}
+expect {
+    1
+    4
+    7
+    10
+}
+
+test generate-series-explicit-negative-stop {
+    SELECT count(*) FROM generate_series(1, -1);
+}
+expect {
+    0
+}

@@ -1,4 +1,5 @@
 #![allow(unused_variables, dead_code)]
+use crate::turso_assert;
 use crate::{LimboError, Result};
 use aegis::aegis128l::Aegis128L;
 use aegis::aegis128x2::Aegis128X2;
@@ -65,12 +66,12 @@ use turso_macros::{match_ignore_ascii_case, AtomicEnum};
 /// ```
 ///
 /// constants used for the Turso page header in the encrypted dbs.
-const TURSO_HEADER_PREFIX: &[u8] = b"Turso";
+pub const TURSO_HEADER_PREFIX: &[u8] = b"Turso";
+pub const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
 const TURSO_VERSION: u8 = 0x00;
 const VERSION_OFFSET: usize = 5;
 const CIPHER_OFFSET: usize = 6;
 const TURSO_HEADER_SIZE: usize = 16;
-const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
 
 #[derive(Clone)]
 pub enum EncryptionKey {
@@ -319,7 +320,7 @@ define_aegis_cipher!(
     "AEGIS-128X4"
 );
 
-#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq)]
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
 pub enum CipherMode {
     None,
     Aes128Gcm,
@@ -481,7 +482,7 @@ impl std::fmt::Debug for Cipher {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct EncryptionContext {
     cipher_mode: CipherMode,
     cipher: Cipher,
@@ -529,6 +530,22 @@ impl EncryptionContext {
     /// Returns the number of reserved bytes required at the end of each page for encryption metadata.
     pub fn required_reserved_bytes(&self) -> u8 {
         self.cipher_mode.metadata_size() as u8
+    }
+
+    pub fn encrypt_chunk(&self, plaintext: &[u8], aad: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+        self.encrypt_raw_with_ad(plaintext, aad)
+    }
+
+    pub fn decrypt_chunk(&self, ciphertext: &[u8], nonce: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+        self.decrypt_raw_with_ad(ciphertext, nonce, aad)
+    }
+
+    pub fn nonce_size(&self) -> usize {
+        self.cipher_mode.nonce_size()
+    }
+
+    pub fn tag_size(&self) -> usize {
+        self.cipher_mode.tag_size()
     }
 
     /// Creates Turso header for encrypted page 1
@@ -611,7 +628,6 @@ impl EncryptionContext {
 
         #[cfg(debug_assertions)]
         {
-            use crate::turso_assert;
             let reserved_bytes_zeroed = reserved_bytes.iter().all(|&b| b == 0);
             turso_assert!(
                 reserved_bytes_zeroed,
@@ -696,7 +712,7 @@ impl EncryptionContext {
         );
 
         // since this is page 1, this must have header
-        crate::turso_assert!(
+        turso_assert!(
             page.starts_with(SQLITE_HEADER),
             "Page 1 must start with SQLite header"
         );
@@ -706,7 +722,6 @@ impl EncryptionContext {
 
         #[cfg(debug_assertions)]
         {
-            use crate::turso_assert;
             // In debug builds, ensure that the reserved bytes are zeroed out. So even when we are
             // reusing a page from buffer pool, we zero out in debug build so that we can be
             // sure that b tree layer is not writing any data into the reserved space.
@@ -742,7 +757,7 @@ impl EncryptionContext {
         let mut result = Vec::with_capacity(self.page_size);
 
         // 1. copy the header
-        result.extend_from_slice(&new_header);
+        result.append(&mut new_header);
         // 2. copy the encrypted payload
         result.extend_from_slice(&encrypted);
         // 3. now add the nonce
@@ -925,6 +940,8 @@ impl From<CipherError> for LimboError {
 #[cfg(test)]
 #[cfg(feature = "encryption")]
 mod tests {
+    use crate::storage::sqlite3_ondisk::DatabaseHeader;
+
     use super::*;
     use rand::Rng;
     const DEFAULT_ENCRYPTED_PAGE_SIZE: usize = 4096;
@@ -1036,6 +1053,11 @@ mod tests {
 
         let page_data = create_test_page_1();
         let encrypted = ctx.encrypt_page(&page_data, 1).unwrap();
+        assert_ne!(
+            &page_data[0..DatabaseHeader::SIZE],
+            &encrypted[0..DatabaseHeader::SIZE],
+            "Encrypted data should be different from the page data"
+        );
         assert_eq!(encrypted.len(), DEFAULT_ENCRYPTED_PAGE_SIZE);
 
         // check that header is readable directly from disk (not encrypted)
@@ -1099,7 +1121,7 @@ mod tests {
         assert!(ctx.decrypt_page(&corrupted, 1).is_err());
 
         // test with wrong cipher ID
-        let mut wrong_cipher = encrypted.clone();
+        let mut wrong_cipher = encrypted;
         wrong_cipher[6] = 99; // invalid cipher ID
         assert!(ctx.decrypt_page(&wrong_cipher, 1).is_err());
     }
@@ -1114,7 +1136,7 @@ mod tests {
         let encrypted = ctx.encrypt_page(&page_data, 1).unwrap();
 
         // modify a byte in the preserved header portion (bytes 16-100)
-        let mut corrupted_ad = encrypted.clone();
+        let mut corrupted_ad = encrypted;
         corrupted_ad[50] ^= 1; // flip one bit in the associated data portion
 
         // this should fail decryption because associated data doesn't match
@@ -1134,7 +1156,7 @@ mod tests {
         let page_data = create_test_page_1();
         let encrypted = ctx.encrypt_page(&page_data, 1).unwrap();
 
-        let mut corrupted_turso_header = encrypted.clone();
+        let mut corrupted_turso_header = encrypted;
         corrupted_turso_header[7] ^= 1;
 
         let decrypt_result = ctx.decrypt_page(&corrupted_turso_header, 1);

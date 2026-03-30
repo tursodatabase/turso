@@ -1,6 +1,6 @@
-import { registerFileAtWorker, unregisterFileAtWorker } from "@tursodatabase/database-wasm-common"
+import { registerFileAtWorker, unregisterFileAtWorker, ioNotifier } from "@tursodatabase/database-wasm-common"
 import { DatabasePromise } from "@tursodatabase/database-common"
-import { ProtocolIo, run, DatabaseOpts, EncryptionOpts, RunOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult, DatabaseStats, SyncEngineGuards, Runner, runner } from "@tursodatabase/sync-common";
+import { ProtocolIo, run, DatabaseOpts, EncryptionOpts, RunOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult, DatabaseStats, SyncEngineGuards, Runner, runner, RemoteWriter, RemoteWriteStatement } from "@tursodatabase/sync-common";
 import { SyncEngine, SyncEngineProtocolVersion, initThreadPool, MainWorker, Database as NativeDatabase } from "./index-turbopack-hack.js";
 
 let BrowserIO: ProtocolIo = {
@@ -38,19 +38,56 @@ async function init(): Promise<Worker> {
     return MainWorker;
 }
 
+function resolveUrl(url: string | (() => string | null)): string {
+    if (typeof url === "function") {
+        const resolved = url();
+        if (resolved == null) {
+            throw new Error("remoteWritesExperimental requires a non-null URL");
+        }
+        return resolved;
+    }
+    return url;
+}
+
 class Database extends DatabasePromise {
     #runner: Runner;
     #engine: any;
     #io: ProtocolIo;
     #guards: SyncEngineGuards;
     #worker: Worker | null;
+    #remoteWriter: RemoteWriter | null = null;
+    #db: any;
     constructor(opts: DatabaseOpts) {
         if (opts.url == null) {
-            super(new NativeDatabase(opts.path, { tracing: opts.tracing }) as any);
+            const db = new NativeDatabase(opts.path, { tracing: opts.tracing }) as any;
+            super(
+                db,
+                () => ioNotifier.waitForCompletion(),
+            );
+            this.#db = db;
             this.#engine = null;
             return;
         }
 
+        let partialSyncOpts = undefined;
+        if (opts.partialSyncExperimental != null) {
+            switch (opts.partialSyncExperimental.bootstrapStrategy.kind) {
+                case "prefix":
+                    partialSyncOpts = {
+                        bootstrapStrategy: { type: "Prefix", length: opts.partialSyncExperimental.bootstrapStrategy.length },
+                        segmentSize: opts.partialSyncExperimental.segmentSize,
+                        prefetch: opts.partialSyncExperimental.prefetch,
+                    };
+                    break;
+                case "query":
+                    partialSyncOpts = {
+                        bootstrapStrategy: { type: "Query", query: opts.partialSyncExperimental.bootstrapStrategy.query },
+                        segmentSize: opts.partialSyncExperimental.segmentSize,
+                        prefetch: opts.partialSyncExperimental.prefetch,
+                    };
+                    break;
+            }
+        }
         const engine = new SyncEngine({
             path: opts.path,
             clientName: opts.clientName,
@@ -60,6 +97,7 @@ class Database extends DatabasePromise {
             tracing: opts.tracing,
             bootstrapIfEmpty: typeof opts.url != "function" || opts.url() != null,
             remoteEncryption: opts.remoteEncryption?.cipher,
+            partialSyncOpts: partialSyncOpts
         });
 
         let headers: { [K: string]: string } | (() => Promise<{ [K: string]: string }>);
@@ -92,12 +130,23 @@ class Database extends DatabasePromise {
         const memory = db.memory;
         const io = memory ? memoryIO() : BrowserIO;
         const run = runner(runOpts, io, engine);
-        super(engine.db() as unknown as any, () => run.wait());
+        super(db, () => run.wait());
 
+        this.#db = db;
         this.#runner = run;
         this.#engine = engine;
         this.#io = io;
         this.#guards = new SyncEngineGuards();
+
+        // Initialize remote writer if remoteWrites is enabled
+        if (opts.remoteWritesExperimental && opts.url) {
+            const url = resolveUrl(opts.url);
+            this.#remoteWriter = new RemoteWriter({
+                url,
+                authToken: opts.authToken,
+                remoteEncryptionKey: opts.remoteEncryption?.key,
+            });
+        }
     }
     /**
      * connect database and initialize it in case of clean start
@@ -106,6 +155,14 @@ class Database extends DatabasePromise {
         if (this.connected) {
             return;
         } else if (this.#engine == null) {
+            if (!this.memory) {
+                const worker = await init();
+                await Promise.all([
+                    registerFileAtWorker(worker, this.name),
+                    registerFileAtWorker(worker, `${this.name}-wal`)
+                ]);
+                this.#worker = worker;
+            }
             await super.connect();
         } else {
             if (!this.memory) {
@@ -166,10 +223,98 @@ class Database extends DatabasePromise {
         }
         return (await run(this.#runner, this.#engine.stats()));
     }
+
+    /**
+     * Executes the given SQL string.
+     * When remoteWrites is enabled, write statements are sent to the remote server.
+     */
+    override async exec(sql: string) {
+        if (!this.#remoteWriter) return super.exec(sql);
+        const category = this.#db.classifySql(sql);
+
+        if (this.#remoteWriter.isInTransaction) {
+            const { shouldPull } = await this.#remoteWriter.execRemote(sql, category);
+            if (shouldPull) await this.pull();
+            return;
+        }
+
+        if (category === "read") return super.exec(sql);
+
+        const { shouldPull } = await this.#remoteWriter.execRemote(sql, category);
+        if (shouldPull) await this.pull();
+    }
+
+    /**
+     * Prepares a SQL statement for execution.
+     * When remoteWrites is enabled, returns a wrapper that routes writes to remote.
+     */
+    override prepare(sql: string) {
+        const localStmt = super.prepare(sql);
+
+        if (!this.#remoteWriter) {
+            return localStmt;
+        }
+
+        const category = this.#db.classifySql(sql);
+        const isReadonly = category === "read";
+        return new RemoteWriteStatement(
+            localStmt,
+            sql,
+            isReadonly,
+            this.#remoteWriter,
+            () => this.pull(),
+        ) as any;
+    }
+
+    /**
+     * Returns a function that executes the given function in a transaction.
+     * When remoteWrites is enabled, the entire transaction goes to remote.
+     */
+    override transaction(fn: (...any) => Promise<any>) {
+        if (typeof fn !== "function")
+            throw new TypeError("Expected first argument to be a function");
+
+        if (!this.#remoteWriter) {
+            return super.transaction(fn);
+        }
+
+        const db = this;
+        const remoteWriter = this.#remoteWriter;
+        const wrapTxn = (mode: string) => {
+            return async (...bindParameters: any[]) => {
+                await remoteWriter.beginTransaction(mode);
+                try {
+                    const result = await fn(...bindParameters);
+                    await remoteWriter.commitTransaction();
+                    await db.pull();
+                    return result;
+                } catch (err) {
+                    await remoteWriter.rollbackTransaction();
+                    throw err;
+                }
+            };
+        };
+        const properties = {
+            default: { value: wrapTxn("") },
+            deferred: { value: wrapTxn("DEFERRED") },
+            immediate: { value: wrapTxn("IMMEDIATE") },
+            exclusive: { value: wrapTxn("EXCLUSIVE") },
+            database: { value: this, enumerable: true },
+        };
+        Object.defineProperties(properties.default.value, properties);
+        Object.defineProperties(properties.deferred.value, properties);
+        Object.defineProperties(properties.immediate.value, properties);
+        Object.defineProperties(properties.exclusive.value, properties);
+        return properties.default.value;
+    }
+
     /**
      * close the database and relevant files
      */
     async close() {
+        if (this.#remoteWriter) {
+            await this.#remoteWriter.close();
+        }
         if (this.#engine != null) {
             if (this.name != null && this.#worker != null) {
                 await Promise.all([
@@ -188,7 +333,7 @@ class Database extends DatabasePromise {
 
 /**
  * Creates a new database connection asynchronously.
- * 
+ *
  * @param {Object} opts - Options for database behavior.
  * @returns {Promise<Database>} - A promise that resolves to a Database instance.
  */

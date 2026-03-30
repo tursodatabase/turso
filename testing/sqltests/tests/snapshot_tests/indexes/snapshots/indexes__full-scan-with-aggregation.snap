@@ -1,0 +1,17 @@
+---
+source: indexes.sqltest
+expression: |-
+  SELECT component, COUNT(*) as count
+      FROM logs
+      GROUP BY component;
+info:
+  statement_type: SELECT
+  tables:
+  - logs
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN logs
+`--USE SORTER FOR GROUP BY

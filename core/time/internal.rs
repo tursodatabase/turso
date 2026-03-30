@@ -187,7 +187,6 @@ impl Time {
         Self { inner: dt }
     }
 
-    //
     #[allow(clippy::too_many_arguments)]
     pub fn time_date(
         year: i32,
@@ -198,7 +197,7 @@ impl Time {
         seconds: i64,
         nano_secs: i64,
         offset: FixedOffset,
-    ) -> Result<Self> {
+    ) -> Result<Option<Self>> {
         let mut dt: NaiveDateTime = NaiveDate::from_ymd_opt(1, 1, 1)
             .unwrap()
             .and_hms_opt(0, 0, 0)
@@ -206,47 +205,81 @@ impl Time {
 
         match year.cmp(&0) {
             std::cmp::Ordering::Greater => {
-                dt = dt
-                    .checked_add_months(chrono::Months::new((year - 1).unsigned_abs() * 12))
-                    .ok_or(TimeError::CreationError)?
+                let months = match (year - 1).unsigned_abs().checked_mul(12) {
+                    Some(m) => m,
+                    None => return Ok(None),
+                };
+
+                dt = match dt.checked_add_months(chrono::Months::new(months)) {
+                    Some(d) => d,
+                    None => return Ok(None),
+                };
             }
             std::cmp::Ordering::Less => {
-                dt = dt
-                    .checked_sub_months(chrono::Months::new((year - 1).unsigned_abs() * 12))
-                    .ok_or(TimeError::CreationError)?
+                let months = match (year - 1).unsigned_abs().checked_mul(12) {
+                    Some(m) => m,
+                    None => return Ok(None),
+                };
+
+                dt = match dt.checked_sub_months(chrono::Months::new(months)) {
+                    Some(d) => d,
+                    None => return Ok(None),
+                };
             }
             std::cmp::Ordering::Equal => (),
         };
 
         match month.cmp(&0) {
             std::cmp::Ordering::Greater => {
-                dt = dt
-                    .checked_add_months(chrono::Months::new((month - 1).unsigned_abs()))
-                    .ok_or(TimeError::CreationError)?
+                dt = match dt.checked_add_months(chrono::Months::new((month - 1).unsigned_abs())) {
+                    Some(d) => d,
+                    None => return Ok(None),
+                };
             }
             std::cmp::Ordering::Less => {
-                dt = dt
-                    .checked_sub_months(chrono::Months::new((month - 1).unsigned_abs()))
-                    .ok_or(TimeError::CreationError)?
+                dt = match dt.checked_sub_months(chrono::Months::new((month - 1).unsigned_abs())) {
+                    Some(d) => d,
+                    None => return Ok(None),
+                };
             }
             std::cmp::Ordering::Equal => (),
         };
 
-        dt += chrono::Duration::try_days(day - 1).ok_or(TimeError::CreationError)?;
+        if let Some(d) = chrono::Duration::try_days(day - 1) {
+            dt += d;
+        } else {
+            return Ok(None);
+        }
 
-        dt += chrono::Duration::try_hours(hour).ok_or(TimeError::CreationError)?;
-        dt += chrono::Duration::try_minutes(minutes).ok_or(TimeError::CreationError)?;
-        dt += chrono::Duration::try_seconds(seconds).ok_or(TimeError::CreationError)?;
+        if let Some(d) = chrono::Duration::try_hours(hour) {
+            dt += d;
+        } else {
+            return Ok(None);
+        }
+
+        if let Some(d) = chrono::Duration::try_minutes(minutes) {
+            dt += d;
+        } else {
+            return Ok(None);
+        }
+
+        if let Some(d) = chrono::Duration::try_seconds(seconds) {
+            dt += d;
+        } else {
+            return Ok(None);
+        }
 
         dt += chrono::Duration::nanoseconds(nano_secs);
 
-        dt = dt
+        let dt = dt
             .and_local_timezone(offset)
             .single()
-            .ok_or(TimeError::CreationError)?
-            .naive_utc();
+            .map(|d| d.naive_utc());
 
-        Ok(dt.into())
+        match dt {
+            Some(valid_dt) => Ok(Some(valid_dt.into())),
+            None => Ok(None),
+        }
     }
 
     pub fn time_add_date(self, years: i32, months: i32, days: i64) -> Result<Self> {
@@ -327,7 +360,7 @@ impl Time {
         })
     }
 
-    pub fn trunc_field(&self, field: TimeRoundField) -> Result<Self> {
+    pub fn trunc_field(&self, field: TimeRoundField) -> Result<Option<Self>> {
         use TimeRoundField::*;
 
         let year: i32;
@@ -416,14 +449,18 @@ impl Time {
             }
         };
 
-        let mut ret = Self::time_date(year, month, day, hour, minutes, seconds, nano_secs, offset)?;
+        let ret = Self::time_date(year, month, day, hour, minutes, seconds, nano_secs, offset)?;
 
-        // Means we have to adjust for the week
+        let mut ret = match ret {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
         if week != 0 {
             ret = ret.time_add_date(0, 0, ((week - 1) * 7) as i64)?;
         }
 
-        Ok(ret)
+        Ok(Some(ret))
     }
 
     pub fn round_duration(&self, d: Duration) -> Result<Self> {

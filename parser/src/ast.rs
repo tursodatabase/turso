@@ -1,6 +1,9 @@
 pub mod check;
 pub mod fmt;
 
+use std::{num::NonZeroU32, sync::Arc};
+
+use crate::lexer::is_quotable_keyword;
 use strum_macros::{EnumIter, EnumString};
 
 /// `?` or `$` Prepared statement arg placeholder(s)
@@ -182,6 +185,15 @@ pub enum Stmt {
 
     /// `CREATE VIRTUAL TABLE`
     CreateVirtualTable(CreateVirtualTable),
+    /// `CREATE TYPE`
+    CreateType {
+        /// `IF NOT EXISTS`
+        if_not_exists: bool,
+        /// type name
+        type_name: String,
+        /// type body
+        body: CreateTypeBody,
+    },
     /// `DELETE`
     Delete {
         /// CTE
@@ -231,6 +243,13 @@ pub enum Stmt {
         if_exists: bool,
         /// view name
         view_name: QualifiedName,
+    },
+    /// `DROP TYPE`
+    DropType {
+        /// `IF EXISTS`
+        if_exists: bool,
+        /// type name
+        type_name: String,
     },
     /// `INSERT`
     Insert {
@@ -287,10 +306,15 @@ pub enum Stmt {
         // into expression
         into: Option<Box<Expr>>,
     },
+    /// `OPTIMIZE INDEX`: index name
+    Optimize {
+        /// index name (None means optimize all indexes)
+        idx_name: Option<QualifiedName>,
+    },
 }
 
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 /// Internal ID of a table reference.
 ///
@@ -300,6 +324,15 @@ pub enum Stmt {
 ///
 /// FIXME: rename this to TableReferenceId.
 pub struct TableInternalId(usize);
+
+impl TableInternalId {
+    /// used in generated columns to signify "the table that the column belongs to"
+    pub const SELF_TABLE: Self = Self(0);
+
+    pub fn is_self_table(&self) -> bool {
+        self.0 == 0
+    }
+}
 
 impl Default for TableInternalId {
     fn default() -> Self {
@@ -475,7 +508,7 @@ pub enum Expr {
     /// Unary expression
     Unary(UnaryOperator, Box<Expr>),
     /// Parameters
-    Variable(String),
+    Variable(Variable),
     /// Subqueries from e.g. the WHERE clause are planned separately
     /// and their results will be placed in registers or in an ephemeral index
     /// pointed to by this type.
@@ -494,6 +527,46 @@ pub enum Expr {
         /// The type of subquery.
         query_type: SubqueryType,
     },
+    /// `DEFAULT` keyword in INSERT VALUES
+    Default,
+    /// `ARRAY[expr, ...]` array literal
+    Array {
+        /// elements of the array
+        elements: Vec<Box<Expr>>,
+    },
+    /// `expr[index]` subscript/element access
+    Subscript {
+        /// base expression (the array)
+        base: Box<Expr>,
+        /// index expression
+        index: Box<Expr>,
+    },
+}
+
+impl Default for Expr {
+    fn default() -> Self {
+        Self::Literal(Literal::Null)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Variable {
+    pub index: NonZeroU32,
+    pub name: Option<Box<str>>,
+}
+
+impl Variable {
+    pub fn indexed(index: NonZeroU32) -> Self {
+        Self { index, name: None }
+    }
+
+    pub fn named(name: impl Into<Box<str>>, index: NonZeroU32) -> Self {
+        Self {
+            index,
+            name: Some(name.into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -509,7 +582,12 @@ pub enum SubqueryType {
     },
     /// IN subquery; result is stored in an ephemeral index.
     /// Example: x <NOT> IN (SELECT ...)
-    In { cursor_id: usize },
+    In {
+        cursor_id: usize,
+        /// Affinity string used by the IN operator probe and ephemeral materialization.
+        /// Mirrors SQLite's exprINAffinity behavior.
+        affinity_str: Arc<String>,
+    },
 }
 
 impl Expr {
@@ -594,7 +672,7 @@ impl Expr {
 }
 
 /// SQL literal
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Literal {
     /// Number
@@ -607,8 +685,13 @@ pub enum Literal {
     Blob(String),
     /// Keyword
     Keyword(String),
+    #[default]
     /// `NULL`
     Null,
+    /// `TRUE` - SQLite boolean literal (equivalent to 1 but semantically distinct for IS TRUE)
+    True,
+    /// `FALSE` - SQLite boolean literal (equivalent to 0 but semantically distinct for IS FALSE)
+    False,
     /// `CURRENT_DATE`
     CurrentDate,
     /// `CURRENT_TIME`
@@ -681,6 +764,10 @@ pub enum Operator {
     RightShift,
     /// `-`
     Subtract,
+    /// `@>` array contains
+    ArrayContains,
+    /// `&&` array overlap
+    ArrayOverlap,
 }
 
 impl Operator {
@@ -844,6 +931,25 @@ pub enum As {
     As(Name),
     /// no `AS`
     Elided(Name), // FIXME Ids
+    /// Implicit column name from original SQL text (not serialized to SQL).
+    /// Used to preserve the original expression text as the column name
+    /// for unaliased expressions, matching SQLite behavior.
+    ImplicitColumnName(Name),
+}
+
+impl As {
+    /// Returns the inner `Name` regardless of variant.
+    pub fn name(&self) -> &Name {
+        match self {
+            As::As(name) | As::Elided(name) | As::ImplicitColumnName(name) => name,
+        }
+    }
+
+    /// Returns `true` if this is a user-provided alias (`AS foo` or elided `foo`),
+    /// not a system-generated implicit column name.
+    pub fn is_explicit(&self) -> bool {
+        matches!(self, As::As(_) | As::Elided(_))
+    }
 }
 
 /// `JOIN` clause
@@ -927,10 +1033,25 @@ pub struct GroupBy {
 }
 
 /// identifier or string or `CROSS` or `FULL` or `INNER` or `LEFT` or `NATURAL` or `OUTER` or `RIGHT`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Two Names are equal if they refer to the same identifier, regardless of
+/// quoting style (e.g. `ABORT` and `"ABORT"` are the same identifier).
+#[derive(Clone, Debug, Eq)]
 pub struct Name {
     quote: Option<char>,
     value: String,
+}
+
+impl PartialEq for Name {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+
+impl std::hash::Hash for Name {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.value.hash(state);
+    }
 }
 
 #[cfg(feature = "serde")]
@@ -1033,7 +1154,7 @@ impl Name {
         }
         let value = self.value.as_bytes();
         let safe_char = |&c: &u8| c.is_ascii_alphanumeric() || c == b'_';
-        if !value.is_empty() && value.iter().all(safe_char) {
+        if !value.is_empty() && value.iter().all(safe_char) && !is_quotable_keyword(value) {
             self.value.clone()
         } else {
             format!("\"{}\"", self.value.replace("\"", "\"\""))
@@ -1121,6 +1242,44 @@ pub enum AlterTableBody {
     },
     /// `DROP COLUMN`
     DropColumn(Name), // TODO distinction between DROP and DROP COLUMN
+}
+
+/// Operator mapping in a `CREATE TYPE` body
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TypeOperator {
+    /// operator symbol: "+", "-", "*", "/", "<", "=", etc.
+    pub op: String,
+    /// function name to call, or None for naked operators (use base type comparison)
+    pub func_name: Option<String>,
+}
+
+/// A parameter in a `CREATE TYPE` definition, with an optional type annotation.
+/// e.g. `value text` or `maxlen integer` or just `maxlen` (untyped, backward compat).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TypeParam {
+    pub name: String,
+    /// Type annotation. None means untyped (backward compat).
+    pub ty: Option<String>,
+}
+
+/// Body of a `CREATE TYPE` statement
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CreateTypeBody {
+    /// type parameters, e.g. `(value text, maxlen integer)` for varchar
+    pub params: Vec<TypeParam>,
+    /// base storage type: "text", "integer", "real", "blob"
+    pub base: String,
+    /// encode expression (called on write), uses `value` placeholder for input
+    pub encode: Option<Box<Expr>>,
+    /// decode expression (called on read), uses `value` placeholder for input
+    pub decode: Option<Box<Expr>>,
+    /// operator-to-function mappings
+    pub operators: Vec<TypeOperator>,
+    /// default expression for columns of this type
+    pub default: Option<Box<Expr>>,
 }
 
 /// `CREATE TABLE` body
@@ -1215,8 +1374,18 @@ pub enum ColumnConstraint {
         /// expression
         expr: Box<Expr>,
         /// `STORED` / `VIRTUAL`
-        typ: Option<Name>,
+        typ: Option<GeneratedColumnType>,
     },
+}
+
+/// Generated column type
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum GeneratedColumnType {
+    /// `STORED`
+    Stored,
+    /// `VIRTUAL`
+    Virtual,
 }
 
 /// Named table constraint
@@ -1264,18 +1433,49 @@ pub enum TableConstraint {
     },
 }
 
-bitflags::bitflags! {
-    /// `CREATE TABLE` options
-    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-    pub struct TableOptions: u8 {
-        /// None
-        const NONE = 0;
-        /// `WITHOUT ROWID`
-        const WITHOUT_ROWID = 1;
-        /// `STRICT`
-        const STRICT = 2;
+/// `CREATE TABLE` options with preserved original text
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TableOptions {
+    /// Original text for WITHOUT ROWID option (e.g., "WITHOUT ROWID", "without rowid", "WiThOuT rOwId")
+    pub without_rowid_text: Option<String>,
+    /// Original text for STRICT option (e.g., "STRICT", "strict", "StRiCt")
+    pub strict_text: Option<String>,
+}
+
+impl TableOptions {
+    /// Create empty table options
+    pub fn empty() -> Self {
+        Self {
+            without_rowid_text: None,
+            strict_text: None,
+        }
     }
+
+    /// Check if table has WITHOUT ROWID option
+    pub fn contains_without_rowid(&self) -> bool {
+        self.without_rowid_text.is_some()
+    }
+
+    /// Check if table has STRICT option
+    pub fn contains_strict(&self) -> bool {
+        self.strict_text.is_some()
+    }
+
+    /// For backward compatibility with bitflags interface
+    pub fn contains(&self, flag: TableOptionsFlag) -> bool {
+        match flag {
+            TableOptionsFlag::WithoutRowid => self.contains_without_rowid(),
+            TableOptionsFlag::Strict => self.contains_strict(),
+        }
+    }
+}
+
+/// Flags for table options (used for backward compatibility)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TableOptionsFlag {
+    WithoutRowid,
+    Strict,
 }
 
 /// Sort orders
@@ -1458,6 +1658,8 @@ pub enum PragmaName {
     BusyTimeout,
     /// `cache_size` pragma
     CacheSize,
+    /// set the cache spill behavior
+    CacheSpill,
     /// encryption cipher algorithm name for encrypted databases
     #[strum(serialize = "cipher")]
     #[cfg_attr(feature = "serde", serde(rename = "cipher"))]
@@ -1472,10 +1674,19 @@ pub enum PragmaName {
     FreelistCount,
     /// Enable or disable foreign key constraint enforcement
     ForeignKeys,
+    /// List all SQL functions known to the database connection
+    FunctionList,
+    /// Use F_FULLFSYNC instead of fsync on macOS (only supported on macOS)
+    #[cfg(target_vendor = "apple")]
+    Fullfsync,
+    /// Enable or disable CHECK constraint enforcement
+    IgnoreCheckConstraints,
     /// Run integrity check on the database file
     IntegrityCheck,
     /// `journal_mode` pragma
     JournalMode,
+    /// Run a quick integrity check (skips expensive index consistency validation)
+    QuickCheck,
     /// encryption key for encrypted databases, specified as hexadecimal string.
     #[strum(serialize = "hexkey")]
     #[cfg_attr(feature = "serde", serde(rename = "hexkey"))]
@@ -1495,11 +1706,34 @@ pub enum PragmaName {
     QueryOnly,
     /// Returns schema version of the database file.
     SchemaVersion,
+    /// Alias for `require_where` pragma, as an homage to MySQL (https://dev.mysql.com/doc/refman/9.6/en/mysql-tips.html#safe-updates)
+    IAmADummy,
+    /// Reject DELETE/UPDATE without WHERE clause
+    RequireWhere,
     /// Control database synchronization mode (OFF | FULL | NORMAL | EXTRA)
     Synchronous,
+    /// Control where temporary tables and indices are stored (DEFAULT=0, FILE=1, MEMORY=2)
+    TempStore,
+    /// returns information about the columns of an index
+    IndexInfo,
+    /// returns extended information about the columns of an index
+    IndexXinfo,
+    /// returns the list of indexes for a table
+    IndexList,
+    /// returns information about all tables and views
+    TableList,
     /// returns information about the columns of a table
     TableInfo,
-    /// enable capture-changes logic for the connection
+    /// returns extended information about the columns of a table
+    ///
+    /// The only differece from TableInfo is additional "hidden" column whose value signifies
+    /// - a normal column (0)
+    /// - a dynamic or stored generated column (2 or 3)
+    /// - or a hidden column in a virtual table (1)
+    TableXinfo,
+    /// enable capture-changes logic for the connection (stable name)
+    CaptureDataChangesConn,
+    /// enable capture-changes logic for the connection (deprecated alias)
     UnstableCaptureDataChangesConn,
     /// Returns the user version of the database file.
     UserVersion,
@@ -1507,6 +1741,8 @@ pub enum PragmaName {
     WalCheckpoint,
     /// Sets or queries the threshold (in bytes) at which MVCC triggers an automatic checkpoint.
     MvccCheckpointThreshold,
+    /// List all available types (built-in and custom)
+    ListTypes,
 }
 
 /// `CREATE TRIGGER` time
@@ -1581,7 +1817,7 @@ pub enum TriggerCmd {
 }
 
 /// Conflict resolution types
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ResolveType {
     /// `ROLLBACK`
@@ -1657,6 +1893,15 @@ pub struct Type {
     pub name: String, // TODO Validate: Ids+
     /// type size
     pub size: Option<TypeSize>,
+    /// Number of array dimensions: 0 = scalar, 1 = `type[]`, 2 = `type[][]`, etc.
+    pub array_dimensions: u32,
+}
+
+impl Type {
+    /// Returns true when this type has at least one array dimension.
+    pub fn is_array(&self) -> bool {
+        self.array_dimensions > 0
+    }
 }
 
 /// Column type size limit(s)

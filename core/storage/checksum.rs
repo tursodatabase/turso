@@ -5,7 +5,7 @@ const CHECKSUM_PAGE_SIZE: usize = 4096;
 const CHECKSUM_SIZE: usize = 8;
 pub(crate) const CHECKSUM_REQUIRED_RESERVED_BYTES: u8 = CHECKSUM_SIZE as u8;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ChecksumContext {}
 
 impl ChecksumContext {

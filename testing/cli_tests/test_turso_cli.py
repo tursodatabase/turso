@@ -41,6 +41,18 @@ class TursoShell:
         if init_commands and pipe.stdin is not None:
             pipe.stdin.write((init_commands + "\n").encode())
             pipe.stdin.flush()
+            # Consume any output from init_commands using a marker
+            end_marker = "END_OF_INIT"
+            pipe.stdin.write(f"SELECT '{end_marker}';\n".encode())
+            pipe.stdin.flush()
+            output = ""
+            while True:
+                ready, _, _ = select.select([pipe.stdout], [], [], 5.0)
+                if pipe.stdout in ready:
+                    fragment = pipe.stdout.read(PIPE_BUF).decode()
+                    output += fragment
+                    if output.rstrip().endswith(end_marker):
+                        break
         return pipe
 
     def get_test_filepath(self) -> Path:
@@ -108,7 +120,7 @@ class TestTursoShell:
         self.config = ShellConfig(exe_name=exec_name, flags=flags)
         if use_testing_db:
             self.init_test_db()
-            init_commands = ".open testing/testing_clone.db"
+            init_commands = ".open testing/system/testing_clone.db"
         if init_commands is None:
             # Default initialization
             init_commands = """
@@ -157,21 +169,21 @@ INSERT INTO t VALUES (zeroblob(1024 - 1), zeroblob(1024 - 2), zeroblob(1024 - 3)
 
     def init_test_db(self) -> None:
         self.cleanup_test_db()
-        path = os.path.join("testing", "testing_clone.db")
+        path = os.path.join("testing", "system", "testing_clone.db")
         if os.path.exists(path):
             os.remove(path)
         time.sleep(0.2)  # Ensure the file is removed before cloning
-        cmd = "sqlite3 testing/testing.db '.clone testing/testing_clone.db'"
+        cmd = "sqlite3 testing/system/testing.db '.clone testing/system/testing_clone.db'"
         subprocess.run(cmd, shell=True, capture_output=True, text=True)
         time.sleep(0.2)  # Ensure lock releaesd
-        if not os.path.exists("testing/testing_clone.db"):
-            raise RuntimeError("Failed to clone testing.db to testing/testing_clone.db")
+        if not os.path.exists("testing/system/testing_clone.db"):
+            raise RuntimeError("Failed to clone testing.db to testing/system/testing_clone.db")
 
     def cleanup_test_db(self) -> None:
-        path = os.path.join("testing", "testing_clone.db")
+        path = os.path.join("testing", "system", "testing_clone.db")
         if os.path.exists(path):
             os.remove(path)
-        walpath = os.path.join("testing", "testing.db-wal")
+        walpath = os.path.join("testing", "system", "testing_clone.db-wal")
         if os.path.exists(walpath):
             os.remove(walpath)
 

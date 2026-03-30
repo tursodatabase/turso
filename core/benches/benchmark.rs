@@ -1,7 +1,17 @@
+#[cfg(not(feature = "codspeed"))]
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+#[cfg(not(feature = "codspeed"))]
 use pprof::criterion::{Output, PProfProfiler};
+
+#[cfg(feature = "codspeed")]
+use codspeed_criterion_compat::{
+    black_box, criterion_group, criterion_main, BenchmarkId, Criterion,
+};
 use regex::Regex;
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tempfile::TempDir;
 use turso_core::{Database, LimboError, PlatformIO, StepResult};
 
@@ -10,7 +20,7 @@ use turso_core::{Database, LimboError, PlatformIO, StepResult};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn rusqlite_open() -> rusqlite::Connection {
-    let sqlite_conn = rusqlite::Connection::open("../testing/testing.db").unwrap();
+    let sqlite_conn = rusqlite::Connection::open("../testing/system/testing.db").unwrap();
     sqlite_conn
         .pragma_update(None, "locking_mode", "EXCLUSIVE")
         .unwrap();
@@ -52,10 +62,10 @@ fn bench_open(criterion: &mut Criterion) {
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
     let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
 
-    if !std::fs::exists("../testing/schema_5k.db").unwrap() {
+    if !std::fs::exists("../testing/system/schema_5k.db").unwrap() {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io.clone(), "../testing/schema_5k.db", false, false).unwrap();
+        let db = Database::open_file(io, "../testing/system/schema_5k.db").unwrap();
         let conn = db.connect().unwrap();
 
         for i in 0..5000 {
@@ -71,8 +81,7 @@ fn bench_open(criterion: &mut Criterion) {
         b.iter(|| {
             #[allow(clippy::arc_with_non_send_sync)]
             let io = Arc::new(PlatformIO::new().unwrap());
-            let db =
-                Database::open_file(io.clone(), "../testing/schema_5k.db", false, false).unwrap();
+            let db = Database::open_file(io, "../testing/system/schema_5k.db").unwrap();
             let conn = db.connect().unwrap();
             conn.execute("SELECT * FROM table_0").unwrap();
         });
@@ -81,7 +90,7 @@ fn bench_open(criterion: &mut Criterion) {
     if enable_rusqlite {
         group.bench_function(BenchmarkId::new("sqlite_schema", ""), |b| {
             b.iter(|| {
-                let conn = rusqlite::Connection::open("../testing/schema_5k.db").unwrap();
+                let conn = rusqlite::Connection::open("../testing/system/schema_5k.db").unwrap();
                 conn.execute("SELECT * FROM table_0", ()).unwrap();
             });
         });
@@ -95,10 +104,10 @@ fn bench_alter(criterion: &mut Criterion) {
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
     let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
 
-    if !std::fs::exists("../testing/schema_5k.db").unwrap() {
+    if !std::fs::exists("../testing/system/schema_5k.db").unwrap() {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io.clone(), "../testing/schema_5k.db", false, false).unwrap();
+        let db = Database::open_file(io, "../testing/system/schema_5k.db").unwrap();
         let conn = db.connect().unwrap();
 
         for i in 0..5000 {
@@ -113,7 +122,7 @@ fn bench_alter(criterion: &mut Criterion) {
     group.bench_function(BenchmarkId::new("limbo_rename_table", ""), |b| {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io.clone(), "../testing/schema_5k.db", false, false).unwrap();
+        let db = Database::open_file(io, "../testing/system/schema_5k.db").unwrap();
         let conn = db.connect().unwrap();
         b.iter_custom(|iters| {
             (0..iters)
@@ -127,13 +136,13 @@ fn bench_alter(criterion: &mut Criterion) {
                     conn.execute("DROP TABLE y").unwrap();
                     elapsed
                 })
-                .sum()
+                .sum::<Duration>()
         });
     });
 
     if enable_rusqlite {
         group.bench_function(BenchmarkId::new("sqlite_rename_table", ""), |b| {
-            let conn = rusqlite::Connection::open("../testing/schema_5k.db").unwrap();
+            let conn = rusqlite::Connection::open("../testing/system/schema_5k.db").unwrap();
             b.iter_custom(|iters| {
                 (0..iters)
                     .map(|_| {
@@ -146,7 +155,7 @@ fn bench_alter(criterion: &mut Criterion) {
                         conn.execute("DROP TABLE y", ()).unwrap();
                         elapsed
                     })
-                    .sum()
+                    .sum::<Duration>()
             });
         });
     }
@@ -158,7 +167,7 @@ fn bench_alter(criterion: &mut Criterion) {
     group.bench_function(BenchmarkId::new("limbo_rename_column", ""), |b| {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io.clone(), "../testing/schema_5k.db", false, false).unwrap();
+        let db = Database::open_file(io, "../testing/system/schema_5k.db").unwrap();
         let conn = db.connect().unwrap();
         b.iter_custom(|iters| {
             (0..iters)
@@ -172,13 +181,13 @@ fn bench_alter(criterion: &mut Criterion) {
                     conn.execute("DROP TABLE x").unwrap();
                     elapsed
                 })
-                .sum()
+                .sum::<Duration>()
         });
     });
 
     if enable_rusqlite {
         group.bench_function(BenchmarkId::new("sqlite_rename_column", ""), |b| {
-            let conn = rusqlite::Connection::open("../testing/schema_5k.db").unwrap();
+            let conn = rusqlite::Connection::open("../testing/system/schema_5k.db").unwrap();
             b.iter_custom(|iters| {
                 (0..iters)
                     .map(|_| {
@@ -192,7 +201,7 @@ fn bench_alter(criterion: &mut Criterion) {
                         conn.execute("DROP TABLE x", ()).unwrap();
                         elapsed
                     })
-                    .sum()
+                    .sum::<Duration>()
             });
         });
     }
@@ -204,7 +213,7 @@ fn bench_alter(criterion: &mut Criterion) {
     group.bench_function(BenchmarkId::new("limbo_add_column", ""), |b| {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io.clone(), "../testing/schema_5k.db", false, false).unwrap();
+        let db = Database::open_file(io, "../testing/system/schema_5k.db").unwrap();
         let conn = db.connect().unwrap();
         b.iter_custom(|iters| {
             (0..iters)
@@ -218,13 +227,13 @@ fn bench_alter(criterion: &mut Criterion) {
                     conn.execute("DROP TABLE x").unwrap();
                     elapsed
                 })
-                .sum()
+                .sum::<Duration>()
         });
     });
 
     if enable_rusqlite {
         group.bench_function(BenchmarkId::new("sqlite_add_column", ""), |b| {
-            let conn = rusqlite::Connection::open("../testing/schema_5k.db").unwrap();
+            let conn = rusqlite::Connection::open("../testing/system/schema_5k.db").unwrap();
             b.iter_custom(|iters| {
                 (0..iters)
                     .map(|_| {
@@ -237,7 +246,7 @@ fn bench_alter(criterion: &mut Criterion) {
                         conn.execute("DROP TABLE x", ()).unwrap();
                         elapsed
                     })
-                    .sum()
+                    .sum::<Duration>()
             });
         });
     }
@@ -249,7 +258,7 @@ fn bench_alter(criterion: &mut Criterion) {
     group.bench_function(BenchmarkId::new("limbo_drop_column", ""), |b| {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io.clone(), "../testing/schema_5k.db", false, false).unwrap();
+        let db = Database::open_file(io, "../testing/system/schema_5k.db").unwrap();
         let conn = db.connect().unwrap();
         b.iter_custom(|iters| {
             (0..iters)
@@ -263,13 +272,13 @@ fn bench_alter(criterion: &mut Criterion) {
                     conn.execute("DROP TABLE x").unwrap();
                     elapsed
                 })
-                .sum()
+                .sum::<Duration>()
         });
     });
 
     if enable_rusqlite {
         group.bench_function(BenchmarkId::new("sqlite_drop_column", ""), |b| {
-            let conn = rusqlite::Connection::open("../testing/schema_5k.db").unwrap();
+            let conn = rusqlite::Connection::open("../testing/system/schema_5k.db").unwrap();
             b.iter_custom(|iters| {
                 (0..iters)
                     .map(|_| {
@@ -282,7 +291,7 @@ fn bench_alter(criterion: &mut Criterion) {
                         conn.execute("DROP TABLE x", ()).unwrap();
                         elapsed
                     })
-                    .sum()
+                    .sum::<Duration>()
             });
         });
     }
@@ -297,7 +306,7 @@ fn bench_prepare_query(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io.clone(), "../testing/testing.db", false, false).unwrap();
+    let db = Database::open_file(io, "../testing/system/testing.db").unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let queries = [
@@ -339,10 +348,13 @@ fn bench_prepare_query(criterion: &mut Criterion) {
         let query = whitespace_re.replace_all(query, " ").to_string();
         let query = query.as_str();
 
+        let byte_index: usize = query.chars().take(50).map(|c| c.len_utf8()).sum();
+
         let mut group = criterion.benchmark_group(format!("Prepare `{query}`"));
 
         group.bench_with_input(
-            BenchmarkId::new("limbo_parse_query", query),
+            // Limit the size of the benchmark id so that Codspeed does not through errors
+            BenchmarkId::new("limbo_parse_query", &query[..byte_index]),
             query,
             |b, query| {
                 b.iter(|| {
@@ -355,7 +367,7 @@ fn bench_prepare_query(criterion: &mut Criterion) {
             let sqlite_conn = rusqlite_open();
 
             group.bench_with_input(
-                BenchmarkId::new("sqlite_parse_query", query),
+                BenchmarkId::new("sqlite_parse_query", &query[..byte_index]),
                 query,
                 |b, query| {
                     b.iter(|| {
@@ -376,7 +388,7 @@ fn bench_execute_select_rows(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io.clone(), "../testing/testing.db", false, false).unwrap();
+    let db = Database::open_file(io, "../testing/system/testing.db").unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let mut group = criterion.benchmark_group("Execute `SELECT * FROM users LIMIT ?`");
@@ -397,7 +409,7 @@ fn bench_execute_select_rows(criterion: &mut Criterion) {
                                 black_box(stmt.row());
                             }
                             turso_core::StepResult::IO => {
-                                stmt.run_once().unwrap();
+                                db.io.step().unwrap();
                             }
                             turso_core::StepResult::Done => {
                                 break;
@@ -407,7 +419,7 @@ fn bench_execute_select_rows(criterion: &mut Criterion) {
                             }
                         }
                     }
-                    stmt.reset();
+                    stmt.reset().unwrap();
                 });
             },
         );
@@ -444,7 +456,7 @@ fn bench_execute_select_1(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io.clone(), "../testing/testing.db", false, false).unwrap();
+    let db = Database::open_file(io, "../testing/system/testing.db").unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let mut group = criterion.benchmark_group("Execute `SELECT 1`");
@@ -458,7 +470,7 @@ fn bench_execute_select_1(criterion: &mut Criterion) {
                         black_box(stmt.row());
                     }
                     turso_core::StepResult::IO => {
-                        stmt.run_once().unwrap();
+                        db.io.step().unwrap();
                     }
                     turso_core::StepResult::Done => {
                         break;
@@ -468,7 +480,7 @@ fn bench_execute_select_1(criterion: &mut Criterion) {
                     }
                 }
             }
-            stmt.reset();
+            stmt.reset().unwrap();
         });
     });
 
@@ -496,7 +508,7 @@ fn bench_execute_select_count(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io.clone(), "../testing/testing.db", false, false).unwrap();
+    let db = Database::open_file(io, "../testing/system/testing.db").unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let mut group = criterion.benchmark_group("Execute `SELECT count() FROM users`");
@@ -510,7 +522,7 @@ fn bench_execute_select_count(criterion: &mut Criterion) {
                         black_box(stmt.row());
                     }
                     turso_core::StepResult::IO => {
-                        stmt.run_once().unwrap();
+                        db.io.step().unwrap();
                     }
                     turso_core::StepResult::Done => {
                         break;
@@ -520,7 +532,7 @@ fn bench_execute_select_count(criterion: &mut Criterion) {
                     }
                 }
             }
-            stmt.reset();
+            stmt.reset().unwrap();
         });
     });
 
@@ -554,7 +566,7 @@ fn bench_insert_rows(criterion: &mut Criterion) {
 
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io.clone(), db_path.to_str().unwrap(), false, false).unwrap();
+        let db = Database::open_file(io.clone(), db_path.to_str().unwrap()).unwrap();
         let limbo_conn = db.connect().unwrap();
 
         let mut stmt = limbo_conn
@@ -565,7 +577,7 @@ fn bench_insert_rows(criterion: &mut Criterion) {
         loop {
             match stmt.step().unwrap() {
                 turso_core::StepResult::IO => {
-                    stmt.run_once().unwrap();
+                    db.io.step().unwrap();
                 }
                 turso_core::StepResult::Done => {
                     break;
@@ -592,7 +604,7 @@ fn bench_insert_rows(criterion: &mut Criterion) {
                 loop {
                     match stmt.step().unwrap() {
                         turso_core::StepResult::IO => {
-                            stmt.run_once().unwrap();
+                            db.io.step().unwrap();
                         }
                         turso_core::StepResult::Done => {
                             break;
@@ -605,7 +617,7 @@ fn bench_insert_rows(criterion: &mut Criterion) {
                         }
                     }
                 }
-                stmt.reset();
+                stmt.reset().unwrap();
             });
         });
 
@@ -678,10 +690,13 @@ fn bench_limbo(
     let io = Arc::new(PlatformIO::new().unwrap());
     let temp_dir = tempfile::tempdir().unwrap();
     let path = temp_dir.path().join("bench.db");
-    let db = Database::open_file(io.clone(), path.to_str().unwrap(), mvcc, false).unwrap();
+    let db = Database::open_file(io, path.to_str().unwrap()).unwrap();
     let mut connecitons = Vec::new();
     {
         let conn = db.connect().unwrap();
+        if mvcc {
+            conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        }
         conn.execute("CREATE TABLE test (x)").unwrap();
         conn.close().unwrap();
     }
@@ -729,7 +744,7 @@ fn bench_limbo(
                     if mvcc {
                         unreachable!();
                     }
-                    stmt.reset();
+                    stmt.reset().unwrap();
                 }
                 _ => {
                     unreachable!()
@@ -761,9 +776,12 @@ fn bench_limbo_mvcc(
     let io = Arc::new(PlatformIO::new().unwrap());
     let temp_dir = tempfile::tempdir().unwrap();
     let path = temp_dir.path().join("bench.db");
-    let db = Database::open_file(io.clone(), path.to_str().unwrap(), mvcc, false).unwrap();
+    let db = Database::open_file(io, path.to_str().unwrap()).unwrap();
     let mut connecitons = Vec::new();
     let conn0 = db.connect().unwrap();
+    if mvcc {
+        conn0.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    }
     conn0.execute("CREATE TABLE test (x)").unwrap();
 
     let inserts =
@@ -779,13 +797,9 @@ fn bench_limbo_mvcc(
         });
     }
     loop {
-        let mut all_finished = true;
-        for conn in &mut connecitons {
-            if !conn.inserts.is_empty() || conn.current_statement.is_some() {
-                all_finished = false;
-                break;
-            }
-        }
+        let all_finished = connecitons
+            .iter()
+            .all(|conn| conn.inserts.is_empty() && conn.current_statement.is_none());
         for conn in connecitons.iter_mut() {
             if conn.current_statement.is_none() && !conn.inserts.is_empty() {
                 let write = conn.inserts.pop().unwrap();
@@ -797,17 +811,23 @@ fn bench_limbo_mvcc(
                 continue;
             }
             let stmt = conn.current_statement.as_mut().unwrap();
+            let is_commit = stmt.get_sql() == "COMMIT";
             match stmt.step() {
                 // These you be only possible cases in write concurrency.
                 // No rows because insert doesn't return
                 // No interrupt because insert doesn't interrupt
                 // No busy because insert in mvcc should be multi concurrent write
                 Ok(StepResult::Done) => {
-                    // Now do commit
-                    conn.current_statement = Some(conn.conn.prepare("COMMIT").unwrap());
+                    if is_commit {
+                        // COMMIT finished, clear statement to start next transaction
+                        conn.current_statement = None;
+                        conn.current_insert = None;
+                    } else {
+                        // INSERT finished, now do commit
+                        conn.current_statement = Some(conn.conn.prepare("COMMIT").unwrap());
+                    }
                 }
                 Ok(StepResult::IO) => {
-                    stmt.step().unwrap();
                     // let's skip doing I/O here, we want to perform io only after all the statements are stepped
                 }
                 Ok(StepResult::Busy) => {
@@ -816,7 +836,7 @@ fn bench_limbo_mvcc(
                         unreachable!();
                     }
                     println!("resetting statement");
-                    stmt.reset();
+                    stmt.reset().unwrap();
                 }
                 Err(err) => {
                     if let LimboError::SchemaUpdated = err {
@@ -875,9 +895,9 @@ fn generate_batch_insert(start: i64, num: usize) -> String {
 fn bench_concurrent_writes(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("Concurrent writes");
 
-    let num_connections = 10;
-    let num_batch_inserts = 100;
-    let num_inserts_per_batch = 200_usize;
+    let num_connections = 4;
+    let num_batch_inserts = 50;
+    let num_inserts_per_batch = 50_usize;
 
     group.bench_function("limbo_wal_concurrent_writes", |b| {
         b.iter(|| {
@@ -940,7 +960,7 @@ fn bench_insert_randomblob(criterion: &mut Criterion) {
 
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io.clone(), db_path.to_str().unwrap(), false, false).unwrap();
+        let db = Database::open_file(io.clone(), db_path.to_str().unwrap()).unwrap();
         let limbo_conn = db.connect().unwrap();
 
         let mut stmt = limbo_conn.query("CREATE TABLE test(x)").unwrap().unwrap();
@@ -948,7 +968,7 @@ fn bench_insert_randomblob(criterion: &mut Criterion) {
         loop {
             match stmt.step().unwrap() {
                 turso_core::StepResult::IO => {
-                    stmt.run_once().unwrap();
+                    db.io.step().unwrap();
                 }
                 turso_core::StepResult::Done => {
                     break;
@@ -972,7 +992,7 @@ fn bench_insert_randomblob(criterion: &mut Criterion) {
                 loop {
                     match stmt.step().unwrap() {
                         turso_core::StepResult::IO => {
-                            stmt.run_once().unwrap();
+                            db.io.step().unwrap();
                         }
                         turso_core::StepResult::Done => {
                             break;
@@ -985,7 +1005,7 @@ fn bench_insert_randomblob(criterion: &mut Criterion) {
                         }
                     }
                 }
-                stmt.reset();
+                stmt.reset().unwrap();
             });
         });
 
@@ -1008,9 +1028,18 @@ fn bench_insert_randomblob(criterion: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(not(feature = "codspeed"))]
 criterion_group! {
     name = benches;
     config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
     targets = bench_open, bench_alter, bench_prepare_query, bench_execute_select_1, bench_execute_select_rows, bench_execute_select_count, bench_insert_rows, bench_concurrent_writes, bench_insert_randomblob
 }
+
+#[cfg(feature = "codspeed")]
+criterion_group! {
+    name = benches;
+    config = Criterion::default();
+    targets = bench_open, bench_alter, bench_prepare_query, bench_execute_select_1, bench_execute_select_rows, bench_execute_select_count, bench_insert_rows, bench_concurrent_writes, bench_insert_randomblob
+}
+
 criterion_main!(benches);

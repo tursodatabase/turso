@@ -1,17 +1,19 @@
 use super::compiler::{DbspCircuit, DbspCompiler, DeltaSet};
 use super::dbsp::Delta;
 use super::operator::ComputationTracker;
+use crate::numeric::Numeric;
 use crate::schema::{BTreeTable, Schema};
 use crate::storage::btree::CursorTrait;
+use crate::sync::Arc;
+use crate::sync::Mutex;
 use crate::translate::logical::LogicalPlanBuilder;
 use crate::types::{IOResult, Value};
 use crate::util::{extract_view_columns, ViewColumnSchema};
 use crate::{return_if_io, LimboError, Pager, Result, Statement};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
 use turso_parser::ast;
 use turso_parser::{
     ast::{Cmd, Stmt},
@@ -44,6 +46,7 @@ pub enum PopulateState {
 // See: https://github.com/tursodatabase/turso/issues/1552
 unsafe impl Send for PopulateState {}
 unsafe impl Sync for PopulateState {}
+crate::assert::assert_send_sync!(PopulateState);
 
 /// State machine for merge_delta to handle I/O operations
 impl fmt::Debug for PopulateState {
@@ -89,7 +92,7 @@ impl ViewTransactionState {
     /// Create a new transaction state
     pub fn new() -> Self {
         Self {
-            table_deltas: RefCell::new(HashMap::new()),
+            table_deltas: RefCell::new(HashMap::default()),
         }
     }
 
@@ -139,18 +142,23 @@ pub struct AllViewsTxState {
 // See: https://github.com/tursodatabase/turso/issues/1552
 unsafe impl Send for AllViewsTxState {}
 unsafe impl Sync for AllViewsTxState {}
+crate::assert::assert_send_sync!(AllViewsTxState);
 
 impl AllViewsTxState {
     /// Create a new container for view transaction states
     pub fn new() -> Self {
         Self {
-            states: Rc::new(RefCell::new(HashMap::new())),
+            states: Rc::new(RefCell::new(HashMap::default())),
         }
     }
 
     /// Get or create a transaction state for a view
+    #[allow(clippy::arc_with_non_send_sync)]
     pub fn get_or_create(&self, view_name: &str) -> Arc<ViewTransactionState> {
         let mut states = self.states.borrow_mut();
+        // ViewTransactionState uses RefCell (not Sync), but AllViewsTxState is
+        // single-threaded (Rc-based). Arc is used for shared ownership, not
+        // cross-thread sharing.
         states
             .entry(view_name.to_string())
             .or_insert_with(|| Arc::new(ViewTransactionState::new()))
@@ -224,6 +232,7 @@ pub struct IncrementalView {
 // See: https://github.com/tursodatabase/turso/issues/1552
 unsafe impl Send for IncrementalView {}
 unsafe impl Sync for IncrementalView {}
+crate::assert::assert_send_sync!(IncrementalView);
 
 impl IncrementalView {
     /// Try to compile the SELECT statement into a DBSP circuit
@@ -283,6 +292,7 @@ impl IncrementalView {
         select: &ast::Select,
         schema: &Schema,
     ) -> Result<ViewColumnSchema> {
+        crate::util::validate_select_for_unsupported_features(select)?;
         // Use the shared function to extract columns with full table context
         extract_view_columns(select, schema)
     }
@@ -331,9 +341,9 @@ impl IncrementalView {
         let column_schema = extract_view_columns(&select, schema)?;
 
         let mut referenced_tables = Vec::new();
-        let mut table_aliases = HashMap::new();
-        let mut qualified_table_names = HashMap::new();
-        let mut table_conditions = HashMap::new();
+        let mut table_aliases = HashMap::default();
+        let mut qualified_table_names = HashMap::default();
+        let mut table_conditions = HashMap::default();
         Self::extract_all_tables(
             &select,
             schema,
@@ -457,15 +467,15 @@ impl IncrementalView {
         // Skip CTEs - they're not real tables
         if !cte_names.contains(table_name) {
             if let Some(table) = schema.get_btree_table(table_name) {
-                table_map.insert(table_name.to_string(), table.clone());
+                table_map.insert(table_name.to_string(), table);
                 qualified_names.insert(table_name.to_string(), qualified_name);
 
                 // Store the alias mapping if there is an alias
                 if let Some(alias_enum) = alias {
-                    let alias_name = match alias_enum {
-                        ast::As::As(name) | ast::As::Elided(name) => name.as_str(),
-                    };
-                    aliases.insert(alias_name.to_string(), table_name.to_string());
+                    aliases.insert(
+                        alias_enum.name().as_str().to_string(),
+                        table_name.to_string(),
+                    );
                 }
             } else {
                 return Err(LimboError::ParseError(format!(
@@ -547,7 +557,11 @@ impl IncrementalView {
                 );
                 // Only add if there's actually a condition for this table
                 if let Some(condition) = table_specific_condition {
-                    let conditions = table_conditions.get_mut(table_name).unwrap();
+                    let conditions = table_conditions.get_mut(table_name).ok_or_else(|| {
+                        LimboError::InternalError(
+                            "table_conditions should have entry for table_name".to_string(),
+                        )
+                    })?;
                     conditions.push(Some(condition));
                 }
             }
@@ -557,7 +571,11 @@ impl IncrementalView {
             // explicitly, because the same table may appear in many conditions - some of which
             // have filters that would otherwise be applied.
             for table_name in table_map.keys() {
-                let conditions = table_conditions.get_mut(table_name).unwrap();
+                let conditions = table_conditions.get_mut(table_name).ok_or_else(|| {
+                    LimboError::InternalError(
+                        "table_conditions should have entry for table_name".to_string(),
+                    )
+                })?;
                 conditions.push(None);
             }
         }
@@ -575,7 +593,7 @@ impl IncrementalView {
         qualified_names: &mut HashMap<String, String>,
         table_conditions: &mut HashMap<String, Vec<Option<ast::Expr>>>,
     ) -> Result<()> {
-        let mut table_map = HashMap::new();
+        let mut table_map = HashMap::default();
         Self::extract_all_tables_inner(
             select,
             schema,
@@ -583,7 +601,7 @@ impl IncrementalView {
             aliases,
             qualified_names,
             table_conditions,
-            &HashSet::new(),
+            &HashSet::default(),
         )?;
 
         // Convert deduplicated table map to vector
@@ -1125,8 +1143,8 @@ impl IncrementalView {
     /// This method is only for materialized views and will persist data to the btree
     pub fn populate_from_table(
         &mut self,
-        conn: &std::sync::Arc<crate::Connection>,
-        pager: &std::sync::Arc<crate::Pager>,
+        conn: &crate::sync::Arc<crate::Connection>,
+        pager: &crate::sync::Arc<crate::Pager>,
         _btree_cursor: &mut dyn CursorTrait,
     ) -> crate::Result<IOResult<()>> {
         // Assert that this is a materialized view with a root page
@@ -1135,6 +1153,22 @@ impl IncrementalView {
             "populate_from_table should only be called for materialized views with root_page"
         );
 
+        // Mark as nested for the duration of this call to prevent inner queries from
+        // committing the outer transaction's dirty pages. We increment on every entry
+        // and decrement on every exit (including IO yields and errors) so re-entrant
+        // calls keep the counter balanced.
+        conn.start_nested();
+        let result = self.populate_from_table_inner(conn, pager, _btree_cursor);
+        conn.end_nested();
+        result
+    }
+
+    fn populate_from_table_inner(
+        &mut self,
+        conn: &crate::sync::Arc<crate::Connection>,
+        pager: &crate::sync::Arc<crate::Pager>,
+        _btree_cursor: &mut dyn CursorTrait,
+    ) -> crate::Result<IOResult<()>> {
         'outer: loop {
             match std::mem::replace(&mut self.populate_state, PopulateState::Done) {
                 PopulateState::Start => {
@@ -1165,13 +1199,13 @@ impl IncrementalView {
                     }
 
                     let query = queries[current_idx].clone();
-                    // Create a new connection for reading to avoid transaction conflicts
-                    // This allows us to read from tables while the parent transaction is writing the view
-                    // The statement holds a reference to this connection, keeping it alive
-                    let read_conn = conn.db.connect()?;
+                    // Use the parent connection directly for reading.
+                    // We need to use the same connection that has the uncommitted schema changes.
+                    // Creating a new connection would cause schema version mismatch issues because
+                    // the new connection's schema cookie check would fail (database file has old version).
 
-                    // Prepare the statement using the read connection
-                    let stmt = read_conn.prepare(&query)?;
+                    // Prepare the statement using the parent connection
+                    let stmt = conn.prepare(&query)?;
 
                     self.populate_state = PopulateState::ProcessingOneTable {
                         queries,
@@ -1221,7 +1255,11 @@ impl IncrementalView {
                         match stmt.step()? {
                             crate::vdbe::StepResult::Row => {
                                 // Get the row
-                                let row = stmt.row().unwrap();
+                                let row = stmt.row().ok_or_else(|| {
+                                    LimboError::InternalError(
+                                        "row should exist after StepResult::Row".to_string(),
+                                    )
+                                })?;
 
                                 // Extract values from the row
                                 let all_values: Vec<crate::types::Value> =
@@ -1343,7 +1381,7 @@ impl IncrementalView {
         if let Some((idx, _)) = self.referenced_tables[table_idx].get_rowid_alias_column() {
             // The rowid is the value at the rowid alias column index
             let rowid = match all_values.get(idx) {
-                Some(Value::Integer(id)) => *id,
+                Some(Value::Numeric(Numeric::Integer(id))) => *id,
                 _ => return None, // Invalid rowid
             };
             // All values are table columns (no separate rowid was selected)
@@ -1351,7 +1389,7 @@ impl IncrementalView {
         } else {
             // The last value is the explicitly selected rowid
             let rowid = match all_values.last() {
-                Some(Value::Integer(id)) => *id,
+                Some(Value::Numeric(Numeric::Integer(id))) => *id,
                 _ => return None, // Invalid rowid
             };
             // Get all values except the rowid
@@ -1383,158 +1421,185 @@ impl IncrementalView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{BTreeTable, Column as SchemaColumn, Schema, Type};
-    use std::sync::Arc;
+    use crate::schema::{BTreeTable, ColDef, Column as SchemaColumn, Schema, Type};
+    use crate::sync::Arc;
     use turso_parser::ast;
     use turso_parser::parser::Parser;
 
     // Helper function to create a test schema with multiple tables
     fn create_test_schema() -> Schema {
-        let mut schema = Schema::new(false);
+        let mut schema = Schema::new();
 
         // Create customers table
+        let columns = vec![
+            SchemaColumn::new(
+                Some("id".to_string()),
+                "INTEGER".to_string(),
+                None,
+                None,
+                Type::Integer,
+                None,
+                ColDef {
+                    primary_key: true,
+                    rowid_alias: true,
+                    notnull: true,
+                    unique: false,
+                    hidden: false,
+                    notnull_conflict_clause: None,
+                },
+            ),
+            SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+        ];
+        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let customers_table = BTreeTable {
             name: "customers".to_string(),
             root_page: 2,
             primary_key_columns: vec![("id".to_string(), ast::SortOrder::Asc)],
-            columns: vec![
-                SchemaColumn::new(
-                    Some("id".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                    Type::Integer,
-                    None,
-                    true,
-                    true,
-                    true,
-                    false,
-                    false,
-                ),
-                SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
-            ],
+            columns,
             has_rowid: true,
             is_strict: false,
             unique_sets: vec![],
             foreign_keys: vec![],
+            check_constraints: vec![],
+            rowid_alias_conflict_clause: None,
             has_autoincrement: false,
+            has_virtual_columns: false,
+            logical_to_physical_map,
         };
 
         // Create orders table
+        let columns = vec![
+            SchemaColumn::new(
+                Some("id".to_string()),
+                "INTEGER".to_string(),
+                None,
+                None,
+                Type::Integer,
+                None,
+                ColDef {
+                    primary_key: true,
+                    rowid_alias: true,
+                    notnull: true,
+                    unique: false,
+                    hidden: false,
+                    notnull_conflict_clause: None,
+                },
+            ),
+            SchemaColumn::new(
+                Some("customer_id".to_string()),
+                "INTEGER".to_string(),
+                None,
+                None,
+                Type::Integer,
+                None,
+                ColDef::default(),
+            ),
+            SchemaColumn::new_default_integer(
+                Some("total".to_string()),
+                "INTEGER".to_string(),
+                None,
+            ),
+        ];
+        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let orders_table = BTreeTable {
             name: "orders".to_string(),
             root_page: 3,
             primary_key_columns: vec![("id".to_string(), ast::SortOrder::Asc)],
-            columns: vec![
-                SchemaColumn::new(
-                    Some("id".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                    Type::Integer,
-                    None,
-                    true,
-                    true,
-                    true,
-                    false,
-                    false,
-                ),
-                SchemaColumn::new(
-                    Some("customer_id".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                    Type::Integer,
-                    None,
-                    false,
-                    false,
-                    false,
-                    false,
-                    false,
-                ),
-                SchemaColumn::new_default_integer(
-                    Some("total".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                ),
-            ],
+            columns,
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,
             foreign_keys: vec![],
+            check_constraints: vec![],
+            rowid_alias_conflict_clause: None,
             unique_sets: vec![],
+            has_virtual_columns: false,
+            logical_to_physical_map,
         };
 
         // Create products table
+        let columns = vec![
+            SchemaColumn::new(
+                Some("id".to_string()),
+                "INTEGER".to_string(),
+                None,
+                None,
+                Type::Integer,
+                None,
+                ColDef {
+                    primary_key: true,
+                    rowid_alias: true,
+                    notnull: true,
+                    unique: false,
+                    hidden: false,
+                    notnull_conflict_clause: None,
+                },
+            ),
+            SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+            SchemaColumn::new(
+                Some("price".to_string()),
+                "REAL".to_string(),
+                None,
+                None,
+                Type::Real,
+                None,
+                ColDef::default(),
+            ),
+        ];
+        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let products_table = BTreeTable {
             name: "products".to_string(),
             root_page: 4,
             primary_key_columns: vec![("id".to_string(), ast::SortOrder::Asc)],
-            columns: vec![
-                SchemaColumn::new(
-                    Some("id".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                    Type::Integer,
-                    None,
-                    true,
-                    true,
-                    true,
-                    false,
-                    false,
-                ),
-                SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
-                SchemaColumn::new(
-                    Some("price".to_string()),
-                    "REAL".to_string(),
-                    None,
-                    Type::Real,
-                    None,
-                    false,
-                    false,
-                    false,
-                    false,
-                    false,
-                ),
-            ],
+            columns,
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,
             foreign_keys: vec![],
+            check_constraints: vec![],
+            rowid_alias_conflict_clause: None,
             unique_sets: vec![],
+            has_virtual_columns: false,
+            logical_to_physical_map,
         };
 
         // Create logs table - without a rowid alias (no INTEGER PRIMARY KEY)
+        let columns = vec![
+            SchemaColumn::new(
+                Some("message".to_string()),
+                "TEXT".to_string(),
+                None,
+                None,
+                Type::Text,
+                None,
+                ColDef::default(),
+            ),
+            SchemaColumn::new_default_integer(
+                Some("level".to_string()),
+                "INTEGER".to_string(),
+                None,
+            ),
+            SchemaColumn::new_default_integer(
+                Some("timestamp".to_string()),
+                "INTEGER".to_string(),
+                None,
+            ),
+        ];
+        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let logs_table = BTreeTable {
             name: "logs".to_string(),
             root_page: 5,
             primary_key_columns: vec![], // No primary key, so no rowid alias
-            columns: vec![
-                SchemaColumn::new(
-                    Some("message".to_string()),
-                    "TEXT".to_string(),
-                    None,
-                    Type::Text,
-                    None,
-                    false,
-                    false,
-                    false,
-                    false,
-                    false,
-                ),
-                SchemaColumn::new_default_integer(
-                    Some("level".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                ),
-                SchemaColumn::new_default_integer(
-                    Some("timestamp".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                ),
-            ],
+            columns,
             has_rowid: true, // Has implicit rowid but no alias
             is_strict: false,
             has_autoincrement: false,
             foreign_keys: vec![],
+            check_constraints: vec![],
+            rowid_alias_conflict_clause: None,
             unique_sets: vec![],
+            has_virtual_columns: false,
+            logical_to_physical_map,
         };
 
         schema
@@ -1576,9 +1641,9 @@ mod tests {
 
     fn extract_all_tables(select: &ast::Select, schema: &Schema) -> Result<ExtractedTableInfo> {
         let mut referenced_tables = Vec::new();
-        let mut table_aliases = HashMap::new();
-        let mut qualified_table_names = HashMap::new();
-        let mut table_conditions = HashMap::new();
+        let mut table_aliases = HashMap::default();
+        let mut qualified_table_names = HashMap::default();
+        let mut table_conditions = HashMap::default();
         IncrementalView::extract_all_tables(
             select,
             schema,
@@ -2153,7 +2218,7 @@ mod tests {
             select.clone(),
             tables,
             aliases,
-            qualified_names.clone(),
+            qualified_names,
             table_conditions,
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
@@ -2201,7 +2266,7 @@ mod tests {
             select.clone(),
             tables,
             aliases,
-            qualified_names.clone(),
+            qualified_names,
             table_conditions,
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
@@ -2344,7 +2409,7 @@ mod tests {
 
         // We're finding duplicates because "customers" appears twice in the recursive CTE
         // Let's deduplicate
-        let unique_tables: std::collections::HashSet<&str> = table_names.iter().cloned().collect();
+        let unique_tables: HashSet<&str> = table_names.iter().cloned().collect();
         assert_eq!(unique_tables.len(), 2);
         assert!(unique_tables.contains("customers"));
         assert!(unique_tables.contains("orders"));
@@ -2504,7 +2569,7 @@ mod tests {
         // Get the orders table twice (simulating what would happen with CTEs)
         let orders_table = schema.get_btree_table("orders").unwrap();
 
-        let referenced_tables = vec![orders_table.clone(), orders_table.clone()];
+        let referenced_tables = vec![orders_table.clone(), orders_table];
 
         // Create a SELECT that would have conflicting WHERE conditions
         let select = parse_select(
@@ -2515,9 +2580,9 @@ mod tests {
             "test_view".to_string(),
             select.clone(),
             referenced_tables,
-            HashMap::new(),
-            HashMap::new(),
-            HashMap::new(),
+            HashMap::default(),
+            HashMap::default(),
+            HashMap::default(),
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
             1,
@@ -2554,9 +2619,9 @@ mod tests {
 
         // Test table extraction directly without creating a view
         let mut tables = Vec::new();
-        let mut aliases = HashMap::new();
-        let mut qualified_names = HashMap::new();
-        let mut table_conditions = HashMap::new();
+        let mut aliases = HashMap::default();
+        let mut qualified_names = HashMap::default();
+        let mut table_conditions = HashMap::default();
 
         IncrementalView::extract_all_tables(
             &select,

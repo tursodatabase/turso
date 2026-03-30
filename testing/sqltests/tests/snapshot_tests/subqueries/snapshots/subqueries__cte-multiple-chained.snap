@@ -1,0 +1,35 @@
+---
+source: subqueries.sqltest
+expression: |-
+  WITH
+      active_customers AS (
+          SELECT id, name
+          FROM customers
+          WHERE created_at >= '2023-01-01'
+      ),
+      customer_orders AS (
+          SELECT customer_id, count(*) AS order_count, sum(total_amount) AS total_spent
+          FROM orders
+          GROUP BY customer_id
+      )
+      SELECT ac.name, co.order_count, co.total_spent
+      FROM active_customers ac
+      JOIN customer_orders co ON co.customer_id = ac.id
+      WHERE co.order_count > 2;
+info:
+  statement_type: WITH (CTE)
+  tables:
+  - active_customers
+  - co.customer_id
+  - customer_orders
+  - customers
+  - orders
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN customer_orders AS co
+|  `--SCAN orders USING INDEX idx_orders_customer
+`--SEARCH ac USING INDEX ephemeral_subquery_t2 (id=?)
+   `--SCAN customers

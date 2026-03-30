@@ -1,0 +1,467 @@
+---
+title: Scalar Functions
+description: Built-in scalar functions for string manipulation, math, type inspection, and more
+sidebarTitle: Scalar Functions
+---
+
+# Scalar Functions
+
+Scalar functions accept one or more arguments and return a single value. They can be used anywhere an expression is valid: SELECT columns, WHERE conditions, ORDER BY, GROUP BY, HAVING, CHECK constraints, and DEFAULT values.
+
+## Function Reference
+
+### Math Functions
+
+| Function | Description |
+|----------|-------------|
+| `abs(X)` | Absolute value of X. Returns INTEGER if X is INTEGER, REAL if X is REAL, NULL if X is NULL |
+| `max(X, Y, ...)` | Returns the argument with the maximum value |
+| `min(X, Y, ...)` | Returns the argument with the minimum value |
+| `random()` | Returns a random 64-bit signed integer |
+| `round(X)` | Rounds X to the nearest integer |
+| `round(X, Y)` | Rounds X to Y decimal places |
+| `sign(X)` | Returns -1, 0, or 1 for negative, zero, or positive X |
+
+### String Functions
+
+| Function | Description |
+|----------|-------------|
+| `char(X1, X2, ..., XN)` | Returns a string composed of characters with Unicode code points X1 through XN |
+| `concat(X, ...)` | Concatenates all arguments as strings. NULL arguments are skipped |
+| `concat_ws(SEP, X, ...)` | Concatenates arguments with separator SEP. NULL arguments are skipped |
+| `format(FORMAT, ...)` | Returns a formatted string using printf-style format specifiers |
+| `hex(X)` | Returns the uppercase hexadecimal representation of X |
+| `instr(X, Y)` | Returns the 1-based position of the first occurrence of Y in X, or 0 if not found |
+| `length(X)` | Returns the string length in characters, or blob length in bytes |
+| `lower(X)` | Returns a lowercase copy of string X |
+| `ltrim(X)` | Removes leading whitespace from X |
+| `ltrim(X, Y)` | Removes leading characters found in Y from X |
+| `octet_length(X)` | Returns the length of X in bytes |
+| `printf(FORMAT, ...)` | Alias for `format()`. Returns a formatted string |
+| `quote(X)` | Returns the SQL literal representation of X |
+| `replace(X, Y, Z)` | Returns X with every occurrence of Y replaced by Z |
+| `rtrim(X)` | Removes trailing whitespace from X |
+| `rtrim(X, Y)` | Removes trailing characters found in Y from X |
+| `soundex(X)` | Returns the Soundex encoding of string X |
+| `substr(X, Y)` | Returns the substring of X starting at position Y (1-based) |
+| `substr(X, Y, Z)` | Returns Z characters from X starting at position Y |
+| `substring(X, Y)` | Alias for `substr(X, Y)` |
+| `substring(X, Y, Z)` | Alias for `substr(X, Y, Z)` |
+| `trim(X)` | Removes leading and trailing whitespace from X |
+| `trim(X, Y)` | Removes leading and trailing characters found in Y from X |
+| `unhex(X)` | Converts hexadecimal string X to a blob. Returns NULL if X contains non-hex characters |
+| `unhex(X, Y)` | Like `unhex(X)`, but characters in Y are silently ignored in X |
+| `unicode(X)` | Returns the Unicode code point of the first character of string X |
+| `upper(X)` | Returns an uppercase copy of string X |
+| `zeroblob(N)` | Returns a blob consisting of N zero bytes |
+
+### Conditional Functions
+
+| Function | Description |
+|----------|-------------|
+| `coalesce(X, Y, ...)` | Returns the first non-NULL argument. Returns NULL if all arguments are NULL |
+| `ifnull(X, Y)` | Returns X if X is not NULL, otherwise returns Y. Equivalent to `coalesce(X, Y)` |
+| `iif(X, Y, Z)` | Returns Y if X is true (non-zero), otherwise returns Z |
+| `if(X, Y, Z)` | Alias for `iif(X, Y, Z)` |
+| `nullif(X, Y)` | Returns NULL if X equals Y, otherwise returns X |
+
+### Type Functions
+
+| Function | Description |
+|----------|-------------|
+| `typeof(X)` | Returns the type of X as a string: `"null"`, `"integer"`, `"real"`, `"text"`, or `"blob"` |
+
+### Pattern Matching Functions
+
+| Function | Description |
+|----------|-------------|
+| `glob(X, Y)` | Returns 1 if string Y matches glob pattern X, 0 otherwise. Case-sensitive |
+| `like(X, Y)` | Returns 1 if string Y matches LIKE pattern X, 0 otherwise. Case-insensitive for ASCII |
+| `like(X, Y, Z)` | Like `like(X, Y)` but uses Z as the escape character |
+
+### Optimizer Hints
+
+| Function | Description |
+|----------|-------------|
+| `likelihood(X, Y)` | Returns X unchanged. Hints to the query planner that X is true with probability Y (0.0 to 1.0) |
+| `likely(X)` | Returns X unchanged. Equivalent to `likelihood(X, 0.9375)` |
+| `unlikely(X)` | Returns X unchanged. Equivalent to `likelihood(X, 0.0625)` |
+
+### Blob Functions
+
+| Function | Description |
+|----------|-------------|
+| `hex(X)` | Returns the uppercase hexadecimal representation of blob or integer X |
+| `randomblob(N)` | Returns a blob of N bytes filled with pseudo-random data |
+| `unhex(X)` | Converts hexadecimal string X to a blob |
+| `zeroblob(N)` | Returns a blob of N zero bytes |
+
+### System Functions
+
+| Function | Description |
+|----------|-------------|
+| `last_insert_rowid()` | Returns the rowid of the most recent successful INSERT on the same database connection |
+| `changes()` | Returns the number of rows modified by the most recent INSERT, UPDATE, or DELETE |
+| `total_changes()` | Returns the total number of rows modified since the database connection was opened |
+| `sqlite_version()` | Returns the version string `"3.42.0"` |
+| `sqlite_source_id()` | Returns the source identifier string for the SQLite-compatible engine |
+| `load_extension(X)` | Loads a Turso-native extension from the shared library at path X |
+
+## Detailed Descriptions and Examples
+
+### abs(X)
+
+Returns the absolute value of X. The return type matches the input: INTEGER for integer inputs, REAL for floating-point inputs. Returns NULL if X is NULL. Returns INTEGER for a text value that looks like an integer.
+
+```sql
+SELECT abs(-42);       -- 42
+SELECT abs(3.14);      -- 3.14
+SELECT abs(0);         -- 0
+SELECT abs(NULL);      -- NULL
+```
+
+### char(X1, X2, ..., XN)
+
+Returns a string composed of characters having the Unicode code points X1 through XN. Arguments that are not valid code points are replaced with the Unicode replacement character (U+FFFD).
+
+```sql
+SELECT char(72, 101, 108, 108, 111);   -- 'Hello'
+SELECT char(9731);                       -- snowman character
+SELECT hex(char(0));                     -- '00'
+```
+
+### coalesce(X, Y, ...)
+
+Returns the first argument that is not NULL. If all arguments are NULL, returns NULL. Requires at least two arguments.
+
+```sql
+SELECT coalesce(NULL, NULL, 'fallback');   -- 'fallback'
+SELECT coalesce(1, 2, 3);                  -- 1
+SELECT coalesce(NULL, 42);                 -- 42
+```
+
+### concat(X, ...) and concat_ws(SEP, X, ...)
+
+`concat` joins all arguments as strings, skipping NULLs. `concat_ws` inserts the separator between non-NULL arguments.
+
+```sql
+SELECT concat('Hello', ' ', 'World');          -- 'Hello World'
+SELECT concat('a', NULL, 'b');                 -- 'ab'
+SELECT concat_ws(', ', 'Alice', 'Bob', NULL, 'Carol');  -- 'Alice, Bob, Carol'
+SELECT concat_ws('-', 2024, 1, 15);            -- '2024-1-15'
+```
+
+### format(FORMAT, ...) and printf(FORMAT, ...)
+
+Returns a formatted string using printf-style format specifiers. `printf` is an alias for `format`.
+
+| Specifier | Description |
+|-----------|-------------|
+| `%d` | Signed integer |
+| `%f` | Floating-point |
+| `%s` | String |
+| `%x` | Lowercase hexadecimal integer |
+| `%X` | Uppercase hexadecimal integer |
+| `%o` | Octal integer |
+| `%e` | Scientific notation |
+| `%g` | General floating-point (shortest representation) |
+| `%%` | Literal percent sign |
+
+```sql
+SELECT format('Hello, %s! You are #%d.', 'Alice', 1);
+-- 'Hello, Alice! You are #1.'
+
+SELECT printf('%.2f%%', 99.5);
+-- '99.50%'
+
+SELECT format('0x%08X', 255);
+-- '0x000000FF'
+```
+
+### glob(X, Y)
+
+Returns 1 if string Y matches the glob pattern X, and 0 otherwise. Glob matching is case-sensitive and uses `*` for any sequence of characters, `?` for any single character, and `[...]` for character classes.
+
+```sql
+SELECT glob('*.txt', 'readme.txt');   -- 1
+SELECT glob('*.TXT', 'readme.txt');   -- 0 (case-sensitive)
+SELECT glob('H?llo', 'Hello');        -- 1
+```
+
+<Info>
+The `glob(X, Y)` function is the functional form of the `Y GLOB X` operator. Note the reversed argument order compared to the operator syntax.
+</Info>
+
+### hex(X) and unhex(X)
+
+`hex` returns the uppercase hexadecimal representation of its argument. For text, it returns the hex encoding of the UTF-8 bytes. For blobs, it encodes each byte. For integers, it returns the hex of the value.
+
+`unhex` converts a hexadecimal string back to a blob. Returns NULL if the input contains non-hex characters, unless a second argument specifies characters to ignore.
+
+```sql
+SELECT hex('ABC');             -- '414243'
+SELECT hex(255);               -- 'FF'
+SELECT hex(x'CAFE');           -- 'CAFE'
+
+SELECT unhex('48454C4C4F');    -- x'48454C4C4F' (blob for 'HELLO')
+SELECT unhex('48-45-4C', '-'); -- x'48454C' (ignoring dashes)
+SELECT unhex('ZZZZ');          -- NULL (invalid hex)
+```
+
+### iif(X, Y, Z) and if(X, Y, Z)
+
+Returns Y if X is true (non-zero and non-NULL), otherwise returns Z. `if` is an alias for `iif`.
+
+```sql
+SELECT iif(1 > 0, 'yes', 'no');       -- 'yes'
+SELECT iif(NULL, 'yes', 'no');         -- 'no'
+SELECT if(10 > 5, 'big', 'small');     -- 'big'
+```
+
+### instr(X, Y)
+
+Returns the 1-based position of the first occurrence of string Y in string X. Returns 0 if Y is not found in X. If either argument is NULL, returns NULL.
+
+```sql
+SELECT instr('Hello World', 'World');   -- 7
+SELECT instr('Hello World', 'xyz');     -- 0
+SELECT instr('abcabc', 'bc');           -- 2
+```
+
+### length(X) and octet_length(X)
+
+`length` returns the number of characters in a text value, or the number of bytes in a blob value. For NULL, returns NULL. For numeric values, returns the length of the text representation.
+
+`octet_length` always returns the length in bytes, regardless of type.
+
+```sql
+SELECT length('Hello');          -- 5
+SELECT length(x'AABBCC');        -- 3 (bytes for blob)
+SELECT length(12345);            -- 5 (text representation)
+SELECT octet_length('Hello');    -- 5 (ASCII, 1 byte per char)
+```
+
+### like(X, Y) and like(X, Y, Z)
+
+Returns 1 if string Y matches LIKE pattern X, and 0 otherwise. `%` matches any sequence of characters, `_` matches any single character. Matching is case-insensitive for ASCII characters. The optional third argument Z specifies an escape character.
+
+```sql
+SELECT like('%ello%', 'Hello World');     -- 1
+SELECT like('H_llo', 'Hello');            -- 1
+SELECT like('10\%%', '10% discount', '\'); -- 1 (escaped %)
+```
+
+<Info>
+The `like(X, Y)` function is the functional form of the `Y LIKE X` operator. Note the reversed argument order compared to the operator syntax.
+</Info>
+
+### lower(X), upper(X)
+
+`lower` returns a copy of string X with all ASCII characters converted to lowercase. `upper` converts to uppercase.
+
+```sql
+SELECT lower('Hello World');   -- 'hello world'
+SELECT upper('Hello World');   -- 'HELLO WORLD'
+```
+
+### ltrim(X), rtrim(X), trim(X)
+
+These functions remove characters from the ends of a string. Without a second argument, they remove whitespace. With a second argument Y, they remove any characters present in the string Y.
+
+```sql
+-- Whitespace trimming
+SELECT ltrim('   Hello');          -- 'Hello'
+SELECT rtrim('Hello   ');          -- 'Hello'
+SELECT trim('   Hello   ');        -- 'Hello'
+
+-- Character trimming
+SELECT ltrim('xxxHello', 'x');     -- 'Hello'
+SELECT rtrim('Helloyyy', 'y');     -- 'Hello'
+SELECT trim('***Hello***', '*');   -- 'Hello'
+SELECT trim('abcHelloabc', 'abc'); -- 'Hello' (removes any of a, b, or c)
+```
+
+### max(X, Y, ...) and min(X, Y, ...)
+
+The multi-argument forms of `max` and `min` return the largest or smallest argument, respectively. Arguments are compared using the standard SQLite comparison rules. If any argument is NULL, the result is NULL.
+
+```sql
+SELECT max(1, 5, 3);          -- 5
+SELECT min(1, 5, 3);          -- 1
+SELECT max('apple', 'banana'); -- 'banana'
+SELECT min(10, NULL, 3);      -- NULL
+```
+
+<Info>
+The multi-argument `max()` and `min()` are scalar functions. When called with a single argument inside an aggregate query (e.g., `SELECT max(salary) FROM employees`), they act as [aggregate functions](/docs/sql-reference/functions/aggregate).
+</Info>
+
+### nullif(X, Y)
+
+Returns NULL if X equals Y, otherwise returns X. This is useful for converting sentinel values to NULL.
+
+```sql
+SELECT nullif(0, 0);        -- NULL
+SELECT nullif(5, 0);        -- 5
+SELECT nullif('N/A', 'N/A'); -- NULL
+SELECT nullif('hello', '');  -- 'hello'
+```
+
+### quote(X)
+
+Returns the text of an SQL literal that represents the value X. Strings are enclosed in single quotes with escaping. BLOBs are encoded as hex literals. NULL returns the string `'NULL'`. Numbers are returned as-is.
+
+```sql
+SELECT quote('it''s');       -- '''it''s'''
+SELECT quote(42);            -- '42'
+SELECT quote(NULL);          -- 'NULL'
+SELECT quote(x'CAFE');       -- 'X''CAFE'''
+```
+
+### random() and randomblob(N)
+
+`random` returns a pseudo-random 64-bit signed integer. `randomblob` returns a blob of N pseudo-random bytes.
+
+```sql
+SELECT random();           -- e.g., -4520312828827489743
+SELECT hex(randomblob(4)); -- e.g., 'A1B2C3D4' (4 random bytes)
+SELECT abs(random()) % 100; -- random number between 0 and 99
+```
+
+### replace(X, Y, Z)
+
+Returns a copy of string X with every occurrence of string Y replaced by string Z. If Y is empty, X is returned unchanged.
+
+```sql
+SELECT replace('Hello World', 'World', 'Turso');   -- 'Hello Turso'
+SELECT replace('aabbcc', 'bb', 'XX');               -- 'aaXXcc'
+SELECT replace('2024-01-15', '-', '/');              -- '2024/01/15'
+```
+
+### round(X) and round(X, Y)
+
+Rounds X to Y decimal places. If Y is omitted, it defaults to 0. The return type is always REAL.
+
+```sql
+SELECT round(3.7);         -- 4.0
+SELECT round(3.14159, 2);  -- 3.14
+SELECT round(2.5);         -- 3.0
+SELECT round(-2.5);        -- -3.0
+```
+
+### sign(X)
+
+Returns -1 for negative values, 0 for zero, and 1 for positive values. Returns NULL if X is NULL.
+
+```sql
+SELECT sign(-42);    -- -1
+SELECT sign(0);      -- 0
+SELECT sign(3.14);   -- 1
+SELECT sign(NULL);   -- NULL
+```
+
+### substr(X, Y) and substr(X, Y, Z)
+
+Returns a substring of X starting at the Y-th character (1-based). If Z is provided, the substring is at most Z characters long. Negative Y counts from the end of the string. `substring` is an alias.
+
+```sql
+SELECT substr('Hello World', 7);       -- 'World'
+SELECT substr('Hello World', 1, 5);    -- 'Hello'
+SELECT substr('Hello World', -5);      -- 'World'
+SELECT substring('Hello', 2, 3);       -- 'ell'
+```
+
+### typeof(X)
+
+Returns the storage class of X as a lowercase string: `"null"`, `"integer"`, `"real"`, `"text"`, or `"blob"`.
+
+```sql
+SELECT typeof(42);         -- 'integer'
+SELECT typeof(3.14);       -- 'real'
+SELECT typeof('hello');    -- 'text'
+SELECT typeof(NULL);       -- 'null'
+SELECT typeof(x'CAFE');    -- 'blob'
+SELECT typeof(1 + 1.0);   -- 'real'
+```
+
+### unicode(X)
+
+Returns the Unicode code point of the first character of string X. Returns NULL if X is NULL or an empty string.
+
+```sql
+SELECT unicode('A');     -- 65
+SELECT unicode('Hello'); -- 72 (code point of 'H')
+```
+
+### soundex(X)
+
+Returns the Soundex encoding of string X as a four-character code. Soundex encodes a string based on how it sounds in English, which is useful for fuzzy name matching.
+
+```sql
+SELECT soundex('Robert');    -- 'R163'
+SELECT soundex('Rupert');    -- 'R163'
+SELECT soundex('Smith');     -- 'S530'
+SELECT soundex('Smythe');    -- 'S530'
+```
+
+### zeroblob(N)
+
+Returns a blob consisting of N zero bytes (0x00). Useful for pre-allocating blob storage.
+
+```sql
+SELECT length(zeroblob(10));    -- 10
+SELECT hex(zeroblob(4));        -- '00000000'
+```
+
+### last_insert_rowid()
+
+Returns the rowid of the most recent successful INSERT on the current database connection. Returns 0 if no INSERT has been performed.
+
+```sql
+CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO users (name) VALUES ('Alice');
+SELECT last_insert_rowid();  -- 1
+INSERT INTO users (name) VALUES ('Bob');
+SELECT last_insert_rowid();  -- 2
+```
+
+### changes() and total_changes()
+
+`changes` returns the number of rows modified by the most recent INSERT, UPDATE, or DELETE statement. `total_changes` returns the total number of rows modified since the database connection was opened.
+
+```sql
+CREATE TABLE t (x INTEGER);
+INSERT INTO t VALUES (1), (2), (3);
+SELECT changes();        -- 3
+
+DELETE FROM t WHERE x > 1;
+SELECT changes();        -- 2
+SELECT total_changes();  -- 5 (3 inserted + 2 deleted)
+```
+
+### sqlite_version()
+
+Returns the SQLite-compatible version string.
+
+```sql
+SELECT sqlite_version();  -- '3.42.0'
+```
+
+### load_extension(X)
+
+Loads a Turso-native extension from the shared library at path X.
+
+```sql
+SELECT load_extension('./my_extension');
+```
+
+<Info>
+Extension loading must be enabled on the database connection. See the [Extensions documentation](/docs/extensions) for details on building and loading extensions.
+</Info>
+
+## See Also
+
+- [Aggregate Functions](/docs/sql-reference/functions/aggregate) for functions that operate across groups of rows
+- [Expressions](/docs/sql-reference/expressions) for operator syntax, CAST, CASE, and subqueries
+- [Data Types](/docs/sql-reference/data-types) for storage classes and type affinity
+- [SELECT](/docs/sql-reference/statements/select) for using functions in queries

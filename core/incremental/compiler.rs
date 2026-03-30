@@ -15,6 +15,8 @@ use crate::incremental::operator::{
 use crate::schema::Type;
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 // Note: logical module must be made pub(crate) in translate/mod.rs
+use crate::numeric::Numeric;
+use crate::sync::{atomic::Ordering, Arc};
 use crate::translate::logical::{
     BinaryOperator, Column, ColumnInfo, JoinType as LogicalJoinType, LogicalExpr, LogicalPlan,
     LogicalSchema, SchemaRef,
@@ -22,9 +24,8 @@ use crate::translate::logical::{
 use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, Value};
 use crate::Pager;
 use crate::{return_and_restore_if_io, return_if_io, LimboError, Result};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::fmt::{self, Display, Formatter};
-use std::sync::{atomic::Ordering, Arc};
 
 // The state table has 5 columns: operator_id, zset_id, element_id, value, weight
 const OPERATOR_COLUMNS: usize = 5;
@@ -76,12 +77,12 @@ impl WriteRowView {
                                 "Found key {key:?} in storage but could not read record"
                             ))
                         })?;
-                        let values = r.get_values();
+                        let last = r.iter()?.last();
 
                         // Weight is always the last value
-                        let existing_weight = match values.last() {
-                            Some(val) => match val.to_owned() {
-                                Value::Integer(w) => w as isize,
+                        let existing_weight = match last {
+                            Some(val) => match val?.to_owned() {
+                                Value::Numeric(Numeric::Integer(w)) => w as isize,
                                 _ => {
                                     return Err(LimboError::InternalError(format!(
                                         "Invalid weight value in storage for key {key:?}"
@@ -235,14 +236,14 @@ impl DeltaSet {
     /// Create a new empty delta set
     pub fn new() -> Self {
         Self {
-            deltas: HashMap::new(),
+            deltas: HashMap::default(),
         }
     }
 
     /// Create an empty delta set (more semantic for "no changes")
     pub fn empty() -> Self {
         Self {
-            deltas: HashMap::new(),
+            deltas: HashMap::default(),
         }
     }
 
@@ -336,6 +337,7 @@ pub struct DbspNode {
 // See: https://github.com/tursodatabase/turso/issues/1552
 unsafe impl Send for DbspNode {}
 unsafe impl Sync for DbspNode {}
+crate::assert::assert_send_sync!(DbspNode);
 
 impl std::fmt::Debug for DbspNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -407,6 +409,7 @@ pub struct DbspCircuit {
 // See: https://github.com/tursodatabase/turso/issues/1552
 unsafe impl Send for DbspCircuit {}
 unsafe impl Sync for DbspCircuit {}
+crate::assert::assert_send_sync!(DbspCircuit);
 
 impl DbspCircuit {
     /// Create a new empty circuit with initial empty schema
@@ -419,7 +422,7 @@ impl DbspCircuit {
         // Start with an empty schema - will be updated when root is set
         let empty_schema = Arc::new(LogicalSchema::new(vec![]));
         Self {
-            nodes: HashMap::new(),
+            nodes: HashMap::default(),
             next_id: 1, // Start from 1 to reserve 0 for metadata
             root: None,
             output_schema: empty_schema,
@@ -621,7 +624,7 @@ impl DbspCircuit {
                         let row_values = row.values.clone();
                         let build_fn = move |final_weight: isize| -> Vec<Value> {
                             let mut values = row_values.clone();
-                            values.push(Value::Integer(final_weight as i64));
+                            values.push(Value::from_i64(final_weight as i64));
                             values
                         };
 
@@ -886,13 +889,21 @@ impl DbspCompiler {
         // Determine the correct pairing: one column must be from left, one from right
         if first_in_left.is_some() && second_in_right.is_some() {
             // first is from left, second is from right
-            let (left_idx, _) = first_in_left.unwrap();
-            let (right_idx, _) = second_in_right.unwrap();
+            let (left_idx, _) = first_in_left.ok_or_else(|| {
+                LimboError::InternalError("first_in_left should exist".to_string())
+            })?;
+            let (right_idx, _) = second_in_right.ok_or_else(|| {
+                LimboError::InternalError("second_in_right should exist".to_string())
+            })?;
             Ok((first_col.clone(), left_idx, second_col.clone(), right_idx))
         } else if first_in_right.is_some() && second_in_left.is_some() {
             // first is from right, second is from left
-            let (left_idx, _) = second_in_left.unwrap();
-            let (right_idx, _) = first_in_right.unwrap();
+            let (left_idx, _) = second_in_left.ok_or_else(|| {
+                LimboError::InternalError("second_in_left should exist".to_string())
+            })?;
+            let (right_idx, _) = first_in_right.ok_or_else(|| {
+                LimboError::InternalError("first_in_right should exist".to_string())
+            })?;
             Ok((second_col.clone(), left_idx, first_col.clone(), right_idx))
         } else {
             // Provide specific error messages for different failure cases
@@ -997,7 +1008,7 @@ impl DbspCompiler {
                     // Now add the expression as a computed column
                     let temp_column_name = "__temp_filter_expr";
                     let computed_expr = Self::extract_expression_from_predicate(&filter.predicate)?;
-                    projection_exprs.push(computed_expr.clone());
+                    projection_exprs.push(computed_expr);
 
                     // Compile the projection expressions
                     let mut compiled_exprs = Vec::new();
@@ -1025,7 +1036,7 @@ impl DbspCompiler {
                         Box::new(ProjectOperator::from_compiled(
                             compiled_exprs.clone(),
                             aliases.clone(),
-                            input_column_names.clone(),
+                            input_column_names,
                             output_names.clone()
                         )?);
 
@@ -1275,8 +1286,8 @@ impl DbspCompiler {
                     operator_id,
                     group_by_indices.clone(),
                     aggregate_functions.clone(),
-                    input_column_names.clone(),
-                ));
+                    input_column_names,
+                )?);
 
                 let result_node_id = self.circuit.add_node(
                     DbspOperator::Aggregate {
@@ -1421,7 +1432,7 @@ impl DbspCompiler {
                         group_by,
                         vec![], // Empty aggregates indicates plain DISTINCT
                         input_column_names,
-                    ),
+                    )?,
                 );
 
                 // Add the node to the circuit
@@ -1620,12 +1631,12 @@ impl DbspCompiler {
         // For all expressions (simple or complex), use CompiledExpression::compile
         // This handles both trivial cases and complex VDBE compilation
         // We need to set up the necessary context
+        use crate::sync::Arc;
         use crate::{Database, MemoryIO, SymbolTable};
-        use std::sync::Arc;
 
         // Create an internal connection for expression compilation
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", false, false)?;
+        let db = Database::open_file(io, ":memory:")?;
         let internal_conn = db.connect()?;
         internal_conn.set_query_only(true);
         internal_conn.auto_commit.store(false, Ordering::SeqCst);
@@ -1634,7 +1645,7 @@ impl DbspCompiler {
         let temp_syms = SymbolTable::new();
 
         // Get a minimal schema for compilation (we don't need the full schema for expressions)
-        let schema = crate::schema::Schema::new(false);
+        let schema = crate::schema::Schema::new();
 
         // Compile the expression using the existing CompiledExpression::compile
         let compiled = CompiledExpression::compile(
@@ -1671,8 +1682,10 @@ impl DbspCompiler {
             }
             LogicalExpr::Literal(val) => {
                 let lit = match val {
-                    Value::Integer(i) => ast::Literal::Numeric(i.to_string()),
-                    Value::Float(f) => ast::Literal::Numeric(f.to_string()),
+                    Value::Numeric(Numeric::Integer(i)) => ast::Literal::Numeric(i.to_string()),
+                    Value::Numeric(Numeric::Float(f)) => {
+                        ast::Literal::Numeric(f64::from(*f).to_string())
+                    }
                     Value::Text(t) => {
                         // Add quotes for string literals as translate_expr expects them
                         // Also escape any single quotes in the string
@@ -2045,7 +2058,7 @@ impl DbspCompiler {
                         table: None,
                     })),
                     op: BinaryOperator::Equals,
-                    right: Box::new(LogicalExpr::Literal(Value::Integer(1))), // true = 1 in SQL
+                    right: Box::new(LogicalExpr::Literal(Value::from_i64(1))), // true = 1 in SQL
                 })
             }
             _ => Ok(expr.clone()),
@@ -2254,58 +2267,90 @@ mod tests {
     use super::*;
     use crate::incremental::dbsp::Delta;
     use crate::incremental::operator::{FilterOperator, FilterPredicate};
-    use crate::schema::{BTreeTable, Column as SchemaColumn, Schema, Type};
+    use crate::schema::{BTreeTable, ColDef, Column as SchemaColumn, Schema, Type};
     use crate::storage::pager::CreateBTreeFlags;
+    use crate::sync::Arc;
     use crate::translate::logical::{ColumnInfo, LogicalPlanBuilder, LogicalSchema};
     use crate::util::IOExt;
     use crate::{Database, MemoryIO, Pager, IO};
-    use std::sync::Arc;
+    use rustc_hash::FxHashSet as HashSet;
     use turso_parser::ast;
     use turso_parser::parser::Parser;
 
     // Macro to create a test schema with a users table
     macro_rules! test_schema {
         () => {{
-            let mut schema = Schema::new(false);
+            let mut schema = Schema::new();
+            let columns = vec![
+                SchemaColumn::new(
+                    Some("id".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                    None,
+                    Type::Integer,
+                    None,
+                    ColDef {
+                        primary_key: true,
+                        rowid_alias: true,
+                        notnull: true,
+                        ..Default::default()
+                    },
+                ),
+                SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+                SchemaColumn::new_default_integer(
+                    Some("age".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                ),
+            ];
+            let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
             let users_table = BTreeTable {
                 name: "users".to_string(),
                 root_page: 2,
                 primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
-                columns: vec![
-                    SchemaColumn::new(
-                        Some("id".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                        Type::Integer,
-                        None,
-                        true,
-                        true,
-                        true,
-                        false,
-                        false,
-                    ),
-                    SchemaColumn::new_default_text(
-                        Some("name".to_string()),
-                        "TEXT".to_string(),
-                        None,
-                    ),
-                    SchemaColumn::new_default_integer(
-                        Some("age".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                    ),
-                ],
+                columns,
                 has_rowid: true,
                 is_strict: false,
                 has_autoincrement: false,
                 unique_sets: vec![],
                 foreign_keys: vec![],
+                check_constraints: vec![],
+                rowid_alias_conflict_clause: None,
+                has_virtual_columns: false,
+                logical_to_physical_map,
             };
             schema
                 .add_btree_table(Arc::new(users_table))
                 .expect("Test setup: failed to add users table");
 
             // Add products table for join tests
+            let columns = vec![
+                SchemaColumn::new(
+                    Some("product_id".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                    None,
+                    Type::Integer,
+                    None,
+                    ColDef {
+                        primary_key: true,
+                        rowid_alias: true,
+                        notnull: true,
+                        ..Default::default()
+                    },
+                ),
+                SchemaColumn::new_default_text(
+                    Some("product_name".to_string()),
+                    "TEXT".to_string(),
+                    None,
+                ),
+                SchemaColumn::new_default_integer(
+                    Some("price".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                ),
+            ];
+            let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
             let products_table = BTreeTable {
                 name: "products".to_string(),
                 root_page: 3,
@@ -2313,41 +2358,54 @@ mod tests {
                     "product_id".to_string(),
                     turso_parser::ast::SortOrder::Asc,
                 )],
-                columns: vec![
-                    SchemaColumn::new(
-                        Some("product_id".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                        Type::Integer,
-                        None,
-                        true,
-                        true,
-                        true,
-                        false,
-                        false,
-                    ),
-                    SchemaColumn::new_default_text(
-                        Some("product_name".to_string()),
-                        "TEXT".to_string(),
-                        None,
-                    ),
-                    SchemaColumn::new_default_integer(
-                        Some("price".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                    ),
-                ],
+                columns,
                 has_rowid: true,
                 is_strict: false,
                 has_autoincrement: false,
                 unique_sets: vec![],
                 foreign_keys: vec![],
+                check_constraints: vec![],
+                rowid_alias_conflict_clause: None,
+                has_virtual_columns: false,
+                logical_to_physical_map,
             };
             schema
                 .add_btree_table(Arc::new(products_table))
                 .expect("Test setup: failed to add products table");
 
             // Add orders table for join tests
+            let columns = vec![
+                SchemaColumn::new(
+                    Some("order_id".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                    None,
+                    Type::Integer,
+                    None,
+                    ColDef {
+                        primary_key: true,
+                        rowid_alias: true,
+                        notnull: true,
+                        ..Default::default()
+                    },
+                ),
+                SchemaColumn::new_default_integer(
+                    Some("user_id".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                ),
+                SchemaColumn::new_default_integer(
+                    Some("product_id".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                ),
+                SchemaColumn::new_default_integer(
+                    Some("quantity".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                ),
+            ];
+            let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
             let orders_table = BTreeTable {
                 name: "orders".to_string(),
                 root_page: 4,
@@ -2355,183 +2413,181 @@ mod tests {
                     "order_id".to_string(),
                     turso_parser::ast::SortOrder::Asc,
                 )],
-                columns: vec![
-                    SchemaColumn::new(
-                        Some("order_id".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                        Type::Integer,
-                        None,
-                        true,
-                        true,
-                        true,
-                        false,
-                        false,
-                    ),
-                    SchemaColumn::new_default_integer(
-                        Some("user_id".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                    ),
-                    SchemaColumn::new_default_integer(
-                        Some("product_id".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                    ),
-                    SchemaColumn::new_default_integer(
-                        Some("quantity".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                    ),
-                ],
+                columns,
                 has_rowid: true,
                 has_autoincrement: false,
                 is_strict: false,
                 unique_sets: vec![],
                 foreign_keys: vec![],
+                check_constraints: vec![],
+                rowid_alias_conflict_clause: None,
+                has_virtual_columns: false,
+                logical_to_physical_map,
             };
             schema
                 .add_btree_table(Arc::new(orders_table))
                 .expect("Test setup: failed to add orders table");
 
             // Add customers table with id and name for testing column ambiguity
+            let columns = vec![
+                SchemaColumn::new(
+                    Some("id".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                    None,
+                    Type::Integer,
+                    None,
+                    ColDef {
+                        primary_key: true,
+                        rowid_alias: true,
+                        notnull: true,
+                        ..Default::default()
+                    },
+                ),
+                SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+            ];
+            let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
             let customers_table = BTreeTable {
                 name: "customers".to_string(),
                 root_page: 6,
                 primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
-                columns: vec![
-                    SchemaColumn::new(
-                        Some("id".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                        Type::Integer,
-                        None,
-                        true,
-                        true,
-                        true,
-                        false,
-                        false,
-                    ),
-                    SchemaColumn::new_default_text(
-                        Some("name".to_string()),
-                        "TEXT".to_string(),
-                        None,
-                    ),
-                ],
+                columns,
                 has_rowid: true,
                 is_strict: false,
                 has_autoincrement: false,
                 unique_sets: vec![],
                 foreign_keys: vec![],
+                check_constraints: vec![],
+                rowid_alias_conflict_clause: None,
+                has_virtual_columns: false,
+                logical_to_physical_map,
             };
             schema
                 .add_btree_table(Arc::new(customers_table))
                 .expect("Test setup: failed to add customers table");
 
             // Add purchases table (junction table for three-way join)
+            let columns = vec![
+                SchemaColumn::new(
+                    Some("id".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                    None,
+                    Type::Integer,
+                    None,
+                    ColDef {
+                        primary_key: true,
+                        rowid_alias: true,
+                        notnull: true,
+                        ..Default::default()
+                    },
+                ),
+                SchemaColumn::new_default_integer(
+                    Some("customer_id".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                ),
+                SchemaColumn::new_default_integer(
+                    Some("vendor_id".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                ),
+                SchemaColumn::new_default_integer(
+                    Some("quantity".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                ),
+            ];
+            let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
             let purchases_table = BTreeTable {
                 name: "purchases".to_string(),
                 root_page: 7,
                 primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
-                columns: vec![
-                    SchemaColumn::new(
-                        Some("id".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                        Type::Integer,
-                        None,
-                        true,
-                        true,
-                        true,
-                        false,
-                        false,
-                    ),
-                    SchemaColumn::new_default_integer(
-                        Some("customer_id".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                    ),
-                    SchemaColumn::new_default_integer(
-                        Some("vendor_id".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                    ),
-                    SchemaColumn::new_default_integer(
-                        Some("quantity".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                    ),
-                ],
+                columns,
                 has_rowid: true,
                 is_strict: false,
                 has_autoincrement: false,
                 unique_sets: vec![],
                 foreign_keys: vec![],
+                check_constraints: vec![],
+                rowid_alias_conflict_clause: None,
+                has_virtual_columns: false,
+                logical_to_physical_map,
             };
             schema
                 .add_btree_table(Arc::new(purchases_table))
                 .expect("Test setup: failed to add purchases table");
 
             // Add vendors table with id, name, and price (ambiguous columns with customers)
+            let columns = vec![
+                SchemaColumn::new(
+                    Some("id".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                    None,
+                    Type::Integer,
+                    None,
+                    ColDef {
+                        primary_key: true,
+                        rowid_alias: true,
+                        notnull: true,
+                        ..Default::default()
+                    },
+                ),
+                SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+                SchemaColumn::new_default_integer(
+                    Some("price".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                ),
+            ];
+            let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
             let vendors_table = BTreeTable {
                 name: "vendors".to_string(),
                 root_page: 8,
                 primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
-                columns: vec![
-                    SchemaColumn::new(
-                        Some("id".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                        Type::Integer,
-                        None,
-                        true,
-                        true,
-                        true,
-                        false,
-                        false,
-                    ),
-                    SchemaColumn::new_default_text(
-                        Some("name".to_string()),
-                        "TEXT".to_string(),
-                        None,
-                    ),
-                    SchemaColumn::new_default_integer(
-                        Some("price".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                    ),
-                ],
+                columns,
                 has_rowid: true,
                 is_strict: false,
                 has_autoincrement: false,
                 unique_sets: vec![],
                 foreign_keys: vec![],
+                check_constraints: vec![],
+                rowid_alias_conflict_clause: None,
+                has_virtual_columns: false,
+                logical_to_physical_map,
             };
             schema
                 .add_btree_table(Arc::new(vendors_table))
                 .expect("Test setup: failed to add vendors table");
 
+            let columns = vec![
+                SchemaColumn::new_default_integer(
+                    Some("product_id".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                ),
+                SchemaColumn::new_default_integer(
+                    Some("amount".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                ),
+            ];
+            let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
             let sales_table = BTreeTable {
                 name: "sales".to_string(),
                 root_page: 2,
                 primary_key_columns: vec![],
-                columns: vec![
-                    SchemaColumn::new_default_integer(
-                        Some("product_id".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                    ),
-                    SchemaColumn::new_default_integer(
-                        Some("amount".to_string()),
-                        "INTEGER".to_string(),
-                        None,
-                    ),
-                ],
+                columns,
                 has_rowid: true,
                 is_strict: false,
                 has_autoincrement: false,
                 unique_sets: vec![],
                 foreign_keys: vec![],
+                check_constraints: vec![],
+                rowid_alias_conflict_clause: None,
+                has_virtual_columns: false,
+                logical_to_physical_map,
             };
             schema
                 .add_btree_table(Arc::new(sales_table))
@@ -2543,7 +2599,7 @@ mod tests {
 
     fn setup_btree_for_circuit() -> (Arc<Pager>, i64, i64, i64) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
+        let db = Database::open_file(io.clone(), ":memory:").unwrap();
         let conn = db.connect().unwrap();
         let pager = conn.pager.load().clone();
 
@@ -2649,7 +2705,7 @@ mod tests {
                     DbspExpr::BinaryExpr { left, op, right } => {
                         assert!(matches!(op, ast::Operator::Greater));
                         assert!(matches!(&**left, DbspExpr::Column(name) if name == $col));
-                        assert!(matches!(&**right, DbspExpr::Literal(Value::Integer($val))));
+                        assert!(matches!(&**right, DbspExpr::Literal(Value::Numeric(Numeric::Integer($val)))));
                     }
                     _ => panic!("Expected binary expression in filter"),
                 },
@@ -2663,7 +2719,7 @@ mod tests {
                     DbspExpr::BinaryExpr { left, op, right } => {
                         assert!(matches!(op, ast::Operator::Less));
                         assert!(matches!(&**left, DbspExpr::Column(name) if name == $col));
-                        assert!(matches!(&**right, DbspExpr::Literal(Value::Integer($val))));
+                        assert!(matches!(&**right, DbspExpr::Literal(Value::Numeric(Numeric::Integer($val)))));
                     }
                     _ => panic!("Expected binary expression in filter"),
                 },
@@ -2677,7 +2733,7 @@ mod tests {
                     DbspExpr::BinaryExpr { left, op, right } => {
                         assert!(matches!(op, ast::Operator::Equals));
                         assert!(matches!(&**left, DbspExpr::Column(name) if name == $col));
-                        assert!(matches!(&**right, DbspExpr::Literal(Value::Integer($val))));
+                        assert!(matches!(&**right, DbspExpr::Literal(Value::Numeric(Numeric::Integer($val)))));
                     }
                     _ => panic!("Expected binary expression in filter"),
                 },
@@ -2743,20 +2799,25 @@ mod tests {
             let rowid = pager.io.block(|| btree_cursor.rowid()).unwrap().unwrap();
 
             // Get the record at this position
-            let record = pager
-                .io
-                .block(|| btree_cursor.record())
-                .unwrap()
-                .unwrap()
-                .to_owned();
+            let record = loop {
+                match btree_cursor.record().unwrap() {
+                    IOResult::Done(r) => break r,
+                    IOResult::IO(io) => io.wait(&*pager.io).unwrap(),
+                }
+            }
+            .unwrap()
+            .to_owned();
 
-            let values_ref = record.get_values();
-            let num_data_columns = values_ref.len() - 1; // Get length before consuming
-            let values: Vec<Value> = values_ref
-                .into_iter()
-                .take(num_data_columns) // Skip the weight column
-                .map(|x| x.to_owned())
-                .collect();
+            let num_data_columns = record.column_count() - 1;
+
+            let mut values = Vec::with_capacity(num_data_columns);
+            let mut values_iter = record.iter()?;
+
+            for _ in 0..num_data_columns {
+                let value = values_iter.next().expect("we already checked bounds")?;
+                values.push(value.to_owned());
+            }
+
             delta.insert(rowid, values);
             pager.io.block(|| btree_cursor.next()).unwrap();
         }
@@ -2798,22 +2859,22 @@ mod tests {
         input_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
         input_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(17),
+                Value::from_i64(17),
             ],
         );
 
         // Create input map
-        let mut inputs = HashMap::new();
+        let mut inputs = HashMap::default();
         inputs.insert("users".to_string(), input_delta);
 
         let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
@@ -2841,30 +2902,30 @@ mod tests {
         input_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
         input_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(17),
+                Value::from_i64(17),
             ],
         );
         input_delta.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("Charlie".into()),
-                Value::Integer(30),
+                Value::from_i64(30),
             ],
         );
 
         // Create input map
-        let mut inputs = HashMap::new();
+        let mut inputs = HashMap::default();
         inputs.insert("users".to_string(), input_delta);
 
         let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
@@ -2921,22 +2982,22 @@ mod tests {
         input_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
         input_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(17),
+                Value::from_i64(17),
             ],
         );
 
         // Create input map
-        let mut inputs = HashMap::new();
+        let mut inputs = HashMap::default();
         inputs.insert("users".to_string(), input_delta);
 
         let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
@@ -2953,7 +3014,10 @@ mod tests {
                                              // First value should be name (Text)
             assert!(matches!(&row.values[0], Value::Text(_)));
             // Second value should be age (Integer)
-            assert!(matches!(&row.values[1], Value::Integer(_)));
+            assert!(matches!(
+                &row.values[1],
+                Value::Numeric(Numeric::Integer(_))
+            ));
         }
     }
 
@@ -2967,30 +3031,30 @@ mod tests {
         input_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
         input_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
         input_delta.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("Charlie".into()),
-                Value::Integer(30),
+                Value::from_i64(30),
             ],
         );
 
         // Create input map
-        let mut inputs = HashMap::new();
+        let mut inputs = HashMap::default();
         inputs.insert("users".to_string(), input_delta);
 
         let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
@@ -3010,7 +3074,11 @@ mod tests {
             assert_eq!(*weight, 1);
             assert_eq!(row.values.len(), 2); // age, count
 
-            if let (Value::Integer(age), Value::Integer(count)) = (&row.values[0], &row.values[1]) {
+            if let (
+                Value::Numeric(Numeric::Integer(age)),
+                Value::Numeric(Numeric::Integer(count)),
+            ) = (&row.values[0], &row.values[1])
+            {
                 if *age == 25 {
                     assert_eq!(*count, 2, "Age 25 should have count 2");
                     found_25 = true;
@@ -3035,30 +3103,30 @@ mod tests {
         input_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
         input_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Alice".into()),
-                Value::Integer(30),
+                Value::from_i64(30),
             ],
         );
         input_delta.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("Bob".into()),
-                Value::Integer(20),
+                Value::from_i64(20),
             ],
         );
 
         // Create input map
-        let mut inputs = HashMap::new();
+        let mut inputs = HashMap::default();
         inputs.insert("users".to_string(), input_delta);
 
         let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
@@ -3074,7 +3142,9 @@ mod tests {
             assert_eq!(*weight, 1);
             assert_eq!(row.values.len(), 2); // name, sum
 
-            if let (Value::Text(name), Value::Float(sum)) = (&row.values[0], &row.values[1]) {
+            if let (Value::Text(name), Value::Numeric(Numeric::Float(sum))) =
+                (&row.values[0], &row.values[1])
+            {
                 if name.as_str() == "Alice" {
                     assert_eq!(*sum, 55.0, "Alice should have sum 55");
                 } else if name.as_str() == "Bob" {
@@ -3094,30 +3164,30 @@ mod tests {
         input_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
         input_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(30),
+                Value::from_i64(30),
             ],
         );
         input_delta.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("Charlie".into()),
-                Value::Integer(20),
+                Value::from_i64(20),
             ],
         );
 
         // Create input map
-        let mut inputs = HashMap::new();
+        let mut inputs = HashMap::default();
         inputs.insert("users".to_string(), input_delta);
 
         let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
@@ -3139,7 +3209,7 @@ mod tests {
 
         // Check aggregate results
         // COUNT should be Integer
-        if let Value::Integer(count) = &row.values[0] {
+        if let Value::Numeric(Numeric::Integer(count)) = &row.values[0] {
             assert_eq!(*count, 3, "COUNT(*) should be 3");
         } else {
             panic!("COUNT should be Integer, got {:?}", row.values[0]);
@@ -3147,14 +3217,16 @@ mod tests {
 
         // SUM can be Integer (if whole number) or Float
         match &row.values[1] {
-            Value::Integer(sum) => assert_eq!(*sum, 75, "SUM(age) should be 75"),
-            Value::Float(sum) => assert_eq!(*sum, 75.0, "SUM(age) should be 75.0"),
+            Value::Numeric(Numeric::Integer(sum)) => assert_eq!(*sum, 75, "SUM(age) should be 75"),
+            Value::Numeric(Numeric::Float(sum)) => {
+                assert_eq!(f64::from(*sum), 75.0, "SUM(age) should be 75.0")
+            }
             other => panic!("SUM should be Integer or Float, got {other:?}"),
         }
 
         // AVG should be Float
-        if let Value::Float(avg) = &row.values[2] {
-            assert_eq!(*avg, 25.0, "AVG(age) should be 25.0");
+        if let Value::Numeric(Numeric::Float(avg)) = &row.values[2] {
+            assert_eq!(f64::from(*avg), 25.0, "AVG(age) should be 25.0");
         } else {
             panic!("AVG should be Float, got {:?}", row.values[2]);
         }
@@ -3170,22 +3242,22 @@ mod tests {
         input_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
         input_delta.insert(
             2,
             vec![
-                Value::Integer(255),
+                Value::from_i64(255),
                 Value::Text("Bob".into()),
-                Value::Integer(17),
+                Value::from_i64(17),
             ],
         );
 
         // Create input map
-        let mut inputs = HashMap::new();
+        let mut inputs = HashMap::default();
         inputs.insert("users".to_string(), input_delta);
 
         let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
@@ -3238,29 +3310,29 @@ mod tests {
         input_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".to_string().into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
         input_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".to_string().into()),
-                Value::Integer(30),
+                Value::from_i64(30),
             ],
         );
         input_delta.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("Charlie".to_string().into()),
-                Value::Integer(35),
+                Value::from_i64(35),
             ],
         );
 
-        let mut input_data = HashMap::new();
+        let mut input_data = HashMap::default();
         input_data.insert("users".to_string(), input_delta);
 
         let result = test_execute(&mut circuit, input_data.clone(), pager.clone()).unwrap();
@@ -3289,16 +3361,16 @@ mod tests {
         input_delta.insert(
             4,
             vec![
-                Value::Integer(4),
+                Value::from_i64(4),
                 Value::Text("David".to_string().into()),
-                Value::Integer(40),
+                Value::from_i64(40),
             ],
         );
 
-        let mut input_data = HashMap::new();
+        let mut input_data = HashMap::default();
         input_data.insert("users".to_string(), input_delta);
 
-        let result = test_execute(&mut circuit, input_data, pager.clone()).unwrap();
+        let result = test_execute(&mut circuit, input_data, pager).unwrap();
 
         // Expected: new SUM(age + 2) = 96.0 + (40+2) = 138.0
         // HEX(138.0) = hex of "138.0" = "3133382E30"
@@ -3331,29 +3403,29 @@ mod tests {
         input_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".to_string().into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
         input_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".to_string().into()),
-                Value::Integer(30),
+                Value::from_i64(30),
             ],
         );
         input_delta.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("Alice".to_string().into()),
-                Value::Integer(35),
+                Value::from_i64(35),
             ],
         );
 
-        let mut input_data = HashMap::new();
+        let mut input_data = HashMap::default();
         input_data.insert("users".to_string(), input_delta);
 
         let result = test_execute(&mut circuit, input_data.clone(), pager.clone()).unwrap();
@@ -3402,22 +3474,22 @@ mod tests {
         let (mut circuit, pager) = compile_sql!("SELECT * FROM users WHERE age > 18");
 
         // Initialize with some data
-        let mut init_data = HashMap::new();
+        let mut init_data = HashMap::default();
         let mut delta = Delta::new();
         delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
         delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(17),
+                Value::from_i64(17),
             ],
         );
         init_data.insert("users".to_string(), delta);
@@ -3433,24 +3505,24 @@ mod tests {
         assert_eq!(state.changes[0].0.values[1], Value::Text("Alice".into()));
 
         // Create uncommitted changes that would be visible in a transaction
-        let mut uncommitted = HashMap::new();
+        let mut uncommitted = HashMap::default();
         let mut uncommitted_delta = Delta::new();
         // Add Charlie (age 30) - should be visible in transaction
         uncommitted_delta.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("Charlie".into()),
-                Value::Integer(30),
+                Value::from_i64(30),
             ],
         );
         // Add David (age 15) - should NOT be visible (filtered out)
         uncommitted_delta.insert(
             4,
             vec![
-                Value::Integer(4),
+                Value::from_i64(4),
                 Value::Text("David".into()),
-                Value::Integer(15),
+                Value::from_i64(15),
             ],
         );
         uncommitted.insert("users".to_string(), uncommitted_delta);
@@ -3468,14 +3540,14 @@ mod tests {
         );
 
         // Now actually commit Charlie (without uncommitted context)
-        let mut commit_data = HashMap::new();
+        let mut commit_data = HashMap::default();
         let mut commit_delta = Delta::new();
         commit_delta.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("Charlie".into()),
-                Value::Integer(30),
+                Value::from_i64(30),
             ],
         );
         commit_data.insert("users".to_string(), commit_delta);
@@ -3496,7 +3568,7 @@ mod tests {
             .unwrap();
 
         // Now if we execute again with no changes, we should see no delta
-        let empty_result = test_execute(&mut circuit, HashMap::new(), pager.clone()).unwrap();
+        let empty_result = test_execute(&mut circuit, HashMap::default(), pager).unwrap();
         assert_eq!(empty_result.changes.len(), 0, "No changes when no new data");
     }
 
@@ -3506,30 +3578,30 @@ mod tests {
         let (mut circuit, pager) = compile_sql!("SELECT * FROM users WHERE age > 18");
 
         // Initialize with some data
-        let mut init_data = HashMap::new();
+        let mut init_data = HashMap::default();
         let mut delta = Delta::new();
         delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
         delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(30),
+                Value::from_i64(30),
             ],
         );
         delta.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("Charlie".into()),
-                Value::Integer(20),
+                Value::from_i64(20),
             ],
         );
         init_data.insert("users".to_string(), delta);
@@ -3544,14 +3616,14 @@ mod tests {
         assert_eq!(state.changes.len(), 3);
 
         // Create uncommitted delete for Bob
-        let mut uncommitted = HashMap::new();
+        let mut uncommitted = HashMap::default();
         let mut uncommitted_delta = Delta::new();
         uncommitted_delta.delete(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(30),
+                Value::from_i64(30),
             ],
         );
         uncommitted.insert("users".to_string(), uncommitted_delta);
@@ -3575,14 +3647,14 @@ mod tests {
         );
 
         // Now actually commit the delete
-        let mut commit_data = HashMap::new();
+        let mut commit_data = HashMap::default();
         let mut commit_delta = Delta::new();
         commit_delta.delete(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(30),
+                Value::from_i64(30),
             ],
         );
         commit_data.insert("users".to_string(), commit_delta);
@@ -3607,7 +3679,7 @@ mod tests {
         );
 
         // After commit, internal state should have only Alice and Charlie
-        let final_state = get_current_state(pager.clone(), &circuit).unwrap();
+        let final_state = get_current_state(pager, &circuit).unwrap();
         assert_eq!(
             final_state.changes.len(),
             2,
@@ -3636,22 +3708,22 @@ mod tests {
         let (mut circuit, pager) = compile_sql!("SELECT * FROM users WHERE age > 18");
 
         // Initialize with some data
-        let mut init_data = HashMap::new();
+        let mut init_data = HashMap::default();
         let mut delta = Delta::new();
         delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
         delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(17),
+                Value::from_i64(17),
             ],
         ); // Bob is 17, filtered out
         init_data.insert("users".to_string(), delta);
@@ -3664,22 +3736,22 @@ mod tests {
 
         // Create uncommitted update: Bob turns 19 (update from 17 to 19)
         // This is modeled as delete + insert
-        let mut uncommitted = HashMap::new();
+        let mut uncommitted = HashMap::default();
         let mut uncommitted_delta = Delta::new();
         uncommitted_delta.delete(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(17),
+                Value::from_i64(17),
             ],
         );
         uncommitted_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(19),
+                Value::from_i64(19),
             ],
         );
         uncommitted.insert("users".to_string(), uncommitted_delta);
@@ -3697,25 +3769,25 @@ mod tests {
             final_result.changes[0].0.values[1],
             Value::Text("Bob".into())
         );
-        assert_eq!(final_result.changes[0].0.values[2], Value::Integer(19));
+        assert_eq!(final_result.changes[0].0.values[2], Value::from_i64(19));
 
         // Now actually commit the update
-        let mut commit_data = HashMap::new();
+        let mut commit_data = HashMap::default();
         let mut commit_delta = Delta::new();
         commit_delta.delete(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(17),
+                Value::from_i64(17),
             ],
         );
         commit_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(19),
+                Value::from_i64(19),
             ],
         );
         commit_data.insert("users".to_string(), commit_delta);
@@ -3727,7 +3799,7 @@ mod tests {
             .unwrap();
 
         // After committing, Bob should be in the view's state
-        let state = get_current_state(pager.clone(), &circuit).unwrap();
+        let state = get_current_state(pager, &circuit).unwrap();
         let mut consolidated_state = state;
         consolidated_state.consolidate();
 
@@ -3759,22 +3831,22 @@ mod tests {
         let (mut circuit, pager) = compile_sql!("SELECT * FROM users WHERE age > 18");
 
         // Initialize with mixed data
-        let mut init_data = HashMap::new();
+        let mut init_data = HashMap::default();
         let mut delta = Delta::new();
         delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
         delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(15),
+                Value::from_i64(15),
             ],
         ); // Bob doesn't pass filter
         init_data.insert("users".to_string(), delta);
@@ -3786,14 +3858,14 @@ mod tests {
             .unwrap();
 
         // Create uncommitted delete for Bob (who isn't in the view because age=15)
-        let mut uncommitted = HashMap::new();
+        let mut uncommitted = HashMap::default();
         let mut uncommitted_delta = Delta::new();
         uncommitted_delta.delete(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(15),
+                Value::from_i64(15),
             ],
         );
         uncommitted.insert("users".to_string(), uncommitted_delta);
@@ -3809,7 +3881,7 @@ mod tests {
         );
 
         // The view state should still only have Alice
-        let state = get_current_state(pager.clone(), &circuit).unwrap();
+        let state = get_current_state(pager, &circuit).unwrap();
         assert_eq!(state.changes.len(), 1, "View still has only Alice");
         assert_eq!(state.changes[0].0.values[1], Value::Text("Alice".into()));
     }
@@ -3820,22 +3892,22 @@ mod tests {
         let (mut circuit, pager) = compile_sql!("SELECT * FROM users WHERE age > 18");
 
         // Initialize with some data
-        let mut init_data = HashMap::new();
+        let mut init_data = HashMap::default();
         let mut delta = Delta::new();
         delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
         delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(30),
+                Value::from_i64(30),
             ],
         );
         init_data.insert("users".to_string(), delta);
@@ -3855,50 +3927,50 @@ mod tests {
         // - Update Bob's age to 35
         // - Insert Charlie (age 40)
         // - Insert David (age 16, filtered out)
-        let mut uncommitted = HashMap::new();
+        let mut uncommitted = HashMap::default();
         let mut uncommitted_delta = Delta::new();
         // Delete Alice
         uncommitted_delta.delete(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
         // Update Bob (delete + insert)
         uncommitted_delta.delete(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(30),
+                Value::from_i64(30),
             ],
         );
         uncommitted_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(35),
+                Value::from_i64(35),
             ],
         );
         // Insert Charlie
         uncommitted_delta.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("Charlie".into()),
-                Value::Integer(40),
+                Value::from_i64(40),
             ],
         );
         // Insert David (will be filtered)
         uncommitted_delta.insert(
             4,
             vec![
-                Value::Integer(4),
+                Value::from_i64(4),
                 Value::Text("David".into()),
-                Value::Integer(16),
+                Value::from_i64(16),
             ],
         );
         uncommitted.insert("users".to_string(), uncommitted_delta);
@@ -3918,46 +3990,46 @@ mod tests {
         assert_eq!(state_after.changes.len(), 2, "Still has Alice and Bob");
 
         // Commit all changes
-        let mut commit_data = HashMap::new();
+        let mut commit_data = HashMap::default();
         let mut commit_delta = Delta::new();
         commit_delta.delete(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
         commit_delta.delete(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(30),
+                Value::from_i64(30),
             ],
         );
         commit_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(35),
+                Value::from_i64(35),
             ],
         );
         commit_delta.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("Charlie".into()),
-                Value::Integer(40),
+                Value::from_i64(40),
             ],
         );
         commit_delta.insert(
             4,
             vec![
-                Value::Integer(4),
+                Value::from_i64(4),
                 Value::Text("David".into()),
-                Value::Integer(16),
+                Value::from_i64(16),
             ],
         );
         commit_data.insert("users".to_string(), commit_delta);
@@ -3975,7 +4047,7 @@ mod tests {
             .unwrap();
 
         // After all commits, execute with no changes should return empty delta
-        let empty_result = test_execute(&mut circuit, HashMap::new(), pager.clone()).unwrap();
+        let empty_result = test_execute(&mut circuit, HashMap::default(), pager).unwrap();
         assert_eq!(empty_result.changes.len(), 0, "No changes when no new data");
     }
 
@@ -3991,12 +4063,12 @@ mod tests {
         let (mut circuit, pager) = compile_sql!("SELECT product_id, SUM(amount) as total, COUNT(*) as cnt FROM sales GROUP BY product_id");
 
         // Initialize with base data: (1, 100), (1, 200), (2, 150), (2, 250)
-        let mut init_data = HashMap::new();
+        let mut init_data = HashMap::default();
         let mut delta = Delta::new();
-        delta.insert(1, vec![Value::Integer(1), Value::Integer(100)]);
-        delta.insert(2, vec![Value::Integer(1), Value::Integer(200)]);
-        delta.insert(3, vec![Value::Integer(2), Value::Integer(150)]);
-        delta.insert(4, vec![Value::Integer(2), Value::Integer(250)]);
+        delta.insert(1, vec![Value::from_i64(1), Value::from_i64(100)]);
+        delta.insert(2, vec![Value::from_i64(1), Value::from_i64(200)]);
+        delta.insert(3, vec![Value::from_i64(2), Value::from_i64(150)]);
+        delta.insert(4, vec![Value::from_i64(2), Value::from_i64(250)]);
         init_data.insert("sales".to_string(), delta);
 
         let _ = test_execute(&mut circuit, init_data.clone(), pager.clone()).unwrap();
@@ -4016,18 +4088,18 @@ mod tests {
             .map(|(row, _)| {
                 // SUM might return Integer or Float, COUNT returns Integer
                 let product_id = match &row.values[0] {
-                    Value::Integer(id) => *id,
+                    Value::Numeric(Numeric::Integer(id)) => *id,
                     _ => panic!("Product ID should be Integer, got {:?}", row.values[0]),
                 };
 
                 let total = match &row.values[1] {
-                    Value::Integer(t) => *t,
-                    Value::Float(t) => *t as i64,
+                    Value::Numeric(Numeric::Integer(t)) => *t,
+                    Value::Numeric(Numeric::Float(t)) => f64::from(*t) as i64,
                     _ => panic!("Total should be numeric, got {:?}", row.values[1]),
                 };
 
                 let count = match &row.values[2] {
-                    Value::Integer(c) => *c,
+                    Value::Numeric(Numeric::Integer(c)) => *c,
                     _ => panic!("Count should be Integer, got {:?}", row.values[2]),
                 };
 
@@ -4047,10 +4119,10 @@ mod tests {
         );
 
         // Create uncommitted changes: INSERT (1, 50), (3, 300)
-        let mut uncommitted = HashMap::new();
+        let mut uncommitted = HashMap::default();
         let mut uncommitted_delta = Delta::new();
-        uncommitted_delta.insert(5, vec![Value::Integer(1), Value::Integer(50)]); // Add to product 1
-        uncommitted_delta.insert(6, vec![Value::Integer(3), Value::Integer(300)]); // New product 3
+        uncommitted_delta.insert(5, vec![Value::from_i64(1), Value::from_i64(50)]); // Add to product 1
+        uncommitted_delta.insert(6, vec![Value::from_i64(3), Value::from_i64(300)]); // New product 3
         uncommitted.insert("sales".to_string(), uncommitted_delta);
 
         // Execute with uncommitted data - simulating a read within transaction
@@ -4079,18 +4151,18 @@ mod tests {
             .iter()
             .map(|(row, _)| {
                 let product_id = match &row.values[0] {
-                    Value::Integer(id) => *id,
+                    Value::Numeric(Numeric::Integer(id)) => *id,
                     _ => panic!("Product ID should be Integer"),
                 };
 
                 let total = match &row.values[1] {
-                    Value::Integer(t) => *t,
-                    Value::Float(t) => *t as i64,
+                    Value::Numeric(Numeric::Integer(t)) => *t,
+                    Value::Numeric(Numeric::Float(t)) => f64::from(*t) as i64,
                     _ => panic!("Total should be numeric"),
                 };
 
                 let count = match &row.values[2] {
-                    Value::Integer(c) => *c,
+                    Value::Numeric(Numeric::Integer(c)) => *c,
                     _ => panic!("Count should be Integer"),
                 };
 
@@ -4114,10 +4186,10 @@ mod tests {
         );
 
         // Now actually commit the changes
-        let mut commit_data = HashMap::new();
+        let mut commit_data = HashMap::default();
         let mut commit_delta = Delta::new();
-        commit_delta.insert(5, vec![Value::Integer(1), Value::Integer(50)]);
-        commit_delta.insert(6, vec![Value::Integer(3), Value::Integer(300)]);
+        commit_delta.insert(5, vec![Value::from_i64(1), Value::from_i64(50)]);
+        commit_delta.insert(6, vec![Value::from_i64(3), Value::from_i64(300)]);
         commit_data.insert("sales".to_string(), commit_delta);
 
         let commit_result = test_execute(&mut circuit, commit_data.clone(), pager.clone()).unwrap();
@@ -4136,7 +4208,7 @@ mod tests {
             .unwrap();
 
         // After commit, verify final state
-        let final_state = get_current_state(pager.clone(), &circuit).unwrap();
+        let final_state = get_current_state(pager, &circuit).unwrap();
         assert_eq!(
             final_state.changes.len(),
             3,
@@ -4148,18 +4220,18 @@ mod tests {
             .iter()
             .map(|(row, _)| {
                 let product_id = match &row.values[0] {
-                    Value::Integer(id) => *id,
+                    Value::Numeric(Numeric::Integer(id)) => *id,
                     _ => panic!("Product ID should be Integer"),
                 };
 
                 let total = match &row.values[1] {
-                    Value::Integer(t) => *t,
-                    Value::Float(t) => *t as i64,
+                    Value::Numeric(Numeric::Integer(t)) => *t,
+                    Value::Numeric(Numeric::Float(t)) => f64::from(*t) as i64,
                     _ => panic!("Total should be numeric"),
                 };
 
                 let count = match &row.values[2] {
-                    Value::Integer(c) => *c,
+                    Value::Numeric(Numeric::Integer(c)) => *c,
                     _ => panic!("Count should be Integer"),
                 };
 
@@ -4192,22 +4264,22 @@ mod tests {
         let (mut circuit, pager) = compile_sql!("SELECT * FROM users WHERE age > 18");
 
         // Initialize with some data - need to match the schema (id, name, age)
-        let mut init_data = HashMap::new();
+        let mut init_data = HashMap::default();
         let mut delta = Delta::new();
         delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
         delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(30),
+                Value::from_i64(30),
             ],
         );
         init_data.insert("users".to_string(), delta);
@@ -4227,22 +4299,22 @@ mod tests {
         );
 
         // Simulate a transaction: INSERT new users that pass the filter - match schema (id, name, age)
-        let mut uncommitted = HashMap::new();
+        let mut uncommitted = HashMap::default();
         let mut tx_delta = Delta::new();
         tx_delta.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("Charlie".into()),
-                Value::Integer(35),
+                Value::from_i64(35),
             ],
         );
         tx_delta.insert(
             4,
             vec![
-                Value::Integer(4),
+                Value::from_i64(4),
                 Value::Text("David".into()),
-                Value::Integer(20),
+                Value::from_i64(20),
             ],
         );
         uncommitted.insert("users".to_string(), tx_delta);
@@ -4273,7 +4345,7 @@ mod tests {
         );
 
         // CRITICAL: Verify the operator state wasn't modified by uncommitted execution
-        let state_after_uncommitted = get_current_state(pager.clone(), &circuit).unwrap();
+        let state_after_uncommitted = get_current_state(pager, &circuit).unwrap();
         assert_eq!(
             state_after_uncommitted.len(),
             2,
@@ -4309,38 +4381,38 @@ mod tests {
             compile_sql!("SELECT age, COUNT(*) as cnt FROM users GROUP BY age");
 
         // Initialize with some data
-        let mut init_data = HashMap::new();
+        let mut init_data = HashMap::default();
         let mut delta = Delta::new();
         delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
         delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(30),
+                Value::from_i64(30),
             ],
         );
         delta.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("Charlie".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
         delta.insert(
             4,
             vec![
-                Value::Integer(4),
+                Value::from_i64(4),
                 Value::Text("David".into()),
-                Value::Integer(30),
+                Value::from_i64(30),
             ],
         );
         init_data.insert("users".to_string(), delta);
@@ -4359,8 +4431,10 @@ mod tests {
             .changes
             .iter()
             .map(|(row, _)| {
-                if let (Value::Integer(age), Value::Integer(count)) =
-                    (&row.values[0], &row.values[1])
+                if let (
+                    Value::Numeric(Numeric::Integer(age)),
+                    Value::Numeric(Numeric::Integer(count)),
+                ) = (&row.values[0], &row.values[1])
                 {
                     (*age, *count)
                 } else {
@@ -4373,41 +4447,41 @@ mod tests {
         assert_eq!(initial_counts.get(&30).unwrap(), &2);
 
         // Create uncommitted changes that would affect aggregations
-        let mut uncommitted = HashMap::new();
+        let mut uncommitted = HashMap::default();
         let mut uncommitted_delta = Delta::new();
         // Add more people aged 25
         uncommitted_delta.insert(
             5,
             vec![
-                Value::Integer(5),
+                Value::from_i64(5),
                 Value::Text("Eve".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
         uncommitted_delta.insert(
             6,
             vec![
-                Value::Integer(6),
+                Value::from_i64(6),
                 Value::Text("Frank".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
         // Add person aged 35 (new group)
         uncommitted_delta.insert(
             7,
             vec![
-                Value::Integer(7),
+                Value::from_i64(7),
                 Value::Text("Grace".into()),
-                Value::Integer(35),
+                Value::from_i64(35),
             ],
         );
         // Delete Bob (age 30)
         uncommitted_delta.delete(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(30),
+                Value::from_i64(30),
             ],
         );
         uncommitted.insert("users".to_string(), uncommitted_delta);
@@ -4424,7 +4498,7 @@ mod tests {
         );
 
         // Verify internal state is unchanged (simulating rollback by not committing)
-        let state_after_rollback = get_current_state(pager.clone(), &circuit).unwrap();
+        let state_after_rollback = get_current_state(pager, &circuit).unwrap();
         assert_eq!(
             state_after_rollback.changes.len(),
             2,
@@ -4435,8 +4509,10 @@ mod tests {
             .changes
             .iter()
             .map(|(row, _)| {
-                if let (Value::Integer(age), Value::Integer(count)) =
-                    (&row.values[0], &row.values[1])
+                if let (
+                    Value::Numeric(Numeric::Integer(age)),
+                    Value::Numeric(Numeric::Integer(count)),
+                ) = (&row.values[0], &row.values[1])
                 {
                     (*age, *count)
                 } else {
@@ -4499,14 +4575,14 @@ mod tests {
 
         let filter_op = FilterOperator::new(FilterPredicate::GreaterThan {
             column_idx: 1, // "value" is at index 1
-            value: Value::Integer(10),
+            value: Value::from_i64(10),
         });
 
         // Create the filter predicate using DbspExpr
         let predicate = DbspExpr::BinaryExpr {
             left: Box::new(DbspExpr::Column("value".to_string())),
             op: ast::Operator::Greater,
-            right: Box::new(DbspExpr::Literal(Value::Integer(10))),
+            right: Box::new(DbspExpr::Literal(Value::from_i64(10))),
         };
 
         let filter_id = circuit.add_node(
@@ -4515,12 +4591,12 @@ mod tests {
             Box::new(filter_op),
         );
 
-        circuit.set_root(filter_id, schema.clone());
+        circuit.set_root(filter_id, schema);
 
         // Initialize with a row
-        let mut init_data = HashMap::new();
+        let mut init_data = HashMap::default();
         let mut delta = Delta::new();
-        delta.insert(5, vec![Value::Integer(5), Value::Integer(20)]);
+        delta.insert(5, vec![Value::from_i64(5), Value::from_i64(20)]);
         init_data.insert("test".to_string(), delta);
 
         let _ = test_execute(&mut circuit, init_data.clone(), pager.clone()).unwrap();
@@ -4535,10 +4611,10 @@ mod tests {
         assert_eq!(state.changes[0].0.rowid, 5);
 
         // Now update the rowid from 5 to 3
-        let mut update_data = HashMap::new();
+        let mut update_data = HashMap::default();
         let mut update_delta = Delta::new();
-        update_delta.delete(5, vec![Value::Integer(5), Value::Integer(20)]);
-        update_delta.insert(3, vec![Value::Integer(3), Value::Integer(20)]);
+        update_delta.delete(5, vec![Value::from_i64(5), Value::from_i64(20)]);
+        update_delta.insert(3, vec![Value::from_i64(3), Value::from_i64(20)]);
         update_data.insert("test".to_string(), update_delta);
 
         test_execute(&mut circuit, update_data.clone(), pager.clone()).unwrap();
@@ -4550,7 +4626,7 @@ mod tests {
             .unwrap();
 
         // The circuit should consolidate the state properly
-        let final_state = get_current_state(pager.clone(), &circuit).unwrap();
+        let final_state = get_current_state(pager, &circuit).unwrap();
         assert_eq!(
             final_state.changes.len(),
             1,
@@ -4559,7 +4635,7 @@ mod tests {
         assert_eq!(final_state.changes[0].0.rowid, 3);
         assert_eq!(
             final_state.changes[0].0.values,
-            vec![Value::Integer(3), Value::Integer(20)]
+            vec![Value::from_i64(3), Value::from_i64(20)]
         );
         assert_eq!(final_state.changes[0].1, 1);
     }
@@ -4573,21 +4649,21 @@ mod tests {
         delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
         delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
 
-        let mut inputs = HashMap::new();
+        let mut inputs = HashMap::default();
         inputs.insert("users".to_string(), delta);
         test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
         pager
@@ -4600,13 +4676,13 @@ mod tests {
         delete_one.delete(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
 
-        let mut inputs = HashMap::new();
+        let mut inputs = HashMap::default();
         inputs.insert("users".to_string(), delete_one);
         test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
         pager
@@ -4615,7 +4691,7 @@ mod tests {
             .unwrap();
 
         // With proper DBSP: row still exists (weight 2 - 1 = 1)
-        let state = get_current_state(pager.clone(), &circuit).unwrap();
+        let state = get_current_state(pager, &circuit).unwrap();
         let mut consolidated = state;
         consolidated.consolidate();
         assert_eq!(
@@ -4640,17 +4716,17 @@ mod tests {
         users_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".into()),
-                Value::Integer(30),
+                Value::from_i64(30),
             ],
         );
         users_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
 
@@ -4659,46 +4735,45 @@ mod tests {
         orders_delta.insert(
             1,
             vec![
-                Value::Integer(1),
-                Value::Integer(1),
-                Value::Integer(101),
-                Value::Integer(5),
+                Value::from_i64(1),
+                Value::from_i64(1),
+                Value::from_i64(101),
+                Value::from_i64(5),
             ],
         ); // Alice: 5
         orders_delta.insert(
             2,
             vec![
-                Value::Integer(2),
-                Value::Integer(1),
-                Value::Integer(102),
-                Value::Integer(3),
+                Value::from_i64(2),
+                Value::from_i64(1),
+                Value::from_i64(102),
+                Value::from_i64(3),
             ],
         ); // Alice: 3
         orders_delta.insert(
             3,
             vec![
-                Value::Integer(3),
-                Value::Integer(2),
-                Value::Integer(101),
-                Value::Integer(7),
+                Value::from_i64(3),
+                Value::from_i64(2),
+                Value::from_i64(101),
+                Value::from_i64(7),
             ],
         ); // Bob: 7
         orders_delta.insert(
             4,
             vec![
-                Value::Integer(4),
-                Value::Integer(1),
-                Value::Integer(103),
-                Value::Integer(2),
+                Value::from_i64(4),
+                Value::from_i64(1),
+                Value::from_i64(103),
+                Value::from_i64(2),
             ],
         ); // Alice: 2
-
-        let inputs = HashMap::from([
+        let inputs = HashMap::from_iter([
             ("users".to_string(), users_delta),
             ("orders".to_string(), orders_delta),
         ]);
 
-        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        let result = test_execute(&mut circuit, inputs, pager).unwrap();
 
         // Should have 2 results: Alice with total 10, Bob with total 7
         assert_eq!(
@@ -4708,13 +4783,15 @@ mod tests {
         );
 
         // Check the results
-        let mut results_map: HashMap<String, f64> = HashMap::new();
+        let mut results_map: HashMap<String, f64> = HashMap::default();
         for (row, weight) in result.changes {
             assert_eq!(weight, 1);
             assert_eq!(row.values.len(), 2); // name and total_quantity
 
-            if let (Value::Text(name), Value::Float(total)) = (&row.values[0], &row.values[1]) {
-                results_map.insert(name.to_string(), *total);
+            if let (Value::Text(name), Value::Numeric(Numeric::Float(total))) =
+                (&row.values[0], &row.values[1])
+            {
+                results_map.insert(name.to_string(), f64::from(*total));
             } else {
                 panic!("Unexpected value types in result");
             }
@@ -4748,25 +4825,25 @@ mod tests {
         users_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".into()),
-                Value::Integer(30),
+                Value::from_i64(30),
             ],
         ); // age > 18
         users_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(17),
+                Value::from_i64(17),
             ],
         ); // age <= 18
         users_delta.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("Charlie".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         ); // age > 18
 
@@ -4775,46 +4852,46 @@ mod tests {
         orders_delta.insert(
             1,
             vec![
-                Value::Integer(1),
-                Value::Integer(1),
-                Value::Integer(101),
-                Value::Integer(5),
+                Value::from_i64(1),
+                Value::from_i64(1),
+                Value::from_i64(101),
+                Value::from_i64(5),
             ],
         ); // Alice: 5
         orders_delta.insert(
             2,
             vec![
-                Value::Integer(2),
-                Value::Integer(2),
-                Value::Integer(102),
-                Value::Integer(10),
+                Value::from_i64(2),
+                Value::from_i64(2),
+                Value::from_i64(102),
+                Value::from_i64(10),
             ],
         ); // Bob: 10 (should be filtered)
         orders_delta.insert(
             3,
             vec![
-                Value::Integer(3),
-                Value::Integer(3),
-                Value::Integer(101),
-                Value::Integer(7),
+                Value::from_i64(3),
+                Value::from_i64(3),
+                Value::from_i64(101),
+                Value::from_i64(7),
             ],
         ); // Charlie: 7
         orders_delta.insert(
             4,
             vec![
-                Value::Integer(4),
-                Value::Integer(1),
-                Value::Integer(103),
-                Value::Integer(3),
+                Value::from_i64(4),
+                Value::from_i64(1),
+                Value::from_i64(103),
+                Value::from_i64(3),
             ],
         ); // Alice: 3
 
-        let inputs = HashMap::from([
+        let inputs = HashMap::from_iter([
             ("users".to_string(), users_delta),
             ("orders".to_string(), orders_delta),
         ]);
 
-        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        let result = test_execute(&mut circuit, inputs, pager).unwrap();
 
         // Should only have results for Alice and Charlie (Bob filtered out due to age <= 18)
         assert_eq!(
@@ -4824,13 +4901,15 @@ mod tests {
         );
 
         // Check the results
-        let mut results_map: HashMap<String, f64> = HashMap::new();
+        let mut results_map: HashMap<String, f64> = HashMap::default();
         for (row, weight) in result.changes {
             assert_eq!(weight, 1);
             assert_eq!(row.values.len(), 2); // name and total
 
-            if let (Value::Text(name), Value::Float(total)) = (&row.values[0], &row.values[1]) {
-                results_map.insert(name.to_string(), *total);
+            if let (Value::Text(name), Value::Numeric(Numeric::Float(total))) =
+                (&row.values[0], &row.values[1])
+            {
+                results_map.insert(name.to_string(), f64::from(*total));
             }
         }
 
@@ -4863,17 +4942,17 @@ mod tests {
         users_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
         users_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(30),
+                Value::from_i64(30),
             ],
         );
 
@@ -4882,25 +4961,25 @@ mod tests {
         products_delta.insert(
             100,
             vec![
-                Value::Integer(100),
+                Value::from_i64(100),
                 Value::Text("Widget".into()),
-                Value::Integer(50),
+                Value::from_i64(50),
             ],
         );
         products_delta.insert(
             101,
             vec![
-                Value::Integer(101),
+                Value::from_i64(101),
                 Value::Text("Gadget".into()),
-                Value::Integer(75),
+                Value::from_i64(75),
             ],
         );
         products_delta.insert(
             102,
             vec![
-                Value::Integer(102),
+                Value::from_i64(102),
                 Value::Text("Doohickey".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
 
@@ -4910,60 +4989,60 @@ mod tests {
         orders_delta.insert(
             1,
             vec![
-                Value::Integer(1),
-                Value::Integer(1),
-                Value::Integer(100),
-                Value::Integer(5),
+                Value::from_i64(1),
+                Value::from_i64(1),
+                Value::from_i64(100),
+                Value::from_i64(5),
             ],
         );
         // Alice orders 3 Gadgets
         orders_delta.insert(
             2,
             vec![
-                Value::Integer(2),
-                Value::Integer(1),
-                Value::Integer(101),
-                Value::Integer(3),
+                Value::from_i64(2),
+                Value::from_i64(1),
+                Value::from_i64(101),
+                Value::from_i64(3),
             ],
         );
         // Bob orders 7 Widgets
         orders_delta.insert(
             3,
             vec![
-                Value::Integer(3),
-                Value::Integer(2),
-                Value::Integer(100),
-                Value::Integer(7),
+                Value::from_i64(3),
+                Value::from_i64(2),
+                Value::from_i64(100),
+                Value::from_i64(7),
             ],
         );
         // Bob orders 2 Doohickeys
         orders_delta.insert(
             4,
             vec![
-                Value::Integer(4),
-                Value::Integer(2),
-                Value::Integer(102),
-                Value::Integer(2),
+                Value::from_i64(4),
+                Value::from_i64(2),
+                Value::from_i64(102),
+                Value::from_i64(2),
             ],
         );
         // Alice orders 4 more Widgets
         orders_delta.insert(
             5,
             vec![
-                Value::Integer(5),
-                Value::Integer(1),
-                Value::Integer(100),
-                Value::Integer(4),
+                Value::from_i64(5),
+                Value::from_i64(1),
+                Value::from_i64(100),
+                Value::from_i64(4),
             ],
         );
 
-        let mut inputs = HashMap::new();
+        let mut inputs = HashMap::default();
         inputs.insert("users".to_string(), users_delta);
         inputs.insert("products".to_string(), products_delta);
         inputs.insert("orders".to_string(), orders_delta);
 
         // Execute the 3-way join with aggregation
-        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        let result = test_execute(&mut circuit, inputs.clone(), pager).unwrap();
 
         // We should get aggregated results for each user-product combination
         // Expected results:
@@ -4974,14 +5053,17 @@ mod tests {
         assert_eq!(result.len(), 4, "Should have 4 aggregated results");
 
         // Verify aggregation results
-        let mut found_results = std::collections::HashSet::new();
+        let mut found_results = HashSet::default();
         for (row, weight) in result.changes.iter() {
             assert_eq!(*weight, 1);
             // Row should have name, product_name, and sum columns
             assert_eq!(row.values.len(), 3);
 
-            if let (Value::Text(name), Value::Text(product), Value::Float(total)) =
-                (&row.values[0], &row.values[1], &row.values[2])
+            if let (
+                Value::Text(name),
+                Value::Text(product),
+                Value::Numeric(Numeric::Float(total)),
+            ) = (&row.values[0], &row.values[1], &row.values[2])
             {
                 let key = format!("{}-{}", name.as_ref(), product.as_ref());
                 found_results.insert(key.clone());
@@ -5022,17 +5104,17 @@ mod tests {
         users_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
         users_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(30),
+                Value::from_i64(30),
             ],
         );
 
@@ -5041,37 +5123,37 @@ mod tests {
         orders_delta.insert(
             1,
             vec![
-                Value::Integer(1),
-                Value::Integer(1),
-                Value::Integer(100),
-                Value::Integer(5),
+                Value::from_i64(1),
+                Value::from_i64(1),
+                Value::from_i64(100),
+                Value::from_i64(5),
             ],
         );
         orders_delta.insert(
             2,
             vec![
-                Value::Integer(2),
-                Value::Integer(1),
-                Value::Integer(101),
-                Value::Integer(3),
+                Value::from_i64(2),
+                Value::from_i64(1),
+                Value::from_i64(101),
+                Value::from_i64(3),
             ],
         );
         orders_delta.insert(
             3,
             vec![
-                Value::Integer(3),
-                Value::Integer(2),
-                Value::Integer(102),
-                Value::Integer(7),
+                Value::from_i64(3),
+                Value::from_i64(2),
+                Value::from_i64(102),
+                Value::from_i64(7),
             ],
         );
 
-        let mut inputs = HashMap::new();
+        let mut inputs = HashMap::default();
         inputs.insert("users".to_string(), users_delta);
         inputs.insert("orders".to_string(), orders_delta);
 
         // Execute the join
-        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        let result = test_execute(&mut circuit, inputs.clone(), pager).unwrap();
 
         // We should get 3 results (2 orders for Alice, 1 for Bob)
         assert_eq!(result.len(), 3, "Should have 3 join results");
@@ -5106,25 +5188,25 @@ mod tests {
 
         // Create test data for customers (id, name)
         let mut customers_delta = Delta::new();
-        customers_delta.insert(1, vec![Value::Integer(1), Value::Text("Alice".into())]);
-        customers_delta.insert(2, vec![Value::Integer(2), Value::Text("Bob".into())]);
+        customers_delta.insert(1, vec![Value::from_i64(1), Value::Text("Alice".into())]);
+        customers_delta.insert(2, vec![Value::from_i64(2), Value::Text("Bob".into())]);
 
         // Create test data for vendors (id, name, price)
         let mut vendors_delta = Delta::new();
         vendors_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Widget Co".into()),
-                Value::Integer(10),
+                Value::from_i64(10),
             ],
         );
         vendors_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Gadget Inc".into()),
-                Value::Integer(20),
+                Value::from_i64(20),
             ],
         );
 
@@ -5134,50 +5216,50 @@ mod tests {
         purchases_delta.insert(
             1,
             vec![
-                Value::Integer(1),
-                Value::Integer(1), // customer_id: Alice
-                Value::Integer(1), // vendor_id: Widget Co
-                Value::Integer(5),
+                Value::from_i64(1),
+                Value::from_i64(1), // customer_id: Alice
+                Value::from_i64(1), // vendor_id: Widget Co
+                Value::from_i64(5),
             ],
         );
         // Alice purchases 3 units from Gadget Inc
         purchases_delta.insert(
             2,
             vec![
-                Value::Integer(2),
-                Value::Integer(1), // customer_id: Alice
-                Value::Integer(2), // vendor_id: Gadget Inc
-                Value::Integer(3),
+                Value::from_i64(2),
+                Value::from_i64(1), // customer_id: Alice
+                Value::from_i64(2), // vendor_id: Gadget Inc
+                Value::from_i64(3),
             ],
         );
         // Bob purchases 2 units from Widget Co
         purchases_delta.insert(
             3,
             vec![
-                Value::Integer(3),
-                Value::Integer(2), // customer_id: Bob
-                Value::Integer(1), // vendor_id: Widget Co
-                Value::Integer(2),
+                Value::from_i64(3),
+                Value::from_i64(2), // customer_id: Bob
+                Value::from_i64(1), // vendor_id: Widget Co
+                Value::from_i64(2),
             ],
         );
         // Alice purchases 4 more units from Widget Co
         purchases_delta.insert(
             4,
             vec![
-                Value::Integer(4),
-                Value::Integer(1), // customer_id: Alice
-                Value::Integer(1), // vendor_id: Widget Co
-                Value::Integer(4),
+                Value::from_i64(4),
+                Value::from_i64(1), // customer_id: Alice
+                Value::from_i64(1), // vendor_id: Widget Co
+                Value::from_i64(4),
             ],
         );
 
-        let inputs = HashMap::from([
+        let inputs = HashMap::from_iter([
             ("customers".to_string(), customers_delta),
             ("purchases".to_string(), purchases_delta),
             ("vendors".to_string(), vendors_delta),
         ]);
 
-        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        let result = test_execute(&mut circuit, inputs, pager).unwrap();
 
         // Expected results:
         // Alice|Gadget Inc|3|60    (3 units * 20 price = 60)
@@ -5199,20 +5281,20 @@ mod tests {
         // Verify Alice's Gadget Inc purchases
         assert_eq!(results[0].0.values[0], Value::Text("Alice".into()));
         assert_eq!(results[0].0.values[1], Value::Text("Gadget Inc".into()));
-        assert_eq!(results[0].0.values[2], Value::Integer(3)); // total_quantity
-        assert_eq!(results[0].0.values[3], Value::Integer(60)); // total_value
+        assert_eq!(results[0].0.values[2], Value::from_i64(3)); // total_quantity
+        assert_eq!(results[0].0.values[3], Value::from_i64(60)); // total_value
 
         // Verify Alice's Widget Co purchases
         assert_eq!(results[1].0.values[0], Value::Text("Alice".into()));
         assert_eq!(results[1].0.values[1], Value::Text("Widget Co".into()));
-        assert_eq!(results[1].0.values[2], Value::Integer(9)); // total_quantity
-        assert_eq!(results[1].0.values[3], Value::Integer(90)); // total_value
+        assert_eq!(results[1].0.values[2], Value::from_i64(9)); // total_quantity
+        assert_eq!(results[1].0.values[3], Value::from_i64(90)); // total_value
 
         // Verify Bob's Widget Co purchases
         assert_eq!(results[2].0.values[0], Value::Text("Bob".into()));
         assert_eq!(results[2].0.values[1], Value::Text("Widget Co".into()));
-        assert_eq!(results[2].0.values[2], Value::Integer(2)); // total_quantity
-        assert_eq!(results[2].0.values[3], Value::Integer(20)); // total_value
+        assert_eq!(results[2].0.values[2], Value::from_i64(2)); // total_quantity
+        assert_eq!(results[2].0.values[3], Value::from_i64(20)); // total_value
     }
 
     #[test]
@@ -5233,43 +5315,43 @@ mod tests {
 
         // Create test data for customers (id, name)
         let mut customers_delta = Delta::new();
-        customers_delta.insert(1, vec![Value::Integer(1), Value::Text("Alice".into())]);
-        customers_delta.insert(2, vec![Value::Integer(2), Value::Text("Bob".into())]);
-        customers_delta.insert(3, vec![Value::Integer(3), Value::Text("Charlie".into())]);
+        customers_delta.insert(1, vec![Value::from_i64(1), Value::Text("Alice".into())]);
+        customers_delta.insert(2, vec![Value::from_i64(2), Value::Text("Bob".into())]);
+        customers_delta.insert(3, vec![Value::from_i64(3), Value::Text("Charlie".into())]);
 
         // Create test data for vendors (id, name, price)
         let mut vendors_delta = Delta::new();
         vendors_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Widget Co".into()),
-                Value::Integer(10),
+                Value::from_i64(10),
             ],
         );
         vendors_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Gadget Inc".into()),
-                Value::Integer(20),
+                Value::from_i64(20),
             ],
         );
         vendors_delta.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("Tool Corp".into()),
-                Value::Integer(30),
+                Value::from_i64(30),
             ],
         );
 
-        let inputs = HashMap::from([
+        let inputs = HashMap::from_iter([
             ("customers".to_string(), customers_delta),
             ("vendors".to_string(), vendors_delta),
         ]);
 
-        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        let result = test_execute(&mut circuit, inputs, pager).unwrap();
 
         // Expected results:
         // For customer 1 (Alice) + vendor 1:
@@ -5279,11 +5361,11 @@ mod tests {
         //   - 1 * 10 = 10
         assert_eq!(result.len(), 3, "Should have 3 join results");
 
-        let mut results = result.changes.clone();
+        let mut results = result.changes;
         results.sort_by_key(|(row, _)| {
             // Sort by the product_value column for predictable ordering
             match &row.values[3] {
-                Value::Integer(n) => *n,
+                Value::Numeric(Numeric::Integer(n)) => *n,
                 _ => 0,
             }
         });
@@ -5292,19 +5374,19 @@ mod tests {
         assert_eq!(results[0].0.values[0], Value::Text("32".into())); // HEX(2)
         assert_eq!(results[0].0.values[1], Value::Text("ALICE".into()));
         assert_eq!(results[0].0.values[2], Value::Text("widget co".into()));
-        assert_eq!(results[0].0.values[3], Value::Integer(10)); // 1 * 10
+        assert_eq!(results[0].0.values[3], Value::from_i64(10)); // 1 * 10
 
         // Second result: Bob + Gadget Inc
         assert_eq!(results[1].0.values[0], Value::Text("34".into())); // HEX(4)
         assert_eq!(results[1].0.values[1], Value::Text("BOB".into()));
         assert_eq!(results[1].0.values[2], Value::Text("gadget inc".into()));
-        assert_eq!(results[1].0.values[3], Value::Integer(40)); // 2 * 20
+        assert_eq!(results[1].0.values[3], Value::from_i64(40)); // 2 * 20
 
         // Third result: Charlie + Tool Corp
         assert_eq!(results[2].0.values[0], Value::Text("36".into())); // HEX(6)
         assert_eq!(results[2].0.values[1], Value::Text("CHARLIE".into()));
         assert_eq!(results[2].0.values[2], Value::Text("tool corp".into()));
-        assert_eq!(results[2].0.values[3], Value::Integer(90)); // 3 * 30
+        assert_eq!(results[2].0.values[3], Value::from_i64(90)); // 3 * 30
     }
 
     #[test]
@@ -5329,17 +5411,17 @@ mod tests {
         users_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
         users_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(30),
+                Value::from_i64(30),
             ],
         );
 
@@ -5348,28 +5430,28 @@ mod tests {
         orders_delta.insert(
             1,
             vec![
-                Value::Integer(101),
-                Value::Integer(1),   // Alice
-                Value::Integer(201), // Widget
-                Value::Integer(5),   // quantity > 2
+                Value::from_i64(101),
+                Value::from_i64(1),   // Alice
+                Value::from_i64(201), // Widget
+                Value::from_i64(5),   // quantity > 2
             ],
         );
         orders_delta.insert(
             2,
             vec![
-                Value::Integer(102),
-                Value::Integer(2),   // Bob
-                Value::Integer(202), // Gadget
-                Value::Integer(1),   // quantity <= 2, filtered out
+                Value::from_i64(102),
+                Value::from_i64(2),   // Bob
+                Value::from_i64(202), // Gadget
+                Value::from_i64(1),   // quantity <= 2, filtered out
             ],
         );
         orders_delta.insert(
             3,
             vec![
-                Value::Integer(103),
-                Value::Integer(1),   // Alice
-                Value::Integer(202), // Gadget
-                Value::Integer(3),   // quantity > 2
+                Value::from_i64(103),
+                Value::from_i64(1),   // Alice
+                Value::from_i64(202), // Gadget
+                Value::from_i64(3),   // quantity > 2
             ],
         );
 
@@ -5378,52 +5460,52 @@ mod tests {
         products_delta.insert(
             201,
             vec![
-                Value::Integer(201),
+                Value::from_i64(201),
                 Value::Text("Widget".into()),
-                Value::Integer(10),
+                Value::from_i64(10),
             ],
         );
         products_delta.insert(
             202,
             vec![
-                Value::Integer(202),
+                Value::from_i64(202),
                 Value::Text("Gadget".into()),
-                Value::Integer(20),
+                Value::from_i64(20),
             ],
         );
 
-        let inputs = HashMap::from([
+        let inputs = HashMap::from_iter([
             ("users".to_string(), users_delta),
             ("orders".to_string(), orders_delta),
             ("products".to_string(), products_delta),
         ]);
 
-        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        let result = test_execute(&mut circuit, inputs, pager).unwrap();
 
         // Should have 2 results (orders with quantity > 2)
         assert_eq!(result.len(), 2, "Should have 2 results after filtering");
 
-        let mut results = result.changes.clone();
+        let mut results = result.changes;
         results.sort_by_key(|(row, _)| {
             match &row.values[2] {
                 // Sort by order_id
-                Value::Integer(n) => *n,
+                Value::Numeric(Numeric::Integer(n)) => *n,
                 _ => 0,
             }
         });
 
         // First result: Alice's order 101 for Widget
-        assert_eq!(results[0].0.values[0], Value::Integer(1)); // customer_id
+        assert_eq!(results[0].0.values[0], Value::from_i64(1)); // customer_id
         assert_eq!(results[0].0.values[1], Value::Text("Alice".into())); // customer_name
-        assert_eq!(results[0].0.values[2], Value::Integer(101)); // order_id
-        assert_eq!(results[0].0.values[3], Value::Integer(5)); // quantity
+        assert_eq!(results[0].0.values[2], Value::from_i64(101)); // order_id
+        assert_eq!(results[0].0.values[3], Value::from_i64(5)); // quantity
         assert_eq!(results[0].0.values[4], Value::Text("Widget".into())); // product_name
 
         // Second result: Alice's order 103 for Gadget
-        assert_eq!(results[1].0.values[0], Value::Integer(1)); // customer_id
+        assert_eq!(results[1].0.values[0], Value::from_i64(1)); // customer_id
         assert_eq!(results[1].0.values[1], Value::Text("Alice".into())); // customer_name
-        assert_eq!(results[1].0.values[2], Value::Integer(103)); // order_id
-        assert_eq!(results[1].0.values[3], Value::Integer(3)); // quantity
+        assert_eq!(results[1].0.values[2], Value::from_i64(103)); // order_id
+        assert_eq!(results[1].0.values[3], Value::from_i64(3)); // quantity
         assert_eq!(results[1].0.values[4], Value::Text("Gadget".into())); // product_name
     }
 
@@ -5448,9 +5530,9 @@ mod tests {
         users_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
 
@@ -5459,28 +5541,28 @@ mod tests {
         orders_delta.insert(
             1,
             vec![
-                Value::Integer(101),
-                Value::Integer(1),   // user_id
-                Value::Integer(201), // product_id
-                Value::Integer(5),   // quantity
+                Value::from_i64(101),
+                Value::from_i64(1),   // user_id
+                Value::from_i64(201), // product_id
+                Value::from_i64(5),   // quantity
             ],
         );
         orders_delta.insert(
             2,
             vec![
-                Value::Integer(102),
-                Value::Integer(1),   // user_id
-                Value::Integer(202), // product_id
-                Value::Integer(3),   // quantity
+                Value::from_i64(102),
+                Value::from_i64(1),   // user_id
+                Value::from_i64(202), // product_id
+                Value::from_i64(3),   // quantity
             ],
         );
 
-        let inputs = HashMap::from([
+        let inputs = HashMap::from_iter([
             ("users".to_string(), users_delta),
             ("orders".to_string(), orders_delta),
         ]);
 
-        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        let result = test_execute(&mut circuit, inputs, pager).unwrap();
 
         assert_eq!(result.len(), 2, "Should have 2 results for user 1");
 
@@ -5489,19 +5571,19 @@ mod tests {
             // Column 0: o.quantity (5 or 3)
             assert!(matches!(
                 row.values[0],
-                Value::Integer(5) | Value::Integer(3)
+                Value::Numeric(Numeric::Integer(5)) | Value::Numeric(Numeric::Integer(3))
             ));
             // Column 1: u.name
             assert_eq!(row.values[1], Value::Text("Alice".into()));
             // Column 2: u.id
-            assert_eq!(row.values[2], Value::Integer(1));
+            assert_eq!(row.values[2], Value::from_i64(1));
             // Column 3: o.quantity * 2 (10 or 6)
             assert!(matches!(
                 row.values[3],
-                Value::Integer(10) | Value::Integer(6)
+                Value::Numeric(Numeric::Integer(10)) | Value::Numeric(Numeric::Integer(6))
             ));
             // Column 4: u.id again
-            assert_eq!(row.values[4], Value::Integer(1));
+            assert_eq!(row.values[4], Value::from_i64(1));
         }
     }
 
@@ -5519,17 +5601,17 @@ mod tests {
         users_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
         users_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(30),
+                Value::from_i64(30),
             ],
         );
 
@@ -5538,37 +5620,37 @@ mod tests {
         orders_delta.insert(
             1,
             vec![
-                Value::Integer(1),
-                Value::Integer(1),
-                Value::Integer(100),
-                Value::Integer(5),
+                Value::from_i64(1),
+                Value::from_i64(1),
+                Value::from_i64(100),
+                Value::from_i64(5),
             ],
         );
         orders_delta.insert(
             2,
             vec![
-                Value::Integer(2),
-                Value::Integer(1),
-                Value::Integer(101),
-                Value::Integer(3),
+                Value::from_i64(2),
+                Value::from_i64(1),
+                Value::from_i64(101),
+                Value::from_i64(3),
             ],
         );
         orders_delta.insert(
             3,
             vec![
-                Value::Integer(3),
-                Value::Integer(2),
-                Value::Integer(102),
-                Value::Integer(7),
+                Value::from_i64(3),
+                Value::from_i64(2),
+                Value::from_i64(102),
+                Value::from_i64(7),
             ],
         );
 
-        let mut inputs = HashMap::new();
+        let mut inputs = HashMap::default();
         inputs.insert("users".to_string(), users_delta);
         inputs.insert("orders".to_string(), orders_delta);
 
         // Execute the join with aggregation
-        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        let result = test_execute(&mut circuit, inputs.clone(), pager).unwrap();
 
         // We should get 2 aggregated results (one for Alice, one for Bob)
         assert_eq!(result.len(), 2, "Should have 2 aggregated results");
@@ -5583,10 +5665,10 @@ mod tests {
             if let Value::Text(name) = &row.values[0] {
                 if name.as_ref() == "Alice" {
                     // Alice should have total quantity of 8 (5 + 3)
-                    assert_eq!(row.values[1], Value::Integer(8));
+                    assert_eq!(row.values[1], Value::from_i64(8));
                 } else if name.as_ref() == "Bob" {
                     // Bob should have total quantity of 7
-                    assert_eq!(row.values[1], Value::Integer(7));
+                    assert_eq!(row.values[1], Value::from_i64(7));
                 }
             }
         }
@@ -5613,25 +5695,25 @@ mod tests {
         users_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".into()),
-                Value::Integer(30),
+                Value::from_i64(30),
             ],
         ); // id = 1
         users_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         ); // id = 2
         users_delta.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("Charlie".into()),
-                Value::Integer(35),
+                Value::from_i64(35),
             ],
         ); // id = 3
 
@@ -5639,7 +5721,7 @@ mod tests {
         customers_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Customer Alice".into()),
                 Value::Text("alice@example.com".into()),
             ],
@@ -5647,7 +5729,7 @@ mod tests {
         customers_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Customer Bob".into()),
                 Value::Text("bob@example.com".into()),
             ],
@@ -5655,17 +5737,17 @@ mod tests {
         customers_delta.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("Customer Charlie".into()),
                 Value::Text("charlie@example.com".into()),
             ],
         ); // id = 3
 
-        let mut inputs = HashMap::new();
+        let mut inputs = HashMap::default();
         inputs.insert("users".to_string(), users_delta);
         inputs.insert("customers".to_string(), customers_delta);
 
-        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        let result = test_execute(&mut circuit, inputs.clone(), pager).unwrap();
 
         // Should get rows where users.id > 1 AND customers.id < 100
         // - users.id=2 (> 1) AND customers.id=2 (< 100) ✓
@@ -5678,13 +5760,17 @@ mod tests {
         assert_eq!(row.values.len(), 4, "Should have 4 columns");
 
         // Verify the filter correctly used qualified columns for Bob
-        assert_eq!(row.values[0], Value::Integer(2), "users.id should be 2");
+        assert_eq!(row.values[0], Value::from_i64(2), "users.id should be 2");
         assert_eq!(
             row.values[1],
             Value::Text("Bob".into()),
             "users.name should be Bob"
         );
-        assert_eq!(row.values[2], Value::Integer(2), "customers.id should be 2");
+        assert_eq!(
+            row.values[2],
+            Value::from_i64(2),
+            "customers.id should be 2"
+        );
         assert_eq!(
             row.values[3],
             Value::Text("Customer Bob".into()),
@@ -5702,33 +5788,33 @@ mod tests {
         input_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".into()),
-                Value::Integer(20), // age * 2 = 40 > 30, should pass
+                Value::from_i64(20), // age * 2 = 40 > 30, should pass
             ],
         );
         input_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(10), // age * 2 = 20 <= 30, should be filtered out
+                Value::from_i64(10), // age * 2 = 20 <= 30, should be filtered out
             ],
         );
         input_delta.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("Charlie".into()),
-                Value::Integer(16), // age * 2 = 32 > 30, should pass
+                Value::from_i64(16), // age * 2 = 32 > 30, should pass
             ],
         );
 
         // Create input map
-        let mut inputs = HashMap::new();
+        let mut inputs = HashMap::default();
         inputs.insert("users".to_string(), input_delta);
 
-        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        let result = test_execute(&mut circuit, inputs.clone(), pager).unwrap();
 
         // Should only have Alice and Charlie (age * 2 > 30)
         assert_eq!(
@@ -5741,25 +5827,25 @@ mod tests {
         let alice = result
             .changes
             .iter()
-            .find(|(row, _)| row.values[0] == Value::Integer(1))
+            .find(|(row, _)| row.values[0] == Value::from_i64(1))
             .expect("Alice should be in result");
         assert_eq!(alice.0.values[1], Value::Text("Alice".into()));
-        assert_eq!(alice.0.values[2], Value::Integer(20));
+        assert_eq!(alice.0.values[2], Value::from_i64(20));
 
         // Check Charlie
         let charlie = result
             .changes
             .iter()
-            .find(|(row, _)| row.values[0] == Value::Integer(3))
+            .find(|(row, _)| row.values[0] == Value::from_i64(3))
             .expect("Charlie should be in result");
         assert_eq!(charlie.0.values[1], Value::Text("Charlie".into()));
-        assert_eq!(charlie.0.values[2], Value::Integer(16));
+        assert_eq!(charlie.0.values[2], Value::from_i64(16));
 
         // Bob should not be in result
         let bob = result
             .changes
             .iter()
-            .find(|(row, _)| row.values[0] == Value::Integer(2));
+            .find(|(row, _)| row.values[0] == Value::from_i64(2));
         assert!(bob.is_none(), "Bob should be filtered out");
     }
 

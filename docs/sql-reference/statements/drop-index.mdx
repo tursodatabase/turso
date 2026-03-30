@@ -1,0 +1,57 @@
+---
+title: DROP INDEX
+description: Remove an index from the database
+sidebarTitle: DROP INDEX
+---
+
+# DROP INDEX
+
+Remove an index from the database. The underlying table and its data are not affected.
+
+## Syntax
+
+```sql
+DROP INDEX [IF EXISTS] [schema-name.]index-name;
+```
+
+## Description
+
+`DROP INDEX` removes a previously created index. After the index is dropped, the query planner can no longer use it to optimize queries. The table data is unchanged.
+
+### Parameters
+
+| Parameter | Description |
+|-----------|-------------|
+| `IF EXISTS` | Prevents an error if the index does not exist. The statement is a no-op when the index is absent. |
+| `schema-name` | The name of the attached database containing the index. Defaults to the main database if omitted. |
+| `index-name` | The name of the index to drop. |
+
+### Behavior
+
+- Only explicitly created indexes can be dropped. Indexes automatically created for PRIMARY KEY and UNIQUE constraints cannot be dropped directly -- drop the table or use ALTER TABLE instead.
+- Dropping an index may degrade query performance for queries that relied on it, but does not affect correctness.
+
+## Examples
+
+### Drop an Index
+
+```sql
+DROP INDEX idx_users_email;
+```
+
+### Drop an Index Only if It Exists
+
+```sql
+DROP INDEX IF EXISTS idx_old_search;
+```
+
+### Drop an Index in an Attached Database
+
+```sql
+DROP INDEX aux.idx_sessions_token;
+```
+
+## See Also
+
+- [CREATE INDEX](/docs/sql-reference/statements/create-index) for creating indexes
+- [EXPLAIN](/docs/sql-reference/statements/explain) for verifying query plans after dropping an index

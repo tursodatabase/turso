@@ -89,6 +89,8 @@ export declare class Database {
   ioLoopSync(): void
   /** Runs the I/O loop asynchronously, returning a Promise. */
   ioLoopAsync(): Promise<void>
+  /** Classify SQL statement. Returns "read", "write", "begin", "commit", or "rollback". */
+  classifySql(sql: string): string
 }
 
 /** A prepared statement. */
@@ -148,6 +150,29 @@ export interface DatabaseOpts {
   timeout?: number
   fileMustExist?: boolean
   tracing?: string
+  /** Experimental features to enable */
+  experimental?: Array<string>
+  /** Optional encryption configuration for local database encryption */
+  encryption?: EncryptionOpts
+}
+
+/** Supported encryption ciphers for local database encryption. */
+export declare const enum EncryptionCipher {
+  Aes128Gcm = 0,
+  Aes256Gcm = 1,
+  Aegis256 = 2,
+  Aegis256x2 = 3,
+  Aegis128l = 4,
+  Aegis128x2 = 5,
+  Aegis128x4 = 6
+}
+
+/** Encryption configuration for local database encryption. */
+export interface EncryptionOpts {
+  /** The cipher to use for encryption */
+  cipher: EncryptionCipher
+  /** The hex-encoded encryption key */
+  hexkey: string
 }
 export declare class GeneratorHolder {
   resumeSync(error?: string | undefined | null): GeneratorResponse
@@ -221,21 +246,28 @@ export type DatabaseRowTransformResultJs =
 export type GeneratorResponse =
   | { type: 'IO' }
   | { type: 'Done' }
-  | { type: 'SyncEngineStats', operations: number, mainWal: number, revertWal: number, lastPullUnixTime?: number, lastPushUnixTime?: number, revision?: string, networkSentBytes: number, networkReceivedBytes: number }
+  | { type: 'SyncEngineStats', cdcOperations: number, mainWalSize: number, revertWalSize: number, lastPullUnixTime?: number, lastPushUnixTime?: number, revision?: string, networkSentBytes: number, networkReceivedBytes: number }
   | { type: 'SyncEngineChanges', changes: SyncEngineChanges }
 
 export type JsPartialBootstrapStrategy =
   | { type: 'Prefix', length: number }
   | { type: 'Query', query: string }
 
+export interface JsPartialSyncOpts {
+  bootstrapStrategy: JsPartialBootstrapStrategy
+  segmentSize?: number
+  prefetch?: boolean
+}
+
 export type JsProtocolRequest =
-  | { type: 'Http', method: string, path: string, body?: Array<number>, headers: Array<[string, string]> }
+  | { type: 'Http', url?: string, method: string, path: string, body?: Array<number>, headers: Array<[string, string]> }
   | { type: 'FullRead', path: string }
   | { type: 'FullWrite', path: string, content: Array<number> }
   | { type: 'Transform', mutations: Array<DatabaseRowMutationJs> }
 
 export interface SyncEngineOpts {
   path: string
+  remoteUrl?: string
   clientName?: string
   walPullBatchSize?: number
   longPollTimeoutMs?: number
@@ -244,8 +276,14 @@ export interface SyncEngineOpts {
   useTransform: boolean
   protocolVersion?: SyncEngineProtocolVersion
   bootstrapIfEmpty: boolean
-  remoteEncryption?: string
-  partialBoostrapStrategy?: JsPartialBootstrapStrategy
+  /** Encryption cipher for the Turso Cloud database. */
+  remoteEncryptionCipher?: string
+  /**
+   * Base64-encoded encryption key for the Turso Cloud database.
+   * Must match the key used when creating the encrypted database.
+   */
+  remoteEncryptionKey?: string
+  partialSyncOpts?: JsPartialSyncOpts
 }
 
 export declare const enum SyncEngineProtocolVersion {

@@ -1,0 +1,16 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+
+# Reproducer: integrity_check reports "Page N: never used" for DBSP state index pages.
+# The DBSP state index root page was not registered in schema.indexes,
+# so integrity_check didn't know the page was in use.
+test matview-integrity-check-dbsp-index {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    CREATE MATERIALIZED VIEW v AS SELECT val, COUNT(*) as cnt FROM t1 GROUP BY val;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}

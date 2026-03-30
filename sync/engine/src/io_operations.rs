@@ -4,7 +4,7 @@ use turso_core::{Completion, LimboError, OpenFlags};
 
 use crate::{
     database_tape::{DatabaseTape, DatabaseTapeOpts},
-    types::{Coro, ProtocolCommand},
+    types::{Coro, SyncEngineIoResult},
     Result,
 };
 
@@ -23,10 +23,11 @@ pub trait IoOperations {
 impl IoOperations for Arc<dyn turso_core::IO> {
     fn open_tape(&self, path: &str, capture: bool) -> Result<DatabaseTape> {
         let io = self.clone();
-        let clean = turso_core::Database::open_file(io, path, false, true).unwrap();
+        let clean = turso_core::Database::open_file(io, path).unwrap();
         let opts = DatabaseTapeOpts {
             cdc_table: None,
             cdc_mode: Some(if capture { "full" } else { "off" }.to_string()),
+            disable_auto_checkpoint: false,
         };
         tracing::debug!("initialize database tape connection: path={}", path);
         Ok(DatabaseTape::new_with_opts(clean, opts))
@@ -36,6 +37,7 @@ impl IoOperations for Arc<dyn turso_core::IO> {
             Ok(file) => Ok(Some(file)),
             Err(LimboError::CompletionError(turso_core::CompletionError::IOError(
                 std::io::ErrorKind::NotFound,
+                _,
             ))) => Ok(None),
             Err(err) => Err(err.into()),
         }
@@ -61,7 +63,7 @@ impl IoOperations for Arc<dyn turso_core::IO> {
         });
         let c = file.truncate(len as u64, c)?;
         while !c.succeeded() {
-            coro.yield_(ProtocolCommand::IO).await?;
+            coro.yield_(SyncEngineIoResult::IO).await?;
         }
         Ok(())
     }

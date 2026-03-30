@@ -1,0 +1,24 @@
+---
+source: multi_index_or_join.sqltest
+expression: |-
+  WITH selected_nodes AS (
+          SELECT id FROM node WHERE id <= 2
+      )
+      SELECT e.id, e.source_id, e.target_id
+      FROM selected_nodes s
+      JOIN edge e ON e.source_id = s.id OR e.target_id = s.id;
+info:
+  statement_type: WITH (CTE)
+  tables:
+  - e.source_id
+  - edge
+  - node
+  - selected_nodes
+  setup_blocks:
+  - graph_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN selected_nodes AS s
+|  `--SEARCH node USING INTEGER PRIMARY KEY (rowid=?)
+`--MULTI-INDEX OR e (idx_edge_source, idx_edge_target)

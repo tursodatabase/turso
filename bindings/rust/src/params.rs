@@ -1,5 +1,7 @@
 //! This module contains all `Param` related utilities and traits.
 
+use std::borrow::Cow;
+
 use crate::{Error, Result, Value};
 
 mod sealed {
@@ -60,12 +62,15 @@ use sealed::Sealed;
 ///
 /// # Named parameters
 ///
+/// Named parameter keys must include the SQL prefix used in the statement,
+/// for example `:name`, `@name`, `$name`, or `?1`.
+///
 /// - For heterogeneous parameter lists of 16 or less items a tuple syntax is supported
-///   by doing `(("key1", 1), ("key2", "foo"))`.
-/// - For hetergeneous parameter lists of 16 or greater, the [`turso::params!`] is supported
-///   by doing `turso::named_params!["key1": 1, "key2": "foo"]`.
+///   by doing `((":key1", 1), (":key2", "foo"))`.
+/// - For heterogeneous parameter lists of 16 or greater, the [`turso::params!`] is supported
+///   by doing `turso::named_params![":key1": 1, ":key2": "foo"]`.
 /// - For homogeneous parameter types (where they are all the same type), const arrays are
-///   supported by doing `[("key1", 1), ("key2, 2), ("key3", 3)]`.
+///   supported by doing `[(":key1", 1), (":key2", 2), (":key3", 3)]`.
 ///
 /// # Example (named)
 ///
@@ -98,7 +103,7 @@ pub trait IntoParams: Sealed {
 pub enum Params {
     None,
     Positional(Vec<Value>),
-    Named(Vec<(String, Value)>),
+    Named(Vec<(Cow<'static, str>, Value)>),
 }
 
 /// Convert an owned iterator into Params.
@@ -158,7 +163,7 @@ impl<T: IntoValue> IntoParams for Vec<(String, T)> {
     fn into_params(self) -> Result<Params> {
         let values = self
             .into_iter()
-            .map(|(k, v)| Ok((k, v.into_value()?)))
+            .map(|(k, v)| Ok((Cow::Owned(k), v.into_value()?)))
             .collect::<Result<Vec<_>>>()?;
 
         Ok(Params::Named(values))
@@ -172,16 +177,16 @@ impl<T: IntoValue, const N: usize> IntoParams for [T; N] {
     }
 }
 
-impl<T: IntoValue, const N: usize> Sealed for [(&str, T); N] {}
-impl<T: IntoValue, const N: usize> IntoParams for [(&str, T); N] {
+// Named parameters with static string keys to avoid String allocations.
+impl<T: IntoValue, const N: usize> Sealed for [(&'static str, T); N] {}
+impl<T: IntoValue, const N: usize> IntoParams for [(&'static str, T); N] {
     fn into_params(self) -> Result<Params> {
-        self.into_iter()
-            // TODO: Pretty unfortunate that we need to allocate here when we know
-            // the str is likely 'static. Maybe we should convert our param names
-            // to be `Cow<'static, str>`?
-            .map(|(k, v)| Ok((k.to_string(), v.into_value()?)))
-            .collect::<Result<Vec<_>>>()?
-            .into_params()
+        let values = self
+            .into_iter()
+            .map(|(k, v)| Ok((Cow::Borrowed(k), v.into_value()?)))
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Params::Named(values))
     }
 }
 
@@ -207,10 +212,10 @@ macro_rules! tuple_into_params {
 
 macro_rules! named_tuple_into_params {
     ($count:literal : $(($field:tt $ftype:ident)),* $(,)?) => {
-        impl<$($ftype,)*> Sealed for ($((&str, $ftype),)*) where $($ftype: IntoValue,)* {}
-        impl<$($ftype,)*> IntoParams for ($((&str, $ftype),)*) where $($ftype: IntoValue,)* {
+        impl<$($ftype,)*> Sealed for ($((&'static str, $ftype),)*) where $($ftype: IntoValue,)* {}
+        impl<$($ftype,)*> IntoParams for ($((&'static str, $ftype),)*) where $($ftype: IntoValue,)* {
             fn into_params(self) -> Result<Params> {
-                let params = Params::Named(vec![$((self.$field.0.to_string(), self.$field.1.into_value()?)),*]);
+                let params = Params::Named(vec![$((Cow::Borrowed(self.$field.0), self.$field.1.into_value()?)),*]);
                 Ok(params)
             }
         }
@@ -276,7 +281,7 @@ impl IntoValue for Result<Value> {
     }
 }
 
-/// Construct positional params from a hetergeneous set of params types.
+/// Construct positional params from a heterogeneous set of params types.
 #[macro_export]
 macro_rules! params {
     () => {
@@ -289,7 +294,7 @@ macro_rules! params {
     }};
 }
 
-/// Construct named params from a hetergeneous set of params types.
+/// Construct named params from a heterogeneous set of params types.
 #[macro_export]
 macro_rules! named_params {
     () => {

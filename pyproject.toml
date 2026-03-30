@@ -14,7 +14,7 @@ package = false
 limbo_test = { workspace = true }
 
 [tool.uv.workspace]
-members = ["testing", "scripts", "antithesis-tests", "bindings/python"]
+members = ["testing", "scripts", "bindings/python"]
 
 [tool.ruff]
 line-length = 120

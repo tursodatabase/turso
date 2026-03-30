@@ -16,6 +16,29 @@ pub fn vector_to_text(vector: &Vector) -> String {
             }
             format_text(dense.iter())
         }
+        VectorType::Float1Bit => {
+            // Each bit → +1 or -1
+            let data = vector.as_1bit_data();
+            let values: Vec<i8> = (0..vector.dims)
+                .map(|i| {
+                    if (data[i / 8] >> (i & 7)) & 1 == 1 {
+                        1
+                    } else {
+                        -1
+                    }
+                })
+                .collect();
+            format_text(values.iter())
+        }
+        VectorType::Float8 => {
+            // Dequantize: f_i = alpha * q_i + shift
+            let (quantized, alpha, shift) = vector.as_f8_data();
+            let values: Vec<f32> = quantized
+                .iter()
+                .map(|&q| alpha * (q as f32) + shift)
+                .collect();
+            format_text(values.iter())
+        }
     }
 }
 
@@ -52,14 +75,20 @@ pub fn vector_from_text(vector_type: VectorType, text: &str) -> Result<Vector> {
     let text = &text[1..text.len() - 1];
     if text.trim().is_empty() {
         return Ok(match vector_type {
-            VectorType::Float32Dense | VectorType::Float64Dense | VectorType::Float32Sparse => {
-                Vector {
-                    vector_type,
-                    dims: 0,
-                    owned: Some(Vec::new()),
-                    refer: None,
-                }
+            VectorType::Float1Bit => {
+                return Err(LimboError::ConversionError(
+                    "empty vector not supported for this type".to_string(),
+                ));
             }
+            VectorType::Float8 => {
+                return Ok(Vector::from_f8(0, Vec::new(), 0.0, 0.0));
+            }
+            _ => Vector {
+                vector_type,
+                dims: 0,
+                owned: Some(Vec::new()),
+                refer: None,
+            },
         });
     }
     let tokens = text.split(',').map(|x| x.trim());
@@ -67,6 +96,8 @@ pub fn vector_from_text(vector_type: VectorType, text: &str) -> Result<Vector> {
         VectorType::Float32Dense => vector32_from_text(tokens),
         VectorType::Float64Dense => vector64_from_text(tokens),
         VectorType::Float32Sparse => vector32_sparse_from_text(tokens),
+        VectorType::Float1Bit => vector_1bit_from_text(tokens),
+        VectorType::Float8 => vector_f8_from_text(tokens),
     }
 }
 
@@ -141,4 +172,59 @@ fn vector32_sparse_from_text<'a>(tokens: impl Iterator<Item = &'a str>) -> Resul
         owned: Some(values),
         refer: None,
     })
+}
+
+fn vector_1bit_from_text<'a>(tokens: impl Iterator<Item = &'a str>) -> Result<Vector<'static>> {
+    let mut floats = Vec::new();
+    for token in tokens {
+        let value = token
+            .parse::<f32>()
+            .map_err(|_| LimboError::ConversionError("Invalid vector value".to_string()))?;
+        if !value.is_finite() {
+            return Err(LimboError::ConversionError(
+                "Invalid vector value".to_string(),
+            ));
+        }
+        floats.push(value);
+    }
+    let dims = floats.len();
+    let byte_count = dims.div_ceil(8);
+    let mut bits = vec![0u8; byte_count];
+    for (i, &f) in floats.iter().enumerate() {
+        if f > 0.0 {
+            bits[i / 8] |= 1 << (i & 7);
+        }
+    }
+    Ok(Vector::from_1bit(dims, bits))
+}
+
+fn vector_f8_from_text<'a>(tokens: impl Iterator<Item = &'a str>) -> Result<Vector<'static>> {
+    let mut floats = Vec::new();
+    for token in tokens {
+        let value = token
+            .parse::<f32>()
+            .map_err(|_| LimboError::ConversionError("Invalid vector value".to_string()))?;
+        if !value.is_finite() {
+            return Err(LimboError::ConversionError(
+                "Invalid vector value".to_string(),
+            ));
+        }
+        floats.push(value);
+    }
+    let dims = floats.len();
+    let min_val = floats.iter().cloned().fold(f32::INFINITY, f32::min);
+    let max_val = floats.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let alpha = (max_val - min_val) / 255.0;
+    let shift = min_val;
+    let mut quantized = Vec::with_capacity(dims);
+    for &f in &floats {
+        let q = if alpha == 0.0 {
+            0u8
+        } else {
+            let v = (f - shift) / alpha + 0.5;
+            (v as i32).clamp(0, 255) as u8
+        };
+        quantized.push(q);
+    }
+    Ok(Vector::from_f8(dims, quantized, alpha, shift))
 }

@@ -80,23 +80,22 @@ public final class JDBC4Connection implements Connection {
 
   @Override
   public void setAutoCommit(boolean autoCommit) throws SQLException {
-    // TODO
+    connection.setAutoCommit(autoCommit);
   }
 
   @Override
   public boolean getAutoCommit() throws SQLException {
-    // TODO
-    return false;
+    return connection.getAutoCommit();
   }
 
   @Override
   public void commit() throws SQLException {
-    // TODO
+    connection.commit();
   }
 
   @Override
   public void rollback() throws SQLException {
-    // TODO
+    connection.rollback();
   }
 
   @Override
@@ -136,13 +135,12 @@ public final class JDBC4Connection implements Connection {
 
   @Override
   public void setTransactionIsolation(int level) throws SQLException {
-    // TODO
+    connection.setTransactionIsolation(level);
   }
 
   @Override
   public int getTransactionIsolation() throws SQLException {
-    // TODO
-    return 0;
+    return connection.getTransactionIsolation();
   }
 
   @Override
@@ -186,25 +184,23 @@ public final class JDBC4Connection implements Connection {
   @Override
   @SkipNullableCheck
   public Savepoint setSavepoint() throws SQLException {
-    // TODO
-    return null;
+    throw new SQLFeatureNotSupportedException("Savepoints are not supported by Turso");
   }
 
   @Override
   @SkipNullableCheck
   public Savepoint setSavepoint(String name) throws SQLException {
-    // TODO
-    return null;
+    throw new SQLFeatureNotSupportedException("Savepoints are not supported by Turso");
   }
 
   @Override
   public void rollback(Savepoint savepoint) throws SQLException {
-    // TODO
+    throw new SQLFeatureNotSupportedException("Savepoints are not supported by Turso");
   }
 
   @Override
   public void releaseSavepoint(Savepoint savepoint) throws SQLException {
-    // TODO
+    throw new SQLFeatureNotSupportedException("Savepoints are not supported by Turso");
   }
 
   @Override

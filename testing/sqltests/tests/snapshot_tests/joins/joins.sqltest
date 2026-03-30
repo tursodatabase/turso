@@ -1,0 +1,902 @@
+# Join Strategy Snapshot Tests
+# These snapshots capture EXPLAIN QUERY PLAN output for various join patterns
+
+@database :memory:
+@skip-file-if mvcc "mvcc has slightly different cursor ids, so skipping it for now"
+
+setup schema {
+    -- Customers table
+    CREATE TABLE customers (
+        customer_id INTEGER PRIMARY KEY NOT NULL,
+        name TEXT NOT NULL,
+        email TEXT NOT NULL,
+        city TEXT NOT NULL,
+        created_at DATE NOT NULL
+    );
+
+    -- Products table
+    CREATE TABLE products (
+        product_id INTEGER PRIMARY KEY NOT NULL,
+        name TEXT NOT NULL,
+        category TEXT NOT NULL,
+        price INTEGER NOT NULL,
+        stock_quantity INTEGER NOT NULL
+    );
+
+    -- Orders table with FK to customers
+    CREATE TABLE orders (
+        order_id INTEGER PRIMARY KEY NOT NULL,
+        customer_id INTEGER NOT NULL,
+        order_date DATE NOT NULL,
+        status TEXT NOT NULL,
+        total_amount INTEGER NOT NULL,
+        FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
+    );
+
+    -- Order items table with FKs to orders and products
+    CREATE TABLE order_items (
+        item_id INTEGER PRIMARY KEY NOT NULL,
+        order_id INTEGER NOT NULL,
+        product_id INTEGER NOT NULL,
+        quantity INTEGER NOT NULL,
+        unit_price INTEGER NOT NULL,
+        FOREIGN KEY (order_id) REFERENCES orders(order_id),
+        FOREIGN KEY (product_id) REFERENCES products(product_id)
+    );
+
+    -- Employees table for self-join tests
+    CREATE TABLE employees (
+        employee_id INTEGER PRIMARY KEY NOT NULL,
+        name TEXT NOT NULL,
+        manager_id INTEGER,
+        department TEXT NOT NULL,
+        salary INTEGER NOT NULL,
+        FOREIGN KEY (manager_id) REFERENCES employees(employee_id)
+    );
+
+    -- Categories table for additional join tests
+    CREATE TABLE categories (
+        category_id INTEGER PRIMARY KEY NOT NULL,
+        category_name TEXT NOT NULL,
+        parent_category_id INTEGER,
+        FOREIGN KEY (parent_category_id) REFERENCES categories(category_id)
+    );
+
+    -- Index on orders.customer_id for index-assisted join tests
+    CREATE INDEX idx_orders_customer_id ON orders(customer_id);
+
+    -- Index on order_items.order_id
+    CREATE INDEX idx_order_items_order_id ON order_items(order_id);
+
+    -- Index on order_items.product_id
+    CREATE INDEX idx_order_items_product_id ON order_items(product_id);
+
+    -- Index on employees.manager_id for self-join
+    CREATE INDEX idx_employees_manager_id ON employees(manager_id);
+}
+
+# =============================================================================
+# 1. Two-table inner join - basic nested loop
+# =============================================================================
+
+@setup schema
+snapshot-eqp two-table-inner-join-basic {
+    SELECT
+        c.customer_id,
+        c.name,
+        o.order_id,
+        o.order_date,
+        o.total_amount
+    FROM
+        customers c,
+        orders o
+    WHERE
+        c.customer_id = o.customer_id;
+}
+
+@setup schema
+snapshot-eqp two-table-inner-join-explicit {
+    SELECT
+        c.customer_id,
+        c.name,
+        o.order_id,
+        o.order_date,
+        o.total_amount
+    FROM
+        customers c
+    INNER JOIN orders o ON c.customer_id = o.customer_id;
+}
+
+@setup schema
+snapshot-eqp two-table-inner-join-with-filter {
+    SELECT
+        c.customer_id,
+        c.name,
+        o.order_id,
+        o.total_amount
+    FROM
+        customers c
+    INNER JOIN orders o ON c.customer_id = o.customer_id
+    WHERE
+        o.status = 'completed'
+        AND o.total_amount > 100;
+}
+
+# =============================================================================
+# 2. Multi-way joins (3+ tables) - join order optimization
+# =============================================================================
+
+@setup schema
+snapshot-eqp three-table-join {
+    SELECT
+        c.name AS customer_name,
+        o.order_id,
+        o.order_date,
+        p.name AS product_name,
+        oi.quantity,
+        oi.unit_price
+    FROM
+        customers c,
+        orders o,
+        order_items oi,
+        products p
+    WHERE
+        c.customer_id = o.customer_id
+        AND o.order_id = oi.order_id
+        AND oi.product_id = p.product_id;
+}
+
+@setup schema
+snapshot-eqp three-table-join-explicit {
+    SELECT
+        c.name AS customer_name,
+        o.order_id,
+        o.order_date,
+        p.name AS product_name,
+        oi.quantity,
+        oi.unit_price
+    FROM
+        customers c
+    INNER JOIN orders o ON c.customer_id = o.customer_id
+    INNER JOIN order_items oi ON o.order_id = oi.order_id
+    INNER JOIN products p ON oi.product_id = p.product_id;
+}
+
+@setup schema
+snapshot-eqp four-table-join-with-aggregation {
+    SELECT
+        c.name AS customer_name,
+        c.city,
+        COUNT(DISTINCT o.order_id) AS order_count,
+        SUM(oi.quantity * oi.unit_price) AS total_spent
+    FROM
+        customers c
+    INNER JOIN orders o ON c.customer_id = o.customer_id
+    INNER JOIN order_items oi ON o.order_id = oi.order_id
+    INNER JOIN products p ON oi.product_id = p.product_id
+    WHERE
+        p.category = 'Electronics'
+    GROUP BY
+        c.customer_id, c.name, c.city
+    ORDER BY
+        total_spent DESC;
+}
+
+@setup schema
+snapshot-eqp multi-table-join-complex-filter {
+    SELECT
+        c.name,
+        o.order_id,
+        o.order_date,
+        p.name AS product_name,
+        p.category
+    FROM
+        customers c,
+        orders o,
+        order_items oi,
+        products p
+    WHERE
+        c.customer_id = o.customer_id
+        AND o.order_id = oi.order_id
+        AND oi.product_id = p.product_id
+        AND c.city = 'New York'
+        AND o.order_date >= '2024-01-01'
+        AND p.price > 50
+    ORDER BY
+        o.order_date DESC,
+        p.name;
+}
+
+# =============================================================================
+# 3. Left outer join - null handling
+# =============================================================================
+
+@setup schema
+snapshot left-outer-join-basic {
+    SELECT
+        c.customer_id,
+        c.name,
+        o.order_id,
+        o.order_date
+    FROM
+        customers c
+    LEFT OUTER JOIN orders o ON c.customer_id = o.customer_id;
+}
+
+@setup schema
+snapshot left-outer-join-find-nulls {
+    SELECT
+        c.customer_id,
+        c.name,
+        c.email
+    FROM
+        customers c
+    LEFT OUTER JOIN orders o ON c.customer_id = o.customer_id
+    WHERE
+        o.order_id IS NULL;
+}
+
+@setup schema
+snapshot left-outer-join-with-aggregation {
+    SELECT
+        c.customer_id,
+        c.name,
+        COUNT(o.order_id) AS order_count,
+        COALESCE(SUM(o.total_amount), 0) AS total_spent
+    FROM
+        customers c
+    LEFT OUTER JOIN orders o ON c.customer_id = o.customer_id
+    GROUP BY
+        c.customer_id, c.name
+    ORDER BY
+        total_spent DESC;
+}
+
+@setup schema
+snapshot left-outer-join-chained {
+    SELECT
+        c.name AS customer_name,
+        o.order_id,
+        oi.item_id,
+        p.name AS product_name
+    FROM
+        customers c
+    LEFT OUTER JOIN orders o ON c.customer_id = o.customer_id
+    LEFT OUTER JOIN order_items oi ON o.order_id = oi.order_id
+    LEFT OUTER JOIN products p ON oi.product_id = p.product_id;
+}
+
+# =============================================================================
+# 4. Right outer join
+# =============================================================================
+
+# TODO: Uncomment when RIGHT JOIN is supported
+# @setup schema
+# snapshot right-outer-join-basic {
+#     SELECT
+#         c.customer_id,
+#         c.name,
+#         o.order_id,
+#         o.order_date,
+#         o.total_amount
+#     FROM
+#         customers c
+#     RIGHT OUTER JOIN orders o ON c.customer_id = o.customer_id;
+# }
+
+# TODO: Uncomment when RIGHT JOIN is supported
+# @setup schema
+# snapshot right-outer-join-find-orphans {
+#     SELECT
+#         o.order_id,
+#         o.order_date,
+#         o.customer_id
+#     FROM
+#         customers c
+#     RIGHT OUTER JOIN orders o ON c.customer_id = o.customer_id
+#     WHERE
+#         c.customer_id IS NULL;
+# }
+
+# =============================================================================
+# 5. Self-join - same table aliased differently
+# =============================================================================
+
+@setup schema
+snapshot self-join-employee-manager {
+    SELECT
+        e.employee_id,
+        e.name AS employee_name,
+        e.department,
+        m.name AS manager_name
+    FROM
+        employees e
+    LEFT OUTER JOIN employees m ON e.manager_id = m.employee_id;
+}
+
+@setup schema
+snapshot-eqp self-join-find-subordinates {
+    SELECT
+        m.name AS manager_name,
+        COUNT(e.employee_id) AS subordinate_count,
+        AVG(e.salary) AS avg_subordinate_salary
+    FROM
+        employees m
+    INNER JOIN employees e ON m.employee_id = e.manager_id
+    GROUP BY
+        m.employee_id, m.name
+    ORDER BY
+        subordinate_count DESC;
+}
+
+@setup schema
+snapshot self-join-category-hierarchy {
+    SELECT
+        c.category_id,
+        c.category_name,
+        p.category_name AS parent_category_name
+    FROM
+        categories c
+    LEFT OUTER JOIN categories p ON c.parent_category_id = p.category_id;
+}
+
+@setup schema
+snapshot-eqp self-join-same-department {
+    SELECT
+        e1.name AS employee1,
+        e2.name AS employee2,
+        e1.department
+    FROM
+        employees e1,
+        employees e2
+    WHERE
+        e1.department = e2.department
+        AND e1.employee_id < e2.employee_id;
+}
+
+# =============================================================================
+# 6. Cross join - cartesian product
+# =============================================================================
+
+@setup schema
+snapshot cross-join-explicit {
+    SELECT
+        c.name AS customer_name,
+        p.name AS product_name,
+        p.price
+    FROM
+        customers c
+    CROSS JOIN products p;
+}
+
+@setup schema
+snapshot-eqp cross-join-implicit {
+    SELECT
+        c.name AS customer_name,
+        p.name AS product_name,
+        p.price
+    FROM
+        customers c,
+        products p;
+}
+
+@setup schema
+snapshot cross-join-with-filter {
+    SELECT
+        c.name AS customer_name,
+        p.name AS product_name,
+        p.price
+    FROM
+        customers c
+    CROSS JOIN products p
+    WHERE
+        c.city = 'Boston'
+        AND p.category = 'Books';
+}
+
+@setup schema
+snapshot cross-join-limited {
+    SELECT
+        c.name AS customer_name,
+        p.name AS product_name
+    FROM
+        customers c
+    CROSS JOIN products p
+    LIMIT 10;
+}
+
+# =============================================================================
+# 7. Join with index on FK - index-assisted join
+# =============================================================================
+
+@setup schema
+snapshot-eqp index-assisted-join-single-customer {
+    SELECT
+        c.name,
+        o.order_id,
+        o.order_date,
+        o.total_amount
+    FROM
+        customers c
+    INNER JOIN orders o ON c.customer_id = o.customer_id
+    WHERE
+        c.customer_id = 42;
+}
+
+@setup schema
+snapshot-eqp index-assisted-join-order-items {
+    SELECT
+        o.order_id,
+        o.order_date,
+        oi.item_id,
+        oi.quantity,
+        p.name AS product_name
+    FROM
+        orders o
+    INNER JOIN order_items oi ON o.order_id = oi.order_id
+    INNER JOIN products p ON oi.product_id = p.product_id
+    WHERE
+        o.order_id = 100;
+}
+
+@setup schema
+snapshot-eqp index-assisted-join-product-lookup {
+    SELECT
+        p.name AS product_name,
+        p.category,
+        oi.quantity,
+        o.order_date,
+        c.name AS customer_name
+    FROM
+        products p
+    INNER JOIN order_items oi ON p.product_id = oi.product_id
+    INNER JOIN orders o ON oi.order_id = o.order_id
+    INNER JOIN customers c ON o.customer_id = c.customer_id
+    WHERE
+        p.product_id = 500;
+}
+
+@setup schema
+snapshot-eqp index-assisted-join-range-scan {
+    SELECT
+        c.name,
+        COUNT(o.order_id) AS order_count
+    FROM
+        customers c
+    INNER JOIN orders o ON c.customer_id = o.customer_id
+    WHERE
+        c.customer_id BETWEEN 10 AND 20
+    GROUP BY
+        c.customer_id, c.name;
+}
+
+# =============================================================================
+# Additional complex join patterns
+# =============================================================================
+
+@setup schema
+snapshot-eqp mixed-join-types {
+    SELECT
+        c.name AS customer_name,
+        o.order_id,
+        oi.quantity,
+        p.name AS product_name
+    FROM
+        customers c
+    LEFT OUTER JOIN orders o ON c.customer_id = o.customer_id
+    INNER JOIN order_items oi ON o.order_id = oi.order_id
+    INNER JOIN products p ON oi.product_id = p.product_id;
+}
+
+@setup schema
+snapshot-eqp join-with-subquery {
+    SELECT
+        c.name,
+        c.city,
+        recent_orders.order_count,
+        recent_orders.total_spent
+    FROM
+        customers c
+    INNER JOIN (
+        SELECT
+            customer_id,
+            COUNT(*) AS order_count,
+            SUM(total_amount) AS total_spent
+        FROM
+            orders
+        WHERE
+            order_date >= '2024-01-01'
+        GROUP BY
+            customer_id
+    ) AS recent_orders ON c.customer_id = recent_orders.customer_id
+    ORDER BY
+        recent_orders.total_spent DESC;
+}
+
+@setup schema
+snapshot-eqp join-with-exists {
+    SELECT
+        c.customer_id,
+        c.name,
+        c.city
+    FROM
+        customers c
+    WHERE
+        EXISTS (
+            SELECT 1
+            FROM orders o
+            WHERE o.customer_id = c.customer_id
+            AND o.total_amount > 1000
+        );
+}
+
+@setup schema
+snapshot-eqp join-multiple-conditions {
+    SELECT
+        e1.name AS employee1,
+        e2.name AS employee2,
+        e1.department,
+        e1.salary
+    FROM
+        employees e1
+    INNER JOIN employees e2 ON
+        e1.department = e2.department
+        AND e1.salary = e2.salary
+        AND e1.employee_id < e2.employee_id;
+}
+
+@setup schema
+snapshot-eqp natural-join {
+    SELECT *
+    FROM customers
+    NATURAL JOIN orders;
+}
+
+@setup schema
+snapshot-eqp using-clause-join {
+    SELECT
+        c.name,
+        o.order_id,
+        o.order_date
+    FROM
+        customers c
+    INNER JOIN orders o USING (customer_id);
+}
+
+# =============================================================================
+# Regression: multi-table join with multiple constraints on same rowid column
+# The optimizer must not skip usable rowid constraints when an unusable
+# constraint on the same column appears first in the constraint list.
+# =============================================================================
+
+@setup schema
+snapshot-eqp three-table-join-rowid-seek {
+    SELECT
+        oi.product_id,
+        COUNT(DISTINCT c.customer_id) AS unique_customers
+    FROM
+        customers c
+    INNER JOIN orders o ON c.customer_id = o.customer_id
+    INNER JOIN order_items oi ON o.order_id = oi.order_id
+    GROUP BY
+        oi.product_id;
+}
+
+setup schema_join_data {
+    -- Customers
+    INSERT INTO customers VALUES (1, 'Alice', 'alice@test.com', 'NYC', '2024-01-01');
+    INSERT INTO customers VALUES (2, 'Bob', 'bob@test.com', 'LA', '2024-01-01');
+    INSERT INTO customers VALUES (3, 'Carol', 'carol@test.com', 'NYC', '2024-01-01');
+
+    -- Orders: customer 1 has 2 orders, customer 2 has 1, customer 3 has 1
+    INSERT INTO orders VALUES (10, 1, '2024-02-01', 'delivered', 100);
+    INSERT INTO orders VALUES (11, 1, '2024-03-01', 'delivered', 200);
+    INSERT INTO orders VALUES (12, 2, '2024-02-15', 'delivered', 150);
+    INSERT INTO orders VALUES (13, 3, '2024-04-01', 'pending', 50);
+
+    -- Order items: order 10 has items for products 501 and 502,
+    -- order 11 has item for 501, order 12 has item for 502, order 13 has item for 503
+    INSERT INTO order_items VALUES (100, 10, 501, 2, 25);
+    INSERT INTO order_items VALUES (101, 10, 502, 1, 50);
+    INSERT INTO order_items VALUES (102, 11, 501, 3, 25);
+    INSERT INTO order_items VALUES (103, 12, 502, 1, 50);
+    INSERT INTO order_items VALUES (104, 13, 503, 1, 50);
+}
+
+# Correctness test for the rowid-seek regression.
+# Expected (ORDER BY product_id):
+#   501: customer 1 via orders 10,11 -> COUNT(DISTINCT customer_id) = 1
+#   502: customer 1 via order 10, customer 2 via order 12 -> 2
+#   503: customer 3 via order 13 -> 1
+@setup schema
+@setup schema_join_data
+test three-table-join-rowid-seek-correctness {
+    SELECT
+        oi.product_id,
+        COUNT(DISTINCT c.customer_id) AS unique_customers
+    FROM
+        customers c
+    INNER JOIN orders o ON c.customer_id = o.customer_id
+    INNER JOIN order_items oi ON o.order_id = oi.order_id
+    GROUP BY
+        oi.product_id
+    ORDER BY
+        oi.product_id;
+}
+expect {
+    501|1
+    502|2
+    503|1
+}
+
+# =============================================================================
+# Regression: verbatim reproduction from testing-bigass.db schema
+# Three-table join where GROUP BY on an indexed column caused the optimizer
+# to miss a usable rowid constraint on the middle table, resulting in a full
+# table scan instead of SeekRowid.
+# =============================================================================
+
+setup bigass_schema {
+    CREATE TABLE customer_support_tickets (
+        id INTEGER PRIMARY KEY,
+        user_id INTEGER,
+        order_id INTEGER,
+        ticket_number TEXT,
+        category TEXT,
+        priority TEXT,
+        status TEXT,
+        subject TEXT,
+        description TEXT,
+        created_at TIMESTAMP,
+        updated_at TIMESTAMP,
+        resolved_at TIMESTAMP,
+        assigned_to TEXT,
+        resolution_notes TEXT
+    );
+
+    CREATE TABLE orders (
+        id INTEGER PRIMARY KEY,
+        user_id INTEGER,
+        order_date TIMESTAMP,
+        total_amount REAL,
+        status TEXT,
+        shipping_address TEXT,
+        shipping_city TEXT,
+        shipping_state TEXT,
+        shipping_zip TEXT,
+        payment_method TEXT,
+        tracking_number TEXT,
+        notes TEXT
+    );
+
+    CREATE TABLE order_items (
+        id INTEGER PRIMARY KEY,
+        order_id INTEGER,
+        product_id INTEGER,
+        quantity INTEGER,
+        unit_price REAL,
+        discount REAL,
+        tax REAL,
+        total_price REAL
+    );
+
+    CREATE INDEX idx_tickets_user_id ON customer_support_tickets(user_id);
+    CREATE INDEX idx_tickets_status ON customer_support_tickets(status);
+    CREATE INDEX idx_orders_user_id ON orders(user_id);
+    CREATE INDEX idx_orders_status ON orders(status);
+    CREATE INDEX idx_order_items_order_id ON order_items(order_id);
+    CREATE INDEX idx_order_items_product_id ON order_items(product_id);
+}
+
+@setup bigass_schema
+snapshot-eqp bigass-three-table-join-rowid-seek {
+    SELECT
+        oi.product_id,
+        COUNT(DISTINCT t.id) AS support_issues
+    FROM
+        customer_support_tickets t
+    INNER JOIN orders o ON t.order_id = o.id
+    INNER JOIN order_items oi ON o.id = oi.order_id
+    GROUP BY
+        oi.product_id;
+}
+
+# Fixture data for semantic correctness tests.
+# Designed so that:
+# - Multiple tickets can reference the same order (tickets 1,2 -> order 1)
+# - One order can have multiple items across different products
+# - A ticket referencing an order with items for products 101 and 102
+#   should count toward BOTH products
+# - Tickets referencing orders with NO items should not appear
+# - DISTINCT matters: ticket 1 touches product 101 via TWO items (oi 1 and 2)
+#   but should only count once per product
+setup bigass_data {
+    -- Orders
+    INSERT INTO orders (id, user_id) VALUES (1, 10);
+    INSERT INTO orders (id, user_id) VALUES (2, 10);
+    INSERT INTO orders (id, user_id) VALUES (3, 20);
+    INSERT INTO orders (id, user_id) VALUES (4, 20);  -- order with no items
+
+    -- Order items: order 1 has 3 items (2 for product 101, 1 for product 102)
+    INSERT INTO order_items (id, order_id, product_id, quantity) VALUES (1, 1, 101, 5);
+    INSERT INTO order_items (id, order_id, product_id, quantity) VALUES (2, 1, 101, 3);
+    INSERT INTO order_items (id, order_id, product_id, quantity) VALUES (3, 1, 102, 1);
+    -- Order 2 has 1 item for product 102
+    INSERT INTO order_items (id, order_id, product_id, quantity) VALUES (4, 2, 102, 2);
+    -- Order 3 has 1 item for product 103
+    INSERT INTO order_items (id, order_id, product_id, quantity) VALUES (5, 3, 103, 1);
+
+    -- Tickets: two tickets for order 1, one for order 2, one for order 3, one for order 4 (no items)
+    INSERT INTO customer_support_tickets (id, user_id, order_id) VALUES (1, 10, 1);
+    INSERT INTO customer_support_tickets (id, user_id, order_id) VALUES (2, 10, 1);
+    INSERT INTO customer_support_tickets (id, user_id, order_id) VALUES (3, 10, 2);
+    INSERT INTO customer_support_tickets (id, user_id, order_id) VALUES (4, 20, 3);
+    INSERT INTO customer_support_tickets (id, user_id, order_id) VALUES (5, 20, 4);  -- dangling: order 4 has no items
+}
+
+# Semantic correctness: verify COUNT(DISTINCT t.id) groups correctly.
+# Expected results (ORDER BY product_id):
+#   product 101: tickets 1,2 via order 1 items 1,2 -> each ticket counted once -> 2
+#   product 102: tickets 1,2 via order 1 item 3 + ticket 3 via order 2 item 4 -> 3
+#   product 103: ticket 4 via order 3 item 5 -> 1
+# Ticket 5 (order 4, no items) does not appear due to INNER JOIN.
+@setup bigass_schema
+@setup bigass_data
+test bigass-three-table-join-correctness {
+    SELECT
+        oi.product_id,
+        COUNT(DISTINCT t.id) AS support_issues
+    FROM
+        customer_support_tickets t
+    INNER JOIN orders o ON t.order_id = o.id
+    INNER JOIN order_items oi ON o.id = oi.order_id
+    GROUP BY
+        oi.product_id
+    ORDER BY
+        oi.product_id;
+}
+expect {
+    101|2
+    102|3
+    103|1
+}
+
+# When two unique indexes have equal cost but different prerequisites,
+# prefer the constant-bound index (fewer prereqs). This mirrors SQLite's
+# whereLoopFindLesser() where plans with fewer dependencies dominate.
+setup prereq_schema {
+    CREATE TABLE t1 (id TEXT PRIMARY KEY NOT NULL);
+    CREATE TABLE t2 (a TEXT NOT NULL, b TEXT NOT NULL);
+    CREATE UNIQUE INDEX idx_t2_a ON t2 (a);
+    CREATE UNIQUE INDEX idx_t2_b ON t2 (b);
+}
+
+@setup prereq_schema
+snapshot-eqp prefer-constant-bound-index-over-join-dependent {
+    SELECT t1.id FROM t1 LEFT JOIN t2 ON t1.id = t2.a AND t2.b = 'x' WHERE t2.a IS NULL;
+}
+
+# Self-join on a non-unique indexed column where the join-dependent index
+# (equality on the shared key) must beat a constant-bound index (equality on
+# a label/category column). Without proper selectivity-based cost estimation,
+# all single-column non-unique indexes get identical cost and the wrong
+# tiebreaker picks the label index — causing a full scan of all matching
+# labels instead of a narrow seek on the shared key.
+setup catalog_schema {
+    CREATE TABLE product (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL DEFAULT '', category TEXT DEFAULT 'general');
+    CREATE TABLE bundle (id TEXT PRIMARY KEY NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL DEFAULT '');
+    CREATE INDEX idx_bundle_kind   ON bundle (kind);
+    CREATE INDEX idx_bundle_target ON bundle (target);
+    CREATE INDEX idx_bundle_source ON bundle (source);
+}
+
+@setup catalog_schema
+snapshot-eqp self-join-prefer-join-dependent-index {
+    SELECT DISTINCT
+        p1.name, p2.name
+    FROM bundle b1
+    JOIN bundle b2 ON b1.source = b2.source
+    JOIN product p1 ON b1.target = p1.id
+    JOIN product p2 ON b2.target = p2.id
+    JOIN product container ON b1.source = container.id
+    LEFT JOIN bundle x1 ON p1.id = x1.target AND x1.kind = 'variant'
+    LEFT JOIN bundle x2 ON p2.id = x2.target AND x2.kind = 'variant'
+    WHERE b1.kind = 'contains'
+      AND b2.kind = 'contains'
+      AND b1.target <> b2.target
+      AND b1.target < b2.target
+      AND container.category = 'kit'
+      AND p1.category NOT IN ('shipping', 'meta', 'kit')
+      AND p2.category NOT IN ('shipping', 'meta', 'kit')
+      AND x1.id IS NULL
+      AND x2.id IS NULL;
+}
+
+# =============================================================================
+# Hash Join Snapshot Tests
+# =============================================================================
+# These capture bytecode for hash joins (tables WITHOUT indexes on join columns)
+# to verify grace hash join opcode emission.
+
+setup hash_schema {
+    -- Tables deliberately have NO indexes on join columns to force hash join
+    CREATE TABLE h_orders (
+        order_id INTEGER PRIMARY KEY NOT NULL,
+        customer_name TEXT NOT NULL,
+        amount INTEGER NOT NULL
+    );
+
+    CREATE TABLE h_items (
+        item_id INTEGER PRIMARY KEY NOT NULL,
+        order_name TEXT NOT NULL,
+        product TEXT NOT NULL,
+        quantity INTEGER NOT NULL
+    );
+
+    CREATE TABLE h_returns (
+        return_id INTEGER PRIMARY KEY NOT NULL,
+        order_name TEXT NOT NULL,
+        reason TEXT NOT NULL
+    );
+}
+
+# Inner hash join - should show HashBuild, HashProbe, and Grace opcodes
+@setup hash_schema
+snapshot hash-join-inner-basic {
+    SELECT h.order_id, h.customer_name, i.product, i.quantity
+    FROM h_orders h
+    JOIN h_items i ON h.customer_name = i.order_name;
+}
+
+# LEFT OUTER hash join - includes HashScanUnmatched for unmatched build rows
+@setup hash_schema
+snapshot hash-join-left-outer {
+    SELECT h.order_id, h.customer_name, i.product
+    FROM h_orders h
+    LEFT JOIN h_items i ON h.customer_name = i.order_name;
+}
+
+# FULL OUTER hash join - both unmatched build and unmatched probe paths
+@setup hash_schema
+snapshot hash-join-full-outer {
+    SELECT h.order_id, h.customer_name, i.item_id, i.product
+    FROM h_orders h
+    FULL OUTER JOIN h_items i ON h.customer_name = i.order_name;
+}
+
+# Hash join with aggregation
+@setup hash_schema
+snapshot hash-join-with-aggregation {
+    SELECT h.customer_name, count(*) as item_count, sum(i.quantity) as total_qty
+    FROM h_orders h
+    JOIN h_items i ON h.customer_name = i.order_name
+    GROUP BY h.customer_name;
+}
+
+# Three-table hash join chain
+@setup hash_schema
+snapshot hash-join-three-table {
+    SELECT h.order_id, i.product, r.reason
+    FROM h_orders h
+    JOIN h_items i ON h.customer_name = i.order_name
+    JOIN h_returns r ON h.customer_name = r.order_name;
+}
+
+# Hash join with ORDER BY (sorter after hash join)
+@setup hash_schema
+snapshot hash-join-with-order-by {
+    SELECT h.order_id, h.customer_name, i.product
+    FROM h_orders h
+    JOIN h_items i ON h.customer_name = i.order_name
+    ORDER BY h.customer_name, i.product;
+}
+
+# LEFT OUTER hash join with aggregation (grace + unmatched + groupby)
+@setup hash_schema
+snapshot hash-join-left-outer-agg {
+    SELECT h.customer_name, count(i.item_id) as item_count
+    FROM h_orders h
+    LEFT JOIN h_items i ON h.customer_name = i.order_name
+    GROUP BY h.customer_name
+    ORDER BY h.customer_name;
+}

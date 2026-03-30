@@ -90,7 +90,7 @@ pub fn phonetic_hash(z_in: &[u8]) -> Option<Vec<u8>> {
             c = b'?';
         }
 
-        if z_out.is_empty() || c != *z_out.last().unwrap() {
+        if z_out.last() != Some(&c) {
             z_out.push(c);
         }
 

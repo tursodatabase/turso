@@ -1,0 +1,67 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+
+# Test that materialized views correctly coerce text values to numeric
+# in arithmetic operations, matching SQLite behavior.
+# See: https://github.com/tursodatabase/turso/issues/5252
+
+test matview-text-subtract {
+    CREATE TABLE t1(x TEXT);
+    INSERT INTO t1 VALUES ('hello');
+    CREATE MATERIALIZED VIEW v1 AS SELECT x - 1 FROM t1;
+    SELECT * FROM v1;
+}
+expect {
+    -1
+}
+
+test matview-text-multiply {
+    CREATE TABLE t2(x TEXT);
+    INSERT INTO t2 VALUES ('hello');
+    CREATE MATERIALIZED VIEW v2 AS SELECT x * 2 FROM t2;
+    SELECT * FROM v2;
+}
+expect {
+    0
+}
+
+test matview-text-divide {
+    CREATE TABLE t3(x TEXT);
+    INSERT INTO t3 VALUES ('hello');
+    CREATE MATERIALIZED VIEW v3 AS SELECT x / 2 FROM t3;
+    SELECT * FROM v3;
+}
+expect {
+    0
+}
+
+test matview-text-add {
+    CREATE TABLE t4(x TEXT);
+    INSERT INTO t4 VALUES ('hello');
+    CREATE MATERIALIZED VIEW v4 AS SELECT x + 1 FROM t4;
+    SELECT * FROM v4;
+}
+expect {
+    1
+}
+
+test matview-numeric-text-subtract {
+    CREATE TABLE t5(x TEXT);
+    INSERT INTO t5 VALUES ('42');
+    CREATE MATERIALIZED VIEW v5 AS SELECT x - 1 FROM t5;
+    SELECT * FROM v5;
+}
+expect {
+    41
+}
+
+test matview-numeric-text-add {
+    CREATE TABLE t6(x TEXT);
+    INSERT INTO t6 VALUES ('42');
+    CREATE MATERIALIZED VIEW v6 AS SELECT x + 8 FROM t6;
+    SELECT * FROM v6;
+}
+expect {
+    50
+}

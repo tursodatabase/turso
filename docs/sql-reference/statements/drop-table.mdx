@@ -1,0 +1,62 @@
+---
+title: DROP TABLE
+description: Remove a table and all its data from the database
+sidebarTitle: DROP TABLE
+---
+
+# DROP TABLE
+
+Remove a table and all its data, indexes, triggers, and constraints from the database.
+
+## Syntax
+
+```sql
+DROP TABLE [IF EXISTS] [schema-name.]table-name;
+```
+
+## Description
+
+`DROP TABLE` permanently removes a table definition and all data stored in the table. All indexes, triggers, and constraints associated with the table are also removed.
+
+### Parameters
+
+| Parameter | Description |
+|-----------|-------------|
+| `IF EXISTS` | Prevents an error if the table does not exist. The statement is a no-op when the table is absent. |
+| `schema-name` | The name of the attached database containing the table. Defaults to the main database if omitted. |
+| `table-name` | The name of the table to drop. |
+
+### Behavior
+
+- All rows in the table are deleted.
+- All indexes built on the table are removed.
+- All triggers associated with the table are removed.
+- The table entry is removed from the `sqlite_schema` system table.
+- If foreign key constraints reference the dropped table, those references become invalid. Turso does not prevent dropping a table that is referenced by foreign keys in other tables.
+- `DROP TABLE` is not allowed while the table is being read or written by another statement in the same connection.
+
+## Examples
+
+### Drop a Table
+
+```sql
+DROP TABLE users;
+```
+
+### Drop a Table Only if It Exists
+
+```sql
+DROP TABLE IF EXISTS temporary_results;
+```
+
+### Drop a Table in an Attached Database
+
+```sql
+DROP TABLE aux.sessions;
+```
+
+## See Also
+
+- [CREATE TABLE](/docs/sql-reference/statements/create-table) for creating tables
+- [ALTER TABLE](/docs/sql-reference/statements/alter-table) for modifying tables
+- [DELETE](/docs/sql-reference/statements/delete) for removing rows without dropping the table

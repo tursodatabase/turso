@@ -1,0 +1,78 @@
+---
+title: ANALYZE
+description: Collect statistics about indexes to help the query optimizer
+sidebarTitle: ANALYZE
+---
+
+# ANALYZE
+
+The ANALYZE statement collects statistics about the contents of tables and indexes. The query optimizer uses these statistics to choose better query plans, particularly when deciding which index to use and how to order joins.
+
+## Syntax
+
+```sql
+ANALYZE;
+ANALYZE schema-name;
+ANALYZE [schema-name.]table-or-index-name;
+```
+
+## Description
+
+The ANALYZE statement gathers statistics about the distribution of values in indexes and stores the results in the `sqlite_stat1` table (and optionally `sqlite_stat4`). The query optimizer reads these statistics to make better decisions about:
+
+- Which index to use for a query
+- The order in which to process tables in a join
+- Whether to use an index or a full table scan
+
+### Forms
+
+| Form | Description |
+|------|-------------|
+| `ANALYZE` | Analyze all tables and indexes in all attached databases |
+| `ANALYZE schema-name` | Analyze all tables and indexes in the named database |
+| `ANALYZE table-name` | Analyze all indexes on the named table |
+| `ANALYZE index-name` | Analyze the named index |
+
+## Examples
+
+### Analyze All Tables
+
+```sql
+-- Collect statistics for the entire database
+ANALYZE;
+```
+
+### Analyze a Specific Table
+
+```sql
+CREATE TABLE orders (
+    id INTEGER PRIMARY KEY,
+    customer_id INTEGER,
+    product_id INTEGER,
+    amount REAL
+);
+
+CREATE INDEX idx_customer ON orders(customer_id);
+CREATE INDEX idx_product ON orders(product_id);
+
+-- Collect statistics for the orders table and its indexes
+ANALYZE orders;
+```
+
+### Viewing Statistics
+
+The statistics are stored in the `sqlite_stat1` table:
+
+```sql
+SELECT * FROM sqlite_stat1;
+-- tbl     | idx           | stat
+-- orders  | idx_customer  | 1000 50
+-- orders  | idx_product   | 1000 10
+```
+
+The `stat` column contains space-separated integers. The first integer is the total number of rows in the table. Subsequent integers estimate the average number of rows that share the same value for the leftmost N columns of the index.
+
+## See Also
+
+- [CREATE INDEX](/docs/sql-reference/statements/create-index) for creating indexes
+- [EXPLAIN](/docs/sql-reference/statements/explain) for examining query plans

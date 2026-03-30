@@ -1,0 +1,121 @@
+name: Dotnet Publish
+
+on:
+  # Manually trigger the workflow
+  workflow_dispatch:
+
+env:
+  working-directory: bindings/dotnet
+
+jobs:
+  # Build native libraries for each platform
+  build-natives:
+    strategy:
+      matrix:
+        include:
+        - os: ubuntu-latest
+          make-target: build-rust-linux64
+          artifact-name: linux64
+          target: x86_64-unknown-linux-gnu
+
+        - os: macos-latest
+          make-target: build-rust-macos64
+          artifact-name: macos64
+          target: x86_64-apple-darwin
+
+        - os: macos-latest
+          make-target: build-rust-macosarm64
+          target: aarch64-apple-darwin
+          artifact-name: macosarm64
+
+        - os: windows-latest
+          make-target: build-rust-windows64
+          target: x86_64-pc-windows-msvc
+          artifact-name: windows64
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build rust native library
+        run: make ${{ matrix.make-target }} RUST_RELEASE_OPT='--profile release-official'
+      
+      - name: Upload rust native library
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.artifact-name }}
+          path: |
+            ${{ env.working-directory }}/rs_compiled/**/turso_dotnet.dll
+            ${{ env.working-directory }}/rs_compiled/**/libturso_dotnet.so
+            ${{ env.working-directory }}/rs_compiled/**/libturso_dotnet.dylib
+
+          retention-days: 1
+
+  # Create Turso.Raw and Turso nuget packages
+  publish:
+    needs: build-natives
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Install dotnet sdk 9.0
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Download all native libraries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: ${{ env.working-directory }}/rs_compiled
+          merge-multiple: true
+
+      - name: Build and pack 
+        run:
+          make pack
+
+      # https://learn.microsoft.com/en-us/nuget/nuget-org/publish-a-package
+      - name: Publish to nuget
+        if: false # TODO: Get nuget api key and publish packages
+        run: |
+          dotnet nuget push ${{ env.working-directory }}/src/Turso.Raw/bin/Release/Turso.Raw.*.nupkg --api-key ... --source https://api.nuget.org/v3/index.json
+
+          dotnet nuget push ${{ env.working-directory }}/src/Turso/bin/Release/Turso.*.nupkg --api-key ... --source https://api.nuget.org/v3/index.json
+
+      - name: Upload Turso.Raw to artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Turso.Raw
+          path: ${{ env.working-directory }}/src/Turso.Raw/bin/Release/Turso.Raw.*.nupkg
+          retention-days: 7
+
+      - name: Upload Turso to artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Turso
+          path: ${{ env.working-directory }}/src/Turso/bin/Release/Turso.*.nupkg
+          retention-days: 7
+
+
+

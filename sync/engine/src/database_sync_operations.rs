@@ -7,29 +7,29 @@ use bytes::BytesMut;
 use prost::Message;
 use roaring::RoaringBitmap;
 use turso_core::{
+    io::FileSyncType,
     types::{Text, WalFrameInfo},
     Buffer, Completion, LimboError, OpenFlags, Value,
 };
 
 use crate::{
     database_replay_generator::DatabaseReplayGenerator,
-    database_sync_engine::{DataStats, DatabaseSyncEngineOpts, PartialBootstrapStrategy},
+    database_sync_engine::{DataStats, DatabaseSyncEngineOpts},
+    database_sync_engine_io::{DataCompletion, DataPollResult, SyncEngineIo},
     database_tape::{
         run_stmt_expect_one_row, run_stmt_ignore_rows, DatabaseChangesIteratorMode,
         DatabaseChangesIteratorOpts, DatabaseReplaySessionOpts, DatabaseTape, DatabaseWalSession,
     },
     errors::Error,
     io_operations::IoOperations,
-    protocol_io::{DataCompletion, DataPollResult, ProtocolIO},
     server_proto::{
-        self, Batch, BatchCond, BatchStep, BatchStreamReq, ExecuteStreamReq, PageData,
-        PageUpdatesEncodingReq, PullUpdatesReqProtoBody, PullUpdatesRespProtoBody, Stmt,
-        StmtResult, StreamRequest,
+        self, Batch, BatchCond, BatchStep, BatchStreamReq, PageData, PageUpdatesEncodingReq,
+        PullUpdatesReqProtoBody, PullUpdatesRespProtoBody, Stmt, StmtResult, StreamRequest,
     },
     types::{
         Coro, DatabasePullRevision, DatabaseRowTransformResult, DatabaseSyncEngineProtocolVersion,
         DatabaseTapeOperation, DatabaseTapeRowChange, DatabaseTapeRowChangeType, DbSyncInfo,
-        DbSyncStatus, ProtocolCommand,
+        DbSyncStatus, PartialBootstrapStrategy, PartialSyncOpts, SyncEngineIoResult,
     },
     wal_session::WalSession,
     Result,
@@ -63,34 +63,34 @@ pub(crate) fn acquire_slot<T: Clone>(slot: &Arc<Mutex<Option<T>>>) -> Result<Mut
     })
 }
 
-pub struct ProtocolIoStats<P: ProtocolIO> {
-    pub protocol: Arc<P>,
+pub struct SyncEngineIoStats<IO: SyncEngineIo> {
+    pub io: Arc<IO>,
     pub network_stats: Arc<DataStats>,
 }
 
-impl<P: ProtocolIO> ProtocolIoStats<P> {
-    pub fn new(protocol: Arc<P>) -> Self {
+impl<IO: SyncEngineIo> SyncEngineIoStats<IO> {
+    pub fn new(io: Arc<IO>) -> Self {
         Self {
-            protocol,
+            io,
             network_stats: Arc::new(DataStats::new()),
         }
     }
 }
 
-impl<P: ProtocolIO> Clone for ProtocolIoStats<P> {
+impl<IO: SyncEngineIo> Clone for SyncEngineIoStats<IO> {
     fn clone(&self) -> Self {
         Self {
-            protocol: self.protocol.clone(),
+            io: self.io.clone(),
             network_stats: self.network_stats.clone(),
         }
     }
 }
 
-impl<P: ProtocolIO> Deref for ProtocolIoStats<P> {
-    type Target = P;
+impl<IO: SyncEngineIo> Deref for SyncEngineIoStats<IO> {
+    type Target = IO;
 
     fn deref(&self) -> &Self::Target {
-        &self.protocol
+        &self.io
     }
 }
 
@@ -106,25 +106,74 @@ pub enum WalPushResult {
 
 pub fn connect_untracked(tape: &DatabaseTape) -> Result<Arc<turso_core::Connection>> {
     let conn = tape.connect_untracked()?;
-    conn.wal_auto_checkpoint_disable();
+    assert!(
+        conn.is_wal_auto_checkpoint_disabled(),
+        "tape must be configured to have autocheckpoint disabled"
+    );
     Ok(conn)
 }
 
+/// HTTP header key for the encryption key, for the encrypted Turso Cloud databases
+pub const ENCRYPTION_KEY_HEADER: &str = "x-turso-encryption-key";
+
+pub struct SyncOperationCtx<'a, IO: SyncEngineIo, Ctx> {
+    pub coro: &'a Coro<Ctx>,
+    pub io: &'a SyncEngineIoStats<IO>,
+    // optional remote url set in the saved configuration section of metadata file
+    pub remote_url: Option<String>,
+    // optional remote encryption key for the encrypted Turso Cloud databases, base64 encoded
+    pub remote_encryption_key: Option<String>,
+}
+
+impl<'a, IO: SyncEngineIo, Ctx> SyncOperationCtx<'a, IO, Ctx> {
+    /// Create a sync operation context.
+    /// `remote_encryption_key` should be base64-encoded if provided.
+    pub fn new(
+        coro: &'a Coro<Ctx>,
+        io: &'a SyncEngineIoStats<IO>,
+        remote_url: Option<String>,
+        remote_encryption_key: Option<&str>,
+    ) -> Self {
+        Self {
+            coro,
+            io,
+            remote_url: remote_url.map(|x| x.to_string()),
+            remote_encryption_key: remote_encryption_key.map(|k| k.to_string()),
+        }
+    }
+    pub fn http(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Vec<u8>>,
+        headers: &[(&str, &str)],
+    ) -> Result<IO::DataCompletionBytes> {
+        let encryption_header = self
+            .remote_encryption_key
+            .as_ref()
+            .map(|key| (ENCRYPTION_KEY_HEADER, key.as_str()));
+
+        let all_headers: Vec<_> = headers.iter().copied().chain(encryption_header).collect();
+
+        self.io
+            .http(self.remote_url.as_deref(), method, path, body, &all_headers)
+    }
+}
+
 /// Bootstrap multiple DB files from latest generation from remote
-pub async fn db_bootstrap<C: ProtocolIO, Ctx>(
-    coro: &Coro<Ctx>,
-    client: &ProtocolIoStats<C>,
+pub async fn db_bootstrap<IO: SyncEngineIo, Ctx>(
+    ctx: &SyncOperationCtx<'_, IO, Ctx>,
     db: Arc<dyn turso_core::File>,
 ) -> Result<DbSyncInfo> {
     tracing::info!("db_bootstrap");
     let start_time = std::time::Instant::now();
-    let db_info = db_info_http(coro, client).await?;
+    let db_info = db_info_http(ctx).await?;
     tracing::info!("db_bootstrap: fetched db_info={db_info:?}");
-    let content = db_bootstrap_http(coro, client, db_info.current_generation).await?;
+    let content = db_bootstrap_http(ctx, db_info.current_generation).await?;
     let mut pos = 0;
     loop {
         while let Some(chunk) = content.poll_data()? {
-            client.network_stats.read(chunk.data().len());
+            ctx.io.network_stats.read(chunk.data().len());
             let chunk = chunk.data();
             let content_len = chunk.len();
 
@@ -141,23 +190,23 @@ pub async fn db_bootstrap<C: ProtocolIO, Ctx>(
             });
             let c = db.pwrite(pos, buffer.clone(), c)?;
             while !c.succeeded() {
-                coro.yield_(ProtocolCommand::IO).await?;
+                ctx.coro.yield_(SyncEngineIoResult::IO).await?;
             }
             pos += content_len as u64;
         }
         if content.is_done()? {
             break;
         }
-        coro.yield_(ProtocolCommand::IO).await?;
+        ctx.coro.yield_(SyncEngineIoResult::IO).await?;
     }
 
     // sync files in the end
     let c = Completion::new_sync(move |_| {
         // todo(sivukhin): we need to error out in case of failed sync
     });
-    let c = db.sync(c)?;
+    let c = db.sync(c, FileSyncType::Fsync)?;
     while !c.succeeded() {
-        coro.yield_(ProtocolCommand::IO).await?;
+        ctx.coro.yield_(SyncEngineIoResult::IO).await?;
     }
 
     let elapsed = std::time::Instant::now().duration_since(start_time);
@@ -180,14 +229,15 @@ pub async fn wal_apply_from_file<Ctx>(
     for offset in (0..size).step_by(WAL_FRAME_SIZE) {
         let c = Completion::new_read(buffer.clone(), move |result| {
             let Ok((_, size)) = result else {
-                return;
+                return None;
             };
             // todo(sivukhin): we need to error out in case of partial read
             assert!(size as usize == WAL_FRAME_SIZE);
+            None
         });
         let c = frames_file.pread(offset, c)?;
         while !c.succeeded() {
-            coro.yield_(ProtocolCommand::IO).await?;
+            coro.yield_(SyncEngineIoResult::IO).await?;
         }
         let info = WalFrameInfo::from_frame_header(buffer.as_slice());
         tracing::info!("got frame: {:?}", info);
@@ -198,9 +248,8 @@ pub async fn wal_apply_from_file<Ctx>(
     Ok(db_size)
 }
 
-pub async fn wal_pull_to_file<C: ProtocolIO, Ctx>(
-    coro: &Coro<Ctx>,
-    client: &ProtocolIoStats<C>,
+pub async fn wal_pull_to_file<IO: SyncEngineIo, Ctx>(
+    ctx: &SyncOperationCtx<'_, IO, Ctx>,
     frames_file: &Arc<dyn turso_core::File>,
     revision: &Option<DatabasePullRevision>,
     wal_pull_batch_size: u64,
@@ -215,7 +264,7 @@ pub async fn wal_pull_to_file<C: ProtocolIO, Ctx>(
     });
     let c = frames_file.truncate(0, c)?;
     while !c.succeeded() {
-        coro.yield_(ProtocolCommand::IO).await?;
+        ctx.coro.yield_(SyncEngineIoResult::IO).await?;
     }
     match revision {
         Some(DatabasePullRevision::Legacy {
@@ -224,8 +273,7 @@ pub async fn wal_pull_to_file<C: ProtocolIO, Ctx>(
         }) => {
             let start_frame = synced_frame_no.unwrap_or(0) + 1;
             wal_pull_to_file_legacy(
-                coro,
-                client,
+                ctx,
                 frames_file,
                 *generation,
                 start_frame,
@@ -234,16 +282,15 @@ pub async fn wal_pull_to_file<C: ProtocolIO, Ctx>(
             .await
         }
         Some(DatabasePullRevision::V1 { revision }) => {
-            wal_pull_to_file_v1(coro, client, frames_file, revision, long_poll_timeout).await
+            wal_pull_to_file_v1(ctx, frames_file, revision, long_poll_timeout).await
         }
-        None => wal_pull_to_file_v1(coro, client, frames_file, "", long_poll_timeout).await,
+        None => wal_pull_to_file_v1(ctx, frames_file, "", long_poll_timeout).await,
     }
 }
 
 /// Pull updates from remote to the separate file
-pub async fn wal_pull_to_file_v1<C: ProtocolIO, Ctx>(
-    coro: &Coro<Ctx>,
-    client: &ProtocolIoStats<C>,
+pub async fn wal_pull_to_file_v1<IO: SyncEngineIo, Ctx>(
+    ctx: &SyncOperationCtx<'_, IO, Ctx>,
     frames_file: &Arc<dyn turso_core::File>,
     revision: &str,
     long_poll_timeout: Option<std::time::Duration>,
@@ -261,8 +308,8 @@ pub async fn wal_pull_to_file_v1<C: ProtocolIO, Ctx>(
         client_pages: BytesMut::new().into(),
     };
     let request = request.encode_to_vec();
-    client.network_stats.write(request.len());
-    let completion = client.http(
+    ctx.io.network_stats.write(request.len());
+    let completion = ctx.http(
         "POST",
         "/pull-updates",
         Some(request),
@@ -272,9 +319,9 @@ pub async fn wal_pull_to_file_v1<C: ProtocolIO, Ctx>(
         ],
     )?;
     let Some(header) = wait_proto_message::<Ctx, PullUpdatesRespProtoBody>(
-        coro,
+        ctx.coro,
         &completion,
-        &client.network_stats,
+        &ctx.io.network_stats,
         &mut bytes,
     )
     .await?
@@ -289,9 +336,13 @@ pub async fn wal_pull_to_file_v1<C: ProtocolIO, Ctx>(
     #[allow(clippy::arc_with_non_send_sync)]
     let buffer = Arc::new(Buffer::new_temporary(WAL_FRAME_SIZE));
 
-    let mut page_data_opt =
-        wait_proto_message::<Ctx, PageData>(coro, &completion, &client.network_stats, &mut bytes)
-            .await?;
+    let mut page_data_opt = wait_proto_message::<Ctx, PageData>(
+        ctx.coro,
+        &completion,
+        &ctx.io.network_stats,
+        &mut bytes,
+    )
+    .await?;
     while let Some(page_data) = page_data_opt.take() {
         let page_id = page_data.page_id;
         tracing::info!("received page {}", page_id);
@@ -305,7 +356,7 @@ pub async fn wal_pull_to_file_v1<C: ProtocolIO, Ctx>(
         }
         buffer.as_mut_slice()[WAL_FRAME_HEADER..].copy_from_slice(&page);
         page_data_opt =
-            wait_proto_message(coro, &completion, &client.network_stats, &mut bytes).await?;
+            wait_proto_message(ctx.coro, &completion, &ctx.io.network_stats, &mut bytes).await?;
         let mut frame_info = WalFrameInfo {
             db_size: 0,
             page_no: page_id as u32 + 1,
@@ -326,7 +377,7 @@ pub async fn wal_pull_to_file_v1<C: ProtocolIO, Ctx>(
 
         let c = frames_file.pwrite(offset, buffer.clone(), c)?;
         while !c.succeeded() {
-            coro.yield_(ProtocolCommand::IO).await?;
+            ctx.coro.yield_(SyncEngineIoResult::IO).await?;
         }
         offset += WAL_FRAME_SIZE as u64;
     }
@@ -334,9 +385,9 @@ pub async fn wal_pull_to_file_v1<C: ProtocolIO, Ctx>(
     let c = Completion::new_sync(move |_| {
         // todo(sivukhin): we need to error out in case of failed sync
     });
-    let c = frames_file.sync(c)?;
+    let c = frames_file.sync(c, FileSyncType::Fsync)?;
     while !c.succeeded() {
-        coro.yield_(ProtocolCommand::IO).await?;
+        ctx.coro.yield_(SyncEngineIoResult::IO).await?;
     }
 
     Ok(DatabasePullRevision::V1 {
@@ -344,14 +395,28 @@ pub async fn wal_pull_to_file_v1<C: ProtocolIO, Ctx>(
     })
 }
 
-/// Pull pages from remote
-pub async fn pull_pages_v1<C: ProtocolIO, Ctx>(
-    coro: &Coro<Ctx>,
-    client: &ProtocolIoStats<C>,
+#[derive(Debug)]
+pub struct PulledPage {
+    pub page_id: u64,
+    pub page: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub struct PulledPages {
+    pub db_pages: u64,
+    pub pages: Vec<PulledPage>,
+}
+
+/// Pull pages from remote, pages slice must be non-empty
+pub async fn pull_pages_v1<IO: SyncEngineIo, Ctx>(
+    ctx: &SyncOperationCtx<'_, IO, Ctx>,
     server_revision: &str,
     pages: &[u32],
-) -> Result<Vec<u8>> {
+) -> Result<PulledPages> {
     tracing::info!("pull_pages_v1: revision={server_revision}, pages={pages:?}");
+
+    assert!(!pages.is_empty(), "pages must be non-empty");
+
     let mut bytes = BytesMut::new();
 
     let mut bitmap = RoaringBitmap::new();
@@ -372,8 +437,8 @@ pub async fn pull_pages_v1<C: ProtocolIO, Ctx>(
         client_pages: BytesMut::new().into(),
     };
     let request = request.encode_to_vec();
-    client.network_stats.write(request.len());
-    let completion = client.http(
+    ctx.io.network_stats.write(request.len());
+    let completion = ctx.http(
         "POST",
         "/pull-updates",
         Some(request),
@@ -383,9 +448,9 @@ pub async fn pull_pages_v1<C: ProtocolIO, Ctx>(
         ],
     )?;
     let Some(header) = wait_proto_message::<Ctx, PullUpdatesRespProtoBody>(
-        coro,
+        ctx.coro,
         &completion,
-        &client.network_stats,
+        &ctx.io.network_stats,
         &mut bytes,
     )
     .await?
@@ -396,11 +461,15 @@ pub async fn pull_pages_v1<C: ProtocolIO, Ctx>(
     };
     tracing::info!("pull_pages_v1: got header={:?}", header);
 
-    let mut pages = Vec::with_capacity(PAGE_SIZE * pages.len());
+    let mut pages = Vec::with_capacity(pages.len());
 
-    let mut page_data_opt =
-        wait_proto_message::<Ctx, PageData>(coro, &completion, &client.network_stats, &mut bytes)
-            .await?;
+    let mut page_data_opt = wait_proto_message::<Ctx, PageData>(
+        ctx.coro,
+        &completion,
+        &ctx.io.network_stats,
+        &mut bytes,
+    )
+    .await?;
     while let Some(page_data) = page_data_opt.take() {
         let page_id = page_data.page_id;
         tracing::info!("received page {}", page_id);
@@ -412,19 +481,21 @@ pub async fn pull_pages_v1<C: ProtocolIO, Ctx>(
                 PAGE_SIZE
             )));
         }
-        pages.extend_from_slice(&page);
+        pages.push(PulledPage { page_id, page });
         page_data_opt =
-            wait_proto_message(coro, &completion, &client.network_stats, &mut bytes).await?;
+            wait_proto_message(ctx.coro, &completion, &ctx.io.network_stats, &mut bytes).await?;
         tracing::info!("page_data_opt: {}", page_data_opt.is_some());
     }
 
-    Ok(pages)
+    Ok(PulledPages {
+        db_pages: header.db_size,
+        pages,
+    })
 }
 
 /// Pull updates from remote to the separate file
-pub async fn wal_pull_to_file_legacy<C: ProtocolIO, Ctx>(
-    coro: &Coro<Ctx>,
-    client: &ProtocolIoStats<C>,
+pub async fn wal_pull_to_file_legacy<IO: SyncEngineIo, Ctx>(
+    ctx: &SyncOperationCtx<'_, IO, Ctx>,
     frames_file: &Arc<dyn turso_core::File>,
     mut generation: u64,
     mut start_frame: u64,
@@ -442,7 +513,7 @@ pub async fn wal_pull_to_file_legacy<C: ProtocolIO, Ctx>(
     let mut committed_len = 0;
     let revision = loop {
         let end_frame = start_frame + wal_pull_batch_size;
-        let result = wal_pull_http(coro, client, generation, start_frame, end_frame).await?;
+        let result = wal_pull_http(ctx, generation, start_frame, end_frame).await?;
         let data = match result {
             WalHttpPullResult::NeedCheckpoint(status) => {
                 assert!(status.status == "checkpoint_needed");
@@ -462,7 +533,7 @@ pub async fn wal_pull_to_file_legacy<C: ProtocolIO, Ctx>(
         };
         loop {
             while let Some(chunk) = data.poll_data()? {
-                client.network_stats.read(chunk.data().len());
+                ctx.io.network_stats.read(chunk.data().len());
                 let mut chunk = chunk.data();
 
                 while !chunk.is_empty() {
@@ -484,7 +555,7 @@ pub async fn wal_pull_to_file_legacy<C: ProtocolIO, Ctx>(
                     });
                     let c = frames_file.pwrite(last_offset, buffer.clone(), c)?;
                     while !c.succeeded() {
-                        coro.yield_(ProtocolCommand::IO).await?;
+                        ctx.coro.yield_(SyncEngineIoResult::IO).await?;
                     }
 
                     last_offset += WAL_FRAME_SIZE as u64;
@@ -500,7 +571,7 @@ pub async fn wal_pull_to_file_legacy<C: ProtocolIO, Ctx>(
             if data.is_done()? {
                 break;
             }
-            coro.yield_(ProtocolCommand::IO).await?;
+            ctx.coro.yield_(SyncEngineIoResult::IO).await?;
         }
         if start_frame < end_frame {
             // chunk which was sent from the server has ended early - so there is nothing left on server-side for pull
@@ -527,15 +598,15 @@ pub async fn wal_pull_to_file_legacy<C: ProtocolIO, Ctx>(
     });
     let c = frames_file.truncate(committed_len, c)?;
     while !c.succeeded() {
-        coro.yield_(ProtocolCommand::IO).await?;
+        ctx.coro.yield_(SyncEngineIoResult::IO).await?;
     }
 
     let c = Completion::new_sync(move |_| {
         // todo(sivukhin): we need to error out in case of failed sync
     });
-    let c = frames_file.sync(c)?;
+    let c = frames_file.sync(c, FileSyncType::Fsync)?;
     while !c.succeeded() {
-        coro.yield_(ProtocolCommand::IO).await?;
+        ctx.coro.yield_(SyncEngineIoResult::IO).await?;
     }
 
     Ok(revision)
@@ -548,9 +619,8 @@ pub async fn wal_pull_to_file_legacy<C: ProtocolIO, Ctx>(
 /// Guarantees:
 /// 1. If there is a single client which calls wal_push, then this operation is idempotent for fixed generation
 ///    and can be called multiple times with same frame range
-pub async fn wal_push<C: ProtocolIO, Ctx>(
-    coro: &Coro<Ctx>,
-    client: &ProtocolIoStats<C>,
+pub async fn wal_push<IO: SyncEngineIo, Ctx>(
+    ctx: &SyncOperationCtx<'_, IO, Ctx>,
     wal_session: &mut WalSession,
     baton: Option<String>,
     generation: u64,
@@ -576,16 +646,7 @@ pub async fn wal_push<C: ProtocolIO, Ctx>(
         frames_data.extend_from_slice(&buffer);
     }
 
-    let status = wal_push_http(
-        coro,
-        client,
-        None,
-        generation,
-        start_frame,
-        end_frame,
-        frames_data,
-    )
-    .await?;
+    let status = wal_push_http(ctx, None, generation, start_frame, end_frame, frames_data).await?;
     if status.status == "ok" {
         Ok(WalPushResult::Ok {
             baton: status.baton,
@@ -620,8 +681,12 @@ fn convert_to_args(values: Vec<turso_core::Value>) -> Vec<server_proto::Value> {
         .into_iter()
         .map(|value| match value {
             Value::Null => server_proto::Value::Null,
-            Value::Integer(value) => server_proto::Value::Integer { value },
-            Value::Float(value) => server_proto::Value::Float { value },
+            Value::Numeric(turso_core::Numeric::Integer(value)) => {
+                server_proto::Value::Integer { value }
+            }
+            Value::Numeric(turso_core::Numeric::Float(value)) => server_proto::Value::Float {
+                value: f64::from(value),
+            },
             Value::Text(value) => server_proto::Value::Text {
                 value: value.as_str().to_string(),
             },
@@ -659,7 +724,7 @@ pub async fn count_local_changes<Ctx>(
     change_id: i64,
 ) -> Result<i64> {
     let mut stmt = conn.prepare("SELECT COUNT(*) FROM turso_cdc WHERE change_id > ?")?;
-    stmt.bind_at(1.try_into().unwrap(), Value::Integer(change_id));
+    stmt.bind_at(1.try_into().unwrap(), Value::from_i64(change_id));
 
     let count = match run_stmt_expect_one_row(coro, &mut stmt).await? {
         Some(row) => row[0]
@@ -692,8 +757,11 @@ pub async fn update_last_change_id<Ctx>(
 
     if row.is_some() {
         let mut update_stmt = conn.prepare(TURSO_SYNC_UPDATE_LAST_CHANGE_ID)?;
-        update_stmt.bind_at(1.try_into().unwrap(), turso_core::Value::Integer(pull_gen));
-        update_stmt.bind_at(2.try_into().unwrap(), turso_core::Value::Integer(change_id));
+        update_stmt.bind_at(1.try_into().unwrap(), turso_core::Value::from_i64(pull_gen));
+        update_stmt.bind_at(
+            2.try_into().unwrap(),
+            turso_core::Value::from_i64(change_id),
+        );
         update_stmt.bind_at(
             3.try_into().unwrap(),
             turso_core::Value::Text(turso_core::types::Text::new(client_id.to_string())),
@@ -706,8 +774,11 @@ pub async fn update_last_change_id<Ctx>(
             1.try_into().unwrap(),
             turso_core::Value::Text(turso_core::types::Text::new(client_id.to_string())),
         );
-        update_stmt.bind_at(2.try_into().unwrap(), turso_core::Value::Integer(pull_gen));
-        update_stmt.bind_at(3.try_into().unwrap(), turso_core::Value::Integer(change_id));
+        update_stmt.bind_at(2.try_into().unwrap(), turso_core::Value::from_i64(pull_gen));
+        update_stmt.bind_at(
+            3.try_into().unwrap(),
+            turso_core::Value::from_i64(change_id),
+        );
         run_stmt_ignore_rows(coro, &mut update_stmt).await?;
         tracing::info!(
             "update_last_change_id(client_id={client_id}): inserted new row for the client"
@@ -753,16 +824,15 @@ pub async fn read_last_change_id<Ctx>(
     }
 }
 
-pub async fn fetch_last_change_id<C: ProtocolIO, Ctx>(
-    coro: &Coro<Ctx>,
-    client: &ProtocolIoStats<C>,
+pub async fn fetch_last_change_id<IO: SyncEngineIo, Ctx>(
+    ctx: &SyncOperationCtx<'_, IO, Ctx>,
     source_conn: &Arc<turso_core::Connection>,
     client_id: &str,
 ) -> Result<(i64, Option<i64>)> {
     tracing::info!("fetch_last_change_id: client_id={client_id}");
 
     // fetch last_change_id from the target DB in order to guarantee atomic replay of changes and avoid conflicts in case of failure
-    let (source_pull_gen, _) = read_last_change_id(coro, source_conn, client_id).await?;
+    let (source_pull_gen, _) = read_last_change_id(ctx.coro, source_conn, client_id).await?;
     tracing::info!(
         "fetch_last_change_id: client_id={client_id}, source_pull_gen={source_pull_gen}"
     );
@@ -772,15 +842,22 @@ pub async fn fetch_last_change_id<C: ProtocolIO, Ctx>(
         baton: None,
         requests: vec![
             // read pull_gen, change_id values for current client if they were set before
-            StreamRequest::Execute(ExecuteStreamReq {
-                stmt: Stmt {
-                    sql: Some(TURSO_SYNC_SELECT_LAST_CHANGE_ID.to_string()),
-                    sql_id: None,
-                    args: vec![server_proto::Value::Text {
-                        value: client_id.to_string(),
-                    }],
-                    named_args: Vec::new(),
-                    want_rows: Some(true),
+            StreamRequest::Batch(BatchStreamReq {
+                batch: Batch {
+                    steps: vec![BatchStep {
+                        stmt: Stmt {
+                            sql: Some(TURSO_SYNC_SELECT_LAST_CHANGE_ID.to_string()),
+                            sql_id: None,
+                            args: vec![server_proto::Value::Text {
+                                value: client_id.to_string(),
+                            }],
+                            named_args: Vec::new(),
+                            want_rows: Some(true),
+                            replication_index: None,
+                        },
+                        condition: None,
+                    }]
+                    .into(),
                     replication_index: None,
                 },
             }),
@@ -788,7 +865,7 @@ pub async fn fetch_last_change_id<C: ProtocolIO, Ctx>(
         .into(),
     };
 
-    let response = match sql_execute_http(coro, client, init_hrana_request).await {
+    let response = match sql_execute_http(ctx, init_hrana_request).await {
         Ok(response) => response,
         Err(Error::DatabaseSyncEngineError(err)) if err.contains("no such table") => {
             return Ok((source_pull_gen, None));
@@ -833,9 +910,8 @@ pub async fn fetch_last_change_id<C: ProtocolIO, Ctx>(
     Ok((source_pull_gen, last_change_id))
 }
 
-pub async fn push_logical_changes<C: ProtocolIO, Ctx>(
-    coro: &Coro<Ctx>,
-    client: &ProtocolIoStats<C>,
+pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
+    ctx: &SyncOperationCtx<'_, IO, Ctx>,
     source: &DatabaseTape,
     client_id: &str,
     opts: &DatabaseSyncEngineOpts,
@@ -844,7 +920,7 @@ pub async fn push_logical_changes<C: ProtocolIO, Ctx>(
     let source_conn = connect_untracked(source)?;
 
     let (source_pull_gen, mut last_change_id) =
-        fetch_last_change_id(coro, client, &source_conn, client_id).await?;
+        fetch_last_change_id(ctx, &source_conn, client_id).await?;
 
     tracing::debug!("push_logical_changes: last_change_id={:?}", last_change_id);
     let replay_opts = DatabaseReplaySessionOpts {
@@ -889,7 +965,7 @@ pub async fn push_logical_changes<C: ProtocolIO, Ctx>(
     let mut rows_changed = 0;
     let mut changes = source.iterate_changes(iterate_opts)?;
     let mut local_changes = Vec::new();
-    while let Some(operation) = changes.next(coro).await? {
+    while let Some(operation) = changes.next(ctx.coro).await? {
         match operation {
             DatabaseTapeOperation::StmtReplay(_) => {
                 panic!("changes iterator must not use StmtReplay option")
@@ -909,7 +985,7 @@ pub async fn push_logical_changes<C: ProtocolIO, Ctx>(
     }
 
     let mut transformed = if opts.use_transform {
-        Some(apply_transformation(coro, client, &local_changes, &generator).await?)
+        Some(apply_transformation(ctx, &local_changes, &generator).await?)
     } else {
         None
     };
@@ -956,7 +1032,7 @@ pub async fn push_logical_changes<C: ProtocolIO, Ctx>(
                 sql_over_http_requests.push(step(replay.sql, convert_to_args(replay.values)))
             }
             DatabaseTapeOperation::RowChange(change) => {
-                let replay_info = generator.replay_info(coro, &change).await?;
+                let replay_info = generator.replay_info(ctx.coro, &change).await?;
                 match change.change {
                     DatabaseTapeRowChangeType::Delete { before } => {
                         let values = generator.replay_values(
@@ -1049,24 +1125,23 @@ pub async fn push_logical_changes<C: ProtocolIO, Ctx>(
         .into(),
     };
 
-    let _ = sql_execute_http(coro, client, replay_hrana_request).await?;
+    let _ = sql_execute_http(ctx, replay_hrana_request).await?;
     tracing::info!("push_logical_changes: rows_changed={:?}", rows_changed);
     Ok((source_pull_gen, last_change_id.unwrap_or(0)))
 }
 
-pub async fn apply_transformation<Ctx, C: ProtocolIO>(
-    coro: &Coro<Ctx>,
-    client: &ProtocolIoStats<C>,
+pub async fn apply_transformation<IO: SyncEngineIo, Ctx>(
+    ctx: &SyncOperationCtx<'_, IO, Ctx>,
     changes: &Vec<DatabaseTapeRowChange>,
     generator: &DatabaseReplayGenerator,
 ) -> Result<Vec<DatabaseRowTransformResult>> {
     let mut mutations = Vec::new();
     for change in changes {
-        let replay_info = generator.replay_info(coro, change).await?;
+        let replay_info = generator.replay_info(ctx.coro, change).await?;
         mutations.push(generator.create_mutation(&replay_info, change)?);
     }
-    let completion = client.transform(mutations)?;
-    let transformed = wait_all_results(coro, &completion, None).await?;
+    let completion = ctx.io.transform(mutations)?;
+    let transformed = wait_all_results(ctx.coro, &completion, None).await?;
     if transformed.len() != changes.len() {
         return Err(Error::DatabaseSyncEngineError(format!(
             "unexpected result from custom transformation: mismatch in shapes: {} != {}",
@@ -1086,15 +1161,16 @@ pub async fn read_wal_salt<Ctx>(
     let buffer = Arc::new(Buffer::new_temporary(WAL_HEADER));
     let c = Completion::new_read(buffer.clone(), |result| {
         let Ok((buffer, len)) = result else {
-            return;
+            return None;
         };
         if (len as usize) < WAL_HEADER {
             buffer.as_mut_slice().fill(0);
         }
+        None
     });
     let c = wal.pread(0, c)?;
     while !c.succeeded() {
-        coro.yield_(ProtocolCommand::IO).await?;
+        coro.yield_(SyncEngineIoResult::IO).await?;
     }
     if buffer.as_mut_slice() == [0u8; WAL_HEADER] {
         return Ok(None);
@@ -1111,7 +1187,7 @@ pub async fn checkpoint_wal_file<Ctx>(
     let mut checkpoint_stmt = conn.prepare("PRAGMA wal_checkpoint(TRUNCATE)")?;
     loop {
         match checkpoint_stmt.step()? {
-            turso_core::StepResult::IO => coro.yield_(ProtocolCommand::IO).await?,
+            turso_core::StepResult::IO => coro.yield_(SyncEngineIoResult::IO).await?,
             turso_core::StepResult::Done => break,
             turso_core::StepResult::Row => continue,
             r => {
@@ -1124,38 +1200,47 @@ pub async fn checkpoint_wal_file<Ctx>(
     Ok(())
 }
 
-pub async fn bootstrap_db_file<C: ProtocolIO, Ctx>(
-    coro: &Coro<Ctx>,
-    client: &ProtocolIoStats<C>,
+pub async fn bootstrap_db_file<IO: SyncEngineIo, Ctx>(
+    ctx: &SyncOperationCtx<'_, IO, Ctx>,
     io: &Arc<dyn turso_core::IO>,
     main_db_path: &str,
     protocol: DatabaseSyncEngineProtocolVersion,
-    partial_bootstrap_strategy: Option<PartialBootstrapStrategy>,
+    partial_sync: Option<PartialSyncOpts>,
 ) -> Result<DatabasePullRevision> {
     match protocol {
         DatabaseSyncEngineProtocolVersion::Legacy => {
-            if partial_bootstrap_strategy.is_some() {
+            if partial_sync.is_some() {
                 return Err(Error::DatabaseSyncEngineError(
                     "can't bootstrap prefix of database with legacy protocol".to_string(),
                 ));
             }
-            bootstrap_db_file_legacy(coro, client, io, main_db_path).await
+            bootstrap_db_file_legacy(ctx, io, main_db_path).await
         }
         DatabaseSyncEngineProtocolVersion::V1 => {
-            bootstrap_db_file_v1(coro, client, io, main_db_path, partial_bootstrap_strategy).await
+            bootstrap_db_file_v1(ctx, io, main_db_path, partial_sync).await
         }
     }
 }
 
-pub async fn bootstrap_db_file_v1<C: ProtocolIO, Ctx>(
-    coro: &Coro<Ctx>,
-    client: &ProtocolIoStats<C>,
+pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
+    ctx: &SyncOperationCtx<'_, IO, Ctx>,
     io: &Arc<dyn turso_core::IO>,
     main_db_path: &str,
-    bootstrap: Option<PartialBootstrapStrategy>,
+    partial_sync: Option<PartialSyncOpts>,
 ) -> Result<DatabasePullRevision> {
-    let server_pages_selector = if let Some(PartialBootstrapStrategy::Prefix { length }) =
-        &bootstrap
+    if let Some(PartialSyncOpts {
+        bootstrap_strategy: None,
+        ..
+    }) = partial_sync
+    {
+        return Err(Error::DatabaseSyncEngineError(
+            "partial sync bootstrap strategy must be set for initialization".to_string(),
+        ));
+    }
+    let server_pages_selector = if let Some(PartialSyncOpts {
+        bootstrap_strategy: Some(PartialBootstrapStrategy::Prefix { length }),
+        ..
+    }) = &partial_sync
     {
         let mut bitmap = RoaringBitmap::new();
         bitmap.insert_range(0..(*length / PAGE_SIZE) as u32);
@@ -1167,7 +1252,11 @@ pub async fn bootstrap_db_file_v1<C: ProtocolIO, Ctx>(
     } else {
         Vec::new()
     };
-    let server_query_selector = if let Some(PartialBootstrapStrategy::Query { query }) = bootstrap {
+    let server_query_selector = if let Some(PartialSyncOpts {
+        bootstrap_strategy: Some(PartialBootstrapStrategy::Query { query }),
+        ..
+    }) = partial_sync
+    {
         query
     } else {
         String::new()
@@ -1183,8 +1272,8 @@ pub async fn bootstrap_db_file_v1<C: ProtocolIO, Ctx>(
         client_pages: BytesMut::new().into(),
     };
     let request = request.encode_to_vec();
-    client.network_stats.write(request.len());
-    let completion = client.http(
+    ctx.io.network_stats.write(request.len());
+    let completion = ctx.http(
         "POST",
         "/pull-updates",
         Some(request),
@@ -1195,9 +1284,9 @@ pub async fn bootstrap_db_file_v1<C: ProtocolIO, Ctx>(
     )?;
     let mut bytes = BytesMut::new();
     let Some(header) = wait_proto_message::<Ctx, PullUpdatesRespProtoBody>(
-        coro,
+        ctx.coro,
         &completion,
-        &client.network_stats,
+        &ctx.io.network_stats,
         &mut bytes,
     )
     .await?
@@ -1220,14 +1309,18 @@ pub async fn bootstrap_db_file_v1<C: ProtocolIO, Ctx>(
     });
     let c = file.truncate(header.db_size * PAGE_SIZE as u64, c)?;
     while !c.succeeded() {
-        coro.yield_(ProtocolCommand::IO).await?;
+        ctx.coro.yield_(SyncEngineIoResult::IO).await?;
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
     let buffer = Arc::new(Buffer::new_temporary(PAGE_SIZE));
-    while let Some(page_data) =
-        wait_proto_message::<Ctx, PageData>(coro, &completion, &client.network_stats, &mut bytes)
-            .await?
+    while let Some(page_data) = wait_proto_message::<Ctx, PageData>(
+        ctx.coro,
+        &completion,
+        &ctx.io.network_stats,
+        &mut bytes,
+    )
+    .await?
     {
         tracing::info!(
             "bootstrap_db_file: received page page_id={}",
@@ -1252,7 +1345,7 @@ pub async fn bootstrap_db_file_v1<C: ProtocolIO, Ctx>(
         });
         let c = file.pwrite(offset, buffer.clone(), c)?;
         while !c.succeeded() {
-            coro.yield_(ProtocolCommand::IO).await?;
+            ctx.coro.yield_(SyncEngineIoResult::IO).await?;
         }
     }
     Ok(DatabasePullRevision::V1 {
@@ -1280,9 +1373,8 @@ fn decode_page(header: &PullUpdatesRespProtoBody, page_data: PageData) -> Result
     ))
 }
 
-pub async fn bootstrap_db_file_legacy<C: ProtocolIO, Ctx>(
-    coro: &Coro<Ctx>,
-    client: &ProtocolIoStats<C>,
+pub async fn bootstrap_db_file_legacy<IO: SyncEngineIo, Ctx>(
+    ctx: &SyncOperationCtx<'_, IO, Ctx>,
     io: &Arc<dyn turso_core::IO>,
     main_db_path: &str,
 ) -> Result<DatabasePullRevision> {
@@ -1292,14 +1384,14 @@ pub async fn bootstrap_db_file_legacy<C: ProtocolIO, Ctx>(
     // cleanup all files left from previous attempt to bootstrap
     // we shouldn't write any WAL files - but let's truncate them too for safety
     if let Some(file) = io.try_open(main_db_path)? {
-        io.truncate(coro, file, 0).await?;
+        io.truncate(ctx.coro, file, 0).await?;
     }
     if let Some(file) = io.try_open(&format!("{main_db_path}-wal"))? {
-        io.truncate(coro, file, 0).await?;
+        io.truncate(ctx.coro, file, 0).await?;
     }
 
     let file = io.create(main_db_path)?;
-    let db_info = db_bootstrap(coro, client, file).await?;
+    let db_info = db_bootstrap(ctx, file).await?;
 
     let elapsed = std::time::Instant::now().duration_since(start_time);
     tracing::info!(
@@ -1334,27 +1426,28 @@ pub async fn reset_wal_file<Ctx>(
     });
     let c = wal.truncate(wal_size, c)?;
     while !c.succeeded() {
-        coro.yield_(ProtocolCommand::IO).await?;
+        coro.yield_(SyncEngineIoResult::IO).await?;
     }
     Ok(())
 }
 
-async fn sql_execute_http<C: ProtocolIO, Ctx>(
-    coro: &Coro<Ctx>,
-    client: &ProtocolIoStats<C>,
+async fn sql_execute_http<IO: SyncEngineIo, Ctx>(
+    ctx: &SyncOperationCtx<'_, IO, Ctx>,
     request: server_proto::PipelineReqBody,
 ) -> Result<Vec<StmtResult>> {
     let body = serde_json::to_vec(&request)?;
 
-    client.network_stats.write(body.len());
-    let completion = client.http("POST", "/v2/pipeline", Some(body), &[])?;
+    ctx.io.network_stats.write(body.len());
+    let completion = ctx.http(
+        "POST",
+        "/v2/pipeline",
+        Some(body),
+        &[("content-type", "application/json")],
+    )?;
 
-    let status = wait_status(coro, &completion).await?;
-    if status != http::StatusCode::OK {
-        let error = format!("sql_execute_http: unexpected status code: {status}");
-        return Err(Error::DatabaseSyncEngineError(error));
-    }
-    let response = wait_all_results(coro, &completion, Some(&client.network_stats)).await?;
+    wait_ok_status(ctx.coro, &completion, "sql_execute_http").await?;
+
+    let response = wait_all_results(ctx.coro, &completion, Some(&ctx.io.network_stats)).await?;
     let response: server_proto::PipelineRespBody = serde_json::from_slice(&response)?;
     tracing::debug!("hrana response: {:?}", response);
     let mut results = Vec::new();
@@ -1390,22 +1483,22 @@ async fn sql_execute_http<C: ProtocolIO, Ctx>(
     Ok(results)
 }
 
-async fn wal_pull_http<C: ProtocolIO, Ctx>(
-    coro: &Coro<Ctx>,
-    client: &ProtocolIoStats<C>,
+async fn wal_pull_http<IO: SyncEngineIo, Ctx>(
+    ctx: &SyncOperationCtx<'_, IO, Ctx>,
     generation: u64,
     start_frame: u64,
     end_frame: u64,
-) -> Result<WalHttpPullResult<C::DataCompletionBytes>> {
-    let completion = client.http(
+) -> Result<WalHttpPullResult<IO::DataCompletionBytes>> {
+    let completion = ctx.http(
         "GET",
         &format!("/sync/{generation}/{start_frame}/{end_frame}"),
         None,
         &[],
     )?;
-    let status = wait_status(coro, &completion).await?;
+    let status = wait_status(ctx.coro, &completion).await?;
     if status == http::StatusCode::BAD_REQUEST {
-        let status_body = wait_all_results(coro, &completion, Some(&client.network_stats)).await?;
+        let status_body =
+            wait_all_results(ctx.coro, &completion, Some(&ctx.io.network_stats)).await?;
         let status: DbSyncStatus = serde_json::from_slice(&status_body)?;
         if status.status == "checkpoint_needed" {
             return Ok(WalHttpPullResult::NeedCheckpoint(status));
@@ -1421,9 +1514,8 @@ async fn wal_pull_http<C: ProtocolIO, Ctx>(
     Ok(WalHttpPullResult::Frames(completion))
 }
 
-async fn wal_push_http<C: ProtocolIO, Ctx>(
-    coro: &Coro<Ctx>,
-    client: &ProtocolIoStats<C>,
+async fn wal_push_http<IO: SyncEngineIo, Ctx>(
+    ctx: &SyncOperationCtx<'_, IO, Ctx>,
     baton: Option<String>,
     generation: u64,
     start_frame: u64,
@@ -1434,52 +1526,54 @@ async fn wal_push_http<C: ProtocolIO, Ctx>(
         .map(|baton| format!("/{baton}"))
         .unwrap_or("".to_string());
 
-    client.network_stats.write(frames.len());
-    let completion = client.http(
+    ctx.io.network_stats.write(frames.len());
+    let completion = ctx.http(
         "POST",
         &format!("/sync/{generation}/{start_frame}/{end_frame}{baton}"),
         Some(frames),
         &[],
     )?;
-    let status = wait_status(coro, &completion).await?;
-    let status_body = wait_all_results(coro, &completion, Some(&client.network_stats)).await?;
-    if status != http::StatusCode::OK {
-        let error = std::str::from_utf8(&status_body).ok().unwrap_or("");
-        return Err(Error::DatabaseSyncEngineError(format!(
-            "wal_push go unexpected status: {status} (error={error})"
-        )));
-    }
+    wait_ok_status(ctx.coro, &completion, "wal_push").await?;
+    let status_body = wait_all_results(ctx.coro, &completion, Some(&ctx.io.network_stats)).await?;
     Ok(serde_json::from_slice(&status_body)?)
 }
 
-async fn db_info_http<C: ProtocolIO, Ctx>(
-    coro: &Coro<Ctx>,
-    client: &ProtocolIoStats<C>,
+async fn db_info_http<IO: SyncEngineIo, Ctx>(
+    ctx: &SyncOperationCtx<'_, IO, Ctx>,
 ) -> Result<DbSyncInfo> {
-    let completion = client.http("GET", "/info", None, &[])?;
-    let status = wait_status(coro, &completion).await?;
-    let status_body = wait_all_results(coro, &completion, Some(&client.network_stats)).await?;
-    if status != http::StatusCode::OK {
-        return Err(Error::DatabaseSyncEngineError(format!(
-            "db_info go unexpected status: {status}"
-        )));
-    }
+    let completion = ctx.http("GET", "/info", None, &[])?;
+    wait_ok_status(ctx.coro, &completion, "db_info").await?;
+    let status_body = wait_all_results(ctx.coro, &completion, Some(&ctx.io.network_stats)).await?;
     Ok(serde_json::from_slice(&status_body)?)
 }
 
-async fn db_bootstrap_http<C: ProtocolIO, Ctx>(
-    coro: &Coro<Ctx>,
-    client: &ProtocolIoStats<C>,
+async fn db_bootstrap_http<IO: SyncEngineIo, Ctx>(
+    ctx: &SyncOperationCtx<'_, IO, Ctx>,
     generation: u64,
-) -> Result<C::DataCompletionBytes> {
-    let completion = client.http("GET", &format!("/export/{generation}"), None, &[])?;
-    let status = wait_status(coro, &completion).await?;
-    if status != http::StatusCode::OK.as_u16() {
-        return Err(Error::DatabaseSyncEngineError(format!(
-            "db_bootstrap go unexpected status: {status}"
-        )));
-    }
+) -> Result<IO::DataCompletionBytes> {
+    let completion = ctx.http("GET", &format!("/export/{generation}"), None, &[])?;
+    wait_ok_status(ctx.coro, &completion, "db_bootstrap").await?;
     Ok(completion)
+}
+
+pub async fn wait_ok_status<Ctx>(
+    coro: &Coro<Ctx>,
+    completion: &impl DataCompletion<u8>,
+    operation: &'static str,
+) -> Result<()> {
+    let status = wait_status(coro, completion).await?;
+    if status == http::StatusCode::OK {
+        return Ok(());
+    }
+    let body = wait_all_results(coro, completion, None).await?;
+    match std::str::from_utf8(body.as_slice()) {
+        Ok(body) => Err(Error::DatabaseSyncEngineError(format!(
+            "{operation}: unexpected http response: status={status}, body={body}"
+        ))),
+        Err(_) => Err(Error::DatabaseSyncEngineError(format!(
+            "{operation}: unexpected http response: status={status}"
+        ))),
+    }
 }
 
 pub async fn wait_status<Ctx, T>(
@@ -1487,7 +1581,7 @@ pub async fn wait_status<Ctx, T>(
     completion: &impl DataCompletion<T>,
 ) -> Result<u16> {
     while completion.status()?.is_none() {
-        coro.yield_(ProtocolCommand::IO).await?;
+        coro.yield_(SyncEngineIoResult::IO).await?;
     }
     Ok(completion.status()?.unwrap())
 }
@@ -1519,6 +1613,21 @@ pub async fn wait_proto_message<Ctx, T: prost::Message + Default>(
     bytes: &mut BytesMut,
 ) -> Result<Option<T>> {
     let start_time = std::time::Instant::now();
+    while completion.status()?.is_none() {
+        coro.yield_(SyncEngineIoResult::IO).await?;
+    }
+    let status = completion.status()?.expect("status must be set");
+    if status != 200 {
+        let body = wait_all_results(coro, completion, Some(network_stats)).await?;
+        return match std::str::from_utf8(body.as_slice()) {
+            Ok(body) => Err(Error::DatabaseSyncEngineError(format!(
+                "remote server returned an error: status={status}, body={body}"
+            ))),
+            Err(_) => Err(Error::DatabaseSyncEngineError(format!(
+                "remote server returned an error: status={status}"
+            ))),
+        };
+    }
     loop {
         let length = read_varint(bytes)?;
         let not_enough_bytes = match length {
@@ -1530,7 +1639,7 @@ pub async fn wait_proto_message<Ctx, T: prost::Message + Default>(
                 network_stats.read(poll.data().len());
                 bytes.extend_from_slice(poll.data());
             } else if !completion.is_done()? {
-                coro.yield_(ProtocolCommand::IO).await?;
+                coro.yield_(SyncEngineIoResult::IO).await?;
             } else if bytes.is_empty() {
                 return Ok(None);
             } else {
@@ -1567,7 +1676,7 @@ pub async fn wait_all_results<Ctx, T: Clone>(
         if completion.is_done()? {
             break;
         }
-        coro.yield_(ProtocolCommand::IO).await?;
+        coro.yield_(SyncEngineIoResult::IO).await?;
     }
     Ok(results)
 }
@@ -1581,8 +1690,8 @@ mod tests {
 
     use crate::{
         database_sync_engine::DataStats,
+        database_sync_engine_io::{DataCompletion, DataPollResult},
         database_sync_operations::wait_proto_message,
-        protocol_io::{DataCompletion, DataPollResult},
         server_proto::PageData,
         types::Coro,
         Result,
@@ -1667,5 +1776,11 @@ mod tests {
                 genawaiter::GeneratorState::Complete(result) => break result.unwrap(),
             }
         }
+    }
+
+    #[test]
+    fn test_remote_encryption_key_header_constant() {
+        use super::ENCRYPTION_KEY_HEADER;
+        assert_eq!(ENCRYPTION_KEY_HEADER, "x-turso-encryption-key");
     }
 }

@@ -11,9 +11,15 @@ on:
     branches:
       - main
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
 env:
   working-directory: bindings/python
   PIP_DISABLE_PIP_VERSION_CHECK: "true"
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: 10
 
 jobs:
   configure-strategy:
@@ -24,7 +30,7 @@ jobs:
     steps:
       - id: gen-matrix
         run: |
-          echo "python-versions=[\"3.9\",\"3.13\"]" >> $GITHUB_OUTPUT
+          echo "python-versions=[\"3.10\",\"3.14\"]" >> $GITHUB_OUTPUT
 
   test:
     needs: configure-strategy
@@ -38,16 +44,27 @@ jobs:
         python-version: ${{ fromJson(needs.configure-strategy.outputs.python-versions) }}
     runs-on: ${{ matrix.os }}
 
-    defaults:
-      run:
-        working-directory: ${{ env.working-directory }}
-
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust (stable)
+      - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup mold linker
+        if: runner.os == 'Linux'
+        uses: rui314/setup-mold@v1
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+
+      - uses: "./.github/shared/setup-sccache"
+
+      - name: Build Rust (debug)
+        run: cargo build --verbose --locked
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: useblacksmith/setup-python@v6
@@ -60,10 +77,44 @@ jobs:
           enable-cache: true
 
       - name: Install the project
+        working-directory: ${{ env.working-directory }}
         run: uv sync --all-extras --dev --all-packages
 
       - name: Run Pytest
-        run: uv run pytest tests
+        working-directory: ${{ env.working-directory }}
+        run: uv run pytest tests/test_database.py
+
+      - name: Run Pytest (async driver)
+        working-directory: ${{ env.working-directory }}
+        run: uv run pytest tests/test_database_aio.py
+
+      - name: Run Pytest (sync)
+        working-directory: ${{ env.working-directory }}
+        if: runner.os != 'Windows'
+        env:
+          LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
+        run: uv run pytest tests/test_database_sync.py
+
+      - name: Run Pytest (sync, async driver)
+        working-directory: ${{ env.working-directory }}
+        if: runner.os != 'Windows'
+        env:
+          LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
+        run: uv run pytest tests/test_database_sync_aio.py
+
+      - name: Run Pytest (windows, sync)
+        working-directory: ${{ env.working-directory }}
+        if: runner.os == 'Windows'
+        env:
+          LOCAL_SYNC_SERVER: "..\\..\\target\\debug\\tursodb.exe"
+        run: uv run pytest tests/test_database_sync.py
+
+      - name: Run Pytest (windows, sync, async driver)
+        working-directory: ${{ env.working-directory }}
+        if: runner.os == 'Windows'
+        env:
+          LOCAL_SYNC_SERVER: "..\\..\\target\\debug\\tursodb.exe"
+        run: uv run pytest tests/test_database_sync_aio.py
 
   lint:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -88,14 +139,18 @@ jobs:
         run: uvx ruff check
 
   linux:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     defaults:
       run:
         working-directory: ${{ env.working-directory }}
     strategy:
       matrix:
-        target: [x86_64]
+        include:
+          - target: x86_64
+            runner: blacksmith-4vcpu-ubuntu-2404
+          - target: aarch64
+            runner: blacksmith-2vcpu-ubuntu-2404-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v3
       - uses: useblacksmith/setup-python@v6
@@ -106,16 +161,16 @@ jobs:
         with:
           working-directory: ${{ env.working-directory }}
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter
+          args: --profile release-official --out dist --find-interpreter
           sccache: 'true'
           manylinux: auto
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-linux
+          name: wheels-linux-${{ matrix.target }}
           path: bindings/python/dist
 
-  macos-arm64:
+  macos:
     runs-on: macos-latest
     timeout-minutes: 30
     defaults:
@@ -123,7 +178,7 @@ jobs:
         working-directory: ${{ env.working-directory }}
     strategy:
       matrix:
-        target: [aarch64]
+        target: [x86_64, aarch64]
     steps:
       - uses: actions/checkout@v3
       - uses: actions/setup-python@v4
@@ -137,12 +192,12 @@ jobs:
         with:
           working-directory: ${{ env.working-directory }}
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter
+          args: --profile release-official --out dist --find-interpreter
           sccache: 'true'
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-macos-arm64
+          name: wheels-macos-${{ matrix.target }}
           path: bindings/python/dist
 
   sdist:
@@ -170,7 +225,7 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     if: "startsWith(github.ref, 'refs/tags/')"
-    needs: [linux, macos-arm64, sdist]
+    needs: [linux, macos, sdist]
     steps:
       - uses: actions/download-artifact@v4
         with:

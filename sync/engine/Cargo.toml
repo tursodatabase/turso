@@ -1,5 +1,6 @@
 [package]
 name = "turso_sync_engine"
+description = "Turso sync engine"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -36,5 +37,4 @@ tokio = { workspace = true, features = [
 uuid = "1.17.0"
 rand = { workspace = true }
 rand_chacha = { workspace = true }
-turso = { workspace = true, features = ["conn_raw_api"] }
 futures = { workspace = true }

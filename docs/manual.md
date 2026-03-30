@@ -39,8 +39,10 @@ Welcome to Turso database manual!
       - [`sqlite3_column`](#sqlite3_column)
     - [WAL manipulation](#wal-manipulation)
       - [`libsql_wal_frame_count`](#libsql_wal_frame_count)
+  - [Journal Mode](#journal-mode)
   - [Encryption](#encryption)
   - [Vector search](#vector-search)
+  - [Full-Text Search](#full-text-search-experimental)
   - [CDC](#cdc-early-preview)
   - [Index Method](#index-method-experimental)
   - [Appendix A: Turso Internals](#appendix-a-turso-internals)
@@ -111,6 +113,7 @@ The MVCC implementation is experimental and has the following limitations:
 * Indexes cannot be created and databases with indexes cannot be used.
 * All the data is eagerly loaded from disk to memory on first access so using big databases may take a long time to start, and will consume a lot of memory
 * Only `PRAGMA wal_checkpoint(TRUNCATE)` is supported and it blocks both readers and writers
+* `AUTOINCREMENT` is not supported. Tables with `AUTOINCREMENT` cannot be created or inserted into while MVCC is enabled.
 * Many features may not work, work incorrectly, and/or cause a panic.
 * Queries may return incorrect results
 * If a database is written to using MVCC and then opened again without MVCC, the changes are not visible unless first checkpointed
@@ -152,8 +155,6 @@ The SQL shell supports the following command line options:
 | `-V`, `--version` | Print version |
 | `--mcp` | Start a MCP server instead of the interactive shell |
 | `--experimental-encryption` | Enable experimental encryption at rest feature. **Note:** the feature is not production ready so do not use it for critical data right now. |
-| `--experimental-mvcc` | Enable experimental MVCC feature. **Note:** the feature is not production ready so do not use it for critical data right now. |
-| `--experimental-strict` | Enable experimental strict schema feature. **Note**: the feature is not production ready so do not use it for critical data right now. |
 | `--experimental-views` | Enable experimental views feature. **Note**: the feature is not production ready so do not use it for critical data right now. |
 
 ## Transactions
@@ -161,6 +162,8 @@ The SQL shell supports the following command line options:
 A transaction is a sequence of one or more SQL statements that execute as a single, atomic unit of work.
 A transaction ensures **atomicity** and **isolation**, meaning that either all SQL statements are executed or none of them are, and that concurrent transactions don't interfere with other transactions.
 Transactions maintain database integrity in the presence of errors, crashes, and concurrent access.
+
+Each connection can have exactly one active transaction at a time. All statements prepared on a connection belong to the same transaction context. You cannot interleave statement execution across different transactions on a single connection. When you need concurrency (including `BEGIN CONCURRENT`), you need to use *different connections*, not parallel statements within the same connection.
 
 Turso supports three types of transactions: **deferred**, **immediate**, and **concurrent** transactions:
 
@@ -577,6 +580,62 @@ in the `p_frame_count` parameter.
 * The `p_frame_count` must be a valid pointer to a `u32` that will store the
 * number of frames in the WAL file.
 
+## Journal Mode
+
+Turso supports switching between different journal modes at runtime using the `PRAGMA journal_mode` statement. Journal modes control how the database handles transaction logging and durability.
+
+### Supported Modes
+
+| Mode | Description |
+|------|-------------|
+| `wal` | Write-Ahead Logging mode. The default mode for new databases. Provides good concurrency for readers and writers. |
+| `mvcc` | Multi-Version Concurrency Control mode. Enables concurrent transactions with snapshot isolation. **Note:** the feature is not production ready so do not use it for critical data right now. |
+
+> **Note:** Legacy SQLite journal modes (`delete`, `truncate`, `persist`, `memory`, `off`) are recognized but not currently supported. Attempting to switch to these modes will return an error.
+
+### Usage
+
+**Query the current journal mode:**
+
+```sql
+PRAGMA journal_mode;
+```
+
+**Switch to WAL mode:**
+
+```sql
+PRAGMA journal_mode = wal;
+```
+
+**Switch to MVCC mode:**
+
+```sql
+PRAGMA journal_mode = mvcc;
+```
+
+### Example
+
+```console
+turso> PRAGMA journal_mode;
+┌──────────────┐
+│ journal_mode │
+├──────────────┤
+│ wal          │
+└──────────────┘
+turso> PRAGMA journal_mode = mvcc;
+┌───────────────────┐
+│ journal_mode      │
+├───────────────────┤
+│ mvcc │
+└───────────────────┘
+```
+
+### Important Notes
+
+- Switching journal modes triggers a checkpoint to ensure all pending changes are persisted before the mode change.
+- When switching from MVCC to WAL mode, the MVCC log file is cleared after checkpointing.
+- Legacy SQLite databases are automatically converted to WAL mode when opened.
+
 ## Encryption
 
 The work-in-progress RFC is [here](https://github.com/tursodatabase/turso/issues/2447).
@@ -617,7 +676,7 @@ Turso supports vector search for building workloads such as semantic search, rec
 
 ### Vector types
 
-Turso supports both **dense** and **sparse** vector representations:
+Turso supports **dense**, **sparse**, **quantized**, and **binary** vector representations:
 
 #### Dense vectors
 
@@ -635,6 +694,18 @@ Sparse vectors only store non-zero values and their indices, making them memory-
 * **Float32 sparse vectors** (`vector32_sparse`): Stores only non-zero 32-bit float values along with their dimension indices.
 
 Sparse vectors are ideal for TF-IDF representations, bag-of-words models, and other scenarios where most dimensions are zero.
+
+#### Quantized vectors
+
+* **8-bit quantized vectors** (`vector8`): Linearly quantizes each float value to an 8-bit integer using min/max scaling. Uses 1 byte per dimension plus 8 bytes for quantization parameters (alpha and shift). Dequantization formula: `f_i = alpha * q_i + shift`.
+
+Quantized vectors reduce memory usage by ~4x compared to Float32 with minimal precision loss, ideal for large-scale similarity search where storage is a concern.
+
+#### Binary vectors
+
+* **1-bit binary vectors** (`vector1bit`): Packs each dimension into a single bit (positive values → 1, non-positive → 0). Uses 1 bit per dimension. Extracted values are displayed as +1/-1.
+
+Binary vectors provide extreme compression (~32x vs Float32) and fast distance computation via bitwise operations. Ideal for binary hashing techniques and approximate nearest neighbor search.
 
 ### Vector functions
 
@@ -664,6 +735,23 @@ Converts a text or blob value into a 64-bit dense vector.
 SELECT vector64('[1.0, 2.0, 3.0]');
 ```
 
+**`vector8(value)`**
+
+Converts a text or blob value into an 8-bit quantized vector. Float values are linearly quantized to the 0–255 range using the min and max of the input.
+
+```sql
+SELECT vector8('[1.0, 2.0, 3.0, 4.0]');
+```
+
+**`vector1bit(value)`**
+
+Converts a text or blob value into a 1-bit binary vector. Positive values become 1, non-positive values become 0 (displayed as +1/-1 when extracted).
+
+```sql
+SELECT vector_extract(vector1bit('[1, -1, 1, 1, -1, 0, 0.5]'));
+-- Returns: [1,-1,1,1,-1,-1,1]
+```
+
 **`vector_extract(blob)`**
 
 Extracts and displays a vector blob as human-readable text.
@@ -674,11 +762,11 @@ SELECT vector_extract(embedding) FROM documents;
 
 #### Distance functions
 
-Turso provides three distance metrics for measuring vector similarity:
+Turso provides three distance metrics for measuring vector similarity. Both vectors must be of the same type and dimension. All distance functions support Float32, Float64, Float32Sparse, Float8, and Float1Bit vectors unless noted otherwise.
 
 **`vector_distance_cos(v1, v2)`**
 
-Computes the cosine distance between two vectors. Returns a value between 0 (identical direction) and 2 (opposite direction). Cosine distance is computed as `1 - cosine_similarity`.
+Computes the cosine distance between two vectors. Returns a value between 0 (identical direction) and 2 (opposite direction). Cosine distance is computed as `1 - cosine_similarity`. For `vector1bit` vectors, returns the Hamming distance (number of differing bits).
 
 Cosine distance is ideal for:
 - Text embeddings where magnitude is less important than direction
@@ -693,7 +781,7 @@ LIMIT 10;
 
 **`vector_distance_l2(v1, v2)`**
 
-Computes the Euclidean (L2) distance between two vectors. Returns the straight-line distance in n-dimensional space.
+Computes the Euclidean (L2) distance between two vectors. Returns the straight-line distance in n-dimensional space. Not supported for `vector1bit` vectors (returns an error).
 
 L2 distance is ideal for:
 - Image embeddings where absolute differences matter
@@ -707,14 +795,30 @@ ORDER BY distance
 LIMIT 10;
 ```
 
+**`vector_distance_dot(v1, v2)`**
+
+Computes the negative dot product between two vectors. Returns `-sum(v1[i] * v2[i])`. Lower values indicate more similar vectors.
+
+Dot product distance is ideal for:
+- Normalized embeddings (equivalent to cosine distance when vectors are unit-length)
+- Maximum inner product search (MIPS)
+
+```sql
+SELECT name, vector_distance_dot(embedding, vector32('[0.1, 0.5, 0.3]')) AS distance
+FROM documents
+ORDER BY distance
+LIMIT 10;
+```
+
 **`vector_distance_jaccard(v1, v2)`**
 
-Computes the weighted Jaccard distance between two vectors, measuring dissimilarity based on the ratio of minimum to maximum values across dimensions. Note that this is different from the ordinary Jaccard distance, which is defined only for binary vectors.
+Computes the weighted Jaccard distance between two vectors, measuring dissimilarity based on the ratio of minimum to maximum values across dimensions. For `vector1bit` vectors, computes binary Jaccard distance: `1 - |intersection| / |union|` over set bits.
 
-Weighted Jaccard distance is ideal for:
+Jaccard distance is ideal for:
 - Sparse vectors with many zero values
 - Set-like comparisons
 - TF-IDF and bag-of-words representations
+- Binary similarity with `vector1bit`
 
 ```sql
 SELECT name, vector_distance_jaccard(sparse_embedding, vector32_sparse('[0.0, 1.0, 0.0, 2.0]')) AS distance
@@ -772,6 +876,176 @@ ORDER BY similarity
 LIMIT 5;
 ```
 
+## Full-Text Search (Experimental)
+
+Turso provides full-text search (FTS) capabilities powered by the [Tantivy](https://github.com/quickwit-oss/tantivy) search engine library. FTS enables efficient text search with relevance ranking, boolean queries, phrase matching, and more.
+
+> **Note:** Full-text search is an experimental feature and requires the `fts` feature to be enabled at compile time.
+
+### Creating an FTS Index
+
+Create an FTS index on text columns using the `USING fts` syntax:
+
+```sql
+CREATE INDEX idx_articles ON articles USING fts (title, body);
+```
+
+You can index multiple columns in a single FTS index. The index automatically tracks inserts, updates, and deletes to the underlying table.
+
+### Tokenizer Configuration
+
+Configure how text is tokenized using the `WITH` clause:
+
+```sql
+-- Use ngram tokenizer for autocomplete/substring matching
+CREATE INDEX idx_products ON products USING fts (name) WITH (tokenizer = 'ngram');
+
+-- Use raw tokenizer for exact-match fields
+CREATE INDEX idx_tags ON articles USING fts (tag) WITH (tokenizer = 'raw');
+```
+
+**Available tokenizers:**
+
+| Tokenizer | Description | Use Case |
+|-----------|-------------|----------|
+| `default` | Lowercase, punctuation split, 40 char limit | General English text |
+| `raw` | No tokenization - exact match only | IDs, UUIDs, tags |
+| `simple` | Basic whitespace/punctuation split | Simple text without lowercase |
+| `whitespace` | Split on whitespace only | Space-separated tokens |
+| `ngram` | 2-3 character n-grams | Autocomplete, substring matching |
+
+### Field Weights
+
+Configure relative importance of indexed columns for relevance scoring:
+
+```sql
+-- Title matches are 2x more important than body matches
+CREATE INDEX idx_articles ON articles USING fts (title, body)
+WITH (weights = 'title=2.0,body=1.0');
+
+-- Combined with tokenizer
+CREATE INDEX idx_docs ON docs USING fts (name, description)
+WITH (tokenizer = 'simple', weights = 'name=3.0,description=1.0');
+```
+
+### Query Functions
+
+Turso provides three FTS functions:
+
+#### `fts_match(col1, col2, ..., 'query')`
+#### or `WHERE col1, col2 MATCH 'query'`
+
+Returns a boolean indicating if the row matches the query. Used in `WHERE` clauses:
+
+```sql
+SELECT id, title FROM articles WHERE fts_match(title, body, 'database');
+```
+
+#### `fts_score(col1, col2, ..., 'query')`
+
+Returns the BM25 relevance score for ranking results:
+
+```sql
+SELECT fts_score(title, body, 'database') as score, id, title
+FROM articles
+WHERE fts_match(title, body, 'database')
+ORDER BY score DESC
+LIMIT 10;
+```
+
+#### `fts_highlight(col1, col2, ..., before_tag, after_tag, 'query')`
+
+Returns text with matching terms wrapped in tags for display:
+
+```sql
+SELECT fts_highlight(body, '<mark>', '</mark>', 'database') as highlighted
+FROM articles
+WHERE fts_match(title, body, 'database');
+-- Returns: "Learn about <mark>database</mark> optimization"
+```
+
+### Query Syntax
+
+The query string supports Tantivy's query syntax:
+[docs](https://docs.rs/tantivy/latest/tantivy/query/struct.QueryParser.html)
+
+| Syntax | Example | Description |
+|--------|---------|-------------|
+| Single term | `database` | Match documents containing "database" |
+| Multiple terms (OR) | `database sql` | Match documents with "database" OR "sql" |
+| AND operator | `database AND sql` | Match documents with both terms |
+| NOT operator | `database NOT nosql` | Match "database" but exclude "nosql" |
+| Phrase search | `"full text search"` | Match exact phrase |
+| Prefix search | `data*` | Match terms starting with "data" |
+| Column filter | `title:database` | Match "database" only in title field |
+| Boosting | `title:database^2` | Boost matches in title field |
+
+### Complex Queries
+
+FTS functions work with additional WHERE conditions:
+
+```sql
+SELECT id, title, fts_score(title, body, 'Rust') as score
+FROM articles
+WHERE fts_match(title, body, 'Rust')
+  AND category = 'tech'
+  AND published = 1
+ORDER BY score DESC;
+```
+
+### Index Maintenance
+
+Use `OPTIMIZE INDEX` to merge Tantivy segments for better query performance:
+
+```sql
+-- Optimize a specific FTS index
+OPTIMIZE INDEX idx_articles;
+
+-- Optimize all FTS indexes
+OPTIMIZE INDEX;
+```
+
+Run optimization after bulk inserts or when query performance degrades.
+
+### Example: Building a Search Feature
+
+```sql
+-- Create a documents table
+CREATE TABLE documents (
+    id INTEGER PRIMARY KEY,
+    title TEXT,
+    content TEXT,
+    category TEXT
+);
+
+-- Create FTS index with weighted fields
+CREATE INDEX fts_docs ON documents USING fts (title, content)
+WITH (weights = 'title=2.0,content=1.0');
+
+-- Insert documents
+INSERT INTO documents VALUES
+    (1, 'Introduction to SQL', 'Learn SQL basics and queries', 'tutorial'),
+    (2, 'Advanced SQL Techniques', 'Complex joins and optimization', 'tutorial'),
+    (3, 'Database Design', 'Schema design best practices', 'architecture');
+
+-- Search with relevance ranking
+SELECT
+    id,
+    title,
+    fts_score(title, content, 'SQL') as score,
+    fts_highlight(content, '<b>', '</b>', 'SQL') as snippet
+FROM documents
+WHERE fts_match(title, content, 'SQL')
+ORDER BY score DESC;
+```
+
+### Limitations
+
+| Limitation | Description |
+|------------|-------------|
+| No MATCH operator | Use `fts_match()` function instead of `WHERE table MATCH 'query'` |
+| No read-your-writes in transaction | FTS changes visible only after COMMIT |
+
 ## CDC (Early Preview)
 
 Turso supports [Change Data Capture](https://en.wikipedia.org/wiki/Change_data_capture), a powerful pattern for tracking and recording changes to your database in real-time. Instead of periodically scanning tables to find what changed, CDC automatically logs every insert, update, and delete as it happens per connection.
@@ -779,7 +1053,7 @@ Turso supports [Change Data Capture](https://en.wikipedia.org/wiki/Change_data_c
 ### Enabling CDC
 
 ```sql
-PRAGMA unstable_capture_data_changes_conn('<mode>[,custom_cdc_table]');
+PRAGMA capture_data_changes_conn('<mode>[,custom_cdc_table]');
 ```
 
 ### Parameters
@@ -847,7 +1121,7 @@ When **Change Data Capture (CDC)** is enabled for a connection, Turso automatica
 
 ```zsh
 Example:
-turso> PRAGMA unstable_capture_data_changes_conn('full');
+turso> PRAGMA capture_data_changes_conn('full');
 turso> .tables
 turso_cdc
 turso> CREATE TABLE users (
@@ -1106,8 +1380,7 @@ To know if a function does any sort of I/O we just have to look at the function 
 The `IOResult` struct looks as follows:
   ```rust
   pub enum IOCompletions {
-    Single(Arc<Completion>),
-    Many(Vec<Arc<Completion>>),
+    Single(Completion),
   }
 
   #[must_use]
@@ -1115,6 +1388,14 @@ The `IOResult` struct looks as follows:
     Done(T),
     IO(IOCompletions),
   }
+  ```
+
+To combine multiple completions, use `CompletionGroup`:
+  ```rust
+  let mut group = CompletionGroup::new(|_| {});
+  group.add(&completion1);
+  group.add(&completion2);
+  let combined = group.build();  // Single completion that waits for all
   ```
 
 This implies that when a function returns an `IOResult`, it must be called again until it returns an `IOResult::Done` variant. This works similarly to how `Future`s are polled in rust. When you receive a `Poll::Ready(None)`, it means that the future stopped it's execution. In a similar vein, if we receive `IOResult::Done`, the function/state machine has reached the end of it's execution. `IOCompletions` is here to signal that, if we are executing any I/O operation, that we need to propagate the completions that are generated from it. This design forces us to handle the fact that a function is asynchronous in nature. This is essentially [function coloring](https://www.tedinski.com/2018/11/13/function-coloring.html), but done at the application level instead of the compiler level.

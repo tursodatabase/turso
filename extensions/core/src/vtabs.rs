@@ -299,7 +299,8 @@ impl IndexInfo {
         let idx_str_len = self.idx_str.as_ref().map(|s| s.len()).unwrap_or(0);
         let c_idx_str = self
             .idx_str
-            .map(|s| std::ffi::CString::new(s).unwrap().into_raw())
+            .and_then(|s| std::ffi::CString::new(s).ok())
+            .map(|s| s.into_raw())
             .unwrap_or(std::ptr::null_mut());
         ExtIndexInfo {
             code: ResultCode::OK,
@@ -323,7 +324,7 @@ impl IndexInfo {
             return Err(ffi.code);
         }
         let constraint_usages = unsafe {
-            Box::from_raw(std::slice::from_raw_parts_mut(
+            Box::from_raw(std::ptr::slice_from_raw_parts_mut(
                 ffi.constraint_usages_ptr,
                 ffi.constraint_usage_len,
             ))
@@ -443,7 +444,7 @@ pub type CloseStmtFn = unsafe extern "C" fn(ctx: *mut Stmt);
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct Conn {
-    // std::sync::Weak from core::Connection
+    // crate::sync::Weak from core::Connection
     pub _ctx: *mut c_void,
     pub _prepare_stmt: PrepareStmtFn,
     pub _execute: ExecuteFn,
@@ -711,7 +712,11 @@ impl Stmt {
         let slice = unsafe { std::slice::from_raw_parts(col_names, count_value as usize) };
         for x in slice {
             let name = unsafe { CStr::from_ptr(*x) };
-            names.push(name.to_str().unwrap().to_string());
+            names.push(
+                name.to_str()
+                    .expect("column name should be valid UTF-8")
+                    .to_string(),
+            );
         }
         unsafe { free_column_names(col_names, count_value) };
         names

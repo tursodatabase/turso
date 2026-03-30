@@ -1,29 +1,51 @@
-from ._turso import (
+import logging
+
+logging.getLogger(__name__).addHandler(logging.NullHandler())
+
+from .lib import (  # noqa: E402
     Connection,
     Cursor,
     DatabaseError,
     DataError,
+    EncryptionOpts,
+    Error,
     IntegrityError,
     InterfaceError,
     InternalError,
     NotSupportedError,
     OperationalError,
     ProgrammingError,
-    __version__,
+    Row,
+    Warning,
+    apilevel,
     connect,
+    paramstyle,
+    setup_logging,
+    sqlite_version,
+    sqlite_version_info,
+    threadsafety,
 )
 
 __all__ = [
-    "__version__",
     "Connection",
     "Cursor",
-    "InterfaceError",
+    "Row",
+    "connect",
+    "setup_logging",
+    "Warning",
     "DatabaseError",
     "DataError",
-    "OperationalError",
+    "Error",
     "IntegrityError",
+    "InterfaceError",
     "InternalError",
-    "ProgrammingError",
     "NotSupportedError",
-    "connect",
+    "OperationalError",
+    "ProgrammingError",
+    "apilevel",
+    "paramstyle",
+    "sqlite_version",
+    "sqlite_version_info",
+    "threadsafety",
+    "EncryptionOpts",
 ]

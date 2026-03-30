@@ -106,7 +106,7 @@ await transaction([
 
 ## API Reference
 
-For complete API documentation, see [JavaScript API Reference](../../../../docs/javascript-api-reference.md).
+For complete API documentation, see [JavaScript API Reference](https://github.com/tursodatabase/turso/blob/main/docs/javascript-api-reference.md).
 
 ## Related Packages
 
@@ -115,7 +115,7 @@ For complete API documentation, see [JavaScript API Reference](../../../../docs/
 
 ## License
 
-This project is licensed under the [MIT license](../../LICENSE.md).
+This project is licensed under the [MIT license](https://github.com/tursodatabase/turso/blob/main/LICENSE.md).
 
 ## Support
 

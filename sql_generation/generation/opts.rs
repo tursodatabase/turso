@@ -17,26 +17,17 @@ pub trait GenerationContext {
     fn opts(&self) -> &Opts;
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct Opts {
-    #[garde(skip)]
-    /// Indexes enabled
-    pub indexes: bool,
     #[garde(dive)]
     pub table: TableOpts,
     #[garde(dive)]
     pub query: QueryOpts,
-}
-
-impl Default for Opts {
-    fn default() -> Self {
-        Self {
-            indexes: true,
-            table: Default::default(),
-            query: Default::default(),
-        }
-    }
+    #[garde(skip)]
+    /// Generate arbitrary INSERT INTO ... SELECT queries. This is disabled by default, as it makes
+    /// the simulator very slow and generates huge databases.
+    pub arbitrary_insert_into_select: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]
@@ -44,6 +35,9 @@ impl Default for Opts {
 pub struct TableOpts {
     #[garde(dive)]
     pub large_table: LargeTableOpts,
+    #[garde(range(min = 0.0, max = 1.0))]
+    #[serde(alias = "rowid_style_prob")]
+    pub rowid_alias_prob: f64,
     /// Range of numbers of columns to generate
     #[garde(custom(range_struct_min(1)))]
     pub column_range: Range<u32>,
@@ -53,6 +47,7 @@ impl Default for TableOpts {
     fn default() -> Self {
         Self {
             large_table: Default::default(),
+            rowid_alias_prob: 0.05,
             // Up to 10 columns
             column_range: 1..11,
         }
@@ -93,6 +88,8 @@ pub struct QueryOpts {
     pub from_clause: FromClauseOpts,
     #[garde(dive)]
     pub insert: InsertOpts,
+    #[garde(dive)]
+    pub update: UpdateOpts,
     #[garde(dive)]
     pub alter_table: AlterTableOpts,
 }
@@ -183,12 +180,14 @@ pub struct JoinWeight {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, default)]
 pub struct InsertOpts {
     #[garde(skip)]
     pub min_rows: NonZeroU32,
     #[garde(skip)]
     pub max_rows: NonZeroU32,
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub upsert_prob: f64,
 }
 
 impl Default for InsertOpts {
@@ -196,8 +195,18 @@ impl Default for InsertOpts {
         Self {
             min_rows: NonZero::new(1).unwrap(),
             max_rows: NonZero::new(10).unwrap(),
+            upsert_prob: 0.15,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Validate)]
+#[serde(deny_unknown_fields, default)]
+pub struct UpdateOpts {
+    #[garde(skip)]
+    pub padding_size: Option<usize>,
+    #[garde(skip)]
+    pub force_late_failure: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]

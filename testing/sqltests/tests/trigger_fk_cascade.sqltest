@@ -1,0 +1,126 @@
+@database :memory:
+@requires-file trigger "trigger tests require trigger support"
+
+# Issue #5538: Triggers during FK CASCADE should see post-delete state of parent table.
+# Per SQLite docs, the parent row is deleted (step 3) before FK cascade actions fire (step 4).
+
+@cross-check-integrity
+test fk-cascade-trigger-sees-parent-deleted {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INT REFERENCES parent(id) ON DELETE CASCADE, val TEXT);
+    CREATE TABLE audit(msg TEXT);
+    CREATE TRIGGER child_delete BEFORE DELETE ON child
+    BEGIN
+        INSERT INTO audit VALUES ('parent_count=' || (SELECT COUNT(*) FROM parent));
+    END;
+    INSERT INTO parent VALUES (1, 'p1'), (2, 'p2');
+    INSERT INTO child VALUES (1, 1, 'c1'), (2, 1, 'c2');
+    DELETE FROM parent WHERE id = 1;
+    SELECT * FROM audit;
+}
+expect {
+    parent_count=1
+    parent_count=1
+}
+
+# AFTER DELETE trigger during FK cascade should also see parent row deleted
+@cross-check-integrity
+test fk-cascade-after-trigger-sees-parent-deleted {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INT REFERENCES parent(id) ON DELETE CASCADE, val TEXT);
+    CREATE TABLE audit(msg TEXT);
+    CREATE TRIGGER child_after_delete AFTER DELETE ON child
+    BEGIN
+        INSERT INTO audit VALUES ('parent_count=' || (SELECT COUNT(*) FROM parent));
+    END;
+    INSERT INTO parent VALUES (1, 'p1'), (2, 'p2');
+    INSERT INTO child VALUES (1, 1, 'c1'), (2, 1, 'c2');
+    DELETE FROM parent WHERE id = 1;
+    SELECT * FROM audit;
+}
+expect {
+    parent_count=1
+    parent_count=1
+}
+
+# Trigger can verify exact parent row that was deleted is gone
+@cross-check-integrity
+test fk-cascade-trigger-specific-parent-gone {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INT REFERENCES parent(id) ON DELETE CASCADE, val TEXT);
+    CREATE TABLE audit(msg TEXT);
+    CREATE TRIGGER child_delete BEFORE DELETE ON child
+    BEGIN
+        INSERT INTO audit VALUES ('exists=' || (SELECT COUNT(*) FROM parent WHERE id = 1));
+    END;
+    INSERT INTO parent VALUES (1, 'p1'), (2, 'p2');
+    INSERT INTO child VALUES (1, 1, 'c1');
+    DELETE FROM parent WHERE id = 1;
+    SELECT * FROM audit;
+}
+expect {
+    exists=0
+}
+
+# Multiple parents deleted: each cascade trigger sees correct intermediate state
+@cross-check-integrity
+test fk-cascade-trigger-multiple-parents {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INT REFERENCES parent(id) ON DELETE CASCADE, val TEXT);
+    CREATE TABLE audit(msg TEXT);
+    CREATE TRIGGER child_delete BEFORE DELETE ON child
+    BEGIN
+        INSERT INTO audit VALUES ('parent_count=' || (SELECT COUNT(*) FROM parent));
+    END;
+    INSERT INTO parent VALUES (1, 'p1'), (2, 'p2'), (3, 'p3');
+    INSERT INTO child VALUES (1, 1, 'c1'), (2, 2, 'c2');
+    DELETE FROM parent WHERE id <= 2;
+    SELECT * FROM audit ORDER BY rowid;
+}
+expect {
+    parent_count=2
+    parent_count=1
+}
+
+# SET NULL trigger should also see parent row deleted
+@cross-check-integrity
+test fk-set-null-trigger-sees-parent-deleted {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INT REFERENCES parent(id) ON DELETE SET NULL, val TEXT);
+    CREATE TABLE audit(msg TEXT);
+    CREATE TRIGGER child_update BEFORE UPDATE ON child
+    BEGIN
+        INSERT INTO audit VALUES ('parent_count=' || (SELECT COUNT(*) FROM parent));
+    END;
+    INSERT INTO parent VALUES (1, 'p1'), (2, 'p2');
+    INSERT INTO child VALUES (1, 1, 'c1');
+    DELETE FROM parent WHERE id = 1;
+    SELECT * FROM audit;
+    SELECT * FROM child;
+}
+expect {
+    parent_count=1
+    1||c1
+}
+
+# Final state is correct after FK cascade delete
+@cross-check-integrity
+test fk-cascade-final-state {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INT REFERENCES parent(id) ON DELETE CASCADE, val TEXT);
+    INSERT INTO parent VALUES (1, 'p1'), (2, 'p2');
+    INSERT INTO child VALUES (1, 1, 'c1'), (2, 1, 'c2'), (3, 2, 'c3');
+    DELETE FROM parent WHERE id = 1;
+    SELECT * FROM parent;
+    SELECT * FROM child;
+}
+expect {
+    2|p2
+    3|2|c3
+}

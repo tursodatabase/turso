@@ -1,0 +1,31 @@
+---
+source: subqueries.sqltest
+expression: |-
+  WITH category_stats AS (
+          SELECT
+              category_id,
+              count(*) AS product_count,
+              avg(price) AS avg_price,
+              sum(stock) AS total_stock
+          FROM products
+          GROUP BY category_id
+      )
+      SELECT c.name, cs.product_count, cs.avg_price
+      FROM category_stats cs
+      JOIN categories c ON c.id = cs.category_id
+      WHERE cs.product_count > 5;
+info:
+  statement_type: WITH (CTE)
+  tables:
+  - c.id
+  - categories
+  - category_stats
+  - products
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN category_stats AS cs
+|  `--SCAN products USING INDEX idx_products_category
+`--SEARCH c USING INTEGER PRIMARY KEY (rowid=?)

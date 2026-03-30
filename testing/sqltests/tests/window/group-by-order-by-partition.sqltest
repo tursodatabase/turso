@@ -1,0 +1,98 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1);
+    INSERT INTO t VALUES (2);
+    INSERT INTO t VALUES (3);
+    INSERT INTO t VALUES (1);
+    INSERT INTO t VALUES (2);
+}
+
+setup schema_multi {
+    CREATE TABLE t2(a, b);
+    INSERT INTO t2 VALUES (1, 10);
+    INSERT INTO t2 VALUES (1, 20);
+    INSERT INTO t2 VALUES (2, 30);
+    INSERT INTO t2 VALUES (2, 40);
+    INSERT INTO t2 VALUES (3, 50);
+}
+
+setup schema_null {
+    CREATE TABLE t_null(a);
+    INSERT INTO t_null VALUES (NULL);
+    INSERT INTO t_null VALUES (1);
+    INSERT INTO t_null VALUES (NULL);
+    INSERT INTO t_null VALUES (2);
+}
+
+setup schema_empty {
+    CREATE TABLE t_empty(a);
+}
+
+@setup schema
+test window-group-by-order-by-partition-basic {
+    SELECT a, count(a) OVER (PARTITION BY a ORDER BY a) FROM t GROUP BY a ORDER BY 2;
+}
+expect {
+    1|1
+    2|1
+    3|1
+}
+
+@setup schema
+test window-group-by-partition-sum-desc {
+    SELECT a, sum(a) OVER (PARTITION BY a ORDER BY a DESC) FROM t GROUP BY a ORDER BY 2;
+}
+expect {
+    1|1
+    2|2
+    3|3
+}
+
+@setup schema
+test window-group-by-partition-max {
+    SELECT a, max(a) OVER (PARTITION BY a ORDER BY a) FROM t GROUP BY a ORDER BY 1;
+}
+expect {
+    1|1
+    2|2
+    3|3
+}
+
+@setup schema_multi
+test window-group-by-partition-with-aggregate {
+    SELECT a, sum(b), count(a) OVER (PARTITION BY a ORDER BY a) FROM t2 GROUP BY a ORDER BY 2;
+}
+expect {
+    1|30|1
+    3|50|1
+    2|70|1
+}
+
+@setup schema_null
+test window-group-by-partition-nulls {
+    SELECT a, count(a) OVER (PARTITION BY a ORDER BY a) FROM t_null GROUP BY a ORDER BY 2;
+}
+expect {
+    |0
+    1|1
+    2|1
+}
+
+@setup schema_empty
+test window-group-by-partition-empty-table {
+    SELECT a, count(a) OVER (PARTITION BY a ORDER BY a) FROM t_empty GROUP BY a ORDER BY 2;
+}
+expect {
+}
+
+@setup schema
+test window-group-by-partition-desc-outer-order {
+    SELECT a, count(a) OVER (PARTITION BY a ORDER BY a) FROM t GROUP BY a ORDER BY 2 DESC;
+}
+expect {
+    1|1
+    2|1
+    3|1
+}

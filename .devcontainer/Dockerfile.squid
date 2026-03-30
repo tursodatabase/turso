@@ -1,0 +1,2 @@
+FROM ubuntu/squid:latest
+RUN apt-get update && apt-get install -y netcat-openbsd && rm -rf /var/lib/apt/lists/*

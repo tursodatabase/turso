@@ -10,8 +10,11 @@ import {
     DatabaseChangeType,
     EncryptionOpts,
 } from "./types.js"
+import { RemoteWriter, RemoteWriterConfig } from "./remote-writer.js"
+import { RemoteWriteStatement } from "./remote-write-statement.js"
 
 export { run, memoryIO, runner, SyncEngineGuards, Runner }
+export { RemoteWriter, RemoteWriteStatement }
 export type {
     DatabaseStats,
     DatabaseOpts,
@@ -20,6 +23,7 @@ export type {
     DatabaseRowStatement,
     DatabaseRowTransformResult,
     EncryptionOpts,
+    RemoteWriterConfig,
 
     ProtocolIo,
     RunOpts,

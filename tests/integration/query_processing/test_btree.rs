@@ -405,7 +405,7 @@ impl BTreeGenerator<'_> {
         let mut pages = Vec::new();
         list_pages(root, &mut pages);
         pages[1..].shuffle(&mut self.rng);
-        let mut page_numbers = HashMap::new();
+        let mut page_numbers = HashMap::default();
         for (page, page_no) in pages.iter().zip(start_page..) {
             page_numbers.insert(Rc::as_ptr(page), page_no);
         }
@@ -440,15 +440,20 @@ fn write_at<F: File + ?Sized>(io: &impl IO, file: &F, offset: usize, data: &[u8]
     }
 }
 
-#[test]
-fn test_btree() {
+// TODO: currently fails with MVCC
+#[turso_macros::test]
+fn test_btree(tmp_db: TempDatabase) {
     let _ = env_logger::try_init();
     let mut rng = ChaCha8Rng::seed_from_u64(0);
+    let opts = tmp_db.db_opts;
+    let flags = tmp_db.db_flags;
     for depth in 0..4 {
         for attempt in 0..16 {
-            let db = TempDatabase::new_with_rusqlite(
-                "create table test (k INTEGER PRIMARY KEY, b BLOB);",
-            );
+            let db = TempDatabase::builder()
+                .with_flags(flags)
+                .with_opts(opts)
+                .with_init_sql("create table test (k INTEGER PRIMARY KEY, b BLOB);")
+                .build();
             log::info!(
                 "depth: {}, attempt: {}, path: {:?}",
                 depth,
@@ -479,7 +484,7 @@ fn test_btree() {
                 };
                 let limbo_sum = {
                     let conn = db.connect_limbo();
-                    limbo_exec_rows(&db, &conn, &query)
+                    limbo_exec_rows(&conn, &query)
                 };
                 assert_eq!(
                     limbo_sum, sqlite_sum,

@@ -1,11 +1,20 @@
-use crate::function::Func;
+use crate::function::{Deterministic, Func};
 use crate::incremental::view::IncrementalView;
 use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
-use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl};
+use crate::return_if_io;
+use crate::stats::AnalyzeStats;
+use crate::sync::RwLock;
+use crate::translate::emitter::Resolver;
+use crate::translate::expr::{
+    bind_and_rewrite_expr, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
+};
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
+use crate::types::IOResult;
+use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::affinity::Affinity;
-use parking_lot::RwLock;
+use crate::vdbe::CursorID;
+use crate::{turso_assert, turso_debug_assert};
 use turso_macros::AtomicEnum;
 
 #[derive(Debug, Clone, AtomicEnum)]
@@ -74,25 +83,68 @@ impl Clone for View {
 /// Type alias for regular views collection
 pub type ViewsMap = HashMap<String, Arc<View>>;
 
+/// Trigger structure
+#[derive(Debug, Clone)]
+pub struct Trigger {
+    pub name: String,
+    pub sql: String,
+    pub table_name: String,
+    pub time: turso_parser::ast::TriggerTime,
+    pub event: turso_parser::ast::TriggerEvent,
+    pub for_each_row: bool,
+    pub when_clause: Option<turso_parser::ast::Expr>,
+    pub commands: Vec<turso_parser::ast::TriggerCmd>,
+    pub temporary: bool,
+}
+
+impl Trigger {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        name: String,
+        sql: String,
+        table_name: String,
+        time: Option<turso_parser::ast::TriggerTime>,
+        event: turso_parser::ast::TriggerEvent,
+        for_each_row: bool,
+        when_clause: Option<turso_parser::ast::Expr>,
+        commands: Vec<turso_parser::ast::TriggerCmd>,
+        temporary: bool,
+    ) -> Self {
+        Self {
+            name,
+            sql,
+            table_name,
+            time: time.unwrap_or(turso_parser::ast::TriggerTime::Before),
+            event,
+            for_each_row,
+            when_clause,
+            commands,
+            temporary,
+        }
+    }
+}
+
 use crate::storage::btree::{BTreeCursor, CursorTrait};
+use crate::sync::Arc;
+use crate::sync::Mutex;
 use crate::translate::collate::CollationSeq;
-use crate::translate::plan::{SelectPlan, TableReferences};
+use crate::translate::plan::{Plan, TableReferences};
 use crate::util::{
-    module_args_from_sql, module_name_from_sql, type_from_name, IOExt, UnparsedFromSqlIndex,
+    module_args_from_sql, module_name_from_sql, type_from_name, UnparsedFromSqlIndex,
 };
+use crate::Result;
 use crate::{
     bail_parse_error, contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case,
-    Connection, LimboError, MvCursor, MvStore, Pager, SymbolTable, ValueRef, VirtualTable,
+    LimboError, MvCursor, Pager, SymbolTable, ValueRef, VirtualTable,
 };
-use crate::{util::normalize_ident, Result};
 use core::fmt;
-use std::collections::{HashMap, HashSet, VecDeque};
+use rustc_hash::{FxBuildHasher, FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::VecDeque;
 use std::ops::Deref;
-use std::sync::Arc;
-use std::sync::Mutex;
 use tracing::trace;
 use turso_parser::ast::{
-    self, ColumnDefinition, Expr, InitDeferredPred, Literal, RefAct, SortOrder, TableOptions,
+    self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, RefAct, ResolveType, SortOrder,
+    TableInternalId, TypeOperator,
 };
 use turso_parser::{
     ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
@@ -101,20 +153,214 @@ use turso_parser::{
 
 const SCHEMA_TABLE_NAME: &str = "sqlite_schema";
 const SCHEMA_TABLE_NAME_ALT: &str = "sqlite_master";
+pub const SQLITE_SEQUENCE_TABLE_NAME: &str = "sqlite_sequence";
+pub const TURSO_TYPES_TABLE_NAME: &str = "__turso_internal_types";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
+pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
+
+/// Quote a SQL identifier with double quotes if it needs quoting.
+/// Quotes when the name contains non-alphanumeric characters (except underscore),
+/// starts with a digit, or is empty. Simple names like "test_uint" are left unquoted.
+fn quote_ident(name: &str) -> String {
+    let needs_quoting = name.is_empty()
+        || name.as_bytes()[0].is_ascii_digit()
+        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        || turso_parser::lexer::is_quotable_keyword(name.as_bytes());
+    if needs_quoting {
+        let escaped = name.replace('"', "\"\"");
+        format!("\"{escaped}\"")
+    } else {
+        name.to_string()
+    }
+}
+
+/// Escape a string literal for SQL single-quote context.
+/// The value goes inside the surrounding quotes already present in the format string.
+fn quote_string_literal(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+/// Custom type definition, loaded from sqlite_turso_types
+#[derive(Debug, Clone)]
+pub struct TypeDef {
+    pub name: String,
+    pub params: Vec<ast::TypeParam>,
+    pub base: String,
+    pub encode: Option<Box<ast::Expr>>,
+    pub decode: Option<Box<ast::Expr>>,
+    pub operators: Vec<TypeOperator>,
+    pub default: Option<Box<ast::Expr>>,
+    pub is_builtin: bool,
+}
+
+impl TypeDef {
+    /// Construct a TypeDef from a parsed CREATE TYPE statement.
+    pub fn from_create_type(type_name: &str, body: &ast::CreateTypeBody, is_builtin: bool) -> Self {
+        Self {
+            name: type_name.to_string(),
+            params: body.params.clone(),
+            base: body.base.clone(),
+            encode: body.encode.clone(),
+            decode: body.decode.clone(),
+            operators: body.operators.clone(),
+            default: body.default.clone(),
+            is_builtin,
+        }
+    }
+
+    /// The expected input type for `value` in this custom type.
+    /// Looks for a `value` parameter with a type annotation.
+    /// Falls back to `self.base` if `value` is not declared.
+    pub fn value_input_type(&self) -> &str {
+        for p in &self.params {
+            if p.name.eq_ignore_ascii_case("value") {
+                return p.ty.as_deref().unwrap_or(&self.base);
+            }
+        }
+        &self.base
+    }
+
+    /// The non-value params (user-provided at column declaration time).
+    pub fn user_params(&self) -> impl Iterator<Item = &turso_parser::ast::TypeParam> {
+        self.params
+            .iter()
+            .filter(|p| !p.name.eq_ignore_ascii_case("value"))
+    }
+
+    /// Reconstruct the CREATE TYPE SQL string from this definition.
+    pub fn to_sql(&self) -> String {
+        let mut sql = if self.params.is_empty() {
+            format!(
+                "CREATE TYPE {} BASE {}",
+                quote_ident(&self.name),
+                quote_ident(&self.base)
+            )
+        } else {
+            let params: Vec<String> = self
+                .params
+                .iter()
+                .map(|p| match &p.ty {
+                    Some(ty) => format!("{} {}", quote_ident(&p.name), ty),
+                    None => quote_ident(&p.name),
+                })
+                .collect();
+            format!(
+                "CREATE TYPE {}({}) BASE {}",
+                quote_ident(&self.name),
+                params.join(", "),
+                quote_ident(&self.base)
+            )
+        };
+        if let Some(ref encode) = self.encode {
+            sql.push_str(&format!(" ENCODE {encode}"));
+        }
+        if let Some(ref decode) = self.decode {
+            sql.push_str(&format!(" DECODE {decode}"));
+        }
+        if let Some(ref default) = self.default {
+            sql.push_str(&format!(" DEFAULT {default}"));
+        }
+        for op in &self.operators {
+            match &op.func_name {
+                Some(func_name) => sql.push_str(&format!(
+                    " OPERATOR '{}' {}",
+                    quote_string_literal(&op.op),
+                    quote_ident(func_name)
+                )),
+                None => sql.push_str(&format!(" OPERATOR '{}'", quote_string_literal(&op.op),)),
+            }
+        }
+        sql
+    }
+}
+
+/// Accumulators for schema loading - kept separate to avoid moving through state variants
+struct MakeFromBtreeAccumulators {
+    from_sql_indexes: Vec<UnparsedFromSqlIndex>,
+    automatic_indices: HashMap<String, Vec<(String, i64)>>,
+    /// Store DBSP state table root pages: view_name -> dbsp_state_root_page
+    dbsp_state_roots: HashMap<String, i64>,
+    /// Store DBSP state table index root pages: view_name -> dbsp_state_index_root_page
+    dbsp_state_index_roots: HashMap<String, i64>,
+    /// Store materialized view info (SQL and root page) for later creation
+    materialized_view_info: HashMap<String, (String, i64)>,
+}
+
+/// Phase tracking for async schema loading
+#[derive(Default, Debug)]
+pub enum MakeFromBtreePhase {
+    #[default]
+    Init,
+    Rewinding,
+    FetchingRecord,
+    Advancing,
+    Done,
+}
+
+/// State machine for async schema loading - passed by caller, not stored on Schema
+pub struct MakeFromBtreeState {
+    phase: MakeFromBtreePhase,
+    cursor: Option<BTreeCursor>,
+    accumulators: Option<MakeFromBtreeAccumulators>,
+    read_tx_active: bool,
+}
+
+impl Default for MakeFromBtreeState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MakeFromBtreeState {
+    pub fn new() -> Self {
+        Self {
+            phase: MakeFromBtreePhase::Init,
+            cursor: None,
+            accumulators: None,
+            read_tx_active: false,
+        }
+    }
+
+    /// Cleanup on error - ensures end_read_tx is called
+    pub fn cleanup(&mut self, pager: &Pager) {
+        if self.read_tx_active {
+            pager.end_read_tx();
+            self.read_tx_active = false;
+        }
+        self.cursor = None;
+        self.accumulators = None;
+    }
+}
 
 /// Used to refer to the implicit rowid column in tables without an alias during UPDATE
 pub const ROWID_SENTINEL: usize = usize::MAX;
+
+/// The Position in Table for indexes which are arbitrary expressions (index.expr.is_some())
+pub const EXPR_INDEX_SENTINEL: usize = usize::MAX;
 
 /// Internal table prefixes that should be protected from CREATE/DROP
 pub const RESERVED_TABLE_PREFIXES: [&str; 2] = ["sqlite_", "__turso_internal_"];
 
 /// Check if a table name refers to a system table that should be protected from direct writes
 pub fn is_system_table(table_name: &str) -> bool {
+    RESERVED_TABLE_PREFIXES
+        .iter()
+        .any(|prefix| table_name.to_lowercase().starts_with(prefix))
+}
+
+pub fn can_write_to_table(table_name: &str) -> bool {
     let normalized = table_name.to_lowercase();
-    normalized == SCHEMA_TABLE_NAME
+    !(normalized == SCHEMA_TABLE_NAME
         || normalized == SCHEMA_TABLE_NAME_ALT
-        || table_name.starts_with(DBSP_TABLE_PREFIX)
+        || normalized.starts_with(TURSO_INTERNAL_PREFIX))
+}
+
+/// Type of schema object for conflict checking
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaObjectType {
+    Table,
+    View,
+    Index,
 }
 
 #[derive(Debug)]
@@ -130,53 +376,224 @@ pub struct Schema {
 
     pub views: ViewsMap,
 
+    /// table_name to list of triggers
+    pub triggers: HashMap<String, VecDeque<Arc<Trigger>>>,
+
     /// table_name to list of indexes for the table
     pub indexes: HashMap<String, VecDeque<Arc<Index>>>,
-    pub has_indexes: std::collections::HashSet<String>,
-    pub indexes_enabled: bool,
+    pub has_indexes: HashSet<String>,
     pub schema_version: u32,
+    /// Statistics collected via ANALYZE for regular B-tree tables and indexes.
+    pub analyze_stats: AnalyzeStats,
 
     /// Mapping from table names to the materialized views that depend on them
     pub table_to_materialized_views: HashMap<String, Vec<String>>,
 
     /// Track views that exist but have incompatible versions
     pub incompatible_views: HashSet<String>,
+
+    /// Root pages of tables/indexes that have been dropped but not yet checkpointed.
+    /// In MVCC mode, when a table is dropped, the btree pages are not freed until checkpoint.
+    /// integrity_check needs to know about these pages to avoid false positives about "page never used".
+    pub dropped_root_pages: HashSet<i64>,
+
+    /// Custom type registry, loaded from sqlite_turso_types
+    pub type_registry: HashMap<String, Arc<TypeDef>>,
+
+    pub generated_columns_enabled: bool,
+}
+
+impl Default for Schema {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) {
+    use turso_parser::ast::{Cmd, Stmt};
+    use turso_parser::parser::Parser;
+
+    let type_sqls: &[&str] = &[
+        #[cfg(feature = "uuid")]
+        "CREATE TYPE uuid(value text) BASE blob ENCODE uuid_blob(value) DECODE uuid_str(value) DEFAULT uuid4_str() OPERATOR '<'",
+        "CREATE TYPE boolean(value any) BASE integer ENCODE boolean_to_int(value) DECODE CASE WHEN value THEN 1 ELSE 0 END OPERATOR '<'",
+        #[cfg(feature = "json")]
+        "CREATE TYPE json(value text) BASE text ENCODE json(value) DECODE value",
+        #[cfg(feature = "json")]
+        "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)",
+        "CREATE TYPE varchar(value text, maxlen integer) BASE text ENCODE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'",
+        "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '<'",
+        "CREATE TYPE time(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN time(value) IS NULL THEN RAISE(ABORT, 'invalid time value') ELSE time(value) END DECODE value OPERATOR '<'",
+        "CREATE TYPE timestamp(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE datetime(value) END DECODE value OPERATOR '<'",
+        "CREATE TYPE smallint(value integer) BASE integer ENCODE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END DECODE value OPERATOR '<'",
+        "CREATE TYPE bigint(value integer) BASE integer",
+        "CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value) DECODE value",
+        "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'",
+        "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value, precision, scale) DECODE numeric_decode(value) OPERATOR '+' numeric_add OPERATOR '-' numeric_sub OPERATOR '*' numeric_mul OPERATOR '/' numeric_div OPERATOR '<' numeric_lt OPERATOR '=' numeric_eq",
+    ];
+
+    for sql in type_sqls {
+        let mut parser = Parser::new(sql.as_bytes());
+        let Ok(Some(Cmd::Stmt(Stmt::CreateType {
+            type_name, body, ..
+        }))) = parser.next_cmd()
+        else {
+            panic!("Failed to parse built-in type SQL: {sql}");
+        };
+
+        let type_def = TypeDef::from_create_type(&type_name, &body, true);
+        registry.insert(type_name.to_lowercase(), Arc::new(type_def));
+    }
+
+    // Register aliases
+    let aliases: &[(&str, &str)] = &[
+        ("bool", "boolean"),
+        ("int2", "smallint"),
+        ("int8", "bigint"),
+    ];
+    for (alias, target) in aliases {
+        if let Some(type_def) = registry.get(*target).cloned() {
+            registry.insert(alias.to_string(), type_def);
+        }
+    }
 }
 
 impl Schema {
-    pub fn new(indexes_enabled: bool) -> Self {
-        let mut tables: HashMap<String, Arc<Table>> = HashMap::new();
-        let has_indexes = std::collections::HashSet::new();
-        let indexes: HashMap<String, VecDeque<Arc<Index>>> = HashMap::new();
+    pub fn new() -> Self {
+        Self::with_options(true)
+    }
+
+    pub fn with_options(enable_custom_types: bool) -> Self {
+        let mut tables: HashMap<String, Arc<Table>> = HashMap::default();
+        let has_indexes = HashSet::default();
+        let indexes: HashMap<String, VecDeque<Arc<Index>>> = HashMap::default();
         #[allow(clippy::arc_with_non_send_sync)]
         tables.insert(
             SCHEMA_TABLE_NAME.to_string(),
             Arc::new(Table::BTree(sqlite_schema_table().into())),
         );
-        for function in VirtualTable::builtin_functions() {
+        for function in VirtualTable::builtin_functions(enable_custom_types) {
             tables.insert(
                 function.name.to_owned(),
                 Arc::new(Table::Virtual(Arc::new((*function).clone()))),
             );
         }
-        let materialized_view_names = HashSet::new();
-        let materialized_view_sql = HashMap::new();
-        let incremental_views = HashMap::new();
-        let views: ViewsMap = HashMap::new();
-        let table_to_materialized_views: HashMap<String, Vec<String>> = HashMap::new();
-        let incompatible_views = HashSet::new();
+        let materialized_view_names = HashSet::default();
+        let materialized_view_sql = HashMap::default();
+        let incremental_views = HashMap::default();
+        let views: ViewsMap = HashMap::default();
+        let triggers = HashMap::default();
+        let table_to_materialized_views: HashMap<String, Vec<String>> = HashMap::default();
+        let incompatible_views = HashSet::default();
         Self {
             tables,
             materialized_view_names,
             materialized_view_sql,
             incremental_views,
             views,
+            triggers,
             indexes,
             has_indexes,
-            indexes_enabled,
             schema_version: 0,
+            analyze_stats: AnalyzeStats::default(),
             table_to_materialized_views,
             incompatible_views,
+            dropped_root_pages: HashSet::default(),
+            type_registry: {
+                let mut registry = HashMap::default();
+                if enable_custom_types {
+                    bootstrap_builtin_types(&mut registry);
+                }
+                registry
+            },
+            generated_columns_enabled: false,
+        }
+    }
+
+    /// Look up a custom type definition by name.
+    /// Custom types are only valid on STRICT tables; pass `is_strict` from the
+    /// owning table so that non-STRICT tables never resolve a custom type.
+    pub fn get_type_def(&self, type_name: &str, is_strict: bool) -> Option<&Arc<TypeDef>> {
+        if !is_strict {
+            return None;
+        }
+        self.type_registry.get(&type_name.to_lowercase())
+    }
+
+    /// Look up a custom type definition by name without a strictness check.
+    /// Only use this for operations that aren't column-scoped (e.g. DROP TYPE,
+    /// CREATE TABLE validation, CAST).
+    pub fn get_type_def_unchecked(&self, type_name: &str) -> Option<&Arc<TypeDef>> {
+        self.type_registry.get(&type_name.to_lowercase())
+    }
+
+    pub fn remove_type(&mut self, type_name: &str) {
+        self.type_registry.remove(&type_name.to_lowercase());
+    }
+
+    /// Parse a CREATE TYPE SQL string and add the type to the in-memory registry.
+    pub fn add_type_from_sql(&mut self, sql: &str) -> crate::Result<()> {
+        use turso_parser::ast::{Cmd, Stmt};
+        use turso_parser::parser::Parser;
+
+        let mut parser = Parser::new(sql.as_bytes());
+        let Ok(Some(Cmd::Stmt(Stmt::CreateType {
+            type_name, body, ..
+        }))) = parser.next_cmd()
+        else {
+            return Err(crate::LimboError::ParseError(format!(
+                "invalid type sql: {sql}"
+            )));
+        };
+
+        let type_def = TypeDef::from_create_type(&type_name, &body, false);
+        self.type_registry
+            .insert(type_name.to_lowercase(), Arc::new(type_def));
+        Ok(())
+    }
+
+    /// Load type definitions from CREATE TYPE SQL strings and resolve custom
+    /// type affinities on all STRICT tables. This is the shared entry point
+    /// used by both initial database open and schema reparse.
+    pub fn load_type_definitions(&mut self, type_sqls: &[String]) -> crate::Result<()> {
+        for sql in type_sqls {
+            self.add_type_from_sql(sql)?;
+        }
+        self.resolve_all_custom_type_affinities();
+        Ok(())
+    }
+
+    /// Resolve custom type affinities for all STRICT tables in the schema.
+    /// Call this after loading user-defined types from __turso_internal_types
+    /// so that columns declared with custom types use the BASE type's affinity.
+    pub fn resolve_all_custom_type_affinities(&mut self) {
+        let table_names: Vec<String> = self
+            .tables
+            .iter()
+            .filter_map(|(name, t)| {
+                if let Table::BTree(bt) = t.as_ref() {
+                    if bt.is_strict {
+                        return Some(name.clone());
+                    }
+                }
+                None
+            })
+            .collect();
+        for name in table_names {
+            if let Some(table_arc) = self.tables.get(&name) {
+                if let Table::BTree(bt) = table_arc.as_ref() {
+                    let needs_fixup = bt
+                        .columns
+                        .iter()
+                        .any(|c| self.get_type_def_unchecked(&c.ty_str).is_some());
+                    if needs_fixup {
+                        let mut modified = (**bt).clone();
+                        modified.resolve_custom_type_affinities(self);
+                        self.tables
+                            .insert(name, Arc::new(Table::BTree(Arc::new(modified))));
+                    }
+                }
+            }
         }
     }
 
@@ -310,6 +727,77 @@ impl Schema {
         self.views.get(&name).cloned()
     }
 
+    pub fn add_trigger(&mut self, trigger: Trigger, table_name: &str) -> Result<()> {
+        // Triggers have their own namespace and duplicate trigger names
+        // are checked in `translate_create_trigger`
+        let table_name = normalize_ident(table_name);
+
+        // See [Schema::add_index] for why we push to the front of the deque.
+        self.triggers
+            .entry(table_name)
+            .or_default()
+            .push_front(Arc::new(trigger));
+
+        Ok(())
+    }
+
+    pub fn remove_trigger(&mut self, name: &str) -> Result<()> {
+        let name = normalize_ident(name);
+
+        let mut removed = false;
+        for triggers_list in self.triggers.values_mut() {
+            for i in 0..triggers_list.len() {
+                let trigger = &triggers_list[i];
+                if normalize_ident(&trigger.name) == name {
+                    removed = true;
+                    triggers_list.remove(i);
+                    break;
+                }
+            }
+            if removed {
+                break;
+            }
+        }
+        if !removed {
+            return Err(crate::LimboError::ParseError(format!(
+                "no such trigger: {name}"
+            )));
+        }
+        Ok(())
+    }
+    pub fn remove_triggers_for_table(&mut self, table_name: &str) {
+        let table_name = normalize_ident(table_name);
+        self.triggers.remove(&table_name);
+    }
+
+    pub fn get_trigger_for_table(&self, table_name: &str, name: &str) -> Option<Arc<Trigger>> {
+        let table_name = normalize_ident(table_name);
+        let name = normalize_ident(name);
+        self.triggers
+            .get(&table_name)
+            .and_then(|triggers| triggers.iter().find(|t| t.name == name).cloned())
+    }
+
+    pub fn get_triggers_for_table(
+        &self,
+        table_name: &str,
+    ) -> impl Iterator<Item = &Arc<Trigger>> + Clone {
+        let table_name = normalize_ident(table_name);
+        self.triggers
+            .get(&table_name)
+            .map(|triggers| triggers.iter())
+            .unwrap_or_default()
+    }
+
+    pub fn get_trigger(&self, name: &str) -> Option<Arc<Trigger>> {
+        let name = normalize_ident(name);
+        self.triggers
+            .values()
+            .flatten()
+            .find(|t| t.name == name)
+            .cloned()
+    }
+
     pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) -> Result<()> {
         self.check_object_name_conflict(&table.name)?;
         let name = normalize_ident(&table.name);
@@ -337,6 +825,7 @@ impl Schema {
     pub fn remove_table(&mut self, table_name: &str) {
         let name = normalize_ident(table_name);
         self.tables.remove(&name);
+        self.analyze_stats.remove_table(&name);
 
         // If this was a materialized view, also clean up the metadata
         if self.materialized_view_names.remove(&name) {
@@ -359,13 +848,35 @@ impl Schema {
         let table_name = normalize_ident(&index.table_name);
         // We must add the new index to the front of the deque, because SQLite stores index definitions as a linked list
         // where the newest parsed index entry is at the head of list. If we would add it to the back of a regular Vec for example,
-        // then we would evaluate ON CONFLICT DO UPDATE clauses in the wrong index iteration order and UPDATE the wrong row. One might
-        // argue that this is an implementation detail and we should not care about this, but it makes e.g. the fuzz test 'partial_index_mutation_and_upsert_fuzz'
-        // fail, so let's just be compatible.
-        self.indexes
-            .entry(table_name)
-            .or_default()
-            .push_front(index.clone());
+        // then we would evaluate ON CONFLICT DO UPDATE clauses in the wrong index iteration order and UPDATE the wrong row.
+        // Additionally, REPLACE indexes must go after all the non-REPLACE indexes so that
+        // non-mutating conflict resolutions all happen before mutating ones, ensuring that
+        // no half-committed state is left behind.
+        let is_replace = index.on_conflict == Some(ResolveType::Replace);
+        let indexes_for_table = self.indexes.entry(table_name).or_default();
+        if is_replace {
+            // REPLACE indexes sort newest-first among themselves.
+            let first_replace = indexes_for_table
+                .iter()
+                .position(|idx| idx.on_conflict == Some(ResolveType::Replace));
+            let pos = first_replace.unwrap_or(indexes_for_table.len());
+            indexes_for_table.insert(pos, index);
+        } else {
+            // Non-REPLACE indexes go at the front, newest first.
+            indexes_for_table.push_front(index);
+        }
+        turso_debug_assert!(
+            indexes_for_table
+                .iter()
+                .position(|idx| idx.on_conflict == Some(ResolveType::Replace))
+                .is_none_or(|first_replace| {
+                    indexes_for_table
+                        .iter()
+                        .skip(first_replace)
+                        .all(|idx| idx.on_conflict == Some(ResolveType::Replace))
+                }),
+            "REPLACE indexes must form a contiguous suffix"
+        );
         Ok(())
     }
 
@@ -376,6 +887,16 @@ impl Schema {
             .map(|v| v.iter())
             .unwrap_or_default()
             .filter(|i| !i.is_backing_btree_index())
+    }
+
+    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    pub fn has_fts_index(&self, table_name: &str) -> bool {
+        use crate::index_method::fts::FTS_INDEX_METHOD_NAME;
+        self.get_indices(table_name).any(|idx| {
+            idx.index_method
+                .as_ref()
+                .is_some_and(|m| m.definition().method_name == FTS_INDEX_METHOD_NAME)
+        })
     }
 
     pub fn get_index(&self, table_name: &str, index_name: &str) -> Option<&Arc<Index>> {
@@ -389,6 +910,7 @@ impl Schema {
     pub fn remove_indices_for_table(&mut self, table_name: &str) {
         let name = normalize_ident(table_name);
         self.indexes.remove(&name);
+        self.analyze_stats.remove_table(&name);
     }
 
     pub fn remove_index(&mut self, idx: &Index) {
@@ -397,6 +919,7 @@ impl Schema {
             .get_mut(&name)
             .expect("Must have the index")
             .retain_mut(|other_idx| other_idx.name != idx.name);
+        self.analyze_stats.remove_index(&name, &idx.name);
     }
 
     pub fn table_has_indexes(&self, table_name: &str) -> bool {
@@ -408,97 +931,162 @@ impl Schema {
         self.has_indexes.insert(table_name.to_string());
     }
 
-    pub fn indexes_enabled(&self) -> bool {
-        self.indexes_enabled
-    }
-
     /// Update [Schema] by scanning the first root page (sqlite_schema)
+    /// Returns Result<IOResult<()>> to allow async operation with external IO loop
     pub fn make_from_btree(
         &mut self,
+        state: &mut MakeFromBtreeState,
         mv_cursor: Option<Arc<RwLock<MvCursor>>>,
-        pager: Arc<Pager>,
+        pager: &Arc<Pager>,
         syms: &SymbolTable,
-    ) -> Result<()> {
-        assert!(
-            mv_cursor.is_none(),
-            "mvcc not yet supported for make_from_btree"
-        );
-        let mut cursor = BTreeCursor::new_table(Arc::clone(&pager), 1, 10);
-
-        let mut from_sql_indexes = Vec::with_capacity(10);
-        let mut automatic_indices: HashMap<String, Vec<(String, i64)>> = HashMap::with_capacity(10);
-
-        // Store DBSP state table root pages: view_name -> dbsp_state_root_page
-        let mut dbsp_state_roots: HashMap<String, i64> = HashMap::new();
-        // Store DBSP state table index root pages: view_name -> dbsp_state_index_root_page
-        let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::new();
-        // Store materialized view info (SQL and root page) for later creation
-        let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::new();
-
-        pager.begin_read_tx()?;
-
-        pager.io.block(|| cursor.rewind())?;
-
-        loop {
-            let Some(row) = pager.io.block(|| cursor.record())? else {
-                break;
-            };
-
-            let mut record_cursor = cursor.record_cursor.borrow_mut();
-            // sqlite schema table has 5 columns: type, name, tbl_name, rootpage, sql
-            let ty_value = record_cursor.get_value(&row, 0)?;
-            let ValueRef::Text(ty) = ty_value else {
-                return Err(LimboError::ConversionError("Expected text value".into()));
-            };
-            let ValueRef::Text(name) = record_cursor.get_value(&row, 1)? else {
-                return Err(LimboError::ConversionError("Expected text value".into()));
-            };
-            let table_name_value = record_cursor.get_value(&row, 2)?;
-            let ValueRef::Text(table_name) = table_name_value else {
-                return Err(LimboError::ConversionError("Expected text value".into()));
-            };
-            let root_page_value = record_cursor.get_value(&row, 3)?;
-            let ValueRef::Integer(root_page) = root_page_value else {
-                return Err(LimboError::ConversionError("Expected integer value".into()));
-            };
-            let sql_value = record_cursor.get_value(&row, 4)?;
-            let sql_textref = match sql_value {
-                ValueRef::Text(sql) => Some(sql),
-                _ => None,
-            };
-            let sql = sql_textref.map(|s| s.as_str());
-
-            self.handle_schema_row(
-                &ty,
-                &name,
-                &table_name,
-                root_page,
-                sql,
-                syms,
-                &mut from_sql_indexes,
-                &mut automatic_indices,
-                &mut dbsp_state_roots,
-                &mut dbsp_state_index_roots,
-                &mut materialized_view_info,
-                None,
-            )?;
-            drop(record_cursor);
-            drop(row);
-
-            pager.io.block(|| cursor.next())?;
+    ) -> Result<IOResult<()>> {
+        let result = self.make_from_btree_internal(state, mv_cursor, pager, syms);
+        if result.is_err() {
+            state.cleanup(pager);
+        } else if let Ok(IOResult::Done(..)) = result {
+            turso_assert!(
+                !state.read_tx_active,
+                "make_from_btree must properly cleanup internal state in case of success"
+            );
         }
+        result
+    }
 
-        pager.end_read_tx();
+    fn make_from_btree_internal(
+        &mut self,
+        state: &mut MakeFromBtreeState,
+        mv_cursor: Option<Arc<RwLock<MvCursor>>>,
+        pager: &Arc<Pager>,
+        syms: &SymbolTable,
+    ) -> Result<IOResult<()>> {
+        loop {
+            tracing::debug!("make_from_btree: state.phase={:?}", state.phase);
+            match &state.phase {
+                MakeFromBtreePhase::Init => {
+                    if mv_cursor.is_some() {
+                        return Err(crate::LimboError::ParseError(
+                            "MVCC is not supported for make_from_btree schema recovery".to_string(),
+                        ));
+                    }
 
-        self.populate_indices(syms, from_sql_indexes, automatic_indices)?;
+                    state.cursor = Some(BTreeCursor::new_table(Arc::clone(pager), 1, 10));
+                    pager.begin_read_tx()?;
+                    state.read_tx_active = true;
 
-        self.populate_materialized_views(
-            materialized_view_info,
-            dbsp_state_roots,
-            dbsp_state_index_roots,
-        )?;
+                    state.accumulators = Some(MakeFromBtreeAccumulators {
+                        from_sql_indexes: Vec::with_capacity(10),
+                        automatic_indices: HashMap::with_capacity_and_hasher(10, FxBuildHasher),
+                        dbsp_state_roots: HashMap::default(),
+                        dbsp_state_index_roots: HashMap::default(),
+                        materialized_view_info: HashMap::default(),
+                    });
 
-        Ok(())
+                    state.phase = MakeFromBtreePhase::Rewinding;
+                }
+
+                MakeFromBtreePhase::Rewinding => {
+                    let cursor = state
+                        .cursor
+                        .as_mut()
+                        .expect("cursor must be initialized in Init phase");
+                    return_if_io!(cursor.rewind());
+                    state.phase = MakeFromBtreePhase::FetchingRecord;
+                }
+
+                MakeFromBtreePhase::FetchingRecord => {
+                    let cursor = state
+                        .cursor
+                        .as_mut()
+                        .expect("cursor must be initialized in Init phase");
+                    let row = return_if_io!(cursor.record());
+
+                    let Some(row) = row else {
+                        // EOF - finalize
+                        pager.end_read_tx();
+                        state.read_tx_active = false;
+
+                        let acc = state
+                            .accumulators
+                            .take()
+                            .expect("accumulators must be initialized in Init phase");
+                        self.populate_indices(
+                            syms,
+                            acc.from_sql_indexes,
+                            acc.automatic_indices,
+                            mv_cursor.is_some(),
+                        )?;
+                        self.populate_materialized_views(
+                            acc.materialized_view_info,
+                            acc.dbsp_state_roots,
+                            acc.dbsp_state_index_roots,
+                        )?;
+
+                        state.cursor = None;
+                        state.phase = MakeFromBtreePhase::Done;
+                        return Ok(IOResult::Done(()));
+                    };
+
+                    // Process the row (no IO - CPU only)
+                    // sqlite schema table has 5 columns: type, name, tbl_name, rootpage, sql
+                    let ty_value = row.get_value(0)?;
+                    let ValueRef::Text(ty) = ty_value else {
+                        return Err(LimboError::ConversionError("Expected text value".into()));
+                    };
+                    let ValueRef::Text(name) = row.get_value(1)? else {
+                        return Err(LimboError::ConversionError("Expected text value".into()));
+                    };
+                    let table_name_value = row.get_value(2)?;
+                    let ValueRef::Text(table_name) = table_name_value else {
+                        return Err(LimboError::ConversionError("Expected text value".into()));
+                    };
+                    let root_page_value = row.get_value(3)?;
+                    let ValueRef::Numeric(crate::numeric::Numeric::Integer(root_page)) =
+                        root_page_value
+                    else {
+                        return Err(LimboError::ConversionError("Expected integer value".into()));
+                    };
+                    let sql_value = row.get_value(4)?;
+                    let sql_textref = match sql_value {
+                        ValueRef::Text(sql) => Some(sql),
+                        _ => None,
+                    };
+                    let sql = sql_textref.map(|s| s.as_str());
+
+                    let acc = state
+                        .accumulators
+                        .as_mut()
+                        .expect("accumulators must be initialized in Init phase");
+                    self.handle_schema_row(
+                        &ty,
+                        &name,
+                        &table_name,
+                        root_page,
+                        sql,
+                        syms,
+                        &mut acc.from_sql_indexes,
+                        &mut acc.automatic_indices,
+                        &mut acc.dbsp_state_roots,
+                        &mut acc.dbsp_state_index_roots,
+                        &mut acc.materialized_view_info,
+                    )?;
+
+                    state.phase = MakeFromBtreePhase::Advancing;
+                }
+
+                MakeFromBtreePhase::Advancing => {
+                    let cursor = state
+                        .cursor
+                        .as_mut()
+                        .expect("cursor must be initialized in Init phase");
+                    return_if_io!(cursor.next());
+                    state.phase = MakeFromBtreePhase::FetchingRecord;
+                }
+
+                MakeFromBtreePhase::Done => {
+                    return Ok(IOResult::Done(()));
+                }
+            }
+        }
     }
 
     /// Populate indices parsed from the schema.
@@ -508,30 +1096,26 @@ impl Schema {
         &mut self,
         syms: &SymbolTable,
         from_sql_indexes: Vec<UnparsedFromSqlIndex>,
-        automatic_indices: std::collections::HashMap<String, Vec<(String, i64)>>,
+        automatic_indices: HashMap<String, Vec<(String, i64)>>,
+        mvcc_enabled: bool,
     ) -> Result<()> {
         for unparsed_sql_from_index in from_sql_indexes {
-            if !self.indexes_enabled() {
-                self.table_set_has_index(&unparsed_sql_from_index.table_name);
-            } else {
-                let table = self
-                    .get_btree_table(&unparsed_sql_from_index.table_name)
-                    .unwrap();
-                let index = Index::from_sql(
-                    syms,
-                    &unparsed_sql_from_index.sql,
-                    unparsed_sql_from_index.root_page,
-                    table.as_ref(),
-                )?;
-                self.add_index(Arc::new(index))?;
+            let table = self
+                .get_btree_table(&unparsed_sql_from_index.table_name)
+                .unwrap();
+            let index = Index::from_sql(
+                syms,
+                &unparsed_sql_from_index.sql,
+                unparsed_sql_from_index.root_page,
+                table.as_ref(),
+            )?;
+            if mvcc_enabled && index.index_method.is_some() {
+                crate::bail_parse_error!("Custom index modules are not supported with MVCC");
             }
+            self.add_index(Arc::new(index))?;
         }
 
         for automatic_index in automatic_indices {
-            if !self.indexes_enabled() {
-                self.table_set_has_index(&automatic_index.0);
-                continue;
-            }
             // Autoindexes must be parsed in definition order.
             // The SQL statement parser enforces that the column definitions come first, and compounds are defined after that,
             // e.g. CREATE TABLE t (a, b, UNIQUE(a, b)), and you can't do something like CREATE TABLE t (a, b, UNIQUE(a, b), c);
@@ -539,45 +1123,10 @@ impl Schema {
             let table = self.get_btree_table(&automatic_index.0).unwrap();
             let mut automatic_indexes = automatic_index.1;
             automatic_indexes.reverse(); // reverse so we can pop() without shifting array elements, while still processing in left-to-right order
+
+            // we must process unique_sets in this exact order in order to emit automatic indices schema entries in the same order
             let mut pk_index_added = false;
-            for unique_set in table.unique_sets.iter().filter(|us| us.columns.len() == 1) {
-                let col_name = &unique_set.columns.first().unwrap().0;
-                let Some((pos_in_table, column)) = table.get_column(col_name) else {
-                    return Err(LimboError::ParseError(format!(
-                        "Column {col_name} not found in table {}",
-                        table.name
-                    )));
-                };
-                if column.primary_key() && unique_set.is_primary_key {
-                    if column.is_rowid_alias() {
-                        // rowid alias, no index needed
-                        continue;
-                    }
-                    assert!(table.primary_key_columns.first().unwrap().0 == *col_name, "trying to add a primary key index for column that is not the first column in the primary key: {} != {}", table.primary_key_columns.first().unwrap().0, col_name);
-                    // Add single column primary key index
-                    assert!(
-                        !pk_index_added,
-                        "trying to add a second primary key index for table {}",
-                        table.name
-                    );
-                    pk_index_added = true;
-                    self.add_index(Arc::new(Index::automatic_from_primary_key(
-                        table.as_ref(),
-                        automatic_indexes.pop().unwrap(),
-                        1,
-                    )?))?;
-                } else {
-                    // Add single column unique index
-                    if let Some(autoidx) = automatic_indexes.pop() {
-                        self.add_index(Arc::new(Index::automatic_from_unique(
-                            table.as_ref(),
-                            autoidx,
-                            vec![(pos_in_table, unique_set.columns.first().unwrap().1)],
-                        )?))?;
-                    }
-                }
-            }
-            for unique_set in table.unique_sets.iter().filter(|us| us.columns.len() > 1) {
+            for unique_set in &table.unique_sets {
                 if unique_set.is_primary_key {
                     assert!(table.primary_key_columns.len() == unique_set.columns.len(), "trying to add a {}-column primary key index for table {}, but the table has {} primary key columns", unique_set.columns.len(), table.name, table.primary_key_columns.len());
                     // Add composite primary key index
@@ -587,11 +1136,38 @@ impl Schema {
                         table.name
                     );
                     pk_index_added = true;
-                    self.add_index(Arc::new(Index::automatic_from_primary_key(
-                        table.as_ref(),
-                        automatic_indexes.pop().unwrap(),
-                        unique_set.columns.len(),
-                    )?))?;
+
+                    if unique_set.columns.len() == 1 {
+                        let col_name = &unique_set.columns.first().unwrap().0;
+                        let Some((_, column)) = table.get_column(col_name) else {
+                            return Err(LimboError::ParseError(format!(
+                                "Column {col_name} not found in table {}",
+                                table.name
+                            )));
+                        };
+                        if column.is_rowid_alias() {
+                            // rowid alias, no index needed
+                            continue;
+                        }
+                    }
+
+                    if let Some(index_entry) = automatic_indexes.pop() {
+                        self.add_index(Arc::new(Index::automatic_from_primary_key(
+                            table.as_ref(),
+                            index_entry,
+                            unique_set.columns.len(),
+                            unique_set.conflict_clause,
+                        )?))?;
+                    } else if mvcc_enabled {
+                        // In MVCC mode, automatic indices might not be fully populated yet during recovery
+                        // Skip creating this index - it will be added later when its schema row is processed
+                        continue;
+                    } else {
+                        return Err(LimboError::InternalError(format!(
+                            "Missing automatic index entry for primary key on table {}",
+                            table.name
+                        )));
+                    }
                 } else {
                     // Add composite unique index
                     let mut column_indices_and_sort_orders =
@@ -605,15 +1181,31 @@ impl Schema {
                         };
                         column_indices_and_sort_orders.push((pos_in_table, *sort_order));
                     }
-                    self.add_index(Arc::new(Index::automatic_from_unique(
-                        table.as_ref(),
-                        automatic_indexes.pop().unwrap(),
-                        column_indices_and_sort_orders,
-                    )?))?;
+                    if let Some(index_entry) = automatic_indexes.pop() {
+                        self.add_index(Arc::new(Index::automatic_from_unique(
+                            table.as_ref(),
+                            index_entry,
+                            column_indices_and_sort_orders,
+                            unique_set.conflict_clause,
+                        )?))?;
+                    } else if mvcc_enabled {
+                        // In MVCC mode, automatic indices might not be fully populated yet during recovery
+                        // Skip creating this index - it will be added later when its schema row is processed
+                        continue;
+                    } else {
+                        return Err(LimboError::InternalError(format!(
+                            "Missing automatic index entry for UNIQUE constraint on table {}",
+                            table.name
+                        )));
+                    }
                 }
             }
 
-            assert!(automatic_indexes.is_empty(), "all automatic indexes parsed from sqlite_schema should have been consumed, but {} remain", automatic_indexes.len());
+            // In MVCC mode during recovery, not all automatic index schema rows might be visible yet
+            // during incremental schema reparsing, so we may have extra entries
+            if !mvcc_enabled {
+                assert!(automatic_indexes.is_empty(), "all automatic indexes parsed from sqlite_schema should have been consumed, but {} remain", automatic_indexes.len());
+            }
         }
         Ok(())
     }
@@ -621,9 +1213,9 @@ impl Schema {
     /// Populate materialized views parsed from the schema.
     pub fn populate_materialized_views(
         &mut self,
-        materialized_view_info: std::collections::HashMap<String, (String, i64)>,
-        dbsp_state_roots: std::collections::HashMap<String, i64>,
-        dbsp_state_index_roots: std::collections::HashMap<String, i64>,
+        materialized_view_info: HashMap<String, (String, i64)>,
+        dbsp_state_roots: HashMap<String, i64>,
+        dbsp_state_index_roots: HashMap<String, i64>,
     ) -> Result<()> {
         for (view_name, (sql, main_root)) in materialized_view_info {
             // Look up the DBSP state root for this view
@@ -645,6 +1237,23 @@ impl Schema {
             // Look up the DBSP state index root (may not exist for older schemas)
             let dbsp_state_index_root =
                 dbsp_state_index_roots.get(&view_name).copied().unwrap_or(0);
+
+            // Register the DBSP state index so integrity check can account for its pages.
+            if dbsp_state_index_root > 0 && dbsp_state_root > 0 {
+                use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+                use crate::incremental::operator::create_dbsp_state_index;
+                let mut index = create_dbsp_state_index(dbsp_state_index_root);
+                let dbsp_table_name =
+                    format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{view_name}");
+                index.name = format!("sqlite_autoindex_{dbsp_table_name}_1");
+                index.table_name = dbsp_table_name;
+                if let Err(e) = self.add_index(std::sync::Arc::new(index)) {
+                    if !e.to_string().contains("already exists") {
+                        return Err(e);
+                    }
+                }
+            }
+
             // Create the IncrementalView with all root pages
             let incremental_view = IncrementalView::from_sql(
                 &sql,
@@ -656,17 +1265,22 @@ impl Schema {
             let referenced_tables = incremental_view.get_referenced_table_names();
 
             // Create a BTreeTable for the materialized view
+            let cols = incremental_view.column_schema.flat_columns();
+            let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&cols);
             let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
                 name: view_name.clone(),
                 root_page: main_root,
-                columns: incremental_view.column_schema.flat_columns(),
+                columns: cols,
                 primary_key_columns: Vec::new(),
                 has_rowid: true,
                 is_strict: false,
                 has_autoincrement: false,
                 foreign_keys: vec![],
-
+                check_constraints: vec![],
+                rowid_alias_conflict_clause: None,
                 unique_sets: vec![],
+                has_virtual_columns: false,
+                logical_to_physical_map,
             })));
 
             // Only add to schema if compatible
@@ -692,11 +1306,10 @@ impl Schema {
         maybe_sql: Option<&str>,
         syms: &SymbolTable,
         from_sql_indexes: &mut Vec<UnparsedFromSqlIndex>,
-        automatic_indices: &mut std::collections::HashMap<String, Vec<(String, i64)>>,
-        dbsp_state_roots: &mut std::collections::HashMap<String, i64>,
-        dbsp_state_index_roots: &mut std::collections::HashMap<String, i64>,
-        materialized_view_info: &mut std::collections::HashMap<String, (String, i64)>,
-        mv_store: Option<&Arc<MvStore>>,
+        automatic_indices: &mut HashMap<String, Vec<(String, i64)>>,
+        dbsp_state_roots: &mut HashMap<String, i64>,
+        dbsp_state_index_roots: &mut HashMap<String, i64>,
+        materialized_view_info: &mut HashMap<String, (String, i64)>,
     ) -> Result<()> {
         match ty {
             "table" => {
@@ -720,6 +1333,13 @@ impl Schema {
                     self.add_virtual_table(vtab)?;
                 } else {
                     let table = BTreeTable::from_sql(sql, root_page)?;
+
+                    if table.has_virtual_columns && !self.generated_columns_enabled {
+                        return Err(LimboError::ParseError(format!(
+                            "table '{}' uses generated columns but the generated_columns feature is not enabled",
+                            table.name
+                        )));
+                    }
 
                     // Check if this is a DBSP state table
                     if table.name.starts_with(DBSP_TABLE_PREFIX) {
@@ -751,11 +1371,12 @@ impl Schema {
                         }
                     }
 
+                    let mut table = table;
+                    table.resolve_custom_type_affinities(self);
                     self.add_btree_table(Arc::new(table))?;
                 }
             }
             "index" => {
-                assert!(mv_store.is_none(), "indexes not yet supported for mvcc");
                 match maybe_sql {
                     Some(sql) => {
                         from_sql_indexes.push(UnparsedFromSqlIndex {
@@ -810,7 +1431,6 @@ impl Schema {
 
                 let sql = maybe_sql.expect("sql should be present for view");
                 let view_name = name.to_string();
-                assert!(mv_store.is_none(), "views not yet supported for mvcc");
 
                 // Parse the SQL to determine if it's a regular or materialized view
                 let mut parser = Parser::new(sql.as_bytes());
@@ -834,6 +1454,8 @@ impl Schema {
                             select,
                             ..
                         } => {
+                            crate::util::validate_select_for_unsupported_features(&select)?;
+
                             // Extract actual columns from the SELECT statement
                             let view_column_schema =
                                 crate::util::extract_view_columns(&select, self)?;
@@ -856,6 +1478,46 @@ impl Schema {
                     }
                 }
             }
+            "trigger" => {
+                use turso_parser::ast::{Cmd, Stmt};
+                use turso_parser::parser::Parser;
+
+                let sql = maybe_sql.expect("sql should be present for trigger");
+                let trigger_name = name.to_string();
+
+                let mut parser = Parser::new(sql.as_bytes());
+                let Ok(Some(Cmd::Stmt(Stmt::CreateTrigger {
+                    temporary,
+                    if_not_exists: _,
+                    trigger_name: _,
+                    time,
+                    event,
+                    tbl_name,
+                    for_each_row,
+                    when_clause,
+                    commands,
+                }))) = parser.next_cmd()
+                else {
+                    return Err(crate::LimboError::ParseError(format!(
+                        "invalid trigger sql: {sql}"
+                    )));
+                };
+                self.add_trigger(
+                    Trigger::new(
+                        trigger_name,
+                        sql.to_string(),
+                        tbl_name.name.to_string(),
+                        time,
+                        event,
+                        for_each_row,
+                        when_clause.map(|e| *e),
+                        commands,
+                        temporary,
+                    ),
+                    tbl_name.name.as_str(),
+                )?;
+            }
+            // Types are stored in sqlite_turso_types, not sqlite_schema
             _ => {}
         };
 
@@ -867,7 +1529,7 @@ impl Schema {
     /// strategy (rowid vs. UNIQUE index or PK).
     pub fn resolved_fks_referencing(&self, table_name: &str) -> Result<Vec<ResolvedFkRef>> {
         let fk_mismatch_err = |child: &str, parent: &str| -> crate::LimboError {
-            crate::LimboError::Constraint(format!(
+            crate::LimboError::ForeignKeyConstraint(format!(
                 "foreign key mismatch - \"{child}\" referencing \"{parent}\""
             ))
         };
@@ -947,20 +1609,18 @@ impl Schema {
                     parent_pos.push(p);
                 }
 
-                // Determine if parent key is ROWID/alias
-                let parent_uses_rowid = parent_tbl.primary_key_columns.len().eq(&1) && {
-                    if parent_tbl.primary_key_columns.len() == 1 {
-                        let pk_name = &parent_tbl.primary_key_columns[0].0;
-                        // rowid or alias INTEGER PRIMARY KEY; either is ok implicitly
-                        parent_tbl.columns.iter().any(|c| {
+                // Determine if the FK's parent key is the ROWID or a rowid alias.
+                let parent_uses_rowid = if parent_cols.len() == 1 {
+                    let pc = &parent_cols[0];
+                    ROWID_STRS.iter().any(|&r| r.eq_ignore_ascii_case(pc))
+                        || parent_tbl.columns.iter().any(|c| {
                             c.is_rowid_alias()
                                 && c.name
                                     .as_deref()
-                                    .is_some_and(|n| n.eq_ignore_ascii_case(pk_name))
-                        }) || ROWID_STRS.iter().any(|&r| r.eq_ignore_ascii_case(pk_name))
-                    } else {
-                        false
-                    }
+                                    .is_some_and(|n| n.eq_ignore_ascii_case(pc))
+                        })
+                } else {
+                    false
                 };
 
                 // If not rowid, there must be a non-partial UNIQUE exactly on parent_cols
@@ -968,14 +1628,11 @@ impl Schema {
                     None
                 } else {
                     find_parent_unique(&parent_cols)
-                        .ok_or_else(|| fk_mismatch_err(&child.name, &parent_tbl.name))?
-                        .into()
                 };
                 fk.validate()?;
                 out.push(ResolvedFkRef {
                     child_table: Arc::clone(&child),
                     fk: Arc::clone(fk),
-                    parent_cols,
                     child_cols,
                     child_pos,
                     parent_pos,
@@ -990,7 +1647,7 @@ impl Schema {
     /// Compute all resolved FKs *declared by* `child_table`
     pub fn resolved_fks_for_child(&self, child_table: &str) -> crate::Result<Vec<ResolvedFkRef>> {
         let fk_mismatch_err = |child: &str, parent: &str| -> crate::LimboError {
-            crate::LimboError::Constraint(format!(
+            crate::LimboError::ForeignKeyConstraint(format!(
                 "foreign key mismatch - \"{child}\" referencing \"{parent}\""
             ))
         };
@@ -1091,7 +1748,6 @@ impl Schema {
             out.push(ResolvedFkRef {
                 child_table: Arc::clone(&child),
                 fk: Arc::clone(fk),
-                parent_cols,
                 child_cols,
                 child_pos,
                 parent_pos,
@@ -1123,29 +1779,39 @@ impl Schema {
     }
 
     fn check_object_name_conflict(&self, name: &str) -> Result<()> {
+        if let Some(object_type) = self.get_object_type(name) {
+            let type_str = match object_type {
+                SchemaObjectType::Table => "table",
+                SchemaObjectType::View => "view",
+                SchemaObjectType::Index => "index",
+            };
+            return Err(crate::LimboError::ParseError(format!(
+                "{type_str} \"{name}\" already exists"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Returns the type of schema object with the given name, if one exists.
+    /// Checks tables, views, and indexes.
+    pub fn get_object_type(&self, name: &str) -> Option<SchemaObjectType> {
         let normalized_name = normalize_ident(name);
 
         if self.tables.contains_key(&normalized_name) {
-            return Err(crate::LimboError::ParseError(
-                ["table \"", name, "\" already exists"].concat().to_string(),
-            ));
+            return Some(SchemaObjectType::Table);
         }
 
         if self.views.contains_key(&normalized_name) {
-            return Err(crate::LimboError::ParseError(
-                ["view \"", name, "\" already exists"].concat().to_string(),
-            ));
+            return Some(SchemaObjectType::View);
         }
 
         for index_list in self.indexes.values() {
             if index_list.iter().any(|i| i.name.eq_ignore_ascii_case(name)) {
-                return Err(crate::LimboError::ParseError(
-                    ["index \"", name, "\" already exists"].concat().to_string(),
-                ));
+                return Some(SchemaObjectType::Index);
             }
         }
 
-        Ok(())
+        None
     }
 }
 
@@ -1175,7 +1841,9 @@ impl Clone for Schema {
                 }
                 Table::FromClauseSubquery(from_clause_subquery) => (
                     name.clone(),
-                    Arc::new(Table::FromClauseSubquery(from_clause_subquery.clone())),
+                    Arc::new(Table::FromClauseSubquery(Arc::new(
+                        (**from_clause_subquery).clone(),
+                    ))),
                 ),
             })
             .collect();
@@ -1202,6 +1870,16 @@ impl Clone for Schema {
             .iter()
             .map(|(name, view)| (name.clone(), Arc::new((**view).clone())))
             .collect();
+        let triggers = self
+            .triggers
+            .iter()
+            .map(|(table_name, triggers)| {
+                (
+                    table_name.clone(),
+                    triggers.iter().map(|t| Arc::new((**t).clone())).collect(),
+                )
+            })
+            .collect();
         let incompatible_views = self.incompatible_views.clone();
         Self {
             tables,
@@ -1209,12 +1887,126 @@ impl Clone for Schema {
             materialized_view_sql,
             incremental_views,
             views,
+            triggers,
             indexes,
             has_indexes: self.has_indexes.clone(),
-            indexes_enabled: self.indexes_enabled,
             schema_version: self.schema_version,
+            analyze_stats: self.analyze_stats.clone(),
             table_to_materialized_views: self.table_to_materialized_views.clone(),
             incompatible_views,
+            dropped_root_pages: self.dropped_root_pages.clone(),
+            type_registry: self.type_registry.clone(),
+            generated_columns_enabled: self.generated_columns_enabled,
+        }
+    }
+}
+
+/// Maps schema column indices to register offsets for DML operations.
+//TODO this should be integrated into a Columns domain type
+// This type should also replace BTreeTable::has_virtual_columns
+#[derive(Debug, Clone)]
+pub enum ColumnLayout {
+    Identity {
+        column_count: usize,
+    },
+    Mapped {
+        // col_index -> offset
+        offsets: Vec<usize>,
+        non_virtual_col_count: usize,
+    },
+}
+
+impl ColumnLayout {
+    pub fn from_table(table: &Table) -> Self {
+        match table {
+            Table::BTree(btree) => Self::from_columns(&btree.columns),
+            Table::Virtual(vtable) => Self::Identity {
+                column_count: vtable.as_ref().columns.len(),
+            },
+            Table::FromClauseSubquery(subquery) => Self::Identity {
+                column_count: subquery.columns.len(),
+            },
+        }
+    }
+
+    pub fn from_btree(btree: &BTreeTable) -> Self {
+        Self::from_columns(&btree.columns)
+    }
+
+    pub fn from_columns(columns: &[Column]) -> Self {
+        let total = columns.len();
+        let non_virtual_col_count = columns.iter().filter(|c| !c.is_virtual_generated()).count();
+        if non_virtual_col_count == total {
+            return Self::Identity {
+                column_count: total,
+            };
+        }
+        let mut offsets = vec![0usize; total];
+        let mut nv_idx = 0;
+        let mut v_idx = non_virtual_col_count;
+        for (i, col) in columns.iter().enumerate() {
+            if col.is_virtual_generated() {
+                offsets[i] = v_idx;
+                v_idx += 1;
+            } else {
+                offsets[i] = nv_idx;
+                nv_idx += 1;
+            }
+        }
+        Self::Mapped {
+            offsets,
+            non_virtual_col_count,
+        }
+    }
+
+    /// Map a schema column index to its register offset.
+    #[inline(always)]
+    pub fn to_reg_offset(&self, col_idx: usize) -> usize {
+        match self {
+            Self::Identity { .. } => col_idx,
+            Self::Mapped { offsets, .. } => offsets[col_idx],
+        }
+    }
+
+    /// Resolve schema column index to an absolute register.
+    #[inline(always)]
+    pub fn to_register(&self, base: usize, schema_idx: usize) -> usize {
+        base + self.to_reg_offset(schema_idx)
+    }
+
+    #[inline(always)]
+    pub fn num_non_virtual_cols(&self) -> usize {
+        match self {
+            Self::Identity {
+                column_count: total,
+            } => *total,
+            Self::Mapped {
+                non_virtual_col_count,
+                ..
+            } => *non_virtual_col_count,
+        }
+    }
+
+    #[inline(always)]
+    pub fn column_count(&self) -> usize {
+        match self {
+            Self::Identity {
+                column_count: total,
+            } => *total,
+            Self::Mapped { offsets, .. } => offsets.len(),
+        }
+    }
+
+    pub fn column_idx_for_offset(&self, offset: usize) -> Option<usize> {
+        match self {
+            Self::Identity { column_count } => {
+                if offset < *column_count {
+                    Some(offset)
+                } else {
+                    None
+                }
+            }
+            Self::Mapped { offsets, .. } => offsets.iter().position(|&s| s == offset),
         }
     }
 }
@@ -1223,15 +2015,19 @@ impl Clone for Schema {
 pub enum Table {
     BTree(Arc<BTreeTable>),
     Virtual(Arc<VirtualTable>),
-    FromClauseSubquery(FromClauseSubquery),
+    FromClauseSubquery(Arc<FromClauseSubquery>),
 }
 
 impl Table {
-    pub fn get_root_page(&self) -> i64 {
+    pub fn get_root_page(&self) -> crate::Result<i64> {
         match self {
-            Table::BTree(table) => table.root_page,
-            Table::Virtual(_) => unimplemented!(),
-            Table::FromClauseSubquery(_) => unimplemented!(),
+            Table::BTree(table) => Ok(table.root_page),
+            Table::Virtual(_) => Err(crate::LimboError::InternalError(
+                "Virtual tables do not have a root page".to_string(),
+            )),
+            Table::FromClauseSubquery(_) => Err(crate::LimboError::InternalError(
+                "FROM clause subqueries do not have a root page".to_string(),
+            )),
         }
     }
 
@@ -1255,19 +2051,22 @@ impl Table {
 
     /// Returns the column position and column for a given column name.
     pub fn get_column_by_name(&self, name: &str) -> Option<(usize, &Column)> {
-        let name = normalize_ident(name);
         match self {
-            Self::BTree(table) => table.get_column(name.as_str()),
-            Self::Virtual(table) => table
-                .columns
-                .iter()
-                .enumerate()
-                .find(|(_, col)| col.name.as_ref() == Some(&name)),
+            Self::BTree(table) => table.get_column(name),
+            Self::Virtual(table) => table.columns.iter().enumerate().find(|(_, col)| {
+                col.name
+                    .as_ref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
+            }),
             Self::FromClauseSubquery(from_clause_subquery) => from_clause_subquery
                 .columns
                 .iter()
                 .enumerate()
-                .find(|(_, col)| col.name.as_ref() == Some(&name)),
+                .find(|(_, col)| {
+                    col.name
+                        .as_ref()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(name))
+                }),
         }
     }
 
@@ -1279,9 +2078,25 @@ impl Table {
         }
     }
 
+    pub fn is_strict(&self) -> bool {
+        match self {
+            Self::BTree(table) => table.is_strict,
+            Self::Virtual(_) => false,
+            Self::FromClauseSubquery(_) => false,
+        }
+    }
+
     pub fn btree(&self) -> Option<Arc<BTreeTable>> {
         match self {
             Self::BTree(table) => Some(table.clone()),
+            Self::Virtual(_) => None,
+            Self::FromClauseSubquery(_) => None,
+        }
+    }
+
+    pub fn btree_mut(&mut self) -> Option<&mut Arc<BTreeTable>> {
+        match self {
+            Self::BTree(table) => Some(table),
             Self::Virtual(_) => None,
             Self::FromClauseSubquery(_) => None,
         }
@@ -1309,6 +2124,33 @@ impl PartialEq for Table {
 pub struct UniqueSet {
     pub columns: Vec<(String, SortOrder)>,
     pub is_primary_key: bool,
+    pub conflict_clause: Option<ResolveType>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CheckConstraint {
+    /// Optional constraint name
+    pub name: Option<String>,
+    /// CHECK expression
+    pub expr: ast::Expr,
+    /// Column name if this is a column-level CHECK constraint (defined inline with the column).
+    /// None if this is a table-level CHECK constraint.
+    pub column: Option<String>,
+}
+
+impl CheckConstraint {
+    pub fn new(name: Option<&ast::Name>, expr: &ast::Expr, column: Option<&str>) -> Self {
+        Self {
+            name: name.map(|n| n.as_str().to_string()),
+            expr: expr.clone(),
+            column: column.map(|s| s.to_string()),
+        }
+    }
+
+    /// Returns the SQL representation of this CHECK constraint (e.g. `CHECK(x > 0)`).
+    pub fn sql(&self) -> String {
+        format!("CHECK({})", self.expr)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1322,17 +2164,139 @@ pub struct BTreeTable {
     pub has_autoincrement: bool,
     pub unique_sets: Vec<UniqueSet>,
     pub foreign_keys: Vec<Arc<ForeignKey>>,
+    pub check_constraints: Vec<CheckConstraint>,
+    /// ON CONFLICT clause for the INTEGER PRIMARY KEY constraint.
+    /// Stored here because rowid-alias PKs have their UniqueSet removed.
+    pub rowid_alias_conflict_clause: Option<ResolveType>,
+    pub has_virtual_columns: bool,
+    pub logical_to_physical_map: Vec<usize>,
 }
 
 impl BTreeTable {
-    pub fn get_rowid_alias_column(&self) -> Option<(usize, &Column)> {
-        if self.primary_key_columns.len() == 1 {
-            let (idx, col) = self.get_column(&self.primary_key_columns[0].0)?;
-            if col.is_rowid_alias() {
-                return Some((idx, col));
+    /// Create a table reference for TypeCheck where custom type columns have
+    /// their `ty_str` replaced with the base type name, and where virtual columns
+    /// are skipped. This ensures TypeCheck validates the encoded value against the
+    /// correct base type (e.g., BLOB) rather than accepting any STRICT type via the wildcard arm.
+    pub fn type_check_table_ref(table: &Arc<BTreeTable>, schema: &Schema) -> Arc<BTreeTable> {
+        let has_virtual = table.has_virtual_columns();
+        let has_custom = table
+            .columns
+            .iter()
+            .any(|c| c.is_array() || schema.get_type_def(&c.ty_str, table.is_strict).is_some());
+        if !has_custom && !has_virtual {
+            return Arc::clone(table);
+        }
+        let mut modified = (**table).clone();
+        if has_virtual {
+            modified.columns.retain(|c| !c.is_virtual_generated());
+            modified.has_virtual_columns = false;
+        }
+        for col in &mut modified.columns {
+            if col.is_array() {
+                // Arrays are stored as record-format blobs.
+                col.ty_str = "BLOB".to_string();
+            } else if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict) {
+                col.ty_str = type_def.base.to_uppercase();
             }
         }
-        None
+        Arc::new(modified)
+    }
+
+    /// Create a table ref for pre-encode TypeCheck that validates user input
+    /// against the type's declared `value` input type (or base if not declared).
+    /// For UPDATE, `only_columns` limits which columns are checked — non-SET
+    /// columns hold encoded values and must be skipped (set to ANY).
+    pub fn input_type_check_table_ref(
+        table: &Arc<BTreeTable>,
+        schema: &Schema,
+        only_columns: Option<&std::collections::HashSet<usize>>,
+    ) -> Arc<BTreeTable> {
+        let has_virtual = table.has_virtual_columns();
+        let has_custom = table
+            .columns
+            .iter()
+            .any(|c| c.is_array() || schema.get_type_def(&c.ty_str, table.is_strict).is_some());
+        if !has_custom && !has_virtual {
+            return Arc::clone(table);
+        }
+        let mut modified = (**table).clone();
+        let remapped_only_columns = if has_virtual {
+            let remapped = only_columns.map(|only| {
+                let mut new_set = std::collections::HashSet::new();
+                let mut physical = 0usize;
+                for (orig, col) in modified.columns.iter().enumerate() {
+                    if col.is_virtual_generated() {
+                        continue;
+                    }
+                    if only.contains(&orig) {
+                        new_set.insert(physical);
+                    }
+                    physical += 1;
+                }
+                new_set
+            });
+            modified.columns.retain(|c| !c.is_virtual_generated());
+            modified.has_virtual_columns = false;
+            remapped
+        } else {
+            None
+        };
+        let effective_only = remapped_only_columns.as_ref().or(only_columns);
+        for (i, col) in modified.columns.iter_mut().enumerate() {
+            if let Some(only) = effective_only {
+                if !only.contains(&i) {
+                    col.ty_str = "ANY".to_string();
+                    continue;
+                }
+            }
+            if col.is_array() {
+                // Pre-encode: user input can be text ('[1,2]') or blob (ARRAY[]),
+                // so accept ANY here; the encoder handles conversion.
+                col.ty_str = "ANY".to_string();
+            } else if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict) {
+                col.ty_str = type_def.value_input_type().to_uppercase();
+            }
+        }
+        Arc::new(modified)
+    }
+
+    /// Override column type metadata for custom type columns so that
+    /// SQLite's name-based type/affinity rules use the BASE type
+    /// instead of the custom type name (e.g. "doubled" contains "DOUB"
+    /// which would incorrectly map to REAL instead of INTEGER).
+    pub fn resolve_custom_type_affinities(&mut self, schema: &Schema) {
+        if !self.is_strict {
+            return;
+        }
+        for col in &mut self.columns {
+            if col.is_array() {
+                // Arrays are stored as record-format blobs regardless of element type.
+                col.set_ty(Type::Blob);
+                col.set_base_affinity(Affinity::Blob);
+                continue;
+            }
+            if let Some(type_def) = schema.get_type_def_unchecked(&col.ty_str) {
+                let (base_ty, _) = type_from_name(&type_def.base);
+                col.set_ty(base_ty);
+                col.set_base_affinity(Affinity::affinity(&type_def.base));
+            }
+        }
+    }
+
+    pub fn get_rowid_alias_column(&self) -> Option<(usize, &Column)> {
+        self.columns
+            .iter()
+            .enumerate()
+            .find(|(_, column)| column.is_rowid_alias())
+    }
+
+    pub fn has_virtual_columns(&self) -> bool {
+        self.has_virtual_columns
+    }
+
+    /// Build a `ColumnLayout` for this table's register mapping.
+    pub fn column_layout(&self) -> ColumnLayout {
+        ColumnLayout::from_btree(self)
     }
 
     /// Returns the column position and column for a given column name.
@@ -1340,12 +2304,12 @@ impl BTreeTable {
     /// E.g. if table is CREATE TABLE t (a, b, c)
     /// then get_column("b") returns (1, &Column { .. })
     pub fn get_column(&self, name: &str) -> Option<(usize, &Column)> {
-        let name = normalize_ident(name);
-
-        self.columns
-            .iter()
-            .enumerate()
-            .find(|(_, column)| column.name.as_ref() == Some(&name))
+        self.columns.iter().enumerate().find(|(_, column)| {
+            column
+                .name
+                .as_ref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        })
     }
 
     pub fn from_sql(sql: &str, root_page: i64) -> Result<BTreeTable> {
@@ -1365,7 +2329,7 @@ impl BTreeTable {
     /// For example, if a user creates a table like: `CREATE TABLE t              (x)`, we store it as
     /// `CREATE TABLE t (x)`, whereas sqlite stores it with the original extra whitespace.
     pub fn to_sql(&self) -> String {
-        let mut sql = format!("CREATE TABLE {} (", self.name);
+        let mut sql = format!("CREATE TABLE {} (", quote_ident(&self.name));
         let needs_pk_inline = self.primary_key_columns.len() == 1;
         // Add columns
         for (i, column) in self.columns.iter().enumerate() {
@@ -1373,19 +2337,15 @@ impl BTreeTable {
                 sql.push_str(", ");
             }
 
-            // we need to wrap the column name in square brackets if it contains special characters
             let column_name = column.name.as_ref().expect("column name is None");
-            if identifier_contains_special_chars(column_name) {
-                sql.push('[');
-                sql.push_str(column_name);
-                sql.push(']');
-            } else {
-                sql.push_str(column_name);
-            }
+            sql.push_str(&quote_ident(column_name));
 
             if !column.ty_str.is_empty() {
                 sql.push(' ');
                 sql.push_str(&column.ty_str);
+                if column.is_array() {
+                    sql.push_str("[]");
+                }
             }
             if column.notnull() {
                 sql.push_str(" NOT NULL");
@@ -1401,6 +2361,25 @@ impl BTreeTable {
             if let Some(default) = &column.default {
                 sql.push_str(" DEFAULT ");
                 sql.push_str(&default.to_string());
+            }
+
+            if let GeneratedType::Virtual { original_sql, .. } = &column.generated_type() {
+                sql.push_str(" AS (");
+                sql.push_str(original_sql);
+                sql.push(')');
+            }
+
+            // Add column-level CHECK constraints inline
+            for check_constraint in &self.check_constraints {
+                if check_constraint.column.as_deref() == Some(column_name) {
+                    sql.push(' ');
+                    if let Some(name) = &check_constraint.name {
+                        sql.push_str("CONSTRAINT ");
+                        sql.push_str(&Name::exact(name.clone()).as_ident());
+                        sql.push(' ');
+                    }
+                    sql.push_str(&check_constraint.sql());
+                }
             }
         }
 
@@ -1461,7 +2440,53 @@ impl BTreeTable {
                 sql.push_str(" DEFERRABLE INITIALLY DEFERRED");
             }
         }
+
+        // Add table-level CHECK constraints (column-level ones were emitted inline above)
+        for check_constraint in &self.check_constraints {
+            if check_constraint.column.is_some() {
+                continue;
+            }
+            sql.push_str(", ");
+            if let Some(name) = &check_constraint.name {
+                sql.push_str("CONSTRAINT ");
+                sql.push_str(&Name::exact(name.clone()).as_ident());
+                sql.push(' ');
+            }
+            sql.push_str(&check_constraint.sql());
+        }
+
+        // Add table-level UNIQUE constraints
+        for unique_set in &self.unique_sets {
+            // Skip primary key (handled above)
+            if unique_set.is_primary_key {
+                continue;
+            }
+            // Skip single-column unique constraints that were already emitted inline
+            if unique_set.columns.len() == 1 {
+                let col_name = &unique_set.columns[0].0;
+                if let Some((_, col)) = self.get_column(col_name) {
+                    if col.unique() {
+                        continue;
+                    }
+                }
+            }
+            sql.push_str(", UNIQUE (");
+            for (i, (col_name, _)) in unique_set.columns.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push_str(&quote_ident(col_name));
+            }
+            sql.push(')');
+        }
+
         sql.push(')');
+
+        // Add STRICT keyword if this is a STRICT table
+        if self.is_strict {
+            sql.push_str(" STRICT");
+        }
+
         sql
     }
 
@@ -1471,10 +2496,75 @@ impl BTreeTable {
             .map(|column| column.collation())
             .collect()
     }
-}
 
-fn identifier_contains_special_chars(name: &str) -> bool {
-    name.chars().any(|c| !c.is_ascii_alphanumeric() && c != '_')
+    #[inline]
+    pub fn logical_to_physical_column(&self, logical: usize) -> usize {
+        self.logical_to_physical_map[logical]
+    }
+
+    pub fn build_logical_to_physical_map(columns: &[Column]) -> Vec<usize> {
+        let mut map = Vec::with_capacity(columns.len());
+        let mut physical = 0;
+        for col in columns {
+            map.push(physical);
+            if !col.is_generated() {
+                physical += 1;
+            }
+        }
+        map
+    }
+
+    pub fn prepare_generated_columns(&mut self) -> Result<()> {
+        self.has_virtual_columns = self.columns.iter().any(|c| c.is_virtual_generated());
+        if !self.has_virtual_columns {
+            return Ok(());
+        }
+        for i in 0..self.columns.len() {
+            if self.columns[i].is_virtual_generated() {
+                let mut expr = self.columns[i].generated_expr().cloned().unwrap();
+                resolve_gencol_expr_columns(&mut expr, &self.columns)?;
+                *self.columns[i].generated_expr_mut().unwrap() = expr;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn shift_generated_column_indices_after_drop(
+        &mut self,
+        dropped_index: usize,
+    ) -> Result<()> {
+        if !self.has_virtual_columns {
+            return Ok(());
+        }
+
+        for column in &mut self.columns {
+            let Some(expr) = column.generated_expr_mut() else {
+                continue;
+            };
+
+            walk_expr_mut(expr, &mut |e| match e {
+                Expr::Column {
+                    table,
+                    column,
+                    is_rowid_alias: _,
+                    ..
+                } if table.is_self_table() => {
+                    if *column == dropped_index {
+                        return Err(LimboError::InternalError(
+                            "dropped column remained referenced by generated column".to_string(),
+                        ));
+                    }
+                    if *column > dropped_index {
+                        *column -= 1;
+                    }
+                    Ok(WalkControl::Continue)
+                }
+                _ => Ok(WalkControl::Continue),
+            })?;
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -1499,13 +2589,364 @@ impl PseudoCursorType {
 pub struct FromClauseSubquery {
     /// The name of the derived table; uses the alias if available.
     pub name: String,
-    /// The query plan for the derived table.
-    pub plan: Box<SelectPlan>,
+    /// The query plan for the derived table. Can be either a simple SelectPlan
+    /// or a compound select (UNION/INTERSECT/EXCEPT).
+    pub plan: Box<Plan>,
     /// The columns of the derived table.
     pub columns: Vec<Column>,
     /// The start register for the result columns of the derived table;
     /// must be set before data is read from it.
     pub result_columns_start_reg: Option<usize>,
+    /// The table cursor backing a materialized EphemeralTable representation of
+    /// this subquery, if one was emitted.
+    pub materialized_cursor_id: Option<CursorID>,
+    /// CTE-specific materialization metadata, when this FROM-subquery is a CTE
+    /// reference rather than an inline derived table.
+    pub cte: Option<FromClauseSubqueryCteMetadata>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FromClauseSubqueryCteMetadata {
+    /// Identity shared by all references to the same CTE definition.
+    pub id: usize,
+    /// True when this CTE is referenced more than once inside the enclosing
+    /// query tree and therefore must be materialized once and shared.
+    pub shared_materialization: bool,
+    /// True for explicit WITH ... AS MATERIALIZED.
+    pub materialize_hint: bool,
+}
+
+impl FromClauseSubquery {
+    pub fn cte_id(&self) -> Option<usize> {
+        self.cte.map(|cte| cte.id)
+    }
+
+    pub fn materialize_hint(&self) -> bool {
+        self.cte.is_some_and(|cte| cte.materialize_hint)
+    }
+
+    pub fn shared_materialization(&self) -> bool {
+        self.cte.is_some_and(|cte| cte.shared_materialization)
+    }
+
+    pub fn set_shared_materialization(&mut self, shared: bool) {
+        if let Some(cte) = &mut self.cte {
+            cte.shared_materialization = shared;
+        }
+    }
+
+    /// Shared CTE references and explicit MATERIALIZED hints both force a
+    /// table-backed materialization that can be scanned or probed later.
+    pub fn requires_table_materialization(&self) -> bool {
+        self.shared_materialization() || self.materialize_hint()
+    }
+
+    /// Only simple single-reference SELECT subqueries can safely use their
+    /// synthesized seek index as the storage target directly. Compound
+    /// subqueries still need table-backed storage so their set-operation
+    /// semantics are preserved before any later SEARCH shape is chosen.
+    pub fn supports_direct_index_materialization(&self) -> bool {
+        matches!(self.plan.as_ref(), Plan::Select(_)) && !self.requires_table_materialization()
+    }
+}
+
+fn collect_column_refs(expr: &Expr) -> HashSet<String> {
+    collect_column_dependencies_of_expr(expr, &[])
+}
+
+/// Extract all column name references from an expression as a set.
+/// `columns` is used to resolve pre-resolved `Expr::Column { SELF_TABLE }` back to names.
+//TODO all this usage of [normalize_ident] should be replaced with a proper [Identifier] domain type.
+pub fn collect_column_dependencies_of_expr(expr: &Expr, columns: &[Column]) -> HashSet<String> {
+    let mut refs = HashSet::default();
+
+    let _ = walk_expr(expr, &mut |e| match e {
+        Expr::Id(name) | Expr::Name(name) => {
+            refs.insert(normalize_ident(name.as_str()));
+            Ok(WalkControl::Continue)
+        }
+        Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
+            refs.insert(normalize_ident(col.as_str()));
+            Ok(WalkControl::Continue)
+        }
+        Expr::Column { table, column, .. } if table.is_self_table() => {
+            if let Some(col) = columns.get(*column) {
+                if let Some(name) = &col.name {
+                    refs.insert(normalize_ident(name));
+                }
+            }
+            Ok(WalkControl::Continue)
+        }
+        Expr::Subquery(_)
+        | Expr::Exists(_)
+        | Expr::InTable { .. }
+        | Expr::SubqueryResult { .. } => Ok(WalkControl::SkipChildren),
+        _ => Ok(WalkControl::Continue),
+    });
+
+    refs
+}
+
+pub(crate) fn columns_affected_by_update(
+    columns: &[Column],
+    updated_cols: &HashSet<usize>,
+) -> HashSet<usize> {
+    let mut affected = updated_cols.clone();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (idx, col) in columns.iter().enumerate() {
+            if affected.contains(&idx) {
+                continue;
+            }
+            let GeneratedType::Virtual { ref resolved, .. } = col.generated_type() else {
+                continue;
+            };
+            if expr_refers_one_of(resolved, columns, &affected) {
+                affected.insert(idx);
+                changed = true;
+            }
+        }
+    }
+    affected
+}
+
+/// Returns true if `expr` references any column in `target_set`.
+fn expr_refers_one_of(expr: &Expr, columns: &[Column], target_set: &HashSet<usize>) -> bool {
+    let mut found = false;
+    let _ = walk_expr(expr, &mut |e| {
+        if found {
+            return Ok(WalkControl::SkipChildren);
+        }
+        match e {
+            Expr::Column { table, column, .. } if table.is_self_table() => {
+                found = target_set.contains(column);
+                Ok(WalkControl::Continue)
+            }
+            Expr::Id(name) | Expr::Name(name) => {
+                if let Some(idx) = find_column_index_by_name(columns, name.as_str()) {
+                    found = target_set.contains(&idx);
+                }
+                Ok(WalkControl::Continue)
+            }
+            Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
+                if let Some(idx) = find_column_index_by_name(columns, col.as_str()) {
+                    found = target_set.contains(&idx);
+                }
+                Ok(WalkControl::Continue)
+            }
+            Expr::Subquery(_)
+            | Expr::Exists(_)
+            | Expr::InTable { .. }
+            | Expr::SubqueryResult { .. } => Ok(WalkControl::SkipChildren),
+            _ => Ok(WalkControl::Continue),
+        }
+    });
+    found
+}
+
+fn find_column_index_by_name(columns: &[Column], col_name: &str) -> Option<usize> {
+    columns.iter().enumerate().find_map(|(i, col)| {
+        col.name
+            .as_ref()
+            .filter(|name| name.eq_ignore_ascii_case(col_name))
+            .map(|_| i)
+    })
+}
+
+fn has_transitive_dependency(start: &str, target: &str, columns: &[Column]) -> bool {
+    let mut visited = std::collections::HashSet::new();
+    has_transitive_dependency_inner(start, target, columns, &mut visited)
+}
+
+fn has_transitive_dependency_inner(
+    start: &str,
+    target: &str,
+    columns: &[Column],
+    visited: &mut std::collections::HashSet<String>,
+) -> bool {
+    if !visited.insert(start.to_owned()) {
+        return false;
+    }
+
+    let Some(col) = columns.iter().find(|c| c.name.as_deref() == Some(start)) else {
+        return false;
+    };
+
+    let GeneratedType::Virtual { ref resolved, .. } = col.generated_type() else {
+        return false;
+    };
+
+    let deps = collect_column_refs(resolved);
+
+    if deps.contains(target) {
+        return true;
+    }
+
+    for dep in deps {
+        if has_transitive_dependency_inner(&dep, target, columns, visited) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Resolve [Expr::Id] / [Expr::Qualified] in a generated column expression to
+/// `Expr::Column { table: SELF_TABLE, column: idx }`.
+pub fn resolve_gencol_expr_columns(gencol_expr: &mut Expr, columns: &[Column]) -> Result<()> {
+    walk_expr_mut(gencol_expr, &mut |e| match e {
+        Expr::Id(name) | Expr::Qualified(_, name) => {
+            let col_name = normalize_ident(name.as_str());
+            let (idx, col) = columns
+                .iter()
+                .enumerate()
+                .find(|(_, c)| {
+                    c.name
+                        .as_ref()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(&col_name))
+                })
+                .ok_or_else(|| LimboError::ParseError(format!("no such column: {col_name}")))?;
+            *e = Expr::Column {
+                database: None,
+                table: TableInternalId::SELF_TABLE,
+                column: idx,
+                is_rowid_alias: col.is_rowid_alias(),
+            };
+            Ok(WalkControl::Continue)
+        }
+        _ => Ok(WalkControl::Continue),
+    })?;
+    Ok(())
+}
+
+pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
+    use ast::Expr;
+    match expr {
+        Expr::Qualified(_, _) => {
+            bail_parse_error!("the \".\" operator prohibited in generated columns");
+        }
+        Expr::DoublyQualified(_, _, _) => {
+            bail_parse_error!("the \".\" operator prohibited in generated columns");
+        }
+
+        Expr::Variable(_) => {
+            bail_parse_error!("bind parameters prohibited in generated columns");
+        }
+
+        Expr::Subquery(_) | Expr::InSelect { .. } | Expr::Exists(_) | Expr::InTable { .. } => {
+            bail_parse_error!("subqueries prohibited in generated columns");
+        }
+
+        Expr::FunctionCall {
+            name,
+            args,
+            filter_over,
+            ..
+        } => {
+            if filter_over.over_clause.is_some() {
+                bail_parse_error!("window functions prohibited in generated columns");
+            }
+            let arg_count = args.len();
+            let Some(func) = Func::resolve_function(name.as_str(), arg_count)? else {
+                return Err(LimboError::ParseError(format!(
+                    "could not resolve function {}",
+                    name.as_str()
+                )));
+            };
+            if matches!(func, Func::Agg(_)) {
+                bail_parse_error!("aggregate functions prohibited in generated columns");
+            }
+            if !func.is_deterministic() {
+                bail_parse_error!("non-deterministic functions prohibited in generated columns");
+            }
+            for arg in args {
+                validate_generated_expr(arg)?;
+            }
+        }
+
+        Expr::FunctionCallStar { name, filter_over } => {
+            if filter_over.over_clause.is_some() {
+                bail_parse_error!("window functions prohibited in generated columns");
+            }
+            let Some(func) = Func::resolve_function(name.as_str(), 0)? else {
+                return Err(LimboError::ParseError(format!(
+                    "could not resolve function {}",
+                    name.as_str()
+                )));
+            };
+
+            if matches!(func, Func::Agg(_)) {
+                bail_parse_error!("aggregate functions prohibited in generated columns");
+            }
+            if !func.is_deterministic() {
+                bail_parse_error!("non-deterministic functions prohibited in generated columns");
+            }
+        }
+
+        Expr::Binary(lhs, _, rhs) => {
+            validate_generated_expr(lhs)?;
+            validate_generated_expr(rhs)?;
+        }
+        Expr::Unary(_, inner) => {
+            validate_generated_expr(inner)?;
+        }
+        Expr::Parenthesized(exprs) => {
+            for e in exprs {
+                validate_generated_expr(e)?;
+            }
+        }
+        Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+            ..
+        } => {
+            if let Some(b) = base {
+                validate_generated_expr(b)?;
+            }
+            for (w, t) in when_then_pairs {
+                validate_generated_expr(w)?;
+                validate_generated_expr(t)?;
+            }
+            if let Some(e) = else_expr {
+                validate_generated_expr(e)?;
+            }
+        }
+        Expr::Cast { expr, .. } => {
+            validate_generated_expr(expr)?;
+        }
+        Expr::InList { lhs, rhs, .. } => {
+            validate_generated_expr(lhs)?;
+            for e in rhs {
+                validate_generated_expr(e)?;
+            }
+        }
+        Expr::Between {
+            lhs, start, end, ..
+        } => {
+            validate_generated_expr(lhs)?;
+            validate_generated_expr(start)?;
+            validate_generated_expr(end)?;
+        }
+        Expr::Like {
+            lhs, rhs, escape, ..
+        } => {
+            validate_generated_expr(lhs)?;
+            validate_generated_expr(rhs)?;
+            if let Some(e) = escape {
+                validate_generated_expr(e)?;
+            }
+        }
+        Expr::Collate(inner, _) => {
+            validate_generated_expr(inner)?;
+        }
+        Expr::IsNull(inner) | Expr::NotNull(inner) => {
+            validate_generated_expr(inner)?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> Result<BTreeTable> {
@@ -1515,21 +2956,28 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     let mut has_autoincrement = false;
     let mut primary_key_columns = vec![];
     let mut foreign_keys = vec![];
-    let mut cols = vec![];
+    let mut check_constraints = vec![];
+    let mut cols: Vec<Column> = vec![];
     let is_strict: bool;
-    let mut unique_sets: Vec<UniqueSet> = vec![];
+    let mut unique_sets_columns: Vec<UniqueSet> = vec![];
+    let mut unique_sets_constraints: Vec<UniqueSet> = vec![];
     match body {
         CreateTableBody::ColumnsAndConstraints {
             columns,
             constraints,
             options,
         } => {
-            is_strict = options.contains(TableOptions::STRICT);
+            is_strict = options.contains_strict();
+
+            // we need to preserve order of unique sets definition
+            // but also, we analyze constraints first in order to check PRIMARY KEY constraint and recognize rowid alias properly
+            // that's why we maintain 2 unique_set sequences and merge them together in the end
+
             for c in constraints {
                 if let ast::TableConstraint::PrimaryKey {
                     columns,
                     auto_increment,
-                    ..
+                    conflict_clause,
                 } = &c.constraint
                 {
                     if !primary_key_columns.is_empty() {
@@ -1555,18 +3003,16 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         primary_key_columns
                             .push((col_name, column.order.unwrap_or(SortOrder::Asc)));
                     }
-                    unique_sets.push(UniqueSet {
+                    unique_sets_constraints.push(UniqueSet {
                         columns: primary_key_columns.clone(),
                         is_primary_key: true,
+                        conflict_clause: *conflict_clause,
                     });
                 } else if let ast::TableConstraint::Unique {
                     columns,
                     conflict_clause,
                 } = &c.constraint
                 {
-                    if conflict_clause.is_some() {
-                        unimplemented!("ON CONFLICT not implemented");
-                    }
                     let mut unique_columns = Vec::with_capacity(columns.len());
                     for column in columns {
                         match column.expr.as_ref() {
@@ -1586,8 +3032,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     let unique_set = UniqueSet {
                         columns: unique_columns,
                         is_primary_key: false,
+                        conflict_clause: *conflict_clause,
                     };
-                    unique_sets.push(unique_set);
+                    unique_sets_constraints.push(unique_set);
                 } else if let ast::TableConstraint::ForeignKey {
                     columns,
                     clause,
@@ -1655,6 +3102,8 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         deferred,
                     };
                     foreign_keys.push(Arc::new(fk));
+                } else if let ast::TableConstraint::Check(expr) = &c.constraint {
+                    check_constraints.push(CheckConstraint::new(c.name.as_ref(), expr, None));
                 }
             }
 
@@ -1681,8 +3130,20 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 let ty_str = col_type
                     .as_ref()
                     .cloned()
-                    .map(|ast::Type { name, .. }| name.clone())
+                    .map(|ast::Type { name, .. }| name)
                     .unwrap_or_default();
+
+                let ty_params: Vec<Box<Expr>> = match col_type {
+                    Some(ast::Type {
+                        size: Some(ast::TypeSize::MaxSize(ref expr)),
+                        ..
+                    }) => vec![expr.clone()],
+                    Some(ast::Type {
+                        size: Some(ast::TypeSize::TypeSize(ref e1, ref e2)),
+                        ..
+                    }) => vec![e1.clone(), e2.clone()],
+                    _ => Vec::new(),
+                };
 
                 let mut typename_exactly_integer = false;
                 let ty = match col_type {
@@ -1695,18 +3156,31 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 };
 
                 let mut default = None;
+                let mut generated: Option<Box<Expr>> = None;
                 let mut primary_key = false;
                 let mut notnull = false;
+                let mut notnull_conflict_clause = None;
                 let mut order = SortOrder::Asc;
                 let mut unique = false;
                 let mut collation = None;
                 for c_def in constraints {
                     match &c_def.constraint {
-                        ast::ColumnConstraint::Check { .. } => {
-                            crate::bail_parse_error!("CHECK constraints are not yet supported");
+                        ast::ColumnConstraint::Check(expr) => {
+                            check_constraints.push(CheckConstraint::new(
+                                c_def.name.as_ref(),
+                                expr,
+                                Some(&name),
+                            ));
                         }
-                        ast::ColumnConstraint::Generated { .. } => {
-                            crate::bail_parse_error!("GENERATED columns are not yet supported");
+                        ast::ColumnConstraint::Generated { expr, typ } => {
+                            if typ
+                                .as_ref()
+                                .is_some_and(|t| matches!(t, ast::GeneratedColumnType::Stored))
+                            {
+                                bail_parse_error!("Stored generated columns are not supported");
+                            }
+                            validate_generated_expr(expr)?;
+                            generated = Some(expr.clone());
                         }
                         ast::ColumnConstraint::PrimaryKey {
                             order: o,
@@ -1714,11 +3188,6 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             conflict_clause,
                             ..
                         } => {
-                            if conflict_clause.is_some() {
-                                crate::bail_parse_error!(
-                                    "ON CONFLICT not implemented for column definition"
-                                );
-                            }
                             if !primary_key_columns.is_empty() {
                                 crate::bail_parse_error!(
                                     "table \"{}\" has more than one primary key",
@@ -1732,9 +3201,10 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             if let Some(o) = o {
                                 order = *o;
                             }
-                            unique_sets.push(UniqueSet {
+                            unique_sets_columns.push(UniqueSet {
                                 columns: vec![(name.clone(), order)],
                                 is_primary_key: true,
+                                conflict_clause: *conflict_clause,
                             });
                         }
                         ast::ColumnConstraint::NotNull {
@@ -1742,29 +3212,21 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             conflict_clause,
                             ..
                         } => {
-                            if conflict_clause.is_some() {
-                                crate::bail_parse_error!(
-                                    "ON CONFLICT not implemented for column definition"
-                                );
-                            }
                             notnull = !nullable;
+                            notnull_conflict_clause = *conflict_clause;
                         }
                         ast::ColumnConstraint::Default(ref expr) => {
                             default = Some(
-                                translate_ident_to_string_literal(expr).unwrap_or(expr.clone()),
+                                translate_ident_to_string_literal(expr)
+                                    .unwrap_or_else(|| expr.clone()),
                             );
                         }
-                        // TODO: for now we don't check Resolve type of unique
                         ast::ColumnConstraint::Unique(conflict) => {
-                            if conflict.is_some() {
-                                crate::bail_parse_error!(
-                                    "ON CONFLICT not implemented for column definition"
-                                );
-                            }
                             unique = true;
-                            unique_sets.push(UniqueSet {
+                            unique_sets_columns.push(UniqueSet {
                                 columns: vec![(name.clone(), order)],
                                 is_primary_key: false,
+                                conflict_clause: *conflict,
                             });
                         }
                         ast::ColumnConstraint::Collate { ref collation_name } => {
@@ -1774,6 +3236,13 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             clause,
                             defer_clause,
                         } => {
+                            if clause.columns.len() > 1 {
+                                crate::bail_parse_error!(
+                                    "foreign key on {} should reference only one column of table {}",
+                                    name,
+                                    clause.tbl_name.as_str()
+                                );
+                            }
                             let fk = ForeignKey {
                                 parent_table: normalize_ident(clause.tbl_name.as_str()),
                                 parent_columns: clause
@@ -1820,6 +3289,38 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     }
                 }
 
+                if let Some(ref gen_expr) = generated {
+                    if primary_key {
+                        bail_parse_error!(
+                            "generated column \"{}\" cannot be part of the PRIMARY KEY",
+                            name
+                        );
+                    }
+                    if default.is_some() {
+                        bail_parse_error!(
+                            "generated column \"{}\" cannot have a DEFAULT value",
+                            name
+                        );
+                    }
+
+                    let referenced_cols = collect_column_refs(gen_expr);
+                    let current_col_name = normalize_ident(&name);
+
+                    if referenced_cols.iter().any(|c| c == &current_col_name) {
+                        bail_parse_error!("generated column \"{}\" cannot reference itself", name);
+                    }
+
+                    for ref_col in &referenced_cols {
+                        if has_transitive_dependency(ref_col, &current_col_name, &cols) {
+                            bail_parse_error!(
+                                "circular dependency in generated columns \"{}\" and \"{}\"",
+                                name,
+                                ref_col
+                            );
+                        }
+                    }
+                }
+
                 if primary_key {
                     primary_key_columns.push((name.clone(), order));
                     if order == SortOrder::Desc {
@@ -1827,29 +3328,51 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     }
                 } else if primary_key_columns
                     .iter()
-                    .any(|(col_name, _)| col_name == &name)
+                    .any(|(col_name, _)| col_name.eq_ignore_ascii_case(&name))
                 {
+                    if generated.is_some() {
+                        crate::bail_parse_error!(
+                            "generated column \"{}\" cannot be part of the PRIMARY KEY",
+                            name
+                        );
+                    }
                     primary_key = true;
                 }
 
-                cols.push(Column::new(
-                    Some(normalize_ident(&name)),
+                let mut col = Column::new(
+                    Some(name),
                     ty_str,
                     default,
+                    generated,
                     ty,
                     collation,
-                    primary_key,
-                    typename_exactly_integer && primary_key && !primary_key_desc_columns_constraint,
-                    notnull,
-                    unique,
-                    false,
-                ));
+                    ColDef {
+                        primary_key,
+                        rowid_alias: typename_exactly_integer
+                            && primary_key
+                            && !primary_key_desc_columns_constraint,
+                        notnull,
+                        unique,
+                        hidden: false,
+                        notnull_conflict_clause,
+                    },
+                );
+                col.ty_params = ty_params;
+                if let Some(t) = col_type.as_ref() {
+                    if t.is_array() {
+                        col.set_array_dimensions(t.array_dimensions);
+                    }
+                }
+                cols.push(col);
             }
-            if options.contains(TableOptions::WITHOUT_ROWID) {
+
+            if options.contains_without_rowid() {
                 has_rowid = false;
             }
         }
-        CreateTableBody::AsSelect(_) => todo!(),
+        CreateTableBody::AsSelect(_) => {
+            crate::bail_parse_error!("CREATE TABLE AS SELECT is not supported")
+        }
     };
 
     // flip is_rowid_alias back to false if the table has multiple primary key columns
@@ -1865,8 +3388,13 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         if primary_key_columns.len() != 1 {
             crate::bail_parse_error!("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY");
         }
+
         let pk_col_name = &primary_key_columns[0].0;
-        let pk_col = cols.iter().find(|c| c.name.as_deref() == Some(pk_col_name));
+        let pk_col = cols.iter().find(|c| {
+            c.name
+                .as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(pk_col_name))
+        });
 
         if let Some(col) = pk_col {
             if col.ty() != Type::Integer {
@@ -1875,6 +3403,16 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         }
     }
 
+    // concat unqiue_sets collected from column definitions and constraints in correct order
+    let mut unique_sets = unique_sets_columns
+        .into_iter()
+        .chain(unique_sets_constraints)
+        .collect::<Vec<_>>();
+    // Capture PK conflict clause before the rowid-alias UniqueSet is removed.
+    let rowid_alias_conflict_clause = unique_sets
+        .iter()
+        .find(|us| us.is_primary_key)
+        .and_then(|us| us.conflict_clause);
     for col in cols.iter() {
         if col.is_rowid_alias() {
             // Unique sets are used for creating automatic indexes. An index is not created for a rowid alias PRIMARY KEY.
@@ -1882,7 +3420,12 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
             let unique_set_w_only_rowid_alias = unique_sets.iter().position(|us| {
                 us.is_primary_key
                     && us.columns.len() == 1
-                    && &us.columns.first().unwrap().0 == col.name.as_ref().unwrap()
+                    && us
+                        .columns
+                        .first()
+                        .unwrap()
+                        .0
+                        .eq_ignore_ascii_case(col.name.as_ref().unwrap())
             });
             if let Some(u) = unique_set_w_only_rowid_alias {
                 unique_sets.remove(u);
@@ -1890,7 +3433,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         }
     }
 
-    Ok(BTreeTable {
+    let mut table = BTreeTable {
         root_page,
         name: table_name,
         has_rowid,
@@ -1917,8 +3460,20 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             .columns
                             .iter()
                             .zip(unique_sets[j].columns.iter())
-                            .all(|((a_name, _), (b_name, _))| a_name == b_name)
+                            .all(|((a_name, _), (b_name, _))| a_name.eq_ignore_ascii_case(b_name))
                     {
+                        // SQLite rejects duplicate constraints on the same columns when both
+                        // specify ON CONFLICT with different resolve types.
+                        if let (Some(a), Some(b)) = (
+                            unique_sets[i].conflict_clause,
+                            unique_sets[j].conflict_clause,
+                        ) {
+                            if a != b {
+                                crate::bail_parse_error!(
+                                    "conflicting ON CONFLICT clauses specified"
+                                );
+                            }
+                        }
                         unique_sets.remove(j);
                     } else {
                         j += 1;
@@ -1928,12 +3483,23 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
             }
             unique_sets
         },
-    })
+        check_constraints,
+        rowid_alias_conflict_clause,
+        has_virtual_columns: false,
+        logical_to_physical_map: Vec::new(),
+    };
+    table.prepare_generated_columns()?;
+    table.logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&table.columns);
+    Ok(table)
 }
 
+/// SQLite treats bare identifiers in DEFAULT clauses as string literals.
+/// E.g., `DEFAULT hello` becomes the string "hello", not a column reference.
 pub fn translate_ident_to_string_literal(expr: &Expr) -> Option<Box<Expr>> {
     match expr {
-        Expr::Name(name) => Some(Box::new(Expr::Literal(Literal::String(name.as_literal())))),
+        Expr::Name(name) | Expr::Id(name) => {
+            Some(Box::new(Expr::Literal(Literal::String(name.as_literal()))))
+        }
         _ => None,
     }
 }
@@ -1971,20 +3537,12 @@ pub struct ForeignKey {
 }
 impl ForeignKey {
     fn validate(&self) -> Result<()> {
-        // TODO: remove this when actions are implemented
-        if !(matches!(self.on_update, RefAct::NoAction)
-            && matches!(self.on_delete, RefAct::NoAction))
-        {
-            crate::bail_parse_error!(
-                "foreign key actions other than NO ACTION are not implemented"
-            );
-        }
         if self
             .parent_columns
             .iter()
             .any(|c| ROWID_STRS.iter().any(|&r| r.eq_ignore_ascii_case(c)))
         {
-            return Err(crate::LimboError::Constraint(format!(
+            return Err(crate::LimboError::ForeignKeyConstraint(format!(
                 "foreign key mismatch referencing \"{}\"",
                 self.parent_table
             )));
@@ -2002,9 +3560,7 @@ pub struct ResolvedFkRef {
     pub fk: Arc<ForeignKey>,
 
     /// Resolved, normalized column names.
-    pub parent_cols: Vec<String>,
     pub child_cols: Vec<String>,
-
     /// Column positions in the child/parent tables (pos_in_table)
     pub child_pos: Vec<usize>,
     pub parent_pos: Vec<usize>,
@@ -2069,8 +3625,35 @@ impl ResolvedFkRef {
 pub struct Column {
     pub name: Option<String>,
     pub ty_str: String,
+    pub ty_params: Vec<Box<Expr>>,
     pub default: Option<Box<Expr>>,
+    generated_type: GeneratedType,
     raw: u16,
+    /// ON CONFLICT clause for NOT NULL constraint on this column.
+    pub notnull_conflict_clause: Option<ResolveType>,
+}
+
+#[derive(Default)]
+pub struct ColDef {
+    pub primary_key: bool,
+    pub rowid_alias: bool,
+    pub notnull: bool,
+    pub unique: bool,
+    pub hidden: bool,
+    pub notnull_conflict_clause: Option<ResolveType>,
+}
+
+#[derive(Debug, Clone)]
+pub enum GeneratedType {
+    /// `resolved` holds the expression with column references resolved to
+    /// `Expr::Column { table: SELF_TABLE }` for use at compile time.
+    /// `original_sql` preserves the original SQL text for `to_sql()` round-tripping.
+    Virtual {
+        resolved: Box<Expr>,
+        original_sql: String,
+    },
+    // Stored { resolved: Box<Expr>, original_sql: String },
+    NotGenerated,
 }
 
 // flags
@@ -2086,11 +3669,53 @@ const TYPE_MASK: u16 = 0b111 << TYPE_SHIFT;
 const COLL_SHIFT: u16 = TYPE_SHIFT + 3;
 const COLL_MASK: u16 = 0b11 << COLL_SHIFT;
 
+// Bits 10-12: base type affinity override for custom type columns.
+// 0 = not set (use ty_str-based affinity), 1-5 = Affinity value + 1
+const BASE_AFF_SHIFT: u16 = COLL_SHIFT + 2;
+const BASE_AFF_MASK: u16 = 0b111 << BASE_AFF_SHIFT;
+
+// Bits 13-15: array dimensions (0 = scalar, 1-7 = number of [] dimensions)
+const ARRAY_DIM_SHIFT: u16 = 13;
+const ARRAY_DIM_MASK: u16 = 0b111 << ARRAY_DIM_SHIFT;
+
 impl Column {
     pub fn affinity(&self) -> Affinity {
-        Affinity::affinity(&self.ty_str)
+        let v = ((self.raw & BASE_AFF_MASK) >> BASE_AFF_SHIFT) as u8;
+        if v > 0 {
+            // Custom type column: use the base type's affinity
+            match v {
+                1 => Affinity::Integer,
+                2 => Affinity::Text,
+                3 => Affinity::Blob,
+                4 => Affinity::Real,
+                _ => Affinity::Numeric,
+            }
+        } else {
+            Affinity::affinity(&self.ty_str)
+        }
     }
-    pub const fn new_default_text(
+
+    /// Set the base type affinity override for a custom type column.
+    /// This ensures affinity rules use the custom type's BASE type
+    /// rather than applying SQLite name-based rules to the type name.
+    pub fn set_base_affinity(&mut self, affinity: Affinity) {
+        let v: u16 = match affinity {
+            Affinity::Integer => 1,
+            Affinity::Text => 2,
+            Affinity::Blob => 3,
+            Affinity::Real => 4,
+            Affinity::Numeric => 5,
+        };
+        self.raw = (self.raw & !BASE_AFF_MASK) | ((v << BASE_AFF_SHIFT) & BASE_AFF_MASK);
+    }
+    pub fn affinity_with_strict(&self, is_strict: bool) -> Affinity {
+        if is_strict && self.ty_str.eq_ignore_ascii_case("ANY") {
+            Affinity::Blob
+        } else {
+            self.affinity()
+        }
+    }
+    pub fn new_default_text(
         name: Option<String>,
         ty_str: String,
         default: Option<Box<Expr>>,
@@ -2099,16 +3724,13 @@ impl Column {
             name,
             ty_str,
             default,
+            None,
             Type::Text,
             None,
-            false,
-            false,
-            false,
-            false,
-            false,
+            ColDef::default(),
         )
     }
-    pub const fn new_default_integer(
+    pub fn new_default_integer(
         name: Option<String>,
         ty_str: String,
         default: Option<Box<Expr>>,
@@ -2117,54 +3739,60 @@ impl Column {
             name,
             ty_str,
             default,
+            None,
             Type::Integer,
             None,
-            false,
-            false,
-            false,
-            false,
-            false,
+            ColDef::default(),
         )
     }
     #[inline]
-    #[allow(clippy::too_many_arguments)]
-    pub const fn new(
+    pub fn new(
         name: Option<String>,
         ty_str: String,
         default: Option<Box<Expr>>,
+        generated: Option<Box<Expr>>,
         ty: Type,
         col: Option<CollationSeq>,
-        primary_key: bool,
-        rowid_alias: bool,
-        notnull: bool,
-        unique: bool,
-        hidden: bool,
+        coldef: ColDef,
     ) -> Self {
+        let generated_type = match generated {
+            Some(expr) => {
+                let original_sql = expr.to_string();
+                GeneratedType::Virtual {
+                    resolved: expr,
+                    original_sql,
+                }
+            }
+            None => GeneratedType::NotGenerated,
+        };
         let mut raw = 0u16;
         raw |= (ty as u16) << TYPE_SHIFT;
         if let Some(c) = col {
             raw |= (c as u16) << COLL_SHIFT;
         }
-        if primary_key {
+        if coldef.primary_key {
             raw |= F_PRIMARY_KEY
         }
-        if rowid_alias {
+        if coldef.rowid_alias {
             raw |= F_ROWID_ALIAS
         }
-        if notnull {
+        if coldef.notnull {
             raw |= F_NOTNULL
         }
-        if unique {
+        if coldef.unique {
             raw |= F_UNIQUE
         }
-        if hidden {
+        if coldef.hidden {
             raw |= F_HIDDEN
         }
         Self {
             name,
             ty_str,
+            ty_params: Vec::new(),
             default,
+            generated_type,
             raw,
+            notnull_conflict_clause: coldef.notnull_conflict_clause,
         }
     }
     #[inline]
@@ -2227,6 +3855,46 @@ impl Column {
         self.raw & F_HIDDEN != 0
     }
 
+    /// Returns an error if this column is a generated column.
+    /// `verb_phrase` should describe the operation, e.g. "INSERT into" or "UPDATE".
+    pub fn ensure_not_generated(&self, verb_phrase: &str, col_name: &str) -> Result<()> {
+        if !matches!(self.generated_type, GeneratedType::NotGenerated) {
+            bail_parse_error!("cannot {} generated column \"{}\"", verb_phrase, col_name);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub fn generated_type(&self) -> &GeneratedType {
+        &self.generated_type
+    }
+
+    #[inline]
+    pub const fn is_generated(&self) -> bool {
+        !matches!(self.generated_type, GeneratedType::NotGenerated)
+    }
+
+    #[inline]
+    pub const fn is_virtual_generated(&self) -> bool {
+        matches!(self.generated_type, GeneratedType::Virtual { .. })
+    }
+
+    #[inline]
+    pub fn generated_expr(&self) -> Option<&Expr> {
+        match &self.generated_type {
+            GeneratedType::Virtual { resolved, .. } => Some(resolved.as_ref()),
+            GeneratedType::NotGenerated => None,
+        }
+    }
+
+    #[inline]
+    pub fn generated_expr_mut(&mut self) -> Option<&mut Expr> {
+        match &mut self.generated_type {
+            GeneratedType::Virtual { resolved, .. } => Some(resolved.as_mut()),
+            GeneratedType::NotGenerated => None,
+        }
+    }
+
     #[inline]
     pub const fn set_primary_key(&mut self, v: bool) {
         self.set_flag(F_PRIMARY_KEY, v);
@@ -2249,6 +3917,23 @@ impl Column {
     }
 
     #[inline]
+    pub const fn is_array(&self) -> bool {
+        (self.raw & ARRAY_DIM_MASK) != 0
+    }
+
+    /// Number of array dimensions (0 = scalar, 1 = `[]`, 2 = `[][]`, etc.)
+    #[inline]
+    pub const fn array_dimensions(&self) -> u32 {
+        ((self.raw & ARRAY_DIM_MASK) >> ARRAY_DIM_SHIFT) as u32
+    }
+
+    #[inline]
+    pub fn set_array_dimensions(&mut self, dims: u32) {
+        assert!(dims <= 7, "array dimensions must be <= 7");
+        self.raw = (self.raw & !ARRAY_DIM_MASK) | ((dims as u16) << ARRAY_DIM_SHIFT);
+    }
+
+    #[inline]
     const fn set_flag(&mut self, mask: u16, val: bool) {
         if val {
             self.raw |= mask
@@ -2259,12 +3944,16 @@ impl Column {
 }
 
 // TODO: This might replace some of util::columns_from_create_table_body
-impl From<&ColumnDefinition> for Column {
-    fn from(value: &ColumnDefinition) -> Self {
+impl TryFrom<&ColumnDefinition> for Column {
+    type Error = crate::LimboError;
+
+    fn try_from(value: &ColumnDefinition) -> crate::Result<Self> {
         let name = value.col_name.as_str();
 
         let mut default = None;
+        let mut generated = None;
         let mut notnull = false;
+        let mut notnull_conflict_clause = None;
         let mut primary_key = false;
         let mut unique = false;
         let mut collation = None;
@@ -2272,17 +3961,23 @@ impl From<&ColumnDefinition> for Column {
         for ast::NamedColumnConstraint { constraint, .. } in &value.constraints {
             match constraint {
                 ast::ColumnConstraint::PrimaryKey { .. } => primary_key = true,
-                ast::ColumnConstraint::NotNull { .. } => notnull = true,
+                ast::ColumnConstraint::NotNull {
+                    conflict_clause, ..
+                } => {
+                    notnull = true;
+                    notnull_conflict_clause = *conflict_clause;
+                }
                 ast::ColumnConstraint::Unique(..) => unique = true,
                 ast::ColumnConstraint::Default(expr) => {
-                    default
-                        .replace(translate_ident_to_string_literal(expr).unwrap_or(expr.clone()));
+                    default.replace(
+                        translate_ident_to_string_literal(expr).unwrap_or_else(|| expr.clone()),
+                    );
                 }
                 ast::ColumnConstraint::Collate { collation_name } => {
-                    collation.replace(
-                        CollationSeq::new(collation_name.as_str())
-                            .expect("collation should have been set correctly in create table"),
-                    );
+                    collation.replace(CollationSeq::new(collation_name.as_str())?);
+                }
+                ast::ColumnConstraint::Generated { expr, .. } => {
+                    generated = Some(expr.clone());
                 }
                 _ => {}
             };
@@ -2299,20 +3994,43 @@ impl From<&ColumnDefinition> for Column {
             .map(|t| t.name.to_string())
             .unwrap_or_default();
 
+        let ty_params: Vec<Box<turso_parser::ast::Expr>> = match &value.col_type {
+            Some(ast::Type {
+                size: Some(ast::TypeSize::MaxSize(ref expr)),
+                ..
+            }) => vec![expr.clone()],
+            Some(ast::Type {
+                size: Some(ast::TypeSize::TypeSize(ref e1, ref e2)),
+                ..
+            }) => vec![e1.clone(), e2.clone()],
+            _ => Vec::new(),
+        };
+
         let hidden = ty_str.contains("HIDDEN");
 
-        Column::new(
-            Some(normalize_ident(name)),
+        let mut col = Column::new(
+            Some(name.to_string()),
             ty_str,
             default,
+            generated,
             ty,
             collation,
-            primary_key,
-            primary_key && matches!(ty, Type::Integer),
-            notnull,
-            unique,
-            hidden,
-        )
+            ColDef {
+                primary_key,
+                rowid_alias: primary_key && matches!(ty, Type::Integer),
+                notnull,
+                unique,
+                hidden,
+                notnull_conflict_clause,
+            },
+        );
+        col.ty_params = ty_params;
+        if let Some(t) = value.col_type.as_ref() {
+            if t.is_array() {
+                col.set_array_dimensions(t.array_dimensions);
+            }
+        }
+        Ok(col)
     }
 }
 
@@ -2357,6 +4075,14 @@ impl fmt::Display for Type {
 }
 
 pub fn sqlite_schema_table() -> BTreeTable {
+    let columns = vec![
+        Column::new_default_text(Some("type".to_string()), "TEXT".to_string(), None),
+        Column::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+        Column::new_default_text(Some("tbl_name".to_string()), "TEXT".to_string(), None),
+        Column::new_default_integer(Some("rootpage".to_string()), "INT".to_string(), None),
+        Column::new_default_text(Some("sql".to_string()), "TEXT".to_string(), None),
+    ];
+    let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
     BTreeTable {
         root_page: 1,
         name: "sqlite_schema".to_string(),
@@ -2364,15 +4090,13 @@ pub fn sqlite_schema_table() -> BTreeTable {
         is_strict: false,
         has_autoincrement: false,
         primary_key_columns: vec![],
-        columns: vec![
-            Column::new_default_text(Some("type".to_string()), "TEXT".to_string(), None),
-            Column::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
-            Column::new_default_text(Some("tbl_name".to_string()), "TEXT".to_string(), None),
-            Column::new_default_integer(Some("rootpage".to_string()), "INT".to_string(), None),
-            Column::new_default_text(Some("sql".to_string()), "TEXT".to_string(), None),
-        ],
+        columns,
         foreign_keys: vec![],
+        check_constraints: vec![],
+        rowid_alias_conflict_clause: None,
         unique_sets: vec![],
+        has_virtual_columns: false,
+        logical_to_physical_map,
     }
 }
 
@@ -2393,6 +4117,8 @@ pub struct Index {
     pub has_rowid: bool,
     pub where_clause: Option<Box<Expr>>,
     pub index_method: Option<Arc<dyn IndexMethodAttachment>>,
+    /// ON CONFLICT clause from the constraint definition (PRIMARY KEY or UNIQUE).
+    pub on_conflict: Option<ResolveType>,
 }
 
 #[allow(dead_code)]
@@ -2408,6 +4134,8 @@ pub struct IndexColumn {
     pub pos_in_table: usize,
     pub collation: Option<CollationSeq>,
     pub default: Option<Box<Expr>>,
+    /// Expression for expression indexes. None for simple column indexes.
+    pub expr: Option<Box<Expr>>,
 }
 
 impl Index {
@@ -2460,6 +4188,7 @@ impl Index {
                         has_rowid: table.has_rowid,
                         where_clause: None,
                         index_method: Some(descriptor),
+                        on_conflict: None,
                     })
                 } else {
                     Ok(Index {
@@ -2472,11 +4201,17 @@ impl Index {
                         has_rowid: table.has_rowid,
                         where_clause,
                         index_method: None,
+                        on_conflict: None,
                     })
                 }
             }
             _ => todo!("Expected create index statement"),
         }
+    }
+
+    /// Check if this is an expression index.
+    pub fn is_expression_index(&self) -> bool {
+        self.columns.iter().any(|c| c.expr.is_some())
     }
 
     /// check if this is special backing_btree index created and managed by custom index_method
@@ -2490,6 +4225,7 @@ impl Index {
         table: &BTreeTable,
         auto_index: (String, i64), // name, root_page
         column_count: usize,
+        conflict_clause: Option<ResolveType>,
     ) -> Result<Index> {
         let has_primary_key_index =
             table.get_rowid_alias_column().is_none() && !table.primary_key_columns.is_empty();
@@ -2511,6 +4247,7 @@ impl Index {
                 pos_in_table,
                 collation: column.collation_opt(),
                 default: column.default.clone(),
+                expr: None,
             });
         }
 
@@ -2526,6 +4263,7 @@ impl Index {
             has_rowid: table.has_rowid,
             where_clause: None,
             index_method: None,
+            on_conflict: conflict_clause,
         })
     }
 
@@ -2533,26 +4271,32 @@ impl Index {
         table: &BTreeTable,
         auto_index: (String, i64), // name, root_page
         column_indices_and_sort_orders: Vec<(usize, SortOrder)>,
+        conflict_clause: Option<ResolveType>,
     ) -> Result<Index> {
         let (index_name, root_page) = auto_index;
 
-        let unique_cols = table
-            .columns
-            .iter()
-            .enumerate()
-            .filter_map(|(pos_in_table, col)| {
-                let (pos_in_table, sort_order) = column_indices_and_sort_orders
-                    .iter()
-                    .find(|(pos, _)| *pos == pos_in_table)?;
-                Some(IndexColumn {
-                    name: normalize_ident(col.name.as_ref().unwrap()),
-                    order: *sort_order,
-                    pos_in_table: *pos_in_table,
-                    collation: col.collation_opt(),
-                    default: col.default.clone(),
-                })
-            })
-            .collect::<Vec<_>>();
+        let mut unique_cols = Vec::with_capacity(column_indices_and_sort_orders.len());
+        for (pos, sort_order) in &column_indices_and_sort_orders {
+            let Some((pos_in_table, col)) = table
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(pos_in_table, _)| pos == pos_in_table)
+            else {
+                return Err(crate::LimboError::ParseError(format!(
+                    "Unique constraint column not found in table {}",
+                    table.name
+                )));
+            };
+            unique_cols.push(IndexColumn {
+                name: normalize_ident(col.name.as_ref().unwrap()),
+                order: *sort_order,
+                pos_in_table,
+                collation: col.collation_opt(),
+                default: col.default.clone(),
+                expr: None,
+            });
+        }
 
         Ok(Index {
             name: normalize_ident(index_name.as_str()),
@@ -2564,6 +4308,7 @@ impl Index {
             has_rowid: table.has_rowid,
             where_clause: None,
             index_method: None,
+            on_conflict: conflict_clause,
         })
     }
 
@@ -2579,25 +4324,36 @@ impl Index {
             .position(|c| c.pos_in_table == table_pos)
     }
 
+    /// Given an expression, return the position in the index if it matches an expression index column.
+    /// Expression index matching is textual (after binding), so the caller should normalize the query
+    /// expression to resemble the stored index expression (e.g. unqualified column names).
+    pub fn expression_to_index_pos(&self, expr: &Expr) -> Option<usize> {
+        self.columns.iter().position(|c| {
+            c.expr
+                .as_ref()
+                .is_some_and(|e| exprs_are_equivalent(e, expr))
+        })
+    }
+
     /// Walk the where_clause Expr of a partial index and validate that it doesn't reference any other
     /// tables or use any disallowed constructs.
-    pub fn validate_where_expr(&self, table: &Table) -> bool {
+    pub fn validate_where_expr(&self, table: &Table, _resolver: &Resolver) -> bool {
         let Some(where_clause) = &self.where_clause else {
             return true;
         };
 
-        let tbl_norm = normalize_ident(self.table_name.as_str());
+        let tbl_norm = self.table_name.as_str();
         let has_col = |name: &str| {
-            let n = normalize_ident(name);
-            table
-                .columns()
-                .iter()
-                .any(|c| c.name.as_ref().is_some_and(|cn| normalize_ident(cn) == n))
+            table.columns().iter().any(|c| {
+                c.name
+                    .as_ref()
+                    .is_some_and(|cn| cn.eq_ignore_ascii_case(name))
+            })
         };
-        let is_tbl = |ns: &str| normalize_ident(ns).eq_ignore_ascii_case(&tbl_norm);
+        let is_tbl = |ns: &str| normalize_ident(ns) == tbl_norm;
         let is_deterministic_fn = |name: &str, argc: usize| {
             let n = normalize_ident(name);
-            Func::resolve_function(&n, argc).is_ok_and(|f| f.is_deterministic())
+            Func::resolve_function(&n, argc).is_ok_and(|f| f.is_some_and(|f| f.is_deterministic()))
         };
 
         let mut ok = true;
@@ -2637,6 +4393,9 @@ impl Index {
                             Expr::FunctionCallStar { .. } => 0,
                             _ => unreachable!(),
                         };
+                        // Reject non-deterministic functions. Function arguments can reference
+                        // columns of the indexed table (e.g., LENGTH(t0.c0)), which will be
+                        // validated by the Expr::Id and Expr::Qualified cases during the walk.
                         if !is_deterministic_fn(name.as_str(), argc) {
                             ok = false;
                         }
@@ -2664,7 +4423,7 @@ impl Index {
     pub fn bind_where_expr(
         &self,
         table_refs: Option<&mut TableReferences>,
-        connection: &Arc<Connection>,
+        resolver: &Resolver,
     ) -> Option<ast::Expr> {
         let Some(where_clause) = &self.where_clause else {
             return None;
@@ -2674,7 +4433,7 @@ impl Index {
             &mut expr,
             table_refs,
             None,
-            connection,
+            resolver,
             BindingBehavior::ResultColumnsNotAllowed,
         )
         .ok()?;
@@ -2823,6 +4582,43 @@ mod tests {
     }
 
     #[test]
+    pub fn test_conflicting_on_conflict_unique_rejected() -> Result<()> {
+        let sql =
+            r#"CREATE TABLE t1 (a UNIQUE ON CONFLICT FAIL, b, UNIQUE(a) ON CONFLICT IGNORE);"#;
+        let table = BTreeTable::from_sql(sql, 0);
+        let error = table.unwrap_err();
+        assert!(
+            matches!(error, LimboError::ParseError(e) if e.contains("conflicting ON CONFLICT clauses"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_conflicting_on_conflict_composite_unique_rejected() -> Result<()> {
+        let sql = r#"CREATE TABLE t1 (a, b, UNIQUE(a, b) ON CONFLICT FAIL, UNIQUE(a, b) ON CONFLICT IGNORE);"#;
+        let table = BTreeTable::from_sql(sql, 0);
+        let error = table.unwrap_err();
+        assert!(
+            matches!(error, LimboError::ParseError(e) if e.contains("conflicting ON CONFLICT clauses"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_same_on_conflict_unique_allowed() -> Result<()> {
+        let sql = r#"CREATE TABLE t1 (a UNIQUE ON CONFLICT FAIL, b, UNIQUE(a) ON CONFLICT FAIL);"#;
+        assert!(BTreeTable::from_sql(sql, 0).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_one_on_conflict_unique_allowed() -> Result<()> {
+        let sql = r#"CREATE TABLE t1 (a UNIQUE ON CONFLICT FAIL, b, UNIQUE(a));"#;
+        assert!(BTreeTable::from_sql(sql, 0).is_ok());
+        Ok(())
+    }
+
+    #[test]
     pub fn test_primary_key_separate_single() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, c REAL, PRIMARY KEY(a desc));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -2965,16 +4761,41 @@ mod tests {
     pub fn test_special_column_names() -> Result<()> {
         let tests = [
             ("foobar", "CREATE TABLE t (foobar TEXT)"),
-            ("_table_name3", "CREATE TABLE t (_table_name3 TEXT)"),
-            ("special name", "CREATE TABLE t ([special name] TEXT)"),
-            ("foo&bar", "CREATE TABLE t ([foo&bar] TEXT)"),
-            (" name", "CREATE TABLE t ([ name] TEXT)"),
+            ("_table_name3", r#"CREATE TABLE t (_table_name3 TEXT)"#),
+            ("special name", r#"CREATE TABLE t ("special name" TEXT)"#),
+            ("foo&bar", r#"CREATE TABLE t ("foo&bar" TEXT)"#),
+            (" name", r#"CREATE TABLE t (" name" TEXT)"#),
         ];
 
         for (input_column_name, expected_sql) in tests {
-            let sql = format!("CREATE TABLE t ([{input_column_name}] TEXT)");
+            let sql = format!(r#"CREATE TABLE t ("{input_column_name}" TEXT)"#);
             let actual = BTreeTable::from_sql(&sql, 0)?.to_sql();
             assert_eq!(expected_sql, actual);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_special_table_names_are_quoted_in_to_sql() -> Result<()> {
+        let tests = [
+            (
+                r#"CREATE TABLE "t t" (x TEXT)"#,
+                r#"CREATE TABLE "t t" (x TEXT)"#,
+            ),
+            (
+                r#"CREATE TABLE "123table" (x TEXT)"#,
+                r#"CREATE TABLE "123table" (x TEXT)"#,
+            ),
+            (
+                r#"CREATE TABLE "t""t" (x TEXT)"#,
+                r#"CREATE TABLE "t""t" (x TEXT)"#,
+            ),
+        ];
+
+        for (input_sql, expected_sql) in tests {
+            let actual = BTreeTable::from_sql(input_sql, 0)?.to_sql();
+            assert_eq!(actual, expected_sql);
         }
 
         Ok(())
@@ -2986,17 +4807,25 @@ mod tests {
         // Without composite primary keys, we should not have an automatic index on a primary key that is a rowid alias
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT);"#;
         let table = BTreeTable::from_sql(sql, 0).unwrap();
-        let _index =
-            Index::automatic_from_primary_key(&table, ("sqlite_autoindex_t1_1".to_string(), 2), 1)
-                .unwrap();
+        let _index = Index::automatic_from_primary_key(
+            &table,
+            ("sqlite_autoindex_t1_1".to_string(), 2),
+            1,
+            None,
+        )
+        .unwrap();
     }
 
     #[test]
     fn test_automatic_index_composite_key() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, PRIMARY KEY(a, b));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
-        let index =
-            Index::automatic_from_primary_key(&table, ("sqlite_autoindex_t1_1".to_string(), 2), 2)?;
+        let index = Index::automatic_from_primary_key(
+            &table,
+            ("sqlite_autoindex_t1_1".to_string(), 2),
+            2,
+            None,
+        )?;
 
         assert_eq!(index.name, "sqlite_autoindex_t1_1");
         assert_eq!(index.table_name, "t1");
@@ -3015,13 +4844,24 @@ mod tests {
     fn test_automatic_index_no_primary_key() {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT);"#;
         let table = BTreeTable::from_sql(sql, 0).unwrap();
-        Index::automatic_from_primary_key(&table, ("sqlite_autoindex_t1_1".to_string(), 2), 1)
-            .unwrap();
+        Index::automatic_from_primary_key(
+            &table,
+            ("sqlite_autoindex_t1_1".to_string(), 2),
+            1,
+            None,
+        )
+        .unwrap();
     }
 
     #[test]
     fn test_automatic_index_nonexistent_column() {
         // Create a table with a primary key column that doesn't exist in the table
+        let columns = vec![Column::new_default_integer(
+            Some("a".to_string()),
+            "INT".to_string(),
+            None,
+        )];
+        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let table = BTreeTable {
             root_page: 0,
             name: "t1".to_string(),
@@ -3029,17 +4869,21 @@ mod tests {
             is_strict: false,
             has_autoincrement: false,
             primary_key_columns: vec![("nonexistent".to_string(), SortOrder::Asc)],
-            columns: vec![Column::new_default_integer(
-                Some("a".to_string()),
-                "INT".to_string(),
-                None,
-            )],
+            columns,
             unique_sets: vec![],
             foreign_keys: vec![],
+            check_constraints: vec![],
+            rowid_alias_conflict_clause: None,
+            has_virtual_columns: false,
+            logical_to_physical_map,
         };
 
-        let result =
-            Index::automatic_from_primary_key(&table, ("sqlite_autoindex_t1_1".to_string(), 2), 1);
+        let result = Index::automatic_from_primary_key(
+            &table,
+            ("sqlite_autoindex_t1_1".to_string(), 2),
+            1,
+            None,
+        );
         assert!(result.is_err());
     }
 
@@ -3051,6 +4895,7 @@ mod tests {
             &table,
             ("sqlite_autoindex_t1_1".to_string(), 2),
             vec![(1, SortOrder::Asc)],
+            None,
         )?;
 
         assert_eq!(index.name, "sqlite_autoindex_t1_1");
@@ -3068,11 +4913,17 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (x PRIMARY KEY, y UNIQUE);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let indices = [
-            Index::automatic_from_primary_key(&table, ("sqlite_autoindex_t1_1".to_string(), 2), 1)?,
+            Index::automatic_from_primary_key(
+                &table,
+                ("sqlite_autoindex_t1_1".to_string(), 2),
+                1,
+                None,
+            )?,
             Index::automatic_from_unique(
                 &table,
                 ("sqlite_autoindex_t1_2".to_string(), 3),
                 vec![(1, SortOrder::Asc)],
+                None,
             )?,
         ];
 
@@ -3105,16 +4956,23 @@ mod tests {
             ("sqlite_autoindex_t1_3".to_string(), 4),
         ];
         let indices = vec![
-            Index::automatic_from_primary_key(&table, ("sqlite_autoindex_t1_1".to_string(), 2), 1)?,
+            Index::automatic_from_primary_key(
+                &table,
+                ("sqlite_autoindex_t1_1".to_string(), 2),
+                1,
+                None,
+            )?,
             Index::automatic_from_unique(
                 &table,
                 ("sqlite_autoindex_t1_2".to_string(), 3),
                 vec![(1, SortOrder::Asc)],
+                None,
             )?,
             Index::automatic_from_unique(
                 &table,
                 ("sqlite_autoindex_t1_3".to_string(), 4),
                 vec![(2, SortOrder::Asc), (3, SortOrder::Asc)],
+                None,
             )?,
         ];
 
@@ -3153,6 +5011,7 @@ mod tests {
             &table,
             ("sqlite_autoindex_t1_1".to_string(), 2),
             vec![(0, SortOrder::Asc), (1, SortOrder::Asc)],
+            None,
         )?;
 
         assert_eq!(index.name, "sqlite_autoindex_t1_1");
@@ -3172,8 +5031,12 @@ mod tests {
     fn test_automatic_index_primary_key_is_unique() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a primary key unique);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
-        let index =
-            Index::automatic_from_primary_key(&table, ("sqlite_autoindex_t1_1".to_string(), 2), 1)?;
+        let index = Index::automatic_from_primary_key(
+            &table,
+            ("sqlite_autoindex_t1_1".to_string(), 2),
+            1,
+            None,
+        )?;
 
         assert_eq!(index.name, "sqlite_autoindex_t1_1");
         assert_eq!(index.table_name, "t1");
@@ -3190,8 +5053,12 @@ mod tests {
     fn test_automatic_index_primary_key_is_unique_and_composite() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a, b, PRIMARY KEY(a, b), UNIQUE(a, b));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
-        let index =
-            Index::automatic_from_primary_key(&table, ("sqlite_autoindex_t1_1".to_string(), 2), 2)?;
+        let index = Index::automatic_from_primary_key(
+            &table,
+            ("sqlite_autoindex_t1_1".to_string(), 2),
+            2,
+            None,
+        )?;
 
         assert_eq!(index.name, "sqlite_autoindex_t1_1");
         assert_eq!(index.table_name, "t1");
@@ -3206,6 +5073,50 @@ mod tests {
     }
 
     #[test]
+    fn test_strict_table_to_sql() -> Result<()> {
+        let sql = r#"CREATE TABLE test_strict (id INTEGER, name TEXT) STRICT"#;
+        let table = BTreeTable::from_sql(sql, 0)?;
+
+        // Verify the table is marked as strict
+        assert!(table.is_strict);
+
+        // Verify that to_sql() includes the STRICT keyword
+        let reconstructed_sql = table.to_sql();
+        assert!(
+            reconstructed_sql.contains("STRICT"),
+            "Reconstructed SQL should contain STRICT keyword: {reconstructed_sql}"
+        );
+        assert_eq!(
+            reconstructed_sql,
+            "CREATE TABLE test_strict (id INTEGER, name TEXT) STRICT"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_non_strict_table_to_sql() -> Result<()> {
+        let sql = r#"CREATE TABLE test_normal (id INTEGER, name TEXT)"#;
+        let table = BTreeTable::from_sql(sql, 0)?;
+
+        // Verify the table is NOT marked as strict
+        assert!(!table.is_strict);
+
+        // Verify that to_sql() does NOT include the STRICT keyword
+        let reconstructed_sql = table.to_sql();
+        assert!(
+            !reconstructed_sql.contains("STRICT"),
+            "Non-strict table SQL should not contain STRICT keyword: {reconstructed_sql}"
+        );
+        assert_eq!(
+            reconstructed_sql,
+            "CREATE TABLE test_normal (id INTEGER, name TEXT)"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_automatic_index_unique_and_a_pk() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a NUMERIC UNIQUE UNIQUE,  b TEXT PRIMARY KEY)"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -3214,8 +5125,14 @@ mod tests {
                 &table,
                 ("sqlite_autoindex_t1_1".to_string(), 2),
                 vec![(0, SortOrder::Asc)],
+                None,
             )?,
-            Index::automatic_from_primary_key(&table, ("sqlite_autoindex_t1_2".to_string(), 3), 1)?,
+            Index::automatic_from_primary_key(
+                &table,
+                ("sqlite_autoindex_t1_2".to_string(), 3),
+                1,
+                None,
+            )?,
         ];
 
         assert!(indexes.len() == 2);
@@ -3238,5 +5155,29 @@ mod tests {
         assert!(matches!(index.columns[0].order, SortOrder::Asc));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_schema_loading_rejects_gencol_without_flag() {
+        let mut schema = Schema::new();
+        schema.generated_columns_enabled = false;
+
+        let result = schema.handle_schema_row(
+            "table",
+            "t1",
+            "t1",
+            2,
+            Some("CREATE TABLE t1(a INTEGER, b AS (a*2))"),
+            &SymbolTable::default(),
+            &mut Vec::new(),
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("generated columns"));
     }
 }

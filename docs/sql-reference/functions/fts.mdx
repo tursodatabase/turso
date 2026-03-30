@@ -1,0 +1,348 @@
+---
+title: Full-Text Search
+description: Full-text search with Tantivy-powered FTS indexes, scoring, and highlighting
+sidebarTitle: Full-Text Search
+---
+
+# Full-Text Search
+
+<Info>
+**Turso Extension**: Full-text search (FTS) in Turso is powered by [Tantivy](https://github.com/quickwit-oss/tantivy), not SQLite's FTS3/FTS4/FTS5 modules. The syntax and functions differ from SQLite FTS.
+</Info>
+
+Turso provides full-text search through custom FTS indexes and three SQL functions: `fts_match` for filtering, `fts_score` for relevance ranking, and `fts_highlight` for displaying results with matched terms highlighted.
+
+---
+
+## Creating FTS Indexes
+
+FTS indexes are created with the `USING fts` clause on `CREATE INDEX`. Each indexed column participates in the full-text search.
+
+```sql
+CREATE INDEX index_name ON table_name USING fts (column1, column2, ...);
+```
+
+### Tokenizer Configuration
+
+Each column can use a different tokenizer via the `WITH` clause.
+
+```sql
+-- All columns use the default tokenizer
+CREATE INDEX idx_articles ON articles USING fts (title, body);
+
+-- Per-column tokenizer configuration
+CREATE INDEX idx_articles ON articles USING fts (
+    title WITH tokenizer=simple,
+    body WITH tokenizer=ngram
+);
+
+-- Global tokenizer for all columns
+CREATE INDEX idx_tags ON tags USING fts (tag) WITH (tokenizer = 'raw');
+```
+
+### Available Tokenizers
+
+| Tokenizer | Description | Use case |
+|-----------|-------------|----------|
+| `default` | Unicode-aware tokenizer with lowercasing and punctuation splitting (40-char limit) | General-purpose text search |
+| `raw` | No tokenization -- matches the entire field value as a single token | IDs, UUIDs, tags, exact-match fields |
+| `simple` | Splits on whitespace and punctuation without lowercasing | Simple text without case-insensitive needs |
+| `whitespace` | Splits on whitespace only | Whitespace-delimited tokens |
+| `ngram` | Generates 2-3 character n-grams from the text | Autocomplete, substring matching |
+
+**Tokenizer examples:**
+
+| Input | default | raw | ngram |
+|-------|---------|-----|-------|
+| `Hello World` | `hello`, `world` | `Hello World` | `He`, `Hel`, `el`, `ell`, `ll`, `llo`, ... |
+| `user-123` | `user`, `123` | `user-123` | `us`, `use`, `se`, `ser`, ... |
+
+### Field Weights
+
+You can assign relative weights to indexed columns to influence the BM25 relevance score.
+
+```sql
+CREATE INDEX idx_articles ON articles USING fts (title, body)
+    WITH (weights = 'title=2.0,body=1.0');
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `weights` | `1.0` for all fields | Comma-separated `column=weight` pairs. Higher weights increase score contribution. |
+
+---
+
+## Functions
+
+### fts_match
+
+Returns 1 if the row matches the full-text query, or 0 otherwise. Used in the `WHERE` clause to filter rows.
+
+```sql
+fts_match(column1, column2, ..., query)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `column1, column2, ...` | TEXT | One or more columns covered by an FTS index |
+| `query` | TEXT | The search query string (see [Query Syntax](#query-syntax) below) |
+
+**Returns:** INTEGER -- 1 if the row matches, 0 otherwise.
+
+The columns passed to `fts_match` must correspond to columns in an existing FTS index. When Turso's query planner detects `fts_match` in a WHERE clause, it routes the query through the FTS index for efficient lookup.
+
+```sql
+SELECT id, title FROM articles
+WHERE fts_match(title, body, 'database');
+
+-- Single column
+SELECT id, title FROM articles
+WHERE fts_match(body, 'machine learning');
+```
+
+### fts_score
+
+Computes the BM25 relevance score for each matching row. Lower scores indicate higher relevance.
+
+```sql
+fts_score(column1, column2, ..., query)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `column1, column2, ...` | TEXT | One or more columns covered by an FTS index |
+| `query` | TEXT | The search query string |
+
+**Returns:** REAL -- the BM25 relevance score. Lower values mean higher relevance.
+
+Use `ORDER BY score ASC` or `ORDER BY score DESC` depending on your preference for result ordering. When used in SELECT, the FTS index automatically provides scored results.
+
+```sql
+SELECT
+    id,
+    title,
+    fts_score(title, body, 'database') AS score
+FROM articles
+ORDER BY score DESC
+LIMIT 10;
+```
+
+### fts_highlight
+
+Returns text with matching query terms wrapped in custom tags. Useful for displaying search results with visual emphasis on matched terms.
+
+```sql
+fts_highlight(column1, column2, ..., open_tag, close_tag, query)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `column1, column2, ...` | TEXT | One or more text columns to highlight |
+| `open_tag` | TEXT | The tag to insert before each matching term (e.g. `'<b>'`) |
+| `close_tag` | TEXT | The tag to insert after each matching term (e.g. `'</b>'`) |
+| `query` | TEXT | The search query string |
+
+**Returns:** TEXT -- the input text with matching terms wrapped in the specified tags. Returns the original text if no matches are found. Returns NULL if the query, open_tag, or close_tag is NULL.
+
+When multiple columns are provided, their text is concatenated with spaces.
+
+```sql
+SELECT fts_highlight(title, '<b>', '</b>', 'database') AS highlighted
+FROM articles
+WHERE fts_match(title, body, 'database');
+-- <b>Database</b> Design Patterns
+
+-- Multiple columns are concatenated
+SELECT fts_highlight(title, body, '<mark>', '</mark>', 'database') AS highlighted
+FROM articles
+WHERE fts_match(title, body, 'database');
+
+-- Standalone usage (without an FTS index)
+SELECT fts_highlight('The quick brown fox', '<em>', '</em>', 'quick fox');
+-- The <em>quick</em> brown <em>fox</em>
+```
+
+---
+
+## Query Syntax {#query-syntax}
+
+The query string passed to `fts_match` and `fts_score` supports Tantivy's query parser syntax.
+
+### Basic queries
+
+| Syntax | Example | Description |
+|--------|---------|-------------|
+| Single term | `'database'` | Match rows containing "database" |
+| Multiple terms (OR) | `'database search'` | Match rows containing "database" OR "search" |
+| Boolean AND | `'database AND search'` | Match rows containing both terms |
+| Boolean NOT | `'database NOT nosql'` | Match "database" but exclude "nosql" |
+
+### Advanced queries
+
+| Syntax | Example | Description |
+|--------|---------|-------------|
+| Phrase search | `'"exact phrase"'` | Match the exact phrase |
+| Prefix search | `'data*'` | Match terms starting with "data" |
+| Column-specific | `'title:database'` | Match "database" only in the `title` field |
+| Boosting | `'title:database^2'` | Boost matches in `title` by a factor of 2 |
+
+### Examples
+
+```sql
+-- Simple term search
+SELECT * FROM articles WHERE fts_match(title, body, 'database');
+
+-- Phrase search: match "full text search" as an exact phrase
+SELECT * FROM articles WHERE fts_match(title, body, '"full text search"');
+
+-- Boolean AND: both terms must be present
+SELECT * FROM articles WHERE fts_match(title, body, 'database AND performance');
+
+-- Prefix search: match "optim", "optimize", "optimization", etc.
+SELECT * FROM articles WHERE fts_match(title, body, 'optim*');
+
+-- Column-specific: only match "rust" in the title field
+SELECT * FROM articles WHERE fts_match(title, body, 'title:rust');
+
+-- Boosted search: title matches count 2x more toward the score
+SELECT id, title, fts_score(title, body, 'title:database^2 body:database') AS score
+FROM articles
+ORDER BY score DESC;
+
+-- Exclusion: match "database" but not "nosql"
+SELECT * FROM articles WHERE fts_match(title, body, 'database NOT nosql');
+```
+
+---
+
+## Complete Example
+
+This example walks through creating a table, adding an FTS index, inserting data, and running queries with scoring and highlighting.
+
+```sql
+-- Create a table
+CREATE TABLE articles (
+    id INTEGER PRIMARY KEY,
+    title TEXT NOT NULL,
+    body TEXT,
+    author TEXT
+);
+
+-- Create an FTS index on title and body with field weights
+CREATE INDEX idx_articles_fts ON articles USING fts (title, body)
+    WITH (weights = 'title=2.0,body=1.0');
+
+-- Insert sample data
+INSERT INTO articles VALUES (1, 'Introduction to Databases', 'Databases store and organize data for efficient retrieval.', 'Alice');
+INSERT INTO articles VALUES (2, 'Full-Text Search in Practice', 'Full-text search allows finding documents by content.', 'Bob');
+INSERT INTO articles VALUES (3, 'Database Performance Tuning', 'Optimizing database queries requires understanding indexes.', 'Alice');
+INSERT INTO articles VALUES (4, 'Getting Started with Rust', 'Rust is a systems programming language focused on safety.', 'Carol');
+
+-- Simple search: find articles mentioning "database"
+SELECT id, title FROM articles
+WHERE fts_match(title, body, 'database');
+-- 1 | Introduction to Databases
+-- 3 | Database Performance Tuning
+
+-- Ranked search: order by relevance
+SELECT
+    id,
+    title,
+    fts_score(title, body, 'database') AS score
+FROM articles
+WHERE fts_match(title, body, 'database')
+ORDER BY score DESC
+LIMIT 10;
+
+-- Highlighted results
+SELECT
+    id,
+    fts_highlight(title, '<b>', '</b>', 'database') AS title,
+    fts_highlight(body, '<b>', '</b>', 'database') AS body
+FROM articles
+WHERE fts_match(title, body, 'database');
+
+-- Combine FTS with regular SQL filters
+SELECT id, title, author,
+    fts_score(title, body, 'database') AS score
+FROM articles
+WHERE fts_match(title, body, 'database')
+  AND author = 'Alice'
+ORDER BY score DESC;
+```
+
+---
+
+## Index Maintenance
+
+### OPTIMIZE INDEX
+
+Merges all Tantivy segments into a single optimized segment. This improves query performance and reduces storage overhead, particularly after bulk inserts.
+
+```sql
+-- Optimize a specific FTS index
+OPTIMIZE INDEX idx_articles_fts;
+
+-- Optimize all FTS indexes in the database
+OPTIMIZE INDEX;
+```
+
+**When to use:**
+- After bulk data imports with many INSERT statements
+- When query performance degrades over time
+- During scheduled maintenance windows
+
+**What it does:**
+- Flushes any pending documents to disk
+- Merges all segments into a single segment
+- Removes deleted document tombstones
+- Invalidates internal caches for fresh reads
+
+### DML and Index Updates
+
+FTS indexes are updated automatically when you modify the underlying table.
+
+| Operation | FTS behavior |
+|-----------|-------------|
+| `INSERT` | New rows are indexed immediately (batched commits every 1000 documents) |
+| `UPDATE` | Implemented as DELETE + INSERT internally |
+| `DELETE` | Marks documents as deleted via tombstones, cleaned up on OPTIMIZE |
+
+```sql
+-- All of these automatically update the FTS index
+INSERT INTO articles VALUES (5, 'New Article', 'Content here.', 'Dave');
+UPDATE articles SET body = 'Updated content.' WHERE id = 5;
+DELETE FROM articles WHERE id = 5;
+```
+
+---
+
+## Comparison with SQLite FTS5
+
+| Feature | SQLite FTS5 | Turso FTS |
+|---------|-------------|-----------|
+| Filtering | `WHERE t MATCH 'query'` | `WHERE fts_match(cols, 'query')` |
+| Ranking | `bm25(t)`, `rank` column | `fts_score(cols, 'query')` |
+| Highlighting | `highlight(t, col_idx, open, close)` | `fts_highlight(cols, open, close, query)` |
+| Snippets | `snippet(t, ...)` | Not supported |
+| Boolean operators | AND, OR, NOT | AND, OR, NOT |
+| Phrase search | `"exact phrase"` | `"exact phrase"` |
+| Prefix search | `word*` | `word*` |
+| Column filter | `col:term` | `col:term` |
+| Tokenizers | unicode61, ascii, porter | default, raw, simple, whitespace, ngram |
+| Segment management | Automatic | Manual via `OPTIMIZE INDEX` |
+| Transaction visibility | Immediate | After COMMIT |
+
+---
+
+## Current Limitations
+
+- **No snippet function**: Use `fts_highlight` for term emphasis; context snippets are not yet available.
+- **No automatic segment merging**: Use `OPTIMIZE INDEX` periodically after bulk writes.
+- **No read-your-writes in a transaction**: FTS changes within a transaction are not visible to queries until the transaction is committed. ROLLBACK correctly discards both table and FTS changes.
+- **No MATCH operator syntax**: Use `fts_match()` function calls instead of `WHERE table MATCH 'query'`.
+
+## See Also
+
+- [CREATE INDEX](/docs/sql-reference/statements/create-index) for the full `CREATE INDEX ... USING fts` syntax
+- [Vector Functions](/docs/sql-reference/functions/vector) for similarity search with embeddings

@@ -1,8 +1,20 @@
-import { expect, test } from 'vitest'
+import { expect, test, afterAll } from 'vitest'
 import { Database, connect, DatabaseRowMutation, DatabaseRowTransformResult } from './promise-default.js'
+import { MainWorker } from './index-default.js'
+
+afterAll(() => {
+    MainWorker?.terminate();
+})
 
 const localeCompare = (a, b) => a.x.localeCompare(b.x);
 const intCompare = (a, b) => a.x - b.x;
+
+test('open non-sync db', async () => {
+    const db = await connect({ path: 'local.db' });
+    await db.exec("CREATE TABLE t(x)");
+    await db.exec("INSERT INTO t VALUES (1), (2), (3)");
+    expect(await (await db.prepare("SELECT * FROM t").all())).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }])
+})
 
 test('checkpoint-and-actions', async () => {
     {
@@ -35,7 +47,7 @@ test('checkpoint-and-actions', async () => {
             await new Promise(resolve => setTimeout(resolve, 10));
             console.info('push', i);
             try {
-                if ((await db1.stats()).operations > 0) {
+                if ((await db1.stats()).cdcOperations > 0) {
                     const start = performance.now();
                     await db1.push();
                     console.info('push', performance.now() - start);
@@ -310,17 +322,17 @@ test('checkpoint', async () => {
     for (let i = 0; i < 1000; i++) {
         await db1.exec(`INSERT INTO q VALUES ('k${i}', 'v${i}')`);
     }
-    expect((await db1.stats()).mainWal).toBeGreaterThan(4096 * 1000);
+    expect((await db1.stats()).mainWalSize).toBeGreaterThan(4096 * 1000);
     await db1.checkpoint();
-    expect((await db1.stats()).mainWal).toBe(0);
-    let revertWal = (await db1.stats()).revertWal;
+    expect((await db1.stats()).mainWalSize).toBe(0);
+    let revertWal = (await db1.stats()).revertWalSize;
     expect(revertWal).toBeLessThan(4096 * 1000 / 100);
 
     for (let i = 0; i < 1000; i++) {
         await db1.exec(`UPDATE q SET y = 'u${i}' WHERE x = 'k${i}'`);
     }
     await db1.checkpoint();
-    expect((await db1.stats()).revertWal).toBe(revertWal);
+    expect((await db1.stats()).revertWalSize).toBe(revertWal);
 })
 
 test('persistence-push', async () => {
@@ -453,7 +465,7 @@ test('pull-push-concurrent', async () => {
     }
     let push = async () => {
         try {
-            if ((await db.stats()).operations > 0) {
+            if ((await db.stats()).cdcOperations > 0) {
                 await db.push();
             }
         } catch (e) {

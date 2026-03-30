@@ -1,6 +1,6 @@
 use std::{ops::Deref, sync::atomic::Ordering};
 
-use crate::{Connection, Result};
+use crate::{Connection, Result, Statement};
 
 /// Options for transaction behavior. See [BEGIN
 /// TRANSACTION](http://www.sqlite.org/lang_transaction.html) for details.
@@ -124,6 +124,14 @@ impl Transaction<'_> {
             drop_behavior: DropBehavior::Rollback,
             in_progress: true,
         })
+    }
+
+    // Use the Connection to Prepare a statement.
+    // This allows a database update function to be passed a transaction,
+    // prepare a statement, and use it without needing direct access to the
+    // Connection
+    pub async fn prepare(&self, sql: &str) -> Result<Statement> {
+        self.conn.prepare(sql).await
     }
 
     /// Get the current setting for what happens to the transaction when it is
@@ -440,7 +448,7 @@ mod test {
     }
 
     fn assert_nested_tx_error(e: Error) {
-        if let Error::SqlExecutionFailure(e) = &e {
+        if let Error::Error(e) = &e {
             assert!(e.contains("transaction"));
         } else {
             panic!("Unexpected error type: {e:?}");

@@ -1,5 +1,5 @@
 import { DatabasePromise, DatabaseOpts, SqliteError, } from "@tursodatabase/database-common"
-import { registerFileAtWorker, unregisterFileAtWorker } from "@tursodatabase/database-wasm-common";
+import { registerFileAtWorker, unregisterFileAtWorker, ioNotifier } from "@tursodatabase/database-wasm-common";
 import { initThreadPool, MainWorker, Database as NativeDatabase } from "./index-default.js";
 
 async function init(): Promise<Worker> {
@@ -13,7 +13,14 @@ async function init(): Promise<Worker> {
 class Database extends DatabasePromise {
     #worker: Worker | null;
     constructor(path: string, opts: DatabaseOpts = {}) {
-        super(new NativeDatabase(path, opts) as unknown as any)
+        const nativeDb = new NativeDatabase(path, opts);
+        super(
+            nativeDb as unknown as any,
+            // In-memory databases use MemoryIO which completes I/O synchronously,
+            // so there's no OPFS Worker dispatch and the IONotifier would never fire.
+            // Use undefined (defaults to no-op) so the step loop retries immediately.
+            (nativeDb as any).memory ? undefined : () => ioNotifier.waitForCompletion(),
+        )
     }
     /**
      * connect database and pre-open necessary files in the OPFS

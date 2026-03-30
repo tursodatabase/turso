@@ -1,0 +1,56 @@
+---
+title: DROP VIEW
+description: Remove a view from the database
+sidebarTitle: DROP VIEW
+---
+
+# DROP VIEW
+
+Remove a view definition from the database. The underlying tables and their data are not affected.
+
+## Syntax
+
+```sql
+DROP VIEW [IF EXISTS] [schema-name.]view-name;
+```
+
+## Description
+
+`DROP VIEW` removes a previously created view. After the view is dropped, queries referencing the view name produce an error. The tables referenced by the view are unaffected.
+
+### Parameters
+
+| Parameter | Description |
+|-----------|-------------|
+| `IF EXISTS` | Prevents an error if the view does not exist. The statement is a no-op when the view is absent. |
+| `schema-name` | The name of the attached database containing the view. Defaults to the main database if omitted. |
+| `view-name` | The name of the view to drop. |
+
+### Behavior
+
+- Any triggers defined as INSTEAD OF on the dropped view are also removed.
+- If the view is a materialized view, the stored data is also removed.
+
+## Examples
+
+### Drop a View
+
+```sql
+DROP VIEW active_users;
+```
+
+### Drop a View Only if It Exists
+
+```sql
+DROP VIEW IF EXISTS old_report;
+```
+
+### Drop a View in an Attached Database
+
+```sql
+DROP VIEW aux.cached_stats;
+```
+
+## See Also
+
+- [CREATE VIEW](/docs/sql-reference/statements/create-view) for creating views and materialized views

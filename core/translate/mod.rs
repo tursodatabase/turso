@@ -17,6 +17,7 @@ pub(crate) mod delete;
 pub(crate) mod display;
 pub(crate) mod emitter;
 pub(crate) mod expr;
+pub(crate) mod expression_index;
 pub(crate) mod fkeys;
 pub(crate) mod group_by;
 pub(crate) mod index;
@@ -33,16 +34,21 @@ pub(crate) mod result_row;
 pub(crate) mod rollback;
 pub(crate) mod schema;
 pub(crate) mod select;
+pub(crate) mod stmt_journal;
 pub(crate) mod subquery;
 pub(crate) mod transaction;
+pub(crate) mod trigger;
+pub(crate) mod trigger_exec;
 pub(crate) mod update;
 pub(crate) mod upsert;
+pub(crate) mod vacuum;
 mod values;
 pub(crate) mod view;
 mod window;
 
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
+use crate::sync::Arc;
 use crate::translate::delete::translate_delete;
 use crate::translate::emitter::Resolver;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
@@ -50,15 +56,14 @@ use crate::vdbe::Program;
 use crate::{bail_parse_error, Connection, Result, SymbolTable};
 use alter::translate_alter_table;
 use analyze::translate_analyze;
-use index::{translate_create_index, translate_drop_index};
+use index::{translate_create_index, translate_drop_index, translate_optimize};
 use insert::translate_insert;
-use rollback::translate_rollback;
+use rollback::{translate_release, translate_rollback, translate_savepoint};
 use schema::{translate_create_table, translate_create_virtual_table, translate_drop_table};
 use select::translate_select;
-use std::sync::Arc;
 use tracing::{instrument, Level};
 use transaction::{translate_tx_begin, translate_tx_commit};
-use turso_parser::ast::{self, Indexed};
+use turso_parser::ast;
 use update::translate_update;
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -83,7 +88,7 @@ pub fn translate(
 
     let mut program = ProgramBuilder::new(
         query_mode,
-        connection.get_capture_data_changes().clone(),
+        connection.get_capture_data_changes_info().clone(),
         // These options will be extended whithin each translate program
         ProgramBuilderOpts {
             num_cursors: 1,
@@ -93,19 +98,32 @@ pub fn translate(
     );
 
     program.prologue();
-    let mut resolver = Resolver::new(schema, syms);
+    let mut resolver = Resolver::new(
+        schema,
+        connection.database_schemas(),
+        connection.attached_databases(),
+        syms,
+        connection.experimental_custom_types_enabled(),
+    );
 
-    program = match stmt {
+    match stmt {
         // There can be no nesting with pragma, so lift it up here
         ast::Stmt::Pragma { name, body } => {
-            pragma::translate_pragma(&resolver, &name, body, pager, connection.clone(), program)?
+            pragma::translate_pragma(
+                &resolver,
+                &name,
+                body,
+                pager,
+                connection.clone(),
+                &mut program,
+            )?;
         }
-        stmt => translate_inner(stmt, &mut resolver, program, &connection, input)?,
+        stmt => translate_inner(stmt, &mut resolver, &mut program, &connection, input)?,
     };
 
     program.epilogue(schema);
 
-    Ok(program.build(connection, change_cnt_on, input))
+    program.build(connection, change_cnt_on, input)
 }
 
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
@@ -114,24 +132,28 @@ pub fn translate(
 pub fn translate_inner(
     stmt: ast::Stmt,
     resolver: &mut Resolver,
-    program: ProgramBuilder,
+    program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
     input: &str,
-) -> Result<ProgramBuilder> {
+) -> Result<()> {
     let is_write = matches!(
         stmt,
         ast::Stmt::AlterTable { .. }
+            | ast::Stmt::Analyze { .. }
             | ast::Stmt::CreateIndex { .. }
             | ast::Stmt::CreateTable { .. }
             | ast::Stmt::CreateTrigger { .. }
             | ast::Stmt::CreateView { .. }
             | ast::Stmt::CreateMaterializedView { .. }
             | ast::Stmt::CreateVirtualTable(..)
+            | ast::Stmt::CreateType { .. }
             | ast::Stmt::Delete { .. }
             | ast::Stmt::DropIndex { .. }
             | ast::Stmt::DropTable { .. }
+            | ast::Stmt::DropType { .. }
             | ast::Stmt::DropView { .. }
             | ast::Stmt::Reindex { .. }
+            | ast::Stmt::Optimize { .. }
             | ast::Stmt::Update { .. }
             | ast::Stmt::Insert { .. }
     );
@@ -142,18 +164,22 @@ pub fn translate_inner(
 
     let is_select = matches!(stmt, ast::Stmt::Select { .. });
 
-    let mut program = match stmt {
+    match stmt {
         ast::Stmt::AlterTable(alter) => {
-            translate_alter_table(alter, resolver, program, connection, input)?
+            translate_alter_table(alter, resolver, program, connection, input)?;
         }
         ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program)?,
         ast::Stmt::Attach { expr, db_name, key } => {
-            attach::translate_attach(&expr, resolver, &db_name, &key, program)?
+            attach::translate_attach(&expr, resolver, &db_name, &key, program, connection.clone())?;
         }
-        ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver.schema, program)?,
-        ast::Stmt::Commit { name } => translate_tx_commit(name, program)?,
+        ast::Stmt::Begin { typ, name } => {
+            translate_tx_begin(typ, name, resolver.schema(), program)?
+        }
+        ast::Stmt::Commit { name } => {
+            translate_tx_commit(name, resolver.schema(), resolver, program)?
+        }
         ast::Stmt::CreateIndex { .. } => {
-            translate_create_index(program, connection, resolver, stmt)?
+            translate_create_index(program, connection, resolver, stmt)?;
         }
         ast::Stmt::CreateTable {
             temporary,
@@ -169,31 +195,59 @@ pub fn translate_inner(
             program,
             connection,
         )?,
-        ast::Stmt::CreateTrigger { .. } => bail_parse_error!("CREATE TRIGGER not supported yet"),
+        ast::Stmt::CreateTrigger {
+            temporary,
+            if_not_exists,
+            trigger_name,
+            time,
+            event,
+            tbl_name,
+            for_each_row,
+            when_clause,
+            commands,
+        } => {
+            // Reconstruct SQL for storage
+            let sql = trigger::create_trigger_to_sql(
+                temporary,
+                if_not_exists,
+                &trigger_name,
+                time,
+                &event,
+                &tbl_name,
+                for_each_row,
+                when_clause.as_deref(),
+                &commands,
+            );
+            trigger::translate_create_trigger(
+                trigger_name,
+                resolver,
+                temporary,
+                if_not_exists,
+                time,
+                tbl_name,
+                program,
+                sql,
+                &commands,
+                when_clause.as_deref(),
+            )?
+        }
         ast::Stmt::CreateView {
             view_name,
             select,
             columns,
             ..
-        } => view::translate_create_view(
-            &view_name.name,
-            resolver,
-            &select,
-            &columns,
-            connection.clone(),
-            program,
-        )?,
+        } => view::translate_create_view(&view_name, resolver, &select, &columns, program)?,
         ast::Stmt::CreateMaterializedView {
             view_name, select, ..
         } => view::translate_create_materialized_view(
-            &view_name.name,
+            &view_name,
             resolver,
             &select,
             connection.clone(),
             program,
         )?,
         ast::Stmt::CreateVirtualTable(vtab) => {
-            translate_create_virtual_table(vtab, resolver, program)?
+            translate_create_virtual_table(vtab, resolver, program, connection)?
         }
         ast::Stmt::Delete {
             tbl_name,
@@ -204,14 +258,13 @@ pub fn translate_inner(
             order_by,
             with,
         } => {
-            if with.is_some() {
-                bail_parse_error!("WITH clause is not supported in DELETE");
-            }
-            if indexed.is_some_and(|i| matches!(i, Indexed::IndexedBy(_))) {
-                bail_parse_error!("INDEXED BY clause is not supported in DELETE");
-            }
             if !order_by.is_empty() {
                 bail_parse_error!("ORDER BY clause is not supported in DELETE");
+            }
+            if where_clause.is_none() && connection.get_dml_require_where() {
+                bail_parse_error!(
+                    "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
+                );
             }
             translate_delete(
                 &tbl_name,
@@ -219,36 +272,63 @@ pub fn translate_inner(
                 where_clause,
                 limit,
                 returning,
+                indexed,
+                with,
                 program,
                 connection,
             )?
         }
-        ast::Stmt::Detach { name } => attach::translate_detach(&name, resolver, program)?,
+        ast::Stmt::Detach { name } => {
+            attach::translate_detach(&name, resolver, program, connection.clone())?
+        }
         ast::Stmt::DropIndex {
             if_exists,
             idx_name,
-        } => translate_drop_index(idx_name.name.as_str(), resolver, if_exists, program)?,
+        } => translate_drop_index(&idx_name, resolver, if_exists, program)?,
         ast::Stmt::DropTable {
             if_exists,
             tbl_name,
         } => translate_drop_table(tbl_name, resolver, if_exists, program, connection)?,
-        ast::Stmt::DropTrigger { .. } => bail_parse_error!("DROP TRIGGER not supported yet"),
+        ast::Stmt::DropTrigger {
+            if_exists,
+            trigger_name,
+        } => trigger::translate_drop_trigger(resolver, &trigger_name, if_exists, program)?,
         ast::Stmt::DropView {
             if_exists,
             view_name,
+        } => view::translate_drop_view(resolver, &view_name, if_exists, program)?,
+        ast::Stmt::CreateType {
+            if_not_exists,
+            type_name,
+            body,
         } => {
-            view::translate_drop_view(resolver.schema, view_name.name.as_str(), if_exists, program)?
+            if !connection.experimental_custom_types_enabled() {
+                bail_parse_error!("Custom types require --experimental-custom-types flag");
+            }
+            schema::translate_create_type(&type_name, &body, if_not_exists, resolver, program)?
+        }
+        ast::Stmt::DropType {
+            if_exists,
+            type_name,
+        } => {
+            if !connection.experimental_custom_types_enabled() {
+                bail_parse_error!("Custom types require --experimental-custom-types flag");
+            }
+            schema::translate_drop_type(&type_name, if_exists, resolver, program)?
         }
         ast::Stmt::Pragma { .. } => {
             bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
         }
         ast::Stmt::Reindex { .. } => bail_parse_error!("REINDEX not supported yet"),
-        ast::Stmt::Release { .. } => bail_parse_error!("RELEASE not supported yet"),
+        ast::Stmt::Optimize { idx_name } => {
+            translate_optimize(idx_name, resolver, program, connection)?
+        }
+        ast::Stmt::Release { name } => translate_release(program, name)?,
         ast::Stmt::Rollback {
             tx_name,
             savepoint_name,
         } => translate_rollback(program, tx_name, savepoint_name)?,
-        ast::Stmt::Savepoint { .. } => bail_parse_error!("SAVEPOINT not supported yet"),
+        ast::Stmt::Savepoint { name } => translate_savepoint(program, name)?,
         ast::Stmt::Select(select) => {
             translate_select(
                 select,
@@ -256,11 +336,19 @@ pub fn translate_inner(
                 program,
                 plan::QueryDestination::ResultRows,
                 connection,
-            )?
-            .program
+            )?;
         }
-        ast::Stmt::Update(update) => translate_update(update, resolver, program, connection)?,
-        ast::Stmt::Vacuum { .. } => bail_parse_error!("VACUUM not supported yet"),
+        ast::Stmt::Update(update) => {
+            if update.where_clause.is_none() && connection.get_dml_require_where() {
+                bail_parse_error!(
+                    "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
+                );
+            }
+            translate_update(update, resolver, program, connection)?
+        }
+        ast::Stmt::Vacuum { name, into } => {
+            vacuum::translate_vacuum(program, name.as_ref(), into.as_deref())?
+        }
         ast::Stmt::Insert {
             with,
             or_conflict,
@@ -268,21 +356,17 @@ pub fn translate_inner(
             columns,
             body,
             returning,
-        } => {
-            if with.is_some() {
-                crate::bail_parse_error!("WITH clause is not supported");
-            }
-            translate_insert(
-                resolver,
-                or_conflict,
-                tbl_name,
-                columns,
-                body,
-                returning,
-                program,
-                connection,
-            )?
-        }
+        } => translate_insert(
+            resolver,
+            or_conflict,
+            tbl_name,
+            columns,
+            body,
+            returning,
+            with,
+            program,
+            connection,
+        )?,
     };
 
     // Indicate write operations so that in the epilogue we can emit the correct type of transaction
@@ -295,5 +379,125 @@ pub fn translate_inner(
         program.begin_read_operation();
     }
 
-    Ok(program)
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::MemoryIO;
+    use crate::schema::{BTreeTable, Table, SQLITE_SEQUENCE_TABLE_NAME};
+    use crate::Database;
+
+    /// Verify that REGEXP produces the correct error when no regexp function is registered.
+    #[test]
+    fn test_regexp_no_function_registered() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:").unwrap();
+        let conn = db.connect().unwrap();
+        let schema = db.schema.lock().clone();
+        let pager = conn.pager.load().clone();
+
+        // Use an empty SymbolTable so regexp() is not available.
+        let empty_syms = SymbolTable::new();
+        let mut parser = turso_parser::parser::Parser::new(b"SELECT 'x' REGEXP 'y'");
+        let cmd = parser.next().unwrap().unwrap();
+        let stmt = match cmd {
+            ast::Cmd::Stmt(s) => s,
+            _ => panic!("expected statement"),
+        };
+
+        let result = translate(
+            &schema,
+            stmt,
+            pager,
+            conn,
+            &empty_syms,
+            QueryMode::Normal,
+            "",
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("no such function: regexp"),
+            "expected 'no such function: regexp', got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_insert_autoincrement_with_malformed_sqlite_sequence_is_corrupt() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:").unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+            .unwrap();
+
+        let mut schema = db.schema.lock().as_ref().clone();
+        let seq_root_page = schema
+            .get_btree_table(SQLITE_SEQUENCE_TABLE_NAME)
+            .expect("sqlite_sequence should exist after creating AUTOINCREMENT table")
+            .root_page;
+        let malformed_seq =
+            BTreeTable::from_sql("CREATE TABLE sqlite_sequence(name)", seq_root_page)
+                .expect("malformed sqlite_sequence SQL should parse");
+        schema.tables.insert(
+            SQLITE_SEQUENCE_TABLE_NAME.to_string(),
+            Arc::new(Table::BTree(Arc::new(malformed_seq))),
+        );
+
+        let pager = conn.pager.load().clone();
+        let syms = SymbolTable::new();
+
+        let mut parser = turso_parser::parser::Parser::new(b"INSERT INTO t(v) VALUES('x')");
+        let cmd = parser.next().unwrap().unwrap();
+        let stmt = match cmd {
+            ast::Cmd::Stmt(s) => s,
+            _ => panic!("expected statement"),
+        };
+
+        let err = translate(&schema, stmt, pager, conn, &syms, QueryMode::Normal, "")
+            .expect_err("translation should fail with malformed sqlite_sequence");
+        match err {
+            crate::LimboError::Corrupt(msg) => {
+                assert!(
+                    msg.contains("sqlite_sequence"),
+                    "expected sqlite_sequence corruption error, got: {msg}"
+                );
+            }
+            other => panic!("expected LimboError::Corrupt, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_insert_autoincrement_with_missing_sqlite_sequence_is_corrupt() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:").unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+            .unwrap();
+
+        let mut schema = db.schema.lock().as_ref().clone();
+        schema.tables.remove(SQLITE_SEQUENCE_TABLE_NAME);
+
+        let pager = conn.pager.load().clone();
+        let syms = SymbolTable::new();
+
+        let mut parser = turso_parser::parser::Parser::new(b"INSERT INTO t(v) VALUES('x')");
+        let cmd = parser.next().unwrap().unwrap();
+        let stmt = match cmd {
+            ast::Cmd::Stmt(s) => s,
+            _ => panic!("expected statement"),
+        };
+
+        let err = translate(&schema, stmt, pager, conn, &syms, QueryMode::Normal, "")
+            .expect_err("translation should fail with missing sqlite_sequence");
+        match err {
+            crate::LimboError::Corrupt(msg) => {
+                assert!(
+                    msg.contains("missing sqlite_sequence"),
+                    "expected missing sqlite_sequence error, got: {msg}"
+                );
+            }
+            other => panic!("expected LimboError::Corrupt, got: {other}"),
+        }
+    }
 }

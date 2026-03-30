@@ -1,0 +1,643 @@
+@database :memory:
+@requires-file trigger "trigger tests require trigger support"
+@skip-file-if mvcc "attach is not supported for mvcc"
+
+# Triggers cannot reference objects in attached databases
+# SQLite rejects triggers whose body references tables in a different database
+# See: https://www.sqlite.org/lang_createtrigger.html
+
+test trigger-cross-db-subquery-reject {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE main_tbl (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE aux.other_tbl (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TRIGGER trg_cross_subquery AFTER INSERT ON main_tbl BEGIN SELECT * FROM aux.other_tbl; END;
+}
+expect error {
+    trigger trg_cross_subquery cannot reference objects in database aux
+}
+
+test trigger-cross-db-when-subquery-reject {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE main_tbl (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE aux.other_tbl (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TRIGGER trg_cross_when AFTER INSERT ON main_tbl WHEN EXISTS (SELECT 1 FROM aux.other_tbl) BEGIN SELECT 1; END;
+}
+expect error {
+    trigger trg_cross_when cannot reference objects in database aux
+}
+
+test trigger-same-db-allowed {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TRIGGER trg_same_db AFTER DELETE ON t1 BEGIN INSERT INTO t2 (id, val) VALUES (OLD.id, OLD.val); END;
+    INSERT INTO t1 VALUES (1, 'test');
+    DELETE FROM t1 WHERE id = 1;
+    SELECT * FROM t2;
+}
+expect {
+    1|test
+}
+
+# Explicit main. qualification should be allowed for triggers on main db tables
+test trigger-explicit-main-qualification {
+    CREATE TABLE t3 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TRIGGER trg_main_qual AFTER INSERT ON t3 BEGIN SELECT * FROM main.t3; END;
+    INSERT INTO t3 VALUES (1, 'hello');
+    SELECT * FROM t3;
+}
+expect {
+    1|hello
+}
+
+# Trigger on attached db referencing only that same attached db should work
+test trigger-attached-db-same-db {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.a1 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE aux.a2 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TRIGGER aux.trg_aux AFTER INSERT ON a1 BEGIN INSERT INTO a2 (id, val) VALUES (NEW.id, NEW.val); END;
+    INSERT INTO aux.a1 VALUES (1, 'from_aux');
+    SELECT * FROM aux.a2;
+}
+expect {
+    1|from_aux
+}
+
+# Trigger on attached db cannot reference main db tables
+test trigger-attached-db-cross-to-main-reject {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE main_t (id INTEGER PRIMARY KEY);
+    CREATE TABLE aux.aux_t (id INTEGER PRIMARY KEY);
+    CREATE TRIGGER aux.trg_aux_cross AFTER INSERT ON aux_t BEGIN SELECT * FROM main.main_t; END;
+}
+expect error {
+    trigger trg_aux_cross cannot reference objects in database main
+}
+
+# Cross-db reference hidden in a nested scalar subquery in INSERT VALUES
+test trigger-cross-db-nested-subquery-in-insert {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE t_ins (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE aux.lookup (id INTEGER PRIMARY KEY, v INT);
+    CREATE TRIGGER trg_ins_cross AFTER INSERT ON t_ins
+    BEGIN
+        INSERT INTO t_ins VALUES (NEW.id + 100, (SELECT v FROM aux.lookup WHERE id = NEW.id));
+    END;
+}
+expect error {
+    trigger trg_ins_cross cannot reference objects in database aux
+}
+
+# Cross-db reference hidden in UPDATE SET expression subquery
+test trigger-cross-db-update-set-subquery {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE t_upd (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE aux.rates (id INTEGER PRIMARY KEY, r INT);
+    CREATE TRIGGER trg_upd_cross AFTER INSERT ON t_upd
+    BEGIN
+        UPDATE t_upd SET val = (SELECT r FROM aux.rates WHERE id = NEW.id) WHERE id = NEW.id;
+    END;
+}
+expect error {
+    trigger trg_upd_cross cannot reference objects in database aux
+}
+
+# Cross-db reference hidden in DELETE WHERE subquery
+test trigger-cross-db-delete-where-subquery {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE t_del (id INTEGER PRIMARY KEY);
+    CREATE TABLE aux.blacklist (id INTEGER PRIMARY KEY);
+    CREATE TRIGGER trg_del_cross AFTER INSERT ON t_del
+    BEGIN
+        DELETE FROM t_del WHERE id IN (SELECT id FROM aux.blacklist);
+    END;
+}
+expect error {
+    trigger trg_del_cross cannot reference objects in database aux
+}
+
+# Cross-db reference inside a CTE within trigger body
+test trigger-cross-db-cte {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE t_cte (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE aux.src (id INTEGER PRIMARY KEY, v INT);
+    CREATE TRIGGER trg_cte_cross AFTER INSERT ON t_cte
+    BEGIN
+        INSERT INTO t_cte
+            WITH c AS (SELECT v FROM aux.src WHERE id = NEW.id)
+            SELECT NEW.id + 100, v FROM c;
+    END;
+}
+expect error {
+    trigger trg_cte_cross cannot reference objects in database aux
+}
+
+# Cross-db reference in UNION ALL compound inside trigger
+test trigger-cross-db-compound {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE t_cmp (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE aux.extra (id INTEGER PRIMARY KEY, v INT);
+    CREATE TRIGGER trg_cmp_cross AFTER INSERT ON t_cmp
+    BEGIN
+        INSERT INTO t_cmp SELECT * FROM t_cmp WHERE 0 UNION ALL SELECT * FROM aux.extra;
+    END;
+}
+expect error {
+    trigger trg_cmp_cross cannot reference objects in database aux
+}
+
+# Cross-db reference in FROM subquery inside trigger
+test trigger-cross-db-from-subquery {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE t_fsub (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE aux.data (id INTEGER PRIMARY KEY, v INT);
+    CREATE TRIGGER trg_fsub_cross AFTER INSERT ON t_fsub
+    BEGIN
+        INSERT INTO t_fsub SELECT * FROM (SELECT * FROM aux.data);
+    END;
+}
+expect error {
+    trigger trg_fsub_cross cannot reference objects in database aux
+}
+
+# Cross-db reference in JOIN inside trigger body
+test trigger-cross-db-join {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE t_join (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE t_join2 (id INTEGER PRIMARY KEY, x INT);
+    CREATE TABLE aux.j (id INTEGER PRIMARY KEY, m INT);
+    CREATE TRIGGER trg_join_cross AFTER INSERT ON t_join
+    BEGIN
+        INSERT INTO t_join2 SELECT t_join.id, aux.j.m FROM t_join JOIN aux.j ON t_join.id = aux.j.id;
+    END;
+}
+expect error {
+    trigger trg_join_cross cannot reference objects in database aux
+}
+
+# DoublyQualified expressions (aux.table.column) are column references, not table
+# references. SQLite allows CREATE TRIGGER but rejects at runtime as "no such column".
+test trigger-doubly-qualified-expr-runtime-error {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE t_dq (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE aux.ref_t (id INTEGER PRIMARY KEY, v INT);
+    CREATE TRIGGER trg_dq AFTER INSERT ON t_dq
+    BEGIN
+        INSERT INTO t_dq VALUES (NEW.id + 100, aux.ref_t.v);
+    END;
+    INSERT INTO t_dq VALUES (1, 42);
+}
+expect error {
+    no such column
+}
+
+# Cross-db in IN (SELECT) expression inside trigger
+test trigger-cross-db-in-select {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE t_in (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE aux.allow (id INTEGER PRIMARY KEY);
+    CREATE TRIGGER trg_in_cross AFTER INSERT ON t_in
+    BEGIN
+        DELETE FROM t_in WHERE id NOT IN (SELECT id FROM aux.allow);
+    END;
+}
+expect error {
+    trigger trg_in_cross cannot reference objects in database aux
+}
+
+# DoublyQualified in WHEN clause — SQLite allows CREATE, rejects at runtime.
+test trigger-doubly-qualified-when-runtime-error {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE t_wdq (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE aux.flag (id INTEGER PRIMARY KEY, on_off INT);
+    CREATE TRIGGER trg_wdq AFTER INSERT ON t_wdq
+    WHEN aux.flag.on_off = 1
+    BEGIN
+        SELECT 1;
+    END;
+    INSERT INTO t_wdq VALUES (1, 42);
+}
+expect error {
+    no such column
+}
+
+# Second attached db: trigger on aux1 cannot reference aux2
+test trigger-cross-attached-dbs {
+    ATTACH ':memory:' AS aux1;
+    ATTACH ':memory:' AS aux2;
+    CREATE TABLE aux1.t1 (id INTEGER PRIMARY KEY);
+    CREATE TABLE aux2.t2 (id INTEGER PRIMARY KEY);
+    CREATE TRIGGER aux1.trg_cross_aux AFTER INSERT ON t1
+    BEGIN
+        INSERT INTO t1 SELECT * FROM aux2.t2;
+    END;
+}
+expect error {
+    trigger trg_cross_aux cannot reference objects in database aux2
+}
+
+# Attached db trigger with same-db explicit qualification should work
+test trigger-attached-db-explicit-self-qualification {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.s1 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE aux.s2 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TRIGGER aux.trg_self_qual AFTER INSERT ON s1
+    BEGIN
+        INSERT INTO s2 SELECT * FROM aux.s1;
+    END;
+    INSERT INTO aux.s1 VALUES (1, 'self');
+    SELECT * FROM aux.s2;
+}
+expect {
+    1|self
+}
+
+# Multiple trigger commands: first OK, second cross-db — should reject
+test trigger-cross-db-second-cmd {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE t_multi (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE t_log (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE aux.bad (id INTEGER PRIMARY KEY);
+    CREATE TRIGGER trg_multi_cross AFTER INSERT ON t_multi
+    BEGIN
+        INSERT INTO t_log VALUES (NEW.id, NEW.val);
+        DELETE FROM t_log WHERE id IN (SELECT id FROM aux.bad);
+    END;
+}
+expect error {
+    trigger trg_multi_cross cannot reference objects in database aux
+}
+
+# ── Trigger event types ──────────────────────────────────────────────
+
+# BEFORE trigger with cross-db reference
+test trigger-cross-db-before-trigger {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE t_before (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE aux.ref_before (id INTEGER PRIMARY KEY);
+    CREATE TRIGGER trg_before_cross BEFORE INSERT ON t_before
+    BEGIN
+        SELECT * FROM aux.ref_before;
+    END;
+}
+expect error {
+    trigger trg_before_cross cannot reference objects in database aux
+}
+
+# UPDATE trigger with cross-db reference
+test trigger-cross-db-update-trigger {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE t_utrig (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE aux.ref_utrig (id INTEGER PRIMARY KEY);
+    CREATE TRIGGER trg_utrig_cross AFTER UPDATE ON t_utrig
+    BEGIN
+        SELECT * FROM aux.ref_utrig;
+    END;
+}
+expect error {
+    trigger trg_utrig_cross cannot reference objects in database aux
+}
+
+# DELETE trigger with cross-db reference
+test trigger-cross-db-delete-trigger {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE t_dtrig (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE aux.ref_dtrig (id INTEGER PRIMARY KEY);
+    CREATE TRIGGER trg_dtrig_cross AFTER DELETE ON t_dtrig
+    BEGIN
+        SELECT * FROM aux.ref_dtrig;
+    END;
+}
+expect error {
+    trigger trg_dtrig_cross cannot reference objects in database aux
+}
+
+# UPDATE OF trigger with cross-db reference
+test trigger-cross-db-update-of-trigger {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE t_uof (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE aux.ref_uof (id INTEGER PRIMARY KEY);
+    CREATE TRIGGER trg_uof_cross AFTER UPDATE OF val ON t_uof
+    BEGIN
+        SELECT * FROM aux.ref_uof;
+    END;
+}
+expect error {
+    trigger trg_uof_cross cannot reference objects in database aux
+}
+
+# ── Compound SELECT variants ─────────────────────────────────────────
+
+# EXCEPT compound with cross-db in second arm
+test trigger-cross-db-except {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE t_exc (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE aux.exc_ref (id INTEGER PRIMARY KEY, val INT);
+    CREATE TRIGGER trg_exc_cross AFTER INSERT ON t_exc
+    BEGIN
+        INSERT INTO t_exc SELECT * FROM t_exc EXCEPT SELECT * FROM aux.exc_ref;
+    END;
+}
+expect error {
+    trigger trg_exc_cross cannot reference objects in database aux
+}
+
+# INTERSECT compound with cross-db in second arm
+test trigger-cross-db-intersect {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE t_int (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE aux.int_ref (id INTEGER PRIMARY KEY, val INT);
+    CREATE TRIGGER trg_int_cross AFTER INSERT ON t_int
+    BEGIN
+        INSERT INTO t_int SELECT * FROM t_int INTERSECT SELECT * FROM aux.int_ref;
+    END;
+}
+expect error {
+    trigger trg_int_cross cannot reference objects in database aux
+}
+
+# ── Deeply nested subqueries ─────────────────────────────────────────
+
+# Cross-db hidden three levels deep in nested subqueries
+test trigger-cross-db-deep-nested {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE t_deep (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE aux.deep_ref (id INTEGER PRIMARY KEY);
+    CREATE TRIGGER trg_deep_cross AFTER INSERT ON t_deep
+    BEGIN
+        INSERT INTO t_deep VALUES (
+            NEW.id + 100,
+            (SELECT * FROM (SELECT * FROM (SELECT id FROM aux.deep_ref LIMIT 1)))
+        );
+    END;
+}
+expect error {
+    trigger trg_deep_cross cannot reference objects in database aux
+}
+
+# Cross-db in subquery inside CASE WHEN inside trigger body
+test trigger-cross-db-case-subquery {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE t_case (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE aux.case_ref (id INTEGER PRIMARY KEY, v INT);
+    CREATE TRIGGER trg_case_cross AFTER INSERT ON t_case
+    BEGIN
+        INSERT INTO t_case VALUES (
+            NEW.id + 100,
+            CASE WHEN (SELECT COUNT(*) FROM aux.case_ref) > 0 THEN 1 ELSE 0 END
+        );
+    END;
+}
+expect error {
+    trigger trg_case_cross cannot reference objects in database aux
+}
+
+# Cross-db inside COALESCE argument subquery
+test trigger-cross-db-coalesce-subquery {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE t_coal (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE aux.coal_ref (id INTEGER PRIMARY KEY, v INT);
+    CREATE TRIGGER trg_coal_cross AFTER INSERT ON t_coal
+    BEGIN
+        INSERT INTO t_coal VALUES (
+            NEW.id + 100,
+            COALESCE((SELECT v FROM aux.coal_ref WHERE id = NEW.id), 0)
+        );
+    END;
+}
+expect error {
+    trigger trg_coal_cross cannot reference objects in database aux
+}
+
+# ── Clause-specific positions ────────────────────────────────────────
+
+# Cross-db only in JOIN ON clause (tables themselves are same-db)
+test trigger-cross-db-in-join-on-subquery {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE t_jon (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE t_jon2 (id INTEGER PRIMARY KEY, x INT);
+    CREATE TABLE aux.jon_ref (id INTEGER PRIMARY KEY);
+    CREATE TRIGGER trg_jon_cross AFTER INSERT ON t_jon
+    BEGIN
+        INSERT INTO t_jon2
+            SELECT t_jon.id, t_jon.val
+            FROM t_jon
+            JOIN t_jon2 ON t_jon.id = t_jon2.id
+                AND t_jon.id IN (SELECT id FROM aux.jon_ref);
+    END;
+}
+expect error {
+    trigger trg_jon_cross cannot reference objects in database aux
+}
+
+# Cross-db in GROUP BY HAVING subquery
+test trigger-cross-db-having-subquery {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE t_hav (id INTEGER PRIMARY KEY, grp INT, val INT);
+    CREATE TABLE t_hav_out (grp INT, total INT);
+    CREATE TABLE aux.hav_ref (grp INT);
+    CREATE TRIGGER trg_hav_cross AFTER INSERT ON t_hav
+    BEGIN
+        INSERT INTO t_hav_out
+            SELECT grp, SUM(val)
+            FROM t_hav
+            GROUP BY grp
+            HAVING grp IN (SELECT grp FROM aux.hav_ref);
+    END;
+}
+expect error {
+    trigger trg_hav_cross cannot reference objects in database aux
+}
+
+# Cross-db in ORDER BY expression subquery
+test trigger-cross-db-orderby-subquery {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE t_ord (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE aux.ord_ref (id INTEGER PRIMARY KEY, priority INT);
+    CREATE TRIGGER trg_ord_cross AFTER INSERT ON t_ord
+    BEGIN
+        INSERT INTO t_ord
+            SELECT id, val FROM t_ord
+            ORDER BY (SELECT priority FROM aux.ord_ref WHERE id = t_ord.id)
+            LIMIT 1;
+    END;
+}
+expect error {
+    trigger trg_ord_cross cannot reference objects in database aux
+}
+
+# Cross-db in LIMIT expression
+test trigger-cross-db-limit-subquery {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE t_lim (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE aux.lim_ref (n INT);
+    CREATE TRIGGER trg_lim_cross AFTER INSERT ON t_lim
+    BEGIN
+        INSERT INTO t_lim
+            SELECT id, val FROM t_lim
+            ORDER BY id
+            LIMIT (SELECT n FROM aux.lim_ref LIMIT 1);
+    END;
+}
+expect error {
+    trigger trg_lim_cross cannot reference objects in database aux
+}
+
+# Cross-db in WHERE clause of SELECT trigger command
+test trigger-cross-db-select-where-subquery {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE t_sw (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE aux.sw_ref (id INTEGER PRIMARY KEY);
+    CREATE TRIGGER trg_sw_cross AFTER INSERT ON t_sw
+    BEGIN
+        SELECT * FROM t_sw WHERE id IN (SELECT id FROM aux.sw_ref);
+    END;
+}
+expect error {
+    trigger trg_sw_cross cannot reference objects in database aux
+}
+
+# ── INSERT ... SELECT directly from cross-db table ───────────────────
+
+# INSERT SELECT from cross-db table (no subquery wrapping)
+test trigger-cross-db-insert-select-from {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE t_isel (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE aux.isel_src (id INTEGER PRIMARY KEY, val INT);
+    CREATE TRIGGER trg_isel_cross AFTER INSERT ON t_isel
+    BEGIN
+        INSERT INTO t_isel SELECT * FROM aux.isel_src;
+    END;
+}
+expect error {
+    trigger trg_isel_cross cannot reference objects in database aux
+}
+
+# ── Positive tests (should succeed) ─────────────────────────────────
+
+# BEFORE trigger on attached db with same-db refs fires correctly
+test trigger-attached-db-before-same-db {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.bf1 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE aux.bf2 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TRIGGER aux.trg_bf BEFORE INSERT ON bf1
+    BEGIN
+        INSERT INTO bf2 VALUES (NEW.id, 'before:' || NEW.val);
+    END;
+    INSERT INTO aux.bf1 VALUES (1, 'hi');
+    SELECT * FROM aux.bf2;
+}
+expect {
+    1|before:hi
+}
+
+# UPDATE trigger on attached db fires correctly with OLD/NEW
+test trigger-attached-db-update-same-db {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.up1 (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE aux.up_log (old_val INT, new_val INT);
+    CREATE TRIGGER aux.trg_up AFTER UPDATE ON up1
+    BEGIN
+        INSERT INTO up_log VALUES (OLD.val, NEW.val);
+    END;
+    INSERT INTO aux.up1 VALUES (1, 10);
+    UPDATE aux.up1 SET val = 20 WHERE id = 1;
+    SELECT * FROM aux.up_log;
+}
+expect {
+    10|20
+}
+
+# DELETE trigger on attached db fires correctly with OLD
+test trigger-attached-db-delete-same-db {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.dl1 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE aux.dl_log (deleted_id INT, deleted_val TEXT);
+    CREATE TRIGGER aux.trg_dl AFTER DELETE ON dl1
+    BEGIN
+        INSERT INTO dl_log VALUES (OLD.id, OLD.val);
+    END;
+    INSERT INTO aux.dl1 VALUES (1, 'gone');
+    DELETE FROM aux.dl1 WHERE id = 1;
+    SELECT * FROM aux.dl_log;
+}
+expect {
+    1|gone
+}
+
+# Multiple trigger commands all referencing same attached db should work
+test trigger-attached-db-multi-cmd-same-db {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.mc1 (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE aux.mc_log1 (msg TEXT);
+    CREATE TABLE aux.mc_log2 (msg TEXT);
+    CREATE TRIGGER aux.trg_mc AFTER INSERT ON mc1
+    BEGIN
+        INSERT INTO mc_log1 VALUES ('first:' || NEW.val);
+        INSERT INTO mc_log2 VALUES ('second:' || NEW.val);
+    END;
+    INSERT INTO aux.mc1 VALUES (1, 42);
+    SELECT * FROM aux.mc_log1;
+    SELECT * FROM aux.mc_log2;
+}
+expect {
+    first:42
+    second:42
+}
+
+# Trigger with subquery referencing same attached db should work
+test trigger-attached-db-subquery-same-db {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.sq1 (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE aux.sq_lookup (id INTEGER PRIMARY KEY, mult INT);
+    CREATE TABLE aux.sq_out (result INT);
+    INSERT INTO aux.sq_lookup VALUES (1, 10);
+    CREATE TRIGGER aux.trg_sq AFTER INSERT ON sq1
+    BEGIN
+        INSERT INTO sq_out VALUES (
+            (SELECT mult FROM sq_lookup WHERE id = NEW.id) * NEW.val
+        );
+    END;
+    INSERT INTO aux.sq1 VALUES (1, 5);
+    SELECT * FROM aux.sq_out;
+}
+expect {
+    50
+}
+
+# Trigger with explicit aux. qualification in subquery on same db
+test trigger-attached-db-explicit-qual-subquery {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.eq1 (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE aux.eq_ref (id INTEGER PRIMARY KEY, v INT);
+    CREATE TABLE aux.eq_out (result INT);
+    INSERT INTO aux.eq_ref VALUES (1, 99);
+    CREATE TRIGGER aux.trg_eq AFTER INSERT ON eq1
+    BEGIN
+        INSERT INTO eq_out VALUES (
+            (SELECT v FROM aux.eq_ref WHERE id = NEW.id)
+        );
+    END;
+    INSERT INTO aux.eq1 VALUES (1, 0);
+    SELECT * FROM aux.eq_out;
+}
+expect {
+    99
+}
+
+# Trigger with CTE referencing same attached db
+test trigger-attached-db-cte-same-db {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.ct1 (id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE aux.ct_out (result INT);
+    CREATE TRIGGER aux.trg_ct AFTER INSERT ON ct1
+    BEGIN
+        INSERT INTO ct_out
+            WITH doubled(v) AS (SELECT NEW.val * 2)
+            SELECT v FROM doubled;
+    END;
+    INSERT INTO aux.ct1 VALUES (1, 7);
+    SELECT * FROM aux.ct_out;
+}
+expect {
+    14
+}

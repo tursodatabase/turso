@@ -1,0 +1,278 @@
+@database :memory:
+
+@cross-check-integrity
+test changes-on-basic-insert {
+    create table temp (t1 integer, primary key (t1));
+    insert into temp values (1);
+    select changes();
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test changes-on-multiple-row-insert {
+    create table temp (t1 integer, primary key (t1));
+    insert into temp values (1), (2), (3);
+    select changes();
+}
+expect {
+    3
+}
+
+@cross-check-integrity
+test changes-shows-most-recent {
+    create table temp (t1 integer, primary key (t1));
+    insert into temp values (1), (2), (3);
+    insert into temp values (4), (5), (6), (7);
+    select changes();
+}
+expect {
+    4
+}
+
+# github.com/tursodatabase/turso/issues/3259
+@cross-check-integrity
+test changes-doesnt-track-indexes {
+    create table users (id integer primary key, name text, age integer);
+    create index idx_name on users(name);
+    create unique index idx_name_age on users(name, age);
+    insert into users (name, age) values ('Alice', 30),('Mike', 33),('Jim', 22),('Sarah', 44),('Rosa', 11),('Cindy', 36),('Bob', 35),('Charlie', 50);
+    UPDATE users SET name = 'young' where age < 40;
+    select changes();
+}
+expect {
+    6
+}
+
+# https://github.com/tursodatabase/turso/issues/3688
+@cross-check-integrity
+test changes-1_69 {
+    create table t(id integer primary key, value text);
+    insert into t values (1, 'a');
+    select changes();
+    update t set id = id+10 where id = 1;
+    select changes();
+}
+expect {
+    1
+    1
+}
+
+@cross-check-integrity
+test changes-delete-doesnt-track-indexes {
+    create table t (a int);
+    create index idx on t(a);
+    insert into t values (1), (2);
+    delete from t where a < 3;
+    select changes();
+}
+expect {
+    2
+}
+
+@cross-check-integrity
+test changes-on-delete {
+    create table temp (t1 integer, primary key (t1));
+    insert into temp values (1), (2), (3), (4), (5);
+    delete from temp where t1 > 2;
+    select changes();
+}
+expect {
+    3
+}
+
+@cross-check-integrity
+test changes-on-update {
+    create table temp (t1 integer, t2 text, primary key (t1));
+    insert into temp values (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd');
+    update temp set t2 = 'updated' where t1 <= 3;
+    select changes();
+}
+expect {
+    3
+}
+
+@cross-check-integrity
+test changes-on-update-rowid {
+    create table temp (t1 integer primary key, t2 text);
+    insert into temp values (1, 'a'), (2, 'b'), (3, 'c');
+    update temp set t1 = t1 + 10 where t1 = 2;
+    select changes();
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test changes-resets-after-select {
+    create table temp (t1 integer, primary key (t1));
+    insert into temp values (1), (2), (3);
+    select * from temp;
+    select changes();
+}
+expect {
+    1
+    2
+    3
+    3
+}
+
+@cross-check-integrity
+test changes-on-delete-no-match {
+    create table temp (t1 integer, primary key (t1));
+    insert into temp values (1), (2), (3);
+    delete from temp where t1 > 100;
+    select changes();
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test changes-on-update-no-match {
+    create table temp (t1 integer, t2 text, primary key (t1));
+    insert into temp values (1, 'a'), (2, 'b');
+    update temp set t2 = 'updated' where t1 > 100;
+    select changes();
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test changes-on-delete-all {
+    create table temp (t1 integer, primary key (t1));
+    insert into temp values (1), (2), (3), (4), (5), (6);
+    delete from temp;
+    select changes();
+}
+expect {
+    6
+}
+
+@cross-check-integrity
+test changes-mixed-operations {
+    create table temp (t1 integer, t2 text, primary key (t1));
+    insert into temp values (1, 'a'), (2, 'b'), (3, 'c');
+    update temp set t2 = 'updated' where t1 <= 2;
+    delete from temp where t1 = 1;
+    select changes();
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test changes-insert-in-transaction {
+    create table t(id integer primary key, val text);
+    begin;
+    insert into t values(1, 'a'), (2, 'b'), (3, 'c');
+    select changes();
+    commit;
+}
+expect {
+    3
+}
+
+@cross-check-integrity
+test changes-insert-in-transaction-after-commit {
+    create table t(id integer primary key, val text);
+    begin;
+    insert into t values(1, 'a'), (2, 'b'), (3, 'c');
+    commit;
+    select changes();
+}
+expect {
+    3
+}
+
+@cross-check-integrity
+test changes-delete-in-transaction {
+    create table t(id integer primary key, val integer);
+    insert into t values(1, 10), (2, 20), (3, 30);
+    begin;
+    delete from t where val > 15;
+    select changes();
+    commit;
+}
+expect {
+    2
+}
+
+@cross-check-integrity
+test changes-insert-in-transaction-with-prior-data {
+    create table t(id integer primary key, val integer);
+    insert into t values(1, 10), (2, 20), (3, 30);
+    begin;
+    insert into t values(4, 40), (5, 50);
+    select changes();
+    commit;
+}
+expect {
+    2
+}
+
+@cross-check-integrity
+test changes-update-in-transaction {
+    create table t(id integer primary key, val text);
+    insert into t values(1, 'a'), (2, 'b'), (3, 'c');
+    begin;
+    update t set val = 'z' where id <= 2;
+    select changes();
+    commit;
+}
+expect {
+    2
+}
+
+@cross-check-integrity
+test changes-multiple-stmts-in-transaction {
+    create table t(id integer primary key, val text);
+    begin;
+    insert into t values(1, 'a'), (2, 'b');
+    select changes();
+    insert into t values(3, 'c');
+    select changes();
+    commit;
+}
+expect {
+    2
+    1
+}
+
+@cross-check-integrity
+test changes-with-returning {
+    create table t1(a integer primary key, b text);
+
+    insert into t1 values(1, 'a');
+    select changes();
+
+    insert into t1 values(10, 'r') returning *;
+    select changes();
+
+    insert into t1 values(11, 's'), (12, 't') returning *;
+    select changes();
+
+    update t1 set b = 'y' where a >= 10 returning *;
+    select changes();
+
+    delete from t1 where a >= 10 returning *;
+    select changes();
+}
+expect {
+    1
+    10|r
+    1
+    11|s
+    12|t
+    2
+    10|y
+    11|y
+    12|y
+    3
+    10|y
+    11|y
+    12|y
+    3
+}

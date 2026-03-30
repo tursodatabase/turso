@@ -1,0 +1,182 @@
+---
+title: CREATE INDEX
+description: Create an index on one or more columns or expressions to accelerate queries
+sidebarTitle: CREATE INDEX
+---
+
+# CREATE INDEX
+
+Create an index on a table to improve query performance for lookups, joins, and ordering.
+
+## Syntax
+
+```sql
+CREATE [UNIQUE] INDEX [IF NOT EXISTS] [schema-name.]index-name
+    ON table-name (column-or-expr [ASC|DESC], ...)
+    [WHERE filter-expression];
+```
+
+## Description
+
+`CREATE INDEX` builds an index on one or more columns or expressions of a table. Turso uses B-tree indexes in the same format as SQLite. The query planner automatically uses indexes when they can speed up a query -- you do not need to reference an index explicitly in your SQL statements.
+
+### Parameters
+
+| Parameter | Description |
+|-----------|-------------|
+| `UNIQUE` | Enforces a uniqueness constraint. Turso rejects any INSERT or UPDATE that would create duplicate values in the indexed columns. |
+| `IF NOT EXISTS` | Prevents an error if an index with the same name already exists. The statement is a no-op when the index is present. |
+| `schema-name` | The name of the attached database containing the table. Defaults to the main database if omitted. |
+| `index-name` | A unique name for the index within the database. |
+| `table-name` | The table to index. |
+| `column-or-expr` | A column name or an expression to include in the index. Multiple entries are separated by commas. |
+| `ASC` / `DESC` | Sort direction for the indexed column. Default is `ASC`. |
+| `WHERE filter-expression` | An optional filter that creates a partial index. Only rows matching the expression are included in the index. |
+
+## Column Indexes
+
+The most common form indexes one or more columns by name.
+
+```sql
+-- Single-column index
+CREATE INDEX idx_users_email ON users (email);
+
+-- Multi-column (composite) index
+CREATE INDEX idx_orders_customer_date ON orders (customer_id, order_date DESC);
+```
+
+A composite index is useful when queries filter or sort by multiple columns. The order of columns matters -- an index on `(a, b)` can accelerate queries filtering on `a` alone, but not queries filtering only on `b`.
+
+## UNIQUE Indexes
+
+A `UNIQUE` index enforces that no two rows contain the same combination of values in the indexed columns. NULL values are considered distinct from each other, so a `UNIQUE` index permits multiple rows with NULL in the indexed columns.
+
+```sql
+CREATE UNIQUE INDEX idx_users_email_unique ON users (email);
+
+-- This succeeds:
+INSERT INTO users (email) VALUES ('alice@example.com');
+
+-- This fails with a UNIQUE constraint violation:
+INSERT INTO users (email) VALUES ('alice@example.com');
+```
+
+## Partial Indexes
+
+A partial index includes only the rows that satisfy the `WHERE` clause. Partial indexes are smaller than full indexes and are more efficient for queries that always include the same filter condition.
+
+```sql
+-- Index only active orders
+CREATE INDEX idx_active_orders ON orders (customer_id)
+    WHERE status = 'active';
+
+-- The query planner uses this index when the WHERE clause matches
+SELECT * FROM orders WHERE status = 'active' AND customer_id = 42;
+```
+
+The `WHERE` clause of a partial index can reference any column of the table and may use operators, literal values, and built-in functions. Subqueries are not allowed.
+
+## Expression Indexes
+
+An expression index stores the result of an expression rather than a raw column value. Use expression indexes when queries frequently filter or sort by a computed value.
+
+```sql
+-- Index on lowercase email for case-insensitive lookups
+CREATE INDEX idx_users_email_lower ON users (lower(email));
+
+-- The query planner can use this index for:
+SELECT * FROM users WHERE lower(email) = 'alice@example.com';
+```
+
+```sql
+-- Index on an arithmetic expression
+CREATE INDEX idx_items_total ON items (quantity * unit_price);
+```
+
+Each expression in the index must be a deterministic expression that references only columns of the indexed table. Aggregate functions and subqueries are not allowed.
+
+## Custom Index Methods {#using-method}
+
+<Info>
+**Turso Extension**: Custom index methods extend indexing beyond B-trees. This feature is experimental and must be [enabled before use](/docs/sql-reference/experimental-features).
+</Info>
+
+Turso supports a `USING` clause to specify an alternative index method.
+
+```sql
+CREATE INDEX index-name ON table-name USING method-name (columns...);
+```
+
+### Full-Text Search with `USING fts`
+
+The `fts` index method creates a full-text search index powered by Tantivy. FTS indexes support tokenizer configuration through the `WITH` clause.
+
+```sql
+-- Basic FTS index
+CREATE INDEX idx_articles_search ON articles USING fts (title, body);
+
+-- FTS index with custom tokenizers
+CREATE INDEX idx_articles_search ON articles USING fts (
+    title WITH tokenizer=simple,
+    body WITH tokenizer=ngram
+);
+```
+
+Once an FTS index exists, use the `search()` function to query it:
+
+```sql
+SELECT * FROM articles WHERE search(articles, 'database performance');
+```
+
+## Examples
+
+### Index for a Common Lookup Pattern
+
+```sql
+CREATE TABLE products (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    category TEXT,
+    price REAL,
+    in_stock INTEGER DEFAULT 1
+);
+
+-- Speed up lookups by category
+CREATE INDEX idx_products_category ON products (category);
+
+-- Speed up price range queries within a category
+CREATE INDEX idx_products_cat_price ON products (category, price);
+```
+
+### Unique Index to Enforce a Business Rule
+
+```sql
+CREATE TABLE employees (
+    id INTEGER PRIMARY KEY,
+    email TEXT NOT NULL,
+    department TEXT
+);
+
+CREATE UNIQUE INDEX idx_employees_email ON employees (email);
+```
+
+### Partial Index for a Status Filter
+
+```sql
+CREATE TABLE tasks (
+    id INTEGER PRIMARY KEY,
+    assignee TEXT,
+    status TEXT DEFAULT 'pending',
+    due_date TEXT
+);
+
+-- Only index pending tasks -- completed tasks are rarely queried
+CREATE INDEX idx_pending_tasks ON tasks (assignee, due_date)
+    WHERE status = 'pending';
+```
+
+## See Also
+
+- [DROP INDEX](/docs/sql-reference/statements/drop-index) for removing indexes
+- [CREATE TABLE](/docs/sql-reference/statements/create-table) for inline UNIQUE and PRIMARY KEY constraints
+- [EXPLAIN](/docs/sql-reference/statements/explain) for verifying index usage in query plans

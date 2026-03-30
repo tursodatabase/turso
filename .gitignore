@@ -1,12 +1,16 @@
 /target
+/target.noindex
 /.idea
 /.vscode
+/.sqlite3
 **/target
 
 *.so
+*.dylib
+*.dSYM/
 *.ipynb
 *.o
-
+*.sqlite
 # Python
 .mypy_cache/
 .pytest_cache/
@@ -26,7 +30,10 @@ dist/
 **/*.db-shm
 **/*-wal
 # perf
-/Mobibench
+**/*/Mobibench
+perf/mobibench/plot/results.csv
+perf/mobibench/plot/mobibench.pdf
+perf/mobibench/plot/uv.lock
 # OS
 .DS_Store
 
@@ -44,9 +51,28 @@ simulator.log
 profile.json.gz
 simulator-output/
 tests/*.sql
-
+stress-go/stress-go
 &1
 bisected.sql
 *.log
 
 *.db-log
+settings.local.json
+.claude/agents/
+.build-hash
+
+# Track empty wals for read only databases
+!testing/sqltests/database/*
+testing/sqltests/database/integrity_*.db
+
+
+# For simulator redo
+test.sql
+
+# for elle edn transaction history
+*.edn
+elle-history-results/
+custom-types-fuzzer-output/
+CLAUDE.md
+bindings/python/dev.py
+bindings/python/implementation-test/

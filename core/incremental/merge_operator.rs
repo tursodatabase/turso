@@ -5,12 +5,13 @@ use crate::incremental::dbsp::{Delta, DeltaPair, HashableRow};
 use crate::incremental::operator::{
     ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator,
 };
+use crate::sync::Arc;
+use crate::sync::Mutex;
 use crate::types::IOResult;
 use crate::Result;
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::fmt::{self, Display};
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex};
 
 /// How the merge operator should handle rowids when combining deltas
 #[derive(Debug, Clone)]
@@ -43,7 +44,7 @@ impl MergeOperator {
         Self {
             operator_id,
             union_mode: mode,
-            seen_rows: HashMap::new(),
+            seen_rows: HashMap::default(),
             next_rowid: 1,
         }
     }

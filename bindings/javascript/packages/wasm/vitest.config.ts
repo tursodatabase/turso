@@ -11,6 +11,7 @@ export default defineConfig({
     },
   },
   test: {
+    testTimeout: 120_000,
     browser: {
       enabled: true,
       provider: 'playwright',

@@ -1,12 +1,13 @@
 use super::{Buffer, Clock, Completion, File, OpenFlags, IO};
+use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
+use crate::io::FileSyncType;
+use crate::sync::Mutex;
 use crate::turso_assert;
-use crate::{io::clock::DefaultClock, Result};
-
-use crate::io::clock::Instant;
+use crate::Result;
 use std::{
     cell::{Cell, UnsafeCell},
     collections::{BTreeMap, HashMap},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 use tracing::debug;
 
@@ -23,7 +24,7 @@ impl MemoryIO {
     pub fn new() -> Self {
         debug!("Using IO backend 'memory'");
         Self {
-            files: Arc::new(Mutex::new(HashMap::new())),
+            files: Arc::new(Mutex::new(HashMap::default())),
         }
     }
 }
@@ -35,18 +36,24 @@ impl Default for MemoryIO {
 }
 
 impl Clock for MemoryIO {
-    fn now(&self) -> Instant {
-        DefaultClock.now()
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        DefaultClock.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        DefaultClock.current_time_wall_clock()
     }
 }
 
 impl IO for MemoryIO {
     fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
-        let mut files = self.files.lock().unwrap();
+        let mut files = self.files.lock();
         if !files.contains_key(path) && !flags.contains(OpenFlags::Create) {
-            return Err(
-                crate::error::CompletionError::IOError(std::io::ErrorKind::NotFound).into(),
-            );
+            return Err(crate::error::CompletionError::IOError(
+                std::io::ErrorKind::NotFound,
+                "open",
+            )
+            .into());
         }
         if !files.contains_key(path) {
             files.insert(
@@ -58,10 +65,15 @@ impl IO for MemoryIO {
                 }),
             );
         }
-        Ok(files.get(path).unwrap().clone())
+        Ok(files
+            .get(path)
+            .ok_or_else(|| {
+                crate::LimboError::InternalError("file should exist after insert".to_string())
+            })?
+            .clone())
     }
     fn remove_file(&self, path: &str) -> Result<()> {
-        let mut files = self.files.lock().unwrap();
+        let mut files = self.files.lock();
         files.remove(path);
         Ok(())
     }
@@ -74,6 +86,7 @@ pub struct MemoryFile {
 }
 
 unsafe impl Sync for MemoryFile {}
+crate::assert::assert_sync!(MemoryFile);
 
 impl File for MemoryFile {
     fn lock_file(&self, _exclusive: bool) -> Result<()> {
@@ -166,7 +179,7 @@ impl File for MemoryFile {
         Ok(c)
     }
 
-    fn sync(&self, c: Completion) -> Result<Completion> {
+    fn sync(&self, c: Completion, _sync_type: FileSyncType) -> Result<Completion> {
         tracing::debug!("sync(path={})", self.path);
         // no-op
         c.complete(0);

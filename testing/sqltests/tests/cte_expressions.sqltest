@@ -1,0 +1,614 @@
+@database :memory:
+
+# =============================================================================
+# CTE with DISTINCT
+# =============================================================================
+
+test cte-distinct-basic {
+    WITH t(x) AS (VALUES(1),(1),(2),(2),(3))
+    SELECT DISTINCT x FROM t ORDER BY x;
+}
+expect {
+    1
+    2
+    3
+}
+
+test cte-distinct-multi-column {
+    WITH t(x,y) AS (VALUES(1,'a'),(1,'a'),(1,'b'),(2,'a'))
+    SELECT DISTINCT x, y FROM t ORDER BY x, y;
+}
+expect {
+    1|a
+    1|b
+    2|a
+}
+
+test cte-distinct-with-expression {
+    WITH t(x) AS (VALUES(1),(2),(3),(4),(5))
+    SELECT DISTINCT x % 2 as mod2 FROM t ORDER BY mod2;
+}
+expect {
+    0
+    1
+}
+
+# =============================================================================
+# CTE with GROUP BY / HAVING
+# =============================================================================
+
+test cte-group-by-count {
+    WITH t(x,y) AS (VALUES(1,'a'),(2,'a'),(3,'b'),(4,'b'),(5,'b'))
+    SELECT y, COUNT(*) as cnt FROM t GROUP BY y ORDER BY y;
+}
+expect {
+    a|2
+    b|3
+}
+
+test cte-group-by-sum {
+    WITH t(x,g) AS (VALUES(10,'a'),(20,'a'),(30,'b'))
+    SELECT g, SUM(x) as total FROM t GROUP BY g ORDER BY g;
+}
+expect {
+    a|30
+    b|30
+}
+
+test cte-having-filter {
+    WITH t(x,y) AS (VALUES(1,'a'),(2,'b'),(3,'a'),(4,'c'))
+    SELECT y, COUNT(*) FROM t GROUP BY y HAVING COUNT(*) > 1;
+}
+expect {
+    a|2
+}
+
+test cte-having-with-sum {
+    WITH t(x,g) AS (VALUES(10,'a'),(20,'a'),(5,'b'))
+    SELECT g, SUM(x) FROM t GROUP BY g HAVING SUM(x) > 10 ORDER BY g;
+}
+expect {
+    a|30
+}
+
+test cte-group-by-expression {
+    WITH t(x) AS (VALUES(1),(2),(3),(4),(5),(6))
+    SELECT x % 2 as mod2, COUNT(*) FROM t GROUP BY x % 2 ORDER BY mod2;
+}
+expect {
+    0|3
+    1|3
+}
+
+# =============================================================================
+# CTE with LIMIT/OFFSET inside CTE body
+# =============================================================================
+
+test cte-limit-inside {
+    WITH t AS (SELECT 1 x UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 LIMIT 2)
+    SELECT * FROM t ORDER BY 1;
+}
+expect {
+    1
+    2
+}
+
+test cte-offset-inside {
+    WITH t AS (SELECT 1 x UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 LIMIT 2 OFFSET 1)
+    SELECT * FROM t ORDER BY 1;
+}
+expect {
+    2
+    3
+}
+
+test cte-limit-zero-inside {
+    WITH t AS (SELECT 1 x UNION SELECT 2 LIMIT 0)
+    SELECT * FROM t;
+}
+expect {
+}
+
+# =============================================================================
+# CTE with NULL handling
+# =============================================================================
+
+test cte-null-in-values {
+    WITH t(x) AS (VALUES(1),(NULL),(3))
+    SELECT x FROM t ORDER BY x;
+}
+expect {
+
+    1
+    3
+}
+
+test cte-null-coalesce {
+    WITH t(x) AS (VALUES(NULL),(1),(NULL))
+    SELECT COALESCE(x, -1) FROM t ORDER BY 1;
+}
+expect {
+    -1
+    -1
+    1
+}
+
+test cte-null-ifnull {
+    WITH t(x) AS (VALUES(NULL),(42))
+    SELECT IFNULL(x, 0) FROM t ORDER BY 1;
+}
+expect {
+    0
+    42
+}
+
+test cte-null-is-null {
+    WITH t(x) AS (VALUES(1),(NULL),(3))
+    SELECT x FROM t WHERE x IS NULL;
+}
+expect {
+
+}
+
+test cte-null-is-not-null {
+    WITH t(x) AS (VALUES(1),(NULL),(3))
+    SELECT x FROM t WHERE x IS NOT NULL ORDER BY x;
+}
+expect {
+    1
+    3
+}
+
+test cte-null-in-aggregate {
+    WITH t(x) AS (VALUES(1),(NULL),(3))
+    SELECT COUNT(*), COUNT(x), SUM(x), AVG(x) FROM t;
+}
+expect {
+    3|2|4|2.0
+}
+expect @js {
+    3|2|4|2
+}
+
+# =============================================================================
+# CTE with CASE expressions
+# =============================================================================
+
+test cte-case-when {
+    WITH t(x) AS (VALUES(1),(2),(3))
+    SELECT x, CASE WHEN x < 2 THEN 'small' WHEN x < 3 THEN 'medium' ELSE 'large' END as size FROM t;
+}
+expect {
+    1|small
+    2|medium
+    3|large
+}
+
+test cte-case-simple {
+    WITH t(x) AS (VALUES(1),(2),(3))
+    SELECT x, CASE x WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END FROM t;
+}
+expect {
+    1|one
+    2|two
+    3|other
+}
+
+test cte-case-with-null {
+    WITH t(x) AS (VALUES(1),(NULL),(3))
+    SELECT CASE WHEN x IS NULL THEN 'null' ELSE 'not null' END FROM t;
+}
+expect {
+    not null
+    null
+    not null
+}
+
+# =============================================================================
+# CTE with expressions and functions
+# =============================================================================
+
+test cte-arithmetic-expressions {
+    WITH t(x) AS (VALUES(10),(20),(30))
+    SELECT x, x + 5, x - 5, x * 2, x / 2 FROM t;
+}
+expect {
+    10|15|5|20|5
+    20|25|15|40|10
+    30|35|25|60|15
+}
+
+test cte-string-functions {
+    WITH t(s) AS (VALUES('hello'),('WORLD'))
+    SELECT s, UPPER(s), LOWER(s), LENGTH(s) FROM t;
+}
+expect {
+    hello|HELLO|hello|5
+    WORLD|WORLD|world|5
+}
+
+test cte-concat-expression {
+    WITH t(first, last) AS (VALUES('John','Doe'),('Jane','Smith'))
+    SELECT first || ' ' || last as full_name FROM t;
+}
+expect {
+    John Doe
+    Jane Smith
+}
+
+test cte-abs-and-math {
+    WITH t(x) AS (VALUES(-5),(0),(5))
+    SELECT x, ABS(x), x * x FROM t;
+}
+expect {
+    -5|5|25
+    0|0|0
+    5|5|25
+}
+
+test cte-typeof-function {
+    WITH t(x) AS (VALUES(1),('text'),(1.5),(NULL))
+    SELECT x, TYPEOF(x) FROM t;
+}
+expect {
+    1|integer
+    text|text
+    1.5|real
+    |null
+}
+
+# =============================================================================
+# CTE with window functions (supported ones)
+# =============================================================================
+
+test cte-window-sum-over {
+    WITH t(x) AS (VALUES(1),(2),(3))
+    SELECT x, SUM(x) OVER () as total FROM t;
+}
+expect {
+    1|6
+    2|6
+    3|6
+}
+
+test cte-window-count-over {
+    WITH t(x) AS (VALUES(1),(2),(3),(4))
+    SELECT x, COUNT(*) OVER () as cnt FROM t;
+}
+expect {
+    1|4
+    2|4
+    3|4
+    4|4
+}
+
+test cte-window-avg-over {
+    WITH t(x) AS (VALUES(10),(20),(30))
+    SELECT x, AVG(x) OVER () as avg_all FROM t;
+}
+expect {
+    10|20.0
+    20|20.0
+    30|20.0
+}
+expect @js {
+    10|20
+    20|20
+    30|20
+}
+
+# =============================================================================
+# Multiple CTEs with cross-references
+# =============================================================================
+
+test cte-multi-cte-simple-chain {
+    WITH
+        a(x) AS (VALUES(1),(2)),
+        b(y) AS (SELECT x * 10 FROM a),
+        c(z) AS (SELECT y + 1 FROM b)
+    SELECT * FROM c ORDER BY z;
+}
+expect {
+    11
+    21
+}
+
+test cte-multi-cte-join {
+    WITH
+        nums(n) AS (VALUES(1),(2),(3)),
+        letters(l) AS (VALUES('a'),('b'))
+    SELECT n, l FROM nums, letters ORDER BY n, l;
+}
+expect {
+    1|a
+    1|b
+    2|a
+    2|b
+    3|a
+    3|b
+}
+
+test cte-multi-cte-aggregate-chain {
+    WITH
+        raw(x) AS (VALUES(1),(2),(3),(4),(5)),
+        doubled(y) AS (SELECT x * 2 FROM raw),
+        summary(total, cnt) AS (SELECT SUM(y), COUNT(*) FROM doubled)
+    SELECT * FROM summary;
+}
+expect {
+    30|5
+}
+
+test cte-multi-cte-filter-chain {
+    WITH
+        all_nums(x) AS (VALUES(1),(2),(3),(4),(5),(6)),
+        evens(e) AS (SELECT x FROM all_nums WHERE x % 2 = 0),
+        large_evens(le) AS (SELECT e FROM evens WHERE e > 2)
+    SELECT * FROM large_evens ORDER BY le;
+}
+expect {
+    4
+    6
+}
+
+# =============================================================================
+# CTE referenced in different positions
+# =============================================================================
+
+test cte-in-order-by {
+    WITH t(x, name) AS (VALUES(3,'c'),(1,'a'),(2,'b'))
+    SELECT name FROM t ORDER BY x;
+}
+expect {
+    a
+    b
+    c
+}
+
+test cte-in-where-subquery {
+    WITH t(x) AS (VALUES(1),(2),(3))
+    SELECT x FROM t WHERE x IN (SELECT x FROM t WHERE x > 1) ORDER BY x;
+}
+expect {
+    2
+    3
+}
+
+test cte-in-select-subquery {
+    WITH t(x) AS (VALUES(1),(2),(3))
+    SELECT x, (SELECT MAX(x) FROM t) as max_val FROM t;
+}
+expect {
+    1|3
+    2|3
+    3|3
+}
+
+test cte-in-having-subquery {
+    WITH t(x,g) AS (VALUES(1,'a'),(2,'a'),(10,'b'))
+    SELECT g, SUM(x) FROM t GROUP BY g HAVING SUM(x) > (SELECT 5);
+}
+expect {
+    b|10
+}
+
+# =============================================================================
+# CTE with self-joins
+# =============================================================================
+
+test cte-self-join-basic {
+    WITH t(x) AS (VALUES(1),(2),(3))
+    SELECT a.x as a, b.x as b FROM t a, t b WHERE a.x < b.x ORDER BY a, b;
+}
+expect {
+    1|2
+    1|3
+    2|3
+}
+
+test cte-self-join-inner {
+    WITH t(x) AS (VALUES(1),(2),(3))
+    SELECT a.x, b.x FROM t a INNER JOIN t b ON a.x = b.x ORDER BY a.x;
+}
+expect {
+    1|1
+    2|2
+    3|3
+}
+
+test cte-self-join-left {
+    WITH t(x) AS (VALUES(1),(2),(3))
+    SELECT a.x, b.x FROM t a LEFT JOIN t b ON a.x = b.x + 1 ORDER BY a.x;
+}
+expect {
+    1|
+    2|1
+    3|2
+}
+
+# =============================================================================
+# CTE with compound operators combined
+# =============================================================================
+
+test cte-union-intersect-combined {
+    WITH
+        a(x) AS (SELECT 1 UNION SELECT 2 UNION SELECT 3),
+        b(y) AS (SELECT 2 UNION SELECT 3 UNION SELECT 4)
+    SELECT x FROM a WHERE x IN (SELECT y FROM b) ORDER BY x;
+}
+expect {
+    2
+    3
+}
+
+test cte-multi-union {
+    WITH t AS (
+        SELECT 1 x, 'a' y
+        UNION SELECT 2, 'b'
+        UNION SELECT 3, 'c'
+    )
+    SELECT * FROM t ORDER BY x;
+}
+expect {
+    1|a
+    2|b
+    3|c
+}
+
+test cte-union-all-with-duplicates {
+    WITH t AS (SELECT 1 x UNION ALL SELECT 1 UNION ALL SELECT 2)
+    SELECT x, COUNT(*) FROM t GROUP BY x ORDER BY x;
+}
+expect {
+    1|2
+    2|1
+}
+
+# =============================================================================
+# CTE edge cases
+# =============================================================================
+
+test cte-single-value {
+    WITH t AS (SELECT 42 as answer)
+    SELECT answer FROM t;
+}
+expect {
+    42
+}
+
+test cte-empty-result {
+    WITH t AS (SELECT 1 x WHERE FALSE)
+    SELECT * FROM t;
+}
+expect {
+}
+
+test cte-empty-with-aggregate {
+    WITH t AS (SELECT 1 x WHERE FALSE)
+    SELECT COUNT(*), SUM(x) FROM t;
+}
+expect {
+    0|
+}
+
+test cte-aliased-expressions {
+    WITH t(a, b, c) AS (SELECT 1+1, 2*2, 3-1)
+    SELECT a, b, c FROM t;
+}
+expect {
+    2|4|2
+}
+
+test cte-nested-cte-in-from {
+    SELECT * FROM (
+        WITH inner_cte(x) AS (VALUES(10),(20))
+        SELECT x * 2 as doubled FROM inner_cte
+    ) ORDER BY 1;
+}
+expect {
+    20
+    40
+}
+
+test cte-in-subquery-select {
+    SELECT (
+        WITH t(x) AS (VALUES(1),(2),(3))
+        SELECT SUM(x) FROM t
+    );
+}
+expect {
+    6
+}
+
+# =============================================================================
+# CTE with BETWEEN and comparison operators
+# =============================================================================
+
+test cte-between-filter {
+    WITH t(x) AS (VALUES(1),(2),(3),(4),(5))
+    SELECT x FROM t WHERE x BETWEEN 2 AND 4 ORDER BY x;
+}
+expect {
+    2
+    3
+    4
+}
+
+test cte-not-between-filter {
+    WITH t(x) AS (VALUES(1),(2),(3),(4),(5))
+    SELECT x FROM t WHERE x NOT BETWEEN 2 AND 4 ORDER BY x;
+}
+expect {
+    1
+    5
+}
+
+test cte-comparison-chain {
+    WITH t(x) AS (VALUES(1),(2),(3),(4),(5))
+    SELECT x FROM t WHERE x > 1 AND x < 5 AND x != 3 ORDER BY x;
+}
+expect {
+    2
+    4
+}
+
+# =============================================================================
+# CTE with LIKE and GLOB
+# =============================================================================
+
+test cte-like-filter {
+    WITH t(name) AS (VALUES('apple'),('apricot'),('banana'),('avocado'))
+    SELECT name FROM t WHERE name LIKE 'a%' ORDER BY name;
+}
+expect {
+    apple
+    apricot
+    avocado
+}
+
+test cte-glob-filter {
+    WITH t(name) AS (VALUES('test.txt'),('data.csv'),('report.txt'))
+    SELECT name FROM t WHERE name GLOB '*.txt' ORDER BY name;
+}
+expect {
+    report.txt
+    test.txt
+}
+
+test cte-like-with-escape {
+    WITH t(s) AS (VALUES('10%'),('20%'),('100'))
+    SELECT s FROM t WHERE s LIKE '%!%%' ESCAPE '!' ORDER BY s;
+}
+expect {
+    10%
+    20%
+}
+
+test cte-join-values-duplicate-keys {
+    WITH left_t AS (VALUES (0)), right_t AS (VALUES (0), (0))
+    SELECT * FROM left_t JOIN right_t ON left_t.column1 = right_t.column1;
+}
+expect {
+    0|0
+    0|0
+}
+
+test cte-join-values-duplicate-keys-with-data {
+    WITH left_t AS (VALUES (0, 93)), right_t AS (VALUES (0, 181), (0, 152))
+    SELECT left_t.column1, left_t.column2, right_t.column2
+    FROM left_t JOIN right_t ON left_t.column1 = right_t.column1
+    ORDER BY right_t.column2;
+}
+expect {
+    0|93|152
+    0|93|181
+}
+
+test cte-cross-join-values-duplicate-keys {
+    WITH left_t AS (VALUES (0)), right_t AS (VALUES (0), (0))
+    SELECT * FROM left_t, right_t WHERE left_t.column1 = right_t.column1;
+}
+expect {
+    0|0
+    0|0
+}

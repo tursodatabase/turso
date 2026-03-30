@@ -40,3 +40,20 @@ This project depends on libm, distributed by the rust-lang project:
 * License: licenses/extensions/libm-apache-license.md (Apache License v2.0)
 * License: licenses/extensions/libm-mit-license.md (MIT License)
 * Homepage: https://github.com/rust-lang/libm
+
+This project depends on pastey, distributed by the pastey authors:
+
+* License: licenses/core/pastey-apache-license.md (Apache License v2.0)
+* License: licenses/core/pastey-mit-license.md (MIT License)
+* Homepage: https://github.com/AS1100K/pastey
+
+This project depends on windows-sys, distributed by the Microsoft:
+
+* License: licenses/core/windows-apache.license.md (Apache License v2.0)
+* License: licenses/core/windows-mit-license.md (MIT License)
+* Homepage: https://github.com/microsoft/windows-rs
+
+This project depends on SQLAlchemy, distributed by the SQLAlchemy authors:
+
+* License: licenses/bindings/python/sqlalchemy-mit-license.md (MIT License)
+* Homepage: https://github.com/sqlalchemy/sqlalchemy

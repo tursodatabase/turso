@@ -90,7 +90,12 @@ public final class TursoResultSet {
 
     if (lastStepResult.isInInvalidState()) {
       open = false;
-      throw new SQLException("step() returned invalid result: " + lastStepResult);
+      String errorMessage = lastStepResult.getErrorMessage();
+      if (errorMessage != null && !errorMessage.isEmpty()) {
+        throw new SQLException("step() returned invalid result: " + errorMessage);
+      } else {
+        throw new SQLException("step() returned invalid result: " + lastStepResult);
+      }
     }
 
     pastLastRow = lastStepResult.isDone();

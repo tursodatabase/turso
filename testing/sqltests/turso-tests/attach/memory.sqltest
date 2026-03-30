@@ -1,0 +1,70 @@
+@database :memory:
+
+# Test querying attached in-memory database
+test attach-db-query {
+    ATTACH DATABASE ':memory:' AS small;
+    CREATE TABLE small.demo (id INTEGER, value TEXT);
+    INSERT INTO small.demo VALUES (1, 'A'), (2, ''), (3, 'B'), (4, ''), (5, 'C');
+    SELECT value FROM small.demo where id = 1;
+}
+expect {
+    A
+}
+
+# Test detach database
+test detach-database {
+    ATTACH DATABASE ':memory:' AS small;
+    DETACH DATABASE small;
+    pragma database_list;
+}
+expect {
+    0|main|
+}
+
+# Test attach in-memory database
+test attach-memory-database {
+    ATTACH DATABASE ':memory:' AS mem;
+    pragma database_list;
+}
+expect {
+    0|main|
+    2|mem|
+}
+
+# Test join between main and attached database
+test attach-cross-database-join {
+    ATTACH DATABASE ':memory:' as small;
+    CREATE TABLE small.demo (id INTEGER, value TEXT);
+    INSERT INTO small.demo VALUES (1, 'A'), (2, ''), (3, 'B'), (4, ''), (5, 'C');
+    create table joiners (id int, otherid int);
+    insert into joiners (id, otherid) values (1,1);
+    insert into joiners (id, otherid) values (3,3);
+    select s.value from joiners j inner join small.demo s where j.otherid = s.id;
+}
+expect {
+    A
+    B
+}
+
+# regression test for https://github.com/tursodatabase/turso/issues/3540
+test attach-from-memory-db {
+    CREATE TABLE t(a);
+    INSERT INTO t SELECT value from generate_series(1,10);
+    ATTACH DATABASE ':memory:' as a;
+    CREATE TABLE a.products (id INTEGER PRIMARY KEY, name TEXT, price REAL);
+    INSERT INTO a.products VALUES (1, 'hat', 79.0);
+    SELECT * from a.products, t LIMIT 1;
+}
+expect {
+    1|hat|79.0|1
+}
+expect @js {
+    1|hat|79|1
+}
+
+test database-list-with-arg {
+    PRAGMA database_list('t1');
+}
+expect {
+    0|main|
+}

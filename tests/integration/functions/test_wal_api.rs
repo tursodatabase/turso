@@ -2,18 +2,17 @@ use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use rusqlite::types::Value;
 use tempfile::TempDir;
 use turso_core::{
     types::{WalFrameInfo, WalState},
     CheckpointMode, LimboError, StepResult,
 };
 
-use crate::common::{limbo_exec_rows, rng_from_time, TempDatabase};
+use crate::common::{rng_from_time, ExecRows, TempDatabase};
 
-#[test]
-fn test_wal_frame_count() {
-    let db = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_frame_count(db: TempDatabase) {
     let conn = db.connect_limbo();
     assert_eq!(conn.wal_state().unwrap().max_frame, 0);
     conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
@@ -27,11 +26,15 @@ fn test_wal_frame_count() {
     assert_eq!(conn.wal_state().unwrap().max_frame, 15);
 }
 
-#[test]
-fn test_wal_frame_transfer_no_schema_changes() {
-    let db1 = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_frame_transfer_no_schema_changes(db: TempDatabase) {
+    let opts = db.db_opts;
+    let flags = db.db_flags;
+    let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+    let db1 = builder.clone().build();
     let conn1 = db1.connect_limbo();
-    let db2 = TempDatabase::new_empty();
+    let db2 = builder.build();
     let conn2 = db2.connect_limbo();
     conn1
         .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
@@ -56,21 +59,20 @@ fn test_wal_frame_transfer_no_schema_changes() {
 
     conn2.wal_insert_end(false).unwrap();
     assert_eq!(conn2.wal_state().unwrap().max_frame, 15);
-    assert_eq!(
-        limbo_exec_rows(&db2, &conn2, "SELECT x, length(y) FROM t"),
-        vec![
-            vec![Value::Integer(5), Value::Integer(1)],
-            vec![Value::Integer(10), Value::Integer(2)],
-            vec![Value::Integer(1024), Value::Integer(40960)],
-        ]
-    );
+    let rows: Vec<(i64, i64)> = conn2.exec_rows("SELECT x, length(y) FROM t");
+    assert_eq!(rows, vec![(5, 1), (10, 2), (1024, 40960)]);
 }
 
-#[test]
-fn test_wal_frame_transfer_various_schema_changes() {
-    let db1 = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_frame_transfer_various_schema_changes(db: TempDatabase) {
+    let opts = db.db_opts;
+    let flags = db.db_flags;
+    let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
+    let db1 = builder.clone().build();
     let conn1 = db1.connect_limbo();
-    let db2 = TempDatabase::new_empty();
+    let db2 = builder.build();
     let conn2 = db2.connect_limbo();
     let conn3 = db2.connect_limbo();
     conn1
@@ -90,14 +92,10 @@ fn test_wal_frame_transfer_various_schema_changes() {
     };
 
     sync();
-    assert_eq!(
-        limbo_exec_rows(&db2, &conn2, "SELECT * FROM t"),
-        vec![] as Vec<Vec<rusqlite::types::Value>>
-    );
-    assert_eq!(
-        limbo_exec_rows(&db2, &conn3, "SELECT * FROM t"),
-        vec![] as Vec<Vec<rusqlite::types::Value>>
-    );
+    let rows: Vec<(i64, i64)> = conn2.exec_rows("SELECT * FROM t");
+    assert!(rows.is_empty());
+    let rows: Vec<(i64, i64)> = conn3.exec_rows("SELECT * FROM t");
+    assert!(rows.is_empty());
 
     conn1.execute("DROP TABLE t").unwrap();
 
@@ -115,21 +113,22 @@ fn test_wal_frame_transfer_various_schema_changes() {
     conn1.execute("CREATE TABLE b(x, y)").unwrap();
 
     sync();
-    assert_eq!(
-        limbo_exec_rows(&db2, &conn2, "SELECT 1 FROM a UNION ALL SELECT 1 FROM b"),
-        vec![] as Vec<Vec<rusqlite::types::Value>>
-    );
-    assert_eq!(
-        limbo_exec_rows(&db2, &conn3, "SELECT 1 FROM a UNION ALL SELECT 1 FROM b"),
-        vec![] as Vec<Vec<rusqlite::types::Value>>
-    );
+    let rows: Vec<(i64,)> = conn2.exec_rows("SELECT 1 FROM a UNION ALL SELECT 1 FROM b");
+    assert!(rows.is_empty());
+    let rows: Vec<(i64,)> = conn3.exec_rows("SELECT 1 FROM a UNION ALL SELECT 1 FROM b");
+    assert!(rows.is_empty());
 }
 
-#[test]
-fn test_wal_frame_transfer_schema_changes() {
-    let db1 = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_frame_transfer_schema_changes(db: TempDatabase) {
+    let opts = db.db_opts;
+    let flags = db.db_flags;
+    let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
+    let db1 = builder.clone().build();
     let conn1 = db1.connect_limbo();
-    let db2 = TempDatabase::new_empty();
+    let db2 = builder.build();
     let conn2 = db2.connect_limbo();
     conn1
         .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
@@ -154,21 +153,20 @@ fn test_wal_frame_transfer_schema_changes() {
     conn2.wal_insert_end(false).unwrap();
     assert_eq!(commits, 3);
     assert_eq!(conn2.wal_state().unwrap().max_frame, 15);
-    assert_eq!(
-        limbo_exec_rows(&db2, &conn2, "SELECT x, length(y) FROM t"),
-        vec![
-            vec![Value::Integer(5), Value::Integer(1)],
-            vec![Value::Integer(10), Value::Integer(2)],
-            vec![Value::Integer(1024), Value::Integer(40960)],
-        ]
-    );
+    let rows: Vec<(i64, i64)> = conn2.exec_rows("SELECT x, length(y) FROM t");
+    assert_eq!(rows, vec![(5, 1), (10, 2), (1024, 40960)]);
 }
 
-#[test]
-fn test_wal_frame_transfer_no_schema_changes_rollback() {
-    let db1 = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_frame_transfer_no_schema_changes_rollback(db: TempDatabase) {
+    let opts = db.db_opts;
+    let flags = db.db_flags;
+    let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
+    let db1 = builder.clone().build();
     let conn1 = db1.connect_limbo();
-    let db2 = TempDatabase::new_empty();
+    let db2 = builder.build();
     let conn2 = db2.connect_limbo();
     conn1
         .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
@@ -189,25 +187,26 @@ fn test_wal_frame_transfer_no_schema_changes_rollback() {
     }
     conn2.wal_insert_end(false).unwrap();
     assert_eq!(conn2.wal_state().unwrap().max_frame, 2);
-    assert_eq!(
-        limbo_exec_rows(&db2, &conn2, "SELECT x, length(y) FROM t"),
-        vec![] as Vec<Vec<rusqlite::types::Value>>
-    );
+    let rows: Vec<(i64, i64)> = conn2.exec_rows("SELECT x, length(y) FROM t");
+    assert!(rows.is_empty());
     conn2.execute("CREATE TABLE q(x)").unwrap();
     conn2
         .execute("INSERT INTO q VALUES (randomblob(4096 * 10))")
         .unwrap();
-    assert_eq!(
-        limbo_exec_rows(&db2, &conn2, "SELECT x, LENGTH(y) FROM t"),
-        vec![] as Vec<Vec<rusqlite::types::Value>>
-    );
+    let rows: Vec<(i64, i64)> = conn2.exec_rows("SELECT x, LENGTH(y) FROM t");
+    assert!(rows.is_empty());
 }
 
-#[test]
-fn test_wal_frame_transfer_schema_changes_rollback() {
-    let db1 = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_frame_transfer_schema_changes_rollback(db: TempDatabase) {
+    let opts = db.db_opts;
+    let flags = db.db_flags;
+    let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
+    let db1 = builder.clone().build();
     let conn1 = db1.connect_limbo();
-    let db2 = TempDatabase::new_empty();
+    let db2 = builder.build();
     let conn2 = db2.connect_limbo();
     conn1
         .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
@@ -224,25 +223,26 @@ fn test_wal_frame_transfer_schema_changes_rollback() {
     }
     conn2.wal_insert_end(false).unwrap();
     assert_eq!(conn2.wal_state().unwrap().max_frame, 2);
-    assert_eq!(
-        limbo_exec_rows(&db2, &conn2, "SELECT x, length(y) FROM t"),
-        vec![] as Vec<Vec<rusqlite::types::Value>>
-    );
+    let rows: Vec<(i64, i64)> = conn2.exec_rows("SELECT x, length(y) FROM t");
+    assert!(rows.is_empty());
     conn2.execute("CREATE TABLE q(x)").unwrap();
     conn2
         .execute("INSERT INTO q VALUES (randomblob(4096 * 10))")
         .unwrap();
-    assert_eq!(
-        limbo_exec_rows(&db2, &conn2, "SELECT x, LENGTH(y) FROM t"),
-        vec![] as Vec<Vec<rusqlite::types::Value>>
-    );
+    let rows: Vec<(i64, i64)> = conn2.exec_rows("SELECT x, LENGTH(y) FROM t");
+    assert!(rows.is_empty());
 }
 
-#[test]
-fn test_wal_frame_conflict() {
-    let db1 = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_frame_conflict(db: TempDatabase) {
+    let opts = db.db_opts;
+    let flags = db.db_flags;
+    let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
+    let db1 = builder.clone().build();
     let conn1 = db1.connect_limbo();
-    let db2 = TempDatabase::new_empty();
+    let db2 = builder.build();
     let conn2 = db2.connect_limbo();
     conn1
         .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
@@ -257,11 +257,16 @@ fn test_wal_frame_conflict() {
     assert!(conn2.wal_insert_frame(1, &frame).is_err());
 }
 
-#[test]
-fn test_wal_frame_far_away_write() {
-    let db1 = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_frame_far_away_write(db: TempDatabase) {
+    let opts = db.db_opts;
+    let flags = db.db_flags;
+    let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
+    let db1 = builder.clone().build();
     let conn1 = db1.connect_limbo();
-    let db2 = TempDatabase::new_empty();
+    let db2 = builder.clone().build();
     let conn2 = db2.connect_limbo();
     conn1
         .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
@@ -283,17 +288,25 @@ fn test_wal_frame_far_away_write() {
     assert!(conn2.wal_insert_frame(5, &frame).is_err());
 }
 
-#[test]
-fn test_wal_frame_api_no_schema_changes_fuzz() {
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_frame_api_no_schema_changes_fuzz(db: TempDatabase) {
     let (mut rng, _) = rng_from_time();
+
+    let opts = db.db_opts;
+    let flags = db.db_flags;
+    let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
     for _ in 0..4 {
-        let db1 = TempDatabase::new_empty();
+        let db1 = builder.clone().build();
         let conn1 = db1.connect_limbo();
-        let db2 = TempDatabase::new_empty();
+        let db2 = builder.clone().build();
         let conn2 = db2.connect_limbo();
+        conn1.wal_auto_checkpoint_disable();
         conn1
             .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
             .unwrap();
+        conn2.wal_auto_checkpoint_disable();
         conn2
             .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
             .unwrap();
@@ -328,21 +341,19 @@ fn test_wal_frame_api_no_schema_changes_fuzz() {
                         synced_frame = *committed;
                     }
                 }
-                if rng.next_u32() % 10 == 0 {
+                if rng.next_u32() % 10 == 0 && synced_frame > 0 {
                     synced_frame = rng.next_u32() as u64 % synced_frame;
                 }
-                assert_eq!(
-                    limbo_exec_rows(&db2, &conn2, "SELECT COUNT(*) FROM t"),
-                    vec![vec![Value::Integer(size as i64)]]
-                );
+                let rows: Vec<(i64,)> = conn2.exec_rows("SELECT COUNT(*) FROM t");
+                assert_eq!(rows, vec![(size as i64,)]);
             }
         }
     }
 }
 
-#[test]
-fn test_wal_api_changed_pages() {
-    let db1 = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_api_changed_pages(db1: TempDatabase) {
     let conn1 = db1.connect_limbo();
     conn1
         .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
@@ -419,9 +430,9 @@ fn revert_to(conn: &Arc<turso_core::Connection>, frame_watermark: u64) -> turso_
     Ok(())
 }
 
-#[test]
-fn test_wal_api_revert_pages() {
-    let db1 = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_api_revert_pages(db1: TempDatabase) {
     let conn1 = db1.connect_limbo();
     conn1
         .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
@@ -439,33 +450,23 @@ fn test_wal_api_revert_pages() {
         .execute("INSERT INTO t VALUES (1024, randomblob(4096 * 2))")
         .unwrap();
 
-    assert_eq!(
-        limbo_exec_rows(&db1, &conn1, "SELECT x, length(y) FROM t"),
-        vec![
-            vec![Value::Integer(1), Value::Integer(10)],
-            vec![Value::Integer(3), Value::Integer(20)],
-            vec![Value::Integer(1024), Value::Integer(4096 * 2)],
-        ]
-    );
+    let rows: Vec<(i64, i64)> = conn1.exec_rows("SELECT x, length(y) FROM t");
+    assert_eq!(rows, vec![(1, 10), (3, 20), (1024, 4096 * 2)]);
 
     revert_to(&conn1, watermark2).unwrap();
 
-    assert_eq!(
-        limbo_exec_rows(&db1, &conn1, "SELECT x, length(y) FROM t"),
-        vec![vec![Value::Integer(1), Value::Integer(10)],]
-    );
+    let rows: Vec<(i64, i64)> = conn1.exec_rows("SELECT x, length(y) FROM t");
+    assert_eq!(rows, vec![(1, 10)]);
 
     revert_to(&conn1, watermark1).unwrap();
 
-    assert_eq!(
-        limbo_exec_rows(&db1, &conn1, "SELECT x, length(y) FROM t"),
-        vec![] as Vec<Vec<Value>>,
-    );
+    let rows: Vec<(i64, i64)> = conn1.exec_rows("SELECT x, length(y) FROM t");
+    assert!(rows.is_empty());
 }
 
-#[test]
-fn test_wal_upper_bound_passive() {
-    let db = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_upper_bound_passive(db: TempDatabase) {
     let writer = db.connect_limbo();
 
     writer
@@ -482,11 +483,11 @@ fn test_wal_upper_bound_passive() {
     let watermark2 = writer.wal_state().unwrap().max_frame;
     let expected = [
         vec![
-            turso_core::types::Value::Integer(1),
+            turso_core::types::Value::from_i64(1),
             turso_core::types::Value::Text(turso_core::types::Text::new("hello")),
         ],
         vec![
-            turso_core::types::Value::Integer(2),
+            turso_core::types::Value::from_i64(2),
             turso_core::types::Value::Text(turso_core::types::Text::new("turso")),
         ],
     ];
@@ -518,9 +519,9 @@ fn test_wal_upper_bound_passive() {
     }
 }
 
-#[test]
-fn test_wal_upper_bound_truncate() {
-    let db = TempDatabase::new_empty();
+// TODO: enable MVCC
+#[turso_macros::test()]
+fn test_wal_upper_bound_truncate(db: TempDatabase) {
     let writer = db.connect_limbo();
 
     writer
@@ -546,9 +547,9 @@ fn test_wal_upper_bound_truncate() {
         .unwrap();
 }
 
-#[test]
-fn test_wal_state_checkpoint_seq() {
-    let db = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_state_checkpoint_seq(db: TempDatabase) {
     let writer = db.connect_limbo();
 
     writer
@@ -584,9 +585,9 @@ fn test_wal_state_checkpoint_seq() {
     );
 }
 
-#[test]
-fn test_wal_checkpoint_no_work() {
-    let db = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_checkpoint_no_work(db: TempDatabase) {
     let writer = db.connect_limbo();
     let reader = db.connect_limbo();
 
@@ -629,9 +630,9 @@ fn test_wal_checkpoint_no_work() {
     reader.execute("SELECT * FROM test").unwrap();
 }
 
-#[test]
-fn test_wal_revert_change_db_size() {
-    let db = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_revert_change_db_size(db: TempDatabase) {
     let writer = db.connect_limbo();
 
     writer.execute("create table t(x, y)").unwrap();
@@ -670,15 +671,13 @@ fn test_wal_revert_change_db_size() {
     writer
         .execute("insert into t values (3, randomblob(30 * 4096))")
         .unwrap();
-    assert_eq!(
-        limbo_exec_rows(&db, &writer, "SELECT x, length(y) FROM t"),
-        vec![vec![Value::Integer(3), Value::Integer(30 * 4096)]]
-    );
+    let rows: Vec<(i64, i64)> = writer.exec_rows("SELECT x, length(y) FROM t");
+    assert_eq!(rows, vec![(3, 30 * 4096)]);
 }
 
-#[test]
-fn test_wal_api_exec_commit() {
-    let db = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_api_exec_commit(db: TempDatabase) {
     let writer = db.connect_limbo();
 
     writer
@@ -712,20 +711,19 @@ fn test_wal_api_exec_commit() {
         rows,
         vec![
             vec![
-                turso_core::types::Value::Integer(1),
+                turso_core::types::Value::from_i64(1),
                 turso_core::types::Value::Text(turso_core::types::Text::new("hello")),
             ],
             vec![
-                turso_core::types::Value::Integer(2),
+                turso_core::types::Value::from_i64(2),
                 turso_core::types::Value::Text(turso_core::types::Text::new("turso")),
             ],
         ]
     );
 }
 
-#[test]
-fn test_wal_api_exec_rollback() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_wal_api_exec_rollback(db: TempDatabase) {
     let writer = db.connect_limbo();
 
     writer
@@ -758,9 +756,9 @@ fn test_wal_api_exec_rollback() {
     assert_eq!(rows, vec![] as Vec<Vec<turso_core::types::Value>>);
 }
 
-#[test]
-fn test_wal_api_insert_exec_mix() {
-    let db = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_api_insert_exec_mix(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     conn.execute("create table a(x, y)").unwrap();
@@ -823,12 +821,12 @@ fn test_wal_api_insert_exec_mix() {
         rows,
         vec![
             vec![
-                turso_core::types::Value::Integer(1),
-                turso_core::types::Value::Integer(4096),
+                turso_core::types::Value::from_i64(1),
+                turso_core::types::Value::from_i64(4096),
             ],
             vec![
-                turso_core::types::Value::Integer(3),
-                turso_core::types::Value::Integer(3 * 4096),
+                turso_core::types::Value::from_i64(3),
+                turso_core::types::Value::from_i64(3 * 4096),
             ],
         ]
     );
@@ -848,12 +846,13 @@ fn test_wal_api_insert_exec_mix() {
     assert_eq!(
         rows,
         vec![vec![
-            turso_core::types::Value::Integer(4),
-            turso_core::types::Value::Integer(4 * 4096),
+            turso_core::types::Value::from_i64(4),
+            turso_core::types::Value::from_i64(4 * 4096),
         ]]
     );
 }
 
+// TODO: see later how this test should work with mvcc
 #[test]
 fn test_db_share_same_file() {
     let mut path = TempDir::new().unwrap().keep();
@@ -870,7 +869,8 @@ fn test_db_share_same_file() {
         path.to_str().unwrap(),
         db_file.clone(),
         turso_core::OpenFlags::Create,
-        turso_core::DatabaseOpts::new().with_indexes(true),
+        turso_core::DatabaseOpts::new(),
+        None,
         None,
     )
     .unwrap();
@@ -896,8 +896,8 @@ fn test_db_share_same_file() {
         path.to_str().unwrap(),
         &format!("{}-wal-copy", path.to_str().unwrap()),
         db_file.clone(),
-        turso_core::OpenFlags::empty(),
-        turso_core::DatabaseOpts::new().with_indexes(true),
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new(),
         None,
     )
     .unwrap();
@@ -919,18 +919,22 @@ fn test_db_share_same_file() {
     assert_eq!(
         rows,
         vec![vec![
-            turso_core::types::Value::Integer(1),
-            turso_core::types::Value::Integer(4096),
+            turso_core::types::Value::from_i64(1),
+            turso_core::types::Value::from_i64(4096),
         ]]
     );
 }
 
-#[test]
-fn test_wal_api_simulate_spilled_frames() {
+#[turso_macros::test(mvcc)]
+fn test_wal_api_simulate_spilled_frames(db: TempDatabase) {
     let (mut rng, _) = rng_from_time();
-    let db1 = TempDatabase::new_empty();
+    let opts = db.db_opts;
+    let flags = db.db_flags;
+    let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
+    let db1 = builder.clone().build();
     let conn1 = db1.connect_limbo();
-    let db2 = TempDatabase::new_empty();
+    let db2 = builder.build();
     let conn2 = db2.connect_limbo();
     conn1
         .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")

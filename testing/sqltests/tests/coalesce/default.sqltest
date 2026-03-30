@@ -1,0 +1,23 @@
+@database :default:
+@database :default-no-rowidalias:
+
+test coalesce-from-table {
+    select coalesce(NULL, 1) from users limit 1;
+}
+expect {
+    1
+}
+
+test coalesce-from-table-column {
+    select coalesce(NULL, age) from users where age = 94 limit 1;
+}
+expect {
+    94
+}
+
+test coalesce-from-table-multiple-columns {
+    select coalesce(NULL, age), coalesce(NULL, id) from users where age = 94 limit 1;
+}
+expect {
+    94|21
+}

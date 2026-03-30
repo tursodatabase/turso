@@ -1,0 +1,435 @@
+#!/usr/bin/env tclsh
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+set version_output [exec $::sqlite_exec --version]
+set is_turso [string match "*Turso*" $version_output]
+if {!$is_turso} {
+    set load_supported 1
+    if {[catch {exec $::sqlite_exec :memory: ".help"} help_output]} {
+        set load_supported 0
+    } elseif {[string first ".load" $help_output] == -1} {
+        set load_supported 0
+    }
+    if {!$load_supported} {
+        puts "Skipping vtab tests: sqlite3 shell lacks .load support"
+        exit 0
+    }
+}
+
+load_extension test_ext
+
+do_execsql_test_in_memory_error_content create-virtual-table-duplicate-name-1 {
+    CREATE VIRTUAL TABLE t1 USING kv_store;
+    CREATE VIRTUAL TABLE t1 USING kv_store;
+} {Table t1 already exists}
+
+do_execsql_test_in_memory_error_content create-virtual-table-duplicate-name-2 {
+    CREATE TABLE t2 (col INTEGER);
+    CREATE VIRTUAL TABLE t2 USING kv_store;
+} {Table t2 already exists}
+
+do_execsql_test_in_memory_error_content create-virtual-table-duplicate-name-3 {
+    CREATE VIRTUAL TABLE t3 USING kv_store;
+    CREATE TABLE t3 (col INTEGER);
+} {Table t3 already exists}
+
+do_execsql_test_on_specific_db {:memory:} create-virtual-table-if-not-exists-1 {
+    CREATE TABLE t2 (col INTEGER);
+    CREATE VIRTUAL TABLE IF NOT EXISTS t2 USING kv_store;
+} {}
+
+do_execsql_test_on_specific_db {:memory:} create-virtual-table-if-not-exists-2 {
+    CREATE VIRTUAL TABLE t1 USING kv_store;
+    CREATE VIRTUAL TABLE IF NOT EXISTS t1 USING kv_store;
+} {}
+
+do_execsql_test_on_specific_db {:memory:} drop-virtual-table {
+    CREATE VIRTUAL TABLE t USING kv_store;
+    INSERT INTO t VALUES ('hello', 'world');
+    DROP TABLE t;
+} {}
+
+do_execsql_test_in_memory_error_content drop-virtual-table-twice {
+    CREATE VIRTUAL TABLE t USING kv_store;
+    INSERT INTO t VALUES ('hello', 'world');
+    DROP TABLE t;
+    DROP TABLE t;
+} {no such table: t}
+
+do_execsql_test_in_memory_error_content trigger-on-virtual-table {
+    CREATE VIRTUAL TABLE t USING kv_store;
+    CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END;
+} {cannot create triggers on virtual tables}
+
+set trigger_insert_vtab_sql {
+    CREATE VIRTUAL TABLE v USING kv_store;
+    CREATE TABLE t1(id TEXT, name TEXT);
+    CREATE TRIGGER trg AFTER INSERT ON t1
+    BEGIN
+        INSERT INTO v(key, value) VALUES (NEW.id, NEW.name);
+    END;
+    INSERT INTO t1 VALUES ('k1', 'v1');
+    INSERT INTO t1 VALUES ('k2', 'v2');
+    SELECT key, value FROM v ORDER BY key;
+}
+do_execsql_test_in_memory_error_content trigger-insert-into-writable-vtab \
+    $trigger_insert_vtab_sql {unsafe use of virtual table}
+
+do_execsql_test_in_memory_error_content trigger-select-from-vtab-unsafe {
+    CREATE VIRTUAL TABLE v USING kv_store;
+    CREATE TABLE t1(id TEXT);
+    CREATE TRIGGER trg AFTER INSERT ON t1 BEGIN SELECT key FROM v; END;
+    INSERT INTO t1 VALUES ('k1');
+} {unsafe use of virtual table}
+
+do_execsql_test_on_specific_db {:memory:} select-hidden-column {
+    create virtual table t using kv_store;
+    insert into t(key, value) values ('k0', 'v0');
+    select comment from t where key = 'k0';
+} {auto-generated}
+
+# hidden columns are not exposed by subqueries by default
+do_execsql_test_in_memory_error select-hidden-column-subquery-1 {
+    create virtual table t using kv_store;
+    insert into t(key, value) values ('k0', 'v0');
+    select comment from (select * from t where key = 'k0');
+} {.*no such column.*}
+
+do_execsql_test_on_specific_db {:memory:} select-hidden-column-subquery-2 {
+    create virtual table t using kv_store;
+    insert into t(key, value) values ('k0', 'v0');
+    select * from (select comment from t where key = 'k0');
+} {auto-generated}
+
+do_execsql_test_on_specific_db {:memory:} insert-hidden-column {
+    create virtual table t using kv_store;
+    insert into t(comment, key, value) values ('my comment', 'hidden', 'test');
+    select comment from t where key = 'hidden';
+} {"my comment"}
+
+# hidden columns should be excluded from * expansion
+do_execsql_test_on_specific_db {:memory:} select-star-hidden-column {
+    create virtual table t using kv_store;
+    insert into t(comment, key, value) values ('my comment', 'hidden', 'test');
+    select * from t where key = 'hidden';
+} {hidden|test}
+
+# hidden columns should be excluded from <table name>.* expansion
+do_execsql_test_on_specific_db {:memory:} select-table-star-hidden-column {
+    create virtual table t using kv_store;
+    insert into t(comment, key, value) values ('my comment', 'hidden', 'test');
+    select t.* from t where key = 'hidden';
+} {hidden|test}
+
+do_execsql_test_in_memory_error insert-values-column-count-mismatch {
+    create virtual table t using kv_store;
+    insert into t(comment, key, value) values ('insert_hidden', 'test');
+} {.*2 values for 3 columns.*}
+
+do_execsql_test_on_specific_db {:memory:} update-hidden-column {
+    create virtual table t using kv_store;
+    insert into t(comment, key, value) values ('my comment', 'hidden', 'test');
+    update t set comment = 'updated comment' where key = 'hidden';
+    select comment from t where key = 'hidden';
+} {"updated comment"}
+
+# hidden columns are not listed in the dataset returned by 'PRAGMA table_info'
+do_execsql_test_on_specific_db {:memory:} pragma-table-info-hidden-columns {
+    create virtual table t using kv_store;
+    PRAGMA table_info=t;
+} {0|key|TEXT|0||1
+1|value|TEXT|0||0}
+
+do_execsql_test_on_specific_db {:memory:} group-by-hidden-column {
+    create virtual table t using kv_store;
+    insert into t(key, value) values ('k0', 'v0');
+    insert into t(key, value) values ('k1', 'v1');
+    insert into t(comment, key, value) values ('updated_comment', 'hidden', 'test');
+    select comment, count(*) from t group by comment order by comment;
+} {auto-generated|2
+updated_comment|1}
+
+do_execsql_test_on_specific_db {:memory:} order-by-hidden-column {
+    CREATE VIRTUAL TABLE o USING kv_store;
+    INSERT INTO o(comment, key, value) VALUES ('0', '5', 'a');
+    INSERT INTO o(comment, key, value) VALUES ('1', '4', 'b');
+    INSERT INTO o(comment, key, value) VALUES ('2', '3', 'c');
+    SELECT * FROM o ORDER BY comment;
+} {5|a
+4|b
+3|c}
+
+do_execsql_test_in_memory_error order-by-hidden-column-index {
+    CREATE VIRTUAL TABLE o USING kv_store;
+    INSERT INTO o(comment, key, value) VALUES ('0', '5', 'a');
+    SELECT * FROM o ORDER BY 0;
+} {.*(invalid column index|term out of range).*}
+
+do_execsql_test_on_specific_db {:memory:} order-by-standard-column-index {
+    CREATE VIRTUAL TABLE o USING kv_store;
+    INSERT INTO o(comment, key, value) VALUES ('0', '5', 'a');
+    INSERT INTO o(comment, key, value) VALUES ('1', '4', 'b');
+    INSERT INTO o(comment, key, value) VALUES ('2', '3', 'c');
+    SELECT * FROM o ORDER BY 1;
+} {3|c
+4|b
+5|a}
+
+do_execsql_test_on_specific_db {:memory:} natural-join-hidden-column-1 {
+    CREATE TABLE r (comment, key, value);
+    INSERT INTO r VALUES ('comment0', '2', '3');
+    INSERT INTO r VALUES ('comment1', '4', '5');
+    CREATE VIRTUAL TABLE l USING kv_store;
+    INSERT INTO l(comment, key, value) values ('comment1', '2', '3');
+    SELECT * FROM l NATURAL JOIN r;
+} {2|3|comment0}
+
+do_execsql_test_on_specific_db {:memory:} natural-join-hidden-column-2 {
+    CREATE TABLE r (comment, key, value);
+    INSERT INTO r VALUES ('comment0', '2', '3');
+    INSERT INTO r VALUES ('comment1', '4', '5');
+    CREATE VIRTUAL TABLE l USING kv_store;
+    INSERT INTO l(comment, key, value) values ('comment1', '2', '3');
+    SELECT * FROM r NATURAL JOIN l;
+} {comment0|2|3}
+
+do_execsql_test_on_specific_db {:memory:} join-using-hidden-column {
+    CREATE TABLE r (comment, key, value);
+    INSERT INTO r VALUES ('comment0', '2', '3');
+    INSERT INTO r VALUES ('comment1', '4', '5');
+    CREATE VIRTUAL TABLE l USING kv_store;
+    INSERT INTO l(comment, key, value) values ('comment1', '2', '3');
+    SELECT * FROM l JOIN r USING (comment);
+} {2|3|4|5}
+
+do_execsql_test_on_specific_db {:memory:} join-on-hidden-column {
+    CREATE TABLE r (comment, key, value);
+    INSERT INTO r VALUES ('comment0', '2', '3');
+    INSERT INTO r VALUES ('comment1', '4', '5');
+    CREATE VIRTUAL TABLE l USING kv_store;
+    INSERT INTO l(comment, key, value) values ('comment1', '2', '3');
+    SELECT * FROM l JOIN r ON l.comment = r.comment;
+} {2|3|comment1|4|5}
+
+do_execsql_test_on_specific_db {:memory:} natural-join-hidden-column-multiple-vtabs-1 {
+    CREATE TABLE r (comment, key, value);
+    INSERT INTO r VALUES ('comment0', '2', '3');
+    INSERT INTO r VALUES ('comment1', '4', '5');
+    CREATE VIRTUAL TABLE l USING kv_store;
+    INSERT INTO l(comment, key, value) values ('comment1', '2', '3');
+    SELECT * FROM l NATURAL JOIN r NATURAL JOIN r;
+} {2|3|comment0}
+
+do_execsql_test_on_specific_db {:memory:} natural-join-hidden-column-multiple-vtabs-2 {
+    CREATE TABLE r (comment, key, value);
+    INSERT INTO r VALUES ('comment0', '2', '3');
+    INSERT INTO r VALUES ('comment1', '4', '5');
+    CREATE VIRTUAL TABLE l USING kv_store;
+    INSERT INTO l(comment, key, value) values ('comment1', '2', '3');
+    SELECT * FROM l NATURAL JOIN r NATURAL JOIN l;
+} {2|3|comment0}
+
+do_execsql_test_on_specific_db {:memory:} natural-join-hidden-column-multiple-vtabs-3 {
+    CREATE TABLE r (comment, key, value);
+    INSERT INTO r VALUES ('comment0', '2', '3');
+    INSERT INTO r VALUES ('comment1', '4', '5');
+    CREATE VIRTUAL TABLE l USING kv_store;
+    INSERT INTO l(comment, key, value) values ('comment1', '2', '3');
+    SELECT * FROM r NATURAL JOIN l NATURAL JOIN r;
+} {comment0|2|3}
+
+do_execsql_test_on_specific_db {:memory:} join-using-hidden-column-subquery-1 {
+    CREATE TABLE r (comment, key, value);
+    INSERT INTO r VALUES ('comment0', '2', '3');
+    INSERT INTO r VALUES ('comment1', '4', '5');
+    CREATE VIRTUAL TABLE l USING kv_store;
+    INSERT INTO l(comment, key, value) values ('comment1', '2', '3');
+    SELECT * FROM (SELECT * FROM l JOIN r USING(key, value)) JOIN r USING(comment, key, value);
+} {2|3|comment0}
+
+do_execsql_test_on_specific_db {:memory:} join-using-hidden-column-subquery-2 {
+    CREATE TABLE r (comment, key, value);
+    INSERT INTO r VALUES ('comment0', '2', '3');
+    INSERT INTO r VALUES ('comment1', '4', '5');
+    CREATE VIRTUAL TABLE l USING kv_store;
+    INSERT INTO l(comment, key, value) values ('comment1', '2', '3');
+    SELECT * FROM (SELECT * FROM l NATURAL JOIN r) JOIN r USING(comment, key, value);
+} {2|3|comment0}
+
+do_execsql_test_on_specific_db {:memory:} multiple-join-using-hidden-column {
+    CREATE TABLE r (comment, key, value);
+    INSERT INTO r VALUES ('comment0', '2', '3');
+    INSERT INTO r VALUES ('comment1', '4', '5');
+    CREATE VIRTUAL TABLE l USING kv_store;
+    INSERT INTO l(comment, key, value) values ('comment1', '2', '3');
+    SELECT * FROM l JOIN r USING(key, value) JOIN r USING(comment, key, value);
+} {}
+
+do_execsql_test_on_specific_db {:memory:} natural-join-using-hidden-column {
+    CREATE TABLE r (comment, key, value);
+    INSERT INTO r VALUES ('comment0', '2', '3');
+    INSERT INTO r VALUES ('comment1', '4', '5');
+    CREATE VIRTUAL TABLE l USING kv_store;
+    INSERT INTO l(comment, key, value) values ('comment1', '2', '3');
+    SELECT * FROM l NATURAL JOIN r JOIN r USING(comment, key, value);
+} {}
+
+do_execsql_test tvf-hidden-column-constraints-as-args {
+    SELECT * FROM generate_series WHERE start = 1 AND stop = 10;
+} {1
+2
+3
+4
+5
+6
+7
+8
+9
+10}
+
+do_execsql_test tvf-hidden-column-constraints-as-args-rhs {
+    SELECT * FROM generate_series WHERE 1 = start AND 10 = stop;
+} {1
+2
+3
+4
+5
+6
+7
+8
+9
+10}
+
+do_execsql_test tvf-hidden-column-constraints-as-args-reversed {
+    SELECT * FROM generate_series WHERE stop = 10 AND start = 1;
+} {1
+2
+3
+4
+5
+6
+7
+8
+9
+10}
+
+do_execsql_test tvf-predicate-not-used-as-arg-1 {
+    SELECT * FROM generate_series(1, 10) WHERE value < 5;
+} {1
+2
+3
+4}
+
+do_execsql_test tvf-predicate-not-used-as-arg-2 {
+    SELECT * FROM generate_series WHERE start = 1 AND stop = 10 AND value < 5;
+} {1
+2
+3
+4}
+
+do_execsql_test tvf-multiple-constraints-on-same-column-1 {
+    SELECT * FROM generate_series WHERE start = 1 AND stop = 10 AND start = 5;
+} {}
+
+do_execsql_test tvf-multiple-constraints-on-same-column-2 {
+    SELECT * FROM generate_series WHERE start = 1 AND stop = 10 AND start > 5;
+} {}
+
+do_execsql_test tvf-multiple-constraints-on-same-column-3 {
+    SELECT * FROM generate_series WHERE start = 1 AND stop = 10 AND step = 2;
+} {1
+3
+5
+7
+9}
+
+do_execsql_test_error_content tvf-too-many-args {
+    SELECT * FROM generate_series(1, 10, 2, 3);
+} {too many arguments}
+
+do_execsql_test tvf-join-basic {
+    SELECT a.value a_val, b.value b_val
+    FROM generate_series(1, 3) a
+    JOIN generate_series(1, 1) b ON a.value = b.value;
+} {1|1}
+
+do_execsql_test_on_specific_db {:memory:} insert-into-select-from-tvf {
+    CREATE TABLE target (id integer primary key);
+    INSERT INTO target SELECT * FROM generate_series(1, 5);
+    SELECT * FROM target;
+} {1
+2
+3
+4
+5}
+
+do_execsql_test_on_specific_db {:memory:} tvf-arg-from-left-table-column {
+    CREATE TABLE target (id integer primary key);
+    INSERT INTO target SELECT * FROM generate_series(1, 5);
+
+    SELECT t.id, series.value
+    FROM target t, generate_series(t.id, 3) series
+    WHERE t.id <= 3;
+} {1|1
+1|2
+1|3
+2|2
+2|3
+3|3}
+
+do_execsql_test_on_specific_db {:memory:} tvf-arg-from-right-table-column  {
+    CREATE TABLE target (id integer primary key);
+    INSERT INTO target SELECT * FROM generate_series(1, 5);
+
+    SELECT t.id, series.value
+    FROM generate_series(t.id, 3) series, target t
+    WHERE t.id <= 3;
+} {1|1
+1|2
+1|3
+2|2
+2|3
+3|3}
+
+do_execsql_test tvf-arg-from-left-subquery-column  {
+    SELECT one.value, series.value
+    FROM (SELECT 1 AS value) one, generate_series(one.value, 3) series;
+} {1|1
+1|2
+1|3}
+
+do_execsql_test tvf-arg-from-right-subquery-column {
+    SELECT one.value, series.value
+    FROM generate_series(one.value, 3) series, (SELECT 1 AS value) one;
+} {1|1
+1|2
+1|3}
+
+do_execsql_test tvf-args-from-natural-join-columns {
+    SELECT *
+    FROM generate_series(a.start, a.stop) series
+    NATURAL JOIN (SELECT 1 AS start, 3 AS stop, 2 AS value) a;
+} {2|1|3}
+
+do_execsql_test tvf-args-from-join-using-columns {
+    SELECT *
+    FROM generate_series(a.start, a.stop)
+    JOIN (SELECT 1 AS start, 3 AS stop) a USING (start, stop);
+} {1
+2
+3}
+
+do_execsql_test tvf-args-from-another-tvf {
+    SELECT a.value, b.value
+    FROM generate_series(b.value, b.value+1) a
+    JOIN generate_series(1, 2) b;
+} {1|1
+2|1
+2|2
+3|2}
+
+do_execsql_test_error tvf-circular-column-references {
+    SELECT * FROM generate_series(a.start, a.stop) b, generate_series(b.start, b.stop) a;
+} {No valid query plan found|no query solution}

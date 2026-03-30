@@ -1,0 +1,127 @@
+@database :memory:
+
+test char {
+    select char(108, 105)
+}
+expect {
+    li
+}
+
+test char-nested {
+    select char(106 + 2, 105)
+}
+expect {
+    li
+}
+
+test char-empty {
+    select char()
+}
+expect {
+}
+
+test char-null {
+    select hex(char(null))
+}
+expect {
+    00
+}
+
+test char-non-integer {
+    select char('a')
+}
+expect {
+}
+
+# char() with unicode codepoints >= 256
+test char-unicode-256 {
+    select unicode(char(256))
+}
+expect {
+    256
+}
+
+test char-basic-ascii {
+    SELECT CHAR(65, 66, 67);
+}
+expect {
+    ABC
+}
+
+test char-mixed-case {
+    SELECT CHAR(65, 66, 67, 97, 98, 99);
+}
+expect {
+    ABCabc
+}
+
+test char-unicode-cjk {
+    SELECT CHAR(26085);
+}
+expect {
+    日
+}
+
+test char-unicode-mixed {
+    SELECT CHAR(65, 26085, 67);
+}
+expect {
+    A日C
+}
+
+test char-unicode-emoji {
+    SELECT CHAR(128512);
+}
+expect {
+    😀
+}
+
+test char-nul {
+    SELECT HEX(CHAR(0));
+}
+expect {
+    00
+}
+
+test char-negative-replacement {
+    SELECT CHAR(65, -1, 66);
+}
+expect {
+    A�B
+}
+
+test char-max-codepoint {
+    SELECT HEX(CHAR(1114111));
+}
+expect {
+    F48FBFBF
+}
+
+test char-over-max-replacement {
+    SELECT HEX(CHAR(0x110000));
+}
+expect {
+    EFBFBD
+}
+
+test char-null-produces-nul {
+    SELECT HEX(CHAR(NULL));
+}
+expect {
+    00
+}
+
+test char-null-in-middle {
+    SELECT HEX(CHAR(65, NULL, 66));
+}
+expect {
+    410042
+}
+
+test char-multiple-nulls {
+    SELECT HEX(CHAR(NULL, 65, NULL, NULL, 66, NULL));
+}
+expect {
+    004100004200
+}
+
