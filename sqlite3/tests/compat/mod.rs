@@ -3486,4 +3486,98 @@ mod tests {
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
     }
+
+    unsafe fn exec_sql(db: *mut sqlite3, sql: &std::ffi::CStr, label: &str) {
+        let mut errmsg: *mut libc::c_char = ptr::null_mut();
+        let rc = sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), &mut errmsg);
+        if rc != SQLITE_OK {
+            let msg = if errmsg.is_null() {
+                "unknown".to_string()
+            } else {
+                let s = std::ffi::CStr::from_ptr(errmsg)
+                    .to_string_lossy()
+                    .to_string();
+                sqlite3_free(errmsg as *mut libc::c_void);
+                s
+            };
+            panic!("{label}: sqlite3_exec failed rc={rc}: {msg}");
+        }
+    }
+
+    #[test]
+    fn test_schema_cookie_stays_in_sync_after_multiple_ddl() {
+        unsafe {
+            let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+            let path = std::ffi::CString::new(temp_file.path().to_str().unwrap()).unwrap();
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+
+            exec_sql(
+                db,
+                c"CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY, run_on TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+                "create migrations table",
+            );
+
+            let mut cached_insert: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"INSERT INTO schema_migrations (version) VALUES (?)".as_ptr(),
+                    -1,
+                    &mut cached_insert,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK,
+                "prepare cached INSERT failed"
+            );
+
+            for i in 0..10 {
+                exec_sql(db, c"BEGIN", &format!("begin migration {i}"));
+
+                let create_sql = std::ffi::CString::new(format!(
+                    "CREATE TABLE t{i} (id INTEGER PRIMARY KEY, val TEXT, extra INTEGER DEFAULT 0)"
+                ))
+                .unwrap();
+                exec_sql(db, &create_sql, &format!("create table t{i}"));
+
+                let version = std::ffi::CString::new(format!("000{i}")).unwrap();
+                assert_eq!(sqlite3_reset(cached_insert), SQLITE_OK);
+                assert_eq!(
+                    sqlite3_bind_text(cached_insert, 1, version.as_ptr(), -1, None,),
+                    SQLITE_OK,
+                    "bind version for migration {i}"
+                );
+                let rc = sqlite3_step(cached_insert);
+                assert!(
+                    rc == SQLITE_DONE || rc == SQLITE_ROW,
+                    "cached INSERT during migration {i} failed rc={rc}"
+                );
+
+                exec_sql(db, c"COMMIT", &format!("commit migration {i}"));
+            }
+
+            assert_eq!(sqlite3_finalize(cached_insert), SQLITE_OK);
+
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT val FROM t0".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK,
+                "prepare SELECT after migrations failed"
+            );
+            let rc = sqlite3_step(stmt);
+            assert_eq!(
+                rc, SQLITE_DONE,
+                "SELECT after migrations must succeed, got rc={rc}"
+            );
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
 }
