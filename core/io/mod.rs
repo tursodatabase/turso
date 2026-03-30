@@ -119,6 +119,17 @@ pub enum FileSyncType {
     FullFsync,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedWalLockKind {
+    LinuxOfd,
+    ProcessScopedFcntl,
+}
+
+pub trait SharedWalMappedRegion: Send + Sync {
+    fn ptr(&self) -> NonNull<u8>;
+    fn len(&self) -> usize;
+}
+
 pub trait File: Send + Sync {
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
@@ -182,6 +193,46 @@ pub trait File: Send + Sync {
     // todo: need to add custom completion type?
     fn punch_hole(&self, _pos: usize, _len: usize) -> Result<()> {
         panic!("punch_hole is not supported for the given IO implementation")
+    }
+
+    fn shared_wal_lock_byte(
+        &self,
+        _offset: u64,
+        _exclusive: bool,
+        _kind: SharedWalLockKind,
+    ) -> Result<()> {
+        Err(crate::LimboError::InternalError(
+            "shared WAL coordination byte locking is not supported for this file".into(),
+        ))
+    }
+
+    fn shared_wal_try_lock_byte(
+        &self,
+        _offset: u64,
+        _exclusive: bool,
+        _kind: SharedWalLockKind,
+    ) -> Result<bool> {
+        Err(crate::LimboError::InternalError(
+            "shared WAL coordination byte locking is not supported for this file".into(),
+        ))
+    }
+
+    fn shared_wal_unlock_byte(&self, _offset: u64, _kind: SharedWalLockKind) -> Result<()> {
+        Err(crate::LimboError::InternalError(
+            "shared WAL coordination byte unlocking is not supported for this file".into(),
+        ))
+    }
+
+    fn shared_wal_set_len(&self, _len: u64) -> Result<()> {
+        Err(crate::LimboError::InternalError(
+            "shared WAL coordination resizing is not supported for this file".into(),
+        ))
+    }
+
+    fn shared_wal_map(&self, _offset: u64, _len: usize) -> Result<Box<dyn SharedWalMappedRegion>> {
+        Err(crate::LimboError::InternalError(
+            "shared WAL coordination memory mapping is not supported for this file".into(),
+        ))
     }
 }
 
@@ -269,6 +320,7 @@ bitflags! {
         const None = 0b00000000;
         const Create = 0b0000001;
         const ReadOnly = 0b0000010;
+        const NoLock = 0b0000100;
     }
 }
 
@@ -281,8 +333,17 @@ impl Default for OpenFlags {
 pub trait IO: Clock + Send + Sync {
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>>;
 
+    fn open_shared_wal_file(&self, path: &str) -> Result<Arc<dyn File>> {
+        self.open_file(path, OpenFlags::Create | OpenFlags::NoLock, false)
+    }
+
     // remove_file is used in the sync-engine
     fn remove_file(&self, path: &str) -> Result<()>;
+
+    /// Whether this IO backend can back host-filesystem shared WAL coordination.
+    fn supports_shared_wal_coordination(&self) -> bool {
+        false
+    }
 
     fn step(&self) -> Result<()> {
         Ok(())

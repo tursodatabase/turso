@@ -29,6 +29,8 @@ dist/
 **/*.db-wal
 **/*.db-shm
 **/*-wal
+**/*.db-tshm
+
 # perf
 **/*/Mobibench
 perf/mobibench/plot/results.csv
