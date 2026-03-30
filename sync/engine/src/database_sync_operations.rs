@@ -865,7 +865,8 @@ pub async fn fetch_last_change_id<IO: SyncEngineIo, Ctx>(
         .into(),
     };
 
-    let response = match sql_execute_http(ctx, init_hrana_request).await {
+    let no_ignored_steps = std::collections::HashSet::new();
+    let response = match sql_execute_http(ctx, init_hrana_request, &no_ignored_steps).await {
         Ok(response) => response,
         Err(Error::DatabaseSyncEngineError(err)) if err.contains("no such table") => {
             return Ok((source_pull_gen, None));
@@ -948,6 +949,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
             cond: Box::new(BatchCond::IsAutocommit {}),
         }),
     };
+    let mut ddl_step_indices = std::collections::HashSet::new();
     let mut sql_over_http_requests = vec![
         BatchStep {
             stmt: Stmt {
@@ -1033,6 +1035,10 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
             }
             DatabaseTapeOperation::RowChange(change) => {
                 let replay_info = generator.replay_info(ctx.coro, &change).await?;
+                // for now we try to support DDL statements which "extends" the schema (CREATE INDEX, CREATE TABLE, ALTER TABLE ADD COLUMN) and they have `IF NOT EXISTS` semantic
+                // as ALTER TABLE has no such syntax - we ignore error for such statements from remote for now
+                let is_alter_add_column =
+                    replay_info.is_ddl_replay && is_alter_table_add_column(&replay_info.query);
                 match change.change {
                     DatabaseTapeRowChangeType::Delete { before } => {
                         let values = generator.replay_values(
@@ -1087,6 +1093,9 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
                             .push(step(replay_info.query.clone(), convert_to_args(values)));
                     }
                 }
+                if is_alter_add_column {
+                    ddl_step_indices.insert(sql_over_http_requests.len() - 1);
+                }
             }
         }
     }
@@ -1125,7 +1134,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
         .into(),
     };
 
-    let _ = sql_execute_http(ctx, replay_hrana_request).await?;
+    let _ = sql_execute_http(ctx, replay_hrana_request, &ddl_step_indices).await?;
     tracing::info!("push_logical_changes: rows_changed={:?}", rows_changed);
     Ok((source_pull_gen, last_change_id.unwrap_or(0)))
 }
@@ -1434,6 +1443,7 @@ pub async fn reset_wal_file<Ctx>(
 async fn sql_execute_http<IO: SyncEngineIo, Ctx>(
     ctx: &SyncOperationCtx<'_, IO, Ctx>,
     request: server_proto::PipelineReqBody,
+    ignored_step_indices: &std::collections::HashSet<usize>,
 ) -> Result<Vec<StmtResult>> {
     let body = serde_json::to_vec(&request)?;
 
@@ -1468,10 +1478,16 @@ async fn sql_execute_http<IO: SyncEngineIo, Ctx>(
                     results.push(execute.result);
                 }
                 server_proto::StreamResponse::Batch(batch) => {
-                    if let Some(error) = batch.result.step_errors.into_iter().flatten().next() {
-                        return Err(Error::DatabaseSyncEngineError(format!(
-                            "failed to execute sql: {error:?}"
-                        )));
+                    for (i, error) in batch.result.step_errors.iter().enumerate() {
+                        if let Some(error) = error {
+                            if ignored_step_indices.contains(&i) {
+                                tracing::info!("ignoring step error at index {i}: {error:?}");
+                            } else {
+                                return Err(Error::DatabaseSyncEngineError(format!(
+                                    "failed to execute sql: {error:?}"
+                                )));
+                            }
+                        }
                     }
                     for result in batch.result.step_results.into_iter().flatten() {
                         results.push(result);
@@ -1481,6 +1497,22 @@ async fn sql_execute_http<IO: SyncEngineIo, Ctx>(
         }
     }
     Ok(results)
+}
+
+fn is_alter_table_add_column(sql: &str) -> bool {
+    let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+    let Some(Ok(ast)) = parser.next() else {
+        return false;
+    };
+    matches!(
+        ast,
+        turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::AlterTable(
+            turso_parser::ast::AlterTable {
+                body: turso_parser::ast::AlterTableBody::AddColumn(_),
+                ..
+            }
+        ))
+    )
 }
 
 async fn wal_pull_http<IO: SyncEngineIo, Ctx>(
