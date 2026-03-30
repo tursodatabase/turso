@@ -269,6 +269,7 @@ bitflags! {
         const None = 0b00000000;
         const Create = 0b0000001;
         const ReadOnly = 0b0000010;
+        const NoLock = 0b0000100;
     }
 }
 
@@ -283,6 +284,11 @@ pub trait IO: Clock + Send + Sync {
 
     // remove_file is used in the sync-engine
     fn remove_file(&self, path: &str) -> Result<()>;
+
+    /// Whether this IO backend can back host-filesystem shared WAL coordination.
+    fn supports_shared_wal_coordination(&self) -> bool {
+        true
+    }
 
     fn step(&self) -> Result<()> {
         Ok(())

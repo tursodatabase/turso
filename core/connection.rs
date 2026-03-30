@@ -8,6 +8,7 @@ use crate::sync::{
     Arc, RwLock,
 };
 use crate::turso_assert;
+use crate::types::ImmutableRecord;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
@@ -435,10 +436,10 @@ impl Connection {
             .store(true, Ordering::SeqCst);
     }
 
-    /// Parse schema from scratch if version of schema for the connection differs from the schema cookie in the root page
-    /// This function must be called outside of any transaction because internally it will start transaction session by itself
-    #[allow(dead_code)]
-    fn maybe_reparse_schema(self: &Arc<Connection>) -> Result<()> {
+    /// Parse schema from scratch if version of schema for the connection differs from the schema cookie in the root page.
+    /// This function must be called outside of any transaction because internally it will start transaction session by itself.
+    /// In multi-process mode, this is the only way to discover schema changes made by other processes.
+    pub fn maybe_reparse_schema(self: &Arc<Connection>) -> Result<()> {
         let pager = self.pager.load().clone();
 
         // first, quickly read schema_version from the root page in order to check if schema changed
@@ -472,10 +473,12 @@ impl Connection {
             return Ok(());
         }
         // maybe_reparse_schema must be called outside of any transaction
-        turso_assert!(
-            self.get_tx_state() == TransactionState::None,
-            "unexpected start transaction"
-        );
+        // because internally it starts a read transaction to read sqlite_schema.
+        if self.get_tx_state() != TransactionState::None {
+            // Inside an explicit transaction, we can't reload — the caller
+            // should handle SchemaUpdated by rolling back first.
+            return Ok(());
+        }
         // start read transaction manually, because we will read schema cookie once again and
         // we must be sure that it will consistent with schema content
         //
@@ -522,6 +525,24 @@ impl Connection {
         // TODO: We may not need to do this if we materialize our views.
         let existing_views = self.schema.read().incremental_views.clone();
 
+        // Capture built-in table-valued functions (e.g. generate_series, json_each)
+        // before dropping the old schema. These are registered programmatically and
+        // don't survive re-parsing from sqlite_schema alone.
+        let table_valued_functions: Vec<_> = self
+            .schema
+            .read()
+            .tables
+            .values()
+            .filter_map(|table| match table.as_ref() {
+                crate::schema::Table::Virtual(vtab)
+                    if matches!(vtab.kind, turso_ext::VTabKind::TableValuedFunction) =>
+                {
+                    Some(vtab.clone())
+                }
+                _ => None,
+            })
+            .collect();
+
         // TODO: this is hack to avoid a cyclical problem with schema reprepare
         // The problem here is that we prepare a statement here, but when the statement tries
         // to execute it, it first checks the schema cookie to see if it needs to reprepare the statement.
@@ -541,6 +562,15 @@ impl Connection {
         };
         // TODO: This function below is synchronous, make it async
         parse_schema_rows(stmt, &mut fresh, &self.syms.read(), mv_tx, existing_views)?;
+
+        // Rehydrate built-in table-valued functions that were captured above.
+        for vtab in &table_valued_functions {
+            let normalized = crate::util::normalize_ident(&vtab.name);
+            fresh
+                .tables
+                .entry(normalized)
+                .or_insert_with(|| Arc::new(crate::schema::Table::Virtual(vtab.clone())));
+        }
 
         // Load custom types from __turso_internal_types if the table exists
         // and custom types are enabled. Type loading errors are non-fatal: we log
@@ -748,12 +778,12 @@ impl Connection {
             (Some(_), None) => {
                 return Err(LimboError::InvalidArgument(
                     "hexkey is required when cipher is provided".to_string(),
-                ))
+                ));
             }
             (None, Some(_)) => {
                 return Err(LimboError::InvalidArgument(
                     "cipher is required when hexkey is provided".to_string(),
-                ))
+                ));
             }
             (None, None) => None,
         };
@@ -796,12 +826,12 @@ impl Connection {
             (Some(_), None) => {
                 return Err(LimboError::InvalidArgument(
                     "hexkey is required when cipher is provided".to_string(),
-                ))
+                ));
             }
             (None, Some(_)) => {
                 return Err(LimboError::InvalidArgument(
                     "cipher is required when hexkey is provided".to_string(),
-                ))
+                ));
             }
             (None, None) => None,
         };
@@ -1176,7 +1206,18 @@ impl Connection {
             }
         }
 
-        if self.db.n_connections.fetch_sub(1, Ordering::SeqCst).eq(&1) && !self.db.is_readonly() {
+        let is_memory_db = self.db.path == ":memory:"
+            || self.db.path.starts_with("file::memory:")
+            || self.db.path.is_empty();
+        let should_checkpoint_on_close = pager
+            .wal
+            .as_ref()
+            .map_or(true, |wal| wal.should_checkpoint_on_close());
+        if self.db.n_connections.fetch_sub(1, Ordering::SeqCst).eq(&1)
+            && !self.db.is_readonly()
+            && !is_memory_db
+            && should_checkpoint_on_close
+        {
             self.pager.load().checkpoint_shutdown(
                 self.is_wal_auto_checkpoint_disabled(),
                 self.get_sync_mode(),
@@ -1879,6 +1920,37 @@ impl Connection {
         self.bump_prepare_context_generation();
 
         Ok(())
+    }
+
+    pub(crate) fn capture_sqlite_schema_rows(
+        self: &Arc<Connection>,
+    ) -> Result<HashMap<i64, ImmutableRecord>> {
+        let mut schema_rows = HashMap::default();
+        if let Some(mut stmt) = self.query(
+            "SELECT rowid, type, name, tbl_name, rootpage, sql FROM sqlite_schema ORDER BY rowid",
+        )? {
+            stmt.run_with_row_callback(|row| {
+                let rowid = row.get::<i64>(0)?;
+                let row_type = row.get::<String>(1)?;
+                let name = row.get::<String>(2)?;
+                let table_name = row.get::<String>(3)?;
+                let root_page = row.get::<i64>(4)?;
+                let sql = row.get::<String>(5).ok();
+                let record = ImmutableRecord::from_values(
+                    &[
+                        Value::build_text(row_type),
+                        Value::build_text(name),
+                        Value::build_text(table_name),
+                        Value::from_i64(root_page),
+                        sql.map(Value::build_text).unwrap_or(Value::Null),
+                    ],
+                    5,
+                );
+                schema_rows.insert(rowid, record);
+                Ok(())
+            })?;
+        }
+        Ok(schema_rows)
     }
 
     // Detach a database by alias name
