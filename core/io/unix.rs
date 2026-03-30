@@ -3,8 +3,8 @@ use crate::error::{io_error, CompletionError, LimboError};
 use crate::io::clock::{Clock, DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::common;
 use crate::io::FileSyncType;
-use crate::Result;
 use crate::sync::Mutex;
+use crate::Result;
 use rustix::{
     fd::{AsFd, AsRawFd},
     fs::{self, FlockOperation},
@@ -107,9 +107,10 @@ impl IO for UnixIO {
         #[allow(clippy::arc_with_non_send_sync)]
         let unix_file = Arc::new(UnixFile {
             file: Arc::new(Mutex::new(file)),
+            path: path.to_string(),
         });
         if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
-            && !flags.contains(OpenFlags::ReadOnly)
+            && !flags.intersects(OpenFlags::ReadOnly | OpenFlags::NoLock)
         {
             unix_file.lock_file(true)?;
         }
@@ -129,6 +130,7 @@ impl IO for UnixIO {
 
 pub struct UnixFile {
     file: Arc<Mutex<std::fs::File>>,
+    path: String,
 }
 
 impl File for UnixFile {
@@ -148,10 +150,11 @@ impl File for UnixFile {
         .map_err(|e| {
             let io_error = std::io::Error::from(e);
             let message = match io_error.kind() {
-                ErrorKind::WouldBlock => {
-                    "Failed locking file. File is locked by another process".to_string()
-                }
-                _ => format!("Failed locking file, {io_error}"),
+                ErrorKind::WouldBlock => format!(
+                    "Failed locking file '{}'. File is locked by another process",
+                    self.path
+                ),
+                _ => format!("Failed locking file '{}', {io_error}", self.path),
             };
             LimboError::LockingError(message)
         })?;
