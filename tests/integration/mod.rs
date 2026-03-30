@@ -10,6 +10,7 @@ mod integrity_check;
 mod mvcc;
 mod pragma;
 mod query_processing;
+mod query_timeout;
 mod statement_reset;
 mod stmt_journal;
 mod storage;

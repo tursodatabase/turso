@@ -241,6 +241,7 @@ impl SyncEngine {
                 file_must_exist: None,
                 readonly: None,
                 timeout: None,
+                default_query_timeout: None,
                 tracing: opts.tracing.clone(),
                 experimental: None,
                 encryption: None, // Local encryption not supported in sync mode
