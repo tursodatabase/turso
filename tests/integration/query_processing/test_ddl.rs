@@ -182,3 +182,20 @@ fn test_fail_not_null_in_upsert(tmp_db: TempDatabase) -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// test which simulation situation when prepared statement is used within a transaction which changed schema itself
+/// in this case DB must not use database schema - but instead use connection schema
+#[turso_macros::test]
+fn test_prepared_stmt_reprepare_ddl_change_txn(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t(x);")?;
+    let mut stmt = conn.prepare("INSERT INTO t VALUES (1)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("CREATE TABLE q(x)").unwrap();
+    stmt.run_ignore_rows().unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    Ok(())
+}
