@@ -1600,12 +1600,154 @@ impl Connection {
         }
     }
 
-    #[cfg(feature = "fs")]
     fn is_attached(&self, alias: &str) -> bool {
         self.attached_databases
             .read()
             .name_to_index
             .contains_key(alias)
+    }
+
+    /// Returns the reserved-space value inherited from the main connection's pager.
+    /// (This reads the main database pager, not the pager of db to be attached)
+    fn inherited_reserved_space_for_fresh_attach(&self) -> u8 {
+        let pager = self.pager.load();
+        pager
+            .get_reserved_space()
+            .unwrap_or_else(|| pager.io_ctx.read().get_reserved_space_bytes())
+    }
+
+    /// Returns the minimum reserved space required by the attached pager's own IO context.
+    /// This is used as a floor so inherited or explicit values cannot undercut the attached DB.
+    fn minimum_reserved_space_for_fresh_attach(pager: &Pager) -> u8 {
+        pager
+            .get_reserved_space()
+            .unwrap_or(0)
+            .max(pager.io_ctx.read().get_reserved_space_bytes())
+    }
+
+    fn database_has_existing_wal_state(db: &Database) -> bool {
+        let shared_wal = db.shared_wal.read();
+        shared_wal.page_size() != 0 || shared_wal.last_checksum_and_max_frame().1 != 0
+    }
+
+    fn install_database_wal_on_pager(db: &Arc<Database>, pager: &mut Arc<Pager>) {
+        let shared_wal = db.shared_wal.clone();
+        let last_checksum_and_max_frame = shared_wal.read().last_checksum_and_max_frame();
+        let wal = Arc::new(crate::storage::wal::WalFile::new(
+            db.io.clone(),
+            shared_wal,
+            last_checksum_and_max_frame,
+            db.buffer_pool.clone(),
+        ));
+
+        let pager = Arc::get_mut(pager)
+            .expect("fresh attached pager must not be shared before bootstrap or publication");
+        pager.set_wal(wal);
+    }
+
+    fn set_mvcc_journal_mode_fresh_db(pager: &Pager) -> Result<()> {
+        turso_assert!(!pager.db_initialized());
+        pager.set_initial_journal_version(crate::storage::sqlite3_ondisk::Version::Mvcc)
+    }
+
+    fn validate_attach_target(db: &Database, is_fresh: bool, alias: &str) -> Result<()> {
+        if is_fresh && Self::database_has_existing_wal_state(db) {
+            return Err(LimboError::InvalidArgument(format!(
+                "cannot attach database '{alias}': main database file is uninitialized but WAL state exists"
+            )));
+        }
+
+        if is_fresh && db.is_readonly() {
+            return Err(LimboError::InvalidArgument(format!(
+                "cannot attach database '{alias}': fresh read-only databases cannot be initialized during attach"
+            )));
+        }
+        Ok(())
+    }
+
+    fn apply_page_layout_to_fresh_attach_db(
+        &self,
+        alias: &str,
+        attached_db_pager: &Pager,
+        reserved_space: Option<u8>,
+    ) -> Result<()> {
+        let target_page_size = self.get_page_size();
+        let attached_min_reserved_space =
+            Self::minimum_reserved_space_for_fresh_attach(attached_db_pager);
+        let target_reserved_space = match reserved_space {
+            Some(space) => {
+                // this happens reserved_space is explicitly passed along with encryption or checksum
+                if space < attached_min_reserved_space {
+                    return Err(LimboError::InvalidArgument(format!(
+                        "cannot attach database '{alias}': reserved space {space} is smaller than attached database minimum {attached_min_reserved_space}"
+                    )));
+                }
+                Some(space)
+            }
+            None => Some(
+                self.inherited_reserved_space_for_fresh_attach()
+                    .max(attached_min_reserved_space),
+            ),
+        };
+
+        attached_db_pager.set_initial_page_size(target_page_size)?;
+        if let Some(reserved_space) = target_reserved_space {
+            attached_db_pager.set_reserved_space_bytes(reserved_space);
+        }
+        Ok(())
+    }
+
+    fn reject_initialized_attach_mismatches(
+        &self,
+        alias: &str,
+        db: &Database,
+        pager: &Pager,
+    ) -> Result<()> {
+        // Reject incompatible journal modes for initialized attached databases:
+        // we cannot silently convert the header (the user may have attached read-only).
+        if self.mvcc_enabled() != db.mvcc_enabled() {
+            let main_mode = if self.mvcc_enabled() { "MVCC" } else { "WAL" };
+            let attached_mode = if db.mvcc_enabled() { "MVCC" } else { "WAL" };
+            return Err(LimboError::InvalidArgument(format!(
+                "cannot attach database '{alias}': main database uses {main_mode} journal mode \
+                 but attached database uses {attached_mode}. Both must use the same journal mode."
+            )));
+        }
+
+        // Reject mismatched page sizes: ephemeral tables and cross-database
+        // operations assume a uniform page size across all attached databases.
+        let main_pager = self.pager.load();
+        if let (Some(main_ps), Some(attached_ps)) =
+            (main_pager.get_page_size(), pager.get_page_size())
+        {
+            if main_ps != attached_ps {
+                return Err(LimboError::InvalidArgument(format!(
+                    "cannot attach database '{alias}': page size mismatch \
+                     (main={main_ps:?}, attached={attached_ps:?})"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn reject_unsupported_fresh_mvcc_attach_durable_storage(
+        &self,
+        alias: &str,
+        db: &Database,
+        attached_is_fresh: bool,
+    ) -> Result<()> {
+        if attached_is_fresh
+            && self.mvcc_enabled()
+            && self.db.durable_storage.is_some()
+            && db.durable_storage.is_none()
+        {
+            return Err(LimboError::InvalidArgument(format!(
+                "cannot attach database '{alias}': fresh MVCC attach does not support inheriting custom durable storage"
+            )));
+        }
+
+        Ok(())
     }
 
     /// Attach a database file with the given alias name
@@ -1616,9 +1758,43 @@ impl Connection {
         )));
     }
 
+    #[cfg(not(feature = "fs"))]
+    pub(crate) fn attach_database_with_config(
+        &self,
+        _path: &str,
+        _alias: &str,
+        _reserved_space: Option<u8>,
+    ) -> Result<()> {
+        // File-backed ATTACH is unavailable without `fs`, so pre-initialization
+        // page-layout overrides are also unsupported in this build.
+        self.attach_database(_path, _alias)
+    }
+
     /// Attach a database file with the given alias name
     #[cfg(feature = "fs")]
     pub(crate) fn attach_database(&self, path: &str, alias: &str) -> Result<()> {
+        self.attach_database_inner(path, alias, None)
+    }
+
+    /// Attach a database file with an optional pre-initialization reserved-space override.
+    #[cfg(feature = "fs")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn attach_database_with_config(
+        &self,
+        path: &str,
+        alias: &str,
+        reserved_space: Option<u8>,
+    ) -> Result<()> {
+        self.attach_database_inner(path, alias, reserved_space)
+    }
+
+    #[cfg(feature = "fs")]
+    fn attach_database_inner(
+        &self,
+        path: &str,
+        alias: &str,
+        reserved_space: Option<u8>,
+    ) -> Result<()> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
@@ -1636,12 +1812,11 @@ impl Connection {
             )));
         }
 
-        let use_views = self.db.experimental_views_enabled();
-        let use_custom_types = self.db.experimental_custom_types_enabled();
-
         let db_opts = DatabaseOpts::new()
-            .with_views(use_views)
-            .with_custom_types(use_custom_types);
+            .with_views(self.db.experimental_views_enabled())
+            .with_custom_types(self.db.experimental_custom_types_enabled())
+            .with_index_method(self.db.experimental_index_method_enabled())
+            .with_generated_columns(self.db.experimental_generated_columns_enabled());
         // Select the IO layer for the attached database:
         // - :memory: databases always get a fresh MemoryIO
         // - File-based databases reuse the parent's IO when the parent is also
@@ -1659,18 +1834,36 @@ impl Connection {
         };
         let main_db_flags = self.db.open_flags;
         let (db, encryption_opts) = Self::from_uri_attached(path, db_opts, main_db_flags, io)?;
+        let attached_is_fresh = !db.initialized();
+        if !is_memory_db {
+            Self::validate_attach_target(&db, attached_is_fresh, alias)?;
+        }
+        self.reject_unsupported_fresh_mvcc_attach_durable_storage(alias, &db, attached_is_fresh)?;
+
         // Build encryption key from URI opts to pass to _init for decrypting page 1.
         let encryption_key = if let Some(ref enc) = encryption_opts {
             Some(EncryptionKey::from_hex_string(&enc.hexkey)?)
         } else {
             None
         };
-        let pager = Arc::new(db._init(encryption_key.as_ref())?);
-        // In-memory attached databases inherit the main database's journal mode.
-        // A fresh :memory: DB defaults to WAL, so when main is MVCC we need to
-        // create an MvStore for the attached DB so it runs in the same mode.
-        if is_memory_db && self.mvcc_enabled() && !db.mvcc_enabled() {
-            let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
+        let mut pager = Arc::new(db._init(encryption_key.as_ref())?);
+
+        if !attached_is_fresh {
+            self.reject_initialized_attach_mismatches(alias, &db, &pager)?;
+            self.attached_databases.write().insert(alias, (db, pager));
+            self.bump_prepare_context_generation();
+            return Ok(());
+        }
+
+        self.apply_page_layout_to_fresh_attach_db(alias, &pager, reserved_space)?;
+
+        // Fresh attached databases inherit the main connection's journal mode.
+        // The header must be normalized before page 1 allocation so the first
+        // write and MVCC bootstrap agree on the target mode.
+        if self.mvcc_enabled() && !db.mvcc_enabled() {
+            Self::set_mvcc_journal_mode_fresh_db(&pager)?;
+            Self::install_database_wal_on_pager(&db, &mut pager);
+            // todo(v): pass required encryption ctx to enable encryption with mvcc
             let mv_store = journal_mode::open_mv_store(
                 db.io.clone(),
                 &db.path,
@@ -1681,29 +1874,6 @@ impl Connection {
             db.mv_store.store(Some(mv_store.clone()));
             let bootstrap_conn = db._connect(true, Some(pager.clone()), encryption_key)?;
             mv_store.bootstrap(bootstrap_conn)?;
-        }
-        // Reject incompatible journal modes for file-based databases: we cannot
-        // silently convert the header (the user may have attached read-only).
-        if self.mvcc_enabled() != db.mvcc_enabled() {
-            let main_mode = if self.mvcc_enabled() { "MVCC" } else { "WAL" };
-            let attached_mode = if db.mvcc_enabled() { "MVCC" } else { "WAL" };
-            return Err(LimboError::InvalidArgument(format!(
-                "cannot attach database '{alias}': main database uses {main_mode} journal mode \
-                 but attached database uses {attached_mode}. Both must use the same journal mode."
-            )));
-        }
-        // Reject mismatched page sizes: ephemeral tables and cross-database
-        // operations assume a uniform page size across all attached databases.
-        let main_pager = self.pager.load();
-        if let (Some(main_ps), Some(attached_ps)) =
-            (main_pager.get_page_size(), pager.get_page_size())
-        {
-            if main_ps != attached_ps {
-                return Err(LimboError::InvalidArgument(format!(
-                    "cannot attach database '{alias}': page size mismatch \
-                     (main={main_ps:?}, attached={attached_ps:?})"
-                )));
-            }
         }
         self.attached_databases.write().insert(alias, (db, pager));
         self.bump_prepare_context_generation();
@@ -2349,5 +2519,109 @@ impl SymbolTable {
         for (name, module) in &other.index_methods {
             self.index_methods.insert(name.clone(), module.clone());
         }
+    }
+}
+
+#[cfg(all(test, feature = "fs"))]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn open_connection(path: &std::path::Path) -> Arc<Connection> {
+        let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            path.to_str().unwrap(),
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+        )
+        .unwrap();
+        db.connect().unwrap()
+    }
+
+    // given a attached 'alias', return the Database and Pager for that attached database
+    fn attached_entry(conn: &Connection, alias: &str) -> (Arc<Database>, Arc<Pager>) {
+        let catalog = conn.attached_databases.read();
+        let index = *catalog.name_to_index.get(alias).unwrap();
+        catalog.index_to_data.get(&index).unwrap().clone()
+    }
+
+    #[test]
+    fn test_attach_database_with_config_overrides_reserved_space_before_initialization() {
+        let temp_dir = TempDir::new().unwrap();
+        let main_path = temp_dir.path().join("main.db");
+        let aux_path = temp_dir.path().join("aux.db");
+        let conn = open_connection(&main_path);
+
+        conn.attach_database_with_config(aux_path.to_str().unwrap(), "aux", Some(48))
+            .unwrap();
+
+        let (attached_db, pager) = attached_entry(&conn, "aux");
+        assert!(!attached_db.initialized());
+        assert!(!pager.db_initialized());
+        assert_eq!(pager.get_reserved_space(), Some(48));
+    }
+
+    #[cfg(feature = "checksum")]
+    #[test]
+    fn test_attach_database_with_config_rejects_reserved_space_below_minimum() {
+        let temp_dir = TempDir::new().unwrap();
+        let main_path = temp_dir.path().join("main.db");
+        let aux_path = temp_dir.path().join("aux.db");
+        let conn = open_connection(&main_path);
+
+        let err = conn
+            .attach_database_with_config(aux_path.to_str().unwrap(), "aux", Some(0))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "Invalid argument supplied: cannot attach database 'aux': reserved space 0 is smaller than attached database minimum 8"
+        );
+    }
+
+    #[test]
+    fn test_fresh_mvcc_attach_installs_wal_before_bootstrap() {
+        // this is a test to check that mvcc db on attach with a fresh db, makes the
+        // attached db also mvcc
+        let temp_dir = TempDir::new().unwrap();
+        let main_path = temp_dir.path().join("main.db");
+        let aux_path = temp_dir.path().join("aux.db");
+        let conn = open_connection(&main_path);
+
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.attach_database(aux_path.to_str().unwrap(), "aux")
+            .unwrap();
+
+        let (attached_db, pager) = attached_entry(&conn, "aux");
+        assert!(attached_db.get_mv_store().as_ref().is_some());
+        assert!(pager.has_wal());
+
+        conn.execute("CREATE TABLE aux.t(x INTEGER)").unwrap();
+        conn.execute("INSERT INTO aux.t VALUES(1)").unwrap();
+        conn.execute("PRAGMA aux.wal_checkpoint(TRUNCATE)").unwrap();
+    }
+
+    #[test]
+    fn test_fresh_mvcc_attach_reuses_database_shared_wal() {
+        let temp_dir = TempDir::new().unwrap();
+        let main_path = temp_dir.path().join("main.db");
+        let aux_path = temp_dir.path().join("aux.db");
+        let conn = open_connection(&main_path);
+
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.attach_database(aux_path.to_str().unwrap(), "aux")
+            .unwrap();
+        conn.execute("CREATE TABLE aux.t(x INTEGER)").unwrap();
+        conn.execute("INSERT INTO aux.t VALUES(1)").unwrap();
+
+        let (attached_db, pager) = attached_entry(&conn, "aux");
+        let pager_shared_ptr = pager
+            .wal_shared_ptr()
+            .expect("fresh MVCC attach must expose WAL shared state in tests");
+        let db_shared_ptr = Arc::as_ptr(&attached_db.shared_wal) as usize;
+
+        assert_eq!(pager_shared_ptr, db_shared_ptr);
     }
 }
