@@ -1,7 +1,6 @@
 use crate::sync::Arc;
 
 #[cfg(all(unix, target_pointer_width = "64"))]
-use crate::storage::shared_wal_coordination::MappedSharedWalCoordination;
 use crate::storage::sqlite3_ondisk::Version;
 use crate::{mvcc, LimboError, MvStore, OpenFlags, Result, IO};
 

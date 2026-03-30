@@ -2107,19 +2107,7 @@ impl Program {
     }
 
     fn rollback_current_txn(&self, pager: &Arc<Pager>) {
-        if let Some(mv_store) = self.connection.mv_store().as_ref() {
-            if let Some(tx_id) = self.connection.get_mv_tx_id() {
-                self.connection.auto_commit.store(true, Ordering::SeqCst);
-                mv_store.rollback_tx(tx_id, pager.clone(), &self.connection, crate::MAIN_DB_ID);
-            }
-            pager.end_read_tx();
-            self.connection.rollback_attached_mvcc_txs(true);
-        } else {
-            pager.rollback_tx(&self.connection);
-            self.connection.auto_commit.store(true, Ordering::SeqCst);
-        }
-        self.connection.rollback_attached_wal_txns();
-        self.connection.set_tx_state(TransactionState::None);
+        self.connection.rollback_current_txn_state(pager, true);
     }
 
     pub fn is_trigger_subprogram(&self) -> bool {

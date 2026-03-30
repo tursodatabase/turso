@@ -60,6 +60,18 @@ fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
 }
 
 #[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
+fn get_rows_without_schema_retry(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
+    let mut stmt = conn.prepare(query).unwrap();
+    let mut rows = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        rows.push(row.get_values().cloned().collect::<Vec<_>>());
+        Ok(())
+    })
+    .unwrap();
+    rows
+}
+
+#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 fn run_checkpoint(conn: &Arc<Connection>, mode: CheckpointMode) -> CheckpointResult {
     let pager = conn.pager.load();
     pager
@@ -178,6 +190,65 @@ fn database_open_reuses_valid_exclusive_shm_authority_without_disk_scan() {
 
     let conn_b = db_b.connect().unwrap();
     assert_eq!(count_test_rows(&conn_b), 1);
+}
+
+#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
+#[test]
+fn database_open_reuses_valid_shm_authority_after_clean_last_close_across_repeated_reopens() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-clean-reopen.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let tshm_path = storage::wal::coordination_path_for_wal_path(&format!("{db_path_str}-wal"));
+
+    let db = Database::open_file(io.clone(), db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("insert into test(value) values ('persisted')")
+        .unwrap();
+    wait_for_file(std::path::Path::new(&tshm_path));
+    let initial_tshm_len = std::fs::metadata(&tshm_path).unwrap().len();
+    assert!(
+        initial_tshm_len > 0,
+        "clean last-close coverage requires a persisted non-empty tshm file"
+    );
+
+    drop(conn);
+    drop(db);
+    let mut manager = DATABASE_MANAGER.lock();
+    manager.clear();
+    drop(manager);
+
+    for cycle in 0..3 {
+        let reopened = Database::open_file(io.clone(), db_path_str).unwrap();
+        assert!(
+            !reopened
+                .shared_wal
+                .read()
+                .metadata
+                .loaded_from_disk_scan
+                .load(Ordering::Acquire),
+            "cold reopen cycle {cycle} should reuse validated tshm authority without a WAL disk scan"
+        );
+
+        let reopened_conn = reopened.connect().unwrap();
+        assert_eq!(
+            count_test_rows(&reopened_conn),
+            1,
+            "cold reopen cycle {cycle} should preserve committed rows"
+        );
+        assert!(
+            std::fs::metadata(&tshm_path).unwrap().len() >= initial_tshm_len,
+            "cold reopen cycle {cycle} should keep tshm persisted on disk"
+        );
+
+        drop(reopened_conn);
+        drop(reopened);
+        let mut manager = DATABASE_MANAGER.lock();
+        manager.clear();
+        drop(manager);
+    }
 }
 
 #[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
@@ -647,7 +718,7 @@ fn subprocess_database_open_peer_refreshes_remote_schema_without_reopen() {
         String::from_utf8_lossy(&schema_output.stderr)
     );
 
-    let schema_rows = get_rows(
+    let schema_rows = get_rows_without_schema_retry(
         &conn,
         "select name, type from sqlite_schema where name = 'child_table'",
     );
@@ -655,7 +726,7 @@ fn subprocess_database_open_peer_refreshes_remote_schema_without_reopen() {
     assert_eq!(schema_rows[0][0].to_string(), "child_table");
     assert_eq!(schema_rows[0][1].to_string(), "table");
 
-    let child_rows = get_rows(&conn, "select value from child_table");
+    let child_rows = get_rows_without_schema_retry(&conn, "select value from child_table");
     assert_eq!(child_rows.len(), 1);
     assert_eq!(child_rows[0][0].to_string(), "child-schema");
 

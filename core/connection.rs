@@ -442,6 +442,13 @@ impl Connection {
     pub fn maybe_reparse_schema(self: &Arc<Connection>) -> Result<()> {
         let pager = self.pager.load().clone();
 
+        // maybe_reparse_schema must be called outside any explicit transaction
+        // because it starts its own read transaction to load a fresh view of
+        // sqlite_schema from disk.
+        if self.get_tx_state() != TransactionState::None {
+            return Ok(());
+        }
+
         // first, quickly read schema_version from the root page in order to check if schema changed
         pager.begin_read_tx()?;
         let on_disk_schema_version = pager
@@ -470,13 +477,6 @@ impl Connection {
         );
         // if schema_versions matches - exit early
         if db_schema_version == on_disk_schema_version {
-            return Ok(());
-        }
-        // maybe_reparse_schema must be called outside of any transaction
-        // because internally it starts a read transaction to read sqlite_schema.
-        if self.get_tx_state() != TransactionState::None {
-            // Inside an explicit transaction, we can't reload — the caller
-            // should handle SchemaUpdated by rolling back first.
             return Ok(());
         }
         // start read transaction manually, because we will read schema cookie once again and
@@ -1922,37 +1922,6 @@ impl Connection {
         Ok(())
     }
 
-    pub(crate) fn capture_sqlite_schema_rows(
-        self: &Arc<Connection>,
-    ) -> Result<HashMap<i64, ImmutableRecord>> {
-        let mut schema_rows = HashMap::default();
-        if let Some(mut stmt) = self.query(
-            "SELECT rowid, type, name, tbl_name, rootpage, sql FROM sqlite_schema ORDER BY rowid",
-        )? {
-            stmt.run_with_row_callback(|row| {
-                let rowid = row.get::<i64>(0)?;
-                let row_type = row.get::<String>(1)?;
-                let name = row.get::<String>(2)?;
-                let table_name = row.get::<String>(3)?;
-                let root_page = row.get::<i64>(4)?;
-                let sql = row.get::<String>(5).ok();
-                let record = ImmutableRecord::from_values(
-                    &[
-                        Value::build_text(row_type),
-                        Value::build_text(name),
-                        Value::build_text(table_name),
-                        Value::from_i64(root_page),
-                        sql.map(Value::build_text).unwrap_or(Value::Null),
-                    ],
-                    5,
-                );
-                schema_rows.insert(rowid, record);
-                Ok(())
-            })?;
-        }
-        Ok(schema_rows)
-    }
-
     // Detach a database by alias name
     pub(crate) fn detach_database(&self, alias: &str) -> Result<()> {
         if self.is_closed() {
@@ -2463,6 +2432,32 @@ impl Connection {
         for (_, attached_pager) in &wal_pagers {
             attached_pager.rollback_attached();
         }
+    }
+
+    /// Roll back the current main-db transaction state and any attached-db
+    /// transaction state on this connection.
+    pub(crate) fn rollback_current_txn_state(
+        &self,
+        pager: &Arc<Pager>,
+        clear_attached_schemas: bool,
+    ) {
+        if let Some(mv_store) = self.mv_store().as_ref() {
+            if let Some(tx_id) = self.get_mv_tx_id() {
+                self.auto_commit.store(true, Ordering::SeqCst);
+                if mv_store.is_tx_rollbackable(tx_id) {
+                    mv_store.rollback_tx(tx_id, pager.clone(), self, crate::MAIN_DB_ID);
+                } else {
+                    self.set_mv_tx(None);
+                }
+            }
+            pager.end_read_tx();
+            self.rollback_attached_mvcc_txs(clear_attached_schemas);
+        } else {
+            pager.rollback_tx(self);
+            self.auto_commit.store(true, Ordering::SeqCst);
+        }
+        self.rollback_attached_wal_txns();
+        self.set_tx_state(TransactionState::None);
     }
 
     /// Iterate over all attached MVCC transactions, calling `f(db_id, tx_id)` for each.
