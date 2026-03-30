@@ -1,8 +1,8 @@
-import { 
-  executeCursor, 
+import {
+  executeCursor,
   executePipeline,
-  encodeValue, 
-  decodeValue, 
+  encodeValue,
+  decodeValue,
   type CursorRequest,
   type CursorResponse,
   type CursorEntry,
@@ -11,6 +11,7 @@ import {
   type CloseRequest,
   type DescribeRequest,
   type DescribeResult,
+  type QueryOptions,
   type NamedArg,
   type Value
 } from './protocol.js';
@@ -29,6 +30,8 @@ export interface SessionConfig {
    * to enable access to encrypted Turso Cloud databases.
    */
   remoteEncryptionKey?: string;
+  /** Default maximum query execution time in milliseconds before interruption. */
+  defaultQueryTimeout?: number;
 }
 
 function normalizeUrl(url: string): string {
@@ -55,13 +58,21 @@ export class Session {
     this.baseUrl = normalizeUrl(config.url);
   }
 
+  private createAbortSignal(queryOptions?: QueryOptions): AbortSignal | undefined {
+    const timeout = queryOptions?.queryTimeout ?? this.config.defaultQueryTimeout;
+    if (timeout != null && timeout > 0) {
+      return AbortSignal.timeout(timeout);
+    }
+    return undefined;
+  }
+
   /**
    * Describe a SQL statement to get its column metadata.
    * 
    * @param sql - The SQL statement to describe
    * @returns Promise resolving to the statement description
    */
-  async describe(sql: string): Promise<DescribeResult> {
+  async describe(sql: string, queryOptions?: QueryOptions): Promise<DescribeResult> {
     const request: PipelineRequest = {
       baton: this.baton,
       requests: [{
@@ -70,7 +81,7 @@ export class Session {
       } as DescribeRequest]
     };
 
-    const response = await executePipeline(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey);
+    const response = await executePipeline(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey, this.createAbortSignal(queryOptions));
 
     this.baton = response.baton;
     if (response.base_url) {
@@ -100,8 +111,8 @@ export class Session {
    * @param safeIntegers - Whether to return integers as BigInt
    * @returns Promise resolving to the complete result set
    */
-  async execute(sql: string, args: any[] | Record<string, any> = [], safeIntegers: boolean = false): Promise<any> {
-    const { response, entries } = await this.executeRaw(sql, args);
+  async execute(sql: string, args: any[] | Record<string, any> = [], safeIntegers: boolean = false, queryOptions?: QueryOptions): Promise<any> {
+    const { response, entries } = await this.executeRaw(sql, args, queryOptions);
     const result = await this.processCursorEntries(entries, safeIntegers);
     return result;
   }
@@ -113,7 +124,7 @@ export class Session {
    * @param args - Optional array of parameter values or object with named parameters
    * @returns Promise resolving to the raw response and cursor entries
    */
-  async executeRaw(sql: string, args: any[] | Record<string, any> = []): Promise<{ response: CursorResponse; entries: AsyncGenerator<CursorEntry> }> {
+  async executeRaw(sql: string, args: any[] | Record<string, any> = [], queryOptions?: QueryOptions): Promise<{ response: CursorResponse; entries: AsyncGenerator<CursorEntry> }> {
     let positionalArgs: Value[] = [];
     let namedArgs: NamedArg[] = [];
 
@@ -166,7 +177,7 @@ export class Session {
       }
     };
 
-    const { response, entries } = await executeCursor(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey);
+    const { response, entries } = await executeCursor(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey, this.createAbortSignal(queryOptions));
 
     this.baton = response.baton;
     if (response.base_url) {
@@ -259,7 +270,7 @@ export class Session {
    * @param statements - Array of SQL statements to execute
    * @returns Promise resolving to batch execution results
    */
-  async batch(statements: string[]): Promise<any> {
+  async batch(statements: string[], queryOptions?: QueryOptions): Promise<any> {
     const request: CursorRequest = {
       baton: this.baton,
       batch: {
@@ -274,7 +285,7 @@ export class Session {
       }
     };
 
-    const { response, entries } = await executeCursor(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey);
+    const { response, entries } = await executeCursor(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey, this.createAbortSignal(queryOptions));
 
     this.baton = response.baton;
     if (response.base_url) {
@@ -312,7 +323,7 @@ export class Session {
    * @param sql - SQL string containing multiple statements separated by semicolons
    * @returns Promise resolving when all statements are executed
    */
-  async sequence(sql: string): Promise<void> {
+  async sequence(sql: string, queryOptions?: QueryOptions): Promise<void> {
     const request: PipelineRequest = {
       baton: this.baton,
       requests: [{
@@ -321,7 +332,7 @@ export class Session {
       } as SequenceRequest]
     };
 
-    const response = await executePipeline(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey);
+    const response = await executePipeline(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey, this.createAbortSignal(queryOptions));
 
     this.baton = response.baton;
     if (response.base_url) {
@@ -355,9 +366,9 @@ export class Session {
         };
 
         await executePipeline(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey);
-      } catch (error) {
-        // Ignore errors during close, as the connection might already be closed
-        console.error('Error closing session:', error);
+      } catch {
+        // Ignore errors during close — the connection might already be closed
+        // or the baton may be stale after a timeout.
       }
     }
 
