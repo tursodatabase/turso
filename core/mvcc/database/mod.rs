@@ -2201,6 +2201,20 @@ pub struct MvStore<Clock: LogicalClock> {
     /// to exclusive, it will abort if another transaction committed after its begin timestamp.
     last_committed_tx_ts: AtomicU64,
     table_id_to_last_rowid: RwLock<HashMap<MVTableId, Arc<RowidAllocator>>>,
+    /// Tx id allowed to override speculative write locks.
+    ///
+    /// `NO_EXCLUSIVE_TX` means "no override-eligible tx".
+    ///
+    /// This is intentionally separate from `exclusive_tx`:
+    /// - `exclusive_tx` = who currently holds exclusive lock
+    /// - this field = who is allowed to bypass a delete/update write-write conflict
+    ///
+    /// We only set this for fresh exclusive starts (IMMEDIATE-like path), not for
+    /// deferred/read transactions that later upgrade to exclusive. That preserves
+    /// `BEGIN IMMEDIATE` behavior while preventing upgraded deferred writers from
+    /// stealing speculative deletes and causing row-visibility anomalies.
+    /// See https://github.com/tursodatabase/turso/issues/5954
+    can_override_speculative_write_lock: AtomicU64,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -2275,6 +2289,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             last_committed_schema_change_ts: AtomicU64::new(0),
             last_committed_tx_ts: AtomicU64::new(0),
             table_id_to_last_rowid: RwLock::new(HashMap::default()),
+            can_override_speculative_write_lock: AtomicU64::new(NO_EXCLUSIVE_TX),
         }
     }
 
@@ -2769,7 +2784,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         if !rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states) {
                             continue;
                         }
-                        if is_write_write_conflict(&self.txs, &self.finalized_tx_states, tx, rv) {
+                        if self.is_delete_conflict(tx, rv) {
                             turso_assert_reachable!("write-write conflict on delete");
                             drop(row_versions);
                             drop(row_versions_opt);
@@ -2806,7 +2821,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         if !rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states) {
                             continue;
                         }
-                        if is_write_write_conflict(&self.txs, &self.finalized_tx_states, tx, rv) {
+                        if self.is_delete_conflict(tx, rv) {
                             turso_assert_reachable!("write-write conflict on delete");
                             drop(row_versions);
                             drop(row_versions_opt);
@@ -3210,6 +3225,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         &self,
         pager: Arc<Pager>,
         maybe_existing_tx_id: Option<TxID>,
+        allow_speculative_override: bool,
     ) -> Result<TxID> {
         // Existing transactions already hold one blocking-checkpoint read guard
         // from begin_tx(). When upgrading read->write, do not acquire another one.
@@ -3288,6 +3304,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         );
         tracing::debug!("begin_exclusive_tx: tx_id={} succeeded", tx_id);
         self.txs.insert(tx_id, tx);
+        // Fresh exclusive tx: mark as override-eligible only when not a deferred upgrade.
+        if allow_speculative_override {
+            self.can_override_speculative_write_lock
+                .store(tx_id, Ordering::Release);
+        }
         Ok(tx_id)
     }
 
@@ -3800,6 +3821,44 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
     }
 
+    fn is_delete_conflict(&self, tx: &Transaction, rv: &RowVersion) -> bool {
+        is_write_write_conflict(&self.txs, &self.finalized_tx_states, tx, rv)
+            && !self.can_exclusive_override_speculative_write_lock(tx, rv)
+    }
+
+    fn can_exclusive_override_speculative_write_lock(
+        &self,
+        tx: &Transaction,
+        rv: &RowVersion,
+    ) -> bool {
+        if !self.is_exclusive_tx(&tx.tx_id) {
+            return false;
+        }
+        if self
+            .can_override_speculative_write_lock
+            .load(Ordering::Acquire)
+            != tx.tx_id
+        {
+            return false;
+        }
+        let Some(TxTimestampOrID::TxID(owner_tx_id)) = rv.end else {
+            return false;
+        };
+        if owner_tx_id == tx.tx_id {
+            return false;
+        }
+        let Some(owner_tx_entry) = self.txs.get(&owner_tx_id) else {
+            return false;
+        };
+        let owner_tx = owner_tx_entry.value();
+        match owner_tx.state.load() {
+            TransactionState::Active | TransactionState::Preparing(_) => {
+                tx.begin_ts < owner_tx.begin_ts
+            }
+            _ => false,
+        }
+    }
+
     /// Returns true if the given transaction is the exclusive transaction.
     #[inline]
     pub fn is_exclusive_tx(&self, tx_id: &TxID) -> bool {
@@ -3844,6 +3903,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     fn release_exclusive_tx(&self, tx_id: &TxID) {
         tracing::trace!("release_exclusive_tx(tx_id={})", tx_id);
         let prev = self.exclusive_tx.swap(NO_EXCLUSIVE_TX, Ordering::Release);
+        self.can_override_speculative_write_lock
+            .store(NO_EXCLUSIVE_TX, Ordering::Release);
         turso_assert_eq!(prev, *tx_id, "exclusive lock released by wrong tx", { "expected_tx_id": *tx_id, "actual_tx_id": prev });
     }
 
