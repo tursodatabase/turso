@@ -211,6 +211,13 @@ test('blobs', async () => {
     await db.close();
 })
 
+test("datetime('now')", async () => {
+    const db = await connect(":memory:");
+    const rows = await db.prepare("SELECT datetime('now') as now").all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].now).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+    await db.close();
+})
 
 test('example-1', async () => {
     const db = await connect(':memory:');
