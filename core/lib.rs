@@ -1651,6 +1651,7 @@ impl Database {
 
         let path = storage::wal::coordination_path_for_wal_path(&self.wal_path);
         let authority = Arc::new(MappedSharedWalCoordination::create_or_open(
+            &self.io,
             std::path::Path::new(&path),
             64,
         )?);
@@ -1688,6 +1689,7 @@ impl Database {
 
         let path = storage::wal::coordination_path_for_wal_path(&self.wal_path);
         let authority = Arc::new(MappedSharedWalCoordination::create_or_open(
+            &self.io,
             std::path::Path::new(&path),
             64,
         )?);
