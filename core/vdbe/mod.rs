@@ -506,6 +506,7 @@ pub struct ProgramState {
     /// capture_data_changes has type Option<CaptureDataChangesInfo> (off mode is None)
     /// so, for pending_cdc_info we wrap it in one more Option<...> layer to represent if mode changed during program execution
     pub(crate) pending_cdc_info: Option<Option<CaptureDataChangesInfo>>,
+    pub(crate) op_parse_schema_state: execute::OpParseSchemaState,
 }
 
 impl std::fmt::Debug for Program {
@@ -588,6 +589,7 @@ impl ProgramState {
             explain_state: RwLock::new(ExplainState::default()),
             pending_fail_error: None,
             pending_cdc_info: None,
+            op_parse_schema_state: None,
         }
     }
 
