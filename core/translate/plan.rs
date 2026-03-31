@@ -754,6 +754,7 @@ pub fn select_star(
     tables: &[JoinedTable],
     out_columns: &mut Vec<ResultSetColumn>,
     right_join_swapped: bool,
+    long_names: bool,
 ) -> crate::Result<()> {
     // RIGHT JOIN swapped tables; iterate in reverse to restore original column order.
     let table_iter: Vec<&JoinedTable> = if right_join_swapped {
@@ -820,16 +821,29 @@ pub fn select_star(
                         true
                     }
                 })
-                .map(|(i, col)| ResultSetColumn {
-                    alias: None,
-                    implicit_column_name: None,
-                    expr: ast::Expr::Column {
-                        database: None,
-                        table: table.internal_id,
-                        column: i,
-                        is_rowid_alias: col.is_rowid_alias(),
-                    },
-                    contains_aggregates: false,
+                .map(|(i, col)| {
+                    // Like SQLite, SELECT * sets column names as aliases (ENAME_NAME),
+                    // bypassing full/short column name logic in get_column_name().
+                    // When long_names (full=ON, short=OFF), use "TABLE.COLUMN".
+                    // Otherwise, use just "COLUMN".
+                    let alias = col.name.as_ref().map(|col_name| {
+                        if long_names {
+                            format!("{}.{}", table.identifier, col_name)
+                        } else {
+                            col_name.clone()
+                        }
+                    });
+                    ResultSetColumn {
+                        alias,
+                        implicit_column_name: None,
+                        expr: ast::Expr::Column {
+                            database: None,
+                            table: table.internal_id,
+                            column: i,
+                            is_rowid_alias: col.is_rowid_alias(),
+                        },
+                        contains_aggregates: false,
+                    }
                 }),
         );
     }

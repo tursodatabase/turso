@@ -1674,6 +1674,8 @@ pub enum PragmaName {
     FreelistCount,
     /// Enable or disable foreign key constraint enforcement
     ForeignKeys,
+    /// Deprecated: control whether column names include table name prefix
+    FullColumnNames,
     /// List all SQL functions known to the database connection
     FunctionList,
     /// Use F_FULLFSYNC instead of fsync on macOS (only supported on macOS)
@@ -1706,6 +1708,8 @@ pub enum PragmaName {
     QueryOnly,
     /// Returns schema version of the database file.
     SchemaVersion,
+    /// Deprecated: control whether unaliased column names omit the table name prefix
+    ShortColumnNames,
     /// Alias for `require_where` pragma, as an homage to MySQL (https://dev.mysql.com/doc/refman/9.6/en/mysql-tips.html#safe-updates)
     IAmADummy,
     /// Reject DELETE/UPDATE without WHERE clause
