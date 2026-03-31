@@ -352,14 +352,21 @@ impl IO for WindowsIOCP {
     fn step(&self) -> Result<()> {
         trace!("I/O Step..");
 
-        match self.instance.process_packet_from_iocp() {
-            Err(GetIOCPPacketError::SystemError(code)) => {
-                Err(get_generic_limboerror_from_os_err(code))
+        // Drain all available completions, matching io_uring's step() behaviour.
+        // Processing only one per call starves pwritev child completions: the
+        // first child completes but can't wake the outer CompletionGroup (only
+        // the last child fires the parent), so the task parks and io.step() is
+        // never called again for the remaining children.
+        loop {
+            match self.instance.process_packet_from_iocp() {
+                Ok(()) | Err(GetIOCPPacketError::Aborted) | Err(GetIOCPPacketError::InvalidIO) => {
+                    continue;
+                }
+                Err(GetIOCPPacketError::Empty) => return Ok(()),
+                Err(GetIOCPPacketError::SystemError(code)) => {
+                    return Err(get_generic_limboerror_from_os_err(code));
+                }
             }
-            Err(GetIOCPPacketError::Aborted)
-            | Err(GetIOCPPacketError::Empty)
-            | Err(GetIOCPPacketError::InvalidIO)
-            | Ok(()) => Ok(()),
         }
     }
 }
