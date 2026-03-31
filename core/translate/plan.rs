@@ -24,7 +24,7 @@ use crate::{
     },
     Result, VirtualTable,
 };
-use crate::{schema::Type, types::SeekOp};
+use crate::{schema::Type, types::SeekOp, MAIN_DB_ID};
 
 use turso_parser::ast::TableInternalId;
 
@@ -1777,7 +1777,7 @@ impl JoinedTable {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: 0,
+            database_id: MAIN_DB_ID,
             indexed: None,
         })
     }
@@ -1878,7 +1878,7 @@ impl JoinedTable {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: 0,
+            database_id: MAIN_DB_ID,
             indexed: None,
         })
     }
