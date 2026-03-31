@@ -59,24 +59,6 @@ impl ContextInner {
     pub fn new() -> Self {
         Self { waker: None }
     }
-
-    pub fn wake(&mut self) {
-        if let Some(waker) = self.waker.take() {
-            waker.wake();
-        }
-    }
-
-    pub fn set_waker(&mut self, waker: &Waker) {
-        if let Some(curr_waker) = self.waker.as_mut() {
-            // only call and change waker if it would awake a different task
-            if !curr_waker.will_wake(waker) {
-                let prev_waker = std::mem::replace(curr_waker, waker.clone());
-                prev_waker.wake();
-            }
-        } else {
-            self.waker = Some(waker.clone());
-        }
-    }
 }
 
 impl Default for Context {
@@ -93,11 +75,34 @@ impl Context {
     }
 
     pub fn wake(&self) {
-        self.inner.lock().wake();
+        // Take the waker out under the lock, then call wake() after releasing.
+        // waker.wake() can synchronously re-poll a future (e.g. tokio
+        // current-thread or inline wakers), which may call set_waker() on the
+        // same Context — deadlocking on the non-reentrant parking_lot Mutex.
+        let waker = self.inner.lock().waker.take();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 
     pub fn set_waker(&self, waker: &Waker) {
-        self.inner.lock().set_waker(waker);
+        // Same pattern: swap under the lock, wake the old waker outside it.
+        let prev_waker = {
+            let mut guard = self.inner.lock();
+            if let Some(curr_waker) = guard.waker.as_mut() {
+                if !curr_waker.will_wake(waker) {
+                    Some(std::mem::replace(curr_waker, waker.clone()))
+                } else {
+                    None
+                }
+            } else {
+                guard.waker = Some(waker.clone());
+                None
+            }
+        };
+        if let Some(prev) = prev_waker {
+            prev.wake();
+        }
     }
 }
 
