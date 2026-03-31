@@ -1582,4 +1582,135 @@ mod tests {
             ]
         );
     }
+
+    /// Pull test: remote adds a column that local already has.
+    /// The pull must succeed (idempotent ALTER TABLE ADD COLUMN).
+    #[tokio::test]
+    pub async fn test_sync_pull_alter_table_add_column_idempotent() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server = TursoServer::new().await.unwrap();
+
+        // Remote: create table with 2 columns and insert data
+        server
+            .db_sql("CREATE TABLE t(x TEXT PRIMARY KEY, y TEXT)")
+            .await
+            .unwrap();
+        server
+            .db_sql("INSERT INTO t VALUES ('a', 'alpha')")
+            .await
+            .unwrap();
+
+        // Local: bootstrap from remote
+        let db = crate::sync::Builder::new_remote(":memory:")
+            .with_remote_url(server.db_url())
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().await.unwrap();
+
+        let rows = all_rows(conn.query("SELECT x, y FROM t", ()).await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![
+                Value::Text("a".to_string()),
+                Value::Text("alpha".to_string())
+            ]]
+        );
+
+        // Both sides independently add the same column z
+        server
+            .db_sql("ALTER TABLE t ADD COLUMN z TEXT")
+            .await
+            .unwrap();
+        server
+            .db_sql("INSERT INTO t VALUES ('b', 'beta', 'from-remote')")
+            .await
+            .unwrap();
+
+        conn.execute("ALTER TABLE t ADD COLUMN z TEXT", ())
+            .await
+            .unwrap();
+
+        // Pull should succeed despite both sides having column z
+        db.pull().await.unwrap();
+
+        // Verify local data is accessible after pull
+        let rows = all_rows(
+            conn.query("SELECT x, y, z FROM t ORDER BY x", ())
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], Value::Text("a".to_string()));
+        assert_eq!(rows[1][0], Value::Text("b".to_string()));
+        assert_eq!(rows[1][2], Value::Text("from-remote".to_string()));
+    }
+
+    /// Push test: local adds a column that remote already has.
+    /// The push must succeed (ALTER TABLE ADD COLUMN error is ignored in the batch).
+    #[tokio::test]
+    pub async fn test_sync_push_alter_table_add_column_idempotent() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server = TursoServer::new().await.unwrap();
+
+        // Remote: create table with 2 columns and insert data
+        server
+            .db_sql("CREATE TABLE t(x TEXT PRIMARY KEY, y TEXT)")
+            .await
+            .unwrap();
+        server
+            .db_sql("INSERT INTO t VALUES ('a', 'alpha')")
+            .await
+            .unwrap();
+
+        // Local: bootstrap from remote
+        let db = crate::sync::Builder::new_remote(":memory:")
+            .with_remote_url(server.db_url())
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().await.unwrap();
+
+        let rows = all_rows(conn.query("SELECT x, y FROM t", ()).await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![
+                Value::Text("a".to_string()),
+                Value::Text("alpha".to_string())
+            ]]
+        );
+
+        // Remote adds column z first
+        server
+            .db_sql("ALTER TABLE t ADD COLUMN z TEXT")
+            .await
+            .unwrap();
+
+        // Local also adds column z and inserts data
+        conn.execute("ALTER TABLE t ADD COLUMN z TEXT", ())
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES ('b', 'beta', 'from-local')", ())
+            .await
+            .unwrap();
+
+        // Push should succeed despite remote already having column z
+        db.push().await.unwrap();
+
+        // Verify the data row made it to remote
+        let remote_rows = server
+            .db_sql("SELECT x, y, z FROM t ORDER BY x")
+            .await
+            .unwrap();
+        assert_eq!(remote_rows.len(), 2);
+        assert_eq!(remote_rows[1][0], Value::Text("b".to_string()));
+        assert_eq!(remote_rows[1][1], Value::Text("beta".to_string()));
+        assert_eq!(remote_rows[1][2], Value::Text("from-local".to_string()));
+    }
 }
