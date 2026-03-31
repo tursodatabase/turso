@@ -867,7 +867,7 @@ fn first_update_safety_reason(
 
         // If the UPDATE is reading the target table through a secondary index,
         // mutating any indexed key requires materializing a stable write set first.
-        let Some(index) = (match &table_ref.op {
+        let index = match &table_ref.op {
             Operation::Scan(Scan::BTreeTable {
                 index: Some(index), ..
             })
@@ -876,10 +876,8 @@ fn first_update_safety_reason(
             })
             | Operation::Search(Search::InSeek {
                 index: Some(index), ..
-            }) => Some(index),
-            _ => None,
-        }) else {
-            break 'requires None;
+            }) => index,
+            _ => break 'requires None,
         };
 
         for (set_clause_col_idx, _) in plan.set_clauses.iter() {
