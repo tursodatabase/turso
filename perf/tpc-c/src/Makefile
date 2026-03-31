@@ -7,7 +7,7 @@
 
 BACKEND ?= turso
 
-TURSO_ROOT ?=	../tmp-turso
+TURSO_ROOT ?=	../../..
 TURSO_INC=	$(TURSO_ROOT)/sqlite3/include
 TURSO_PROFILE ?= release
 TURSO_LIB=	$(TURSO_ROOT)/target/$(TURSO_PROFILE)
