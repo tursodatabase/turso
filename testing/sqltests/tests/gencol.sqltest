@@ -2446,6 +2446,85 @@ expect {
     ok
 }
 
+# UPDATE with indexed virtual column + TEXT PK
+@cross-check-integrity
+test update-text-pk-with-indexed-virtual-column {
+    CREATE TABLE t(id TEXT PRIMARY KEY, col_a TEXT);
+    ALTER TABLE t ADD COLUMN v TEXT GENERATED ALWAYS AS (CAST(col_a AS TEXT)) VIRTUAL;
+    CREATE INDEX t_v_idx ON t(v);
+    INSERT INTO t VALUES ('r1', 'hello');
+    UPDATE t SET col_a = 'world' WHERE id = 'r1';
+    SELECT count(*) FROM t WHERE v = 'world';
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    ok
+}
+
+# DELETE with indexed virtual column + TEXT PK
+@cross-check-integrity
+@skip "Same col_used_mask bug exists in DELETE path - panics (see #6206)"
+test delete-text-pk-indexed-virtual-column {
+    CREATE TABLE t3(id TEXT PRIMARY KEY, col_a TEXT);
+    ALTER TABLE t3 ADD COLUMN v TEXT GENERATED ALWAYS AS (CAST(col_a AS TEXT)) VIRTUAL;
+    CREATE INDEX t3_v_idx ON t3(v);
+    INSERT INTO t3 VALUES ('r1', 'hello'), ('r2', 'world');
+    DELETE FROM t3 WHERE id = 'r1';
+    SELECT count(*) FROM t3 WHERE v = 'hello';
+    PRAGMA integrity_check;
+}
+expect {
+    0
+    ok
+}
+
+# UPDATE with expression index (not virtual column) + TEXT PK
+@cross-check-integrity
+test update-text-pk-expression-index {
+    CREATE TABLE t4(id TEXT PRIMARY KEY, col_a TEXT);
+    CREATE INDEX t4_expr_idx ON t4(LOWER(col_a));
+    INSERT INTO t4 VALUES ('r1', 'Hello');
+    UPDATE t4 SET col_a = 'World' WHERE id = 'r1';
+    SELECT count(*) FROM t4 WHERE LOWER(col_a) = 'world';
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    ok
+}
+
+# UPDATE with virtual column depending on multiple base columns
+@cross-check-integrity
+test update-text-pk-virtual-multi-dep {
+    CREATE TABLE t5(id TEXT PRIMARY KEY, a TEXT, b TEXT);
+    ALTER TABLE t5 ADD COLUMN v TEXT GENERATED ALWAYS AS (a || '-' || b) VIRTUAL;
+    CREATE INDEX t5_v_idx ON t5(v);
+    INSERT INTO t5 VALUES ('r1', 'foo', 'bar');
+    UPDATE t5 SET a = 'baz' WHERE id = 'r1';
+    SELECT count(*) FROM t5 WHERE v = 'baz-bar';
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    ok
+}
+
+# UPDATE with mixed indexes (expression-based + plain) + TEXT PK
+@cross-check-integrity
+test update-text-pk-mixed-indexes {
+    CREATE TABLE t6(id TEXT PRIMARY KEY, col_a TEXT, col_b TEXT);
+    ALTER TABLE t6 ADD COLUMN v TEXT GENERATED ALWAYS AS (UPPER(col_a)) VIRTUAL;
+    CREATE INDEX t6_v_idx ON t6(v);
+    CREATE INDEX t6_b_idx ON t6(col_b);
+    INSERT INTO t6 VALUES ('r1', 'hello', 'x');
+    UPDATE t6 SET col_a = 'world', col_b = 'y' WHERE id = 'r1';
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
 # =============================================================================
 # 12. Triggers
 # =============================================================================
