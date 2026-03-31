@@ -374,6 +374,13 @@ impl Connection {
         self.prepare_stmt_with_origin(stmt, StatementOrigin::Root)
     }
 
+    pub(crate) fn prepare_stmt_internal(
+        self: &Arc<Connection>,
+        stmt: ast::Stmt,
+    ) -> Result<Statement> {
+        self.prepare_stmt_with_origin(stmt, StatementOrigin::InternalHelper)
+    }
+
     fn prepare_stmt_with_origin(
         self: &Arc<Connection>,
         stmt: ast::Stmt,

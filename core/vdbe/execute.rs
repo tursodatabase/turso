@@ -13767,13 +13767,10 @@ fn prepare_qualified_vacuum_schema_stmt(
 ) -> Result<crate::Statement> {
     let stmt = qualify_vacuum_schema_stmt(parse_single_stmt(sql)?, alias)?;
     if is_internal {
-        conn.start_nested();
+        conn.prepare_stmt_internal(stmt)
+    } else {
+        conn.prepare_stmt(stmt)
     }
-    let prepared = conn.prepare_stmt(stmt);
-    if is_internal {
-        conn.end_nested();
-    }
-    prepared
 }
 
 fn cleanup_vacuum_into_error(program: &Program, vacuum_state: &mut OpVacuumIntoState) {
