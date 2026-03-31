@@ -306,3 +306,32 @@ fn test_attach_inherits_index_method_flag_on_reattach(_tmp_db: TempDatabase) -> 
 
     Ok(())
 }
+
+#[turso_macros::test]
+fn test_attach_create_index_stores_canonical_schema_sql(
+    _tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let aux_path = temp_dir.path().join("existing_attach_index.db");
+
+    let aux_db = TempDatabase::builder().with_db_path(&aux_path).build();
+    let aux_conn = aux_db.connect_limbo();
+    aux_conn.execute("CREATE TABLE t(name TEXT)")?;
+    do_flush(&aux_conn, &aux_db)?;
+
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let conn = db.connect_limbo();
+
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    conn.execute("CREATE INDEX aux.idx_t_name ON t(name)")?;
+
+    let rows: Vec<(String,)> = conn.exec_rows(
+        "SELECT sql FROM aux.sqlite_schema WHERE type = 'index' AND name = 'idx_t_name'",
+    );
+    assert_eq!(
+        rows,
+        vec![("CREATE INDEX idx_t_name ON t (name)".to_string(),)]
+    );
+
+    Ok(())
+}
