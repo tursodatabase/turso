@@ -497,7 +497,7 @@ impl DatabaseReplayGenerator {
         let (current_columns, _) = self.table_columns_info(coro, table_name).await?;
         let col_name = col_def.col_name.as_str();
         if current_columns.iter().any(|c| c == col_name) {
-            tracing::info!(
+            tracing::debug!(
                 "execute_ddl_idempotent: column {col_name} already exists in {table_name}, skipping"
             );
             return Ok(());

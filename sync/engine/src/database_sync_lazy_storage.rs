@@ -357,20 +357,20 @@ async fn read_page<Ctx, IO: SyncEngineIo>(
     let page_action = guard.load_start(page)?;
 
     let data = if matches!(page_action, PageLoadAction::Wait) {
-        tracing::info!("read_page(page={page}): wait for the page to load");
+        tracing::debug!("read_page(page={page}): wait for the page to load");
         // another connection already loading this page - so we need to wait
         loop {
             let _ = ctx.coro.yield_(crate::types::SyncEngineIoResult::IO).await;
             let Some(result) = guard.load_result(page) else {
                 continue;
             };
-            tracing::info!("read_page(page={page}): err={:?}", result.as_ref().err());
+            tracing::debug!("read_page(page={page}): err={:?}", result.as_ref().err());
             let data = result?;
             assert!(data.len() == PAGE_SIZE);
             break data;
         }
     } else {
-        tracing::info!(
+        tracing::debug!(
             "read_page(page={page}, segment_size={segment_size}): read page from the remote server"
         );
         let segment_start = page * PAGE_SIZE / segment_size * segment_size;
@@ -398,7 +398,7 @@ async fn read_page<Ctx, IO: SyncEngineIo>(
         {
             Some(page_data) => page_data,
             None => {
-                tracing::info!("read_page(page={page}): no page was fetched from server");
+                tracing::debug!("read_page(page={page}): no page was fetched from server");
                 c.complete(0);
                 return Ok(());
             }
@@ -407,17 +407,17 @@ async fn read_page<Ctx, IO: SyncEngineIo>(
 
     let buffer = Arc::new(Buffer::new(data));
     if prefetch {
-        tracing::info!("read_page(page={page}): trying to prefetch more pages");
+        tracing::debug!("read_page(page={page}): trying to prefetch more pages");
         let content = PageContent::new(buffer.clone());
         if content.page_type().is_ok() {
-            tracing::info!(
+            tracing::debug!(
                 "read_page(page={page}): detected valid page for prefetch load: {:?}",
                 content.page_type().ok()
             );
             let mut page_refs = Vec::with_capacity(content.cell_count() + 1);
             for cell_id in 0..content.cell_count() {
                 let Ok(cell) = content.cell_get(cell_id, PAGE_SIZE) else {
-                    tracing::info!(
+                    tracing::debug!(
                         "read_page(page={page}): unable to parse cell at position {cell_id}"
                     );
                     break;
@@ -443,7 +443,7 @@ async fn read_page<Ctx, IO: SyncEngineIo>(
                     Ok(PageLoadAction::Wait) => guard.wait_end(page_ref as usize),
                     Err(err) => {
                         // the prefetch is an optimization; if we can't load the page this is fine
-                        tracing::info!("read_page(page={page}): unable to lock page {page_ref} for prefetch load: {err}");
+                        tracing::debug!("read_page(page={page}): unable to lock page {page_ref} for prefetch load: {err}");
                     }
                 }
             }
@@ -451,7 +451,7 @@ async fn read_page<Ctx, IO: SyncEngineIo>(
         }
     }
 
-    tracing::info!("read_page(page={page}): page loaded");
+    tracing::debug!("read_page(page={page}): page loaded");
     read_buf.copy_from_slice(&buffer.as_slice()[0..read_buf_len]);
     c.complete(read_buf_len as i32);
     Ok(())
@@ -506,7 +506,7 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
             .clean_file
             .has_hole(page_offset as usize, read_buf_len)?;
 
-        tracing::info!("read_page(page={}): is_hole={}", page, is_hole);
+        tracing::debug!("read_page(page={}): is_hole={}", page, is_hole);
         if !is_hole {
             let Some(dirty_file) = &self.dirty_file else {
                 // no dirty file was set - this means that FS is atomic (e.g. MemoryIO)
@@ -542,7 +542,7 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
             }
         }
 
-        tracing::info!(
+        tracing::debug!(
             "read_page(page={}): is_hole={}, creating generator",
             page,
             is_hole
@@ -579,7 +579,7 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
                     c,
                 )
                 .await?;
-                tracing::info!(
+                tracing::debug!(
                     "PartialDatabaseStorage::read_page(page={}): page read succeeded",
                     page
                 );
