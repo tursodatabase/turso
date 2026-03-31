@@ -1297,7 +1297,7 @@ impl Wal for WalFile {
     /// Begin a write transaction
     #[instrument(skip_all, level = Level::DEBUG)]
     fn begin_write_tx(&self) -> Result<()> {
-        tracing::info!("begin_write_tx");
+        tracing::debug!("begin_write_tx");
         self.with_shared(|shared| {
             // sqlite/src/wal.c 3702
             // Cannot start a write transaction without first holding a read

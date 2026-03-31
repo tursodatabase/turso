@@ -992,7 +992,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
         None
     };
 
-    tracing::info!("local_changes: {:?}", local_changes);
+    tracing::debug!("local_changes: {:?}", local_changes);
 
     for (i, change) in local_changes.into_iter().enumerate() {
         let change_id = change.change_id;
@@ -1019,7 +1019,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
         rows_changed += 1;
         // we give user full control over CDC table - so let's not emit assert here for now
         if last_change_id.is_some() && last_change_id.unwrap() + 1 != change_id {
-            tracing::warn!(
+            tracing::debug!(
                 "out of order change sequence: {} -> {}",
                 last_change_id.unwrap(),
                 change_id
