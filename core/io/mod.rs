@@ -33,7 +33,15 @@ cfg_block! {
         pub use win_iocp::WindowsIOCP;
     }
 
-    #[cfg(any(not(any(target_family = "unix", target_os = "android", target_os = "ios")), miri))] {
+    #[cfg(all(target_os = "windows", not(miri)))] {
+        mod windows;
+        #[cfg(feature = "fs")]
+        pub use windows::WindowsIO;
+        pub use windows::WindowsIO as PlatformIO;
+        pub use PlatformIO as SyscallIO;
+    }
+
+    #[cfg(any(not(any(target_family = "unix", target_os = "windows", target_os = "android", target_os = "ios")), miri))] {
         mod generic;
         pub use generic::GenericIO as PlatformIO;
         pub use PlatformIO as SyscallIO;
