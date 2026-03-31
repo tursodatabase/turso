@@ -19,9 +19,10 @@ use crate::{
             UpdateRowSource,
         },
         expr::{
-            emit_returning_results, emit_returning_scan_back, restore_returning_row_image_in_cache,
-            seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
-            NoConstantOptReason, ReturningBufferCtx,
+            emit_returning_results, emit_returning_scan_back, emit_table_column,
+            restore_returning_row_image_in_cache, seed_returning_row_image_in_cache,
+            translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,
+            ReturningBufferCtx,
         },
         fkeys::{
             emit_fk_child_update_counters, emit_fk_parent_new_key_reconcile,
@@ -1085,20 +1086,23 @@ fn emit_update_insns<'a>(
         // Only read OLD row values when triggers or FK cascades need them
         let columns = target_table.table.columns();
         let old_registers: Option<Vec<usize>> = if needs_old_registers {
-            Some(
-                (0..col_len)
-                    .map(|i| {
-                        let reg = program.alloc_register();
-                        if columns[i].is_virtual_generated() {
-                            program.emit_null(reg, None);
-                        } else {
-                            program.emit_column_or_rowid(target_table_cursor_id, i, reg);
-                        }
-                        reg
-                    })
-                    .chain(std::iter::once(beg))
-                    .collect(),
-            )
+            let mut regs = Vec::with_capacity(col_len + 1);
+            for (i, column) in columns.iter().enumerate() {
+                let reg = program.alloc_register();
+                emit_table_column(
+                    program,
+                    target_table_cursor_id,
+                    internal_id,
+                    table_references,
+                    column,
+                    i,
+                    reg,
+                    &t_ctx.resolver,
+                )?;
+                regs.push(reg);
+            }
+            regs.push(beg);
+            Some(regs)
         } else {
             None
         };
@@ -1114,10 +1118,6 @@ fn emit_update_insns<'a>(
             // Compute virtual columns for NEW values
             let new_ctx = DmlColumnContext::layout(columns, start, new_rowid_reg, layout.clone());
             compute_virtual_columns(program, columns, &new_ctx, &t_ctx.resolver)?;
-
-            // Compute virtual columns for OLD values
-            let old_ctx = DmlColumnContext::indexed(columns.clone(), old_registers.clone());
-            compute_virtual_columns(program, columns, &old_ctx, &t_ctx.resolver)?;
 
             let new_registers = (0..col_len)
                 .map(|i| layout.to_register(start, i))

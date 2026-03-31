@@ -11,9 +11,9 @@ use crate::{
             get_relevant_triggers_type_and_time, init_limit, OperationMode, TriggerTime,
         },
         expr::{
-            emit_returning_results, emit_returning_scan_back, restore_returning_row_image_in_cache,
-            seed_returning_row_image_in_cache, translate_expr_no_constant_opt, NoConstantOptReason,
-            ReturningBufferCtx,
+            emit_returning_results, emit_returning_scan_back, emit_table_column,
+            restore_returning_row_image_in_cache, seed_returning_row_image_in_cache,
+            translate_expr_no_constant_opt, NoConstantOptReason, ReturningBufferCtx,
         },
         fkeys::{
             build_index_affinity_string, emit_guarded_fk_decrement, open_read_index,
@@ -511,8 +511,17 @@ fn emit_delete_insns<'a>(
             let columns_start_reg = program.alloc_registers(cols_len);
 
             // Read all column values from the row to be deleted
-            for (i, _column) in unsafe { &*table_reference }.columns().iter().enumerate() {
-                program.emit_column_or_rowid(main_table_cursor_id, i, columns_start_reg + i);
+            for (i, column) in unsafe { &*table_reference }.columns().iter().enumerate() {
+                emit_table_column(
+                    program,
+                    main_table_cursor_id,
+                    internal_id,
+                    table_references,
+                    column,
+                    i,
+                    columns_start_reg + i,
+                    resolver,
+                )?;
             }
 
             (Some(columns_start_reg), rowid_reg)
@@ -885,12 +894,22 @@ fn emit_delete_insns_when_triggers_present(
     };
     let cols_len = unsafe { &*table_reference }.columns().len();
 
+    let internal_id = unsafe { (*table_reference).internal_id };
     let columns_start_reg = if !has_returning && !has_delete_triggers {
         None
     } else {
         let columns_start_reg = program.alloc_registers(cols_len);
-        for (i, _column) in unsafe { &*table_reference }.columns().iter().enumerate() {
-            program.emit_column_or_rowid(main_table_cursor_id, i, columns_start_reg + i);
+        for (i, column) in unsafe { &*table_reference }.columns().iter().enumerate() {
+            emit_table_column(
+                program,
+                main_table_cursor_id,
+                internal_id,
+                table_references,
+                column,
+                i,
+                columns_start_reg + i,
+                resolver,
+            )?;
         }
         Some(columns_start_reg)
     };

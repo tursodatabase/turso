@@ -3703,3 +3703,189 @@ expect {
     2|210
     3|310
 }
+
+# =============================================================================
+# Self-join on table with virtual generated columns (#6148)
+# =============================================================================
+
+test gencol_self_join_virtual {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b AS (a * 10));
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    SELECT a1.a, a1.b, a2.a, a2.b FROM t1 a1 JOIN t1 a2 ON a1.a = a2.a;
+}
+expect {
+    1|10|1|10
+    2|20|2|20
+    3|30|3|30
+}
+
+# =============================================================================
+# Three-table INNER JOIN with virtual generated columns (#6151)
+# =============================================================================
+
+test gencol_three_table_inner_join {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER, c AS (b + 100));
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, t1_a INTEGER);
+    CREATE TABLE t3(id INTEGER PRIMARY KEY, t2_id INTEGER);
+    INSERT INTO t1 VALUES(1, 10);
+    INSERT INTO t1 VALUES(2, 20);
+    INSERT INTO t2 VALUES(1, 1);
+    INSERT INTO t2 VALUES(2, 2);
+    INSERT INTO t3 VALUES(1, 1);
+    INSERT INTO t3 VALUES(2, 2);
+    SELECT t1.a, t1.b, t1.c, t2.id, t3.id
+      FROM t1
+      INNER JOIN t2 ON t2.t1_a = t1.a
+      INNER JOIN t3 ON t3.t2_id = t2.id;
+}
+expect {
+    1|10|110|1|1
+    2|20|120|2|2
+}
+
+test gencol_three_table_inner_join_select_gencol {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER, c AS (b + 100));
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, t1_a INTEGER);
+    CREATE TABLE t3(id INTEGER PRIMARY KEY, t2_id INTEGER);
+    INSERT INTO t1 VALUES(1, 10);
+    INSERT INTO t1 VALUES(2, 20);
+    INSERT INTO t2 VALUES(1, 1);
+    INSERT INTO t2 VALUES(2, 2);
+    INSERT INTO t3 VALUES(1, 1);
+    INSERT INTO t3 VALUES(2, 2);
+    SELECT t1.c
+      FROM t1
+      INNER JOIN t2 ON t2.t1_a = t1.a
+      INNER JOIN t3 ON t3.t2_id = t2.id;
+}
+expect {
+    110
+    120
+}
+
+test gencol_three_table_inner_join_where_gencol {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER, c AS (b + 100));
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, t1_a INTEGER);
+    CREATE TABLE t3(id INTEGER PRIMARY KEY, t2_id INTEGER);
+    INSERT INTO t1 VALUES(1, 10);
+    INSERT INTO t1 VALUES(2, 20);
+    INSERT INTO t2 VALUES(1, 1);
+    INSERT INTO t2 VALUES(2, 2);
+    INSERT INTO t3 VALUES(1, 1);
+    INSERT INTO t3 VALUES(2, 2);
+    SELECT t1.a, t1.c
+      FROM t1
+      INNER JOIN t2 ON t2.t1_a = t1.a
+      INNER JOIN t3 ON t3.t2_id = t2.id
+      WHERE t1.c > 115;
+}
+expect {
+    2|120
+}
+
+test gencol_four_table_inner_join {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER, c AS (b * 2));
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, t1_a INTEGER);
+    CREATE TABLE t3(id INTEGER PRIMARY KEY, t2_id INTEGER);
+    CREATE TABLE t4(id INTEGER PRIMARY KEY, t3_id INTEGER, val TEXT);
+    INSERT INTO t1 VALUES(1, 5);
+    INSERT INTO t2 VALUES(1, 1);
+    INSERT INTO t3 VALUES(1, 1);
+    INSERT INTO t4 VALUES(1, 1, 'ok');
+    SELECT t1.a, t1.b, t1.c, t4.val
+      FROM t1
+      INNER JOIN t2 ON t2.t1_a = t1.a
+      INNER JOIN t3 ON t3.t2_id = t2.id
+      INNER JOIN t4 ON t4.t3_id = t3.id;
+}
+expect {
+    1|5|10|ok
+}
+
+# =============================================================================
+# DELETE triggers on tables with virtual generated columns (#6150)
+# =============================================================================
+
+test gencol_delete_before_trigger_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER tr_before_del BEFORE DELETE ON t1
+    BEGIN
+        INSERT INTO log VALUES('deleting ' || OLD.a);
+    END;
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    DELETE FROM t1 WHERE a = 2;
+    SELECT * FROM log;
+    SELECT a, b FROM t1;
+}
+expect {
+    deleting 2
+    1|2
+    3|6
+}
+
+test gencol_delete_after_trigger_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER tr_after_del AFTER DELETE ON t1
+    BEGIN
+        INSERT INTO log VALUES('deleted ' || OLD.a);
+    END;
+    INSERT INTO t1(a) VALUES(10), (20);
+    DELETE FROM t1;
+    SELECT * FROM log;
+}
+expect {
+    deleted 10
+    deleted 20
+}
+
+test gencol_delete_trigger_ref_virtual_col {
+    CREATE TABLE t1(a INTEGER, b AS (a + 100));
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER tr_del BEFORE DELETE ON t1
+    BEGIN
+        INSERT INTO log VALUES('old_b=' || OLD.b);
+    END;
+    INSERT INTO t1(a) VALUES(5);
+    DELETE FROM t1 WHERE a = 5;
+    SELECT * FROM log;
+}
+expect {
+    old_b=105
+}
+
+test gencol_delete_trigger_multiple_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c TEXT, d AS (a || c));
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER tr_del AFTER DELETE ON t1
+    BEGIN
+        INSERT INTO log VALUES(OLD.a || '|' || OLD.c);
+    END;
+    INSERT INTO t1(a, c) VALUES(1, 'x'), (2, 'y');
+    DELETE FROM t1 WHERE a = 1;
+    SELECT * FROM log;
+    SELECT a, b, c, d FROM t1;
+}
+expect {
+    1|x
+    2|4|y|2y
+}
+
+test gencol_upsert_trigger_virtual_col {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c AS (a || b));
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER tr AFTER UPDATE ON t1
+    BEGIN
+        INSERT INTO log VALUES('old_c=' || OLD.c || ' new_c=' || NEW.c);
+    END;
+    INSERT INTO t1(a, b) VALUES(1, 'x');
+    INSERT INTO t1(a, b) VALUES(1, 'y') ON CONFLICT(a) DO UPDATE SET b = excluded.b;
+    SELECT * FROM log;
+    SELECT a, b, c FROM t1;
+}
+expect {
+    old_c=1x new_c=1y
+    1|y|1y
+}
+
