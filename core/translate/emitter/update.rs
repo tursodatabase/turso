@@ -1089,11 +1089,7 @@ fn emit_update_insns<'a>(
                 (0..col_len)
                     .map(|i| {
                         let reg = program.alloc_register();
-                        if columns[i].is_virtual_generated() {
-                            program.emit_null(reg, None);
-                        } else {
-                            program.emit_column_or_rowid(target_table_cursor_id, i, reg);
-                        }
+                        program.emit_column_or_rowid(target_table_cursor_id, i, reg);
                         reg
                     })
                     .chain(std::iter::once(beg))

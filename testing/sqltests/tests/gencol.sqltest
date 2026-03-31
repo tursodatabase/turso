@@ -3703,3 +3703,90 @@ expect {
     2|210
     3|310
 }
+
+# =============================================================================
+# DELETE triggers on tables with virtual generated columns
+# =============================================================================
+
+test gencol_delete_before_trigger_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER tr_before_del BEFORE DELETE ON t1
+    BEGIN
+        INSERT INTO log VALUES('deleting ' || OLD.a);
+    END;
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    DELETE FROM t1 WHERE a = 2;
+    SELECT * FROM log;
+    SELECT a, b FROM t1;
+}
+expect {
+    deleting 2
+    1|2
+    3|6
+}
+
+test gencol_delete_after_trigger_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER tr_after_del AFTER DELETE ON t1
+    BEGIN
+        INSERT INTO log VALUES('deleted ' || OLD.a);
+    END;
+    INSERT INTO t1(a) VALUES(10), (20);
+    DELETE FROM t1;
+    SELECT * FROM log;
+}
+expect {
+    deleted 10
+    deleted 20
+}
+
+test gencol_delete_trigger_ref_virtual_col {
+    CREATE TABLE t1(a INTEGER, b AS (a + 100));
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER tr_del BEFORE DELETE ON t1
+    BEGIN
+        INSERT INTO log VALUES('old_b=' || OLD.b);
+    END;
+    INSERT INTO t1(a) VALUES(5);
+    DELETE FROM t1 WHERE a = 5;
+    SELECT * FROM log;
+}
+expect {
+    old_b=105
+}
+
+test gencol_delete_trigger_multiple_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c TEXT, d AS (a || c));
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER tr_del AFTER DELETE ON t1
+    BEGIN
+        INSERT INTO log VALUES(OLD.a || '|' || OLD.c);
+    END;
+    INSERT INTO t1(a, c) VALUES(1, 'x'), (2, 'y');
+    DELETE FROM t1 WHERE a = 1;
+    SELECT * FROM log;
+    SELECT a, b, c, d FROM t1;
+}
+expect {
+    1|x
+    2|4|y|2y
+}
+
+test gencol_upsert_trigger_virtual_col {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c AS (a || b));
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER tr AFTER UPDATE ON t1
+    BEGIN
+        INSERT INTO log VALUES('old_c=' || OLD.c || ' new_c=' || NEW.c);
+    END;
+    INSERT INTO t1(a, b) VALUES(1, 'x');
+    INSERT INTO t1(a, b) VALUES(1, 'y') ON CONFLICT(a) DO UPDATE SET b = excluded.b;
+    SELECT * FROM log;
+    SELECT a, b, c FROM t1;
+}
+expect {
+    old_c=1x new_c=1y
+    1|y|1y
+}

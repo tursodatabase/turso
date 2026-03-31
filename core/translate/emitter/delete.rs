@@ -8,7 +8,8 @@ use crate::{
         emitter::{
             emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
             emit_index_column_value_old_image, emit_program_for_select,
-            get_relevant_triggers_type_and_time, init_limit, OperationMode, TriggerTime,
+            gencol::compute_virtual_columns, get_relevant_triggers_type_and_time, init_limit,
+            OperationMode, TriggerTime,
         },
         expr::{
             emit_returning_results, emit_returning_scan_back, restore_returning_row_image_in_cache,
@@ -28,7 +29,7 @@ use crate::{
         trigger_exec::{fire_trigger, has_relevant_triggers_type_only, TriggerContext},
     },
     vdbe::{
-        builder::{CursorKey, CursorType, ProgramBuilder},
+        builder::{CursorKey, CursorType, DmlColumnContext, ProgramBuilder},
         insn::{Insn, RegisterOrLiteral},
     },
     CaptureDataChangesExt, Connection,
@@ -515,6 +516,19 @@ fn emit_delete_insns<'a>(
                 program.emit_column_or_rowid(main_table_cursor_id, i, columns_start_reg + i);
             }
 
+            // Compute virtual generated column values from the stored columns
+            // so that triggers referencing OLD.virtual_col see correct values.
+            if let Some(btree_table) = unsafe { &*table_reference }.btree() {
+                if btree_table.has_virtual_columns() {
+                    let columns = unsafe { &*table_reference }.columns();
+                    let col_regs = (0..cols_len)
+                        .map(|i| columns_start_reg + i)
+                        .collect::<Vec<_>>();
+                    let dml_ctx = DmlColumnContext::indexed(columns.to_vec(), col_regs);
+                    compute_virtual_columns(program, columns, &dml_ctx, resolver)?;
+                }
+            }
+
             (Some(columns_start_reg), rowid_reg)
         }
     };
@@ -892,6 +906,18 @@ fn emit_delete_insns_when_triggers_present(
         for (i, _column) in unsafe { &*table_reference }.columns().iter().enumerate() {
             program.emit_column_or_rowid(main_table_cursor_id, i, columns_start_reg + i);
         }
+
+        if let Some(btree_table) = unsafe { &*table_reference }.btree() {
+            if btree_table.has_virtual_columns() {
+                let columns = unsafe { &*table_reference }.columns();
+                let col_regs = (0..cols_len)
+                    .map(|i| columns_start_reg + i)
+                    .collect::<Vec<_>>();
+                let dml_ctx = DmlColumnContext::indexed(columns.to_vec(), col_regs);
+                compute_virtual_columns(program, columns, &dml_ctx, &t_ctx.resolver)?;
+            }
+        }
+
         Some(columns_start_reg)
     };
 

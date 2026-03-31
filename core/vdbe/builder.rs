@@ -1646,6 +1646,11 @@ impl ProgramBuilder {
                     cursor_id,
                     dest: out,
                 });
+            } else if column_def.is_virtual_generated() {
+                // Virtual generated columns are not stored on disk.
+                // Emit NULL; the caller computes them from other columns if needed.
+                self.suppress_column_default = false;
+                self.emit_null(out, None);
             } else {
                 self.emit_column(cursor_id, column, out);
             }

@@ -412,16 +412,8 @@ pub fn emit_upsert(
 
     let current_start = program.alloc_registers(num_cols);
     for i in 0..num_cols {
-        let col = &table.columns()[i];
         let reg = layout.to_register(current_start, i);
-        if col.is_virtual_generated() {
-            program.emit_insn(Insn::Null {
-                dest: reg,
-                dest_end: None,
-            });
-        } else {
-            program.emit_column_or_rowid(ctx.cursor_id, i, reg);
-        }
+        program.emit_column_or_rowid(ctx.cursor_id, i, reg);
     }
 
     if ctx.table.has_virtual_columns() {
