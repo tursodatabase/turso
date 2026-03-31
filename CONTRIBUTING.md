@@ -28,6 +28,7 @@ This document is a quick helper to get you going.
   - [Making Releases](#making-releases)
     - [Pre-releases](#pre-releases)
     - [Releases](#releases)
+    - [Cleaning up PyPI Storage](#cleaning-up-pypi-storage)
 <!--toc:end-->
 
 ## Getting Started
@@ -434,3 +435,20 @@ Releases use a plain version number:
 ./scripts/update-version.py 0.6.0
 git push origin main v0.6.0
 ```
+
+## Cleaning up PyPI Storage
+
+PyPI has a storage quota for the `pyturso` package. If you run out of storage, you need to delete old release candidate (RC) packages to free up space.
+
+Use the `scripts/pypi-cleanup` script to manage this:
+
+```console
+# Dry run — lists RC packages older than 90 days (safe, no changes made)
+./scripts/pypi-cleanup
+
+# Actually delete the packages
+./scripts/pypi-cleanup --execute
+```
+
+Always run the dry run first to review what will be deleted before executing.
+
