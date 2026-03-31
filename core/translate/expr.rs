@@ -3204,6 +3204,9 @@ pub fn translate_expr(
 
                                 program
                                     .emit_column_affinity(target_register, table_column.affinity());
+                                // The virtual column's declared collation must override
+                                // whatever collation the inner expression resolved to.
+                                program.set_collation(Some((table_column.collation(), false)));
                             }
                             _ => {
                                 let read_cursor = if read_from_index {
