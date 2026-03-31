@@ -240,7 +240,7 @@ pub async fn wal_apply_from_file<Ctx>(
             coro.yield_(SyncEngineIoResult::IO).await?;
         }
         let info = WalFrameInfo::from_frame_header(buffer.as_slice());
-        tracing::info!("got frame: {:?}", info);
+        tracing::debug!("got frame: {:?}", info);
         db_size = info.db_size;
         session.append_page(info.page_no, &buffer.as_slice()[WAL_FRAME_HEADER..])?;
     }
@@ -345,7 +345,7 @@ pub async fn wal_pull_to_file_v1<IO: SyncEngineIo, Ctx>(
     .await?;
     while let Some(page_data) = page_data_opt.take() {
         let page_id = page_data.page_id;
-        tracing::info!("received page {}", page_id);
+        tracing::debug!("received page {}", page_id);
         let page = decode_page(&header, page_data)?;
         if page.len() != PAGE_SIZE {
             return Err(Error::DatabaseSyncEngineError(format!(
@@ -364,7 +364,7 @@ pub async fn wal_pull_to_file_v1<IO: SyncEngineIo, Ctx>(
         if page_data_opt.is_none() {
             frame_info.db_size = header.db_size as u32;
         }
-        tracing::info!("page_data_opt: {}", page_data_opt.is_some());
+        tracing::debug!("page_data_opt: {}", page_data_opt.is_some());
         frame_info.put_to_frame_header(buffer.as_mut_slice());
 
         let c = Completion::new_write(move |result| {
@@ -472,7 +472,7 @@ pub async fn pull_pages_v1<IO: SyncEngineIo, Ctx>(
     .await?;
     while let Some(page_data) = page_data_opt.take() {
         let page_id = page_data.page_id;
-        tracing::info!("received page {}", page_id);
+        tracing::debug!("received page {}", page_id);
         let page = decode_page(&header, page_data)?;
         if page.len() != PAGE_SIZE {
             return Err(Error::DatabaseSyncEngineError(format!(
@@ -484,7 +484,7 @@ pub async fn pull_pages_v1<IO: SyncEngineIo, Ctx>(
         pages.push(PulledPage { page_id, page });
         page_data_opt =
             wait_proto_message(ctx.coro, &completion, &ctx.io.network_stats, &mut bytes).await?;
-        tracing::info!("page_data_opt: {}", page_data_opt.is_some());
+        tracing::debug!("page_data_opt: {}", page_data_opt.is_some());
     }
 
     Ok(PulledPages {
@@ -1007,7 +1007,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
         } else {
             DatabaseTapeOperation::RowChange(change)
         };
-        tracing::info!(
+        tracing::debug!(
             "change_id: {}, last_change_id: {:?}",
             change_id,
             last_change_id
@@ -1331,7 +1331,7 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
     )
     .await?
     {
-        tracing::info!(
+        tracing::debug!(
             "bootstrap_db_file: received page page_id={}",
             page_data.page_id
         );

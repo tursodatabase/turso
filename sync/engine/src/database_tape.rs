@@ -341,7 +341,7 @@ impl DatabaseWalSession {
     ) -> Result<usize> {
         let conn = self.wal_session.conn();
         let pages = conn.wal_changed_pages_after(frame_watermark)?;
-        tracing::info!("rolling back {} pages", pages.len());
+        tracing::debug!("rolling back {} pages", pages.len());
         let pages_cnt = pages.len();
         for page_no in pages {
             self.rollback_page(coro, page_no, frame_watermark).await?;

@@ -706,7 +706,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     fn step_inner(&mut self, _context: &()) -> Result<TransitionResult<CheckpointResult>> {
         match &self.state {
             CheckpointState::AcquireLock => {
-                tracing::debug!("Acquiring blocking checkpoint lock");
+                tracing::info!("Acquiring blocking checkpoint lock");
                 let locked = self.checkpoint_lock.write();
                 if !locked {
                     return Err(crate::LimboError::Busy);
@@ -714,10 +714,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 self.lock_states.blocking_checkpoint_lock_held = true;
 
                 self.collect_committed_table_row_versions();
-                tracing::debug!("Collected {} committed versions", self.write_set.len());
+                tracing::info!("Collected {} committed versions", self.write_set.len());
 
                 self.collect_committed_index_row_versions();
-                tracing::debug!("Collected {} index row changes", self.index_write_set.len());
+                tracing::info!("Collected {} index row changes", self.index_write_set.len());
                 // Checkpoint boundary is derived from a stable snapshot under the blocking lock:
                 // old durable boundary plus the latest committed tx watermark. This covers both
                 // row/index commits and header-only commits.
@@ -739,7 +739,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 Ok(TransitionResult::Continue)
             }
             CheckpointState::BeginPagerTxn => {
-                tracing::debug!("Beginning pager transaction");
+                tracing::info!("Beginning pager transaction");
                 // Start a pager transaction to write committed versions to B-tree
                 let read_tx_active = self
                     .pager
@@ -1279,7 +1279,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 // the pager transaction. durable_txid_max is NOT advanced (only happens
                 // on success below), so a retry will re-stage from the previous boundary.
                 // The logical log is also unaffected — its offset is not advanced here.
-                tracing::debug!("Committing pager transaction");
+                tracing::info!("Committing pager transaction");
                 let result = self
                     .pager
                     .commit_tx(&self.connection, self.update_transaction_state)?;
@@ -1309,7 +1309,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             }
 
             CheckpointState::TruncateLogicalLog => {
-                tracing::debug!("Truncating logical log file");
+                tracing::info!("Truncating logical log file");
                 let c = self.truncate_logical_log()?;
                 self.state = CheckpointState::FsyncLogicalLog;
                 // if Completion Completed without errors we can continue
@@ -1339,7 +1339,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             }
 
             CheckpointState::CheckpointWal => {
-                tracing::debug!("Performing TRUNCATE checkpoint on WAL");
+                tracing::info!("Performing TRUNCATE checkpoint on WAL");
                 match self.checkpoint_wal()? {
                     IOResult::Done(result) => {
                         self.checkpoint_result = Some(result);
@@ -1377,7 +1377,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     return Ok(TransitionResult::Continue);
                 }
 
-                tracing::debug!("Fsyncing database file before WAL truncation");
+                tracing::info!("Fsyncing database file before WAL truncation");
                 let c = self
                     .pager
                     .db_file
@@ -1407,7 +1407,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             }
 
             CheckpointState::Finalize => {
-                tracing::debug!("Releasing blocking checkpoint lock");
+                tracing::info!("Releasing blocking checkpoint lock");
                 // Patch sqlite_schema in MV Store to contain positive rootpages instead of negative ones
                 // for tables and indexes that were flushed to the physical database
                 for (sqlite_schema_rowid, (_, row_version)) in self.created_btrees.drain() {
@@ -1520,7 +1520,7 @@ impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
                 self.mvstore
                     .storage
                     .on_checkpoint_end(self.durable_txid_max_new, Err(err.clone()))?;
-                tracing::debug!("Error in checkpoint state machine: {err}");
+                tracing::info!("Error in checkpoint state machine: {err}");
                 self.cleanup_after_external_io_error();
                 res
             }

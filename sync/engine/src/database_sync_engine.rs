@@ -699,7 +699,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 .collect();
             for page_no in main_changed_pages {
                 if revert_changed_pages.contains(&page_no) {
-                    tracing::info!(
+                    tracing::debug!(
                         "checkpoint(path={:?}): skip page {} as it present in revert WAL",
                         self.main_db_path,
                         page_no
@@ -707,7 +707,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     continue;
                 }
                 if page_no > db_size {
-                    tracing::info!(
+                    tracing::debug!(
                         "checkpoint(path={:?}): skip page {} as it ahead of revert-DB size",
                         self.main_db_path,
                         page_no
@@ -727,14 +727,14 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     None => false,
                 };
                 if !end_read_result {
-                    tracing::info!(
+                    tracing::debug!(
                         "checkpoint(path={:?}): skip page {} as it was allocated in the WAL portion for revert",
                         self.main_db_path,
                         page_no
                     );
                     continue;
                 }
-                tracing::info!(
+                tracing::debug!(
                     "checkpoint(path={:?}): append page {} (current db_size={})",
                     self.main_db_path,
                     page_no,

@@ -738,7 +738,7 @@ impl Database {
 
             // Check if already in registry
             if let Some(db) = registry.get(&canonical_path).and_then(Weak::upgrade) {
-                tracing::debug!("took database {canonical_path:?} from the registry");
+                tracing::info!("took database {canonical_path:?} from the registry");
 
                 // Check encryption compatibility using cipher mode (key is not stored in Database for security)
                 let db_is_encrypted = !matches!(db.encryption_cipher_mode.get(), CipherMode::None);

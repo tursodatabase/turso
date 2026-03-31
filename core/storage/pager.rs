@@ -2636,7 +2636,7 @@ impl Pager {
                     // we do not set TransactionState::None here - because caller can decide that nothing should be done for this connection
                     // and skip next calls of the commit_tx methods after IO
 
-                    tracing::debug!("commit_tx: schema_did_change={schema_did_change}");
+                    tracing::info!("commit_tx: schema_did_change={schema_did_change}");
                     if schema_did_change {
                         let schema = connection.schema.read().clone();
                         connection.db.update_schema_if_newer(schema);
