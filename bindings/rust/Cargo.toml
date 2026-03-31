@@ -23,6 +23,7 @@ sync = [
     "dep:http-body-util",
     "dep:bytes",
 ]
+experimental_win_iocp = []
 
 [dependencies]
 turso_sdk_kit = { workspace = true }
@@ -57,4 +58,3 @@ rand_chacha = { workspace = true }
 anyhow.workspace = true
 reqwest = { version = "0.12.28", features = ["json"] }
 serde_json.workspace = true
-
