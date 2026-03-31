@@ -1,0 +1,20 @@
+name: Fossier PR Check
+
+on:
+  pull_request_target:
+    types: [opened, synchronize]
+
+permissions:
+  pull-requests: write
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PThorpe92/fossier@main
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          registry-api-key: ${{ secrets.FOSSIER_REGISTRY_API_KEY }}
+          contact-url: "https://discord.gg/mNUkCHs2R"
