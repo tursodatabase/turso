@@ -104,12 +104,13 @@ pub fn expr_to_value<T: TableContext>(
     match expr {
         ast::Expr::DoublyQualified(_, _, col_name)
         | ast::Expr::Qualified(_, col_name)
-        | ast::Expr::Id(col_name) => {
+        | ast::Expr::Id(col_name)
+        | ast::Expr::Name(col_name) => {
             let col_name = col_name.as_str();
             assert_eq!(row.len(), table.columns().count());
             table
                 .columns()
-                .position(|c| c.column.name == col_name)
+                .position(|c| c.column.name.eq_ignore_ascii_case(col_name))
                 .map(|idx| row[idx].clone())
         }
         ast::Expr::Literal(literal) => Some(literal.into()),

@@ -229,7 +229,7 @@ fn extract_column_refs(expr: &ast::Expr, columns: &[Column]) -> Vec<String> {
 }
 
 fn rename_column_in_expr(expr: &mut ast::Expr, from: &str, to: &str) {
-    if from.is_empty() || from.eq_ignore_ascii_case(to) {
+    if from.is_empty() || from == to {
         return;
     }
     turso_core::walk_expr_mut(expr, &mut |e| {
@@ -574,7 +574,15 @@ impl From<&turso_core::types::Value> for SimValue {
 
 #[cfg(test)]
 mod tests {
-    use crate::model::table::{escape_singlequotes, unescape_singlequotes};
+    use turso_parser::ast::{self, Name, SortOrder};
+
+    use crate::model::{
+        query::predicate::expr_to_value,
+        table::{
+            escape_singlequotes, unescape_singlequotes, Column, ColumnType, Index, IndexColumn,
+            IndexColumnKind, SimValue, Table,
+        },
+    };
 
     #[test]
     fn test_unescape_singlequotes() {
@@ -598,5 +606,45 @@ mod tests {
         );
         assert_eq!(escape_singlequotes("test''test"), "'test''''test'");
         assert_eq!(escape_singlequotes("many'''quotes"), "'many''''''quotes'");
+    }
+
+    #[test]
+    fn test_rename_column_refs_updates_case_only_expr_refs() {
+        let mut index = Index {
+            table_name: "t".to_string(),
+            index_name: "idx_t_expr".to_string(),
+            columns: vec![IndexColumn {
+                kind: IndexColumnKind::Expr {
+                    expr: Box::new(ast::Expr::Id(Name::exact("A".to_string()))),
+                },
+                order: SortOrder::Asc,
+            }],
+        };
+
+        index.rename_column_refs("A", "a");
+
+        assert!(matches!(
+            &index.columns[0].kind,
+            IndexColumnKind::Expr { expr }
+                if matches!(expr.as_ref(), ast::Expr::Id(name) if name.as_str() == "a")
+        ));
+    }
+
+    #[test]
+    fn test_expr_to_value_resolves_columns_case_insensitively() {
+        let table = Table {
+            name: "t".to_string(),
+            columns: vec![Column {
+                name: "a".to_string(),
+                column_type: ColumnType::Integer,
+                constraints: vec![],
+            }],
+            rows: vec![],
+            indexes: vec![],
+        };
+        let row = vec![SimValue(turso_core::Value::from_i64(7))];
+        let expr = ast::Expr::Id(Name::exact("A".to_string()));
+
+        assert_eq!(expr_to_value(&expr, &row, &table), Some(row[0].clone()));
     }
 }

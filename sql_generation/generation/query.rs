@@ -971,8 +971,10 @@ fn get_column_diff(table: &Table) -> IndexSet<&str> {
     table
         .columns
         .iter()
-        .map(|c| c.name.as_str())
-        .filter(|&name| !undropable_norm.contains(&name.to_ascii_lowercase()))
+        .filter_map(|c| {
+            let norm = c.name.to_ascii_lowercase();
+            (!undropable_norm.contains(&norm)).then_some(c.name.as_str())
+        })
         .collect()
 }
 
