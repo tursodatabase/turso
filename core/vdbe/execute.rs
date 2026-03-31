@@ -3759,7 +3759,7 @@ pub fn op_program(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Program {
-            params,
+            param_registers,
             program: subprogram,
             ignore_jump_target,
         },
@@ -3768,15 +3768,24 @@ pub fn op_program(
     loop {
         match &mut state.op_program_state {
             OpProgramState::Start => {
-                let mut statement = Statement::new_with_origin(
-                    Program::from_prepared(subprogram.clone(), program.connection.clone()),
-                    pager.clone(),
-                    QueryMode::Normal,
-                    0,
-                    crate::statement::StatementOrigin::Subprogram,
-                    false,
-                );
-                statement.reset()?;
+                // Try to reuse a cached statement for this PC, otherwise create a new one.
+                // When we have triggers or fk-actions with multi-row inserts, we can re-use
+                // cached statements by storing them key'd by the state.pc if we are in a loop
+                let pc_key = state.pc as usize;
+                let mut statement =
+                    if let Some(mut cached) = state.subprogram_stmt_cache.remove(&pc_key) {
+                        cached.reset_for_subprogram_reuse();
+                        cached
+                    } else {
+                        Box::new(Statement::new_with_origin(
+                            Program::from_prepared(subprogram.clone(), program.connection.clone()),
+                            pager.clone(),
+                            QueryMode::Normal,
+                            0,
+                            crate::statement::StatementOrigin::Subprogram,
+                            false,
+                        ))
+                    };
 
                 // Check if this is a trigger subprogram - if so, track execution
                 // and save last_insert_rowid so it can be restored after the trigger finishes.
@@ -3788,34 +3797,17 @@ pub fn op_program(
                         (false, None)
                     };
 
-                // Extract register values from params (which contain register indices encoded as negative integers)
-                // and bind them to the subprogram's parameters
-                for (param_idx, param_value) in params.iter().enumerate() {
-                    if let Value::Numeric(Numeric::Integer(reg_idx)) = param_value {
-                        let reg_idx = *reg_idx as usize;
-                        if reg_idx < state.registers.len() {
-                            let value = state.registers[reg_idx].get_value().clone();
-                            let param_index = NonZero::<usize>::new(param_idx + 1)
-                                .expect("param_idx + 1 should be non-zero");
-                            statement.bind_at(param_index, value);
-                        } else {
-                            crate::bail_corrupt_error!(
-                                "Register index {} out of bounds (len={})",
-                                reg_idx,
-                                state.registers.len()
-                            );
-                        }
-                    } else {
-                        crate::bail_parse_error!(
-                            "Subprogram parameters should be integers, got {:?}",
-                            param_value
-                        );
-                    }
+                // Copy parameter values from parent registers into the subprogram's parameters.
+                for (param_idx, &parent_reg) in param_registers.iter().enumerate() {
+                    let value = state.registers[parent_reg].get_value().clone();
+                    let param_index = NonZero::<usize>::new(param_idx + 1)
+                        .expect("param_idx + 1 should be non-zero");
+                    statement.bind_at(param_index, value);
                 }
 
                 state.op_program_state = OpProgramState::Step {
                     is_trigger,
-                    statement: Box::new(statement),
+                    statement,
                     saved_last_insert_rowid,
                 };
             }
@@ -3832,7 +3824,7 @@ pub fn op_program(
                 // so we must not call it again after the loop.
                 let mut subprogram_aborted = false;
                 loop {
-                    let res = statement.step();
+                    let res = statement.step_subprogram();
                     match res {
                         Ok(step_result) => match step_result {
                             StepResult::Done => break,
@@ -3864,7 +3856,6 @@ pub fn op_program(
                         }
                     }
                 }
-
                 // Only end trigger execution for normal completion. Error paths
                 // already called end_trigger_execution() via abort() in the subprogram.
                 if is_trigger && !subprogram_aborted {
@@ -3877,7 +3868,17 @@ pub fn op_program(
                     program.connection.update_last_rowid(rowid);
                 }
 
-                state.op_program_state = OpProgramState::Start;
+                // Cache the statement for reuse on subsequent fires of this
+                // same Program instruction (e.g. next row in an INSERT loop).
+                // Only cache on clean completion - aborted statements have dirty
+                // internal state and cannot be safely reused.
+                let pc_key = state.pc as usize;
+                let prev = std::mem::replace(&mut state.op_program_state, OpProgramState::Start);
+                if !subprogram_aborted {
+                    if let OpProgramState::Step { statement, .. } = prev {
+                        state.subprogram_stmt_cache.insert(pc_key, statement);
+                    }
+                }
                 if raise_ignore {
                     // RAISE(IGNORE) — skip the current row by jumping to ignore_jump_target
                     state.pc = ignore_jump_target.as_offset_int();

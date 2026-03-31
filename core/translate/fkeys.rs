@@ -11,7 +11,7 @@ use crate::{
         insn::{CmpInsFlags, Insn},
         BranchOffset,
     },
-    Connection, LimboError, Result, Value,
+    Connection, LimboError, Result,
 };
 use std::{num::NonZero, num::NonZeroUsize, sync::Arc};
 
@@ -1408,28 +1408,18 @@ fn emit_fk_action_subprogram(
     subprogram_builder.epilogue(resolver.schema());
     let built_subprogram = subprogram_builder.build(connection.clone(), true, description)?;
 
-    // Build params: OLD key register indices, then optionally NEW key register indices
-    let mut params: Vec<Value> = ctx
-        .old_key_registers
-        .iter()
-        .copied()
-        .map(|reg_idx| Value::from_i64(reg_idx as i64))
-        .collect();
+    // Build param_registers: OLD key register indices, then optionally NEW key register indices
+    let mut param_registers: Vec<usize> = ctx.old_key_registers.to_vec();
 
     if let Some(new_regs) = &ctx.new_key_registers {
-        params.extend(
-            new_regs
-                .iter()
-                .copied()
-                .map(|reg_idx| Value::from_i64(reg_idx as i64)),
-        );
+        param_registers.extend(new_regs.iter().copied());
     }
 
     // FK action subprograms can't contain RAISE(IGNORE), so ignore_jump_target
     // is a no-op that resolves to the next instruction (just falls through).
     let ignore_jump_target = program.allocate_label();
     program.emit_insn(Insn::Program {
-        params,
+        param_registers,
         program: built_subprogram.prepared().clone(),
         ignore_jump_target,
     });
