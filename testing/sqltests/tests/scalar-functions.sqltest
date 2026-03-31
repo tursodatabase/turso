@@ -2283,3 +2283,99 @@ test unistr-error-non-hex-capital-U {
 expect error {
     invalid Unicode escape
 }
+
+@skip-if sqlite "unistr_quote not available in CI SQLite build"
+test unistr-quote-plain-text {
+    SELECT unistr_quote('hello');
+}
+expect {
+    'hello'
+}
+
+@skip-if sqlite "unistr_quote not available in CI SQLite build"
+test unistr-quote-null {
+    SELECT unistr_quote(NULL);
+}
+expect {
+    NULL
+}
+
+@skip-if sqlite "unistr_quote not available in CI SQLite build"
+test unistr-quote-integer {
+    SELECT unistr_quote(42);
+}
+expect {
+    42
+}
+
+@skip-if sqlite "unistr_quote not available in CI SQLite build"
+test unistr-quote-float {
+    SELECT unistr_quote(3.14);
+}
+expect {
+    3.14
+}
+
+@skip-if sqlite "unistr_quote not available in CI SQLite build"
+test unistr-quote-with-tab {
+    SELECT unistr_quote(char(97, 9, 98));
+}
+expect {
+    unistr('a\u0009b')
+}
+
+@skip-if sqlite "unistr_quote not available in CI SQLite build"
+test unistr-quote-with-newline {
+    SELECT unistr_quote(char(97, 10, 98));
+}
+expect {
+    unistr('a\u000ab')
+}
+
+@skip-if sqlite "unistr_quote not available in CI SQLite build"
+test unistr-quote-backslash-no-ctrl {
+    SELECT unistr_quote('a\b');
+}
+expect {
+    'a\b'
+}
+
+@skip-if sqlite "unistr_quote not available in CI SQLite build"
+test unistr-quote-backslash-with-ctrl {
+    SELECT unistr_quote(char(97, 9, 92, 98));
+}
+expect {
+    unistr('a\u0009\\\\b')
+}
+
+@skip-if sqlite "unistr_quote not available in CI SQLite build"
+test unistr-quote-single-quote-with-ctrl {
+    SELECT unistr_quote(char(97, 1) || '''');
+}
+expect {
+    unistr('a\u0001''')
+}
+
+@skip-if sqlite "unistr_quote not available in CI SQLite build"
+test unistr-quote-blob {
+    SELECT unistr_quote(X'DEADBEEF');
+}
+expect {
+    X'DEADBEEF'
+}
+
+@skip-if sqlite "unistr_quote not available in CI SQLite build"
+test unistr-quote-matches-quote-no-ctrl {
+    SELECT unistr_quote('hello world') = quote('hello world');
+}
+expect {
+    1
+}
+
+@skip-if sqlite "unistr_quote not available in CI SQLite build"
+test unistr-quote-ignores-control-after-nul {
+    SELECT unistr_quote(char(97, 0, 9));
+}
+expect {
+    'a'
+}
