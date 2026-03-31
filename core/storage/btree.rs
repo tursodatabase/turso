@@ -11,12 +11,16 @@ use super::{
         write_varint_to_vec, IndexInteriorCell, IndexLeafCell, OverflowCell, MINIMUM_CELL_SIZE,
     },
 };
+#[cfg(not(feature = "omit_autovacuum"))]
+use crate::storage::pager::ptrmap::PtrmapType;
+#[cfg(not(feature = "omit_autovacuum"))]
+use crate::storage::pager::AutoVacuumMode;
 use crate::{
     io::CompletionGroup,
     io_yield_one,
     schema::Index,
     storage::{
-        pager::{AutoVacuumMode, BtreePageAllocMode, Pager},
+        pager::{BtreePageAllocMode, Pager},
         sqlite3_ondisk::{
             payload_overflows, read_u32, read_varint, write_varint, BTreeCell, DatabaseHeader,
             PageContent, PageSize, PageType, TableInteriorCell, TableLeafCell, CELL_PTR_SIZE_BYTES,
@@ -40,7 +44,6 @@ use crate::{
     vdbe::Register,
     Completion, MvStore,
 };
-use crate::storage::pager::ptrmap::PtrmapType;
 use crate::{
     numeric::Numeric,
     return_corrupt, return_if_io,
@@ -231,6 +234,9 @@ struct BalanceContext {
     sibling_count_new: usize,
     cell_array: CellArray,
     old_cell_count_per_page_cumulative: [u16; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE],
+    /// The page-id of the parent interior node. Stored here so that
+    /// NonRootDoBalancingAllocate can register newly-allocated sibling pages
+    /// in the pointer map (required for autovacuum correctness).
     parent_page_id: u32,
     #[cfg(debug_assertions)]
     cells_debug: Vec<Vec<u8>>,
@@ -2550,6 +2556,28 @@ impl BTreeCursor {
         }
     }
 
+    /// Register a newly-allocated btree page in the pointer map so that
+    /// autovacuum can locate its parent when moving pages.
+    ///
+    /// All feature-flag and runtime-mode checks live here so call sites stay
+    /// clean.  When the `omit_autovacuum` feature is enabled, or when the
+    /// database is not in autovacuum mode, this is a no-op.
+    #[inline]
+    fn update_ptrmap(&mut self, new_page_id: u32, parent_page_id: u32) -> Result<IOResult<()>> {
+        #[cfg(not(feature = "omit_autovacuum"))]
+        if self.pager.get_auto_vacuum_mode() != AutoVacuumMode::None {
+            return_if_io!(self.pager.ptrmap_put(
+                new_page_id,
+                PtrmapType::BTreeNode,
+                parent_page_id,
+            ));
+        }
+        // Suppress unused-variable warnings when omit_autovacuum is active.
+        #[cfg(feature = "omit_autovacuum")]
+        let _ = (new_page_id, parent_page_id);
+        Ok(IOResult::Done(()))
+    }
+
     /// Fast balancing routine for the common special case where the rightmost leaf page of a given subtree overflows (= an append).
     /// In this case we just add a new leaf page as the right sibling of that page, and insert a new divider cell into the parent.
     /// The high level steps are:
@@ -2570,6 +2598,15 @@ impl BTreeCursor {
         ));
         self.pager.add_dirty(&new_rightmost_leaf)?;
 
+        // Register the new leaf page in the ptrmap so autovacuum can find its parent.
+        let parent_id = self
+            .stack
+            .get_page_at_level(self.stack.current() - 1)
+            .expect("parent page should be on the stack")
+            .get()
+            .id as u32;
+        return_if_io!(self.update_ptrmap(new_rightmost_leaf.get().id as u32, parent_id));
+
         let usable_space = self.usable_space();
         let old_rightmost_leaf = self.stack.top_ref();
         let old_rightmost_leaf_contents = old_rightmost_leaf.get_contents();
@@ -2584,14 +2621,6 @@ impl BTreeCursor {
             .get_page_at_level(self.stack.current() - 1)
             .expect("parent page should be on the stack");
         self.pager.add_dirty(parent)?;
-        #[cfg(not(feature = "omit_autovacuum"))]
-        if self.pager.get_auto_vacuum_mode() != AutoVacuumMode::None {
-            return_if_io!(self.pager.ptrmap_put(
-                new_rightmost_leaf.get().id as u32,
-                PtrmapType::BTreeNode,
-                parent.get().id as u32,
-            ));
-        }
         let parent_contents = parent.get_contents();
         let rightmost_pointer = parent_contents
             .rightmost_pointer()?
@@ -3444,6 +3473,9 @@ impl BTreeCursor {
                         parent_page_id,
                         ..
                     } = context.as_mut().unwrap();
+                    // Suppress unused warning when omit_autovacuum is enabled.
+                    #[cfg(feature = "omit_autovacuum")]
+                    let _ = parent_page_id;
                     let pager = self.pager.clone();
                     let balance_info = balance_info.as_mut().unwrap();
                     let page_type = balance_info.pages_to_balance[0]
@@ -3462,6 +3494,10 @@ impl BTreeCursor {
                             0,
                             BtreePageAllocMode::Any
                         ));
+                        // Register the new sibling page in the ptrmap.
+                        // Note: we use the cloned `pager` here rather than
+                        // `self.update_ptrmap` because `sub_state` already holds
+                        // a mutable borrow of `self.balance_state`.
                         #[cfg(not(feature = "omit_autovacuum"))]
                         if pager.get_auto_vacuum_mode() != AutoVacuumMode::None {
                             return_if_io!(pager.ptrmap_put(
@@ -3492,9 +3528,9 @@ impl BTreeCursor {
                             sibling_count_new,
                             cell_array,
                             old_cell_count_per_page_cumulative,
-                            parent_page_id: _,
                             #[cfg(debug_assertions)]
                             cells_debug,
+                            ..
                         },
                 } => {
                     let balance_info = balance_info.as_mut().unwrap();
@@ -4418,14 +4454,10 @@ impl BTreeCursor {
             0,
             BtreePageAllocMode::Any
         ));
-        #[cfg(not(feature = "omit_autovacuum"))]
-        if self.pager.get_auto_vacuum_mode() != AutoVacuumMode::None {
-            return_if_io!(self.pager.ptrmap_put(
-                child.get().id as u32,
-                PtrmapType::BTreeNode,
-                root.get().id as u32,
-            ));
-        }
+
+        // Register the child page in the ptrmap. Its parent is the root page,
+        // which keeps its page number when the root splits (balance-deeper pattern).
+        return_if_io!(self.update_ptrmap(child.get().id as u32, root.get().id as u32));
 
         let is_page_1 = root.get().id == 1;
         let offset = if is_page_1 { DatabaseHeader::SIZE } else { 0 };
