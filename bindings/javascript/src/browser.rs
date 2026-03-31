@@ -155,6 +155,10 @@ impl IO for Opfs {
     fn remove_file(&self, _: &str) -> turso_core::Result<()> {
         Ok(())
     }
+
+    fn file_id(&self, path: &str) -> turso_core::Result<turso_core::io::FileId> {
+        Ok(turso_core::io::FileId::from_path_hash(path))
+    }
 }
 
 impl File for OpfsFile {
