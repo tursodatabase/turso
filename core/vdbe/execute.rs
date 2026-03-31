@@ -3768,11 +3768,13 @@ pub fn op_program(
     loop {
         match &mut state.op_program_state {
             OpProgramState::Start => {
-                let mut statement = Statement::new(
+                let mut statement = Statement::new_with_origin(
                     Program::from_prepared(subprogram.clone(), program.connection.clone()),
                     pager.clone(),
                     QueryMode::Normal,
                     0,
+                    crate::statement::StatementOrigin::Subprogram,
+                    false,
                 );
                 statement.reset()?;
 
@@ -10243,7 +10245,7 @@ pub fn op_parse_schema(
     } else {
         format!("SELECT * FROM {schema_table}")
     };
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_internal(sql)?;
 
     // Get a mutable schema clone *without* holding the schema lock during
     // nested statement execution.  The nested Statement may call reprepare()
@@ -10280,8 +10282,6 @@ pub fn op_parse_schema(
     // Set up MVCC transaction for the nested statement
     let mv_tx = program.connection.get_mv_tx();
     stmt.set_mv_tx(mv_tx);
-
-    conn.start_nested();
 
     // Store state for resumption across IO boundaries
     state.op_parse_schema_state = Some(Box::new(OpParseSchemaInner {
@@ -10347,59 +10347,76 @@ fn op_parse_schema_step(
             }
             StepResult::Done => {
                 // Take the state to finalize
-                let inner = state
+                let OpParseSchemaInner {
+                    stmt,
+                    mut schema_arc,
+                    from_sql_indexes,
+                    automatic_indices,
+                    dbsp_state_roots,
+                    dbsp_state_index_roots,
+                    materialized_view_info,
+                    db,
+                    previous_auto_commit,
+                } = *state
                     .op_parse_schema_state
                     .take()
                     .expect("parse schema state should exist");
-                let mut schema_arc = inner.schema_arc;
                 let schema = Arc::make_mut(&mut schema_arc);
-                let mv_store = inner.stmt.mv_store();
+                let mv_store = stmt.mv_store();
                 let syms = conn.syms.read();
 
                 let res1 = schema.populate_indices(
                     &syms,
-                    inner.from_sql_indexes,
-                    inner.automatic_indices,
+                    from_sql_indexes,
+                    automatic_indices,
                     mv_store.is_some(),
                 );
                 let res2 = schema.populate_materialized_views(
-                    inner.materialized_view_info,
-                    inner.dbsp_state_roots,
-                    inner.dbsp_state_index_roots,
+                    materialized_view_info,
+                    dbsp_state_roots,
+                    dbsp_state_index_roots,
                 );
 
                 // Store the modified schema back
-                if crate::is_attached_db(inner.db) {
-                    conn.database_schemas().write().insert(inner.db, schema_arc);
+                if crate::is_attached_db(db) {
+                    conn.database_schemas().write().insert(db, schema_arc);
                 } else {
                     *conn.schema.write() = schema_arc;
                 }
-                conn.end_nested();
+                drop(stmt);
                 conn.auto_commit
-                    .store(inner.previous_auto_commit, Ordering::SeqCst);
+                    .store(previous_auto_commit, Ordering::SeqCst);
                 let _ = (res1?, res2?);
 
                 state.pc += 1;
                 return Ok(InsnFunctionStepResult::Step);
             }
             StepResult::Interrupt => {
-                let inner = state
+                let OpParseSchemaInner {
+                    stmt,
+                    previous_auto_commit,
+                    ..
+                } = *state
                     .op_parse_schema_state
                     .take()
                     .expect("parse schema state should exist");
-                conn.end_nested();
+                drop(stmt);
                 conn.auto_commit
-                    .store(inner.previous_auto_commit, Ordering::SeqCst);
+                    .store(previous_auto_commit, Ordering::SeqCst);
                 return Err(LimboError::Interrupt);
             }
             StepResult::Busy => {
-                let inner = state
+                let OpParseSchemaInner {
+                    stmt,
+                    previous_auto_commit,
+                    ..
+                } = *state
                     .op_parse_schema_state
                     .take()
                     .expect("parse schema state should exist");
-                conn.end_nested();
+                drop(stmt);
                 conn.auto_commit
-                    .store(inner.previous_auto_commit, Ordering::SeqCst);
+                    .store(previous_auto_commit, Ordering::SeqCst);
                 return Err(LimboError::Busy);
             }
         }
@@ -10447,8 +10464,7 @@ pub fn op_init_cdc_version(
     // Step 0: Check if the CDC table already exists but has no version row.
     // If so, it's a legacy v1 table that pre-dates version tracking.
     let cdc_table_exists = {
-        conn.start_nested();
-        let mut stmt = conn.prepare(format!(
+        let mut stmt = conn.prepare_internal(format!(
             "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='{escaped_cdc_table_name}'",
         ))?;
         stmt.program
@@ -10456,13 +10472,11 @@ pub fn op_init_cdc_version(
             .needs_stmt_subtransactions
             .store(false, Ordering::Relaxed);
         let rows = stmt.run_collect_rows();
-        conn.end_nested();
         !rows?.is_empty()
     };
 
     // Step 1: Create CDC table if needed
     {
-        conn.start_nested();
         let create_sql = match version {
             CdcVersion::V1 => format!(
                 "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
@@ -10471,29 +10485,24 @@ pub fn op_init_cdc_version(
                 "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_txn_id INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
             ),
         };
-        let mut stmt = conn.prepare(create_sql)?;
+        let mut stmt = conn.prepare_internal(create_sql)?;
         stmt.program
             .prepared
             .needs_stmt_subtransactions
             .store(false, Ordering::Relaxed);
-        let res = stmt.run_ignore_rows();
-        conn.end_nested();
-        res?;
+        stmt.run_ignore_rows()?;
     }
 
     // Step 2: Create version table if needed
     {
-        conn.start_nested();
-        let mut stmt = conn.prepare(format!(
+        let mut stmt = conn.prepare_internal(format!(
             "CREATE TABLE IF NOT EXISTS {TURSO_CDC_VERSION_TABLE_NAME} (table_name TEXT PRIMARY KEY, version TEXT NOT NULL)",
         ))?;
         stmt.program
             .prepared
             .needs_stmt_subtransactions
             .store(false, Ordering::Relaxed);
-        let res = stmt.run_ignore_rows();
-        conn.end_nested();
-        res?;
+        stmt.run_ignore_rows()?;
     }
 
     // Step 3: Insert version row only if one doesn't already exist.
@@ -10504,24 +10513,20 @@ pub fn op_init_cdc_version(
         *version
     };
     {
-        conn.start_nested();
-        let mut stmt = conn.prepare(format!(
+        let mut stmt = conn.prepare_internal(format!(
             "INSERT OR IGNORE INTO {TURSO_CDC_VERSION_TABLE_NAME} (table_name, version) VALUES ('{escaped_cdc_table_name}', '{version_to_insert}')",
         ))?;
         stmt.program
             .prepared
             .needs_stmt_subtransactions
             .store(false, Ordering::Relaxed);
-        let res = stmt.run_ignore_rows();
-        conn.end_nested();
-        res?;
+        stmt.run_ignore_rows()?;
     }
 
     // Step 4: Read back the actual version from the table (may differ from
     // `version` if the row already existed with an older version).
     let actual_version = {
-        conn.start_nested();
-        let mut stmt = conn.prepare(format!(
+        let mut stmt = conn.prepare_internal(format!(
             "SELECT version FROM {TURSO_CDC_VERSION_TABLE_NAME} WHERE table_name = '{escaped_cdc_table_name}'",
         ))?;
         stmt.program
@@ -10529,7 +10534,6 @@ pub fn op_init_cdc_version(
             .needs_stmt_subtransactions
             .store(false, Ordering::Relaxed);
         let rows = stmt.run_collect_rows();
-        conn.end_nested();
         let rows = rows?;
         match rows.first().and_then(|r| r.first()) {
             Some(crate::Value::Text(text)) => text.to_string().parse::<CdcVersion>()?,
@@ -13827,6 +13831,19 @@ fn op_vacuum_into_inner(
                 if !program.connection.auto_commit.load(Ordering::SeqCst) {
                     return Err(LimboError::TxError(
                         "cannot VACUUM INTO from within a transaction".to_string(),
+                    ));
+                }
+                if program
+                    .connection
+                    .n_active_root_statements
+                    .load(Ordering::SeqCst)
+                    != 1
+                {
+                    // This VACUUM INTO statement itself is the one active root
+                    // statement. Any count other than 1 means some other
+                    // top-level statement on the same connection is still active.
+                    return Err(LimboError::TxError(
+                        "cannot VACUUM - SQL statements in progress".to_string(),
                     ));
                 }
 
