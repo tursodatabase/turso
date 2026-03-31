@@ -27,12 +27,23 @@ NPM_PACKAGES = [
     "bindings/javascript/sync/packages/native",
     "bindings/javascript/sync/packages/wasm",
     "bindings/react-native",
+    "packages/turso-cli",
+    "packages/turso-cli/npm/darwin-arm64",
+    "packages/turso-cli/npm/darwin-x64",
+    "packages/turso-cli/npm/linux-arm64-gnu",
+    "packages/turso-cli/npm/linux-x64-gnu",
+    "packages/turso-cli/npm/win32-x64-msvc",
 ]
 
 NPM_WORKSPACE_PACKAGES = [
     "@tursodatabase/database-common",
     "@tursodatabase/database-wasm-common",
     "@tursodatabase/sync-common",
+    "@tursodatabase/cli-darwin-arm64",
+    "@tursodatabase/cli-darwin-x64",
+    "@tursodatabase/cli-linux-arm64-gnu",
+    "@tursodatabase/cli-linux-x64-gnu",
+    "@tursodatabase/cli-win32-x64-msvc",
 ]
 
 NPM_WORKSPACES = [
@@ -112,6 +123,11 @@ def update_package_json(dir_path, new_version):  # noqa: C901
                 if dependency not in NPM_WORKSPACE_PACKAGES:
                     continue
                 package_data["dependencies"][dependency] = f"^{new_version}"
+        if "optionalDependencies" in package_data:
+            for dependency in package_data["optionalDependencies"].keys():
+                if dependency not in NPM_WORKSPACE_PACKAGES:
+                    continue
+                package_data["optionalDependencies"][dependency] = new_version
 
         # Write updated package.json
         with open(package_path, "w") as f:
