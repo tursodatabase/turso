@@ -23,8 +23,8 @@ use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{
     to_u16, {CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral},
 };
-use crate::Connection;
 use crate::{bail_parse_error, CaptureDataChangesExt, Result};
+use crate::{Connection, MAIN_DB_ID};
 
 use turso_ext::VTabKind;
 use turso_parser::ast;
@@ -2057,7 +2057,7 @@ pub fn translate_create_type(
         // Create the sqlite_turso_types btree
         let table_root_reg = program.alloc_register();
         program.emit_insn(Insn::CreateBtree {
-            db: 0,
+            db: MAIN_DB_ID,
             root: table_root_reg,
             flags: CreateBTreeFlags::new_table(),
         });
@@ -2072,7 +2072,7 @@ pub fn translate_create_type(
         program.emit_insn(Insn::OpenWrite {
             cursor_id: schema_cursor_id,
             root_page: 1i64.into(),
-            db: 0,
+            db: MAIN_DB_ID,
         });
         emit_schema_entry(
             program,
@@ -2100,7 +2100,7 @@ pub fn translate_create_type(
     program.emit_insn(Insn::OpenWrite {
         cursor_id: types_cursor_id,
         root_page: types_root_page,
-        db: 0,
+        db: MAIN_DB_ID,
     });
 
     // Insert (name, sql) record
@@ -2129,10 +2129,13 @@ pub fn translate_create_type(
     });
 
     // Add the type to the in-memory registry
-    program.emit_insn(Insn::AddType { db: 0, sql });
+    program.emit_insn(Insn::AddType {
+        db: MAIN_DB_ID,
+        sql,
+    });
 
     program.emit_insn(Insn::SetCookie {
-        db: 0,
+        db: MAIN_DB_ID,
         cookie: Cookie::SchemaVersion,
         value: (resolver.schema().schema_version + 1) as i32,
         p5: 0,
@@ -2185,7 +2188,7 @@ pub fn translate_drop_type(
     program.emit_insn(Insn::OpenWrite {
         cursor_id: types_cursor_id,
         root_page: types_table.root_page.into(),
-        db: 0,
+        db: MAIN_DB_ID,
     });
 
     // Search for matching row: name=type_name (col 0)
@@ -2237,12 +2240,12 @@ pub fn translate_drop_type(
 
     // Remove from in-memory schema
     program.emit_insn(Insn::DropType {
-        db: 0,
+        db: MAIN_DB_ID,
         type_name: normalized_name,
     });
 
     program.emit_insn(Insn::SetCookie {
-        db: 0,
+        db: MAIN_DB_ID,
         cookie: Cookie::SchemaVersion,
         value: (resolver.schema().schema_version + 1) as i32,
         p5: 0,

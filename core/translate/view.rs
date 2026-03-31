@@ -8,7 +8,7 @@ use crate::util::{
 };
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral};
-use crate::{bail_parse_error, Connection, Result};
+use crate::{bail_parse_error, Connection, Result, MAIN_DB_ID};
 use turso_parser::ast;
 
 pub fn translate_create_materialized_view(
@@ -468,7 +468,8 @@ pub fn translate_drop_view(
     }
 
     // Open cursor to sqlite_schema table (structure is the same for all databases)
-    let schema_table = resolver.with_schema(0, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
+    let schema_table =
+        resolver.with_schema(MAIN_DB_ID, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
