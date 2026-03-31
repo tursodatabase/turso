@@ -3321,6 +3321,126 @@ expect {
     7|14|7!
 }
 
+# STRICT tables must type-check virtual generated columns (SQLite 3.51.0+)
+
+test gencol_strict_virtual_insert_type_error {
+    CREATE TABLE t1(a TEXT, b INTEGER AS (a) VIRTUAL) STRICT;
+    INSERT INTO t1(a) VALUES('not_a_number');
+}
+expect error {
+    cannot store TEXT value in INTEGER column
+}
+
+test gencol_strict_virtual_insert_coercible {
+    CREATE TABLE t1(a TEXT, b INTEGER AS (a) VIRTUAL) STRICT;
+    INSERT INTO t1(a) VALUES('42');
+    SELECT a, b FROM t1;
+}
+expect {
+    42|42
+}
+
+test gencol_strict_virtual_update_type_error {
+    CREATE TABLE t1(a TEXT, b INTEGER AS (a) VIRTUAL) STRICT;
+    INSERT INTO t1(a) VALUES('42');
+    UPDATE t1 SET a = 'not_a_number';
+}
+expect error {
+    cannot store TEXT value in INTEGER column
+}
+
+test gencol_strict_virtual_insert_blob_into_text {
+    CREATE TABLE t1(a BLOB, b TEXT AS (a) VIRTUAL) STRICT;
+    INSERT INTO t1(a) VALUES(x'1234');
+}
+expect error {
+    cannot store BLOB value in TEXT column
+}
+
+test gencol_strict_virtual_null_ok {
+    CREATE TABLE t1(a INTEGER, b INTEGER AS (a) VIRTUAL) STRICT;
+    INSERT INTO t1(a) VALUES(NULL);
+    SELECT a, b FROM t1;
+}
+expect {
+    |
+}
+
+test gencol_strict_virtual_int_to_text_coerce {
+    CREATE TABLE t1(a INTEGER, b TEXT AS (a) VIRTUAL) STRICT;
+    INSERT INTO t1(a) VALUES(99);
+    SELECT a, b FROM t1;
+}
+expect {
+    99|99
+}
+
+test gencol_strict_virtual_upsert_type_error {
+    CREATE TABLE t1(a TEXT, b INTEGER AS (a) VIRTUAL, c INTEGER UNIQUE) STRICT;
+    INSERT INTO t1(a, c) VALUES('42', 1);
+    INSERT INTO t1(a, c) VALUES('42', 1) ON CONFLICT(c) DO UPDATE SET a = 'not_a_number';
+}
+expect error {
+    cannot store TEXT value in INTEGER column
+}
+
+test gencol_strict_virtual_update_no_index {
+    CREATE TABLE t1(a TEXT, b INTEGER AS (a) VIRTUAL) STRICT;
+    INSERT INTO t1(a) VALUES('10');
+    UPDATE t1 SET a = 'hello';
+}
+expect error {
+    cannot store TEXT value in INTEGER column
+}
+
+test gencol_strict_virtual_multiple_cols_one_invalid {
+    CREATE TABLE t1(a TEXT, b INTEGER AS (a) VIRTUAL, c TEXT AS (a) VIRTUAL) STRICT;
+    INSERT INTO t1(a) VALUES('hello');
+}
+expect error {
+    cannot store TEXT value in INTEGER column
+}
+
+# NOT NULL on virtual generated columns must be enforced on UPDATE/UPSERT (#6159)
+
+test gencol_virtual_notnull_update {
+    CREATE TABLE t1(a INTEGER, b GENERATED ALWAYS AS (a*2) VIRTUAL NOT NULL);
+    INSERT INTO t1(a) VALUES(1),(2),(3);
+    UPDATE t1 SET a = NULL WHERE a = 2;
+}
+expect error {
+    NOT NULL constraint failed: t1.b
+}
+
+test gencol_virtual_notnull_update_ok {
+    CREATE TABLE t1(a INTEGER, b GENERATED ALWAYS AS (a*2) VIRTUAL NOT NULL);
+    INSERT INTO t1(a) VALUES(1),(2),(3);
+    UPDATE t1 SET a = 10 WHERE a = 2;
+    SELECT a, b FROM t1 ORDER BY a;
+}
+expect {
+    1|2
+    3|6
+    10|20
+}
+
+test gencol_virtual_notnull_upsert {
+    CREATE TABLE t1(a INTEGER, b GENERATED ALWAYS AS (a*2) VIRTUAL NOT NULL, c INTEGER UNIQUE);
+    INSERT INTO t1(a, c) VALUES(1, 10),(2, 20),(3, 30);
+    INSERT INTO t1(a, c) VALUES(99, 20) ON CONFLICT(c) DO UPDATE SET a = NULL;
+}
+expect error {
+    NOT NULL constraint failed: t1.b
+}
+
+test gencol_virtual_notnull_insert {
+    CREATE TABLE t1(a INTEGER, b GENERATED ALWAYS AS (a*2) VIRTUAL NOT NULL);
+    INSERT INTO t1(a) VALUES(NULL);
+}
+expect error {
+    NOT NULL constraint failed: t1.b
+}
+
 # --- Large row counts (100+ rows) ---
 
 test gencol_large_row_count {

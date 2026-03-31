@@ -737,6 +737,21 @@ pub fn translate_insert(
             insertion.rowid_alias_mapping(),
             resolver,
         )?;
+
+        // STRICT tables must type-check virtual generated columns after computation.
+        if ctx.table.is_strict {
+            let num_virtual = insertion.col_mappings.len() - insertion.num_non_virtual_cols;
+            if let Some(table_ref) =
+                BTreeTable::virtual_type_check_table_ref(ctx.table, resolver.schema())
+            {
+                program.emit_insn(Insn::TypeCheck {
+                    start_reg: insertion.first_col_register() + insertion.num_non_virtual_cols,
+                    count: num_virtual,
+                    check_generated: true,
+                    table_reference: table_ref,
+                });
+            }
+        }
     }
 
     // Evaluate CHECK constraints after type affinity/TypeCheck but before other constraints

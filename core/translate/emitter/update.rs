@@ -1045,7 +1045,6 @@ fn emit_update_insns<'a>(
 
     // Fire BEFORE UPDATE triggers and preserve old_registers for AFTER triggers
     let mut has_before_triggers = false;
-    let mut has_after_triggers = false;
     let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) =
         target_table.table.btree()
     {
@@ -1062,7 +1061,7 @@ fn emit_update_insns<'a>(
                 )
                 .collect()
             });
-        has_after_triggers = t_ctx.resolver.with_schema(update_database_id, |s| {
+        let has_after_triggers = t_ctx.resolver.with_schema(update_database_id, |s| {
             get_relevant_triggers_type_and_time(
                 s,
                 TriggerEvent::Update,
@@ -1113,11 +1112,11 @@ fn emit_update_insns<'a>(
 
             // Compute virtual columns for NEW values
             let new_ctx = DmlColumnContext::layout(columns, start, new_rowid_reg, layout.clone());
-            compute_virtual_columns(program, columns, &new_ctx, &t_ctx.resolver)?;
+            compute_virtual_columns(program, columns, &new_ctx, &t_ctx.resolver, None)?;
 
             // Compute virtual columns for OLD values
             let old_ctx = DmlColumnContext::indexed(columns.clone(), old_registers.clone());
-            compute_virtual_columns(program, columns, &old_ctx, &t_ctx.resolver)?;
+            compute_virtual_columns(program, columns, &old_ctx, &t_ctx.resolver, None)?;
 
             let new_registers = (0..col_len)
                 .map(|i| layout.to_register(start, i))
@@ -1313,29 +1312,56 @@ fn emit_update_insns<'a>(
         .table
         .btree()
         .is_some_and(|bt| bt.has_virtual_columns());
-    let has_returning = returning.as_ref().is_some_and(|r| !r.is_empty());
-    let has_check_constraints = target_table
-        .table
-        .btree()
-        .is_some_and(|bt| !bt.check_constraints.is_empty());
-    if has_virtual_columns
-        && (!indexes_to_update.is_empty()
-            || has_before_triggers
-            || has_after_triggers
-            || has_returning
-            || has_check_constraints)
-    {
-        let columns = target_table.table.columns();
-        let rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
-
-        let dml_ctx = DmlColumnContext::layout(columns, start, rowid_reg, layout.clone());
-        compute_virtual_columns(program, columns, &dml_ctx, &t_ctx.resolver)?;
-    }
-
     let target_is_strict = target_table
         .table
         .btree()
         .is_some_and(|btree| btree.is_strict);
+    if has_virtual_columns {
+        let columns = target_table.table.columns();
+        let rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
+
+        let updated_cols: HashSet<usize> =
+            set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
+        let affected = columns_affected_by_update(columns, &updated_cols);
+
+        let dml_ctx = DmlColumnContext::layout(columns, start, rowid_reg, layout.clone());
+        compute_virtual_columns(program, columns, &dml_ctx, &t_ctx.resolver, Some(&affected))?;
+
+        // NOT NULL checks for virtual generated columns. These columns are never
+        // in the SET clause, so the regular NOT NULL path doesn't cover them.
+        let or_conflict = program.resolve_type;
+        for (idx, col) in columns.iter().enumerate() {
+            if !col.is_virtual_generated() || !col.notnull() {
+                continue;
+            }
+            let target_reg = layout.to_register(start, idx);
+            let effective = if program.has_statement_conflict {
+                or_conflict
+            } else {
+                col.notnull_conflict_clause.unwrap_or(ResolveType::Abort)
+            };
+            match effective {
+                ResolveType::Ignore => {
+                    program.emit_insn(Insn::IsNull {
+                        reg: target_reg,
+                        target_pc: skip_row_label,
+                    });
+                }
+                _ => {
+                    use crate::error::SQLITE_CONSTRAINT_NOTNULL;
+                    program.emit_insn(Insn::HaltIfNull {
+                        target_reg,
+                        err_code: SQLITE_CONSTRAINT_NOTNULL,
+                        description: format!(
+                            "{}.{}",
+                            table_name,
+                            col.name.as_ref().expect("Column name must be present")
+                        ),
+                    });
+                }
+            }
+        }
+    }
 
     // Non-REPLACE PK constraint check. Must run BEFORE the index preflight so that
     // PK ABORT/FAIL/ROLLBACK fires before an index IGNORE can silently skip the row.
@@ -1459,6 +1485,21 @@ fn emit_update_insns<'a>(
                     t_ctx.resolver.schema(),
                 ),
             });
+
+            // TypeCheck virtual generated columns after they have been computed.
+            let num_virtual = layout.column_count() - layout.num_non_virtual_cols();
+            if num_virtual > 0 {
+                if let Some(table_ref) =
+                    BTreeTable::virtual_type_check_table_ref(&btree_table, t_ctx.resolver.schema())
+                {
+                    program.emit_insn(Insn::TypeCheck {
+                        start_reg: start + layout.num_non_virtual_cols(),
+                        count: num_virtual,
+                        check_generated: true,
+                        table_reference: table_ref,
+                    });
+                }
+            }
         }
 
         if !btree_table.check_constraints.is_empty() {
@@ -2231,12 +2272,12 @@ fn emit_update_insns<'a>(
 
                     // Compute VIRTUAL columns for NEW values
                     let new_ctx = DmlColumnContext::layout(columns, start, beg, layout.clone());
-                    compute_virtual_columns(program, columns, &new_ctx, &t_ctx.resolver)?;
+                    compute_virtual_columns(program, columns, &new_ctx, &t_ctx.resolver, None)?;
 
                     // Compute VIRTUAL columns for OLD values if we have preserved OLD registers
                     if let Some(ref old_regs) = preserved_old_registers {
                         let old_ctx = DmlColumnContext::indexed(columns.clone(), old_regs.clone());
-                        compute_virtual_columns(program, columns, &old_ctx, &t_ctx.resolver)?;
+                        compute_virtual_columns(program, columns, &old_ctx, &t_ctx.resolver, None)?;
                     }
 
                     let new_rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
