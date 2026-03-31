@@ -1,0 +1,53 @@
+name: Pre-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version (e.g. 0.6.0-pre.14)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  pre-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate version format
+        run: |
+          if ! echo "${{ inputs.version }}" | grep -qP '^\d+\.\d+\.\d+-pre\.\d+$'; then
+            echo "::error::Invalid version format '${{ inputs.version }}'. Expected: MAJOR.MINOR.PATCH-pre.N (e.g. 0.6.0-pre.14)"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Run update-version.py
+        run: python scripts/update-version.py "${{ inputs.version }}"
+
+      - name: Push commit and tag
+        run: |
+          git push origin main
+          git push origin "v${{ inputs.version }}"
