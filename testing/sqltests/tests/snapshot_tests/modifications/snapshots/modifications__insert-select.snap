@@ -43,12 +43,12 @@ addr  opcode            p1  p2  p3  p4                         p5  comment
   21    Copy             6  15   0                              0  r[15]=r[6]
   22    Copy             7  16   0                              0  r[16]=r[7]
   23    Null             0  17   0                              0  r[17]=NULL
-  24    NotNull         11  26   0                              0  r[11]!=NULL -> goto 26
-  25    Goto             0  28   0                              0
-  26    MustBeInt       11   0   0                              0
-  27    Goto             0  29   0                              0
-  28    NewRowid         1  11   0                              0  r[11]=rowid
-  29    Affinity        12   6   0                              0  r[12..18] = D, D, D, D, E, B
+  24    Affinity        12   6   0                              0  r[12..18] = D, D, D, D, E, B
+  25    NotNull         11  27   0                              0  r[11]!=NULL -> goto 27
+  26    Goto             0  29   0                              0
+  27    MustBeInt       11   0   0                              0
+  28    Goto             0  30   0                              0
+  29    NewRowid         1  11   0                              0  r[11]=rowid
   30    HaltIfNull    1299   0  13  order_archive.user_id       0
   31    HaltIfNull    1299   0  14  order_archive.product_id    0
   32    HaltIfNull    1299   0  15  order_archive.quantity      0
