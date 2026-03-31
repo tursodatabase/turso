@@ -4749,11 +4749,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     }
                     if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
                         let rowid_int = rowid.row_id.to_int_or_panic();
-                        let record = schema_rows.get(&rowid_int).ok_or_else(|| {
-                            LimboError::Corrupt(format!(
-                                "Logical log deletes sqlite_schema rowid {rowid_int} that does not exist in merged schema state"
-                            ))
-                        })?;
+                        let Some(record) = schema_rows.get(&rowid_int) else {
+                            // this can happen if a row in sqlite_schema was inserted and then
+                            // deleted in the same transaction (ex: a CREATE TABLE followed by a DROP TABLE)
+                            continue;
+                        };
                         if record.column_count() < 5 {
                             return Err(LimboError::Corrupt(format!(
                                 "sqlite_schema row must have at least 5 columns, got {}",
