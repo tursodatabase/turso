@@ -1,7 +1,8 @@
-import { 
-  decodeValue, 
+import {
+  decodeValue,
   type CursorEntry,
-  type Column
+  type Column,
+  type QueryOptions
 } from './protocol.js';
 import { Session, type SessionConfig } from './session.js';
 import { DatabaseError } from './error.js';
@@ -127,9 +128,9 @@ export class Statement {
    * console.log(`Inserted user with ID ${result.lastInsertRowid}`);
    * ```
    */
-  async run(args?: any): Promise<any> {
+  async run(args?: any, queryOptions?: QueryOptions): Promise<any> {
     const normalizedArgs = this.normalizeArgs(args);
-    const result = await this.session.execute(this.sql, normalizedArgs, this.safeIntegerMode);
+    const result = await this.session.execute(this.sql, normalizedArgs, this.safeIntegerMode, queryOptions);
     return { changes: result.rowsAffected, lastInsertRowid: result.lastInsertRowid };
   }
 
@@ -148,9 +149,9 @@ export class Statement {
    * }
    * ```
    */
-  async get(args?: any): Promise<any> {
+  async get(args?: any, queryOptions?: QueryOptions): Promise<any> {
     const normalizedArgs = this.normalizeArgs(args);
-    const result = await this.session.execute(this.sql, normalizedArgs, this.safeIntegerMode);
+    const result = await this.session.execute(this.sql, normalizedArgs, this.safeIntegerMode, queryOptions);
     const row = result.rows[0];
     if (!row) {
       return undefined;
@@ -188,9 +189,9 @@ export class Statement {
    * console.log(`Found ${activeUsers.length} active users`);
    * ```
    */
-  async all(args?: any): Promise<any[]> {
+  async all(args?: any, queryOptions?: QueryOptions): Promise<any[]> {
     const normalizedArgs = this.normalizeArgs(args);
-    const result = await this.session.execute(this.sql, normalizedArgs, this.safeIntegerMode);
+    const result = await this.session.execute(this.sql, normalizedArgs, this.safeIntegerMode, queryOptions);
     
     if (this.presentationMode === 'pluck') {
       // In pluck mode, return only the first column value from each row
@@ -229,9 +230,9 @@ export class Statement {
    * }
    * ```
    */
-  async *iterate(args?: any): AsyncGenerator<any> {
+  async *iterate(args?: any, queryOptions?: QueryOptions): AsyncGenerator<any> {
     const normalizedArgs = this.normalizeArgs(args);
-    const { response, entries } = await this.session.executeRaw(this.sql, normalizedArgs);
+    const { response, entries } = await this.session.executeRaw(this.sql, normalizedArgs, queryOptions);
     
     let columns: string[] = [];
     

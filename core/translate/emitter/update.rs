@@ -1,6 +1,6 @@
 use super::gencol::compute_virtual_columns;
 use super::TranslateCtx;
-use crate::schema::{ColumnLayout, GeneratedType, Table};
+use crate::schema::{columns_affected_by_update, ColumnLayout, GeneratedType, Table};
 use crate::translate::insert::halt_desc_and_on_error;
 use crate::translate::stmt_journal::any_effective_replace;
 use crate::{
@@ -1464,16 +1464,15 @@ fn emit_update_insns<'a>(
         if !btree_table.check_constraints.is_empty() {
             // SQLite only evaluates CHECK constraints that reference at least one
             // column in the SET clause. Build a set of updated column names to filter.
-            let mut updated_col_names: HashSet<String> = set_clauses
-                .iter()
-                .filter_map(|(col_idx, _)| {
-                    btree_table
-                        .columns
-                        .get(*col_idx)
-                        .and_then(|c| c.name.as_deref())
-                        .map(normalize_ident)
-                })
-                .collect();
+            let mut updated_col_names: HashSet<String> = columns_affected_by_update(
+                &btree_table.columns,
+                &set_clauses.iter().map(|(idx, _)| *idx).collect(),
+            )
+            .iter()
+            .filter_map(|col_idx| btree_table.columns.get(*col_idx))
+            .filter_map(|col| col.name.as_deref())
+            .map(normalize_ident)
+            .collect();
 
             // If the rowid is being updated (either directly via ROWID_SENTINEL or
             // through a rowid alias column), also include the rowid pseudo-column

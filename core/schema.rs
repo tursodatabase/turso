@@ -151,7 +151,7 @@ use turso_parser::{
     parser::Parser,
 };
 
-const SCHEMA_TABLE_NAME: &str = "sqlite_schema";
+pub const SCHEMA_TABLE_NAME: &str = "sqlite_schema";
 const SCHEMA_TABLE_NAME_ALT: &str = "sqlite_master";
 pub const SQLITE_SEQUENCE_TABLE_NAME: &str = "sqlite_sequence";
 pub const TURSO_TYPES_TABLE_NAME: &str = "__turso_internal_types";
