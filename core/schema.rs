@@ -2202,6 +2202,29 @@ impl BTreeTable {
         Arc::new(modified)
     }
 
+    /// Create a table reference containing ONLY virtual generated columns for
+    /// TypeCheck. Returns `None` if no virtual columns exist. Used to type-check
+    /// virtual columns in STRICT tables after they have been computed.
+    pub fn virtual_type_check_table_ref(
+        table: &Arc<BTreeTable>,
+        schema: &Schema,
+    ) -> Option<Arc<BTreeTable>> {
+        if !table.has_virtual_columns() {
+            return None;
+        }
+        let mut modified = (**table).clone();
+        modified.columns.retain(|c| c.is_virtual_generated());
+        modified.has_virtual_columns = false;
+        for col in &mut modified.columns {
+            if col.is_array() {
+                col.ty_str = "BLOB".to_string();
+            } else if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict) {
+                col.ty_str = type_def.base.to_uppercase();
+            }
+        }
+        Some(Arc::new(modified))
+    }
+
     /// Create a table ref for pre-encode TypeCheck that validates user input
     /// against the type's declared `value` input type (or base if not declared).
     /// For UPDATE, `only_columns` limits which columns are checked — non-SET

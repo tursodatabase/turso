@@ -5,7 +5,7 @@
 
 set -e
 
-SQLITE_VERSION="${SQLITE_VERSION:-3490100}"
+SQLITE_VERSION="${SQLITE_VERSION:-3510100}"
 SQLITE_YEAR="${SQLITE_YEAR:-2025}"
 
 # Get the directory where this script is located

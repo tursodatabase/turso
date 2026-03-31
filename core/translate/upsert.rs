@@ -431,7 +431,7 @@ pub fn emit_upsert(
             ctx.conflict_rowid_reg,
             layout.clone(),
         );
-        compute_virtual_columns(program, &ctx.table.columns, &dml_ctx, resolver)?;
+        compute_virtual_columns(program, &ctx.table.columns, &dml_ctx, resolver, None)?;
     }
 
     // BEFORE for index maintenance / CDC
@@ -584,11 +584,32 @@ pub fn emit_upsert(
 
     // Recompute virtual columns for the new row after SET clauses have modified base columns.
     // This must happen before CHECK constraints, triggers, and index updates.
+    // Only recompute virtual columns that transitively depend on SET clause columns.
     if ctx.table.has_virtual_columns() {
         let rowid_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
         let dml_ctx =
             DmlColumnContext::layout(&ctx.table.columns, new_start, rowid_reg, layout.clone());
-        compute_virtual_columns(program, &ctx.table.columns, &dml_ctx, resolver)?;
+        let updated_cols: HashSet<usize> = set_pairs.iter().map(|(col_idx, _)| *col_idx).collect();
+        let affected = columns_affected_by_update(&ctx.table.columns, &updated_cols);
+        compute_virtual_columns(
+            program,
+            &ctx.table.columns,
+            &dml_ctx,
+            resolver,
+            Some(&affected),
+        )?;
+
+        // NOT NULL checks for virtual generated columns — not covered by the
+        // SET-clause NOT NULL checks above.
+        for (idx, col) in ctx.table.columns.iter().enumerate() {
+            if col.is_virtual_generated() && col.notnull() {
+                program.emit_insn(Insn::HaltIfNull {
+                    target_reg: layout.to_register(new_start, idx),
+                    err_code: SQLITE_CONSTRAINT_NOTNULL,
+                    description: String::from(table.get_name()) + "." + col.name.as_ref().unwrap(),
+                });
+            }
+        }
     }
 
     if let Some(bt) = table.btree() {
@@ -625,6 +646,21 @@ pub fn emit_upsert(
                 check_generated: true,
                 table_reference: BTreeTable::type_check_table_ref(&bt, resolver.schema()),
             });
+
+            // TypeCheck virtual generated columns after they have been computed.
+            let num_virtual = layout.column_count() - layout.num_non_virtual_cols();
+            if num_virtual > 0 {
+                if let Some(table_ref) =
+                    BTreeTable::virtual_type_check_table_ref(&bt, resolver.schema())
+                {
+                    program.emit_insn(Insn::TypeCheck {
+                        start_reg: new_start + layout.num_non_virtual_cols(),
+                        count: num_virtual,
+                        check_generated: true,
+                        table_reference: table_ref,
+                    });
+                }
+            }
         } else {
             // For non-STRICT tables, apply column affinity to the values.
             // This must happen early so that both index records and the table record
@@ -1297,7 +1333,7 @@ pub fn emit_upsert(
         let rowid_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
         let dml_ctx =
             DmlColumnContext::layout(&ctx.table.columns, new_start, rowid_reg, layout.clone());
-        compute_virtual_columns(program, &ctx.table.columns, &dml_ctx, resolver)?;
+        compute_virtual_columns(program, &ctx.table.columns, &dml_ctx, resolver, None)?;
     }
 
     // RETURNING from NEW image + final rowid
