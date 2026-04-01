@@ -8,7 +8,6 @@ use crate::sync::{
     Arc, RwLock,
 };
 use crate::turso_assert;
-use crate::types::ImmutableRecord;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
@@ -25,16 +24,35 @@ use crate::{
     BusyHandlerCallback, CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd,
     Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
     EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
-    Parser, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode, Trigger,
-    Value, VirtualTable,
+    Parser, Program, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode,
+    Trigger, Value, VirtualTable,
 };
 use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
 use std::fmt::Display;
 use std::ops::Deref;
+#[cfg(feature = "simulator")]
+use std::path::Path;
 use tracing::{instrument, Level};
 use turso_macros::AtomicEnum;
+
+#[cfg(feature = "simulator")]
+fn db_identity_for_testing(db_path: &Path) -> Result<(u32, u32)> {
+    let bytes =
+        std::fs::read(db_path).map_err(|e| io_error(e, "read db header for simulator testing"))?;
+    let db_header_size = crate::storage::sqlite3_ondisk::DatabaseHeader::SIZE;
+    if bytes.len() < db_header_size {
+        return Err(LimboError::InternalError(format!(
+            "database file is smaller than the header: got {}, need at least {}",
+            bytes.len(),
+            db_header_size
+        )));
+    }
+    let db_size_pages = u32::from_be_bytes(bytes[28..32].try_into().unwrap());
+    let crc = crc32c::crc32c(&bytes[..db_header_size]);
+    Ok((db_size_pages, crc))
+}
 
 #[derive(Clone, AtomicEnum, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum TransactionState {
@@ -285,6 +303,61 @@ impl Connection {
         );
         self.executing_triggers.write().pop();
     }
+
+    fn should_retry_cross_process_schema_lookup(
+        self: &Arc<Connection>,
+        err: &LimboError,
+    ) -> Result<bool> {
+        let LimboError::ParseError(msg) = err else {
+            return Ok(false);
+        };
+        if !msg.contains("no such table") && !msg.contains("table not found") {
+            return Ok(false);
+        }
+        if self.get_tx_state() != TransactionState::None {
+            return Ok(false);
+        }
+        if self.db.shared_wal_coordination()?.is_none() {
+            return Ok(false);
+        }
+        self.maybe_reparse_schema()?;
+        Ok(true)
+    }
+
+    fn compile_cmd(
+        self: &Arc<Connection>,
+        cmd: &Cmd,
+        input: &str,
+    ) -> Result<(Program, Arc<Pager>, QueryMode)> {
+        let mut retried_after_schema_refresh = false;
+        loop {
+            self.maybe_update_schema();
+            let syms = self.syms.read();
+            let pager = self.pager.load().clone();
+            let mode = QueryMode::new(cmd);
+            let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd.clone();
+            let schema = self.schema.read().clone();
+            match translate::translate(
+                &schema,
+                stmt,
+                pager.clone(),
+                self.clone(),
+                &syms,
+                mode,
+                input,
+            ) {
+                Ok(program) => return Ok((program, pager, mode)),
+                Err(err)
+                    if !retried_after_schema_refresh
+                        && self.should_retry_cross_process_schema_lookup(&err)? =>
+                {
+                    retried_after_schema_refresh = true;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
     pub fn prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         self._prepare(sql)
     }
@@ -331,29 +404,11 @@ impl Connection {
                     ));
                 }
             };
-            let syms = self.syms.read();
             let byte_offset_end = parser.offset();
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            self.maybe_update_schema();
-            let pager = self.pager.load().clone();
-            let mode = QueryMode::new(&cmd);
-            let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
-
-            // Read lock + Arc::Clone the schema here to avoid a possible recursive read lock in `op_parse_schema`,
-            // where we try to read the schema again there
-            let schema = self.schema.read().clone();
-
-            let program = translate::translate(
-                &schema,
-                stmt,
-                pager.clone(),
-                self.clone(),
-                &syms,
-                mode,
-                input,
-            )?;
+            let (program, pager, mode) = self.compile_cmd(&cmd, input)?;
             Ok(Statement::new_with_origin(
                 program,
                 pager,
@@ -447,6 +502,14 @@ impl Connection {
         // sqlite_schema from disk.
         if self.get_tx_state() != TransactionState::None {
             return Ok(());
+        }
+
+        if self.db.shared_wal_coordination()?.is_some() {
+            // Cross-process schema changes can leave page 1 and sqlite_schema
+            // pages cached from an earlier WAL snapshot. Drop the cache before
+            // probing the cookie so reparsing observes the current committed view.
+            pager.clear_page_cache(false);
+            pager.set_schema_cookie(None);
         }
 
         // first, quickly read schema_version from the root page in order to check if schema changed
@@ -618,29 +681,15 @@ impl Connection {
                 "The supplied SQL string contains no statements".to_string(),
             ));
         }
-        self.maybe_update_schema();
         let sql = sql.as_ref();
         tracing::trace!("Preparing and executing batch: {}", sql);
         let mut parser = Parser::new(sql.as_bytes());
         while let Some(cmd) = parser.next_cmd()? {
-            let syms = self.syms.read();
-            let pager = self.pager.load().clone();
             let byte_offset_end = parser.offset();
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let mode = QueryMode::new(&cmd);
-            let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
-            let schema = self.schema.read().clone();
-            let program = translate::translate(
-                &schema,
-                stmt,
-                pager.clone(),
-                self.clone(),
-                &syms,
-                mode,
-                input,
-            )?;
+            let (program, pager, mode) = self.compile_cmd(&cmd, input)?;
             Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
         }
         Ok(())
@@ -652,7 +701,6 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let sql = sql.as_ref();
-        self.maybe_update_schema();
         tracing::trace!("Querying: {}", sql);
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
@@ -675,20 +723,7 @@ impl Connection {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        let syms = self.syms.read();
-        let pager = self.pager.load().clone();
-        let mode = QueryMode::new(&cmd);
-        let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
-        let schema = self.schema.read().clone();
-        let program = translate::translate(
-            &schema,
-            stmt,
-            pager.clone(),
-            self.clone(),
-            &syms,
-            mode,
-            input,
-        )?;
+        let (program, pager, mode) = self.compile_cmd(&cmd, input)?;
         let stmt = Statement::new(program, pager, mode, 0);
         Ok(Some(stmt))
     }
@@ -705,27 +740,13 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let sql = sql.as_ref();
-        self.maybe_update_schema();
         let mut parser = Parser::new(sql.as_bytes());
         while let Some(cmd) = parser.next_cmd()? {
-            let syms = self.syms.read();
-            let pager = self.pager.load().clone();
             let byte_offset_end = parser.offset();
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let mode = QueryMode::new(&cmd);
-            let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
-            let schema = self.schema.read().clone();
-            let program = translate::translate(
-                &schema,
-                stmt,
-                pager.clone(),
-                self.clone(),
-                &syms,
-                mode,
-                input,
-            )?;
+            let (program, pager, mode) = self.compile_cmd(&cmd, input)?;
             Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
         }
         Ok(())
@@ -740,24 +761,11 @@ impl Connection {
         let Some(cmd) = parser.next_cmd()? else {
             return Ok(None);
         };
-        let syms = self.syms.read();
-        let pager = self.pager.load().clone();
         let byte_offset_end = parser.offset();
         let input = str::from_utf8(&sql.as_ref().as_bytes()[..byte_offset_end])
             .unwrap()
             .trim();
-        let mode = QueryMode::new(&cmd);
-        let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
-        let schema = self.schema.read().clone();
-        let program = translate::translate(
-            &schema,
-            stmt,
-            pager.clone(),
-            self.clone(),
-            &syms,
-            mode,
-            input,
-        )?;
+        let (program, pager, mode) = self.compile_cmd(&cmd, input)?;
         let stmt = Statement::new(program, pager, mode, 0);
         Ok(Some((stmt, parser.offset())))
     }
@@ -1212,7 +1220,7 @@ impl Connection {
         let should_checkpoint_on_close = pager
             .wal
             .as_ref()
-            .map_or(true, |wal| wal.should_checkpoint_on_close());
+            .is_none_or(|wal| wal.should_checkpoint_on_close());
         if self.db.n_connections.fetch_sub(1, Ordering::SeqCst).eq(&1)
             && !self.db.is_readonly()
             && !is_memory_db
@@ -1233,6 +1241,46 @@ impl Connection {
 
     pub fn is_wal_auto_checkpoint_disabled(&self) -> bool {
         self.wal_auto_checkpoint_disabled.load(Ordering::SeqCst) || self.db.get_mv_store().is_some()
+    }
+
+    #[cfg(feature = "simulator")]
+    pub fn checkpoint_for_testing(&self, mode: CheckpointMode) -> Result<CheckpointResult> {
+        let pager = self.pager.load();
+        pager
+            .io
+            .block(|| pager.checkpoint(mode, SyncMode::Full, true))
+    }
+
+    #[cfg(feature = "simulator")]
+    pub fn install_unpublished_backfill_proof_for_testing(
+        &self,
+        upper_bound_inclusive: u64,
+    ) -> Result<()> {
+        let pager = self.pager.load();
+        let proof_nbackfills =
+            pager.run_checkpoint_until_post_sync_gap_for_testing(CheckpointMode::Passive {
+                upper_bound_inclusive: Some(upper_bound_inclusive),
+            })?;
+        let authority = self.db.shared_wal_coordination()?.ok_or_else(|| {
+            LimboError::InternalError("shared WAL authority is unavailable".into())
+        })?;
+        let snapshot_before_publish = authority.snapshot();
+        if snapshot_before_publish.nbackfills != 0 {
+            return Err(LimboError::InternalError(
+                "unpublished-proof setup requires nbackfills to remain unpublished".into(),
+            ));
+        }
+
+        let (db_size_pages, db_header_crc32c) = db_identity_for_testing(Path::new(&self.db.path))?;
+        authority.install_backfill_proof(
+            crate::storage::shared_wal_coordination::SharedWalCoordinationHeader {
+                nbackfills: proof_nbackfills,
+                ..snapshot_before_publish
+            },
+            db_size_pages,
+            db_header_crc32c,
+        );
+        Ok(())
     }
 
     pub fn last_insert_rowid(&self) -> i64 {

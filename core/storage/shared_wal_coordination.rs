@@ -23,10 +23,12 @@
 //! conservatism, never correctness: if the authority cannot prove a slot is
 //! dead, it must leave that slot in place.
 
-use crate::io::{File, SharedWalLockKind, SharedWalMappedRegion, IO};
+use crate::io::{
+    Completion, File, FileSyncType, OpenFlags, SharedWalLockKind, SharedWalMappedRegion, IO,
+};
 use crate::storage::slot_bitmap::AtomicSlotBitmap;
 use crate::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use crate::{turso_assert, LimboError, Result};
+use crate::{turso_assert, CompletionError, LimboError, Result};
 use std::collections::HashMap;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
@@ -34,7 +36,8 @@ use std::ptr::NonNull;
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
 const SHARED_WAL_COORDINATION_MAGIC: [u8; 8] = *b"TSHMWAL\0";
-const SHARED_WAL_COORDINATION_VERSION: u32 = 8;
+const SHARED_WAL_COORDINATION_VERSION: u32 = 9;
+const SHARED_WAL_BACKFILL_PROOF_VERSION: u32 = 1;
 const UNUSED_READER_FRAME: u64 = u64::MAX;
 const UNOWNED_LOCK: u64 = 0;
 const SHARED_WAL_COORDINATION_MAP_ALIGNMENT: usize = 4096;
@@ -102,6 +105,13 @@ struct ProcessLocalOwnershipState {
     writer_owner: Option<SharedOwnerRecord>,
     checkpoint_owner: Option<SharedOwnerRecord>,
     reader_owners: Vec<Option<SharedOwnerRecord>>,
+    shared_snapshot_readers: HashMap<u64, SharedReadMarkRegistration>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SharedReadMarkRegistration {
+    slot: SharedReaderSlot,
+    ref_count: usize,
 }
 
 impl ProcessLocalOwnershipState {
@@ -110,6 +120,7 @@ impl ProcessLocalOwnershipState {
             writer_owner: None,
             checkpoint_owner: None,
             reader_owners: vec![None; reader_slot_count as usize],
+            shared_snapshot_readers: HashMap::default(),
         }
     }
 
@@ -173,6 +184,54 @@ impl ProcessLocalOwnershipState {
 
     fn reader_owner(&self, slot_index: u32) -> Option<SharedOwnerRecord> {
         self.reader_owners[slot_index as usize]
+    }
+
+    fn shared_snapshot_reader(&self, max_frame: u64) -> Option<SharedReadMarkRegistration> {
+        self.shared_snapshot_readers.get(&max_frame).copied()
+    }
+
+    fn retain_shared_snapshot_reader(&mut self, max_frame: u64) -> Option<SharedReaderSlot> {
+        let registration = self.shared_snapshot_readers.get_mut(&max_frame)?;
+        registration.ref_count += 1;
+        Some(registration.slot)
+    }
+
+    fn publish_shared_snapshot_reader(&mut self, slot: SharedReaderSlot) {
+        let previous = self.shared_snapshot_readers.insert(
+            slot.max_frame,
+            SharedReadMarkRegistration { slot, ref_count: 1 },
+        );
+        turso_assert!(
+            previous.is_none(),
+            "process-local shared snapshot publication replaced a live registration",
+            { "max_frame": slot.max_frame }
+        );
+    }
+
+    fn release_shared_snapshot_reader(&mut self, slot: SharedReaderSlot) -> bool {
+        let registration = self
+            .shared_snapshot_readers
+            .get_mut(&slot.max_frame)
+            .expect("shared snapshot registration missing for release");
+        turso_assert!(
+            registration.slot == slot,
+            "shared snapshot released with mismatched reader slot",
+            {
+                "published_slot_index": registration.slot.slot_index,
+                "released_slot_index": slot.slot_index,
+                "max_frame": slot.max_frame
+            }
+        );
+        turso_assert!(
+            registration.ref_count > 0,
+            "shared snapshot refcount underflow"
+        );
+        registration.ref_count -= 1;
+        if registration.ref_count != 0 {
+            return false;
+        }
+        self.shared_snapshot_readers.remove(&slot.max_frame);
+        true
     }
 }
 
@@ -351,6 +410,63 @@ pub(crate) struct SharedWalCoordinationState {
     reader_slots: AtomicSlotBitmap,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SharedWalBackfillProof {
+    nbackfills: u64,
+    max_frame: u64,
+    checkpoint_seq: u32,
+    page_size: u32,
+    salt_1: u32,
+    salt_2: u32,
+    checksum_1: u32,
+    checksum_2: u32,
+    db_size_pages: u32,
+    db_header_crc32c: u32,
+}
+
+impl SharedWalBackfillProof {
+    const CRC_INPUT_LEN: usize = 52;
+
+    fn from_snapshot_and_db(
+        snapshot: SharedWalCoordinationHeader,
+        db_size_pages: u32,
+        db_header_crc32c: u32,
+    ) -> Self {
+        Self {
+            nbackfills: snapshot.nbackfills,
+            max_frame: snapshot.max_frame,
+            checkpoint_seq: snapshot.checkpoint_seq,
+            page_size: snapshot.page_size,
+            salt_1: snapshot.salt_1,
+            salt_2: snapshot.salt_2,
+            checksum_1: snapshot.checksum_1,
+            checksum_2: snapshot.checksum_2,
+            db_size_pages,
+            db_header_crc32c,
+        }
+    }
+
+    fn crc32c(self) -> u32 {
+        let mut bytes = [0u8; Self::CRC_INPUT_LEN];
+        bytes[0..4].copy_from_slice(&SHARED_WAL_BACKFILL_PROOF_VERSION.to_le_bytes());
+        bytes[4..12].copy_from_slice(&self.nbackfills.to_le_bytes());
+        bytes[12..20].copy_from_slice(&self.max_frame.to_le_bytes());
+        bytes[20..24].copy_from_slice(&self.checkpoint_seq.to_le_bytes());
+        bytes[24..28].copy_from_slice(&self.page_size.to_le_bytes());
+        bytes[28..32].copy_from_slice(&self.salt_1.to_le_bytes());
+        bytes[32..36].copy_from_slice(&self.salt_2.to_le_bytes());
+        bytes[36..40].copy_from_slice(&self.checksum_1.to_le_bytes());
+        bytes[40..44].copy_from_slice(&self.checksum_2.to_le_bytes());
+        bytes[44..48].copy_from_slice(&self.db_size_pages.to_le_bytes());
+        bytes[48..52].copy_from_slice(&self.db_header_crc32c.to_le_bytes());
+        crc32c::crc32c(&bytes)
+    }
+
+    fn is_structurally_valid(self) -> bool {
+        self.nbackfills != 0 && self.nbackfills <= self.max_frame && self.page_size != 0
+    }
+}
+
 #[repr(C)]
 struct SharedWalCoordinationMapHeader {
     magic: [u8; 8],
@@ -380,6 +496,18 @@ struct SharedWalCoordinationMapHeader {
     salt_2: AtomicU32,
     checksum_1: AtomicU32,
     checksum_2: AtomicU32,
+    backfill_proof_version: AtomicU32,
+    backfill_proof_nbackfills: AtomicU64,
+    backfill_proof_max_frame: AtomicU64,
+    backfill_proof_checkpoint_seq: AtomicU32,
+    backfill_proof_page_size: AtomicU32,
+    backfill_proof_salt_1: AtomicU32,
+    backfill_proof_salt_2: AtomicU32,
+    backfill_proof_checksum_1: AtomicU32,
+    backfill_proof_checksum_2: AtomicU32,
+    backfill_proof_db_size_pages: AtomicU32,
+    backfill_proof_db_header_crc32c: AtomicU32,
+    backfill_proof_crc32c: AtomicU32,
     writer_owner: AtomicU64,
     checkpoint_owner: AtomicU64,
 }
@@ -455,6 +583,7 @@ pub(crate) struct MappedSharedWalCoordination {
     process_local_ownership: Arc<Mutex<ProcessLocalOwnershipState>>,
     local_lock_state: Mutex<LocalLockState>,
     open_mode: SharedWalCoordinationOpenMode,
+    sanitized_backfill_proof_on_open: bool,
     primary_process_mapping: bool,
     registry_path: Option<PathBuf>,
 }
@@ -819,6 +948,16 @@ impl MappedSharedWalCoordination {
         )
     }
 
+    fn process_already_has_mapping(path: &Path) -> bool {
+        let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let opens = PROCESS_LOCAL_COORDINATION_OPENS
+            .lock()
+            .expect("process-local coordination registry poisoned");
+        opens
+            .get(&canonical_path)
+            .is_some_and(|entry| entry.open_count > 0)
+    }
+
     /// Open (or create) the `.tshm` coordination file at `path`.
     ///
     /// On first open within a host, the file is created, sized, and
@@ -834,6 +973,14 @@ impl MappedSharedWalCoordination {
         Self::create_or_open_with_mode(io, path, reader_slot_count, Self::default_ownership_mode())
     }
 
+    pub(crate) fn open_existing(
+        io: &Arc<dyn IO>,
+        path: &Path,
+        reader_slot_count: u32,
+    ) -> Result<Option<Self>> {
+        Self::open_existing_with_mode(io, path, reader_slot_count, Self::default_ownership_mode())
+    }
+
     #[cfg(test)]
     fn create_or_open_process_scoped_for_tests(
         io: &Arc<dyn IO>,
@@ -846,6 +993,13 @@ impl MappedSharedWalCoordination {
             reader_slot_count,
             SharedWalOwnershipMode::ProcessScopedFcntl,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_frame_index_overflowed_for_tests(&self) {
+        self.header()
+            .frame_index_overflowed
+            .store(1, Ordering::Release);
     }
 
     fn create_or_open_with_mode(
@@ -866,7 +1020,10 @@ impl MappedSharedWalCoordination {
             LimboError::InternalError("shared WAL coordination path is not valid UTF-8".into())
         })?)?;
         let lock_kind = Self::lock_kind_for_mode(ownership_mode);
-        let open_mode =
+        let open_mode = if Self::process_already_has_mapping(path) {
+            file.shared_wal_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, false, lock_kind)?;
+            SharedWalCoordinationOpenMode::MultiProcess
+        } else {
             match file.shared_wal_try_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, true, lock_kind)? {
                 true => {
                     file.shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
@@ -877,7 +1034,8 @@ impl MappedSharedWalCoordination {
                     file.shared_wal_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, false, lock_kind)?;
                     SharedWalCoordinationOpenMode::MultiProcess
                 }
-            };
+            }
+        };
         let metadata_len = file.size()? as usize;
         let initialize = metadata_len == 0
             || (open_mode == SharedWalCoordinationOpenMode::Exclusive && metadata_len < base_len);
@@ -912,6 +1070,7 @@ impl MappedSharedWalCoordination {
                 reader_locks: vec![0; reader_slot_count as usize],
             }),
             open_mode,
+            sanitized_backfill_proof_on_open: false,
             primary_process_mapping: false,
             registry_path: None,
         };
@@ -924,6 +1083,10 @@ impl MappedSharedWalCoordination {
             } else {
                 return Err(err);
             }
+        }
+        if open_mode == SharedWalCoordinationOpenMode::Exclusive {
+            region.sanitized_backfill_proof_on_open =
+                region.sanitize_backfill_proof_for_exclusive_open();
         }
         let mapped_blocks = region.header().frame_index_blocks.load(Ordering::Acquire);
         region.ensure_mapped_frame_index_blocks(mapped_blocks)?;
@@ -938,6 +1101,102 @@ impl MappedSharedWalCoordination {
         region.primary_process_mapping = primary_process_mapping;
         region.registry_path = Some(registry_path);
         Ok(region)
+    }
+
+    fn open_existing_with_mode(
+        io: &Arc<dyn IO>,
+        path: &Path,
+        reader_slot_count: u32,
+        ownership_mode: SharedWalOwnershipMode,
+    ) -> Result<Option<Self>> {
+        turso_assert!(
+            reader_slot_count >= 64 && reader_slot_count % 64 == 0,
+            "reader_slot_count must be a non-zero multiple of 64"
+        );
+
+        let base_len = Self::base_mapped_len(reader_slot_count);
+        let file = match io.open_file(
+            path.to_str().ok_or_else(|| {
+                LimboError::InternalError("shared WAL coordination path is not valid UTF-8".into())
+            })?,
+            OpenFlags::NoLock,
+            false,
+        ) {
+            Ok(file) => file,
+            Err(LimboError::CompletionError(CompletionError::IOError(
+                std::io::ErrorKind::NotFound,
+                _,
+            ))) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let lock_kind = Self::lock_kind_for_mode(ownership_mode);
+        let open_mode = if Self::process_already_has_mapping(path) {
+            file.shared_wal_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, false, lock_kind)?;
+            SharedWalCoordinationOpenMode::MultiProcess
+        } else {
+            match file.shared_wal_try_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, true, lock_kind)? {
+                true => {
+                    file.shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
+                    file.shared_wal_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, false, lock_kind)?;
+                    SharedWalCoordinationOpenMode::Exclusive
+                }
+                false => {
+                    file.shared_wal_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, false, lock_kind)?;
+                    SharedWalCoordinationOpenMode::MultiProcess
+                }
+            }
+        };
+        let metadata_len = file.size()? as usize;
+        if metadata_len < base_len {
+            file.shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
+            return Err(LimboError::Corrupt(format!(
+                "shared WAL coordination file is smaller than the coordination header: got {metadata_len}, minimum {base_len}"
+            )));
+        }
+
+        let base_mapping = file.shared_wal_map(0, base_len)?;
+        let base_ptr = base_mapping.ptr();
+        let mut region = Self {
+            file,
+            _base_mapping: base_mapping,
+            base_ptr,
+            base_len,
+            owner_record: SharedOwnerRecord::current_process(next_shared_owner_instance_id()),
+            ownership_mode,
+            frame_index_blocks: RwLock::new(Vec::new()),
+            frame_index_publish_lock: Arc::new(Mutex::new(())),
+            process_local_ownership: Arc::new(Mutex::new(ProcessLocalOwnershipState::new(
+                reader_slot_count,
+            ))),
+            local_lock_state: Mutex::new(LocalLockState {
+                writer_lock_held: false,
+                checkpoint_lock_held: false,
+                reader_locks: vec![0; reader_slot_count as usize],
+            }),
+            open_mode,
+            sanitized_backfill_proof_on_open: false,
+            primary_process_mapping: false,
+            registry_path: None,
+        };
+        if let Err(err) = region.validate_existing(reader_slot_count, metadata_len) {
+            region
+                .file
+                .shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
+            return Err(err);
+        }
+        let mapped_blocks = region.header().frame_index_blocks.load(Ordering::Acquire);
+        region.ensure_mapped_frame_index_blocks(mapped_blocks)?;
+        let (
+            registry_path,
+            primary_process_mapping,
+            frame_index_publish_lock,
+            process_local_ownership,
+        ) = Self::register_process_mapping(path, reader_slot_count);
+        region.frame_index_publish_lock = frame_index_publish_lock;
+        region.process_local_ownership = process_local_ownership;
+        region.primary_process_mapping = primary_process_mapping;
+        region.registry_path = Some(registry_path);
+        Ok(Some(region))
     }
 
     fn process_lock_offset_for_reader(slot_index: u32) -> u64 {
@@ -977,12 +1236,12 @@ impl MappedSharedWalCoordination {
 
         if writer_lock_held {
             if self.uses_linux_ofd_locking() {
-                let _ = self
-                    .file
-                    .shared_wal_unlock_byte(WRITER_LOCK_OFFSET, self.lock_kind());
                 self.header()
                     .writer_owner
                     .store(UNOWNED_LOCK, Ordering::Release);
+                let _ = self
+                    .file
+                    .shared_wal_unlock_byte(WRITER_LOCK_OFFSET, self.lock_kind());
             } else {
                 let _ = self
                     .file
@@ -1003,12 +1262,12 @@ impl MappedSharedWalCoordination {
 
         if checkpoint_lock_held {
             if self.uses_linux_ofd_locking() {
-                let _ = self
-                    .file
-                    .shared_wal_unlock_byte(CHECKPOINT_LOCK_OFFSET, self.lock_kind());
                 self.header()
                     .checkpoint_owner
                     .store(UNOWNED_LOCK, Ordering::Release);
+                let _ = self
+                    .file
+                    .shared_wal_unlock_byte(CHECKPOINT_LOCK_OFFSET, self.lock_kind());
             } else {
                 let _ = self
                     .file
@@ -1080,6 +1339,10 @@ impl MappedSharedWalCoordination {
         self.open_mode
     }
 
+    pub(crate) const fn sanitized_backfill_proof_on_open(&self) -> bool {
+        self.sanitized_backfill_proof_on_open
+    }
+
     pub(crate) const fn owner_record(&self) -> SharedOwnerRecord {
         self.owner_record
     }
@@ -1089,6 +1352,7 @@ impl MappedSharedWalCoordination {
     }
 
     pub(crate) fn install_snapshot(&self, snapshot: SharedWalCoordinationHeader) {
+        self.clear_backfill_proof();
         // Snapshots define the authoritative visible WAL range. If the shared
         // frame index still carries entries from an older generation past that
         // range, trim them before publishing the new header so later frame
@@ -1127,11 +1391,11 @@ impl MappedSharedWalCoordination {
             .store(snapshot.checksum_2, Ordering::Release);
     }
 
-    /// Reset transient runtime state when a process determines that it can
-    /// repair the tshm from a local WAL disk scan.
+    /// Repair transient runtime state when a process determines that it can
+    /// reconcile the tshm with a local WAL disk scan.
     ///
-    /// Clears writer/checkpoint owners and the frame index unconditionally
-    /// (the caller holds the writer lock or has verified no writer is active).
+    /// Clears writer/checkpoint owners and reclaims stale reader slots, but
+    /// leaves the durable frame index intact.
     ///
     /// For reader slots, we must NOT blindly clear slots owned by
     /// live processes: doing so would cause those processes to panic with
@@ -1142,14 +1406,12 @@ impl MappedSharedWalCoordination {
     ///   can be acquired, the owner is dead and the slot is safe to reclaim.
     /// - **Process-scoped fcntl (macOS)**: check `kill(pid, 0)` on the slot's
     ///   `SharedOwnerRecord` PID. Same semantics — dead owner ⇒ reclaim.
-    pub(crate) fn reset_runtime_state_for_exclusive_open(&self) {
+    pub(crate) fn repair_transient_state_for_exclusive_open(&self) {
         let header = self.header();
         header.writer_owner.store(UNOWNED_LOCK, Ordering::Release);
         header
             .checkpoint_owner
             .store(UNOWNED_LOCK, Ordering::Release);
-        header.frame_index_len.store(0, Ordering::Release);
-        header.frame_index_overflowed.store(0, Ordering::Release);
 
         // For reader slots, we must check OFD locks before
         // clearing: another live process may hold a slot. Blindly clearing
@@ -1209,6 +1471,19 @@ impl MappedSharedWalCoordination {
         }
     }
 
+    /// Discard the durable shared frame index so the caller can rebuild it
+    /// from a local WAL scan. The caller must decide separately when that is
+    /// safe; this is intentionally distinct from transient-state repair.
+    pub(crate) fn discard_durable_frame_index_for_exclusive_rebuild(&self) {
+        let _publish_guard = self
+            .frame_index_publish_lock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let header = self.header();
+        header.frame_index_len.store(0, Ordering::Release);
+        header.frame_index_overflowed.store(0, Ordering::Release);
+    }
+
     pub(crate) fn frame_index_overflowed(&self) -> bool {
         self.header().frame_index_overflowed.load(Ordering::Acquire) != 0
     }
@@ -1220,6 +1495,7 @@ impl MappedSharedWalCoordination {
         checksum_2: u32,
         transaction_count: u64,
     ) {
+        self.clear_backfill_proof();
         let header = self.header();
         // Use fetch_max to ensure we never lower max_frame. In multi-process
         // mode, another process may have committed frames after ours, advancing
@@ -1239,9 +1515,164 @@ impl MappedSharedWalCoordination {
     }
 
     pub(crate) fn publish_backfill(&self, nbackfills: u64) {
+        if nbackfills == 0 {
+            self.clear_backfill_proof();
+        }
         self.header()
             .nbackfills
             .store(nbackfills, Ordering::Release);
+    }
+
+    pub(crate) fn clear_backfill_proof(&self) {
+        let header = self.header();
+        header.backfill_proof_version.store(0, Ordering::Release);
+        header.backfill_proof_nbackfills.store(0, Ordering::Release);
+        header.backfill_proof_max_frame.store(0, Ordering::Release);
+        header
+            .backfill_proof_checkpoint_seq
+            .store(0, Ordering::Release);
+        header.backfill_proof_page_size.store(0, Ordering::Release);
+        header.backfill_proof_salt_1.store(0, Ordering::Release);
+        header.backfill_proof_salt_2.store(0, Ordering::Release);
+        header.backfill_proof_checksum_1.store(0, Ordering::Release);
+        header.backfill_proof_checksum_2.store(0, Ordering::Release);
+        header
+            .backfill_proof_db_size_pages
+            .store(0, Ordering::Release);
+        header
+            .backfill_proof_db_header_crc32c
+            .store(0, Ordering::Release);
+        header.backfill_proof_crc32c.store(0, Ordering::Release);
+    }
+
+    pub(crate) fn install_backfill_proof(
+        &self,
+        snapshot: SharedWalCoordinationHeader,
+        db_size_pages: u32,
+        db_header_crc32c: u32,
+    ) {
+        turso_assert!(
+            snapshot.nbackfills != 0,
+            "backfill proof requires positive nbackfills"
+        );
+        let proof =
+            SharedWalBackfillProof::from_snapshot_and_db(snapshot, db_size_pages, db_header_crc32c);
+        let header = self.header();
+        header.backfill_proof_version.store(0, Ordering::Release);
+        header
+            .backfill_proof_nbackfills
+            .store(proof.nbackfills, Ordering::Release);
+        header
+            .backfill_proof_max_frame
+            .store(proof.max_frame, Ordering::Release);
+        header
+            .backfill_proof_checkpoint_seq
+            .store(proof.checkpoint_seq, Ordering::Release);
+        header
+            .backfill_proof_page_size
+            .store(proof.page_size, Ordering::Release);
+        header
+            .backfill_proof_salt_1
+            .store(proof.salt_1, Ordering::Release);
+        header
+            .backfill_proof_salt_2
+            .store(proof.salt_2, Ordering::Release);
+        header
+            .backfill_proof_checksum_1
+            .store(proof.checksum_1, Ordering::Release);
+        header
+            .backfill_proof_checksum_2
+            .store(proof.checksum_2, Ordering::Release);
+        header
+            .backfill_proof_db_size_pages
+            .store(proof.db_size_pages, Ordering::Release);
+        header
+            .backfill_proof_db_header_crc32c
+            .store(proof.db_header_crc32c, Ordering::Release);
+        header
+            .backfill_proof_crc32c
+            .store(proof.crc32c(), Ordering::Release);
+        header
+            .backfill_proof_version
+            .store(SHARED_WAL_BACKFILL_PROOF_VERSION, Ordering::Release);
+    }
+
+    pub(crate) fn validate_backfill_proof(
+        &self,
+        snapshot: SharedWalCoordinationHeader,
+        db_size_pages: u32,
+        db_header_crc32c: u32,
+    ) -> bool {
+        let header = self.header();
+        let version = header.backfill_proof_version.load(Ordering::Acquire);
+        if version != SHARED_WAL_BACKFILL_PROOF_VERSION {
+            return false;
+        }
+        let proof = SharedWalBackfillProof {
+            nbackfills: header.backfill_proof_nbackfills.load(Ordering::Acquire),
+            max_frame: header.backfill_proof_max_frame.load(Ordering::Acquire),
+            checkpoint_seq: header.backfill_proof_checkpoint_seq.load(Ordering::Acquire),
+            page_size: header.backfill_proof_page_size.load(Ordering::Acquire),
+            salt_1: header.backfill_proof_salt_1.load(Ordering::Acquire),
+            salt_2: header.backfill_proof_salt_2.load(Ordering::Acquire),
+            checksum_1: header.backfill_proof_checksum_1.load(Ordering::Acquire),
+            checksum_2: header.backfill_proof_checksum_2.load(Ordering::Acquire),
+            db_size_pages: header.backfill_proof_db_size_pages.load(Ordering::Acquire),
+            db_header_crc32c: header
+                .backfill_proof_db_header_crc32c
+                .load(Ordering::Acquire),
+        };
+        if !proof.is_structurally_valid() {
+            return false;
+        }
+        let stored_crc = header.backfill_proof_crc32c.load(Ordering::Acquire);
+        if proof.crc32c() != stored_crc {
+            return false;
+        }
+        proof
+            == SharedWalBackfillProof::from_snapshot_and_db(
+                snapshot,
+                db_size_pages,
+                db_header_crc32c,
+            )
+    }
+
+    pub(crate) fn sync(&self, io: &Arc<dyn IO>, sync_type: FileSyncType) -> Result<()> {
+        let c = self.file.sync(Completion::new_sync(|_| {}), sync_type)?;
+        io.wait_for_completion(c)?;
+        Ok(())
+    }
+
+    fn sanitize_backfill_proof_for_exclusive_open(&self) -> bool {
+        let header = self.header();
+        let version = header.backfill_proof_version.load(Ordering::Acquire);
+        if version == 0 {
+            return false;
+        }
+        if version != SHARED_WAL_BACKFILL_PROOF_VERSION {
+            self.clear_backfill_proof();
+            return true;
+        }
+        let proof = SharedWalBackfillProof {
+            nbackfills: header.backfill_proof_nbackfills.load(Ordering::Acquire),
+            max_frame: header.backfill_proof_max_frame.load(Ordering::Acquire),
+            checkpoint_seq: header.backfill_proof_checkpoint_seq.load(Ordering::Acquire),
+            page_size: header.backfill_proof_page_size.load(Ordering::Acquire),
+            salt_1: header.backfill_proof_salt_1.load(Ordering::Acquire),
+            salt_2: header.backfill_proof_salt_2.load(Ordering::Acquire),
+            checksum_1: header.backfill_proof_checksum_1.load(Ordering::Acquire),
+            checksum_2: header.backfill_proof_checksum_2.load(Ordering::Acquire),
+            db_size_pages: header.backfill_proof_db_size_pages.load(Ordering::Acquire),
+            db_header_crc32c: header
+                .backfill_proof_db_header_crc32c
+                .load(Ordering::Acquire),
+        };
+        let stored_crc = header.backfill_proof_crc32c.load(Ordering::Acquire);
+        if !proof.is_structurally_valid() || proof.crc32c() != stored_crc {
+            self.clear_backfill_proof();
+            return true;
+        }
+        false
     }
 
     pub(crate) fn install_header_fields(&self, page_size: u32, salt_1: u32, salt_2: u32) {
@@ -1777,12 +2208,46 @@ impl MappedSharedWalCoordination {
         }
     }
 
+    pub(crate) fn register_reader_for_snapshot(
+        &self,
+        owner: SharedOwnerRecord,
+        max_frame: u64,
+    ) -> Option<SharedReaderSlot> {
+        {
+            let mut process_local = self
+                .process_local_ownership
+                .lock()
+                .expect("process-local ownership registry poisoned");
+            if let Some(slot) = process_local.retain_shared_snapshot_reader(max_frame) {
+                return Some(slot);
+            }
+        }
+
+        let slot = self.register_reader(owner, max_frame)?;
+        let mut process_local = self
+            .process_local_ownership
+            .lock()
+            .expect("process-local ownership registry poisoned");
+        if let Some(existing_slot) = process_local.shared_snapshot_reader(max_frame) {
+            let retained = process_local.retain_shared_snapshot_reader(max_frame);
+            turso_assert!(
+                retained == Some(existing_slot.slot),
+                "shared snapshot retention should return the published slot"
+            );
+            drop(process_local);
+            self.unregister_reader(slot);
+            return Some(existing_slot.slot);
+        }
+        process_local.publish_shared_snapshot_reader(slot);
+        Some(slot)
+    }
+
     /// Release a reader slot previously acquired by `register_reader`.
     ///
     /// Asserts that the current shared-memory owner matches `slot.owner` —
     /// a mismatch means another process reclaimed this slot while we still
     /// thought we held it, which is a correctness bug in the coordination
-    /// layer (see `reset_runtime_state_for_exclusive_open`).
+    /// layer (see `repair_transient_state_for_exclusive_open`).
     pub(crate) fn unregister_reader(&self, slot: SharedReaderSlot) {
         let mut local = self
             .local_lock_state
@@ -1827,6 +2292,19 @@ impl MappedSharedWalCoordination {
         let word_idx = (slot.slot_index >> 6) as usize;
         let bit = slot.slot_index & 63;
         self.reader_bitmap_words()[word_idx].fetch_or(1u64 << bit, Ordering::Release);
+    }
+
+    pub(crate) fn unregister_reader_for_snapshot(&self, slot: SharedReaderSlot) {
+        let release_slot = {
+            let mut process_local = self
+                .process_local_ownership
+                .lock()
+                .expect("process-local ownership registry poisoned");
+            process_local.release_shared_snapshot_reader(slot)
+        };
+        if release_slot {
+            self.unregister_reader(slot);
+        }
     }
 
     pub(crate) fn reader_owner(&self, slot_index: u32) -> Option<SharedOwnerRecord> {
@@ -2294,6 +2772,7 @@ impl MappedSharedWalCoordination {
         unsafe { mappings[block_index].entries_ptr.as_ptr().add(entry_index) }
     }
 
+    #[allow(clippy::mut_from_ref)]
     fn frame_index_block_hash_slice(mapping: &FrameIndexBlockMapping) -> &mut [u16] {
         unsafe {
             std::slice::from_raw_parts_mut(
@@ -2457,6 +2936,20 @@ impl MappedSharedWalCoordination {
             std::ptr::addr_of_mut!((*header).frame_index_capacity).write(MAX_FRAME_INDEX_CAPACITY);
             std::ptr::addr_of_mut!((*header).frame_index_len).write(AtomicU32::new(0));
             std::ptr::addr_of_mut!((*header).frame_index_overflowed).write(AtomicU32::new(0));
+            std::ptr::addr_of_mut!((*header).backfill_proof_version).write(AtomicU32::new(0));
+            std::ptr::addr_of_mut!((*header).backfill_proof_nbackfills).write(AtomicU64::new(0));
+            std::ptr::addr_of_mut!((*header).backfill_proof_max_frame).write(AtomicU64::new(0));
+            std::ptr::addr_of_mut!((*header).backfill_proof_checkpoint_seq)
+                .write(AtomicU32::new(0));
+            std::ptr::addr_of_mut!((*header).backfill_proof_page_size).write(AtomicU32::new(0));
+            std::ptr::addr_of_mut!((*header).backfill_proof_salt_1).write(AtomicU32::new(0));
+            std::ptr::addr_of_mut!((*header).backfill_proof_salt_2).write(AtomicU32::new(0));
+            std::ptr::addr_of_mut!((*header).backfill_proof_checksum_1).write(AtomicU32::new(0));
+            std::ptr::addr_of_mut!((*header).backfill_proof_checksum_2).write(AtomicU32::new(0));
+            std::ptr::addr_of_mut!((*header).backfill_proof_db_size_pages).write(AtomicU32::new(0));
+            std::ptr::addr_of_mut!((*header).backfill_proof_db_header_crc32c)
+                .write(AtomicU32::new(0));
+            std::ptr::addr_of_mut!((*header).backfill_proof_crc32c).write(AtomicU32::new(0));
             std::ptr::addr_of_mut!((*header).writer_owner).write(AtomicU64::new(UNOWNED_LOCK));
             std::ptr::addr_of_mut!((*header).checkpoint_owner).write(AtomicU64::new(UNOWNED_LOCK));
         }
@@ -2519,8 +3012,7 @@ impl MappedSharedWalCoordination {
         let blocks = header.frame_index_blocks.load(Ordering::Acquire);
         if !(INITIAL_FRAME_INDEX_BLOCKS..=MAX_FRAME_INDEX_BLOCKS).contains(&blocks) {
             return Err(LimboError::Corrupt(format!(
-                "shared WAL coordination map frame index block count out of range: {}",
-                blocks
+                "shared WAL coordination map frame index block count out of range: {blocks}"
             )));
         }
         if header.frame_index_capacity != MAX_FRAME_INDEX_CAPACITY {
@@ -2930,6 +3422,63 @@ mod tests {
     }
 
     #[test]
+    fn mapped_shared_wal_coordination_repair_reclaims_dead_owners_without_clearing_frame_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let mapped = create_mapping(&path);
+
+        mapped.record_frame(7, 2);
+        mapped.record_frame(9, 4);
+        mapped
+            .header()
+            .writer_owner
+            .store(SharedOwnerRecord::new(u32::MAX, 1).raw(), Ordering::Release);
+        mapped
+            .header()
+            .checkpoint_owner
+            .store(SharedOwnerRecord::new(u32::MAX, 2).raw(), Ordering::Release);
+        mapped.reader_bitmap_words()[0].fetch_and(!1u64, Ordering::Release);
+        mapped.reader_frames()[0].store(4, Ordering::Release);
+        mapped.reader_owners()[0]
+            .store(SharedOwnerRecord::new(u32::MAX, 3).raw(), Ordering::Release);
+
+        mapped.repair_transient_state_for_exclusive_open();
+
+        assert_eq!(mapped.writer_owner(), None);
+        assert_eq!(mapped.checkpoint_owner(), None);
+        assert_eq!(mapped.reader_owner(0), None);
+        assert_eq!(mapped.min_active_reader_frame(), None);
+        assert_eq!(mapped.find_frame(7, 0, 4, None), Some(2));
+        assert_eq!(mapped.find_frame(9, 0, 4, None), Some(4));
+    }
+
+    #[test]
+    fn mapped_shared_wal_coordination_repair_preserves_live_reader_slots_and_frame_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let mapped_a = create_mapping(&path);
+        let mapped_b = create_mapping(&path);
+
+        mapped_a.record_frame(7, 2);
+        mapped_a.record_frame(9, 4);
+        let reader = mapped_b
+            .register_reader(mapped_b.owner_record(), 4)
+            .unwrap();
+
+        mapped_a.repair_transient_state_for_exclusive_open();
+
+        assert_eq!(mapped_a.reader_owner(reader.slot_index), Some(reader.owner));
+        assert_eq!(mapped_a.min_active_reader_frame(), Some(4));
+        assert_eq!(mapped_a.find_frame(7, 0, 4, None), Some(2));
+        assert_eq!(mapped_a.find_frame(9, 0, 4, None), Some(4));
+
+        mapped_b.unregister_reader(reader);
+        assert_eq!(mapped_a.min_active_reader_frame(), None);
+        assert_eq!(mapped_a.find_frame(7, 0, 4, None), Some(2));
+        assert_eq!(mapped_a.find_frame(9, 0, 4, None), Some(4));
+    }
+
+    #[test]
     fn mapped_shared_wal_coordination_rebuilds_undersized_file_on_exclusive_open() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("coordination.tshm");
@@ -3010,6 +3559,334 @@ mod tests {
     }
 
     #[test]
+    fn mapped_shared_wal_coordination_second_process_local_mapping_is_multiprocess() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+
+        let mapped_a = create_mapping(&path);
+        assert_eq!(
+            mapped_a.open_mode(),
+            SharedWalCoordinationOpenMode::Exclusive
+        );
+        assert!(mapped_a.is_primary_process_mapping());
+
+        let mapped_b = create_mapping(&path);
+        assert_eq!(
+            mapped_b.open_mode(),
+            SharedWalCoordinationOpenMode::MultiProcess
+        );
+        assert!(!mapped_b.is_primary_process_mapping());
+    }
+
+    #[test]
+    fn mapped_shared_wal_coordination_persists_backfill_proof_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let snapshot = SharedWalCoordinationHeader {
+            max_frame: 14,
+            nbackfills: 8,
+            transaction_count: 9,
+            visibility_generation: 1,
+            checkpoint_seq: 5,
+            checkpoint_epoch: 7,
+            page_size: 4096,
+            salt_1: 17,
+            salt_2: 23,
+            checksum_1: 31,
+            checksum_2: 37,
+            reader_slot_count: 64,
+        };
+
+        {
+            let mapped = create_mapping(&path);
+            mapped.install_snapshot(snapshot);
+            mapped.install_backfill_proof(snapshot, 11, 0xAABB_CCDD);
+            assert!(mapped.validate_backfill_proof(snapshot, 11, 0xAABB_CCDD));
+        }
+
+        let reopened = create_mapping(&path);
+        assert!(reopened.validate_backfill_proof(snapshot, 11, 0xAABB_CCDD));
+    }
+
+    #[test]
+    fn mapped_shared_wal_coordination_publish_commit_clears_backfill_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let mapped = create_mapping(&path);
+        let snapshot = SharedWalCoordinationHeader {
+            max_frame: 14,
+            nbackfills: 8,
+            transaction_count: 9,
+            visibility_generation: 1,
+            checkpoint_seq: 5,
+            checkpoint_epoch: 7,
+            page_size: 4096,
+            salt_1: 17,
+            salt_2: 23,
+            checksum_1: 31,
+            checksum_2: 37,
+            reader_slot_count: 64,
+        };
+
+        mapped.install_snapshot(snapshot);
+        mapped.install_backfill_proof(snapshot, 11, 0xAABB_CCDD);
+        assert!(mapped.validate_backfill_proof(snapshot, 11, 0xAABB_CCDD));
+
+        mapped.publish_commit(15, 41, 43, 10);
+
+        assert!(!mapped.validate_backfill_proof(snapshot, 11, 0xAABB_CCDD));
+        assert_eq!(
+            mapped
+                .header()
+                .backfill_proof_version
+                .load(Ordering::Acquire),
+            0
+        );
+    }
+
+    #[test]
+    fn mapped_shared_wal_coordination_install_snapshot_clears_backfill_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let mapped = create_mapping(&path);
+        let snapshot = SharedWalCoordinationHeader {
+            max_frame: 14,
+            nbackfills: 8,
+            transaction_count: 9,
+            visibility_generation: 1,
+            checkpoint_seq: 5,
+            checkpoint_epoch: 7,
+            page_size: 4096,
+            salt_1: 17,
+            salt_2: 23,
+            checksum_1: 31,
+            checksum_2: 37,
+            reader_slot_count: 64,
+        };
+
+        mapped.install_snapshot(snapshot);
+        mapped.install_backfill_proof(snapshot, 11, 0xAABB_CCDD);
+        assert!(mapped.validate_backfill_proof(snapshot, 11, 0xAABB_CCDD));
+
+        mapped.install_snapshot(SharedWalCoordinationHeader {
+            max_frame: 0,
+            nbackfills: 0,
+            checkpoint_seq: 6,
+            salt_1: 19,
+            salt_2: 29,
+            ..snapshot
+        });
+
+        assert!(!mapped.validate_backfill_proof(snapshot, 11, 0xAABB_CCDD));
+        assert_eq!(
+            mapped
+                .header()
+                .backfill_proof_version
+                .load(Ordering::Acquire),
+            0
+        );
+    }
+
+    #[test]
+    fn mapped_shared_wal_coordination_rejects_corrupt_backfill_proof_crc() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let mapped = create_mapping(&path);
+        let snapshot = SharedWalCoordinationHeader {
+            max_frame: 14,
+            nbackfills: 8,
+            transaction_count: 9,
+            visibility_generation: 1,
+            checkpoint_seq: 5,
+            checkpoint_epoch: 7,
+            page_size: 4096,
+            salt_1: 17,
+            salt_2: 23,
+            checksum_1: 31,
+            checksum_2: 37,
+            reader_slot_count: 64,
+        };
+
+        mapped.install_snapshot(snapshot);
+        mapped.install_backfill_proof(snapshot, 11, 0xAABB_CCDD);
+        mapped
+            .header()
+            .backfill_proof_crc32c
+            .store(0xDEAD_BEEF, Ordering::Release);
+
+        assert!(!mapped.validate_backfill_proof(snapshot, 11, 0xAABB_CCDD));
+    }
+
+    #[test]
+    fn mapped_shared_wal_coordination_rejects_structurally_impossible_backfill_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let mapped = create_mapping(&path);
+        let snapshot = SharedWalCoordinationHeader {
+            max_frame: 14,
+            nbackfills: 8,
+            transaction_count: 9,
+            visibility_generation: 1,
+            checkpoint_seq: 5,
+            checkpoint_epoch: 7,
+            page_size: 4096,
+            salt_1: 17,
+            salt_2: 23,
+            checksum_1: 31,
+            checksum_2: 37,
+            reader_slot_count: 64,
+        };
+
+        mapped.install_snapshot(snapshot);
+        mapped.install_backfill_proof(snapshot, 11, 0xAABB_CCDD);
+        mapped
+            .header()
+            .backfill_proof_max_frame
+            .store(3, Ordering::Release);
+        mapped.header().backfill_proof_crc32c.store(
+            SharedWalBackfillProof {
+                max_frame: 3,
+                ..SharedWalBackfillProof::from_snapshot_and_db(snapshot, 11, 0xAABB_CCDD)
+            }
+            .crc32c(),
+            Ordering::Release,
+        );
+
+        assert!(
+            !mapped.validate_backfill_proof(snapshot, 11, 0xAABB_CCDD),
+            "proof with nbackfills beyond max_frame must be rejected even if CRC matches"
+        );
+    }
+
+    #[test]
+    fn mapped_shared_wal_coordination_exclusive_reopen_clears_corrupt_backfill_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let snapshot = SharedWalCoordinationHeader {
+            max_frame: 14,
+            nbackfills: 8,
+            transaction_count: 9,
+            visibility_generation: 1,
+            checkpoint_seq: 5,
+            checkpoint_epoch: 7,
+            page_size: 4096,
+            salt_1: 17,
+            salt_2: 23,
+            checksum_1: 31,
+            checksum_2: 37,
+            reader_slot_count: 64,
+        };
+
+        {
+            let mapped = create_mapping(&path);
+            mapped.install_snapshot(snapshot);
+            mapped.install_backfill_proof(snapshot, 11, 0xAABB_CCDD);
+            mapped
+                .header()
+                .backfill_proof_crc32c
+                .store(0xDEAD_BEEF, Ordering::Release);
+        }
+
+        let reopened = create_mapping(&path);
+        assert_eq!(
+            reopened
+                .header()
+                .backfill_proof_version
+                .load(Ordering::Acquire),
+            0,
+            "exclusive reopen should clear corrupt backfill proof state instead of rejecting the map"
+        );
+    }
+
+    #[test]
+    fn mapped_shared_wal_coordination_exclusive_reopen_clears_unsupported_backfill_proof_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let snapshot = SharedWalCoordinationHeader {
+            max_frame: 14,
+            nbackfills: 8,
+            transaction_count: 9,
+            visibility_generation: 1,
+            checkpoint_seq: 5,
+            checkpoint_epoch: 7,
+            page_size: 4096,
+            salt_1: 17,
+            salt_2: 23,
+            checksum_1: 31,
+            checksum_2: 37,
+            reader_slot_count: 64,
+        };
+
+        {
+            let mapped = create_mapping(&path);
+            mapped.install_snapshot(snapshot);
+            mapped.install_backfill_proof(snapshot, 11, 0xAABB_CCDD);
+            mapped
+                .header()
+                .backfill_proof_version
+                .store(SHARED_WAL_BACKFILL_PROOF_VERSION + 1, Ordering::Release);
+        }
+
+        let reopened = create_mapping(&path);
+        assert_eq!(
+            reopened
+                .header()
+                .backfill_proof_version
+                .load(Ordering::Acquire),
+            0,
+            "exclusive reopen should clear unsupported proof versions instead of discarding the whole map"
+        );
+    }
+
+    #[test]
+    fn mapped_shared_wal_coordination_exclusive_reopen_clears_impossible_backfill_proof_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let snapshot = SharedWalCoordinationHeader {
+            max_frame: 14,
+            nbackfills: 8,
+            transaction_count: 9,
+            visibility_generation: 1,
+            checkpoint_seq: 5,
+            checkpoint_epoch: 7,
+            page_size: 4096,
+            salt_1: 17,
+            salt_2: 23,
+            checksum_1: 31,
+            checksum_2: 37,
+            reader_slot_count: 64,
+        };
+
+        {
+            let mapped = create_mapping(&path);
+            mapped.install_snapshot(snapshot);
+            mapped.install_backfill_proof(snapshot, 11, 0xAABB_CCDD);
+            mapped
+                .header()
+                .backfill_proof_max_frame
+                .store(3, Ordering::Release);
+            mapped.header().backfill_proof_crc32c.store(
+                SharedWalBackfillProof {
+                    max_frame: 3,
+                    ..SharedWalBackfillProof::from_snapshot_and_db(snapshot, 11, 0xAABB_CCDD)
+                }
+                .crc32c(),
+                Ordering::Release,
+            );
+        }
+
+        let reopened = create_mapping(&path);
+        assert_eq!(
+            reopened
+                .header()
+                .backfill_proof_version
+                .load(Ordering::Acquire),
+            0,
+            "exclusive reopen should clear structurally impossible proof payloads"
+        );
+    }
+
+    #[test]
     fn mapped_shared_wal_coordination_prevents_reentrant_lock_reuse_within_same_mapping() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("coordination.tshm");
@@ -3085,6 +3962,25 @@ mod tests {
 
         assert_eq!(mapped.find_frame(7, 0, 5, None), Some(2));
         assert_eq!(mapped.iter_latest_frames(0, 5), vec![(7, 2), (9, 4)]);
+    }
+
+    #[test]
+    fn mapped_shared_wal_coordination_finds_simple_kv_page_after_seed_frame_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let mapped = create_mapping(&path);
+
+        for (frame_id, page_id) in [1, 702, 703, 1377, 1378, 559, 560, 1, 1066, 1067, 1377]
+            .into_iter()
+            .enumerate()
+            .map(|(idx, page_id)| ((idx + 1) as u64, page_id as u64))
+        {
+            mapped.record_frame(page_id, frame_id);
+        }
+
+        assert_eq!(mapped.find_frame(1066, 0, 11, None), Some(9));
+        assert_eq!(mapped.find_frame(1067, 0, 11, None), Some(10));
+        assert_eq!(mapped.find_frame(1377, 0, 11, None), Some(11));
     }
 
     #[test]
@@ -3824,7 +4720,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mp_dbfile_read_blocks_when_shared_reader_slots_are_exhausted() {
+    fn test_mp_dbfile_readers_do_not_consume_shared_reader_slots() {
         let (db, conn_writer, _dir) = open_mp_database();
 
         exec(
@@ -3840,37 +4736,26 @@ mod tests {
         );
 
         let mut readers = Vec::new();
-        for slot in 0..64 {
+        for slot in 0..128 {
             let conn = db.connect().unwrap();
             exec(&conn, "BEGIN");
             assert_eq!(
                 query_i64(&conn, "SELECT count(*) FROM t"),
                 1,
-                "reader slot {slot} should acquire a shared reader slot"
+                "db-file reader {slot} should not fail due to shared-reader slot pressure"
             );
             readers.push(conn);
         }
 
-        let err = match db.connect() {
-            Ok(_) => {
-                panic!("65th reader should not connect while all shared reader slots are occupied")
-            }
-            Err(err) => err,
-        };
-        assert!(
-            matches!(err, LimboError::Busy),
-            "slot exhaustion should surface as Busy, got {err:?}"
-        );
-
-        let released_conn = readers.pop().unwrap();
-        exec(&released_conn, "COMMIT");
-        drop(released_conn);
-
-        let overflow_conn = db.connect().unwrap();
+        let authority = db.shared_wal_coordination().unwrap().unwrap();
         assert_eq!(
-            query_i64(&overflow_conn, "SELECT count(*) FROM t"),
-            1,
-            "read should succeed once a shared reader slot is released"
+            authority.min_active_reader_frame(),
+            None,
+            "db-file-only readers should not publish shared WAL reader slots"
         );
+
+        for conn in readers {
+            exec(&conn, "COMMIT");
+        }
     }
 }
