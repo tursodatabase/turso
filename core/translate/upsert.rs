@@ -29,8 +29,8 @@ use crate::{
             emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, OperationMode, Resolver,
         },
         expr::{
-            emit_returning_results, translate_expr, translate_expr_no_constant_opt, walk_expr_mut,
-            NoConstantOptReason,
+            emit_returning_results, emit_table_column, translate_expr,
+            translate_expr_no_constant_opt, walk_expr_mut, NoConstantOptReason,
         },
         insert::Insertion,
         plan::{ResultSetColumn, TableReferences},
@@ -410,28 +410,25 @@ pub fn emit_upsert(
     let num_cols = ctx.table.columns.len();
     let layout = ctx.table.column_layout();
 
+    let table_ref_id = table_references
+        .joined_tables()
+        .first()
+        .expect("upsert must have a target table")
+        .internal_id;
     let current_start = program.alloc_registers(num_cols);
     for i in 0..num_cols {
         let col = &table.columns()[i];
         let reg = layout.to_register(current_start, i);
-        if col.is_virtual_generated() {
-            program.emit_insn(Insn::Null {
-                dest: reg,
-                dest_end: None,
-            });
-        } else {
-            program.emit_column_or_rowid(ctx.cursor_id, i, reg);
-        }
-    }
-
-    if ctx.table.has_virtual_columns() {
-        let dml_ctx = DmlColumnContext::layout(
-            &ctx.table.columns,
-            current_start,
-            ctx.conflict_rowid_reg,
-            layout.clone(),
-        );
-        compute_virtual_columns(program, &ctx.table.columns, &dml_ctx, resolver)?;
+        emit_table_column(
+            program,
+            ctx.cursor_id,
+            table_ref_id,
+            table_references,
+            col,
+            i,
+            reg,
+            resolver,
+        )?;
     }
 
     // BEFORE for index maintenance / CDC

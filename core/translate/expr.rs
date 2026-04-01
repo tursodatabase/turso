@@ -27,7 +27,7 @@ use crate::vdbe::builder::{CursorKey, SelfTableContext};
 use crate::vdbe::{
     builder::ProgramBuilder,
     insn::{CmpInsFlags, InsertFlags, Insn},
-    BranchOffset,
+    BranchOffset, CursorID,
 };
 use crate::{LimboError, Numeric, Result, Value};
 use std::collections::HashSet;
@@ -5192,6 +5192,48 @@ fn wrap_eval_jump_expr_zero_or_null(
         dest: target_register,
     });
     program.preassign_label_to_next_insn(if_true_label);
+}
+
+/// Read a single column from a BTreeTable cursor, transparently computing
+/// virtual generated columns inline instead of hitting `emit_column`.
+/// All bulk column-reading call sites should use this instead of
+/// `emit_column_or_rowid` directly.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_table_column(
+    program: &mut ProgramBuilder,
+    cursor_id: CursorID,
+    table_ref_id: TableInternalId,
+    referenced_tables: &TableReferences,
+    column: &Column,
+    column_index: usize,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    match column.generated_type() {
+        GeneratedType::Virtual { resolved: expr, .. } => {
+            program.with_self_table_context(
+                Some(&SelfTableContext::ForSelect {
+                    table_ref_id,
+                    referenced_tables: referenced_tables.clone(),
+                }),
+                |program, _| {
+                    translate_expr(
+                        program,
+                        Some(referenced_tables),
+                        expr,
+                        target_register,
+                        resolver,
+                    )?;
+                    Ok(())
+                },
+            )?;
+            program.emit_column_affinity(target_register, column.affinity());
+        }
+        _ => {
+            program.emit_column_or_rowid(cursor_id, column_index, target_register);
+        }
+    }
+    Ok(())
 }
 
 pub fn maybe_apply_affinity(col_type: Type, target_register: usize, program: &mut ProgramBuilder) {
