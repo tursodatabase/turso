@@ -1953,10 +1953,7 @@ impl Pager {
                 continue;
             }
             if page_id > db_size {
-                let mut cache = self.page_cache.write();
-                self.discard_post_savepoint_page(page_id, &mut dirty_pages, &mut cache)?;
                 current_offset += page_size;
-                rollback_bitset.insert(page_id);
                 continue;
             }
 
@@ -1980,7 +1977,21 @@ impl Pager {
             "memory IO should complete immediately"
         );
 
-        self.discard_pages_after_savepoint(db_size, &mut dirty_pages)?;
+        // Discard all dirty pages allocated after the savepoint. These pages
+        // are never subjournaled (see subjournal_page_if_required), so the loop
+        // above won't encounter them. We must clean them from dirty_pages before
+        // truncating the cache, or phantom dirty entries survive into commit.
+        {
+            let mut cache = self.page_cache.write();
+            for page_id in dirty_pages.iter().filter(|&id| id > db_size) {
+                if let Some(page) = cache.get(&PageCacheKey::new(page_id as usize))? {
+                    page.clear_dirty();
+                    page.try_unpin();
+                }
+            }
+            dirty_pages.remove_range((db_size + 1)..);
+            cache.truncate(db_size as usize)?;
+        }
 
         if let Some(wal) = &self.wal {
             wal.rollback(Some(RollbackTo {
@@ -1989,41 +2000,6 @@ impl Pager {
             }));
         }
 
-        Ok(())
-    }
-
-    fn discard_pages_after_savepoint(
-        &self,
-        db_size: u32,
-        dirty_pages: &mut RoaringBitmap,
-    ) -> Result<()> {
-        let max_page_num = db_size as usize;
-        let post_savepoint_pages: Vec<u32> = dirty_pages
-            .iter()
-            .filter(|page_id| *page_id > db_size)
-            .collect();
-        let mut cache = self.page_cache.write();
-
-        for page_id in post_savepoint_pages {
-            self.discard_post_savepoint_page(page_id, dirty_pages, &mut cache)?;
-        }
-
-        cache.truncate(max_page_num)?;
-        Ok(())
-    }
-
-    fn discard_post_savepoint_page(
-        &self,
-        page_id: u32,
-        dirty_pages: &mut RoaringBitmap,
-        cache: &mut PageCache,
-    ) -> Result<()> {
-        dirty_pages.remove(page_id);
-        let page_key = PageCacheKey::new(page_id as usize);
-        if let Some(page) = cache.get(&page_key)? {
-            page.clear_dirty();
-            page.try_unpin();
-        }
         Ok(())
     }
 
