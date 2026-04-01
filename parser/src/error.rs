@@ -87,10 +87,10 @@ pub enum Error {
     },
     // parse errors
     // Unexpected end of file
-    #[error("unexpected end of file")]
+    #[error("incomplete input")]
     ParseUnexpectedEOF,
     // Unexpected token
-    #[error("unexpected token '{token_text}' at offset {offset}")]
+    #[error("near \"{token_text}\": syntax error")]
     #[diagnostic(help("expected {expected_display} but found '{token_text}'"))]
     ParseUnexpectedToken {
         #[label("here")]

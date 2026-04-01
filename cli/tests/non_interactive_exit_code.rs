@@ -275,7 +275,7 @@ SELECT msg FROM log;\n";
     std::fs::remove_file(&sql_path).ok();
 
     assert!(
-        !stderr.contains("unexpected end of file"),
+        !stderr.contains("incomplete input"),
         "trigger should not produce parse errors, stderr: {stderr}"
     );
     assert!(
