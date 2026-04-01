@@ -77,3 +77,4 @@ custom-types-fuzzer-output/
 CLAUDE.md
 bindings/python/dev.py
 bindings/python/implementation-test/
+dhat-heap.json

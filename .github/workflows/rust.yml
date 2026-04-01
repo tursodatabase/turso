@@ -94,7 +94,7 @@ jobs:
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
         # for some reason, test(test_busy_snapshot_immediate) hung with coverage - so let's exclude it from the run for now
         run: |
-          cargo llvm-cov nextest --workspace --all-features --locked --no-fail-fast -E 'not binary(fuzz_tests) and not test(test_busy_snapshot_immediate)' --failure-output=final --html --output-dir coverage
+          cargo llvm-cov nextest --workspace --all-features --locked --no-fail-fast --exclude memory-benchmark -E 'not binary(fuzz_tests) and not test(test_busy_snapshot_immediate)' --failure-output=final --html --output-dir coverage
           echo "::group::Coverage Summary"
           cargo llvm-cov report | tee coverage/summary.txt
           echo "::endgroup::"
@@ -104,7 +104,7 @@ jobs:
         env:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
-        run: cargo nextest run --workspace --all-features --locked --no-fail-fast -E 'not binary(fuzz_tests)' --failure-output=final
+        run: cargo nextest run --workspace --all-features --locked --no-fail-fast --exclude memory-benchmark -E 'not binary(fuzz_tests)' --failure-output=final
         timeout-minutes: 20
       - name: Test integrity_check corruption and short reads (no checksum feature because it interferes with the test)
         run: cargo nextest run -p core_tester --locked --no-fail-fast -E 'test(integrity_check) | test(short_read)' --failure-output=final
@@ -112,7 +112,7 @@ jobs:
       - name: Test doctests
         env:
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
-        run: cargo test --workspace --all-features --doc --locked
+        run: cargo test --workspace --all-features --doc --locked --exclude memory-benchmark
       - name: Upload coverage report
         if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
@@ -173,7 +173,7 @@ jobs:
           cache-on-failure: true
       - name: Clippy
         run: |
-          cargo clippy --workspace --all-features --all-targets --locked -- --deny=warnings
+          cargo clippy --workspace --all-features --all-targets --locked --exclude memory-benchmark -- --deny=warnings
 
   simulator:
     runs-on: blacksmith-4vcpu-ubuntu-2404

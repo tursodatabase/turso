@@ -34,15 +34,57 @@ members = [
     "perf/throughput/turso",
     "perf/throughput/rusqlite",
     "perf/encryption",
+    "perf/memory",
     "tools/dbhash",
     "sdk-kit",
-    "sdk-kit-macros", 
+    "sdk-kit-macros",
     "testing/differential-oracle/sql_gen_prop",
     "testing/differential-oracle/sql_gen",
     "testing/differential-oracle/fuzzer",
     "testing/sqltests"
 ]
 exclude = ["perf/latency/limbo"]
+
+default-members = [
+    "bindings/java",
+    "bindings/javascript",
+    "bindings/javascript/sync",
+    "bindings/python",
+    "bindings/dotnet",
+    "bindings/rust",
+    "cli",
+    "core",
+    "extensions/completion",
+    "extensions/core",
+    "extensions/crypto",
+    "extensions/csv",
+    "extensions/ipaddr",
+    "extensions/percentile",
+    "extensions/regexp",
+    "extensions/tests",
+    "extensions/fuzzy",
+    "macros",
+    "testing/simulator",
+    "sqlite3",
+    "testing/stress",
+    "testing/sqlite_test_ext",
+    "tests",
+    "parser",
+    "sync/engine",
+    "sync/sdk-kit",
+    "sql_generation",
+    "testing/concurrent-simulator",
+    "perf/throughput/turso",
+    "perf/throughput/rusqlite",
+    "perf/encryption",
+    "tools/dbhash",
+    "sdk-kit",
+    "sdk-kit-macros",
+    "testing/differential-oracle/sql_gen_prop",
+    "testing/differential-oracle/sql_gen",
+    "testing/differential-oracle/fuzzer",
+    "testing/sqltests"
+]
 
 [workspace.package]
 version = "0.6.0-pre.14"
