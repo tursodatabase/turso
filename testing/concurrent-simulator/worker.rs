@@ -46,7 +46,7 @@ pub fn run_worker(db_path: &str, enable_mvcc: bool) -> anyhow::Result<()> {
         .try_init();
 
     let io = Arc::new(UnixIO::new()?);
-    let db_opts = DatabaseOpts::new();
+    let db_opts = DatabaseOpts::new().with_multiprocess_wal(true);
     let db = Database::open_file_with_flags(
         io,
         db_path,

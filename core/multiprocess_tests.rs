@@ -18,6 +18,8 @@ const MULTIPROCESS_SHM_SCHEMA_CHILD_TEST: &str =
 #[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 const MULTIPROCESS_SHM_INSERT_AND_CLOSE_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_insert_and_close_child_process";
+#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
+const DEFAULT_LOCKED_DB_CHILD_TEST: &str = "multiprocess_tests::default_locked_db_child_process";
 
 #[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 fn count_test_rows(conn: &Arc<Connection>) -> i64 {
@@ -103,6 +105,31 @@ fn wait_for_file(path: &std::path::Path) {
 }
 
 #[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
+fn multiprocess_wal_db_opts() -> DatabaseOpts {
+    DatabaseOpts::new().with_multiprocess_wal(true)
+}
+
+#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
+fn open_multiprocess_db(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
+    Database::open_file_with_flags(
+        io,
+        path,
+        OpenFlags::default(),
+        multiprocess_wal_db_opts(),
+        None,
+    )
+}
+
+#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
+fn open_multiprocess_db_with_flags(
+    io: Arc<dyn IO>,
+    path: &str,
+    flags: OpenFlags,
+) -> Result<Arc<Database>> {
+    Database::open_file_with_flags(io, path, flags, multiprocess_wal_db_opts(), None)
+}
+
+#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 fn flip_db_header_reserved_byte(path: &std::path::Path) {
     use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -151,12 +178,58 @@ fn shared_wal_coordination_rejects_remote_filesystem_magic_values() {
 
 #[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
+fn database_open_without_experimental_multiprocess_wal_uses_in_process_backend() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-default-off.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file(io, db_path_str).unwrap();
+
+    let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
+    let wal = db
+        .build_wal(last_checksum_and_max_frame, db.buffer_pool.clone())
+        .unwrap();
+    let wal_file = wal.as_any().downcast_ref::<WalFile>().unwrap();
+    assert_eq!(wal_file.coordination_backend_name(), "in_process");
+    assert!(db.shared_wal_coordination().unwrap().is_none());
+
+    let shm_path = storage::wal::coordination_path_for_wal_path(&format!("{db_path_str}-wal"));
+    assert!(!std::path::Path::new(&shm_path).exists());
+}
+
+#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
+#[test]
+fn database_open_without_experimental_multiprocess_wal_rejects_second_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-default-locked.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let _db = Database::open_file(io, db_path_str).unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let child_output = Command::new(&current_exe)
+        .arg(DEFAULT_LOCKED_DB_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        child_output.status.success(),
+        "second default-open child process unexpectedly succeeded: stdout={}; stderr={}",
+        String::from_utf8_lossy(&child_output.stdout),
+        String::from_utf8_lossy(&child_output.stderr)
+    );
+}
+
+#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
+#[test]
 fn database_open_selects_shm_wal_backend() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("coordination.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, db_path_str).unwrap();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
 
     let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
     let wal = db
@@ -177,7 +250,7 @@ fn database_open_rebuilds_from_disk_scan_when_exclusive_shm_snapshot_is_stale() 
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
 
-    let db_a = Database::open_file(io.clone(), db_path_str).unwrap();
+    let db_a = open_multiprocess_db(io.clone(), db_path_str).unwrap();
     let conn_a = db_a.connect().unwrap();
     conn_a
         .execute("create table test(id integer primary key, value text)")
@@ -201,7 +274,7 @@ fn database_open_rebuilds_from_disk_scan_when_exclusive_shm_snapshot_is_stale() 
     manager.clear();
     drop(manager);
 
-    let db_b = Database::open_file(io, db_path_str).unwrap();
+    let db_b = open_multiprocess_db(io, db_path_str).unwrap();
     assert!(
         db_b.shared_wal
             .read()
@@ -228,7 +301,7 @@ fn database_open_reuses_trusted_tshm_snapshot_after_partial_checkpoint_with_back
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
 
-    let db = Database::open_file(io.clone(), db_path_str).unwrap();
+    let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
     let conn = db.connect().unwrap();
     conn.wal_auto_checkpoint_disable();
     conn.execute("create table test(id integer primary key, value blob)")
@@ -268,7 +341,7 @@ fn database_open_reuses_trusted_tshm_snapshot_after_partial_checkpoint_with_back
     manager.clear();
     drop(manager);
 
-    let reopened = Database::open_file(io, db_path_str).unwrap();
+    let reopened = open_multiprocess_db(io, db_path_str).unwrap();
     assert!(
         !reopened
             .shared_wal
@@ -304,7 +377,7 @@ fn database_open_rebuilds_from_disk_scan_after_partial_checkpoint_without_backfi
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
 
-    let db = Database::open_file(io.clone(), db_path_str).unwrap();
+    let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
     let conn = db.connect().unwrap();
     conn.wal_auto_checkpoint_disable();
     conn.execute("create table test(id integer primary key, value blob)")
@@ -345,7 +418,7 @@ fn database_open_rebuilds_from_disk_scan_after_partial_checkpoint_without_backfi
     manager.clear();
     drop(manager);
 
-    let reopened = Database::open_file(io, db_path_str).unwrap();
+    let reopened = open_multiprocess_db(io, db_path_str).unwrap();
     let mut expected_snapshot = snapshot_before;
     expected_snapshot.nbackfills = 0;
     assert!(
@@ -383,7 +456,7 @@ fn database_open_rebuilds_from_disk_scan_after_wal_append_invalidates_backfill_p
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
 
-    let db = Database::open_file(io.clone(), db_path_str).unwrap();
+    let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
     let conn = db.connect().unwrap();
     conn.wal_auto_checkpoint_disable();
     conn.execute("create table test(id integer primary key, value blob)")
@@ -427,7 +500,7 @@ fn database_open_rebuilds_from_disk_scan_after_wal_append_invalidates_backfill_p
     manager.clear();
     drop(manager);
 
-    let reopened = Database::open_file(io, db_path_str).unwrap();
+    let reopened = open_multiprocess_db(io, db_path_str).unwrap();
     assert!(
         reopened
             .shared_wal
@@ -456,7 +529,7 @@ fn database_open_rebuilds_from_disk_scan_after_db_header_mismatch_invalidates_ba
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
 
-    let db = Database::open_file(io.clone(), db_path_str).unwrap();
+    let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
     let conn = db.connect().unwrap();
     conn.wal_auto_checkpoint_disable();
     conn.execute("create table test(id integer primary key, value blob)")
@@ -493,7 +566,7 @@ fn database_open_rebuilds_from_disk_scan_after_db_header_mismatch_invalidates_ba
     manager.clear();
     drop(manager);
 
-    let reopened = Database::open_file(io, db_path_str).unwrap();
+    let reopened = open_multiprocess_db(io, db_path_str).unwrap();
     let mut expected_snapshot = snapshot_before;
     expected_snapshot.nbackfills = 0;
     assert!(
@@ -523,13 +596,29 @@ fn database_open_rebuilds_from_disk_scan_after_db_header_mismatch_invalidates_ba
 
 #[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
+fn default_locked_db_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let err = Database::open_file(io, db_path.to_str().unwrap())
+        .expect_err("default non-multiprocess open should stay DB-file locked across processes");
+    assert!(
+        matches!(err, LimboError::LockingError(_)),
+        "expected LockingError from second default open, got {err:?}"
+    );
+}
+
+#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
+#[test]
 fn multiprocess_shm_insert_child_process() {
     let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
         return;
     };
 
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, db_path.to_str().unwrap()).unwrap();
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
     let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
     let wal = db
         .build_wal(last_checksum_and_max_frame, db.buffer_pool.clone())
@@ -551,7 +640,7 @@ fn multiprocess_shm_insert_and_close_child_process() {
     };
 
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, db_path.to_str().unwrap()).unwrap();
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
     let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
     let wal = db
         .build_wal(last_checksum_and_max_frame, db.buffer_pool.clone())
@@ -578,7 +667,7 @@ fn multiprocess_shm_count_child_process() {
         .unwrap();
 
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, db_path.to_str().unwrap()).unwrap();
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
     let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
     let wal = db
         .build_wal(last_checksum_and_max_frame, db.buffer_pool.clone())
@@ -608,16 +697,9 @@ fn multiprocess_shm_hold_read_tx_child_process() {
 
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
     let db = if readonly {
-        Database::open_file_with_flags(
-            io,
-            db_path.to_str().unwrap(),
-            OpenFlags::ReadOnly,
-            DatabaseOpts::new(),
-            None,
-        )
-        .unwrap()
+        open_multiprocess_db_with_flags(io, db_path.to_str().unwrap(), OpenFlags::ReadOnly).unwrap()
     } else {
-        Database::open_file(io, db_path.to_str().unwrap()).unwrap()
+        open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap()
     };
     let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
     let wal = db
@@ -653,7 +735,7 @@ fn multiprocess_shm_schema_child_process() {
     };
 
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, db_path.to_str().unwrap()).unwrap();
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
     let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
     let wal = db
         .build_wal(last_checksum_and_max_frame, db.buffer_pool.clone())
@@ -675,7 +757,7 @@ fn subprocess_database_open_selects_multiprocess_shm_backend() {
     let db_path = dir.path().join("coordination-subprocess.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, db_path_str).unwrap();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
     let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
     let wal = db
         .build_wal(last_checksum_and_max_frame, db.buffer_pool.clone())
@@ -728,7 +810,7 @@ fn subprocess_child_close_skips_shutdown_checkpoint_in_multiprocess_wal_mode() {
     let db_path = dir.path().join("close-skip-shutdown-checkpoint.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, db_path_str).unwrap();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
     let conn = db.connect().unwrap();
 
     conn.execute("create table test(id integer primary key, value text)")
@@ -778,7 +860,7 @@ fn subprocess_database_open_survives_truncate_rewrite_cycles() {
     let db_path = dir.path().join("coordination-truncate-rewrite.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, db_path_str).unwrap();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
     let conn = db.connect().unwrap();
     conn.execute("create table test(id integer primary key, value text)")
         .unwrap();
@@ -842,7 +924,7 @@ fn subprocess_database_open_peer_refreshes_remote_schema_without_reopen() {
     let db_path = dir.path().join("coordination-peer-schema-refresh.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, db_path_str).unwrap();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
     let conn = db.connect().unwrap();
     conn.execute("create table t(value integer, next_value integer)")
         .unwrap();
@@ -906,7 +988,7 @@ fn subprocess_database_open_parent_directly_uses_child_created_table() {
     let db_path = dir.path().join("coordination-direct-child-table-use.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, db_path_str).unwrap();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
     let conn = db.connect().unwrap();
     conn.execute("create table t(value integer)").unwrap();
 
@@ -944,7 +1026,7 @@ fn subprocess_database_open_parent_execute_uses_child_created_table() {
     let db_path = dir.path().join("coordination-execute-child-table-use.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, db_path_str).unwrap();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
     let conn = db.connect().unwrap();
     conn.execute("create table t(value integer)").unwrap();
 
@@ -985,7 +1067,7 @@ fn subprocess_readonly_child_reader_blocks_restart_and_truncate_checkpoints() {
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
 
-    let db = Database::open_file(io, db_path_str).unwrap();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
     let conn = db.connect().unwrap();
     conn.wal_auto_checkpoint_disable();
     conn.execute("create table test(id integer primary key, value blob)")
@@ -1080,7 +1162,7 @@ fn subprocess_readonly_disk_scan_child_reader_stays_in_shared_coordination() {
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
 
-    let db = Database::open_file(io.clone(), db_path_str).unwrap();
+    let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
     let conn = db.connect().unwrap();
     conn.wal_auto_checkpoint_disable();
     conn.execute("create table test(id integer primary key, value blob)")
@@ -1143,7 +1225,7 @@ fn subprocess_readonly_disk_scan_child_reader_stays_in_shared_coordination() {
         "disk-scan read-only child should protect the live WAL tail, not the checkpointed prefix"
     );
 
-    let reopened = Database::open_file(io, db_path_str).unwrap();
+    let reopened = open_multiprocess_db(io, db_path_str).unwrap();
     let reopened_conn = reopened.connect().unwrap();
 
     let restart_err = reopened_conn
@@ -1185,7 +1267,7 @@ fn subprocess_readonly_disk_scan_child_reader_stays_in_shared_coordination() {
         "disk-scan read-only child should exit cleanly after releasing its read transaction: {child_status:?}"
     );
 
-    let reopened = Database::open_file(Arc::new(PlatformIO::new().unwrap()), db_path_str).unwrap();
+    let reopened = open_multiprocess_db(Arc::new(PlatformIO::new().unwrap()), db_path_str).unwrap();
     let reopened_conn = reopened.connect().unwrap();
     let checkpoint = reopened_conn
         .checkpoint(CheckpointMode::Truncate {
@@ -1212,7 +1294,7 @@ fn subprocess_database_truncate_checkpoint_reclaims_dead_child_reader_slot() {
     let release_file = dir.path().join("child-release");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, db_path_str).unwrap();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
     let conn = db.connect().unwrap();
     conn.execute("create table test(id integer primary key, value text)")
         .unwrap();
@@ -1294,7 +1376,7 @@ fn subprocess_database_truncate_checkpoint_reclaims_dead_child_reader_slot() {
     drop(manager);
 
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-    let reopened = Database::open_file(io, db_path_str).unwrap();
+    let reopened = open_multiprocess_db(io, db_path_str).unwrap();
     let reopened_conn = reopened.connect().unwrap();
     assert_eq!(
         count_test_rows(&reopened_conn),
@@ -1313,7 +1395,7 @@ fn database_open_reopen_with_live_child_reader_does_not_clobber_authority() {
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
 
-    let db = Database::open_file(io.clone(), db_path_str).unwrap();
+    let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
     let conn = db.connect().unwrap();
     conn.wal_auto_checkpoint_disable();
     conn.execute("create table test(id integer primary key, value blob)")
@@ -1374,7 +1456,7 @@ fn database_open_reopen_with_live_child_reader_does_not_clobber_authority() {
     manager.clear();
     drop(manager);
 
-    let reopened = Database::open_file(io, db_path_str).unwrap();
+    let reopened = open_multiprocess_db(io, db_path_str).unwrap();
     let reopened_authority = reopened.shared_wal_coordination().unwrap().unwrap();
     assert_eq!(reopened_authority.snapshot(), snapshot_before);
     assert_eq!(
@@ -1413,7 +1495,7 @@ fn database_open_rebuilds_from_disk_scan_when_shared_frame_index_overflowed() {
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
 
-    let db_a = Database::open_file(io.clone(), db_path_str).unwrap();
+    let db_a = open_multiprocess_db(io.clone(), db_path_str).unwrap();
     let conn_a = db_a.connect().unwrap();
     conn_a
         .execute("create table test(id integer primary key, value text)")
@@ -1458,7 +1540,7 @@ fn database_open_rebuilds_from_disk_scan_when_shared_frame_index_overflowed() {
     manager.clear();
     drop(manager);
 
-    let db_b = Database::open_file(io, db_path_str).unwrap();
+    let db_b = open_multiprocess_db(io, db_path_str).unwrap();
     assert!(
         db_b.shared_wal
             .read()
