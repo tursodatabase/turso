@@ -96,12 +96,11 @@ impl IO for WindowsIO {
             handle: file_handle,
         });
 
-        if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
-            && !flags.contains(OpenFlags::ReadOnly)
-        {
-            // Drop will handle CloseHandle if lock_file fails
-            windows_file.lock_file(true)?;
-        }
+        // Windows LockFileEx is per-handle, not per-process like Unix fcntl locks.
+        // This means the same process opening the file twice (e.g. sync engine with
+        // multiple connections) would fail on the second lock. Skip lock-on-open and
+        // rely on the sharing mode set in CreateFileW for cross-process protection.
+        // lock_file/unlock_file remain available for explicit use when needed.
 
         Ok(windows_file)
     }
@@ -362,7 +361,6 @@ impl File for WindowsFile {
 
 impl Drop for WindowsFile {
     fn drop(&mut self) {
-        let _ = self.unlock_file();
         unsafe {
             CloseHandle(self.handle);
         }
