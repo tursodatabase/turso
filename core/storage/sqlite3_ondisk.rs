@@ -1625,6 +1625,21 @@ impl StreamingWalReader {
                 calc == (h.checksum_1, h.checksum_2),
             )
         };
+        #[cfg(debug_assertions)]
+        {
+            let header = self.header.lock();
+            tracing::debug!(
+                "WAL_SCAN header page_size={} checkpoint_seq={} salts=({}, {}) checksum=({}, {}) use_native={} valid={}",
+                page_sz,
+                header.checkpoint_seq,
+                header.salt_1,
+                header.salt_2,
+                c1,
+                c2,
+                use_native,
+                ok
+            );
+        }
         if PageSize::new(page_sz).is_none() || !ok {
             self.finalize_loading();
             return;
@@ -1691,6 +1706,14 @@ impl StreamingWalReader {
             }
             if s1 != header.salt_1 || s2 != header.salt_2 {
                 tracing::debug!(
+                    "WAL_SCAN stop: frame={} salt mismatch frame=({}, {}) header=({}, {})",
+                    st.frame_idx,
+                    s1,
+                    s2,
+                    header.salt_1,
+                    header.salt_2
+                );
+                tracing::debug!(
                     "process_frames: salt mismatch, stop reading WAL at initialization phase"
                 );
                 break;
@@ -1700,7 +1723,12 @@ impl StreamingWalReader {
             let calc = checksum_wal(page, header, seed, use_native);
             if calc != (c1, c2) {
                 tracing::debug!(
-                    "process_frames: checksum mismatch, stop reading WAL at initialization phase"
+                    " WAL_SCAN stop: process_frames, checksum mismatch, stop reading WAL at initialization phase: frame={} checksum mismatch calc=({},{}) file=({},{})",
+                    st.frame_idx,
+                    calc.0,
+                    calc.1,
+                    c1,
+                    c2
                 );
                 break;
             }
@@ -1715,6 +1743,12 @@ impl StreamingWalReader {
             if db_size > 0 {
                 st.last_valid_frame = st.frame_idx;
                 st.last_valid_checksum = calc;
+                tracing::debug!(
+                    "WAL_SCAN commit frame={} page_no={} db_size={}",
+                    st.frame_idx,
+                    page_no,
+                    db_size
+                );
                 self.flush_pending_frames(&mut st);
             }
             st.frame_idx += 1;
@@ -1747,6 +1781,12 @@ impl StreamingWalReader {
     fn finalize_loading(&self) {
         let mut wfs = self.wal_shared.write();
         let st = self.state.read();
+        tracing::debug!(
+            "WAL_SCAN finalize last_valid_frame={} pending_pages={} header_valid={}",
+            st.last_valid_frame,
+            st.pending_frames.len(),
+            st.header_valid
+        );
 
         let max_frame = st.last_valid_frame;
         if max_frame > 0 {

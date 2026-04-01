@@ -91,28 +91,6 @@ fn wal_max_frame(conn: &Arc<Connection>) -> u64 {
 }
 
 #[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
-fn grow_wal_past_frame_boundary(conn: &Arc<Connection>, target_frame: u64) {
-    conn.wal_auto_checkpoint_disable();
-
-    for _ in 0..64 {
-        if wal_max_frame(conn) > target_frame {
-            return;
-        }
-
-        conn.execute("begin immediate").unwrap();
-        for _ in 0..128 {
-            conn.execute("insert into test(value) values (randomblob(8192))")
-                .unwrap();
-        }
-        conn.execute("commit").unwrap();
-    }
-    panic!(
-        "failed to grow WAL beyond frame boundary {target_frame}; max_frame={}",
-        wal_max_frame(conn)
-    );
-}
-
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 fn wait_for_file(path: &std::path::Path) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
@@ -122,6 +100,41 @@ fn wait_for_file(path: &std::path::Path) {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     panic!("timed out waiting for {}", path.display());
+}
+
+#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
+fn flip_db_header_reserved_byte(path: &std::path::Path) {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+
+    #[cfg(feature = "checksum")]
+    {
+        let mut page = vec![0u8; 4096];
+        file.read_exact(&mut page).unwrap();
+        page[72] ^= 0x01;
+        crate::storage::checksum::ChecksumContext::new()
+            .add_checksum_to_page(&mut page, 1)
+            .unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&page).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    #[cfg(not(feature = "checksum"))]
+    {
+        file.seek(SeekFrom::Start(72)).unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0x01;
+        file.seek(SeekFrom::Start(72)).unwrap();
+        file.write_all(&byte).unwrap();
+        file.sync_all().unwrap();
+    }
 }
 
 #[cfg(all(feature = "fs", target_os = "linux", target_pointer_width = "64"))]
@@ -154,101 +167,6 @@ fn database_open_selects_shm_wal_backend() {
 
     let shm_path = storage::wal::coordination_path_for_wal_path(&format!("{db_path_str}-wal"));
     assert!(std::path::Path::new(&shm_path).exists());
-}
-
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
-#[test]
-fn database_open_reuses_valid_exclusive_shm_authority_without_disk_scan() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("coordination-reopen.db");
-    let db_path_str = db_path.to_str().unwrap();
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-
-    let db_a = Database::open_file(io.clone(), db_path_str).unwrap();
-    let conn_a = db_a.connect().unwrap();
-    conn_a
-        .execute("create table test(id integer primary key, value text)")
-        .unwrap();
-    conn_a
-        .execute("insert into test(value) values ('parent')")
-        .unwrap();
-
-    let db_b = Database::open_file(io, db_path_str).unwrap();
-    assert!(!db_b
-        .shared_wal
-        .read()
-        .metadata
-        .loaded_from_disk_scan
-        .load(Ordering::Acquire));
-
-    let last_checksum_and_max_frame = db_b.shared_wal.read().last_checksum_and_max_frame();
-    let wal = db_b
-        .build_wal(last_checksum_and_max_frame, db_b.buffer_pool.clone())
-        .unwrap();
-    let wal_file = wal.as_any().downcast_ref::<WalFile>().unwrap();
-    assert_eq!(wal_file.coordination_backend_name(), "tshm");
-
-    let conn_b = db_b.connect().unwrap();
-    assert_eq!(count_test_rows(&conn_b), 1);
-}
-
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
-#[test]
-fn database_open_reuses_valid_shm_authority_after_clean_last_close_across_repeated_reopens() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("coordination-clean-reopen.db");
-    let db_path_str = db_path.to_str().unwrap();
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-    let tshm_path = storage::wal::coordination_path_for_wal_path(&format!("{db_path_str}-wal"));
-
-    let db = Database::open_file(io.clone(), db_path_str).unwrap();
-    let conn = db.connect().unwrap();
-    conn.execute("create table test(id integer primary key, value text)")
-        .unwrap();
-    conn.execute("insert into test(value) values ('persisted')")
-        .unwrap();
-    wait_for_file(std::path::Path::new(&tshm_path));
-    let initial_tshm_len = std::fs::metadata(&tshm_path).unwrap().len();
-    assert!(
-        initial_tshm_len > 0,
-        "clean last-close coverage requires a persisted non-empty tshm file"
-    );
-
-    drop(conn);
-    drop(db);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
-
-    for cycle in 0..3 {
-        let reopened = Database::open_file(io.clone(), db_path_str).unwrap();
-        assert!(
-            !reopened
-                .shared_wal
-                .read()
-                .metadata
-                .loaded_from_disk_scan
-                .load(Ordering::Acquire),
-            "cold reopen cycle {cycle} should reuse validated tshm authority without a WAL disk scan"
-        );
-
-        let reopened_conn = reopened.connect().unwrap();
-        assert_eq!(
-            count_test_rows(&reopened_conn),
-            1,
-            "cold reopen cycle {cycle} should preserve committed rows"
-        );
-        assert!(
-            std::fs::metadata(&tshm_path).unwrap().len() >= initial_tshm_len,
-            "cold reopen cycle {cycle} should keep tshm persisted on disk"
-        );
-
-        drop(reopened_conn);
-        drop(reopened);
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-        drop(manager);
-    }
 }
 
 #[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
@@ -304,83 +222,302 @@ fn database_open_rebuilds_from_disk_scan_when_exclusive_shm_snapshot_is_stale() 
 
 #[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
-fn database_open_reuses_valid_shm_authority_after_large_wal_crosses_frame_index_block_boundary() {
+fn database_open_reuses_trusted_tshm_snapshot_after_partial_checkpoint_with_backfill_proof() {
     let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("coordination-large-wal-reopen.db");
+    let db_path = dir.path().join("coordination-partial-checkpoint-reopen.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-    let tshm_path = storage::wal::coordination_path_for_wal_path(&format!("{db_path_str}-wal"));
 
-    let db_a = Database::open_file(io.clone(), db_path_str).unwrap();
-    let conn_a = db_a.connect().unwrap();
-    conn_a
-        .execute("create table test(id integer primary key, value blob)")
+    let db = Database::open_file(io.clone(), db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.wal_auto_checkpoint_disable();
+    conn.execute("create table test(id integer primary key, value blob)")
         .unwrap();
-    wait_for_file(std::path::Path::new(&tshm_path));
-    let initial_tshm_len = std::fs::metadata(&tshm_path).unwrap().len();
+    conn.execute("begin immediate").unwrap();
+    for _ in 0..32 {
+        conn.execute("insert into test(value) values (randomblob(2048))")
+            .unwrap();
+    }
+    conn.execute("commit").unwrap();
+    assert!(
+        wal_max_frame(&conn) > 1,
+        "partial-checkpoint reopen coverage requires more than one WAL frame before checkpointing"
+    );
 
-    grow_wal_past_frame_boundary(&conn_a, 4096);
-    assert!(
-        wal_max_frame(&conn_a) > 4096,
-        "test setup should cross the first shared frame-index block boundary"
+    run_checkpoint(
+        &conn,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: Some(1),
+        },
     );
-    let grown_tshm_len = std::fs::metadata(&tshm_path).unwrap().len();
-    assert!(
-        grown_tshm_len > initial_tshm_len,
-        "shared WAL coordination map should grow when the frame index crosses one block boundary"
-    );
-    let authority = db_a.shared_wal_coordination().unwrap().unwrap();
-    let snapshot = authority.snapshot();
-    assert_eq!(
-        snapshot.nbackfills, 0,
-        "large-WAL reopen coverage requires uncheckpointed WAL frames"
-    );
-    let wal_bytes = std::fs::read(format!("{db_path_str}-wal")).unwrap();
-    let frame_size =
-        crate::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE + snapshot.page_size as usize;
-    let expected_wal_len =
-        crate::storage::sqlite3_ondisk::WAL_HEADER_SIZE + snapshot.max_frame as usize * frame_size;
-    assert_eq!(
-        wal_bytes.len(),
-        expected_wal_len,
-        "authority snapshot should match on-disk WAL length before reopen"
-    );
-    let last_frame_offset = crate::storage::sqlite3_ondisk::WAL_HEADER_SIZE
-        + (snapshot.max_frame as usize - 1) * frame_size;
-    let (last_frame_header, _) =
-        crate::storage::sqlite3_ondisk::parse_wal_frame_header(&wal_bytes[last_frame_offset..]);
-    assert!(
-        last_frame_header.is_commit_frame(),
-        "large-WAL setup should end on a commit frame"
-    );
-    assert_eq!(last_frame_header.salt_1, snapshot.salt_1);
-    assert_eq!(last_frame_header.salt_2, snapshot.salt_2);
-    assert_eq!(last_frame_header.checksum_1, snapshot.checksum_1);
-    assert_eq!(last_frame_header.checksum_2, snapshot.checksum_2);
 
-    drop(conn_a);
-    drop(db_a);
+    let authority = db.shared_wal_coordination().unwrap().unwrap();
+    let snapshot_before = authority.snapshot();
+    assert!(
+        snapshot_before.nbackfills > 0,
+        "partial-checkpoint reopen coverage requires persisted positive nbackfills"
+    );
+    assert!(
+        snapshot_before.max_frame > snapshot_before.nbackfills,
+        "partial-checkpoint reopen coverage requires live WAL frames beyond the backfill point"
+    );
+
+    drop(conn);
+    drop(db);
     let mut manager = DATABASE_MANAGER.lock();
     manager.clear();
     drop(manager);
 
-    let db_b = Database::open_file(io, db_path_str).unwrap();
+    let reopened = Database::open_file(io, db_path_str).unwrap();
     assert!(
-        !db_b
+        !reopened
             .shared_wal
             .read()
             .metadata
             .loaded_from_disk_scan
             .load(Ordering::Acquire),
-        "cold reopen should still trust tshm after the shared frame index grows past one block"
+        "reopen should reuse the persisted tshm snapshot when the backfill proof still matches the WAL and DB header"
     );
 
-    let conn_b = db_b.connect().unwrap();
-    let rows = get_rows(&conn_b, "select count(*) from test");
-    assert_eq!(rows.len(), 1);
+    let reopened_authority = reopened.shared_wal_coordination().unwrap().unwrap();
+    assert_eq!(
+        reopened_authority.snapshot(),
+        snapshot_before,
+        "trusted reopen must preserve the authoritative partial-checkpoint snapshot"
+    );
+
+    let reopened_conn = reopened.connect().unwrap();
+    assert_eq!(
+        count_test_rows(&reopened_conn),
+        32,
+        "trusted partial-checkpoint reopen should preserve committed rows without a disk scan"
+    );
+}
+
+#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
+#[test]
+fn database_open_rebuilds_from_disk_scan_after_partial_checkpoint_without_backfill_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir
+        .path()
+        .join("coordination-partial-checkpoint-reopen-no-proof.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+    let db = Database::open_file(io.clone(), db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.wal_auto_checkpoint_disable();
+    conn.execute("create table test(id integer primary key, value blob)")
+        .unwrap();
+    conn.execute("begin immediate").unwrap();
+    for _ in 0..32 {
+        conn.execute("insert into test(value) values (randomblob(2048))")
+            .unwrap();
+    }
+    conn.execute("commit").unwrap();
     assert!(
-        rows[0][0].as_int().unwrap() > 0,
-        "large WAL reopen should preserve committed rows across the frame-index block boundary"
+        wal_max_frame(&conn) > 1,
+        "partial-checkpoint reopen coverage requires more than one WAL frame before checkpointing"
+    );
+
+    run_checkpoint(
+        &conn,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: Some(1),
+        },
+    );
+
+    let authority = db.shared_wal_coordination().unwrap().unwrap();
+    let snapshot_before = authority.snapshot();
+    assert!(
+        snapshot_before.nbackfills > 0,
+        "partial-checkpoint reopen coverage requires persisted positive nbackfills"
+    );
+    assert!(
+        snapshot_before.max_frame > snapshot_before.nbackfills,
+        "partial-checkpoint reopen coverage requires live WAL frames beyond the backfill point"
+    );
+    authority.clear_backfill_proof();
+
+    drop(conn);
+    drop(db);
+    let mut manager = DATABASE_MANAGER.lock();
+    manager.clear();
+    drop(manager);
+
+    let reopened = Database::open_file(io, db_path_str).unwrap();
+    let mut expected_snapshot = snapshot_before;
+    expected_snapshot.nbackfills = 0;
+    assert!(
+        reopened
+            .shared_wal
+            .read()
+            .metadata
+            .loaded_from_disk_scan
+            .load(Ordering::Acquire),
+        "reopen must rebuild shared WAL state from disk when positive nbackfills are not durably provable"
+    );
+
+    let reopened_authority = reopened.shared_wal_coordination().unwrap().unwrap();
+    assert_eq!(
+        reopened_authority.snapshot(),
+        expected_snapshot,
+        "disk-scan reopen must preserve the WAL generation while clearing untrusted positive nbackfills"
+    );
+
+    let reopened_conn = reopened.connect().unwrap();
+    assert_eq!(
+        count_test_rows(&reopened_conn),
+        32,
+        "partial-checkpoint reopen should preserve committed rows after the conservative disk scan"
+    );
+}
+
+#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
+#[test]
+fn database_open_rebuilds_from_disk_scan_after_wal_append_invalidates_backfill_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir
+        .path()
+        .join("coordination-partial-checkpoint-reopen-stale-proof.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+    let db = Database::open_file(io.clone(), db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.wal_auto_checkpoint_disable();
+    conn.execute("create table test(id integer primary key, value blob)")
+        .unwrap();
+    conn.execute("begin immediate").unwrap();
+    for _ in 0..32 {
+        conn.execute("insert into test(value) values (randomblob(2048))")
+            .unwrap();
+    }
+    conn.execute("commit").unwrap();
+
+    run_checkpoint(
+        &conn,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: Some(1),
+        },
+    );
+
+    let authority = db.shared_wal_coordination().unwrap().unwrap();
+    let snapshot_after_checkpoint = authority.snapshot();
+    assert!(
+        snapshot_after_checkpoint.nbackfills > 0,
+        "stale-proof coverage requires a partial checkpoint that publishes positive nbackfills"
+    );
+    assert!(
+        snapshot_after_checkpoint.max_frame > snapshot_after_checkpoint.nbackfills,
+        "stale-proof coverage requires live WAL frames beyond the backfill point"
+    );
+
+    conn.execute("insert into test(value) values (randomblob(2048))")
+        .unwrap();
+    let snapshot_after_append = authority.snapshot();
+    assert!(
+        snapshot_after_append.max_frame > snapshot_after_checkpoint.max_frame,
+        "stale-proof coverage requires a WAL append after proof installation"
+    );
+
+    drop(conn);
+    drop(db);
+    let mut manager = DATABASE_MANAGER.lock();
+    manager.clear();
+    drop(manager);
+
+    let reopened = Database::open_file(io, db_path_str).unwrap();
+    assert!(
+        reopened
+            .shared_wal
+            .read()
+            .metadata
+            .loaded_from_disk_scan
+            .load(Ordering::Acquire),
+        "reopen must rebuild from disk after a WAL append invalidates the tshm backfill proof"
+    );
+
+    let reopened_conn = reopened.connect().unwrap();
+    assert_eq!(
+        count_test_rows(&reopened_conn),
+        33,
+        "stale-proof reopen should preserve rows committed after the partial checkpoint"
+    );
+}
+
+#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
+#[test]
+fn database_open_rebuilds_from_disk_scan_after_db_header_mismatch_invalidates_backfill_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir
+        .path()
+        .join("coordination-partial-checkpoint-reopen-db-header-mismatch.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+    let db = Database::open_file(io.clone(), db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.wal_auto_checkpoint_disable();
+    conn.execute("create table test(id integer primary key, value blob)")
+        .unwrap();
+    conn.execute("begin immediate").unwrap();
+    for _ in 0..32 {
+        conn.execute("insert into test(value) values (randomblob(2048))")
+            .unwrap();
+    }
+    conn.execute("commit").unwrap();
+
+    run_checkpoint(
+        &conn,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: Some(1),
+        },
+    );
+
+    let authority = db.shared_wal_coordination().unwrap().unwrap();
+    let snapshot_before = authority.snapshot();
+    assert!(
+        snapshot_before.nbackfills > 0,
+        "DB-header mismatch coverage requires a partial checkpoint that publishes positive nbackfills"
+    );
+    assert!(
+        snapshot_before.max_frame > snapshot_before.nbackfills,
+        "DB-header mismatch coverage requires live WAL frames beyond the backfill point"
+    );
+
+    drop(conn);
+    drop(db);
+    flip_db_header_reserved_byte(&db_path);
+    let mut manager = DATABASE_MANAGER.lock();
+    manager.clear();
+    drop(manager);
+
+    let reopened = Database::open_file(io, db_path_str).unwrap();
+    let mut expected_snapshot = snapshot_before;
+    expected_snapshot.nbackfills = 0;
+    assert!(
+        reopened
+            .shared_wal
+            .read()
+            .metadata
+            .loaded_from_disk_scan
+            .load(Ordering::Acquire),
+        "reopen must rebuild from disk when the DB header fingerprint no longer matches the tshm backfill proof"
+    );
+
+    let reopened_authority = reopened.shared_wal_coordination().unwrap().unwrap();
+    assert_eq!(
+        reopened_authority.snapshot(),
+        expected_snapshot,
+        "disk-scan reopen must preserve the WAL generation while clearing untrusted positive nbackfills"
+    );
+
+    let reopened_conn = reopened.connect().unwrap();
+    assert_eq!(
+        count_test_rows(&reopened_conn),
+        32,
+        "DB-header-mismatch reopen should preserve committed rows after the conservative disk scan"
     );
 }
 
@@ -466,9 +603,22 @@ fn multiprocess_shm_hold_read_tx_child_process() {
     let release_file = std::env::var_os("TURSO_MULTIPROCESS_RELEASE_FILE")
         .map(std::path::PathBuf::from)
         .unwrap();
+    let readonly = std::env::var_os("TURSO_MULTIPROCESS_READONLY").is_some();
+    let expect_disk_scan = std::env::var_os("TURSO_MULTIPROCESS_EXPECT_DISK_SCAN").is_some();
 
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, db_path.to_str().unwrap()).unwrap();
+    let db = if readonly {
+        Database::open_file_with_flags(
+            io,
+            db_path.to_str().unwrap(),
+            OpenFlags::ReadOnly,
+            DatabaseOpts::new(),
+            None,
+        )
+        .unwrap()
+    } else {
+        Database::open_file(io, db_path.to_str().unwrap()).unwrap()
+    };
     let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
     let wal = db
         .build_wal(last_checksum_and_max_frame, db.buffer_pool.clone())
@@ -476,6 +626,15 @@ fn multiprocess_shm_hold_read_tx_child_process() {
     let wal_file = wal.as_any().downcast_ref::<WalFile>().unwrap();
     assert_eq!(wal_file.coordination_backend_name(), "tshm");
     assert_eq!(wal_file.coordination_open_mode_name(), Some("multiprocess"));
+    assert_eq!(
+        db.shared_wal
+            .read()
+            .metadata
+            .loaded_from_disk_scan
+            .load(Ordering::Acquire),
+        expect_disk_scan,
+        "child reopen path did not match expected disk-scan behavior"
+    );
 
     let conn = db.connect().unwrap();
     let pager = conn.pager.load();
@@ -742,6 +901,310 @@ fn subprocess_database_open_peer_refreshes_remote_schema_without_reopen() {
 
 #[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
+fn subprocess_database_open_parent_directly_uses_child_created_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-direct-child-table-use.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file(io, db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("create table t(value integer)").unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let schema_output = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_SCHEMA_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        schema_output.status.success(),
+        "child schema process failed: stdout={}; stderr={}",
+        String::from_utf8_lossy(&schema_output.stdout),
+        String::from_utf8_lossy(&schema_output.stderr)
+    );
+
+    let mut stmt = conn
+        .prepare("insert into child_table(value) values ('parent-schema')")
+        .unwrap();
+    stmt.run_ignore_rows().unwrap();
+
+    let child_rows =
+        get_rows_without_schema_retry(&conn, "select value from child_table order by rowid");
+    assert_eq!(child_rows.len(), 2);
+    assert_eq!(child_rows[0][0].to_string(), "child-schema");
+    assert_eq!(child_rows[1][0].to_string(), "parent-schema");
+}
+
+#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
+#[test]
+fn subprocess_database_open_parent_execute_uses_child_created_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-execute-child-table-use.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file(io, db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("create table t(value integer)").unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let schema_output = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_SCHEMA_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        schema_output.status.success(),
+        "child schema process failed: stdout={}; stderr={}",
+        String::from_utf8_lossy(&schema_output.stdout),
+        String::from_utf8_lossy(&schema_output.stderr)
+    );
+
+    conn.execute("insert into child_table(value) values ('parent-schema')")
+        .unwrap();
+
+    let child_rows =
+        get_rows_without_schema_retry(&conn, "select value from child_table order by rowid");
+    assert_eq!(child_rows.len(), 2);
+    assert_eq!(child_rows[0][0].to_string(), "child-schema");
+    assert_eq!(child_rows[1][0].to_string(), "parent-schema");
+}
+
+#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
+#[test]
+fn subprocess_readonly_child_reader_blocks_restart_and_truncate_checkpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir
+        .path()
+        .join("coordination-readonly-reader-blocks-checkpoint.db");
+    let ready_file = dir.path().join("child-ready");
+    let release_file = dir.path().join("child-release");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+    let db = Database::open_file(io, db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.wal_auto_checkpoint_disable();
+    conn.execute("create table test(id integer primary key, value blob)")
+        .unwrap();
+    conn.execute("begin immediate").unwrap();
+    for _ in 0..32 {
+        conn.execute("insert into test(value) values (randomblob(2048))")
+            .unwrap();
+    }
+    conn.execute("commit").unwrap();
+    assert!(
+        wal_max_frame(&conn) > 0,
+        "read-only reader coverage requires committed WAL frames"
+    );
+
+    let authority = db.shared_wal_coordination().unwrap().unwrap();
+    assert_eq!(
+        authority.min_active_reader_frame(),
+        None,
+        "setup should start without active shared readers"
+    );
+
+    let current_exe = std::env::current_exe().unwrap();
+    let mut child = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_HOLD_READ_TX_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .env("TURSO_MULTIPROCESS_READY_FILE", &ready_file)
+        .env("TURSO_MULTIPROCESS_RELEASE_FILE", &release_file)
+        .env("TURSO_MULTIPROCESS_READONLY", "1")
+        .spawn()
+        .unwrap();
+
+    wait_for_file(&ready_file);
+    let reader_frame = authority
+        .min_active_reader_frame()
+        .expect("read-only child should publish an active shared reader slot");
+    assert!(
+        reader_frame > 0,
+        "read-only child should pin a positive WAL frame while its read transaction is active"
+    );
+
+    let restart_err = conn.checkpoint(CheckpointMode::Restart).unwrap_err();
+    assert!(
+        matches!(restart_err, LimboError::Busy),
+        "restart checkpoint should fail with Busy while the read-only child holds a WAL snapshot: {restart_err:?}",
+    );
+
+    let truncate_err = conn
+        .checkpoint(CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(truncate_err, LimboError::Busy),
+        "truncate checkpoint should fail with Busy while the read-only child holds a WAL snapshot: {truncate_err:?}",
+    );
+
+    std::fs::write(&release_file, b"release").unwrap();
+    let child_status = child.wait().unwrap();
+    assert!(
+        child_status.success(),
+        "read-only child should exit cleanly after releasing its read transaction: {child_status:?}"
+    );
+
+    let checkpoint = conn
+        .checkpoint(CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+    assert!(
+        checkpoint.everything_backfilled(),
+        "truncate checkpoint should succeed once the read-only child releases its WAL snapshot"
+    );
+    assert_eq!(
+        authority.min_active_reader_frame(),
+        None,
+        "shared reader state should clear once the read-only child releases its WAL snapshot"
+    );
+}
+
+#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
+#[test]
+fn subprocess_readonly_disk_scan_child_reader_stays_in_shared_coordination() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir
+        .path()
+        .join("coordination-readonly-disk-scan-reader-blocks-checkpoint.db");
+    let ready_file = dir.path().join("child-ready");
+    let release_file = dir.path().join("child-release");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+    let db = Database::open_file(io.clone(), db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.wal_auto_checkpoint_disable();
+    conn.execute("create table test(id integer primary key, value blob)")
+        .unwrap();
+    conn.execute("begin immediate").unwrap();
+    for _ in 0..32 {
+        conn.execute("insert into test(value) values (randomblob(2048))")
+            .unwrap();
+    }
+    conn.execute("commit").unwrap();
+    assert!(
+        wal_max_frame(&conn) > 1,
+        "disk-scan read-only coverage requires more than one WAL frame before partial checkpoint"
+    );
+
+    run_checkpoint(
+        &conn,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: Some(1),
+        },
+    );
+
+    let authority = db.shared_wal_coordination().unwrap().unwrap();
+    let snapshot_before = authority.snapshot();
+    assert!(
+        snapshot_before.nbackfills > 0,
+        "disk-scan read-only coverage requires persisted positive nbackfills before proof removal"
+    );
+    assert!(
+        snapshot_before.max_frame > snapshot_before.nbackfills,
+        "disk-scan read-only coverage requires a live WAL tail beyond the backfill point"
+    );
+    authority.clear_backfill_proof();
+
+    drop(conn);
+    drop(db);
+    let mut manager = DATABASE_MANAGER.lock();
+    manager.clear();
+    drop(manager);
+
+    let current_exe = std::env::current_exe().unwrap();
+    let mut child = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_HOLD_READ_TX_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .env("TURSO_MULTIPROCESS_READY_FILE", &ready_file)
+        .env("TURSO_MULTIPROCESS_RELEASE_FILE", &release_file)
+        .env("TURSO_MULTIPROCESS_READONLY", "1")
+        .env("TURSO_MULTIPROCESS_EXPECT_DISK_SCAN", "1")
+        .spawn()
+        .unwrap();
+
+    wait_for_file(&ready_file);
+    let reader_frame = authority
+        .min_active_reader_frame()
+        .expect("disk-scan read-only child should publish an active shared reader slot");
+    assert!(
+        reader_frame > snapshot_before.nbackfills,
+        "disk-scan read-only child should protect the live WAL tail, not the checkpointed prefix"
+    );
+
+    let reopened = Database::open_file(io, db_path_str).unwrap();
+    let reopened_conn = reopened.connect().unwrap();
+
+    let restart_err = reopened_conn
+        .checkpoint(CheckpointMode::Restart)
+        .unwrap_err();
+    assert!(
+        matches!(restart_err, LimboError::Busy),
+        "restart checkpoint should fail with Busy while the disk-scan read-only child holds a WAL snapshot: {restart_err:?}",
+    );
+
+    let truncate_err = reopened_conn
+        .checkpoint(CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(truncate_err, LimboError::Busy),
+        "truncate checkpoint should fail with Busy while the disk-scan read-only child holds a WAL snapshot: {truncate_err:?}",
+    );
+
+    drop(reopened_conn);
+    drop(reopened);
+    let mut manager = DATABASE_MANAGER.lock();
+    manager.clear();
+    drop(manager);
+
+    let wal_len = std::fs::metadata(format!("{db_path_str}-wal"))
+        .unwrap_or_else(|_| panic!("expected WAL file at {db_path_str}-wal"))
+        .len();
+    assert!(
+        wal_len > 0,
+        "closing the other process must not run shutdown checkpoint while the disk-scan read-only child still holds a shared reader slot"
+    );
+
+    std::fs::write(&release_file, b"release").unwrap();
+    let child_status = child.wait().unwrap();
+    assert!(
+        child_status.success(),
+        "disk-scan read-only child should exit cleanly after releasing its read transaction: {child_status:?}"
+    );
+
+    let reopened = Database::open_file(Arc::new(PlatformIO::new().unwrap()), db_path_str).unwrap();
+    let reopened_conn = reopened.connect().unwrap();
+    let checkpoint = reopened_conn
+        .checkpoint(CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+    assert!(
+        checkpoint.everything_backfilled(),
+        "truncate checkpoint should succeed once the disk-scan read-only child releases its WAL snapshot"
+    );
+    assert_eq!(
+        count_test_rows(&reopened_conn),
+        32,
+        "disk-scan read-only reopen should preserve committed rows"
+    );
+}
+
+#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
+#[test]
 fn subprocess_database_truncate_checkpoint_reclaims_dead_child_reader_slot() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("coordination-dead-reader-slot.db");
@@ -842,9 +1305,111 @@ fn subprocess_database_truncate_checkpoint_reclaims_dead_child_reader_slot() {
 
 #[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
-fn database_open_reuses_valid_shm_authority_after_truncate_rewrite_without_disk_scan() {
+fn database_open_reopen_with_live_child_reader_does_not_clobber_authority() {
     let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("coordination-truncate-rewrite-reopen.db");
+    let db_path = dir.path().join("coordination-live-reader-reopen.db");
+    let ready_file = dir.path().join("child-ready");
+    let release_file = dir.path().join("child-release");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+    let db = Database::open_file(io.clone(), db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.wal_auto_checkpoint_disable();
+    conn.execute("create table test(id integer primary key, value blob)")
+        .unwrap();
+    conn.execute("begin immediate").unwrap();
+    for _ in 0..32 {
+        conn.execute("insert into test(value) values (randomblob(2048))")
+            .unwrap();
+    }
+    conn.execute("commit").unwrap();
+    assert!(
+        wal_max_frame(&conn) > 1,
+        "disk-scan reopen coverage requires more than one WAL frame before partial checkpoint"
+    );
+
+    run_checkpoint(
+        &conn,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: Some(1),
+        },
+    );
+
+    let authority = db.shared_wal_coordination().unwrap().unwrap();
+    let snapshot_before = authority.snapshot();
+    assert!(
+        snapshot_before.nbackfills > 0,
+        "disk-scan reopen coverage requires a persisted authority snapshot with positive nbackfills"
+    );
+    assert!(
+        snapshot_before.max_frame > snapshot_before.nbackfills,
+        "disk-scan reopen coverage requires live WAL frames beyond the backfill point"
+    );
+    let frames_before = authority.iter_latest_frames(0, snapshot_before.max_frame);
+    assert!(
+        !frames_before.is_empty(),
+        "setup should publish durable frame-index entries before reopen repair"
+    );
+
+    let current_exe = std::env::current_exe().unwrap();
+    let mut child = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_HOLD_READ_TX_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .env("TURSO_MULTIPROCESS_READY_FILE", &ready_file)
+        .env("TURSO_MULTIPROCESS_RELEASE_FILE", &release_file)
+        .spawn()
+        .unwrap();
+
+    wait_for_file(&ready_file);
+    let reader_frame = authority
+        .min_active_reader_frame()
+        .expect("child read transaction should publish an active shared reader slot");
+
+    drop(conn);
+    drop(db);
+    let mut manager = DATABASE_MANAGER.lock();
+    manager.clear();
+    drop(manager);
+
+    let reopened = Database::open_file(io, db_path_str).unwrap();
+    let reopened_authority = reopened.shared_wal_coordination().unwrap().unwrap();
+    assert_eq!(reopened_authority.snapshot(), snapshot_before);
+    assert_eq!(
+        reopened_authority.iter_latest_frames(0, snapshot_before.max_frame),
+        frames_before,
+        "reopen repair must preserve durable frame-index content while the child reader is still alive"
+    );
+    assert_eq!(
+        reopened_authority.min_active_reader_frame(),
+        Some(reader_frame),
+        "reopen repair must not reclaim the live child reader slot"
+    );
+
+    std::fs::write(&release_file, b"release").unwrap();
+    let child_status = child.wait().unwrap();
+    assert!(
+        child_status.success(),
+        "child reader should exit cleanly after reopen repair: {child_status:?}"
+    );
+
+    let reopened_conn = reopened.connect().unwrap();
+    assert_eq!(
+        count_test_rows(&reopened_conn),
+        32,
+        "reopen repair should preserve committed rows while leaving the child reader intact"
+    );
+}
+
+#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
+#[test]
+fn database_open_rebuilds_from_disk_scan_when_shared_frame_index_overflowed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir
+        .path()
+        .join("coordination-overflowed-frame-index-reopen.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
 
@@ -854,41 +1419,72 @@ fn database_open_reuses_valid_shm_authority_after_truncate_rewrite_without_disk_
         .execute("create table test(id integer primary key, value text)")
         .unwrap();
     conn_a
-        .execute("insert into test(value) values ('before-truncate')")
+        .execute("insert into test(value) values ('before-overflow')")
+        .unwrap();
+    conn_a
+        .execute("insert into test(value) values ('after-overflow')")
         .unwrap();
 
-    let checkpoint = run_checkpoint(
-        &conn_a,
-        CheckpointMode::Truncate {
-            upper_bound_inclusive: None,
-        },
+    let authority = db_a.shared_wal_coordination().unwrap().unwrap();
+    let snapshot = authority.snapshot();
+    assert!(
+        snapshot.max_frame > 0,
+        "overflow reopen coverage requires committed WAL frames before the authority is marked incomplete"
     );
     assert!(
-        checkpoint.everything_backfilled(),
-        "truncate checkpoint should fully backfill before WAL rewrite"
+        !authority
+            .iter_latest_frames(0, snapshot.max_frame)
+            .is_empty(),
+        "overflow reopen coverage requires a populated durable frame index before it is discarded"
     );
 
-    conn_a
-        .execute("insert into test(value) values ('after-truncate')")
-        .unwrap();
+    authority.discard_durable_frame_index_for_exclusive_rebuild();
+    authority.mark_frame_index_overflowed_for_tests();
+
+    assert!(
+        authority
+            .iter_latest_frames(0, snapshot.max_frame)
+            .is_empty(),
+        "test setup should clear durable frame-index entries before reopen"
+    );
+    assert!(
+        authority.frame_index_overflowed(),
+        "test setup should mark the shared frame index incomplete before reopen"
+    );
+
+    drop(conn_a);
+    drop(db_a);
+    let mut manager = DATABASE_MANAGER.lock();
+    manager.clear();
+    drop(manager);
 
     let db_b = Database::open_file(io, db_path_str).unwrap();
-    assert!(!db_b
-        .shared_wal
-        .read()
-        .metadata
-        .loaded_from_disk_scan
-        .load(Ordering::Acquire));
+    assert!(
+        db_b.shared_wal
+            .read()
+            .metadata
+            .loaded_from_disk_scan
+            .load(Ordering::Acquire),
+        "overflowed shared frame index must force a conservative WAL disk scan on reopen"
+    );
 
-    let last_checksum_and_max_frame = db_b.shared_wal.read().last_checksum_and_max_frame();
-    let wal = db_b
-        .build_wal(last_checksum_and_max_frame, db_b.buffer_pool.clone())
-        .unwrap();
-    let wal_file = wal.as_any().downcast_ref::<WalFile>().unwrap();
-    assert_eq!(wal_file.coordination_backend_name(), "tshm");
+    let reopened_authority = db_b.shared_wal_coordination().unwrap().unwrap();
+    assert!(
+        !reopened_authority.frame_index_overflowed(),
+        "disk-scan reopen should rebuild the durable frame index instead of leaving it overflowed"
+    );
+    assert!(
+        !reopened_authority
+            .iter_latest_frames(0, snapshot.max_frame)
+            .is_empty(),
+        "disk-scan reopen should repopulate the durable frame index from the WAL"
+    );
 
     let conn_b = db_b.connect().unwrap();
-    assert_eq!(count_test_rows(&conn_b), 2);
+    let rows = get_rows(&conn_b, "select value from test order by id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].to_string(), "before-overflow");
+    assert_eq!(rows[1][0].to_string(), "after-overflow");
 }
 
 #[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
