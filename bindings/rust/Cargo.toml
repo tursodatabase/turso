@@ -15,14 +15,18 @@ workspace = true
 [features]
 default = ["mimalloc"]
 mimalloc = ["dep:mimalloc"]
-sync = [
+# Base sync deps shared by both TLS backends (not meant to be activated directly)
+_sync_base = [
     "dep:hyper",
     "dep:tokio",
-    "dep:hyper-tls",
     "dep:hyper-util",
     "dep:http-body-util",
     "dep:bytes",
 ]
+# Original sync feature uses native-tls (OpenSSL on Linux)
+sync = ["_sync_base", "dep:hyper-tls"]
+# Pure-Rust TLS via rustls -- no OpenSSL needed
+sync-rustls = ["_sync_base", "dep:hyper-rustls"]
 
 [dependencies]
 turso_sdk_kit = { workspace = true }
@@ -35,6 +39,13 @@ mimalloc = { workspace = true, optional = true }
 hyper = { version = "1.8.1", features = ["http1"], optional = true }
 tokio = { workspace = true, features = ["full"], optional = true }
 hyper-tls = { version = "0.6.0", optional = true }
+hyper-rustls = { version = "0.27", optional = true, default-features = false, features = [
+    "http1",
+    "tls12",
+    "ring",
+    "native-tokio",
+    "webpki-tokio",
+] }
 hyper-util = { version = "0.1.19", features = [
     "http1",
     "tokio",
