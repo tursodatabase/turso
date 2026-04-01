@@ -271,6 +271,7 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
                     "autovacuum" => core_opts.with_autovacuum(true),
                     "attach" => core_opts.with_attach(true),
                     "generated_columns" => core_opts.with_generated_columns(true),
+                    "multiprocess_wal" => core_opts.with_multiprocess_wal(true),
                     _ => core_opts,
                 };
             }
