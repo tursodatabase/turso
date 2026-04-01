@@ -1202,9 +1202,17 @@ impl Connection {
         self.last_insert_rowid.store(rowid, Ordering::SeqCst);
     }
 
-    pub fn set_changes(&self, nchange: i64) {
+    pub(crate) fn set_last_change(&self, nchange: i64) {
         self.last_change.store(nchange, Ordering::SeqCst);
+    }
+
+    pub(crate) fn add_total_changes(&self, nchange: i64) {
         self.total_changes.fetch_add(nchange, Ordering::SeqCst);
+    }
+
+    pub fn set_changes(&self, nchange: i64) {
+        self.set_last_change(nchange);
+        self.add_total_changes(nchange);
     }
 
     pub fn changes(&self) -> i64 {

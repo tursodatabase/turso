@@ -904,6 +904,15 @@ pub fn insn_to_row(
                 0,
                 format!("subprogram={}", program.sql),
             ),
+            Insn::ResetCount => (
+                "ResetCount",
+                0,
+                0,
+                0,
+                Value::build_text(""),
+                0,
+                "".to_string(),
+            ),
             Insn::Real { value, dest } => (
                 "Real",
                 0,
