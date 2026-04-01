@@ -10,8 +10,8 @@ use std::ptr;
 use tracing::debug;
 use tracing::{instrument, trace, Level};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, FALSE, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
-    ERROR_HANDLE_EOF,
+    CloseHandle, GetLastError, ERROR_HANDLE_EOF, FALSE, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FileEndOfFileInfo, FlushFileBuffers, GetFileSizeEx, LockFileEx, ReadFile,
@@ -35,7 +35,7 @@ fn overlapped_at(pos: u64) -> OVERLAPPED {
                 OffsetHigh: (pos >> 32) as u32,
             },
         },
-        hEvent: 0,
+        hEvent: std::ptr::null_mut(),
     }
 }
 
@@ -92,7 +92,9 @@ impl IO for WindowsIO {
             return Err(last_os_error("open"));
         }
 
-        let windows_file = Arc::new(WindowsFile { handle: file_handle });
+        let windows_file = Arc::new(WindowsFile {
+            handle: file_handle,
+        });
 
         if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
             && !flags.contains(OpenFlags::ReadOnly)
