@@ -2123,6 +2123,7 @@ pub fn translate_expr(
                         | ScalarFunc::Typeof
                         | ScalarFunc::Unicode
                         | ScalarFunc::Unistr
+                        | ScalarFunc::UnistrQuote
                         | ScalarFunc::Quote
                         | ScalarFunc::RandomBlob
                         | ScalarFunc::Sign
