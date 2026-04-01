@@ -12,8 +12,8 @@ fn main() {
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-env-changed=SOURCE_DATE_EPOCH");
 
-    // Honor reproducible-builds: when SOURCE_DATE_EPOCH is set, skip git entirely
-    // so the output is fully deterministic (no commit hash, no git-derived timestamp).
+    // For reproducible builds: when SOURCE_DATE_EPOCH is set, skip git entirely
+    // so the output is fully deterministic.
     let source_date_epoch = env::var("SOURCE_DATE_EPOCH")
         .ok()
         .and_then(|epoch| epoch.parse::<i64>().ok());
@@ -22,7 +22,6 @@ fn main() {
     // We use `git rev-parse --git-dir` instead of hardcoding ".git" to support worktrees,
     // where the git directory lives elsewhere (e.g., ../.git/worktrees/my-worktree).
     // Silently ignored if git unavailable (e.g., building from tarball).
-    // Skipped entirely when SOURCE_DATE_EPOCH is set (reproducible builds).
     let (git_hash, git_commit_epoch) = if source_date_epoch.is_some() {
         (None, None)
     } else {
@@ -48,9 +47,7 @@ fn main() {
             }
         }
 
-        // We shell out to git instead of using libgit2 (via the `built` crate's git2 feature)
-        // because libgit2-sys adds ~18s to clean release builds. The git CLI is always available
-        // in dev environments and CI. Falls back to None if git unavailable.
+        // Falls back to None if the git cli is unavailable.
         // Commit hash is used for sqlite_source_id() and to derive a stable timestamp.
         let hash = run_git(&["rev-parse", "HEAD"]);
         let epoch = run_git(&["show", "-s", "--format=%ct", "HEAD"])
@@ -64,7 +61,7 @@ fn main() {
     };
 
     // Pre-format the timestamp so sqlite_source_id() doesn't need chrono at runtime.
-    // Prefer SOURCE_DATE_EPOCH (reproducible builds), then git commit time, and fall back to now.
+    // Prefer SOURCE_DATE_EPOCH, then git commit time, and fall back to now.
     let sqlite_date = format_utc(source_date_epoch.or(git_commit_epoch).unwrap_or_else(|| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
