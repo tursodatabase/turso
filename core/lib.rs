@@ -311,10 +311,9 @@ pub struct OpenDbAsyncState {
     /// Schema lock held during LoadingSchema phase to ensure atomicity across IO yields
     schema_guard: Option<sync::ArcMutexGuard<Arc<Schema>>>,
     /// Registry lock held during open_with_flags_async to prevent concurrent opens
-    registry_guard:
-        Option<parking_lot::ArcMutexGuard<parking_lot::RawMutex, HashMap<String, Weak<Database>>>>,
-    /// Canonical path for registry insertion (computed once at start)
-    canonical_path: Option<String>,
+    registry_guard: Option<
+        parking_lot::ArcMutexGuard<parking_lot::RawMutex, HashMap<DatabaseKey, Weak<Database>>>,
+    >,
 }
 
 impl Default for OpenDbAsyncState {
@@ -334,7 +333,6 @@ impl OpenDbAsyncState {
             make_from_btree_state: schema::MakeFromBtreeState::new(),
             schema_guard: None,
             registry_guard: None,
-            canonical_path: None,
         }
     }
 }
@@ -349,8 +347,18 @@ impl OpenDbAsyncState {
 /// state between iterations, but static variables persist - using shuttle's
 /// Mutex here would cause panics when the second iteration tries to lock a
 /// mutex that belongs to a stale execution context.
+/// Registry key for the process-wide database manager.
+/// File-backed databases are keyed by their OS-level identity (dev, ino),
+/// matching SQLite's inodeList approach. Shared in-memory databases use
+/// their name as the key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum DatabaseKey {
+    File(io::FileId),
+    SharedMemory(String),
+}
+
 #[allow(clippy::type_complexity)]
-static DATABASE_MANAGER: LazyLock<Arc<parking_lot::Mutex<HashMap<String, Weak<Database>>>>> =
+static DATABASE_MANAGER: LazyLock<Arc<parking_lot::Mutex<HashMap<DatabaseKey, Weak<Database>>>>> =
     LazyLock::new(|| Arc::new(parking_lot::Mutex::new(HashMap::default())));
 
 /// The `Database` object contains per database file state that is shared
@@ -458,6 +466,8 @@ impl Database {
         db_file: Arc<dyn DatabaseStorage>,
         encryption_opts: Option<EncryptionOpts>,
     ) -> Result<Self> {
+        let path = path.into();
+        let wal_path = wal_path.into();
         let shared_wal = WalFileShared::new_noop();
         let mv_store = ArcSwapOption::empty();
 
@@ -485,11 +495,10 @@ impl Database {
             None
         };
 
-        // opts is now passed as parameter
         let db = Database {
             mv_store,
-            path: path.into(),
-            wal_path: wal_path.into(),
+            path,
+            wal_path,
             schema: Arc::new(Mutex::new(Arc::new({
                 let mut s = Schema::with_options(opts.enable_custom_types);
                 s.generated_columns_enabled = opts.enable_generated_columns;
@@ -530,11 +539,11 @@ impl Database {
     /// matching SQLite's `file:name?mode=memory&cache=shared` semantics.
     #[cfg(feature = "fs")]
     pub fn open_shared_memory(name: &str) -> Result<Arc<Database>> {
-        let registry_key = format!(":memory:shared:{name}");
+        let key = DatabaseKey::SharedMemory(name.to_string());
 
         {
             let registry = DATABASE_MANAGER.lock_arc();
-            if let Some(db) = registry.get(&registry_key).and_then(Weak::upgrade) {
+            if let Some(db) = registry.get(&key).and_then(Weak::upgrade) {
                 return Ok(db);
             }
         }
@@ -543,14 +552,14 @@ impl Database {
         let db = Self::open_file(io, ":memory:")?;
 
         let mut registry = DATABASE_MANAGER.lock_arc();
-        if let Some(existing) = registry.get(&registry_key).and_then(Weak::upgrade) {
+        if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
             return Ok(existing);
         }
-        registry.insert(registry_key, Arc::downgrade(&db));
+        registry.insert(key, Arc::downgrade(&db));
         Ok(db)
     }
 
-    /// Look up a database in the process-wide registry by path.
+    /// Look up a database in the process-wide registry by file identity.
     /// Returns the cached Database if found, with encryption validation.
     /// This avoids opening a file (and acquiring a file lock) when the
     /// database is already open in this process.
@@ -561,15 +570,13 @@ impl Database {
         if path.starts_with(":memory:") {
             return Ok(None);
         }
-        let canonical = match std::fs::canonicalize(path)
-            .ok()
-            .and_then(|p| p.to_str().map(|s| s.to_string()))
-        {
-            Some(c) => c,
-            None => return Ok(None),
+        let file_id = match io::get_file_id(path) {
+            Ok(id) => id,
+            Err(_) => return Ok(None), // file doesn't exist yet
         };
+        let key = DatabaseKey::File(file_id);
         let registry = DATABASE_MANAGER.lock_arc();
-        let db = match registry.get(&canonical).and_then(Weak::upgrade) {
+        let db = match registry.get(&key).and_then(Weak::upgrade) {
             Some(db) => db,
             None => return Ok(None),
         };
@@ -731,37 +738,33 @@ impl Database {
             // lock the database manager for the whole duration of open_with_flags_async method
             let registry = DATABASE_MANAGER.lock_arc();
 
-            let canonical_path = std::fs::canonicalize(path)
-                .ok()
-                .and_then(|p| p.to_str().map(|s| s.to_string()))
-                .unwrap_or_else(|| path.to_string());
+            // Look up by file identity (dev, ino). If file doesn't exist
+            // yet (CREATE mode), skip lookup — no cached entry is possible.
+            if let Ok(file_id) = io.file_id(path) {
+                let key = DatabaseKey::File(file_id);
+                if let Some(db) = registry.get(&key).and_then(Weak::upgrade) {
+                    tracing::debug!("took database {path:?} from the registry");
 
-            // Check if already in registry
-            if let Some(db) = registry.get(&canonical_path).and_then(Weak::upgrade) {
-                tracing::info!("took database {canonical_path:?} from the registry");
+                    let db_is_encrypted =
+                        !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
+                    if db_is_encrypted && encryption_opts.is_none() {
+                        return Err(LimboError::InvalidArgument(
+                            "Database is encrypted but no encryption options provided".to_string(),
+                        ));
+                    }
 
-                // Check encryption compatibility using cipher mode (key is not stored in Database for security)
-                let db_is_encrypted = !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
-
-                if db_is_encrypted && encryption_opts.is_none() {
-                    return Err(LimboError::InvalidArgument(
-                        "Database is encrypted but no encryption options provided".to_string(),
-                    ));
+                    return Ok(IOResult::Done(db));
                 }
-
-                // Found in registry, no need to hold lock
-                return Ok(IOResult::Done(db));
             }
 
-            // Not in registry, hold the lock and store canonical path for later insertion
+            // Not in registry — hold the lock to prevent concurrent opens.
             state.registry_guard = Some(registry);
-            state.canonical_path = Some(canonical_path);
         }
 
-        // Open the database asynchronously (registry lock is held in state for not `:memory:.*` pathes)
+        // Open the database asynchronously (registry lock is held in state for not `:memory:.*` paths)
         let result = Self::open_with_flags_bypass_registry_async(
             state,
-            io,
+            io.clone(),
             path,
             None,
             db_file,
@@ -772,11 +775,11 @@ impl Database {
         )?;
 
         if let IOResult::Done(ref db) = result {
-            // will be unset in case of `:memory:.*` path
-            if let (Some(mut registry), Some(canonical_path)) =
-                (state.registry_guard.take(), state.canonical_path.take())
-            {
-                registry.insert(canonical_path, Arc::downgrade(db));
+            if let Some(mut registry) = state.registry_guard.take() {
+                // File now exists — compute identity and insert.
+                if let Ok(file_id) = io.file_id(path) {
+                    registry.insert(DatabaseKey::File(file_id), Arc::downgrade(db));
+                }
             }
         }
 

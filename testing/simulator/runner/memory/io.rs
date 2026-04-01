@@ -310,4 +310,8 @@ impl IO for MemorySimIO {
         self.files.borrow_mut().shift_remove(path);
         Ok(())
     }
+
+    fn file_id(&self, path: &str) -> Result<turso_core::io::FileId> {
+        Ok(turso_core::io::FileId::from_path_hash(path))
+    }
 }

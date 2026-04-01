@@ -155,6 +155,10 @@ impl IO for SimulatorIO {
         Ok(())
     }
 
+    fn file_id(&self, path: &str) -> Result<turso_core::io::FileId> {
+        self.inner.file_id(path)
+    }
+
     fn step(&self) -> Result<()> {
         let now = self.current_time_wall_clock();
         for file in self.files.borrow().iter() {

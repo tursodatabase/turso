@@ -144,6 +144,10 @@ impl IO for SimulatorIO {
         Ok(file as Arc<dyn File>)
     }
 
+    fn file_id(&self, path: &str) -> Result<turso_core::io::FileId> {
+        Ok(turso_core::io::FileId::from_path_hash(path))
+    }
+
     fn remove_file(&self, path: &str) -> Result<()> {
         let mut files = self.files.lock().unwrap();
         files.retain(|(p, _)| p != path);
