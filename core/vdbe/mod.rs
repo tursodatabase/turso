@@ -68,7 +68,8 @@ use crate::{
     vdbe::{builder::CursorType, insn::Insn},
 };
 use crate::{
-    AtomicBool, CaptureDataChangesInfo, Connection, MvStore, Result, SyncMode, TransactionState,
+    AtomicBool, CaptureDataChangesInfo, Connection, MvStore, Result, Statement, SyncMode,
+    TransactionState,
 };
 use branches::{mark_unlikely, unlikely};
 use builder::{CursorKey, QueryMode};
@@ -511,6 +512,9 @@ pub struct ProgramState {
     /// so, for pending_cdc_info we wrap it in one more Option<...> layer to represent if mode changed during program execution
     pub(crate) pending_cdc_info: Option<Option<CaptureDataChangesInfo>>,
     pub(crate) op_parse_schema_state: execute::OpParseSchemaState,
+    /// Cached subprogram Statements keyed by the PC of the Program instruction.
+    /// Avoids re-allocating ProgramState on each trigger/FK-action fire.
+    pub(crate) subprogram_stmt_cache: HashMap<usize, Box<Statement>>,
 }
 
 impl std::fmt::Debug for Program {
@@ -595,6 +599,7 @@ impl ProgramState {
             pending_fail_error: None,
             pending_cdc_info: None,
             op_parse_schema_state: None,
+            subprogram_stmt_cache: HashMap::default(),
         }
     }
 
@@ -732,6 +737,7 @@ impl ProgramState {
         *self.explain_state.write() = ExplainState::default();
         self.pending_fail_error = None;
         self.pending_cdc_info = None;
+        self.subprogram_stmt_cache.clear();
     }
 
     pub fn get_cursor(&mut self, cursor_id: CursorID) -> &mut Cursor {
@@ -1934,7 +1940,11 @@ impl Program {
 
         let mut abort_error: Option<LimboError> = None;
 
-        if self.is_trigger_subprogram() {
+        // Only end trigger execution if the subprogram was actually running.
+        // Cached (pooled) statements may be dropped after their trigger execution
+        // was already ended by op_program; calling end again would pop the wrong
+        // entry from the executing_triggers stack.
+        if self.is_trigger_subprogram() && state.execution_state.is_running() {
             self.connection.end_trigger_execution();
         }
         // Errors from nested statements are handled by the parent statement.

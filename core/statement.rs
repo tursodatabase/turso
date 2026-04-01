@@ -379,6 +379,15 @@ impl Statement {
         self._step(Some(waker))
     }
 
+    /// Fast step for trigger/FK subprograms: skips reprepare checks, timeout
+    /// arming, busy handler, metrics recording, and schema retry.
+    /// The parent statement handles all of those concerns.
+    #[inline]
+    pub fn step_subprogram(&mut self) -> Result<StepResult> {
+        self.program
+            .step(&mut self.state, &self.pager, self.query_mode, None)
+    }
+
     pub fn run_ignore_rows(&mut self) -> Result<()> {
         loop {
             match self.step()? {
@@ -763,6 +772,19 @@ impl Statement {
                 tracing::error!("Statement reset panicked during best-effort cleanup");
             }
         }
+    }
+
+    /// Lightweight reset for reusing a cached subprogram statement.
+    /// Skips transaction handling and abort(): the caller (op_program) has
+    /// already handled trigger execution tracking. Only resets ProgramState
+    /// fields so the subprogram can run again from the beginning.
+    pub fn reset_for_subprogram_reuse(&mut self) {
+        self.state.reset(None, None);
+        self.state
+            .n_change
+            .store(0, std::sync::atomic::Ordering::Release);
+        self.busy = false;
+        self.has_returned_row = false;
     }
 
     fn reset_internal(

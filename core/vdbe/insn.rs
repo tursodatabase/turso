@@ -730,7 +730,10 @@ pub enum Insn {
     /// subprogram, so subprograms can be reentrant and recursive. The Param opcode
     /// is used by subprograms to access content in registers of the calling bytecode program."
     Program {
-        params: Vec<Value>,
+        /// Parent register indices for each parameter the subprogram reads.
+        /// At runtime, values are copied from these parent registers into
+        /// the child statement's parameters via bind_at.
+        param_registers: Vec<usize>,
         program: Arc<PreparedProgram>,
         /// Jump target when RAISE(IGNORE) fires in the subprogram.
         /// Points to the "skip this row" address in the parent program.

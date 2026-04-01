@@ -458,6 +458,30 @@ pub fn translate_insert(
         init_autoincrement(program, &mut ctx, resolver)?;
     }
 
+    // For non-STRICT tables, apply column affinity to the values early.
+    // This must happen before BEFORE triggers (matching SQLite's order) so that
+    // trigger bodies see affinity-applied values. Affinity is idempotent, so
+    // applying it here means we can skip the per-trigger Copy+Affinity in fire_trigger.
+    if !ctx.table.is_strict {
+        let affinity = insertion
+            .col_mappings
+            .iter()
+            .filter(|cm| !cm.column.is_virtual_generated())
+            .map(|col_mapping| col_mapping.column.affinity());
+
+        // Only emit Affinity if there's meaningful affinity to apply
+        // (i.e., not all BLOB/NONE affinity)
+        if affinity.clone().any(|a| a != Affinity::Blob) {
+            if let Ok(count) = NonZeroUsize::try_from(insertion.num_non_virtual_cols) {
+                program.emit_insn(Insn::Affinity {
+                    start_reg: insertion.first_col_register(),
+                    count,
+                    affinities: affinity.map(|a| a.aff_mask()).collect(),
+                });
+            }
+        }
+    }
+
     // Fire BEFORE INSERT triggers
 
     let relevant_before_triggers: Vec<_> = resolver.with_schema(database_id, |s| {
@@ -627,29 +651,8 @@ pub fn translate_insert(
             check_generated: true,
             table_reference: BTreeTable::type_check_table_ref(ctx.table, resolver.schema()),
         });
-    } else {
-        // For non-STRICT tables, apply column affinity to the values.
-        // This must happen early so that both index records and the table record
-        // use the converted values. SQLite does this with OP_Affinity before
-        // any index or constraint checks.
-        let affinity = insertion
-            .col_mappings
-            .iter()
-            .filter(|cm| !cm.column.is_virtual_generated())
-            .map(|col_mapping| col_mapping.column.affinity());
-
-        // Only emit Affinity if there's meaningful affinity to apply
-        // (i.e., not all BLOB/NONE affinity)
-        if affinity.clone().any(|a| a != Affinity::Blob) {
-            if let Ok(count) = NonZeroUsize::try_from(insertion.num_non_virtual_cols) {
-                program.emit_insn(Insn::Affinity {
-                    start_reg: insertion.first_col_register(),
-                    count,
-                    affinities: affinity.map(|a| a.aff_mask()).collect(),
-                });
-            }
-        }
     }
+    // Non-STRICT tables: Affinity was already emitted earlier (before BEFORE triggers).
 
     // For AUTOINCREMENT tables with an explicit rowid, update sqlite_sequence
     // before CHECK constraints. SQLite updates sqlite_sequence even when

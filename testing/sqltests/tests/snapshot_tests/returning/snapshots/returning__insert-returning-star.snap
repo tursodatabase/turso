@@ -33,12 +33,12 @@ addr  opcode           p1  p2  p3  p4     p5  comment
   16    Copy            4   8   0          0  r[8]=r[4]
   17    Copy            5   9   0          0  r[9]=r[5]
   18    OpenWrite       0   3   0          0  root=3; iDb=0
-  19    NotNull         6  21   0          0  r[6]!=NULL -> goto 21
-  20    Goto            0  23   0          0
-  21    MustBeInt       6   0   0          0
-  22    Goto            0  24   0          0
-  23    NewRowid        2   6   0          0  r[6]=rowid
-  24    Affinity        7   3   0          0  r[7..10] = D, B, E
+  19    Affinity        7   3   0          0  r[7..10] = D, B, E
+  20    NotNull         6  22   0          0  r[6]!=NULL -> goto 22
+  21    Goto            0  24   0          0
+  22    MustBeInt       6   0   0          0
+  23    Goto            0  25   0          0
+  24    NewRowid        2   6   0          0  r[6]=rowid
   25    NotExists       2  27   6          0
   26    Halt         1555   0   0  t1.id   0
   27    Copy            8  11   0          0  r[11]=r[8]
