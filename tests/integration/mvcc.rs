@@ -908,3 +908,27 @@ fn test_attach_memory_db_allowed_on_encrypted_mvcc_main(
     assert_eq!(aux_rows, vec![(42,)]);
     Ok(())
 }
+
+#[turso_macros::test]
+fn test_add_then_drop_table_in_same_tx_then_recover(db: TempDatabase) -> anyhow::Result<()> {
+    let path = db.path.clone();
+    let io = db.io.clone();
+
+    {
+        let conn = db.connect_limbo();
+        [
+            "pragma journal_mode = 'mvcc'",
+            "begin",
+            "create table t(a)",
+            "drop table t",
+            "commit",
+        ]
+        .iter()
+        .try_for_each(|sql| conn.execute(sql))?;
+    }
+    drop(db);
+
+    Database::open_file(io, path.to_str().unwrap())?;
+
+    Ok(())
+}
