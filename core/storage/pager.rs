@@ -2469,6 +2469,23 @@ impl Pager {
         Ok(())
     }
 
+    /// Set the initial journal version in page 1 before the database is initialized.
+    pub fn set_initial_journal_version(&self, version: sqlite3_ondisk::Version) -> Result<()> {
+        turso_assert!(!self.db_initialized());
+        let raw_version = sqlite3_ondisk::RawVersion::from(version);
+        let IOResult::Done(_) = self.with_header_mut(|header| {
+            header.read_version = raw_version;
+            header.write_version = raw_version;
+        })?
+        else {
+            panic!("DB should not be initialized and should not do any IO");
+        };
+        // Clear dirty pages since this is pre-initialization setup, not a real write transaction.
+        // with_header_mut marks page 1 dirty as a side effect, but no transaction is active.
+        self.dirty_pages.write().clear();
+        Ok(())
+    }
+
     /// Get the current page size. Returns None if not set yet.
     pub fn get_page_size(&self) -> Option<PageSize> {
         let value = self.page_size.load(Ordering::SeqCst);
@@ -2484,6 +2501,19 @@ impl Pager {
         let value = self.page_size.load(Ordering::SeqCst);
         turso_assert_ne!(value, 0);
         PageSize::new(value).expect("invalid page size stored")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_wal(&self) -> bool {
+        self.wal.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wal_shared_ptr(&self) -> Option<usize> {
+        self.wal
+            .as_ref()
+            .and_then(|wal| wal.as_any().downcast_ref::<crate::storage::wal::WalFile>())
+            .map(crate::storage::wal::WalFile::shared_ptr)
     }
 
     /// Set the page size. Used internally when page size is determined.

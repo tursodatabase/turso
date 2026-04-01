@@ -504,7 +504,7 @@ pub trait Wal: Debug + Send + Sync {
         sync_type: FileSyncType,
     ) -> Result<IOResult<()>>;
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
@@ -2191,7 +2191,7 @@ impl Wal for WalFile {
         Ok(c)
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -2252,6 +2252,11 @@ impl WalFile {
             checkpoint_guard: RwLock::new(None),
             io_ctx: RwLock::new(IOContext::default()),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shared_ptr(&self) -> usize {
+        Arc::as_ptr(&self.shared) as usize
     }
 
     fn page_size(&self) -> u32 {
@@ -2976,6 +2981,7 @@ impl WalFileShared {
     pub fn last_checksum_and_max_frame(&self) -> ((u32, u32), u64) {
         (self.last_checksum, self.max_frame.load(Ordering::Acquire))
     }
+
     pub fn open_shared_if_exists(
         io: &Arc<dyn IO>,
         path: &str,

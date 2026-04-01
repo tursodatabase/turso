@@ -707,6 +707,16 @@ expect {
     table|t1|t1
 }
 
+test attach-write-schema-with-index-sql-canonical {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE INDEX aux.idx1 ON t1(name);
+    SELECT sql FROM aux.sqlite_schema WHERE type='index' AND name='idx1';
+}
+expect {
+    CREATE INDEX idx1 ON t1 (name)
+}
+
 # =============================================================================
 # Main and attached tables with same name
 # =============================================================================
@@ -1472,4 +1482,3 @@ expect {
     t1|1
     t1|0
 }
-
