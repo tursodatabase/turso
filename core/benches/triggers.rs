@@ -42,10 +42,7 @@ fn setup_limbo(temp_dir: &TempDir, stmts: &[&str]) -> Arc<Database> {
     let db = Database::open_file(io, db_path.to_str().unwrap()).unwrap();
     let conn = db.connect().unwrap();
 
-    let mut stmt = conn
-        .query("PRAGMA synchronous = OFF".to_string())
-        .unwrap()
-        .unwrap();
+    let mut stmt = conn.query("PRAGMA synchronous = OFF").unwrap().unwrap();
     run_to_completion(&mut stmt, &db).unwrap();
 
     for ddl in stmts {
