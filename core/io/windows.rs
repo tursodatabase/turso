@@ -2,10 +2,13 @@ use crate::error::io_error;
 use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::common;
 use crate::io::FileSyncType;
-use crate::sync::Arc;
+use crate::sync::{Arc, Mutex};
 use crate::{Clock, Completion, CompletionError, File, LimboError, OpenFlags, Result, IO};
+use std::collections::HashMap;
 use std::io::ErrorKind;
+use std::path::PathBuf;
 use std::ptr;
+use std::sync::OnceLock;
 #[cfg(feature = "fs")]
 use tracing::debug;
 use tracing::{instrument, trace, Level};
@@ -43,6 +46,134 @@ fn overlapped_at(pos: u64) -> OVERLAPPED {
 fn last_os_error(context: &'static str) -> LimboError {
     let err = std::io::Error::last_os_error();
     io_error(err, context)
+}
+
+/// Process-wide cross-process advisory lock for a single path.
+///
+/// `LockFileEx` is per-handle on Windows: two handles in the same process — even
+/// to the same file — race against each other instead of sharing a lock the way
+/// POSIX `fcntl` locks do per-process. Acquiring an exclusive byte-range lock on
+/// every `open_file` therefore breaks legitimate same-process patterns (multiple
+/// connections, busy-timeout retries, parallel readers).
+///
+/// To match Unix semantics — one OS lock per (process, path) — we hold a single
+/// dedicated lock handle in a process-global registry, ref-counted across all
+/// `WindowsFile`s for the same canonical path. The first opener acquires the
+/// `LockFileEx`; subsequent in-process openers just bump the refcount. Once the
+/// last opener drops its guard, the dedicated handle is closed and the OS lock
+/// is released, freeing the path for other processes.
+///
+/// The lock targets a single sentinel byte at an offset far beyond any
+/// realistic database size: `LockFileEx` blocks `ReadFile`/`WriteFile` on
+/// locked regions across *all* handles (including ones in our own process), so
+/// locking the data region itself would deadlock our own writes. The sentinel
+/// byte is never read or written by the engine, only locked.
+const PROCESS_LOCK_OFFSET: u64 = 0x4000_0000_0000_0000;
+
+struct ProcessFileLockEntry {
+    handle: HANDLE,
+    refcount: usize,
+}
+
+// HANDLE is a raw pointer; the registry mutex serializes all access to it.
+unsafe impl Send for ProcessFileLockEntry {}
+
+type ProcessFileLockRegistry = Mutex<HashMap<PathBuf, ProcessFileLockEntry>>;
+
+fn process_file_lock_registry() -> &'static ProcessFileLockRegistry {
+    static REGISTRY: OnceLock<ProcessFileLockRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct ProcessFileLockGuard {
+    key: PathBuf,
+}
+
+impl Drop for ProcessFileLockGuard {
+    fn drop(&mut self) {
+        let mut registry = process_file_lock_registry().lock();
+        let Some(entry) = registry.get_mut(&self.key) else {
+            return;
+        };
+        entry.refcount -= 1;
+        if entry.refcount > 0 {
+            return;
+        }
+        // Release the OS lock and close the handle while still holding the
+        // registry mutex. A concurrent acquirer for the same path is blocked
+        // on the mutex; once we drop it the entry is gone and they'll open a
+        // fresh dedicated handle. Releasing inside the critical section
+        // ensures the previous `LockFileEx` is fully unwound before any new
+        // `LockFileEx` is attempted, otherwise the new attempt would race
+        // and fail with `ERROR_LOCK_VIOLATION`.
+        let handle = registry.remove(&self.key).expect("entry just observed").handle;
+        unsafe {
+            let mut overlapped = overlapped_at(PROCESS_LOCK_OFFSET);
+            UnlockFileEx(handle, 0, 1, 0, &mut overlapped);
+            CloseHandle(handle);
+        }
+    }
+}
+
+fn acquire_process_file_lock(path: &str) -> Result<ProcessFileLockGuard> {
+    // Canonicalize so that different path strings resolving to the same file
+    // (e.g. relative vs. absolute) share a single registry entry. Fall back
+    // to the raw path if canonicalize fails for any reason; collisions across
+    // distinct paths only matter if the same caller mixes spellings, and the
+    // OS lock still provides correctness in that case.
+    let key = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+    let mut registry = process_file_lock_registry().lock();
+    if let Some(entry) = registry.get_mut(&key) {
+        entry.refcount += 1;
+        return Ok(ProcessFileLockGuard { key });
+    }
+
+    // First opener for this path in this process. Open a dedicated handle whose
+    // sole purpose is to hold the byte-range lock. Its lifetime is tied to the
+    // registry entry, decoupled from any individual `WindowsFile`.
+    let wide_path: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    let handle = unsafe {
+        CreateFileW(
+            wide_path.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(last_os_error("open lock handle"));
+    }
+
+    let mut overlapped = overlapped_at(PROCESS_LOCK_OFFSET);
+    let ok = unsafe {
+        LockFileEx(
+            handle,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        )
+    };
+    if ok == FALSE {
+        let err = std::io::Error::last_os_error();
+        unsafe {
+            CloseHandle(handle);
+        }
+        let message = match err.kind() {
+            ErrorKind::WouldBlock => {
+                "Failed locking file. File is locked by another process".to_string()
+            }
+            _ => format!("Failed locking file, {err}"),
+        };
+        return Err(LimboError::LockingError(message));
+    }
+
+    registry.insert(key.clone(), ProcessFileLockEntry { handle, refcount: 1 });
+    Ok(ProcessFileLockGuard { key })
 }
 
 pub struct WindowsIO {}
@@ -92,18 +223,28 @@ impl IO for WindowsIO {
             return Err(last_os_error("open"));
         }
 
-        let windows_file = Arc::new(WindowsFile {
-            handle: file_handle,
-        });
-
-        if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
-            && !flags.contains(OpenFlags::ReadOnly)
+        // Cross-process advisory lock: rejects opens from other processes while
+        // permitting multiple in-process handles. See `ProcessFileLockEntry`.
+        let process_lock = if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
+            && !flags.intersects(OpenFlags::ReadOnly | OpenFlags::NoLock)
         {
-            // Drop will handle CloseHandle if lock_file fails
-            windows_file.lock_file(true)?;
-        }
+            match acquire_process_file_lock(path) {
+                Ok(guard) => Some(guard),
+                Err(e) => {
+                    unsafe {
+                        CloseHandle(file_handle);
+                    }
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
 
-        Ok(windows_file)
+        Ok(Arc::new(WindowsFile {
+            handle: file_handle,
+            _process_lock: process_lock,
+        }))
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
@@ -131,6 +272,10 @@ impl Clock for WindowsIO {
 
 pub struct WindowsFile {
     handle: HANDLE,
+    /// Process-wide advisory lock held while this file is open. The lock lives
+    /// in a dedicated handle managed by `ProcessFileLockEntry`; this field
+    /// just keeps the registry refcount up. Dropped automatically with `self`.
+    _process_lock: Option<ProcessFileLockGuard>,
 }
 
 unsafe impl Send for WindowsFile {}
@@ -362,10 +507,11 @@ impl File for WindowsFile {
 
 impl Drop for WindowsFile {
     fn drop(&mut self) {
-        let _ = self.unlock_file();
         unsafe {
             CloseHandle(self.handle);
         }
+        // The process-wide advisory lock is released by `ProcessFileLockGuard::drop`
+        // after the `_process_lock` field is dropped here.
     }
 }
 
