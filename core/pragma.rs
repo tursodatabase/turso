@@ -59,6 +59,7 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NeedSchema | PragmaFlags::Result0 | PragmaFlags::SchemaReq,
             &["journal_mode"],
         ),
+        LockingMode => Pragma::new(PragmaFlags::Result0, &["locking_mode"]),
         FullColumnNames | ShortColumnNames => {
             unreachable!("pragma_for() called with FullColumnNames/ShortColumnNames, which are deprecated no-ops")
         }
