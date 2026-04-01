@@ -1863,7 +1863,7 @@ impl Connection {
         if self.mvcc_enabled() && !db.mvcc_enabled() {
             Self::set_mvcc_journal_mode_fresh_db(&pager)?;
             Self::install_database_wal_on_pager(&db, &mut pager);
-            // todo(v): pass required encryption ctx to enable encryption with mvcc
+            let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
             let mv_store = journal_mode::open_mv_store(
                 db.io.clone(),
                 &db.path,
