@@ -145,6 +145,7 @@ pub struct Builder {
     enable_index_method: bool,
     enable_materialized_views: bool,
     enable_generated_columns: bool,
+    enable_multiprocess_wal: bool,
     vfs: Option<String>,
     encryption_opts: Option<turso_sdk_kit::rsapi::EncryptionOpts>,
     io: Option<Arc<dyn turso_core::IO>>,
@@ -161,6 +162,7 @@ impl Builder {
             enable_index_method: false,
             enable_materialized_views: false,
             enable_generated_columns: false,
+            enable_multiprocess_wal: false,
             vfs: None,
             encryption_opts: None,
             io: None,
@@ -212,6 +214,11 @@ impl Builder {
         self
     }
 
+    pub fn experimental_multiprocess_wal(mut self, enabled: bool) -> Self {
+        self.enable_multiprocess_wal = enabled;
+        self
+    }
+
     pub fn with_io(mut self, vfs: String) -> Self {
         self.vfs = Some(vfs);
         self
@@ -242,6 +249,9 @@ impl Builder {
         }
         if self.enable_generated_columns {
             features.push("generated_columns");
+        }
+        if self.enable_multiprocess_wal {
+            features.push("multiprocess_wal");
         }
         if features.is_empty() {
             return None;

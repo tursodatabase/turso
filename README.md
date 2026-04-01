@@ -58,6 +58,7 @@ The database has the following experimental features:
 * **Encryption at rest** for protecting the data locally.
 * **Incremental computation** using DBSP for incremental view maintenance and query subscriptions.
 * **Full-Text-Search** powered by the awesome [tantivy](https://github.com/quickwit-oss/tantivy) library
+* **Multi-process WAL coordination** via the `.tshm` sidecar for cross-process WAL readers and writers.
 
 The following features are on our current roadmap:
 

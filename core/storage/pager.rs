@@ -5406,7 +5406,14 @@ mod checkpoint_phase_tests {
                 .unwrap();
         }
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io, db_path.to_str().unwrap()).unwrap();
+        let db = Database::open_file_with_flags(
+            io,
+            db_path.to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new().with_multiprocess_wal(true),
+            None,
+        )
+        .unwrap();
         (db, dir)
     }
 

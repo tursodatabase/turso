@@ -661,6 +661,7 @@ impl TursoDatabase {
                                 "encryption" => opts.with_encryption(true),
                                 "attach" => opts.with_attach(true),
                                 "generated_columns" => opts.with_generated_columns(true),
+                                "multiprocess_wal" => opts.with_multiprocess_wal(true),
                                 _ => opts,
                             };
                         }

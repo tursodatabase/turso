@@ -198,6 +198,7 @@ pub struct DatabaseOpts {
     pub enable_autovacuum: bool,
     pub enable_attach: bool,
     pub enable_generated_columns: bool,
+    pub enable_multiprocess_wal: bool,
     pub unsafe_testing: bool,
     enable_load_extension: bool,
 }
@@ -245,6 +246,11 @@ impl DatabaseOpts {
 
     pub fn with_generated_columns(mut self, enable: bool) -> Self {
         self.enable_generated_columns = enable;
+        self
+    }
+
+    pub fn with_multiprocess_wal(mut self, enable: bool) -> Self {
+        self.enable_multiprocess_wal = enable;
         self
     }
 
@@ -630,13 +636,20 @@ impl Database {
     }
 
     #[cfg(feature = "fs")]
-    fn effective_open_flags_for_path(path: &str, flags: OpenFlags) -> OpenFlags {
+    fn effective_open_flags_for_path(
+        path: &str,
+        flags: OpenFlags,
+        opts: DatabaseOpts,
+    ) -> OpenFlags {
         #[cfg(all(unix, target_pointer_width = "64"))]
         {
             let is_memory_like = path.starts_with(":memory:")
                 || path.starts_with("file::memory:")
                 || path.is_empty();
-            if !flags.contains(OpenFlags::ReadOnly) && !is_memory_like {
+            if opts.enable_multiprocess_wal
+                && !flags.contains(OpenFlags::ReadOnly)
+                && !is_memory_like
+            {
                 return flags | OpenFlags::NoLock;
             }
         }
@@ -713,7 +726,7 @@ impl Database {
             }
             return Ok(db);
         }
-        let effective_flags = Self::effective_open_flags_for_path(path, flags);
+        let effective_flags = Self::effective_open_flags_for_path(path, flags, opts);
         let file = io.open_file(path, effective_flags, true)?;
         let db_file = Arc::new(DatabaseFile::new(file));
         Self::open_with_flags(
@@ -1717,6 +1730,9 @@ impl Database {
         let is_memory_like = |path: &str| {
             path.starts_with(":memory:") || path.starts_with("file::memory:") || path.is_empty()
         };
+        if !self.opts.enable_multiprocess_wal {
+            return Ok(None);
+        }
         if !self.io.supports_shared_wal_coordination() {
             return Ok(None);
         }
@@ -1770,6 +1786,9 @@ impl Database {
         let is_memory_like = |path: &str| {
             path.starts_with(":memory:") || path.starts_with("file::memory:") || path.is_empty()
         };
+        if !self.opts.enable_multiprocess_wal {
+            return Ok(None);
+        }
         if !self.io.supports_shared_wal_coordination() {
             return Ok(None);
         }
@@ -2116,6 +2135,10 @@ impl Database {
 
     pub fn experimental_generated_columns_enabled(&self) -> bool {
         self.opts.enable_generated_columns
+    }
+
+    pub fn experimental_multiprocess_wal_enabled(&self) -> bool {
+        self.opts.enable_multiprocess_wal
     }
 
     /// check if database is currently in MVCC mode
