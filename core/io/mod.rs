@@ -128,6 +128,10 @@ pub enum SharedWalLockKind {
 pub trait SharedWalMappedRegion: Send + Sync {
     fn ptr(&self) -> NonNull<u8>;
     fn len(&self) -> usize;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 pub trait File: Send + Sync {
