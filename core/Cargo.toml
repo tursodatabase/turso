@@ -202,3 +202,7 @@ required-features = ["fts"]
 [[bench]]
 name = "graph_queries_benchmark"
 harness = false
+
+[[bench]]
+name = "triggers"
+harness = false
