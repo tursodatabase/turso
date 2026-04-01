@@ -1687,6 +1687,8 @@ pub enum PragmaName {
     IntegrityCheck,
     /// `journal_mode` pragma
     JournalMode,
+    /// `locking_mode` pragma
+    LockingMode,
     /// Run a quick integrity check (skips expensive index consistency validation)
     QuickCheck,
     /// encryption key for encrypted databases, specified as hexadecimal string.

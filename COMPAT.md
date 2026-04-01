@@ -179,7 +179,7 @@ ongoing work to pass the full SQLite TCL test suite.
 | PRAGMA journal_size_limit        | ❌ No         |                                              |
 | PRAGMA legacy_alter_table        | ❌ No         |                                              |
 | PRAGMA legacy_file_format        | ✅ Yes        |                                              |
-| PRAGMA locking_mode              | ❌ No         |                                              |
+| PRAGMA locking_mode              | 🚧 Partial    | `EXCLUSIVE` only                             |
 | PRAGMA max_page_count            | ✅ Yes        |                                              |
 | PRAGMA mmap_size                 | ❌ No         |                                              |
 | PRAGMA module_list               | ❌ No         |                                              |

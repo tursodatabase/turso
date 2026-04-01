@@ -226,6 +226,28 @@ fn update_pragma(
             program.add_pragma_result_column("journal_mode".into());
             Ok(TransactionMode::None)
         }
+        PragmaName::LockingMode => {
+            let mode = match &value {
+                Expr::Name(name) => name.as_str().to_string(),
+                Expr::Literal(Literal::Keyword(kw)) => kw.clone(),
+                Expr::Literal(Literal::String(s)) => s.clone(),
+                _ => parse_string(&value)?,
+            };
+            let mode_bytes = mode.as_bytes();
+            match_ignore_ascii_case!(match mode_bytes {
+                b"EXCLUSIVE" => {}
+                _ => bail_parse_error!("locking_mode must be EXCLUSIVE"),
+            });
+            query_pragma(
+                PragmaName::LockingMode,
+                resolver,
+                None,
+                pager,
+                connection,
+                database_id,
+                program,
+            )
+        }
         PragmaName::FullColumnNames => {
             let enabled = parse_pragma_enabled(&value);
             connection.set_full_column_names(enabled);
@@ -646,6 +668,12 @@ fn query_pragma(
                 dest: register,
                 new_mode: None,
             });
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::LockingMode => {
+            program.emit_string8("exclusive".to_string(), register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)
