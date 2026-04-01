@@ -4681,7 +4681,14 @@ pub mod test {
                 .unwrap();
         }
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io.clone(), path.to_str().unwrap()).unwrap();
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            path.to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new().with_multiprocess_wal(true),
+            None,
+        )
+        .unwrap();
         // db + tmp directory
         (db, dbpath)
     }
@@ -5023,6 +5030,7 @@ pub mod test {
         buffer_pool
             .finalize_with_page_size(wal_header.page_size as usize)
             .unwrap();
+        #[allow(unused_mut)]
         let mut page = vec![0x5a; wal_header.page_size as usize];
         #[cfg(feature = "checksum")]
         crate::storage::checksum::ChecksumContext::new()

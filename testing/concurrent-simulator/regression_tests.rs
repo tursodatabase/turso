@@ -38,6 +38,11 @@ fn wait_for_file(path: &Path) {
 }
 
 #[cfg(all(unix, target_pointer_width = "64"))]
+fn multiprocess_wal_db_opts() -> DatabaseOpts {
+    DatabaseOpts::new().with_multiprocess_wal(true)
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
 fn flip_db_header_reserved_byte(path: &Path) {
     use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -206,7 +211,7 @@ fn read_simple_kv_length(db_path: &Path, table_name: &str, key: &str) -> Option<
         io,
         db_path.to_str().expect("db path utf8"),
         OpenFlags::ReadOnly,
-        DatabaseOpts::new(),
+        multiprocess_wal_db_opts(),
         None,
     )
     .expect("open observer database");
@@ -743,7 +748,7 @@ fn multiprocess_seed_5724542806254236599_localizes_key_4362_loss() {
         observer_io,
         db_path.to_str().expect("db path utf8"),
         OpenFlags::ReadOnly,
-        DatabaseOpts::new(),
+        multiprocess_wal_db_opts(),
         None,
     )
     .expect("open observer database for diagnostics");
@@ -956,7 +961,7 @@ fn multiprocess_seed_5724542806254236599_localizes_key_4994_loss() {
         observer_io,
         db_path.to_str().expect("db path utf8"),
         OpenFlags::ReadOnly,
-        DatabaseOpts::new(),
+        multiprocess_wal_db_opts(),
         None,
     )
     .expect("open observer database after insert");

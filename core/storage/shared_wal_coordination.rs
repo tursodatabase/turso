@@ -4260,7 +4260,7 @@ mod tests {
                 Some(&wal_path),
                 db_file.clone(),
                 OpenFlags::default(),
-                DatabaseOpts::new(),
+                DatabaseOpts::new().with_multiprocess_wal(true),
                 None,
                 None,
             )? {
