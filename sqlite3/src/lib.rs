@@ -2838,7 +2838,7 @@ pub unsafe extern "C" fn sqlite3_table_column_metadata(
 fn limbo_err_code(err: &LimboError) -> i32 {
     match err {
         LimboError::Corrupt(..) => SQLITE_CORRUPT,
-        LimboError::NotADB => SQLITE_NOTADB,
+        LimboError::NotADB | LimboError::EncryptedDatabase => SQLITE_NOTADB,
         LimboError::Constraint(_) | LimboError::ForeignKeyConstraint(_) => SQLITE_CONSTRAINT,
         LimboError::DatabaseFull(_) => SQLITE_FULL,
         LimboError::TableLocked => SQLITE_LOCKED,

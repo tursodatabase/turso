@@ -1212,7 +1212,7 @@ fn test_encrypted_db_then_enable_mvcc(_db: TempDatabase) -> anyhow::Result<()> {
             None,
         );
         assert!(
-            matches!(result, Err(LimboError::NotADB)),
+            matches!(result, Err(LimboError::EncryptedDatabase)),
             "opening an encrypted MVCC db without key material must fail during db open"
         );
     }

@@ -8,6 +8,8 @@ pub enum LimboError {
     Corrupt(String),
     #[error("File is not a database")]
     NotADB,
+    #[error("Database is encrypted. To open it, use: tursodb --experimental-encryption \"file:<path>?cipher=<cipher>&hexkey=<key>\"")]
+    EncryptedDatabase,
     #[error("Internal error: {0}")]
     InternalError(String),
     #[error(transparent)]

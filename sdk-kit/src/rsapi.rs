@@ -430,6 +430,7 @@ impl From<LimboError> for TursoError {
             }
             LimboError::Corrupt(e) => TursoError::Corrupt(e),
             LimboError::NotADB => TursoError::NotAdb("file is not a database".to_string()),
+            LimboError::EncryptedDatabase => TursoError::NotAdb(value.to_string()),
             LimboError::DatabaseFull(e) => TursoError::DatabaseFull(e),
             LimboError::ReadOnly => TursoError::Readonly("database is readonly".to_string()),
             LimboError::Busy => TursoError::Busy("database is locked".to_string()),

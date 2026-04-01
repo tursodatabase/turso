@@ -1143,6 +1143,9 @@ impl Database {
         let (read_version, write_version) = { (header_mut.read_version, header_mut.write_version) };
 
         if encryption_key.is_none() && header_mut.magic != SQLITE_HEADER {
+            if header_mut.magic.starts_with(TURSO_HEADER_PREFIX) {
+                return Err(LimboError::EncryptedDatabase);
+            }
             tracing::error!(
                 "invalid value of database header magic bytes: {:?}",
                 header_mut.magic

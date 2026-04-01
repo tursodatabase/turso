@@ -8179,7 +8179,7 @@ fn test_mvcc_encrypted_restart_without_key_fails_before_recovery() {
 
     db.enc_opts = None;
     assert!(
-        matches!(db.restart_result(), Err(LimboError::NotADB)),
+        matches!(db.restart_result(), Err(LimboError::EncryptedDatabase)),
         "reopening an encrypted MVCC database without a key must fail during db open, before recovery",
     );
 }
