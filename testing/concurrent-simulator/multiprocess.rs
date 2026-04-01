@@ -237,7 +237,7 @@ impl MultiprocessWhopper {
                 io,
                 db_path.to_str().unwrap(),
                 OpenFlags::default(),
-                DatabaseOpts::new(),
+                DatabaseOpts::new().with_multiprocess_wal(true),
                 None,
             )?;
             let conn = db.connect()?;
