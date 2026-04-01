@@ -3321,6 +3321,81 @@ expect {
     7|14|7!
 }
 
+# COLLATE on virtual generated columns must be applied in WHERE (#6153)
+
+test gencol_virtual_collate_where_eq {
+    CREATE TABLE t1(a TEXT, b TEXT GENERATED ALWAYS AS (a) VIRTUAL COLLATE NOCASE);
+    INSERT INTO t1(a) VALUES('Hello'),('HELLO'),('hello');
+    SELECT * FROM t1 WHERE b = 'hello';
+}
+expect {
+    Hello|Hello
+    HELLO|HELLO
+    hello|hello
+}
+
+test gencol_virtual_collate_where_in {
+    CREATE TABLE t1(a TEXT, b TEXT GENERATED ALWAYS AS (a) VIRTUAL COLLATE NOCASE);
+    INSERT INTO t1(a) VALUES('Hello'),('HELLO'),('hello');
+    SELECT count(*) FROM t1 WHERE b IN ('hello');
+}
+expect {
+    3
+}
+
+test gencol_virtual_collate_where_and {
+    CREATE TABLE t2(
+        id INTEGER PRIMARY KEY,
+        season TEXT,
+        scene TEXT GENERATED ALWAYS AS (upper(season)) VIRTUAL COLLATE NOCASE
+    );
+    INSERT INTO t2(season) VALUES('summer'),('SUMMER');
+    SELECT count(*) FROM t2 WHERE scene = 'summer' AND id BETWEEN 1 AND 2;
+}
+expect {
+    2
+}
+
+test gencol_virtual_collate_index_eq {
+    CREATE TABLE t1(a TEXT, b TEXT GENERATED ALWAYS AS (a) VIRTUAL COLLATE NOCASE);
+    CREATE INDEX idx_b ON t1(b);
+    INSERT INTO t1(a) VALUES('Hello'),('HELLO'),('hello');
+    SELECT * FROM t1 WHERE b = 'hello';
+}
+expect {
+    Hello|Hello
+    HELLO|HELLO
+    hello|hello
+}
+
+test gencol_virtual_collate_index_in {
+    CREATE TABLE t1(a TEXT, b TEXT GENERATED ALWAYS AS (a) VIRTUAL COLLATE NOCASE);
+    CREATE INDEX idx_b ON t1(b);
+    INSERT INTO t1(a) VALUES('Hello'),('HELLO'),('hello'),('World');
+    SELECT count(*) FROM t1 WHERE b IN ('hello', 'world');
+}
+expect {
+    4
+}
+
+test gencol_virtual_collate_group_by {
+    CREATE TABLE t1(a TEXT, b TEXT GENERATED ALWAYS AS (a) VIRTUAL COLLATE NOCASE);
+    INSERT INTO t1(a) VALUES('Hello'),('HELLO'),('hello');
+    SELECT b, count(*) FROM t1 GROUP BY b;
+}
+expect {
+    Hello|3
+}
+
+test gencol_virtual_collate_distinct {
+    CREATE TABLE t1(a TEXT, b TEXT GENERATED ALWAYS AS (a) VIRTUAL COLLATE NOCASE);
+    INSERT INTO t1(a) VALUES('Hello'),('HELLO'),('hello');
+    SELECT DISTINCT b FROM t1;
+}
+expect {
+    Hello
+}
+
 # --- Large row counts (100+ rows) ---
 
 test gencol_large_row_count {
