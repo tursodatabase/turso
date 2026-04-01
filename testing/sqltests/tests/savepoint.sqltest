@@ -229,6 +229,22 @@ expect {
 }
 
 @cross-check-integrity
+test savepoint-rollback-discards-post-savepoint-pages-without-losing-outer-row {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB);
+    BEGIN;
+    INSERT INTO t VALUES (1, 'outer');
+    SAVEPOINT s;
+    INSERT INTO t VALUES (2, zeroblob(8000));
+    ROLLBACK TO s;
+    RELEASE s;
+    COMMIT;
+    SELECT id, v FROM t ORDER BY id;
+}
+expect {
+    1|outer
+}
+
+@cross-check-integrity
 test savepoint-release-root-with-deferred-fk-fails {
     PRAGMA foreign_keys = ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
