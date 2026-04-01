@@ -239,6 +239,31 @@ impl DatabaseOpts {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedWalCoordinationOpenTelemetryMode {
+    Exclusive,
+    MultiProcess,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedWalOpenTelemetry {
+    pub loaded_from_disk_scan: bool,
+    pub reopened_max_frame: u64,
+    pub reopened_nbackfills: u64,
+    pub reopened_checkpoint_seq: u32,
+    pub coordination_open_mode: Option<SharedWalCoordinationOpenTelemetryMode>,
+    pub sanitized_backfill_proof_on_open: bool,
+}
+
+#[cfg(feature = "simulator")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedWalTestingSnapshot {
+    pub max_frame: u64,
+    pub nbackfills: u64,
+    pub checkpoint_seq: u32,
+    pub frame_index_overflowed: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct EncryptionOpts {
     pub cipher: String,
@@ -1213,8 +1238,8 @@ impl Database {
 
         if is_autovacuumed_db && !self.opts.enable_autovacuum {
             tracing::warn!(
-                        "Database has autovacuum enabled but --experimental-autovacuum flag is not set. Opening in readonly mode."
-                    );
+                "Database has autovacuum enabled but --experimental-autovacuum flag is not set. Opening in readonly mode."
+            );
             self.open_flags |= OpenFlags::ReadOnly;
         }
 
@@ -1322,7 +1347,10 @@ impl Database {
         let header_modified = match read_version {
             Version::Legacy => {
                 if is_readonly {
-                    tracing::warn!("Database {} is opened in readonly mode, cannot convert Legacy mode to WAL. Running in Legacy mode.", self.path);
+                    tracing::warn!(
+                        "Database {} is opened in readonly mode, cannot convert Legacy mode to WAL. Running in Legacy mode.",
+                        self.path
+                    );
                     false
                 } else {
                     // Convert Legacy to WAL mode
@@ -1376,7 +1404,8 @@ impl Database {
                             &self.io,
                             &self.wal_path,
                             flags,
-                            authority.snapshot(),
+                            authority,
+                            &self.db_file,
                         )?
                     } else {
                         WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, flags)?
@@ -1672,9 +1701,6 @@ impl Database {
         let is_memory_like = |path: &str| {
             path.starts_with(":memory:") || path.starts_with("file::memory:") || path.is_empty()
         };
-        if self.open_flags.contains(OpenFlags::ReadOnly) {
-            return Ok(None);
-        }
         if !self.io.supports_shared_wal_coordination() {
             return Ok(None);
         }
@@ -1695,11 +1721,23 @@ impl Database {
         }
 
         let path = storage::wal::coordination_path_for_wal_path(&self.wal_path);
-        let authority = Arc::new(MappedSharedWalCoordination::create_or_open(
-            &self.io,
-            std::path::Path::new(&path),
-            64,
-        )?);
+        let authority = if self.open_flags.contains(OpenFlags::ReadOnly) {
+            let Some(authority) = MappedSharedWalCoordination::open_existing(
+                &self.io,
+                std::path::Path::new(&path),
+                64,
+            )?
+            else {
+                return Ok(None);
+            };
+            Arc::new(authority)
+        } else {
+            Arc::new(MappedSharedWalCoordination::create_or_open(
+                &self.io,
+                std::path::Path::new(&path),
+                64,
+            )?)
+        };
         let _ = self.shared_wal_coordination.set(authority.clone());
         Ok(Some(
             self.shared_wal_coordination
@@ -1716,9 +1754,6 @@ impl Database {
         let is_memory_like = |path: &str| {
             path.starts_with(":memory:") || path.starts_with("file::memory:") || path.is_empty()
         };
-        if self.open_flags.contains(OpenFlags::ReadOnly) {
-            return Ok(None);
-        }
         if !self.io.supports_shared_wal_coordination() {
             return Ok(None);
         }
@@ -1733,11 +1768,23 @@ impl Database {
         }
 
         let path = storage::wal::coordination_path_for_wal_path(&self.wal_path);
-        let authority = Arc::new(MappedSharedWalCoordination::create_or_open(
-            &self.io,
-            std::path::Path::new(&path),
-            64,
-        )?);
+        let authority = if self.open_flags.contains(OpenFlags::ReadOnly) {
+            let Some(authority) = MappedSharedWalCoordination::open_existing(
+                &self.io,
+                std::path::Path::new(&path),
+                64,
+            )?
+            else {
+                return Ok(None);
+            };
+            Arc::new(authority)
+        } else {
+            Arc::new(MappedSharedWalCoordination::create_or_open(
+                &self.io,
+                std::path::Path::new(&path),
+                64,
+            )?)
+        };
         let _ = self.shared_wal_coordination.set(authority.clone());
         Ok(Some(
             self.shared_wal_coordination
@@ -1745,6 +1792,114 @@ impl Database {
                 .cloned()
                 .unwrap_or(authority),
         ))
+    }
+
+    pub fn shared_wal_open_telemetry(&self) -> Result<SharedWalOpenTelemetry> {
+        let shared_wal = self.shared_wal.read();
+        let loaded_from_disk_scan = shared_wal
+            .metadata
+            .loaded_from_disk_scan
+            .load(Ordering::Acquire);
+        let reopened_max_frame = shared_wal.metadata.max_frame.load(Ordering::Acquire);
+        let reopened_nbackfills = shared_wal.metadata.nbackfills.load(Ordering::Acquire);
+        let reopened_checkpoint_seq = shared_wal.metadata.wal_header.lock().checkpoint_seq;
+        drop(shared_wal);
+
+        #[cfg(all(unix, target_pointer_width = "64"))]
+        let (coordination_open_mode, sanitized_backfill_proof_on_open) =
+            if let Some(authority) = self.shared_wal_coordination()? {
+                let mode = match authority.open_mode() {
+                storage::shared_wal_coordination::SharedWalCoordinationOpenMode::Exclusive => {
+                    SharedWalCoordinationOpenTelemetryMode::Exclusive
+                }
+                storage::shared_wal_coordination::SharedWalCoordinationOpenMode::MultiProcess => {
+                    SharedWalCoordinationOpenTelemetryMode::MultiProcess
+                }
+            };
+                (Some(mode), authority.sanitized_backfill_proof_on_open())
+            } else {
+                (None, false)
+            };
+        #[cfg(not(all(unix, target_pointer_width = "64")))]
+        let (coordination_open_mode, sanitized_backfill_proof_on_open) = (None, false);
+
+        Ok(SharedWalOpenTelemetry {
+            loaded_from_disk_scan,
+            reopened_max_frame,
+            reopened_nbackfills,
+            reopened_checkpoint_seq,
+            coordination_open_mode,
+            sanitized_backfill_proof_on_open,
+        })
+    }
+
+    #[cfg(feature = "simulator")]
+    pub fn shared_wal_snapshot_for_testing(&self) -> Result<Option<SharedWalTestingSnapshot>> {
+        #[cfg(all(unix, target_pointer_width = "64"))]
+        if let Some(authority) = self.shared_wal_coordination()? {
+            let snapshot = authority.snapshot();
+            return Ok(Some(SharedWalTestingSnapshot {
+                max_frame: snapshot.max_frame,
+                nbackfills: snapshot.nbackfills,
+                checkpoint_seq: snapshot.checkpoint_seq,
+                frame_index_overflowed: authority.frame_index_overflowed(),
+            }));
+        }
+
+        Ok(None)
+    }
+
+    #[cfg(feature = "simulator")]
+    pub fn shared_wal_find_frame_for_testing(&self, page_id: u64) -> Result<Option<u64>> {
+        #[cfg(all(unix, target_pointer_width = "64"))]
+        if let Some(authority) = self.shared_wal_coordination()? {
+            let snapshot = authority.snapshot();
+            return Ok(authority.find_frame(page_id, 0, snapshot.max_frame, None));
+        }
+
+        Ok(None)
+    }
+
+    #[cfg(feature = "simulator")]
+    pub fn local_wal_find_frame_for_testing(&self, page_id: u64) -> Result<Option<u64>> {
+        let shared = self.shared_wal.read();
+        let max_frame = shared.metadata.max_frame.load(Ordering::Acquire);
+        let frame_cache = shared.runtime.frame_cache.lock();
+        Ok(frame_cache.get(&page_id).and_then(|frames| {
+            frames
+                .iter()
+                .rfind(|&&frame_id| frame_id <= max_frame)
+                .copied()
+        }))
+    }
+
+    #[cfg(feature = "simulator")]
+    pub fn local_wal_max_frame_for_testing(&self) -> Result<u64> {
+        Ok(self
+            .shared_wal
+            .read()
+            .metadata
+            .max_frame
+            .load(Ordering::Acquire))
+    }
+
+    #[cfg(feature = "simulator")]
+    pub fn clear_backfill_proof_for_testing(&self) -> Result<()> {
+        #[cfg(all(unix, target_pointer_width = "64"))]
+        {
+            let authority = self.shared_wal_coordination()?.ok_or_else(|| {
+                LimboError::InternalError("shared WAL authority is unavailable".into())
+            })?;
+            authority.clear_backfill_proof();
+            Ok(())
+        }
+
+        #[cfg(not(all(unix, target_pointer_width = "64")))]
+        {
+            Err(LimboError::InternalError(
+                "shared WAL authority is unavailable on this platform".into(),
+            ))
+        }
     }
 
     fn build_wal(
