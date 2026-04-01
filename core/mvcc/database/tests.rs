@@ -137,10 +137,7 @@ impl MvccTestDbNoConn {
             hexkey: hex_key.to_string(),
         };
         let temp_dir = tempfile::TempDir::new().unwrap();
-        let path = temp_dir
-            .path()
-            .join(format!("test_{}", rand::random::<u64>()));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let path = temp_dir.path().join("test.db");
         let io = Arc::new(PlatformIO::new().unwrap());
         let db = Database::open_file_with_flags(
             io,
@@ -4115,58 +4112,60 @@ fn test_commit_dep_readonly_does_not_cause_spurious_busy() {
     mvcc_store.release_exclusive_tx(&exclusive_tx_id);
 }
 
+/// Insert a synthetic table and a single row via the MVCC store, then commit.
+/// Used by restart / recovery tests to seed durable state before a restart cycle.
+fn write_synthetic_row(db: &MvccTestDbNoConn, value: &str) {
+    let conn = db.connect();
+    let mvcc_store = db.get_mvcc_store();
+    let max_root_page = get_rows(
+        &conn,
+        "SELECT COALESCE(MAX(rootpage), 0) FROM sqlite_schema WHERE rootpage > 0",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let next_schema_rowid = get_rows(
+        &conn,
+        "SELECT COALESCE(MAX(rowid), 0) + 1 FROM sqlite_schema",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let synthetic_root = -(max_root_page + 100);
+    let synthetic_table_id = MVTableId::new(synthetic_root);
+    let tx_id = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
+    let data = ImmutableRecord::from_values(
+        &[
+            Value::Text(Text::new("table")),
+            Value::Text(Text::new("test")),
+            Value::Text(Text::new("test")),
+            Value::from_i64(synthetic_root),
+            Value::Text(Text::new(
+                "CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)",
+            )),
+        ],
+        5,
+    );
+    mvcc_store
+        .insert(
+            tx_id,
+            Row::new_table_row(
+                RowID::new((-1).into(), RowKey::Int(next_schema_rowid)),
+                data.as_blob().to_vec(),
+                5,
+            ),
+        )
+        .unwrap();
+    let row = generate_simple_string_row(synthetic_table_id, 1, value);
+    mvcc_store.insert(tx_id, row).unwrap();
+    commit_tx(mvcc_store, &conn, tx_id).unwrap();
+    conn.close().unwrap();
+}
+
 /// What this test checks: Startup recovery reconciles WAL/log artifacts into one consistent MVCC state and replay boundary.
 /// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
 #[test]
 fn test_restart() {
     let mut db = MvccTestDbNoConn::new_with_random_db();
-    {
-        let conn = db.connect();
-        let mvcc_store = db.get_mvcc_store();
-        let max_root_page = get_rows(
-            &conn,
-            "SELECT COALESCE(MAX(rootpage), 0) FROM sqlite_schema WHERE rootpage > 0",
-        )[0][0]
-            .as_int()
-            .unwrap();
-        let next_schema_rowid = get_rows(
-            &conn,
-            "SELECT COALESCE(MAX(rowid), 0) + 1 FROM sqlite_schema",
-        )[0][0]
-            .as_int()
-            .unwrap();
-        let synthetic_root = -(max_root_page + 100);
-        let synthetic_table_id = MVTableId::new(synthetic_root);
-        let tx_id = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
-        // Insert synthetic table metadata into sqlite_schema (table_id -1).
-        let data = ImmutableRecord::from_values(
-            &[
-                Value::Text(Text::new("table")), // type
-                Value::Text(Text::new("test")),  // name
-                Value::Text(Text::new("test")),  // tbl_name
-                Value::from_i64(synthetic_root), // rootpage
-                Value::Text(Text::new(
-                    "CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)",
-                )), // sql
-            ],
-            5,
-        );
-        mvcc_store
-            .insert(
-                tx_id,
-                Row::new_table_row(
-                    RowID::new((-1).into(), RowKey::Int(next_schema_rowid)),
-                    data.as_blob().to_vec(),
-                    5,
-                ),
-            )
-            .unwrap();
-        // Now insert a row into the synthetic table.
-        let row = generate_simple_string_row(synthetic_table_id, 1, "foo");
-        mvcc_store.insert(tx_id, row).unwrap();
-        commit_tx(mvcc_store, &conn, tx_id).unwrap();
-        conn.close().unwrap();
-    }
+    write_synthetic_row(&db, "foo");
     db.restart();
 
     {
@@ -8021,54 +8020,7 @@ fn test_committed_update_version_conflict() {
 fn test_mvcc_encrypted_log_recovery_and_wrong_key() {
     let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
     let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
-
-    // --- Write phase (identical to test_restart, just on an encrypted DB) ---
-    {
-        let conn = db.connect();
-        let mvcc_store = db.get_mvcc_store();
-        let max_root_page = get_rows(
-            &conn,
-            "SELECT COALESCE(MAX(rootpage), 0) FROM sqlite_schema WHERE rootpage > 0",
-        )[0][0]
-            .as_int()
-            .unwrap();
-        let next_schema_rowid = get_rows(
-            &conn,
-            "SELECT COALESCE(MAX(rowid), 0) + 1 FROM sqlite_schema",
-        )[0][0]
-            .as_int()
-            .unwrap();
-        let synthetic_root = -(max_root_page + 100);
-        let synthetic_table_id = MVTableId::new(synthetic_root);
-        let tx_id = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
-        let data = ImmutableRecord::from_values(
-            &[
-                Value::Text(Text::new("table")),
-                Value::Text(Text::new("test")),
-                Value::Text(Text::new("test")),
-                Value::from_i64(synthetic_root),
-                Value::Text(Text::new(
-                    "CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)",
-                )),
-            ],
-            5,
-        );
-        mvcc_store
-            .insert(
-                tx_id,
-                Row::new_table_row(
-                    RowID::new((-1).into(), RowKey::Int(next_schema_rowid)),
-                    data.as_blob().to_vec(),
-                    5,
-                ),
-            )
-            .unwrap();
-        let row = generate_simple_string_row(synthetic_table_id, 1, "encrypted_value");
-        mvcc_store.insert(tx_id, row).unwrap();
-        commit_tx(mvcc_store, &conn, tx_id).unwrap();
-        // Do NOT checkpoint — row lives only in the encrypted logical log.
-        conn.close().unwrap();
-    }
+    write_synthetic_row(&db, "encrypted_value");
 
     // --- Verify the raw log file is encrypted (no plaintext leakage) ---
     {
@@ -8127,9 +8079,7 @@ fn test_mvcc_encrypted_log_recovery_and_wrong_key() {
 #[test]
 fn test_mvcc_late_encryption_setup_keeps_metadata_bootstrapped() {
     let temp_dir = tempfile::TempDir::new().unwrap();
-    let path = temp_dir
-        .path()
-        .join(format!("test_{}", rand::random::<u64>()));
+    let path = temp_dir.path().join("test.db");
     let io = Arc::new(PlatformIO::new().unwrap());
     let opts = DatabaseOpts::new().with_encryption(true);
     let db = Database::open_file_with_flags(
