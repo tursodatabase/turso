@@ -99,10 +99,8 @@ impl IO for WindowsIO {
         if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
             && !flags.contains(OpenFlags::ReadOnly)
         {
-            if let Err(e) = windows_file.lock_file(true) {
-                unsafe { CloseHandle(windows_file.handle) };
-                return Err(e);
-            }
+            // Drop will handle CloseHandle if lock_file fails
+            windows_file.lock_file(true)?;
         }
 
         Ok(windows_file)
