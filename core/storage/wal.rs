@@ -28,7 +28,7 @@ use crate::io::clock::MonotonicInstant;
 use crate::io::CompletionGroup;
 use crate::io::{File, IO};
 use crate::storage::database::{DatabaseStorage, EncryptionOrChecksum};
-#[cfg(all(test, unix, target_pointer_width = "64"))]
+#[cfg(all(unix, target_pointer_width = "64"))]
 use crate::storage::shared_wal_coordination::SharedWalCoordinationOpenMode;
 #[cfg(all(unix, target_pointer_width = "64"))]
 use crate::storage::shared_wal_coordination::{
@@ -4416,6 +4416,16 @@ impl WalFileShared {
             );
             return sqlite3_ondisk::build_shared_wal(&file, io);
         }
+        if snapshot.nbackfills != 0
+            && authority.open_mode() == SharedWalCoordinationOpenMode::Exclusive
+        {
+            tracing::debug!(
+                nbackfills = snapshot.nbackfills,
+                max_frame = snapshot.max_frame,
+                "rebuilding WAL state from disk because an exclusive reopen must conservatively clear published backfill progress"
+            );
+            return sqlite3_ondisk::build_shared_wal(&file, io);
+        }
         if snapshot.max_frame > snapshot.nbackfills
             && authority
                 .iter_latest_frames(0, snapshot.max_frame)
@@ -5897,6 +5907,57 @@ pub mod test {
             .loaded_from_disk_scan
             .load(Ordering::Acquire));
         assert!(shared.runtime.frame_cache.lock().is_empty());
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_open_shared_from_authority_exclusive_rebuilds_positive_snapshot_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-exclusive-positive.db-wal");
+        let shm_path = dir.path().join("test-exclusive-positive.db-tshm");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let snapshot = write_test_wal_with_single_commit_frame(&io, &wal_path);
+        {
+            let authority =
+                Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+            authority.install_snapshot(SharedWalCoordinationHeader {
+                nbackfills: snapshot.max_frame,
+                ..snapshot
+            });
+            authority.record_frame(7, 1);
+            assert_eq!(
+                authority.open_mode(),
+                SharedWalCoordinationOpenMode::Exclusive
+            );
+        }
+
+        let reopened_authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        assert_eq!(
+            reopened_authority.open_mode(),
+            SharedWalCoordinationOpenMode::Exclusive
+        );
+
+        let shared = WalFileShared::open_shared_from_authority_if_exists(
+            &io,
+            wal_path.to_str().unwrap(),
+            crate::OpenFlags::Create,
+            &reopened_authority,
+            &open_test_db_file_for_wal(&io, &wal_path),
+        )
+        .unwrap();
+
+        let shared = shared.read();
+        assert_eq!(shared.metadata.max_frame.load(Ordering::Acquire), 1);
+        assert_eq!(shared.metadata.nbackfills.load(Ordering::Acquire), 0);
+        assert!(shared
+            .metadata
+            .loaded_from_disk_scan
+            .load(Ordering::Acquire));
+        assert_eq!(
+            shared.runtime.frame_cache.lock().get(&7).cloned(),
+            Some(vec![1])
+        );
     }
 
     #[cfg(all(unix, target_pointer_width = "64"))]
