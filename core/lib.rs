@@ -1767,6 +1767,11 @@ impl Database {
         ))
     }
 
+    #[cfg(not(all(unix, target_pointer_width = "64")))]
+    pub(crate) fn shared_wal_coordination(&self) -> Result<Option<()>> {
+        Ok(None)
+    }
+
     #[cfg(all(unix, target_pointer_width = "64"))]
     pub(crate) fn open_shared_wal_coordination_for_open(
         &self,
