@@ -145,6 +145,10 @@ test-constraint: build uv-sync-test
 	fi
 .PHONY: test-constraint
 
+test-multiprocess:
+	cargo run --release -p turso_whopper -- --mode fast --multiprocess --max-connections 4
+.PHONY: test-multiprocess
+
 bench-vfs: uv-sync-test build-release
 	RUST_LOG=$(RUST_LOG) uv run --project limbo_test bench-vfs "$(SQL)" "$(N)"
 
