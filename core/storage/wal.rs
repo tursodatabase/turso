@@ -4202,7 +4202,6 @@ fn wal_header_matches_authority_snapshot(
         && wal_header.salt_2 == snapshot.salt_2
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
 fn database_identity_from_header_bytes(header_bytes: &[u8]) -> Result<(u32, u32)> {
     if header_bytes.len() < DatabaseHeader::SIZE {
         return Err(LimboError::Corrupt(format!(
@@ -4219,7 +4218,6 @@ fn database_identity_from_header_bytes(header_bytes: &[u8]) -> Result<(u32, u32)
     Ok((db_size_pages, header_crc32c))
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
 fn read_database_identity_from_storage(
     io: &Arc<dyn IO>,
     db_file: &Arc<dyn DatabaseStorage>,

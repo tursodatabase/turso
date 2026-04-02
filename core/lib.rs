@@ -621,24 +621,28 @@ impl Database {
     }
 
     #[cfg(feature = "fs")]
+    #[cfg(all(unix, target_pointer_width = "64"))]
     fn effective_open_flags_for_path(
         path: &str,
         flags: OpenFlags,
         opts: DatabaseOpts,
     ) -> OpenFlags {
-        #[cfg(all(unix, target_pointer_width = "64"))]
-        {
-            let is_memory_like = path.starts_with(":memory:")
-                || path.starts_with("file::memory:")
-                || path.is_empty();
-            if opts.enable_multiprocess_wal
-                && !flags.contains(OpenFlags::ReadOnly)
-                && !is_memory_like
-            {
-                return flags | OpenFlags::NoLock;
-            }
+        let is_memory_like =
+            path.starts_with(":memory:") || path.starts_with("file::memory:") || path.is_empty();
+        if opts.enable_multiprocess_wal && !flags.contains(OpenFlags::ReadOnly) && !is_memory_like {
+            return flags | OpenFlags::NoLock;
         }
 
+        flags
+    }
+
+    #[cfg(feature = "fs")]
+    #[cfg(not(all(unix, target_pointer_width = "64")))]
+    fn effective_open_flags_for_path(
+        _path: &str,
+        flags: OpenFlags,
+        _opts: DatabaseOpts,
+    ) -> OpenFlags {
         flags
     }
 
