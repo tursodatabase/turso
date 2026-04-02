@@ -1166,9 +1166,7 @@ fn test_encrypted_db_then_enable_mvcc_large_payload_chunked() -> anyhow::Result<
     let _ = env_logger::try_init();
 
     let temp_dir = tempfile::tempdir()?;
-    let db_path = temp_dir
-        .path()
-        .join(format!("test-enc-mvcc-large-{}.db", rng().next_u32()));
+    let db_path = temp_dir.path().join("test.db");
     let db_path_str = db_path.to_str().unwrap();
 
     let hex_key = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
@@ -1216,31 +1214,18 @@ fn test_encrypted_db_then_enable_mvcc_large_payload_chunked() -> anyhow::Result<
         let key = EncryptionKey::from_hex_string(hex_key)?;
         let conn = db.connect_with_encryption(Some(key))?;
 
-        let rows = conn.query(
+        let rows: Vec<(i64, i64, String, String)> = conn.exec_rows(
             "SELECT id, length(value), substr(value, 1, 16), substr(value, length(value) - 15, 16) FROM test",
-        )?;
-        let mut seen = false;
-        if let Some(mut rows) = rows {
-            loop {
-                match rows.step()? {
-                    turso_core::StepResult::Row => {
-                        let row = rows.row().unwrap();
-                        assert_eq!(row.get::<i64>(0).unwrap(), 1);
-                        assert_eq!(row.get::<i64>(1).unwrap(), large_value.len() as i64);
-                        assert_eq!(row.get::<String>(2).unwrap(), "xxxxxxxxxxxxxxxx");
-                        assert_eq!(row.get::<String>(3).unwrap(), "xxxxxxxxxxxxxxxx");
-                        seen = true;
-                    }
-                    turso_core::StepResult::Done => break,
-                    turso_core::StepResult::Interrupt => break,
-                    turso_core::StepResult::Busy | turso_core::StepResult::IO => continue,
-                }
-            }
-        }
-        assert!(
-            seen,
+        );
+        assert_eq!(
+            rows.len(),
+            1,
             "Should recover multi-chunk MVCC payload after restart"
         );
+        assert_eq!(rows[0].0, 1);
+        assert_eq!(rows[0].1, large_value.len() as i64);
+        assert_eq!(rows[0].2, "xxxxxxxxxxxxxxxx");
+        assert_eq!(rows[0].3, "xxxxxxxxxxxxxxxx");
     }
 
     Ok(())
@@ -1254,9 +1239,7 @@ fn test_encrypted_db_with_data_then_enable_mvcc() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
 
     let temp_dir = tempfile::tempdir()?;
-    let db_path = temp_dir
-        .path()
-        .join(format!("test-enc-data-mvcc-{}.db", rng().next_u32()));
+    let db_path = temp_dir.path().join("test.db");
     let db_path_str = db_path.to_str().unwrap();
 
     let hex_key = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
@@ -1298,23 +1281,9 @@ fn test_encrypted_db_with_data_then_enable_mvcc() -> anyhow::Result<()> {
         let conn = db.connect_with_encryption(Some(key))?;
 
         // Pre-existing row should be readable
-        let rows = conn.query("SELECT value FROM test")?;
-        let mut count = 0;
-        if let Some(mut rows) = rows {
-            loop {
-                match rows.step()? {
-                    turso_core::StepResult::Row => {
-                        let row = rows.row().unwrap();
-                        assert_eq!(row.get::<String>(0).unwrap(), "before mvcc");
-                        count += 1;
-                    }
-                    turso_core::StepResult::Done => break,
-                    turso_core::StepResult::Interrupt => break,
-                    turso_core::StepResult::Busy | turso_core::StepResult::IO => continue,
-                }
-            }
-        }
-        assert_eq!(count, 1, "pre-existing row must be readable");
+        let rows: Vec<(String,)> = conn.exec_rows("SELECT value FROM test");
+        assert_eq!(rows.len(), 1, "pre-existing row must be readable");
+        assert_eq!(rows[0].0, "before mvcc");
 
         // Switch to MVCC
         conn.execute("PRAGMA journal_mode = 'mvcc'")?;
@@ -1353,22 +1322,11 @@ fn test_encrypted_db_with_data_then_enable_mvcc() -> anyhow::Result<()> {
         let key = EncryptionKey::from_hex_string(hex_key)?;
         let conn = db.connect_with_encryption(Some(key))?;
 
-        let rows = conn.query("SELECT value FROM test ORDER BY id")?;
-        let mut values = Vec::new();
-        if let Some(mut rows) = rows {
-            loop {
-                match rows.step()? {
-                    turso_core::StepResult::Row => {
-                        let row = rows.row().unwrap();
-                        values.push(row.get::<String>(0).unwrap());
-                    }
-                    turso_core::StepResult::Done => break,
-                    turso_core::StepResult::Interrupt => break,
-                    turso_core::StepResult::Busy | turso_core::StepResult::IO => continue,
-                }
-            }
-        }
-        assert_eq!(values, vec!["before mvcc", "after mvcc"]);
+        let rows: Vec<(String,)> = conn.exec_rows("SELECT value FROM test ORDER BY id");
+        assert_eq!(
+            rows.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+            vec!["before mvcc", "after mvcc"]
+        );
     }
 
     Ok(())

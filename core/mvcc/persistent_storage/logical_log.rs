@@ -85,7 +85,7 @@
 //!   (`ENCRYPTED_PAYLOAD_CHUNK_SIZE`, except the final remainder chunk)
 //!   - each chunk is written as `ciphertext(chunk_plain_len + tag_size) | nonce(nonce_size)`
 //!   - AEAD additional data:
-//!     `salt(8) || payload_size_or_zero(8) || op_count(4) || commit_ts(8) || chunk_index(4)`
+//!     `salt(8) || payload_size_or_zero(8) || op_count(4) || commit_ts(8) || chunk_index(4)` (little-endian)
 //!     where the payload-size slot is zero for non-final chunks and carries the real payload size
 //!     only in the final chunk
 //!
@@ -211,51 +211,67 @@ fn encrypted_payload_chunk_count(payload_size: usize, chunk_size: usize) -> usiz
     }
 }
 
+/// Returns how many plaintext bytes belong to `chunk_index` before encryption.
+/// If the payload fits within a chunk, then that is the length.
+/// If a payload spans over multiple chunks, then except the last chunk rest of the chunks
+/// will have `chunk_size` plaintext and the last one will have the remainder.
 fn encrypted_chunk_plaintext_len(
     payload_size: usize,
     chunk_index: usize,
     chunk_size: usize,
-) -> Option<usize> {
-    // Returns how many plaintext bytes belong to chunk_index before encryption.
-    // Full chunks use chunk_size; the final chunk carries the remainder.
-    let chunk_start = chunk_index.checked_mul(chunk_size)?;
+) -> Result<usize> {
+    let chunk_start = chunk_index.checked_mul(chunk_size).ok_or_else(|| {
+        LimboError::Corrupt(format!(
+            "encrypted chunk offset overflow: chunk_index={chunk_index}, chunk_size={chunk_size}"
+        ))
+    })?;
     if chunk_start >= payload_size {
-        return None;
+        return Err(LimboError::Corrupt(format!(
+            "encrypted chunk index {chunk_index} out of range for payload_size={payload_size}"
+        )));
     }
-    Some((payload_size - chunk_start).min(chunk_size))
+    Ok((payload_size - chunk_start).min(chunk_size))
 }
 
+/// On-disk size of one encrypted chunk: `plaintext_len + tag + nonce`.
 fn encrypted_chunk_blob_size(
     plaintext_len: usize,
     tag_size: usize,
     nonce_size: usize,
-) -> Option<usize> {
-    // Returns the on-disk size of one encrypted chunk:
-    // plaintext bytes plus the AEAD tag and per-chunk nonce.
+) -> Result<usize> {
     plaintext_len
         .checked_add(tag_size)
         .and_then(|size| size.checked_add(nonce_size))
+        .ok_or_else(|| {
+            LimboError::Corrupt(format!(
+                "encrypted chunk size overflow: plaintext={plaintext_len}, tag={tag_size}, nonce={nonce_size}"
+            ))
+        })
 }
 
+/// Total on-disk size of an encrypted payload: the sum of every chunk's
+/// `plaintext_len + tag + nonce`. The last chunk may be shorter than `chunk_size`.
 fn encrypted_payload_blob_size(
     payload_size: usize,
     chunk_size: usize,
     tag_size: usize,
     nonce_size: usize,
-) -> Option<usize> {
-    // Returns the total on-disk size of an encrypted payload after splitting it
-    // into fixed-size plaintext chunks and adding tag+nonce overhead to each chunk.
+) -> Result<usize> {
     let chunk_count = encrypted_payload_chunk_count(payload_size, chunk_size);
     if chunk_count == 0 {
-        return Some(0);
+        return Ok(0);
     }
 
     let full_chunk_on_disk = encrypted_chunk_blob_size(chunk_size, tag_size, nonce_size)?;
-    let full_chunks_total = full_chunk_on_disk.checked_mul(chunk_count.saturating_sub(1))?;
+    let full_chunks_total = full_chunk_on_disk
+        .checked_mul(chunk_count.saturating_sub(1))
+        .ok_or_else(|| LimboError::Corrupt("encrypted payload total size overflow".to_string()))?;
     let last_plaintext_len =
         encrypted_chunk_plaintext_len(payload_size, chunk_count - 1, chunk_size)?;
     let last_chunk_on_disk = encrypted_chunk_blob_size(last_plaintext_len, tag_size, nonce_size)?;
-    full_chunks_total.checked_add(last_chunk_on_disk)
+    full_chunks_total
+        .checked_add(last_chunk_on_disk)
+        .ok_or_else(|| LimboError::Corrupt("encrypted payload total size overflow".to_string()))
 }
 
 fn build_encrypted_chunk_aad(
@@ -586,26 +602,24 @@ impl LogicalLog {
             if let Some(hdr) = tx.header {
                 serialize_header_entry(&mut self.encryption_scratch_buffer, &hdr);
             }
-            let payload_size = self.encryption_scratch_buffer.len() as u64;
+            let payload_size = self.encryption_scratch_buffer.len();
 
             let salt = self
                 .header
                 .as_ref()
                 .expect("log header must be set before writing")
                 .salt;
-            if let Some(total_on_disk_size) = encrypted_payload_blob_size(
-                payload_size as usize,
+            let total_on_disk_size = encrypted_payload_blob_size(
+                payload_size,
                 self.encrypted_payload_chunk_size,
                 enc_ctx.tag_size(),
                 enc_ctx.nonce_size(),
-            ) {
-                self.write_buf.reserve(total_on_disk_size);
-            }
-            let chunk_count = encrypted_payload_chunk_count(
-                payload_size as usize,
-                self.encrypted_payload_chunk_size,
-            );
+            )?;
+            self.write_buf.reserve(total_on_disk_size);
+            let chunk_count =
+                encrypted_payload_chunk_count(payload_size, self.encrypted_payload_chunk_size);
 
+            let payload_size = payload_size as u64;
             for (chunk_index, plaintext_chunk) in self
                 .encryption_scratch_buffer
                 .chunks(self.encrypted_payload_chunk_size)
@@ -1218,10 +1232,11 @@ impl StreamingLogicalLogReader {
         self.remaining_bytes() == 0
     }
 
-    /// Parse as many complete ops as possible from decrypted plaintext, starting at `start`.
+    /// Parse as many complete ops as possible from decrypted plaintext, up to `op_count` and
+    /// starting at `start`.
     /// Returns how many plaintext bytes were fully consumed into `parsed_ops`.
     fn parse_decrypted_chunk_ops(
-        buf: &[u8],
+        plaintext: &[u8],
         start: usize,
         parsed_ops: &mut Vec<ParsedOp>,
         op_count: u32,
@@ -1229,7 +1244,7 @@ impl StreamingLogicalLogReader {
     ) -> Result<usize> {
         let mut consumed = 0usize;
         while parsed_ops.len() < op_count as usize {
-            match try_parse_one_op_from_buf(&buf[start + consumed..], commit_ts)? {
+            match try_parse_one_op_from_buf(&plaintext[start + consumed..], commit_ts)? {
                 Some((op, bytes_consumed)) => {
                     consumed += bytes_consumed;
                     parsed_ops.push(op);
@@ -1283,22 +1298,13 @@ impl StreamingLogicalLogReader {
     ) -> Result<EncryptedChunkReadResult> {
         // first we gotta figure out, how many bytes to read off the disk, its either
         // `self.encrypted_payload_chunk_size` or the remainder in the last chunk
-        let plaintext_len = match encrypted_chunk_plaintext_len(
+        let plaintext_len = encrypted_chunk_plaintext_len(
             payload_ctx.payload_size,
             chunk_index,
             self.encrypted_payload_chunk_size,
-        ) {
-            Some(len) => len,
-            None => return Ok(EncryptedChunkReadResult::InvalidFrame),
-        };
-        let on_disk_size = match encrypted_chunk_blob_size(
-            plaintext_len,
-            payload_ctx.tag_size,
-            payload_ctx.nonce_size,
-        ) {
-            Some(size) => size,
-            None => return Ok(EncryptedChunkReadResult::InvalidFrame),
-        };
+        )?;
+        let on_disk_size =
+            encrypted_chunk_blob_size(plaintext_len, payload_ctx.tag_size, payload_ctx.nonce_size)?;
         let chunk_count = encrypted_payload_chunk_count(
             payload_ctx.payload_size,
             self.encrypted_payload_chunk_size,
@@ -1569,7 +1575,8 @@ impl StreamingLogicalLogReader {
             if plaintext_start < plaintext.len() {
                 // IOW we still have some bytes left over, so lets add that to carry so that
                 // in the next iteration it is parsed.
-                // it is safe to add it to carry buffer since we have already ass
+                // it is safe to add it to carry buffer since we have already asserted that it is
+                // empty
                 carry.extend_from_slice(&plaintext[plaintext_start..]);
             }
         }
@@ -2194,7 +2201,7 @@ enum ParseResult {
     InvalidFrame,
 }
 
-#[cfg_attr(test, derive(Debug))]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 enum ParsedOp {
     UpsertTable {
         table_id: MVTableId,
@@ -2225,107 +2232,6 @@ enum ParsedOp {
         commit_ts: u64,
     },
 }
-
-#[cfg(test)]
-impl PartialEq for ParsedOp {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (
-                Self::UpsertTable {
-                    table_id: left_table_id,
-                    rowid: left_rowid,
-                    record_bytes: left_record_bytes,
-                    commit_ts: left_commit_ts,
-                    btree_resident: left_btree_resident,
-                },
-                Self::UpsertTable {
-                    table_id: right_table_id,
-                    rowid: right_rowid,
-                    record_bytes: right_record_bytes,
-                    commit_ts: right_commit_ts,
-                    btree_resident: right_btree_resident,
-                },
-            ) => {
-                left_table_id == right_table_id
-                    && left_rowid == right_rowid
-                    && left_record_bytes == right_record_bytes
-                    && left_commit_ts == right_commit_ts
-                    && left_btree_resident == right_btree_resident
-            }
-            (
-                Self::DeleteTable {
-                    rowid: left_rowid,
-                    commit_ts: left_commit_ts,
-                    btree_resident: left_btree_resident,
-                },
-                Self::DeleteTable {
-                    rowid: right_rowid,
-                    commit_ts: right_commit_ts,
-                    btree_resident: right_btree_resident,
-                },
-            ) => {
-                left_rowid == right_rowid
-                    && left_commit_ts == right_commit_ts
-                    && left_btree_resident == right_btree_resident
-            }
-            (
-                Self::UpsertIndex {
-                    table_id: left_table_id,
-                    payload: left_payload,
-                    commit_ts: left_commit_ts,
-                    btree_resident: left_btree_resident,
-                },
-                Self::UpsertIndex {
-                    table_id: right_table_id,
-                    payload: right_payload,
-                    commit_ts: right_commit_ts,
-                    btree_resident: right_btree_resident,
-                },
-            ) => {
-                left_table_id == right_table_id
-                    && left_payload == right_payload
-                    && left_commit_ts == right_commit_ts
-                    && left_btree_resident == right_btree_resident
-            }
-            (
-                Self::DeleteIndex {
-                    table_id: left_table_id,
-                    payload: left_payload,
-                    commit_ts: left_commit_ts,
-                    btree_resident: left_btree_resident,
-                },
-                Self::DeleteIndex {
-                    table_id: right_table_id,
-                    payload: right_payload,
-                    commit_ts: right_commit_ts,
-                    btree_resident: right_btree_resident,
-                },
-            ) => {
-                left_table_id == right_table_id
-                    && left_payload == right_payload
-                    && left_commit_ts == right_commit_ts
-                    && left_btree_resident == right_btree_resident
-            }
-            (
-                Self::UpdateHeader {
-                    header: left_header,
-                    commit_ts: left_commit_ts,
-                },
-                Self::UpdateHeader {
-                    header: right_header,
-                    commit_ts: right_commit_ts,
-                },
-            ) => {
-                left_commit_ts == right_commit_ts
-                    && bytemuck::bytes_of(left_header) == bytemuck::bytes_of(right_header)
-            }
-            _ => false,
-        }
-    }
-}
-
-#[cfg(test)]
-impl Eq for ParsedOp {}
 
 #[cfg(test)]
 mod tests {
