@@ -9,6 +9,7 @@ repository.workspace = true
 
 [features]
 encryption = ["turso_core/encryption"]
+pure-rust-crypto = ["turso_core/pure-rust-crypto"]
 
 [lib]
 doc = false

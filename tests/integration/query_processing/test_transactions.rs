@@ -498,9 +498,13 @@ fn test_mvcc_checkpoint_works() {
         conn.execute("COMMIT").unwrap();
     }
 
-    // Before checkpoint: assert that the DB file size is exactly 4096, .db-wal size is exactly 32, and there is a nonzero size .db-log file
+    // Before checkpoint: the DB file size is no longer guaranteed to be exactly 4096,
+    // because MVCC bootstrap may already have persisted its internal metadata table.
     let db_file_size = std::fs::metadata(&tmp_db.path).unwrap().len();
-    assert!(db_file_size == 4096);
+    assert!(
+        db_file_size >= 4096 && db_file_size % 4096 == 0,
+        "db file size should be a positive multiple of 4096 bytes, but is {db_file_size}",
+    );
     let wal_file_size = std::fs::metadata(tmp_db.path.with_extension("db-wal"))
         .unwrap()
         .len();

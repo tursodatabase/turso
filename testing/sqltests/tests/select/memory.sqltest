@@ -1188,6 +1188,29 @@ test ambiguous-self-join {
 expect error {
 }
 
+# Regression test: ambiguous column error message must match SQLite format
+@cross-check-integrity
+test ambiguous-column-error-message-format {
+    CREATE TABLE test1(f1 int, f2 int);
+    INSERT INTO test1 VALUES(11,22);
+    SELECT A.f1, f1 FROM test1 AS A, test1 AS B ORDER BY f2;
+}
+expect error {
+    ambiguous column name: f1
+}
+
+# Regression test: duplicate table alias produces "ambiguous column name" not
+# "table name specified more than once" (matches SQLite behavior)
+@cross-check-integrity
+test duplicate-alias-ambiguous-column {
+    CREATE TABLE test1(f1 int, f2 int);
+    INSERT INTO test1 VALUES(11,22);
+    SELECT A.f1, f1 FROM test1 AS A, test1 AS A ORDER BY f2;
+}
+expect error {
+    ambiguous column name: A.f1
+}
+
 @cross-check-integrity
 test unambiguous-self-join {
     CREATE TABLE T(a);

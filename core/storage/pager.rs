@@ -1953,17 +1953,7 @@ impl Pager {
                 continue;
             }
             if page_id > db_size {
-                dirty_pages.remove(page_id);
-                if let Some(page) = self
-                    .page_cache
-                    .write()
-                    .get(&PageCacheKey::new(page_id as usize))?
-                {
-                    page.clear_dirty();
-                    page.try_unpin();
-                }
                 current_offset += page_size;
-                rollback_bitset.insert(page_id);
                 continue;
             }
 
@@ -1987,7 +1977,21 @@ impl Pager {
             "memory IO should complete immediately"
         );
 
-        self.page_cache.write().truncate(db_size as usize)?;
+        // Discard all dirty pages allocated after the savepoint. These pages
+        // are never subjournaled (see subjournal_page_if_required), so the loop
+        // above won't encounter them. We must clean them from dirty_pages before
+        // truncating the cache, or phantom dirty entries survive into commit.
+        {
+            let mut cache = self.page_cache.write();
+            for page_id in dirty_pages.iter().filter(|&id| id > db_size) {
+                if let Some(page) = cache.get(&PageCacheKey::new(page_id as usize))? {
+                    page.clear_dirty();
+                    page.try_unpin();
+                }
+            }
+            dirty_pages.remove_range((db_size + 1)..);
+            cache.truncate(db_size as usize)?;
+        }
 
         if let Some(wal) = &self.wal {
             wal.rollback(Some(RollbackTo {
@@ -2435,13 +2439,47 @@ impl Pager {
     /// Set the initial page size for the database. Should only be called before the database is initialized
     pub fn set_initial_page_size(&self, size: PageSize) -> Result<()> {
         turso_assert!(!self.db_initialized());
+        let IOResult::Done(mut header) = self.with_header(|header| *header)? else {
+            panic!("DB should not be initialized and should not do any IO");
+        };
+        header.page_size = size;
+
+        let page = Arc::new(Page::new(DatabaseHeader::PAGE_ID as i64));
+        {
+            let inner = page.get();
+            inner.buffer = Some(Arc::new(Buffer::new_temporary(size.get() as usize)));
+        }
+
+        page.get_contents().write_database_header(&header);
+        page.set_loaded();
+        page.clear_wal_tag();
+
+        btree_init_page(
+            &page,
+            PageType::TableLeaf,
+            DatabaseHeader::SIZE,
+            (size.get() - header.reserved_space as u32) as usize,
+        );
+
+        self.init_page_1.store(Some(page));
+        self.page_size.store(size.get(), Ordering::SeqCst);
+        // Clear dirty pages since this is pre-initialization setup, not a real write transaction.
+        // Rebuilding init_page_1 must not leak any stale 4 KiB page-1 image into the first write.
+        self.dirty_pages.write().clear();
+        Ok(())
+    }
+
+    /// Set the initial journal version in page 1 before the database is initialized.
+    pub fn set_initial_journal_version(&self, version: sqlite3_ondisk::Version) -> Result<()> {
+        turso_assert!(!self.db_initialized());
+        let raw_version = sqlite3_ondisk::RawVersion::from(version);
         let IOResult::Done(_) = self.with_header_mut(|header| {
-            header.page_size = size;
+            header.read_version = raw_version;
+            header.write_version = raw_version;
         })?
         else {
             panic!("DB should not be initialized and should not do any IO");
         };
-        self.page_size.store(size.get(), Ordering::SeqCst);
         // Clear dirty pages since this is pre-initialization setup, not a real write transaction.
         // with_header_mut marks page 1 dirty as a side effect, but no transaction is active.
         self.dirty_pages.write().clear();
@@ -2463,6 +2501,19 @@ impl Pager {
         let value = self.page_size.load(Ordering::SeqCst);
         turso_assert_ne!(value, 0);
         PageSize::new(value).expect("invalid page size stored")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_wal(&self) -> bool {
+        self.wal.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wal_shared_ptr(&self) -> Option<usize> {
+        self.wal
+            .as_ref()
+            .and_then(|wal| wal.as_any().downcast_ref::<crate::storage::wal::WalFile>())
+            .map(crate::storage::wal::WalFile::shared_ptr)
     }
 
     /// Set the page size. Used internally when page size is determined.

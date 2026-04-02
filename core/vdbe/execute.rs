@@ -1,10 +1,11 @@
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::AlterTableFunc;
+use crate::io::TempFile;
 use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
 use crate::mvcc::database::CheckpointStateMachine;
 use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
-use crate::schema::{Schema, Table, SQLITE_SEQUENCE_TABLE_NAME};
+use crate::schema::{Schema, Table, SCHEMA_TABLE_NAME, SQLITE_SEQUENCE_TABLE_NAME};
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
     integrity_check, CursorTrait, IntegrityCheckError, IntegrityCheckState, PageCategory,
@@ -23,10 +24,11 @@ use crate::types::{
 use crate::util::{
     escape_sql_string_literal, normalize_ident, rename_identifiers,
     rename_identifiers_scoped_when_clause, rewrite_check_expr_table_refs,
-    rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
-    rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
-    rewrite_trigger_cmd_column_refs, rewrite_trigger_cmd_table_refs,
-    rewrite_view_sql_for_column_rename, trim_ascii_whitespace, RewrittenView,
+    rewrite_column_level_fk_parent_columns_if_needed, rewrite_column_references_if_needed,
+    rewrite_fk_parent_cols_if_self_ref, rewrite_fk_parent_table_if_needed,
+    rewrite_inline_col_fk_target_if_needed, rewrite_trigger_cmd_column_refs,
+    rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename, trim_ascii_whitespace,
+    RewrittenView,
 };
 use crate::vdbe::affinity::{
     apply_numeric_affinity, try_for_float, Affinity, NumericParseResult, ParsedNumber,
@@ -71,7 +73,6 @@ use branches::{mark_unlikely, unlikely};
 use either::Either;
 use smallvec::SmallVec;
 use std::any::Any;
-use std::env::temp_dir;
 use std::str::FromStr;
 use std::{
     borrow::BorrowMut,
@@ -87,7 +88,7 @@ use crate::storage::btree::{BTreeCursor, BTreeKey};
 use crate::{
     storage::wal::CheckpointResult,
     types::{AggContext, Cursor, ExternalAggState, SeekKey, SeekOp, SumAggState, Value, ValueType},
-    util::{cast_real_to_integer, checked_cast_text_to_numeric, parse_schema_rows},
+    util::{cast_real_to_integer, checked_cast_text_to_numeric},
     vdbe::{
         builder::CursorType,
         insn::{IdxInsertFlags, Insn, SavepointOp},
@@ -108,7 +109,7 @@ use super::{
     CommitState,
 };
 use crate::sync::{Mutex, RwLock};
-use turso_parser::ast::{self, ForeignKeyClause, Name, ResolveType};
+use turso_parser::ast::{self, ForeignKeyClause, Name, QualifiedName, ResolveType};
 use turso_parser::parser::Parser;
 
 use super::sorter::Sorter;
@@ -1109,6 +1110,7 @@ pub fn op_open_read(
                 .clone();
             Ok(Box::new(MvCursor::new(
                 mv_store,
+                &program.connection,
                 tx_id,
                 *root_page,
                 mv_cursor_type,
@@ -3757,7 +3759,7 @@ pub fn op_program(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Program {
-            params,
+            param_registers,
             program: subprogram,
             ignore_jump_target,
         },
@@ -3766,13 +3768,24 @@ pub fn op_program(
     loop {
         match &mut state.op_program_state {
             OpProgramState::Start => {
-                let mut statement = Statement::new(
-                    Program::from_prepared(subprogram.clone(), program.connection.clone()),
-                    pager.clone(),
-                    QueryMode::Normal,
-                    0,
-                );
-                statement.reset()?;
+                // Try to reuse a cached statement for this PC, otherwise create a new one.
+                // When we have triggers or fk-actions with multi-row inserts, we can re-use
+                // cached statements by storing them key'd by the state.pc if we are in a loop
+                let pc_key = state.pc as usize;
+                let mut statement =
+                    if let Some(mut cached) = state.subprogram_stmt_cache.remove(&pc_key) {
+                        cached.reset_for_subprogram_reuse();
+                        cached
+                    } else {
+                        Box::new(Statement::new_with_origin(
+                            Program::from_prepared(subprogram.clone(), program.connection.clone()),
+                            pager.clone(),
+                            QueryMode::Normal,
+                            0,
+                            crate::statement::StatementOrigin::Subprogram,
+                            false,
+                        ))
+                    };
 
                 // Check if this is a trigger subprogram - if so, track execution
                 // and save last_insert_rowid so it can be restored after the trigger finishes.
@@ -3784,34 +3797,17 @@ pub fn op_program(
                         (false, None)
                     };
 
-                // Extract register values from params (which contain register indices encoded as negative integers)
-                // and bind them to the subprogram's parameters
-                for (param_idx, param_value) in params.iter().enumerate() {
-                    if let Value::Numeric(Numeric::Integer(reg_idx)) = param_value {
-                        let reg_idx = *reg_idx as usize;
-                        if reg_idx < state.registers.len() {
-                            let value = state.registers[reg_idx].get_value().clone();
-                            let param_index = NonZero::<usize>::new(param_idx + 1)
-                                .expect("param_idx + 1 should be non-zero");
-                            statement.bind_at(param_index, value);
-                        } else {
-                            crate::bail_corrupt_error!(
-                                "Register index {} out of bounds (len={})",
-                                reg_idx,
-                                state.registers.len()
-                            );
-                        }
-                    } else {
-                        crate::bail_parse_error!(
-                            "Subprogram parameters should be integers, got {:?}",
-                            param_value
-                        );
-                    }
+                // Copy parameter values from parent registers into the subprogram's parameters.
+                for (param_idx, &parent_reg) in param_registers.iter().enumerate() {
+                    let value = state.registers[parent_reg].get_value().clone();
+                    let param_index = NonZero::<usize>::new(param_idx + 1)
+                        .expect("param_idx + 1 should be non-zero");
+                    statement.bind_at(param_index, value);
                 }
 
                 state.op_program_state = OpProgramState::Step {
                     is_trigger,
-                    statement: Box::new(statement),
+                    statement,
                     saved_last_insert_rowid,
                 };
             }
@@ -3828,7 +3824,7 @@ pub fn op_program(
                 // so we must not call it again after the loop.
                 let mut subprogram_aborted = false;
                 loop {
-                    let res = statement.step();
+                    let res = statement.step_subprogram();
                     match res {
                         Ok(step_result) => match step_result {
                             StepResult::Done => break,
@@ -3860,7 +3856,6 @@ pub fn op_program(
                         }
                     }
                 }
-
                 // Only end trigger execution for normal completion. Error paths
                 // already called end_trigger_execution() via abort() in the subprogram.
                 if is_trigger && !subprogram_aborted {
@@ -3873,7 +3868,17 @@ pub fn op_program(
                     program.connection.update_last_rowid(rowid);
                 }
 
-                state.op_program_state = OpProgramState::Start;
+                // Cache the statement for reuse on subsequent fires of this
+                // same Program instruction (e.g. next row in an INSERT loop).
+                // Only cache on clean completion - aborted statements have dirty
+                // internal state and cannot be safely reused.
+                let pc_key = state.pc as usize;
+                let prev = std::mem::replace(&mut state.op_program_state, OpProgramState::Start);
+                if !subprogram_aborted {
+                    if let OpProgramState::Step { statement, .. } = prev {
+                        state.subprogram_stmt_cache.insert(pc_key, statement);
+                    }
+                }
                 if raise_ignore {
                     // RAISE(IGNORE) — skip the current row by jumping to ignore_jump_target
                     state.pc = ignore_jump_target.as_offset_int();
@@ -5649,7 +5654,7 @@ pub fn op_sorter_open(
         SorterOpen {
             cursor_id,
             columns: _,
-            order_and_collations,
+            order_collations_nulls,
             comparators,
         },
         insn
@@ -5670,10 +5675,14 @@ pub fn op_sorter_open(
     } else {
         (cache_size as usize) * page_size
     };
-    let (order, collations): (Vec<_>, Vec<_>) = order_and_collations
-        .iter()
-        .map(|(ord, coll)| (*ord, coll.unwrap_or_default()))
-        .unzip();
+    let mut order = Vec::with_capacity(order_collations_nulls.len());
+    let mut collations = Vec::with_capacity(order_collations_nulls.len());
+    let mut nulls_orders = Vec::with_capacity(order_collations_nulls.len());
+    for (ord, coll, nulls) in order_collations_nulls.iter() {
+        order.push(*ord);
+        collations.push(coll.unwrap_or_default());
+        nulls_orders.push(*nulls);
+    }
     let comparators = comparators
         .iter()
         .map(|c| c.as_ref().map(make_sort_comparator))
@@ -5682,6 +5691,7 @@ pub fn op_sorter_open(
     let cursor = Sorter::new(
         &order,
         collations,
+        nulls_orders,
         comparators,
         max_buffer_size_bytes,
         page_size,
@@ -6478,6 +6488,8 @@ pub fn op_function(
             | ScalarFunc::OctetLength
             | ScalarFunc::Typeof
             | ScalarFunc::Unicode
+            | ScalarFunc::Unistr
+            | ScalarFunc::UnistrQuote
             | ScalarFunc::Quote
             | ScalarFunc::RandomBlob
             | ScalarFunc::Sign
@@ -6493,7 +6505,9 @@ pub fn op_function(
                     ScalarFunc::OctetLength => Some(reg_value.exec_octet_length()),
                     ScalarFunc::Typeof => Some(reg_value.exec_typeof()),
                     ScalarFunc::Unicode => Some(reg_value.exec_unicode()),
+                    ScalarFunc::Unistr => Some(reg_value.exec_unistr()?),
                     ScalarFunc::Quote => Some(reg_value.exec_quote()),
+                    ScalarFunc::UnistrQuote => Some(reg_value.exec_unistr_quote()),
                     ScalarFunc::RandomBlob => {
                         Some(reg_value.exec_randomblob(|dest| pager.io.fill_bytes(dest))?)
                     }
@@ -7995,7 +8009,7 @@ pub fn op_function(
                                             &normalized_tbl_name,
                                             &rename_from,
                                             column_def.col_name.as_str(),
-                                        );
+                                        )?;
                                     }
                                 } else {
                                     // This is a different table, check if it has FKs referencing the renamed column
@@ -8032,7 +8046,7 @@ pub fn op_function(
                                     for col in &mut columns {
                                         let _before = fk_updated;
                                         let mut local_col = col.clone();
-                                        rewrite_column_references_if_needed(
+                                        rewrite_column_level_fk_parent_columns_if_needed(
                                             &mut local_col,
                                             &table,
                                             &rename_from,
@@ -9658,6 +9672,7 @@ pub fn op_open_write(
                     .clone();
                 Ok(Box::new(MvCursor::new(
                     mv_store,
+                    &program.connection,
                     tx_id,
                     root_page,
                     mv_cursor_type,
@@ -10119,6 +10134,7 @@ pub fn op_close(
     if let Some(deferred_seek) = state.deferred_seeks.get_mut(*cursor_id) {
         deferred_seek.take();
     }
+    state.ephemeral_temp_files.remove(cursor_id);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -10181,6 +10197,24 @@ pub fn op_page_count(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// State for the async ParseSchema instruction state machine.
+/// Stored in `ProgramState::op_parse_schema_state` so that when the inner
+/// schema query yields IO, we can return control to the outer caller and
+/// resume later without losing intermediate parsing state.
+pub struct OpParseSchemaInner {
+    stmt: crate::Statement,
+    schema_arc: Arc<Schema>,
+    from_sql_indexes: Vec<crate::util::UnparsedFromSqlIndex>,
+    automatic_indices: crate::HashMap<String, Vec<(String, i64)>>,
+    dbsp_state_roots: crate::HashMap<String, i64>,
+    dbsp_state_index_roots: crate::HashMap<String, i64>,
+    materialized_view_info: crate::HashMap<String, (String, i64)>,
+    db: usize,
+    previous_auto_commit: bool,
+}
+
+pub type OpParseSchemaState = Option<Box<OpParseSchemaInner>>;
+
 pub fn op_parse_schema(
     program: &Program,
     state: &mut ProgramState,
@@ -10190,6 +10224,12 @@ pub fn op_parse_schema(
     load_insn!(ParseSchema { db, where_clause }, insn);
 
     let conn = program.connection.clone();
+
+    // If we have in-progress state, resume stepping through schema rows.
+    if state.op_parse_schema_state.is_some() {
+        return op_parse_schema_step(state, &conn);
+    }
+
     // set auto commit to false in order for parse schema to not commit changes as transaction state is stored in connection,
     // and we use the same connection for nested query.
     let previous_auto_commit = conn.auto_commit.load(Ordering::SeqCst);
@@ -10202,21 +10242,21 @@ pub fn op_parse_schema(
             .unwrap_or_else(|| "main".to_string());
         format!("{db_name}.sqlite_schema")
     } else {
-        "sqlite_schema".to_string()
+        SCHEMA_TABLE_NAME.to_string()
     };
     let sql = if let Some(where_clause) = where_clause {
         format!("SELECT * FROM {schema_table} WHERE {where_clause}")
     } else {
         format!("SELECT * FROM {schema_table}")
     };
-    let stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_internal(sql)?;
 
     // Get a mutable schema clone *without* holding the schema lock during
     // nested statement execution.  The nested Statement may call reprepare()
     // which also acquires the schema / database_schemas write lock, so holding
     // it here would deadlock on the same thread (parking_lot RwLock is not
     // re-entrant).
-    let mut schema_arc = if crate::is_attached_db(*db) {
+    let schema_arc = if crate::is_attached_db(*db) {
         // Fetch the fallback schema from attached_databases BEFORE acquiring
         // database_schemas.write() to avoid a nested lock ordering dependency
         // (database_schemas.write -> attached_databases.read).
@@ -10228,9 +10268,8 @@ pub fn op_parse_schema(
                 .map(|(db_inst, _pager)| db_inst.schema.lock().clone())
         };
         let Some(fallback_schema) = fallback_schema else {
-            // The db index refers to a database that was detached after this
-            // program was compiled. The schema cookie check should have caught
-            // this, but defensively return an error instead of panicking.
+            conn.auto_commit
+                .store(previous_auto_commit, Ordering::SeqCst);
             return Err(LimboError::InternalError(format!(
                 "stale reference to detached database (index {db})"
             )));
@@ -10244,37 +10283,148 @@ pub fn op_parse_schema(
         conn.schema.read().clone()
     };
 
-    let schema = Arc::make_mut(&mut schema_arc);
-    // TODO: This function below is synchronous, make it async
-    let existing_views = schema.incremental_views.clone();
-    conn.start_nested();
-    let maybe_nested_stmt_err = parse_schema_rows(
+    // Set up MVCC transaction for the nested statement
+    let mv_tx = program.connection.get_mv_tx();
+    stmt.set_mv_tx(mv_tx);
+
+    // Store state for resumption across IO boundaries
+    state.op_parse_schema_state = Some(Box::new(OpParseSchemaInner {
         stmt,
-        schema,
-        &conn.syms.read(),
-        // NOTE: We always pass the main DB's mv_tx here because
-        // Statement::set_mv_tx() writes to connection.mv_tx (main DB field).
-        // Passing an attached DB's tx would corrupt the main DB's transaction
-        // state.  The nested statement's opcodes use get_mv_tx_id_for_db(db)
-        // to read the correct per-database tx, so the attached DB case works
-        // correctly without setting mv_tx.
-        program.connection.get_mv_tx(),
-        existing_views,
-    );
+        schema_arc,
+        from_sql_indexes: Vec::with_capacity(10),
+        automatic_indices: Default::default(),
+        dbsp_state_roots: Default::default(),
+        dbsp_state_index_roots: Default::default(),
+        materialized_view_info: Default::default(),
+        db: *db,
+        previous_auto_commit,
+    }));
 
-    // Store the modified schema back
-    if crate::is_attached_db(*db) {
-        conn.database_schemas().write().insert(*db, schema_arc);
-    } else {
-        *conn.schema.write() = schema_arc;
+    // Now begin stepping through the schema rows
+    op_parse_schema_step(state, &conn)
+}
+
+/// Drive the inner schema statement one step at a time.
+/// Returns IO to the outer VDBE loop when the inner statement needs it,
+/// preserving all intermediate parsing state for resumption.
+fn op_parse_schema_step(
+    state: &mut ProgramState,
+    conn: &Arc<Connection>,
+) -> Result<InsnFunctionStepResult> {
+    loop {
+        let inner = state.op_parse_schema_state.as_mut().unwrap();
+        match inner.stmt.step()? {
+            StepResult::IO => {
+                let io = inner
+                    .stmt
+                    .take_io_completions()
+                    .expect("IO returned but no completions");
+                return Ok(InsnFunctionStepResult::IO(io));
+            }
+            StepResult::Row => {
+                let inner = state
+                    .op_parse_schema_state
+                    .as_mut()
+                    .expect("parse schema state should exist");
+                let row = inner.stmt.row().expect("row should be present");
+                let ty = row.get::<&str>(0)?;
+                let name = row.get::<&str>(1)?;
+                let table_name = row.get::<&str>(2)?;
+                let root_page = row.get::<i64>(3)?;
+                let sql = row.get::<&str>(4).ok();
+                let schema = Arc::make_mut(&mut inner.schema_arc);
+                let syms = conn.syms.read();
+                schema.handle_schema_row(
+                    ty,
+                    name,
+                    table_name,
+                    root_page,
+                    sql,
+                    &syms,
+                    &mut inner.from_sql_indexes,
+                    &mut inner.automatic_indices,
+                    &mut inner.dbsp_state_roots,
+                    &mut inner.dbsp_state_index_roots,
+                    &mut inner.materialized_view_info,
+                )?;
+                continue;
+            }
+            StepResult::Done => {
+                // Take the state to finalize
+                let OpParseSchemaInner {
+                    stmt,
+                    mut schema_arc,
+                    from_sql_indexes,
+                    automatic_indices,
+                    dbsp_state_roots,
+                    dbsp_state_index_roots,
+                    materialized_view_info,
+                    db,
+                    previous_auto_commit,
+                } = *state
+                    .op_parse_schema_state
+                    .take()
+                    .expect("parse schema state should exist");
+                let schema = Arc::make_mut(&mut schema_arc);
+                let mv_store = stmt.mv_store();
+                let syms = conn.syms.read();
+
+                let res1 = schema.populate_indices(
+                    &syms,
+                    from_sql_indexes,
+                    automatic_indices,
+                    mv_store.is_some(),
+                );
+                let res2 = schema.populate_materialized_views(
+                    materialized_view_info,
+                    dbsp_state_roots,
+                    dbsp_state_index_roots,
+                );
+
+                // Store the modified schema back
+                if crate::is_attached_db(db) {
+                    conn.database_schemas().write().insert(db, schema_arc);
+                } else {
+                    *conn.schema.write() = schema_arc;
+                }
+                drop(stmt);
+                conn.auto_commit
+                    .store(previous_auto_commit, Ordering::SeqCst);
+                let _ = (res1?, res2?);
+
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+            StepResult::Interrupt => {
+                let OpParseSchemaInner {
+                    stmt,
+                    previous_auto_commit,
+                    ..
+                } = *state
+                    .op_parse_schema_state
+                    .take()
+                    .expect("parse schema state should exist");
+                drop(stmt);
+                conn.auto_commit
+                    .store(previous_auto_commit, Ordering::SeqCst);
+                return Err(LimboError::Interrupt);
+            }
+            StepResult::Busy => {
+                let OpParseSchemaInner {
+                    stmt,
+                    previous_auto_commit,
+                    ..
+                } = *state
+                    .op_parse_schema_state
+                    .take()
+                    .expect("parse schema state should exist");
+                drop(stmt);
+                conn.auto_commit
+                    .store(previous_auto_commit, Ordering::SeqCst);
+                return Err(LimboError::Busy);
+            }
+        }
     }
-    conn.end_nested();
-    conn.auto_commit
-        .store(previous_auto_commit, Ordering::SeqCst);
-    maybe_nested_stmt_err?;
-
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
 }
 
 pub fn op_init_cdc_version(
@@ -10318,8 +10468,7 @@ pub fn op_init_cdc_version(
     // Step 0: Check if the CDC table already exists but has no version row.
     // If so, it's a legacy v1 table that pre-dates version tracking.
     let cdc_table_exists = {
-        conn.start_nested();
-        let mut stmt = conn.prepare(format!(
+        let mut stmt = conn.prepare_internal(format!(
             "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='{escaped_cdc_table_name}'",
         ))?;
         stmt.program
@@ -10327,13 +10476,11 @@ pub fn op_init_cdc_version(
             .needs_stmt_subtransactions
             .store(false, Ordering::Relaxed);
         let rows = stmt.run_collect_rows();
-        conn.end_nested();
         !rows?.is_empty()
     };
 
     // Step 1: Create CDC table if needed
     {
-        conn.start_nested();
         let create_sql = match version {
             CdcVersion::V1 => format!(
                 "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
@@ -10342,29 +10489,24 @@ pub fn op_init_cdc_version(
                 "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_txn_id INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
             ),
         };
-        let mut stmt = conn.prepare(create_sql)?;
+        let mut stmt = conn.prepare_internal(create_sql)?;
         stmt.program
             .prepared
             .needs_stmt_subtransactions
             .store(false, Ordering::Relaxed);
-        let res = stmt.run_ignore_rows();
-        conn.end_nested();
-        res?;
+        stmt.run_ignore_rows()?;
     }
 
     // Step 2: Create version table if needed
     {
-        conn.start_nested();
-        let mut stmt = conn.prepare(format!(
+        let mut stmt = conn.prepare_internal(format!(
             "CREATE TABLE IF NOT EXISTS {TURSO_CDC_VERSION_TABLE_NAME} (table_name TEXT PRIMARY KEY, version TEXT NOT NULL)",
         ))?;
         stmt.program
             .prepared
             .needs_stmt_subtransactions
             .store(false, Ordering::Relaxed);
-        let res = stmt.run_ignore_rows();
-        conn.end_nested();
-        res?;
+        stmt.run_ignore_rows()?;
     }
 
     // Step 3: Insert version row only if one doesn't already exist.
@@ -10375,24 +10517,20 @@ pub fn op_init_cdc_version(
         *version
     };
     {
-        conn.start_nested();
-        let mut stmt = conn.prepare(format!(
+        let mut stmt = conn.prepare_internal(format!(
             "INSERT OR IGNORE INTO {TURSO_CDC_VERSION_TABLE_NAME} (table_name, version) VALUES ('{escaped_cdc_table_name}', '{version_to_insert}')",
         ))?;
         stmt.program
             .prepared
             .needs_stmt_subtransactions
             .store(false, Ordering::Relaxed);
-        let res = stmt.run_ignore_rows();
-        conn.end_nested();
-        res?;
+        stmt.run_ignore_rows()?;
     }
 
     // Step 4: Read back the actual version from the table (may differ from
     // `version` if the row already existed with an older version).
     let actual_version = {
-        conn.start_nested();
-        let mut stmt = conn.prepare(format!(
+        let mut stmt = conn.prepare_internal(format!(
             "SELECT version FROM {TURSO_CDC_VERSION_TABLE_NAME} WHERE table_name = '{escaped_cdc_table_name}'",
         ))?;
         stmt.program
@@ -10400,7 +10538,6 @@ pub fn op_init_cdc_version(
             .needs_stmt_subtransactions
             .store(false, Ordering::Relaxed);
         let rows = stmt.run_collect_rows();
-        conn.end_nested();
         let rows = rows?;
         match rows.first().and_then(|r| r.first()) {
             Some(crate::Value::Text(text)) => text.to_string().parse::<CdcVersion>()?,
@@ -10820,14 +10957,17 @@ pub enum OpOpenEphemeralState {
     // Slow path states for creating new ephemeral cursor
     StartingTxn {
         pager: Arc<Pager>,
+        temp_file: Option<TempFile>,
     },
     CreateBtree {
         pager: Arc<Pager>,
+        temp_file: Option<TempFile>,
     },
     // clippy complains this variant is too big when compared to the rest of the variants
     // so it says we need to box it here
     Rewind {
         cursor: Box<dyn CursorTrait>,
+        temp_file: Option<TempFile>,
     },
 }
 pub fn op_open_ephemeral(
@@ -10866,44 +11006,11 @@ pub fn op_open_ephemeral(
             ));
             let conn = program.connection.clone();
             let io = conn.pager.load().io.clone();
-            let rand_num = io.generate_random_number();
-            let db_file: Arc<dyn DatabaseStorage>;
-            let db_file_io: Arc<dyn crate::IO>;
-
-            // we support OPFS in WASM - but it require files to be pre-opened in the browser before use
-            // we can fix this if we will make open_file interface async
-            // but for now for simplicity we use MemoryIO for all intermediate calculations
-            #[cfg(target_family = "wasm")]
-            {
-                use crate::MemoryIO;
-
-                db_file_io = Arc::new(MemoryIO::new());
-                let file = db_file_io.open_file("temp-file", OpenFlags::Create, false)?;
-                db_file = Arc::new(DatabaseFile::new(file));
-            }
-            #[cfg(not(target_family = "wasm"))]
-            {
-                let temp_store = conn.get_temp_store();
-                if matches!(temp_store, crate::TempStore::Memory) {
-                    // When temp_store=memory, use in-memory storage for ephemeral tables
-                    use crate::MemoryIO;
-                    db_file_io = Arc::new(MemoryIO::new());
-                    let file = db_file_io.open_file("temp-file", OpenFlags::Create, false)?;
-                    db_file = Arc::new(DatabaseFile::new(file));
-                } else {
-                    let temp_dir = temp_dir();
-                    let rand_path = std::path::Path::new(&temp_dir)
-                        .join(format!("tursodb-ephemeral-{rand_num}"));
-                    let Some(rand_path_str) = rand_path.to_str() else {
-                        return Err(LimboError::InternalError(
-                            "Failed to convert path to string".to_string(),
-                        ));
-                    };
-                    let file = io.open_file(rand_path_str, OpenFlags::Create, false)?;
-                    db_file = Arc::new(DatabaseFile::new(file));
-                    db_file_io = io;
-                }
-            }
+            let temp_store = conn.get_temp_store();
+            let temp_file = TempFile::with_temp_store(&io, temp_store)?;
+            let db_file: Arc<dyn DatabaseStorage> =
+                Arc::new(DatabaseFile::new(temp_file.file.clone()));
+            let db_file_io: Arc<dyn crate::IO> = io;
 
             let buffer_pool = program.connection.db.buffer_pool.clone();
 
@@ -10923,7 +11030,10 @@ pub fn op_open_ephemeral(
 
             pager.set_page_size(page_size);
 
-            state.op_open_ephemeral_state = OpOpenEphemeralState::StartingTxn { pager };
+            state.op_open_ephemeral_state = OpOpenEphemeralState::StartingTxn {
+                pager,
+                temp_file: Some(temp_file),
+            };
         }
         OpOpenEphemeralState::ClearExisting => {
             tracing::trace!("ClearExisting");
@@ -10954,7 +11064,7 @@ pub fn op_open_ephemeral(
             state.pc += 1;
             state.op_open_ephemeral_state = OpOpenEphemeralState::Start;
         }
-        OpOpenEphemeralState::StartingTxn { pager } => {
+        OpOpenEphemeralState::StartingTxn { pager, temp_file } => {
             tracing::trace!("StartingTxn");
             pager
                 .begin_read_tx() // we have to begin a read tx before beginning a write
@@ -10962,9 +11072,10 @@ pub fn op_open_ephemeral(
             return_if_io!(pager.begin_write_tx());
             state.op_open_ephemeral_state = OpOpenEphemeralState::CreateBtree {
                 pager: pager.clone(),
+                temp_file: temp_file.take(),
             };
         }
-        OpOpenEphemeralState::CreateBtree { pager } => {
+        OpOpenEphemeralState::CreateBtree { pager, temp_file } => {
             tracing::trace!("CreateBtree");
             // FIXME: handle page cache is full
             let flag = if is_table {
@@ -10992,9 +11103,13 @@ pub fn op_open_ephemeral(
             };
             state.op_open_ephemeral_state = OpOpenEphemeralState::Rewind {
                 cursor: Box::new(cursor),
+                temp_file: temp_file.take(),
             };
         }
-        OpOpenEphemeralState::Rewind { cursor } => {
+        OpOpenEphemeralState::Rewind {
+            cursor,
+            temp_file: _,
+        } => {
             return_if_io!(cursor.rewind());
 
             let cursors = &mut state.cursors;
@@ -11004,11 +11119,14 @@ pub fn op_open_ephemeral(
                 .get(cursor_id)
                 .expect("cursor_id should exist in cursor_ref");
 
-            let OpOpenEphemeralState::Rewind { cursor } =
+            let OpOpenEphemeralState::Rewind { cursor, temp_file } =
                 std::mem::take(&mut state.op_open_ephemeral_state)
             else {
                 unreachable!()
             };
+
+            let tf = temp_file.expect("temp_file must be present in Rewind state");
+            state.ephemeral_temp_files.insert(cursor_id, tf);
 
             // Table content is erased if the cursor already exists
             match cursor_type {
@@ -11097,6 +11215,7 @@ pub fn op_open_dup(
                         .clone();
                     Box::new(MvCursor::new(
                         mv_store,
+                        &program.connection,
                         tx_id,
                         root_page,
                         MvccCursorType::Table,
@@ -11489,6 +11608,34 @@ pub fn op_cast(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Regenerate trigger SQL from its in-memory fields to keep trigger.sql
+/// in sync after table/column renames.
+fn regenerate_trigger_sql(trigger: &crate::schema::Trigger) -> String {
+    use crate::translate::trigger::create_trigger_to_sql;
+
+    let trigger_name = QualifiedName {
+        db_name: None,
+        name: Name::from_string(&trigger.name),
+        alias: None,
+    };
+    let tbl_name = QualifiedName {
+        db_name: None,
+        name: Name::from_string(&trigger.table_name),
+        alias: None,
+    };
+    create_trigger_to_sql(
+        trigger.temporary,
+        false, // IF NOT EXISTS is stripped from stored schema SQL
+        &trigger_name,
+        Some(trigger.time),
+        &trigger.event,
+        &tbl_name,
+        trigger.for_each_row,
+        trigger.when_clause.as_ref(),
+        &trigger.commands,
+    )
+}
+
 pub fn op_rename_table(
     program: &Program,
     state: &mut ProgramState,
@@ -11581,6 +11728,8 @@ pub fn op_rename_table(
                 if let Some(ref mut when) = trigger.when_clause {
                     rewrite_check_expr_table_refs(when, &normalized_from, &normalized_to);
                 }
+                // Regenerate trigger.sql to reflect the updated table name and body
+                trigger.sql = regenerate_trigger_sql(trigger);
             }
             schema.triggers.insert(normalized_to.to_owned(), triggers);
         }
@@ -11590,11 +11739,16 @@ pub fn op_rename_table(
         for (_, triggers) in schema.triggers.iter_mut() {
             for trigger_arc in triggers.iter_mut() {
                 let trigger = Arc::make_mut(trigger_arc);
+                let old_sql = trigger.sql.clone();
                 for cmd in &mut trigger.commands {
                     rewrite_trigger_cmd_table_refs(cmd, &normalized_from, &normalized_to);
                 }
                 if let Some(ref mut when) = trigger.when_clause {
                     rewrite_check_expr_table_refs(when, &normalized_from, &normalized_to);
+                }
+                let new_sql = regenerate_trigger_sql(trigger);
+                if new_sql != old_sql {
+                    trigger.sql = new_sql;
                 }
             }
         }
@@ -11639,7 +11793,7 @@ pub fn op_drop_column(
             .clone()
     });
 
-    conn.with_database_schema_mut(*db, |schema| {
+    conn.with_database_schema_mut(*db, |schema| -> Result<()> {
         let table = schema
             .tables
             .get_mut(&normalized_table_name)
@@ -11653,6 +11807,8 @@ pub fn op_drop_column(
 
         let btree = Arc::make_mut(btree);
         btree.columns.remove(*column_index);
+        btree.logical_to_physical_map =
+            crate::schema::BTreeTable::build_logical_to_physical_map(&btree.columns);
         // Remove column-level CHECK constraints for the dropped column
         let col_name = column_name.clone();
         btree.check_constraints.retain(|c| {
@@ -11660,7 +11816,11 @@ pub fn op_drop_column(
                 .as_ref()
                 .is_none_or(|col| normalize_ident(col) != normalize_ident(&col_name))
         });
-    });
+
+        btree.has_virtual_columns = btree.columns.iter().any(|c| c.is_virtual_generated());
+        btree.shift_generated_column_indices_after_drop(*column_index)?;
+        Ok(())
+    })?;
 
     conn.with_schema(*db, |schema| -> crate::Result<()> {
         if let Some(indexes) = schema.indexes.get(&normalized_table_name) {
@@ -11730,7 +11890,7 @@ pub fn op_add_column(
     let conn = program.connection.clone();
     let normalized_table_name = normalize_ident(table.as_str());
 
-    conn.with_database_schema_mut(*db, |schema| {
+    conn.with_database_schema_mut(*db, |schema| -> Result<()> {
         let table_ref = schema
             .tables
             .get_mut(&normalized_table_name)
@@ -11744,9 +11904,15 @@ pub fn op_add_column(
 
         let btree = Arc::make_mut(btree);
         btree.columns.push((**column).clone());
+        btree.logical_to_physical_map =
+            crate::schema::BTreeTable::build_logical_to_physical_map(&btree.columns);
         // Update CHECK constraints to include any constraints from the new column
         btree.check_constraints.clone_from(check_constraints);
-    });
+
+        // Resolve generated column expressions and update virtual column metadata
+        btree.prepare_generated_columns()?;
+        Ok(())
+    })?;
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -11815,7 +11981,7 @@ pub fn op_alter_column(
         Vec::new()
     };
 
-    conn.with_database_schema_mut(*db, |schema| {
+    conn.with_database_schema_mut(*db, |schema| -> Result<()> {
         let table_arc = schema
             .tables
             .get_mut(&normalized_table_name)
@@ -11826,19 +11992,22 @@ pub fn op_alter_column(
             panic!("only btree tables can be altered");
         };
         let btree = Arc::make_mut(btree_arc);
-        let col = btree
+        let existing_column_name = btree
             .columns
-            .get_mut(*column_index)
+            .get(*column_index)
             .expect("column being ALTERed should be in schema");
+        let existing_column_name = existing_column_name
+            .name
+            .as_ref()
+            .expect("btree column should be named")
+            .clone();
 
         // Update indexes on THIS table that name the old column (you already had this)
         if let Some(idxs) = schema.indexes.get_mut(&normalized_table_name) {
             for idx in idxs {
                 let idx = Arc::make_mut(idx);
                 for ic in &mut idx.columns {
-                    if ic.name.eq_ignore_ascii_case(
-                        col.name.as_ref().expect("btree column should be named"),
-                    ) {
+                    if ic.name.eq_ignore_ascii_case(&existing_column_name) {
                         ic.name.clone_from(&new_name);
                     }
                 }
@@ -11849,10 +12018,14 @@ pub fn op_alter_column(
             }
         }
         if *rename {
-            col.name = Some(new_name.clone());
+            btree.columns[*column_index].name = Some(new_name.clone());
         } else {
-            *col = new_column.clone();
+            btree.columns[*column_index] = new_column.clone();
         }
+
+        btree.prepare_generated_columns()?;
+        btree.logical_to_physical_map =
+            crate::schema::BTreeTable::build_logical_to_physical_map(&btree.columns);
 
         // Keep primary_key_columns consistent (names may change on rename)
         for (pk_name, _ord) in &mut btree.primary_key_columns {
@@ -11926,7 +12099,8 @@ pub fn op_alter_column(
                 }
             }
         }
-    });
+        Ok(())
+    })?;
 
     if *rename {
         let old_col = old_column_name.clone();
@@ -13375,13 +13549,13 @@ fn op_journal_mode_inner(
                         ));
                     }
                     let db_path = program.connection.get_database_canonical_path();
-                    // todo(v): pass required encryption ctx to enable encryption with mvcc
+                    let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
                     let mv_store = journal_mode::open_mv_store(
                         pager.io.clone(),
                         &db_path,
                         program.connection.db.open_flags,
                         program.connection.db.durable_storage.clone(),
-                        None,
+                        enc_ctx,
                     )?;
                     program.connection.db.mv_store.store(Some(mv_store.clone()));
                     program.connection.demote_to_mvcc_connection();
@@ -13642,6 +13816,19 @@ fn op_vacuum_into_inner(
                 if !program.connection.auto_commit.load(Ordering::SeqCst) {
                     return Err(LimboError::TxError(
                         "cannot VACUUM INTO from within a transaction".to_string(),
+                    ));
+                }
+                if program
+                    .connection
+                    .n_active_root_statements
+                    .load(Ordering::SeqCst)
+                    != 1
+                {
+                    // This VACUUM INTO statement itself is the one active root
+                    // statement. Any count other than 1 means some other
+                    // top-level statement on the same connection is still active.
+                    return Err(LimboError::TxError(
+                        "cannot VACUUM - SQL statements in progress".to_string(),
                     ));
                 }
 

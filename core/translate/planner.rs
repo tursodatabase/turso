@@ -216,8 +216,8 @@ pub fn resolve_window_and_aggregate_functions(
                 let args_count = args.len();
                 let distinctness = Distinctness::from_ast(distinctness.as_ref());
 
-                match Func::resolve_function(name.as_str(), args_count) {
-                    Ok(Func::Agg(f)) => {
+                match Func::resolve_function(name.as_str(), args_count)? {
+                    Some(Func::Agg(f)) => {
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
                                 windows.as_deref_mut(),
@@ -232,7 +232,7 @@ pub fn resolve_window_and_aggregate_functions(
                         }
                         return Ok(WalkControl::SkipChildren);
                     }
-                    Ok(Func::Window(f)) => {
+                    Some(Func::Window(f)) => {
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
                                 windows.as_deref_mut(),
@@ -246,7 +246,7 @@ pub fn resolve_window_and_aggregate_functions(
                         }
                         return Ok(WalkControl::SkipChildren);
                     }
-                    Err(e) => {
+                    None => {
                         if let Some(f) = resolver
                             .symbol_table
                             .resolve_function(name.as_str(), args_count)
@@ -273,8 +273,6 @@ pub fn resolve_window_and_aggregate_functions(
                                 }
                                 return Ok(WalkControl::SkipChildren);
                             }
-                        } else {
-                            return Err(e);
                         }
                     }
                     _ => {
@@ -289,8 +287,8 @@ pub fn resolve_window_and_aggregate_functions(
             }
             Expr::FunctionCallStar { name, filter_over } => {
                 validate_aggregate_function_tail(filter_over, &[])?;
-                match Func::resolve_function(name.as_str(), 0) {
-                    Ok(Func::Agg(f)) => {
+                match Func::resolve_function(name.as_str(), 0)? {
+                    Some(Func::Agg(f)) => {
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
                                 windows.as_deref_mut(),
@@ -311,7 +309,7 @@ pub fn resolve_window_and_aggregate_functions(
                         }
                         return Ok(WalkControl::SkipChildren);
                     }
-                    Ok(Func::Window(f)) => {
+                    Some(Func::Window(f)) => {
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
                                 windows.as_deref_mut(),
@@ -325,7 +323,7 @@ pub fn resolve_window_and_aggregate_functions(
                         }
                         return Ok(WalkControl::SkipChildren);
                     }
-                    Ok(_) => {
+                    Some(func) => {
                         if filter_over.over_clause.is_some() {
                             crate::bail_parse_error!(
                                 "{} may not be used as a window function",
@@ -334,36 +332,43 @@ pub fn resolve_window_and_aggregate_functions(
                         }
 
                         // Check if the function supports (*) syntax using centralized logic
-                        match crate::function::Func::resolve_function(name.as_str(), 0) {
-                            Ok(func) => {
-                                if func.supports_star_syntax() {
-                                    return Ok(WalkControl::Continue);
-                                } else {
-                                    crate::bail_parse_error!(
-                                        "wrong number of arguments to function {}()",
-                                        name.as_str()
-                                    );
-                                }
-                            }
-                            Err(_) => {
-                                crate::bail_parse_error!(
-                                    "wrong number of arguments to function {}()",
-                                    name.as_str()
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => match e {
-                        crate::LimboError::ParseError(e) => {
-                            crate::bail_parse_error!("{}", e);
-                        }
-                        _ => {
+                        if func.supports_star_syntax() {
+                            return Ok(WalkControl::Continue);
+                        } else {
                             crate::bail_parse_error!(
-                                "Invalid aggregate function: {}",
+                                "wrong number of arguments to function {}()",
                                 name.as_str()
                             );
                         }
-                    },
+                    }
+                    None => {
+                        if let Some(f) = resolver.symbol_table.resolve_function(name.as_str(), 0) {
+                            let func = AggFunc::External(f.func.clone().into());
+                            if let ExtFunc::Aggregate { .. } = f.as_ref().func {
+                                if let Some(over_clause) = filter_over.over_clause.as_ref() {
+                                    link_with_window(
+                                        windows.as_deref_mut(),
+                                        expr,
+                                        WindowFunctionKind::Agg(func),
+                                        over_clause,
+                                        Distinctness::NonDistinct,
+                                    )?;
+                                } else {
+                                    add_aggregate_if_not_exists(
+                                        aggs,
+                                        expr,
+                                        &[],
+                                        Distinctness::NonDistinct,
+                                        func,
+                                    )?;
+                                    contains_aggregates = true;
+                                }
+                                return Ok(WalkControl::SkipChildren);
+                            }
+                        } else {
+                            crate::bail_parse_error!("no such function: {}", name.as_str());
+                        }
+                    }
                 }
             }
             _ => {}
@@ -767,12 +772,8 @@ fn parse_from_clause_table(
             }
             let cur_table_index = table_references.joined_tables().len();
             let identifier = maybe_alias
-                .map(|a| match a {
-                    ast::As::As(id) => id,
-                    ast::As::Elided(id) => id,
-                })
-                .map(|id| normalize_ident(id.as_str()))
-                .unwrap_or_else(|| format!("subquery_{cur_table_index}"));
+                .map(|a| normalize_ident(a.name().as_str()))
+                .unwrap_or_else(|| format!("(subquery-{cur_table_index})"));
             table_references.add_joined_table(JoinedTable::new_subquery_from_plan(
                 identifier,
                 subplan,
@@ -840,11 +841,7 @@ fn parse_table(
 
         // If there's an alias provided, update the identifier to use that alias
         if let Some(a) = maybe_alias {
-            let alias = match a {
-                ast::As::As(id) => id,
-                ast::As::Elided(id) => id,
-            };
-            cte_table.identifier = normalize_ident(alias.as_str());
+            cte_table.identifier = normalize_ident(a.name().as_str());
         }
 
         // Mark the pre-planned outer_query_ref as "CTE definition only" so it is
@@ -875,12 +872,7 @@ fn parse_table(
         if let Some(cte_id) = outer_ref.cte_id {
             program.increment_cte_reference(cte_id);
         }
-        let alias = maybe_alias
-            .map(|a| match a {
-                ast::As::As(id) => id,
-                ast::As::Elided(id) => id,
-            })
-            .map(|a| normalize_ident(a.as_str()));
+        let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
         // Clone fields we need before dropping the borrow on table_references.
         let cte_select = outer_ref.cte_select.clone();
         let cte_explicit_columns = outer_ref.cte_explicit_columns.clone();
@@ -962,12 +954,7 @@ fn parse_table(
     let table = resolver.with_schema(database_id, |schema| schema.get_table(table_name.as_str()));
 
     if let Some(table) = table {
-        let alias = maybe_alias
-            .map(|a| match a {
-                ast::As::As(id) => id,
-                ast::As::Elided(id) => id,
-            })
-            .map(|a| normalize_ident(a.as_str()));
+        let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
         let internal_id = program.table_reference_counter.next();
         let tbl_ref = if let Table::Virtual(tbl) = table.as_ref() {
             transform_args_into_where_terms(args, internal_id, vtab_predicates, table.as_ref())?;
@@ -1070,10 +1057,13 @@ fn parse_table(
 
         // This is a materialized view with storage - treat it as a regular BTree table
         // Create a BTreeTable from the view's metadata
+        let columns = view_guard.column_schema.flat_columns();
+        let logical_to_physical_map =
+            crate::schema::BTreeTable::build_logical_to_physical_map(&columns);
         let btree_table = Arc::new(crate::schema::BTreeTable {
             name: view_guard.name().to_string(),
             root_page,
-            columns: view_guard.column_schema.flat_columns(),
+            columns,
             primary_key_columns: Vec::new(),
             has_rowid: true,
             is_strict: false,
@@ -1083,15 +1073,12 @@ fn parse_table(
             foreign_keys: vec![],
             check_constraints: vec![],
             rowid_alias_conflict_clause: None,
+            has_virtual_columns: false,
+            logical_to_physical_map,
         });
         drop(view_guard);
 
-        let alias = maybe_alias
-            .map(|a| match a {
-                ast::As::As(id) => id,
-                ast::As::Elided(id) => id,
-            })
-            .map(|a| normalize_ident(a.as_str()));
+        let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
 
         table_references.add_joined_table(JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
@@ -1812,27 +1799,9 @@ fn parse_join(
         crate::bail_parse_error!("NATURAL JOIN cannot be combined with ON or USING clause");
     }
 
-    // this is called once for each join, so we only need to check the rightmost table
-    // against all previous tables for duplicates
+    // SQLite allows duplicate table names/aliases in FROM clauses.
+    // Ambiguity is detected later during column resolution.
     let rightmost_table = table_references.joined_tables().last().unwrap();
-    let has_duplicate = table_references
-        .joined_tables()
-        .iter()
-        .take(table_references.joined_tables().len() - 1)
-        .any(|t| t.identifier == rightmost_table.identifier);
-
-    if has_duplicate
-        && !natural
-        && constraint
-            .as_ref()
-            .is_none_or(|c| !matches!(c, ast::JoinConstraint::Using(_)))
-    {
-        // Duplicate table names are only allowed for NATURAL or USING joins
-        crate::bail_parse_error!(
-            "table name {} specified more than once - use an alias to disambiguate",
-            rightmost_table.identifier
-        );
-    }
     let constraint = if natural {
         turso_assert_greater_than_or_equal!(table_references.joined_tables().len(), 2);
         // NATURAL JOIN is first transformed into a USING join with the common columns

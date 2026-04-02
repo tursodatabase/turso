@@ -18,12 +18,12 @@ addr  opcode         p1  p2  p3  p4               p5  comment
    3  SoftNull        3   0   0                    0
    4  Integer       100   4   0                    0  r[4]=100
    5  String8         0   5   0  hello             0  r[5]='hello'
-   6  NotNull         2   8   0                    0  r[2]!=NULL -> goto 8
-   7  Goto            0  10   0                    0
-   8  MustBeInt       2   0   0                    0
-   9  Goto            0  11   0                    0
-  10  NewRowid        0   2   0                    0  r[2]=rowid
-  11  Affinity        3   3   0                    0  r[3..6] = D, D, B
+   6  Affinity        3   3   0                    0  r[3..6] = D, D, B
+   7  NotNull         2   9   0                    0  r[2]!=NULL -> goto 9
+   8  Goto            0  11   0                    0
+   9  MustBeInt       2   0   0                    0
+  10  Goto            0  12   0                    0
+  11  NewRowid        0   2   0                    0  r[2]=rowid
   12  NotNull         4  14   0                    0  r[4]!=NULL -> goto 14
   13  Integer        42   4   0                    0  r[4]=42
   14  HaltIfNull   1299   0   4  t_defaults.val    0

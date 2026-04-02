@@ -1,7 +1,7 @@
 import { AsyncLock } from "./async-lock.js";
 import { bindParams } from "./bind.js";
 import { SqliteError } from "./sqlite-error.js";
-import { NativeDatabase, NativeStatement, STEP_IO, STEP_ROW, STEP_DONE, DatabaseOpts } from "./types.js";
+import { NativeDatabase, NativeStatement, QueryOptions, STEP_IO, STEP_ROW, STEP_DONE, DatabaseOpts } from "./types.js";
 
 const convertibleErrorTypes = { TypeError };
 const CONVERTIBLE_ERROR_PREFIX = "[TURSO_CONVERT_TYPE]";
@@ -24,6 +24,33 @@ function createErrorByName(name, message) {
   }
 
   return new ErrorConstructor(message);
+}
+
+function isQueryOptions(value) {
+  return value != null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && Object.prototype.hasOwnProperty.call(value, "queryTimeout");
+}
+
+function splitBindParameters(bindParameters) {
+  if (bindParameters.length === 0) {
+    return { params: undefined, queryOptions: undefined };
+  }
+  if (bindParameters.length > 1 && isQueryOptions(bindParameters[bindParameters.length - 1])) {
+    return {
+      params: bindParameters.length === 2 ? bindParameters[0] : bindParameters.slice(0, -1),
+      queryOptions: bindParameters[bindParameters.length - 1],
+    };
+  }
+  return { params: bindParameters.length === 1 ? bindParameters[0] : bindParameters, queryOptions: undefined };
+}
+
+function toBindArgs(params) {
+  if (params === undefined) {
+    return [];
+  }
+  return [params];
 }
 
 /**
@@ -184,12 +211,12 @@ class Database {
    *
    * @param {string} sql - The string containing SQL statements to execute
    */
-  async exec(sql) {
+  async exec(sql, queryOptions?: QueryOptions) {
     if (!this.open) {
       throw new TypeError("The database connection is not open");
     }
     await this.execLock.acquire();
-    const exec = this.db.executor(sql);
+    const exec = this.db.executor(sql, queryOptions);
     try {
       while (true) {
         const stepResult = exec.stepSync();
@@ -362,8 +389,10 @@ class Statement {
    */
   async run(...bindParameters) {
     let stmt = await this.stmt.resolve();
+    const { params, queryOptions } = splitBindParameters(bindParameters);
 
-    bindParams(stmt, bindParameters);
+    stmt.setQueryTimeout(queryOptions);
+    bindParams(stmt, toBindArgs(params));
 
     const totalChangesBefore = this.db.totalChanges();
     await this.execLock.acquire();
@@ -400,8 +429,10 @@ class Statement {
    */
   async get(...bindParameters) {
     let stmt = await this.stmt.resolve();
+    const { params, queryOptions } = splitBindParameters(bindParameters);
 
-    bindParams(stmt, bindParameters);
+    stmt.setQueryTimeout(queryOptions);
+    bindParams(stmt, toBindArgs(params));
 
     await this.execLock.acquire();
     let row = undefined;
@@ -434,8 +465,10 @@ class Statement {
    */
   async *iterate(...bindParameters) {
     let stmt = await this.stmt.resolve();
+    const { params, queryOptions } = splitBindParameters(bindParameters);
 
-    bindParams(stmt, bindParameters);
+    stmt.setQueryTimeout(queryOptions);
+    bindParams(stmt, toBindArgs(params));
 
     await this.execLock.acquire();
     try {
@@ -465,8 +498,10 @@ class Statement {
    */
   async all(...bindParameters) {
     let stmt = await this.stmt.resolve();
+    const { params, queryOptions } = splitBindParameters(bindParameters);
 
-    bindParams(stmt, bindParameters);
+    stmt.setQueryTimeout(queryOptions);
+    bindParams(stmt, toBindArgs(params));
     const rows: any[] = [];
 
     await this.execLock.acquire();

@@ -544,8 +544,8 @@ pub enum Insn {
     TypeCheck {
         start_reg: usize, // P1
         count: usize,     // P2
-        /// GENERATED ALWAYS AS ... STATIC columns are only checked if P3 is zero.
-        /// When P3 is non-zero, no type checking occurs for static generated columns.
+        /// GENERATED ALWAYS AS ... STORED columns are only checked if P3 is zero.
+        /// When P3 is non-zero, no type checking occurs for stored generated columns.
         check_generated: bool, // P3
         table_reference: Arc<BTreeTable>, // P4
     },
@@ -730,7 +730,10 @@ pub enum Insn {
     /// subprogram, so subprograms can be reentrant and recursive. The Param opcode
     /// is used by subprograms to access content in registers of the calling bytecode program."
     Program {
-        params: Vec<Value>,
+        /// Parent register indices for each parameter the subprogram reads.
+        /// At runtime, values are copied from these parent registers into
+        /// the child statement's parameters via bind_at.
+        param_registers: Vec<usize>,
         program: Arc<PreparedProgram>,
         /// Jump target when RAISE(IGNORE) fires in the subprogram.
         /// Points to the "skip this row" address in the parent program.
@@ -929,8 +932,12 @@ pub enum Insn {
     SorterOpen {
         cursor_id: CursorID, // P1
         columns: usize,      // P2
-        /// Combined order and collation per column (keeps Insn small, and order+collations are always the same length).
-        order_and_collations: Vec<(SortOrder, Option<CollationSeq>)>,
+        /// Combined order, collation, and nulls ordering per column.
+        order_collations_nulls: Vec<(
+            SortOrder,
+            Option<CollationSeq>,
+            Option<turso_parser::ast::NullsOrder>,
+        )>,
         /// Per-column custom type comparators for ORDER BY sorting.
         /// When present, the comparator is used instead of standard value comparison.
         comparators: Vec<Option<SortComparatorType>>,

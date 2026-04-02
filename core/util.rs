@@ -1784,10 +1784,7 @@ pub fn extract_view_columns(
                     tables.push(ViewTable {
                         name: table_name,
                         db_name,
-                        alias: alias.as_ref().map(|a| match a {
-                            ast::As::As(name) => normalize_ident(name.as_str()),
-                            ast::As::Elided(name) => normalize_ident(name.as_str()),
-                        }),
+                        alias: alias.as_ref().map(|a| normalize_ident(a.name().as_str())),
                     });
                 }
                 _ => {
@@ -1807,10 +1804,7 @@ pub fn extract_view_columns(
                         tables.push(ViewTable {
                             name: table_name,
                             db_name,
-                            alias: alias.as_ref().map(|a| match a {
-                                ast::As::As(name) => normalize_ident(name.as_str()),
-                                ast::As::Elided(name) => normalize_ident(name.as_str()),
-                            }),
+                            alias: alias.as_ref().map(|a| normalize_ident(a.name().as_str())),
                         });
                     }
                     _ => {
@@ -1852,10 +1846,10 @@ pub fn extract_view_columns(
 
                     let col_name = alias
                         .as_ref()
-                        .map(|a| match a {
-                            ast::As::Elided(name) => name.as_str().to_string(),
-                            ast::As::As(name) => name.as_str().to_string(),
-                        })
+                        // ImplicitColumnName is only for display; skip it
+                        // so we derive the proper column name below.
+                        .filter(|a| !matches!(a, ast::As::ImplicitColumnName(_)))
+                        .map(|a| a.name().as_str().to_string())
                         .or_else(|| extract_column_name_from_expr(expr))
                         .unwrap_or_else(|| {
                             // If we can't extract a simple column name, use the expression itself
@@ -2305,9 +2299,7 @@ mod rename_column_view {
     }
 
     fn alias_name(alias: &ast::As) -> &str {
-        match alias {
-            ast::As::As(name) | ast::As::Elided(name) => name.as_str(),
-        }
+        alias.name().as_str()
     }
 
     #[derive(Clone)]
@@ -3197,7 +3189,7 @@ pub fn rewrite_column_references_if_needed(
     table: &str,
     from: &str,
     to: &str,
-) {
+) -> Result<()> {
     for cc in &mut col.constraints {
         match &mut cc.constraint {
             ast::ColumnConstraint::ForeignKey { clause, .. } => {
@@ -3206,7 +3198,27 @@ pub fn rewrite_column_references_if_needed(
             ast::ColumnConstraint::Check(expr) => {
                 rename_identifiers(expr, from, to);
             }
+            ast::ColumnConstraint::Generated { expr, .. } => {
+                rename_identifiers(expr, from, to);
+            }
             _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// For a column definition like `parent_id REFERENCES parent(old_col)`, update
+/// the referenced parent column names when another table renames
+/// `old_col -> new_col`.
+pub fn rewrite_column_level_fk_parent_columns_if_needed(
+    col: &mut ast::ColumnDefinition,
+    table: &str,
+    from: &str,
+    to: &str,
+) {
+    for cc in &mut col.constraints {
+        if let ast::ColumnConstraint::ForeignKey { clause, .. } = &mut cc.constraint {
+            rewrite_fk_parent_cols_if_self_ref(clause, table, from, to);
         }
     }
 }

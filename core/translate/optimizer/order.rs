@@ -40,6 +40,7 @@ pub struct ColumnOrder {
     pub target: ColumnTarget,
     pub order: SortOrder,
     pub collation: CollationSeq,
+    pub nulls_order: Option<ast::NullsOrder>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -85,7 +86,7 @@ impl OrderTarget {
     /// Build an `OrderTarget` from a list of expressions if they can all be
     /// satisfied by a single-table ordering (needed for index satisfaction).
     fn maybe_from_iterator<'a>(
-        list: impl Iterator<Item = (&'a ast::Expr, SortOrder)> + Clone,
+        list: impl Iterator<Item = (&'a ast::Expr, SortOrder, Option<ast::NullsOrder>)> + Clone,
         tables: &crate::translate::plan::TableReferences,
         purpose: OrderTargetPurpose,
     ) -> Option<Self> {
@@ -93,8 +94,8 @@ impl OrderTarget {
             return None;
         }
         let mut cols = Vec::new();
-        for (expr, order) in list {
-            let col = expr_to_column_order(expr, order, tables)?;
+        for (expr, order, nulls) in list {
+            let col = expr_to_column_order(expr, order, nulls, tables)?;
             cols.push(col);
         }
         Some(OrderTarget {
@@ -118,7 +119,7 @@ pub fn simple_aggregate_order_target(
     };
 
     let mut target = OrderTarget::maybe_from_iterator(
-        std::iter::once((&min_max.argument, min_max.order)),
+        std::iter::once((&min_max.argument, min_max.order, None)),
         tables,
         OrderTargetPurpose::Extremum,
     )?;
@@ -136,7 +137,7 @@ pub fn simple_aggregate_order_target(
 /// TODO: this does not currently handle the case where we definitely cannot eliminate
 /// the ORDER BY sorter, but we could still eliminate the GROUP BY sorter.
 pub fn compute_order_target(
-    order_by: &mut Vec<(Box<ast::Expr>, SortOrder)>,
+    order_by: &mut Vec<(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)>,
     group_by_opt: Option<&mut GroupBy>,
     tables: &TableReferences,
 ) -> Option<OrderTarget> {
@@ -145,13 +146,18 @@ pub fn compute_order_target(
         (true, None) => None,
         // Only ORDER BY - we would like the joined result rows to be in the order specified by the ORDER BY
         (false, None) => OrderTarget::maybe_from_iterator(
-            order_by.iter().map(|(expr, order)| (expr.as_ref(), *order)),
+            order_by
+                .iter()
+                .map(|(expr, order, nulls)| (expr.as_ref(), *order, *nulls)),
             tables,
             OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
         ),
         // Only GROUP BY - we would like the joined result rows to be in the order specified by the GROUP BY
         (true, Some(group_by)) => OrderTarget::maybe_from_iterator(
-            group_by.exprs.iter().map(|expr| (expr, SortOrder::Asc)),
+            group_by
+                .exprs
+                .iter()
+                .map(|expr| (expr, SortOrder::Asc, None)),
             tables,
             OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Group),
         ),
@@ -166,7 +172,7 @@ pub fn compute_order_target(
         // however in this case we must take the ASC/DESC from ORDER BY into account.
         (false, Some(group_by)) => {
             // Does the group by contain all expressions in the order by?
-            let group_by_contains_all = order_by.iter().all(|(expr, _)| {
+            let group_by_contains_all = order_by.iter().all(|(expr, _, _)| {
                 group_by
                     .exprs
                     .iter()
@@ -175,7 +181,10 @@ pub fn compute_order_target(
             // If not, let's try to target an ordering that matches the group by -- we don't care about ASC/DESC
             if !group_by_contains_all {
                 return OrderTarget::maybe_from_iterator(
-                    group_by.exprs.iter().map(|expr| (expr, SortOrder::Asc)),
+                    group_by
+                        .exprs
+                        .iter()
+                        .map(|expr| (expr, SortOrder::Asc, None)),
                     tables,
                     OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Group),
                 );
@@ -185,24 +194,26 @@ pub fn compute_order_target(
             group_by.exprs.sort_by_key(|expr| {
                 order_by
                     .iter()
-                    .position(|(order_by_expr, _)| exprs_are_equivalent(expr, order_by_expr))
+                    .position(|(order_by_expr, _, _)| exprs_are_equivalent(expr, order_by_expr))
                     .map_or(usize::MAX, |i| i)
             });
 
             // Now, regardless of whether we can eventually eliminate the sorting entirely in the optimizer,
             // we know that we don't need ORDER BY sorting anyway, because the GROUP BY will sort the result since
             // it contains all the necessary columns required for the ORDER BY, and the GROUP BY columns are now in the correct order.
-            // First, however, we need to make sure the GROUP BY sorter's column sort directions match the ORDER BY requirements.
+            // First, however, we need to make sure the GROUP BY sorter's column sort directions and NULLS
+            // ordering match the ORDER BY requirements.
             turso_assert_greater_than_or_equal!(group_by.exprs.len(), order_by.len());
-            let sort_order = &mut group_by.sort_order;
-            for (i, (_, order_by_dir)) in order_by.iter().enumerate() {
-                sort_order[i] = *order_by_dir;
+            for (i, (_, order_by_dir, order_by_nulls)) in order_by.iter().enumerate() {
+                group_by.sort_order[i] = *order_by_dir;
+                group_by.nulls_order[i] = *order_by_nulls;
             }
             // The sort_by_key above reordered group_by.exprs but not sort_order,
             // so remaining positions may have stale values. GROUP BY columns not
             // in ORDER BY should default to ASC (matching SQLite's tie-breaking).
-            for s in &mut sort_order[order_by.len()..] {
-                *s = SortOrder::Asc;
+            for i in order_by.len()..group_by.sort_order.len() {
+                group_by.sort_order[i] = SortOrder::Asc;
+                group_by.nulls_order[i] = None;
             }
             // Now we can remove the ORDER BY from the query.
             order_by.clear();
@@ -212,7 +223,8 @@ pub fn compute_order_target(
                     .exprs
                     .iter()
                     .zip(group_by.sort_order.iter())
-                    .map(|(expr, dir)| (expr, *dir)),
+                    .zip(group_by.nulls_order.iter())
+                    .map(|((expr, dir), nulls)| (expr, *dir, *nulls)),
                 tables,
                 OrderTargetPurpose::EliminatesSort(EliminatesSortBy::GroupByAndOrder),
             )
@@ -446,7 +458,7 @@ pub fn subquery_intrinsic_order_consumed(
             select_plan
                 .order_by
                 .iter()
-                .map(|(expr, order)| (expr.as_ref(), *order)),
+                .map(|(expr, order, nulls)| (expr.as_ref(), *order, *nulls)),
         );
         return match_intrinsic_order(&intrinsic, iter_dir, target);
     }
@@ -459,7 +471,9 @@ pub fn subquery_intrinsic_order_consumed(
             group_by
                 .exprs
                 .iter()
-                .zip(group_by.sort_order.iter().copied()),
+                .zip(group_by.sort_order.iter().copied())
+                .zip(group_by.nulls_order.iter().copied())
+                .map(|((expr, order), nulls)| (expr, order, nulls)),
         );
         let consumed = match_intrinsic_order(&intrinsic, iter_dir, target);
         if consumed > 0 {
@@ -474,10 +488,16 @@ pub fn subquery_intrinsic_order_consumed(
 fn build_intrinsic_order(
     table_id: TableInternalId,
     select_plan: &crate::translate::plan::SelectPlan,
-    exprs: impl Iterator<Item = (impl std::borrow::Borrow<ast::Expr>, SortOrder)>,
+    exprs: impl Iterator<
+        Item = (
+            impl std::borrow::Borrow<ast::Expr>,
+            SortOrder,
+            Option<ast::NullsOrder>,
+        ),
+    >,
 ) -> Vec<ColumnOrder> {
     let mut intrinsic = Vec::new();
-    for (expr, order) in exprs {
+    for (expr, order, nulls) in exprs {
         let expr = expr.borrow();
         let Some((col_idx, result_col)) = select_plan
             .result_columns
@@ -500,6 +520,7 @@ fn build_intrinsic_order(
                     .flatten()
                     .unwrap_or_default()
             }),
+            nulls_order: nulls,
         });
     }
     intrinsic
@@ -530,6 +551,19 @@ fn match_intrinsic_order(
         };
         if expected_order != target_col.order {
             return 0;
+        }
+        // If the target requests an explicit NULLS ordering, the intrinsic
+        // order must provide the same. When the intrinsic order has no explicit
+        // NULLS (None), it follows the default (ASC → NULLS FIRST,
+        // DESC → NULLS LAST), so only a matching explicit request is compatible.
+        if let Some(target_nulls) = target_col.nulls_order {
+            let intrinsic_nulls = intrinsic_col.nulls_order.unwrap_or(match expected_order {
+                SortOrder::Asc => ast::NullsOrder::First,
+                SortOrder::Desc => ast::NullsOrder::Last,
+            });
+            if intrinsic_nulls != target_nulls {
+                return 0;
+            }
         }
     }
     target_len
@@ -601,6 +635,7 @@ fn finalized_scan_subquery_order_consumed(
         let Some(mut inner_target_col) = expr_to_column_order(
             &result_col.expr,
             target_col.order,
+            target_col.nulls_order,
             &select_plan.table_references,
         ) else {
             return 0;
@@ -643,6 +678,7 @@ fn finalized_scan_subquery_order_consumed(
 fn expr_to_column_order(
     expr: &ast::Expr,
     order: SortOrder,
+    nulls_order: Option<ast::NullsOrder>,
     tables: &TableReferences,
 ) -> Option<ColumnOrder> {
     match expr {
@@ -658,6 +694,7 @@ fn expr_to_column_order(
                 target: ColumnTarget::Column(*column),
                 order,
                 collation: col.collation(),
+                nulls_order,
             });
         }
         ast::Expr::Collate(expr, collation) => {
@@ -673,6 +710,7 @@ fn expr_to_column_order(
                     target: ColumnTarget::Column(*column),
                     order,
                     collation,
+                    nulls_order,
                 });
             };
         }
@@ -682,6 +720,7 @@ fn expr_to_column_order(
                 target: ColumnTarget::RowId,
                 order,
                 collation: CollationSeq::default(),
+                nulls_order,
             });
         }
         _ => {}
@@ -704,6 +743,7 @@ fn expr_to_column_order(
         target: ColumnTarget::Expr(expr as *const ast::Expr),
         order,
         collation,
+        nulls_order,
     })
 }
 
@@ -843,14 +883,30 @@ pub(super) fn btree_access_order_consumed(
                     break;
                 }
 
-                let correct_order = if iter_dir == IterationDirection::Forwards {
+                let correct_order_for_direction = if iter_dir == IterationDirection::Forwards {
                     target_col.order == idx_col.order
                 } else {
                     target_col.order != idx_col.order
                 };
-                if !correct_order {
+                if !correct_order_for_direction {
                     break;
                 }
+
+                // An index scan delivers NULLs in a fixed position:
+                //   Forward scan  → NULLs first  (B-tree stores NULLs at start)
+                //   Reverse scan  → NULLs last
+                // If the query explicitly requests a different NULLS order,
+                // the index cannot satisfy it and we must fall back to a sorter.
+                if let Some(requested_nulls) = target_col.nulls_order {
+                    let default_nulls = match target_col.order {
+                        SortOrder::Asc => ast::NullsOrder::First,
+                        SortOrder::Desc => ast::NullsOrder::Last,
+                    };
+                    if requested_nulls != default_nulls {
+                        break;
+                    }
+                }
+
                 col_idx += 1;
                 idx_pos += 1;
             }

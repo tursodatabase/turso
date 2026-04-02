@@ -7,6 +7,7 @@
 
 *.so
 *.dylib
+*.dSYM/
 *.ipynb
 *.o
 *.sqlite
@@ -33,6 +34,7 @@ dist/
 perf/mobibench/plot/results.csv
 perf/mobibench/plot/mobibench.pdf
 perf/mobibench/plot/uv.lock
+
 # OS
 .DS_Store
 
@@ -75,3 +77,4 @@ custom-types-fuzzer-output/
 CLAUDE.md
 bindings/python/dev.py
 bindings/python/implementation-test/
+dhat-heap.json

@@ -25,6 +25,10 @@ This document is a quick helper to get you going.
   - [Fault injection with unreliable libc](#fault-injection-with-unreliable-libc)
   - [Antithesis](#antithesis)
   - [Adding Third Party Dependencies](#adding-third-party-dependencies)
+  - [Making Releases](#making-releases)
+    - [Pre-releases](#pre-releases)
+    - [Releases](#releases)
+    - [Cleaning up PyPI Storage](#cleaning-up-pypi-storage)
 <!--toc:end-->
 
 ## Getting Started
@@ -404,3 +408,47 @@ When you want to add third party dependencies, please follow these steps:
 
 By following these steps, you ensure that all third-party dependencies are properly documented and their licenses are
 included in the project.
+
+## Making Releases
+
+Releases are made using the `scripts/update-version.py` script, which updates version numbers across all `Cargo.toml`, `package.json`, `package-lock.json`, and `gradle.properties` files in the workspace, creates a git commit, and adds a version tag.
+
+The process is:
+
+1. Run the version update script with the desired version number.
+2. Push the commit and tag to the remote.
+
+### Pre-releases
+
+Pre-releases use a version suffix such as `-pre.N`:
+
+```console
+./scripts/update-version.py 0.6.0-pre.9
+git push origin main v0.6.0-pre.9
+```
+
+### Releases
+
+Releases use a plain version number:
+
+```console
+./scripts/update-version.py 0.6.0
+git push origin main v0.6.0
+```
+
+## Cleaning up PyPI Storage
+
+PyPI has a storage quota for the `pyturso` package. If you run out of storage, you need to delete old release candidate (RC) packages to free up space.
+
+Use the `scripts/pypi-cleanup` script to manage this:
+
+```console
+# Dry run — lists RC packages older than 90 days (safe, no changes made)
+./scripts/pypi-cleanup
+
+# Actually delete the packages
+./scripts/pypi-cleanup --execute
+```
+
+Always run the dry run first to review what will be deleted before executing.
+

@@ -1,6 +1,5 @@
 use crate::sync::Arc;
 
-use crate::ast;
 use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
 use crate::schema::{
@@ -28,6 +27,7 @@ use crate::Connection;
 use crate::{bail_parse_error, CaptureDataChangesExt, Result};
 
 use turso_ext::VTabKind;
+use turso_parser::ast;
 use turso_parser::ast::ColumnDefinition;
 
 /// Validate a CHECK constraint expression at CREATE TABLE / ALTER TABLE ADD COLUMN time.
@@ -78,7 +78,7 @@ pub(crate) fn validate_check_expr(
                 if filter_over.over_clause.is_some() {
                     bail_parse_error!("misuse of window function {}()", name.as_str());
                 }
-                if let Some(func) = resolver.resolve_function(name.as_str(), args.len()) {
+                if let Some(func) = resolver.resolve_function(name.as_str(), args.len())? {
                     if matches!(func, Func::Agg(..)) {
                         bail_parse_error!("misuse of aggregate function {}()", name.as_str());
                     }
@@ -93,7 +93,7 @@ pub(crate) fn validate_check_expr(
                 if filter_over.over_clause.is_some() {
                     bail_parse_error!("misuse of window function {}()", name.as_str());
                 }
-                if let Some(func) = resolver.resolve_function(name.as_str(), 0) {
+                if let Some(func) = resolver.resolve_function(name.as_str(), 0)? {
                     if matches!(func, Func::Agg(..)) {
                         bail_parse_error!("misuse of aggregate function {}()", name.as_str());
                     }
@@ -339,7 +339,7 @@ fn resolve_check_expr_type(
         }
         ast::Expr::NotNull(_) | ast::Expr::IsNull(_) => Ok(CheckExprType::Integer),
         ast::Expr::FunctionCall { name, args, .. } => {
-            if let Some(func) = resolver.resolve_function(name.as_str(), args.len()) {
+            if let Some(func) = resolver.resolve_function(name.as_str(), args.len())? {
                 resolve_func_return_type(&func, name.as_str(), args, columns, resolver)
             } else {
                 bail_parse_error!(
@@ -351,7 +351,7 @@ fn resolve_check_expr_type(
             }
         }
         ast::Expr::FunctionCallStar { name, .. } => {
-            if let Some(func) = resolver.resolve_function(name.as_str(), 0) {
+            if let Some(func) = resolver.resolve_function(name.as_str(), 0)? {
                 resolve_func_return_type(&func, name.as_str(), &[], columns, resolver)
             } else {
                 bail_parse_error!(
@@ -714,7 +714,12 @@ fn validate_check_types_in_expr(
     Ok(())
 }
 
-fn validate(body: &ast::CreateTableBody, table_name: &str, resolver: &Resolver) -> Result<()> {
+fn validate(
+    body: &ast::CreateTableBody,
+    table_name: &str,
+    resolver: &Resolver,
+    conn: &Connection,
+) -> Result<()> {
     if let ast::CreateTableBody::ColumnsAndConstraints {
         options,
         columns,
@@ -732,8 +737,12 @@ fn validate(body: &ast::CreateTableBody, table_name: &str, resolver: &Resolver) 
                     ast::ColumnConstraint::Check(expr) => {
                         validate_check_expr(expr, table_name, &column_names, resolver)?;
                     }
-                    ast::ColumnConstraint::Generated { .. } => {
-                        bail_parse_error!("GENERATED columns are not supported yet");
+                    ast::ColumnConstraint::Generated { .. }
+                        if !conn.experimental_generated_columns_enabled() =>
+                    {
+                        bail_parse_error!(
+                            "Generated columns require --experimental-generated-columns flag"
+                        );
                     }
                     ast::ColumnConstraint::Default(expr) => {
                         let expr =
@@ -860,7 +869,7 @@ pub fn translate_create_table(
     if temporary {
         bail_parse_error!("TEMPORARY table not supported yet");
     }
-    validate(&body, &normalized_tbl_name, resolver)?;
+    validate(&body, &normalized_tbl_name, resolver, connection)?;
 
     // Gate array column types behind the experimental custom types flag.
     if !connection.experimental_custom_types_enabled() {
@@ -1659,26 +1668,30 @@ pub fn translate_drop_table(
         // cursor id 1
         let sqlite_schema_cursor_id_1 =
             program.alloc_cursor_id(CursorType::BTreeTable(schema_table.clone()));
+        let columns = vec![Column::new(
+            Some("rowid".to_string()),
+            "INTEGER".to_string(),
+            None,
+            None,
+            Type::Integer,
+            None,
+            ColDef::default(),
+        )];
+        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let simple_table_rc = Arc::new(BTreeTable {
             root_page: 0, // Not relevant for ephemeral table definition
             name: "ephemeral_scratch".to_string(),
             has_rowid: true,
             has_autoincrement: false,
             primary_key_columns: vec![],
-            columns: vec![Column::new(
-                Some("rowid".to_string()),
-                "INTEGER".to_string(),
-                None,
-                None,
-                Type::Integer,
-                None,
-                ColDef::default(),
-            )],
+            columns,
             is_strict: false,
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
             rowid_alias_conflict_clause: None,
+            has_virtual_columns: false,
+            logical_to_physical_map,
         });
         // cursor id 2
         let ephemeral_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(simple_table_rc));
@@ -1822,7 +1835,7 @@ pub fn translate_drop_table(
         let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
         let seq_table_name_reg = program.alloc_register();
         let dropped_table_name_reg =
-            program.emit_string8_new_reg(tbl_name.name.as_str().to_string());
+            program.emit_string8_new_reg(normalize_ident(tbl_name.name.as_str()));
         program.mark_last_insn_constant();
 
         program.emit_insn(Insn::OpenWrite {
@@ -1875,7 +1888,8 @@ pub fn translate_drop_table(
     {
         let ver_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(version_table.clone()));
         let ver_table_name_reg = program.alloc_register();
-        let dropped_name_reg = program.emit_string8_new_reg(tbl_name.name.as_str().to_string());
+        let dropped_name_reg =
+            program.emit_string8_new_reg(normalize_ident(tbl_name.name.as_str()));
         program.mark_last_insn_constant();
 
         program.emit_insn(Insn::OpenWrite {
@@ -1956,7 +1970,7 @@ fn validate_type_expr(expr: &ast::Expr, kind: &str, resolver: &Resolver) -> Resu
                 if filter_over.over_clause.is_some() {
                     bail_parse_error!("window functions prohibited in {kind} expressions");
                 }
-                if let Some(func) = resolver.resolve_function(name.as_str(), args.len()) {
+                if let Some(func) = resolver.resolve_function(name.as_str(), args.len())? {
                     if matches!(func, Func::Agg(..)) {
                         bail_parse_error!(
                             "aggregate functions prohibited in {kind} expressions: {}",

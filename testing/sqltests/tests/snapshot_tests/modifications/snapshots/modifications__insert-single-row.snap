@@ -25,12 +25,12 @@ addr  opcode         p1  p2  p3  p4              p5  comment
    6  Integer       100   6   0                   0  r[6]=100
    7  String8         0   7   0  Electronics      0  r[7]='Electronics'
    8  OpenWrite       0  11   0                   0  root=11; iDb=0
-   9  NotNull         2  11   0                   0  r[2]!=NULL -> goto 11
-  10  Goto            0  13   0                   0
-  11  MustBeInt       2   0   0                   0
-  12  Goto            0  14   0                   0
-  13  NewRowid        1   2   0                   0  r[2]=rowid
-  14  Affinity        3   5   0                   0  r[3..8] = D, B, E, D, B
+   9  Affinity        3   5   0                   0  r[3..8] = D, B, E, D, B
+  10  NotNull         2  12   0                   0  r[2]!=NULL -> goto 12
+  11  Goto            0  14   0                   0
+  12  MustBeInt       2   0   0                   0
+  13  Goto            0  15   0                   0
+  14  NewRowid        1   2   0                   0  r[2]=rowid
   15  HaltIfNull   1299   0   4  products.name    0
   16  HaltIfNull   1299   0   5  products.price   0
   17  NotExists       1  19   2                   0

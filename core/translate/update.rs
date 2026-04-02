@@ -1,7 +1,7 @@
 use crate::sync::Arc;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use crate::schema::ROWID_SENTINEL;
+use crate::schema::{columns_affected_by_update, ROWID_SENTINEL};
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
 use crate::translate::expression_index::expression_index_column_usage;
@@ -314,7 +314,11 @@ pub fn prepare_update_plan(
             let ident = normalize_ident(col_name.as_str());
 
             let col_index = match column_lookup.get(&ident) {
-                Some(idx) => *idx,
+                Some(idx) => {
+                    // cannot update generated columns directly
+                    table.columns()[*idx].ensure_not_generated("UPDATE", col_name.as_str())?;
+                    *idx
+                }
                 None => {
                     // Check if this is the 'rowid' keyword
                     if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&ident)) {
@@ -410,7 +414,7 @@ pub fn prepare_update_plan(
                 resolver,
                 BindingBehavior::ResultColumnsNotAllowed,
             );
-            (o.expr.clone(), o.order.unwrap_or(SortOrder::Asc))
+            (o.expr.clone(), o.order.unwrap_or(SortOrder::Asc), o.nulls)
         })
         .collect();
 
@@ -434,61 +438,76 @@ pub fn prepare_update_plan(
         .limit
         .map_or(Ok((None, None)), |l| parse_limit(l, resolver))?;
 
-    // Check what indexes will need to be updated by checking set_clauses and see
-    // if a column is contained in an index.
+    // Determine which indexes need updating
     let indexes: Vec<_> = resolver.with_schema(database_id, |s| {
         s.get_indices(table_name).cloned().collect()
     });
-    let updated_cols: HashSet<usize> = set_clauses.iter().map(|(i, _)| *i).collect();
-    let rowid_alias_used = set_clauses
-        .iter()
-        .any(|(idx, _)| *idx == ROWID_SENTINEL || columns[*idx].is_rowid_alias());
     let target_table_ref = table_references
         .joined_tables()
         .first()
         .expect("UPDATE must have a target table reference");
-    let indexes_to_update = if rowid_alias_used {
-        // If the rowid alias is used in the SET clause, we need to update all indexes
-        indexes
-    } else {
-        // otherwise we need to update the indexes whose columns are set in the SET clause,
-        // or if the columns used in the partial index WHERE clause are being updated.
-        let mut indexes_to_update = Vec::new();
-        for idx in indexes {
-            let mut needs = false;
-            for col in idx.columns.iter() {
-                if let Some(expr) = col.expr.as_ref() {
-                    let cols_used =
-                        expression_index_column_usage(expr.as_ref(), target_table_ref, resolver)?;
-                    if cols_used.iter().any(|cidx| updated_cols.contains(&cidx)) {
-                        needs = true;
-                        break;
-                    }
-                } else if updated_cols.contains(&col.pos_in_table) {
-                    needs = true;
-                    break;
-                }
-            }
+    let target_table_internal_id = target_table_ref.internal_id;
+    let target_table_ref = target_table_ref.clone();
+    let rowid_alias_used = set_clauses
+        .iter()
+        .any(|(idx, _)| *idx == ROWID_SENTINEL || columns[*idx].is_rowid_alias());
+    let updated_cols = (!rowid_alias_used).then(|| set_clauses.iter().map(|(i, _)| *i).collect());
+    let affected_cols = updated_cols
+        .as_ref()
+        .map(|updated_cols: &HashSet<usize>| columns_affected_by_update(columns, updated_cols));
+    let mut indexes_to_update = Vec::new();
 
-            if !needs {
-                if let Some(where_expr) = &idx.where_clause {
-                    let cols_used = expression_index_column_usage(
-                        where_expr.as_ref(),
-                        target_table_ref,
-                        resolver,
-                    )?;
-                    // If any column used in the partial index WHERE clause is being updated,
-                    // this index must be updated as well.
-                    needs = cols_used.iter().any(|cidx| updated_cols.contains(&cidx));
-                }
-            }
+    for idx in indexes {
+        let mut must_update = rowid_alias_used;
+        let mut expression_cols_used = ColumnUsedMask::default();
 
-            if needs {
-                indexes_to_update.push(idx);
+        for col in idx.columns.iter() {
+            if let Some(expr) = col.expr.as_ref() {
+                let cols_used =
+                    expression_index_column_usage(expr.as_ref(), &target_table_ref, resolver)?;
+                // if it turns out that we need to update the index, we'll need to use all columns
+                // that are used by indexed expressions
+                expression_cols_used |= &cols_used;
+
+                if !must_update
+                    && affected_cols.as_ref().is_some_and(|affected_cols| {
+                        cols_used.iter().any(|cidx| affected_cols.contains(&cidx))
+                    })
+                {
+                    // an index must be updated if any of the affected columns is used in an indexed expression
+                    must_update = true;
+                }
+            } else if !must_update
+                && affected_cols
+                    .as_ref()
+                    .is_some_and(|affected_cols| affected_cols.contains(&col.pos_in_table))
+            {
+                // an index must be updated if any of its columns is affected by the update
+                must_update = true;
             }
         }
-        indexes_to_update
-    };
+
+        if !must_update {
+            if let Some(where_expr) = &idx.where_clause {
+                let cols_used = expression_index_column_usage(
+                    where_expr.as_ref(),
+                    &target_table_ref,
+                    resolver,
+                )?;
+                // a partial index must be updated if any column of its WHERE clause is affected
+                must_update = affected_cols.as_ref().is_some_and(|affected_cols| {
+                    cols_used.iter().any(|cidx| affected_cols.contains(&cidx))
+                });
+            }
+        }
+
+        if must_update {
+            for col_idx in expression_cols_used.iter() {
+                table_references.mark_column_used(target_table_internal_id, col_idx);
+            }
+            indexes_to_update.push(idx);
+        }
+    }
 
     Ok(Plan::Update(UpdatePlan {
         table_references,

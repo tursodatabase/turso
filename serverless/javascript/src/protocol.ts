@@ -1,4 +1,4 @@
-import { DatabaseError } from './error.js';
+import { DatabaseError, TimeoutError } from './error.js';
 
 export interface Value {
   type: 'null' | 'integer' | 'float' | 'text' | 'blob';
@@ -183,11 +183,25 @@ export interface CursorEntry {
 /** HTTP header key for the encryption key */
 export const ENCRYPTION_KEY_HEADER = 'x-turso-encryption-key';
 
+/** Per-query timeout options. Overrides defaultQueryTimeout for this call. */
+export interface QueryOptions {
+  /** Per-query timeout in milliseconds. Overrides defaultQueryTimeout for this call. */
+  queryTimeout?: number;
+}
+
+function wrapAbortError(error: unknown): never {
+  if (error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError')) {
+    throw new TimeoutError('Query timed out');
+  }
+  throw error;
+}
+
 export async function executeCursor(
   url: string,
   authToken: string | undefined,
   request: CursorRequest,
-  remoteEncryptionKey?: string
+  remoteEncryptionKey?: string,
+  signal?: AbortSignal
 ): Promise<{ response: CursorResponse; entries: AsyncGenerator<CursorEntry> }> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -199,11 +213,17 @@ export async function executeCursor(
     headers[ENCRYPTION_KEY_HEADER] = remoteEncryptionKey;
   }
 
-  const response = await fetch(`${url}/v3/cursor`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(request),
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${url}/v3/cursor`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(request),
+      signal,
+    });
+  } catch (error) {
+    wrapAbortError(error);
+  }
 
   if (!response.ok) {
     let errorMessage = `HTTP error! status: ${response.status}`;
@@ -229,25 +249,31 @@ export async function executeCursor(
   let cursorResponse: CursorResponse | undefined;
 
   // First, read until we get the cursor response (first line)
-  while (!cursorResponse) {
-    const { done, value } = await reader.read();
-    if (done) break;
+  try {
+    while (!cursorResponse) {
+      const { done, value } = await reader.read();
+      if (done) break;
 
-    buffer += decoder.decode(value, { stream: true });
-    
-    const newlineIndex = buffer.indexOf('\n');
-    if (newlineIndex !== -1) {
-      const line = buffer.slice(0, newlineIndex).trim();
-      buffer = buffer.slice(newlineIndex + 1);
-      
-      if (line) {
-        cursorResponse = JSON.parse(line);
-        break;
+      buffer += decoder.decode(value, { stream: true });
+
+      const newlineIndex = buffer.indexOf('\n');
+      if (newlineIndex !== -1) {
+        const line = buffer.slice(0, newlineIndex).trim();
+        buffer = buffer.slice(newlineIndex + 1);
+
+        if (line) {
+          cursorResponse = JSON.parse(line);
+          break;
+        }
       }
     }
+  } catch (error) {
+    reader.releaseLock();
+    wrapAbortError(error);
   }
 
   if (!cursorResponse) {
+    reader.releaseLock();
     throw new DatabaseError('No cursor response received');
   }
 
@@ -258,7 +284,7 @@ export async function executeCursor(
       while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
         const line = buffer.slice(0, newlineIndex).trim();
         buffer = buffer.slice(newlineIndex + 1);
-        
+
         if (line) {
           yield JSON.parse(line) as CursorEntry;
         }
@@ -266,15 +292,20 @@ export async function executeCursor(
 
       // Continue reading from the stream
       while (true) {
-        const { done, value } = await reader!.read();
-        if (done) break;
+        let readResult: ReadableStreamReadResult<Uint8Array>;
+        try {
+          readResult = await reader!.read();
+        } catch (error) {
+          wrapAbortError(error);
+        }
+        if (readResult.done) break;
 
-        buffer += decoder.decode(value, { stream: true });
-        
+        buffer += decoder.decode(readResult.value, { stream: true });
+
         while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
           const line = buffer.slice(0, newlineIndex).trim();
           buffer = buffer.slice(newlineIndex + 1);
-          
+
           if (line) {
             yield JSON.parse(line) as CursorEntry;
           }
@@ -297,7 +328,8 @@ export async function executePipeline(
   url: string,
   authToken: string | undefined,
   request: PipelineRequest,
-  remoteEncryptionKey?: string
+  remoteEncryptionKey?: string,
+  signal?: AbortSignal
 ): Promise<PipelineResponse> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -309,11 +341,17 @@ export async function executePipeline(
     headers[ENCRYPTION_KEY_HEADER] = remoteEncryptionKey;
   }
 
-  const response = await fetch(`${url}/v3/pipeline`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(request),
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${url}/v3/pipeline`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(request),
+      signal,
+    });
+  } catch (error) {
+    wrapAbortError(error);
+  }
 
   if (!response.ok) {
     throw new DatabaseError(`HTTP error! status: ${response.status}`);

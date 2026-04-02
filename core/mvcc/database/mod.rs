@@ -1,5 +1,8 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
+#[cfg(any(test, injected_yields))]
+use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
+use crate::mvcc::yield_points::inject_transition_yield;
 use crate::schema::{Schema, Table};
 use crate::state_machine::StateMachine;
 use crate::state_machine::StateTransition;
@@ -42,6 +45,8 @@ use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Bound;
+#[cfg(any(test, injected_yields))]
+use strum::EnumCount;
 use tracing::instrument;
 use tracing::Level;
 
@@ -892,9 +897,47 @@ impl CommitCoordinator {
     }
 }
 
+#[cfg(any(test, injected_yields))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
+#[repr(u8)]
+enum CommitYieldPoint {
+    CommitValidation,
+    WaitForDependencies,
+    LogRecordPrepared,
+}
+
+#[cfg(any(test, injected_yields))]
+impl YieldPointMarker for CommitYieldPoint {
+    const POINT_COUNT: u8 = Self::COUNT as u8;
+
+    fn ordinal(self) -> u8 {
+        self as u8
+    }
+}
+
+#[cfg(any(test, injected_yields))]
+fn commit_yield_key(tx_id: u64) -> u64 {
+    // any large number will do
+    const COMMIT_SELECTION_TAG: u64 = 0xC011_C011_C011_C011;
+    tx_id ^ COMMIT_SELECTION_TAG
+}
+
+#[cfg(any(test, injected_yields))]
+impl<Clock: LogicalClock> ProvidesYieldContext for CommitStateMachine<Clock> {
+    fn yield_context(&self) -> YieldContext {
+        YieldContext::new(
+            self.connection.yield_injector(),
+            self.yield_instance_id,
+            commit_yield_key(self.tx_id),
+        )
+    }
+}
+
 pub struct CommitStateMachine<Clock: LogicalClock> {
     state: CommitState<Clock>,
     is_finalized: bool,
+    #[cfg(any(test, injected_yields))]
+    yield_instance_id: u64,
     did_commit_schema_change: bool,
     tx_id: TxID,
     connection: Arc<Connection>,
@@ -958,6 +1001,8 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         Self {
             state,
             is_finalized: false,
+            #[cfg(any(test, injected_yields))]
+            yield_instance_id: connection.next_yield_instance_id(),
             did_commit_schema_change: false,
             tx_id,
             connection,
@@ -1567,6 +1612,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     return Ok(TransitionResult::Done(()));
                 }
                 self.state = CommitState::Commit { end_ts };
+                inject_transition_yield!(self, CommitYieldPoint::CommitValidation);
                 Ok(TransitionResult::Continue)
             }
             CommitState::Commit { end_ts } => {
@@ -1596,6 +1642,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // TxID references until CommitEnd so an abandoned commit can
                 // still be rolled back by matching on TxID(self.tx_id).
                 self.state = CommitState::WaitForDependencies { end_ts: *end_ts };
+                inject_transition_yield!(self, CommitYieldPoint::WaitForDependencies);
                 return Ok(TransitionResult::Continue);
             }
             CommitState::WaitForDependencies { end_ts } => {
@@ -1665,6 +1712,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 } else {
                     self.state = CommitState::BeginCommitLogicalLog { end_ts, log_record };
                 }
+                inject_transition_yield!(self, CommitYieldPoint::LogRecordPrepared);
                 return Ok(TransitionResult::Continue);
             }
             CommitState::BeginCommitLogicalLog { end_ts, log_record } => {
@@ -1837,7 +1885,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     }
                     Err(err) => {
                         // Auto-checkpoint errors should not surface to the committed statement.
-                        tracing::debug!("MVCC auto-checkpoint failed: {err}");
+                        tracing::info!("MVCC auto-checkpoint failed: {err}");
                         self.finalize(mvcc_store)?;
                         return Ok(TransitionResult::Done(()));
                     }
@@ -2343,41 +2391,38 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 None => {
                     let log_size = self.get_logical_log_file().size()?;
                     let pager = bootstrap_conn.pager.load().clone();
-                    if !pager.is_encryption_enabled() {
-                        if bootstrap_conn.db.is_readonly() {
-                            return Err(LimboError::Corrupt(
-                                "Missing MVCC metadata table in read-only mode".to_string(),
-                            ));
-                        }
-                        if log_size > LOG_HDR_SIZE as u64 {
-                            return Err(LimboError::Corrupt(
-                                "Missing MVCC metadata table while logical log state exists"
-                                    .to_string(),
-                            ));
-                        }
-                        // First-time MVCC bootstrap: ensure a durable logical-log header exists
-                        // before any metadata-table writes can commit into WAL.
-                        // If a previous crash left a torn header tail (0 < size < LOG_HDR_SIZE),
-                        // clear it before rewriting the header.
-                        if log_size > 0 && log_size < LOG_HDR_SIZE as u64 {
-                            let log_file = self.get_logical_log_file();
-                            let c = log_file.truncate(0, Completion::new_trunc(|_| {}))?;
-                            bootstrap_conn.db.io.wait_for_completion(c)?;
-                        }
-                        if log_size <= LOG_HDR_SIZE as u64 {
-                            let pager = bootstrap_conn.pager.load().clone();
-                            let c = self.storage.update_header()?;
-                            pager.io.wait_for_completion(c)?;
-                            if bootstrap_conn.get_sync_mode() != SyncMode::Off {
-                                let c = self.storage.sync(pager.get_sync_type())?;
-                                pager.io.wait_for_completion(c)?;
-                            }
-                        }
-                        self.initialize_mvcc_metadata_table(&bootstrap_conn)?;
-                        // Metadata bootstrap writes land in SQLite WAL first; reconcile immediately so
-                        // subsequent opens (including read-only opens) do not depend on WAL replay.
-                        self.maybe_complete_interrupted_checkpoint(&bootstrap_conn)?;
+                    if bootstrap_conn.db.is_readonly() {
+                        return Err(LimboError::Corrupt(
+                            "Missing MVCC metadata table in read-only mode".to_string(),
+                        ));
                     }
+                    if log_size > LOG_HDR_SIZE as u64 {
+                        return Err(LimboError::Corrupt(
+                            "Missing MVCC metadata table while logical log state exists"
+                                .to_string(),
+                        ));
+                    }
+                    // First-time MVCC bootstrap: ensure a durable logical-log header exists
+                    // before any metadata-table writes can commit into WAL.
+                    // If a previous crash left a torn header tail (0 < size < LOG_HDR_SIZE),
+                    // clear it before rewriting the header.
+                    if log_size > 0 && log_size < LOG_HDR_SIZE as u64 {
+                        let log_file = self.get_logical_log_file();
+                        let c = log_file.truncate(0, Completion::new_trunc(|_| {}))?;
+                        bootstrap_conn.db.io.wait_for_completion(c)?;
+                    }
+                    if log_size <= LOG_HDR_SIZE as u64 {
+                        let c = self.storage.update_header()?;
+                        pager.io.wait_for_completion(c)?;
+                        if bootstrap_conn.get_sync_mode() != SyncMode::Off {
+                            let c = self.storage.sync(pager.get_sync_type())?;
+                            pager.io.wait_for_completion(c)?;
+                        }
+                    }
+                    self.initialize_mvcc_metadata_table(&bootstrap_conn)?;
+                    // Metadata bootstrap writes land in SQLite WAL first; reconcile immediately so
+                    // subsequent opens (including read-only opens) do not depend on WAL replay.
+                    self.maybe_complete_interrupted_checkpoint(&bootstrap_conn)?;
                 }
             }
         }
@@ -4208,6 +4253,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     fn logical_log_header_crc_valid(&self, pager: &Arc<Pager>) -> Result<bool> {
         let file = self.get_logical_log_file();
+        // Header is never encrypted; no need to pass EncryptionContext here.
         let mut reader = StreamingLogicalLogReader::new(file, None);
         match reader.try_read_header(&pager.io)? {
             HeaderReadResult::Valid(_) => Ok(true),
@@ -4234,6 +4280,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         let wal_max_frame = wal.get_max_frame_in_wal();
         let file = self.get_logical_log_file();
+        // This method only reads the header (never encrypted); no need to pass EncryptionContext.
         let mut reader = StreamingLogicalLogReader::new(file, None);
         let header_result = reader.try_read_header(&pager.io)?;
 
@@ -4337,7 +4384,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn maybe_recover_logical_log(&self, connection: Arc<Connection>) -> Result<bool> {
         let pager = connection.pager.load().clone();
         let file = self.get_logical_log_file();
-        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
+        let enc_ctx = self.storage.encryption_ctx();
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), enc_ctx);
         let preserved_table_valued_functions =
             Self::capture_table_valued_functions(&connection.schema.read());
 
@@ -4357,7 +4405,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let persistent_tx_ts_max = if self.uses_durable_mvcc_metadata(&connection) {
             match self.try_read_persistent_tx_ts_max(&connection)? {
                 Some(ts) => ts,
-                None if pager.is_encryption_enabled() => 0,
                 None if header.is_none() => 0,
                 None => {
                     return Err(LimboError::Corrupt(
@@ -4417,6 +4464,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             .get(),
                     );
                 let mut fresh = Schema::new();
+                fresh.generated_columns_enabled =
+                    connection.db.experimental_generated_columns_enabled();
                 fresh.schema_version = cookie;
                 let mut from_sql_indexes = Vec::with_capacity(10);
                 let mut automatic_indices: HashMap<String, Vec<(String, i64)>> = HashMap::default();
@@ -4700,11 +4749,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     }
                     if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
                         let rowid_int = rowid.row_id.to_int_or_panic();
-                        let record = schema_rows.get(&rowid_int).ok_or_else(|| {
-                            LimboError::Corrupt(format!(
-                                "Logical log deletes sqlite_schema rowid {rowid_int} that does not exist in merged schema state"
-                            ))
-                        })?;
+                        let Some(record) = schema_rows.get(&rowid_int) else {
+                            // this can happen if a row in sqlite_schema was inserted and then
+                            // deleted in the same transaction (ex: a CREATE TABLE followed by a DROP TABLE)
+                            continue;
+                        };
                         if record.column_count() < 5 {
                             return Err(LimboError::Corrupt(format!(
                                 "sqlite_schema row must have at least 5 columns, got {}",

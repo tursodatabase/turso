@@ -6,13 +6,12 @@ use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
 use crate::{
     index_method::IndexMethodAttachment,
     parameters::Parameters,
-    schema::{BTreeTable, Index, PseudoCursorType, Schema, Table, Trigger},
+    schema::{BTreeTable, Column, ColumnLayout, Index, PseudoCursorType, Schema, Table, Trigger},
     translate::{
         collate::CollationSeq,
         emitter::{MaterializedColumnRef, TransactionMode},
         plan::{ResultSetColumn, TableReferences},
     },
-    vdbe::affinity::Affinity,
     Arc, CaptureDataChangesInfo, Connection, VirtualTable,
 };
 
@@ -39,9 +38,11 @@ impl TableRefIdCounter {
     }
 }
 
+use std::num::NonZeroUsize;
+
 use super::{
-    BranchOffset, CursorID, Insn, InsnReference, JumpTarget, PrepareContext, PreparedProgram,
-    Program,
+    affinity::Affinity, BranchOffset, CursorID, Insn, InsnReference, JumpTarget, PrepareContext,
+    PreparedProgram, Program,
 };
 
 /// A key that uniquely identifies a cursor.
@@ -100,6 +101,77 @@ impl CursorKey {
             (Some(self_index), Some(other_index)) => self_index.name == other_index.name,
             (None, None) => true,
             _ => false,
+        }
+    }
+}
+
+/// Context for resolving `Expr::Column` that has a `TableInternalId::SELF_TABLE` placeholder.
+#[derive(Clone)]
+pub enum SelfTableContext {
+    ForSelect {
+        table_ref_id: TableInternalId,
+        referenced_tables: TableReferences,
+    },
+    ForDML(DmlColumnContext),
+}
+
+#[derive(Clone)]
+pub enum DmlColumnRegisters {
+    // Used to compute column registers lazily
+    Layout {
+        base_reg: usize,
+        rowid_reg: usize,
+        layout: ColumnLayout,
+    },
+    Indexed {
+        column_regs: Vec<usize>,
+    },
+}
+
+#[derive(Clone)]
+pub struct DmlColumnContext {
+    pub registers: DmlColumnRegisters,
+    pub columns: Arc<[Column]>,
+}
+
+impl DmlColumnContext {
+    pub fn layout(
+        columns: &[Column],
+        base_reg: usize,
+        rowid_reg: usize,
+        layout: ColumnLayout,
+    ) -> Self {
+        Self {
+            registers: DmlColumnRegisters::Layout {
+                base_reg,
+                rowid_reg,
+                layout,
+            },
+            columns: Arc::from(columns),
+        }
+    }
+
+    pub fn indexed(columns: impl Into<Arc<[Column]>>, column_regs: Vec<usize>) -> Self {
+        Self {
+            registers: DmlColumnRegisters::Indexed { column_regs },
+            columns: columns.into(),
+        }
+    }
+
+    pub fn to_column_reg(&self, col_idx: usize) -> usize {
+        match &self.registers {
+            DmlColumnRegisters::Layout {
+                base_reg,
+                rowid_reg,
+                layout,
+            } => {
+                if self.columns[col_idx].is_rowid_alias() {
+                    *rowid_reg
+                } else {
+                    layout.to_register(*base_reg, col_idx)
+                }
+            }
+            DmlColumnRegisters::Indexed { column_regs } => column_regs[col_idx],
         }
     }
 }
@@ -197,6 +269,8 @@ pub struct ProgramBuilder {
     /// Maps table internal_id to result_columns_start_reg for FROM clause subqueries.
     /// Used when nested subqueries need to reference columns from outer query subqueries.
     subquery_result_regs: HashMap<TableInternalId, usize>,
+    /// Context for resolving an Expr::Column that has a [TableInternalId::SELF_TABLE] placeholder.
+    self_table_context: Option<SelfTableContext>,
     /// Counter for CTE identity tracking. Each CTE definition gets a unique ID
     /// so that multiple references to the same CTE can share materialized data.
     next_cte_id: usize,
@@ -453,6 +527,7 @@ impl ProgramBuilder {
             hash_build_signatures: HashMap::default(),
             hash_tables_to_keep_open: HashSet::default(),
             subquery_result_regs: HashMap::default(),
+            self_table_context: None,
             next_cte_id: 0,
             materialized_ctes: HashMap::default(),
             cte_reference_counts: HashMap::default(),
@@ -774,6 +849,7 @@ impl ProgramBuilder {
         self.result_columns.push(ResultSetColumn {
             expr,
             alias: Some(col_name),
+            implicit_column_name: None,
             contains_aggregates: false,
         });
     }
@@ -1578,8 +1654,34 @@ impl ProgramBuilder {
         }
     }
 
+    /// Emit an Affinity instruction for a single register with the given column affinity.
+    pub fn emit_column_affinity(&mut self, register: usize, affinity: Affinity) {
+        self.emit_insn(Insn::Affinity {
+            start_reg: register,
+            count: NonZeroUsize::MIN,
+            affinities: affinity.aff_mask().to_string(),
+        });
+    }
+
     fn emit_column(&mut self, cursor_id: CursorID, column: usize, out: usize) {
         let (_, cursor_type) = self.cursor_ref.get(cursor_id).expect("cursor_id is valid");
+
+        if let CursorType::BTreeTable(btree) = cursor_type {
+            let column_def = btree
+                .columns
+                .get(column)
+                .expect("column index out of bounds");
+            turso_assert!(
+                !column_def.is_virtual_generated(),
+                "emit_column called with virtual generated column index",
+                {"column_index": column}
+            );
+        }
+
+        let physical_column = match cursor_type {
+            CursorType::BTreeTable(btree) => btree.logical_to_physical_column(column),
+            _ => column,
+        };
 
         let default = 'value: {
             let default = match cursor_type {
@@ -1633,7 +1735,7 @@ impl ProgramBuilder {
 
         self.emit_insn(Insn::Column {
             cursor_id,
-            column,
+            column: physical_column,
             dest: out,
             default,
         });
@@ -1696,5 +1798,29 @@ impl ProgramBuilder {
         let prepare_context = PrepareContext::from_connection(&connection);
         let prepared = self.build_prepared_program(prepare_context, change_cnt_on, sql)?;
         Ok(Program::from_prepared(Arc::new(prepared), connection))
+    }
+
+    pub fn with_existing_self_table_context<T>(
+        &mut self,
+        f: impl FnOnce(&mut ProgramBuilder, Option<&SelfTableContext>) -> crate::Result<T>,
+    ) -> crate::Result<T> {
+        let result = f(self, self.self_table_context.clone().as_ref())?;
+        Ok(result)
+    }
+
+    pub fn with_self_table_context<T>(
+        &mut self,
+        ctx: Option<&SelfTableContext>,
+        f: impl FnOnce(&mut ProgramBuilder, Option<&SelfTableContext>) -> crate::Result<T>,
+    ) -> crate::Result<T> {
+        let prev = self.self_table_context.take();
+        self.self_table_context = ctx.cloned();
+        let result = f(self, ctx);
+        self.self_table_context = prev;
+        result
+    }
+
+    pub fn self_table_context(&self) -> &Option<SelfTableContext> {
+        &self.self_table_context
     }
 }

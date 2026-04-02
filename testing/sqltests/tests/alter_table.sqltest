@@ -314,11 +314,68 @@ expect {
 @cross-check-integrity
 test alter-table-add-quoted-column {
     CREATE TABLE test (a);
-    ALTER TABLE test ADD COLUMN [b c];
+    ALTER TABLE test ADD COLUMN "b c";
     SELECT sql FROM sqlite_schema;
 }
 expect {
-    CREATE TABLE test (a, [b c])
+    CREATE TABLE test (a, "b c")
+}
+
+test alter-table-add-column-hyphen-digit-name {
+    CREATE TABLE t (id INTEGER PRIMARY KEY);
+    ALTER TABLE t ADD COLUMN "c-39uSrAeJEV" TEXT;
+    INSERT INTO t VALUES (1, 'hello');
+    SELECT id, "c-39uSrAeJEV" FROM t;
+}
+expect {
+    1|hello
+}
+
+test alter-table-add-column-hyphen-digit-schema-sql {
+    CREATE TABLE t (id INTEGER PRIMARY KEY);
+    ALTER TABLE t ADD COLUMN "c-39uSrAeJEV" TEXT;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, "c-39uSrAeJEV" TEXT)
+}
+
+test alter-table-add-column-keyword-name {
+    CREATE TABLE t (id INTEGER PRIMARY KEY);
+    ALTER TABLE t ADD COLUMN "select" TEXT;
+    INSERT INTO t VALUES (1, 'world');
+    SELECT id, "select" FROM t;
+}
+expect {
+    1|world
+}
+
+test alter-table-add-column-keyword-schema-sql {
+    CREATE TABLE t (id INTEGER PRIMARY KEY);
+    ALTER TABLE t ADD COLUMN "select" TEXT;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, "select" TEXT)
+}
+
+test alter-table-add-column-digit-start-name {
+    CREATE TABLE t (id INTEGER PRIMARY KEY);
+    ALTER TABLE t ADD COLUMN "123abc" TEXT;
+    INSERT INTO t VALUES (1, 'test');
+    SELECT id, "123abc" FROM t;
+}
+expect {
+    1|test
+}
+
+test alter-table-add-column-bracket-quoted-hyphen-digit {
+    CREATE TABLE t ([c-39uSrAeJEV] TEXT);
+    INSERT INTO t VALUES ('hello');
+    SELECT "c-39uSrAeJEV" FROM t;
+}
+expect {
+    hello
 }
 
 @cross-check-integrity
@@ -408,7 +465,7 @@ expect {
 
 @cross-check-integrity
 test alter-table-drop-column-special-name {
-    CREATE TABLE t (a, b, [c c]);
+    CREATE TABLE t (a, b, "c c");
     INSERT INTO t VALUES (1, 2, 3);
     ALTER TABLE t DROP COLUMN b;
 
@@ -417,7 +474,7 @@ test alter-table-drop-column-special-name {
 }
 expect {
     3
-    CREATE TABLE t (a, [c c])
+    CREATE TABLE t (a, "c c")
 }
 
 @cross-check-integrity
@@ -434,6 +491,16 @@ test fail-alter-table-drop-unique-column-constraint {
     ALTER TABLE t DROP b;
 }
 expect error {
+}
+
+@cross-check-integrity
+test alter-table-drop-column-unique-special-name-schema-sql {
+    CREATE TABLE t (a, b, "c c", UNIQUE(a, "c c"));
+    ALTER TABLE t DROP COLUMN b;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+}
+expect pattern {
+    CREATE TABLE t \(a, "c c", UNIQUE\s?\(a, "c c"\)\)
 }
 
 # refer https://github.com/tursodatabase/turso/issues/3231
@@ -2187,4 +2254,19 @@ test fail-drop-column-case-expr-ref {
 }
 expect error {
     error in trigger tr after drop column: no such column:
+}
+
+# Rename table then rename column with trigger present
+# Regression test for https://github.com/tursodatabase/turso/issues/6085
+@cross-check-integrity
+test alter-table-rename-then-rename-column-with-trigger {
+    CREATE TABLE orders(id INT, customer TEXT);
+    CREATE TRIGGER tr AFTER INSERT ON orders BEGIN SELECT 1; END;
+    ALTER TABLE orders RENAME TO purchases;
+    ALTER TABLE purchases RENAME COLUMN customer TO buyer;
+    SELECT type, name, tbl_name FROM sqlite_schema ORDER BY type;
+}
+expect {
+    table|purchases|purchases
+    trigger|tr|purchases
 }

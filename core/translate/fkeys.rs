@@ -4,14 +4,14 @@ use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
 use crate::{
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
-    schema::{BTreeTable, ForeignKey, Index, ResolvedFkRef, ROWID_SENTINEL},
+    schema::{BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef, ROWID_SENTINEL},
     translate::{collate::CollationSeq, emitter::Resolver, planner::ROWID_STRS},
     vdbe::{
         builder::{CursorType, QueryMode},
         insn::{CmpInsFlags, Insn},
         BranchOffset,
     },
-    Connection, LimboError, Result, Value,
+    Connection, LimboError, Result,
 };
 use std::{num::NonZero, num::NonZeroUsize, sync::Arc};
 
@@ -777,6 +777,7 @@ pub fn emit_fk_child_update_counters(
     updated_cols: &HashSet<usize>,
     database_id: usize,
     resolver: &Resolver,
+    layout: &ColumnLayout,
 ) -> Result<()> {
     // Helper: materialize OLD tuple for this FK; returns (start_reg, ncols, null_skip_label).
     // The null_skip_label is unresolved and must be resolved by the caller after the FK check
@@ -895,7 +896,7 @@ pub fn emit_fk_child_update_counters(
             let src = if col.is_rowid_alias() {
                 new_rowid_reg
             } else {
-                new_start_reg + i
+                layout.to_register(new_start_reg, i)
             };
             program.emit_insn(Insn::IsNull {
                 reg: src,
@@ -914,7 +915,7 @@ pub fn emit_fk_child_update_counters(
             let val_reg = if col_child.is_rowid_alias() {
                 new_rowid_reg
             } else {
-                new_start_reg + i_child
+                layout.to_register(new_start_reg, i_child)
             };
 
             let tmp = program.alloc_register();
@@ -958,7 +959,7 @@ pub fn emit_fk_child_update_counters(
                         src_reg: if col.is_rowid_alias() {
                             new_rowid_reg
                         } else {
-                            new_start_reg + i
+                            layout.to_register(new_start_reg, i)
                         },
                         dst_reg: start + k,
                         extra_amount: 0,
@@ -1407,28 +1408,18 @@ fn emit_fk_action_subprogram(
     subprogram_builder.epilogue(resolver.schema());
     let built_subprogram = subprogram_builder.build(connection.clone(), true, description)?;
 
-    // Build params: OLD key register indices, then optionally NEW key register indices
-    let mut params: Vec<Value> = ctx
-        .old_key_registers
-        .iter()
-        .copied()
-        .map(|reg_idx| Value::from_i64(reg_idx as i64))
-        .collect();
+    // Build param_registers: OLD key register indices, then optionally NEW key register indices
+    let mut param_registers: Vec<usize> = ctx.old_key_registers.to_vec();
 
     if let Some(new_regs) = &ctx.new_key_registers {
-        params.extend(
-            new_regs
-                .iter()
-                .copied()
-                .map(|reg_idx| Value::from_i64(reg_idx as i64)),
-        );
+        param_registers.extend(new_regs.iter().copied());
     }
 
     // FK action subprograms can't contain RAISE(IGNORE), so ignore_jump_target
     // is a no-op that resolves to the next instruction (just falls through).
     let ignore_jump_target = program.allocate_label();
     program.emit_insn(Insn::Program {
-        params,
+        param_registers,
         program: built_subprogram.prepared().clone(),
         ignore_jump_target,
     });

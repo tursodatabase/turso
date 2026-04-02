@@ -345,6 +345,18 @@ test.serial("Statement.get() values", async (t) => {
   t.deepEqual(stmt.get(9007199254740991n), [9007199254740991]);
 });
 
+
+test.serial("Statement.get() datetime('now')", async (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("SELECT datetime('now') AS now");
+  const row = stmt.get();
+  t.truthy(row.now, "datetime('now') should return a value");
+  // Verify the result matches the expected ISO 8601 datetime format: YYYY-MM-DD HH:MM:SS
+  t.regex(row.now, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/, "datetime('now') should return a valid datetime string");
+});
+
+
 test.serial("Statement.get() [blob]", (t) => {
   const db = t.context.db;
 
@@ -546,6 +558,65 @@ test.serial("Statement.reader [DELETE RETURNING is true]", (t) => {
   t.is(stmt.reader, true);
 });
 
+test.serial("Query timeout option interrupts long-running query", async (t) => {
+  const path = genDatabaseFilename();
+  const [db] = await connect(path, { defaultQueryTimeout: 50 });
+  const stmt = db.prepare("SELECT sum(value) FROM generate_series(1, 1000000000);");
+
+  const error = t.throws(() => {
+    stmt.get();
+  });
+  t.truthy(error);
+  t.true(error.message.toLowerCase().includes("interrupt"));
+
+  db.close();
+  cleanupDatabaseFiles(path);
+});
+
+test.serial("Query timeout option allows short-running query", async (t) => {
+  const path = genDatabaseFilename();
+  const [db] = await connect(path, { defaultQueryTimeout: 50 });
+  const stmt = db.prepare("SELECT 1 AS value");
+  t.deepEqual(stmt.get(), { value: 1 });
+
+  db.close();
+  cleanupDatabaseFiles(path);
+});
+
+test.serial("Per-query timeout option interrupts long-running Statement.get()", async (t) => {
+  if (t.context.provider !== "turso") {
+    t.pass("Skipping queryTimeout test for non-Turso providers");
+    return;
+  }
+
+  const path = genDatabaseFilename();
+  const [db] = await connect(path);
+  const stmt = db.prepare("SELECT sum(value) FROM generate_series(1, 1000000000);");
+
+  const error = t.throws(() => {
+    stmt.get(undefined, { queryTimeout: 50 });
+  });
+  t.truthy(error);
+  t.true(error.message.toLowerCase().includes("interrupt"));
+
+  db.close();
+  cleanupDatabaseFiles(path);
+});
+
+test.serial("Per-query timeout option is accepted by Database.exec()", async (t) => {
+  if (t.context.provider !== "turso") {
+    t.pass("Skipping queryTimeout test for non-Turso providers");
+    return;
+  }
+
+  const path = genDatabaseFilename();
+  const [db] = await connect(path);
+  t.notThrows(() => db.exec("SELECT 1", { queryTimeout: 50 }));
+
+  db.close();
+  cleanupDatabaseFiles(path);
+});
+
 test.skip("Timeout option", async (t) => {
   const timeout = 1000;
   const path = genDatabaseFilename();
@@ -641,4 +712,13 @@ const connect = async (path, options = {}) => {
 /// Generate a unique database filename
 const genDatabaseFilename = () => {
   return `test-${crypto.randomBytes(8).toString('hex')}.db`;
+};
+
+const cleanupDatabaseFiles = (path) => {
+  for (const suffix of ["", "-wal", "-shm"]) {
+    const file = path + suffix;
+    if (fs.existsSync(file)) {
+      fs.unlinkSync(file);
+    }
+  }
 };

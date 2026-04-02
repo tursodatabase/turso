@@ -49,12 +49,12 @@ addr  opcode           p1  p2  p3  p4              p5  comment
   27    Copy            6  12   0                   0  r[12]=r[6]
   28    Copy            7  13   0                   0  r[13]=r[7]
   29    OpenWrite       0  11   0                   0  root=11; iDb=0
-  30    NotNull         8  32   0                   0  r[8]!=NULL -> goto 32
-  31    Goto            0  34   0                   0
-  32    MustBeInt       8   0   0                   0
-  33    Goto            0  35   0                   0
-  34    NewRowid        1   8   0                   0  r[8]=rowid
-  35    Affinity        9   5   0                   0  r[9..14] = D, B, E, D, B
+  30    Affinity        9   5   0                   0  r[9..14] = D, B, E, D, B
+  31    NotNull         8  33   0                   0  r[8]!=NULL -> goto 33
+  32    Goto            0  35   0                   0
+  33    MustBeInt       8   0   0                   0
+  34    Goto            0  36   0                   0
+  35    NewRowid        1   8   0                   0  r[8]=rowid
   36    HaltIfNull   1299   0  10  products.name    0
   37    HaltIfNull   1299   0  11  products.price   0
   38    NotExists       1  40   8                   0

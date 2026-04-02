@@ -128,6 +128,7 @@ pub use storage::{
     pager::{Page, PageRef, Pager},
     wal::{CheckpointMode, CheckpointResult, Wal, WalFile, WalFileShared},
 };
+pub use translate::expr::{walk_expr_mut, WalkControl};
 pub use turso_macros::{
     turso_assert, turso_assert_all, turso_assert_eq, turso_assert_greater_than,
     turso_assert_greater_than_or_equal, turso_assert_less_than, turso_assert_less_than_or_equal,
@@ -171,6 +172,7 @@ pub struct DatabaseOpts {
     pub enable_index_method: bool,
     pub enable_autovacuum: bool,
     pub enable_attach: bool,
+    pub enable_generated_columns: bool,
     pub unsafe_testing: bool,
     enable_load_extension: bool,
 }
@@ -213,6 +215,11 @@ impl DatabaseOpts {
 
     pub fn with_attach(mut self, enable: bool) -> Self {
         self.enable_attach = enable;
+        self
+    }
+
+    pub fn with_generated_columns(mut self, enable: bool) -> Self {
+        self.enable_generated_columns = enable;
         self
     }
 
@@ -304,10 +311,9 @@ pub struct OpenDbAsyncState {
     /// Schema lock held during LoadingSchema phase to ensure atomicity across IO yields
     schema_guard: Option<sync::ArcMutexGuard<Arc<Schema>>>,
     /// Registry lock held during open_with_flags_async to prevent concurrent opens
-    registry_guard:
-        Option<parking_lot::ArcMutexGuard<parking_lot::RawMutex, HashMap<String, Weak<Database>>>>,
-    /// Canonical path for registry insertion (computed once at start)
-    canonical_path: Option<String>,
+    registry_guard: Option<
+        parking_lot::ArcMutexGuard<parking_lot::RawMutex, HashMap<DatabaseKey, Weak<Database>>>,
+    >,
 }
 
 impl Default for OpenDbAsyncState {
@@ -327,7 +333,6 @@ impl OpenDbAsyncState {
             make_from_btree_state: schema::MakeFromBtreeState::new(),
             schema_guard: None,
             registry_guard: None,
-            canonical_path: None,
         }
     }
 }
@@ -342,8 +347,18 @@ impl OpenDbAsyncState {
 /// state between iterations, but static variables persist - using shuttle's
 /// Mutex here would cause panics when the second iteration tries to lock a
 /// mutex that belongs to a stale execution context.
+/// Registry key for the process-wide database manager.
+/// File-backed databases are keyed by their OS-level identity (dev, ino),
+/// matching SQLite's inodeList approach. Shared in-memory databases use
+/// their name as the key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum DatabaseKey {
+    File(io::FileId),
+    SharedMemory(String),
+}
+
 #[allow(clippy::type_complexity)]
-static DATABASE_MANAGER: LazyLock<Arc<parking_lot::Mutex<HashMap<String, Weak<Database>>>>> =
+static DATABASE_MANAGER: LazyLock<Arc<parking_lot::Mutex<HashMap<DatabaseKey, Weak<Database>>>>> =
     LazyLock::new(|| Arc::new(parking_lot::Mutex::new(HashMap::default())));
 
 /// The `Database` object contains per database file state that is shared
@@ -451,6 +466,8 @@ impl Database {
         db_file: Arc<dyn DatabaseStorage>,
         encryption_opts: Option<EncryptionOpts>,
     ) -> Result<Self> {
+        let path = path.into();
+        let wal_path = wal_path.into();
         let shared_wal = WalFileShared::new_noop();
         let mv_store = ArcSwapOption::empty();
 
@@ -478,14 +495,15 @@ impl Database {
             None
         };
 
-        // opts is now passed as parameter
         let db = Database {
             mv_store,
-            path: path.into(),
-            wal_path: wal_path.into(),
-            schema: Arc::new(Mutex::new(Arc::new(Schema::with_options(
-                opts.enable_custom_types,
-            )))),
+            path,
+            wal_path,
+            schema: Arc::new(Mutex::new(Arc::new({
+                let mut s = Schema::with_options(opts.enable_custom_types);
+                s.generated_columns_enabled = opts.enable_generated_columns;
+                s
+            }))),
             _shared_page_cache: shared_page_cache,
             shared_wal,
             db_file,
@@ -516,7 +534,32 @@ impl Database {
         Self::open_file_with_flags(io, path, OpenFlags::default(), DatabaseOpts::new(), None)
     }
 
-    /// Look up a database in the process-wide registry by path.
+    /// Open or retrieve a shared named in-memory database.
+    /// Multiple connections to the same `name` share a single `Database`,
+    /// matching SQLite's `file:name?mode=memory&cache=shared` semantics.
+    #[cfg(feature = "fs")]
+    pub fn open_shared_memory(name: &str) -> Result<Arc<Database>> {
+        let key = DatabaseKey::SharedMemory(name.to_string());
+
+        {
+            let registry = DATABASE_MANAGER.lock_arc();
+            if let Some(db) = registry.get(&key).and_then(Weak::upgrade) {
+                return Ok(db);
+            }
+        }
+        // `:memory:` paths bypass DATABASE_MANAGER internally, so no deadlock.
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Self::open_file(io, ":memory:")?;
+
+        let mut registry = DATABASE_MANAGER.lock_arc();
+        if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
+            return Ok(existing);
+        }
+        registry.insert(key, Arc::downgrade(&db));
+        Ok(db)
+    }
+
+    /// Look up a database in the process-wide registry by file identity.
     /// Returns the cached Database if found, with encryption validation.
     /// This avoids opening a file (and acquiring a file lock) when the
     /// database is already open in this process.
@@ -527,15 +570,13 @@ impl Database {
         if path.starts_with(":memory:") {
             return Ok(None);
         }
-        let canonical = match std::fs::canonicalize(path)
-            .ok()
-            .and_then(|p| p.to_str().map(|s| s.to_string()))
-        {
-            Some(c) => c,
-            None => return Ok(None),
+        let file_id = match io::get_file_id(path) {
+            Ok(id) => id,
+            Err(_) => return Ok(None), // file doesn't exist yet
         };
+        let key = DatabaseKey::File(file_id);
         let registry = DATABASE_MANAGER.lock_arc();
-        let db = match registry.get(&canonical).and_then(Weak::upgrade) {
+        let db = match registry.get(&key).and_then(Weak::upgrade) {
             Some(db) => db,
             None => return Ok(None),
         };
@@ -697,37 +738,33 @@ impl Database {
             // lock the database manager for the whole duration of open_with_flags_async method
             let registry = DATABASE_MANAGER.lock_arc();
 
-            let canonical_path = std::fs::canonicalize(path)
-                .ok()
-                .and_then(|p| p.to_str().map(|s| s.to_string()))
-                .unwrap_or_else(|| path.to_string());
+            // Look up by file identity (dev, ino). If file doesn't exist
+            // yet (CREATE mode), skip lookup — no cached entry is possible.
+            if let Ok(file_id) = io.file_id(path) {
+                let key = DatabaseKey::File(file_id);
+                if let Some(db) = registry.get(&key).and_then(Weak::upgrade) {
+                    tracing::debug!("took database {path:?} from the registry");
 
-            // Check if already in registry
-            if let Some(db) = registry.get(&canonical_path).and_then(Weak::upgrade) {
-                tracing::debug!("took database {canonical_path:?} from the registry");
+                    let db_is_encrypted =
+                        !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
+                    if db_is_encrypted && encryption_opts.is_none() {
+                        return Err(LimboError::InvalidArgument(
+                            "Database is encrypted but no encryption options provided".to_string(),
+                        ));
+                    }
 
-                // Check encryption compatibility using cipher mode (key is not stored in Database for security)
-                let db_is_encrypted = !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
-
-                if db_is_encrypted && encryption_opts.is_none() {
-                    return Err(LimboError::InvalidArgument(
-                        "Database is encrypted but no encryption options provided".to_string(),
-                    ));
+                    return Ok(IOResult::Done(db));
                 }
-
-                // Found in registry, no need to hold lock
-                return Ok(IOResult::Done(db));
             }
 
-            // Not in registry, hold the lock and store canonical path for later insertion
+            // Not in registry — hold the lock to prevent concurrent opens.
             state.registry_guard = Some(registry);
-            state.canonical_path = Some(canonical_path);
         }
 
-        // Open the database asynchronously (registry lock is held in state for not `:memory:.*` pathes)
+        // Open the database asynchronously (registry lock is held in state for not `:memory:.*` paths)
         let result = Self::open_with_flags_bypass_registry_async(
             state,
-            io,
+            io.clone(),
             path,
             None,
             db_file,
@@ -738,11 +775,11 @@ impl Database {
         )?;
 
         if let IOResult::Done(ref db) = result {
-            // will be unset in case of `:memory:.*` path
-            if let (Some(mut registry), Some(canonical_path)) =
-                (state.registry_guard.take(), state.canonical_path.take())
-            {
-                registry.insert(canonical_path, Arc::downgrade(db));
+            if let Some(mut registry) = state.registry_guard.take() {
+                // File now exists — compute identity and insert.
+                if let Ok(file_id) = io.file_id(path) {
+                    registry.insert(DatabaseKey::File(file_id), Arc::downgrade(db));
+                }
             }
         }
 
@@ -1255,13 +1292,13 @@ impl Database {
         pager.set_schema_cookie(None);
 
         if open_mv_store {
-            // todo(v): pass required encryption ctx to enable encryption with mvcc
+            let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
             let mv_store = journal_mode::open_mv_store(
                 self.io.clone(),
                 &self.path,
                 self.open_flags,
                 self.durable_storage.clone(),
-                None,
+                enc_ctx,
             )?;
             self.mv_store.store(Some(mv_store));
         }
@@ -1331,6 +1368,10 @@ impl Database {
             dml_require_where: AtomicBool::new(false),
             mv_tx: RwLock::new(None),
             attached_mv_txs: RwLock::new(HashMap::default()),
+            #[cfg(any(test, injected_yields))]
+            yield_injector: RwLock::new(None),
+            #[cfg(any(test, injected_yields))]
+            yield_instance_id_counter: AtomicU64::new(1),
             view_transaction_states: AllViewsTxState::new(),
             metrics: RwLock::new(ConnectionMetrics::new()),
             nestedness: AtomicI32::new(0),
@@ -1342,10 +1383,14 @@ impl Database {
             temp_store: AtomicTempStore::new(TempStore::Default),
             data_sync_retry: AtomicBool::new(false),
             busy_handler: RwLock::new(BusyHandler::None),
+            query_timeout_ms: AtomicU64::new(0),
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
+            full_column_names: AtomicBool::new(false),
+            short_column_names: AtomicBool::new(true),
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
             n_active_writes: AtomicI32::new(0),
+            n_active_root_statements: AtomicI32::new(0),
             check_constraints_pragma: AtomicBool::new(false),
             vtab_txn_states: RwLock::new(HashSet::default()),
             prepare_context_generation: AtomicU64::new(0),
@@ -1616,6 +1661,10 @@ impl Database {
 
     pub fn experimental_attach_enabled(&self) -> bool {
         self.opts.enable_attach
+    }
+
+    pub fn experimental_generated_columns_enabled(&self) -> bool {
+        self.opts.enable_generated_columns
     }
 
     /// check if database is currently in MVCC mode

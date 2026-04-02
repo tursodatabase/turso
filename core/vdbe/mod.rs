@@ -68,7 +68,8 @@ use crate::{
     vdbe::{builder::CursorType, insn::Insn},
 };
 use crate::{
-    AtomicBool, CaptureDataChangesInfo, Connection, MvStore, Result, SyncMode, TransactionState,
+    AtomicBool, CaptureDataChangesInfo, Connection, MvStore, Result, Statement, SyncMode,
+    TransactionState,
 };
 use branches::{mark_unlikely, unlikely};
 use builder::{CursorKey, QueryMode};
@@ -78,6 +79,7 @@ use execute::{
 };
 use turso_parser::ast::ResolveType;
 
+use crate::io::TempFile;
 use crate::vdbe::bloom_filter::BloomFilter;
 use crate::vdbe::rowset::RowSet;
 use explain::{insn_to_row_with_comment, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS};
@@ -437,6 +439,9 @@ pub struct ProgramState {
     /// Indicate whether an [Insn::Once] instruction at a given program counter position has already been executed, well, once.
     once: SmallVec<[u32; 4]>,
     pub execution_state: ProgramExecutionState,
+    /// Per-execution statement deadline derived from the connection query timeout.
+    /// `None` means no timeout.
+    pub query_deadline: Option<crate::MonotonicInstant>,
     pub parameters: Vec<Value>,
     commit_state: CommitState,
     #[cfg(feature = "json")]
@@ -483,6 +488,9 @@ pub struct ProgramState {
     /// Scratch buffer for [Insn::HashDistinct] to avoid per-row allocations.
     distinct_key_values: Vec<Value>,
     hash_tables: HashMap<usize, HashTable>,
+    /// TempFile handles for ephemeral cursors, keyed by cursor_id.
+    /// Dropping removes the temp file from disk.
+    ephemeral_temp_files: HashMap<usize, TempFile>,
     uses_subjournal: bool,
     /// Whether this statement is an active write inside an explicit transaction.
     pub(crate) is_active_write: bool,
@@ -503,6 +511,10 @@ pub struct ProgramState {
     /// capture_data_changes has type Option<CaptureDataChangesInfo> (off mode is None)
     /// so, for pending_cdc_info we wrap it in one more Option<...> layer to represent if mode changed during program execution
     pub(crate) pending_cdc_info: Option<Option<CaptureDataChangesInfo>>,
+    pub(crate) op_parse_schema_state: execute::OpParseSchemaState,
+    /// Cached subprogram Statements keyed by the PC of the Program instruction.
+    /// Avoids re-allocating ProgramState on each trigger/FK-action fire.
+    pub(crate) subprogram_stmt_cache: HashMap<usize, Box<Statement>>,
 }
 
 impl std::fmt::Debug for Program {
@@ -537,6 +549,7 @@ impl ProgramState {
             ended_coroutine: vec![],
             once: SmallVec::<[u32; 4]>::new(),
             execution_state: ProgramExecutionState::Init,
+            query_deadline: None,
             parameters: Vec::new(),
             commit_state: CommitState::Ready,
             #[cfg(feature = "json")]
@@ -576,6 +589,7 @@ impl ProgramState {
             rowsets: HashMap::default(),
             bloom_filters: HashMap::default(),
             hash_tables: HashMap::default(),
+            ephemeral_temp_files: HashMap::default(),
             uses_subjournal: false,
             is_active_write: false,
             has_stmt_transaction: false,
@@ -584,6 +598,8 @@ impl ProgramState {
             explain_state: RwLock::new(ExplainState::default()),
             pending_fail_error: None,
             pending_cdc_info: None,
+            op_parse_schema_state: None,
+            subprogram_stmt_cache: HashMap::default(),
         }
     }
 
@@ -668,6 +684,7 @@ impl ProgramState {
         self.ended_coroutine.clear();
         self.once.clear();
         self.execution_state = ProgramExecutionState::Init;
+        self.query_deadline = None;
         self.current_collation = None;
         #[cfg(feature = "json")]
         self.json_cache.clear();
@@ -708,6 +725,7 @@ impl ProgramState {
         self.rowsets.clear();
         self.bloom_filters.clear();
         self.hash_tables.clear();
+        self.ephemeral_temp_files.clear();
         self.op_hash_build_state = None;
         self.op_hash_probe_state = None;
         self.uses_subjournal = false;
@@ -719,6 +737,7 @@ impl ProgramState {
         *self.explain_state.write() = ExplainState::default();
         self.pending_fail_error = None;
         self.pending_cdc_info = None;
+        self.subprogram_stmt_cache.clear();
     }
 
     pub fn get_cursor(&mut self, cursor_id: CursorID) -> &mut Cursor {
@@ -1144,6 +1163,12 @@ impl Program {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
 
+        if let Some(deadline) = state.query_deadline {
+            if pager.io.current_time_monotonic() >= deadline {
+                state.execution_state = ProgramExecutionState::Interrupting;
+            }
+        }
+
         if matches!(state.execution_state, ProgramExecutionState::Interrupting) {
             return Ok(StepResult::Interrupt);
         }
@@ -1245,6 +1270,12 @@ impl Program {
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
 
+            if let Some(deadline) = state.query_deadline {
+                if pager.io.current_time_monotonic() >= deadline {
+                    state.execution_state = ProgramExecutionState::Interrupting;
+                }
+            }
+
             if matches!(state.execution_state, ProgramExecutionState::Interrupting) {
                 return Ok(StepResult::Interrupt);
             }
@@ -1291,6 +1322,11 @@ impl Program {
                     pager.rollback_tx(&self.connection);
                 }
                 return Err(LimboError::InternalError("Connection closed".to_string()));
+            }
+            if let Some(deadline) = state.query_deadline {
+                if pager.io.current_time_monotonic() >= deadline {
+                    state.execution_state = ProgramExecutionState::Interrupting;
+                }
             }
             if matches!(state.execution_state, ProgramExecutionState::Interrupting) {
                 self.abort(pager, None, state)?;
@@ -1904,7 +1940,11 @@ impl Program {
 
         let mut abort_error: Option<LimboError> = None;
 
-        if self.is_trigger_subprogram() {
+        // Only end trigger execution if the subprogram was actually running.
+        // Cached (pooled) statements may be dropped after their trigger execution
+        // was already ended by op_program; calling end again would pop the wrong
+        // entry from the executing_triggers stack.
+        if self.is_trigger_subprogram() && state.execution_state.is_running() {
             self.connection.end_trigger_execution();
         }
         // Errors from nested statements are handled by the parent statement.

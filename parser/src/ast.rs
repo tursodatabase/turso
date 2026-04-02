@@ -3,7 +3,7 @@ pub mod fmt;
 
 use std::{num::NonZeroU32, sync::Arc};
 
-use crate::lexer::is_keyword;
+use crate::lexer::is_quotable_keyword;
 use strum_macros::{EnumIter, EnumString};
 
 /// `?` or `$` Prepared statement arg placeholder(s)
@@ -325,6 +325,15 @@ pub enum Stmt {
 /// FIXME: rename this to TableReferenceId.
 pub struct TableInternalId(usize);
 
+impl TableInternalId {
+    /// used in generated columns to signify "the table that the column belongs to"
+    pub const SELF_TABLE: Self = Self(0);
+
+    pub fn is_self_table(&self) -> bool {
+        self.0 == 0
+    }
+}
+
 impl Default for TableInternalId {
     fn default() -> Self {
         Self(1)
@@ -518,6 +527,8 @@ pub enum Expr {
         /// The type of subquery.
         query_type: SubqueryType,
     },
+    /// `DEFAULT` keyword in INSERT VALUES
+    Default,
     /// `ARRAY[expr, ...]` array literal
     Array {
         /// elements of the array
@@ -920,6 +931,25 @@ pub enum As {
     As(Name),
     /// no `AS`
     Elided(Name), // FIXME Ids
+    /// Implicit column name from original SQL text (not serialized to SQL).
+    /// Used to preserve the original expression text as the column name
+    /// for unaliased expressions, matching SQLite behavior.
+    ImplicitColumnName(Name),
+}
+
+impl As {
+    /// Returns the inner `Name` regardless of variant.
+    pub fn name(&self) -> &Name {
+        match self {
+            As::As(name) | As::Elided(name) | As::ImplicitColumnName(name) => name,
+        }
+    }
+
+    /// Returns `true` if this is a user-provided alias (`AS foo` or elided `foo`),
+    /// not a system-generated implicit column name.
+    pub fn is_explicit(&self) -> bool {
+        matches!(self, As::As(_) | As::Elided(_))
+    }
 }
 
 /// `JOIN` clause
@@ -1124,7 +1154,7 @@ impl Name {
         }
         let value = self.value.as_bytes();
         let safe_char = |&c: &u8| c.is_ascii_alphanumeric() || c == b'_';
-        if !value.is_empty() && value.iter().all(safe_char) && !is_keyword(value) {
+        if !value.is_empty() && value.iter().all(safe_char) && !is_quotable_keyword(value) {
             self.value.clone()
         } else {
             format!("\"{}\"", self.value.replace("\"", "\"\""))
@@ -1344,8 +1374,18 @@ pub enum ColumnConstraint {
         /// expression
         expr: Box<Expr>,
         /// `STORED` / `VIRTUAL`
-        typ: Option<Name>,
+        typ: Option<GeneratedColumnType>,
     },
+}
+
+/// Generated column type
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum GeneratedColumnType {
+    /// `STORED`
+    Stored,
+    /// `VIRTUAL`
+    Virtual,
 }
 
 /// Named table constraint
@@ -1634,6 +1674,8 @@ pub enum PragmaName {
     FreelistCount,
     /// Enable or disable foreign key constraint enforcement
     ForeignKeys,
+    /// Deprecated: control whether column names include table name prefix
+    FullColumnNames,
     /// List all SQL functions known to the database connection
     FunctionList,
     /// Use F_FULLFSYNC instead of fsync on macOS (only supported on macOS)
@@ -1645,6 +1687,8 @@ pub enum PragmaName {
     IntegrityCheck,
     /// `journal_mode` pragma
     JournalMode,
+    /// `locking_mode` pragma
+    LockingMode,
     /// Run a quick integrity check (skips expensive index consistency validation)
     QuickCheck,
     /// encryption key for encrypted databases, specified as hexadecimal string.
@@ -1666,6 +1710,8 @@ pub enum PragmaName {
     QueryOnly,
     /// Returns schema version of the database file.
     SchemaVersion,
+    /// Deprecated: control whether unaliased column names omit the table name prefix
+    ShortColumnNames,
     /// Alias for `require_where` pragma, as an homage to MySQL (https://dev.mysql.com/doc/refman/9.6/en/mysql-tips.html#safe-updates)
     IAmADummy,
     /// Reject DELETE/UPDATE without WHERE clause

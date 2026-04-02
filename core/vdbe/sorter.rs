@@ -96,9 +96,11 @@ pub struct Sorter {
 }
 
 impl Sorter {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         order: &[SortOrder],
         collations: Vec<CollationSeq>,
+        nulls_orders: Vec<Option<turso_parser::ast::NullsOrder>>,
         comparators: Vec<Option<SortComparator>>,
         max_buffer_size_bytes: usize,
         min_chunk_read_buffer_size_bytes: usize,
@@ -115,9 +117,11 @@ impl Sorter {
                 order
                     .iter()
                     .zip(collations)
-                    .map(|(order, collation)| KeyInfo {
+                    .zip(nulls_orders)
+                    .map(|((order, collation), nulls)| KeyInfo {
                         sort_order: *order,
                         collation,
+                        nulls_order: nulls,
                     })
                     .collect(),
             ),
@@ -836,6 +840,19 @@ impl Ord for ArenaSortableRecord {
                 }
             };
             if cmp != Ordering::Equal {
+                let involves_null =
+                    matches!(self_val, ValueRef::Null) || matches!(other_val, ValueRef::Null);
+                if involves_null {
+                    if let Some(nulls_order) = key_info.nulls_order {
+                        // ValueRef ordering: NULL < non-NULL.
+                        // NULLS FIRST: keep that natural order regardless of ASC/DESC.
+                        // NULLS LAST: reverse it regardless of ASC/DESC.
+                        return match nulls_order {
+                            turso_parser::ast::NullsOrder::First => cmp,
+                            turso_parser::ast::NullsOrder::Last => cmp.reverse(),
+                        };
+                    }
+                }
                 return match key_info.sort_order {
                     SortOrder::Asc => cmp,
                     SortOrder::Desc => cmp.reverse(),
@@ -938,6 +955,16 @@ impl Ord for BoxedSortableRecord {
                 }
             };
             if cmp != Ordering::Equal {
+                let involves_null =
+                    matches!(self_val, ValueRef::Null) || matches!(other_val, ValueRef::Null);
+                if involves_null {
+                    if let Some(nulls_order) = key_info.nulls_order {
+                        return match nulls_order {
+                            turso_parser::ast::NullsOrder::First => cmp,
+                            turso_parser::ast::NullsOrder::Last => cmp.reverse(),
+                        };
+                    }
+                }
                 return match key_info.sort_order {
                     SortOrder::Asc => cmp,
                     SortOrder::Desc => cmp.reverse(),
@@ -1010,6 +1037,7 @@ mod tests {
             let mut sorter = Sorter::new(
                 &[SortOrder::Asc],
                 vec![CollationSeq::Binary],
+                vec![None],
                 vec![None],
                 256,
                 64,

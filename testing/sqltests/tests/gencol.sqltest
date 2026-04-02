@@ -1,0 +1,4045 @@
+@database :memory:
+
+# =============================================================================
+# 1. Basics & Syntax Variants
+# =============================================================================
+
+test gencol_virtual_basic_1 {
+    CREATE TABLE t1(a INTEGER, b AS (a*2));
+    INSERT INTO t1(a) VALUES(5);
+    SELECT a, b FROM t1;
+}
+expect {
+    5|10
+}
+
+test gencol_virtual_basic_2 {
+    CREATE TABLE t1(a INTEGER, b AS (a*2) VIRTUAL);
+    INSERT INTO t1(a) VALUES(7);
+    SELECT a, b FROM t1;
+}
+expect {
+    7|14
+}
+
+test gencol_virtual_select_star {
+    CREATE TABLE t1(x, y AS (x+1), z);
+    INSERT INTO t1(x, z) VALUES(10, 30);
+    SELECT * FROM t1;
+}
+expect {
+    10|11|30
+}
+
+test gencol_virtual_expression_concat {
+    CREATE TABLE t1(first TEXT, last TEXT, full AS (first || ' ' || last));
+    INSERT INTO t1(first, last) VALUES('John', 'Doe');
+    SELECT full FROM t1;
+}
+expect {
+    John Doe
+}
+
+test gencol_generated_always_virtual {
+    CREATE TABLE t1(a INTEGER, b GENERATED ALWAYS AS (a*2));
+    INSERT INTO t1(a) VALUES(5);
+    SELECT b FROM t1;
+}
+expect {
+    10
+}
+
+# Multiple generated columns
+test gencol_multiple_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a*2), c AS (a*3), d AS (a*4));
+    INSERT INTO t1(a) VALUES(5);
+    SELECT b, c, d FROM t1;
+}
+expect {
+    10|15|20
+}
+
+# Test that INTEGER AS columns are correctly marked as VIRTUAL (hidden=2).
+test gencol_pragma_table_xinfo_integer_as_virtual {
+    CREATE TABLE t1(a REAL, b INTEGER AS (a), c REAL AS (b), d INTEGER AS (c + 1));
+    PRAGMA table_xinfo(t1);
+}
+expect {
+    0|a|REAL|0||0|0
+    1|b|INTEGER|0||0|2
+    2|c|REAL|0||0|2
+    3|d|INTEGER|0||0|2
+}
+
+# =============================================================================
+# 2. Expression Types
+# =============================================================================
+
+# --- Arithmetic operators ---
+
+test gencol_arithmetic_add {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a+b));
+    INSERT INTO t1(a, b) VALUES(3, 7);
+    SELECT c FROM t1;
+}
+expect {
+    10
+}
+
+test gencol_arithmetic_subtract {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a-b));
+    INSERT INTO t1(a, b) VALUES(10, 3);
+    SELECT c FROM t1;
+}
+expect {
+    7
+}
+
+test gencol_arithmetic_multiply {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a*b));
+    INSERT INTO t1(a, b) VALUES(4, 5);
+    SELECT c FROM t1;
+}
+expect {
+    20
+}
+
+test gencol_arithmetic_divide {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a/b));
+    INSERT INTO t1(a, b) VALUES(20, 4);
+    SELECT c FROM t1;
+}
+expect {
+    5
+}
+
+test gencol_arithmetic_modulo {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a%b));
+    INSERT INTO t1(a, b) VALUES(17, 5);
+    SELECT c FROM t1;
+}
+expect {
+    2
+}
+
+# --- Comparison operators ---
+
+test gencol_comparison_equal {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a=b));
+    INSERT INTO t1(a, b) VALUES(5, 5), (5, 6);
+    SELECT c FROM t1;
+}
+expect {
+    1
+    0
+}
+
+test gencol_comparison_greater {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a>b));
+    INSERT INTO t1(a, b) VALUES(10, 5), (3, 7);
+    SELECT c FROM t1;
+}
+expect {
+    1
+    0
+}
+
+# TEXT column uses text comparison: '10' > '5' is false (lexicographic)
+@skip "TODO needs virtual column affinity handling"
+test gencol_comparison_affinity_text_integer {
+    CREATE TABLE t1(a TEXT, b INTEGER AS (a > 5));
+    INSERT INTO t1(a) VALUES('10'), ('3'), ('7');
+    SELECT a, b FROM t1;
+}
+expect {
+    10|0
+    3|0
+    7|1
+}
+
+@skip "TODO needs virtual column affinity handling"
+test gencol_comparison_affinity_equals {
+    CREATE TABLE t1(a TEXT, b INTEGER AS (a = 10));
+    INSERT INTO t1(a) VALUES('10'), ('5');
+    SELECT a, b FROM t1;
+}
+expect {
+    10|1
+    5|0
+}
+
+@skip "TODO needs virtual column affinity handling"
+test gencol_comparison_affinity_null {
+    CREATE TABLE t1(a TEXT, b INTEGER AS (a > 5));
+    INSERT INTO t1(a) VALUES(NULL), ('10');
+    SELECT a, b FROM t1;
+}
+expect {
+    |
+    10|0
+}
+
+@skip "TODO needs virtual column affinity handling"
+test gencol_comparison_affinity_negative {
+    CREATE TABLE t1(a TEXT, b INTEGER AS (a > -5));
+    INSERT INTO t1(a) VALUES('-3'), ('-7'), ('0');
+    SELECT a, b FROM t1;
+}
+expect {
+    -3|0
+    -7|1
+    0|1
+}
+
+@skip "TODO needs virtual column affinity handling"
+test gencol_comparison_affinity_real {
+    CREATE TABLE t1(a TEXT, b INTEGER AS (a > 5.5));
+    INSERT INTO t1(a) VALUES('6'), ('5'), ('5.5');
+    SELECT a, b FROM t1;
+}
+expect {
+    6|1
+    5|0
+    5.5|0
+}
+
+# --- Unary operators ---
+
+test gencol_unary_negative {
+    CREATE TABLE t1(a INTEGER, b AS (-a));
+    INSERT INTO t1(a) VALUES(5);
+    SELECT b FROM t1;
+}
+expect {
+    -5
+}
+
+test gencol_unary_positive {
+    CREATE TABLE t1(a INTEGER, b AS (+a));
+    INSERT INTO t1(a) VALUES(5);
+    SELECT b FROM t1;
+}
+expect {
+    5
+}
+
+test gencol_unary_not {
+    CREATE TABLE t1(a INTEGER, b AS (NOT a));
+    INSERT INTO t1(a) VALUES(0), (1);
+    SELECT a, b FROM t1;
+}
+expect {
+    0|1
+    1|0
+}
+
+# --- Bitwise operators ---
+
+test gencol_bitwise_and {
+    CREATE TABLE t1(a INT, b INT, c AS (a & b));
+    INSERT INTO t1(a, b) VALUES(15, 9);
+    SELECT c FROM t1;
+}
+expect {
+    9
+}
+
+test gencol_bitwise_or {
+    CREATE TABLE t1(a INT, b INT, c AS (a | b));
+    INSERT INTO t1(a, b) VALUES(15, 9);
+    SELECT c FROM t1;
+}
+expect {
+    15
+}
+
+test gencol_shift_left {
+    CREATE TABLE t1(a INT, b INT, c AS (a << b));
+    INSERT INTO t1(a, b) VALUES(1, 4);
+    SELECT c FROM t1;
+}
+expect {
+    16
+}
+
+test gencol_shift_right {
+    CREATE TABLE t1(a INT, b INT, c AS (a >> b));
+    INSERT INTO t1(a, b) VALUES(16, 2);
+    SELECT c FROM t1;
+}
+expect {
+    4
+}
+
+test gencol_bitwise_not {
+    CREATE TABLE t1(a INT, b AS (~a));
+    INSERT INTO t1(a) VALUES(0);
+    SELECT b FROM t1;
+}
+expect {
+    -1
+}
+
+# --- CASE expressions ---
+
+test gencol_case_expression {
+    CREATE TABLE t1(a INTEGER, b AS (CASE WHEN a > 0 THEN 'positive' WHEN a < 0 THEN 'negative' ELSE 'zero' END));
+    INSERT INTO t1(a) VALUES(5), (-3), (0);
+    SELECT a, b FROM t1;
+}
+expect {
+    5|positive
+    -3|negative
+    0|zero
+}
+
+test gencol_case_base_column {
+    CREATE TABLE t1(a INTEGER, b AS (CASE a WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END));
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    SELECT a, b FROM t1;
+}
+expect {
+    1|one
+    2|two
+    3|other
+}
+
+test gencol_case_multi_column {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (CASE WHEN a > b THEN a WHEN b > a THEN b ELSE 0 END));
+    INSERT INTO t1(a, b) VALUES(5, 3), (2, 8), (4, 4);
+    SELECT c FROM t1;
+}
+expect {
+    5
+    8
+    0
+}
+
+test gencol_case_nested {
+    CREATE TABLE t1(a INTEGER, b AS (CASE WHEN a > 0 THEN CASE WHEN a > 10 THEN 'large' ELSE 'small' END ELSE 'negative' END));
+    INSERT INTO t1(a) VALUES(20), (5), (-3);
+    SELECT a, b FROM t1;
+}
+expect {
+    20|large
+    5|small
+    -3|negative
+}
+
+test gencol_case_no_else {
+    CREATE TABLE t1(a INTEGER, b AS (CASE WHEN a = 1 THEN 'one' WHEN a = 2 THEN 'two' END));
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    SELECT a, b FROM t1;
+}
+expect {
+    1|one
+    2|two
+    3|
+}
+
+test gencol_case_with_not {
+    CREATE TABLE t1(a INTEGER, b AS (CASE WHEN NOT (a > 0) THEN 'non-positive' ELSE 'positive' END));
+    INSERT INTO t1(a) VALUES(5), (-3), (0);
+    SELECT a, b FROM t1;
+}
+expect {
+    5|positive
+    -3|non-positive
+    0|non-positive
+}
+
+# --- CAST, COLLATE, parenthesized ---
+
+test gencol_validate_cast {
+    CREATE TABLE t1(a INTEGER, b AS (CAST(a AS TEXT)));
+    INSERT INTO t1(a) VALUES(42);
+    SELECT typeof(b), b FROM t1;
+}
+expect {
+    text|42
+}
+
+test gencol_validate_parenthesized {
+    CREATE TABLE t1(a INTEGER, b AS ((a + 1)));
+    INSERT INTO t1(a) VALUES(5);
+    SELECT b FROM t1;
+}
+expect {
+    6
+}
+
+test gencol_parentheses {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS ((a+b)*2));
+    INSERT INTO t1(a, b) VALUES(3, 7);
+    SELECT c FROM t1;
+}
+expect {
+    20
+}
+
+test gencol_validate_collate {
+    CREATE TABLE t1(a TEXT, b AS (a COLLATE NOCASE));
+    INSERT INTO t1(a) VALUES('Hello');
+    SELECT b FROM t1;
+}
+expect {
+    Hello
+}
+
+# --- BETWEEN, IN, LIKE ---
+
+test gencol_between {
+    CREATE TABLE t1(a INTEGER, b AS (a BETWEEN 5 AND 10));
+    INSERT INTO t1(a) VALUES(3), (7), (12);
+    SELECT a, b FROM t1;
+}
+expect {
+    3|0
+    7|1
+    12|0
+}
+
+test gencol_between_update {
+    CREATE TABLE t1(a INTEGER, b AS (a BETWEEN 5 AND 10));
+    INSERT INTO t1(a) VALUES(3);
+    UPDATE t1 SET a = 7;
+    SELECT a, b FROM t1;
+}
+expect {
+    7|1
+}
+
+test gencol_in_list {
+    CREATE TABLE t1(a INTEGER, b AS (a IN (1, 3, 5, 7, 9)));
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    SELECT a, b FROM t1;
+}
+expect {
+    1|1
+    2|0
+    3|1
+}
+
+test gencol_in_list_update {
+    CREATE TABLE t1(a INTEGER, b AS (a IN (1, 3, 5, 7, 9)));
+    INSERT INTO t1(a) VALUES(1);
+    UPDATE t1 SET a = 2;
+    SELECT a, b FROM t1;
+}
+expect {
+    2|0
+}
+
+test gencol_like {
+    CREATE TABLE t1(a TEXT, b AS (a LIKE '%ell%'));
+    INSERT INTO t1(a) VALUES('hello'), ('world'), ('shell');
+    SELECT a, b FROM t1;
+}
+expect {
+    hello|1
+    world|0
+    shell|1
+}
+
+test gencol_like_update {
+    CREATE TABLE t1(a TEXT, b AS (a LIKE '%ell%'));
+    INSERT INTO t1(a) VALUES('hello');
+    UPDATE t1 SET a = 'world';
+    SELECT a, b FROM t1;
+}
+expect {
+    world|0
+}
+
+test gencol_validate_like_escape {
+    CREATE TABLE t1(a TEXT, b AS (a LIKE '%!%%' ESCAPE '!'));
+    INSERT INTO t1(a) VALUES('100%'), ('hello'), ('50% off');
+    SELECT a, b FROM t1;
+}
+expect {
+    100%|1
+    hello|0
+    50% off|1
+}
+
+# --- ISNULL / NOTNULL keywords ---
+
+test gencol_validate_isnull {
+    CREATE TABLE t1(a INTEGER, b AS (a ISNULL));
+    INSERT INTO t1(a) VALUES(NULL), (5);
+    SELECT a, b FROM t1;
+}
+expect {
+    |1
+    5|0
+}
+
+test gencol_validate_notnull {
+    CREATE TABLE t1(a INTEGER, b AS (a NOTNULL));
+    INSERT INTO t1(a) VALUES(NULL), (5);
+    SELECT a, b FROM t1;
+}
+expect {
+    |0
+    5|1
+}
+
+# =============================================================================
+# 3. Functions in Expressions
+# =============================================================================
+
+test gencol_func_abs {
+    CREATE TABLE t1(a INTEGER, b AS (ABS(a)));
+    INSERT INTO t1(a) VALUES(-5);
+    SELECT b FROM t1;
+}
+expect {
+    5
+}
+
+test gencol_func_length {
+    CREATE TABLE t1(a TEXT, b AS (LENGTH(a)));
+    INSERT INTO t1(a) VALUES('hello');
+    SELECT b FROM t1;
+}
+expect {
+    5
+}
+
+test gencol_func_upper {
+    CREATE TABLE t1(a TEXT, b AS (UPPER(a)));
+    INSERT INTO t1(a) VALUES('hello');
+    SELECT b FROM t1;
+}
+expect {
+    HELLO
+}
+
+test gencol_func_lower {
+    CREATE TABLE t1(a TEXT, b AS (LOWER(a)));
+    INSERT INTO t1(a) VALUES('HELLO');
+    SELECT b FROM t1;
+}
+expect {
+    hello
+}
+
+test gencol_func_substr {
+    CREATE TABLE t1(a TEXT, b AS (SUBSTR(a, 1, 3)));
+    INSERT INTO t1(a) VALUES('hello');
+    SELECT b FROM t1;
+}
+expect {
+    hel
+}
+
+test gencol_func_ifnull {
+    CREATE TABLE t1(a INTEGER, b AS (IFNULL(a, 0)));
+    INSERT INTO t1(a) VALUES(NULL);
+    UPDATE t1 SET a = 5;
+    SELECT b FROM t1;
+}
+expect {
+    5
+}
+
+test gencol_func_nested_abs {
+    CREATE TABLE t1(a INTEGER, b AS (ABS(ABS(a))));
+    INSERT INTO t1(a) VALUES(-5);
+    SELECT b FROM t1;
+}
+expect {
+    5
+}
+
+test gencol_func_nested_upper_substr {
+    CREATE TABLE t1(a TEXT, b AS (UPPER(SUBSTR(a, 1, 3))));
+    INSERT INTO t1(a) VALUES('hello');
+    SELECT b FROM t1;
+}
+expect {
+    HEL
+}
+
+test gencol_func_coalesce_multi_col {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c INTEGER, d AS (COALESCE(a, b, c)));
+    INSERT INTO t1(a, b, c) VALUES(NULL, NULL, 3);
+    UPDATE t1 SET b = 7;
+    SELECT d FROM t1;
+}
+expect {
+    7
+}
+
+test gencol_func_ifnull_two_cols {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (IFNULL(a, b)));
+    INSERT INTO t1(a, b) VALUES(NULL, 42);
+    UPDATE t1 SET a = 10;
+    SELECT c FROM t1;
+}
+expect {
+    10
+}
+
+test gencol_func_abs_arithmetic {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (ABS(a - b)));
+    INSERT INTO t1(a, b) VALUES(3, 10);
+    SELECT c FROM t1;
+}
+expect {
+    7
+}
+
+test gencol_func_multi_abs_arithmetic {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (ABS(a) + ABS(b)));
+    INSERT INTO t1(a, b) VALUES(-3, -7);
+    SELECT c FROM t1;
+}
+expect {
+    10
+}
+
+test gencol_func_dependency_chain {
+    CREATE TABLE t1(a INTEGER, b AS (ABS(a)), c AS (b * 2));
+    INSERT INTO t1(a) VALUES(-5);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    -5|5|10
+}
+
+test gencol_func_min_cols {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (MIN(a, b)));
+    INSERT INTO t1(a, b) VALUES(3, 7), (10, 2);
+    SELECT c FROM t1;
+}
+expect {
+    3
+    2
+}
+
+test gencol_func_max_cols {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (MAX(a, b)));
+    INSERT INTO t1(a, b) VALUES(3, 7), (10, 2);
+    SELECT c FROM t1;
+}
+expect {
+    7
+    10
+}
+
+test gencol_glob_pattern_column {
+    CREATE TABLE t1(a TEXT, b AS (a GLOB '[0-9]*'));
+    INSERT INTO t1(a) VALUES('123abc'), ('abc123'), ('456');
+    SELECT a, b FROM t1;
+}
+expect {
+    123abc|1
+    abc123|0
+    456|1
+}
+
+# =============================================================================
+# 4. Column Dependency Chains
+# =============================================================================
+
+test gencol_dependency_chain_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a*2), c AS (b*2));
+    INSERT INTO t1(a) VALUES(3);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    3|6|12
+}
+
+test gencol_dependency_out_of_order_virtual {
+    CREATE TABLE t1(a INTEGER, c AS (b+1), b AS (a*2));
+    INSERT INTO t1(a) VALUES(5);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    5|10|11
+}
+
+test gencol_dependency_reverse_order_virtual {
+    CREATE TABLE t1(a INTEGER, d AS (c+1), c AS (b+1), b AS (a*2));
+    INSERT INTO t1(a) VALUES(3);
+    SELECT a, b, c, d FROM t1;
+}
+expect {
+    3|6|7|8
+}
+
+test gencol_dependency_diamond_virtual {
+    CREATE TABLE t1(a INTEGER, d AS (b + c), b AS (a*2), c AS (a*3));
+    INSERT INTO t1(a) VALUES(5);
+    SELECT a, b, c, d FROM t1;
+}
+expect {
+    5|10|15|25
+}
+
+# Forward references are allowed in SQLite generated columns
+test gencol_forward_reference {
+    CREATE TABLE t1(a AS (b*2), b INTEGER);
+    INSERT INTO t1(b) VALUES(5);
+    SELECT a, b FROM t1;
+}
+expect {
+    10|5
+}
+
+# =============================================================================
+# 5. Type Affinity
+# =============================================================================
+
+test gencol_affinity_integer {
+    CREATE TABLE t1(a TEXT, b INTEGER AS (a*2));
+    INSERT INTO t1(a) VALUES('5');
+    SELECT typeof(b), b FROM t1;
+}
+expect {
+    integer|10
+}
+
+test gencol_affinity_text {
+    CREATE TABLE t1(a INTEGER, b TEXT AS (a || 'x'));
+    INSERT INTO t1(a) VALUES(42);
+    SELECT typeof(b), b FROM t1;
+}
+expect {
+    text|42x
+}
+
+test gencol_affinity_real {
+    CREATE TABLE t1(a INTEGER, b REAL AS (a/2.0));
+    INSERT INTO t1(a) VALUES(5);
+    SELECT typeof(b), b FROM t1;
+}
+expect {
+    real|2.5
+}
+
+test gencol_affinity_float_to_int_exact {
+    CREATE TABLE t1(a REAL, b INTEGER AS (a));
+    INSERT INTO t1(a) VALUES (5.0);
+    SELECT typeof(b), b FROM t1;
+}
+expect {
+    integer|5
+}
+
+test gencol_affinity_float_fractional {
+    CREATE TABLE t1(a REAL);
+    INSERT INTO t1(a) VALUES (5.5);
+    SELECT typeof(a), a FROM t1;
+}
+expect {
+    real|5.5
+}
+
+test gencol_affinity_large_int_exact {
+    CREATE TABLE t1(a REAL, b INTEGER AS (a));
+    INSERT INTO t1(a) VALUES (1000000.0);
+    SELECT typeof(b), b FROM t1;
+}
+expect {
+    integer|1000000
+}
+
+test gencol_affinity_numeric_float_to_int {
+    CREATE TABLE t1(a REAL, b NUMERIC AS (a));
+    INSERT INTO t1(a) VALUES (42.0);
+    SELECT typeof(b), b FROM t1;
+}
+expect {
+    integer|42
+}
+
+test gencol_affinity_numeric_fractional {
+    CREATE TABLE t1(a REAL, b NUMERIC AS (a));
+    INSERT INTO t1(a) VALUES (42.5);
+    SELECT typeof(b), b FROM t1;
+}
+expect {
+    real|42.5
+}
+
+test gencol_float_literal_in_expr {
+    CREATE TABLE t1(a INTEGER, b REAL AS (a + 0.5));
+    INSERT INTO t1(a) VALUES (5);
+    SELECT typeof(b), b FROM t1;
+}
+expect {
+    real|5.5
+}
+
+test gencol_division_exact_int {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c INTEGER AS (a / b));
+    INSERT INTO t1(a, b) VALUES (10, 2);
+    SELECT typeof(c), c FROM t1;
+}
+expect {
+    integer|5
+}
+
+test gencol_division_truncated {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c INTEGER AS (a / b));
+    INSERT INTO t1(a, b) VALUES (10, 3);
+    SELECT typeof(c), c FROM t1;
+}
+expect {
+    integer|3
+}
+
+# NUMERIC affinity: text "3.0" -> float 3.0 -> integer 3
+test gencol_numeric_affinity {
+    CREATE TABLE t1(a TEXT, b NUMERIC GENERATED ALWAYS AS (a) VIRTUAL);
+    INSERT INTO t1(a) VALUES('3.0');
+    SELECT typeof(b), b FROM t1;
+}
+expect {
+    integer|3
+}
+
+# REAL->INTEGER->REAL->INTEGER affinity chain
+test gencol_virtual_affinity_chain {
+    CREATE TABLE t1 (
+        a REAL,
+        b INTEGER AS (a),
+        c REAL AS (b),
+        d INTEGER AS (- (c - (141 - c)))
+    );
+    INSERT INTO t1 (a) VALUES (10.0);
+    SELECT typeof(a), typeof(b), typeof(c), typeof(d) FROM t1;
+    SELECT a, b, c, d FROM t1;
+}
+expect {
+    real|integer|real|integer
+    10.0|10|10.0|121
+}
+# JS Number omits .0 for whole numbers
+expect @js {
+    real|integer|real|integer
+    10|10|10|121
+}
+
+@skip-if sqlite "bug/quirk in SQLite: the sorter strips the internal MEM_IntReal optimization, so the value is formatted as an int"
+test gencol_intreal_typeof {
+    CREATE TABLE t1 (b REAL, c REAL AS (b));
+    INSERT INTO t1 VALUES (20.0);
+    SELECT typeof(c), c FROM t1 ORDER BY c;
+}
+expect {
+    real|20.0
+}
+expect @js {
+    real|20
+}
+
+# Generated columns use their own collation (BINARY), not the source column's
+test gencol_collation_not_inherited {
+    CREATE TABLE t1(name TEXT COLLATE NOCASE, gen TEXT GENERATED ALWAYS AS (name));
+    INSERT INTO t1(name) VALUES('b'),('a'),('B'),('A');
+    SELECT gen FROM t1 ORDER BY gen;
+}
+expect {
+    A
+    B
+    a
+    b
+}
+
+test gencol_type_mismatch_text_in_integer {
+    CREATE TABLE t1(a TEXT, b INTEGER AS (a));
+    INSERT INTO t1(a) VALUES('hello');
+    SELECT typeof(b), b FROM t1;
+}
+expect {
+    text|hello
+}
+
+test gencol_type_mismatch_int_in_text {
+    CREATE TABLE t1(a INTEGER, b TEXT AS (a));
+    INSERT INTO t1(a) VALUES(42);
+    SELECT typeof(b), b FROM t1;
+}
+expect {
+    text|42
+}
+
+test gencol_type_mismatch_real_in_integer {
+    CREATE TABLE t1(a REAL, b INTEGER AS (a));
+    INSERT INTO t1(a) VALUES(3.7);
+    SELECT typeof(b), b FROM t1;
+}
+expect {
+    real|3.7
+}
+
+test gencol_type_mismatch_blob_in_text {
+    CREATE TABLE t1(a BLOB, b TEXT AS (a));
+    INSERT INTO t1(a) VALUES(x'DEADBEEF');
+    SELECT typeof(b), quote(b) FROM t1;
+}
+expect {
+    blob|X'DEADBEEF'
+}
+
+# =============================================================================
+# 6. Column Positions
+# =============================================================================
+
+test gencol_first_position {
+    CREATE TABLE t1(a AS (b+c), b INTEGER, c INTEGER);
+    INSERT INTO t1(b, c) VALUES(3, 5);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    8|3|5
+}
+
+test gencol_middle_position {
+    CREATE TABLE t1(a INTEGER, b AS (a*2), c INTEGER);
+    INSERT INTO t1(a, c) VALUES(5, 100);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    5|10|100
+}
+
+test gencol_last_position {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a+b));
+    INSERT INTO t1(a, b) VALUES(3, 7);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    3|7|10
+}
+
+# =============================================================================
+# 7. NULL Handling
+# =============================================================================
+
+test gencol_null_input {
+    CREATE TABLE t1(a INTEGER, b AS (a*2));
+    INSERT INTO t1(a) VALUES(NULL);
+    SELECT a, b FROM t1;
+}
+expect {
+    |
+}
+
+test gencol_null_in_expression {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a+b));
+    INSERT INTO t1(a, b) VALUES(5, NULL);
+    SELECT c FROM t1;
+}
+expect {
+
+}
+
+test gencol_coalesce_null {
+    CREATE TABLE t1(a INTEGER, b AS (COALESCE(a, 0) * 2));
+    INSERT INTO t1(a) VALUES(NULL);
+    UPDATE t1 SET a = 5;
+    SELECT b FROM t1;
+}
+expect {
+    10
+}
+
+# SQL three-valued logic: NULL AND TRUE = NULL, NULL AND FALSE = FALSE
+test gencol_null_and_semantics {
+    CREATE TABLE t1(a INT, b INT, c AS (a AND b));
+    INSERT INTO t1(a, b) VALUES(NULL, 1), (NULL, 0), (1, NULL), (0, NULL);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    |1|
+    |0|0
+    1||
+    0||0
+}
+
+# NULL OR TRUE = TRUE, NULL OR FALSE = NULL
+test gencol_null_or_semantics {
+    CREATE TABLE t1(a INT, b INT, c AS (a OR b));
+    INSERT INTO t1(a, b) VALUES(NULL, 0), (NULL, 1), (0, NULL), (1, NULL);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    |0|
+    |1|1
+    0||
+    1||1
+}
+
+# IN-list NULL handling with generated columns
+test gencol_in_list_null_handling {
+    CREATE TABLE t1(a INTEGER, b AS (a) VIRTUAL);
+    INSERT INTO t1(a) VALUES(1), (2), (NULL);
+    SELECT a, b IN (1, NULL) FROM t1 ORDER BY a;
+}
+expect {
+    |
+    1|1
+    2|
+}
+
+# =============================================================================
+# 8. DML (INSERT, UPDATE, DELETE, RETURNING)
+# =============================================================================
+
+test gencol_update_virtual_unchanged {
+    CREATE TABLE t1(a INTEGER, b AS (a*2));
+    INSERT INTO t1(a) VALUES(5);
+    UPDATE t1 SET a = 10;
+    SELECT a, b FROM t1;
+}
+expect {
+    10|20
+}
+
+# INSERT DEFAULT VALUES with virtual generated column
+test gencol_insert_default_values_virtual {
+    CREATE TABLE t1(a INT DEFAULT 10, b INT GENERATED ALWAYS AS (a + 5) VIRTUAL);
+    INSERT INTO t1 DEFAULT VALUES;
+    SELECT * FROM t1;
+}
+expect {
+    10|15
+}
+
+# --- Division by zero handling ---
+
+test gencol_division_by_zero_null {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a / b));
+    INSERT INTO t1(a, b) VALUES (10, 0);
+    UPDATE t1 SET a = 20;
+    SELECT a, b, c FROM t1;
+}
+expect {
+    20|0|
+}
+
+test gencol_modulo_by_zero {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a % b));
+    INSERT INTO t1(a, b) VALUES (10, 0);
+    UPDATE t1 SET a = 20;
+    SELECT a, b, c FROM t1;
+}
+expect {
+    20|0|
+}
+
+test gencol_division_by_zero_coalesce {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (COALESCE(a / NULLIF(b, 0), 0)));
+    INSERT INTO t1(a, b) VALUES (10, 0);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    10|0|0
+}
+
+test gencol_division_by_zero_case {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (CASE WHEN b = 0 THEN 0 ELSE a / b END));
+    INSERT INTO t1(a, b) VALUES (10, 0), (10, 2);
+    SELECT a, b, c FROM t1 ORDER BY b;
+}
+expect {
+    10|0|0
+    10|2|5
+}
+
+# --- RETURNING ---
+
+test gencol_returning_insert_star_middle {
+    CREATE TABLE t1(a INT, v AS (a*2) VIRTUAL, b INT);
+    INSERT INTO t1(a, b) VALUES(1, 100) RETURNING *;
+}
+expect {
+    1|2|100
+}
+
+test gencol_returning_insert_specific_cols {
+    CREATE TABLE t1(a INT, v AS (a*2) VIRTUAL, b INT);
+    INSERT INTO t1(a, b) VALUES(5, 50) RETURNING a, b, v;
+}
+expect {
+    5|50|10
+}
+
+test gencol_returning_update_star {
+    CREATE TABLE t1(a INT, v AS (a*2) VIRTUAL, b INT);
+    INSERT INTO t1(a, b) VALUES(1, 100);
+    UPDATE t1 SET a = 10 RETURNING *;
+}
+expect {
+    10|20|100
+}
+
+test gencol_returning_virtual_first {
+    CREATE TABLE t1(v AS (b*3) VIRTUAL, a INT, b INT);
+    INSERT INTO t1(a, b) VALUES(1, 2) RETURNING *;
+}
+expect {
+    6|1|2
+}
+
+test gencol_returning_multiple_virtual {
+    CREATE TABLE t1(a INT, v1 AS (a*2) VIRTUAL, b INT, v2 AS (b*3) VIRTUAL, c INT);
+    INSERT INTO t1(a, b, c) VALUES(1, 2, 3) RETURNING *;
+}
+expect {
+    1|2|2|6|3
+}
+
+# --- Virtual column chain updates ---
+
+test gencol_virtual_chain_update {
+    CREATE TABLE t1 (
+        a REAL,
+        b INTEGER AS (a),
+        c REAL AS (b),
+        d INTEGER AS (- (c - (141 - c)))
+    );
+    INSERT INTO t1 (a) VALUES (1.5);
+    UPDATE t1 SET a = 2.7;
+    SELECT a, b, c, d FROM t1;
+}
+expect {
+    2.7|2.7|2.7|135.6
+}
+
+test gencol_virtual_simple_update {
+    CREATE TABLE t1 (
+        a REAL,
+        b REAL AS (a * 2)
+    );
+    INSERT INTO t1 (a) VALUES (5.0);
+    SELECT a, b FROM t1;
+}
+expect {
+    5.0|10.0
+}
+# JS Number omits .0 for whole numbers
+expect @js {
+    5|10
+}
+
+test gencol_virtual_simple_update_2 {
+    CREATE TABLE t1 (
+        a REAL,
+        b REAL AS (a * 2)
+    );
+    INSERT INTO t1 (a) VALUES (5.0);
+    UPDATE t1 SET a = 10.0;
+    SELECT a, b FROM t1;
+}
+expect {
+    10.0|20.0
+}
+# JS Number omits .0 for whole numbers
+expect @js {
+    10|20
+}
+
+test gencol_virtual_three_deep {
+    CREATE TABLE t1 (
+        base REAL,
+        level1 REAL AS (base + 10),
+        level2 REAL AS (level1 + 100),
+        level3 REAL AS (level2 + 1000)
+    );
+    INSERT INTO t1 (base) VALUES (1);
+    SELECT base, level1, level2, level3 FROM t1;
+}
+expect {
+    1.0|11.0|111.0|1111.0
+}
+# JS Number omits .0 for whole numbers
+expect @js {
+    1|11|111|1111
+}
+
+test gencol_virtual_three_deep_update {
+    CREATE TABLE t1 (
+        base REAL,
+        level1 REAL AS (base + 10),
+        level2 REAL AS (level1 + 100),
+        level3 REAL AS (level2 + 1000)
+    );
+    INSERT INTO t1 (base) VALUES (1);
+    UPDATE t1 SET base = 2;
+    SELECT base, level1, level2, level3 FROM t1;
+}
+expect {
+    2.0|12.0|112.0|1112.0
+}
+expect @js {
+    2|12|112|1112
+}
+
+# UPDATE with virtual column as FIRST column
+test gencol_update_virtual_first_col {
+    CREATE TABLE t1(v AS (b*3) VIRTUAL, a INT, b INT);
+    INSERT INTO t1(a, b) VALUES(1, 2);
+    UPDATE t1 SET a = 10;
+    SELECT * FROM t1;
+}
+expect {
+    6|10|2
+}
+
+# UPDATE with VIRTUAL column referencing id (verify still works)
+test gencol_rowid_alias_update_virtual {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, other INTEGER, b AS (id + other));
+    INSERT INTO t1(id, other) VALUES (5, 10);
+    UPDATE t1 SET other = 20;
+    SELECT id, other, b FROM t1;
+}
+expect {
+    5|20|25
+}
+
+test gencol_delete_where_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    INSERT INTO t1(a) VALUES(1), (2), (3), (4), (5);
+    DELETE FROM t1 WHERE b > 6;
+    SELECT a, b FROM t1;
+}
+expect {
+    1|2
+    2|4
+    3|6
+}
+
+test gencol_delete_multiple_verify_remaining {
+    CREATE TABLE t1(a INTEGER, b TEXT, c AS (a || '-' || b));
+    INSERT INTO t1(a, b) VALUES(1, 'x'), (2, 'y'), (3, 'z'), (4, 'w');
+    DELETE FROM t1 WHERE a IN (2, 4);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    1|x|1-x
+    3|z|3-z
+}
+
+test gencol_replace_into {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c AS (b || '!'));
+    INSERT INTO t1(a, b) VALUES(1, 'hello');
+    REPLACE INTO t1(a, b) VALUES(1, 'world');
+    SELECT a, b, c FROM t1;
+}
+expect {
+    1|world|world!
+}
+
+test gencol_insert_or_replace {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER, c AS (b * 10));
+    INSERT INTO t1(a, b) VALUES(1, 5);
+    INSERT OR REPLACE INTO t1(a, b) VALUES(1, 9);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    1|9|90
+}
+
+test gencol_insert_or_ignore {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER, c AS (b + 100));
+    INSERT INTO t1(a, b) VALUES(1, 5);
+    INSERT OR IGNORE INTO t1(a, b) VALUES(1, 9);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    1|5|105
+}
+
+@skip "TODO: INSERT OR REPLACE with virtual column index triggers SELF_TABLE parse error"
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_insert_or_replace_with_index {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER, c AS (b * 2));
+    CREATE INDEX idx1 ON t1(c);
+    INSERT INTO t1(a, b) VALUES(1, 5);
+    INSERT OR REPLACE INTO t1(a, b) VALUES(1, 20);
+    SELECT a, b, c FROM t1;
+    PRAGMA integrity_check;
+}
+expect {
+    1|20|40
+    ok
+}
+
+test gencol_delete_basic {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    DELETE FROM t1 WHERE a = 2;
+    SELECT a, b FROM t1 ORDER BY a;
+}
+expect {
+    1|2
+    3|6
+}
+
+test gencol_delete_all {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    DELETE FROM t1;
+    SELECT COUNT(*) FROM t1;
+}
+expect {
+    0
+}
+
+# DELETE with virtual column in middle of table
+test gencol_delete_virtual_middle {
+    CREATE TABLE t1(a INTEGER, v AS (a * 2), c INTEGER);
+    INSERT INTO t1(a, c) VALUES(1, 10), (2, 20), (3, 30);
+    DELETE FROM t1 WHERE v = 4;
+    SELECT a, v, c FROM t1 ORDER BY a;
+}
+expect {
+    1|2|10
+    3|6|30
+}
+
+# DELETE with chained virtual columns
+test gencol_delete_chained_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + 1));
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    DELETE FROM t1 WHERE c > 5;
+    SELECT a, b, c FROM t1 ORDER BY a;
+}
+expect {
+    1|2|3
+    2|4|5
+}
+
+test gencol_insert_or_replace_multiple {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER, c AS (b * 3));
+    INSERT INTO t1(a, b) VALUES(1, 10), (2, 20), (3, 30);
+    INSERT OR REPLACE INTO t1(a, b) VALUES(2, 200), (4, 40);
+    SELECT a, b, c FROM t1 ORDER BY a;
+}
+expect {
+    1|10|30
+    2|200|600
+    3|30|90
+    4|40|120
+}
+
+test gencol_replace_virtual_first_col {
+    CREATE TABLE t1(v AS (b * 2) VIRTUAL, a INTEGER PRIMARY KEY, b INTEGER);
+    INSERT INTO t1(a, b) VALUES(1, 5);
+    REPLACE INTO t1(a, b) VALUES(1, 15);
+    SELECT * FROM t1;
+}
+expect {
+    30|1|15
+}
+
+test gencol_insert_or_ignore_notnull_violation {
+    CREATE TABLE t1(a INTEGER NOT NULL, b AS (a * 2));
+    INSERT OR IGNORE INTO t1(a) VALUES(5);
+    INSERT OR IGNORE INTO t1(a) VALUES(NULL);
+    SELECT a, b FROM t1;
+}
+expect {
+    5|10
+}
+
+test gencol_insert_select_basic {
+    CREATE TABLE src(x INTEGER);
+    INSERT INTO src VALUES(1), (2), (3);
+    CREATE TABLE dst(a INTEGER, b AS (a * 2));
+    INSERT INTO dst(a) SELECT x FROM src;
+    SELECT a, b FROM dst ORDER BY a;
+}
+expect {
+    1|2
+    2|4
+    3|6
+}
+
+test gencol_insert_select_with_transform {
+    CREATE TABLE src(x INTEGER, y INTEGER);
+    INSERT INTO src VALUES(1, 10), (2, 20);
+    CREATE TABLE dst(a INTEGER, b INTEGER, c AS (a + b));
+    INSERT INTO dst(a, b) SELECT x, y FROM src;
+    SELECT a, b, c FROM dst ORDER BY a;
+}
+expect {
+    1|10|11
+    2|20|22
+}
+
+test gencol_insert_select_from_gencol_table {
+    CREATE TABLE src(a INTEGER, b AS (a * 2));
+    INSERT INTO src(a) VALUES(5), (10);
+    CREATE TABLE dst(x INTEGER, y AS (x * 3));
+    INSERT INTO dst(x) SELECT b FROM src;
+    SELECT x, y FROM dst ORDER BY x;
+}
+expect {
+    10|30
+    20|60
+}
+
+test gencol_insert_select_virtual_middle {
+    CREATE TABLE src(x INTEGER);
+    INSERT INTO src VALUES(1), (2), (3);
+    CREATE TABLE dst(a INTEGER, v AS (a * 10), c INTEGER DEFAULT 99);
+    INSERT INTO dst(a) SELECT x FROM src;
+    SELECT a, v, c FROM dst ORDER BY a;
+}
+expect {
+    1|10|99
+    2|20|99
+    3|30|99
+}
+
+test gencol_update_fanout {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (a * 3), d AS (a + 100));
+    INSERT INTO t1(a) VALUES(5);
+    SELECT a, b, c, d FROM t1;
+    UPDATE t1 SET a = 10;
+    SELECT a, b, c, d FROM t1;
+}
+expect {
+    5|10|15|105
+    10|20|30|110
+}
+
+test gencol_update_fanout_multiple_rows {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a INTEGER, b AS (a * 2), c AS (a + 100));
+    INSERT INTO t1(id, a) VALUES(1, 5), (2, 10), (3, 15);
+    UPDATE t1 SET a = a + 1;
+    SELECT id, a, b, c FROM t1 ORDER BY id;
+}
+expect {
+    1|6|12|106
+    2|11|22|111
+    3|16|32|116
+}
+
+# =============================================================================
+# 9. Queries (WHERE, ORDER BY, GROUP BY, JOINs, window functions)
+# =============================================================================
+
+test gencol_where_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a*2));
+    INSERT INTO t1(a) VALUES(1), (2), (3), (4), (5);
+    SELECT a FROM t1 WHERE b > 6;
+}
+expect {
+    4
+    5
+}
+
+test gencol_order_by {
+    CREATE TABLE t1(a INTEGER, b AS (a*2));
+    INSERT INTO t1(a) VALUES(3), (1), (4), (1), (5);
+    SELECT a, b FROM t1 ORDER BY b DESC;
+}
+expect {
+    5|10
+    4|8
+    3|6
+    1|2
+    1|2
+}
+
+test gencol_group_by_virtual {
+    CREATE TABLE t1(a INTEGER, b TEXT, c AS (a * 2) VIRTUAL);
+    INSERT INTO t1(a, b) VALUES(1, 'x'), (1, 'y'), (2, 'z'), (3, 'a'), (3, 'b');
+    SELECT c, COUNT(*) FROM t1 GROUP BY c ORDER BY c;
+}
+expect {
+    2|2
+    4|1
+    6|2
+}
+
+test gencol_having_count {
+    CREATE TABLE t1(a INTEGER, b AS (a % 3) VIRTUAL);
+    INSERT INTO t1(a) VALUES(1), (2), (3), (4), (5), (6), (7);
+    SELECT b, COUNT(*) FROM t1 GROUP BY b HAVING COUNT(*) >= 3 ORDER BY b;
+}
+expect {
+    1|3
+}
+
+test gencol_exists_subquery {
+    CREATE TABLE t1(a INTEGER, b TEXT, c AS (LENGTH(b)) VIRTUAL);
+    CREATE TABLE t2(x INTEGER);
+    INSERT INTO t1(a, b) VALUES(1, 'hi'), (2, 'hello'), (3, 'hey');
+    INSERT INTO t2 VALUES(5);
+    SELECT a, b, c FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x = t1.c) ORDER BY a;
+}
+expect {
+    2|hello|5
+}
+
+test gencol_cross_join {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) VIRTUAL);
+    CREATE TABLE t2(x TEXT);
+    INSERT INTO t1(a) VALUES(1), (2);
+    INSERT INTO t2 VALUES('a'), ('b');
+    SELECT t1.a, t1.b, t2.x FROM t1, t2 ORDER BY t1.a, t2.x;
+}
+expect {
+    1|2|a
+    1|2|b
+    2|4|a
+    2|4|b
+}
+
+test gencol_virtual_join {
+    CREATE TABLE t1 (a INTEGER, b REAL, c REAL AS (b));
+    INSERT INTO t1 VALUES (1, 10.5), (2, 20.5), (3, 30.5);
+    CREATE TABLE t2 (x INTEGER, y TEXT);
+    INSERT INTO t2 VALUES (1, 'one'), (2, 'two');
+    CREATE INDEX idx_c ON t1 (c);
+    SELECT t2.x, t1.c FROM t1 INNER JOIN t2 ON (t1.c > 15.0) WHERE t2.x = 1 ORDER BY t2.x, t1.c;
+}
+expect {
+    1|20.5
+    1|30.5
+}
+
+test gencol_hash_join_virtual_affinity {
+    CREATE TABLE t1(a INTEGER, b INTEGER AS (a * 2));
+    CREATE TABLE t2(x INTEGER);
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    INSERT INTO t2 VALUES(2), (4);
+    SELECT t1.a, t1.b, t2.x FROM t1, t2 WHERE t1.b = t2.x ORDER BY t1.a;
+}
+expect {
+    1|2|2
+    2|4|4
+}
+
+test gencol_window_sum_partition {
+    CREATE TABLE t1(a INTEGER, b TEXT, c AS (a % 2) VIRTUAL);
+    INSERT INTO t1(a, b) VALUES(1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e');
+    SELECT a, c, SUM(a) OVER (PARTITION BY c ORDER BY a) AS running FROM t1 ORDER BY a;
+}
+expect {
+    1|1|1
+    2|0|2
+    3|1|4
+    4|0|6
+    5|1|9
+}
+
+test gencol_cte_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    WITH cte AS (SELECT a, b FROM t1 WHERE b > 2) SELECT * FROM cte;
+}
+expect {
+    2|4
+    3|6
+}
+
+test gencol_view_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 3));
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    CREATE VIEW v1 AS SELECT a, b FROM t1;
+    SELECT * FROM v1;
+}
+expect {
+    1|3
+    2|6
+    3|9
+}
+
+test gencol_union_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE TABLE t2(x INTEGER, y AS (x * 3));
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    INSERT INTO t2(x) VALUES(2), (3), (4);
+    SELECT b FROM t1 UNION SELECT y FROM t2 ORDER BY 1;
+}
+expect {
+    2
+    4
+    6
+    9
+    12
+}
+
+test gencol_intersect_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE TABLE t2(x INTEGER, y AS (x * 2));
+    INSERT INTO t1(a) VALUES(1), (2), (3), (4);
+    INSERT INTO t2(x) VALUES(3), (4), (5);
+    SELECT b FROM t1 INTERSECT SELECT y FROM t2 ORDER BY 1;
+}
+expect {
+    6
+    8
+}
+
+test gencol_except_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE TABLE t2(x INTEGER, y AS (x * 2));
+    INSERT INTO t1(a) VALUES(1), (2), (3), (4);
+    INSERT INTO t2(x) VALUES(3), (4), (5);
+    SELECT b FROM t1 EXCEPT SELECT y FROM t2 ORDER BY 1;
+}
+expect {
+    2
+    4
+}
+
+test gencol_distinct_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a % 3));
+    INSERT INTO t1(a) VALUES(1), (2), (3), (4), (5), (6);
+    SELECT DISTINCT b FROM t1 ORDER BY b;
+}
+expect {
+    0
+    1
+    2
+}
+
+test gencol_limit_offset_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 10));
+    INSERT INTO t1(a) VALUES(1), (2), (3), (4), (5);
+    SELECT a, b FROM t1 ORDER BY b LIMIT 3 OFFSET 1;
+}
+expect {
+    2|20
+    3|30
+    4|40
+}
+
+test gencol_left_join_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE TABLE t2(x INTEGER, y INTEGER);
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    INSERT INTO t2(x, y) VALUES(2, 20), (4, 40);
+    SELECT t1.a, t1.b, t2.y FROM t1 LEFT JOIN t2 ON t1.a = t2.x ORDER BY t1.a;
+}
+expect {
+    1|2|
+    2|4|20
+    3|6|
+}
+
+test gencol_correlated_subquery_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE TABLE t2(x INTEGER, val TEXT);
+    INSERT INTO t1(a) VALUES(1), (2), (3), (4);
+    INSERT INTO t2(x, val) VALUES(4, 'yes'), (6, 'yes');
+    SELECT a, b, (SELECT val FROM t2 WHERE t2.x = t1.b) FROM t1 ORDER BY a;
+}
+expect {
+    1|2|
+    2|4|yes
+    3|6|yes
+    4|8|
+}
+
+test gencol_having_multiple_aggregates {
+    CREATE TABLE t1(a INTEGER, cat TEXT, b AS (a * 2));
+    INSERT INTO t1(a, cat) VALUES(1, 'x'), (2, 'x'), (5, 'y'), (10, 'y'), (15, 'y');
+    SELECT cat, SUM(b), AVG(b), MAX(b) FROM t1 GROUP BY cat HAVING SUM(b) > 10 ORDER BY cat;
+}
+expect {
+    y|60|20.0|30
+}
+expect @js {
+    y|60|20|30
+}
+
+test gencol_window_functions_multiple {
+    CREATE TABLE t1(a INTEGER, grp TEXT, b AS (a * 2));
+    INSERT INTO t1(a, grp) VALUES(1, 'A'), (2, 'A'), (3, 'B'), (4, 'B'), (5, 'B');
+    SELECT a, b, grp,
+           AVG(b) OVER (PARTITION BY grp) as avg_b,
+           MIN(b) OVER (PARTITION BY grp) as min_b,
+           MAX(b) OVER (PARTITION BY grp) as max_b,
+           COUNT(b) OVER (PARTITION BY grp) as cnt_b
+    FROM t1 ORDER BY a;
+}
+expect {
+    1|2|A|3.0|2|4|2
+    2|4|A|3.0|2|4|2
+    3|6|B|8.0|6|10|3
+    4|8|B|8.0|6|10|3
+    5|10|B|8.0|6|10|3
+}
+expect @js {
+    1|2|A|3|2|4|2
+    2|4|A|3|2|4|2
+    3|6|B|8|6|10|3
+    4|8|B|8|6|10|3
+    5|10|B|8|6|10|3
+}
+
+test gencol_distinct_virtual_with_base {
+    CREATE TABLE t1(a INTEGER, b TEXT, c AS (LENGTH(b)));
+    INSERT INTO t1(a, b) VALUES(1, 'hi'), (2, 'hey'), (3, 'hi'), (4, 'hey');
+    SELECT DISTINCT c FROM t1 ORDER BY c;
+}
+expect {
+    2
+    3
+}
+
+test gencol_union_all_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE TABLE t2(x INTEGER, y AS (x * 2));
+    INSERT INTO t1(a) VALUES(1), (2);
+    INSERT INTO t2(x) VALUES(2), (3);
+    SELECT b FROM t1 UNION ALL SELECT y FROM t2 ORDER BY 1;
+}
+expect {
+    2
+    4
+    4
+    6
+}
+
+test gencol_cte_insert_into_gencol {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    WITH vals(x) AS (VALUES(10), (20), (30))
+    INSERT INTO t1(a) SELECT x FROM vals;
+    SELECT a, b FROM t1 ORDER BY a;
+}
+expect {
+    10|20
+    20|40
+    30|60
+}
+
+test gencol_offset_past_end {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    SELECT a, b FROM t1 ORDER BY a LIMIT 10 OFFSET 5;
+}
+expect {
+}
+
+test gencol_scalar_subquery_in_select {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE TABLE t2(x INTEGER);
+    INSERT INTO t1(a) VALUES(5), (10);
+    INSERT INTO t2 VALUES(100);
+    SELECT a, b, (SELECT x FROM t2) AS sub FROM t1 ORDER BY a;
+}
+expect {
+    5|10|100
+    10|20|100
+}
+
+# =============================================================================
+# 10. Constraints
+# =============================================================================
+
+test gencol_constraint_notnull_virtual_success {
+    CREATE TABLE t1(a INTEGER NOT NULL, b AS (a * 2));
+    INSERT INTO t1(a) VALUES (5);
+    SELECT a, b FROM t1;
+}
+expect {
+    5|10
+}
+
+test gencol_constraint_notnull_virtual_violation {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) NOT NULL);
+    INSERT INTO t1(a) VALUES (NULL);
+}
+expect error {
+    NOT NULL constraint failed
+}
+
+test gencol_constraint_notnull_virtual_coalesce_success {
+    CREATE TABLE t1(a INTEGER, b AS (COALESCE(a, 0)) NOT NULL);
+    INSERT INTO t1(a) VALUES (NULL);
+    SELECT a, b FROM t1;
+}
+expect {
+    |0
+}
+
+test gencol_constraint_notnull_virtual_ifnull_success {
+    CREATE TABLE t1(a INTEGER, b AS (IFNULL(a, 99)) NOT NULL);
+    INSERT INTO t1(a) VALUES (NULL);
+    SELECT a, b FROM t1;
+}
+expect {
+    |99
+}
+
+test gencol_constraint_notnull_virtual_case_success {
+    CREATE TABLE t1(a INTEGER, b AS (CASE WHEN a IS NULL THEN -1 ELSE a END) NOT NULL);
+    INSERT INTO t1(a) VALUES (NULL);
+    SELECT a, b FROM t1;
+}
+expect {
+    |-1
+}
+
+test gencol_constraint_notnull_virtual_multiple {
+    CREATE TABLE t1(a INTEGER, b AS (COALESCE(a, 10)) NOT NULL, c AS (COALESCE(a, 20)) NOT NULL);
+    INSERT INTO t1(a) VALUES (NULL);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    |10|20
+}
+
+# STRICT table UPDATE with virtual column: type check must still catch violations
+test gencol_strict_update_type_check {
+    CREATE TABLE t1(a INTEGER, v INTEGER AS (a*2), b INTEGER) STRICT;
+    INSERT INTO t1(a, b) VALUES(1, 2);
+    UPDATE t1 SET b = 'not_a_number';
+}
+expect error {
+    cannot store TEXT value in INTEGER column
+}
+
+test gencol_check_on_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) CHECK(b > 0));
+    INSERT INTO t1(a) VALUES(5);
+    SELECT a, b FROM t1;
+}
+expect {
+    5|10
+}
+
+test gencol_check_on_virtual_violation {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) CHECK(b > 0));
+    INSERT INTO t1(a) VALUES(-1);
+}
+expect error {
+    CHECK constraint failed
+}
+
+test gencol_check_table_level_referencing_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), CHECK(b < 100));
+    INSERT INTO t1(a) VALUES(10);
+    SELECT a, b FROM t1;
+}
+expect {
+    10|20
+}
+
+test gencol_check_table_level_referencing_virtual_violation {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), CHECK(b < 100));
+    INSERT INTO t1(a) VALUES(50);
+}
+expect error {
+    CHECK constraint failed
+}
+
+test gencol_check_update_virtual_violation {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) CHECK(b > 0));
+    INSERT INTO t1(a) VALUES(5);
+    UPDATE t1 SET a = -1;
+}
+expect error {
+    CHECK constraint failed
+}
+
+test gencol_check_update_virtual_success {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) CHECK(b > 0));
+    INSERT INTO t1(a) VALUES(5);
+    UPDATE t1 SET a = 3;
+    SELECT a, b FROM t1;
+}
+expect {
+    3|6
+}
+
+test gencol_check_update_virtual_chain {
+    CREATE TABLE t1(a INTEGER, b AS (a+1), c AS (b+1), CHECK(c > 0));
+    INSERT INTO t1(a) VALUES(5);
+    UPDATE t1 SET a = -3;
+}
+expect error {
+    CHECK constraint failed
+}
+
+test gencol_check_update_virtual_chain_success {
+    CREATE TABLE t1(a INTEGER, b AS (a+1), c AS (b+1), CHECK(c > 0));
+    INSERT INTO t1(a) VALUES(5);
+    UPDATE t1 SET a = -1;
+    SELECT a, b, c FROM t1;
+}
+expect {
+    -1|0|1
+}
+
+test gencol_check_multiple_virtual {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a * 2), d AS (b * 3), CHECK(c + d > 0));
+    INSERT INTO t1(a, b) VALUES(1, 1);
+    SELECT a, b, c, d FROM t1;
+}
+expect {
+    1|1|2|3
+}
+
+test gencol_check_multiple_virtual_violation {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a * 2), d AS (b * 3), CHECK(c + d > 0));
+    INSERT INTO t1(a, b) VALUES(-5, 1);
+}
+expect error {
+    CHECK constraint failed
+}
+
+test gencol_check_virtual_null_passes {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) CHECK(b > 0));
+    INSERT INTO t1(a) VALUES(NULL);
+    SELECT a, b FROM t1;
+}
+expect {
+    |
+}
+
+test gencol_check_virtual_coalesce {
+    CREATE TABLE t1(a INTEGER, b AS (COALESCE(a, 0)) CHECK(b >= 0));
+    INSERT INTO t1(a) VALUES(5);
+    SELECT a, b FROM t1;
+}
+expect {
+    5|5
+}
+
+test gencol_check_virtual_coalesce_violation {
+    CREATE TABLE t1(a INTEGER, b AS (COALESCE(a, 0)) CHECK(b >= 0));
+    INSERT INTO t1(a) VALUES(-1);
+}
+expect error {
+    CHECK constraint failed
+}
+
+test gencol_check_virtual_function {
+    CREATE TABLE t1(first TEXT, last TEXT, full_name AS (first || ' ' || last), CHECK(LENGTH(full_name) < 20));
+    INSERT INTO t1(first, last) VALUES('John', 'Doe');
+    SELECT first, last, full_name FROM t1;
+}
+expect {
+    John|Doe|John Doe
+}
+
+test gencol_check_virtual_function_violation {
+    CREATE TABLE t1(first TEXT, last TEXT, full_name AS (first || ' ' || last), CHECK(LENGTH(full_name) < 20));
+    INSERT INTO t1(first, last) VALUES('Bartholomew', 'Konstantinopoulos');
+}
+expect error {
+    CHECK constraint failed
+}
+
+test gencol_check_insert_or_ignore {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) CHECK(b > 0));
+    INSERT OR IGNORE INTO t1(a) VALUES(5), (-1), (3);
+    SELECT a, b FROM t1;
+}
+expect {
+    5|10
+    3|6
+}
+
+test gencol_check_update_or_ignore {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b AS (a * 2) CHECK(b > 0));
+    INSERT INTO t1(a) VALUES(1), (2);
+    UPDATE OR IGNORE t1 SET a = -1 WHERE a = 1;
+    SELECT a, b FROM t1;
+}
+expect {
+    1|2
+    2|4
+}
+
+test gencol_glob_in_expression {
+    CREATE TABLE t1(a TEXT, b AS (a GLOB 'h*'));
+    INSERT INTO t1(a) VALUES('hello'), ('world'), ('hi');
+    SELECT a, b FROM t1;
+}
+expect {
+    hello|1
+    world|0
+    hi|1
+}
+
+test gencol_is_null_operator {
+    CREATE TABLE t1(a, b AS (a IS NULL));
+    INSERT INTO t1(a) VALUES(1), (NULL), (0);
+    SELECT a, b FROM t1;
+}
+expect {
+    1|0
+    |1
+    0|0
+}
+
+test gencol_is_not_null_operator {
+    CREATE TABLE t1(a, b AS (a IS NOT NULL));
+    INSERT INTO t1(a) VALUES(1), (NULL), (0);
+    SELECT a, b FROM t1;
+}
+expect {
+    1|1
+    |0
+    0|1
+}
+
+# =============================================================================
+# 11. Indexes
+# =============================================================================
+
+# --- Basic index on VIRTUAL column ---
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_index_on_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE INDEX idx_b ON t1(b);
+    INSERT INTO t1(a) VALUES (5), (10), (3);
+    SELECT b FROM t1 WHERE b > 8 ORDER BY b;
+}
+expect {
+    10
+    20
+}
+
+# VIRTUAL column without index - must compute expression
+test gencol_virtual_no_index_where {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    INSERT INTO t1(a) VALUES (5), (10), (3);
+    SELECT a, b FROM t1 WHERE b > 8 ORDER BY b;
+}
+expect {
+    5|10
+    10|20
+}
+
+# Non-covering index - needs table for column 'c'
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_virtual_non_covering_index {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c TEXT);
+    CREATE INDEX idx_b ON t1(b);
+    INSERT INTO t1(a, c) VALUES (5, 'five'), (10, 'ten'), (3, 'three');
+    SELECT a, b, c FROM t1 WHERE b > 8 ORDER BY b;
+}
+expect {
+    5|10|five
+    10|20|ten
+}
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_index_virtual_where_filter {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE INDEX idx_b ON t1(b);
+    INSERT INTO t1(a) VALUES (1), (2), (3), (5), (10), (15);
+    SELECT a, b FROM t1 WHERE b BETWEEN 4 AND 12 ORDER BY b;
+}
+expect {
+    2|4
+    3|6
+    5|10
+}
+
+# --- Index UPDATE and integrity ---
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_index_virtual_update_integrity {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a + b));
+    CREATE INDEX idx_c ON t1(c);
+    INSERT INTO t1(a, b) VALUES (10, 20);
+    SELECT c FROM t1;
+    UPDATE t1 SET a = 100;
+    SELECT c FROM t1;
+}
+expect {
+    30
+    120
+}
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_index_virtual_multiple_updates {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a * b));
+    CREATE INDEX idx_c ON t1(c);
+    INSERT INTO t1(a, b) VALUES (2, 3);
+    UPDATE t1 SET a = 5;
+    UPDATE t1 SET b = 7;
+    SELECT a, b, c FROM t1;
+}
+expect {
+    5|7|35
+}
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_index_virtual_update_basic {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE INDEX idx_b ON t1(b);
+    INSERT INTO t1(a) VALUES (5);
+    UPDATE t1 SET a = 10;
+    SELECT a, b FROM t1;
+}
+expect {
+    10|20
+}
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_index_virtual_chain {
+    CREATE TABLE t1(x INTEGER, y AS (x + 1), z AS (y * 2));
+    CREATE INDEX idx_z ON t1(z);
+    INSERT INTO t1(x) VALUES (5);
+    UPDATE t1 SET x = 10;
+    SELECT x, y, z FROM t1;
+}
+expect {
+    10|11|22
+}
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_index_virtual_multirow_update {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val INTEGER, computed AS (val * 10));
+    CREATE INDEX idx_computed ON t1(computed);
+    INSERT INTO t1(id, val) VALUES (1, 5), (2, 10), (3, 15);
+    UPDATE t1 SET val = val + 1 WHERE id = 2;
+    SELECT id, val, computed FROM t1 ORDER BY id;
+}
+expect {
+    1|5|50
+    2|11|110
+    3|15|150
+}
+
+# --- Integrity checks ---
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_integrity_virtual_index {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a + b));
+    CREATE INDEX idx_c ON t1(c);
+    INSERT INTO t1(a, b) VALUES (10, 20);
+    INSERT INTO t1(a, b) VALUES (100, 200);
+    SELECT c FROM t1 ORDER BY c;
+}
+expect {
+    30
+    300
+}
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_integrity_virtual_middle {
+    CREATE TABLE t1(x INTEGER, v AS (x * 2), y INTEGER);
+    CREATE INDEX idx_y ON t1(y);
+    INSERT INTO t1(x, y) VALUES (1, 10);
+    INSERT INTO t1(x, y) VALUES (2, 20);
+    SELECT x, v, y FROM t1 ORDER BY y;
+}
+expect {
+    1|2|10
+    2|4|20
+}
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_integrity_multiple_virtual_before {
+    CREATE TABLE t1(a INTEGER, v1 AS (a), v2 AS (a * 2), b INTEGER);
+    CREATE INDEX idx_b ON t1(b);
+    INSERT INTO t1(a, b) VALUES (1, 100);
+    INSERT INTO t1(a, b) VALUES (2, 200);
+    SELECT a, v1, v2, b FROM t1 ORDER BY b;
+}
+expect {
+    1|1|2|100
+    2|2|4|200
+}
+
+test gencol_integrity_virtual_middle_verify {
+    CREATE TABLE t1(x INTEGER, v AS (x * 2), y INTEGER);
+    INSERT INTO t1(x, y) VALUES (5, 50);
+    SELECT x, v, y FROM t1;
+}
+expect {
+    5|10|50
+}
+
+# --- Virtual column chain indexes ---
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_update_virtual_chain_in_index {
+    CREATE TABLE t1 (
+        base INTEGER,
+        v1 INTEGER AS (base * 2),
+        v2 INTEGER AS (v1 + 1)
+    );
+    CREATE INDEX idx_v2 ON t1 (v2);
+    INSERT INTO t1 (base) VALUES (100);
+    UPDATE t1 SET base = 200;
+    SELECT base, v1, v2 FROM t1;
+}
+expect {
+    200|400|401
+}
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_update_deep_virtual_chain_in_index {
+    CREATE TABLE t1 (
+        a INTEGER,
+        v1 AS (a + 1),
+        v2 AS (v1 * 2),
+        v3 AS (v2 + v1)
+    );
+    CREATE INDEX idx_v3 ON t1 (v3);
+    INSERT INTO t1 (a) VALUES (10);
+    UPDATE t1 SET a = 20;
+    SELECT a, v1, v2, v3 FROM t1;
+}
+expect {
+    20|21|42|63
+}
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_update_virtual_chain_multiple_rows {
+    CREATE TABLE t1 (
+        id INTEGER PRIMARY KEY,
+        val INTEGER,
+        v1 AS (val * 10),
+        v2 AS (v1 + id)
+    );
+    CREATE INDEX idx_v2 ON t1 (v2);
+    INSERT INTO t1 (id, val) VALUES (1, 5), (2, 10), (3, 15);
+    UPDATE t1 SET val = val + 1 WHERE id = 2;
+    SELECT id, val, v1, v2 FROM t1 ORDER BY id;
+}
+expect {
+    1|5|50|51
+    2|11|110|112
+    3|15|150|153
+}
+
+# Covering index: selecting VIRTUAL column `c` through index should read correct position
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_covering_index_virtual_column_dependency {
+    CREATE TABLE t1 (a TEXT, b REAL AS (c), c INTEGER, d TEXT AS ('gen_46'));
+    INSERT INTO t1 (a, c) VALUES ('test', 4658494526751244126);
+    CREATE INDEX idx1 ON t1 (a, c, b);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    test|4.65849452675124e+18|4658494526751244126
+}
+expect @js {
+    test|4658494526751244000|4658494526751244126
+}
+
+# --- Expression indexes on VIRTUAL columns ---
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_expression_index_on_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a + 1));
+    CREATE INDEX idx_expr ON t1(b * 2);
+    INSERT INTO t1(a) VALUES (5);
+    UPDATE t1 SET a = 10;
+    SELECT a, b FROM t1;
+}
+expect {
+    10|11
+}
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_expression_index_on_virtual_basic_integrity {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE INDEX idx ON t1(b + 10);
+    INSERT INTO t1(a) VALUES (1), (2), (3);
+    SELECT a, b FROM t1 ORDER BY a;
+}
+expect {
+    1|2
+    2|4
+    3|6
+}
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_multiple_expr_indexes_virtual_integrity {
+    CREATE TABLE t1(a INTEGER, b AS (a + 1));
+    CREATE INDEX idx1 ON t1(b * 2);
+    CREATE INDEX idx2 ON t1(b - 1);
+    INSERT INTO t1(a) VALUES (10);
+    SELECT a, b FROM t1;
+}
+expect {
+    10|11
+}
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_expr_index_multi_virtual_integrity {
+    CREATE TABLE t1(a INTEGER, b AS (a + 1), c AS (a * 2));
+    CREATE INDEX idx ON t1(b + c);
+    INSERT INTO t1(a) VALUES (5);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    5|6|10
+}
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_expr_index_virtual_basic {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE INDEX idx1 ON t1(b + 10);
+    INSERT INTO t1(a) VALUES(5), (10), (15);
+    SELECT * FROM t1 WHERE b + 10 = 30 ORDER BY a;
+}
+expect {
+    10|20
+}
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_expr_index_virtual_update {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE INDEX idx1 ON t1(b + 10);
+    INSERT INTO t1(a) VALUES(5);
+    UPDATE t1 SET a = 10;
+    SELECT * FROM t1 WHERE b + 10 = 30;
+    SELECT * FROM t1 WHERE b + 10 = 20;
+}
+expect {
+    10|20
+}
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_expr_index_virtual_delete {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE INDEX idx1 ON t1(b + 10);
+    INSERT INTO t1(a) VALUES(5), (10);
+    DELETE FROM t1 WHERE a = 5;
+    SELECT * FROM t1 WHERE b + 10 = 20;
+}
+expect {
+}
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_expr_index_virtual_multirow_update {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE INDEX idx1 ON t1(b + 10);
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    UPDATE t1 SET a = a * 10;
+    SELECT * FROM t1 WHERE b + 10 >= 20 ORDER BY a;
+}
+expect {
+    10|20
+    20|40
+    30|60
+}
+
+# UPDATE with index on virtual column (old image must not panic)
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_update_index_on_virtual_col {
+    CREATE TABLE t1(a INTEGER, b AS (a * 10));
+    CREATE INDEX idx_b ON t1(b);
+    INSERT INTO t1(a) VALUES(1);
+    UPDATE t1 SET a = 2;
+    SELECT * FROM t1;
+}
+expect {
+    2|20
+}
+
+# UPDATE with indexed virtual column
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_update_indexed_virtual_col {
+    CREATE TABLE t1(a INT, v AS (a*2) VIRTUAL, b INT);
+    CREATE INDEX idx_v ON t1(v);
+    INSERT INTO t1(a, b) VALUES(5, 10);
+    UPDATE t1 SET a = 20;
+    SELECT * FROM t1;
+}
+expect {
+    20|40|10
+}
+
+# --- Multiple indexes updated simultaneously ---
+
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_multiple_indexes_insert {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c INTEGER);
+    CREATE INDEX idx_b ON t1(b);
+    CREATE INDEX idx_c ON t1(c);
+    INSERT INTO t1(a, c) VALUES(1, 10), (2, 20), (3, 30);
+    SELECT a, b, c FROM t1 ORDER BY b;
+    PRAGMA integrity_check;
+}
+expect {
+    1|2|10
+    2|4|20
+    3|6|30
+    ok
+}
+
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_multiple_indexes_update {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c INTEGER);
+    CREATE INDEX idx_b ON t1(b);
+    CREATE INDEX idx_c ON t1(c);
+    INSERT INTO t1(a, c) VALUES(1, 10), (2, 20);
+    UPDATE t1 SET a = 100, c = 200 WHERE a = 1;
+    SELECT a, b, c FROM t1 ORDER BY a;
+    PRAGMA integrity_check;
+}
+expect {
+    2|4|20
+    100|200|200
+    ok
+}
+
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_multiple_indexes_delete {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c INTEGER);
+    CREATE INDEX idx_b ON t1(b);
+    CREATE INDEX idx_c ON t1(c);
+    INSERT INTO t1(a, c) VALUES(1, 10), (2, 20), (3, 30);
+    DELETE FROM t1 WHERE a = 2;
+    SELECT a, b, c FROM t1 ORDER BY a;
+    PRAGMA integrity_check;
+}
+expect {
+    1|2|10
+    3|6|30
+    ok
+}
+
+# Two indexes on two different virtual columns
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_two_virtual_indexes {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (a * 3));
+    CREATE INDEX idx_b ON t1(b);
+    CREATE INDEX idx_c ON t1(c);
+    INSERT INTO t1(a) VALUES(5), (10);
+    UPDATE t1 SET a = 15 WHERE a = 5;
+    SELECT a, b, c FROM t1 ORDER BY a;
+    PRAGMA integrity_check;
+}
+expect {
+    10|20|30
+    15|30|45
+    ok
+}
+
+# UPDATE with indexed virtual column + TEXT PK
+@cross-check-integrity
+test update-text-pk-with-indexed-virtual-column {
+    CREATE TABLE t(id TEXT PRIMARY KEY, col_a TEXT);
+    ALTER TABLE t ADD COLUMN v TEXT GENERATED ALWAYS AS (CAST(col_a AS TEXT)) VIRTUAL;
+    CREATE INDEX t_v_idx ON t(v);
+    INSERT INTO t VALUES ('r1', 'hello');
+    UPDATE t SET col_a = 'world' WHERE id = 'r1';
+    SELECT count(*) FROM t WHERE v = 'world';
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    ok
+}
+
+# DELETE with indexed virtual column + TEXT PK
+@cross-check-integrity
+@skip "Same col_used_mask bug exists in DELETE path - panics (see #6206)"
+test delete-text-pk-indexed-virtual-column {
+    CREATE TABLE t3(id TEXT PRIMARY KEY, col_a TEXT);
+    ALTER TABLE t3 ADD COLUMN v TEXT GENERATED ALWAYS AS (CAST(col_a AS TEXT)) VIRTUAL;
+    CREATE INDEX t3_v_idx ON t3(v);
+    INSERT INTO t3 VALUES ('r1', 'hello'), ('r2', 'world');
+    DELETE FROM t3 WHERE id = 'r1';
+    SELECT count(*) FROM t3 WHERE v = 'hello';
+    PRAGMA integrity_check;
+}
+expect {
+    0
+    ok
+}
+
+# UPDATE with expression index (not virtual column) + TEXT PK
+@cross-check-integrity
+test update-text-pk-expression-index {
+    CREATE TABLE t4(id TEXT PRIMARY KEY, col_a TEXT);
+    CREATE INDEX t4_expr_idx ON t4(LOWER(col_a));
+    INSERT INTO t4 VALUES ('r1', 'Hello');
+    UPDATE t4 SET col_a = 'World' WHERE id = 'r1';
+    SELECT count(*) FROM t4 WHERE LOWER(col_a) = 'world';
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    ok
+}
+
+# UPDATE with virtual column depending on multiple base columns
+@cross-check-integrity
+test update-text-pk-virtual-multi-dep {
+    CREATE TABLE t5(id TEXT PRIMARY KEY, a TEXT, b TEXT);
+    ALTER TABLE t5 ADD COLUMN v TEXT GENERATED ALWAYS AS (a || '-' || b) VIRTUAL;
+    CREATE INDEX t5_v_idx ON t5(v);
+    INSERT INTO t5 VALUES ('r1', 'foo', 'bar');
+    UPDATE t5 SET a = 'baz' WHERE id = 'r1';
+    SELECT count(*) FROM t5 WHERE v = 'baz-bar';
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    ok
+}
+
+# UPDATE with mixed indexes (expression-based + plain) + TEXT PK
+@cross-check-integrity
+test update-text-pk-mixed-indexes {
+    CREATE TABLE t6(id TEXT PRIMARY KEY, col_a TEXT, col_b TEXT);
+    ALTER TABLE t6 ADD COLUMN v TEXT GENERATED ALWAYS AS (UPPER(col_a)) VIRTUAL;
+    CREATE INDEX t6_v_idx ON t6(v);
+    CREATE INDEX t6_b_idx ON t6(col_b);
+    INSERT INTO t6 VALUES ('r1', 'hello', 'x');
+    UPDATE t6 SET col_a = 'world', col_b = 'y' WHERE id = 'r1';
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+# =============================================================================
+# 12. Triggers
+# =============================================================================
+
+@requires trigger "needs triggers"
+test gencol_trigger_after_insert_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE TABLE log(val INTEGER);
+    CREATE TRIGGER trg_insert AFTER INSERT ON t1 BEGIN INSERT INTO log VALUES(NEW.b); END;
+    INSERT INTO t1(a) VALUES (5);
+    SELECT val FROM log;
+}
+expect {
+    10
+}
+
+@requires trigger "needs triggers"
+test gencol_trigger_virtual_expression {
+    CREATE TABLE t1(a INTEGER, b AS (a + 100));
+    CREATE TABLE log(val INTEGER);
+    CREATE TRIGGER trg_expr AFTER INSERT ON t1 BEGIN INSERT INTO log VALUES(NEW.b + 1); END;
+    INSERT INTO t1(a) VALUES (5);
+    SELECT val FROM log;
+}
+expect {
+    106
+}
+
+@requires trigger "needs triggers"
+test gencol_trigger_before_insert_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a + 100));
+    CREATE TABLE log(val INTEGER);
+    CREATE TRIGGER trg_before BEFORE INSERT ON t1 BEGIN INSERT INTO log VALUES(NEW.b); END;
+    INSERT INTO t1(a) VALUES (5);
+    SELECT val FROM log;
+}
+expect {
+    105
+}
+
+@requires trigger "needs triggers"
+test gencol_trigger_after_update_virtual_old_new {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE TABLE log(old_val INTEGER, new_val INTEGER);
+    CREATE TRIGGER trg_update AFTER UPDATE ON t1 BEGIN INSERT INTO log VALUES(OLD.b, NEW.b); END;
+    INSERT INTO t1(a) VALUES (5);
+    UPDATE t1 SET a = 10;
+    SELECT old_val, new_val FROM log;
+}
+expect {
+    10|20
+}
+
+@requires trigger "needs triggers"
+test gencol_trigger_when_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE TABLE log(val INTEGER);
+    CREATE TRIGGER trg_when AFTER INSERT ON t1 WHEN NEW.b > 15 BEGIN INSERT INTO log VALUES(NEW.b); END;
+    INSERT INTO t1(a) VALUES (5);
+    INSERT INTO t1(a) VALUES (10);
+    SELECT val FROM log;
+}
+expect {
+    20
+}
+
+@requires trigger "needs triggers"
+test gencol_trigger_virtual_chain {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + 1));
+    CREATE TABLE log(b_val INTEGER, c_val INTEGER);
+    CREATE TRIGGER trg_chain AFTER INSERT ON t1 BEGIN INSERT INTO log VALUES(NEW.b, NEW.c); END;
+    INSERT INTO t1(a) VALUES (5);
+    SELECT b_val, c_val FROM log;
+}
+expect {
+    10|11
+}
+
+@requires trigger "needs triggers"
+test gencol_trigger_before_update_virtual_new {
+    CREATE TABLE t1(a INTEGER, b AS (a * 3));
+    CREATE TABLE log(new_val INTEGER);
+    CREATE TRIGGER trg_before_upd BEFORE UPDATE ON t1 BEGIN INSERT INTO log VALUES(NEW.b); END;
+    INSERT INTO t1(a) VALUES (5);
+    UPDATE t1 SET a = 10;
+    SELECT new_val FROM log;
+}
+expect {
+    30
+}
+
+@requires trigger "needs triggers"
+test gencol_trigger_multiple_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (a * 3), d AS (a * 4));
+    CREATE TABLE log(b_val INTEGER, c_val INTEGER, d_val INTEGER);
+    CREATE TRIGGER trg_multi AFTER INSERT ON t1 BEGIN INSERT INTO log VALUES(NEW.b, NEW.c, NEW.d); END;
+    INSERT INTO t1(a) VALUES (5);
+    SELECT b_val, c_val, d_val FROM log;
+}
+expect {
+    10|15|20
+}
+
+@requires trigger "needs triggers"
+test gencol_trigger_for_each_row_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE TABLE log(val INTEGER);
+    CREATE TRIGGER trg_row AFTER INSERT ON t1 FOR EACH ROW BEGIN INSERT INTO log VALUES(NEW.b); END;
+    INSERT INTO t1(a) VALUES (1), (2), (3);
+    SELECT val FROM log ORDER BY val;
+}
+expect {
+    2
+    4
+    6
+}
+
+# BEFORE/AFTER trigger NEW values in UPDATE
+test gencol_update_trigger_new_values {
+    CREATE TABLE t1(a INT, v AS (a*2) VIRTUAL, b INT);
+    CREATE TABLE log(op TEXT, old_a INT, old_b INT, new_a INT, new_b INT);
+    CREATE TRIGGER trg_before BEFORE UPDATE ON t1 BEGIN INSERT INTO log VALUES('BEFORE', OLD.a, OLD.b, NEW.a, NEW.b); END;
+    CREATE TRIGGER trg_after AFTER UPDATE ON t1 BEGIN INSERT INTO log VALUES('AFTER', OLD.a, OLD.b, NEW.a, NEW.b); END;
+    INSERT INTO t1(a, b) VALUES(1, 2);
+    UPDATE t1 SET a = 10;
+    SELECT * FROM log;
+}
+expect {
+    BEFORE|1|2|10|2
+    AFTER|1|2|10|2
+}
+
+# =============================================================================
+# 13. UPSERT
+# =============================================================================
+
+test gencol_upsert_virtual {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER, c AS (b * 3));
+    INSERT INTO t1(a, b) VALUES (1, 5);
+    INSERT INTO t1(a, b) VALUES (1, 10) ON CONFLICT(a) DO UPDATE SET b = excluded.b;
+    SELECT a, b, c FROM t1;
+}
+expect {
+    1|10|30
+}
+
+test gencol_upsert_virtual_error {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER, c AS (b * 2) VIRTUAL);
+    INSERT INTO t1(a, b) VALUES(1, 10);
+    INSERT INTO t1(a, b) VALUES(1, 10) ON CONFLICT(a) DO UPDATE SET c = 999;
+}
+expect error {
+    cannot UPDATE generated column
+}
+
+test gencol_returning_upsert {
+    CREATE TABLE t1(a INT PRIMARY KEY, v AS (a*2) VIRTUAL, b INT);
+    INSERT INTO t1(a, b) VALUES(1, 100);
+    INSERT INTO t1(a, b) VALUES(1, 200) ON CONFLICT(a) DO UPDATE SET b = excluded.b RETURNING *;
+}
+expect {
+    1|2|200
+}
+
+test gencol_upsert_set_current_row {
+    CREATE TABLE t1(a INT PRIMARY KEY, v AS (a*2) VIRTUAL, b INT);
+    INSERT INTO t1(a, b) VALUES(1, 100);
+    INSERT INTO t1(a, b) VALUES(1, 200) ON CONFLICT(a) DO UPDATE SET b = t1.b + excluded.b;
+    SELECT * FROM t1;
+}
+expect {
+    1|2|300
+}
+
+test gencol_upsert_where_clause {
+    CREATE TABLE t1(a INT PRIMARY KEY, v AS (a*2) VIRTUAL, b INT);
+    INSERT INTO t1(a, b) VALUES(1, 100);
+    INSERT INTO t1(a, b) VALUES(1, 200) ON CONFLICT(a) DO UPDATE SET b = excluded.b WHERE t1.b < 150;
+    SELECT * FROM t1;
+}
+expect {
+    1|2|200
+}
+
+test gencol_upsert_index_integrity {
+    CREATE TABLE t1(a INT PRIMARY KEY, v AS (a*2) VIRTUAL, b INT UNIQUE);
+    INSERT INTO t1(a, b) VALUES(1, 100);
+    INSERT INTO t1(a, b) VALUES(1, 200) ON CONFLICT(a) DO UPDATE SET b = excluded.b;
+    SELECT * FROM t1;
+    PRAGMA integrity_check;
+}
+expect {
+    1|2|200
+    ok
+}
+
+test gencol_upsert_fk_enforcement {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent(id INT PRIMARY KEY);
+    INSERT INTO parent VALUES(1), (2);
+    CREATE TABLE child(a INT PRIMARY KEY, v AS (a*10) VIRTUAL, b INT REFERENCES parent(id));
+    INSERT INTO child(a, b) VALUES(1, 1);
+    INSERT INTO child(a, b) VALUES(1, 999) ON CONFLICT(a) DO UPDATE SET b = excluded.b;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# UPSERT SET referencing virtual column (should see computed value, not NULL)
+test gencol_upsert_set_references_virtual {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER, c AS (b * 10));
+    INSERT INTO t1(a, b) VALUES(1, 5);
+    INSERT INTO t1(a, b) VALUES(1, 99) ON CONFLICT(a) DO UPDATE SET b = c;
+    SELECT a, b, c FROM t1;
+}
+expect {
+    1|50|500
+}
+
+@skip "TODO requires https://github.com/tursodatabase/turso/issues/6087"
+test gencol_upsert_virtual_before_regular_with_index {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b AS (a * 2) VIRTUAL, c TEXT);
+    CREATE INDEX idx_c ON t1(c);
+    INSERT INTO t1(a, c) VALUES(1, 'hello');
+    INSERT INTO t1(a, c) VALUES(1, 'ignored') ON CONFLICT(a) DO UPDATE SET a = 1;
+    SELECT a, b, c FROM t1;
+    PRAGMA integrity_check;
+}
+expect {
+    1|2|hello
+    ok
+}
+
+# =============================================================================
+# 14. ALTER TABLE
+# =============================================================================
+
+# --- DROP COLUMN with generated columns ---
+
+# Cannot drop column referenced by a virtual column
+test gencol_error_drop_column_referenced_virtual {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a * b));
+    ALTER TABLE t1 DROP COLUMN b;
+}
+expect error {
+    error in table t1 after drop column: no such column: b
+}
+
+test gencol_error_drop_column_in_function {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (abs(a) + b));
+    ALTER TABLE t1 DROP COLUMN a;
+}
+expect error {
+    error in table t1 after drop column: no such column: a
+}
+
+# Cannot drop virtual column that another virtual column depends on
+test gencol_error_drop_generated_column_with_dependent {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + 1));
+    ALTER TABLE t1 DROP COLUMN b;
+}
+expect error {
+    error in table t1 after drop column: no such column: b
+}
+
+# Can drop a virtual column that has no dependents
+test gencol_drop_virtual_column {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c INTEGER);
+    INSERT INTO t1(a, c) VALUES(5, 100);
+    ALTER TABLE t1 DROP COLUMN b;
+    SELECT * FROM t1;
+}
+expect {
+    5|100
+}
+
+# Only non-generated column is referenced by virtual column
+test gencol_error_drop_column_case_insensitive {
+    CREATE TABLE t1(MyColumn INTEGER, b AS (MYCOLUMN * 2));
+    ALTER TABLE t1 DROP COLUMN mycolumn;
+}
+expect error {
+    error in table t1 after drop column: must have at least one non-generated column
+}
+
+test gencol_error_drop_column_in_case {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (CASE WHEN a > 0 THEN b ELSE 0 END));
+    ALTER TABLE t1 DROP COLUMN a;
+}
+expect error {
+    error in table t1 after drop column: no such column: a
+}
+
+# Drop non-referenced regular column from table with virtual columns
+test gencol_drop_column_with_virtual_present {
+    CREATE TABLE t1(a INTEGER, v AS (a * 2) VIRTUAL, b INTEGER);
+    INSERT INTO t1(a, b) VALUES (5, 100);
+    INSERT INTO t1(a, b) VALUES (10, 200);
+    ALTER TABLE t1 DROP COLUMN b;
+    SELECT a, v FROM t1;
+}
+expect {
+    5|10
+    10|20
+}
+
+test gencol_drop_column_with_multiple_virtual {
+    CREATE TABLE t1(a INTEGER, v1 AS (a), v2 AS (a * 2), b INTEGER, v3 AS (a * 3));
+    INSERT INTO t1(a, b) VALUES (5, 100);
+    ALTER TABLE t1 DROP COLUMN b;
+    SELECT a, v1, v2, v3 FROM t1;
+}
+expect {
+    5|5|10|15
+}
+
+test gencol_drop_column_rebinds_generated_after_preceding_drop {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (b + 1), d INTEGER);
+    INSERT INTO t1(a, b, d) VALUES(10, 20, 30);
+    ALTER TABLE t1 DROP COLUMN a;
+    SELECT b, c, d FROM t1;
+}
+expect {
+    20|21|30
+}
+
+# Drop a virtual column, verify remaining data is intact
+test gencol_drop_virtual_column_itself {
+    CREATE TABLE t1(a INT, b AS (a * 2), c INT);
+    INSERT INTO t1(a, c) VALUES(5, 100);
+    ALTER TABLE t1 DROP COLUMN b;
+    SELECT * FROM t1;
+}
+expect {
+    5|100
+}
+
+# Only non-generated column — rejected before dependency check
+test gencol_drop_only_regular_column_error {
+    CREATE TABLE t1(a INT, b AS (a * 2));
+    ALTER TABLE t1 DROP COLUMN a;
+}
+expect error {
+    error in table t1 after drop column: must have at least one non-generated column
+}
+
+# Second drop leaves only virtual columns
+test gencol_drop_last_non_generated_error {
+    CREATE TABLE t1(a INT, b INT, v AS (a * 2));
+    ALTER TABLE t1 DROP COLUMN b;
+    ALTER TABLE t1 DROP COLUMN a;
+}
+expect error {
+    error in table t1 after drop column: must have at least one non-generated column
+}
+
+# --- ADD COLUMN with generated columns ---
+
+test gencol_alter_add_virtual {
+    CREATE TABLE t1(a INTEGER);
+    INSERT INTO t1 VALUES (5), (10);
+    ALTER TABLE t1 ADD COLUMN b AS (a * 2);
+    SELECT a, b FROM t1 ORDER BY a;
+}
+expect {
+    5|10
+    10|20
+}
+
+test gencol_alter_add_virtual_explicit {
+    CREATE TABLE t1(a INTEGER);
+    INSERT INTO t1 VALUES (3);
+    ALTER TABLE t1 ADD COLUMN b AS (a + 100) VIRTUAL;
+    SELECT a, b FROM t1;
+}
+expect {
+    3|103
+}
+
+test gencol_alter_add_multiple_virtual {
+    CREATE TABLE t1(a INTEGER);
+    INSERT INTO t1 VALUES (5);
+    ALTER TABLE t1 ADD COLUMN b AS (a * 2);
+    ALTER TABLE t1 ADD COLUMN c AS (a * 3);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    5|10|15
+}
+
+test gencol_alter_add_virtual_function {
+    CREATE TABLE t1(name TEXT);
+    INSERT INTO t1 VALUES ('hello');
+    ALTER TABLE t1 ADD COLUMN upper_name AS (UPPER(name));
+    SELECT name, upper_name FROM t1;
+}
+expect {
+    hello|HELLO
+}
+
+test gencol_alter_add_virtual_complex_expr {
+    CREATE TABLE t1(a INTEGER, b INTEGER);
+    INSERT INTO t1 VALUES (3, 7);
+    ALTER TABLE t1 ADD COLUMN c AS (a + b);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    3|7|10
+}
+
+# Non-deterministic functions in generated columns are rejected
+test gencol_alter_add_virtual_random_error {
+    CREATE TABLE t1(a INTEGER);
+    ALTER TABLE t1 ADD COLUMN b AS (random()) VIRTUAL;
+}
+expect error {
+    non-deterministic functions prohibited in generated columns
+}
+
+test gencol_alter_add_column_generated_pk_rejected {
+    CREATE TABLE t1(a INTEGER);
+    ALTER TABLE t1 ADD COLUMN b AS (a+1) PRIMARY KEY;
+}
+expect error {
+    (Cannot add a PRIMARY KEY column|generated columns cannot be part of the PRIMARY KEY)
+}
+
+@skip "TODO: parser accepts DEFAULT + GENERATED without error"
+test gencol_alter_add_column_generated_default_rejected {
+    CREATE TABLE t1(a INTEGER);
+    ALTER TABLE t1 ADD COLUMN b DEFAULT 5 AS (a+1);
+}
+expect error {
+    (Cannot add a column with non-constant default|error in generated column|cannot have a DEFAULT)
+}
+
+# NOT NULL on virtual column validated against existing data
+test gencol_alter_add_virtual_not_null_violation {
+    CREATE TABLE t1(a, b);
+    INSERT INTO t1 VALUES(1, 2), ('null!', NULL), (3, 4);
+    ALTER TABLE t1 ADD COLUMN d AS (b + 1) NOT NULL;
+}
+expect error {
+    NOT NULL constraint failed
+}
+
+# NOT NULL on virtual column succeeds when all data satisfies it
+test gencol_alter_add_virtual_not_null_ok {
+    CREATE TABLE t1(a, b);
+    INSERT INTO t1 VALUES(1, 2), (3, 4);
+    ALTER TABLE t1 ADD COLUMN d AS (b + 1) NOT NULL;
+    SELECT a, b, d FROM t1;
+}
+expect {
+    1|2|3
+    3|4|5
+}
+
+# CHECK constraint validated against existing data
+test gencol_alter_add_virtual_check_violation {
+    CREATE TABLE t1(a, b);
+    INSERT INTO t1 VALUES(1, 2), (3, 4);
+    ALTER TABLE t1 ADD COLUMN d AS (b + 1) CHECK(a <> 1);
+}
+expect error {
+    CHECK constraint failed
+}
+
+test gencol_alter_add_virtual_check_with_existing_virtual_middle {
+    CREATE TABLE t1(a, b AS (a + 1), c);
+    INSERT INTO t1(a, c) VALUES(1, 10), (3, 20);
+    ALTER TABLE t1 ADD COLUMN d AS (c + 1) CHECK(b < d);
+    SELECT a, b, c, d FROM t1 ORDER BY a;
+}
+expect {
+    1|2|10|11
+    3|4|20|21
+}
+
+test gencol_alter_add_virtual_check_with_existing_virtual_middle_violation {
+    CREATE TABLE t1(a, b AS (a + 1), c);
+    INSERT INTO t1(a, c) VALUES(1, -2), (3, 20);
+    ALTER TABLE t1 ADD COLUMN d AS (c + 1) CHECK(b < d);
+}
+expect error {
+    CHECK constraint failed
+}
+
+# INSERT/UPDATE work after ADD COLUMN virtual
+test gencol_alter_add_virtual_insert_after {
+    CREATE TABLE t1(a INTEGER);
+    INSERT INTO t1 VALUES(1);
+    ALTER TABLE t1 ADD COLUMN b AS (a * 10);
+    INSERT INTO t1(a) VALUES(2);
+    SELECT a, b FROM t1 ORDER BY a;
+}
+expect {
+    1|10
+    2|20
+}
+
+# ADD COLUMN virtual referencing a column added via ADD COLUMN with DEFAULT
+# Existing rows have shorter records; validation must use the default, not NULL
+test gencol_alter_add_virtual_after_add_default_notnull {
+    CREATE TABLE t1(a INTEGER);
+    INSERT INTO t1 VALUES(1), (2);
+    ALTER TABLE t1 ADD COLUMN b INTEGER DEFAULT 42;
+    ALTER TABLE t1 ADD COLUMN c AS (b + 1) NOT NULL;
+    SELECT a, b, c FROM t1 ORDER BY a;
+}
+expect {
+    1|42|43
+    2|42|43
+}
+
+# ADD COLUMN STORED is rejected (SQLite allows STORED, limbo does not)
+@skip-if sqlite "limbo does not support STORED generated columns"
+test gencol_alter_add_stored_rejected {
+    CREATE TABLE t1(a INTEGER);
+    ALTER TABLE t1 ADD COLUMN b AS (a * 2) STORED;
+}
+expect error {
+    cannot add a STORED column
+}
+
+# --- RENAME COLUMN with generated columns ---
+
+test gencol_rename_column_updates_expression {
+    CREATE TABLE t1 (a TEXT, b TEXT AS (a));
+    ALTER TABLE t1 RENAME COLUMN a TO c;
+    SELECT sql FROM sqlite_master WHERE name='t1';
+}
+expect {
+    CREATE TABLE t1 (c TEXT, b TEXT AS (c))
+}
+
+test gencol_rename_column_chain {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + a));
+    ALTER TABLE t1 RENAME COLUMN a TO x;
+    INSERT INTO t1(x) VALUES(5);
+    SELECT x, b, c FROM t1;
+}
+expect {
+    5|10|15
+}
+
+test gencol_rename_column_middle {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + 1));
+    ALTER TABLE t1 RENAME COLUMN b TO y;
+    INSERT INTO t1(a) VALUES(5);
+    SELECT a, y, c FROM t1;
+}
+expect {
+    5|10|11
+}
+
+test gencol_rename_column_complex_expr {
+    CREATE TABLE t1(a TEXT, b AS (UPPER(a) || '_suffix'));
+    ALTER TABLE t1 RENAME COLUMN a TO name;
+    INSERT INTO t1(name) VALUES('hello');
+    SELECT name, b FROM t1;
+}
+expect {
+    hello|HELLO_suffix
+}
+
+test gencol_rename_column_multiple_refs {
+    CREATE TABLE t1(a INTEGER, b AS (a + 1), c AS (a * 2), d AS (a - 1));
+    ALTER TABLE t1 RENAME COLUMN a TO val;
+    INSERT INTO t1(val) VALUES(10);
+    SELECT val, b, c, d FROM t1;
+}
+expect {
+    10|11|20|9
+}
+
+test gencol_rename_column_case_insensitive {
+    CREATE TABLE t1(MyCol INTEGER, b AS (MYCOL * 2));
+    ALTER TABLE t1 RENAME COLUMN mycol TO newcol;
+    INSERT INTO t1(newcol) VALUES(5);
+    SELECT newcol, b FROM t1;
+}
+expect {
+    5|10
+}
+
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_rename_column_with_index_on_generated {
+    CREATE TABLE t1 (
+        a TEXT,
+        b REAL,
+        c TEXT AS (a || a)
+    );
+    INSERT INTO t1 (a, b) VALUES ('test', 1.0);
+    CREATE INDEX idx_t1 ON t1 (c DESC, a ASC);
+    ALTER TABLE t1 RENAME COLUMN a TO d;
+    UPDATE t1 SET b = 2.0, d = 'updated' WHERE b = 1.0;
+    SELECT d, b, c FROM t1;
+}
+expect {
+    updated|2.0|updatedupdated
+}
+expect @js {
+    updated|2|updatedupdated
+}
+
+# Renaming in one table must not affect generated columns in another table
+test gencol_rename_column_other_table_unaffected {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, othername, extra AS (c + 1));
+    ALTER TABLE t1 RENAME a to othername;
+    SELECT sql FROM sqlite_schema WHERE name = 't2';
+}
+expect pattern {
+    ^CREATE TABLE t2 ?\(c, othername, extra AS \(c \+ 1\)\)$
+}
+
+test gencol_rename_column_other_table_matching_name_unaffected {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(a, z AS (a + 1));
+    ALTER TABLE t1 RENAME a TO x;
+    SELECT sql FROM sqlite_schema WHERE name = 't2';
+}
+expect pattern {
+    ^CREATE TABLE t2 ?\(a, z AS \(a \+ 1\)\)$
+}
+
+# =============================================================================
+# 15. INTEGER PRIMARY KEY Reference in Generated Columns
+# =============================================================================
+
+test gencol_rowid_alias_virtual {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, b AS (id * 2));
+    INSERT INTO t1(id) VALUES (5);
+    SELECT id, b FROM t1;
+}
+expect {
+    5|10
+}
+
+test gencol_rowid_alias_autogenerated {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, b AS (id * 3));
+    INSERT INTO t1(id) VALUES (NULL);
+    SELECT id, b FROM t1;
+}
+expect {
+    1|3
+}
+
+test gencol_rowid_alias_with_other_cols {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT, info AS (id || ': ' || name));
+    INSERT INTO t1(id, name) VALUES (42, 'Test');
+    SELECT info FROM t1;
+}
+expect {
+    42: Test
+}
+
+test gencol_rowid_alias_chain {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, b AS (id * 2), c AS (b + id));
+    INSERT INTO t1(id) VALUES (5);
+    SELECT id, b, c FROM t1;
+}
+expect {
+    5|10|15
+}
+
+# Rowid alias PK + only virtual columns is valid
+test gencol_pk_plus_only_virtual {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, b AS (id * 2));
+    INSERT INTO t1(id) VALUES(5);
+    SELECT id, b FROM t1;
+}
+expect {
+    5|10
+}
+
+# =============================================================================
+# 16. Schema Operations
+# =============================================================================
+
+# --- VACUUM ---
+
+@skip "TODO: VACUUM is not supported yet"
+test gencol_vacuum_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    INSERT INTO t1(a) VALUES(1), (2), (3), (4), (5);
+    DELETE FROM t1 WHERE a IN (2, 4);
+    VACUUM;
+    SELECT a, b FROM t1;
+}
+expect {
+    1|2
+    3|6
+    5|10
+}
+
+@skip "TODO: VACUUM is not supported yet"
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_vacuum_virtual_with_index {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE INDEX idx1 ON t1(b);
+    INSERT INTO t1(a) VALUES(1), (2), (3), (4), (5);
+    DELETE FROM t1 WHERE a IN (2, 4);
+    VACUUM;
+    SELECT a, b FROM t1;
+    PRAGMA integrity_check;
+}
+expect {
+    1|2
+    3|6
+    5|10
+    ok
+}
+
+# --- PRAGMA table_info hides virtual columns ---
+
+test gencol_pragma_table_info_hides_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c TEXT);
+    PRAGMA table_info(t1);
+}
+expect {
+    0|a|INTEGER|0||0
+    1|c|TEXT|0||0
+}
+
+# =============================================================================
+# 17. Edge Cases
+# =============================================================================
+
+test gencol_null_concat {
+    CREATE TABLE t1(a TEXT, b TEXT, c AS (a || b));
+    INSERT INTO t1(a, b) VALUES('hello', NULL), (NULL, 'world'), (NULL, NULL);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    hello||
+    |world|
+    ||
+}
+
+test gencol_deep_dependency_chain {
+    CREATE TABLE t1(a INTEGER, b AS (a+1), c AS (b+1), d AS (c+1), e AS (d+1), f AS (e+1));
+    INSERT INTO t1(a) VALUES(1);
+    SELECT a, b, c, d, e, f FROM t1;
+}
+expect {
+    1|2|3|4|5|6
+}
+
+test gencol_default_value_with_virtual {
+    CREATE TABLE t1(a INTEGER DEFAULT 42, b AS (a * 2));
+    INSERT INTO t1 DEFAULT VALUES;
+    SELECT a, b FROM t1;
+}
+expect {
+    42|84
+}
+
+# --- STRICT tables with virtual columns ---
+
+test gencol_strict_basic {
+    CREATE TABLE t1(a INTEGER, b INTEGER AS (a * 2)) STRICT;
+    INSERT INTO t1(a) VALUES(5);
+    SELECT a, b FROM t1;
+}
+expect {
+    5|10
+}
+
+test gencol_strict_type_enforcement {
+    CREATE TABLE t1(a INTEGER, b TEXT AS (a || 'x')) STRICT;
+    INSERT INTO t1(a) VALUES(5);
+    SELECT a, typeof(b), b FROM t1;
+}
+expect {
+    5|text|5x
+}
+
+test gencol_strict_insert_type_violation {
+    CREATE TABLE t1(a INTEGER, b INTEGER AS (a * 2)) STRICT;
+    INSERT INTO t1(a) VALUES('not_a_number');
+}
+expect error {
+    cannot store TEXT value in INTEGER column
+}
+
+test gencol_strict_multiple_virtual {
+    CREATE TABLE t1(a INTEGER, b INTEGER AS (a * 2), c TEXT AS (a || '!')) STRICT;
+    INSERT INTO t1(a) VALUES(7);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    7|14|7!
+}
+
+# COLLATE on virtual generated columns must be applied in WHERE (#6153)
+
+test gencol_virtual_collate_where_eq {
+    CREATE TABLE t1(a TEXT, b TEXT GENERATED ALWAYS AS (a) VIRTUAL COLLATE NOCASE);
+    INSERT INTO t1(a) VALUES('Hello'),('HELLO'),('hello');
+    SELECT * FROM t1 WHERE b = 'hello';
+}
+expect {
+    Hello|Hello
+    HELLO|HELLO
+    hello|hello
+}
+
+test gencol_virtual_collate_where_in {
+    CREATE TABLE t1(a TEXT, b TEXT GENERATED ALWAYS AS (a) VIRTUAL COLLATE NOCASE);
+    INSERT INTO t1(a) VALUES('Hello'),('HELLO'),('hello');
+    SELECT count(*) FROM t1 WHERE b IN ('hello');
+}
+expect {
+    3
+}
+
+test gencol_virtual_collate_where_and {
+    CREATE TABLE t2(
+        id INTEGER PRIMARY KEY,
+        season TEXT,
+        scene TEXT GENERATED ALWAYS AS (upper(season)) VIRTUAL COLLATE NOCASE
+    );
+    INSERT INTO t2(season) VALUES('summer'),('SUMMER');
+    SELECT count(*) FROM t2 WHERE scene = 'summer' AND id BETWEEN 1 AND 2;
+}
+expect {
+    2
+}
+
+test gencol_virtual_collate_index_eq {
+    CREATE TABLE t1(a TEXT, b TEXT GENERATED ALWAYS AS (a) VIRTUAL COLLATE NOCASE);
+    CREATE INDEX idx_b ON t1(b);
+    INSERT INTO t1(a) VALUES('Hello'),('HELLO'),('hello');
+    SELECT * FROM t1 WHERE b = 'hello';
+}
+expect {
+    Hello|Hello
+    HELLO|HELLO
+    hello|hello
+}
+
+test gencol_virtual_collate_index_in {
+    CREATE TABLE t1(a TEXT, b TEXT GENERATED ALWAYS AS (a) VIRTUAL COLLATE NOCASE);
+    CREATE INDEX idx_b ON t1(b);
+    INSERT INTO t1(a) VALUES('Hello'),('HELLO'),('hello'),('World');
+    SELECT count(*) FROM t1 WHERE b IN ('hello', 'world');
+}
+expect {
+    4
+}
+
+test gencol_virtual_collate_group_by {
+    CREATE TABLE t1(a TEXT, b TEXT GENERATED ALWAYS AS (a) VIRTUAL COLLATE NOCASE);
+    INSERT INTO t1(a) VALUES('Hello'),('HELLO'),('hello');
+    SELECT b, count(*) FROM t1 GROUP BY b;
+}
+expect {
+    Hello|3
+}
+
+test gencol_virtual_collate_distinct {
+    CREATE TABLE t1(a TEXT, b TEXT GENERATED ALWAYS AS (a) VIRTUAL COLLATE NOCASE);
+    INSERT INTO t1(a) VALUES('Hello'),('HELLO'),('hello');
+    SELECT DISTINCT b FROM t1;
+}
+expect {
+    Hello
+}
+
+# --- Large row counts (100+ rows) ---
+
+test gencol_large_row_count {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    INSERT INTO t1(a) SELECT value FROM generate_series(1, 150);
+    SELECT COUNT(*) FROM t1;
+    SELECT MIN(b), MAX(b) FROM t1;
+    SELECT a, b FROM t1 WHERE a = 100;
+}
+expect {
+    150
+    2|300
+    100|200
+}
+
+test gencol_large_row_update {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    INSERT INTO t1(a) SELECT value FROM generate_series(1, 100);
+    UPDATE t1 SET a = a + 1000 WHERE a > 50;
+    SELECT COUNT(*) FROM t1 WHERE b > 2000;
+}
+expect {
+    50
+}
+
+test gencol_large_row_delete {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    INSERT INTO t1(a) SELECT value FROM generate_series(1, 200);
+    DELETE FROM t1 WHERE b > 100;
+    SELECT COUNT(*) FROM t1;
+}
+expect {
+    50
+}
+
+# =============================================================================
+# 18. Error Cases: CREATE TABLE Validation
+# =============================================================================
+
+# --- Cannot UPDATE/INSERT generated columns ---
+
+test gencol_error_update_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a*2));
+    INSERT INTO t1(a) VALUES(5);
+    UPDATE t1 SET b = 100;
+}
+expect error {
+    cannot UPDATE generated column
+}
+
+test gencol_error_insert_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a*2));
+    INSERT INTO t1(a, b) VALUES(5, 10);
+}
+expect error {
+    cannot INSERT into generated column
+}
+
+# --- PRIMARY KEY / DEFAULT on generated columns ---
+
+test gencol_error_primary_key_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a*2) PRIMARY KEY);
+}
+expect error {
+    generated column.*cannot be part of the PRIMARY KEY
+}
+
+test gencol_error_composite_pk_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), PRIMARY KEY(a, b));
+}
+expect error {
+    generated column.*cannot be part of the PRIMARY KEY
+}
+
+test gencol_error_default_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a*2) DEFAULT 0);
+}
+expect error {
+    (cannot have a DEFAULT value|cannot use DEFAULT on a generated column)
+}
+
+# --- Self-reference and circular dependencies ---
+
+test gencol_error_self_reference {
+    CREATE TABLE t1(a INTEGER, b AS (b+1));
+}
+expect error {
+    (cannot reference itself|generated column loop)
+}
+
+test gencol_error_self_reference_case_insensitive {
+    CREATE TABLE t1(a INTEGER, B AS (b+1));
+}
+expect error {
+    (cannot reference itself|generated column loop)
+}
+
+test gencol_error_circular_reference {
+    CREATE TABLE t1(a AS (c*2), b INTEGER, c AS (a*2));
+}
+expect error {
+    (circular dependency|generated column loop)
+}
+
+test gencol_error_transitive_circular_reference {
+    CREATE TABLE t1(a INTEGER, v1 AS (v3+1) VIRTUAL, v2 AS (v1+1) VIRTUAL, v3 AS (v2+1) VIRTUAL);
+}
+expect error {
+    (circular dependency|generated column loop)
+}
+
+# --- Must have at least one non-generated column ---
+
+test gencol_error_all_generated {
+    CREATE TABLE t1(a AS (123));
+}
+expect error {
+    (must have at least one non-generated column|must have at least one non-generated column)
+}
+
+# --- Rowid aliases not allowed in generated columns ---
+
+test gencol_error_rowid {
+    CREATE TABLE t1(a INTEGER, b AS (rowid * 2));
+}
+expect error {
+    no such column: rowid
+}
+
+test gencol_error_rowid2 {
+    CREATE TABLE t1(a INTEGER, b AS (_rowid_ * 2));
+}
+expect error {
+    no such column: _rowid_
+}
+
+test gencol_error_oid {
+    CREATE TABLE t1(a INTEGER, b AS (oid * 2));
+}
+expect error {
+    no such column: oid
+}
+
+# --- Subqueries prohibited ---
+
+test gencol_error_subquery {
+    CREATE TABLE t1(a INT, b INT GENERATED ALWAYS AS ((SELECT 1)));
+}
+expect error {
+    subqueries prohibited in generated columns
+}
+
+test gencol_error_in_select {
+    CREATE TABLE t2(x INTEGER);
+    CREATE TABLE t1(a INTEGER, b AS (a IN (SELECT x FROM t2)));
+}
+expect error {
+    subqueries prohibited in generated columns
+}
+
+test gencol_error_exists {
+    CREATE TABLE t2(x INTEGER);
+    CREATE TABLE t1(a INTEGER, b AS (EXISTS(SELECT 1 FROM t2)));
+}
+expect error {
+    subqueries prohibited in generated columns
+}
+
+# --- Aggregates prohibited ---
+
+test gencol_error_aggregate {
+    CREATE TABLE t1(a INT, b INT GENERATED ALWAYS AS (sum(a)));
+}
+expect error {
+    (aggregate functions prohibited|misuse of aggregate function)
+}
+
+test gencol_error_aggregate_star {
+    CREATE TABLE t1(a INTEGER, b AS (count(*)));
+}
+expect error {
+    (aggregate functions prohibited|misuse of aggregate function)
+}
+
+# --- Non-deterministic functions prohibited ---
+
+test gencol_error_nondeterministic_virtual {
+    CREATE TABLE t1(a INT, b INT GENERATED ALWAYS AS (random()) VIRTUAL);
+}
+expect error {
+    non-deterministic functions prohibited in generated columns
+}
+
+# SQLite defers the error to the INSERT for these functions.
+test gencol_error_nondeterministic_datetime {
+    CREATE TABLE t5(a INT, b TEXT GENERATED ALWAYS AS (datetime('now')));
+    INSERT INTO t5 DEFAULT VALUES;
+}
+expect error {
+    non-deterministic
+}
+
+test gencol_error_nondeterministic_strftime {
+    CREATE TABLE t6(a INT, b TEXT GENERATED ALWAYS AS (strftime('%s','now')));
+    INSERT INTO t6 DEFAULT VALUES;
+}
+expect error {
+    non-deterministic
+}
+
+test gencol_error_nondeterministic_unixepoch {
+    CREATE TABLE t7(a INT, b INT GENERATED ALWAYS AS (unixepoch('now')));
+    INSERT INTO t7 DEFAULT VALUES;
+}
+expect error {
+    non-deterministic
+}
+
+# --- Dot operator prohibited ---
+
+test gencol_error_dot_operator {
+    CREATE TABLE t1(a AS (t1.b), b);
+}
+expect error {
+    the "." operator prohibited in generated columns
+}
+
+test gencol_error_doubly_qualified {
+    CREATE TABLE t1(a INTEGER, b AS (main.t1.a));
+}
+expect error {
+    the "." operator prohibited in generated columns
+}
+
+# --- Window functions prohibited ---
+
+test gencol_error_window_function {
+    CREATE TABLE t1(a INTEGER, b AS (sum(a) OVER ()));
+}
+expect error {
+    (window functions prohibited|misuse of window function)
+}
+
+test gencol_error_nested_window_function {
+    CREATE TABLE t1(a INTEGER, b AS (a + sum(a) OVER ()));
+}
+expect error {
+    (window functions prohibited|misuse of window function)
+}
+
+# --- Bind parameters prohibited ---
+
+test gencol_error_bind_parameter {
+    CREATE TABLE t1(a INTEGER, b AS (?1 + a));
+}
+expect error {
+    (bind parameters prohibited|parameters prohibited in generated columns)
+}
+
+test gencol_error_bind_parameter_unnamed {
+    CREATE TABLE t1(a INTEGER, b AS (? + a));
+}
+expect error {
+    (bind parameters prohibited|parameters prohibited in generated columns)
+}
+
+# --- Stored generated columns rejected ---
+
+@skip-if sqlite "TODO support stored generated columns"
+test gencol_stored_rejected {
+    CREATE TABLE t1(a INTEGER, b INTEGER AS (a * 2) STORED);
+}
+expect error {
+    Stored generated columns are not supported
+}
+
+@skip-if sqlite "TODO support stored generated columns"
+test gencol_stored_generated_always_rejected {
+    CREATE TABLE t1(a REAL, b INTEGER GENERATED ALWAYS AS (a) STORED);
+}
+expect error {
+    Stored generated columns are not supported
+}
+
+# =============================================================================
+# 17. validate_generated_expr Branch Coverage (nested expressions)
+# =============================================================================
+
+# --- Nested error cases ---
+
+test gencol_error_nested_subquery_in_func {
+    CREATE TABLE t2(x INTEGER);
+    CREATE TABLE t1(a INTEGER, b AS (ABS((SELECT x FROM t2))));
+}
+expect error {
+    subqueries prohibited in generated columns
+}
+
+test gencol_error_nested_aggregate {
+    CREATE TABLE t1(a INTEGER, b AS (a + sum(a)));
+}
+expect error {
+    (aggregate functions prohibited|misuse of aggregate function)
+}
+
+test gencol_error_nested_nondeterministic {
+    CREATE TABLE t1(a INTEGER, b AS (a + random()));
+}
+expect error {
+    non-deterministic functions prohibited in generated columns
+}
+
+test gencol_error_nested_dot_in_case {
+    CREATE TABLE t1(a INTEGER, b AS (CASE WHEN a > 0 THEN t1.a ELSE 0 END));
+}
+expect error {
+    the "." operator prohibited in generated columns
+}
+
+test gencol_error_nested_subquery_in_case {
+    CREATE TABLE t2(x INTEGER);
+    CREATE TABLE t1(a INTEGER, b AS (CASE WHEN (SELECT 1 FROM t2) THEN a ELSE 0 END));
+}
+expect error {
+    subqueries prohibited in generated columns
+}
+
+test gencol_error_nested_in_select {
+    CREATE TABLE t2(x INTEGER);
+    CREATE TABLE t1(a INTEGER, b AS (CASE WHEN a IN (SELECT x FROM t2) THEN 1 ELSE 0 END));
+}
+expect error {
+    subqueries prohibited in generated columns
+}
+
+test gencol_error_nested_exists_in_arith {
+    CREATE TABLE t2(x INTEGER);
+    CREATE TABLE t1(a INTEGER, b AS (a + EXISTS(SELECT 1 FROM t2)));
+}
+expect error {
+    subqueries prohibited in generated columns
+}
+
+test gencol_error_nested_aggregate_star {
+    CREATE TABLE t1(a INTEGER, b AS (a + count(*)));
+}
+expect error {
+    (aggregate functions prohibited|misuse of aggregate function)
+}
+
+test gencol_error_nested_doubly_qualified {
+    CREATE TABLE t1(a INTEGER, b AS (ABS(main.t1.a)));
+}
+expect error {
+    the "." operator prohibited in generated columns
+}
+
+# --- Nested valid expressions ---
+
+test gencol_validate_nested_cast {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (ABS(CAST(a AS REAL)) + b));
+    INSERT INTO t1(a, b) VALUES(-5, 3);
+    SELECT c FROM t1;
+}
+expect {
+    8.0
+}
+expect @js {
+    8
+}
+
+test gencol_validate_nested_isnull {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (CASE WHEN a IS NULL THEN b ELSE a END));
+    INSERT INTO t1(a, b) VALUES(NULL, 99), (5, 99);
+    SELECT c FROM t1;
+}
+expect {
+    99
+    5
+}
+
+test gencol_validate_nested_inlist {
+    CREATE TABLE t1(a INTEGER, b AS (CASE WHEN a IN (1, 2, 3) THEN 'low' ELSE 'high' END));
+    INSERT INTO t1(a) VALUES(2), (10);
+    SELECT a, b FROM t1;
+}
+expect {
+    2|low
+    10|high
+}
+
+test gencol_validate_nested_between {
+    CREATE TABLE t1(a INTEGER, b AS ((a BETWEEN 1 AND 10) + 0));
+    INSERT INTO t1(a) VALUES(5), (15);
+    SELECT a, b FROM t1;
+}
+expect {
+    5|1
+    15|0
+}
+
+test gencol_validate_nested_like {
+    CREATE TABLE t1(a TEXT, b AS (CASE WHEN a LIKE '%hello%' THEN 1 ELSE 0 END));
+    INSERT INTO t1(a) VALUES('say hello'), ('goodbye');
+    SELECT a, b FROM t1;
+}
+expect {
+    say hello|1
+    goodbye|0
+}
+
+test gencol_validate_nested_collate {
+    CREATE TABLE t1(a TEXT, b TEXT, c AS ((a COLLATE NOCASE) = b));
+    INSERT INTO t1(a, b) VALUES('Hello', 'hello'), ('World', 'earth');
+    SELECT a, b, c FROM t1;
+}
+expect {
+    Hello|hello|1
+    World|earth|0
+}
+
+test gencol_validate_nested_like_escape {
+    CREATE TABLE t1(a TEXT, b AS (CASE WHEN a LIKE '%!%%' ESCAPE '!' THEN 1 ELSE 0 END));
+    INSERT INTO t1(a) VALUES('100%'), ('hello');
+    SELECT a, b FROM t1;
+}
+expect {
+    100%|1
+    hello|0
+}
+
+test gencol_validate_nested_isnull_arith {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (b + (a ISNULL)));
+    INSERT INTO t1(a, b) VALUES(NULL, 10), (5, 10);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    |10|11
+    5|10|10
+}
+
+test gencol_validate_nested_notnull_arith {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (b + (a NOTNULL)));
+    INSERT INTO t1(a, b) VALUES(NULL, 10), (5, 10);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    |10|10
+    5|10|11
+}
+
+test gencol_validate_nested_case_base {
+    CREATE TABLE t1(a INTEGER, b AS (10 + CASE a WHEN 1 THEN 100 WHEN 2 THEN 200 ELSE 300 END));
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    SELECT a, b FROM t1;
+}
+expect {
+    1|110
+    2|210
+    3|310
+}
+
+# =============================================================================
+# Self-join on table with virtual generated columns (#6148)
+# =============================================================================
+
+test gencol_self_join_virtual {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b AS (a * 10));
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    SELECT a1.a, a1.b, a2.a, a2.b FROM t1 a1 JOIN t1 a2 ON a1.a = a2.a;
+}
+expect {
+    1|10|1|10
+    2|20|2|20
+    3|30|3|30
+}
+
+# =============================================================================
+# Three-table INNER JOIN with virtual generated columns (#6151)
+# =============================================================================
+
+test gencol_three_table_inner_join {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER, c AS (b + 100));
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, t1_a INTEGER);
+    CREATE TABLE t3(id INTEGER PRIMARY KEY, t2_id INTEGER);
+    INSERT INTO t1 VALUES(1, 10);
+    INSERT INTO t1 VALUES(2, 20);
+    INSERT INTO t2 VALUES(1, 1);
+    INSERT INTO t2 VALUES(2, 2);
+    INSERT INTO t3 VALUES(1, 1);
+    INSERT INTO t3 VALUES(2, 2);
+    SELECT t1.a, t1.b, t1.c, t2.id, t3.id
+      FROM t1
+      INNER JOIN t2 ON t2.t1_a = t1.a
+      INNER JOIN t3 ON t3.t2_id = t2.id;
+}
+expect {
+    1|10|110|1|1
+    2|20|120|2|2
+}
+
+test gencol_three_table_inner_join_select_gencol {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER, c AS (b + 100));
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, t1_a INTEGER);
+    CREATE TABLE t3(id INTEGER PRIMARY KEY, t2_id INTEGER);
+    INSERT INTO t1 VALUES(1, 10);
+    INSERT INTO t1 VALUES(2, 20);
+    INSERT INTO t2 VALUES(1, 1);
+    INSERT INTO t2 VALUES(2, 2);
+    INSERT INTO t3 VALUES(1, 1);
+    INSERT INTO t3 VALUES(2, 2);
+    SELECT t1.c
+      FROM t1
+      INNER JOIN t2 ON t2.t1_a = t1.a
+      INNER JOIN t3 ON t3.t2_id = t2.id;
+}
+expect {
+    110
+    120
+}
+
+test gencol_three_table_inner_join_where_gencol {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER, c AS (b + 100));
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, t1_a INTEGER);
+    CREATE TABLE t3(id INTEGER PRIMARY KEY, t2_id INTEGER);
+    INSERT INTO t1 VALUES(1, 10);
+    INSERT INTO t1 VALUES(2, 20);
+    INSERT INTO t2 VALUES(1, 1);
+    INSERT INTO t2 VALUES(2, 2);
+    INSERT INTO t3 VALUES(1, 1);
+    INSERT INTO t3 VALUES(2, 2);
+    SELECT t1.a, t1.c
+      FROM t1
+      INNER JOIN t2 ON t2.t1_a = t1.a
+      INNER JOIN t3 ON t3.t2_id = t2.id
+      WHERE t1.c > 115;
+}
+expect {
+    2|120
+}
+
+test gencol_four_table_inner_join {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER, c AS (b * 2));
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, t1_a INTEGER);
+    CREATE TABLE t3(id INTEGER PRIMARY KEY, t2_id INTEGER);
+    CREATE TABLE t4(id INTEGER PRIMARY KEY, t3_id INTEGER, val TEXT);
+    INSERT INTO t1 VALUES(1, 5);
+    INSERT INTO t2 VALUES(1, 1);
+    INSERT INTO t3 VALUES(1, 1);
+    INSERT INTO t4 VALUES(1, 1, 'ok');
+    SELECT t1.a, t1.b, t1.c, t4.val
+      FROM t1
+      INNER JOIN t2 ON t2.t1_a = t1.a
+      INNER JOIN t3 ON t3.t2_id = t2.id
+      INNER JOIN t4 ON t4.t3_id = t3.id;
+}
+expect {
+    1|5|10|ok
+}
+
+# =============================================================================
+# DELETE triggers on tables with virtual generated columns (#6150)
+# =============================================================================
+
+test gencol_delete_before_trigger_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER tr_before_del BEFORE DELETE ON t1
+    BEGIN
+        INSERT INTO log VALUES('deleting ' || OLD.a);
+    END;
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    DELETE FROM t1 WHERE a = 2;
+    SELECT * FROM log;
+    SELECT a, b FROM t1;
+}
+expect {
+    deleting 2
+    1|2
+    3|6
+}
+
+test gencol_delete_after_trigger_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER tr_after_del AFTER DELETE ON t1
+    BEGIN
+        INSERT INTO log VALUES('deleted ' || OLD.a);
+    END;
+    INSERT INTO t1(a) VALUES(10), (20);
+    DELETE FROM t1;
+    SELECT * FROM log;
+}
+expect {
+    deleted 10
+    deleted 20
+}
+
+test gencol_delete_trigger_ref_virtual_col {
+    CREATE TABLE t1(a INTEGER, b AS (a + 100));
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER tr_del BEFORE DELETE ON t1
+    BEGIN
+        INSERT INTO log VALUES('old_b=' || OLD.b);
+    END;
+    INSERT INTO t1(a) VALUES(5);
+    DELETE FROM t1 WHERE a = 5;
+    SELECT * FROM log;
+}
+expect {
+    old_b=105
+}
+
+test gencol_delete_trigger_multiple_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c TEXT, d AS (a || c));
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER tr_del AFTER DELETE ON t1
+    BEGIN
+        INSERT INTO log VALUES(OLD.a || '|' || OLD.c);
+    END;
+    INSERT INTO t1(a, c) VALUES(1, 'x'), (2, 'y');
+    DELETE FROM t1 WHERE a = 1;
+    SELECT * FROM log;
+    SELECT a, b, c, d FROM t1;
+}
+expect {
+    1|x
+    2|4|y|2y
+}
+
+test gencol_upsert_trigger_virtual_col {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c AS (a || b));
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER tr AFTER UPDATE ON t1
+    BEGIN
+        INSERT INTO log VALUES('old_c=' || OLD.c || ' new_c=' || NEW.c);
+    END;
+    INSERT INTO t1(a, b) VALUES(1, 'x');
+    INSERT INTO t1(a, b) VALUES(1, 'y') ON CONFLICT(a) DO UPDATE SET b = excluded.b;
+    SELECT * FROM log;
+    SELECT a, b, c FROM t1;
+}
+expect {
+    old_c=1x new_c=1y
+    1|y|1y
+}
+

@@ -100,6 +100,7 @@ impl SqlBackend for RustBackend {
             .experimental_index_method(true)
             .experimental_materialized_views(true)
             .experimental_custom_types(true)
+            .experimental_generated_columns(true)
             .build()
             .await
             .map_err(|e| BackendError::CreateDatabase(e.to_string()))?;

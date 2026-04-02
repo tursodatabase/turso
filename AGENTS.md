@@ -13,7 +13,7 @@ cargo run -q --bin tursodb -- -q # run the interactive cli
 
 make test                      # TCL compat + sqlite3 + extensions + MVCC
 make test-single TEST=foo.test # single TCL test
-make -C testing/sqltests run-rust  # sqltest runner (preferred for new tests)
+CI=1 make -C testing/sqltests run-rust  # sqltest runner (preferred for new tests)
 
 scripts/diff.sh "SQL" [label]  # compare sqlite3 vs tursodb output
 ```

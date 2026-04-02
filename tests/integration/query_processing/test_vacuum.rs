@@ -2,7 +2,7 @@ use crate::common::{compute_dbhash, ExecRows, TempDatabase};
 use rusqlite::Connection as SqliteConnection;
 use std::sync::Arc;
 use tempfile::TempDir;
-use turso_core::{Connection, Value};
+use turso_core::{Connection, StepResult, Value};
 
 /// Helper to run integrity_check and return the result string
 fn run_integrity_check(conn: &Arc<Connection>) -> String {
@@ -98,7 +98,8 @@ fn test_vacuum_into_basic(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Test VACUUM INTO error cases: plain VACUUM, existing file, within transaction
+/// Test VACUUM INTO error cases: plain VACUUM, existing file, within
+/// transaction, and query_only mode.
 #[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER);")]
 fn test_vacuum_into_error_cases(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
@@ -143,6 +144,201 @@ fn test_vacuum_into_error_cases(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let rows: Vec<(i64,)> = conn.exec_rows("SELECT a FROM t");
     assert_eq!(rows, vec![(1,)]);
 
+    // 4. VACUUM / VACUUM INTO should fail in query_only mode with a
+    // VACUUM-specific error message.
+    conn.set_query_only(true);
+    let query_only_path = dest_dir.path().join("query-only.db");
+    let escaped_query_only_path = escape_sqlite_string_literal(query_only_path.to_str().unwrap());
+    let result = conn.execute(format!("VACUUM INTO '{escaped_query_only_path}'"));
+    assert!(
+        result.is_err(),
+        "VACUUM INTO should fail in query_only mode"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("VACUUM") && err_msg.contains("query_only"),
+        "Error should mention VACUUM and query_only, got: {err_msg}"
+    );
+    assert!(
+        !query_only_path.exists(),
+        "File should not be created in query_only mode"
+    );
+    conn.set_query_only(false);
+
+    Ok(())
+}
+
+/// Active-statement accounting matrix for VACUUM INTO:
+///
+/// - active other statement, no reprepare -> reject
+/// - active other statement, with reprepare -> still reject
+/// Active-statement accounting for VACUUM INTO:
+///
+/// - active other statement, no reprepare -> reject
+/// - active other statement, with reprepare -> still reject
+///
+/// SQLite-compatible behavior: VACUUM INTO must reject if another statement is
+/// still active on the same connection.
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER);")]
+fn test_vacuum_into_rejects_active_select_on_same_connection(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)")?;
+
+    let mut select_stmt = conn.prepare("SELECT a FROM t ORDER BY a")?;
+    assert!(
+        matches!(select_stmt.step()?, StepResult::Row),
+        "SELECT should remain active after yielding its first row"
+    );
+    assert_eq!(
+        select_stmt.row().unwrap().get_values().next(),
+        Some(&Value::from_i64(1))
+    );
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("active-select-vacuum-into.db");
+
+    let err = conn
+        .execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))
+        .expect_err("VACUUM INTO should reject same-connection active statements");
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("SQL statements in progress"),
+        "error should mention active statements, got: {err_msg}"
+    );
+    assert!(
+        !dest_path.exists(),
+        "destination file should not be created on failure"
+    );
+
+    let mut seen = vec![1];
+    loop {
+        match select_stmt.step()? {
+            StepResult::Row => {
+                let row = select_stmt.row().expect("row should be present");
+                match row.get_values().next() {
+                    Some(v) => seen.push(v.as_int().expect("expected integer row value")),
+                    other => panic!("unexpected row value after VACUUM INTO: {other:?}"),
+                }
+            }
+            StepResult::Done => break,
+            StepResult::IO => select_stmt.get_pager().io.step()?,
+            StepResult::Busy => anyhow::bail!("unexpected Busy while draining SELECT"),
+            StepResult::Interrupt => anyhow::bail!("unexpected Interrupt while draining SELECT"),
+        }
+    }
+
+    assert_eq!(seen, vec![1, 2, 3]);
+    Ok(())
+}
+
+/// Reprepared active root statements must remain counted so VACUUM INTO still
+/// rejects them as "SQL statements in progress".
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER);")]
+fn test_vacuum_into_rejects_reprepared_active_select_on_same_connection(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)")?;
+
+    let mut select_stmt = conn.prepare("SELECT a FROM t ORDER BY a")?;
+    conn.execute("PRAGMA foreign_keys = ON")?;
+
+    assert!(
+        matches!(select_stmt.step()?, StepResult::Row),
+        "SELECT should remain active after reprepare and first row"
+    );
+    assert_eq!(
+        select_stmt.row().unwrap().get_values().next(),
+        Some(&Value::from_i64(1))
+    );
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir
+        .path()
+        .join("reprepared-active-select-vacuum-into.db");
+
+    let err = conn
+        .execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))
+        .expect_err("VACUUM INTO should reject re-prepared active statements");
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("SQL statements in progress"),
+        "error should mention active statements, got: {err_msg}"
+    );
+    assert!(
+        !dest_path.exists(),
+        "destination file should not be created on failure"
+    );
+
+    let mut seen = vec![1];
+    loop {
+        match select_stmt.step()? {
+            StepResult::Row => {
+                let row = select_stmt.row().expect("row should be present");
+                match row.get_values().next() {
+                    Some(v) => seen.push(v.as_int().expect("expected integer row value")),
+                    other => panic!("unexpected row value after VACUUM INTO: {other:?}"),
+                }
+            }
+            StepResult::Done => break,
+            StepResult::IO => select_stmt.get_pager().io.step()?,
+            StepResult::Busy => anyhow::bail!("unexpected Busy while draining SELECT"),
+            StepResult::Interrupt => anyhow::bail!("unexpected Interrupt while draining SELECT"),
+        }
+    }
+
+    assert_eq!(seen, vec![1, 2, 3]);
+    Ok(())
+}
+
+/// Statement overlap: a live SELECT on one connection can continue after a
+/// same-connection write, and it keeps reading its original snapshot.
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER);")]
+fn test_same_connection_select_then_write_then_continue_select(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)")?;
+
+    let mut select_stmt = conn.prepare("SELECT a FROM t ORDER BY a")?;
+    assert!(
+        matches!(select_stmt.step()?, StepResult::Row),
+        "SELECT should remain active after yielding its first row"
+    );
+    assert_eq!(
+        select_stmt.row().unwrap().get_values().next(),
+        Some(&Value::from_i64(1))
+    );
+
+    conn.execute("INSERT INTO t VALUES (4)")?;
+
+    let mut seen = vec![1];
+    loop {
+        match select_stmt.step()? {
+            StepResult::Row => {
+                let row = select_stmt.row().expect("row should be present");
+                match row.get_values().next() {
+                    Some(v) => seen.push(v.as_int().expect("expected integer row value")),
+                    other => panic!("unexpected row value after INSERT: {other:?}"),
+                }
+            }
+            StepResult::Done => break,
+            StepResult::IO => select_stmt.get_pager().io.step()?,
+            StepResult::Busy => anyhow::bail!("unexpected Busy while draining SELECT"),
+            StepResult::Interrupt => anyhow::bail!("unexpected Interrupt while draining SELECT"),
+        }
+    }
+
+    assert_eq!(
+        seen,
+        vec![1, 2, 3],
+        "active SELECT should continue reading its original snapshot"
+    );
+
+    let fresh_rows: Vec<(i64,)> = conn.exec_rows("SELECT a FROM t ORDER BY a");
+    assert_eq!(fresh_rows, vec![(1,), (2,), (3,), (4,)]);
     Ok(())
 }
 
@@ -1548,7 +1744,6 @@ fn test_vacuum_into_preserves_reserved_space(tmp_db: TempDatabase) -> anyhow::Re
 }
 
 /// Test VACUUM INTO with partial indexes (CREATE INDEX ... WHERE)
-/// NOTE: There is a bug with partial indexes which fails integrity_check on the destination.
 /// Note: Partial indexes are not supported with MVCC
 #[turso_macros::test]
 fn test_vacuum_into_with_partial_indexes(tmp_db: TempDatabase) -> anyhow::Result<()> {
@@ -1575,6 +1770,8 @@ fn test_vacuum_into_with_partial_indexes(tmp_db: TempDatabase) -> anyhow::Result
     conn.execute("INSERT INTO orders VALUES (4, 'Charlie', 'shipped', 2000.0)")?;
     conn.execute("INSERT INTO orders VALUES (5, 'Bob', 'pending', 100.0)")?;
 
+    assert_eq!(run_integrity_check(&conn), "ok");
+
     let source_hash = compute_dbhash(&tmp_db);
 
     let dest_dir = TempDir::new()?;
@@ -1586,15 +1783,7 @@ fn test_vacuum_into_with_partial_indexes(tmp_db: TempDatabase) -> anyhow::Result
     let dest_db = TempDatabase::new_with_existent(&dest_path);
     let dest_conn = dest_db.connect_limbo();
 
-    // this fails due to existing bug in the integrity_check with partial indexes
-    // ---- query_processing::test_vacuum::test_vacuum_into_with_partial_indexes stdout ----
-    //
-    // thread 'query_processing::test_vacuum::test_vacuum_into_with_partial_indexes' panicked at tests/integration/query_processing/test_vacuum.rs:1220:5:
-    // assertion `left == right` failed
-    //   left: "wrong # of entries in index idx_large_orders\nwrong # of entries in index idx_pending_orders\nrow 1 missing from index idx_large_orders\nrow 2 missing from index idx_large_orders\nrow 2 missing from index idx_pending_orders\nrow 4 missing from index idx_pending_orders\nrow 5 missing from index idx_large_orders"
-    //  right: "ok"
-
-    // assert_eq!(run_integrity_check(&dest_conn), "ok");
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
 
     if !tmp_db.enable_mvcc {
         assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
@@ -1637,6 +1826,114 @@ fn test_vacuum_into_with_partial_indexes(tmp_db: TempDatabase) -> anyhow::Result
             (5, "Bob".to_string(), "pending".to_string(), 100.0)
         ]
     );
+    Ok(())
+}
+
+/// Test VACUUM INTO with mixed index types: normal, unique, partial, expression.
+/// Note: Partial indexes are not supported with MVCC.
+#[turso_macros::test]
+fn test_vacuum_into_with_mixed_index_types(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute(
+        "CREATE TABLE products (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            category TEXT NOT NULL,
+            price REAL NOT NULL,
+            stock INTEGER NOT NULL,
+            discontinued INTEGER NOT NULL DEFAULT 0
+        )",
+    )?;
+
+    conn.execute("CREATE UNIQUE INDEX idx_products_name ON products(name)")?;
+    conn.execute("CREATE INDEX idx_products_category_price ON products(category, price)")?;
+    conn.execute(
+        "CREATE INDEX idx_products_instock ON products(category) WHERE stock > 0 AND discontinued = 0",
+    )?;
+    conn.execute("CREATE INDEX idx_products_name_expr ON products(lower(name), abs(price))")?;
+
+    conn.execute("INSERT INTO products VALUES (1, 'Widget A', 'tools', 10.5, 5, 0)")?;
+    conn.execute("INSERT INTO products VALUES (2, 'Widget B', 'tools', 12.0, 0, 0)")?;
+    conn.execute("INSERT INTO products VALUES (3, 'Gadget C', 'electronics', 99.9, 10, 0)")?;
+    conn.execute("INSERT INTO products VALUES (4, 'Legacy D', 'electronics', 49.5, 3, 1)")?;
+    conn.execute("INSERT INTO products VALUES (5, 'Spare E', 'parts', 4.25, 25, 0)")?;
+
+    assert_eq!(run_integrity_check(&conn), "ok");
+    let source_hash = compute_dbhash(&tmp_db);
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed_mixed_indexes.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+
+    let index_defs: Vec<(String, String)> = dest_conn.exec_rows(
+        "SELECT name, sql FROM sqlite_schema
+         WHERE type = 'index'
+           AND name IN (
+               'idx_products_name',
+               'idx_products_category_price',
+               'idx_products_instock',
+               'idx_products_name_expr'
+           )
+         ORDER BY name",
+    );
+    assert_eq!(index_defs.len(), 4);
+
+    let partial_idx_sql = &index_defs
+        .iter()
+        .find(|(name, _)| name == "idx_products_instock")
+        .expect("partial index should exist")
+        .1;
+    let normalized_partial_sql = partial_idx_sql
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_lowercase();
+    let has_expected_partial_predicate = normalized_partial_sql
+        .contains("wherestock>0anddiscontinued=0")
+        || normalized_partial_sql.contains("wherediscontinued=0andstock>0")
+        || normalized_partial_sql.contains("where(stock>0)and(discontinued=0)")
+        || normalized_partial_sql.contains("where(discontinued=0)and(stock>0)");
+    assert!(
+        has_expected_partial_predicate,
+        "partial index WHERE predicate should be preserved"
+    );
+
+    let expr_idx_sql = &index_defs
+        .iter()
+        .find(|(name, _)| name == "idx_products_name_expr")
+        .expect("expression index should exist")
+        .1;
+    let normalized_expr_sql = expr_idx_sql
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_lowercase();
+    assert!(
+        normalized_expr_sql.contains("lower(name)") && normalized_expr_sql.contains("abs(price)"),
+        "expression index definition should be preserved"
+    );
+
+    let in_stock_products: Vec<(String,)> = dest_conn
+        .exec_rows("SELECT name FROM products WHERE stock > 0 AND discontinued = 0 ORDER BY name");
+    assert_eq!(
+        in_stock_products,
+        vec![
+            ("Gadget C".to_string(),),
+            ("Spare E".to_string(),),
+            ("Widget A".to_string(),)
+        ]
+    );
+
+    let expr_match: Vec<(i64,)> =
+        dest_conn.exec_rows("SELECT id FROM products WHERE lower(name) = 'widget a'");
+    assert_eq!(expr_match, vec![(1,)]);
+
     Ok(())
 }
 
@@ -2113,6 +2410,84 @@ fn test_vacuum_into_with_multiple_strict_tables(tmp_db: TempDatabase) -> anyhow:
 
     let logs: Vec<(i64, String)> = dest_conn.exec_rows("SELECT id, message FROM logs");
     assert_eq!(logs, vec![(1, "Order 1 created".to_string())]);
+
+    Ok(())
+}
+
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_compacts_fragmented_database(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE fragmented_data (id INTEGER PRIMARY KEY, data BLOB)")?;
+
+    for i in 0..100 {
+        conn.execute(format!(
+            "INSERT INTO fragmented_data VALUES ({i}, randomblob(4096))",
+        ))?;
+    }
+
+    conn.execute("DELETE FROM fragmented_data WHERE id < 60")?;
+
+    for i in 60..100 {
+        conn.execute(format!(
+            "UPDATE fragmented_data SET data = randomblob(4096) WHERE id = {i}",
+        ))?;
+
+        conn.execute(format!(
+            "UPDATE fragmented_data SET data = randomblob(8192) WHERE id = {i}",
+        ))?;
+    }
+
+    let count: Vec<(i64,)> = conn.exec_rows("SELECT COUNT(*) FROM fragmented_data");
+    assert_eq!(count[0].0, 40, "Expected 40 rows after deletes");
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    let source_size = std::fs::metadata(&tmp_db.path)?.len();
+    let source_hash = compute_dbhash(&tmp_db);
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(
+        run_integrity_check(&dest_conn),
+        "ok",
+        "Vacuumed database should pass integrity check"
+    );
+
+    if !tmp_db.enable_mvcc {
+        assert_eq!(
+            source_hash.hash,
+            compute_dbhash(&dest_db).hash,
+            "Source and vacuumed database should have same content hash"
+        );
+    }
+
+    let source_pages: Vec<(i64,)> = conn.exec_rows("PRAGMA page_count");
+    let dest_pages: Vec<(i64,)> = dest_conn.exec_rows("PRAGMA page_count");
+
+    assert!(
+        dest_pages[0].0 < source_pages[0].0,
+        "Page count should reduce from {} to {}",
+        source_pages[0].0,
+        dest_pages[0].0
+    );
+
+    let dest_count: Vec<(i64,)> = dest_conn.exec_rows("SELECT COUNT(*) FROM fragmented_data");
+    assert_eq!(dest_count[0].0, 40, "Vacuumed db should have 40 rows");
+
+    let dest_size = std::fs::metadata(&dest_path)?.len();
+    assert!(
+        dest_size < source_size,
+        "VACUUM INTO should reduce file size. Source: {source_size} bytes, Destination: {dest_size} bytes"
+    );
 
     Ok(())
 }

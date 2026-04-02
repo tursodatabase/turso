@@ -1,6 +1,7 @@
 import { AsyncLock } from './async-lock.js';
 import { Session, type SessionConfig } from './session.js';
 import { Statement } from './statement.js';
+import { type QueryOptions } from './protocol.js';
 
 /**
  * Configuration options for connecting to a Turso database.
@@ -127,13 +128,13 @@ export class Connection {
    * console.log(result.rows);
    * ```
    */
-  async execute(sql: string, args?: any[]): Promise<any> {
+  async execute(sql: string, args?: any[], queryOptions?: QueryOptions): Promise<any> {
     if (!this.isOpen) {
       throw new TypeError("The database connection is not open");
     }
     await this.execLock.acquire();
     try {
-      return await this.session.execute(sql, args || [], this.defaultSafeIntegerMode);
+      return await this.session.execute(sql, args || [], this.defaultSafeIntegerMode, queryOptions);
     } finally {
       this.execLock.release();
     }
@@ -151,13 +152,13 @@ export class Connection {
    * console.log(result.rows);
    * ```
    */
-  async exec(sql: string): Promise<any> {
+  async exec(sql: string, queryOptions?: QueryOptions): Promise<any> {
     if (!this.isOpen) {
       throw new TypeError("The database connection is not open");
     }
     await this.execLock.acquire();
     try {
-      return await this.session.sequence(sql);
+      return await this.session.sequence(sql, queryOptions);
     } finally {
       this.execLock.release();
     }
@@ -180,13 +181,13 @@ export class Connection {
    * ]);
    * ```
    */
-  async batch(statements: string[], mode?: string): Promise<any> {
+  async batch(statements: string[], mode?: string, queryOptions?: QueryOptions): Promise<any> {
     if (!this.isOpen) {
       throw new TypeError("The database connection is not open");
     }
     await this.execLock.acquire();
     try {
-      return await this.session.batch(statements);
+      return await this.session.batch(statements, queryOptions);
     } finally {
       this.execLock.release();
     }
@@ -198,14 +199,14 @@ export class Connection {
    * @param pragma - The pragma to execute
    * @returns Promise resolving to the result of the pragma
    */
-  async pragma(pragma: string): Promise<any> {
+  async pragma(pragma: string, queryOptions?: QueryOptions): Promise<any> {
     if (!this.isOpen) {
       throw new TypeError("The database connection is not open");
     }
     await this.execLock.acquire();
     try {
       const sql = `PRAGMA ${pragma}`;
-      return await this.session.execute(sql);
+      return await this.session.execute(sql, [], false, queryOptions);
     } finally {
       this.execLock.release();
     }
