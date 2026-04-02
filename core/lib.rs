@@ -7,7 +7,7 @@ pub mod index_method;
 pub mod io;
 #[cfg(all(feature = "json", any(feature = "fuzz", feature = "bench")))]
 pub mod json;
-#[cfg(test)]
+#[cfg(all(test, feature = "fs", unix, target_pointer_width = "64"))]
 mod multiprocess_tests;
 pub mod mvcc;
 #[cfg(any(feature = "fuzz", feature = "bench"))]

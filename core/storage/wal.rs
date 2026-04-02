@@ -5116,6 +5116,7 @@ pub mod test {
     }
 
     #[test]
+    #[cfg(all(unix, target_pointer_width = "64"))]
     fn test_read_frame_keeps_epoch_from_issue_time() {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("epoch-race.db-wal");
