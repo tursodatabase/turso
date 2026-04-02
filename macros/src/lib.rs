@@ -617,15 +617,29 @@ pub fn derive_atomic_enum(input: TokenStream) -> TokenStream {
 /// Macro accepts the following arguments
 ///
 /// - `mvcc` flag: creates an additional test that will run the same code with MVCC enabled
+/// - `encryption` flag: creates an additional `_encrypted` variant that passes
+///   `Some(EncryptionOpts)` to the test function (the plain variant passes `None`).
+///   The function parameter must be `Option<EncryptionOpts>`.
 /// - `path` arg: specifies the name of the database to be created
 /// - `init_sql` arg: specifies the SQL query that will be run by `rusqlite` before initializing the Turso database
 ///
-/// Example:
+/// Example (TempDatabase):
 /// ```no_run,rust
 /// #[turso_macros::test(mvcc, path = "test.db", init_sql = "CREATE TABLE test_rowid (id INTEGER PRIMARY KEY);")]
 /// fn test_integer_primary_key(tmp_db: TempDatabase) -> anyhow::Result<()> {
 ///     // Code goes here to test
 ///     Ok(())
+/// }
+/// ```
+///
+/// Example (encryption):
+/// ```no_run,rust
+/// #[turso_macros::test(encryption)]
+/// fn test_restart() {
+///     // `encrypted` is injected by the macro: false for the plain variant,
+///     // true for the _encrypted variant.
+///     let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
+///     // test body
 /// }
 /// ```
 #[proc_macro_attribute]

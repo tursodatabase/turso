@@ -5014,7 +5014,7 @@ mod tests {
     }
 
     /// Random fuzzer to test encrypted chunking logic, especially carry.
-    /// We create a plan from a seed, then generate ops, write to ecnrypted log file and read it back
+    /// We create a plan from a seed, then generate ops, write to encrypted log file and read it back
     #[test]
     fn test_encrypted_log_carry_fuzz() {
         init_tracing();

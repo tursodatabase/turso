@@ -165,6 +165,58 @@ impl MvccTestDbNoConn {
         self.restart_result().unwrap();
     }
 
+    /// Creates a file-backed MVCC test database, randomly picking a cipher
+    /// when `encrypted` is true.
+    pub fn new_maybe_encrypted(encrypted: bool) -> Self {
+        if !encrypted {
+            return Self::new_with_random_db();
+        }
+        const KEY128: &str = "b1bbfda4f589dc9daaf004fe21111e00";
+        const KEY256: &str = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+        let ciphers: &[(&str, &str)] = &[
+            ("aes128gcm", KEY128),
+            ("aes256gcm", KEY256),
+            ("aegis128l", KEY128),
+            ("aegis128x2", KEY128),
+            ("aegis128x4", KEY128),
+            ("aegis256", KEY256),
+            ("aegis256x2", KEY256),
+            ("aegis256x4", KEY256),
+        ];
+        let (cipher, hexkey) = ciphers[rand::random_range(0..ciphers.len())];
+        Self::new_encrypted_with_cipher(hexkey, cipher)
+    }
+
+    fn new_encrypted_with_cipher(hex_key: &str, cipher: &str) -> Self {
+        let opts = DatabaseOpts::new().with_encryption(true);
+        let enc_opts = crate::EncryptionOpts {
+            cipher: cipher.to_string(),
+            hexkey: hex_key.to_string(),
+        };
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("test.db");
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            path.as_os_str().to_str().unwrap(),
+            OpenFlags::default(),
+            opts,
+            Some(enc_opts.clone()),
+        )
+        .unwrap();
+        let encryption_key = EncryptionKey::from_hex_string(hex_key).unwrap();
+        let conn = db.connect_with_encryption(Some(encryption_key)).unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.close().unwrap();
+        Self {
+            db: Some(db),
+            path: Some(path.to_str().unwrap().to_string()),
+            opts,
+            enc_opts: Some(enc_opts),
+            _temp_dir: Some(temp_dir),
+        }
+    }
+
     /// Like `restart`, but returns the error instead of panicking.
     /// Useful for testing wrong-key scenarios.
     pub fn restart_result(&mut self) -> crate::Result<()> {
@@ -803,9 +855,9 @@ fn test_journal_mode_switch_from_mvcc_to_wal_without_log_frames() {
 
 /// What this test checks: Startup recovery reconciles WAL/log artifacts into one consistent MVCC state and replay boundary.
 /// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
-#[test]
+#[turso_macros::test(encryption)]
 fn test_recovery_checkpoint_then_more_writes() {
-    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
     {
         let conn = db.connect();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
@@ -861,9 +913,9 @@ fn test_restart_with_trigger_rootpage_zero() {
 
 /// What this test checks: Startup recovery reconciles WAL/log artifacts into one consistent MVCC state and replay boundary.
 /// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
-#[test]
+#[turso_macros::test(encryption)]
 fn test_btree_resident_recovery_then_checkpoint_delete_stays_deleted() {
-    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
     {
         let conn = db.connect();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
@@ -1428,9 +1480,9 @@ fn test_meta_recovery_case_1_no_wal_no_log_metadata_present_clean_boot() {
 
 /// What this test checks: With no committed WAL and metadata present, replay includes only frames above `persistent_tx_ts_max`.
 /// Why this matters: This is the core idempotency contract for logical-log replay.
-#[test]
+#[turso_macros::test(encryption)]
 fn test_meta_recovery_case_2_no_wal_replay_above_metadata_boundary() {
-    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
     {
         let conn = db.connect();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
@@ -1469,9 +1521,9 @@ fn test_meta_recovery_case_2_no_wal_replay_above_metadata_boundary() {
 /// then persisted into the database header by checkpoint.
 /// Why this matters: PRAGMA header mutations (for example user_version) must survive restart
 /// both before and after log truncation, including implicit autocommit statement transactions.
-#[test]
+#[turso_macros::test(encryption)]
 fn test_header_only_mutation_is_replayed_and_checkpointed() {
-    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
 
     {
         let conn = db.connect();
@@ -4596,9 +4648,9 @@ fn test_select_empty_table() {
 
 /// What this test checks: Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
 /// Why this matters: Read-path correctness is critical: wrong cursor semantics directly surface as wrong query answers.
-#[test]
+#[turso_macros::test(encryption)]
 fn test_cursor_with_btree_and_mvcc() {
-    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
     // First write some rows and checkpoint so data is flushed to BTree file (.db)
     {
         let conn = db.connect();
@@ -4620,9 +4672,9 @@ fn test_cursor_with_btree_and_mvcc() {
 
 /// What this test checks: Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
 /// Why this matters: Read-path correctness is critical: wrong cursor semantics directly surface as wrong query answers.
-#[test]
+#[turso_macros::test(encryption)]
 fn test_cursor_with_btree_and_mvcc_2() {
-    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
     // First write some rows and checkpoint so data is flushed to BTree file (.db)
     {
         let conn = db.connect();
@@ -4648,9 +4700,9 @@ fn test_cursor_with_btree_and_mvcc_2() {
 
 /// What this test checks: Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
 /// Why this matters: Read-path correctness is critical: wrong cursor semantics directly surface as wrong query answers.
-#[test]
+#[turso_macros::test(encryption)]
 fn test_cursor_with_btree_and_mvcc_with_backward_cursor() {
-    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
     // First write some rows and checkpoint so data is flushed to BTree file (.db)
     {
         let conn = db.connect();
@@ -4675,9 +4727,9 @@ fn test_cursor_with_btree_and_mvcc_with_backward_cursor() {
 
 /// What this test checks: Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
 /// Why this matters: Read-path correctness is critical: wrong cursor semantics directly surface as wrong query answers.
-#[test]
+#[turso_macros::test(encryption)]
 fn test_cursor_with_btree_and_mvcc_with_backward_cursor_with_delete() {
-    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
     // First write some rows and checkpoint so data is flushed to BTree file (.db)
     {
         let conn = db.connect();
@@ -4707,10 +4759,10 @@ fn test_cursor_with_btree_and_mvcc_with_backward_cursor_with_delete() {
 
 /// What this test checks: Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
 /// Why this matters: Read-path correctness is critical: wrong cursor semantics directly surface as wrong query answers.
-#[test]
+#[turso_macros::test(encryption)]
 #[ignore] // FIXME: This fails constantly on main and is really annoying, disabling for now :]
 fn test_cursor_with_btree_and_mvcc_fuzz() {
-    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
     let mut rows_in_db = sorted_vec::SortedVec::new();
     let mut seen = HashSet::default();
     let (mut rng, _seed) = rng_from_time_or_env();
@@ -6694,9 +6746,9 @@ fn test_gc_e2e_checkpointed_row_readable_after_gc() {
 
 /// After deleting a B-tree row and checkpointing, the tombstone is removed
 /// by GC. The deleted row must stay invisible (B-tree no longer has it).
-#[test]
+#[turso_macros::test(encryption)]
 fn test_gc_e2e_deleted_row_stays_hidden_after_gc() {
-    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
     {
         let conn = db.connect();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
@@ -6730,9 +6782,9 @@ fn test_gc_e2e_deleted_row_stays_hidden_after_gc() {
 
 /// After updating a B-tree row and checkpointing, GC removes old versions.
 /// The updated value must be visible (from B-tree after GC).
-#[test]
+#[turso_macros::test(encryption)]
 fn test_gc_e2e_updated_row_correct_after_gc() {
-    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
     {
         let conn = db.connect();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
