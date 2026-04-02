@@ -1605,6 +1605,14 @@ impl ProgramBuilder {
         matches!(self.cursor_ref[cursor_id].1, CursorType::BTreeTable(_))
     }
 
+    /// Returns the BTreeTable for the given cursor, if it is a BTreeTable cursor.
+    pub fn btree_table_from_cursor(&self, cursor_id: CursorID) -> Option<&Arc<BTreeTable>> {
+        match &self.cursor_ref[cursor_id].1 {
+            CursorType::BTreeTable(t) => Some(t),
+            _ => None,
+        }
+    }
+
     #[inline]
     pub fn cursor_loop(&mut self, cursor_id: CursorID, f: impl Fn(&mut ProgramBuilder, usize)) {
         let loop_start = self.allocate_label();
@@ -1679,7 +1687,7 @@ impl ProgramBuilder {
                 .expect("column index out of bounds");
             turso_assert!(
                 !column_def.is_virtual_generated(),
-                "emit_column called with virtual generated column index",
+                "emit_column called with virtual generated column index", //FIXME this panics
                 {"column_index": column}
             );
         }
