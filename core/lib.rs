@@ -1603,7 +1603,31 @@ impl Database {
         }
     }
 
-    #[cfg(all(unix, target_pointer_width = "64", target_os = "linux"))]
+    #[cfg(all(unix, target_pointer_width = "64", target_os = "macos"))]
+    fn filesystem_type_allows_shared_wal(fs_type: &str) -> bool {
+        // Network and distributed filesystems where mmap'd shared memory
+        // cannot guarantee cross-process coherency.
+        !matches!(
+            fs_type,
+            "nfs" | "smbfs" | "afpfs" | "webdav" | "cifs" | "acfs"
+        )
+    }
+
+    #[cfg(all(
+        unix,
+        target_pointer_width = "64",
+        not(any(target_os = "linux", target_os = "android")),
+        not(target_os = "macos")
+    ))]
+    fn filesystem_type_allows_shared_wal(_fs_type: &str) -> bool {
+        true
+    }
+
+    #[cfg(all(
+        unix,
+        target_pointer_width = "64",
+        any(target_os = "linux", target_os = "android")
+    ))]
     fn filesystem_magic_allows_shared_wal(filesystem_magic: libc::c_long) -> bool {
         const AFS_SUPER_MAGIC: libc::c_long = 0x5346_414f;
         const CIFS_SUPER_MAGIC: libc::c_long = 0xFF53_4D42u32 as libc::c_long;
@@ -1633,7 +1657,11 @@ impl Database {
         )
     }
 
-    #[cfg(all(unix, target_pointer_width = "64", target_os = "linux"))]
+    #[cfg(all(
+        unix,
+        target_pointer_width = "64",
+        any(target_os = "linux", target_os = "android")
+    ))]
     fn path_allows_shared_wal_coordination(path: &Path) -> Result<bool> {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
@@ -1658,12 +1686,49 @@ impl Database {
             ));
         }
         let stat = unsafe { stat.assume_init() };
-        Ok(Self::filesystem_magic_allows_shared_wal(stat.f_type))
+        Ok(Self::filesystem_magic_allows_shared_wal(
+            stat.f_type as libc::c_long,
+        ))
     }
 
-    #[cfg(all(unix, target_pointer_width = "64", not(target_os = "linux")))]
-    fn path_allows_shared_wal_coordination(_path: &Path) -> Result<bool> {
-        Ok(true)
+    #[cfg(all(
+        unix,
+        target_pointer_width = "64",
+        not(any(target_os = "linux", target_os = "android"))
+    ))]
+    fn path_allows_shared_wal_coordination(path: &Path) -> Result<bool> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let probe_path = if path.exists() {
+            path
+        } else {
+            path.parent().unwrap_or_else(|| Path::new("."))
+        };
+        let c_path = CString::new(probe_path.as_os_str().as_bytes()).map_err(|_| {
+            LimboError::InvalidArgument(format!(
+                "path contains interior NUL bytes: {}",
+                probe_path.display()
+            ))
+        })?;
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        let rc = unsafe { libc::statfs(c_path.as_ptr(), stat.as_mut_ptr()) };
+        if rc != 0 {
+            return Err(io_error(
+                std::io::Error::last_os_error(),
+                "statfs shared WAL coordination path",
+            ));
+        }
+        let stat = unsafe { stat.assume_init() };
+        // macOS and other BSDs expose the filesystem type as a
+        // null-terminated string in f_fstypename rather than an
+        // integer magic number.
+        let fs_type = unsafe {
+            std::ffi::CStr::from_ptr(stat.f_fstypename.as_ptr())
+                .to_str()
+                .unwrap_or("")
+        };
+        Ok(Self::filesystem_type_allows_shared_wal(fs_type))
     }
 
     #[cfg(all(unix, target_pointer_width = "64"))]
