@@ -217,7 +217,7 @@ impl TempDatabaseBuilder {
             io.clone(),
             db_path.to_str().unwrap(),
             flags,
-            opts,
+            opts.clone(),
             None,
         )
         .unwrap();

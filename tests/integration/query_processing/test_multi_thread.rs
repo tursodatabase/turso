@@ -44,13 +44,13 @@ fn test_schema_reprepare(tmp_db: TempDatabase) {
 fn test_create_multiple_connections(tmp_db: TempDatabase) -> anyhow::Result<()> {
     maybe_setup_tracing();
     let tries = 1;
-    let opts = tmp_db.db_opts;
+    let opts = tmp_db.db_opts.clone();
     let flags = tmp_db.db_flags;
     for _ in 0..tries {
         let tmp_db = Arc::new(
             TempDatabase::builder()
                 .with_flags(flags)
-                .with_opts(opts)
+                .with_opts(opts.clone())
                 .build(),
         );
         {
@@ -116,13 +116,13 @@ fn test_create_multiple_connections(tmp_db: TempDatabase) -> anyhow::Result<()> 
 #[ignore]
 fn test_reader_writer(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let tries = 10;
-    let opts = tmp_db.db_opts;
+    let opts = tmp_db.db_opts.clone();
     let flags = tmp_db.db_flags;
     for _ in 0..tries {
         let tmp_db = Arc::new(
             TempDatabase::builder()
                 .with_flags(flags)
-                .with_opts(opts)
+                .with_opts(opts.clone())
                 .build(),
         );
         {

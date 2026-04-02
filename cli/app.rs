@@ -238,7 +238,7 @@ impl Limbo {
         let db_file = normalize_db_path(db_file);
 
         let (io, conn) = if db_file.starts_with("file:") {
-            Connection::from_uri(&db_file, db_opts)?
+            Connection::from_uri(&db_file, db_opts.clone())?
         } else {
             let flags = if opts.readonly {
                 OpenFlags::default().union(OpenFlags::ReadOnly)
@@ -249,7 +249,7 @@ impl Limbo {
                 &db_file,
                 opts.vfs.as_ref(),
                 flags,
-                db_opts.turso_cli(),
+                db_opts.clone().turso_cli(),
                 None,
             )?;
             let conn = db.connect()?;
@@ -467,7 +467,7 @@ impl Limbo {
                     io.clone(),
                     path,
                     OpenFlags::default(),
-                    self.db_opts,
+                    self.db_opts.clone(),
                     None,
                 )?,
             )

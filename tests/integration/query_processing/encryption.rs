@@ -163,7 +163,7 @@ fn run_corruption_associated_data_bytes_test(
 fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let db_path = tmp_db.path.clone();
-    let opts = tmp_db.db_opts;
+    let opts = tmp_db.db_opts.clone();
 
     {
         let conn = tmp_db.connect_limbo();
@@ -199,7 +199,7 @@ fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
             db_path.to_str().unwrap()
         );
-        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts)?;
+        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts.clone())?;
         let mut row_count = 0;
         run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |row: &Row| {
             assert_eq!(row.get::<i64>(0).unwrap(), 1);
@@ -214,7 +214,7 @@ fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
             db_path.to_str().unwrap()
         );
-        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts)?;
+        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts.clone())?;
         run_query(
             &tmp_db,
             &conn,
@@ -228,7 +228,7 @@ fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
             db_path.to_str().unwrap()
         );
-        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts)?;
+        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts.clone())?;
         run_query(
             &tmp_db,
             &conn,
@@ -250,7 +250,7 @@ fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76377",
             db_path.to_str().unwrap()
         );
-        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts)?;
+        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts.clone())?;
         let result = run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
         assert!(
             result.is_err(),
@@ -260,7 +260,7 @@ fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
     {
         // test connecting to encrypted db using insufficient encryption parameters in URI.
         let uri = format!("file:{}?cipher=aegis256", db_path.to_str().unwrap());
-        let result = turso_core::Connection::from_uri(&uri, opts);
+        let result = turso_core::Connection::from_uri(&uri, opts.clone());
         assert!(
             result.is_err(),
             "should return error when accessing encrypted DB without passing hexkey in URI"
@@ -271,7 +271,7 @@ fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
             "file:{}?hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
             db_path.to_str().unwrap()
         );
-        let result = turso_core::Connection::from_uri(&uri, opts);
+        let result = turso_core::Connection::from_uri(&uri, opts.clone());
         assert!(
             result.is_err(),
             "should return error when accessing encrypted DB without passing cipher in URI"
@@ -355,7 +355,7 @@ fn test_corruption_turso_magic_bytes(tmp_db: TempDatabase) -> anyhow::Result<()>
     let _ = env_logger::try_init();
     let db_path = tmp_db.path.clone();
 
-    let opts = tmp_db.db_opts;
+    let opts = tmp_db.db_opts.clone();
 
     {
         let conn = tmp_db.connect_limbo();
@@ -397,7 +397,7 @@ fn test_corruption_turso_magic_bytes(tmp_db: TempDatabase) -> anyhow::Result<()>
             db_path.to_str().unwrap()
         );
 
-        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts)?;
+        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts.clone())?;
         let result = run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
 
         assert!(
@@ -508,12 +508,12 @@ fn test_turso_header_structure(db: TempDatabase) -> anyhow::Result<()> {
             "b1bbfda4f589dc9daaf004fe21111e00",
         ),
     ];
-    let opts = db.db_opts;
+    let opts = db.db_opts.clone();
     let flags = db.db_flags;
 
     for (cipher_name, expected_id, description, hexkey) in test_cases {
         let tmp_db = TempDatabase::builder()
-            .with_opts(opts)
+            .with_opts(opts.clone())
             .with_flags(flags)
             .build();
         let db_path = tmp_db.path.clone();
@@ -569,7 +569,7 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
         io.clone(),
         db_path_str,
         OpenFlags::Create,
-        opts,
+        opts.clone(),
         correct_encryption_opts.clone(),
     )?;
 
@@ -599,7 +599,7 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
             io.clone(),
             db_path_str,
             OpenFlags::default(),
-            opts,
+            opts.clone(),
             correct_encryption_opts.clone(),
         )?;
 
@@ -634,7 +634,7 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
             io.clone(),
             db_path_str,
             OpenFlags::default(),
-            opts,
+            opts.clone(),
             Some(EncryptionOpts {
                 cipher: "aegis256".to_string(),
                 hexkey: wrong_key.to_string(),
@@ -672,7 +672,7 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
             io.clone(),
             db_path_str,
             OpenFlags::default(),
-            opts,
+            opts.clone(),
             None,
         );
 

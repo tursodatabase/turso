@@ -172,7 +172,7 @@ pub fn generate_random_text(rng: &mut ChaCha8Rng, max_len: usize) -> String {
 pub fn builder_from_db(db: &TempDatabase) -> TempDatabaseBuilder {
     TempDatabase::builder()
         .with_flags(db.db_flags)
-        .with_opts(db.db_opts)
+        .with_opts(db.db_opts.clone())
 }
 
 /// Verify that a set of queries returns identical results on both engines.

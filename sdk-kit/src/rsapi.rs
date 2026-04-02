@@ -689,7 +689,10 @@ impl TursoDatabase {
                         .as_ref()
                         .expect("db_file must be initialized in Init phase")
                         .clone();
-                    let opts = state.opts.expect("opts must be initialized in Init phase");
+                    let opts = state
+                        .opts
+                        .clone()
+                        .expect("opts must be initialized in Init phase");
 
                     match Database::open_with_flags_async(
                         &mut state.open_db_state,

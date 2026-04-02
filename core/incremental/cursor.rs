@@ -386,17 +386,7 @@ mod tests {
             io,
             ":memory:",
             OpenFlags::default(),
-            crate::DatabaseOpts {
-                enable_views: true,
-                enable_custom_types: false,
-                enable_load_extension: false,
-                enable_encryption: false,
-                enable_index_method: false,
-                enable_autovacuum: false,
-                enable_attach: false,
-                enable_generated_columns: false,
-                unsafe_testing: false,
-            },
+            crate::DatabaseOpts::new().with_views(true),
             None,
         )?;
         let conn = db.connect()?;

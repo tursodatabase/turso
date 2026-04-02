@@ -164,7 +164,7 @@ pub const fn is_attached_db(database_id: usize) -> bool {
 }
 
 /// Configuration for database features
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct DatabaseOpts {
     pub enable_views: bool,
     pub enable_custom_types: bool,
@@ -672,7 +672,7 @@ impl Database {
                 path,
                 db_file.clone(),
                 flags,
-                opts,
+                opts.clone(),
                 encryption_opts.clone(),
                 durable_storage.clone(),
             )? {
@@ -806,7 +806,7 @@ impl Database {
                 Some(wal_path),
                 db_file.clone(),
                 flags,
-                opts,
+                opts.clone(),
                 encryption_opts.clone(),
                 None,
             )? {
@@ -884,7 +884,7 @@ impl Database {
                         &format!("{path}-wal")
                     };
                     let mut db = Self::new(
-                        opts,
+                        opts.clone(),
                         flags,
                         path,
                         wal_path,

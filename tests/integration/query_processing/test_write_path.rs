@@ -705,7 +705,7 @@ fn test_write_concurrent_connections(tmp_db: TempDatabase) -> anyhow::Result<()>
 fn test_wal_bad_frame(tmp_db: TempDatabase) -> anyhow::Result<()> {
     maybe_setup_tracing();
     let _ = env_logger::try_init();
-    let db_opts = tmp_db.db_opts;
+    let db_opts = tmp_db.db_opts.clone();
     let db_path = {
         let tmp_db = tmp_db;
         let db_path = tmp_db.path.clone();
@@ -754,7 +754,7 @@ fn test_wal_bad_frame(tmp_db: TempDatabase) -> anyhow::Result<()> {
         let result = {
             let tmp_db = TempDatabase::builder()
                 .with_db_path(db_path)
-                .with_opts(db_opts)
+                .with_opts(db_opts.clone())
                 .build();
             let conn = tmp_db.connect_limbo();
             common::run_query_on_row(&tmp_db, &conn, "SELECT count(1) from t2", |row| {
@@ -788,7 +788,7 @@ fn test_wal_bad_frame(tmp_db: TempDatabase) -> anyhow::Result<()> {
 fn test_read_wal_dumb_no_frames(tmp_db: TempDatabase) -> anyhow::Result<()> {
     maybe_setup_tracing();
     let _ = env_logger::try_init();
-    let opts = tmp_db.db_opts;
+    let opts = tmp_db.db_opts.clone();
     let db_path = {
         let tmp_db = tmp_db;
         let conn = tmp_db.connect_limbo();
@@ -797,7 +797,7 @@ fn test_read_wal_dumb_no_frames(tmp_db: TempDatabase) -> anyhow::Result<()> {
     };
     // Second connection must recover from the WAL file. Last checksum should be filled correctly.
     {
-        let tmp_db = TempDatabase::new_with_existent_with_opts(&db_path, opts);
+        let tmp_db = TempDatabase::new_with_existent_with_opts(&db_path, opts.clone());
         let conn = tmp_db.connect_limbo();
         conn.execute("CREATE TABLE t0 (x)")?;
         conn.close()?;
