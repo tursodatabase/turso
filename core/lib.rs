@@ -1166,7 +1166,6 @@ impl Database {
             }
         }
 
-
         // Read header within the read transaction, ensuring cleanup on error
         let result = (|| -> Result<AutoVacuumMode> {
             let header_ref = pager.io.block(|| HeaderRef::from_pager(&pager))?;
