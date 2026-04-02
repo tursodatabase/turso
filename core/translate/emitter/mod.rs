@@ -1455,9 +1455,9 @@ fn generated_column(
             table
                 .columns
                 .get(idx_col.pos_in_table)
+                .filter(|col| col.is_virtual_generated())
                 .map(|col| (table.clone(), col.clone()))
         })
-        .filter(|(_, col)| col.is_virtual_generated())
         .next()
 }
 
