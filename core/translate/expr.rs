@@ -5591,19 +5591,15 @@ where
 }
 
 /// The precedence of binding identifiers to columns.
-///
-/// TryResultColumnsFirst means that result columns (e.g. SELECT x AS y, ...) take precedence over canonical columns (e.g. SELECT x, y AS z, ...). This is the default behavior.
-///
-/// TryCanonicalColumnsFirst means that canonical columns take precedence over result columns. This is used for e.g. WHERE clauses.
-///
-/// ResultColumnsNotAllowed means that referring to result columns is not allowed. This is used e.g. for DML statements.
-///
-/// AllowUnboundIdentifiers means that unbound identifiers are allowed. This is used for INSERT ... ON CONFLICT DO UPDATE SET ... where binding is handled later than this phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindingBehavior {
+    /// `TryResultColumnsFirst` means that result columns (e.g. SELECT x AS y, ...) take precedence over canonical columns (e.g. SELECT x, y AS z, ...). This is the default behavior.
     TryResultColumnsFirst,
+    /// `TryCanonicalColumnsFirst` means that canonical columns take precedence over result columns. This is used for e.g. WHERE clauses.
     TryCanonicalColumnsFirst,
+    /// `ResultColumnsNotAllowed` means that referring to result columns is not allowed. This is used e.g. for DML statements.
     ResultColumnsNotAllowed,
+    /// `AllowUnboundIdentifiers` means that unbound identifiers are allowed. This is used for INSERT ... ON CONFLICT DO UPDATE SET ... where binding is handled later than this phase.
     AllowUnboundIdentifiers,
 }
 
