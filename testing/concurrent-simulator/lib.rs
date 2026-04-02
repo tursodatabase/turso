@@ -21,10 +21,13 @@ use turso_parser::ast::{ColumnConstraint, SortOrder};
 pub mod chaotic_elle;
 pub mod elle;
 mod io;
+#[cfg(all(unix, target_pointer_width = "64"))]
 pub mod multiprocess;
 pub mod operations;
 pub mod properties;
+#[cfg(all(unix, target_pointer_width = "64"))]
 pub mod protocol;
+#[cfg(all(unix, target_pointer_width = "64"))]
 pub mod worker;
 pub mod workloads;
 mod yield_injection;
