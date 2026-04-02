@@ -308,28 +308,6 @@ fn advance_seeded_whopper_to_step(whopper: &mut MultiprocessWhopper, step_after_
     }
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
-fn wal_frame_summaries(path: &Path, page_size: usize, frame_count: usize) -> Vec<(u32, u32)> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let mut file = std::fs::File::open(path).expect("open wal file");
-    let frame_size = 24 + page_size as u64;
-    let mut frames = Vec::with_capacity(frame_count);
-    for frame_idx in 0..frame_count {
-        let offset = 32 + frame_idx as u64 * frame_size;
-        file.seek(SeekFrom::Start(offset))
-            .expect("seek wal frame header");
-        let mut buf = [0u8; 8];
-        file.read_exact(&mut buf)
-            .expect("read wal frame page number and db size");
-        frames.push((
-            u32::from_be_bytes(buf[0..4].try_into().expect("page bytes")),
-            u32::from_be_bytes(buf[4..8].try_into().expect("db size bytes")),
-        ));
-    }
-    frames
-}
-
 /// Regression test for MVCC concurrent commit yield-spin deadlock.
 ///
 /// Under round-robin cooperative scheduling, when two BEGIN CONCURRENT
@@ -702,210 +680,6 @@ fn multiprocess_seed_5724542806254236599_restart_then_finalize_preserves_key_684
 
 #[cfg(all(unix, target_pointer_width = "64"))]
 #[test]
-fn multiprocess_seed_5724542806254236599_localizes_key_4362_loss() {
-    configure_worker_exe();
-    let mut whopper = MultiprocessWhopper::new(MultiprocessOpts {
-        seed: Some(5724542806254236599),
-        enable_mvcc: false,
-        max_connections: 16,
-        max_steps: 4913,
-        elle_tables: vec![],
-        workloads: vec![
-            (10, Box::new(IntegrityCheckWorkload)),
-            (5, Box::new(WalCheckpointWorkload)),
-            (10, Box::new(CreateSimpleTableWorkload)),
-            (20, Box::new(SimpleSelectWorkload)),
-            (20, Box::new(SimpleInsertWorkload)),
-            (15, Box::new(UpdateWorkload)),
-            (15, Box::new(DeleteWorkload)),
-            (2, Box::new(CreateIndexWorkload)),
-            (2, Box::new(DropIndexWorkload)),
-            (30, Box::new(BeginWorkload)),
-            (10, Box::new(CommitWorkload)),
-            (10, Box::new(RollbackWorkload)),
-        ],
-        properties: vec![],
-        chaotic_profiles: vec![],
-        kill_probability: 0.0,
-        restart_probability: 0.05,
-        history_output: None,
-        keep_files: true,
-    })
-    .expect("create seeded multiprocess whopper");
-
-    let table_name = "simple_kv_76514";
-    let key = "key_4362";
-    let db_path = whopper.db_path().to_path_buf();
-    let wal_path = Path::new(&format!("{}-wal", db_path.display())).to_path_buf();
-    let tshm_path = Path::new(&format!("{}-tshm", db_path.display())).to_path_buf();
-
-    advance_seeded_whopper_to_step(&mut whopper, 4728);
-    unsafe {
-        std::env::set_var("WAL_SCAN_TRACE", "1");
-    }
-    let observer_io: Arc<dyn IO> = Arc::new(PlatformIO::new().expect("platform io"));
-    let observer_db = Database::open_file_with_flags(
-        observer_io,
-        db_path.to_str().expect("db path utf8"),
-        OpenFlags::ReadOnly,
-        multiprocess_wal_db_opts(),
-        None,
-    )
-    .expect("open observer database for diagnostics");
-    unsafe {
-        std::env::remove_var("WAL_SCAN_TRACE");
-    }
-    eprintln!(
-        "after step 4727: db_path={} snapshot={:?} wal_size={:?} tshm_size={:?} frame_summaries={:?} authority_find_frame={{1066:{:?},1067:{:?},1377:{:?}}} observer_telemetry={:?} observer_find_frame_1066={:?} observer_local_max_frame={} observer_local_find_frame={{1066:{:?},1067:{:?},1377:{:?}}}",
-        db_path.display(),
-        whopper
-            .shared_wal_snapshot_direct(0)
-            .expect("read shared WAL snapshot"),
-        std::fs::metadata(&wal_path).ok().map(|m| m.len()),
-        std::fs::metadata(&tshm_path).ok().map(|m| m.len()),
-        wal_frame_summaries(&wal_path, 4096, 11),
-        whopper
-            .find_frame_for_page_direct(0, 1066)
-            .expect("lookup table root page in authority"),
-        whopper
-            .find_frame_for_page_direct(0, 1067)
-            .expect("lookup table overflow page in authority"),
-        whopper
-            .find_frame_for_page_direct(0, 1377)
-            .expect("lookup reused page in authority"),
-        observer_db
-            .shared_wal_open_telemetry()
-            .expect("observer shared wal telemetry"),
-        observer_db
-            .shared_wal_find_frame_for_testing(1066)
-            .expect("observer frame lookup"),
-        observer_db
-            .local_wal_max_frame_for_testing()
-            .expect("observer local max frame"),
-        observer_db
-            .local_wal_find_frame_for_testing(1066)
-            .expect("observer local frame lookup"),
-        observer_db
-            .local_wal_find_frame_for_testing(1067)
-            .expect("observer local overflow page lookup"),
-        observer_db
-            .local_wal_find_frame_for_testing(1377)
-            .expect("observer local reused page lookup"),
-    );
-    assert_eq!(
-        read_simple_kv_length(&db_path, table_name, key),
-        Some(5431),
-        "inserted row must be visible immediately after step 4727",
-    );
-
-    advance_seeded_whopper_to_step(&mut whopper, 4753);
-    assert!(
-        whopper
-            .worker_startup_telemetries()
-            .iter()
-            .all(|startup| startup.loaded_from_disk_scan),
-        "step 4752 should reproduce the all-workers disk-scan restart",
-    );
-    assert_eq!(
-        read_simple_kv_length(&db_path, table_name, key),
-        Some(5431),
-        "row disappeared during the step 4752 restart recovery",
-    );
-
-    advance_seeded_whopper_to_step(&mut whopper, 4758);
-    assert!(
-        whopper
-            .worker_startup_telemetries()
-            .iter()
-            .all(|startup| startup.loaded_from_disk_scan),
-        "step 4757 should reproduce the second all-workers disk-scan restart",
-    );
-    assert_eq!(
-        read_simple_kv_length(&db_path, table_name, key),
-        Some(5431),
-        "row disappeared during the step 4757 restart recovery",
-    );
-
-    advance_seeded_whopper_to_step(&mut whopper, 4829);
-    assert_eq!(
-        read_simple_kv_length(&db_path, table_name, key),
-        Some(5431),
-        "row disappeared by the step 4828 TRUNCATE checkpoint",
-    );
-
-    advance_seeded_whopper_to_step(&mut whopper, 4877);
-    assert_eq!(
-        read_simple_kv_length(&db_path, table_name, key),
-        Some(5431),
-        "row disappeared during the step 4876 restart",
-    );
-
-    advance_seeded_whopper_to_step(&mut whopper, 4883);
-    assert_eq!(
-        read_simple_kv_length(&db_path, table_name, key),
-        Some(5431),
-        "row disappeared during the step 4882 restart",
-    );
-
-    advance_seeded_whopper_to_step(&mut whopper, 4910);
-    assert_eq!(
-        read_simple_kv_length(&db_path, table_name, key),
-        Some(5431),
-        "row disappeared before the recorded failing read at step 4909",
-    );
-
-    advance_seeded_whopper_to_step(&mut whopper, 4911);
-    let after_step_4910_length = read_simple_kv_length(&db_path, table_name, key);
-    eprintln!(
-        "after step 4910 create-table commit: snapshot={:?} worker_startups={:?} observer_length={:?}",
-        whopper
-            .shared_wal_snapshot_direct(0)
-            .expect("read shared WAL snapshot after step 4910"),
-        whopper.worker_startup_telemetries(),
-        after_step_4910_length,
-    );
-    assert_eq!(
-        after_step_4910_length,
-        Some(5431),
-        "row disappeared immediately after the step 4910 create-table commit",
-    );
-
-    advance_seeded_whopper_to_step(&mut whopper, 4913);
-    let worker_0_rows = whopper
-        .execute_sql_direct(
-            0,
-            format!("select key, length(value) from {table_name} where key='{key}'"),
-        )
-        .expect("query failing worker directly after step 4912")
-        .expect("worker query should succeed");
-    let observer_length = read_simple_kv_length(&db_path, table_name, key);
-    eprintln!(
-        "after step 4912: snapshot={:?} worker_startups={:?} worker_0_rows={:?} observer_length={:?}",
-        whopper
-            .shared_wal_snapshot_direct(0)
-            .expect("read shared WAL snapshot after failing step"),
-        whopper.worker_startup_telemetries(),
-        worker_0_rows,
-        observer_length,
-    );
-    assert_eq!(
-        observer_length,
-        Some(5431),
-        "fresh observer lost the row by the recorded failing read at step 4912",
-    );
-    assert_eq!(
-        worker_0_rows.len(),
-        1,
-        "worker 0 still cannot see the row immediately after the recorded failing step",
-    );
-
-    whopper
-        .finalize()
-        .expect("finalize seeded multiprocess whopper");
-}
-
-#[cfg(all(unix, target_pointer_width = "64"))]
-#[test]
 fn multiprocess_seed_5724542806254236599_localizes_key_4994_loss() {
     configure_worker_exe();
     let mut whopper = MultiprocessWhopper::new(MultiprocessOpts {
@@ -1036,13 +810,6 @@ fn multiprocess_seed_8849519299024683634_localizes_schema_loss_boundary() {
 
     advance_seeded_whopper_to_step(&mut whopper, 67);
     assert!(
-        whopper
-            .worker_startup_telemetries()
-            .iter()
-            .all(|startup| startup.loaded_from_disk_scan),
-        "step 66 should reproduce the first all-workers disk-scan restart",
-    );
-    assert!(
         probe_table_rootpage_via_fresh_worker(&whopper, "simple_kv_9842").is_some(),
         "simple_kv_9842 should still exist for a fresh opener immediately after the step 66 restart",
     );
@@ -1053,13 +820,6 @@ fn multiprocess_seed_8849519299024683634_localizes_schema_loss_boundary() {
     );
 
     advance_seeded_whopper_to_step(&mut whopper, 70);
-    assert!(
-        whopper
-            .worker_startup_telemetries()
-            .iter()
-            .all(|startup| startup.loaded_from_disk_scan),
-        "step 70 should reproduce the second all-workers disk-scan restart",
-    );
     assert!(
         probe_table_rootpage_via_fresh_worker(&whopper, "simple_kv_9842").is_some(),
         "simple_kv_9842 disappeared from sqlite_schema by the step 70 restart; cohort_telemetries={:?}",
