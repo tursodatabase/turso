@@ -3591,6 +3591,7 @@ pub fn op_savepoint(
             Ok(InsnFunctionStepResult::Step)
         }
         SavepointOp::RollbackTo => {
+            let mut mvcc_tx_id = None;
             let deferred_fk_snapshot = if let Some(mv_store) = mv_store.as_ref() {
                 // Rollback named savepoints on attached MVCC databases.
                 conn.for_each_attached_mv_tx(|db_id, att_tx_id| {
@@ -3599,7 +3600,10 @@ pub fn op_savepoint(
                     }
                 });
                 match conn.get_mv_tx_id() {
-                    Some(tx_id) => mv_store.rollback_to_named_savepoint(tx_id, name)?,
+                    Some(tx_id) => {
+                        mvcc_tx_id = Some(tx_id);
+                        mv_store.rollback_to_named_savepoint(tx_id, name)?
+                    }
                     None => None,
                 }
             } else {
@@ -3618,28 +3622,39 @@ pub fn op_savepoint(
             // cached schema cookie and check if a schema reparse is needed.
             pager.set_schema_cookie(None);
             let in_memory_version = conn.schema.read().schema_version;
-            let pager_ref = conn.pager.load().clone();
-            match pager_ref
-                .io
-                .block(|| pager.with_header(|h| h.schema_cookie.get()))
-            {
-                Ok(on_disk_cookie) if in_memory_version != on_disk_cookie => {
+            let current_cookie = if let Some(mv_store) = mv_store.as_ref() {
+                mv_store.with_header(|header| header.schema_cookie.get(), mvcc_tx_id.as_ref())
+            } else {
+                conn.read_current_schema_cookie()
+            };
+            match current_cookie {
+                Ok(current_cookie)
+                    if mv_store.is_some()
+                        && current_cookie == conn.db.schema.lock().schema_version =>
+                {
+                    *conn.schema.write() = conn.db.clone_schema();
+                }
+                Ok(current_cookie) if in_memory_version != current_cookie => {
                     // Schema was modified during the savepoint. Try to reparse
                     // from the restored database pages. If that fails (e.g. the
                     // database was empty at the savepoint), use an empty schema.
-                    if conn.reparse_schema().is_err() {
+                    if let Err(err) = conn.reparse_schema_with_cookie(current_cookie) {
+                        if current_cookie != 0 {
+                            return Err(err);
+                        }
                         conn.with_schema_mut(|schema| {
                             *schema = Schema::new();
                         });
                     }
                 }
-                Err(_) => {
+                Err(LimboError::Page1NotAlloc) => {
                     // Header page is not readable (database empty after rollback).
                     // Reset to an empty schema.
                     conn.with_schema_mut(|schema| {
                         *schema = Schema::new();
                     });
                 }
+                Err(err) => return Err(err),
                 _ => {} // Schema unchanged, nothing to do.
             }
 
