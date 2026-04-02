@@ -738,7 +738,7 @@ fn emit_fk_parent_key_probe(
 
 /// `layout` has to be the [ColumnLayout] from `table.column_layout()`. It's passed this way
 /// because cloning it is cheaper than recreating it.
-fn cursor_to_registers(
+pub fn cursor_to_registers(
     program: &mut ProgramBuilder,
     table: &BTreeTable,
     layout: ColumnLayout,

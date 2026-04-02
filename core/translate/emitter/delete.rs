@@ -544,6 +544,7 @@ fn emit_delete_insns<'a>(
                 &t_ctx.resolver,
                 table_references,
                 main_table_cursor_id,
+                internal_id,
                 column_index,
                 start_reg + reg_offset,
             )?;
@@ -728,6 +729,7 @@ fn emit_delete_row_common(
                     &t_ctx.resolver,
                     table_references,
                     main_table_cursor_id,
+                    internal_id,
                     column_index,
                     start_reg + reg_offset,
                 )?;
