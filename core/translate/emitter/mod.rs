@@ -1421,18 +1421,8 @@ pub(crate) fn emit_index_column_value_old_image(
             )?;
             Ok(())
         })?;
-    } else if let Some((table, generated_column)) = program
-        .btree_table_from_cursor(table_cursor_id)
-        .iter()
-        .cloned()
-        .flat_map(|table| {
-            table
-                .columns
-                .get(idx_col.pos_in_table)
-                .map(|col| (table.clone(), col.clone()))
-        })
-        .filter(|(_, col)| col.is_virtual_generated())
-        .next()
+    } else if let Some((table, generated_column)) =
+        generated_column(&program, table_cursor_id, idx_col)
     {
         cursor_to_registers(program, &table, table.column_layout(), table_cursor_id, 0);
 
@@ -1450,6 +1440,25 @@ pub(crate) fn emit_index_column_value_old_image(
         program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
     }
     Ok(())
+}
+
+fn generated_column(
+    program: &&mut ProgramBuilder,
+    table_cursor_id: usize,
+    idx_col: &IndexColumn,
+) -> Option<(Arc<BTreeTable>, Column)> {
+    program
+        .btree_table_from_cursor(table_cursor_id)
+        .iter()
+        .cloned()
+        .flat_map(|table| {
+            table
+                .columns
+                .get(idx_col.pos_in_table)
+                .map(|col| (table.clone(), col.clone()))
+        })
+        .filter(|(_, col)| col.is_virtual_generated())
+        .next()
 }
 
 /// Emit code to load the value of an IndexColumn from the NEW image of the row being updated.
