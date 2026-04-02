@@ -2288,6 +2288,12 @@ pub struct WalFile {
     checkpoint_guard: RwLock<Option<CheckpointLocks>>,
 
     io_ctx: RwLock<IOContext>,
+
+    /// Set when `write_frame_raw` appends frames without a commit marker
+    /// (`db_size == 0`), meaning the coordination backend's max_frame is
+    /// behind our connection-local max_frame. Cleared once
+    /// `finish_append_frames_commit` publishes the state.
+    has_unpublished_frames: AtomicBool,
 }
 
 impl fmt::Debug for WalFile {
@@ -3006,6 +3012,8 @@ impl Wal for WalFile {
         self.complete_append_frame(page_id, frame_id, checksums);
         if db_size > 0 {
             self.finish_append_frames_commit()?;
+        } else {
+            self.has_unpublished_frames.store(true, Ordering::Release);
         }
         Ok(())
     }
@@ -3127,6 +3135,7 @@ impl Wal for WalFile {
             last_checksum,
             transaction_count,
         });
+        self.has_unpublished_frames.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -3244,13 +3253,24 @@ impl Wal for WalFile {
                         local_state.snapshot.max_frame + 1,
                     )
                 } else if snapshot != local_state.snapshot {
-                    // The current generation was restarted/truncated back to
-                    // frame 0 or another process changed the durable WAL
-                    // state. Re-seed this connection from the authoritative
-                    // snapshot so replacement generations after
-                    // RESTART/TRUNCATE do not append using stale local state.
-                    self.install_connection_state(local_state.with_snapshot(snapshot));
-                    (snapshot.last_checksum, snapshot.max_frame + 1)
+                    if self.has_unpublished_frames.load(Ordering::Acquire) {
+                        // write_frame_raw appended frames without a commit
+                        // marker (db_size == 0), so the coordination backend's
+                        // max_frame is behind our local max_frame. Chain from
+                        // local state so we don't overwrite those frames.
+                        (
+                            local_state.snapshot.last_checksum,
+                            local_state.snapshot.max_frame + 1,
+                        )
+                    } else {
+                        // The current generation was restarted/truncated back to
+                        // frame 0 or another process changed the durable WAL
+                        // state. Re-seed this connection from the authoritative
+                        // snapshot so replacement generations after
+                        // RESTART/TRUNCATE do not append using stale local state.
+                        self.install_connection_state(local_state.with_snapshot(snapshot));
+                        (snapshot.last_checksum, snapshot.max_frame + 1)
+                    }
                 } else {
                     (
                         local_state.snapshot.last_checksum,
@@ -3545,6 +3565,7 @@ impl WalFile {
             last_checksum: RwLock::new(last_checksum),
             checkpoint_guard: RwLock::new(None),
             io_ctx: RwLock::new(IOContext::default()),
+            has_unpublished_frames: AtomicBool::new(false),
         }
     }
 
