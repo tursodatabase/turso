@@ -1463,6 +1463,60 @@ expect {
     3|15|150
 }
 
+# --- Index DELETE operations ---
+
+@cross-check-integrity
+test gencol_index_virtual_delete_basic {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE INDEX idx_b ON t1(b);
+    INSERT INTO t1(a) VALUES (1), (2), (3);
+    DELETE FROM t1 WHERE b = 4;
+    SELECT a, b FROM t1 ORDER BY a;
+}
+expect {
+    1|2
+    3|6
+}
+
+@cross-check-integrity
+test gencol_index_virtual_delete_composite {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c TEXT);
+    CREATE INDEX idx_bc ON t1(b, c);
+    INSERT INTO t1(a) VALUES (1), (2), (3);
+    DELETE FROM t1 WHERE b = 4;
+    SELECT a, b FROM t1 ORDER BY a;
+}
+expect {
+    1|2
+    3|6
+}
+
+@cross-check-integrity
+test gencol_index_virtual_delete_multiple {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE INDEX idx_b ON t1(b);
+    INSERT INTO t1(a) VALUES (1), (2), (3), (4), (5);
+    DELETE FROM t1 WHERE b IN (4, 8);
+    SELECT a, b FROM t1 ORDER BY a;
+}
+expect {
+    1|2
+    3|6
+    5|10
+}
+
+@cross-check-integrity
+test gencol_index_virtual_delete_all {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE INDEX idx_b ON t1(b);
+    INSERT INTO t1(a) VALUES (1), (2), (3);
+    DELETE FROM t1 WHERE b > 0;
+    SELECT count(*) FROM t1;
+}
+expect {
+    0
+}
+
 # --- Integrity checks ---
 
 @cross-check-integrity

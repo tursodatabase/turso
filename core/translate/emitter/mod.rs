@@ -20,6 +20,7 @@ use crate::error::SQLITE_CONSTRAINT_CHECK;
 use crate::function::Func;
 use crate::schema::{
     BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema, Table,
+    EXPR_INDEX_SENTINEL,
 };
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{
@@ -1380,7 +1381,7 @@ fn rewrite_where_for_update_registers(
 }
 
 /// Emit code to load the value of an IndexColumn from the OLD image of the row being updated.
-/// Handling expression indexes and regular columns
+/// Handling expression indexes, virtual generated columns, and regular columns
 pub(crate) fn emit_index_column_value_old_image(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -1391,6 +1392,51 @@ pub(crate) fn emit_index_column_value_old_image(
 ) -> Result<()> {
     if let Some(expr) = &idx_col.expr {
         let mut expr = expr.as_ref().clone();
+        if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
+            if let Some(jt) = table_references.joined_tables().first() {
+                if let Some(btree) = jt.btree() {
+                    walk_expr_mut(&mut expr, &mut |e| {
+                        if let Expr::Column {
+                            table,
+                            column,
+                            is_rowid_alias,
+                            ..
+                        } = e
+                        {
+                            if table.is_self_table() {
+                                let col_idx = *column;
+                                let dest = program.alloc_register();
+                                if *is_rowid_alias {
+                                    program.emit_insn(Insn::RowId {
+                                        cursor_id: table_cursor_id,
+                                        dest,
+                                    });
+                                } else {
+                                    program.emit_insn(Insn::Column {
+                                        cursor_id: table_cursor_id,
+                                        column: btree.logical_to_physical_column(col_idx),
+                                        dest,
+                                        default: None,
+                                    });
+                                }
+                                *e = Expr::Register(dest);
+                            }
+                        }
+                        Ok(WalkControl::Continue)
+                    })?;
+                    return translate_expr_no_constant_opt(
+                        program,
+                        None,
+                        &expr,
+                        dest_reg,
+                        resolver,
+                        NoConstantOptReason::RegisterReuse,
+                    )
+                    .map(|_| ());
+                }
+            }
+        }
+        
         bind_and_rewrite_expr(
             &mut expr,
             Some(table_references),
@@ -1418,6 +1464,56 @@ pub(crate) fn emit_index_column_value_old_image(
             )?;
             Ok(())
         })?;
+    } else if let Some(jt) = table_references.joined_tables().first() {
+        if let Some(btree) = jt.btree() {
+            if let Some(col) = btree.columns.get(idx_col.pos_in_table) {
+                if col.is_virtual_generated() {
+                    let mut expr = col
+                        .generated_expr()
+                        .expect("virtual generated column must have expression")
+                        .clone();
+                    walk_expr_mut(&mut expr, &mut |e| {
+                        if let Expr::Column {
+                            table,
+                            column,
+                            is_rowid_alias,
+                            ..
+                        } = e
+                        {
+                            if table.is_self_table() {
+                                let col_idx = *column;
+                                let dest = program.alloc_register();
+                                if *is_rowid_alias {
+                                    program.emit_insn(Insn::RowId {
+                                        cursor_id: table_cursor_id,
+                                        dest,
+                                    });
+                                } else {
+                                    program.emit_insn(Insn::Column {
+                                        cursor_id: table_cursor_id,
+                                        column: btree.logical_to_physical_column(col_idx),
+                                        dest,
+                                        default: None,
+                                    });
+                                }
+                                *e = Expr::Register(dest);
+                            }
+                        }
+                        Ok(WalkControl::Continue)
+                    })?;
+                    translate_expr_no_constant_opt(
+                        program,
+                        None,
+                        &expr,
+                        dest_reg,
+                        resolver,
+                        NoConstantOptReason::RegisterReuse,
+                    )?;
+                    return Ok(());
+                }
+            }
+        }
+        program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
     } else {
         program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
     }
