@@ -1166,6 +1166,7 @@ impl Database {
             }
         }
 
+
         // Read header within the read transaction, ensuring cleanup on error
         let result = (|| -> Result<AutoVacuumMode> {
             let header_ref = pager.io.block(|| HeaderRef::from_pager(&pager))?;
@@ -1916,8 +1917,6 @@ impl Database {
                 // For encryption, use the cipher's metadata size
                 Some(cipher.metadata_size() as u8)
             } else {
-                // For non-encrypted databases, don't set reserved_bytes here.
-                // This allows checksums to be enabled by default (disable_checksums will be false).
                 None
             }
         });

@@ -6601,6 +6601,7 @@ dependencies = [
  "tracing-subscriber",
  "turso_core",
  "turso_parser",
+ "twox-hash",
 ]
 
 [[package]]
