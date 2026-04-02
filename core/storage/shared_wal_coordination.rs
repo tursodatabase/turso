@@ -256,7 +256,7 @@ impl SharedOwnerRecord {
         Self::new(std::process::id(), instance_id)
     }
 
-    pub(crate) const fn new(pid: u32, instance_id: u32) -> Self {
+    pub(crate) fn new(pid: u32, instance_id: u32) -> Self {
         let raw = ((pid as u64) << 32) | instance_id as u64;
         turso_assert!(raw != UNOWNED_LOCK, "shared owner record must be non-zero");
         Self(raw)
