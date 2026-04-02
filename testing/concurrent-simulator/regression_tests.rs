@@ -51,15 +51,34 @@ fn flip_db_header_reserved_byte(path: &Path) {
         .write(true)
         .open(path)
         .expect("open db file for header mutation");
-    file.seek(SeekFrom::Start(72))
-        .expect("seek to reserved header byte");
-    let mut byte = [0u8; 1];
-    file.read_exact(&mut byte)
-        .expect("read reserved header byte");
-    byte[0] ^= 0x01;
-    file.seek(SeekFrom::Start(72))
-        .expect("seek to reserved header byte for write");
-    file.write_all(&byte).expect("write mutated header byte");
+
+    #[cfg(feature = "checksum")]
+    {
+        let mut page = vec![0u8; 4096];
+        file.read_exact(&mut page).expect("read page 1");
+        page[72] ^= 0x01;
+        // Recompute the page checksum (last 8 bytes) so the
+        // page-level integrity check passes and the test exercises
+        // the tshm proof validation path rather than crashing early.
+        let checksum = twox_hash::XxHash3_64::oneshot(&page[..4088]);
+        page[4088..].copy_from_slice(&checksum.to_le_bytes());
+        file.seek(SeekFrom::Start(0)).expect("seek to start");
+        file.write_all(&page).expect("write mutated page 1");
+    }
+
+    #[cfg(not(feature = "checksum"))]
+    {
+        file.seek(SeekFrom::Start(72))
+            .expect("seek to reserved header byte");
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte)
+            .expect("read reserved header byte");
+        byte[0] ^= 0x01;
+        file.seek(SeekFrom::Start(72))
+            .expect("seek to reserved header byte for write");
+        file.write_all(&byte).expect("write mutated header byte");
+    }
+
     file.sync_all().expect("sync db header mutation");
 }
 
