@@ -1687,7 +1687,7 @@ impl ProgramBuilder {
                 .expect("column index out of bounds");
             turso_assert!(
                 !column_def.is_virtual_generated(),
-                "emit_column called with virtual generated column index", //FIXME this panics
+                "emit_column called with virtual generated column index",
                 {"column_index": column}
             );
         }
