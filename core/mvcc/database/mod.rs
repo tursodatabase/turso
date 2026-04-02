@@ -2287,6 +2287,41 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         Ok(())
     }
 
+    fn reconcile_autoincrement_sequences_after_recovery(&self, connection: &Arc<Connection>) {
+        let schema = connection.schema.read();
+        let allocator_map = self.table_id_to_last_rowid.read();
+        let mut next_sequences = HashMap::default();
+
+        for table in schema.tables.values() {
+            let Table::BTree(table) = table.as_ref() else {
+                continue;
+            };
+            if !table.has_autoincrement {
+                continue;
+            }
+
+            let table_id = self.get_table_id_from_root_page(table.root_page);
+            let persisted_seq = self.get_committed_autoincrement_sequence(&table_id);
+            let recovered_seq = allocator_map
+                .get(&table_id)
+                .map(|allocator| allocator.current_max_rowid())
+                .unwrap_or(0);
+            let seq = persisted_seq.max(recovered_seq);
+            if seq > 0 {
+                next_sequences.insert(table_id, seq);
+            }
+        }
+
+        drop(allocator_map);
+
+        let mut committed = self.committed_autoincrement_sequences.write();
+        let changed = *committed != next_sequences;
+        *committed = next_sequences;
+
+        self.autoincrement_needs_checkpoint
+            .store(changed, Ordering::Release);
+    }
+
     /// Bootstrap the MV store from the SQLite schema table and logical log.
     /// 1. Get all root pages from the already parsed schema object
     /// 2. Assign table IDs to the root pages (table_id = -1 * root_page)
@@ -4812,6 +4847,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             });
         }
         *connection.db.schema.lock() = connection.schema.read().clone();
+        self.reconcile_autoincrement_sequences_after_recovery(&connection);
         self.clock.reset(max_commit_ts_seen + 1);
         self.last_committed_tx_ts
             .store(max_commit_ts_seen, Ordering::SeqCst);
@@ -5005,6 +5041,10 @@ impl RowidAllocator {
         tracing::trace!("initialize({rowid:?})");
         self.max_rowid.store(rowid.unwrap_or(0), Ordering::SeqCst);
         self.initialized.store(true, Ordering::SeqCst);
+    }
+
+    pub fn current_max_rowid(&self) -> i64 {
+        self.max_rowid.load(Ordering::SeqCst)
     }
 
     pub fn lock(&self) -> bool {

@@ -7420,6 +7420,87 @@ fn test_autoincrement_no_reuse_after_delete_and_restart() {
     );
 }
 
+#[test]
+fn test_mvcc_autoincrement_recovery_no_reuse_after_delete() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("recovery_reuse.db");
+    let io = Arc::new(PlatformIO::new().unwrap());
+
+    {
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path.to_str().unwrap(),
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.execute(
+            "CREATE TABLE recovery_test(id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT)",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO recovery_test(value) VALUES ('a'), ('b'), ('c')")
+            .unwrap();
+
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("INSERT INTO recovery_test(value) VALUES ('d'), ('e')")
+            .unwrap();
+
+        let rows = get_rows(&conn, "SELECT id, value FROM recovery_test ORDER BY id");
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[3][0].as_int().unwrap(), 4);
+        assert_eq!(rows[3][1].to_string(), "d");
+        assert_eq!(rows[4][0].as_int().unwrap(), 5);
+        assert_eq!(rows[4][1].to_string(), "e");
+    }
+
+    {
+        let mut manager = DATABASE_MANAGER.lock();
+        manager.clear();
+    }
+
+    {
+        let db = Database::open_file_with_flags(
+            io,
+            db_path.to_str().unwrap(),
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+
+        let rows = get_rows(&conn, "SELECT id, value FROM recovery_test ORDER BY id");
+        assert_eq!(rows.len(), 5, "log replay should restore all 5 rows");
+        assert_eq!(rows[4][0].as_int().unwrap(), 5);
+        assert_eq!(rows[4][1].to_string(), "e");
+
+        conn.execute("DELETE FROM recovery_test WHERE id IN (4, 5)")
+            .unwrap();
+
+        let rows = get_rows(&conn, "SELECT id, value FROM recovery_test ORDER BY id");
+        assert_eq!(rows.len(), 3, "should have 3 rows after delete");
+
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("INSERT INTO recovery_test(value) VALUES ('f')")
+            .unwrap();
+
+        let rows = get_rows(&conn, "SELECT id, value FROM recovery_test ORDER BY id");
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            rows[3][0].as_int().unwrap(),
+            6,
+            "MUST get ID 6; rowids 4 and 5 were previously assigned and must never be reused"
+        );
+        assert_eq!(rows[3][1].to_string(), "f");
+    }
+}
+
 /// Schema-driven sqlite_sequence rebuild must update names when AUTOINCREMENT
 /// tables are renamed, without leaving stale rows behind.
 #[test]
