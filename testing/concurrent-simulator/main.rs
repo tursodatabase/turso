@@ -5,10 +5,11 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand, ValueEnum};
 use rand::{Rng, RngCore};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+#[cfg(all(unix, target_pointer_width = "64"))]
+use turso_whopper::multiprocess::{MultiprocessOpts, MultiprocessWhopper};
 use turso_whopper::{
     StepResult, Whopper, WhopperOpts,
     chaotic_elle::{ChaoticElleProfile, ChaoticWorkloadProfile, ElleModelKind},
-    multiprocess::{MultiprocessOpts, MultiprocessWhopper},
     properties::*,
     workloads::*,
 };
@@ -95,6 +96,7 @@ fn main() -> anyhow::Result<()> {
         enable_mvcc,
     }) = &args.subcommand
     {
+        #[cfg(all(unix, target_pointer_width = "64"))]
         return turso_whopper::worker::run_worker(db_path, *enable_mvcc);
     }
 
@@ -113,12 +115,14 @@ fn main() -> anyhow::Result<()> {
     println!("seed = {seed}");
 
     if args.multiprocess {
+        #[cfg(all(unix, target_pointer_width = "64"))]
         return run_multiprocess(&args, seed);
     }
 
     run_inprocess(&args, seed)
 }
 
+#[cfg(all(unix, target_pointer_width = "64"))]
 fn run_multiprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
     if args.enable_mvcc {
         eprintln!("MVCC mode not yet supported with multiprocess mode");
