@@ -1,27 +1,19 @@
 use super::*;
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 use std::os::unix::process::ExitStatusExt;
 use std::process::Command;
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 const MULTIPROCESS_SHM_INSERT_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_insert_child_process";
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 const MULTIPROCESS_SHM_COUNT_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_count_child_process";
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 const MULTIPROCESS_SHM_HOLD_READ_TX_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_hold_read_tx_child_process";
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 const MULTIPROCESS_SHM_SCHEMA_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_schema_child_process";
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 const MULTIPROCESS_SHM_INSERT_AND_CLOSE_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_insert_and_close_child_process";
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 const DEFAULT_LOCKED_DB_CHILD_TEST: &str = "multiprocess_tests::default_locked_db_child_process";
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 fn count_test_rows(conn: &Arc<Connection>) -> i64 {
     let mut stmt = conn.prepare("select count(*) from test").unwrap();
     let mut count = 0;
@@ -33,7 +25,6 @@ fn count_test_rows(conn: &Arc<Connection>) -> i64 {
     count
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
     for _attempt in 0..3 {
         let mut stmt = match conn.prepare(query) {
@@ -61,7 +52,6 @@ fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
     panic!("get_rows: exhausted SchemaUpdated retries for: {query}");
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 fn get_rows_without_schema_retry(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
     let mut stmt = conn.prepare(query).unwrap();
     let mut rows = Vec::new();
@@ -73,7 +63,6 @@ fn get_rows_without_schema_retry(conn: &Arc<Connection>, query: &str) -> Vec<Vec
     rows
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 fn run_checkpoint(conn: &Arc<Connection>, mode: CheckpointMode) -> CheckpointResult {
     let pager = conn.pager.load();
     pager
@@ -82,7 +71,6 @@ fn run_checkpoint(conn: &Arc<Connection>, mode: CheckpointMode) -> CheckpointRes
         .unwrap()
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 fn wal_max_frame(conn: &Arc<Connection>) -> u64 {
     conn.pager
         .load()
@@ -92,7 +80,6 @@ fn wal_max_frame(conn: &Arc<Connection>) -> u64 {
         .get_max_frame_in_wal()
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 fn wait_for_file(path: &std::path::Path) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
@@ -104,12 +91,10 @@ fn wait_for_file(path: &std::path::Path) {
     panic!("timed out waiting for {}", path.display());
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 fn multiprocess_wal_db_opts() -> DatabaseOpts {
     DatabaseOpts::new().with_multiprocess_wal(true)
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 fn open_multiprocess_db(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
     Database::open_file_with_flags(
         io,
@@ -120,7 +105,6 @@ fn open_multiprocess_db(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
     )
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 fn open_multiprocess_db_with_flags(
     io: Arc<dyn IO>,
     path: &str,
@@ -129,7 +113,6 @@ fn open_multiprocess_db_with_flags(
     Database::open_file_with_flags(io, path, flags, multiprocess_wal_db_opts(), None)
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 fn flip_db_header_reserved_byte(path: &std::path::Path) {
     use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -164,7 +147,6 @@ fn flip_db_header_reserved_byte(path: &std::path::Path) {
     }
 }
 
-#[cfg(all(feature = "fs", target_os = "linux", target_pointer_width = "64"))]
 #[test]
 fn shared_wal_coordination_rejects_remote_filesystem_magic_values() {
     assert!(!Database::filesystem_magic_allows_shared_wal(0x6969));
@@ -176,7 +158,6 @@ fn shared_wal_coordination_rejects_remote_filesystem_magic_values() {
     assert!(Database::filesystem_magic_allows_shared_wal(0x0102_1994));
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
 fn database_open_without_experimental_multiprocess_wal_uses_in_process_backend() {
     let dir = tempfile::tempdir().unwrap();
@@ -197,7 +178,6 @@ fn database_open_without_experimental_multiprocess_wal_uses_in_process_backend()
     assert!(!std::path::Path::new(&shm_path).exists());
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
 fn database_open_without_experimental_multiprocess_wal_rejects_second_process() {
     let dir = tempfile::tempdir().unwrap();
@@ -222,7 +202,6 @@ fn database_open_without_experimental_multiprocess_wal_rejects_second_process() 
     );
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
 fn database_open_selects_shm_wal_backend() {
     let dir = tempfile::tempdir().unwrap();
@@ -242,7 +221,6 @@ fn database_open_selects_shm_wal_backend() {
     assert!(std::path::Path::new(&shm_path).exists());
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
 fn database_open_rebuilds_from_disk_scan_when_exclusive_shm_snapshot_is_stale() {
     let dir = tempfile::tempdir().unwrap();
@@ -293,7 +271,6 @@ fn database_open_rebuilds_from_disk_scan_when_exclusive_shm_snapshot_is_stale() 
     assert_eq!(rows[1][1].to_string(), "after-stale");
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
 fn database_open_reuses_trusted_tshm_snapshot_after_partial_checkpoint_with_backfill_proof() {
     let dir = tempfile::tempdir().unwrap();
@@ -367,7 +344,6 @@ fn database_open_reuses_trusted_tshm_snapshot_after_partial_checkpoint_with_back
     );
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
 fn database_open_rebuilds_from_disk_scan_after_partial_checkpoint_without_backfill_proof() {
     let dir = tempfile::tempdir().unwrap();
@@ -446,7 +422,6 @@ fn database_open_rebuilds_from_disk_scan_after_partial_checkpoint_without_backfi
     );
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
 fn database_open_rebuilds_from_disk_scan_after_wal_append_invalidates_backfill_proof() {
     let dir = tempfile::tempdir().unwrap();
@@ -519,7 +494,6 @@ fn database_open_rebuilds_from_disk_scan_after_wal_append_invalidates_backfill_p
     );
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
 fn database_open_rebuilds_from_disk_scan_after_db_header_mismatch_invalidates_backfill_proof() {
     let dir = tempfile::tempdir().unwrap();
@@ -594,7 +568,6 @@ fn database_open_rebuilds_from_disk_scan_after_db_header_mismatch_invalidates_ba
     );
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
 fn default_locked_db_child_process() {
     let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
@@ -610,7 +583,6 @@ fn default_locked_db_child_process() {
     );
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
 fn multiprocess_shm_insert_child_process() {
     let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
@@ -632,7 +604,6 @@ fn multiprocess_shm_insert_child_process() {
         .unwrap();
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
 fn multiprocess_shm_insert_and_close_child_process() {
     let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
@@ -655,7 +626,6 @@ fn multiprocess_shm_insert_and_close_child_process() {
     conn.close().unwrap();
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
 fn multiprocess_shm_count_child_process() {
     let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
@@ -680,7 +650,6 @@ fn multiprocess_shm_count_child_process() {
     assert_eq!(count_test_rows(&conn), expected_count);
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
 fn multiprocess_shm_hold_read_tx_child_process() {
     let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
@@ -727,7 +696,6 @@ fn multiprocess_shm_hold_read_tx_child_process() {
     wal.end_read_tx();
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
 fn multiprocess_shm_schema_child_process() {
     let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
@@ -803,7 +771,6 @@ fn subprocess_database_open_selects_multiprocess_shm_backend() {
     );
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
 fn subprocess_child_close_skips_shutdown_checkpoint_in_multiprocess_wal_mode() {
     let dir = tempfile::tempdir().unwrap();
@@ -853,7 +820,6 @@ fn subprocess_child_close_skips_shutdown_checkpoint_in_multiprocess_wal_mode() {
     );
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
 fn subprocess_database_open_survives_truncate_rewrite_cycles() {
     let dir = tempfile::tempdir().unwrap();
@@ -917,7 +883,6 @@ fn subprocess_database_open_survives_truncate_rewrite_cycles() {
     assert_eq!(count_test_rows(&conn), 3);
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
 fn subprocess_database_open_peer_refreshes_remote_schema_without_reopen() {
     let dir = tempfile::tempdir().unwrap();
@@ -981,7 +946,6 @@ fn subprocess_database_open_peer_refreshes_remote_schema_without_reopen() {
     assert_eq!(inserted_rows[2][1].to_string(), "4");
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
 fn subprocess_database_open_parent_directly_uses_child_created_table() {
     let dir = tempfile::tempdir().unwrap();
@@ -1019,7 +983,6 @@ fn subprocess_database_open_parent_directly_uses_child_created_table() {
     assert_eq!(child_rows[1][0].to_string(), "parent-schema");
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
 fn subprocess_database_open_parent_execute_uses_child_created_table() {
     let dir = tempfile::tempdir().unwrap();
@@ -1055,7 +1018,6 @@ fn subprocess_database_open_parent_execute_uses_child_created_table() {
     assert_eq!(child_rows[1][0].to_string(), "parent-schema");
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
 fn subprocess_readonly_child_reader_blocks_restart_and_truncate_checkpoints() {
     let dir = tempfile::tempdir().unwrap();
@@ -1150,7 +1112,6 @@ fn subprocess_readonly_child_reader_blocks_restart_and_truncate_checkpoints() {
     );
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
 fn subprocess_readonly_disk_scan_child_reader_stays_in_shared_coordination() {
     let dir = tempfile::tempdir().unwrap();
@@ -1285,7 +1246,6 @@ fn subprocess_readonly_disk_scan_child_reader_stays_in_shared_coordination() {
     );
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
 fn subprocess_database_truncate_checkpoint_reclaims_dead_child_reader_slot() {
     let dir = tempfile::tempdir().unwrap();
@@ -1385,7 +1345,6 @@ fn subprocess_database_truncate_checkpoint_reclaims_dead_child_reader_slot() {
     );
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
 fn database_open_reopen_with_live_child_reader_does_not_clobber_authority() {
     let dir = tempfile::tempdir().unwrap();
@@ -1485,7 +1444,6 @@ fn database_open_reopen_with_live_child_reader_does_not_clobber_authority() {
     );
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
 fn database_open_rebuilds_from_disk_scan_when_shared_frame_index_overflowed() {
     let dir = tempfile::tempdir().unwrap();
@@ -1569,7 +1527,6 @@ fn database_open_rebuilds_from_disk_scan_when_shared_frame_index_overflowed() {
     assert_eq!(rows[1][0].to_string(), "after-overflow");
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
 fn memory_database_keeps_in_process_wal_backend() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
@@ -1583,7 +1540,6 @@ fn memory_database_keeps_in_process_wal_backend() {
     assert_eq!(wal_file.coordination_backend_name(), "in_process");
 }
 
-#[cfg(all(feature = "fs", unix, target_pointer_width = "64"))]
 #[test]
 fn memory_database_query_can_close_without_checkpointing() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
