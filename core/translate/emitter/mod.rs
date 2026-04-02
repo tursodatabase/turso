@@ -11,7 +11,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
 use turso_macros::match_ignore_ascii_case;
 
-use super::expr::translate_expr;
+use super::expr::{emit_table_column, translate_expr};
 use super::group_by::GroupByMetadata;
 use super::main_loop::{LeftJoinMetadata, LoopLabels};
 use super::order_by::SortMetadata;
@@ -26,6 +26,7 @@ use crate::translate::expr::{
     bind_and_rewrite_expr, translate_expr_no_constant_opt, walk_expr, walk_expr_mut,
     BindingBehavior, NoConstantOptReason, WalkControl,
 };
+use crate::translate::fkeys::cursor_to_registers;
 use crate::translate::plan::{JoinedTable, NonFromClauseSubquery, Plan, ResultSetColumn};
 use crate::translate::planner::TableMask;
 use crate::translate::planner::ROWID_STRS;
@@ -44,6 +45,7 @@ use tracing::instrument;
 use turso_parser::ast::{
     self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerTime,
 };
+
 pub(crate) mod delete;
 pub(crate) mod gencol;
 pub(crate) mod select;
@@ -1386,6 +1388,7 @@ pub(crate) fn emit_index_column_value_old_image(
     resolver: &Resolver,
     table_references: &mut TableReferences,
     table_cursor_id: usize,
+    table_internal_id: TableInternalId,
     idx_col: &IndexColumn,
     dest_reg: usize,
 ) -> Result<()> {
@@ -1418,6 +1421,31 @@ pub(crate) fn emit_index_column_value_old_image(
             )?;
             Ok(())
         })?;
+    } else if let Some((table, generated_column)) = program
+        .btree_table_from_cursor(table_cursor_id)
+        .iter()
+        .cloned()
+        .flat_map(|table| {
+            table
+                .columns
+                .get(idx_col.pos_in_table)
+                .map(|col| (table.clone(), col.clone()))
+        })
+        .filter(|(_, col)| col.is_virtual_generated())
+        .next()
+    {
+        cursor_to_registers(program, &table, table.column_layout(), table_cursor_id, 0);
+
+        emit_table_column(
+            program,
+            table_cursor_id,
+            table_internal_id,
+            &table_references,
+            &generated_column,
+            idx_col.pos_in_table,
+            dest_reg,
+            resolver,
+        )?;
     } else {
         program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
     }

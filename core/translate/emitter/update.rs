@@ -1810,6 +1810,7 @@ fn emit_update_insns<'a>(
                                 &t_ctx.resolver,
                                 table_references,
                                 target_table_cursor_id,
+                                internal_id,
                                 column_index,
                                 other_start_reg + reg_offset,
                             )?;
@@ -1979,6 +1980,7 @@ fn emit_update_insns<'a>(
                     &t_ctx.resolver,
                     table_references,
                     target_table_cursor_id,
+                    internal_id,
                     column_index,
                     other_start_reg + reg_offset,
                 )?;
@@ -2043,6 +2045,7 @@ fn emit_update_insns<'a>(
                 &t_ctx.resolver,
                 table_references,
                 target_table_cursor_id,
+                internal_id,
                 column_index,
                 delete_start_reg + reg_offset,
             )?;
