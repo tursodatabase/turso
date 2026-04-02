@@ -326,35 +326,52 @@ impl Connection {
 
     fn compile_cmd(
         self: &Arc<Connection>,
-        cmd: &Cmd,
+        cmd: Cmd,
         input: &str,
     ) -> Result<(Program, Arc<Pager>, QueryMode)> {
-        let mut retried_after_schema_refresh = false;
-        loop {
-            self.maybe_update_schema();
-            let syms = self.syms.read();
-            let pager = self.pager.load().clone();
-            let mode = QueryMode::new(cmd);
-            let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd.clone();
-            let schema = self.schema.read().clone();
-            match translate::translate(
-                &schema,
-                stmt,
-                pager.clone(),
-                self.clone(),
-                &syms,
-                mode,
-                input,
-            ) {
-                Ok(program) => return Ok((program, pager, mode)),
-                Err(err)
-                    if !retried_after_schema_refresh
-                        && self.should_retry_cross_process_schema_lookup(&err)? =>
-                {
-                    retried_after_schema_refresh = true;
-                }
-                Err(err) => return Err(err),
+        self.maybe_update_schema();
+        let syms = self.syms.read();
+        let pager = self.pager.load().clone();
+        let mode = QueryMode::new(&cmd);
+        let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+        let schema = self.schema.read().clone();
+        match translate::translate(
+            &schema,
+            stmt,
+            pager.clone(),
+            self.clone(),
+            &syms,
+            mode,
+            input,
+        ) {
+            Ok(program) => Ok((program, pager, mode)),
+            Err(err) if self.should_retry_cross_process_schema_lookup(&err)? => {
+                // Cold path: re-parse the SQL from scratch after schema refresh rather
+                // than cloning the original AST, which can overflow the stack
+                // on deeply nested expression trees.
+                drop(syms);
+                let mut parser = Parser::new(input.as_bytes());
+                let Some(cmd) = parser.next_cmd()? else {
+                    return Err(err);
+                };
+                self.maybe_update_schema();
+                let syms = self.syms.read();
+                let pager = self.pager.load().clone();
+                let mode = QueryMode::new(&cmd);
+                let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+                let schema = self.schema.read().clone();
+                translate::translate(
+                    &schema,
+                    stmt,
+                    pager.clone(),
+                    self.clone(),
+                    &syms,
+                    mode,
+                    input,
+                )
+                .map(|program| (program, pager, mode))
             }
+            Err(err) => Err(err),
         }
     }
 
@@ -408,7 +425,7 @@ impl Connection {
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) = self.compile_cmd(&cmd, input)?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input)?;
             Ok(Statement::new_with_origin(
                 program,
                 pager,
@@ -709,7 +726,7 @@ impl Connection {
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) = self.compile_cmd(&cmd, input)?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input)?;
             Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
         }
         Ok(())
@@ -743,7 +760,7 @@ impl Connection {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        let (program, pager, mode) = self.compile_cmd(&cmd, input)?;
+        let (program, pager, mode) = self.compile_cmd(cmd, input)?;
         let stmt = Statement::new(program, pager, mode, 0);
         Ok(Some(stmt))
     }
@@ -766,7 +783,7 @@ impl Connection {
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) = self.compile_cmd(&cmd, input)?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input)?;
             Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
         }
         Ok(())
@@ -785,7 +802,7 @@ impl Connection {
         let input = str::from_utf8(&sql.as_ref().as_bytes()[..byte_offset_end])
             .unwrap()
             .trim();
-        let (program, pager, mode) = self.compile_cmd(&cmd, input)?;
+        let (program, pager, mode) = self.compile_cmd(cmd, input)?;
         let stmt = Statement::new(program, pager, mode, 0);
         Ok(Some((stmt, parser.offset())))
     }
