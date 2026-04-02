@@ -4209,3 +4209,10 @@ test fk-child-references-parent-virtual-col-using-rowid-missing {
 }
 expect error {
 }
+@cross-check-integrity
+test delete_with_unique_gencol {
+    create table t(a, b as (a + 1) unique);
+    delete from t;
+}
+expect {
+}
