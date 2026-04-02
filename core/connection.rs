@@ -1273,7 +1273,7 @@ impl Connection {
             .block(|| pager.checkpoint(mode, SyncMode::Full, true))
     }
 
-    #[cfg(feature = "simulator")]
+    #[cfg(all(feature = "simulator", target_pointer_width = "64", unix))]
     pub fn install_unpublished_backfill_proof_for_testing(
         &self,
         upper_bound_inclusive: u64,
