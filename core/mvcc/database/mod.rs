@@ -383,6 +383,8 @@ enum SavepointKind {
 pub struct Savepoint {
     kind: SavepointKind,
     deferred_fk_violations: isize,
+    header: DatabaseHeader,
+    header_dirty: bool,
     /// Versions CREATED during this savepoint (insert operations).
     /// On rollback: these versions are removed from their chains.
     created_table_versions: Vec<(RowID, u64)>,
@@ -398,18 +400,30 @@ pub struct Savepoint {
 
 impl Savepoint {
     /// Creates an internal statement savepoint used for per-statement rollback.
-    fn statement() -> Self {
-        Self::default()
+    fn statement(header: DatabaseHeader, header_dirty: bool) -> Self {
+        Self {
+            header,
+            header_dirty,
+            ..Default::default()
+        }
     }
 
     /// Creates a user-visible named savepoint snapshot.
-    fn named(name: String, starts_transaction: bool, deferred_fk_violations: isize) -> Self {
+    fn named(
+        name: String,
+        starts_transaction: bool,
+        deferred_fk_violations: isize,
+        header: DatabaseHeader,
+        header_dirty: bool,
+    ) -> Self {
         Self {
             kind: SavepointKind::Named {
                 name,
                 starts_transaction,
             },
             deferred_fk_violations,
+            header,
+            header_dirty,
             ..Default::default()
         }
     }
@@ -512,7 +526,11 @@ impl Transaction {
     fn begin_savepoint(&self) {
         let depth = self.savepoint_stack.read().len();
         tracing::debug!("begin_savepoint(tx_id={}, depth={})", self.tx_id, depth);
-        self.savepoint_stack.write().push(Savepoint::statement());
+        let header = *self.header.read();
+        let header_dirty = self.header_dirty.load(Ordering::Acquire);
+        self.savepoint_stack
+            .write()
+            .push(Savepoint::statement(header, header_dirty));
     }
 
     /// Begin a new named savepoint. If `starts_transaction` is true, this savepoint represents the
@@ -531,10 +549,14 @@ impl Transaction {
             depth,
             name
         );
+        let header = *self.header.read();
+        let header_dirty = self.header_dirty.load(Ordering::Acquire);
         self.savepoint_stack.write().push(Savepoint::named(
             name,
             starts_transaction,
             deferred_fk_violations,
+            header,
+            header_dirty,
         ));
     }
 
@@ -636,12 +658,16 @@ impl Transaction {
             }
         );
         let deferred_fk_violations = savepoints[target_idx].deferred_fk_violations;
+        let header = savepoints[target_idx].header;
+        let header_dirty = savepoints[target_idx].header_dirty;
 
         let drained: Vec<Savepoint> = savepoints.drain(target_idx..).collect();
         savepoints.push(Savepoint::named(
             target_name,
             starts_transaction,
             deferred_fk_violations,
+            header,
+            header_dirty,
         ));
         Some(SavepointRollbackResult {
             rolledback_savepoints: drained,
@@ -1807,17 +1833,24 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
             }
             CommitState::EndCommitLogicalLog { end_ts } => {
                 let connection = self.connection.clone();
-                let schema_did_change = self.did_commit_schema_change;
-                if schema_did_change {
-                    let schema = connection.schema.read().clone();
-                    connection.db.update_schema_if_newer(schema);
-                }
                 let tx = mvcc_store
                     .txs
                     .get(&self.tx_id)
                     .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
                 let tx_unlocked = tx.value();
-                self.header.write().replace(*tx_unlocked.header.read());
+                let tx_header = *tx_unlocked.header.read();
+                let schema_did_change = self.did_commit_schema_change
+                    || self
+                        .header
+                        .read()
+                        .as_ref()
+                        .map(|header| header.schema_cookie.get())
+                        != Some(tx_header.schema_cookie.get());
+                if schema_did_change {
+                    let schema = connection.schema.read().clone();
+                    connection.db.update_schema_if_newer(schema);
+                }
+                self.header.write().replace(tx_header);
                 tracing::trace!("end_commit_logical_log(tx_id={})", self.tx_id);
                 self.state = CommitState::CommitEnd { end_ts: *end_ts };
                 return Ok(TransitionResult::Continue);
@@ -3709,6 +3742,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     fn rollback_savepoint_changes(&self, tx_id: TxID, savepoint: Savepoint) {
         let Savepoint {
+            header,
+            header_dirty,
             created_table_versions,
             created_index_versions,
             deleted_table_versions,
@@ -3796,6 +3831,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         touched_rowids.extend(newly_added_to_write_set);
         self.remove_rolled_back_rows_from_write_set(tx_id, touched_rowids.clone());
+
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .unwrap_or_else(|| panic!("Transaction {tx_id} not found while restoring savepoint"));
+        let tx = tx.value();
+        *tx.header.write() = header;
+        tx.header_dirty.store(header_dirty, Ordering::Release);
     }
 
     fn row_has_uncommitted_version_for_tx(&self, rowid: &RowID, tx_id: TxID) -> bool {

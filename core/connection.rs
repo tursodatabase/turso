@@ -791,6 +791,7 @@ impl Connection {
     /// In multi-process mode, this is the only way to discover schema changes made by other processes.
     pub fn maybe_reparse_schema(self: &Arc<Connection>) -> Result<()> {
         let pager = self.pager.load().clone();
+        let mv_store = self.mv_store();
 
         // maybe_reparse_schema must be called outside any explicit transaction
         // because it starts its own read transaction to load a fresh view of
@@ -807,24 +808,32 @@ impl Connection {
             pager.set_schema_cookie(None);
         }
 
-        // first, quickly read schema_version from the root page in order to check if schema changed
-        pager.begin_read_tx()?;
-        let on_disk_schema_version = pager
-            .io
-            .block(|| pager.with_header(|header| header.schema_cookie));
+        let on_disk_schema_version = if mv_store.as_ref().is_some() {
+            self.read_current_schema_cookie().or_else(|err| match err {
+                LimboError::Page1NotAlloc => Ok(0),
+                other => Err(other),
+            })?
+        } else {
+            // first, quickly read schema_version from the root page in order to check if schema changed
+            pager.begin_read_tx()?;
+            let on_disk_schema_version = pager
+                .io
+                .block(|| pager.with_header(|header| header.schema_cookie));
 
-        let on_disk_schema_version = match on_disk_schema_version {
-            Ok(db_schema_version) => db_schema_version.get(),
-            Err(LimboError::Page1NotAlloc) => {
-                // this means this is a fresh db, so return a schema version of 0
-                0
-            }
-            Err(err) => {
-                pager.end_read_tx();
-                return Err(err);
-            }
+            let on_disk_schema_version = match on_disk_schema_version {
+                Ok(db_schema_version) => db_schema_version.get(),
+                Err(LimboError::Page1NotAlloc) => {
+                    // this means this is a fresh db, so return a schema version of 0
+                    0
+                }
+                Err(err) => {
+                    pager.end_read_tx();
+                    return Err(err);
+                }
+            };
+            pager.end_read_tx();
+            on_disk_schema_version
         };
-        pager.end_read_tx();
 
         let db_schema_version = self.db.schema.lock().schema_version;
         tracing::debug!(
@@ -866,14 +875,12 @@ impl Connection {
     }
 
     pub(crate) fn reparse_schema(self: &Arc<Connection>) -> Result<()> {
-        let pager = self.pager.load().clone();
-
         // read cookie before consuming statement program - otherwise we can end up reading cookie with closed transaction state
-        let cookie = pager
-            .io
-            .block(|| pager.with_header(|header| header.schema_cookie))?
-            .get();
+        let cookie = self.read_current_schema_cookie()?;
+        self.reparse_schema_with_cookie(cookie)
+    }
 
+    pub(crate) fn reparse_schema_with_cookie(self: &Arc<Connection>, cookie: u32) -> Result<()> {
         // create fresh schema as some objects can be deleted
         let mut fresh = Schema::with_options(self.experimental_custom_types_enabled());
         fresh.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
@@ -974,6 +981,19 @@ impl Connection {
             *schema = fresh;
         });
         Result::Ok(())
+    }
+
+    pub(crate) fn read_current_schema_cookie(&self) -> Result<u32> {
+        if let Some(mv_store) = self.mv_store().as_ref() {
+            let tx_id = self.get_mv_tx_id();
+            mv_store.with_header(|header| header.schema_cookie.get(), tx_id.as_ref())
+        } else {
+            let pager = self.pager.load();
+            pager
+                .io
+                .block(|| pager.with_header(|header| header.schema_cookie))
+                .map(|cookie| cookie.get())
+        }
     }
 
     #[instrument(skip_all, level = Level::INFO)]
@@ -1225,6 +1245,8 @@ impl Connection {
         let current_schema_version = self.schema.read().schema_version;
         let schema = self.db.schema.lock();
         if matches!(self.get_tx_state(), TransactionState::None)
+            && self.get_mv_tx().is_none()
+            && self.next_attached_mv_tx().is_none()
             && current_schema_version != schema.schema_version
         {
             *self.schema.write() = schema.clone();
@@ -1556,7 +1578,7 @@ impl Connection {
             .block(|| pager.checkpoint(mode, SyncMode::Full, true))
     }
 
-    #[cfg(feature = "simulator")]
+    #[cfg(all(feature = "simulator", target_pointer_width = "64", unix))]
     pub fn install_unpublished_backfill_proof_for_testing(
         &self,
         upper_bound_inclusive: u64,
