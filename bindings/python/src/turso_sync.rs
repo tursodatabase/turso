@@ -19,7 +19,7 @@ use crate::turso::{
     turso_error_to_py_err, Error, Misuse, PyTursoConnection, PyTursoDatabaseConfig,
 };
 
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyTursoPartialSyncOpts {
     // prefix bootstrap strategy which will enable partial sync which lazily pull necessary pages on demand and bootstrap db with pages from first N bytes of the db
@@ -56,7 +56,7 @@ impl PyTursoPartialSyncOpts {
 
 /// Encryption cipher for Turso Cloud remote encryption.
 /// These match the server-side encryption settings.
-#[pyclass(eq, eq_int)]
+#[pyclass(eq, eq_int, from_py_object)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PyRemoteEncryptionCipher {
     Aes256Gcm,
@@ -210,7 +210,7 @@ pub struct PyTursoAsyncOperation {
     operation: Box<TursoDatabaseAsyncOperation>,
 }
 
-#[pyclass(eq, eq_int)]
+#[pyclass(eq, eq_int, skip_from_py_object)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)] // Add necessary traits for your use case
 pub enum PyTursoAsyncOperationResultKind {
     /// async operation has no return value ("void" operation)
@@ -379,7 +379,7 @@ impl PyTursoAsyncOperation {
     }
 }
 
-#[pyclass(eq, eq_int)]
+#[pyclass(eq, eq_int, skip_from_py_object)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)] // Add necessary traits for your use case
 pub enum PyTursoSyncIoItemRequestKind {
     /// HTTP IO operation

@@ -478,6 +478,34 @@ impl DatabaseReplayGenerator {
         })
     }
 
+    /// Execute a DDL statement idempotently: for CREATE TABLE statements,
+    /// check which columns already exist and only ALTER TABLE ADD COLUMN
+    /// for missing ones. Falls back to direct execution for non-CREATE TABLE DDL.
+    pub async fn execute_ddl_idempotent<Ctx>(&self, coro: &Coro<Ctx>, ddl: &str) -> Result<()> {
+        let mut parser = Parser::new(ddl.as_bytes());
+        let Some(Ok(turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::AlterTable(
+            turso_parser::ast::AlterTable {
+                name: tbl_name,
+                body: turso_parser::ast::AlterTableBody::AddColumn(col_def),
+            },
+        )))) = parser.next()
+        else {
+            self.conn.execute(ddl)?;
+            return Ok(());
+        };
+        let table_name = tbl_name.name.as_str();
+        let (current_columns, _) = self.table_columns_info(coro, table_name).await?;
+        let col_name = col_def.col_name.as_str();
+        if current_columns.iter().any(|c| c == col_name) {
+            tracing::debug!(
+                "execute_ddl_idempotent: column {col_name} already exists in {table_name}, skipping"
+            );
+            return Ok(());
+        }
+        self.conn.execute(ddl)?;
+        Ok(())
+    }
+
     async fn table_columns_info<Ctx>(
         &self,
         coro: &Coro<Ctx>,

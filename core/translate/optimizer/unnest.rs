@@ -419,7 +419,7 @@ fn contains_nondeterministic_function(expr: &Expr) -> bool {
     let _ = walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
         match e {
             Expr::FunctionCall { name, args, .. } => {
-                if let Ok(func) = Func::resolve_function(name.as_str(), args.len()) {
+                if let Ok(Some(func)) = Func::resolve_function(name.as_str(), args.len()) {
                     if !func.is_deterministic() {
                         found = true;
                     }
@@ -427,7 +427,7 @@ fn contains_nondeterministic_function(expr: &Expr) -> bool {
             }
             Expr::FunctionCallStar { name, .. } => {
                 // Star functions like count(*) — resolve with 0 args
-                if let Ok(func) = Func::resolve_function(name.as_str(), 0) {
+                if let Ok(Some(func)) = Func::resolve_function(name.as_str(), 0) {
                     if !func.is_deterministic() {
                         found = true;
                     }

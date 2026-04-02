@@ -447,6 +447,7 @@ fn emit_materialized_build_inputs(
                 payload_columns,
             } => build_materialized_input_columns(*num_keys, payload_columns),
         };
+        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let ephemeral_table = Arc::new(BTreeTable {
             root_page: 0,
             name: format!("hash_build_input_{internal_id}"),
@@ -458,7 +459,9 @@ fn emit_materialized_build_inputs(
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
-            pk_conflict_clause: None,
+            rowid_alias_conflict_clause: None,
+            has_virtual_columns: false,
+            logical_to_physical_map,
         });
         let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ephemeral_table.clone()));
 
@@ -910,6 +913,7 @@ fn build_materialized_build_input_plan(
                 table: build_internal_id,
             },
             alias: None,
+            implicit_column_name: None,
             contains_aggregates: false,
         }],
         MaterializedBuildInputMode::KeyPayload { num_keys, .. } => {
@@ -922,6 +926,7 @@ fn build_materialized_build_input_plan(
                 result_columns.push(ResultSetColumn {
                     expr: expr.clone(),
                     alias: None,
+                    implicit_column_name: None,
                     contains_aggregates: false,
                 });
             }
@@ -945,6 +950,7 @@ fn build_materialized_build_input_plan(
                 result_columns.push(ResultSetColumn {
                     expr,
                     alias: None,
+                    implicit_column_name: None,
                     contains_aggregates: false,
                 });
             }

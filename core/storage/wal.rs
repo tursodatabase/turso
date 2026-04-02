@@ -132,6 +132,76 @@ impl CheckpointMode {
     }
 }
 
+/// Immutable view of the WAL metadata a connection snapshots from shared state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WalSnapshot {
+    max_frame: u64,
+    nbackfills: u64,
+    last_checksum: (u32, u32),
+    checkpoint_seq: u32,
+    transaction_count: u64,
+}
+
+impl WalSnapshot {
+    /// First frame that is still visible in the WAL after checkpoint backfill.
+    const fn min_frame(self) -> u64 {
+        self.nbackfills + 1
+    }
+}
+
+/// Which read-mark, if any, currently protects this connection's snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadGuardKind {
+    None,
+    DbFile,
+    ReadMark(usize),
+}
+
+impl ReadGuardKind {
+    /// Convert the lock index stored on `WalFile` into a semantic guard kind.
+    const fn from_lock_index(lock_index: usize) -> Self {
+        match lock_index {
+            NO_LOCK_HELD => Self::None,
+            0 => Self::DbFile,
+            idx => Self::ReadMark(idx),
+        }
+    }
+
+    /// Convert the semantic guard kind back into the legacy lock index representation.
+    const fn lock_index(self) -> usize {
+        match self {
+            Self::None => NO_LOCK_HELD,
+            Self::DbFile => 0,
+            Self::ReadMark(idx) => idx,
+        }
+    }
+}
+
+/// Connection-local WAL state derived from a shared snapshot plus a held read guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WalConnectionState {
+    snapshot: WalSnapshot,
+    read_guard: ReadGuardKind,
+}
+
+impl WalConnectionState {
+    /// Build a new connection-local WAL state bundle.
+    const fn new(snapshot: WalSnapshot, read_guard: ReadGuardKind) -> Self {
+        Self {
+            snapshot,
+            read_guard,
+        }
+    }
+
+    /// Replace just the shared snapshot while preserving the current read guard.
+    const fn with_snapshot(self, snapshot: WalSnapshot) -> Self {
+        Self {
+            snapshot,
+            read_guard: self.read_guard,
+        }
+    }
+}
+
 #[repr(transparent)]
 #[derive(Debug, Default)]
 /// A 64-bit read-write lock with embedded 32-bit value storage.
@@ -434,7 +504,7 @@ pub trait Wal: Debug + Send + Sync {
         sync_type: FileSyncType,
     ) -> Result<IOResult<()>>;
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
@@ -956,6 +1026,51 @@ enum TryBeginReadResult {
 }
 
 impl WalFile {
+    /// Read the shared WAL metadata that defines a connection snapshot.
+    fn load_shared_snapshot(shared: &WalFileShared) -> WalSnapshot {
+        WalSnapshot {
+            max_frame: shared.max_frame.load(Ordering::Acquire),
+            nbackfills: shared.nbackfills.load(Ordering::Acquire),
+            last_checksum: shared.last_checksum,
+            checkpoint_seq: shared.wal_header.lock().checkpoint_seq,
+            transaction_count: shared.transaction_count.load(Ordering::Acquire),
+        }
+    }
+
+    /// Reconstruct the connection-local WAL state stored on this `WalFile`.
+    fn connection_state(&self) -> WalConnectionState {
+        WalConnectionState::new(
+            WalSnapshot {
+                max_frame: self.max_frame.load(Ordering::Acquire),
+                nbackfills: self.min_frame.load(Ordering::Acquire).saturating_sub(1),
+                last_checksum: *self.last_checksum.read(),
+                checkpoint_seq: self.checkpoint_seq.load(Ordering::Acquire),
+                transaction_count: self.transaction_count.load(Ordering::Acquire),
+            },
+            ReadGuardKind::from_lock_index(self.max_frame_read_lock_index.load(Ordering::Acquire)),
+        )
+    }
+
+    /// Persist a connection-local WAL snapshot bundle back into the legacy fields on `WalFile`.
+    fn install_connection_state(&self, state: WalConnectionState) {
+        self.max_frame
+            .store(state.snapshot.max_frame, Ordering::Release);
+        self.min_frame
+            .store(state.snapshot.min_frame(), Ordering::Release);
+        *self.last_checksum.write() = state.snapshot.last_checksum;
+        self.checkpoint_seq
+            .store(state.snapshot.checkpoint_seq, Ordering::Release);
+        self.transaction_count
+            .store(state.snapshot.transaction_count, Ordering::Release);
+        self.max_frame_read_lock_index
+            .store(state.read_guard.lock_index(), Ordering::Release);
+    }
+
+    /// Compare a freshly loaded shared snapshot against the connection's current snapshot.
+    fn db_changed_against(&self, snapshot: WalSnapshot, local_state: WalConnectionState) -> bool {
+        snapshot != local_state.snapshot
+    }
+
     /// Try to begin a read transaction. Returns Retry for transient conditions
     /// that should be retried immediately, Ok for success.
     fn try_begin_read_tx(&self) -> TryBeginReadResult {
@@ -969,38 +1084,29 @@ impl WalFile {
 
         // Snapshot the shared WAL state. We haven't taken a read lock yet, so we need
         // to validate these values later.
-        let (shared_max, nbackfills, last_checksum, checkpoint_seq, transaction_count) = self
-            .with_shared(|shared| {
-                (
-                    shared.max_frame.load(Ordering::Acquire),
-                    shared.nbackfills.load(Ordering::Acquire),
-                    shared.last_checksum,
-                    shared.wal_header.lock().checkpoint_seq,
-                    shared.transaction_count.load(Ordering::Acquire),
-                )
-            });
+        let shared_snapshot = self.with_shared(Self::load_shared_snapshot);
         tracing::debug!(
             "try_begin_read_tx: shared_max={}, nbackfills={}, last_checksum={:?}, checkpoint_seq={:?}, transaction_count={}",
-            shared_max,
-            nbackfills,
-            last_checksum,
-            checkpoint_seq,
-            transaction_count
+            shared_snapshot.max_frame,
+            shared_snapshot.nbackfills,
+            shared_snapshot.last_checksum,
+            shared_snapshot.checkpoint_seq,
+            shared_snapshot.transaction_count
         );
 
         // Check if database changed since this connection's last read transaction.
         // If it has, the connection will invalidate its page cache.
-        let db_changed = self.with_shared(|shared: &WalFileShared| self.db_changed(shared));
+        let db_changed = self.db_changed_against(shared_snapshot, self.connection_state());
 
         tracing::debug!("try_begin_read_tx: db_changed={}", db_changed);
 
         // If WAL is fully checkpointed (shared_max == nbackfills), readers can ignore
         // the WAL and read directly from the DB file by holding read_locks[0].
-        if shared_max == nbackfills {
+        if shared_snapshot.max_frame == shared_snapshot.nbackfills {
             tracing::debug!(
                 "begin_read_tx: WAL fully checkpointed, shared_max={}, nbackfills={}",
-                shared_max,
-                nbackfills
+                shared_snapshot.max_frame,
+                shared_snapshot.nbackfills
             );
             if !self.with_shared(|shared| shared.read_locks[0].read()) {
                 tracing::debug!("begin_read_tx: unable to acquire read-0 lock slot, retrying");
@@ -1009,30 +1115,28 @@ impl WalFile {
             // Re-validate: a writer could have appended frames between our snapshot
             // and lock acquisition. If so, we cannot proceed because we'd not be reading
             // up to date committed content from the WAL.
-            let (mx2, nb2, cksm2, ckpt_seq2) = self.with_shared(|shared| {
-                (
-                    shared.max_frame.load(Ordering::Acquire),
-                    shared.nbackfills.load(Ordering::Acquire),
-                    shared.last_checksum,
-                    shared.wal_header.lock().checkpoint_seq,
-                )
-            });
-            if mx2 != shared_max
-                || nb2 != nbackfills
-                || cksm2 != last_checksum
-                || ckpt_seq2 != checkpoint_seq
-            {
-                tracing::debug!("begin_read_tx: shared data changed ({shared_max}, {nbackfills}, {last_checksum:?}, {checkpoint_seq}) != ({mx2}, {nb2}, {cksm2:?}, {ckpt_seq2}), retrying");
+            let snapshot_after_lock = self.with_shared(Self::load_shared_snapshot);
+            if snapshot_after_lock != shared_snapshot {
+                tracing::debug!(
+                    "begin_read_tx: shared data changed ({}, {}, {:?}, {}, {}) != ({}, {}, {:?}, {}, {}), retrying",
+                    shared_snapshot.max_frame,
+                    shared_snapshot.nbackfills,
+                    shared_snapshot.last_checksum,
+                    shared_snapshot.checkpoint_seq,
+                    shared_snapshot.transaction_count,
+                    snapshot_after_lock.max_frame,
+                    snapshot_after_lock.nbackfills,
+                    snapshot_after_lock.last_checksum,
+                    snapshot_after_lock.checkpoint_seq,
+                    snapshot_after_lock.transaction_count
+                );
                 self.with_shared(|shared| shared.read_locks[0].unlock());
                 return TryBeginReadResult::Retry;
             }
-            self.max_frame.store(shared_max, Ordering::Release);
-            self.max_frame_read_lock_index.store(0, Ordering::Release);
-            self.min_frame.store(nbackfills + 1, Ordering::Release);
-            *self.last_checksum.write() = last_checksum;
-            self.checkpoint_seq.store(checkpoint_seq, Ordering::Release);
-            self.transaction_count
-                .store(transaction_count, Ordering::Release);
+            self.install_connection_state(WalConnectionState::new(
+                shared_snapshot,
+                ReadGuardKind::DbFile,
+            ));
             return TryBeginReadResult::Ok(db_changed);
         }
 
@@ -1046,7 +1150,8 @@ impl WalFile {
         self.with_shared(|shared| {
             for (idx, lock) in shared.read_locks.iter().enumerate().skip(1) {
                 let m = lock.get_value();
-                if m != READMARK_NOT_USED && m <= shared_max as u32 && m > best_mark {
+                if m != READMARK_NOT_USED && m <= shared_snapshot.max_frame as u32 && m > best_mark
+                {
                     best_mark = m;
                     best_idx = idx as i64;
                 }
@@ -1059,16 +1164,16 @@ impl WalFile {
         );
 
         // If none found or lagging, try to claim/update a slot
-        if best_idx == -1 || (best_mark as u64) < shared_max {
+        if best_idx == -1 || (best_mark as u64) < shared_snapshot.max_frame {
             self.with_shared(|shared| {
                 for (idx, lock) in shared.read_locks.iter().enumerate().skip(1) {
                     if !lock.write() {
                         continue; // busy slot
                     }
                     // claim or bump this slot
-                    lock.set_value_exclusive(shared_max as u32);
+                    lock.set_value_exclusive(shared_snapshot.max_frame as u32);
                     best_idx = idx as i64;
-                    best_mark = shared_max as u32;
+                    best_mark = shared_snapshot.max_frame as u32;
                     lock.unlock();
                     break;
                 }
@@ -1088,17 +1193,14 @@ impl WalFile {
                 return None;
             }
             Some((
-                shared.max_frame.load(Ordering::Acquire),
-                shared.nbackfills.load(Ordering::Acquire),
-                shared.last_checksum,
-                shared.wal_header.lock().checkpoint_seq,
+                Self::load_shared_snapshot(shared),
                 shared.read_locks[best_idx as usize].get_value(),
             ))
         });
 
         tracing::debug!("try_begin_read_tx: read_result={:?}", read_result);
 
-        let Some((mx2, nb2, cksm2, ckpt_seq2, current_slot_mark)) = read_result else {
+        let Some((snapshot_after_lock, current_slot_mark)) = read_result else {
             return TryBeginReadResult::Retry;
         };
 
@@ -1118,29 +1220,20 @@ impl WalFile {
         // - cksm2 != last_checksum: WAL content changed (e.g., rollback reused frame slots).
         //
         // - ckpt_seq2 != checkpoint_seq: WAL was reset. Frame numbers are now meaningless.
-        if current_slot_mark != best_mark
-            || mx2 != shared_max
-            || nb2 != nbackfills
-            || cksm2 != last_checksum
-            || ckpt_seq2 != checkpoint_seq
-        {
+        if current_slot_mark != best_mark || snapshot_after_lock != shared_snapshot {
             self.with_shared(|shared| shared.read_locks[best_idx as usize].unlock());
             return TryBeginReadResult::Retry;
         }
-        self.min_frame.store(nb2 + 1, Ordering::Release);
-        self.max_frame.store(shared_max, Ordering::Release);
-        self.max_frame_read_lock_index
-            .store(best_idx as usize, Ordering::Release);
-        *self.last_checksum.write() = last_checksum;
-        self.checkpoint_seq.store(checkpoint_seq, Ordering::Release);
-        self.transaction_count
-            .store(transaction_count, Ordering::Release);
+        self.install_connection_state(WalConnectionState::new(
+            shared_snapshot,
+            ReadGuardKind::ReadMark(best_idx as usize),
+        ));
         tracing::debug!(
             "begin_read_tx(min={}, max={}, slot={}, max_frame_in_wal={})",
             self.min_frame.load(Ordering::Acquire),
             self.max_frame.load(Ordering::Acquire),
             best_idx,
-            shared_max
+            shared_snapshot.max_frame
         );
         TryBeginReadResult::Ok(db_changed)
     }
@@ -1228,7 +1321,7 @@ impl Wal for WalFile {
                 // Return BusySnapshot instead of Busy so the caller knows it must
                 // restart the read transaction to get a fresh snapshot.
                 // Retrying with busy_timeout will NEVER HELP.
-                tracing::debug!("unable to upgrade transaction from read to write: snapshot is stale, give up and let caller retry from scratch, self.max_frame={}, shared_max={}", self.max_frame.load(Ordering::Acquire), shared.max_frame.load(Ordering::Acquire));
+                tracing::info!("unable to upgrade transaction from read to write: snapshot is stale, give up and let caller retry from scratch, self.max_frame={}, shared_max={}", self.max_frame.load(Ordering::Acquire), shared.max_frame.load(Ordering::Acquire));
                 shared.write_lock.unlock();
                 return Err(LimboError::BusySnapshot);
             }
@@ -1641,7 +1734,7 @@ impl Wal for WalFile {
         mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>> {
         self.checkpoint_inner(pager, mode).inspect_err(|e| {
-            tracing::debug!("Wal Checkpoint failed: {e}");
+            tracing::info!("Wal Checkpoint failed: {e}");
             let _ = self.checkpoint_guard.write().take();
             self.ongoing_checkpoint.write().state = CheckpointState::Start;
         })
@@ -2098,7 +2191,7 @@ impl Wal for WalFile {
         Ok(c)
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -2159,6 +2252,11 @@ impl WalFile {
             checkpoint_guard: RwLock::new(None),
             io_ctx: RwLock::new(IOContext::default()),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shared_ptr(&self) -> usize {
+        Arc::as_ptr(&self.shared) as usize
     }
 
     fn page_size(&self) -> u32 {
@@ -2234,7 +2332,7 @@ impl WalFile {
     fn increment_checkpoint_epoch(&self) {
         self.with_shared(|shared| {
             let prev = shared.epoch.fetch_add(1, Ordering::Release);
-            tracing::debug!("increment checkpoint epoch: prev={}", prev);
+            tracing::info!("increment checkpoint epoch: prev={}", prev);
         });
     }
 
@@ -2290,7 +2388,7 @@ impl WalFile {
                         let n_backfills = shared.nbackfills.load(Ordering::Acquire);
                         (max_frame, n_backfills)
                     });
-                    tracing::debug!("shared_wal: max_frame={max_frame}, nbackfills={nbackfills}");
+                    tracing::info!("shared_wal: max_frame={max_frame}, nbackfills={nbackfills}");
                     let needs_backfill = max_frame > nbackfills;
                     if !needs_backfill && !mode.should_restart_log() {
                         // there are no frames to copy over and we don't need to reset
@@ -2328,7 +2426,7 @@ impl WalFile {
                         let oc = self.ongoing_checkpoint.read();
                         (oc.min_frame, oc.max_frame)
                     };
-                    tracing::debug!("checkpoint_inner::Start: min_frame={oc_min_frame}, max_frame={oc_max_frame}");
+                    tracing::info!("checkpoint_inner::Start: min_frame={oc_min_frame}, max_frame={oc_max_frame}");
                     let to_checkpoint = self.with_shared(|shared| {
                         let frame_cache = shared.frame_cache.lock();
                         let mut list = Vec::with_capacity(
@@ -2494,11 +2592,11 @@ impl WalFile {
                         let wal_checkpoint_backfilled =
                             wal_total_backfilled.saturating_sub(ongoing_chkpt.min_frame - 1);
 
-                        tracing::debug!("checkpoint: wal_max_frame={wal_max_frame}, wal_total_backfilled={wal_total_backfilled}, wal_checkpoint_backfilled={wal_checkpoint_backfilled}");
+                        tracing::info!("checkpoint: wal_max_frame={wal_max_frame}, wal_total_backfilled={wal_total_backfilled}, wal_checkpoint_backfilled={wal_checkpoint_backfilled}");
 
                         CheckpointResult::new(wal_max_frame, wal_total_backfilled, wal_checkpoint_backfilled)
                     });
-                    tracing::debug!("checkpoint_result={:?}, mode={:?}", checkpoint_result, mode);
+                    tracing::info!("checkpoint_result={:?}, mode={:?}", checkpoint_result, mode);
 
                     // store the max frame we were able to successfully checkpoint.
                     // NOTE: we don't have a .shm file yet, so it's safe to update nbackfills here
@@ -2549,7 +2647,7 @@ impl WalFile {
                     // increment wal epoch to ensure no stale pages are used for backfilling
                     self.increment_checkpoint_epoch();
 
-                    tracing::debug!("checkpoint_result={:?}", checkpoint_result);
+                    tracing::info!("checkpoint_result={:?}", checkpoint_result);
                     // we cannot truncate the db file here because we are currently inside a
                     // mut borrow of pager.wal, and accessing the header will attempt a borrow
                     // during 'read_page', so the caller will use the result to determine if:
@@ -2686,7 +2784,7 @@ impl WalFile {
     }
 
     fn restart_log(&self) -> Result<()> {
-        tracing::debug!("restart_log");
+        tracing::info!("restart_log");
         self.with_shared(|shared| {
             // Block all readers
             for idx in 1..shared.read_locks.len() {
@@ -2856,17 +2954,7 @@ impl WalFile {
 
     /// Check if database changed since this connection's last read transaction.
     fn db_changed(&self, shared: &WalFileShared) -> bool {
-        let shared_max = shared.max_frame.load(Ordering::Acquire);
-        let nbackfills = shared.nbackfills.load(Ordering::Acquire);
-        let last_checksum = shared.last_checksum;
-        let checkpoint_seq = shared.wal_header.lock().checkpoint_seq;
-        let transaction_count = shared.transaction_count.load(Ordering::Acquire);
-
-        shared_max != self.max_frame.load(Ordering::Acquire)
-            || last_checksum != *self.last_checksum.read()
-            || checkpoint_seq != self.checkpoint_seq.load(Ordering::Acquire)
-            || transaction_count != self.transaction_count.load(Ordering::Acquire)
-            || nbackfills + 1 != self.min_frame.load(Ordering::Acquire)
+        self.db_changed_against(Self::load_shared_snapshot(shared), self.connection_state())
     }
 
     /// MVCC helper: check if WAL state changed and refresh local snapshot without starting a read tx.
@@ -2878,24 +2966,11 @@ impl WalFile {
     /// the stop-the-world MVCC checkpoint that blocks all reads.
     pub fn mvcc_refresh_if_db_changed(&self) -> bool {
         self.with_shared(|shared| {
-            let shared_max = shared.max_frame.load(Ordering::Acquire);
-            let nbackfills = shared.nbackfills.load(Ordering::Acquire);
-            let last_checksum = shared.last_checksum;
-            let checkpoint_seq = shared.wal_header.lock().checkpoint_seq;
-            let transaction_count = shared.transaction_count.load(Ordering::Acquire);
-
-            let changed = shared_max != self.max_frame.load(Ordering::Acquire)
-                || last_checksum != *self.last_checksum.read()
-                || checkpoint_seq != self.checkpoint_seq.load(Ordering::Acquire)
-                || transaction_count != self.transaction_count.load(Ordering::Acquire)
-                || nbackfills + 1 != self.min_frame.load(Ordering::Acquire);
+            let snapshot = Self::load_shared_snapshot(shared);
+            let local_state = self.connection_state();
+            let changed = self.db_changed_against(snapshot, local_state);
             if changed {
-                self.max_frame.store(shared_max, Ordering::Release);
-                self.min_frame.store(nbackfills + 1, Ordering::Release);
-                *self.last_checksum.write() = last_checksum;
-                self.checkpoint_seq.store(checkpoint_seq, Ordering::Release);
-                self.transaction_count
-                    .store(transaction_count, Ordering::Release);
+                self.install_connection_state(local_state.with_snapshot(snapshot));
             }
             changed
         })
@@ -2906,6 +2981,7 @@ impl WalFileShared {
     pub fn last_checksum_and_max_frame(&self) -> ((u32, u32), u64) {
         (self.last_checksum, self.max_frame.load(Ordering::Acquire))
     }
+
     pub fn open_shared_if_exists(
         io: &Arc<dyn IO>,
         path: &str,
@@ -3044,10 +3120,12 @@ impl WalFileShared {
 
 #[cfg(test)]
 pub mod test {
+    use super::{ReadGuardKind, WalConnectionState, WalFile, WalSnapshot};
     use crate::sync::{atomic::Ordering, Arc};
     use crate::sync::{Mutex, RwLock};
     use crate::{
         storage::{
+            buffer_pool::BufferPool,
             sqlite3_ondisk::{self, WAL_HEADER_SIZE},
             wal::READMARK_NOT_USED,
         },
@@ -3200,6 +3278,27 @@ pub mod test {
             .unwrap()
     }
 
+    fn make_test_wal() -> (Arc<RwLock<WalFileShared>>, WalFile) {
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        let shared = WalFileShared::new_noop();
+        let wal = WalFile::new(io, shared.clone(), ((0, 0), 0), buffer_pool);
+        (shared, wal)
+    }
+
+    fn set_shared_snapshot(shared: &Arc<RwLock<WalFileShared>>, snapshot: WalSnapshot) {
+        let mut guard = shared.write();
+        guard.max_frame.store(snapshot.max_frame, Ordering::Release);
+        guard
+            .nbackfills
+            .store(snapshot.nbackfills, Ordering::Release);
+        guard.last_checksum = snapshot.last_checksum;
+        guard.wal_header.lock().checkpoint_seq = snapshot.checkpoint_seq;
+        guard
+            .transaction_count
+            .store(snapshot.transaction_count, Ordering::Release);
+    }
+
     #[cfg(test)]
     fn read_slots_with_readers(shared: &WalFileShared) -> Vec<usize> {
         shared
@@ -3219,6 +3318,57 @@ pub mod test {
         let shared_guard = shared.read();
         let hdr = shared_guard.wal_header.lock();
         (hdr.checkpoint_seq, hdr.salt_1, hdr.salt_2, hdr.page_size)
+    }
+
+    #[test]
+    fn test_wal_connection_state_round_trip() {
+        let (_shared, wal) = make_test_wal();
+        let state = WalConnectionState::new(
+            WalSnapshot {
+                max_frame: 11,
+                nbackfills: 7,
+                last_checksum: (31, 47),
+                checkpoint_seq: 5,
+                transaction_count: 13,
+            },
+            ReadGuardKind::ReadMark(3),
+        );
+
+        wal.install_connection_state(state);
+
+        assert_eq!(wal.connection_state(), state);
+        assert_eq!(wal.connection_state().snapshot.min_frame(), 8);
+    }
+
+    #[test]
+    fn test_mvcc_refresh_updates_snapshot_without_changing_read_guard() {
+        let (shared, wal) = make_test_wal();
+        let initial = WalSnapshot {
+            max_frame: 4,
+            nbackfills: 2,
+            last_checksum: (9, 10),
+            checkpoint_seq: 1,
+            transaction_count: 3,
+        };
+        set_shared_snapshot(&shared, initial);
+        wal.install_connection_state(WalConnectionState::new(initial, ReadGuardKind::ReadMark(2)));
+
+        assert!(!wal.mvcc_refresh_if_db_changed());
+
+        let updated = WalSnapshot {
+            max_frame: 8,
+            nbackfills: 5,
+            last_checksum: (21, 34),
+            checkpoint_seq: 7,
+            transaction_count: 4,
+        };
+        set_shared_snapshot(&shared, updated);
+
+        assert!(wal.mvcc_refresh_if_db_changed());
+        assert_eq!(
+            wal.connection_state(),
+            WalConnectionState::new(updated, ReadGuardKind::ReadMark(2))
+        );
     }
 
     #[test]

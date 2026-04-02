@@ -102,6 +102,57 @@ pub fn get_collseq_from_expr(
     Ok(explicit.or(column))
 }
 
+/// Return the collation context that standalone expression translation would
+/// propagate to a parent comparison when this expression is reused from cache.
+///
+/// This differs from `get_collseq_from_expr()` in one important way: plain
+/// column references keep their default BINARY collation, because standalone
+/// column translation records that fact in `ProgramBuilder::curr_collation_ctx()`.
+/// Synthetic expressions such as aggregates must opt out by storing `None` in
+/// the cache entry instead of calling this helper.
+pub fn get_expr_collation_ctx(
+    top_expr: &Expr,
+    referenced_tables: &TableReferences,
+) -> Result<Option<(CollationSeq, bool)>> {
+    let mut maybe_column_collseq = None;
+    let mut maybe_explicit_collseq = None;
+
+    walk_expr(top_expr, &mut |expr: &Expr| -> Result<WalkControl> {
+        match expr {
+            Expr::Collate(_, seq) => {
+                if maybe_explicit_collseq.is_none() {
+                    maybe_explicit_collseq =
+                        Some(CollationSeq::new(seq.as_str()).unwrap_or_default());
+                }
+                return Ok(WalkControl::SkipChildren);
+            }
+            Expr::Column { table, column, .. } => {
+                // generated columns (the SELF_TABLE placeholder) don't inherit an implicit
+                // collation from their expression, so we skip them
+                if !table.is_self_table() {
+                    let (_, table_ref) = referenced_tables
+                        .find_table_by_internal_id(*table)
+                        .ok_or_else(|| {
+                            crate::LimboError::ParseError("table not found".to_string())
+                        })?;
+                    let column = table_ref.get_column_at(*column).ok_or_else(|| {
+                        crate::LimboError::ParseError("column not found".to_string())
+                    })?;
+                    if maybe_column_collseq.is_none() {
+                        maybe_column_collseq = Some(column.collation());
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+
+    Ok(maybe_explicit_collseq
+        .map(|collation| (collation, true))
+        .or_else(|| maybe_column_collseq.map(|collation| (collation, false))))
+}
+
 /// Resolve the collation for a binary comparison (=, <, >, etc.) per SQLite rules:
 /// 1. Explicit COLLATE operator on either side wins (LHS takes precedence)
 /// 2. Column with defined collation on either side wins (LHS takes precedence)
@@ -461,6 +512,16 @@ mod tests {
         collation: Option<CollationSeq>,
     ) -> TableReferences {
         let mut table_references = TableReferences::new_empty();
+        let columns = vec![Column::new(
+            Some("foo".to_string()),
+            "text".to_string(),
+            None,
+            None,
+            Type::Text,
+            collation,
+            ColDef::default(),
+        )];
+        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let table = Table::BTree(Arc::new(BTreeTable {
             root_page: 0,
             has_autoincrement: false,
@@ -468,19 +529,13 @@ mod tests {
             is_strict: false,
             name: "foo".to_string(),
             primary_key_columns: vec![],
-            columns: vec![Column::new(
-                Some("foo".to_string()),
-                "text".to_string(),
-                None,
-                None,
-                Type::Text,
-                collation,
-                ColDef::default(),
-            )],
+            columns,
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
-            pk_conflict_clause: None,
+            rowid_alias_conflict_clause: None,
+            has_virtual_columns: false,
+            logical_to_physical_map,
         }));
         table_references.add_joined_table(JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
@@ -495,6 +550,7 @@ mod tests {
             internal_id: TableInternalId::from(1),
             join_info: None,
             table,
+            indexed: None,
         });
 
         table_references
@@ -506,6 +562,16 @@ mod tests {
     ) -> TableReferences {
         let mut table_references = TableReferences::new_empty();
         // Left table t1(id=1)
+        let columns = vec![Column::new(
+            Some("a".to_string()),
+            "text".to_string(),
+            None,
+            None,
+            Type::Text,
+            left,
+            ColDef::default(),
+        )];
+        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         table_references.add_joined_table(JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
                 iter_dir: IterationDirection::Forwards,
@@ -525,22 +591,27 @@ mod tests {
                 is_strict: false,
                 name: "t1".to_string(),
                 primary_key_columns: vec![],
-                columns: vec![Column::new(
-                    Some("a".to_string()),
-                    "text".to_string(),
-                    None,
-                    None,
-                    Type::Text,
-                    left,
-                    ColDef::default(),
-                )],
+                columns,
                 unique_sets: vec![],
                 foreign_keys: vec![],
                 check_constraints: vec![],
-                pk_conflict_clause: None,
+                rowid_alias_conflict_clause: None,
+                has_virtual_columns: false,
+                logical_to_physical_map,
             })),
+            indexed: None,
         });
         // Right table t2(id=2)
+        let columns = vec![Column::new(
+            Some("b".to_string()),
+            "text".to_string(),
+            None,
+            None,
+            Type::Text,
+            right,
+            ColDef::default(),
+        )];
+        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         table_references.add_joined_table(JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
                 iter_dir: IterationDirection::Forwards,
@@ -560,20 +631,15 @@ mod tests {
                 is_strict: false,
                 name: "t2".to_string(),
                 primary_key_columns: vec![],
-                columns: vec![Column::new(
-                    Some("b".to_string()),
-                    "text".to_string(),
-                    None,
-                    None,
-                    Type::Text,
-                    right,
-                    ColDef::default(),
-                )],
+                columns,
                 unique_sets: vec![],
                 foreign_keys: vec![],
                 check_constraints: vec![],
-                pk_conflict_clause: None,
+                rowid_alias_conflict_clause: None,
+                has_virtual_columns: false,
+                logical_to_physical_map,
             })),
+            indexed: None,
         });
         table_references
     }
@@ -583,6 +649,23 @@ mod tests {
     ) -> TableReferences {
         use turso_parser::ast::SortOrder;
         let mut table_references = TableReferences::new_empty();
+        let columns = vec![Column::new(
+            Some("id".to_string()),
+            "INTEGER".to_string(),
+            None,
+            None,
+            Type::Integer,
+            collation,
+            ColDef {
+                primary_key: true,
+                rowid_alias: true,
+                notnull: false,
+                unique: true,
+                hidden: false,
+                notnull_conflict_clause: None,
+            },
+        )];
+        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         table_references.add_joined_table(JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
                 iter_dir: IterationDirection::Forwards,
@@ -595,6 +678,7 @@ mod tests {
             identifier: "bar".to_string(),
             internal_id: TableInternalId::from(1),
             join_info: None,
+            indexed: None,
             table: Table::BTree(Arc::new(BTreeTable {
                 root_page: 0,
                 has_autoincrement: false,
@@ -602,26 +686,13 @@ mod tests {
                 is_strict: false,
                 name: "bar".to_string(),
                 primary_key_columns: vec![("id".to_string(), SortOrder::Asc)],
-                columns: vec![Column::new(
-                    Some("id".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                    None,
-                    Type::Integer,
-                    collation,
-                    ColDef {
-                        primary_key: true,
-                        rowid_alias: true,
-                        notnull: false,
-                        unique: true,
-                        hidden: false,
-                        notnull_conflict_clause: None,
-                    },
-                )],
+                columns,
                 unique_sets: vec![],
                 foreign_keys: vec![],
                 check_constraints: vec![],
-                pk_conflict_clause: None,
+                rowid_alias_conflict_clause: None,
+                has_virtual_columns: false,
+                logical_to_physical_map,
             })),
         });
         table_references

@@ -10,7 +10,7 @@ use crate::mvcc::database::LogRecord;
 use crate::mvcc::persistent_storage::logical_log::{
     LogicalLog, OnSerializationComplete, DEFAULT_LOG_CHECKPOINT_THRESHOLD,
 };
-use crate::{Completion, File, Result};
+use crate::{CheckpointResult, Completion, File, Result};
 
 pub trait DurableStorage: Send + Sync + Debug {
     /// Write a transaction to the logical log without advancing the writer offset.
@@ -52,11 +52,23 @@ pub trait DurableStorage: Send + Sync + Debug {
     /// Called when a checkpoint begins, before any rows are written to the B-tree.
     /// `durable_txid_max` is the transaction watermark that will be durably persisted
     /// once the checkpoint completes.
-    fn on_checkpoint_start(&self, _durable_txid_max: u64) {}
+    fn on_checkpoint_start(&self, _durable_txid_max: u64) -> Result<()> {
+        Ok(())
+    }
 
     /// Called after the checkpoint has fully completed: rows are flushed, WAL is
     /// truncated, and the logical log is reset.
-    fn on_checkpoint_end(&self, _durable_txid_max: u64) {}
+    fn on_checkpoint_end(
+        &self,
+        _durable_txid_max: u64,
+        _result: Result<&CheckpointResult>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn encryption_ctx(&self) -> Option<EncryptionContext> {
+        None
+    }
 }
 
 pub struct Storage {
@@ -119,6 +131,10 @@ impl DurableStorage for Storage {
 
     fn get_logical_log_file(&self) -> Arc<dyn File> {
         self.logical_log.write().file.clone()
+    }
+
+    fn encryption_ctx(&self) -> Option<EncryptionContext> {
+        self.logical_log.read().encryption_ctx().cloned()
     }
 
     /// Lock-free: reads shadowed atomics only.

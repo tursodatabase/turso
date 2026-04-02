@@ -21,10 +21,10 @@ COPY parser ./parser/
 COPY perf/encryption ./perf/encryption
 COPY perf/throughput/rusqlite ./perf/throughput/rusqlite
 COPY perf/throughput/turso ./perf/throughput/turso
+COPY perf/memory ./perf/memory/
 COPY cli ./cli/
 COPY sqlite3 ./sqlite3/
 COPY tests ./tests/
-COPY packages ./packages/
 COPY testing ./testing/
 COPY sql_generation ./sql_generation/
 COPY sdk-kit ./sdk-kit/
@@ -46,7 +46,7 @@ COPY --from=planner /app/parser ./parser/
 COPY --from=planner /app/perf/encryption ./perf/encryption
 COPY --from=planner /app/perf/throughput/rusqlite ./perf/throughput/rusqlite
 COPY --from=planner /app/perf/throughput/turso ./perf/throughput/turso
-COPY --from=planner /app/packages ./packages/
+COPY --from=planner /app/perf/memory ./perf/memory/
 COPY --from=planner /app/sql_generation ./sql_generation/
 COPY --from=planner /app/testing ./testing/
 COPY --from=planner /app/Cargo.toml /app/Cargo.lock ./

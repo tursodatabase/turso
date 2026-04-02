@@ -345,6 +345,18 @@ test.serial("Statement.get() values", async (t) => {
   t.deepEqual(stmt.get(9007199254740991n), [9007199254740991]);
 });
 
+
+test.serial("Statement.get() datetime('now')", async (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("SELECT datetime('now') AS now");
+  const row = stmt.get();
+  t.truthy(row.now, "datetime('now') should return a value");
+  // Verify the result matches the expected ISO 8601 datetime format: YYYY-MM-DD HH:MM:SS
+  t.regex(row.now, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/, "datetime('now') should return a valid datetime string");
+});
+
+
 test.serial("Statement.get() [blob]", (t) => {
   const db = t.context.db;
 
@@ -546,6 +558,65 @@ test.serial("Statement.reader [DELETE RETURNING is true]", (t) => {
   t.is(stmt.reader, true);
 });
 
+test.serial("Query timeout option interrupts long-running query", async (t) => {
+  const path = genDatabaseFilename();
+  const [db] = await connect(path, { defaultQueryTimeout: 50 });
+  const stmt = db.prepare("SELECT sum(value) FROM generate_series(1, 1000000000);");
+
+  const error = t.throws(() => {
+    stmt.get();
+  });
+  t.truthy(error);
+  t.true(error.message.toLowerCase().includes("interrupt"));
+
+  db.close();
+  cleanupDatabaseFiles(path);
+});
+
+test.serial("Query timeout option allows short-running query", async (t) => {
+  const path = genDatabaseFilename();
+  const [db] = await connect(path, { defaultQueryTimeout: 50 });
+  const stmt = db.prepare("SELECT 1 AS value");
+  t.deepEqual(stmt.get(), { value: 1 });
+
+  db.close();
+  cleanupDatabaseFiles(path);
+});
+
+test.serial("Per-query timeout option interrupts long-running Statement.get()", async (t) => {
+  if (t.context.provider !== "turso") {
+    t.pass("Skipping queryTimeout test for non-Turso providers");
+    return;
+  }
+
+  const path = genDatabaseFilename();
+  const [db] = await connect(path);
+  const stmt = db.prepare("SELECT sum(value) FROM generate_series(1, 1000000000);");
+
+  const error = t.throws(() => {
+    stmt.get(undefined, { queryTimeout: 50 });
+  });
+  t.truthy(error);
+  t.true(error.message.toLowerCase().includes("interrupt"));
+
+  db.close();
+  cleanupDatabaseFiles(path);
+});
+
+test.serial("Per-query timeout option is accepted by Database.exec()", async (t) => {
+  if (t.context.provider !== "turso") {
+    t.pass("Skipping queryTimeout test for non-Turso providers");
+    return;
+  }
+
+  const path = genDatabaseFilename();
+  const [db] = await connect(path);
+  t.notThrows(() => db.exec("SELECT 1", { queryTimeout: 50 }));
+
+  db.close();
+  cleanupDatabaseFiles(path);
+});
+
 test.skip("Timeout option", async (t) => {
   const timeout = 1000;
   const path = genDatabaseFilename();
@@ -566,6 +637,53 @@ test.skip("Timeout option", async (t) => {
     t.is(elapsed > timeout/2, true);
   }
   fs.unlinkSync(path);
+});
+
+// ==========================================================================
+// Database rename
+// ==========================================================================
+
+test.serial("Open database after rename", async (t) => {
+  // 1. Open database A, create a table and insert data.
+  const pathA = genDatabaseFilename();
+  const pathB = genDatabaseFilename();
+  const [dbA] = await connect(pathA);
+  dbA.exec("CREATE TABLE t(x INTEGER)");
+  dbA.exec("INSERT INTO t VALUES (42)");
+  const row = dbA.prepare("SELECT x FROM t").get();
+  t.is(row.x, 42);
+
+  // 2. Close database A.
+  dbA.close();
+
+  // 3. Rename A -> B on disk (main file + WAL + SHM).
+  fs.renameSync(pathA, pathB);
+  if (fs.existsSync(pathA + "-wal")) {
+    fs.renameSync(pathA + "-wal", pathB + "-wal");
+  }
+  if (fs.existsSync(pathA + "-shm")) {
+    fs.renameSync(pathA + "-shm", pathB + "-shm");
+  }
+
+  // 4. Open a new database at the original path A.
+  const [dbA2] = await connect(pathA);
+
+  // 5. The new A should be a fresh, empty database — table 't' must not exist.
+  const tables = dbA2.prepare(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='t'"
+  ).all();
+  t.is(tables.length, 0,
+    "New database at A should not have table 't' — " +
+    "DATABASE_MANAGER returned stale Database after rename"
+  );
+
+  // Cleanup.
+  dbA2.close();
+  for (const p of [pathA, pathB]) {
+    for (const suffix of ["", "-wal", "-shm"]) {
+      if (fs.existsSync(p + suffix)) fs.unlinkSync(p + suffix);
+    }
+  }
 });
 
 const connect = async (path, options = {}) => {
@@ -594,4 +712,13 @@ const connect = async (path, options = {}) => {
 /// Generate a unique database filename
 const genDatabaseFilename = () => {
   return `test-${crypto.randomBytes(8).toString('hex')}.db`;
+};
+
+const cleanupDatabaseFiles = (path) => {
+  for (const suffix of ["", "-wal", "-shm"]) {
+    const file = path + suffix;
+    if (fs.existsSync(file)) {
+      fs.unlinkSync(file);
+    }
+  }
 };

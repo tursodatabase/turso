@@ -186,7 +186,7 @@ fn update_pragma(
             };
             let busy_timeout_ms = busy_timeout_ms.max(0);
             connection.set_busy_timeout(std::time::Duration::from_millis(busy_timeout_ms as u64));
-            Ok(TransactionMode::Write)
+            Ok(TransactionMode::None)
         }
         PragmaName::CacheSize => {
             let cache_size = match parse_signed_number(&value)? {
@@ -224,6 +224,38 @@ fn update_pragma(
 
             program.emit_result_row(result_reg, 1);
             program.add_pragma_result_column("journal_mode".into());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::LockingMode => {
+            let mode = match &value {
+                Expr::Name(name) => name.as_str().to_string(),
+                Expr::Literal(Literal::Keyword(kw)) => kw.clone(),
+                Expr::Literal(Literal::String(s)) => s.clone(),
+                _ => parse_string(&value)?,
+            };
+            let mode_bytes = mode.as_bytes();
+            match_ignore_ascii_case!(match mode_bytes {
+                b"EXCLUSIVE" => {}
+                _ => bail_parse_error!("locking_mode must be EXCLUSIVE"),
+            });
+            query_pragma(
+                PragmaName::LockingMode,
+                resolver,
+                None,
+                pager,
+                connection,
+                database_id,
+                program,
+            )
+        }
+        PragmaName::FullColumnNames => {
+            let enabled = parse_pragma_enabled(&value);
+            connection.set_full_column_names(enabled);
+            Ok(TransactionMode::None)
+        }
+        PragmaName::ShortColumnNames => {
+            let enabled = parse_pragma_enabled(&value);
+            connection.set_short_column_names(enabled);
             Ok(TransactionMode::None)
         }
         PragmaName::LegacyFileFormat => Ok(TransactionMode::None),
@@ -636,6 +668,28 @@ fn query_pragma(
                 dest: register,
                 new_mode: None,
             });
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::LockingMode => {
+            program.emit_string8("exclusive".to_string(), register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::FullColumnNames => {
+            let enabled = connection.get_full_column_names();
+            let register = program.alloc_register();
+            program.emit_int(enabled as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::ShortColumnNames => {
+            let enabled = connection.get_short_column_names();
+            let register = program.alloc_register();
+            program.emit_int(enabled as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)
@@ -1358,8 +1412,10 @@ fn emit_columns_for_table_info(
         //
         // (see https://sqlite.org/pragma.html#pragma_table_xinfo)
         let column_type = if column.hidden() {
-            // hidden column
+            // hidden column in virtual table
             1
+        } else if column.is_virtual_generated() {
+            2
         } else {
             // normal column
             0

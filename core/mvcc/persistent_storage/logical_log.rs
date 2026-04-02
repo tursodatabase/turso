@@ -15,6 +15,49 @@
 //! - one fixed-size header (`LOG_HDR_SIZE = 56` bytes), then
 //! - zero or more transaction frames.
 //!
+//! ```text
+//!     ┌─────────────────────────────────────────┐
+//!     │         Log Header (56 bytes)           │
+//!     │  magic(4) | ver(1) | flags(1) | len(2)  │
+//!     │  salt(8) | reserved(36) | crc32c(4)     │
+//!     ├─────────────────────────────────────────┤
+//!     │         TX Frame 0                      │
+//!     ├─────────────────────────────────────────┤
+//!     │         TX Frame 1                      │
+//!     ├─────────────────────────────────────────┤
+//!     │         ...                             │
+//!     └─────────────────────────────────────────┘
+//! ```
+//!
+//! ### Transaction frame (TX Frame)
+//!
+//! ```text
+//!     ┌─────────────────────────────────────────┐
+//!     │       TX Header (24 bytes)              │
+//!     │  frame_magic(4) | payload_size(8)       │
+//!     │  op_count(4) | commit_ts(8)             │
+//!     ├─────────────────────────────────────────┤
+//!     │       Payload (variable)                │
+//!     │                                         │
+//!     │  Unencrypted:                           │
+//!     │    op entries serialized directly       │
+//!     │                                         │
+//!     │  Encrypted:                             │
+//!     │    ciphertext(plain_len + tag_size)     │
+//!     │    nonce(nonce_size)                    │
+//!     ├─────────────────────────────────────────┤
+//!     │       TX Trailer (8 bytes)              │
+//!     │  crc32c(4) | end_magic(4)               │
+//!     └─────────────────────────────────────────┘
+//! ```
+//!
+//! When encryption is enabled, only the payload is encrypted. The log header,
+//! TX header, and TX trailer are always written in plaintext. The log header's salt and TX header
+//! fields (payload_size, op_count, commit_ts) are bound to the ciphertext
+//! as AEAD additional data, so tampering with them will cause decryption to fail.
+//! The CRC in the trailer covers the TX header and the payload as written on disk
+//! (i.e. the ciphertext when encrypted).
+//!
 //! ### Header fields (56 bytes, little-endian)
 //! - `magic: u32` (`LOG_MAGIC`)
 //! - `version: u8` (`LOG_VERSION`)
@@ -24,23 +67,23 @@
 //! - `reserved: [u8; 36]` (must be zero for current format)
 //! - `hdr_crc32c: u32` (CRC32C of the header with this field zeroed)
 //!
-//! ### Transaction frame (LOG_VERSION = 2)
-//!
-//! Header (`TX_HEADER_SIZE = 24`):
+//! ### TX Header (`TX_HEADER_SIZE = 24`)
 //! - `frame_magic: u32` (`FRAME_MAGIC`)
-//! - `payload_size: u64` (total bytes of all op entries)
+//! - `payload_size: u64` (total bytes of all op entries, pre-encryption)
 //! - `op_count: u32`
 //! - `commit_ts: u64`
 //!
-//! Payload:
-//! - `op_count` operation entries:
+//! ### Payload
+//! - When **unencrypted**: `op_count` operation entries serialized directly:
 //!   - `tag: u8` (`OP_*`)
 //!   - `flags: u8` (`OP_FLAG_BTREE_RESIDENT` currently defined)
 //!   - `table_id: i32` (must be negative)
 //!   - `payload_len: sqlite varint`
 //!   - `payload: [u8; payload_len]`
+//! - When **encrypted**: `ciphertext(payload_size + tag_size) | nonce(nonce_size)`
+//!   - AEAD additional data: `salt(8) || payload_size(8) || op_count(4) || commit_ts(8)`
 //!
-//! Trailer (`TX_TRAILER_SIZE = 8`):
+//! ### TX Trailer (`TX_TRAILER_SIZE = 8`)
 //! - `crc32c: u32` (chained CRC32C: `crc32c_append(prev_frame_crc, tx_header || payload)`;
 //!   the first frame uses `crc32c(salt.to_le_bytes())` as its seed)
 //! - `end_magic: u32` (`END_MAGIC`)
@@ -122,7 +165,7 @@ pub const DEFAULT_LOG_CHECKPOINT_THRESHOLD: i64 = 4120 * 1000;
 
 /// Optional callback invoked after serialization with a zero-copy reference to
 /// the serialized frame bytes and the running CRC, before the disk write.
-pub type OnSerializationComplete<'a> = Option<&'a dyn Fn(&[u8], u32)>;
+pub type OnSerializationComplete<'a> = Option<&'a dyn Fn(&[u8], u32) -> crate::Result<()>>;
 
 const LOG_MAGIC: u32 = 0x4C4D4C32; // "LML2" in LE
 const LOG_VERSION: u8 = 2;
@@ -132,7 +175,7 @@ const LOG_HDR_SALT_SIZE: usize = 8;
 const LOG_HDR_RESERVED_START: usize = LOG_HDR_SALT_START + LOG_HDR_SALT_SIZE; // 16
 const LOG_HDR_CRC_START: usize = 52;
 const LOG_HDR_RESERVED_SIZE: usize = LOG_HDR_CRC_START - LOG_HDR_RESERVED_START; // 36
-const FRAME_MAGIC: u32 = 0x5854564D; // "MVTX" in LE
+pub(crate) const FRAME_MAGIC: u32 = 0x5854564D; // "MVTX" in LE
 const END_MAGIC: u32 = 0x4554564D; // "MVTE" in LE
 
 const OP_UPSERT_TABLE: u8 = 0;
@@ -318,6 +361,10 @@ impl LogicalLog {
         self.header.as_ref()
     }
 
+    pub(crate) fn encryption_ctx(&self) -> Option<&EncryptionContext> {
+        self.encryption_ctx.as_ref()
+    }
+
     /// Serializes a transaction into `write_buf`, optionally calls
     /// `on_serialization_complete` with a zero-copy reference to the frame bytes,
     /// then writes to disk. `write_buf` retains its allocation across calls.
@@ -383,7 +430,7 @@ impl LogicalLog {
 
         // 6. Call observer before writing — zero-copy reference into write_buf.
         if let Some(cb) = on_serialization_complete {
-            cb(&self.write_buf, crc);
+            cb(&self.write_buf, crc)?;
         }
 
         // 7. Copy write_buf into an I/O buffer and pwrite. write_buf keeps its allocation.

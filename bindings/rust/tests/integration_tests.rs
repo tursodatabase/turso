@@ -1504,6 +1504,52 @@ async fn test_lost_updates() {
     );
 }
 
+#[tokio::test]
+async fn test_busy_timeout_pragma_does_not_wait_on_unrelated_writer() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("busy-timeout-pragma.db");
+    let db = Builder::new_local(db_path.to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let writer = db.connect().unwrap();
+    let reader = db.connect().unwrap();
+
+    writer
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER)", ())
+        .await
+        .unwrap();
+    writer
+        .execute("INSERT INTO t VALUES(1, 10)", ())
+        .await
+        .unwrap();
+
+    writer.execute("BEGIN", ()).await.unwrap();
+    writer
+        .execute("UPDATE t SET val = 20 WHERE id = 1", ())
+        .await
+        .unwrap();
+
+    let visible_before_commit = query_i64(&reader, "SELECT val FROM t WHERE id = 1").await;
+    assert_eq!(visible_before_commit, 10);
+
+    tokio::time::timeout(
+        Duration::from_millis(250),
+        reader.execute("PRAGMA busy_timeout = 30000", ()),
+    )
+    .await
+    .expect("busy_timeout pragma should not block on another connection's write txn")
+    .unwrap();
+
+    let visible_after_pragma = query_i64(&reader, "SELECT val FROM t WHERE id = 1").await;
+    assert_eq!(visible_after_pragma, 10);
+
+    writer.execute("COMMIT", ()).await.unwrap();
+
+    let visible_after_commit = query_i64(&reader, "SELECT val FROM t WHERE id = 1").await;
+    assert_eq!(visible_after_commit, 20);
+}
+
 /// Helper: create MVCC-enabled file-backed database with given schema
 async fn setup_mvcc_db(schema: &str) -> (turso::Database, tempfile::TempDir) {
     setup_mvcc_db_with_options(schema).await

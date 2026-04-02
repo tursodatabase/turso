@@ -1,3 +1,4 @@
+use crate::function::WindowFunc;
 use crate::schema::{BTreeTable, Table};
 use crate::sync::Arc;
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
@@ -7,17 +8,19 @@ use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::order_by::EmitOrderBy;
 use crate::translate::plan::{
     Aggregate, Distinctness, JoinOrderMember, JoinedTable, QueryDestination, ResultSetColumn,
-    SelectPlan, TableReferences, Window,
+    SelectPlan, TableReferences, Window, WindowFunctionKind,
 };
 use crate::translate::planner::resolve_window_and_aggregate_functions;
 use crate::translate::result_row::emit_select_result;
+use crate::translate::subquery::plan_subqueries_from_select_plan;
 use crate::types::KeyInfo;
 use crate::util::exprs_are_equivalent;
-use crate::vdbe::builder::{CursorType, ProgramBuilder, TableRefIdCounter};
+use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{
     to_u16, {InsertFlags, Insn},
 };
 use crate::vdbe::{BranchOffset, CursorID};
+use crate::Connection;
 use crate::Result;
 use crate::{turso_assert, turso_assert_eq};
 use std::mem;
@@ -28,7 +31,7 @@ const SUBQUERY_DATABASE_ID: usize = 0;
 
 struct WindowSubqueryContext<'a> {
     resolver: &'a Resolver<'a>,
-    subquery_order_by: &'a mut Vec<(Box<Expr>, SortOrder)>,
+    subquery_order_by: &'a mut Vec<(Box<Expr>, SortOrder, Option<turso_parser::ast::NullsOrder>)>,
     subquery_result_columns: &'a mut Vec<ResultSetColumn>,
     subquery_id: &'a TableInternalId,
 }
@@ -86,9 +89,10 @@ struct WindowSubqueryContext<'a> {
 /// );
 /// ```
 pub fn plan_windows(
+    program: &mut ProgramBuilder,
     plan: &mut SelectPlan,
     resolver: &Resolver,
-    table_ref_counter: &mut TableRefIdCounter,
+    connection: &Arc<Connection>,
     windows: &mut Vec<Window>,
 ) -> crate::Result<()> {
     // Remove named windows that are not referenced by any function, as they can be ignored.
@@ -102,24 +106,30 @@ pub fn plan_windows(
         );
     }
 
-    prepare_window_subquery(plan, resolver, table_ref_counter, windows, 0)
+    prepare_window_subquery(program, plan, resolver, connection, windows, 0)
 }
 
 fn prepare_window_subquery(
+    program: &mut ProgramBuilder,
     outer_plan: &mut SelectPlan,
     resolver: &Resolver,
-    table_ref_counter: &mut TableRefIdCounter,
+    connection: &Arc<Connection>,
     windows: &mut Vec<Window>,
     processed_window_count: usize,
 ) -> crate::Result<()> {
     if windows.is_empty() {
+        // The innermost plan holds the original FROM/WHERE/GROUP BY plus any
+        // raw subquery expressions pushed down from outer window layers.
+        // Plan them now so they become SubqueryResult nodes with entries in
+        // non_from_clause_subqueries.
+        plan_subqueries_from_select_plan(program, outer_plan, resolver, connection)?;
         return Ok(());
     }
 
     let mut current_window = windows.swap_remove(0);
     let mut subquery_result_columns = Vec::new();
     let mut subquery_order_by = Vec::new();
-    let subquery_id = table_ref_counter.next();
+    let subquery_id = program.table_reference_counter.next();
 
     if current_window.name.is_none() {
         // This is part of normalizing the window definition. The remaining logic lives in
@@ -151,11 +161,11 @@ fn prepare_window_subquery(
     // columns with its ORDER BY columns.This ensures that rows in the subquery are returned
     // in the correct order for partitioning and window function evaluation.
     for expr in current_window.partition_by.iter_mut() {
-        append_order_by(outer_plan, expr, &SortOrder::Asc, &mut ctx)?;
+        append_order_by(outer_plan, expr, &SortOrder::Asc, None, &mut ctx)?;
         current_window.deduplicated_partition_by_len = Some(ctx.subquery_result_columns.len())
     }
-    for (expr, order) in current_window.order_by.iter_mut() {
-        append_order_by(outer_plan, expr, order, &mut ctx)?;
+    for (expr, order, nulls) in current_window.order_by.iter_mut() {
+        append_order_by(outer_plan, expr, order, *nulls, &mut ctx)?;
     }
 
     // Rewrite expressions from the outer query’s result columns and ORDER BY clause so that
@@ -169,7 +179,7 @@ fn prepare_window_subquery(
             &mut ctx,
         )?;
     }
-    for (expr, _) in outer_plan.order_by.iter_mut() {
+    for (expr, _, _) in outer_plan.order_by.iter_mut() {
         rewrite_terminal_expr(
             &mut outer_plan.aggregates,
             expr,
@@ -185,6 +195,7 @@ fn prepare_window_subquery(
         subquery_result_columns.push(ResultSetColumn {
             expr: Expr::Literal(Literal::Numeric("0".to_string())),
             alias: None,
+            implicit_column_name: None,
             contains_aggregates: false,
         });
     }
@@ -221,9 +232,10 @@ fn prepare_window_subquery(
     };
 
     prepare_window_subquery(
+        program,
         &mut inner_plan,
         resolver,
-        table_ref_counter,
+        connection,
         windows,
         processed_window_count + 1,
     )?;
@@ -254,6 +266,7 @@ fn append_order_by(
     plan: &mut SelectPlan,
     expr: &mut Expr,
     sort_order: &SortOrder,
+    nulls_order: Option<turso_parser::ast::NullsOrder>,
     ctx: &mut WindowSubqueryContext,
 ) -> crate::Result<()> {
     // Deduplicate: if an equivalent expression already exists in the subquery ORDER BY,
@@ -263,10 +276,10 @@ fn append_order_by(
     let already_exists = ctx
         .subquery_order_by
         .iter()
-        .any(|(existing, _)| exprs_are_equivalent(existing, expr));
+        .any(|(existing, _, _)| exprs_are_equivalent(existing, expr));
     if !already_exists {
         ctx.subquery_order_by
-            .push((Box::new(expr.clone()), *sort_order));
+            .push((Box::new(expr.clone()), *sort_order, nulls_order));
     }
 
     let contains_aggregates =
@@ -326,6 +339,13 @@ fn rewrite_terminal_expr(
                 }
                 Expr::RowId { .. } | Expr::Column { .. } => {
                     rewrite_expr_as_subquery_column(expr, ctx, false);
+                }
+                Expr::SubqueryResult { .. }
+                | Expr::Exists(..)
+                | Expr::InSelect { .. }
+                | Expr::Subquery(..) => {
+                    rewrite_expr_as_subquery_column(expr, ctx, false);
+                    return Ok(WalkControl::SkipChildren);
                 }
                 _ => {}
             }
@@ -418,6 +438,7 @@ fn rewrite_expr_as_subquery_column(
         ctx.subquery_result_columns.push(ResultSetColumn {
             expr: subquery_expr,
             alias: None,
+            implicit_column_name: None,
             contains_aggregates,
         });
     }
@@ -451,11 +472,12 @@ pub struct WindowRegisters {
     pub rowid: usize,
     /// Start of the register array storing partition key values for the current partition.
     pub partition_start: Option<usize>,
-    /// Start of the register array storing accumulator states for each window function
-    /// (populated by `AggStep` during aggregation).
+    /// Start of the register array storing per-function state for window functions.
+    /// Aggregates use `AggStep` to populate their state.
     pub acc_start: usize,
-    /// Start of the register array storing current accumulator results for each window function
-    /// (populated by `AggValue` when computing results without clearing accumulators).
+    /// Start of the register array storing per-function outputs. Aggregate windows
+    /// populate these via `AggValue`; window-only functions like ROW_NUMBER()
+    /// keep their running state here.
     pub acc_result_start: usize,
     /// Stores the address to which control returns after all buffered rows are flushed.
     pub flush_buffer_return_offset: usize,
@@ -490,7 +512,7 @@ impl EmitWindow {
         window: &'a Window,
         plan: &SelectPlan,
         result_columns: &'a [ResultSetColumn],
-        order_by: &'a [(Box<Expr>, SortOrder)],
+        order_by: &'a [(Box<Expr>, SortOrder, Option<turso_parser::ast::NullsOrder>)],
     ) -> crate::Result<()> {
         let joined_tables = &plan.joined_tables();
         turso_assert_eq!(joined_tables.len(), 1, "expected only one joined table");
@@ -507,7 +529,6 @@ impl EmitWindow {
                     src_table.table
                 );
             };
-
         let src_columns = src_table.columns().to_vec();
         let src_column_count = src_columns.len();
         let window_name = window.name.clone().expect("window name is missing");
@@ -518,6 +539,7 @@ impl EmitWindow {
         let window_function_count = window.functions.len();
 
         // An ephemeral table used to buffer rows for the current frame
+        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&src_columns);
         let buffer_table = Arc::new(BTreeTable {
             root_page: 0,
             // TODO: Generating the name this way may cause collisions with real tables in the
@@ -533,7 +555,9 @@ impl EmitWindow {
             has_autoincrement: false,
             foreign_keys: vec![],
             check_constraints: vec![],
-            pk_conflict_clause: None,
+            rowid_alias_conflict_clause: None,
+            has_virtual_columns: false,
+            logical_to_physical_map,
         });
         let cursor_buffer_read =
             program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone()));
@@ -555,11 +579,12 @@ impl EmitWindow {
         let reg_acc_start = program.alloc_registers(window_function_count);
         let reg_acc_result_start = program.alloc_registers(window_function_count);
         for (i, func) in window.functions.iter().enumerate() {
-            t_ctx.resolver.expr_to_reg_cache.push((
+            t_ctx.resolver.cache_expr_reg(
                 std::borrow::Cow::Borrowed(&func.original_expr),
                 reg_acc_result_start + i,
                 false,
-            ));
+                None,
+            );
         }
 
         // The same approach applies to expressions referencing the subquery (columns).
@@ -573,11 +598,12 @@ impl EmitWindow {
         )?;
         let reg_col_start = program.alloc_registers(expressions_referencing_subquery.len());
         for (i, (expr, _)) in expressions_referencing_subquery.iter().enumerate() {
-            t_ctx.resolver.expr_to_reg_cache.push((
+            t_ctx.resolver.cache_scalar_expr_reg(
                 std::borrow::Cow::Borrowed(expr),
                 reg_col_start + i,
                 false,
-            ));
+                &plan.table_references,
+            )?;
         }
 
         t_ctx.meta_window = Some(WindowMetadata {
@@ -669,7 +695,7 @@ fn alloc_optional_registers(program: &mut ProgramBuilder, count: usize) -> Optio
 
 fn collect_expressions_referencing_subquery<'a>(
     result_columns: &'a [ResultSetColumn],
-    order_by: &'a [(Box<Expr>, SortOrder)],
+    order_by: &'a [(Box<Expr>, SortOrder, Option<turso_parser::ast::NullsOrder>)],
     subquery_id: &TableInternalId,
 ) -> crate::Result<Vec<(&'a Expr, usize)>> {
     let mut expressions_referencing_subquery: Vec<(&'a Expr, usize)> = Vec::new();
@@ -677,7 +703,7 @@ fn collect_expressions_referencing_subquery<'a>(
     for root_expr in result_columns
         .iter()
         .map(|col| &col.expr)
-        .chain(order_by.iter().map(|(e, _)| e.as_ref()))
+        .chain(order_by.iter().map(|(e, _, _)| e.as_ref()))
     {
         walk_expr(
             root_expr,
@@ -737,6 +763,7 @@ fn emit_flush_buffer_if_new_partition(
             .map(|_| KeyInfo {
                 sort_order: SortOrder::Asc,
                 collation: CollationSeq::default(),
+                nulls_order: None,
             })
             .collect::<Vec<_>>();
         for (i, c) in compare_key_info
@@ -825,6 +852,11 @@ fn emit_reset_state_if_new_partition(
         dest: registers.acc_start,
         dest_end: Some(registers.acc_start + window.functions.len() - 1),
     });
+    for (i, func) in window.functions.iter().enumerate() {
+        if matches!(func.func, WindowFunctionKind::Window(WindowFunc::RowNumber)) {
+            program.emit_int(0, registers.acc_result_start + i);
+        }
+    }
 
     program.preassign_label_to_next_insn(label_skip_reset_state);
 }
@@ -849,6 +881,7 @@ fn emit_flush_buffer_if_not_peer(
             .map(|_| KeyInfo {
                 sort_order: SortOrder::Asc,
                 collation: CollationSeq::default(),
+                nulls_order: None,
             })
             .collect::<Vec<_>>();
         for (i, c) in compare_key_info
@@ -899,7 +932,7 @@ fn emit_load_order_by_columns(
         // Source columns are deduplicated and may appear in a different order than
         // the ORDER BY terms. Therefore, we must restore the original ORDER BY layout
         // here by copying the values into an array of registers.
-        for (i, (expr, _)) in window.order_by.iter().enumerate() {
+        for (i, (expr, _, _)) in window.order_by.iter().enumerate() {
             match expr {
                 Expr::Column { column, .. } => {
                     program.emit_insn(Insn::Copy {
@@ -952,6 +985,9 @@ fn emit_aggregation_step(
     registers: &WindowRegisters,
 ) -> crate::Result<()> {
     for (i, func) in window.functions.iter().enumerate() {
+        let WindowFunctionKind::Agg(agg_func) = &func.func else {
+            continue;
+        };
         // The aggregation step is performed incrementally as each row from the subquery is
         // processed. Therefore, we don’t need to access the buffer table and can obtain argument
         // values directly by evaluating the expressions that reference the subquery result columns.
@@ -967,7 +1003,7 @@ fn emit_aggregation_step(
         translate_aggregation_step(
             program,
             &plan.table_references,
-            AggArgumentSource::new_from_expression(&func.func, &args, &Distinctness::NonDistinct),
+            AggArgumentSource::new_from_expression(agg_func, &args, &Distinctness::NonDistinct),
             reg_acc_start,
             resolver,
         )?;
@@ -1053,15 +1089,26 @@ fn emit_return_buffered_rows(
     } = t_ctx.meta_window.as_ref().expect("missing window metadata");
 
     for (i, func) in window.functions.iter().enumerate() {
-        program.emit_insn(Insn::AggValue {
-            acc_reg: registers.acc_start + i,
-            dest_reg: registers.acc_result_start + i,
-            func: func.func.clone(),
-        });
+        if let WindowFunctionKind::Agg(agg_func) = &func.func {
+            program.emit_insn(Insn::AggValue {
+                acc_reg: registers.acc_start + i,
+                dest_reg: registers.acc_result_start + i,
+                func: agg_func.clone(),
+            });
+        }
     }
 
     let label_skip_returning_row = program.allocate_label();
     let label_loop_start = program.allocate_label();
+    let reg_one = window
+        .functions
+        .iter()
+        .any(|func| matches!(func.func, WindowFunctionKind::Window(WindowFunc::RowNumber)))
+        .then(|| {
+            let reg = program.alloc_register();
+            program.emit_int(1, reg);
+            reg
+        });
     program.preassign_label_to_next_insn(label_loop_start);
 
     // Propagate subquery result column values to the outer query (if any) or directly to
@@ -1070,6 +1117,17 @@ fn emit_return_buffered_rows(
     for (i, (_, col_idx)) in expressions_referencing_subquery.iter().enumerate() {
         let reg_result = registers.result_columns_start + i;
         program.emit_column_or_rowid(cursors.buffer_read, *col_idx, reg_result);
+    }
+    for (i, func) in window.functions.iter().enumerate() {
+        if let WindowFunctionKind::Window(WindowFunc::RowNumber) = &func.func {
+            let reg_one = reg_one.expect("row_number must allocate reg_one");
+            let reg_row_number = registers.acc_result_start + i;
+            program.emit_insn(Insn::Add {
+                lhs: reg_row_number,
+                rhs: reg_one,
+                dest: reg_row_number,
+            });
+        }
     }
     t_ctx.resolver.enable_expr_to_reg_cache();
 

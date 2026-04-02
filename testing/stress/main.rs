@@ -267,7 +267,17 @@ fn generate_random_value(rng: &mut ThreadRng, data_type: &DataType) -> String {
         DataType::Integer => (rng.get_random() % 1000).to_string(),
         DataType::Real => format!("{:.2}", (rng.get_random() % 1000) as f64 / 100.0),
         DataType::Text => format!("'{}'", generate_random_identifier(rng)),
-        DataType::Blob => format!("x'{}'", hex::encode(generate_random_identifier(rng))),
+        DataType::Blob => {
+            // 20% chance of generating a large blob via zeroblob() to trigger
+            // page allocation (the pattern that exposed the savepoint rollback
+            // bug in tursodatabase/turso#6176).
+            if rng.get_random() % 5 == 0 {
+                let size = 1000 + (rng.get_random() % 8000);
+                format!("zeroblob({size})")
+            } else {
+                format!("x'{}'", hex::encode(generate_random_identifier(rng)))
+            }
+        }
         DataType::Numeric => (rng.get_random() % 1000).to_string(),
     }
 }
@@ -884,6 +894,49 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                             turso_macros::turso_assert_unreachable!("fatal error executing query", { "thread": thread, "error": e, "sql": sql });
                         }
                     },
+                }
+
+                // When inside a transaction, 30% chance to exercise savepoints.
+                // This generates the pattern that exposed the pager rollback bug
+                // in tursodatabase/turso#6176: SAVEPOINT → DML (possibly with
+                // large blobs that allocate new pages) → ROLLBACK TO / RELEASE.
+                if tx.is_some() && rng.get_random() % 100 < 30 {
+                    let sp_name = format!("sp_{}", rng.get_random() % 100);
+                    let savepoint_sql = format!("SAVEPOINT {sp_name};");
+                    match conn.execute(&savepoint_sql, ()).await {
+                        Ok(_) => log_sql(&sql_log, thread, &savepoint_sql, "OK"),
+                        Err(e) => log_sql(&sql_log, thread, &savepoint_sql, &format!("ERROR: {e}")),
+                    }
+
+                    // Execute 1-3 DML statements inside the savepoint.
+                    let sp_stmts = 1 + (rng.get_random() % 3) as usize;
+                    for _ in 0..sp_stmts {
+                        let sp_sql = generate_random_statement(&mut rng, &schema_for_task);
+                        match conn.execute(&sp_sql, ()).await {
+                            Ok(_) => log_sql(&sql_log, thread, &sp_sql, "OK"),
+                            Err(turso::Error::Corrupt(e)) => {
+                                log_sql(&sql_log, thread, &sp_sql, &format!("ERROR(corrupt): {e}"));
+                                turso_macros::turso_assert_unreachable!("corrupt error in savepoint", { "thread": thread, "error": e, "sql": sp_sql });
+                            }
+                            Err(e) => log_sql(&sql_log, thread, &sp_sql, &format!("ERROR: {e}")),
+                        }
+                    }
+
+                    // 50% ROLLBACK TO (partial undo), 50% RELEASE (keep changes).
+                    if rng.get_random() % 2 == 0 {
+                        let rollback_sql = format!("ROLLBACK TO {sp_name};");
+                        match conn.execute(&rollback_sql, ()).await {
+                            Ok(_) => log_sql(&sql_log, thread, &rollback_sql, "OK"),
+                            Err(e) => {
+                                log_sql(&sql_log, thread, &rollback_sql, &format!("ERROR: {e}"))
+                            }
+                        }
+                    }
+                    let release_sql = format!("RELEASE {sp_name};");
+                    match conn.execute(&release_sql, ()).await {
+                        Ok(_) => log_sql(&sql_log, thread, &release_sql, "OK"),
+                        Err(e) => log_sql(&sql_log, thread, &release_sql, &format!("ERROR: {e}")),
+                    }
                 }
 
                 if tx.is_some() {

@@ -536,6 +536,57 @@ test.skip("Statement.interrupt()", async (t) => {
   });
 });
 
+test.serial("Query timeout option interrupts long-running query", async (t) => {
+  const path = genDatabaseFilename();
+  const [db] = await connect(path, { defaultQueryTimeout: 50 });
+  const stmt = await db.prepare("SELECT sum(value) FROM generate_series(1, 1000000000);");
+
+  const error = await t.throwsAsync(async () => {
+    await stmt.get();
+  });
+  t.truthy(error);
+  t.true(error.message.toLowerCase().includes("interrupt"));
+
+  await db.close();
+  cleanupDatabaseFiles(path);
+});
+
+test.serial("Query timeout option allows short-running query", async (t) => {
+  const path = genDatabaseFilename();
+  const [db] = await connect(path, { defaultQueryTimeout: 50 });
+  const stmt = await db.prepare("SELECT 1 AS value");
+  t.deepEqual(await stmt.get(), { value: 1 });
+
+  await db.close();
+  cleanupDatabaseFiles(path);
+});
+
+test.serial("Per-query timeout option interrupts long-running Statement.get()", async (t) => {
+  const path = genDatabaseFilename();
+  const [db] = await connect(path);
+  const stmt = await db.prepare("SELECT sum(value) FROM generate_series(1, 1000000000);");
+
+  const error = await t.throwsAsync(async () => {
+    await stmt.get(undefined, { queryTimeout: 50 });
+  });
+  t.truthy(error);
+  t.true(error.message.toLowerCase().includes("interrupt"));
+
+  await db.close();
+  cleanupDatabaseFiles(path);
+});
+
+test.serial("Per-query timeout option is accepted by Database.exec()", async (t) => {
+  const path = genDatabaseFilename();
+  const [db] = await connect(path);
+  await t.notThrowsAsync(async () => {
+    await db.exec("SELECT 1", { queryTimeout: 50 });
+  });
+
+  await db.close();
+  cleanupDatabaseFiles(path);
+});
+
 test.skip("Timeout option", async (t) => {
   const timeout = 1000;
   const path = genDatabaseFilename();
@@ -596,6 +647,166 @@ test.serial("Concurrent writes over same connection", async (t) => {
   t.is(rows[0][0], 22);
 });
 
+// ==========================================================================
+// Database rename
+// ==========================================================================
+
+test.serial("Open database after rename", async (t) => {
+  if (process.env.PROVIDER === "serverless") {
+    t.pass("Skipping rename test for serverless");
+    return;
+  }
+
+  // 1. Open database A, create a table and insert data.
+  const pathA = genDatabaseFilename();
+  const pathB = genDatabaseFilename();
+  const [dbA] = await connect(pathA);
+  await dbA.exec("CREATE TABLE t(x INTEGER)");
+  await dbA.exec("INSERT INTO t VALUES (42)");
+  const row = await (await dbA.prepare("SELECT x FROM t")).get();
+  t.is(row.x, 42);
+
+  // 2. Close database A.
+  await dbA.close();
+
+  // 3. Rename A -> B on disk (main file + WAL + SHM).
+  fs.renameSync(pathA, pathB);
+  if (fs.existsSync(pathA + "-wal")) {
+    fs.renameSync(pathA + "-wal", pathB + "-wal");
+  }
+  if (fs.existsSync(pathA + "-shm")) {
+    fs.renameSync(pathA + "-shm", pathB + "-shm");
+  }
+
+  // 4. Open a new database at the original path A.
+  const [dbA2] = await connect(pathA);
+
+  // 5. The new A should be a fresh, empty database — table 't' must not exist.
+  const tables = await (await dbA2.prepare(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='t'"
+  )).all();
+  t.is(tables.length, 0,
+    "New database at A should not have table 't' — " +
+    "DATABASE_MANAGER returned stale Database after rename"
+  );
+
+  // Cleanup.
+  await dbA2.close();
+  for (const p of [pathA, pathB]) {
+    for (const suffix of ["", "-wal", "-shm"]) {
+      if (fs.existsSync(p + suffix)) fs.unlinkSync(p + suffix);
+    }
+  }
+});
+
+// ==========================================================================
+// Query timeout (serverless only — uses AbortSignal under the hood)
+// ==========================================================================
+
+test.serial("defaultQueryTimeout interrupts long-running query", async (t) => {
+  if (process.env.PROVIDER !== "serverless") {
+    t.pass("Skipping serverless-only test");
+    return;
+  }
+  const turso = await import("@tursodatabase/serverless");
+  const db = turso.connect({
+    url: process.env.TURSO_DATABASE_URL,
+    authToken: process.env.TURSO_AUTH_TOKEN,
+    defaultQueryTimeout: 100,
+  });
+
+  const error = await t.throwsAsync(async () => {
+    await db.execute(
+      "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT * FROM r;"
+    );
+  });
+  t.truthy(error);
+  t.true(error instanceof turso.TimeoutError);
+  t.is(error.code, "TIMEOUT");
+
+  await db.close();
+});
+
+test.serial("defaultQueryTimeout allows short-running query", async (t) => {
+  if (process.env.PROVIDER !== "serverless") {
+    t.pass("Skipping serverless-only test");
+    return;
+  }
+  const turso = await import("@tursodatabase/serverless");
+  const db = turso.connect({
+    url: process.env.TURSO_DATABASE_URL,
+    authToken: process.env.TURSO_AUTH_TOKEN,
+    defaultQueryTimeout: 5000,
+  });
+
+  const result = await db.execute("SELECT 1 AS value");
+  t.is(result.rows.length, 1);
+  t.is(result.rows[0].value, 1);
+
+  await db.close();
+});
+
+test.serial("Per-query queryTimeout interrupts long-running query", async (t) => {
+  if (process.env.PROVIDER !== "serverless") {
+    t.pass("Skipping serverless-only test");
+    return;
+  }
+  const turso = await import("@tursodatabase/serverless");
+  const db = turso.connect({
+    url: process.env.TURSO_DATABASE_URL,
+    authToken: process.env.TURSO_AUTH_TOKEN,
+  });
+
+  const error = await t.throwsAsync(async () => {
+    await db.execute(
+      "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT * FROM r;",
+      [],
+      { queryTimeout: 100 }
+    );
+  });
+  t.truthy(error);
+  t.true(error instanceof turso.TimeoutError);
+  t.is(error.code, "TIMEOUT");
+
+  await db.close();
+});
+
+test.serial("Per-query queryTimeout is accepted by exec()", async (t) => {
+  if (process.env.PROVIDER !== "serverless") {
+    t.pass("Skipping serverless-only test");
+    return;
+  }
+  const turso = await import("@tursodatabase/serverless");
+  const db = turso.connect({
+    url: process.env.TURSO_DATABASE_URL,
+    authToken: process.env.TURSO_AUTH_TOKEN,
+  });
+
+  await t.notThrowsAsync(async () => {
+    await db.exec("SELECT 1", { queryTimeout: 5000 });
+  });
+
+  await db.close();
+});
+
+test.serial("Per-query queryTimeout on Statement.get()", async (t) => {
+  if (process.env.PROVIDER !== "serverless") {
+    t.pass("Skipping serverless-only test");
+    return;
+  }
+  const turso = await import("@tursodatabase/serverless");
+  const db = turso.connect({
+    url: process.env.TURSO_DATABASE_URL,
+    authToken: process.env.TURSO_AUTH_TOKEN,
+  });
+
+  const stmt = await db.prepare("SELECT 1 AS value");
+  const row = await stmt.get(undefined, { queryTimeout: 5000 });
+  t.is(row.value, 1);
+
+  await db.close();
+});
+
 const connect = async (path, options = {}) => {
   if (!path) {
     path = genDatabaseFilename();
@@ -629,4 +840,13 @@ const connect = async (path, options = {}) => {
 /// Generate a unique database filename
 const genDatabaseFilename = () => {
   return `test-${crypto.randomBytes(8).toString('hex')}.db`;
+};
+
+const cleanupDatabaseFiles = (path) => {
+  for (const suffix of ["", "-wal", "-shm"]) {
+    const file = path + suffix;
+    if (fs.existsSync(file)) {
+      fs.unlinkSync(file);
+    }
+  }
 };

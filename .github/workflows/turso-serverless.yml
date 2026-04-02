@@ -5,16 +5,16 @@ on:
   push:
     branches: [ main ]
     paths:
-      - 'packages/turso-serverless/**'
+      - 'serverless/javascript/**'
       - '.github/workflows/turso-serverless.yml'
   pull_request:
     branches: [ main ]
     paths:
-      - 'packages/turso-serverless/**'
+      - 'serverless/javascript/**'
       - '.github/workflows/turso-serverless.yml'
 
 env:
-  working-directory: packages/turso-serverless
+  working-directory: serverless/javascript
 
 jobs:
   build:

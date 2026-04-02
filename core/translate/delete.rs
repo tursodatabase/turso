@@ -27,6 +27,7 @@ pub fn translate_delete(
     where_clause: Option<Box<Expr>>,
     limit: Option<Limit>,
     returning: Vec<ResultColumn>,
+    indexed: Option<turso_parser::ast::Indexed>,
     with: Option<With>,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
@@ -54,6 +55,7 @@ pub fn translate_delete(
         where_clause,
         limit,
         returning,
+        indexed,
         with,
         connection,
         database_id,
@@ -139,6 +141,7 @@ pub fn prepare_delete_plan(
     where_clause: Option<Box<Expr>>,
     limit: Option<Limit>,
     mut returning: Vec<ResultColumn>,
+    indexed: Option<turso_parser::ast::Indexed>,
     with: Option<With>,
     connection: &Arc<crate::Connection>,
     database_id: usize,
@@ -195,6 +198,7 @@ pub fn prepare_delete_plan(
         column_use_counts: Vec::new(),
         expression_index_usages: Vec::new(),
         database_id,
+        indexed,
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
 
@@ -356,6 +360,7 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
                 table: rowid_internal_id,
             },
             alias: None,
+            implicit_column_name: None,
             contains_aggregates: false,
         }],
         where_clause: std::mem::take(&mut plan.where_clause),

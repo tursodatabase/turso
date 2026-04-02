@@ -184,7 +184,16 @@ pub enum HashTableState {
     Building,
     Probing,
     Spilled,
+    GraceProcessing,
     Closed,
+}
+
+/// A probe entry returned by `grace_next_probe_entry()`.
+/// The VDBE writes these to registers for HashProbe to use.
+#[derive(Debug)]
+pub struct GraceProbeEntry {
+    pub key_values: Vec<Value>,
+    pub probe_rowid: i64,
 }
 
 /// A single entry in a hash table bucket.
@@ -203,6 +212,22 @@ pub struct HashEntry {
     /// When populated, these are the result columns needed from the build table,
     /// stored in column index order as specified during hash table construction.
     pub payload_values: Vec<Value>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PendingHashInsert {
+    pub(crate) key_values: Vec<Value>,
+    pub(crate) rowid: i64,
+    pub(crate) payload_values: Vec<Value>,
+}
+
+#[derive(Debug)]
+pub(crate) enum HashInsertResult {
+    Done,
+    IO {
+        io: IOCompletions,
+        pending: PendingHashInsert,
+    },
 }
 
 impl HashEntry {
@@ -815,6 +840,88 @@ impl SpillState {
     }
 }
 
+/// Probe-side buffering/spilling state for grace hash join.
+/// Reuses the same serialization format and types as build-side spilling.
+struct ProbeSpillState {
+    /// In-memory partition buffers for probe rows targeting spilled build partitions.
+    partition_buffers: Vec<PartitionBuffer>,
+    /// Spilled probe partition metadata.
+    partitions: Vec<SpilledPartition>,
+    /// Current file offset for next probe spill write.
+    next_spill_offset: u64,
+    /// Separate temp file for probe-side spills.
+    temp_file: TempFile,
+    /// Same partitioning as build side, so partition indices correspond.
+    partitioning: Partitioning,
+    /// Current memory used by probe buffers.
+    mem_used: usize,
+    /// Memory budget for probe-side buffers.
+    mem_budget: usize,
+}
+
+impl ProbeSpillState {
+    fn new(
+        io: &Arc<dyn IO>,
+        temp_store: crate::TempStore,
+        partitioning: Partitioning,
+        mem_budget: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            partition_buffers: (0..partitioning.count)
+                .map(|_| PartitionBuffer::new())
+                .collect(),
+            partitions: Vec::new(),
+            next_spill_offset: 0,
+            temp_file: TempFile::with_temp_store(io, temp_store)?,
+            partitioning,
+            mem_used: 0,
+            mem_budget,
+        })
+    }
+
+    fn find_partition_mut(&mut self, logical_idx: usize) -> Option<&mut SpilledPartition> {
+        self.partitions
+            .iter_mut()
+            .find(|p| p.partition_idx == logical_idx)
+    }
+
+    fn find_partition(&self, logical_idx: usize) -> Option<&SpilledPartition> {
+        self.partitions
+            .iter()
+            .find(|p| p.partition_idx == logical_idx)
+    }
+}
+
+/// State for grace hash join partition-by-partition processing.
+/// The VDBE drives the loop; this tracks partition iteration and probe chunk loading.
+struct GraceState {
+    /// Current probe entries loaded from disk (one chunk at a time).
+    probe_entries: Vec<HashEntry>,
+    /// Cursor into probe_entries.
+    probe_entry_cursor: usize,
+    /// Ordered list of partition indices to process (only spilled ones).
+    partitions_to_process: Vec<usize>,
+    /// Index into partitions_to_process.
+    partition_list_idx: usize,
+    /// Current load state for the active grace partition.
+    load_state: GracePartitionLoadState,
+}
+
+impl GraceState {
+    fn current_partition_idx(&self) -> Option<usize> {
+        self.partitions_to_process
+            .get(self.partition_list_idx)
+            .copied()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GracePartitionLoadState {
+    NeedBuildLoad,
+    NeedProbeLoad,
+    Ready,
+}
+
 /// HashTable is the build-side data structure used for hash joins and DISTINCT. It behaves like a
 /// standard in-memory hash table until a configurable memory budget is exceeded, at
 /// which point it transparently switches to a grace-hash-join style layout and spills
@@ -865,7 +972,8 @@ pub struct HashTable {
     current_spill_partition_idx: usize,
     /// Track non-empty buckets for fast clear in distinct/group-by usage.
     non_empty_buckets: Vec<usize>,
-    /// LRU of loaded partitions to cap probe-time memory
+    /// LRU of resident spilled partitions to cap memory for DISTINCT, grace,
+    /// and unmatched-scan partition loads.
     loaded_partitions_lru: RefCell<VecDeque<usize>>,
     /// Memory used by resident (loaded or in-memory) partitions
     loaded_partitions_mem: usize,
@@ -883,8 +991,10 @@ pub struct HashTable {
     unmatched_scan_partition: usize,
     /// Optional override for partition count selection
     partition_count_override: Option<usize>,
-    /// Track last probed partition for switch metrics
-    last_probe_partition: Option<usize>,
+    /// Probe-side spill state for grace hash join.
+    probe_spill_state: Option<ProbeSpillState>,
+    /// Grace processing state machine.
+    grace_state: Option<GraceState>,
 }
 
 crate::assert::assert_send!(HashTable);
@@ -905,6 +1015,22 @@ enum SpillAction {
     },
     Restart,
     NotFound,
+}
+
+enum GraceProbeChunkAction {
+    WaitingForIO,
+    ParseChunk {
+        partition_idx: usize,
+    },
+    LoadChunk {
+        read_size: usize,
+        file_offset: u64,
+        io_state: Arc<AtomicSpillIOState>,
+        buffer_len: Arc<AtomicUsize>,
+        read_buffer_ref: Arc<RwLock<Vec<u8>>>,
+    },
+    Restart,
+    NoMoreChunks,
 }
 
 enum ParseChunkResult {
@@ -948,7 +1074,8 @@ impl HashTable {
             unmatched_scan_entry: 0,
             unmatched_scan_partition: 0,
             partition_count_override: config.partition_count,
-            last_probe_partition: None,
+            probe_spill_state: None,
+            grace_state: None,
         }
     }
 
@@ -988,28 +1115,9 @@ impl HashTable {
         spill_state.partitioning.index(hash)
     }
 
-    fn record_probe_partition(
-        &mut self,
-        partition_idx: usize,
-        metrics: Option<&mut HashJoinMetrics>,
-    ) {
+    fn record_probe_call(&mut self, metrics: Option<&mut HashJoinMetrics>) {
         if let Some(metrics) = metrics {
             metrics.probe_calls = metrics.probe_calls.saturating_add(1);
-            if let Some(prev) = self.last_probe_partition {
-                if prev != partition_idx {
-                    metrics.probe_partition_switches =
-                        metrics.probe_partition_switches.saturating_add(1);
-                }
-            }
-        }
-        self.last_probe_partition = Some(partition_idx);
-    }
-
-    fn update_max_loaded_mem(&mut self, metrics: Option<&mut HashJoinMetrics>) {
-        if let Some(metrics) = metrics {
-            metrics.max_loaded_partitions_mem = metrics
-                .max_loaded_partitions_mem
-                .max(self.loaded_partitions_mem as u64);
         }
     }
 
@@ -1024,8 +1132,24 @@ impl HashTable {
         payload_values: Vec<Value>,
         metrics: Option<&mut HashJoinMetrics>,
     ) -> Result<IOResult<()>> {
+        let pending = PendingHashInsert {
+            key_values,
+            rowid,
+            payload_values,
+        };
+        match self.insert_pending(pending, metrics)? {
+            HashInsertResult::Done => Ok(IOResult::Done(())),
+            HashInsertResult::IO { io, .. } => Ok(IOResult::IO(io)),
+        }
+    }
+
+    pub(crate) fn insert_pending(
+        &mut self,
+        pending: PendingHashInsert,
+        metrics: Option<&mut HashJoinMetrics>,
+    ) -> Result<HashInsertResult> {
         turso_assert!(
-            self.state == HashTableState::Building || self.state == HashTableState::Spilled,
+            matches!(self.state,  HashTableState::Building | HashTableState::Spilled),
             "Cannot insert into hash table in unexpected state",
             { "state": format!("{:?}", self.state) }
         );
@@ -1033,20 +1157,14 @@ impl HashTable {
         // Skip rows with NULL join keys - they can never match anything since NULL != NULL in SQL.
         // However, when track_matched is enabled (outer joins), we must keep NULL-key entries
         // so they appear as unmatched in the unmatched scan.
-        if has_null_key(&key_values) && !self.track_matched {
-            return Ok(IOResult::Done(()));
+        if has_null_key(&pending.key_values) && !self.track_matched {
+            return Ok(HashInsertResult::Done);
         }
 
         // Compute hash of the join keys using collations
-        let key_refs: Vec<ValueRef> = key_values.iter().map(|v| v.as_ref()).collect();
+        let key_refs: Vec<ValueRef> = pending.key_values.iter().map(|v| v.as_ref()).collect();
         let hash = hash_join_key(&key_refs, &self.collations);
-
-        let entry = if payload_values.is_empty() {
-            HashEntry::new(hash, key_values, rowid)
-        } else {
-            HashEntry::new_with_payload(hash, key_values, rowid, payload_values)
-        };
-        let entry_size = entry.size_bytes();
+        let entry_size = HashEntry::size_from_values(&pending.key_values, &pending.payload_values);
 
         // Check if we would exceed memory budget
         if self.mem_used + entry_size > self.mem_budget {
@@ -1069,10 +1187,24 @@ impl HashTable {
             if let Some(c) = self.spill_partitions_for_entry(entry_size, metrics)? {
                 // I/O pending, caller will re-enter after completion and retry the insert.
                 if !c.finished() {
-                    return Ok(IOResult::IO(IOCompletions::Single(c)));
+                    return Ok(HashInsertResult::IO {
+                        io: IOCompletions::Single(c),
+                        pending,
+                    });
                 }
             }
         }
+
+        let PendingHashInsert {
+            key_values,
+            rowid,
+            payload_values,
+        } = pending;
+        let entry = if payload_values.is_empty() {
+            HashEntry::new(hash, key_values, rowid)
+        } else {
+            HashEntry::new_with_payload(hash, key_values, rowid, payload_values)
+        };
 
         if self.spill_state.is_some() {
             let partition_idx = {
@@ -1097,7 +1229,7 @@ impl HashTable {
         self.num_entries += 1;
         self.mem_used += entry_size;
 
-        Ok(IOResult::Done(()))
+        Ok(HashInsertResult::Done)
     }
 
     /// Insert keys into the hash table if not already present.
@@ -1222,10 +1354,11 @@ impl HashTable {
             self.probe_bucket_idx = 0;
             self.probe_entry_idx = 0;
             self.current_spill_partition_idx = 0;
-            self.last_probe_partition = None;
             self.loaded_partitions_lru.borrow_mut().clear();
             self.loaded_partitions_mem = 0;
             self.non_empty_buckets.clear();
+            self.probe_spill_state = None;
+            self.grace_state = None;
             return;
         }
 
@@ -1250,7 +1383,6 @@ impl HashTable {
         self.probe_bucket_idx = 0;
         self.probe_entry_idx = 0;
         self.current_spill_partition_idx = 0;
-        self.last_probe_partition = None;
         self.loaded_partitions_lru.borrow_mut().clear();
         self.loaded_partitions_mem = 0;
     }
@@ -1735,7 +1867,7 @@ impl HashTable {
                 spill_state.partitioning
             };
             let target_partition = partitioning.index(hash);
-            self.record_probe_partition(target_partition, metrics);
+            self.record_probe_call(metrics);
             self.touch_partition_lru(target_partition);
 
             let bucket_idx = {
@@ -1817,7 +1949,7 @@ impl HashTable {
     /// Get the next matching entry for the current probe keys.
     pub fn next_match(&mut self) -> Option<&HashEntry> {
         turso_assert!(
-            self.state == HashTableState::Probing,
+            self.state == HashTableState::Probing || self.state == HashTableState::GraceProcessing,
             "Cannot get next match in unexpected state",
             { "state": format!("{:?}", self.state) }
         );
@@ -1892,6 +2024,22 @@ impl HashTable {
         }
     }
 
+    /// Reset all matched_bits to false. Called at the start of each outer-loop
+    /// iteration so that marks from a previous iteration don't suppress NULL-fill
+    /// rows in the current one.
+    pub fn reset_matched_bits(&mut self) {
+        if let Some(spill_state) = self.spill_state.as_mut() {
+            for partition in &mut spill_state.partitions {
+                for bits in &mut partition.matched_bits {
+                    bits.fill(false);
+                }
+            }
+        }
+        for bits in &mut self.matched_bits {
+            bits.fill(false);
+        }
+    }
+
     /// Reset the unmatched scan state to the beginning.
     pub fn begin_unmatched_scan(&mut self) {
         self.unmatched_scan_bucket = 0;
@@ -1903,9 +2051,27 @@ impl HashTable {
     /// Returns the entry if found, or None when the scan is complete
     /// (or a spilled partition needs loading).
     pub fn next_unmatched(&mut self) -> Option<&HashEntry> {
-        if self.spill_state.is_some() {
+        let has_spill_state = self.spill_state.is_some();
+        let in_grace = self.grace_state.is_some();
+        let has_pending_grace = !in_grace && self.has_grace_partitions();
+
+        if has_spill_state {
+            if in_grace {
+                // During grace: scan only the partition currently owned by grace.
+                return self.next_unmatched_current_grace_partition();
+            }
+            if has_pending_grace {
+                // Before grace starts, emit unmatched rows from never-spilled in-memory
+                // partitions here. Grace will handle only partitions that actually have
+                // disk chunks, so skipping these would lose unmatched build rows.
+                return self.next_unmatched_spilled_in_memory_only();
+            }
             return self.next_unmatched_spilled();
         }
+        self.next_unmatched_main_buckets()
+    }
+
+    fn next_unmatched_main_buckets(&mut self) -> Option<&HashEntry> {
         while self.unmatched_scan_bucket < self.buckets.len() {
             let bucket = &self.buckets[self.unmatched_scan_bucket];
             let matched = &self.matched_bits[self.unmatched_scan_bucket];
@@ -1953,8 +2119,84 @@ impl HashTable {
         None
     }
 
+    /// Scan unmatched rows from partitions that stayed resident in memory after spilling.
+    /// These partitions have no disk chunks, so grace never revisits them.
+    fn next_unmatched_spilled_in_memory_only(&mut self) -> Option<&HashEntry> {
+        let spill_state = self.spill_state.as_ref()?;
+        while self.unmatched_scan_partition < spill_state.partitions.len() {
+            let partition = &spill_state.partitions[self.unmatched_scan_partition];
+            if !partition.chunks.is_empty() {
+                self.unmatched_scan_partition += 1;
+                self.unmatched_scan_bucket = 0;
+                self.unmatched_scan_entry = 0;
+                continue;
+            }
+
+            turso_assert!(
+                partition.is_loaded(),
+                "in-memory partition unexpectedly unavailable during unmatched scan",
+                { "partition_idx": partition.partition_idx }
+            );
+
+            while self.unmatched_scan_bucket < partition.buckets.len() {
+                let bucket = &partition.buckets[self.unmatched_scan_bucket];
+                let matched = &partition.matched_bits[self.unmatched_scan_bucket];
+                while self.unmatched_scan_entry < bucket.entries.len() {
+                    let idx = self.unmatched_scan_entry;
+                    self.unmatched_scan_entry += 1;
+                    if !matched[idx] {
+                        return Some(&bucket.entries[idx]);
+                    }
+                }
+                self.unmatched_scan_bucket += 1;
+                self.unmatched_scan_entry = 0;
+            }
+
+            self.unmatched_scan_partition += 1;
+            self.unmatched_scan_bucket = 0;
+            self.unmatched_scan_entry = 0;
+        }
+        None
+    }
+
+    /// Scan unmatched entries only for the active grace partition.
+    /// Grace unmatched emission happens partition-by-partition before eviction, so
+    /// scanning any other loaded partition can duplicate or suppress rows.
+    fn next_unmatched_current_grace_partition(&mut self) -> Option<&HashEntry> {
+        let partition_idx = self.grace_state.as_ref()?.current_partition_idx()?;
+        let spill_state = self.spill_state.as_ref()?;
+        let partition = spill_state
+            .find_partition(partition_idx)
+            .expect("current grace partition missing from spill state");
+
+        if !partition.is_loaded() {
+            return None;
+        }
+
+        while self.unmatched_scan_bucket < partition.buckets.len() {
+            let bucket = &partition.buckets[self.unmatched_scan_bucket];
+            let matched = &partition.matched_bits[self.unmatched_scan_bucket];
+            while self.unmatched_scan_entry < bucket.entries.len() {
+                let idx = self.unmatched_scan_entry;
+                self.unmatched_scan_entry += 1;
+                if !matched[idx] {
+                    return Some(&bucket.entries[idx]);
+                }
+            }
+            self.unmatched_scan_bucket += 1;
+            self.unmatched_scan_entry = 0;
+        }
+        None
+    }
+
     /// Get the current partition index for unmatched scan (for spilled partition loading).
     pub fn unmatched_scan_current_partition(&self) -> Option<usize> {
+        if let Some(grace_state) = self.grace_state.as_ref() {
+            return grace_state.current_partition_idx();
+        }
+        if self.has_grace_partitions() {
+            return None;
+        }
         let spill_state = self.spill_state.as_ref()?;
         if self.unmatched_scan_partition < spill_state.partitions.len() {
             Some(spill_state.partitions[self.unmatched_scan_partition].partition_idx)
@@ -1999,8 +2241,7 @@ impl HashTable {
                 };
                 let io_state = spilled.io_state.get();
 
-                if matches!(io_state, SpillIOState::Error) {
-                    mark_unlikely();
+                if unlikely(matches!(io_state, SpillIOState::Error)) {
                     return Err(LimboError::InternalError(
                         "hash join spill I/O failure".into(),
                     ));
@@ -2021,10 +2262,6 @@ impl HashTable {
                             let is_first_load = matches!(spilled.state, PartitionState::OnDisk)
                                 && spilled.current_chunk_idx == 0;
                             if is_first_load {
-                                if let Some(metrics) = metrics.as_deref_mut() {
-                                    metrics.partition_loads =
-                                        metrics.partition_loads.saturating_add(1);
-                                }
                                 let total_entries = spilled.total_num_entries();
                                 let bucket_count = total_entries.next_power_of_two().max(64);
                                 spilled.buckets =
@@ -2062,14 +2299,6 @@ impl HashTable {
                         }
                         None => {
                             // No chunks at all: partition is logically empty, mark as loaded.
-                            if matches!(spilled.state, PartitionState::OnDisk)
-                                && spilled.current_chunk_idx == 0
-                            {
-                                if let Some(metrics) = metrics.as_deref_mut() {
-                                    metrics.partition_loads =
-                                        metrics.partition_loads.saturating_add(1);
-                                }
-                            }
                             spilled.state = PartitionState::Loaded;
                             SpillAction::NoChunks
                         }
@@ -2083,9 +2312,8 @@ impl HashTable {
                     return Ok(IOResult::Done(()));
                 }
                 SpillAction::NoChunks => {
-                    self.evict_partitions_to_fit(0, partition_idx, metrics.as_deref_mut());
+                    self.evict_partitions_to_fit(0, partition_idx);
                     self.record_partition_resident(partition_idx, 0);
-                    self.update_max_loaded_mem(metrics.as_deref_mut());
                     return Ok(IOResult::Done(()));
                 }
                 SpillAction::NotFound => {
@@ -2095,13 +2323,8 @@ impl HashTable {
                     match self.parse_partition_chunk(partition_idx, metrics.as_deref_mut())? {
                         ParseChunkResult::MoreChunks => continue,
                         ParseChunkResult::Done { resident_mem } => {
-                            self.evict_partitions_to_fit(
-                                resident_mem,
-                                partition_idx,
-                                metrics.as_deref_mut(),
-                            );
+                            self.evict_partitions_to_fit(resident_mem, partition_idx);
                             self.record_partition_resident(partition_idx, resident_mem);
-                            self.update_max_loaded_mem(metrics.as_deref_mut());
                             return Ok(IOResult::Done(()));
                         }
                     }
@@ -2283,7 +2506,7 @@ impl HashTable {
         self.current_probe_keys = Some(probe_keys.to_vec());
         self.current_probe_hash = Some(hash);
 
-        self.record_probe_partition(partition_idx, metrics);
+        self.record_probe_call(metrics);
         self.touch_partition_lru(partition_idx);
         let spill_state = self.spill_state.as_ref()?;
         let partition = spill_state.find_partition(partition_idx)?;
@@ -2328,7 +2551,8 @@ impl HashTable {
         buckets.iter().map(|b| b.size_bytes()).sum()
     }
 
-    /// Touch a partition for LRU ordering without changing its accounted memory.
+    /// Touch a resident spilled partition for LRU ordering without changing its
+    /// accounted memory.
     fn touch_partition_lru(&self, partition_idx: usize) {
         let mut lru = self.loaded_partitions_lru.borrow_mut();
         if let Some(pos) = lru.iter().position(|p| *p == partition_idx) {
@@ -2337,7 +2561,8 @@ impl HashTable {
         lru.push_back(partition_idx);
     }
 
-    /// Record that a partition is resident with the given memory footprint and update LRU.
+    /// Record that a spilled partition is resident with the given memory
+    /// footprint and update LRU ordering.
     fn record_partition_resident(&mut self, partition_idx: usize, mem_used: usize) {
         if let Some(spill_state) = self.spill_state.as_mut() {
             if let Some(partition) = spill_state.find_partition_mut(partition_idx) {
@@ -2351,12 +2576,7 @@ impl HashTable {
         }
     }
 
-    fn evict_partitions_to_fit(
-        &mut self,
-        incoming_mem: usize,
-        protect_idx: usize,
-        mut metrics: Option<&mut HashJoinMetrics>,
-    ) {
+    fn evict_partitions_to_fit(&mut self, incoming_mem: usize, protect_idx: usize) {
         while self.mem_used + self.loaded_partitions_mem + incoming_mem > self.mem_budget {
             let Some(victim_idx) = self.next_evictable(protect_idx) else {
                 break;
@@ -2376,10 +2596,6 @@ impl HashTable {
                         victim.partial_entry.clear();
                         victim.parsed_entries = 0;
                         victim.io_state.set(SpillIOState::None);
-                        if let Some(metrics) = metrics.as_deref_mut() {
-                            metrics.partition_evictions =
-                                metrics.partition_evictions.saturating_add(1);
-                        }
                     }
                 }
             }
@@ -2388,7 +2604,8 @@ impl HashTable {
         }
     }
 
-    /// Find the next evictable partition (LRU) that is not protected and has backing spill data.
+    /// Find the next evictable resident spilled partition (LRU) that is not
+    /// protected and has backing spill data.
     fn next_evictable(&mut self, protect_idx: usize) -> Option<usize> {
         let spill_state = self.spill_state.as_ref()?;
 
@@ -2411,6 +2628,585 @@ impl HashTable {
         None
     }
 
+    /// Buffer a probe row whose target build partition is on disk.
+    /// Called from op_hash_probe when `probe_rowid_reg` is Some and the
+    /// partition is OnDisk.
+    pub fn buffer_probe_row(
+        &mut self,
+        key_values: Vec<Value>,
+        probe_rowid: i64,
+        metrics: Option<&mut HashJoinMetrics>,
+    ) -> Result<IOResult<()>> {
+        let spill_state = self
+            .spill_state
+            .as_ref()
+            .expect("buffer_probe_row requires build-side spill state");
+        let partitioning = spill_state.partitioning;
+
+        // Lazily initialize probe spill state on first call
+        if self.probe_spill_state.is_none() {
+            self.probe_spill_state = Some(ProbeSpillState::new(
+                &self.io,
+                self.temp_store,
+                partitioning,
+                self.mem_budget / 2,
+            )?);
+        }
+
+        let key_refs: Vec<ValueRef> = key_values.iter().map(|v| v.as_ref()).collect();
+        let hash = hash_join_key(&key_refs, &self.collations);
+        let partition_idx = partitioning.index(hash);
+
+        let entry = HashEntry::new(hash, key_values, probe_rowid);
+        let entry_size = entry.size_bytes();
+
+        let probe_state = self
+            .probe_spill_state
+            .as_mut()
+            .expect("probe spill state just initialized");
+
+        probe_state.partition_buffers[partition_idx].insert(entry);
+        probe_state.mem_used += entry_size;
+
+        if let Some(metrics) = metrics {
+            metrics.grace_probe_rows_buffered = metrics.grace_probe_rows_buffered.saturating_add(1);
+        }
+
+        // If probe buffers exceed budget, spill the largest one
+        if probe_state.mem_used > probe_state.mem_budget {
+            if let Some(c) = self.spill_largest_probe_partition(None)? {
+                if !c.finished() {
+                    return Ok(IOResult::IO(IOCompletions::Single(c)));
+                }
+            }
+        }
+
+        Ok(IOResult::Done(()))
+    }
+
+    /// Spill the largest probe partition buffer to disk.
+    fn spill_largest_probe_partition(
+        &mut self,
+        metrics: Option<&mut HashJoinMetrics>,
+    ) -> Result<Option<Completion>> {
+        let probe_state = self
+            .probe_spill_state
+            .as_mut()
+            .expect("probe spill state must exist");
+
+        let largest_idx = probe_state
+            .partition_buffers
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| !p.is_empty())
+            .max_by_key(|(_, p)| p.mem_used)
+            .map(|(idx, _)| idx);
+
+        let Some(partition_idx) = largest_idx else {
+            return Ok(None);
+        };
+
+        Self::spill_probe_partition(probe_state, partition_idx, &self.io, metrics)
+    }
+
+    /// Spill a probe partition buffer to its temp file.
+    fn spill_probe_partition(
+        probe_state: &mut ProbeSpillState,
+        partition_idx: usize,
+        io: &Arc<dyn IO>,
+        metrics: Option<&mut HashJoinMetrics>,
+    ) -> Result<Option<Completion>> {
+        let partition = &probe_state.partition_buffers[partition_idx];
+        if partition.is_empty() {
+            return Ok(None);
+        }
+
+        // Calculate total serialized size
+        let mut total_size = 0usize;
+        let mut entry_sizes = Vec::with_capacity(partition.entries.len());
+        for entry in &partition.entries {
+            let s = entry.serialized_size();
+            entry_sizes.push(s);
+            total_size += varint_len(s as u64) + s;
+        }
+
+        // Serialize into I/O buffer
+        let buffer = Buffer::new_temporary(total_size);
+        let buf = buffer.as_mut_slice();
+        let mut offset = 0;
+        for (entry, &entry_size) in partition.entries.iter().zip(entry_sizes.iter()) {
+            offset += write_varint(&mut buf[offset..], entry_size as u64);
+            offset += entry.serialize_to_slice(&mut buf[offset..]);
+        }
+        turso_assert!(offset == total_size, "serialized size mismatch");
+
+        let file_offset = probe_state.next_spill_offset;
+        let num_entries = partition.entries.len();
+        let mem_freed = partition.mem_used;
+
+        probe_state.partition_buffers[partition_idx].clear();
+
+        // Record chunk
+        let io_state = if let Some(existing) = probe_state.find_partition_mut(partition_idx) {
+            existing.add_chunk(file_offset, total_size, num_entries);
+            existing.io_state.clone()
+        } else {
+            let mut new_partition = SpilledPartition::new(partition_idx);
+            new_partition.add_chunk(file_offset, total_size, num_entries);
+            let io_state = new_partition.io_state.clone();
+            probe_state.partitions.push(new_partition);
+            io_state
+        };
+
+        if let Some(metrics) = metrics {
+            metrics.probe_spill_bytes_written = metrics
+                .probe_spill_bytes_written
+                .saturating_add(total_size as u64);
+            metrics.probe_spill_chunks = metrics.probe_spill_chunks.saturating_add(1);
+        }
+
+        io_state.set(SpillIOState::WaitingForWrite);
+        let buffer_ref = Arc::new(buffer);
+        let write_complete = Box::new(move |res: Result<i32, crate::CompletionError>| match res {
+            Ok(_) => io_state.set(SpillIOState::WriteComplete),
+            Err(e) => {
+                tracing::error!("Error writing probe partition to disk: {e:?}");
+                io_state.set(SpillIOState::Error);
+            }
+        });
+
+        let completion = Completion::new_write(write_complete);
+        let file = probe_state.temp_file.file.clone();
+        let completion = file.pwrite(file_offset, buffer_ref, completion)?;
+
+        probe_state.mem_used -= mem_freed;
+        probe_state.next_spill_offset += total_size as u64;
+        let _ = io;
+        Ok(Some(completion))
+    }
+
+    /// Finalize probe-side spilling after the probe cursor is exhausted.
+    /// Flushes remaining in-memory probe buffers for partitions that have spill
+    /// chunks, keeps purely in-memory probe buffers as-is.
+    pub fn finalize_probe_spill(
+        &mut self,
+        metrics: Option<&mut HashJoinMetrics>,
+    ) -> Result<IOResult<()>> {
+        let mut metrics = metrics;
+        let Some(probe_state) = self.probe_spill_state.as_ref() else {
+            return Ok(IOResult::Done(()));
+        };
+
+        // Wait for any pending probe writes
+        for spilled in &probe_state.partitions {
+            if matches!(spilled.io_state.get(), SpillIOState::WaitingForWrite) {
+                io_yield_one!(Completion::new_yield());
+            }
+        }
+
+        // Collect partition indices that need flushing
+        let partition_count = probe_state.partitioning.count;
+        let mut flush_targets = Vec::new();
+        for partition_idx in 0..partition_count {
+            if probe_state.partition_buffers[partition_idx].is_empty() {
+                continue;
+            }
+            if probe_state.find_partition(partition_idx).is_some() {
+                flush_targets.push(partition_idx);
+            }
+        }
+
+        for partition_idx in flush_targets {
+            if let Some(c) = Self::spill_probe_partition(
+                self.probe_spill_state.as_mut().expect("probe state exists"),
+                partition_idx,
+                &self.io,
+                metrics.as_deref_mut(),
+            )? {
+                if !c.finished() {
+                    io_yield_one!(c);
+                }
+            }
+        }
+
+        Ok(IOResult::Done(()))
+    }
+
+    /// Initialize grace processing. Builds partition list, frees in-memory build partitions.
+    /// Returns true if there are partitions to process. No IO.
+    pub fn grace_begin(&mut self) -> bool {
+        if self.probe_spill_state.is_none() || self.spill_state.is_none() {
+            return false;
+        }
+
+        // Build list of partitions that were spilled on the build side
+        let partitions_to_process: Vec<usize> = {
+            let spill_state = self.spill_state.as_ref().expect("spill state exists");
+            spill_state
+                .partitions
+                .iter()
+                .filter(|p| !p.chunks.is_empty())
+                .map(|p| p.partition_idx)
+                .collect()
+        };
+
+        if partitions_to_process.is_empty() {
+            return false;
+        }
+
+        // Free in-memory build partitions -- initial probe is done with them
+        self.free_in_memory_build_partitions();
+
+        self.grace_state = Some(GraceState {
+            probe_entries: Vec::new(),
+            probe_entry_cursor: 0,
+            partitions_to_process,
+            partition_list_idx: 0,
+            load_state: GracePartitionLoadState::NeedBuildLoad,
+        });
+
+        if let Some(probe_state) = self.probe_spill_state.as_mut() {
+            for partition in &mut probe_state.partitions {
+                partition.current_chunk_idx = 0;
+                partition.buffer_len.store(0, atomic::Ordering::Release);
+                partition.read_buffer.write().clear();
+                partition.partial_entry.clear();
+                partition.parsed_entries = 0;
+                partition.io_state.set(SpillIOState::None);
+            }
+        }
+
+        self.state = HashTableState::GraceProcessing;
+        true
+    }
+
+    /// Load build partition at current index + first probe chunk. IO-blocking.
+    /// Returns true if loaded, false if partition list exhausted.
+    pub fn grace_load_current_partition(
+        &mut self,
+        mut metrics: Option<&mut HashJoinMetrics>,
+    ) -> Result<IOResult<bool>> {
+        loop {
+            let grace = self.grace_state.as_ref().expect("grace state must exist");
+            if grace.partition_list_idx >= grace.partitions_to_process.len() {
+                return Ok(IOResult::Done(false));
+            }
+
+            let partition_idx = grace.partitions_to_process[grace.partition_list_idx];
+            match grace.load_state {
+                GracePartitionLoadState::NeedBuildLoad => {
+                    self.evict_all_loaded_partitions();
+                    return_if_io!(
+                        self.load_spilled_partition(partition_idx, metrics.as_deref_mut())
+                    );
+
+                    let grace = self.grace_state.as_mut().expect("grace state");
+                    grace.probe_entries.clear();
+                    grace.probe_entry_cursor = 0;
+                    grace.load_state = GracePartitionLoadState::NeedProbeLoad;
+                }
+                GracePartitionLoadState::NeedProbeLoad => {
+                    return_if_io!(self.grace_load_probe_entries(partition_idx));
+
+                    let grace = self.grace_state.as_mut().expect("grace state");
+                    grace.load_state = GracePartitionLoadState::Ready;
+                    if let Some(m) = metrics.as_mut() {
+                        m.grace_partitions_processed =
+                            m.grace_partitions_processed.saturating_add(1);
+                    }
+                    return Ok(IOResult::Done(true));
+                }
+                GracePartitionLoadState::Ready => return Ok(IOResult::Done(true)),
+            }
+        }
+    }
+
+    /// Advance to next probe entry. Returns keys+rowid or None when exhausted.
+    pub fn grace_next_probe_entry(&mut self) -> Result<IOResult<Option<GraceProbeEntry>>> {
+        loop {
+            let grace = self.grace_state.as_ref().expect("grace state must exist");
+            if grace.probe_entry_cursor < grace.probe_entries.len() {
+                let entry = &grace.probe_entries[grace.probe_entry_cursor];
+                let result = GraceProbeEntry {
+                    key_values: entry.key_values.clone(),
+                    probe_rowid: entry.rowid,
+                };
+                let grace = self.grace_state.as_mut().expect("grace state");
+                grace.probe_entry_cursor += 1;
+                return Ok(IOResult::Done(Some(result)));
+            }
+
+            // Current probe entries exhausted, try loading more
+            let grace = self.grace_state.as_ref().expect("grace state");
+            let partition_idx = match grace.current_partition_idx() {
+                Some(idx) => idx,
+                None => return Ok(IOResult::Done(None)),
+            };
+            match self.grace_try_load_next_probe_chunk(partition_idx)? {
+                IOResult::Done(true) => continue,
+                IOResult::Done(false) => return Ok(IOResult::Done(None)),
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            }
+        }
+    }
+
+    /// Try to load the next probe chunk for the given partition.
+    /// Returns true if more probe entries were loaded, false if exhausted.
+    fn grace_try_load_next_probe_chunk(&mut self, partition_idx: usize) -> Result<IOResult<bool>> {
+        loop {
+            let Some(probe_state) = self.probe_spill_state.as_ref() else {
+                return Ok(IOResult::Done(false));
+            };
+
+            let Some(spilled) = probe_state.find_partition(partition_idx) else {
+                return Ok(IOResult::Done(false));
+            };
+
+            if spilled.current_chunk_idx >= spilled.chunks.len() {
+                return Ok(IOResult::Done(false));
+            }
+
+            match self.grace_load_next_probe_chunk(partition_idx)? {
+                IOResult::Done(true) => return Ok(IOResult::Done(true)),
+                IOResult::Done(false) => continue,
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            }
+        }
+    }
+
+    /// Evict current partition, advance to next. Returns true if more partitions. No IO.
+    pub fn grace_advance_partition(&mut self) -> bool {
+        self.evict_all_loaded_partitions();
+        let grace = self.grace_state.as_mut().expect("grace state must exist");
+        grace.partition_list_idx += 1;
+        grace.probe_entries.clear();
+        grace.probe_entry_cursor = 0;
+        grace.load_state = GracePartitionLoadState::NeedBuildLoad;
+        grace.partition_list_idx < grace.partitions_to_process.len()
+    }
+
+    /// Free all in-memory build partitions (InMemory state).
+    fn free_in_memory_build_partitions(&mut self) {
+        if let Some(spill_state) = self.spill_state.as_mut() {
+            for partition in &mut spill_state.partitions {
+                if matches!(partition.state, PartitionState::InMemory) {
+                    partition.buckets.clear();
+                    partition.state = PartitionState::OnDisk;
+                    partition.resident_mem = 0;
+                }
+            }
+        }
+        // Also free the main buckets
+        self.buckets.clear();
+        self.loaded_partitions_lru.borrow_mut().clear();
+        self.loaded_partitions_mem = 0;
+    }
+
+    /// Evict all currently loaded build partitions.
+    fn evict_all_loaded_partitions(&mut self) {
+        if let Some(spill_state) = self.spill_state.as_mut() {
+            for partition in &mut spill_state.partitions {
+                if matches!(partition.state, PartitionState::Loaded) && !partition.chunks.is_empty()
+                {
+                    partition.buckets.clear();
+                    partition.state = PartitionState::OnDisk;
+                    partition.resident_mem = 0;
+                    partition.current_chunk_idx = 0;
+                    partition.buffer_len.store(0, atomic::Ordering::Release);
+                    partition.read_buffer.write().clear();
+                    partition.partial_entry.clear();
+                    partition.parsed_entries = 0;
+                    partition.io_state.set(SpillIOState::None);
+                }
+            }
+        }
+        self.loaded_partitions_lru.borrow_mut().clear();
+        self.loaded_partitions_mem = 0;
+    }
+
+    /// Load probe entries for a given partition into grace_state.probe_entries.
+    /// Loads from in-memory buffers or from the first spill chunk.
+    fn grace_load_probe_entries(&mut self, partition_idx: usize) -> Result<IOResult<()>> {
+        {
+            let grace = self.grace_state.as_mut().expect("grace state");
+            grace.probe_entries.clear();
+            grace.probe_entry_cursor = 0;
+        }
+
+        let Some(probe_state) = self.probe_spill_state.as_ref() else {
+            return Ok(IOResult::Done(()));
+        };
+
+        // First: check if there are in-memory entries for this partition
+        let buffer = &probe_state.partition_buffers[partition_idx];
+        if !buffer.is_empty() {
+            let grace = self.grace_state.as_mut().expect("grace state");
+            grace.probe_entries.clone_from(&buffer.entries);
+            return Ok(IOResult::Done(()));
+        }
+
+        // Check if there are spill chunks
+        let Some(spilled) = probe_state.find_partition(partition_idx) else {
+            return Ok(IOResult::Done(()));
+        };
+        if spilled.chunks.is_empty() {
+            return Ok(IOResult::Done(()));
+        }
+
+        self.grace_load_next_probe_chunk(partition_idx)
+            .map(|result| result.map(|_| ()))
+    }
+
+    /// Load the next probe spill chunk into grace_state.probe_entries.
+    fn grace_load_next_probe_chunk(&mut self, partition_idx: usize) -> Result<IOResult<bool>> {
+        loop {
+            let action = {
+                let probe_state = self.probe_spill_state.as_mut().expect("probe spill state");
+                let spilled = probe_state
+                    .find_partition_mut(partition_idx)
+                    .expect("probe partition must exist");
+                let io_state = spilled.io_state.get();
+
+                if unlikely(matches!(io_state, SpillIOState::Error)) {
+                    return Err(LimboError::InternalError(
+                        "grace probe spill I/O failure".into(),
+                    ));
+                }
+
+                if matches!(io_state, SpillIOState::WaitingForRead) {
+                    GraceProbeChunkAction::WaitingForIO
+                } else if matches!(io_state, SpillIOState::ReadComplete) {
+                    GraceProbeChunkAction::ParseChunk { partition_idx }
+                } else {
+                    match spilled.current_chunk() {
+                        Some(chunk) if chunk.size_bytes == 0 => {
+                            spilled.current_chunk_idx += 1;
+                            GraceProbeChunkAction::Restart
+                        }
+                        Some(chunk) => {
+                            spilled.io_state.set(SpillIOState::WaitingForRead);
+                            GraceProbeChunkAction::LoadChunk {
+                                read_size: chunk.size_bytes,
+                                file_offset: chunk.file_offset,
+                                io_state: spilled.io_state.clone(),
+                                buffer_len: spilled.buffer_len.clone(),
+                                read_buffer_ref: spilled.read_buffer.clone(),
+                            }
+                        }
+                        None => GraceProbeChunkAction::NoMoreChunks,
+                    }
+                }
+            };
+
+            match action {
+                GraceProbeChunkAction::WaitingForIO => {
+                    io_yield_one!(Completion::new_yield());
+                }
+                GraceProbeChunkAction::ParseChunk { partition_idx } => {
+                    return Ok(IOResult::Done(self.parse_grace_probe_chunk(partition_idx)?));
+                }
+                GraceProbeChunkAction::LoadChunk {
+                    read_size,
+                    file_offset,
+                    io_state,
+                    buffer_len,
+                    read_buffer_ref,
+                } => {
+                    let read_buffer = Arc::new(Buffer::new_temporary(read_size));
+                    let read_complete = Box::new(
+                        move |res: Result<(Arc<Buffer>, i32), CompletionError>| match res {
+                            Ok((buf, bytes_read)) => {
+                                let mut persistent_buf = read_buffer_ref.write();
+                                persistent_buf.clear();
+                                persistent_buf
+                                    .extend_from_slice(&buf.as_slice()[..bytes_read as usize]);
+                                buffer_len.store(bytes_read as usize, atomic::Ordering::Release);
+                                io_state.set(SpillIOState::ReadComplete);
+                                None
+                            }
+                            Err(e) => {
+                                mark_unlikely();
+                                tracing::error!("Error reading probe chunk: {e:?}");
+                                io_state.set(SpillIOState::Error);
+                                None
+                            }
+                        },
+                    );
+
+                    let completion = Completion::new_read(read_buffer, read_complete);
+                    let probe_state = self.probe_spill_state.as_ref().expect("probe spill state");
+                    let c = probe_state.temp_file.file.pread(file_offset, completion)?;
+                    if !c.finished() {
+                        io_yield_one!(c);
+                    }
+                }
+                GraceProbeChunkAction::Restart => continue,
+                GraceProbeChunkAction::NoMoreChunks => return Ok(IOResult::Done(false)),
+            }
+        }
+    }
+
+    fn parse_grace_probe_chunk(&mut self, partition_idx: usize) -> Result<bool> {
+        let entries = {
+            let probe_state = self.probe_spill_state.as_mut().expect("probe spill state");
+            let partition = probe_state
+                .find_partition_mut(partition_idx)
+                .expect("probe partition must exist for parsing");
+            let chunk = partition
+                .current_chunk()
+                .expect("probe chunk must exist while parsing");
+            let expected_entries = chunk.num_entries;
+            let data_len = partition.buffer_len();
+
+            let data_guard = partition.read_buffer.read();
+            let data = &data_guard[..data_len];
+            let mut entries = Vec::with_capacity(expected_entries);
+            let mut offset = 0;
+            while offset < data_len {
+                let Some((entry_len, varint_size)) = read_varint_partial(&data[offset..])? else {
+                    return Err(LimboError::InternalError(
+                        "truncated grace probe spill chunk header".into(),
+                    ));
+                };
+                let total_needed = varint_size + entry_len as usize;
+                if offset + total_needed > data_len {
+                    return Err(LimboError::InternalError(
+                        "truncated grace probe spill chunk payload".into(),
+                    ));
+                }
+                let start = offset + varint_size;
+                let end = start + entry_len as usize;
+                let (entry, _consumed) = HashEntry::deserialize(&data[start..end])?;
+                entries.push(entry);
+                offset += total_needed;
+            }
+            drop(data_guard);
+
+            if unlikely(entries.len() != expected_entries) {
+                return Err(LimboError::InternalError(format!(
+                    "grace probe spill chunk entry count mismatch: expected {expected_entries}, got {}",
+                    entries.len()
+                )));
+            }
+
+            partition.buffer_len.store(0, atomic::Ordering::Release);
+            partition.read_buffer.write().clear();
+            partition.io_state.set(SpillIOState::None);
+            partition.current_chunk_idx += 1;
+            entries
+        };
+
+        let grace = self.grace_state.as_mut().expect("grace state");
+        grace.probe_entries = entries;
+        grace.probe_entry_cursor = 0;
+        Ok(!grace.probe_entries.is_empty())
+    }
+
+    /// Returns true if grace processing has any spilled partitions to process.
+    pub fn has_grace_partitions(&self) -> bool {
+        self.probe_spill_state.is_some()
+    }
+
     /// Close the hash table and free resources.
     pub fn close(&mut self) {
         self.state = HashTableState::Closed;
@@ -2419,14 +3215,16 @@ impl HashTable {
         self.mem_used = 0;
         self.loaded_partitions_lru.borrow_mut().clear();
         self.loaded_partitions_mem = 0;
-        self.last_probe_partition = None;
         let _ = self.spill_state.take();
+        self.probe_spill_state = None;
+        self.grace_state = None;
     }
 }
 
 #[cfg(test)]
 mod hashtests {
     use super::*;
+    use crate::io::Buffer;
     use crate::MemoryIO;
 
     #[test]
@@ -3513,5 +4311,588 @@ mod hashtests {
 
         // Entry with payload should have larger size
         assert!(entry_with_payload.size_bytes() > entry_no_payload.size_bytes());
+    }
+
+    // ── Grace hash join tests ──────────────────────────────────────
+
+    /// Helper: build a spilled hash table with given keys and payloads
+    fn make_spilled_ht_with_payload(
+        io: Arc<dyn IO>,
+        build_keys: &[(i64, Vec<Value>)], // (rowid, key_values)
+        payload: bool,
+    ) -> HashTable {
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 1024, // tiny, forces spill
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
+            track_matched: false,
+            ..Default::default()
+        };
+        let mut ht = HashTable::new(config, io);
+        for (rowid, keys) in build_keys {
+            let payload_values = if payload {
+                vec![Value::Text(format!("payload_{rowid}").into())]
+            } else {
+                vec![]
+            };
+            let _ = ht.insert(keys.clone(), *rowid, payload_values, None);
+        }
+        let _ = ht.finalize_build(None).unwrap();
+        ht
+    }
+
+    /// Helper: run grace processing with the new fine-grained API.
+    /// Returns (build_rowid, probe_rowid) pairs for all matches found.
+    fn run_grace_processing(ht: &mut HashTable) -> Vec<(i64, i64)> {
+        let _ = ht.finalize_probe_spill(None).unwrap();
+        let mut matches = Vec::new();
+
+        if !ht.grace_begin() {
+            return matches;
+        }
+
+        // Partition loop
+        loop {
+            match ht.grace_load_current_partition(None).unwrap() {
+                IOResult::Done(true) => {}
+                IOResult::Done(false) => break,
+                _ => panic!("unexpected IO"),
+            }
+
+            // Probe entry loop
+            loop {
+                let entry = match ht.grace_next_probe_entry().unwrap() {
+                    IOResult::Done(entry) => entry,
+                    IOResult::IO(_) => panic!("unexpected IO"),
+                };
+                let Some(entry) = entry else {
+                    break;
+                };
+
+                // Use probe_partition + next_match to find build matches
+                let key_values = entry.key_values;
+                let probe_rowid = entry.probe_rowid;
+                let partition_idx = ht.partition_for_keys(&key_values);
+
+                if ht
+                    .probe_partition(partition_idx, &key_values, None)
+                    .is_some()
+                {
+                    // First match from probe_partition
+                    let build_entry = ht.probe_partition(partition_idx, &key_values, None);
+                    // Re-probe to get entry again
+                    if let Some(build_entry) = build_entry {
+                        matches.push((build_entry.rowid, probe_rowid));
+                    }
+                    // Get additional matches via next_match
+                    while let Some(build_entry) = ht.next_match() {
+                        matches.push((build_entry.rowid, probe_rowid));
+                    }
+                }
+            }
+
+            if !ht.grace_advance_partition() {
+                break;
+            }
+        }
+        matches
+    }
+
+    #[test]
+    fn test_grace_basic() {
+        let io = Arc::new(MemoryIO::new());
+        let build_keys: Vec<(i64, Vec<Value>)> =
+            (0..200).map(|i| (i, vec![Value::from_i64(i)])).collect();
+        let mut ht = make_spilled_ht_with_payload(io, &build_keys, true);
+        assert!(ht.has_spilled(), "should have spilled");
+
+        // Buffer probe rows for keys that map to spilled partitions
+        let mut buffered = 0;
+        for i in 0..200 {
+            let key = vec![Value::from_i64(i)];
+            let partition_idx = ht.partition_for_keys(&key);
+            if !ht.is_partition_loaded(partition_idx) {
+                let _ = ht.buffer_probe_row(key, i + 1000, None).unwrap();
+                buffered += 1;
+            }
+        }
+        assert!(buffered > 0, "should have buffered some probe rows");
+
+        let matches = run_grace_processing(&mut ht);
+
+        // Every buffered probe row should have found a match
+        assert_eq!(
+            matches.len(),
+            buffered,
+            "each buffered probe row should match exactly one build row"
+        );
+        // Verify correctness: build_rowid should equal probe_rowid - 1000
+        for (build_rowid, probe_rowid) in &matches {
+            assert_eq!(
+                *build_rowid,
+                probe_rowid - 1000,
+                "build_rowid should match probe key"
+            );
+        }
+    }
+
+    #[test]
+    fn test_grace_no_spill_noop() {
+        let io = Arc::new(MemoryIO::new());
+        // Use large budget so nothing spills
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 1024 * 1024,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
+            track_matched: false,
+            ..Default::default()
+        };
+        let mut ht = HashTable::new(config, io);
+        for i in 0..10 {
+            let _ = ht.insert(vec![Value::from_i64(i)], i, vec![], None);
+        }
+        let _ = ht.finalize_build(None).unwrap();
+        assert!(!ht.has_spilled(), "should NOT have spilled");
+
+        // grace_begin should return false since nothing was spilled
+        assert!(
+            !ht.grace_begin(),
+            "grace_begin should return false when nothing spilled"
+        );
+    }
+
+    #[test]
+    fn test_grace_duplicate_keys() {
+        let io = Arc::new(MemoryIO::new());
+        // Insert multiple build rows with same key
+        let mut build_keys: Vec<(i64, Vec<Value>)> = Vec::new();
+        for i in 0..100 {
+            // 3 build rows per key value
+            build_keys.push((i * 3, vec![Value::from_i64(i)]));
+            build_keys.push((i * 3 + 1, vec![Value::from_i64(i)]));
+            build_keys.push((i * 3 + 2, vec![Value::from_i64(i)]));
+        }
+        let mut ht = make_spilled_ht_with_payload(io, &build_keys, false);
+        assert!(ht.has_spilled());
+
+        // Buffer probe rows
+        let mut buffered_keys = Vec::new();
+        for i in 0..100 {
+            let key = vec![Value::from_i64(i)];
+            let partition_idx = ht.partition_for_keys(&key);
+            if !ht.is_partition_loaded(partition_idx) {
+                let _ = ht.buffer_probe_row(key, i + 500, None).unwrap();
+                buffered_keys.push(i);
+            }
+        }
+
+        let matches = run_grace_processing(&mut ht);
+
+        // Each buffered probe key should match 3 build rows
+        assert_eq!(
+            matches.len(),
+            buffered_keys.len() * 3,
+            "each probe key should find 3 matches"
+        );
+    }
+
+    #[test]
+    fn test_grace_empty_partitions() {
+        let io = Arc::new(MemoryIO::new());
+        // Build with keys 0..100, probe with keys 200..300 (no overlap)
+        let build_keys: Vec<(i64, Vec<Value>)> =
+            (0..200).map(|i| (i, vec![Value::from_i64(i)])).collect();
+        let mut ht = make_spilled_ht_with_payload(io, &build_keys, false);
+        assert!(ht.has_spilled());
+
+        // Buffer probe rows with non-matching keys
+        for i in 1000..1050 {
+            let key = vec![Value::from_i64(i)];
+            let partition_idx = ht.partition_for_keys(&key);
+            if !ht.is_partition_loaded(partition_idx) {
+                let _ = ht.buffer_probe_row(key, i, None).unwrap();
+            }
+        }
+
+        let matches = run_grace_processing(&mut ht);
+        assert_eq!(
+            matches.len(),
+            0,
+            "non-matching keys should produce no matches"
+        );
+    }
+
+    #[test]
+    fn test_grace_null_keys() {
+        let io = Arc::new(MemoryIO::new());
+        let build_keys: Vec<(i64, Vec<Value>)> =
+            (0..200).map(|i| (i, vec![Value::from_i64(i)])).collect();
+        let mut ht = make_spilled_ht_with_payload(io, &build_keys, false);
+        assert!(ht.has_spilled());
+
+        // Buffer a probe row with NULL key - should be skipped
+        let null_key = vec![Value::Null];
+        // NULL keys can't match, so we just verify no crash
+        let partition_idx = ht.partition_for_keys(&[Value::from_i64(0)]);
+        if !ht.is_partition_loaded(partition_idx) {
+            // Buffer with a valid key to ensure grace processing runs
+            let _ = ht
+                .buffer_probe_row(vec![Value::from_i64(0)], 999, None)
+                .unwrap();
+        }
+        // Buffer a null key row to the same partition
+        let _ = ht.buffer_probe_row(null_key, 888, None).unwrap();
+
+        let _ = ht.finalize_probe_spill(None).unwrap();
+        // Should not crash; NULL key entries should return from grace_next_probe_entry
+        assert!(ht.grace_begin(), "should have partitions to process");
+        loop {
+            match ht.grace_load_current_partition(None).unwrap() {
+                IOResult::Done(true) => {}
+                IOResult::Done(false) => break,
+                _ => panic!("unexpected IO"),
+            }
+            loop {
+                let entry = match ht.grace_next_probe_entry().unwrap() {
+                    IOResult::Done(entry) => entry,
+                    IOResult::IO(_) => panic!("unexpected IO"),
+                };
+                if entry.is_none() {
+                    break;
+                }
+                // NULL key probe entries are still returned; the VDBE's HashProbe
+                // handles NULL skip. Just verify no crash.
+            }
+            if !ht.grace_advance_partition() {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn test_grace_with_payload() {
+        let io = Arc::new(MemoryIO::new());
+        let build_keys: Vec<(i64, Vec<Value>)> =
+            (0..200).map(|i| (i, vec![Value::from_i64(i)])).collect();
+        let mut ht = make_spilled_ht_with_payload(io, &build_keys, true);
+        assert!(ht.has_spilled());
+
+        // Buffer some probe rows
+        let mut buffered = 0;
+        for i in 0..200 {
+            let key = vec![Value::from_i64(i)];
+            let partition_idx = ht.partition_for_keys(&key);
+            if !ht.is_partition_loaded(partition_idx) {
+                let _ = ht.buffer_probe_row(key, i + 1000, None).unwrap();
+                buffered += 1;
+            }
+        }
+
+        let _ = ht.finalize_probe_spill(None).unwrap();
+        assert!(ht.grace_begin(), "should have partitions to process");
+
+        let mut match_count = 0;
+        loop {
+            match ht.grace_load_current_partition(None).unwrap() {
+                IOResult::Done(true) => {}
+                IOResult::Done(false) => break,
+                _ => panic!("unexpected IO"),
+            }
+            loop {
+                let entry = match ht.grace_next_probe_entry().unwrap() {
+                    IOResult::Done(entry) => entry,
+                    IOResult::IO(_) => panic!("unexpected IO"),
+                };
+                let Some(entry) = entry else {
+                    break;
+                };
+                let key_values = entry.key_values;
+                let partition_idx = ht.partition_for_keys(&key_values);
+                if let Some(build_entry) = ht.probe_partition(partition_idx, &key_values, None) {
+                    // Check payload was correctly round-tripped
+                    let expected_payload = format!("payload_{}", build_entry.rowid);
+                    assert_eq!(build_entry.payload_values.len(), 1);
+                    match &build_entry.payload_values[0] {
+                        Value::Text(t) => assert_eq!(t.as_str(), expected_payload.as_str()),
+                        other => panic!("expected text payload, got {other:?}"),
+                    }
+                    match_count += 1;
+                }
+            }
+            if !ht.grace_advance_partition() {
+                break;
+            }
+        }
+        assert_eq!(match_count, buffered);
+    }
+
+    #[test]
+    fn test_grace_unmatched_scan_uses_current_partition() {
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 4096,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
+            track_matched: true,
+            partition_count: Some(4),
+        };
+        let mut ht = HashTable::new(config, io);
+
+        for i in 0..400 {
+            let key = vec![Value::from_i64(i)];
+            let _ = ht.insert(key, i, vec![], None);
+        }
+        let _ = ht.finalize_build(None).unwrap();
+        assert!(ht.has_spilled(), "should have spilled");
+
+        let mut keys_by_partition = std::collections::BTreeMap::<usize, Vec<i64>>::new();
+        for i in 0..400 {
+            let partition_idx = ht.partition_for_keys(&[Value::from_i64(i)]);
+            keys_by_partition.entry(partition_idx).or_default().push(i);
+        }
+
+        let partitions_to_process: Vec<usize> = ht
+            .spill_state
+            .as_ref()
+            .expect("spill state")
+            .partitions
+            .iter()
+            .filter(|partition| !partition.chunks.is_empty())
+            .map(|partition| partition.partition_idx)
+            .collect();
+        assert!(
+            partitions_to_process.len() >= 2,
+            "test requires at least two spilled partitions"
+        );
+
+        let first_partition = partitions_to_process[0];
+        let second_partition = partitions_to_process[1];
+        let first_keys = keys_by_partition
+            .get(&first_partition)
+            .cloned()
+            .expect("first partition keys");
+        let second_keys = keys_by_partition
+            .get(&second_partition)
+            .cloned()
+            .expect("second partition keys");
+
+        for key in &first_keys {
+            let _ = ht
+                .buffer_probe_row(vec![Value::from_i64(*key)], key + 10_000, None)
+                .unwrap();
+        }
+        let _ = ht.finalize_probe_spill(None).unwrap();
+        assert!(ht.grace_begin(), "should enter grace");
+
+        match ht.grace_load_current_partition(None).unwrap() {
+            IOResult::Done(true) => {}
+            other => panic!("unexpected grace load result: {other:?}"),
+        }
+        assert_eq!(
+            ht.grace_state
+                .as_ref()
+                .expect("grace state")
+                .current_partition_idx(),
+            Some(first_partition)
+        );
+
+        loop {
+            let entry = match ht.grace_next_probe_entry().unwrap() {
+                IOResult::Done(entry) => entry,
+                IOResult::IO(_) => panic!("unexpected IO"),
+            };
+            let Some(entry) = entry else {
+                break;
+            };
+            let partition_idx = ht.partition_for_keys(&entry.key_values);
+            if ht
+                .probe_partition(partition_idx, &entry.key_values, None)
+                .is_some()
+            {
+                ht.mark_current_matched();
+                while ht.next_match().is_some() {
+                    ht.mark_current_matched();
+                }
+            }
+        }
+
+        ht.begin_unmatched_scan();
+        assert!(
+            ht.next_unmatched().is_none(),
+            "all rows in the first partition were matched"
+        );
+
+        assert!(
+            ht.grace_advance_partition(),
+            "should have another partition"
+        );
+        match ht.grace_load_current_partition(None).unwrap() {
+            IOResult::Done(true) => {}
+            other => panic!("unexpected grace load result: {other:?}"),
+        }
+        assert_eq!(
+            ht.grace_state
+                .as_ref()
+                .expect("grace state")
+                .current_partition_idx(),
+            Some(second_partition)
+        );
+
+        match ht.load_spilled_partition(first_partition, None).unwrap() {
+            IOResult::Done(()) => {}
+            other => panic!("unexpected spill load result: {other:?}"),
+        }
+
+        ht.begin_unmatched_scan();
+        assert_eq!(
+            ht.unmatched_scan_current_partition(),
+            Some(second_partition),
+            "grace unmatched scan must target the active grace partition"
+        );
+        match ht.load_spilled_partition(second_partition, None).unwrap() {
+            IOResult::Done(()) => {}
+            other => panic!("unexpected spill load result: {other:?}"),
+        }
+
+        let mut unmatched_rowids = Vec::new();
+        while let Some(entry) = ht.next_unmatched() {
+            unmatched_rowids.push(entry.rowid);
+        }
+        unmatched_rowids.sort_unstable();
+
+        let mut expected = second_keys;
+        expected.sort_unstable();
+        assert_eq!(unmatched_rowids, expected);
+    }
+
+    #[test]
+    fn test_unmatched_scan_preserves_in_memory_partitions_before_grace() {
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 1024,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
+            track_matched: true,
+            partition_count: Some(16),
+        };
+        let mut ht = HashTable::new(config, io);
+
+        let mut next_rowid = 0i64;
+        while !ht.has_spilled() {
+            let _ = ht
+                .insert(vec![Value::from_i64(next_rowid)], next_rowid, vec![], None)
+                .unwrap();
+            next_rowid += 1;
+        }
+
+        let partition_keys: std::collections::BTreeMap<usize, Vec<i64>> = (0..4096)
+            .map(|i| (ht.partition_for_keys(&[Value::from_i64(i)]), i))
+            .fold(
+                std::collections::BTreeMap::new(),
+                |mut acc, (partition, key)| {
+                    acc.entry(partition).or_default().push(key);
+                    acc
+                },
+            );
+
+        let hot_partition = ht
+            .spill_state
+            .as_ref()
+            .expect("spill state")
+            .partitions
+            .first()
+            .map(|partition| partition.partition_idx)
+            .expect("expected at least one spilled partition");
+        let cold_partition = partition_keys
+            .keys()
+            .copied()
+            .find(|partition_idx| {
+                ht.spill_state
+                    .as_ref()
+                    .expect("spill state")
+                    .find_partition(*partition_idx)
+                    .is_none()
+            })
+            .expect("expected at least one partition without spill chunks yet");
+        let hot_key = partition_keys
+            .get(&hot_partition)
+            .and_then(|keys| keys.first())
+            .copied()
+            .expect("hot partition key");
+        let cold_key = partition_keys
+            .get(&cold_partition)
+            .and_then(|keys| keys.first())
+            .copied()
+            .expect("cold partition key");
+
+        for _ in 0..160 {
+            let _ = ht
+                .insert(vec![Value::from_i64(hot_key)], next_rowid, vec![], None)
+                .unwrap();
+            next_rowid += 1;
+        }
+        for _ in 0..6 {
+            let _ = ht
+                .insert(vec![Value::from_i64(cold_key)], next_rowid, vec![], None)
+                .unwrap();
+            next_rowid += 1;
+        }
+
+        let _ = ht.finalize_build(None).unwrap();
+        assert!(ht.has_spilled(), "should have spilled");
+
+        let (spilled_partition, mut expected_unmatched) = {
+            let spill_state = ht.spill_state.as_ref().expect("spill state");
+            let spilled_partition = spill_state
+                .partitions
+                .iter()
+                .find(|partition| !partition.chunks.is_empty())
+                .map(|partition| partition.partition_idx)
+                .expect("expected at least one spilled partition");
+            let expected_unmatched: Vec<i64> = spill_state
+                .partitions
+                .iter()
+                .filter(|partition| partition.chunks.is_empty())
+                .flat_map(|partition| {
+                    partition
+                        .buckets
+                        .iter()
+                        .flat_map(|bucket| bucket.entries.iter().map(|entry| entry.rowid))
+                })
+                .collect();
+            (spilled_partition, expected_unmatched)
+        };
+        assert!(
+            !expected_unmatched.is_empty(),
+            "expected at least one resident in-memory partition"
+        );
+
+        let probe_key = (0..400)
+            .map(|i| vec![Value::from_i64(i)])
+            .find(|key| ht.partition_for_keys(key) == spilled_partition)
+            .expect("spilled partition should have at least one key");
+        let _ = ht.buffer_probe_row(probe_key, 10_000, None).unwrap();
+        assert!(
+            ht.has_grace_partitions(),
+            "probe buffering should enable grace"
+        );
+
+        ht.begin_unmatched_scan();
+        let mut actual_unmatched = Vec::new();
+        while let Some(entry) = ht.next_unmatched() {
+            actual_unmatched.push(entry.rowid);
+        }
+
+        expected_unmatched.sort_unstable();
+        actual_unmatched.sort_unstable();
+        assert_eq!(actual_unmatched, expected_unmatched);
     }
 }

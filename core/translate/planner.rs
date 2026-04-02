@@ -3,7 +3,7 @@ use crate::{turso_assert, turso_assert_greater_than_or_equal, turso_assert_less_
 use std::cmp::PartialEq;
 
 use super::{
-    expr::walk_expr,
+    expr::{walk_expr, walk_expr_mut},
     plan::{
         Aggregate, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
         JoinOrderMember, JoinType as PlanJoinType, JoinedTable, Operation, OuterQueryReference,
@@ -28,7 +28,7 @@ use crate::{
     translate::expr::bind_and_rewrite_expr,
 };
 use crate::{
-    translate::plan::{Window, WindowFunction},
+    translate::plan::{Window, WindowFunction, WindowFunctionKind},
     vdbe::builder::ProgramBuilder,
 };
 use smallvec::SmallVec;
@@ -216,13 +216,13 @@ pub fn resolve_window_and_aggregate_functions(
                 let args_count = args.len();
                 let distinctness = Distinctness::from_ast(distinctness.as_ref());
 
-                match Func::resolve_function(name.as_str(), args_count) {
-                    Ok(Func::Agg(f)) => {
+                match Func::resolve_function(name.as_str(), args_count)? {
+                    Some(Func::Agg(f)) => {
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
                                 windows.as_deref_mut(),
                                 expr,
-                                f,
+                                WindowFunctionKind::Agg(f),
                                 over_clause,
                                 distinctness,
                             )?;
@@ -232,7 +232,21 @@ pub fn resolve_window_and_aggregate_functions(
                         }
                         return Ok(WalkControl::SkipChildren);
                     }
-                    Err(e) => {
+                    Some(Func::Window(f)) => {
+                        if let Some(over_clause) = filter_over.over_clause.as_ref() {
+                            link_with_window(
+                                windows.as_deref_mut(),
+                                expr,
+                                WindowFunctionKind::Window(f),
+                                over_clause,
+                                distinctness,
+                            )?;
+                        } else {
+                            crate::bail_parse_error!("misuse of window function: {}()", f);
+                        }
+                        return Ok(WalkControl::SkipChildren);
+                    }
+                    None => {
                         if let Some(f) = resolver
                             .symbol_table
                             .resolve_function(name.as_str(), args_count)
@@ -243,7 +257,7 @@ pub fn resolve_window_and_aggregate_functions(
                                     link_with_window(
                                         windows.as_deref_mut(),
                                         expr,
-                                        func,
+                                        WindowFunctionKind::Agg(func),
                                         over_clause,
                                         distinctness,
                                     )?;
@@ -259,8 +273,6 @@ pub fn resolve_window_and_aggregate_functions(
                                 }
                                 return Ok(WalkControl::SkipChildren);
                             }
-                        } else {
-                            return Err(e);
                         }
                     }
                     _ => {
@@ -275,13 +287,13 @@ pub fn resolve_window_and_aggregate_functions(
             }
             Expr::FunctionCallStar { name, filter_over } => {
                 validate_aggregate_function_tail(filter_over, &[])?;
-                match Func::resolve_function(name.as_str(), 0) {
-                    Ok(Func::Agg(f)) => {
+                match Func::resolve_function(name.as_str(), 0)? {
+                    Some(Func::Agg(f)) => {
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
                                 windows.as_deref_mut(),
                                 expr,
-                                f,
+                                WindowFunctionKind::Agg(f),
                                 over_clause,
                                 Distinctness::NonDistinct,
                             )?;
@@ -297,7 +309,21 @@ pub fn resolve_window_and_aggregate_functions(
                         }
                         return Ok(WalkControl::SkipChildren);
                     }
-                    Ok(_) => {
+                    Some(Func::Window(f)) => {
+                        if let Some(over_clause) = filter_over.over_clause.as_ref() {
+                            link_with_window(
+                                windows.as_deref_mut(),
+                                expr,
+                                WindowFunctionKind::Window(f),
+                                over_clause,
+                                Distinctness::NonDistinct,
+                            )?;
+                        } else {
+                            crate::bail_parse_error!("misuse of window function: {}()", f);
+                        }
+                        return Ok(WalkControl::SkipChildren);
+                    }
+                    Some(func) => {
                         if filter_over.over_clause.is_some() {
                             crate::bail_parse_error!(
                                 "{} may not be used as a window function",
@@ -306,36 +332,43 @@ pub fn resolve_window_and_aggregate_functions(
                         }
 
                         // Check if the function supports (*) syntax using centralized logic
-                        match crate::function::Func::resolve_function(name.as_str(), 0) {
-                            Ok(func) => {
-                                if func.supports_star_syntax() {
-                                    return Ok(WalkControl::Continue);
-                                } else {
-                                    crate::bail_parse_error!(
-                                        "wrong number of arguments to function {}()",
-                                        name.as_str()
-                                    );
-                                }
-                            }
-                            Err(_) => {
-                                crate::bail_parse_error!(
-                                    "wrong number of arguments to function {}()",
-                                    name.as_str()
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => match e {
-                        crate::LimboError::ParseError(e) => {
-                            crate::bail_parse_error!("{}", e);
-                        }
-                        _ => {
+                        if func.supports_star_syntax() {
+                            return Ok(WalkControl::Continue);
+                        } else {
                             crate::bail_parse_error!(
-                                "Invalid aggregate function: {}",
+                                "wrong number of arguments to function {}()",
                                 name.as_str()
                             );
                         }
-                    },
+                    }
+                    None => {
+                        if let Some(f) = resolver.symbol_table.resolve_function(name.as_str(), 0) {
+                            let func = AggFunc::External(f.func.clone().into());
+                            if let ExtFunc::Aggregate { .. } = f.as_ref().func {
+                                if let Some(over_clause) = filter_over.over_clause.as_ref() {
+                                    link_with_window(
+                                        windows.as_deref_mut(),
+                                        expr,
+                                        WindowFunctionKind::Agg(func),
+                                        over_clause,
+                                        Distinctness::NonDistinct,
+                                    )?;
+                                } else {
+                                    add_aggregate_if_not_exists(
+                                        aggs,
+                                        expr,
+                                        &[],
+                                        Distinctness::NonDistinct,
+                                        func,
+                                    )?;
+                                    contains_aggregates = true;
+                                }
+                                return Ok(WalkControl::SkipChildren);
+                            }
+                        } else {
+                            crate::bail_parse_error!("no such function: {}", name.as_str());
+                        }
+                    }
                 }
             }
             _ => {}
@@ -350,7 +383,7 @@ pub fn resolve_window_and_aggregate_functions(
 fn link_with_window(
     windows: Option<&mut Vec<Window>>,
     expr: &Expr,
-    func: AggFunc,
+    func: WindowFunctionKind,
     over_clause: &Over,
     distinctness: Distinctness,
 ) -> Result<()> {
@@ -365,7 +398,11 @@ fn link_with_window(
             original_expr: expr.clone(),
         });
     } else {
-        crate::bail_parse_error!("misuse of window function: {}()", func.as_str());
+        let func_name = match &func {
+            WindowFunctionKind::Agg(f) => f.as_str().to_string(),
+            WindowFunctionKind::Window(f) => f.to_string(),
+        };
+        crate::bail_parse_error!("misuse of window function: {}()", func_name);
     }
     Ok(())
 }
@@ -661,24 +698,18 @@ fn parse_from_clause_table(
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     match table {
-        ast::SelectTable::Table(qualified_name, maybe_alias, indexed) => {
-            if indexed.is_some() {
-                crate::bail_parse_error!(
-                    "INDEXED BY / NOT INDEXED clauses are not supported yet in FROM clause"
-                );
-            }
-            parse_table(
-                table_references,
-                resolver,
-                program,
-                cte_definitions,
-                vtab_predicates,
-                &qualified_name,
-                maybe_alias.as_ref(),
-                &[],
-                connection,
-            )
-        }
+        ast::SelectTable::Table(qualified_name, maybe_alias, indexed) => parse_table(
+            table_references,
+            resolver,
+            program,
+            cte_definitions,
+            vtab_predicates,
+            &qualified_name,
+            maybe_alias.as_ref(),
+            &[],
+            indexed,
+            connection,
+        ),
         ast::SelectTable::Select(subselect, maybe_alias) => {
             // For inline subqueries, we plan all CTEs once and pass them as outer_query_refs.
             // This allows the subquery to reference CTEs defined in the parent's WITH clause.
@@ -741,12 +772,8 @@ fn parse_from_clause_table(
             }
             let cur_table_index = table_references.joined_tables().len();
             let identifier = maybe_alias
-                .map(|a| match a {
-                    ast::As::As(id) => id,
-                    ast::As::Elided(id) => id,
-                })
-                .map(|id| normalize_ident(id.as_str()))
-                .unwrap_or_else(|| format!("subquery_{cur_table_index}"));
+                .map(|a| normalize_ident(a.name().as_str()))
+                .unwrap_or_else(|| format!("(subquery-{cur_table_index})"));
             table_references.add_joined_table(JoinedTable::new_subquery_from_plan(
                 identifier,
                 subplan,
@@ -767,6 +794,7 @@ fn parse_from_clause_table(
             &qualified_name,
             maybe_alias.as_ref(),
             &args,
+            None, // table-valued functions don't support INDEXED BY
             connection,
         ),
         ast::SelectTable::Sub(..) => {
@@ -785,6 +813,7 @@ fn parse_table(
     qualified_name: &QualifiedName,
     maybe_alias: Option<&As>,
     args: &[Box<Expr>],
+    indexed: Option<ast::Indexed>,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     let normalized_qualified_name = normalize_ident(qualified_name.name.as_str());
@@ -812,11 +841,7 @@ fn parse_table(
 
         // If there's an alias provided, update the identifier to use that alias
         if let Some(a) = maybe_alias {
-            let alias = match a {
-                ast::As::As(id) => id,
-                ast::As::Elided(id) => id,
-            };
-            cte_table.identifier = normalize_ident(alias.as_str());
+            cte_table.identifier = normalize_ident(a.name().as_str());
         }
 
         // Mark the pre-planned outer_query_ref as "CTE definition only" so it is
@@ -847,12 +872,7 @@ fn parse_table(
         if let Some(cte_id) = outer_ref.cte_id {
             program.increment_cte_reference(cte_id);
         }
-        let alias = maybe_alias
-            .map(|a| match a {
-                ast::As::As(id) => id,
-                ast::As::Elided(id) => id,
-            })
-            .map(|a| normalize_ident(a.as_str()));
+        let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
         // Clone fields we need before dropping the borrow on table_references.
         let cte_select = outer_ref.cte_select.clone();
         let cte_explicit_columns = outer_ref.cte_explicit_columns.clone();
@@ -924,6 +944,7 @@ fn parse_table(
                 column_use_counts: Vec::new(),
                 expression_index_usages: Vec::new(),
                 database_id,
+                indexed: None,
             });
         }
         return Ok(());
@@ -933,12 +954,7 @@ fn parse_table(
     let table = resolver.with_schema(database_id, |schema| schema.get_table(table_name.as_str()));
 
     if let Some(table) = table {
-        let alias = maybe_alias
-            .map(|a| match a {
-                ast::As::As(id) => id,
-                ast::As::Elided(id) => id,
-            })
-            .map(|a| normalize_ident(a.as_str()));
+        let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
         let internal_id = program.table_reference_counter.next();
         let tbl_ref = if let Table::Virtual(tbl) = table.as_ref() {
             transform_args_into_where_terms(args, internal_id, vtab_predicates, table.as_ref())?;
@@ -960,6 +976,7 @@ fn parse_table(
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id,
+            indexed,
         });
         return Ok(());
     };
@@ -1040,10 +1057,13 @@ fn parse_table(
 
         // This is a materialized view with storage - treat it as a regular BTree table
         // Create a BTreeTable from the view's metadata
+        let columns = view_guard.column_schema.flat_columns();
+        let logical_to_physical_map =
+            crate::schema::BTreeTable::build_logical_to_physical_map(&columns);
         let btree_table = Arc::new(crate::schema::BTreeTable {
             name: view_guard.name().to_string(),
             root_page,
-            columns: view_guard.column_schema.flat_columns(),
+            columns,
             primary_key_columns: Vec::new(),
             has_rowid: true,
             is_strict: false,
@@ -1052,16 +1072,13 @@ fn parse_table(
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
-            pk_conflict_clause: None,
+            rowid_alias_conflict_clause: None,
+            has_virtual_columns: false,
+            logical_to_physical_map,
         });
         drop(view_guard);
 
-        let alias = maybe_alias
-            .map(|a| match a {
-                ast::As::As(id) => id,
-                ast::As::Elided(id) => id,
-            })
-            .map(|a| normalize_ident(a.as_str()));
+        let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
 
         table_references.add_joined_table(JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
@@ -1076,6 +1093,7 @@ fn parse_table(
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id,
+            indexed: None,
         });
         return Ok(());
     }
@@ -1101,6 +1119,7 @@ fn parse_table(
                 column_use_counts: Vec::new(),
                 expression_index_usages: Vec::new(),
                 database_id,
+                indexed: None,
             });
             return Ok(());
         }
@@ -1334,8 +1353,54 @@ pub fn parse_where(
                 resolver,
                 BindingBehavior::TryCanonicalColumnsFirst,
             )?;
+            let _ = walk_expr_mut(&mut expr.expr, &mut |e: &mut Expr| -> Result<WalkControl> {
+                if let Expr::Between {
+                    lhs,
+                    not,
+                    start,
+                    end,
+                } = e
+                {
+                    let lhs_expr = std::mem::take(lhs.as_mut());
+                    let start_expr = std::mem::take(start.as_mut());
+                    let end_expr = std::mem::take(end.as_mut());
+
+                    let (lower, upper, combine_op) = if *not {
+                        (
+                            Expr::Binary(
+                                Box::new(start_expr),
+                                ast::Operator::Greater,
+                                Box::new(lhs_expr.clone()),
+                            ),
+                            Expr::Binary(
+                                Box::new(lhs_expr),
+                                ast::Operator::Greater,
+                                Box::new(end_expr),
+                            ),
+                            ast::Operator::Or,
+                        )
+                    } else {
+                        (
+                            Expr::Binary(
+                                Box::new(start_expr),
+                                ast::Operator::LessEquals,
+                                Box::new(lhs_expr.clone()),
+                            ),
+                            Expr::Binary(
+                                Box::new(lhs_expr),
+                                ast::Operator::LessEquals,
+                                Box::new(end_expr),
+                            ),
+                            ast::Operator::And,
+                        )
+                    };
+                    *e = Expr::Binary(Box::new(lower), combine_op, Box::new(upper));
+                }
+                Ok(WalkControl::Continue)
+            });
         }
-        // BETWEEN is rewritten to (lhs >= start) AND (lhs <= end) by bind_and_rewrite_expr.
+        // BETWEEN in WHERE is rewritten to binary terms here so each side can be
+        // considered independently by constraint extraction and range planning.
         // Re-break any ANDs that were created so they become separate WhereTerms for
         // constraint extraction.
         let mut i = start_idx;
@@ -1734,27 +1799,9 @@ fn parse_join(
         crate::bail_parse_error!("NATURAL JOIN cannot be combined with ON or USING clause");
     }
 
-    // this is called once for each join, so we only need to check the rightmost table
-    // against all previous tables for duplicates
+    // SQLite allows duplicate table names/aliases in FROM clauses.
+    // Ambiguity is detected later during column resolution.
     let rightmost_table = table_references.joined_tables().last().unwrap();
-    let has_duplicate = table_references
-        .joined_tables()
-        .iter()
-        .take(table_references.joined_tables().len() - 1)
-        .any(|t| t.identifier == rightmost_table.identifier);
-
-    if has_duplicate
-        && !natural
-        && constraint
-            .as_ref()
-            .is_none_or(|c| !matches!(c, ast::JoinConstraint::Using(_)))
-    {
-        // Duplicate table names are only allowed for NATURAL or USING joins
-        crate::bail_parse_error!(
-            "table name {} specified more than once - use an alias to disambiguate",
-            rightmost_table.identifier
-        );
-    }
     let constraint = if natural {
         turso_assert_greater_than_or_equal!(table_references.joined_tables().len(), 2);
         // NATURAL JOIN is first transformed into a USING join with the common columns

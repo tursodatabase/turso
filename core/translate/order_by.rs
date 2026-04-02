@@ -25,26 +25,29 @@ use super::{
     result_row::{emit_offset, emit_result_row_and_limit},
 };
 
-/// Returns true if the given function name has a known sort comparator
-/// implementation in the VDBE sorter. Functions not in this list will
-/// produce wrong ORDER BY results, so they should be treated as if the
-/// type has no `<` operator (sort on encoded blobs instead).
-fn has_known_sort_comparator(func_name: &str) -> bool {
-    matches!(
-        func_name,
-        "numeric_lt" | "test_uint_lt" | "string_reverse" | "array_lt"
-    )
+use crate::vdbe::insn::SortComparatorType;
+
+/// Maps a custom type `<` operator function name to a SortComparatorType.
+/// Returns None if the function name is not recognized.
+fn sort_comparator_from_func_name(func_name: &str) -> Option<SortComparatorType> {
+    match func_name {
+        "numeric_lt" => Some(SortComparatorType::NumericLt),
+        "test_uint_lt" => Some(SortComparatorType::TestUintLt),
+        "string_reverse" => Some(SortComparatorType::StringReverse),
+        "array_lt" => Some(SortComparatorType::ArrayLt),
+        _ => None,
+    }
 }
 
 /// For an ORDER BY expression that is a column reference to a custom type,
-/// returns the `<` operator function name if the type has one AND the function
-/// has a known sort comparator. Returns None otherwise, which causes the
-/// sorter to use encoded blob ordering instead of silently wrong results.
-pub(crate) fn custom_type_lt_func(
+/// returns the SortComparatorType if the type has a `<` operator with a known
+/// comparator. Returns None otherwise, which causes the sorter to use encoded
+/// blob ordering instead of silently wrong results.
+pub(crate) fn custom_type_comparator(
     expr: &ast::Expr,
     referenced_tables: &TableReferences,
     schema: &Schema,
-) -> Option<String> {
+) -> Option<SortComparatorType> {
     if let ast::Expr::Column {
         table: table_ref_id,
         column,
@@ -55,7 +58,7 @@ pub(crate) fn custom_type_lt_func(
         let col = table.get_column_at(*column)?;
         // Array columns use element-wise comparison
         if col.is_array() {
-            return Some("array_lt".to_string());
+            return Some(SortComparatorType::ArrayLt);
         }
         let type_def = schema.get_type_def(&col.ty_str, table.is_strict())?;
         type_def
@@ -63,10 +66,9 @@ pub(crate) fn custom_type_lt_func(
             .iter()
             .find(|op| op.op == "<")
             .and_then(|op| op.func_name.as_ref())
-            .filter(|func_name| has_known_sort_comparator(func_name))
-            .cloned()
+            .and_then(|func_name| sort_comparator_from_func_name(func_name))
     } else if super::expr::expr_is_array(expr, Some(referenced_tables)) {
-        Some("array_lt".to_string())
+        Some(SortComparatorType::ArrayLt)
     } else {
         None
     }
@@ -154,14 +156,18 @@ impl EmitOrderBy {
         program: &mut ProgramBuilder,
         t_ctx: &mut TranslateCtx,
         result_columns: &[ResultSetColumn],
-        order_by: &[(Box<ast::Expr>, SortOrder)],
+        order_by: &[(
+            Box<ast::Expr>,
+            SortOrder,
+            Option<turso_parser::ast::NullsOrder>,
+        )],
         referenced_tables: &TableReferences,
         has_group_by: bool,
         has_distinct: bool,
         aggregates: &[Aggregate],
     ) -> Result<()> {
         // Block ORDER BY on custom type columns without OPERATOR '<'
-        for (expr, _) in order_by.iter() {
+        for (expr, _, _) in order_by.iter() {
             if is_custom_type_without_lt(expr, referenced_tables, t_ctx.resolver.schema()) {
                 if let Some((col, type_def)) =
                     result_column_custom_type_info(expr, referenced_tables, t_ctx.resolver.schema())
@@ -181,9 +187,11 @@ impl EmitOrderBy {
 
         let only_aggs = order_by
             .iter()
-            .all(|(e, _)| is_orderby_agg_or_const(&t_ctx.resolver, e, aggregates));
+            .all(|(e, _, _)| is_orderby_agg_or_const(&t_ctx.resolver, e, aggregates));
 
-        let use_heap_sort = !has_distinct && !has_group_by && t_ctx.limit_ctx.is_some();
+        let has_explicit_nulls = order_by.iter().any(|(_, _, nulls)| nulls.is_some());
+        let use_heap_sort =
+            !has_distinct && !has_group_by && t_ctx.limit_ctx.is_some() && !has_explicit_nulls;
 
         // only emit sequence column if (we have GROUP BY and ORDER BY is not only aggregates or constants) OR (we decided to use heap-sort)
         let has_sequence = (has_group_by && !only_aggs) || use_heap_sort;
@@ -193,7 +201,7 @@ impl EmitOrderBy {
         let sort_cursor = if use_heap_sort {
             let index_name = format!("heap_sort_{}", program.offset().as_offset_int()); // we don't really care about the name that much, just enough that we don't get name collisions
             let mut index_columns = Vec::with_capacity(order_by.len() + result_columns.len());
-            for (column, order) in order_by {
+            for (column, order, _nulls) in order_by {
                 let collation = get_collseq_from_expr(column, referenced_tables)?;
                 let pos_in_table = index_columns.len();
                 index_columns.push(IndexColumn {
@@ -263,36 +271,40 @@ impl EmitOrderBy {
              * then the collating sequence of the column is used to determine sort order.
              * If the expression is not a column and has no COLLATE clause, then the BINARY collating sequence is used.
              */
-            let mut order_and_collations: Vec<(SortOrder, Option<CollationSeq>)> = order_by
+            let mut order_collations_nulls: Vec<(
+                SortOrder,
+                Option<CollationSeq>,
+                Option<turso_parser::ast::NullsOrder>,
+            )> = order_by
                 .iter()
-                .map(|(expr, dir)| {
+                .map(|(expr, dir, nulls)| {
                     let collation = get_collseq_from_expr(expr, referenced_tables)?;
-                    Ok((*dir, collation))
+                    Ok((*dir, collation, *nulls))
                 })
                 .collect::<Result<Vec<_>>>()?;
 
             // Resolve custom type comparators for ORDER BY columns.
             // For types with a `<` operator, the comparator is used for correct sort ordering.
-            let mut comparator_func_names: Vec<Option<String>> = order_by
+            let mut comparators: Vec<Option<SortComparatorType>> = order_by
                 .iter()
-                .map(|(expr, _)| {
-                    custom_type_lt_func(expr, referenced_tables, t_ctx.resolver.schema())
+                .map(|(expr, _, _)| {
+                    custom_type_comparator(expr, referenced_tables, t_ctx.resolver.schema())
                 })
                 .collect();
 
             if has_sequence {
-                // sequence column: ascending with BINARY collation, no comparator
-                order_and_collations.push((SortOrder::Asc, Some(CollationSeq::default())));
-                comparator_func_names.push(None);
+                // sequence column: ascending with BINARY collation, no comparator, no nulls order
+                order_collations_nulls.push((SortOrder::Asc, Some(CollationSeq::default()), None));
+                comparators.push(None);
             }
 
-            let key_len = order_and_collations.len();
+            let key_len = order_collations_nulls.len();
 
             program.emit_insn(Insn::SorterOpen {
                 cursor_id: sort_cursor,
                 columns: key_len,
-                order_and_collations,
-                comparator_func_names,
+                order_collations_nulls,
+                comparators,
             });
         }
         Ok(())
@@ -468,7 +480,7 @@ impl EmitOrderBy {
                 - result_columns_to_skip_len;
 
         let start_reg = program.alloc_registers(orderby_sorter_column_count);
-        for (i, (expr, _)) in order_by.iter().enumerate() {
+        for (i, (expr, _, _)) in order_by.iter().enumerate() {
             let key_reg = start_reg + i;
 
             // Check if this ORDER BY expression matches a finalized aggregate
@@ -708,7 +720,11 @@ pub struct OrderByRemapping {
 /// If we skip a result column, we need to keep track what index in the ORDER BY sorter the result columns have,
 /// because the result columns should be emitted in the SELECT clause order, not the ORDER BY clause order.
 pub fn order_by_deduplicate_result_columns(
-    order_by: &[(Box<ast::Expr>, SortOrder)],
+    order_by: &[(
+        Box<ast::Expr>,
+        SortOrder,
+        Option<turso_parser::ast::NullsOrder>,
+    )],
     result_columns: &[ResultSetColumn],
     has_sequence: bool,
 ) -> Vec<OrderByRemapping> {
@@ -723,7 +739,7 @@ pub fn order_by_deduplicate_result_columns(
         let found = order_by
             .iter()
             .enumerate()
-            .find(|(_, (expr, _))| exprs_are_equivalent(expr, &rc.expr));
+            .find(|(_, (expr, _, _))| exprs_are_equivalent(expr, &rc.expr));
         if let Some((j, _)) = found {
             result_column_remapping.push(OrderByRemapping {
                 orderby_sorter_idx: j,

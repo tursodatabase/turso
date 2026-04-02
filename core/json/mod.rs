@@ -287,6 +287,10 @@ pub fn json_array_length(
     path: Option<&Value>,
     json_cache: &JsonCacheCell,
 ) -> crate::Result<Value> {
+    if let Value::Null = value {
+        return Ok(Value::Null);
+    }
+
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
     let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
 
@@ -577,7 +581,7 @@ where
 ///
 /// - `jsonb` – the value to convert
 /// - `element_type` – the element type of the jsonb
-/// - `flag` – how the result should be formatted.
+/// - `flag` – how the result should be formatted (null values will stay null).
 ///   - If the flag is `OutputVariant::Binary`, the result is a `Value::Blob`.
 ///   - If it is `OutputVariant::ElementType` and the `element_type` is text, the result has a subtype of `TestSubtype::Text`, with the outer quotes removed.
 ///   - If it is `OutputVariant::String` and the `element_type` is text, the result has a subtype of `TextSubtype::Text`.
@@ -587,6 +591,9 @@ pub fn json_string_to_db_type(
     element_type: ElementType,
     flag: OutputVariant,
 ) -> crate::Result<Value> {
+    if element_type == ElementType::NULL {
+        return Ok(Value::Null);
+    }
     if matches!(flag, OutputVariant::Binary) {
         return Ok(Value::Blob(json.data()));
     }
@@ -636,7 +643,6 @@ pub fn json_string_to_db_type(
         }
         ElementType::TRUE => Ok(Value::from_i64(1)),
         ElementType::FALSE => Ok(Value::from_i64(0)),
-        ElementType::NULL => Ok(Value::Null),
         _ => unreachable!(),
     }
 }
@@ -1134,6 +1140,14 @@ mod tests {
         } else {
             panic!("Expected Value::Numeric(Numeric::Integer)");
         }
+    }
+
+    #[test]
+    fn test_json_array_length_null() {
+        let input = Value::Null;
+        let json_cache = JsonCacheCell::new();
+        let result = json_array_length(&input, None, &json_cache).unwrap();
+        assert_eq!(result, Value::Null);
     }
 
     #[test]

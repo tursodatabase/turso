@@ -886,20 +886,17 @@ pub fn insn_to_row(
                 format!("r[{dest}]={value}"),
             ),
             Insn::Program {
-                params,
+                param_registers,
                 ignore_jump_target,
                 ..
             } => (
                 "Program",
-                // P1: first register that contains a param
-                params.first().map(|v| match v {
-                    crate::types::Value::Numeric(crate::numeric::Numeric::Integer(i)) if *i < 0 => -i - 1,
-                    _ => 0,
-                }).unwrap_or(0),
+                // P1: first parent register that contains a param
+                param_registers.first().copied().unwrap_or(0) as i64,
                 // P2: ignore jump target (for RAISE(IGNORE))
                 ignore_jump_target.as_debug_int() as i64,
                 // P3: number of registers that contain params
-                params.len() as i64,
+                param_registers.len() as i64,
                 Value::build_text(program.sql.clone()),
                 0,
                 format!("subprogram={}", program.sql),
@@ -1135,7 +1132,7 @@ pub fn insn_to_row(
                 acc_reg,
                 delimiter: _,
                 col,
-                comparator_func_name: _,
+                comparator: _,
             } => (
                 "AggStep",
                 0,
@@ -1166,20 +1163,25 @@ pub fn insn_to_row(
             Insn::SorterOpen {
                 cursor_id,
                 columns,
-                order_and_collations,
+                order_collations_nulls,
                 ..
             } => {
-                let to_print: Vec<String> = order_and_collations
+                let to_print: Vec<String> = order_collations_nulls
                     .iter()
-                    .map(|(order, collation)| {
+                    .map(|(order, collation, nulls)| {
                         let sign = match order {
                             SortOrder::Asc => "",
                             SortOrder::Desc => "-",
                         };
-                        if let Some(coll) = collation {
+                        let coll_str = if let Some(coll) = collation {
                             format!("{sign}{coll}")
                         } else {
                             format!("{sign}B")
+                        };
+                        match nulls {
+                            Some(turso_parser::ast::NullsOrder::First) => format!("{coll_str} NF"),
+                            Some(turso_parser::ast::NullsOrder::Last) => format!("{coll_str} NL"),
+                            None => coll_str,
                         }
                     })
                     .collect();
@@ -1188,7 +1190,7 @@ pub fn insn_to_row(
                     *cursor_id as i64,
                     *columns as i64,
                     0,
-                    Value::build_text(format!("k({},{})", order_and_collations.len(), to_print.join(","))),
+                    Value::build_text(format!("k({},{})", order_collations_nulls.len(), to_print.join(","))),
                     0,
                     format!("cursor={cursor_id}"),
                 )
@@ -1352,6 +1354,7 @@ pub fn insn_to_row(
             Insn::Yield {
                 yield_reg,
                 end_offset,
+                ..
             } => (
                 "Yield",
                 *yield_reg as i64,
@@ -2192,7 +2195,7 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        Insn::HashProbe{hash_table_id: hash_table_reg, key_start_reg, num_keys, dest_reg, target_pc, payload_dest_reg, num_payload} => {
+        Insn::HashProbe{hash_table_id: hash_table_reg, key_start_reg, num_keys, dest_reg, target_pc, payload_dest_reg, num_payload, probe_rowid_reg: _} => {
             let payload_info = if let Some(p_reg) = payload_dest_reg {
                 format!(" payload=r[{}]..r[{}]", p_reg, p_reg + num_payload - 1)
             } else {
@@ -2260,6 +2263,15 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
+        Insn::HashResetMatched { hash_table_id } => (
+            "HashResetMatched",
+            *hash_table_id as i64,
+            0,
+            0,
+            Value::build_text(""),
+            0,
+            String::new(),
+        ),
         Insn::HashScanUnmatched { hash_table_id, dest_reg, target_pc, payload_dest_reg, num_payload } => {
             let payload_info = if let Some(p_reg) = payload_dest_reg {
                 format!(" payload=r[{}]..r[{}]", p_reg, p_reg + num_payload - 1)
@@ -2290,6 +2302,50 @@ pub fn insn_to_row(
                 Value::build_text(""),
                 0,
                 format!("hash_table_id={hash_table_id}{payload_info}"),
+            )
+        },
+        Insn::HashGraceInit { hash_table_id, target_pc } => {
+            (
+                "HashGraceInit",
+                *hash_table_id as i64,
+                0,
+                target_pc.as_debug_int() as i64,
+                Value::build_text(""),
+                0,
+                format!("hash_table_id={hash_table_id}"),
+            )
+        },
+        Insn::HashGraceLoadPartition { hash_table_id, target_pc } => {
+            (
+                "HashGraceLoadPart",
+                *hash_table_id as i64,
+                0,
+                target_pc.as_debug_int() as i64,
+                Value::build_text(""),
+                0,
+                format!("hash_table_id={hash_table_id}"),
+            )
+        },
+        Insn::HashGraceNextProbe { hash_table_id, key_start_reg, num_keys, probe_rowid_dest, target_pc } => {
+            (
+                "HashGraceNextProbe",
+                *hash_table_id as i64,
+                *key_start_reg as i64,
+                target_pc.as_debug_int() as i64,
+                Value::build_text(""),
+                0,
+                format!("hash_table_id={hash_table_id} keys=r[{}]..r[{}] probe_rowid_dest=r[{probe_rowid_dest}]", key_start_reg, *key_start_reg + *num_keys - 1),
+            )
+        },
+        Insn::HashGraceAdvancePartition { hash_table_id, target_pc } => {
+            (
+                "HashGraceAdvPart",
+                *hash_table_id as i64,
+                0,
+                target_pc.as_debug_int() as i64,
+                Value::build_text(""),
+                0,
+                format!("hash_table_id={hash_table_id}"),
             )
         },
         Insn::VacuumInto { dest_path } => (

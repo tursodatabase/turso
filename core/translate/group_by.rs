@@ -8,7 +8,7 @@ use super::{
 };
 use crate::translate::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
-    order_by::{custom_type_lt_func, EmitOrderBy},
+    order_by::{custom_type_comparator, EmitOrderBy},
     plan::{Aggregate, NonFromClauseSubquery},
     subquery::emit_non_from_clause_subqueries_for_phase,
 };
@@ -94,7 +94,11 @@ impl EmitGroupBy {
         group_by: &'a GroupBy,
         plan: &SelectPlan,
         result_columns: &'a [ResultSetColumn],
-        order_by: &'a [(Box<ast::Expr>, ast::SortOrder)],
+        order_by: &'a [(
+            Box<ast::Expr>,
+            ast::SortOrder,
+            Option<turso_parser::ast::NullsOrder>,
+        )],
     ) -> Result<()> {
         collect_non_aggregate_expressions(
             &mut t_ctx.non_aggregate_expressions,
@@ -154,30 +158,35 @@ impl EmitGroupBy {
              * then the collating sequence of the column is used to determine sort order.
              * If the expression is not a column and has no COLLATE clause, then the BINARY collating sequence is used.
              */
-            let order_and_collations: Vec<(SortOrder, Option<CollationSeq>)> = group_by
+            let order_collations_nulls: Vec<(
+                SortOrder,
+                Option<CollationSeq>,
+                Option<turso_parser::ast::NullsOrder>,
+            )> = group_by
                 .exprs
                 .iter()
                 .zip(sort_order.iter())
-                .map(|(expr, ord)| {
+                .zip(group_by.nulls_order.iter())
+                .map(|((expr, ord), nulls)| {
                     let collation = get_collseq_from_expr(expr, &plan.table_references)?;
-                    Ok((*ord, collation))
+                    Ok((*ord, collation, *nulls))
                 })
                 .collect::<Result<Vec<_>>>()?;
 
             // Resolve custom type comparators for GROUP BY columns (e.g. array_lt).
-            let comparator_func_names: Vec<Option<String>> = group_by
+            let comparators = group_by
                 .exprs
                 .iter()
                 .map(|expr| {
-                    custom_type_lt_func(expr, &plan.table_references, t_ctx.resolver.schema())
+                    custom_type_comparator(expr, &plan.table_references, t_ctx.resolver.schema())
                 })
                 .collect();
 
             program.emit_insn(Insn::SorterOpen {
                 cursor_id: sort_cursor,
                 columns: column_count,
-                order_and_collations,
-                comparator_func_names,
+                order_collations_nulls,
+                comparators,
             });
             emit_explain!(program, false, "USE SORTER FOR GROUP BY".to_owned());
             let pseudo_cursor = group_by_create_pseudo_table(program, column_count);
@@ -285,33 +294,43 @@ pub fn is_orderby_agg_or_const(resolver: &Resolver, e: &ast::Expr, aggs: &[Aggre
 /// appears in ORDER BY, and the remaining keys default to `ASC`.
 pub fn compute_group_by_sort_order(
     group_by_exprs: &[ast::Expr],
-    order_by: &[(Box<ast::Expr>, SortOrder)],
+    order_by: &[(
+        Box<ast::Expr>,
+        SortOrder,
+        Option<turso_parser::ast::NullsOrder>,
+    )],
     aggs: &[Aggregate],
     resolver: &Resolver,
-) -> Vec<SortOrder> {
+) -> (Vec<SortOrder>, Vec<Option<ast::NullsOrder>>) {
     let groupby_len = group_by_exprs.len();
     if groupby_len == 0 || order_by.is_empty() {
-        return vec![SortOrder::Asc; groupby_len];
+        return (vec![SortOrder::Asc; groupby_len], vec![None; groupby_len]);
     }
     let only_agg_or_const = order_by
         .iter()
-        .all(|(e, _)| is_orderby_agg_or_const(resolver, e, aggs));
+        .all(|(e, _, _)| is_orderby_agg_or_const(resolver, e, aggs));
 
     if only_agg_or_const {
         let first_direction = order_by[0].1;
-        return vec![first_direction; groupby_len];
+        let first_nulls = order_by[0].2;
+        return (
+            vec![first_direction; groupby_len],
+            vec![first_nulls; groupby_len],
+        );
     }
 
-    let mut result = vec![SortOrder::Asc; groupby_len];
+    let mut sort_order = vec![SortOrder::Asc; groupby_len];
+    let mut nulls_order = vec![None; groupby_len];
     for (idx, groupby_expr) in group_by_exprs.iter().enumerate() {
-        if let Some((_, direction)) = order_by
+        if let Some((_, direction, nulls)) = order_by
             .iter()
-            .find(|(expr, _)| exprs_are_equivalent(expr, groupby_expr))
+            .find(|(expr, _, _)| exprs_are_equivalent(expr, groupby_expr))
         {
-            result[idx] = *direction;
+            sort_order[idx] = *direction;
+            nulls_order[idx] = *nulls;
         }
     }
-    result
+    (sort_order, nulls_order)
 }
 
 /// Extracts unique leaf column references from all aggregate function arguments.
@@ -348,13 +367,17 @@ fn collect_non_aggregate_expressions<'a>(
     group_by: &'a GroupBy,
     plan: &SelectPlan,
     root_result_columns: &'a [ResultSetColumn],
-    order_by: &'a [(Box<ast::Expr>, ast::SortOrder)],
+    order_by: &'a [(
+        Box<ast::Expr>,
+        ast::SortOrder,
+        Option<turso_parser::ast::NullsOrder>,
+    )],
 ) -> Result<()> {
     let mut result_columns = Vec::new();
     for expr in root_result_columns
         .iter()
         .map(|col| &col.expr)
-        .chain(order_by.iter().map(|(e, _)| e.as_ref()))
+        .chain(order_by.iter().map(|(e, _, _)| e.as_ref()))
         .chain(group_by.having.iter().flatten())
     {
         collect_result_columns(expr, plan, &mut result_columns)?;
@@ -606,6 +629,7 @@ pub fn group_by_process_single_group(
         .map(|_| KeyInfo {
             sort_order: SortOrder::Asc,
             collation: CollationSeq::default(),
+            nulls_order: None,
         })
         .collect::<Vec<_>>();
     for (i, c) in compare_key_info
@@ -683,11 +707,12 @@ pub fn group_by_process_single_group(
             let cache_len = t_ctx.resolver.expr_to_reg_cache.len();
             let cache_was_enabled = t_ctx.resolver.expr_to_reg_cache_enabled;
             for (i, leaf_expr) in t_ctx.agg_leaf_columns.drain(..).enumerate() {
-                t_ctx.resolver.expr_to_reg_cache.push((
+                t_ctx.resolver.cache_expr_reg(
                     std::borrow::Cow::Owned(leaf_expr),
                     leaf_regs + i,
                     false,
-                ));
+                    None,
+                );
             }
             t_ctx.resolver.enable_expr_to_reg_cache();
 
@@ -770,11 +795,12 @@ pub fn group_by_process_single_group(
             {
                 if *expr_appears_in_result_columns {
                     program.emit_column_or_rowid(*pseudo_cursor, sorter_column_index, next_reg);
-                    t_ctx.resolver.expr_to_reg_cache.push((
+                    t_ctx.resolver.cache_scalar_expr_reg(
                         std::borrow::Cow::Borrowed(expr),
                         next_reg,
                         false,
-                    ));
+                        &plan.table_references,
+                    )?;
                     next_reg += 1;
                 }
             }
@@ -797,11 +823,12 @@ pub fn group_by_process_single_group(
                     dest_reg,
                     &t_ctx.resolver,
                 )?;
-                t_ctx.resolver.expr_to_reg_cache.push((
+                t_ctx.resolver.cache_scalar_expr_reg(
                     std::borrow::Cow::Borrowed(expr),
                     dest_reg,
                     false,
-                ));
+                    &plan.table_references,
+                )?;
             }
         }
     }
@@ -925,11 +952,12 @@ pub fn group_by_emit_row_phase<'a>(
             register: agg_result_reg,
             func: agg.func.clone(),
         });
-        t_ctx.resolver.expr_to_reg_cache.push((
+        t_ctx.resolver.cache_expr_reg(
             std::borrow::Cow::Owned(agg.original_expr.clone()),
             agg_result_reg,
             false,
-        ));
+            None,
+        );
     }
 
     t_ctx.resolver.enable_expr_to_reg_cache();

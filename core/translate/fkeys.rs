@@ -4,14 +4,14 @@ use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
 use crate::{
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
-    schema::{BTreeTable, ForeignKey, Index, ResolvedFkRef, ROWID_SENTINEL},
+    schema::{BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef, ROWID_SENTINEL},
     translate::{collate::CollationSeq, emitter::Resolver, planner::ROWID_STRS},
     vdbe::{
         builder::{CursorType, QueryMode},
         insn::{CmpInsFlags, Insn},
         BranchOffset,
     },
-    Connection, LimboError, Result, Value,
+    Connection, LimboError, Result,
 };
 use std::{num::NonZero, num::NonZeroUsize, sync::Arc};
 
@@ -540,6 +540,103 @@ pub fn emit_fk_parent_pk_change_counters(
     Ok(())
 }
 
+/// After INSERT in the UPDATE path, if REPLACE fired during Phase 1,
+/// children referencing the NEW parent key may resolve deferred FK violations
+/// that the REPLACE delete incremented. This emits a FkIfZero-guarded scan
+/// that decrements the counter for each matching child row.
+///
+/// Matches SQLite's post-delete / pre-insert FK reconciliation
+/// (sqlite3FkCheck → fkScanChildren with isIgnoreErr=1 path).
+#[allow(clippy::too_many_arguments)]
+pub fn emit_fk_parent_new_key_reconcile(
+    program: &mut ProgramBuilder,
+    table_btree: &BTreeTable,
+    new_values_start: usize,
+    new_rowid_reg: usize,
+    set_clauses: &[(usize, Box<ast::Expr>)],
+    database_id: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let updated_positions: HashSet<usize> = set_clauses.iter().map(|(i, _)| *i).collect();
+    let incoming = resolver.with_schema(database_id, |s| {
+        s.resolved_fks_referencing(&table_btree.name)
+    })?;
+
+    let is_relevant = |fk: &ResolvedFkRef| -> bool {
+        fk.fk.deferred && fk.parent_key_may_change(&updated_positions, table_btree)
+    };
+    if !incoming.iter().any(&is_relevant) {
+        return Ok(());
+    }
+
+    // FkIfZero guard: skip entire section if counter is already zero.
+    let skip_all = program.allocate_label();
+    program.emit_insn(Insn::FkIfZero {
+        deferred: true,
+        target_pc: skip_all,
+    });
+
+    for fk_ref in incoming.iter().filter(|fk| is_relevant(fk)) {
+        if fk_ref.parent_uses_rowid {
+            emit_fk_parent_key_probe(
+                program,
+                fk_ref,
+                new_rowid_reg,
+                1,
+                ParentProbePass::New,
+                database_id,
+                resolver,
+            )?;
+            continue;
+        }
+
+        // Build contiguous NEW key registers from the parent column positions.
+        // Parent columns come from explicit FK declaration, or implicitly from PK.
+        let explicit = &fk_ref.fk.parent_columns;
+        let pk = &table_btree.primary_key_columns;
+        let n_cols = if explicit.is_empty() {
+            pk.len()
+        } else {
+            explicit.len()
+        };
+        let new_key = program.alloc_registers(n_cols);
+
+        for i in 0..n_cols {
+            let col_name = if explicit.is_empty() {
+                pk[i].0.as_str()
+            } else {
+                explicit[i].as_str()
+            };
+            let (pos, col) = table_btree
+                .get_column(col_name)
+                .ok_or_else(|| LimboError::InternalError(format!("col {col_name} missing")))?;
+            let src = if col.is_rowid_alias() {
+                new_rowid_reg
+            } else {
+                new_values_start + pos
+            };
+            program.emit_insn(Insn::Copy {
+                src_reg: src,
+                dst_reg: new_key + i,
+                extra_amount: 0,
+            });
+        }
+
+        emit_fk_parent_key_probe(
+            program,
+            fk_ref,
+            new_key,
+            n_cols,
+            ParentProbePass::New,
+            database_id,
+            resolver,
+        )?;
+    }
+
+    program.preassign_label_to_next_insn(skip_all);
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum ParentProbePass {
     Old,
@@ -680,6 +777,7 @@ pub fn emit_fk_child_update_counters(
     updated_cols: &HashSet<usize>,
     database_id: usize,
     resolver: &Resolver,
+    layout: &ColumnLayout,
 ) -> Result<()> {
     // Helper: materialize OLD tuple for this FK; returns (start_reg, ncols, null_skip_label).
     // The null_skip_label is unresolved and must be resolved by the caller after the FK check
@@ -798,7 +896,7 @@ pub fn emit_fk_child_update_counters(
             let src = if col.is_rowid_alias() {
                 new_rowid_reg
             } else {
-                new_start_reg + i
+                layout.to_register(new_start_reg, i)
             };
             program.emit_insn(Insn::IsNull {
                 reg: src,
@@ -817,7 +915,7 @@ pub fn emit_fk_child_update_counters(
             let val_reg = if col_child.is_rowid_alias() {
                 new_rowid_reg
             } else {
-                new_start_reg + i_child
+                layout.to_register(new_start_reg, i_child)
             };
 
             let tmp = program.alloc_register();
@@ -861,7 +959,7 @@ pub fn emit_fk_child_update_counters(
                         src_reg: if col.is_rowid_alias() {
                             new_rowid_reg
                         } else {
-                            new_start_reg + i
+                            layout.to_register(new_start_reg, i)
                         },
                         dst_reg: start + k,
                         extra_amount: 0,
@@ -1310,28 +1408,18 @@ fn emit_fk_action_subprogram(
     subprogram_builder.epilogue(resolver.schema());
     let built_subprogram = subprogram_builder.build(connection.clone(), true, description)?;
 
-    // Build params: OLD key register indices, then optionally NEW key register indices
-    let mut params: Vec<Value> = ctx
-        .old_key_registers
-        .iter()
-        .copied()
-        .map(|reg_idx| Value::from_i64(reg_idx as i64))
-        .collect();
+    // Build param_registers: OLD key register indices, then optionally NEW key register indices
+    let mut param_registers: Vec<usize> = ctx.old_key_registers.to_vec();
 
     if let Some(new_regs) = &ctx.new_key_registers {
-        params.extend(
-            new_regs
-                .iter()
-                .copied()
-                .map(|reg_idx| Value::from_i64(reg_idx as i64)),
-        );
+        param_registers.extend(new_regs.iter().copied());
     }
 
     // FK action subprograms can't contain RAISE(IGNORE), so ignore_jump_target
     // is a no-op that resolves to the next instruction (just falls through).
     let ignore_jump_target = program.allocate_label();
     program.emit_insn(Insn::Program {
-        params,
+        param_registers,
         program: built_subprogram.prepared().clone(),
         ignore_jump_target,
     });
@@ -1454,7 +1542,12 @@ fn generate_cascade_update_stmt(
                 .expect("new params required for cascade update");
             ast::Set {
                 col_names: vec![Name::from_string(col)],
-                expr: Box::new(Expr::Variable(format!("{}", param_idx.get()))),
+                expr: Box::new(Expr::Variable(ast::Variable::indexed(
+                    u32::try_from(param_idx.get())
+                        .ok()
+                        .and_then(std::num::NonZeroU32::new)
+                        .expect("fk parameter index must fit into NonZeroU32"),
+                ))),
             }
         })
         .collect();
@@ -1484,7 +1577,12 @@ fn build_fk_match_where_clause(child_cols: &[String], ctx: &FkSubprogramContext)
         let cond = Expr::Binary(
             Box::new(Expr::Id(Name::from_string(col))),
             ast::Operator::Equals,
-            Box::new(Expr::Variable(format!("{}", param_idx.get()))),
+            Box::new(Expr::Variable(ast::Variable::indexed(
+                u32::try_from(param_idx.get())
+                    .ok()
+                    .and_then(std::num::NonZeroU32::new)
+                    .expect("fk parameter index must fit into NonZeroU32"),
+            ))),
         );
         conditions.push(cond);
     }

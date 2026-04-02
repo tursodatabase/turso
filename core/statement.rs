@@ -1,10 +1,10 @@
-use crate::turso_assert_eq;
 use std::{
     borrow::Cow,
     num::NonZero,
     ops::Deref,
     sync::{atomic::Ordering, Arc},
     task::Waker,
+    time::Duration,
 };
 
 use tracing::{instrument, Level};
@@ -31,6 +31,38 @@ type ProgramExecutionState = vdbe::ProgramExecutionState;
 type Row = vdbe::Row;
 type StepResult = vdbe::StepResult;
 
+/// Classifies how a [`Statement`] participates in connection-level lifecycle
+/// and active-statement accounting.
+///
+/// Use [`StatementOrigin::Root`] for ordinary top-level statements prepared on
+/// behalf of the user. Root statements are the only statements that count
+/// toward `Connection::n_active_root_statements` once execution begins, which
+/// is the SQLite-compatible notion of "another SQL statement in progress" used
+/// by operations like `VACUUM`.
+///
+/// Use [`StatementOrigin::InternalHelper`] when the engine prepares and runs a
+/// separate helper statement on the same connection, for example helper SQL in
+/// schema parsing or CDC setup. This is separately prepared SQL with its own
+/// `prepare`/`step`/`reset`/`drop` lifecycle, but it is owned by a parent root
+/// statement, so it stays nested and does not count as another root statement.
+///
+/// Use [`StatementOrigin::Subprogram`] only for bytecode subprograms that are
+/// already compiled into a parent statement and entered through `OP_Program`,
+/// such as trigger or foreign-key actions. This is not separately prepared SQL;
+/// it is embedded child bytecode execution inside the parent statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatementOrigin {
+    Root,
+    InternalHelper,
+    Subprogram,
+}
+
+impl StatementOrigin {
+    pub(crate) const fn needs_nested_guard(self) -> bool {
+        matches!(self, Self::InternalHelper)
+    }
+}
+
 pub struct Statement {
     pub(crate) program: vdbe::Program,
     state: vdbe::ProgramState,
@@ -41,6 +73,11 @@ pub struct Statement {
     busy: bool,
     /// Busy handler state for tracking invocations and timeouts
     busy_handler_state: Option<BusyHandlerState>,
+    /// Per-execution timeout override for this statement.
+    /// - `None`: use connection default
+    /// - `Some(Some(duration))`: override with a query-specific timeout
+    /// - `Some(None)`: disable timeout for this execution
+    query_timeout_override: Option<Option<Duration>>,
     /// True once step() has returned Row for a write statement (INSERT/UPDATE/DELETE
     /// with RETURNING). With ephemeral-buffered RETURNING, the first Row proves all
     /// DML completed — only the scan-back remains. Used by reset_internal to decide
@@ -49,6 +86,13 @@ pub struct Statement {
     /// Byte offset in the original SQL string where this statement ends.
     /// Used by sqlite3_prepare_v2 to set the *pzTail output parameter.
     tail_offset: usize,
+    origin: StatementOrigin,
+    /// True once this root statement has started executing and incremented
+    /// `Connection::n_active_root_statements`.
+    counted_as_active_root: bool,
+    /// True if this statement called `Connection::start_nested()` during
+    /// construction and therefore must call `end_nested()` on drop.
+    nested_guard_active: bool,
 }
 
 crate::assert::assert_send_sync!(Statement);
@@ -59,18 +103,30 @@ impl std::fmt::Debug for Statement {
     }
 }
 
-impl Drop for Statement {
-    fn drop(&mut self) {
-        self.reset_best_effort();
-    }
-}
-
 impl Statement {
     pub fn new(
         program: vdbe::Program,
         pager: Arc<Pager>,
         query_mode: QueryMode,
         tail_offset: usize,
+    ) -> Self {
+        Self::new_with_origin(
+            program,
+            pager,
+            query_mode,
+            tail_offset,
+            StatementOrigin::Root,
+            false,
+        )
+    }
+
+    pub(crate) fn new_with_origin(
+        program: vdbe::Program,
+        pager: Arc<Pager>,
+        query_mode: QueryMode,
+        tail_offset: usize,
+        origin: StatementOrigin,
+        nested_guard_active: bool,
     ) -> Self {
         let (max_registers, cursor_count) = match query_mode {
             QueryMode::Normal => (program.max_registers, program.cursor_ref.len()),
@@ -85,8 +141,12 @@ impl Statement {
             query_mode,
             busy: false,
             busy_handler_state: None,
+            query_timeout_override: None,
             has_returned_row: false,
             tail_offset,
+            origin,
+            counted_as_active_root: false,
+            nested_guard_active,
         }
     }
 
@@ -124,6 +184,15 @@ impl Statement {
         self.state.interrupt();
     }
 
+    /// Sets a per-execution timeout override for this statement.
+    ///
+    /// - `None`: use connection default
+    /// - `Some(Some(duration))`: use query-specific timeout
+    /// - `Some(None)`: disable timeout for this execution
+    pub fn set_query_timeout_override(&mut self, timeout: Option<Option<Duration>>) {
+        self.query_timeout_override = timeout;
+    }
+
     pub fn execution_state(&self) -> ProgramExecutionState {
         self.state.execution_state
     }
@@ -144,15 +213,70 @@ impl Statement {
         self.state.io_completions.take()
     }
 
+    fn arm_query_timeout_if_needed(&mut self) {
+        if !matches!(self.state.execution_state, ProgramExecutionState::Init)
+            || self.state.query_deadline.is_some()
+        {
+            return;
+        }
+        let timeout = match self.query_timeout_override {
+            Some(timeout_override) => timeout_override,
+            None => {
+                let connection_timeout = self.program.connection.get_query_timeout();
+                if connection_timeout.is_zero() {
+                    None
+                } else {
+                    Some(connection_timeout)
+                }
+            }
+        };
+        let Some(timeout) = timeout else {
+            return;
+        };
+        self.state.query_deadline = Some(self.pager.io.current_time_monotonic() + timeout);
+    }
+
+    fn maybe_interrupt_for_query_timeout(&mut self) {
+        if let Some(deadline) = self.state.query_deadline {
+            if self.pager.io.current_time_monotonic() >= deadline {
+                self.state.interrupt();
+            }
+        }
+    }
+
+    fn release_active_root_if_counted(&mut self) {
+        if self.counted_as_active_root {
+            self.program
+                .connection
+                .n_active_root_statements
+                .fetch_sub(1, Ordering::SeqCst);
+            self.counted_as_active_root = false;
+        }
+    }
+
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        if !self.counted_as_active_root && matches!(self.origin, StatementOrigin::Root) {
+            self.program
+                .connection
+                .n_active_root_statements
+                .fetch_add(1, Ordering::SeqCst);
+            self.counted_as_active_root = true;
+        }
         if matches!(self.state.execution_state, ProgramExecutionState::Init)
             && !self
                 .program
                 .prepare_context
                 .matches_connection(&self.program.connection)
         {
-            self.reprepare()?;
+            if let Err(err) = self.reprepare() {
+                self.release_active_root_if_counted();
+                return Err(err);
+            }
         }
+
+        self.arm_query_timeout_if_needed();
+        self.maybe_interrupt_for_query_timeout();
+
         // If we're waiting for a busy handler timeout, check if we can proceed
         if let Some(busy_state) = self.busy_handler_state.as_ref() {
             if self.pager.io.current_time_monotonic() < busy_state.timeout() {
@@ -174,7 +298,10 @@ impl Statement {
                 break;
             }
             tracing::debug!("reprepare: attempt={}", attempt);
-            self.reprepare()?;
+            if let Err(err) = self.reprepare() {
+                self.release_active_root_if_counted();
+                return Err(err);
+            }
             res = self
                 .program
                 .step(&mut self.state, &self.pager, self.query_mode, waker);
@@ -189,6 +316,7 @@ impl Statement {
                 .record_statement(&self.state.metrics);
             self.busy = false;
             self.busy_handler_state = None; // Reset busy state on completion
+            self.state.query_deadline = None;
 
             // After ANALYZE completes, refresh in-memory stats so planners can use them.
             let sql = self.program.sql.trim_start().as_bytes();
@@ -232,6 +360,12 @@ impl Statement {
             self.has_returned_row = true;
         }
 
+        if self.counted_as_active_root
+            && (matches!(res, Ok(StepResult::Done | StepResult::Interrupt)) || res.is_err())
+        {
+            self.release_active_root_if_counted();
+        }
+
         res
     }
 
@@ -243,6 +377,15 @@ impl Statement {
     #[inline]
     pub fn step_with_waker(&mut self, waker: &Waker) -> Result<StepResult> {
         self._step(Some(waker))
+    }
+
+    /// Fast step for trigger/FK subprograms: skips reprepare checks, timeout
+    /// arming, busy handler, metrics recording, and schema retry.
+    /// The parent statement handles all of those concerns.
+    #[inline]
+    pub fn step_subprogram(&mut self) -> Result<StepResult> {
+        self.program
+            .step(&mut self.state, &self.pager, self.query_mode, None)
     }
 
     pub fn run_ignore_rows(&mut self) -> Result<()> {
@@ -346,7 +489,14 @@ impl Statement {
             }
         }
 
-        *conn.schema.write() = conn.db.clone_schema();
+        // if current connection is within a transaction which changed schema - we must use its schema version instead of DB schema version
+        // see test_prepared_stmt_reprepare_ddl_change_txn (plus test_sync_pull_after_local_ddl_and_remote_writes)
+        {
+            let mut conn_schema = conn.schema.write();
+            if conn_schema.schema_version < conn.db.schema.lock().schema_version {
+                *conn_schema = conn.db.clone_schema();
+            }
+        }
         self.program = {
             let mut parser = Parser::new(self.program.sql.as_bytes());
             let cmd = parser.next_cmd()?;
@@ -355,7 +505,7 @@ impl Statement {
             let syms = conn.syms.read();
             let mode = self.query_mode;
             #[cfg(debug_assertions)]
-            turso_assert_eq!(QueryMode::new(&cmd), mode);
+            crate::turso_assert_eq!(QueryMode::new(&cmd), mode);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
             let schema = conn.schema.read().clone();
             translate::translate(
@@ -376,7 +526,13 @@ impl Statement {
             QueryMode::Explain => (EXPLAIN_COLUMNS.len(), 0),
             QueryMode::ExplainQueryPlan => (EXPLAIN_QUERY_PLAN_COLUMNS.len(), 0),
         };
-        self.reset_internal(Some(max_registers), Some(cursor_count))?;
+        // Repreparing a root statement must not make it disappear from
+        // `n_active_root_statements` while it is still logically in progress.
+        self.reset_internal(
+            Some(max_registers),
+            Some(cursor_count),
+            self.counted_as_active_root,
+        )?;
         // Load the parameters back into the state
         self.state.parameters = parameters;
         Ok(())
@@ -405,12 +561,65 @@ impl Statement {
         match self.query_mode {
             QueryMode::Normal => {
                 let column = &self.program.result_columns.get(idx).expect("No column");
-                match column.name(&self.program.table_references) {
-                    Some(name) => Cow::Borrowed(name),
-                    None => {
-                        let tables = [&self.program.table_references];
-                        let ctx = PlanContext(&tables);
-                        Cow::Owned(column.expr.displayer(&ctx).to_string())
+
+                // 1. Explicit alias (AS clause) or SELECT * expansion always wins.
+                if let Some(alias) = &column.alias {
+                    return Cow::Borrowed(alias);
+                }
+
+                let full = self.program.connection.get_full_column_names();
+                let short = self.program.connection.get_short_column_names();
+
+                // 2. For column references, apply full/short column name logic.
+                match &column.expr {
+                    turso_parser::ast::Expr::Column {
+                        table,
+                        column: col_idx,
+                        ..
+                    } => {
+                        if full {
+                            // full_column_names=ON: use REAL_TABLE_NAME.COLUMN
+                            if let Some((_, table_ref)) = self
+                                .program
+                                .table_references
+                                .find_table_by_internal_id(*table)
+                            {
+                                let col_name = table_ref
+                                    .get_column_at(*col_idx)
+                                    .and_then(|c| c.name.as_deref())
+                                    .unwrap_or("?");
+                                return Cow::Owned(format!(
+                                    "{}.{}",
+                                    table_ref.get_name(),
+                                    col_name
+                                ));
+                            }
+                        }
+                        if short || full {
+                            // short_column_names=ON: use just COLUMN
+                            if let Some(name) = column.name(&self.program.table_references) {
+                                return Cow::Borrowed(name);
+                            }
+                        }
+                        // Both OFF: use original expression text
+                        if let Some(name) = &column.implicit_column_name {
+                            Cow::Borrowed(name.as_str())
+                        } else {
+                            let tables = [&self.program.table_references];
+                            let ctx = PlanContext(&tables);
+                            Cow::Owned(column.expr.displayer(&ctx).to_string())
+                        }
+                    }
+                    _ => {
+                        // Non-column-ref: use implicit_column_name or displayer
+                        match column.name(&self.program.table_references) {
+                            Some(name) => Cow::Borrowed(name),
+                            None => {
+                                let tables = [&self.program.table_references];
+                                let ctx = PlanContext(&tables);
+                                Cow::Owned(column.expr.displayer(&ctx).to_string())
+                            }
+                        }
                     }
                 }
             }
@@ -550,7 +759,7 @@ impl Statement {
     }
 
     pub fn reset(&mut self) -> Result<()> {
-        self.reset_internal(None, None)
+        self.reset_internal(None, None, false)
     }
 
     pub fn reset_best_effort(&mut self) {
@@ -565,10 +774,24 @@ impl Statement {
         }
     }
 
+    /// Lightweight reset for reusing a cached subprogram statement.
+    /// Skips transaction handling and abort(): the caller (op_program) has
+    /// already handled trigger execution tracking. Only resets ProgramState
+    /// fields so the subprogram can run again from the beginning.
+    pub fn reset_for_subprogram_reuse(&mut self) {
+        self.state.reset(None, None);
+        self.state
+            .n_change
+            .store(0, std::sync::atomic::Ordering::Release);
+        self.busy = false;
+        self.has_returned_row = false;
+    }
+
     fn reset_internal(
         &mut self,
         max_registers: Option<usize>,
         max_cursors: Option<usize>,
+        preserve_active_root_count: bool,
     ) -> Result<()> {
         fn capture_reset_error(
             reset_error: &mut Option<LimboError>,
@@ -693,10 +916,14 @@ impl Statement {
                 .fetch_sub(1, Ordering::SeqCst);
             self.state.is_active_write = false;
         }
+        if self.counted_as_active_root && !preserve_active_root_count {
+            self.release_active_root_if_counted();
+        }
         self.state.reset(max_registers, max_cursors);
         self.state.n_change.store(0, Ordering::SeqCst);
         self.busy = false;
         self.busy_handler_state = None;
+        self.query_timeout_override = None;
         self.has_returned_row = false;
 
         if let Some(err) = reset_error {
@@ -724,5 +951,19 @@ impl Statement {
     /// Prefer to use helper methods instead such as [Self::run_with_row_callback]
     pub fn _io(&self) -> &dyn crate::IO {
         self.pager.io.as_ref()
+    }
+}
+
+impl Drop for Statement {
+    fn drop(&mut self) {
+        // Keep helper statements nested while drop-time reset/abort cleanup runs.
+        // That cleanup consults `is_nested_stmt()` to decide whether top-level
+        // transaction/savepoint finalization belongs to this statement or to its
+        // parent, so we release the nested guard only after reset completes.
+        self.reset_best_effort();
+        if self.nested_guard_active {
+            self.program.connection.end_nested();
+            self.nested_guard_active = false;
+        }
     }
 }

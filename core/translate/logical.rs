@@ -604,10 +604,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 }
 
                 // Regular table scan
-                let table_alias = alias.as_ref().map(|a| match a {
-                    ast::As::As(name) => Self::name_to_string(name),
-                    ast::As::Elided(name) => Self::name_to_string(name),
-                });
+                let table_alias = alias.as_ref().map(|a| Self::name_to_string(a.name()));
                 let table_schema = self.get_table_schema(&table_name, table_alias.as_deref())?;
                 Ok(LogicalPlan::TableScan(TableScan {
                     table_name,
@@ -930,10 +927,9 @@ impl<'a> LogicalPlanBuilder<'a> {
             match col {
                 ast::ResultColumn::Expr(expr, alias) => {
                     let logical_expr = self.build_expr(expr, input_schema)?;
-                    let col_name = match alias {
-                        Some(as_alias) => match as_alias {
-                            ast::As::As(name) | ast::As::Elided(name) => Self::name_to_string(name),
-                        },
+                    let explicit_alias = alias.as_ref().filter(|a| a.is_explicit());
+                    let col_name = match explicit_alias {
+                        Some(as_alias) => Self::name_to_string(as_alias.name()),
                         None => Self::expr_to_column_name(expr),
                     };
                     let col_type = Self::infer_expr_type(&logical_expr, input_schema)?;
@@ -946,10 +942,8 @@ impl<'a> LogicalPlanBuilder<'a> {
                         table_alias: None,
                     });
 
-                    if let Some(as_alias) = alias {
-                        let alias_name = match as_alias {
-                            ast::As::As(name) | ast::As::Elided(name) => Self::name_to_string(name),
-                        };
+                    if let Some(as_alias) = explicit_alias {
+                        let alias_name = Self::name_to_string(as_alias.name());
                         proj_exprs.push(LogicalExpr::Alias {
                             expr: Box::new(logical_expr),
                             alias: alias_name,
@@ -1167,11 +1161,8 @@ impl<'a> LogicalPlanBuilder<'a> {
                 let logical_expr = self.build_expr(expr, input_schema)?;
                 select_exprs.push(logical_expr.clone());
 
-                if let Some(alias) = alias {
-                    let alias_name = match alias {
-                        ast::As::As(name) | ast::As::Elided(name) => Self::name_to_string(name),
-                    };
-                    alias_to_expr.insert(alias_name, logical_expr);
+                if let Some(alias) = alias.as_ref().filter(|a| a.is_explicit()) {
+                    alias_to_expr.insert(Self::name_to_string(alias.name()), logical_expr);
                 }
             }
         }
@@ -1257,10 +1248,8 @@ impl<'a> LogicalPlanBuilder<'a> {
                     let logical_expr = self.build_expr(expr, input_schema)?;
 
                     // Determine the column name for this expression
-                    let col_name = match alias {
-                        Some(as_alias) => match as_alias {
-                            ast::As::As(name) | ast::As::Elided(name) => Self::name_to_string(name),
-                        },
+                    let col_name = match alias.as_ref().filter(|a| a.is_explicit()) {
+                        Some(as_alias) => Self::name_to_string(as_alias.name()),
                         None => Self::expr_to_column_name(expr),
                     };
 
@@ -1392,12 +1381,12 @@ impl<'a> LogicalPlanBuilder<'a> {
         for (i, expr) in projection_exprs.iter().enumerate() {
             let col_name = if i < columns.len() {
                 match &columns[i] {
-                    ast::ResultColumn::Expr(e, alias) => match alias {
-                        Some(as_alias) => match as_alias {
-                            ast::As::As(name) | ast::As::Elided(name) => Self::name_to_string(name),
-                        },
-                        None => Self::expr_to_column_name(e),
-                    },
+                    ast::ResultColumn::Expr(e, alias) => {
+                        match alias.as_ref().filter(|a| a.is_explicit()) {
+                            Some(as_alias) => Self::name_to_string(as_alias.name()),
+                            None => Self::expr_to_column_name(e),
+                        }
+                    }
                     _ => format!("col_{i}"),
                 }
             } else {
@@ -1728,7 +1717,9 @@ impl<'a> LogicalPlanBuilder<'a> {
                         args: vec![],
                         distinct: false,
                     })
-                } else if let Ok(func) = crate::function::Func::resolve_function(&func_name, 0) {
+                } else if let Ok(Some(func)) =
+                    crate::function::Func::resolve_function(&func_name, 0)
+                {
                     // Check if this function supports star expansion (e.g., json_object, jsonb_object)
                     if func.needs_star_expansion() {
                         // Expand * to all columns as alternating key-value pairs
@@ -2416,140 +2407,144 @@ mod tests {
         let mut schema = Schema::new();
 
         // Create users table
+        let columns = vec![
+            SchemaColumn::new(
+                Some("id".to_string()),
+                "INTEGER".to_string(),
+                None,
+                None,
+                Type::Integer,
+                None,
+                ColDef {
+                    primary_key: true,
+                    rowid_alias: true,
+                    notnull: true,
+                    ..Default::default()
+                },
+            ),
+            SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+            SchemaColumn::new_default_integer(Some("age".to_string()), "INTEGER".to_string(), None),
+            SchemaColumn::new_default_text(Some("email".to_string()), "TEXT".to_string(), None),
+        ];
+        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let users_table = BTreeTable {
             name: "users".to_string(),
             root_page: 2,
             primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
             foreign_keys: vec![],
             check_constraints: vec![],
-            pk_conflict_clause: None,
-            columns: vec![
-                SchemaColumn::new(
-                    Some("id".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                    None,
-                    Type::Integer,
-                    None,
-                    ColDef {
-                        primary_key: true,
-                        rowid_alias: true,
-                        notnull: true,
-                        ..Default::default()
-                    },
-                ),
-                SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
-                SchemaColumn::new_default_integer(
-                    Some("age".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                ),
-                SchemaColumn::new_default_text(Some("email".to_string()), "TEXT".to_string(), None),
-            ],
+            rowid_alias_conflict_clause: None,
+            columns,
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,
             unique_sets: vec![],
+            has_virtual_columns: false,
+            logical_to_physical_map,
         };
         schema
             .add_btree_table(Arc::new(users_table))
             .expect("Test setup: failed to add users table");
 
         // Create orders table
+        let columns = vec![
+            SchemaColumn::new(
+                Some("id".to_string()),
+                "INTEGER".to_string(),
+                None,
+                None,
+                Type::Integer,
+                None,
+                ColDef {
+                    primary_key: true,
+                    rowid_alias: true,
+                    notnull: true,
+                    ..Default::default()
+                },
+            ),
+            SchemaColumn::new_default_integer(
+                Some("user_id".to_string()),
+                "INTEGER".to_string(),
+                None,
+            ),
+            SchemaColumn::new_default_text(Some("product".to_string()), "TEXT".to_string(), None),
+            SchemaColumn::new(
+                Some("amount".to_string()),
+                "REAL".to_string(),
+                None,
+                None,
+                Type::Real,
+                None,
+                ColDef::default(),
+            ),
+        ];
+        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let orders_table = BTreeTable {
             name: "orders".to_string(),
             root_page: 3,
             primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
-            columns: vec![
-                SchemaColumn::new(
-                    Some("id".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                    None,
-                    Type::Integer,
-                    None,
-                    ColDef {
-                        primary_key: true,
-                        rowid_alias: true,
-                        notnull: true,
-                        ..Default::default()
-                    },
-                ),
-                SchemaColumn::new_default_integer(
-                    Some("user_id".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                ),
-                SchemaColumn::new_default_text(
-                    Some("product".to_string()),
-                    "TEXT".to_string(),
-                    None,
-                ),
-                SchemaColumn::new(
-                    Some("amount".to_string()),
-                    "REAL".to_string(),
-                    None,
-                    None,
-                    Type::Real,
-                    None,
-                    ColDef::default(),
-                ),
-            ],
+            columns,
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
-            pk_conflict_clause: None,
+            rowid_alias_conflict_clause: None,
+            has_virtual_columns: false,
+            logical_to_physical_map,
         };
         schema
             .add_btree_table(Arc::new(orders_table))
             .expect("Test setup: failed to add orders table");
 
         // Create products table
+        let columns = vec![
+            SchemaColumn::new(
+                Some("id".to_string()),
+                "INTEGER".to_string(),
+                None,
+                None,
+                Type::Integer,
+                None,
+                ColDef {
+                    primary_key: true,
+                    rowid_alias: true,
+                    notnull: true,
+                    ..Default::default()
+                },
+            ),
+            SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+            SchemaColumn::new(
+                Some("price".to_string()),
+                "REAL".to_string(),
+                None,
+                None,
+                Type::Real,
+                None,
+                ColDef::default(),
+            ),
+            SchemaColumn::new_default_integer(
+                Some("product_id".to_string()),
+                "INTEGER".to_string(),
+                None,
+            ),
+        ];
+        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let products_table = BTreeTable {
             name: "products".to_string(),
             root_page: 4,
             primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
-            columns: vec![
-                SchemaColumn::new(
-                    Some("id".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                    None,
-                    Type::Integer,
-                    None,
-                    ColDef {
-                        primary_key: true,
-                        rowid_alias: true,
-                        notnull: true,
-                        ..Default::default()
-                    },
-                ),
-                SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
-                SchemaColumn::new(
-                    Some("price".to_string()),
-                    "REAL".to_string(),
-                    None,
-                    None,
-                    Type::Real,
-                    None,
-                    ColDef::default(),
-                ),
-                SchemaColumn::new_default_integer(
-                    Some("product_id".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                ),
-            ],
+            columns,
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
-            pk_conflict_clause: None,
+            rowid_alias_conflict_clause: None,
+            has_virtual_columns: false,
+            logical_to_physical_map,
         };
         schema
             .add_btree_table(Arc::new(products_table))

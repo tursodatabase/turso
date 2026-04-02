@@ -1,0 +1,93 @@
+@database :memory:
+@requires-file trigger "trigger tests require trigger support"
+
+test trigger-last-insert-rowid-basic {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(x INTEGER PRIMARY KEY, y TEXT);
+    CREATE TRIGGER tr AFTER INSERT ON t1 BEGIN
+        INSERT INTO t2 VALUES(NEW.a + 1000, 'from trigger');
+    END;
+    INSERT INTO t1 VALUES(1, 'hello');
+    SELECT last_insert_rowid();
+}
+expect {
+    1
+}
+
+test trigger-last-insert-rowid-multiple {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(x INTEGER PRIMARY KEY, y TEXT);
+    CREATE TRIGGER tr AFTER INSERT ON t1 BEGIN
+        INSERT INTO t2 VALUES(NEW.a + 1000, 'from trigger');
+    END;
+    INSERT INTO t1 VALUES(2, 'world');
+    INSERT INTO t1 VALUES(3, 'foo');
+    SELECT last_insert_rowid();
+}
+expect {
+    3
+}
+
+test trigger-last-insert-rowid-side-effect {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(x INTEGER PRIMARY KEY, y TEXT);
+    CREATE TRIGGER tr AFTER INSERT ON t1 BEGIN
+        INSERT INTO t2 VALUES(NEW.a + 1000, 'from trigger');
+    END;
+    INSERT INTO t1 VALUES(42, 'check');
+    SELECT last_insert_rowid();
+    SELECT x, y FROM t2;
+}
+expect {
+    42
+    1042|from trigger
+}
+
+test trigger-last-insert-rowid-autoincrement {
+    CREATE TABLE t3(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t4(x INTEGER PRIMARY KEY, y TEXT);
+    CREATE TRIGGER tr2 AFTER INSERT ON t3 BEGIN
+        INSERT INTO t4 VALUES(NEW.a * 100, 'triggered');
+    END;
+    INSERT INTO t3(b) VALUES('auto1');
+    SELECT last_insert_rowid();
+}
+expect {
+    1
+}
+
+test trigger-last-insert-rowid-before-insert {
+    CREATE TABLE t5(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t6(x INTEGER PRIMARY KEY, y TEXT);
+    CREATE TRIGGER tr_before BEFORE INSERT ON t5 BEGIN
+        INSERT INTO t6 VALUES(NEW.a + 500, 'before trigger');
+    END;
+    INSERT INTO t5 VALUES(10, 'before test');
+    SELECT last_insert_rowid();
+    SELECT x, y FROM t6;
+}
+expect {
+    10
+    510|before trigger
+}
+
+test trigger-last-insert-rowid-nested {
+    CREATE TABLE outer_t(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE mid_t(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE inner_t(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TRIGGER tr_outer AFTER INSERT ON outer_t BEGIN
+        INSERT INTO mid_t VALUES(NEW.id + 100, 'mid');
+    END;
+    CREATE TRIGGER tr_mid AFTER INSERT ON mid_t BEGIN
+        INSERT INTO inner_t VALUES(NEW.id + 1000, 'inner');
+    END;
+    INSERT INTO outer_t VALUES(5, 'start');
+    SELECT last_insert_rowid();
+    SELECT * FROM mid_t;
+    SELECT * FROM inner_t;
+}
+expect {
+    5
+    105|mid
+    1105|inner
+}

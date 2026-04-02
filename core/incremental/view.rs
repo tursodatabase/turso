@@ -472,10 +472,10 @@ impl IncrementalView {
 
                 // Store the alias mapping if there is an alias
                 if let Some(alias_enum) = alias {
-                    let alias_name = match alias_enum {
-                        ast::As::As(name) | ast::As::Elided(name) => name.as_str(),
-                    };
-                    aliases.insert(alias_name.to_string(), table_name.to_string());
+                    aliases.insert(
+                        alias_enum.name().as_str().to_string(),
+                        table_name.to_string(),
+                    );
                 }
             } else {
                 return Err(LimboError::ParseError(format!(
@@ -1431,159 +1431,175 @@ mod tests {
         let mut schema = Schema::new();
 
         // Create customers table
+        let columns = vec![
+            SchemaColumn::new(
+                Some("id".to_string()),
+                "INTEGER".to_string(),
+                None,
+                None,
+                Type::Integer,
+                None,
+                ColDef {
+                    primary_key: true,
+                    rowid_alias: true,
+                    notnull: true,
+                    unique: false,
+                    hidden: false,
+                    notnull_conflict_clause: None,
+                },
+            ),
+            SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+        ];
+        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let customers_table = BTreeTable {
             name: "customers".to_string(),
             root_page: 2,
             primary_key_columns: vec![("id".to_string(), ast::SortOrder::Asc)],
-            columns: vec![
-                SchemaColumn::new(
-                    Some("id".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                    None,
-                    Type::Integer,
-                    None,
-                    ColDef {
-                        primary_key: true,
-                        rowid_alias: true,
-                        notnull: true,
-                        unique: false,
-                        hidden: false,
-                        notnull_conflict_clause: None,
-                    },
-                ),
-                SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
-            ],
+            columns,
             has_rowid: true,
             is_strict: false,
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
-            pk_conflict_clause: None,
+            rowid_alias_conflict_clause: None,
             has_autoincrement: false,
+            has_virtual_columns: false,
+            logical_to_physical_map,
         };
 
         // Create orders table
+        let columns = vec![
+            SchemaColumn::new(
+                Some("id".to_string()),
+                "INTEGER".to_string(),
+                None,
+                None,
+                Type::Integer,
+                None,
+                ColDef {
+                    primary_key: true,
+                    rowid_alias: true,
+                    notnull: true,
+                    unique: false,
+                    hidden: false,
+                    notnull_conflict_clause: None,
+                },
+            ),
+            SchemaColumn::new(
+                Some("customer_id".to_string()),
+                "INTEGER".to_string(),
+                None,
+                None,
+                Type::Integer,
+                None,
+                ColDef::default(),
+            ),
+            SchemaColumn::new_default_integer(
+                Some("total".to_string()),
+                "INTEGER".to_string(),
+                None,
+            ),
+        ];
+        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let orders_table = BTreeTable {
             name: "orders".to_string(),
             root_page: 3,
             primary_key_columns: vec![("id".to_string(), ast::SortOrder::Asc)],
-            columns: vec![
-                SchemaColumn::new(
-                    Some("id".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                    None,
-                    Type::Integer,
-                    None,
-                    ColDef {
-                        primary_key: true,
-                        rowid_alias: true,
-                        notnull: true,
-                        unique: false,
-                        hidden: false,
-                        notnull_conflict_clause: None,
-                    },
-                ),
-                SchemaColumn::new(
-                    Some("customer_id".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                    None,
-                    Type::Integer,
-                    None,
-                    ColDef::default(),
-                ),
-                SchemaColumn::new_default_integer(
-                    Some("total".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                ),
-            ],
+            columns,
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,
             foreign_keys: vec![],
             check_constraints: vec![],
-            pk_conflict_clause: None,
+            rowid_alias_conflict_clause: None,
             unique_sets: vec![],
+            has_virtual_columns: false,
+            logical_to_physical_map,
         };
 
         // Create products table
+        let columns = vec![
+            SchemaColumn::new(
+                Some("id".to_string()),
+                "INTEGER".to_string(),
+                None,
+                None,
+                Type::Integer,
+                None,
+                ColDef {
+                    primary_key: true,
+                    rowid_alias: true,
+                    notnull: true,
+                    unique: false,
+                    hidden: false,
+                    notnull_conflict_clause: None,
+                },
+            ),
+            SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+            SchemaColumn::new(
+                Some("price".to_string()),
+                "REAL".to_string(),
+                None,
+                None,
+                Type::Real,
+                None,
+                ColDef::default(),
+            ),
+        ];
+        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let products_table = BTreeTable {
             name: "products".to_string(),
             root_page: 4,
             primary_key_columns: vec![("id".to_string(), ast::SortOrder::Asc)],
-            columns: vec![
-                SchemaColumn::new(
-                    Some("id".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                    None,
-                    Type::Integer,
-                    None,
-                    ColDef {
-                        primary_key: true,
-                        rowid_alias: true,
-                        notnull: true,
-                        unique: false,
-                        hidden: false,
-                        notnull_conflict_clause: None,
-                    },
-                ),
-                SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
-                SchemaColumn::new(
-                    Some("price".to_string()),
-                    "REAL".to_string(),
-                    None,
-                    None,
-                    Type::Real,
-                    None,
-                    ColDef::default(),
-                ),
-            ],
+            columns,
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,
             foreign_keys: vec![],
             check_constraints: vec![],
-            pk_conflict_clause: None,
+            rowid_alias_conflict_clause: None,
             unique_sets: vec![],
+            has_virtual_columns: false,
+            logical_to_physical_map,
         };
 
         // Create logs table - without a rowid alias (no INTEGER PRIMARY KEY)
+        let columns = vec![
+            SchemaColumn::new(
+                Some("message".to_string()),
+                "TEXT".to_string(),
+                None,
+                None,
+                Type::Text,
+                None,
+                ColDef::default(),
+            ),
+            SchemaColumn::new_default_integer(
+                Some("level".to_string()),
+                "INTEGER".to_string(),
+                None,
+            ),
+            SchemaColumn::new_default_integer(
+                Some("timestamp".to_string()),
+                "INTEGER".to_string(),
+                None,
+            ),
+        ];
+        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let logs_table = BTreeTable {
             name: "logs".to_string(),
             root_page: 5,
             primary_key_columns: vec![], // No primary key, so no rowid alias
-            columns: vec![
-                SchemaColumn::new(
-                    Some("message".to_string()),
-                    "TEXT".to_string(),
-                    None,
-                    None,
-                    Type::Text,
-                    None,
-                    ColDef::default(),
-                ),
-                SchemaColumn::new_default_integer(
-                    Some("level".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                ),
-                SchemaColumn::new_default_integer(
-                    Some("timestamp".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                ),
-            ],
+            columns,
             has_rowid: true, // Has implicit rowid but no alias
             is_strict: false,
             has_autoincrement: false,
             foreign_keys: vec![],
             check_constraints: vec![],
-            pk_conflict_clause: None,
+            rowid_alias_conflict_clause: None,
             unique_sets: vec![],
+            has_virtual_columns: false,
+            logical_to_physical_map,
         };
 
         schema

@@ -205,7 +205,7 @@ pub fn plan_subqueries_from_select_plan(
         &mut plan.non_from_clause_subqueries,
         &mut plan.table_references,
         resolver,
-        plan.order_by.iter_mut().map(|(expr, _)| &mut **expr),
+        plan.order_by.iter_mut().map(|(expr, _, _)| &mut **expr),
         connection,
         SubqueryPosition::OrderBy,
         SubqueryOrigin::SelectOrderBy,
@@ -638,9 +638,7 @@ fn get_subquery_parser<'a>(
                 let subquery_id = program.table_reference_counter.next();
                 let outer_query_refs = get_outer_query_refs(referenced_tables);
 
-                let ast::Expr::InSelect { lhs, not, rhs } =
-                    std::mem::replace(expr, ast::Expr::Literal(ast::Literal::Null))
-                else {
+                let ast::Expr::InSelect { lhs, not, rhs } = std::mem::take(expr) else {
                     unreachable!();
                 };
                 let plan = prepare_select_plan(
@@ -794,7 +792,7 @@ fn recollect_aggregates(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()
     }
 
     // Collect from ORDER BY
-    for (expr, _) in &plan.order_by {
+    for (expr, _, _) in &plan.order_by {
         resolve_window_and_aggregate_functions(expr, resolver, &mut new_aggregates, None)?;
     }
 
@@ -1493,6 +1491,7 @@ fn emit_materialized_subquery_table(
     // insertion order, which SQL semantics require for UNION ALL. It also
     // needs the subquery's column layout so later Column opcodes can read
     // materialized rows through the normal table-cursor path.
+    let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(columns);
     let ephemeral_table = Arc::new(BTreeTable {
         root_page: 0,
         name: String::new(),
@@ -1504,7 +1503,9 @@ fn emit_materialized_subquery_table(
         unique_sets: vec![],
         foreign_keys: vec![],
         check_constraints: vec![],
-        pk_conflict_clause: None,
+        rowid_alias_conflict_clause: None,
+        has_virtual_columns: false,
+        logical_to_physical_map,
     });
 
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ephemeral_table.clone()));

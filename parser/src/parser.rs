@@ -2,19 +2,21 @@ use crate::ast::{
     check::ColumnCount, AlterTable, AlterTableBody, As, Cmd, ColumnConstraint, ColumnDefinition,
     CommonTableExpr, CompoundOperator, CompoundSelect, CreateTableBody, CreateTypeBody,
     CreateVirtualTable, DeferSubclause, Distinctness, Expr, ForeignKeyClause, FrameBound,
-    FrameClause, FrameExclude, FrameMode, FromClause, FunctionTail, GroupBy, Indexed,
-    IndexedColumn, InitDeferredPred, InsertBody, JoinConstraint, JoinOperator, JoinType,
+    FrameClause, FrameExclude, FrameMode, FromClause, FunctionTail, GeneratedColumnType, GroupBy,
+    Indexed, IndexedColumn, InitDeferredPred, InsertBody, JoinConstraint, JoinOperator, JoinType,
     JoinedSelectTable, LikeOperator, Limit, Literal, Materialized, Name, NamedColumnConstraint,
     NamedTableConstraint, NullsOrder, OneSelect, Operator, Over, PragmaBody, PragmaValue,
     QualifiedName, RefAct, RefArg, ResolveType, ResultColumn, Select, SelectBody, SelectTable, Set,
     SortOrder, SortedColumn, Stmt, TableConstraint, TableOptions, TransactionType, TriggerCmd,
     TriggerEvent, TriggerTime, Type, TypeOperator, TypeParam, TypeSize, UnaryOperator, Update,
-    Upsert, UpsertDo, UpsertIndex, Window, WindowDef, With,
+    Upsert, UpsertDo, UpsertIndex, Variable, Window, WindowDef, With,
 };
 use crate::error::Error;
 use crate::lexer::{Lexer, Token};
 use crate::token::TokenType::{self, *};
 use crate::Result;
+use std::collections::HashMap;
+use std::num::NonZeroU32;
 use turso_macros::match_ignore_ascii_case;
 
 macro_rules! peek_expect {
@@ -150,6 +152,7 @@ pub struct Parser<'a> {
     /// Last assigned id of positional variable
     /// Parser tracks that in order to properly auto-assign variable ids in correct order for anonymous parameters '?'
     last_variable_id: u32,
+    named_variables: HashMap<&'a [u8], NonZeroU32>,
 }
 
 impl<'a> Iterator for Parser<'a> {
@@ -173,16 +176,29 @@ impl<'a> Parser<'a> {
             peekable: false,
             current_token: Token::new(&input[..0], TokenType::TK_NONE),
             last_variable_id: 0,
+            named_variables: HashMap::new(),
         }
     }
 
-    fn create_variable(&mut self, token: &[u8]) -> Result<Expr> {
+    fn create_variable(&mut self, token: &'a [u8]) -> Result<Expr> {
         if token.is_empty() {
             // Rewrite anonymous variables in encounter order
             self.last_variable_id += 1;
-            Ok(Expr::Variable(format!("{}", self.last_variable_id)))
+            let index = NonZeroU32::new(self.last_variable_id).unwrap();
+            Ok(Expr::Variable(Variable::indexed(index)))
         } else if matches!(token[0], b':' | b'@' | b'$' | b'#') {
-            Ok(Expr::Variable(from_bytes(token)))
+            let index = if let Some(index) = self.named_variables.get(token).copied() {
+                index
+            } else {
+                self.last_variable_id += 1;
+                let index = NonZeroU32::new(self.last_variable_id).unwrap();
+                self.named_variables.insert(token, index);
+                index
+            };
+            Ok(Expr::Variable(Variable::named(
+                from_bytes_as_str(token),
+                index,
+            )))
         } else {
             let variable_str = std::str::from_utf8(token)
                 .map_err(|e| Error::Custom(format!("non-utf8 positional variable id: {e}")))?;
@@ -194,8 +210,14 @@ impl<'a> Parser<'a> {
                     "variable number must be between ?1 and ?250000".to_string(),
                 ));
             }
-            self.last_variable_id = variable_id;
-            Ok(Expr::Variable(from_bytes(token)))
+            if variable_id > 250000 {
+                return Err(Error::Custom(
+                    "variable number must be between ?1 and ?250000".to_string(),
+                ));
+            }
+            self.last_variable_id = self.last_variable_id.max(variable_id);
+            let index = NonZeroU32::new(variable_id).unwrap();
+            Ok(Expr::Variable(Variable::indexed(index)))
         }
     }
 
@@ -212,6 +234,9 @@ impl<'a> Parser<'a> {
 
     // entrypoint of parsing
     pub fn next_cmd(&mut self) -> Result<Option<Cmd>> {
+        self.last_variable_id = 0;
+        self.named_variables.clear();
+
         // consumes prefix SEMI
         while let Some(token) = self.peek()? {
             if token.token_type == TK_SEMI {
@@ -656,26 +681,19 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a bracket-quoted identifier like `[name]` or `[ multi word name]`.
-    /// Captures the raw bytes between `[` and `]` so whitespace is preserved
-    /// verbatim (the lexer discards inter-token whitespace, so we can't
-    /// reassemble from tokens without losing e.g. leading spaces).
     fn parse_bracket_quoted_name(&mut self) -> Result<Name> {
         eat_assert!(self, TK_LBRACKET);
-        // Byte offset right after the `[` token
         let start = self.lexer.offset;
-        loop {
-            let tok = match self.eat()? {
-                Some(t) => t,
-                None => return Err(Error::ParseUnexpectedEOF),
-            };
-            if tok.token_type == TK_RBRACKET {
-                // tok.value points to `]`; its start is the end of our content
-                let end = tok.value.as_ptr() as usize - self.lexer.input.as_ptr() as usize;
-                let raw = &self.lexer.input[start..end];
-                let name = String::from_utf8_lossy(raw).into_owned();
-                return Ok(Name::exact(name));
-            }
-        }
+        let rest = &self.lexer.input[start..];
+        let end_pos = rest
+            .iter()
+            .position(|&b| b == b']')
+            .ok_or(Error::ParseUnexpectedEOF)?;
+        let raw = &self.lexer.input[start..start + end_pos];
+        let name = String::from_utf8_lossy(raw).into_owned();
+        // Advance lexer past the closing `]`
+        self.lexer.offset = start + end_pos + 1;
+        Ok(Name::exact(name))
     }
 
     fn parse_transopt(&mut self) -> Result<Option<Name>> {
@@ -1384,9 +1402,14 @@ impl<'a> Parser<'a> {
             TK_EXISTS,
             TK_CASE,
             TK_LBRACKET,
+            TK_DEFAULT,
         );
 
         match tok.token_type {
+            TK_DEFAULT => {
+                eat_assert!(self, TK_DEFAULT);
+                Ok(Box::new(Expr::Default))
+            }
             TK_LP => {
                 eat_assert!(self, TK_LP);
                 match self.peek_no_eof()?.token_type {
@@ -2639,8 +2662,24 @@ impl<'a> Parser<'a> {
                     }
                 }
 
+                let expr_start = self.offset();
                 let expr = self.parse_expr(0)?;
+                let expr_end = self.offset();
                 let alias = self.parse_as()?;
+                // When there is no explicit AS alias, use the original SQL
+                // text of the expression as an implicit column name. This
+                // matches SQLite's behavior of preserving the verbatim
+                // expression text as the column name.
+                let alias = alias.or_else(|| {
+                    let text = std::str::from_utf8(&self.lexer.input[expr_start..expr_end])
+                        .ok()?
+                        .trim();
+                    if text.is_empty() {
+                        None
+                    } else {
+                        Some(As::ImplicitColumnName(Name::exact(text.to_string())))
+                    }
+                });
                 Ok(ResultColumn::Expr(expr, alias))
             }
         }
@@ -3563,7 +3602,14 @@ impl<'a> Parser<'a> {
             Some(tok) => match tok.token_type.fallback_id_if_ok() {
                 TK_ID => {
                     let tok = eat_assert!(self, TK_ID);
-                    Some(Name::exact(from_bytes(tok.as_bytes())))
+                    let s = from_bytes(tok.as_bytes());
+                    if s.eq_ignore_ascii_case("STORED") {
+                        Some(GeneratedColumnType::Stored)
+                    } else if s.eq_ignore_ascii_case("VIRTUAL") {
+                        Some(GeneratedColumnType::Virtual)
+                    } else {
+                        None
+                    }
                 }
                 _ => None,
             },
@@ -4613,6 +4659,42 @@ mod tests {
     }
 
     #[test]
+    fn test_offset_multiple_statements_with_insert_columns() {
+        let s = "CREATE TABLE test (id INTEGER PRIMARY KEY AUTOINCREMENT, col_a TEXT, col_b TEXT, col_c TEXT, col_d TEXT); INSERT INTO test (col_b, col_d, col_a, col_c) VALUES ('1', '2', '3', '4'); SELECT * FROM test;";
+        let mut p = Parser::new(s.as_bytes());
+
+        p.next_cmd().unwrap();
+        let first = p.offset();
+        assert_eq!(&s[..first], "CREATE TABLE test (id INTEGER PRIMARY KEY AUTOINCREMENT, col_a TEXT, col_b TEXT, col_c TEXT, col_d TEXT); ");
+
+        p.next_cmd().unwrap();
+        let second = p.offset();
+        assert_eq!(
+            &s[first..second],
+            "INSERT INTO test (col_b, col_d, col_a, col_c) VALUES ('1', '2', '3', '4'); "
+        );
+
+        p.next_cmd().unwrap();
+        let third = p.offset();
+        assert_eq!(&s[second..third], "SELECT * FROM test;");
+    }
+
+    #[test]
+    fn test_variable_index_bounds() {
+        for sql in ["SELECT ?0", "SELECT ?250001"] {
+            let mut p = Parser::new(sql.as_bytes());
+            let err = p.next_cmd().unwrap_err().to_string();
+            assert!(
+                err.contains("variable number must be between ?1 and ?250000"),
+                "unexpected error for {sql}: {err}"
+            );
+        }
+
+        let mut p = Parser::new("SELECT ?250000".as_bytes());
+        assert!(p.next_cmd().is_ok());
+    }
+
+    #[test]
     fn test_expect_fail() {
         let testcases = vec![
             "ALTER TABLE my_table ADD COLUMN my_column PRIMARY KEY",
@@ -4986,9 +5068,44 @@ mod tests {
                         select: OneSelect::Select {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
-                                Box::new(Expr::Variable("1".to_owned())),
+                                Box::new(Expr::Variable(Variable::indexed(1u32.try_into().unwrap()))),
                                 None,
                             )],
+                            from: None,
+                            where_clause: None,
+                            group_by: None,
+                            window_clause: vec![],
+                        },
+                        compounds: vec![],
+                    },
+                    order_by: vec![],
+                    limit: None,
+                }))],
+            ),
+            (
+                b"SELECT ?, :named, ?".as_slice(),
+                vec![Cmd::Stmt(Stmt::Select(Select {
+                    with: None,
+                    body: SelectBody {
+                        select: OneSelect::Select {
+                            distinctness: None,
+                            columns: vec![
+                                ResultColumn::Expr(
+                                    Box::new(Expr::Variable(Variable::indexed(1u32.try_into().unwrap()))),
+                                    None,
+                                ),
+                                ResultColumn::Expr(
+                                    Box::new(Expr::Variable(Variable::named(
+                                        ":named".to_owned(),
+                                        2u32.try_into().unwrap(),
+                                    ))),
+                                    None,
+                                ),
+                                ResultColumn::Expr(
+                                    Box::new(Expr::Variable(Variable::indexed(3u32.try_into().unwrap()))),
+                                    None,
+                                ),
+                            ],
                             from: None,
                             where_clause: None,
                             group_by: None,
@@ -5008,7 +5125,7 @@ mod tests {
                         select: OneSelect::Select {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
-                                Box::new(Expr::Variable("1".to_owned())),
+                                Box::new(Expr::Variable(Variable::indexed(1u32.try_into().unwrap()))),
                                 None,
                             )],
                             from: None,
@@ -10595,7 +10712,7 @@ mod tests {
                                 name: None,
                                 constraint: ColumnConstraint::Generated {
                                     expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                                    typ: Some(Name::exact("STORED".to_owned())),
+                                    typ: Some(GeneratedColumnType::Stored),
                                 },
                             },
                         ],
@@ -12100,15 +12217,20 @@ mod tests {
                 results.push(cmd.unwrap());
             }
 
-            assert_eq!(results, expected, "Input: {input_str:?}");
+            // Compare serialized forms since ImplicitColumnName (display-only
+            // metadata) serializes to nothing, making comparison insensitive
+            // to its presence.
+            let results_str: Vec<String> = results.iter().map(|c| c.to_string()).collect();
+            let expected_str: Vec<String> = expected.iter().map(|c| c.to_string()).collect();
+            assert_eq!(results_str, expected_str, "Input: {input_str:?}");
 
-            // to_string tests
+            // to_string round-trip tests
             for (i, r) in results.iter().enumerate() {
                 let rstring = r.to_string();
                 // put new string into parser again
                 let result = Parser::new(rstring.as_bytes()).next().unwrap().unwrap();
-                let expected = &expected[i];
-                assert_eq!(result, expected.clone(), "Input: {rstring:?}");
+                let result_str = result.to_string();
+                assert_eq!(result_str, expected_str[i], "Input: {rstring:?}");
             }
         }
     }

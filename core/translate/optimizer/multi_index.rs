@@ -1163,6 +1163,7 @@ mod tests {
     }
 
     fn create_btree_table(name: &str, columns: Vec<Column>) -> Arc<BTreeTable> {
+        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         Arc::new(BTreeTable {
             root_page: 1,
             name: name.to_string(),
@@ -1174,7 +1175,9 @@ mod tests {
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
-            pk_conflict_clause: None,
+            rowid_alias_conflict_clause: None,
+            has_virtual_columns: false,
+            logical_to_physical_map,
         })
     }
 
@@ -1195,6 +1198,7 @@ mod tests {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: 0,
+            indexed: None,
         }
     }
 

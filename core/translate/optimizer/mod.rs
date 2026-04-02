@@ -1,15 +1,31 @@
+use super::{
+    collate::get_collseq_from_expr,
+    emitter::Resolver,
+    plan::{
+        DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinOrderMember, JoinType,
+        JoinedTable, MinMaxDef, MultiIndexBranch, MultiIndexScanOp, Operation, Plan, Search,
+        SeekDef, SeekKey, SelectPlan, SetOperation, SimpleAggregate, TableReferences, UpdatePlan,
+        WhereTerm,
+    },
+    planner::TableMask,
+};
+use crate::schema::GeneratedType;
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::MultiIndexBranchAccess;
 use crate::{
     function::{AggFunc, Deterministic},
     index_method::IndexMethodCostEstimate,
     numeric::Numeric,
-    schema::{BTreeTable, Index, IndexColumn, Schema, Table, ROWID_SENTINEL},
+    schema::{
+        columns_affected_by_update, BTreeTable, Index, IndexColumn, Schema, Table, ROWID_SENTINEL,
+    },
     translate::{
         insert::ROWID_COLUMN,
         optimizer::{
             access_method::AccessMethodParams,
-            constraints::{RangeConstraintRef, SeekRangeConstraint, TableConstraints},
+            constraints::{
+                ConstraintUseCandidate, RangeConstraintRef, SeekRangeConstraint, TableConstraints,
+            },
             cost::RowCountEstimate,
             multi_index::MultiIndexBranchAccessParams,
             order::{ColumnTarget, OrderTarget},
@@ -48,18 +64,6 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
 use turso_parser::ast::{self, Expr, SortOrder, SubqueryType, TriggerEvent};
-
-use super::{
-    collate::get_collseq_from_expr,
-    emitter::Resolver,
-    plan::{
-        DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinOrderMember, JoinType,
-        JoinedTable, MinMaxDef, MultiIndexBranch, MultiIndexScanOp, Operation, Plan, Search,
-        SeekDef, SeekKey, SelectPlan, SetOperation, SimpleAggregate, TableReferences, UpdatePlan,
-        WhereTerm,
-    },
-    planner::TableMask,
-};
 
 pub(crate) mod access_method;
 pub(crate) mod constraints;
@@ -130,7 +134,11 @@ fn try_match_index_method_pattern(
     pattern: &ast::Select,
     table: &JoinedTable,
     query_where_terms: &[WhereTerm],
-    order_by: &[(Box<ast::Expr>, SortOrder)],
+    order_by: &[(
+        Box<ast::Expr>,
+        SortOrder,
+        Option<turso_parser::ast::NullsOrder>,
+    )],
     limit: &Option<Box<Expr>>,
     offset: &Option<Box<Expr>>,
     pattern_idx: usize,
@@ -215,10 +223,15 @@ fn try_match_index_method_pattern(
 
     // Match ORDER BY if pattern has it
     if pattern_has_order_by {
-        for (pattern_column, (query_column, query_order)) in
+        for (pattern_column, (query_column, query_order, query_nulls)) in
             pattern.order_by.iter().zip(order_by.iter())
         {
             if *query_order != pattern_column.order.unwrap_or(SortOrder::Asc) {
+                return None;
+            }
+            // If the query has explicit NULLS ordering, the index pattern cannot
+            // satisfy it (index methods have no NULLS awareness).
+            if query_nulls.is_some() {
                 return None;
             }
             let num_col_args = count_fts_column_args(&pattern_column.expr);
@@ -340,7 +353,11 @@ fn collect_index_method_candidates(
     table_references: &TableReferences,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
     where_clause: &[WhereTerm],
-    order_by: &[(Box<ast::Expr>, SortOrder)],
+    order_by: &[(
+        Box<ast::Expr>,
+        SortOrder,
+        Option<turso_parser::ast::NullsOrder>,
+    )],
     group_by: &Option<GroupBy>,
     limit: &Option<Box<Expr>>,
     offset: &Option<Box<Expr>>,
@@ -448,10 +465,40 @@ pub fn optimize_plan(
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 /// Transform MATCH expressions to fts_match() function calls.
-fn transform_match_to_fts_match(where_clause: &mut [WhereTerm]) {
-    use super::ast::{FunctionTail, LikeOperator, Name};
+fn transform_match_to_fts_match(
+    where_clause: &mut [WhereTerm],
+    schema: &Schema,
+    table_references: &TableReferences,
+) -> Result<()> {
+    use super::ast::{FunctionTail, LikeOperator, Name, TableInternalId};
     use super::expr::{walk_expr_mut, WalkControl};
 
+    // Helper to extract table ID from a column expression
+    fn get_table_id_from_expr(expr: &Expr) -> Option<TableInternalId> {
+        match expr {
+            Expr::Column { table, .. } => Some(*table),
+            Expr::Parenthesized(exprs) if !exprs.is_empty() => get_table_id_from_expr(&exprs[0]),
+            _ => None,
+        }
+    }
+
+    // Helper to check if a table has an FTS index by its internal ID
+    let table_has_fts_index = |table_id: TableInternalId| -> bool {
+        table_references
+            .joined_tables()
+            .iter()
+            .find(|t| t.internal_id == table_id)
+            .and_then(|t| {
+                if let Table::BTree(btree) = &t.table {
+                    Some(schema.has_fts_index(&btree.name))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(false)
+    };
+
+    let mut match_without_fts = false;
     for term in where_clause.iter_mut() {
         let _ = walk_expr_mut(&mut term.expr, &mut |e: &mut Expr| -> Result<WalkControl> {
             match e {
@@ -462,6 +509,15 @@ fn transform_match_to_fts_match(where_clause: &mut [WhereTerm]) {
                     rhs,
                     escape: _,
                 } => {
+                    // Check if the specific table referenced by this MATCH has an FTS index
+                    let has_fts = get_table_id_from_expr(lhs).is_some_and(table_has_fts_index);
+
+                    if !has_fts {
+                        match_without_fts = true;
+                        // Don't transform, we'll error after the walk
+                        return Ok(WalkControl::SkipChildren);
+                    }
+
                     // Transform MATCH to fts_match():
                     // - `col MATCH 'query'` -> `fts_match(col, 'query')`
                     // - `(col1, col2) MATCH 'query'` -> `fts_match(col1, col2, 'query')`
@@ -493,6 +549,14 @@ fn transform_match_to_fts_match(where_clause: &mut [WhereTerm]) {
             }
         });
     }
+
+    if match_without_fts {
+        return Err(LimboError::ParseError(
+            "unable to use function MATCH in the requested context".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 /// Detect whether this plan qualifies for the simple-aggregate fast path.
@@ -574,7 +638,7 @@ struct OptimizeTableAccessResult {
 pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
     // Transform MATCH expressions to fts_match() for FTS optimizer recognition
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-    transform_match_to_fts_match(&mut plan.where_clause);
+    transform_match_to_fts_match(&mut plan.where_clause, schema, &plan.table_references)?;
 
     unnest::unnest_exists_subqueries(plan)?;
     // EXISTS only needs 1 row. Add LIMIT 1 to surviving (non-unnested) EXISTS
@@ -663,7 +727,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
 
 fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-    transform_match_to_fts_match(&mut plan.where_clause);
+    transform_match_to_fts_match(&mut plan.where_clause, schema, &plan.table_references)?;
 
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
@@ -702,7 +766,7 @@ fn optimize_update_plan(
 ) -> Result<()> {
     let schema = resolver.schema();
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-    transform_match_to_fts_match(&mut plan.where_clause);
+    transform_match_to_fts_match(&mut plan.where_clause, schema, &plan.table_references)?;
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
@@ -814,10 +878,17 @@ fn first_update_safety_reason(
                     if expr_idx_cols_mask.get(*set_clause_col_idx) {
                         break 'requires Some(DmlSafetyReason::KeyMutation);
                     }
-                } else if c.pos_in_table == *set_clause_col_idx {
-                    break 'requires Some(DmlSafetyReason::KeyMutation);
                 }
             }
+        }
+
+        let affected_cols = columns_affected_by_update(&btree_table.columns, &updated_cols);
+        if index
+            .columns
+            .iter()
+            .any(|c| affected_cols.contains(&c.pos_in_table))
+        {
+            break 'requires Some(DmlSafetyReason::KeyMutation);
         }
         break 'requires None;
     };
@@ -870,18 +941,22 @@ fn add_ephemeral_table_to_update_plan(
     plan: &mut UpdatePlan,
 ) -> Result<()> {
     let internal_id = program.table_reference_counter.next();
+    let columns = vec![(*ROWID_COLUMN).clone()];
+    let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
     let ephemeral_table = Arc::new(BTreeTable {
         root_page: 0, // Not relevant for ephemeral table definition
         name: "ephemeral_scratch".to_string(),
         has_rowid: true,
         has_autoincrement: false,
         primary_key_columns: vec![],
-        columns: vec![(*ROWID_COLUMN).clone()],
+        columns,
         is_strict: false,
         unique_sets: vec![],
         foreign_keys: vec![],
         check_constraints: vec![],
-        pk_conflict_clause: None,
+        rowid_alias_conflict_clause: None,
+        has_virtual_columns: false,
+        logical_to_physical_map,
     });
 
     let temp_cursor_id = program.alloc_cursor_id_keyed(
@@ -904,6 +979,7 @@ fn add_ephemeral_table_to_update_plan(
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: 0,
+            indexed: None,
         }],
         vec![],
     );
@@ -962,6 +1038,7 @@ fn add_ephemeral_table_to_update_plan(
                 table: rowid_internal_id,
             },
             alias: None,
+            implicit_column_name: None,
             contains_aggregates: false,
         }],
         where_clause: plan.where_clause.drain(..).collect(),
@@ -1119,7 +1196,11 @@ fn optimize_table_access_with_custom_modules(
     table_references: &mut TableReferences,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
     where_query: &mut [WhereTerm],
-    order_by: &mut Vec<(Box<ast::Expr>, SortOrder)>,
+    order_by: &mut Vec<(
+        Box<ast::Expr>,
+        SortOrder,
+        Option<turso_parser::ast::NullsOrder>,
+    )>,
     group_by: &mut Option<GroupBy>,
     limit: &mut Option<Box<Expr>>,
     offset: &mut Option<Box<Expr>>,
@@ -1240,14 +1321,18 @@ fn optimize_table_access_with_custom_modules(
 fn register_expression_index_usages_for_plan(
     table_references: &mut TableReferences,
     result_columns: &[ResultSetColumn],
-    order_by: &[(Box<ast::Expr>, SortOrder)],
+    order_by: &[(
+        Box<ast::Expr>,
+        SortOrder,
+        Option<turso_parser::ast::NullsOrder>,
+    )],
     group_by: Option<&GroupBy>,
 ) {
     table_references.reset_expression_index_usages();
     for rc in result_columns {
         table_references.register_expression_index_usage(&rc.expr);
     }
-    for (expr, _) in order_by {
+    for (expr, _, _) in order_by {
         table_references.register_expression_index_usage(expr);
     }
     if let Some(group_by) = group_by {
@@ -1391,7 +1476,8 @@ fn expr_has_null_masking_for_table(expr: &ast::Expr, table_id: ast::TableInterna
     let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
         match e {
             ast::Expr::FunctionCall { name, args, .. } => {
-                if let Ok(func) = crate::function::Func::resolve_function(name.as_str(), args.len())
+                if let Ok(Some(func)) =
+                    crate::function::Func::resolve_function(name.as_str(), args.len())
                 {
                     // IIF(cond, then, else) is like CASE WHEN cond THEN then ELSE else END.
                     // If the condition is a null check on the target table, IIF masks nulls.
@@ -1438,6 +1524,60 @@ fn expr_has_null_masking_for_table(expr: &ast::Expr, table_id: ast::TableInterna
     found
 }
 
+/// Enforce INDEXED BY / NOT INDEXED hints by validating index existence and
+/// filtering constraint candidates accordingly.
+fn enforce_indexed_by_hints(
+    table_references: &TableReferences,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    constraints_per_table: &mut [TableConstraints],
+) -> Result<()> {
+    for (i, table_ref) in table_references.joined_tables().iter().enumerate() {
+        let Some(ref indexed) = table_ref.indexed else {
+            continue;
+        };
+        let Some(btree) = table_ref.btree() else {
+            continue;
+        };
+        let Some(cs) = constraints_per_table.get_mut(i) else {
+            continue;
+        };
+        match indexed {
+            ast::Indexed::IndexedBy(name) => {
+                let idx_name = name.as_str();
+                // Verify the index exists and belongs to this table.
+                let forced_index = available_indexes.get(&btree.name).and_then(|indexes| {
+                    indexes.iter().find(|idx| {
+                        idx.name.eq_ignore_ascii_case(idx_name) && idx.index_method.is_none()
+                    })
+                });
+                let Some(forced_index) = forced_index else {
+                    crate::bail_parse_error!("no such index: {}", idx_name);
+                };
+                // Keep only the candidate for the forced index.
+                let forced_index = forced_index.clone();
+                cs.candidates.retain(|c| {
+                    c.index
+                        .as_ref()
+                        .is_some_and(|idx| Arc::ptr_eq(idx, &forced_index))
+                });
+                // If no candidate survived (no WHERE constraints matched), add an empty one
+                // so the optimizer can still scan the index.
+                if cs.candidates.is_empty() {
+                    cs.candidates.push(ConstraintUseCandidate {
+                        index: Some(forced_index),
+                        refs: Vec::new(),
+                    });
+                }
+            }
+            ast::Indexed::NotIndexed => {
+                // Remove all secondary index candidates, keep only rowid.
+                cs.candidates.retain(|c| c.index.is_none());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Optimize the join order and index selection for a query.
 ///
 /// This function does the following:
@@ -1456,7 +1596,11 @@ fn optimize_table_access(
     table_references: &mut TableReferences,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
     where_clause: &mut [WhereTerm],
-    order_by: &mut Vec<(Box<ast::Expr>, SortOrder)>,
+    order_by: &mut Vec<(
+        Box<ast::Expr>,
+        SortOrder,
+        Option<turso_parser::ast::NullsOrder>,
+    )>,
     group_by: &mut Option<GroupBy>,
     simple_aggregate: Option<&SimpleAggregate>,
     subqueries: &[NonFromClauseSubquery],
@@ -1498,8 +1642,13 @@ fn optimize_table_access(
 
     // For single-table queries, try to optimize with custom index methods directly.
     // This is the fast path that preserves the original behavior.
+    // Skip when INDEXED BY / NOT INDEXED is specified — those force a specific btree index or table scan.
     let is_single_table = table_references.joined_tables().len() == 1;
-    if is_single_table {
+    let has_indexed_by_hint = table_references
+        .joined_tables()
+        .iter()
+        .any(|t| t.indexed.is_some());
+    if is_single_table && !has_indexed_by_hint {
         let optimized = optimize_table_access_with_custom_modules(
             result_columns,
             table_references,
@@ -1550,6 +1699,13 @@ fn optimize_table_access(
         subqueries,
         schema,
         params,
+    )?;
+
+    // Enforce INDEXED BY / NOT INDEXED hints on constraint candidates.
+    enforce_indexed_by_hints(
+        table_references,
+        available_indexes,
+        &mut constraints_per_table,
     )?;
 
     let base_table_rows = table_references
@@ -1622,6 +1778,11 @@ fn optimize_table_access(
             subqueries,
             schema,
             params,
+        )?;
+        enforce_indexed_by_hints(
+            table_references,
+            available_indexes,
+            &mut constraints_per_table,
         )?;
     }
 
@@ -2560,6 +2721,7 @@ impl Optimizable for ast::Expr {
             Expr::Unary(_, expr) => expr.is_nonnull(tables),
             Expr::Variable(..) => false,
             Expr::Register(..) => false, // Register values can be null
+            Expr::Default => false,
             Expr::Array { .. } | Expr::Subscript { .. } => {
                 unreachable!("Array and Subscript are desugared into function calls by the parser")
             }
@@ -2599,8 +2761,20 @@ impl Optimizable for ast::Expr {
             // contain DoublyQualified nodes.
             Expr::DoublyQualified(_, _, _) => false,
             Expr::Exists(_) => false,
-            Expr::FunctionCall { args, name, .. } => {
-                let Some(func) = resolver.resolve_function(name.as_str(), args.len()) else {
+            Expr::FunctionCall {
+                args,
+                name,
+                filter_over,
+                ..
+            } => {
+                if filter_over.over_clause.is_some() {
+                    return false;
+                }
+                let Some(func) = resolver
+                    .resolve_function(name.as_str(), args.len())
+                    .ok()
+                    .flatten()
+                else {
                     return false;
                 };
                 func.is_deterministic() && args.iter().all(|arg| arg.is_constant(resolver))
@@ -2640,6 +2814,7 @@ impl Optimizable for ast::Expr {
             Expr::Unary(_, expr) => expr.is_constant(resolver),
             Expr::Variable(_) => true,
             Expr::Register(_) => false,
+            Expr::Default => true,
             Expr::Array { .. } | Expr::Subscript { .. } => {
                 unreachable!("Array and Subscript are desugared into function calls by the parser")
             }
@@ -2754,13 +2929,19 @@ fn ephemeral_index_build(
         .columns()
         .iter()
         .enumerate()
-        .map(|(i, c)| IndexColumn {
-            name: c.name.clone().unwrap(),
-            order: SortOrder::Asc,
-            pos_in_table: i,
-            collation: c.collation_opt(),
-            default: c.default.clone(),
-            expr: None,
+        .map(|(i, c)| {
+            let expr = match c.generated_type() {
+                GeneratedType::Virtual { .. } => c.generated_expr().cloned(),
+                GeneratedType::NotGenerated => None,
+            };
+            IndexColumn {
+                name: c.name.clone().unwrap(),
+                order: SortOrder::Asc,
+                pos_in_table: i,
+                collation: c.collation_opt(),
+                default: c.default.clone(),
+                expr: expr.map(Box::new),
+            }
         })
         // only include columns that are used in the query
         .filter(|c| table_reference.column_is_used(c.pos_in_table))
@@ -3244,16 +3425,6 @@ fn build_seek_def(
             }
         }
     })
-}
-
-pub trait TakeOwnership {
-    fn take_ownership(&mut self) -> Self;
-}
-
-impl TakeOwnership for ast::Expr {
-    fn take_ownership(&mut self) -> Self {
-        std::mem::replace(self, ast::Expr::Literal(ast::Literal::Null))
-    }
 }
 
 #[cfg(test)]

@@ -4,8 +4,9 @@ use turso_macros::match_ignore_ascii_case;
 /// Returns true if the given identifier (case-insensitive) is a SQL keyword.
 /// This is used to determine whether an identifier needs to be quoted when
 /// rendered back to SQL text.
-pub fn is_keyword(input: &[u8]) -> bool {
-    keyword_or_id_token(input) != TokenType::TK_ID
+pub fn is_quotable_keyword(input: &[u8]) -> bool {
+    let token = keyword_or_id_token(input);
+    token != TokenType::TK_ID && token != TokenType::TK_TYPE
 }
 
 fn keyword_or_id_token(input: &[u8]) -> TokenType {
@@ -875,7 +876,7 @@ impl<'a> Lexer<'a> {
                         debug_assert!(end_hex >= start_hex);
                         self.eat_and_assert(|b| b == b'\'');
 
-                        if (end_hex - start_hex) % 2 != 0 {
+                        if ((end_hex - start_hex) & 1) != 0 {
                             let token_text =
                                 String::from_utf8_lossy(&self.input[start..self.offset])
                                     .to_string();

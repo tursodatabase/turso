@@ -141,6 +141,7 @@ pub struct Builder {
     enable_custom_types: bool,
     enable_index_method: bool,
     enable_materialized_views: bool,
+    enable_generated_columns: bool,
     vfs: Option<String>,
     encryption_opts: Option<turso_sdk_kit::rsapi::EncryptionOpts>,
 }
@@ -155,6 +156,7 @@ impl Builder {
             enable_custom_types: false,
             enable_index_method: false,
             enable_materialized_views: false,
+            enable_generated_columns: false,
             vfs: None,
             encryption_opts: None,
         }
@@ -190,6 +192,11 @@ impl Builder {
         self
     }
 
+    pub fn experimental_generated_columns(mut self, gencols_enabled: bool) -> Self {
+        self.enable_generated_columns = gencols_enabled;
+        self
+    }
+
     pub fn experimental_index_method(mut self, index_method_enabled: bool) -> Self {
         self.enable_index_method = index_method_enabled;
         self
@@ -220,6 +227,9 @@ impl Builder {
         }
         if self.enable_materialized_views {
             features.push("views");
+        }
+        if self.enable_generated_columns {
+            features.push("generated_columns");
         }
         if features.is_empty() {
             return None;
@@ -319,7 +329,7 @@ impl Statement {
                     let mut values = Vec::with_capacity(columns);
                     for i in 0..columns {
                         let value = stmt.row_value(i)?;
-                        values.push(value.to_owned());
+                        values.push(value);
                     }
                     Poll::Ready(Ok(Some(Row { values })))
                 } else {
@@ -406,8 +416,7 @@ impl Statement {
         }
         Ok(stmt
             .column_name(idx)
-            .expect("column index must be within valid range")
-            .into_owned())
+            .expect("column index must be within valid range"))
     }
 
     /// Returns the names of all columns in the result set.
@@ -418,7 +427,6 @@ impl Statement {
             .map(|i| {
                 stmt.column_name(i)
                     .expect("column index must be within valid range")
-                    .into_owned()
             })
             .collect()
     }
@@ -431,7 +439,7 @@ impl Statement {
             let col_name = stmt
                 .column_name(i)
                 .expect("column index must be within valid range");
-            if col_name.eq_ignore_ascii_case(name) {
+            if col_name.as_str().eq_ignore_ascii_case(name) {
                 return Ok(i);
             }
         }
@@ -451,8 +459,7 @@ impl Statement {
         for i in 0..n {
             let name = stmt
                 .column_name(i)
-                .expect("column index must be within valid range")
-                .into_owned();
+                .expect("column index must be within valid range");
             let decl_type = stmt.column_decltype(i);
             cols.push(Column { name, decl_type });
         }
@@ -720,6 +727,84 @@ mod tests {
                 assert!(rows_iter.next().await?.is_none());
             }
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parallel_writes_and_wal_size() -> Result<()> {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let db_path_str = db_path.to_str().unwrap();
+
+        let db = Builder::new_local(db_path_str).build().await?;
+        let conn = db.connect()?;
+        conn.execute(
+            "CREATE TABLE test_data (id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL);",
+            (),
+        )
+        .await?;
+
+        // Generate a ~200KB payload
+        let payload = "X".repeat(200 * 1024);
+
+        // Parallel writes: spawn 8 connections, each inserting 5 rows
+        let mut handles = Vec::new();
+        for conn_id in 0..8u32 {
+            let db = db.clone();
+            let payload = payload.clone();
+            handles.push(tokio::spawn(async move {
+                let conn = db.connect().unwrap();
+                for row_id in 0..5u32 {
+                    let tag = format!("conn{conn_id}_row{row_id}");
+                    let data = format!("{tag}_{payload}");
+                    loop {
+                        match conn
+                            .execute(
+                                "INSERT INTO test_data (payload) VALUES (?);",
+                                params::Params::Positional(vec![Value::Text(data.clone())]),
+                            )
+                            .await
+                        {
+                            Ok(_) => break,
+                            Err(Error::Busy(_)) => {
+                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                                continue;
+                            }
+                            Err(e) => panic!("Insert failed: {e:?}"),
+                        }
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // Sequential writes: 3 more large inserts
+        for i in 0..3 {
+            let data = format!("sequential_{i}_{payload}");
+            conn.execute(
+                "INSERT INTO test_data (payload) VALUES (?);",
+                params::Params::Positional(vec![Value::Text(data)]),
+            )
+            .await?;
+        }
+
+        // Verify row count: 8*5 + 3 = 43
+        let mut rows = conn.query("SELECT count(*) FROM test_data;", ()).await?;
+        let row = rows.next().await?.unwrap();
+        assert_eq!(row.get_value(0)?, Value::Integer(43));
+
+        // Report WAL size
+        let wal_path = format!("{db_path_str}-wal");
+        let wal_size = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        eprintln!(
+            "WAL size after all writes: {} bytes ({:.2} KB)",
+            wal_size,
+            wal_size as f64 / 1024.0
+        );
+        assert!(wal_size > 0, "WAL file should exist and be non-empty");
 
         Ok(())
     }

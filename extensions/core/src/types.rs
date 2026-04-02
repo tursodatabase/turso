@@ -317,6 +317,18 @@ impl Value {
         }
     }
 
+    /// Returns the text value for any ValueType
+    pub fn to_text_coerced(&self) -> Option<String> {
+        match self.value_type {
+            ValueType::Text => self.to_text().map(|s| s.to_string()),
+            ValueType::Integer => self.to_integer().map(|i| i.to_string()),
+            ValueType::Float => self.to_float().map(|f| f.to_string()),
+            ValueType::Blob => self.to_blob().and_then(|b| String::from_utf8(b).ok()),
+            ValueType::Null => None,
+            ValueType::Error => None,
+        }
+    }
+
     pub fn is_json(&self) -> bool {
         unsafe {
             if self.value_type == ValueType::Text && !self.value.text.is_null() {

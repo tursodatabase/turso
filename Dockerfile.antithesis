@@ -1,4 +1,4 @@
-FROM lukemathwalker/cargo-chef:0.1.72-rust-1.88.0-slim-bullseye AS chef
+FROM lukemathwalker/cargo-chef:0.1.72-rust-1.88.0-slim-bookworm AS chef
 RUN apt update \
     && apt install -y git libssl-dev pkg-config\
     && apt clean \
@@ -21,11 +21,11 @@ COPY ./cli ./cli/
 COPY ./core ./core/
 COPY ./extensions ./extensions/
 COPY ./macros ./macros/
-COPY ./packages ./packages/
 COPY ./parser ./parser/
 COPY ./perf/encryption ./perf/encryption
 COPY ./perf/throughput/rusqlite ./perf/throughput/rusqlite/
 COPY ./perf/throughput/turso ./perf/throughput/turso/
+COPY ./perf/memory ./perf/memory/
 COPY ./testing/simulator ./testing/simulator/
 COPY ./sql_generation ./sql_generation
 COPY ./sqlite3 ./sqlite3/
@@ -34,7 +34,7 @@ COPY ./sync ./sync/
 COPY ./testing/sqlite_test_ext ./testing/sqlite_test_ext/
 COPY ./testing/unreliable-libc ./testing/unreliable-libc/
 COPY ./tests ./tests/
-COPY ./testing/runner ./testing/runner/
+COPY ./testing/sqltests ./testing/sqltests/
 COPY ./testing/concurrent-simulator ./testing/concurrent-simulator/
 COPY ./testing/differential-oracle ./testing/differential-oracle/
 COPY ./sdk-kit ./sdk-kit/
@@ -51,7 +51,7 @@ FROM chef AS builder
 ARG antithesis=true
 
 RUN apt-get update && apt-get install -y pip && rm -rf /var/lib/apt/lists/*
-RUN pip install maturin
+RUN pip install --break-system-packages maturin
 
 # Antithesis instrumentation library
 ADD https://antithesis.com/assets/instrumentation/libvoidstar.so /opt/antithesis/libvoidstar.so
@@ -68,11 +68,11 @@ COPY --from=planner /app/cli ./cli/
 COPY --from=planner /app/core ./core/
 COPY --from=planner /app/extensions ./extensions/
 COPY --from=planner /app/macros ./macros/
-COPY --from=planner /app/packages ./packages/
 COPY --from=planner /app/parser ./parser/
 COPY --from=planner /app/perf/encryption ./perf/encryption
 COPY --from=planner /app/perf/throughput/rusqlite ./perf/throughput/rusqlite/
 COPY --from=planner /app/perf/throughput/turso ./perf/throughput/turso/
+COPY --from=planner /app/perf/memory ./perf/memory/
 COPY --from=planner /app/testing/simulator ./testing/simulator/
 COPY --from=planner /app/sql_generation ./sql_generation
 COPY --from=planner /app/sqlite3 ./sqlite3/
@@ -81,7 +81,7 @@ COPY --from=planner /app/sync ./sync/
 COPY --from=planner /app/testing/sqlite_test_ext ./testing/sqlite_test_ext/
 COPY --from=planner /app/testing/unreliable-libc ./testing/unreliable-libc/
 COPY --from=planner /app/tests ./tests/
-COPY --from=planner /app/testing/runner ./testing/runner/
+COPY --from=planner /app/testing/sqltests ./testing/sqltests/
 COPY --from=planner /app/testing/concurrent-simulator ./testing/concurrent-simulator/
 COPY --from=planner /app/testing/differential-oracle ./testing/differential-oracle
 COPY --from=planner /app/sdk-kit ./sdk-kit/
@@ -115,9 +115,9 @@ RUN make
 # The final image.
 #
 
-FROM debian:bullseye-slim AS runtime
+FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y bash curl xz-utils python3 procps sqlite3 bc binutils pip rust-gdb && rm -rf /var/lib/apt/lists/*
-RUN pip install antithesis
+RUN pip install --break-system-packages antithesis
 
 WORKDIR /app
 EXPOSE 8080
@@ -129,7 +129,7 @@ COPY testing/stress/docker-entrypoint.sh /bin
 RUN chmod +x /bin/docker-entrypoint.sh
 
 COPY --from=builder /app/target/wheels/* /tmp
-RUN pip install /tmp/*.whl
+RUN pip install --break-system-packages /tmp/*.whl
 
 WORKDIR /app
 COPY ./testing/antithesis/bank-test/*.py /opt/antithesis/test/v1/bank-test/

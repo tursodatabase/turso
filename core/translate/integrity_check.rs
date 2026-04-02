@@ -1,3 +1,4 @@
+use crate::vdbe::builder::SelfTableContext;
 use crate::{
     schema::{Index, Schema, Table},
     translate::{
@@ -228,6 +229,7 @@ fn translate_integrity_check_impl(
                 column_use_counts: Vec::new(),
                 expression_index_usages: Vec::new(),
                 database_id,
+                indexed: None,
             }],
             vec![],
         );
@@ -402,14 +404,28 @@ fn translate_integrity_check_impl(
                         program.emit_column_or_rowid(table_cursor_id, *pos, target);
                     }
                     BoundIndexColumn::Expr(expr) => {
-                        translate_expr_no_constant_opt(
-                            program,
-                            Some(&table_references),
-                            expr,
-                            target,
-                            resolver,
-                            NoConstantOptReason::RegisterReuse,
-                        )?;
+                        let self_table_context =
+                            table_references.joined_tables().first().map(|jt| {
+                                SelfTableContext::ForSelect {
+                                    table_ref_id: jt.internal_id,
+                                    referenced_tables: table_references.clone(),
+                                }
+                            });
+
+                        program.with_self_table_context(
+                            self_table_context.as_ref(),
+                            |program, _| {
+                                translate_expr_no_constant_opt(
+                                    program,
+                                    Some(&table_references),
+                                    expr,
+                                    target,
+                                    resolver,
+                                    NoConstantOptReason::RegisterReuse,
+                                )?;
+                                Ok(())
+                            },
+                        )?
                     }
                 }
             }

@@ -1,6 +1,6 @@
 use super::*;
 use crate::translate::main_loop::hash::{
-    emit_hash_join_unmatched_build_rows, HashProbeCloseEmitter,
+    emit_hash_join_unmatched_build_rows, GraceHashLoop, HashProbeCloseEmitter,
 };
 
 /// Represents final step of Loop emission
@@ -261,6 +261,10 @@ impl CloseLoop {
                     program.preassign_label_to_next_insn(loop_labels.loop_end);
 
                     // Outer joins: emit unmatched build rows with NULLs for the probe side.
+                    // This runs BEFORE grace so that in-memory partitions (with valid
+                    // matched_bits from the main probe) are scanned while still available.
+                    // At runtime, the scan skips spilled partitions — those are handled
+                    // per-partition inside the grace loop where matched_bits are still live.
                     if matches!(
                         hash_join_op.join_type,
                         HashJoinType::LeftOuter | HashJoinType::FullOuter
@@ -280,6 +284,27 @@ impl CloseLoop {
                                 probe_cursor_id,
                             )?;
                         }
+                    }
+
+                    // Grace hash join processing: process spilled partition pairs.
+                    // At runtime, this is a no-op if the build side didn't spill.
+                    // For LEFT/FULL OUTER, each grace partition gets its own unmatched
+                    // scan before eviction (so matched_bits are still live).
+                    if let Some(hash_ctx) = t_ctx
+                        .hash_table_contexts
+                        .get(&hash_join_op.build_table_idx)
+                        .cloned()
+                    {
+                        // emit grace processing loop after the probe cursor is exhausted.
+                        GraceHashLoop::emit(
+                            program,
+                            t_ctx,
+                            hash_join_op,
+                            &hash_ctx,
+                            select_plan,
+                            table_index,
+                            probe_cursor_id,
+                        )?;
                     }
                 }
                 Operation::MultiIndexScan(_) => {
@@ -426,6 +451,11 @@ pub(super) struct AutoIndexBuild<'a> {
     pub(super) num_seek_keys: usize,
     pub(super) seek_def: &'a SeekDef,
     pub(super) affinity_str: Option<&'a Arc<String>>,
+    /// Table columns needed for transparent virtual column computation.
+    pub(super) table_columns: Option<&'a [crate::schema::Column]>,
+    pub(super) table_ref_id: turso_parser::ast::TableInternalId,
+    pub(super) table_references: &'a TableReferences,
+    pub(super) resolver: &'a Resolver<'a>,
 }
 
 /// Open an ephemeral index cursor and build an automatic index on a table.
@@ -443,6 +473,10 @@ pub(super) fn emit_autoindex(
         num_seek_keys,
         seek_def,
         affinity_str,
+        table_columns,
+        table_ref_id,
+        table_references,
+        resolver,
     } = build;
     turso_assert!(index.ephemeral, "index must be ephemeral", { "index_name": &index.name });
     let label_ephemeral_build_end = program.allocate_label();
@@ -466,6 +500,23 @@ pub(super) fn emit_autoindex(
     let ephemeral_cols_start_reg = program.alloc_registers(num_regs_to_reserve);
     for (i, col) in index.columns.iter().enumerate() {
         let reg = ephemeral_cols_start_reg + i;
+        if let Some(columns) = table_columns {
+            if let Some(column_def) = columns.get(col.pos_in_table) {
+                if column_def.is_virtual_generated() {
+                    crate::translate::expr::emit_table_column(
+                        program,
+                        table_cursor_id,
+                        table_ref_id,
+                        table_references,
+                        column_def,
+                        col.pos_in_table,
+                        reg,
+                        resolver,
+                    )?;
+                    continue;
+                }
+            }
+        }
         program.emit_column_or_rowid(table_cursor_id, col.pos_in_table, reg);
     }
     if table_has_rowid {

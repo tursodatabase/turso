@@ -1,7 +1,7 @@
 use crate::sync::Arc;
 
 use crate::storage::sqlite3_ondisk::Version;
-use crate::{mvcc, MvStore, OpenFlags, Result, IO};
+use crate::{mvcc, LimboError, MvStore, OpenFlags, Result, IO};
 
 #[derive(
     Debug,
@@ -69,6 +69,12 @@ pub fn open_mv_store(
     durable_storage: Option<Arc<dyn mvcc::persistent_storage::DurableStorage>>,
     encryption_ctx: Option<crate::storage::encryption::EncryptionContext>,
 ) -> Result<Arc<MvStore>> {
+    if durable_storage.is_some() && encryption_ctx.is_some() {
+        return Err(LimboError::InvalidArgument(
+            "encrypted MVCC is not supported with custom DurableStorage".to_string(),
+        ));
+    }
+
     let storage: Arc<dyn mvcc::persistent_storage::DurableStorage> =
         if let Some(storage) = durable_storage {
             storage

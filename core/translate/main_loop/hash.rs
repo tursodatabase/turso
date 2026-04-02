@@ -1,4 +1,7 @@
 use super::*;
+use crate::schema::GeneratedType;
+use crate::translate::emitter::HashLabels;
+use crate::vdbe::builder::SelfTableContext;
 
 #[derive(Debug, Clone)]
 /// Payload layout metadata recorded during hash-build planning or reuse.
@@ -413,11 +416,38 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
         let (payload_start_reg, mut payload_info) = if num_payload > 0 {
             let payload_reg = planner.program.alloc_registers(num_payload);
             for (i, &col_idx) in config.payload_signature_columns.iter().enumerate() {
-                planner.program.emit_column_or_rowid(
-                    payload_source_cursor_id,
-                    col_idx,
-                    payload_reg + i,
-                );
+                match build_table
+                    .columns()
+                    .get(col_idx)
+                    .map(|c| c.generated_type())
+                {
+                    Some(GeneratedType::Virtual { resolved: expr, .. }) => {
+                        planner.program.with_self_table_context(
+                            Some(&SelfTableContext::ForSelect {
+                                table_ref_id: build_table.internal_id,
+                                referenced_tables: planner.table_references.clone(),
+                            }),
+                            |program, _| -> Result<()> {
+                                translate_expr(
+                                    program,
+                                    Some(planner.table_references),
+                                    expr,
+                                    payload_reg + i,
+                                    &planner.t_ctx.resolver,
+                                )?;
+                                Ok(())
+                            },
+                        )?;
+
+                        planner.program.emit_column_affinity(
+                            payload_reg + i,
+                            build_table.columns()[col_idx].affinity(),
+                        );
+                    }
+                    Some(GeneratedType::NotGenerated) | None => planner
+                        .program
+                        .emit_column_or_rowid(payload_source_cursor_id, col_idx, payload_reg + i),
+                };
             }
             (
                 Some(payload_reg),
@@ -507,6 +537,10 @@ struct ProbeSetupState {
     hash_probe_miss_label: BranchOffset,
     match_found_label: BranchOffset,
     hash_next_label: BranchOffset,
+    probe_rowid_reg: Option<usize>,
+    key_start_reg: usize,
+    num_keys: usize,
+    grace_flag_reg: Option<usize>,
 }
 
 /// Hash-join probe setup in `open_loop`.
@@ -623,6 +657,17 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
         let hash_table_id: usize = build_table.internal_id.into();
         let num_keys = self.hash_join_op.join_keys.len();
 
+        // For LEFT/FULL OUTER hash joins, reset matched_bits at the start of
+        // each outer-loop iteration so marks from a previous probe pass don't
+        // suppress NULL-fill rows in the current one.
+        if matches!(
+            self.hash_join_op.join_type,
+            HashJoinType::LeftOuter | HashJoinType::FullOuter
+        ) {
+            self.program
+                .emit_insn(Insn::HashResetMatched { hash_table_id });
+        }
+
         self.program.emit_insn(Insn::Rewind {
             cursor_id: self.probe_cursor_id,
             pc_if_empty: self.loop_end,
@@ -681,6 +726,21 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
             self.next
         };
 
+        let (probe_rowid_reg, grace_flag_reg) = {
+            let rowid_reg = self.program.alloc_register();
+            self.program.emit_insn(Insn::RowId {
+                cursor_id: self.probe_cursor_id,
+                dest: rowid_reg,
+            });
+            // grace_flag_reg: 0 during main probe loop, 1 during grace loop
+            let flag_reg = self.program.alloc_register();
+            self.program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: flag_reg,
+            });
+            (Some(rowid_reg), Some(flag_reg))
+        };
+
         let match_reg = self.program.alloc_register();
         self.program.emit_insn(Insn::HashProbe {
             hash_table_id: to_u16(hash_table_id),
@@ -690,6 +750,9 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
             target_pc: hash_probe_miss_label,
             payload_dest_reg: payload_dest_reg.map(to_u16),
             num_payload: to_u16(num_payload),
+            // Main probe loop always carries the probe rowid so spilled build
+            // partitions are deferred to grace processing instead of loaded here.
+            probe_rowid_reg: probe_rowid_reg.map(to_u16),
         });
 
         let match_found_label = self.program.allocate_label();
@@ -704,6 +767,10 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
             hash_probe_miss_label,
             match_found_label,
             hash_next_label,
+            probe_rowid_reg,
+            key_start_reg: probe_key_start_reg,
+            num_keys,
+            grace_flag_reg,
         })
     }
 
@@ -717,25 +784,27 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
             hash_probe_miss_label,
             match_found_label,
             hash_next_label,
+            probe_rowid_reg,
+            key_start_reg,
+            num_keys,
+            grace_flag_reg,
         } = state;
         let build_table = &self.table_references.joined_tables()[self.hash_join_op.build_table_idx];
         let hash_table_id: usize = build_table.internal_id.into();
         let payload_columns = payload_info.payload_columns.clone();
 
+        let mut labels = HashLabels::new(match_found_label, hash_next_label);
+        if self.hash_join_op.join_type == HashJoinType::FullOuter {
+            labels.check_outer = Some(hash_probe_miss_label);
+        };
         self.t_ctx.hash_table_contexts.insert(
             self.hash_join_op.build_table_idx,
             HashCtx {
+                labels,
                 hash_table_reg: hash_table_id,
                 match_reg,
-                match_found_label,
-                hash_next_label,
                 payload_start_reg: payload_dest_reg,
                 payload_columns: payload_info.payload_columns,
-                check_outer_label: if self.hash_join_op.join_type == HashJoinType::FullOuter {
-                    Some(hash_probe_miss_label)
-                } else {
-                    None
-                },
                 build_cursor_id: if payload_info.allow_seek {
                     Some(build_cursor_id)
                 } else {
@@ -743,8 +812,10 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
                 },
                 join_type: self.hash_join_op.join_type,
                 inner_loop_gosub_reg: None,
-                inner_loop_gosub_label: None,
-                inner_loop_skip_label: None,
+                probe_rowid_reg,
+                key_start_reg,
+                num_keys,
+                grace_flag_reg,
             },
         );
 
@@ -763,8 +834,7 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
         if payload_info.allow_seek && !payload_has_build_rowid && !build_table_is_live {
             self.t_ctx
                 .resolver
-                .expr_to_reg_cache
-                .push((Cow::Owned(rowid_expr), match_reg, false));
+                .cache_expr_reg(Cow::Owned(rowid_expr), match_reg, false, None);
         }
         if let Some(payload_reg) = payload_dest_reg {
             for (i, payload) in payload_columns.iter().enumerate() {
@@ -795,11 +865,21 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
                 if self.live_table_ids.contains(&payload_table_id) {
                     continue;
                 }
-                self.t_ctx.resolver.expr_to_reg_cache.push((
-                    Cow::Owned(expr),
-                    payload_reg + i,
-                    is_column,
-                ));
+                if is_column {
+                    self.t_ctx.resolver.cache_scalar_expr_reg(
+                        Cow::Owned(expr),
+                        payload_reg + i,
+                        true,
+                        self.table_references,
+                    )?;
+                } else {
+                    self.t_ctx.resolver.cache_expr_reg(
+                        Cow::Owned(expr),
+                        payload_reg + i,
+                        false,
+                        None,
+                    );
+                }
             }
         } else if payload_info.allow_seek && !build_table_is_live {
             self.program.emit_insn(Insn::SeekRowid {
@@ -843,7 +923,6 @@ pub(super) struct HashProbeCloseEmitter<'a, 'plan> {
 }
 
 impl<'a, 'plan> HashProbeCloseEmitter<'a, 'plan> {
-    #[allow(clippy::too_many_arguments)]
     /// Capture the mutable close-loop inputs for a single hash probe table.
     pub(super) fn new(
         program: &'a mut ProgramBuilder,
@@ -867,14 +946,14 @@ impl<'a, 'plan> HashProbeCloseEmitter<'a, 'plan> {
     fn emit_matched_iteration(&mut self) -> Result<ProbeCloseState> {
         let hash_table_reg = self.hash_ctx.hash_table_reg;
         let match_reg = self.hash_ctx.match_reg;
-        let match_found_label = self.hash_ctx.match_found_label;
-        let hash_next_label = self.hash_ctx.hash_next_label;
+        let match_found_label = self.hash_ctx.labels.match_found;
+        let hash_next_label = self.hash_ctx.labels.next;
         let payload_dest_reg = self.hash_ctx.payload_start_reg;
         let num_payload = self.hash_ctx.payload_columns.len();
-        let check_outer_label = self.hash_ctx.check_outer_label;
+        let check_outer_label = self.hash_ctx.labels.check_outer;
         let join_type = self.hash_ctx.join_type;
         let inner_loop_gosub_reg = self.hash_ctx.inner_loop_gosub_reg;
-        let inner_loop_skip_label = self.hash_ctx.inner_loop_skip_label;
+        let inner_loop_skip_label = self.hash_ctx.labels.inner_loop_skip;
         let label_next_probe_row = self.program.allocate_label();
         let mut semi_anti_next_pc = None;
 
@@ -900,6 +979,23 @@ impl<'a, 'plan> HashProbeCloseEmitter<'a, 'plan> {
         }
         self.program
             .resolve_label(hash_next_label, self.program.offset());
+
+        // Grace dispatch: if grace_flag_reg > 0, jump to the grace loop's own
+        // HashNext (which has a different miss target). This lets the inner body
+        // be shared between the main probe loop and the grace loop.
+        if let Some(grace_flag_reg) = self.hash_ctx.grace_flag_reg {
+            let grace_hash_next_label = self.program.allocate_label();
+            // Store in hash_ctx for the grace loop emitter to resolve later.
+            let build_table_idx = self.hash_join_op.build_table_idx;
+            if let Some(ctx) = self.t_ctx.hash_table_contexts.get_mut(&build_table_idx) {
+                ctx.labels.grace_hash_next = Some(grace_hash_next_label);
+            }
+            self.program.emit_insn(Insn::IfPos {
+                reg: grace_flag_reg,
+                target_pc: grace_hash_next_label,
+                decrement_by: 0,
+            });
+        }
 
         self.program.emit_insn(Insn::HashNext {
             hash_table_id: hash_table_reg,
@@ -932,7 +1028,7 @@ impl<'a, 'plan> HashProbeCloseEmitter<'a, 'plan> {
                 .expect("FULL OUTER probe table must have left join metadata");
             let reg_match_flag = lj_meta.reg_match_flag;
 
-            if let Some(check_outer_label) = self.hash_ctx.check_outer_label {
+            if let Some(check_outer_label) = self.hash_ctx.labels.check_outer {
                 self.program
                     .resolve_label(check_outer_label, self.program.offset());
             }
@@ -969,7 +1065,7 @@ impl<'a, 'plan> HashProbeCloseEmitter<'a, 'plan> {
                     label_next_probe_row,
                     self.hash_ctx
                         .inner_loop_gosub_reg
-                        .zip(self.hash_ctx.inner_loop_gosub_label),
+                        .zip(self.hash_ctx.labels.inner_loop_gosub),
                 )?;
             }
         }
@@ -1000,7 +1096,6 @@ impl<'a, 'plan> HashProbeCloseEmitter<'a, 'plan> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Emit unmatched build rows after the probe cursor has been exhausted.
 pub(super) fn emit_hash_join_unmatched_build_rows<'a>(
     program: &mut ProgramBuilder,
@@ -1061,7 +1156,7 @@ pub(super) fn emit_hash_join_unmatched_build_rows<'a>(
         label_next_unmatched,
         hash_ctx
             .inner_loop_gosub_reg
-            .zip(hash_ctx.inner_loop_gosub_label),
+            .zip(hash_ctx.labels.inner_loop_gosub),
     )?;
 
     program.resolve_label(label_next_unmatched, program.offset());
@@ -1077,4 +1172,275 @@ pub(super) fn emit_hash_join_unmatched_build_rows<'a>(
     });
     program.preassign_label_to_next_insn(done_unmatched);
     Ok(())
+}
+
+/// Grace Hash Join processing loop after the probe cursor is exhausted.
+pub(crate) struct GraceHashLoop;
+
+impl GraceHashLoop {
+    /// Emit VDBE-driven grace hash join processing loop.
+    /// Uses the shared inner body via `Goto match_found_label` and `grace_flag_reg`
+    /// dispatch so that aggregates, LIMIT, ORDER BY, etc. all work naturally.
+    /// At runtime, HashGraceInit is a no-op if the build side didn't spill.
+    pub fn emit<'a>(
+        program: &mut ProgramBuilder,
+        t_ctx: &mut TranslateCtx<'a>,
+        hash_join_op: &HashJoinOp,
+        hash_ctx: &HashCtx,
+        select_plan: Option<&'a SelectPlan>,
+        table_index: usize,
+        probe_cursor_id: CursorID,
+    ) -> Result<()> {
+        // Need grace_flag_reg + probe_rowid_reg for grace processing
+        let Some(probe_rowid_reg) = hash_ctx.probe_rowid_reg else {
+            return Ok(());
+        };
+        let Some(grace_flag_reg) = hash_ctx.grace_flag_reg else {
+            return Ok(());
+        };
+
+        let hash_table_reg = hash_ctx.hash_table_reg;
+        let match_reg = hash_ctx.match_reg;
+        let match_found_label = hash_ctx.labels.match_found;
+        let payload_dest_reg = hash_ctx.payload_start_reg;
+        let num_payload = hash_ctx.payload_columns.len();
+        let is_full_outer = hash_join_op.join_type == HashJoinType::FullOuter;
+
+        let grace_done = program.allocate_label();
+        let grace_partition_top = program.allocate_label();
+        let grace_probe_top = program.allocate_label();
+        let grace_advance = program.allocate_label();
+        let grace_cleanup = program.allocate_label();
+
+        // HashGraceInit: finalize probe spill + grace_begin
+        program.emit_insn(Insn::HashGraceInit {
+            hash_table_id: to_u16(hash_table_reg),
+            target_pc: grace_done,
+        });
+
+        // Set grace mode flag = 1
+        program.emit_insn(Insn::Integer {
+            value: 1,
+            dest: grace_flag_reg,
+        });
+
+        // grace_partition_top: load build partition + first probe chunk
+        program.preassign_label_to_next_insn(grace_partition_top);
+        program.emit_insn(Insn::HashGraceLoadPartition {
+            hash_table_id: to_u16(hash_table_reg),
+            target_pc: grace_cleanup,
+        });
+
+        // grace_probe_top: get next probe entry (writes keys + rowid to registers)
+        program.preassign_label_to_next_insn(grace_probe_top);
+
+        // FULL OUTER: reset match flag before each probe entry so we can detect misses
+        if is_full_outer {
+            let probe_table_idx = hash_join_op.probe_table_idx;
+            if let Some(lj_meta) = t_ctx.meta_left_joins[probe_table_idx].as_ref() {
+                program.emit_insn(Insn::Integer {
+                    value: 0,
+                    dest: lj_meta.reg_match_flag,
+                });
+            }
+        }
+
+        program.emit_insn(Insn::HashGraceNextProbe {
+            hash_table_id: to_u16(hash_table_reg),
+            key_start_reg: to_u16(hash_ctx.key_start_reg),
+            num_keys: to_u16(hash_ctx.num_keys),
+            probe_rowid_dest: to_u16(probe_rowid_reg),
+            target_pc: grace_advance,
+        });
+
+        // Re-position probe cursor via SeekRowid
+        program.emit_insn(Insn::SeekRowid {
+            cursor_id: probe_cursor_id,
+            src_reg: probe_rowid_reg,
+            target_pc: grace_probe_top,
+        });
+
+        // For FULL OUTER, HashProbe miss needs to go to the outer-check path
+        // (emit unmatched probe row with NULL build columns).
+        // For INNER/LEFT OUTER, miss just advances to next probe entry.
+        let grace_outer_check = if is_full_outer {
+            program.allocate_label()
+        } else {
+            grace_probe_top
+        };
+
+        // HashProbe the loaded build partition with the probe keys
+        program.emit_insn(Insn::HashProbe {
+            hash_table_id: to_u16(hash_table_reg),
+            key_start_reg: to_u16(hash_ctx.key_start_reg),
+            num_keys: to_u16(hash_ctx.num_keys),
+            dest_reg: to_u16(match_reg),
+            target_pc: grace_outer_check,
+            payload_dest_reg: payload_dest_reg.map(to_u16),
+            num_payload: to_u16(num_payload),
+            probe_rowid_reg: None, // grace-only: HashGraceLoadPartition already loaded this partition
+        });
+
+        // Jump INTO the shared inner body (conditions, result columns, aggregation).
+        // The IfPos dispatch before the main loop's HashNext will route back here.
+        program.emit_insn(Insn::Goto {
+            target_pc: match_found_label,
+        });
+
+        // grace_hash_next: the grace loop's own HashNext, reached via IfPos dispatch
+        // from the shared body.
+        if let Some(grace_hash_next_label) = hash_ctx.labels.grace_hash_next {
+            program.resolve_label(grace_hash_next_label, program.offset());
+        }
+
+        // For FULL OUTER, HashNext miss goes to outer check (unmatched probe row).
+        // For INNER/LEFT OUTER, miss advances to next probe entry.
+        program.emit_insn(Insn::HashNext {
+            hash_table_id: hash_table_reg,
+            dest_reg: match_reg,
+            target_pc: grace_outer_check,
+            payload_dest_reg,
+            num_payload,
+        });
+        // Another match found, loop back to shared body
+        program.emit_insn(Insn::Goto {
+            target_pc: match_found_label,
+        });
+
+        // FULL OUTER: unmatched probe row path.
+        // If match_flag is still 0, emit the probe row with NULL build columns.
+        if is_full_outer {
+            program.resolve_label(grace_outer_check, program.offset());
+
+            let probe_table_idx = hash_join_op.probe_table_idx;
+            if let Some(lj_meta) = t_ctx.meta_left_joins[probe_table_idx].as_ref() {
+                // If match_flag > 0, a match was found, skip to next probe entry
+                program.emit_insn(Insn::IfPos {
+                    reg: lj_meta.reg_match_flag,
+                    target_pc: grace_probe_top,
+                    decrement_by: 0,
+                });
+            }
+
+            // Set build cursor to NULL row
+            if let Some(cursor_id) = hash_ctx.build_cursor_id {
+                program.emit_insn(Insn::NullRow { cursor_id });
+            }
+
+            // NULL out payload registers
+            if let Some(payload_reg) = hash_ctx.payload_start_reg {
+                if num_payload > 0 {
+                    program.emit_insn(Insn::Null {
+                        dest: payload_reg,
+                        dest_end: Some(payload_reg + num_payload - 1),
+                    });
+                }
+            }
+
+            // Emit the unmatched row through the shared body
+            if let Some(plan) = select_plan {
+                emit_unmatched_row_conditions_and_loop(
+                    program,
+                    t_ctx,
+                    plan,
+                    hash_join_op.build_table_idx,
+                    table_index,
+                    grace_probe_top,
+                    hash_ctx
+                        .inner_loop_gosub_reg
+                        .zip(hash_ctx.labels.inner_loop_gosub),
+                )?;
+            }
+
+            // Advance to next probe entry
+            program.emit_insn(Insn::Goto {
+                target_pc: grace_probe_top,
+            });
+        }
+
+        // grace_advance: probe entries exhausted for this partition.
+        program.resolve_label(grace_advance, program.offset());
+
+        // LEFT/FULL OUTER: emit unmatched build rows for this partition BEFORE evicting.
+        // After eviction, matched_bits are lost, so the global unmatched scan can't
+        // see which build rows were matched during grace probing.
+        if matches!(
+            hash_join_op.join_type,
+            HashJoinType::LeftOuter | HashJoinType::FullOuter
+        ) {
+            if let Some(plan) = select_plan {
+                let done_grace_unmatched = program.allocate_label();
+                let grace_unmatched_loop = program.allocate_label();
+                let grace_next_unmatched = program.allocate_label();
+
+                // Set probe cursor to NULL row (unmatched build rows have no probe match)
+                program.emit_insn(Insn::NullRow {
+                    cursor_id: probe_cursor_id,
+                });
+
+                program.emit_insn(Insn::HashScanUnmatched {
+                    hash_table_id: hash_table_reg,
+                    dest_reg: match_reg,
+                    target_pc: done_grace_unmatched,
+                    payload_dest_reg,
+                    num_payload,
+                });
+
+                program.preassign_label_to_next_insn(grace_unmatched_loop);
+
+                if let Some(cursor_id) = hash_ctx.build_cursor_id {
+                    program.emit_insn(Insn::SeekRowid {
+                        cursor_id,
+                        src_reg: match_reg,
+                        target_pc: done_grace_unmatched,
+                    });
+                }
+
+                emit_unmatched_row_conditions_and_loop(
+                    program,
+                    t_ctx,
+                    plan,
+                    hash_join_op.build_table_idx,
+                    table_index,
+                    grace_next_unmatched,
+                    hash_ctx
+                        .inner_loop_gosub_reg
+                        .zip(hash_ctx.labels.inner_loop_gosub),
+                )?;
+
+                program.resolve_label(grace_next_unmatched, program.offset());
+                program.emit_insn(Insn::HashNextUnmatched {
+                    hash_table_id: hash_table_reg,
+                    dest_reg: match_reg,
+                    target_pc: done_grace_unmatched,
+                    payload_dest_reg,
+                    num_payload,
+                });
+                program.emit_insn(Insn::Goto {
+                    target_pc: grace_unmatched_loop,
+                });
+                program.preassign_label_to_next_insn(done_grace_unmatched);
+            }
+        }
+
+        // Evict current partition, advance to next
+        program.emit_insn(Insn::HashGraceAdvancePartition {
+            hash_table_id: to_u16(hash_table_reg),
+            target_pc: grace_cleanup,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: grace_partition_top,
+        });
+
+        // grace_cleanup: clear grace mode flag
+        program.resolve_label(grace_cleanup, program.offset());
+        program.emit_insn(Insn::Integer {
+            value: 0,
+            dest: grace_flag_reg,
+        });
+
+        // grace_done
+        program.preassign_label_to_next_insn(grace_done);
+        Ok(())
+    }
 }

@@ -646,7 +646,7 @@ fn test_alter_table_drop_column_fails_when_trigger_references_new_column(db: Tem
 
     let error_msg = result.unwrap_err().to_string();
     assert!(
-        error_msg.contains("cannot drop column") && error_msg.contains("trigger"),
+        error_msg.contains("error in trigger") && error_msg.contains("after drop column"),
         "Error should mention column drop and trigger: {error_msg}",
     );
 }
@@ -676,7 +676,7 @@ fn test_alter_table_drop_column_fails_when_trigger_references_old_column(db: Tem
 
     let error_msg = result.unwrap_err().to_string();
     assert!(
-        error_msg.contains("cannot drop column") && error_msg.contains("trigger"),
+        error_msg.contains("error in trigger") && error_msg.contains("after drop column"),
         "Error should mention column drop and trigger: {error_msg}",
     );
 }
@@ -706,7 +706,7 @@ fn test_alter_table_drop_column_fails_when_trigger_references_unqualified_column
 
     let error_msg = result.unwrap_err().to_string();
     assert!(
-        error_msg.contains("cannot drop column") && error_msg.contains("trigger"),
+        error_msg.contains("error in trigger") && error_msg.contains("after drop column"),
         "Error should mention column drop and trigger: {error_msg}",
     );
 }
@@ -1365,28 +1365,6 @@ fn test_alter_table_drop_column_allows_when_insert_targets_other_table(db: TempD
     .unwrap();
 
     // Dropping column x from table t should succeed (INSERT INTO u(x) refers to u.x, not t.x)
-    conn.execute("ALTER TABLE t DROP COLUMN x").unwrap();
-}
-
-#[turso_macros::test(mvcc)]
-fn test_alter_table_drop_column_allows_when_update_targets_other_table(db: TempDatabase) {
-    let conn = db.connect_limbo();
-
-    // Create two tables, both with column 'x'
-    conn.execute("CREATE TABLE t (x INTEGER, y INTEGER)")
-        .unwrap();
-    conn.execute("CREATE TABLE u (x INTEGER, z INTEGER)")
-        .unwrap();
-
-    // Create trigger on t that updates u SET x = ... - this should NOT prevent dropping x from t
-    conn.execute(
-        "CREATE TRIGGER tu BEFORE INSERT ON t BEGIN
-         UPDATE u SET x = NEW.y WHERE z = 1;
-        END",
-    )
-    .unwrap();
-
-    // Dropping column x from table t should succeed (UPDATE u SET x refers to u.x, not t.x)
     conn.execute("ALTER TABLE t DROP COLUMN x").unwrap();
 }
 

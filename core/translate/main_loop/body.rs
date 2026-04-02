@@ -1,7 +1,7 @@
 use crate::translate::plan::SimpleAggregate;
 use crate::translate::{
     aggregation::emit_collseq_if_needed,
-    order_by::{custom_type_lt_func, EmitOrderBy},
+    order_by::{custom_type_comparator, EmitOrderBy},
     window::EmitWindow,
 };
 
@@ -252,7 +252,7 @@ fn emit_loop_source<'a>(
                 };
 
                 emit_collseq_if_needed(program, &plan.table_references, &min_max.argument);
-                let comparator_func_name = custom_type_lt_func(
+                let comparator = custom_type_comparator(
                     &min_max.argument,
                     &plan.table_references,
                     t_ctx.resolver.schema(),
@@ -262,7 +262,7 @@ fn emit_loop_source<'a>(
                     col: expr_reg,
                     delimiter: 0,
                     func: min_max.func.clone(),
-                    comparator_func_name,
+                    comparator,
                 });
                 program.emit_insn(Insn::Goto {
                     target_pc: loop_end,
@@ -354,11 +354,12 @@ fn emit_loop_source<'a>(
                                 reg,
                                 &t_ctx.resolver,
                             )?;
-                            t_ctx.resolver.expr_to_reg_cache.push((
+                            t_ctx.resolver.cache_scalar_expr_reg(
                                 Cow::Owned(expr.clone()),
                                 reg,
                                 false,
-                            ));
+                                &plan.table_references,
+                            )?;
                             Ok(WalkControl::SkipChildren)
                         }
                         _ => {

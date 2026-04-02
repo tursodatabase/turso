@@ -594,8 +594,8 @@ fn test_avg_agg(tmp_db: TempDatabase) -> anyhow::Result<()> {
     })?;
 
     assert_eq!(stmt.num_columns(), 2);
-    assert_eq!(stmt.get_column_name(0), "avg (t.x)");
-    assert_eq!(stmt.get_column_name(1), "avg (t.y)");
+    assert_eq!(stmt.get_column_name(0), "avg(x)");
+    assert_eq!(stmt.get_column_name(1), "avg(y)");
 
     assert_eq!(
         rows,

@@ -14,11 +14,18 @@ export interface DatabaseOpts {
     readonly?: boolean,
     fileMustExist?: boolean,
     timeout?: number
+    /** Default maximum query execution time in milliseconds before interruption. */
+    defaultQueryTimeout?: number
     tracing?: 'info' | 'debug' | 'trace'
     /** Experimental features to enable */
     experimental?: ExperimentalFeature[]
     /** Optional local encryption configuration */
     encryption?: EncryptionOpts
+}
+
+export interface QueryOptions {
+    /** Per-query timeout in milliseconds. Overrides defaultQueryTimeout for this call. */
+    queryTimeout?: number
 }
 
 export interface NativeDatabase {
@@ -35,7 +42,7 @@ export interface NativeDatabase {
     ioLoopAsync(): Promise<void>;
 
     prepare(sql: string): NativeStatement;
-    executor(sql: string): NativeExecutor;
+    executor(sql: string, queryOptions?: QueryOptions): NativeExecutor;
 
     defaultSafeIntegers(toggle: boolean);
     totalChanges(): number;
@@ -60,6 +67,7 @@ export interface NativeExecutor {
     reset();
 }
 export interface NativeStatement {
+    setQueryTimeout(queryOptions?: QueryOptions): void;
     stepAsync(): Promise<number>;
     stepSync(): number;
 

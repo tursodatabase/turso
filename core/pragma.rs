@@ -59,6 +59,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NeedSchema | PragmaFlags::Result0 | PragmaFlags::SchemaReq,
             &["journal_mode"],
         ),
+        LockingMode => Pragma::new(PragmaFlags::Result0, &["locking_mode"]),
+        FullColumnNames | ShortColumnNames => {
+            unreachable!("pragma_for() called with FullColumnNames/ShortColumnNames, which are deprecated no-ops")
+        }
         LegacyFileFormat => {
             unreachable!("pragma_for() called with LegacyFileFormat, which is unsupported")
         }
@@ -210,7 +214,11 @@ pub(crate) struct PragmaVirtualTable {
 impl PragmaVirtualTable {
     pub(crate) fn functions() -> Vec<(PragmaVirtualTable, String)> {
         PragmaName::iter()
-            .filter(|name| *name != PragmaName::LegacyFileFormat)
+            .filter(|name| {
+                *name != PragmaName::LegacyFileFormat
+                    && *name != PragmaName::FullColumnNames
+                    && *name != PragmaName::ShortColumnNames
+            })
             .filter_map(|name| {
                 let pragma = pragma_for(&name);
                 if pragma

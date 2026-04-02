@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use turso_core::{types::Text, IOResult};
+use turso_core::{types::AsValueRef, types::Text, IOResult};
 use turso_sdk_kit_macros::signature;
 
 use crate::rsapi::{
@@ -347,29 +347,55 @@ pub extern "C" fn turso_statement_column_decltype(
     }
 }
 
+/// Lock the statement handle and get a ValueRef for the given row index.
+/// Returns None if the statement is null, finalized, has no row, or index is out of bounds.
+/// The returned MutexGuard must be kept alive for the duration of ValueRef use.
+macro_rules! with_row_value {
+    ($statement:expr, $index:expr, $default:expr, $body:expr) => {{
+        let statement = match unsafe { TursoStatement::ref_from_capi($statement) } {
+            Ok(s) => s,
+            Err(_) => return $default,
+        };
+        let handle = statement.handle.lock().unwrap();
+        let Some(stmt) = handle.as_ref() else {
+            return $default;
+        };
+        let Some(row) = stmt.row() else {
+            return $default;
+        };
+        if $index >= row.len() {
+            return $default;
+        }
+        let value_ref = row.get_value($index).as_value_ref();
+        #[allow(clippy::redundant_closure_call)]
+        ($body)(value_ref)
+    }};
+}
+
 #[no_mangle]
 #[signature(c)]
 pub extern "C" fn turso_statement_row_value_kind(
     statement: *const c::turso_statement_t,
     index: usize,
 ) -> c::turso_type_t {
-    let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
-        Ok(statement) => statement,
-        Err(_) => return c::turso_type_t::TURSO_TYPE_UNKNOWN,
-    };
-    let value = statement.row_value(index);
-    match value {
-        Ok(turso_core::ValueRef::Null) => c::turso_type_t::TURSO_TYPE_NULL,
-        Ok(turso_core::ValueRef::Numeric(turso_core::Numeric::Integer(..))) => {
-            c::turso_type_t::TURSO_TYPE_INTEGER
+    with_row_value!(
+        statement,
+        index,
+        c::turso_type_t::TURSO_TYPE_UNKNOWN,
+        |value_ref: turso_core::ValueRef| {
+            match value_ref {
+                turso_core::ValueRef::Null => c::turso_type_t::TURSO_TYPE_NULL,
+                turso_core::ValueRef::Numeric(turso_core::Numeric::Integer(..)) => {
+                    c::turso_type_t::TURSO_TYPE_INTEGER
+                }
+                turso_core::ValueRef::Numeric(turso_core::Numeric::Float(..)) => {
+                    c::turso_type_t::TURSO_TYPE_REAL
+                }
+                turso_core::ValueRef::Text(..) => c::turso_type_t::TURSO_TYPE_TEXT,
+                turso_core::ValueRef::Blob(..) => c::turso_type_t::TURSO_TYPE_BLOB,
+            }
         }
-        Ok(turso_core::ValueRef::Numeric(turso_core::Numeric::Float(..))) => {
-            c::turso_type_t::TURSO_TYPE_REAL
-        }
-        Ok(turso_core::ValueRef::Text(..)) => c::turso_type_t::TURSO_TYPE_TEXT,
-        Ok(turso_core::ValueRef::Blob(..)) => c::turso_type_t::TURSO_TYPE_BLOB,
-        Err(_) => c::turso_type_t::TURSO_TYPE_UNKNOWN,
-    }
+    )
 }
 
 #[no_mangle]
@@ -378,16 +404,13 @@ pub extern "C" fn turso_statement_row_value_bytes_count(
     statement: *const c::turso_statement_t,
     index: usize,
 ) -> i64 {
-    let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
-        Ok(statement) => statement,
-        Err(_) => return -1,
-    };
-    let value = statement.row_value(index);
-    match value {
-        Ok(turso_core::ValueRef::Text(text)) => text.len() as i64,
-        Ok(turso_core::ValueRef::Blob(blob)) => blob.len() as i64,
-        _ => -1,
-    }
+    with_row_value!(statement, index, -1, |value_ref: turso_core::ValueRef| {
+        match value_ref {
+            turso_core::ValueRef::Text(text) => text.len() as i64,
+            turso_core::ValueRef::Blob(blob) => blob.len() as i64,
+            _ => -1,
+        }
+    })
 }
 
 #[no_mangle]
@@ -396,16 +419,20 @@ pub extern "C" fn turso_statement_row_value_bytes_ptr(
     statement: *const c::turso_statement_t,
     index: usize,
 ) -> *const std::ffi::c_char {
-    let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
-        Ok(statement) => statement,
-        Err(_) => return std::ptr::null(),
-    };
-    let value = statement.row_value(index);
-    match value {
-        Ok(turso_core::ValueRef::Text(text)) => text.as_bytes().as_ptr() as *const std::ffi::c_char,
-        Ok(turso_core::ValueRef::Blob(blob)) => blob.as_ptr() as *const std::ffi::c_char,
-        _ => std::ptr::null(),
-    }
+    with_row_value!(
+        statement,
+        index,
+        std::ptr::null(),
+        |value_ref: turso_core::ValueRef| {
+            match value_ref {
+                turso_core::ValueRef::Text(text) => {
+                    text.as_bytes().as_ptr() as *const std::ffi::c_char
+                }
+                turso_core::ValueRef::Blob(blob) => blob.as_ptr() as *const std::ffi::c_char,
+                _ => std::ptr::null(),
+            }
+        }
+    )
 }
 
 #[no_mangle]
@@ -414,15 +441,12 @@ pub extern "C" fn turso_statement_row_value_int(
     statement: *const c::turso_statement_t,
     index: usize,
 ) -> i64 {
-    let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
-        Ok(statement) => statement,
-        Err(_) => return 0,
-    };
-    let value = statement.row_value(index);
-    match value {
-        Ok(turso_core::ValueRef::Numeric(turso_core::Numeric::Integer(value))) => value,
-        _ => 0,
-    }
+    with_row_value!(statement, index, 0, |value_ref: turso_core::ValueRef| {
+        match value_ref {
+            turso_core::ValueRef::Numeric(turso_core::Numeric::Integer(value)) => value,
+            _ => 0,
+        }
+    })
 }
 
 #[no_mangle]
@@ -431,15 +455,12 @@ pub extern "C" fn turso_statement_row_value_double(
     statement: *const c::turso_statement_t,
     index: usize,
 ) -> f64 {
-    let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
-        Ok(statement) => statement,
-        Err(_) => return 0.0,
-    };
-    let value = statement.row_value(index);
-    match value {
-        Ok(turso_core::ValueRef::Numeric(turso_core::Numeric::Float(value))) => f64::from(value),
-        _ => 0.0,
-    }
+    with_row_value!(statement, index, 0.0, |value_ref: turso_core::ValueRef| {
+        match value_ref {
+            turso_core::ValueRef::Numeric(turso_core::Numeric::Float(value)) => f64::from(value),
+            _ => 0.0,
+        }
+    })
 }
 
 #[no_mangle]
@@ -646,8 +667,9 @@ mod tests {
             turso_statement_bind_positional_int, turso_statement_bind_positional_null,
             turso_statement_bind_positional_text, turso_statement_column_count,
             turso_statement_deinit, turso_statement_execute, turso_statement_n_change,
-            turso_statement_named_position, turso_statement_run_io, turso_statement_step,
-            turso_status_code_t, turso_str_deinit, turso_version,
+            turso_statement_named_position, turso_statement_parameters_count,
+            turso_statement_run_io, turso_statement_step, turso_status_code_t, turso_str_deinit,
+            turso_version,
         },
         value_from_c_value,
     };
@@ -1221,6 +1243,137 @@ mod tests {
                     turso_core::Value::Blob(vec![6]),
                 ]
             );
+        }
+    }
+
+    #[test]
+    pub fn test_db_stmt_named_position_requires_prefixed_name() {
+        unsafe {
+            let path = CString::new(":memory:").unwrap();
+            let config = c::turso_database_config_t {
+                path: path.as_ptr(),
+                ..Default::default()
+            };
+            let mut db = std::ptr::null();
+            let status = turso_database_new(&config, &mut db, std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            let status = turso_database_open(db, std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            let mut connection = std::ptr::null_mut();
+            let status = turso_database_connect(db, &mut connection, std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            let sql = c"SELECT :e";
+            let mut statement = std::ptr::null_mut();
+            let status = turso_connection_prepare_single(
+                connection,
+                sql.as_ptr(),
+                &mut statement,
+                std::ptr::null_mut(),
+            );
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            assert_eq!(turso_statement_named_position(statement, c":e".as_ptr()), 1);
+            assert_eq!(turso_statement_named_position(statement, c"e".as_ptr()), -1);
+
+            turso_statement_deinit(statement);
+            turso_connection_deinit(connection);
+            turso_database_deinit(db);
+        }
+    }
+
+    #[test]
+    pub fn test_db_stmt_bind_positional_out_of_bounds() {
+        unsafe {
+            let path = CString::new(":memory:").unwrap();
+            let config = c::turso_database_config_t {
+                path: path.as_ptr(),
+                ..Default::default()
+            };
+            let mut db = std::ptr::null();
+            let status = turso_database_new(&config, &mut db, std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            let status = turso_database_open(db, std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            let mut connection = std::ptr::null_mut();
+            let status = turso_database_connect(db, &mut connection, std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            let sql = c"SELECT ?1";
+            let mut statement = std::ptr::null_mut();
+            let status = turso_connection_prepare_single(
+                connection,
+                sql.as_ptr(),
+                &mut statement,
+                std::ptr::null_mut(),
+            );
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            assert_eq!(
+                turso_statement_bind_positional_int(statement, 1, 1),
+                turso_status_code_t::TURSO_OK
+            );
+            assert_eq!(
+                turso_statement_bind_positional_int(statement, 2, 2),
+                turso_status_code_t::TURSO_MISUSE
+            );
+
+            turso_statement_deinit(statement);
+            turso_connection_deinit(connection);
+            turso_database_deinit(db);
+        }
+    }
+
+    #[test]
+    pub fn test_db_stmt_sparse_positional_slot_range_matches_sqlite() {
+        unsafe {
+            let path = CString::new(":memory:").unwrap();
+            let config = c::turso_database_config_t {
+                path: path.as_ptr(),
+                ..Default::default()
+            };
+            let mut db = std::ptr::null();
+            let status = turso_database_new(&config, &mut db, std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            let status = turso_database_open(db, std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            let mut connection = std::ptr::null_mut();
+            let status = turso_database_connect(db, &mut connection, std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            let sql = c"SELECT ?3";
+            let mut statement = std::ptr::null_mut();
+            let status = turso_connection_prepare_single(
+                connection,
+                sql.as_ptr(),
+                &mut statement,
+                std::ptr::null_mut(),
+            );
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            assert_eq!(turso_statement_parameters_count(statement), 3);
+            assert_eq!(
+                turso_statement_bind_positional_int(statement, 1, 1),
+                turso_status_code_t::TURSO_OK
+            );
+            assert_eq!(
+                turso_statement_bind_positional_int(statement, 3, 3),
+                turso_status_code_t::TURSO_OK
+            );
+            assert_eq!(
+                turso_statement_bind_positional_int(statement, 4, 4),
+                turso_status_code_t::TURSO_MISUSE
+            );
+
+            turso_statement_deinit(statement);
+            turso_connection_deinit(connection);
+            turso_database_deinit(db);
         }
     }
 }

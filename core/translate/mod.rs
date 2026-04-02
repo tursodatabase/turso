@@ -63,7 +63,7 @@ use schema::{translate_create_table, translate_create_virtual_table, translate_d
 use select::translate_select;
 use tracing::{instrument, Level};
 use transaction::{translate_tx_begin, translate_tx_commit};
-use turso_parser::ast::{self, Indexed};
+use turso_parser::ast;
 use update::translate_update;
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -157,6 +157,11 @@ pub fn translate_inner(
             | ast::Stmt::Update { .. }
             | ast::Stmt::Insert { .. }
     );
+    let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
+
+    if is_vacuum && connection.get_query_only() {
+        bail_parse_error!("Cannot execute VACUUM in query_only mode")
+    }
 
     if is_write && connection.get_query_only() {
         bail_parse_error!("Cannot execute write statement in query_only mode")
@@ -258,9 +263,6 @@ pub fn translate_inner(
             order_by,
             with,
         } => {
-            if indexed.is_some_and(|i| matches!(i, Indexed::IndexedBy(_))) {
-                bail_parse_error!("INDEXED BY clause is not supported in DELETE");
-            }
             if !order_by.is_empty() {
                 bail_parse_error!("ORDER BY clause is not supported in DELETE");
             }
@@ -275,6 +277,7 @@ pub fn translate_inner(
                 where_clause,
                 limit,
                 returning,
+                indexed,
                 with,
                 program,
                 connection,

@@ -451,7 +451,10 @@ pub fn try_substitute_parameters(
             }))
         }
         Expr::Variable(var) => {
-            let Ok(var) = var.parse::<i32>() else {
+            if var.name.is_some() {
+                return None;
+            }
+            let Ok(var) = i32::try_from(var.index.get()) else {
                 return None;
             };
             Some(Box::new(parameters.get(&var)?.clone()))
@@ -501,7 +504,10 @@ pub fn try_capture_parameters(pattern: &Expr, query: &Expr) -> Option<HashMap<i3
             Some(captured)
         }
         (Expr::Variable(var), expr) => {
-            let Ok(var) = var.parse::<i32>() else {
+            if var.name.is_some() {
+                return None;
+            }
+            let Ok(var) = i32::try_from(var.index.get()) else {
                 return None;
             };
             captured.insert(var, expr.clone());
@@ -770,10 +776,6 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
         (Expr::Unary(op1, expr1), Expr::Unary(op2, expr2)) => {
             op1 == op2 && exprs_are_equivalent(expr1, expr2)
         }
-        // Variables that are not bound to a specific value, are treated as NULL
-        // https://sqlite.org/lang_expr.html#varparam
-        (Expr::Variable(var), Expr::Variable(var2)) if var.is_empty() && var2.is_empty() => false,
-        // Named variables can be compared by their name
         (Expr::Variable(val), Expr::Variable(val2)) => val == val2,
         (Expr::Parenthesized(exprs1), Expr::Parenthesized(exprs2)) => {
             exprs1.len() == exprs2.len()
@@ -1603,7 +1605,7 @@ where
     }
 }
 
-fn walk_expr_with_subqueries<F>(expr: &ast::Expr, func: &mut F) -> Result<()>
+pub fn walk_expr_with_subqueries<F>(expr: &ast::Expr, func: &mut F) -> Result<()>
 where
     F: FnMut(&ast::Expr) -> Result<WalkControl>,
 {
@@ -1782,10 +1784,7 @@ pub fn extract_view_columns(
                     tables.push(ViewTable {
                         name: table_name,
                         db_name,
-                        alias: alias.as_ref().map(|a| match a {
-                            ast::As::As(name) => normalize_ident(name.as_str()),
-                            ast::As::Elided(name) => normalize_ident(name.as_str()),
-                        }),
+                        alias: alias.as_ref().map(|a| normalize_ident(a.name().as_str())),
                     });
                 }
                 _ => {
@@ -1805,10 +1804,7 @@ pub fn extract_view_columns(
                         tables.push(ViewTable {
                             name: table_name,
                             db_name,
-                            alias: alias.as_ref().map(|a| match a {
-                                ast::As::As(name) => normalize_ident(name.as_str()),
-                                ast::As::Elided(name) => normalize_ident(name.as_str()),
-                            }),
+                            alias: alias.as_ref().map(|a| normalize_ident(a.name().as_str())),
                         });
                     }
                     _ => {
@@ -1850,10 +1846,10 @@ pub fn extract_view_columns(
 
                     let col_name = alias
                         .as_ref()
-                        .map(|a| match a {
-                            ast::As::Elided(name) => name.as_str().to_string(),
-                            ast::As::As(name) => name.as_str().to_string(),
-                        })
+                        // ImplicitColumnName is only for display; skip it
+                        // so we derive the proper column name below.
+                        .filter(|a| !matches!(a, ast::As::ImplicitColumnName(_)))
+                        .map(|a| a.name().as_str().to_string())
                         .or_else(|| extract_column_name_from_expr(expr))
                         .unwrap_or_else(|| {
                             // If we can't extract a simple column name, use the expression itself
@@ -2303,9 +2299,7 @@ mod rename_column_view {
     }
 
     fn alias_name(alias: &ast::As) -> &str {
-        match alias {
-            ast::As::As(name) | ast::As::Elided(name) => name.as_str(),
-        }
+        alias.name().as_str()
     }
 
     #[derive(Clone)]
@@ -3195,7 +3189,7 @@ pub fn rewrite_column_references_if_needed(
     table: &str,
     from: &str,
     to: &str,
-) {
+) -> Result<()> {
     for cc in &mut col.constraints {
         match &mut cc.constraint {
             ast::ColumnConstraint::ForeignKey { clause, .. } => {
@@ -3204,7 +3198,27 @@ pub fn rewrite_column_references_if_needed(
             ast::ColumnConstraint::Check(expr) => {
                 rename_identifiers(expr, from, to);
             }
+            ast::ColumnConstraint::Generated { expr, .. } => {
+                rename_identifiers(expr, from, to);
+            }
             _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// For a column definition like `parent_id REFERENCES parent(old_col)`, update
+/// the referenced parent column names when another table renames
+/// `old_col -> new_col`.
+pub fn rewrite_column_level_fk_parent_columns_if_needed(
+    col: &mut ast::ColumnDefinition,
+    table: &str,
+    from: &str,
+    to: &str,
+) {
+    for cc in &mut col.constraints {
+        if let ast::ColumnConstraint::ForeignKey { clause, .. } = &mut cc.constraint {
+            rewrite_fk_parent_cols_if_self_ref(clause, table, from, to);
         }
     }
 }
@@ -3843,7 +3857,7 @@ fn rewrite_upsert_table_refs(upsert: &mut ast::Upsert, old_tbl: &str, new_tbl: &
 pub mod tests {
     use super::*;
     use crate::schema::{BTreeTable, Type as SchemaValueType};
-    use turso_parser::ast::{self, Expr, FunctionTail, Literal, Name, Operator::*, Type};
+    use turso_parser::ast::{self, Expr, FunctionTail, Literal, Name, Operator::*, Type, Variable};
 
     #[test]
     fn test_normalize_ident() {
@@ -4087,20 +4101,20 @@ pub mod tests {
     }
 
     #[test]
-    fn test_anonymous_variable_comparison() {
-        let expr1 = Expr::Variable("".to_string());
-        let expr2 = Expr::Variable("".to_string());
-        assert!(!exprs_are_equivalent(&expr1, &expr2));
+    fn test_indexed_variable_comparison() {
+        let expr1 = Expr::Variable(Variable::indexed(1u32.try_into().unwrap()));
+        let expr2 = Expr::Variable(Variable::indexed(1u32.try_into().unwrap()));
+        assert!(exprs_are_equivalent(&expr1, &expr2));
     }
 
     #[test]
     fn test_named_variable_comparison() {
-        let expr1 = Expr::Variable("1".to_string());
-        let expr2 = Expr::Variable("1".to_string());
+        let expr1 = Expr::Variable(Variable::named(":a".to_string(), 1u32.try_into().unwrap()));
+        let expr2 = Expr::Variable(Variable::named(":a".to_string(), 1u32.try_into().unwrap()));
         assert!(exprs_are_equivalent(&expr1, &expr2));
 
-        let expr1 = Expr::Variable("1".to_string());
-        let expr2 = Expr::Variable("2".to_string());
+        let expr1 = Expr::Variable(Variable::named(":a".to_string(), 1u32.try_into().unwrap()));
+        let expr2 = Expr::Variable(Variable::named(":b".to_string(), 2u32.try_into().unwrap()));
         assert!(!exprs_are_equivalent(&expr1, &expr2));
     }
 
