@@ -26,53 +26,75 @@
 use crate::io::{
     Completion, File, FileSyncType, OpenFlags, SharedWalLockKind, SharedWalMappedRegion, IO,
 };
-use crate::storage::slot_bitmap::AtomicSlotBitmap;
 use crate::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use crate::sync::{Arc, LazyLock, Mutex, RwLock};
+use crate::HashMap;
 use crate::{turso_assert, CompletionError, LimboError, Result};
-use std::collections::HashMap;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
+/// Durable file-format magic stored at the start of every `.tshm` mapping.
 const SHARED_WAL_COORDINATION_MAGIC: [u8; 8] = *b"TSHMWAL\0";
+/// Durable `.tshm` file-format version. Bump whenever persisted layout changes.
 const SHARED_WAL_COORDINATION_VERSION: u32 = 9;
+/// Version for the optional persisted backfill-proof payload.
 const SHARED_WAL_BACKFILL_PROOF_VERSION: u32 = 1;
+/// Sentinel meaning a reader slot is not currently pinning any WAL frame.
 const UNUSED_READER_FRAME: u64 = u64::MAX;
+/// Sentinel meaning a shared owner slot is unclaimed.
 const UNOWNED_LOCK: u64 = 0;
+/// Mmap alignment for the fixed `.tshm` header region.
 const SHARED_WAL_COORDINATION_MAP_ALIGNMENT: usize = 4096;
+/// Byte 0: lifetime lock used only to detect whether another process is present.
 const PROCESS_LIFETIME_LOCK_OFFSET: u64 = 0;
+/// Byte 1: single-writer ownership byte.
 const WRITER_LOCK_OFFSET: u64 = 1;
+/// Byte 2: single-checkpointer ownership byte.
 const CHECKPOINT_LOCK_OFFSET: u64 = 2;
+/// Byte range starting at 3: one reader-byte lock per shared reader slot.
 const READER_LOCK_START_OFFSET: u64 = 3;
+/// Entries per frame-index block in the append-only shared page->frame index.
 const FRAME_INDEX_BLOCK_CAPACITY: u32 = 4096;
+/// Open-addressing hash slots per frame-index block.
+///
+/// Mirroring SQLite's oversubscription keeps probe chains short without making
+/// each block materially larger.
 const FRAME_INDEX_BLOCK_HASH_SLOTS: u32 = FRAME_INDEX_BLOCK_CAPACITY * 2;
+/// Hard cap on reserved frame-index blocks in one `.tshm` generation.
 const MAX_FRAME_INDEX_BLOCKS: u32 = 64;
+/// Blocks provisioned on first open before the index grows lazily.
 const INITIAL_FRAME_INDEX_BLOCKS: u32 = 1;
+/// Maximum number of shared frame-index entries representable by the mapping.
 const MAX_FRAME_INDEX_CAPACITY: u32 = FRAME_INDEX_BLOCK_CAPACITY * MAX_FRAME_INDEX_BLOCKS;
 
 /// Monotonic counter for generating unique per-connection instance IDs within
 /// a process. Combined with the PID to form a `SharedOwnerRecord`.
 static NEXT_SHARED_OWNER_INSTANCE_ID: AtomicU32 = AtomicU32::new(1);
 
-/// Global registry of open tshm mappings, keyed by canonical file path.
 /// Defensive dedup registry for tshm mappings within a single process.
 ///
 /// In production, `DATABASE_MANAGER` already ensures one `Database` (and
-/// therefore one `Arc<MappedSharedWalCoordination>`) per file per process,
-/// so `open_count` is always 1. This registry exists as a safety net for
-/// test code that may bypass `DATABASE_MANAGER` and open the same file
-/// multiple times. The shared Arcs it provides (`frame_index_publish_lock`,
-/// `process_local_ownership`) ensure those test-only re-opens still
-/// coordinate correctly within the process.
+/// therefore one `Arc<MappedSharedWalCoordination>`) per file per process.
+/// This registry enforces that invariant for callers that bypass the manager.
+///
+/// Unit tests still use it as a shim to share same-process bookkeeping across
+/// duplicate opens, but only under `cfg(test)`. That test-only convenience must
+/// not change the durable cross-process meaning of `open_mode`.
 static PROCESS_LOCAL_COORDINATION_OPENS: LazyLock<
     Mutex<HashMap<PathBuf, ProcessLocalCoordinationEntry>>,
-> = LazyLock::new(|| Mutex::new(HashMap::new()));
+> = LazyLock::new(|| Mutex::new(HashMap::default()));
 
 #[derive(Debug)]
 struct ProcessLocalCoordinationEntry {
+    /// Number of live mappings in this process for the same canonical tshm path.
     open_count: usize,
+    /// Shared publish mutex reused only by tests that bypass `DATABASE_MANAGER`.
+    #[cfg(test)]
     frame_index_publish_lock: Arc<Mutex<()>>,
+    /// Same-process ownership registry shared only by tests that bypass
+    /// `DATABASE_MANAGER`.
+    #[cfg(test)]
     ownership: Arc<Mutex<ProcessLocalOwnershipState>>,
 }
 
@@ -115,6 +137,8 @@ struct SharedReadMarkRegistration {
 }
 
 impl ProcessLocalOwnershipState {
+    /// Create empty same-process ownership state for a mapping with
+    /// `reader_slot_count` shared reader slots.
     fn new(reader_slot_count: u32) -> Self {
         Self {
             writer_owner: None,
@@ -124,6 +148,7 @@ impl ProcessLocalOwnershipState {
         }
     }
 
+    /// Record that one local connection now owns the process-local writer slot.
     fn try_acquire_writer(&mut self, owner: SharedOwnerRecord) -> bool {
         if self.writer_owner.is_some() {
             return false;
@@ -132,6 +157,7 @@ impl ProcessLocalOwnershipState {
         true
     }
 
+    /// Release the process-local writer slot, asserting the recorded owner matches.
     fn release_writer(&mut self, owner: SharedOwnerRecord) {
         turso_assert!(
             self.writer_owner == Some(owner),
@@ -140,10 +166,12 @@ impl ProcessLocalOwnershipState {
         self.writer_owner = None;
     }
 
+    /// Return whether any sibling connection in this process currently owns the writer slot.
     fn writer_active(&self) -> bool {
         self.writer_owner.is_some()
     }
 
+    /// Record that one local connection now owns the process-local checkpoint slot.
     fn try_acquire_checkpoint(&mut self, owner: SharedOwnerRecord) -> bool {
         if self.checkpoint_owner.is_some() {
             return false;
@@ -152,6 +180,7 @@ impl ProcessLocalOwnershipState {
         true
     }
 
+    /// Release the process-local checkpoint slot, asserting the recorded owner matches.
     fn release_checkpoint(&mut self, owner: SharedOwnerRecord) {
         turso_assert!(
             self.checkpoint_owner == Some(owner),
@@ -160,10 +189,12 @@ impl ProcessLocalOwnershipState {
         self.checkpoint_owner = None;
     }
 
+    /// Return whether any sibling connection in this process currently owns the checkpoint slot.
     fn checkpoint_active(&self) -> bool {
         self.checkpoint_owner.is_some()
     }
 
+    /// Mark one reader slot as owned by a same-process sibling connection.
     fn try_register_reader(&mut self, slot_index: u32, owner: SharedOwnerRecord) -> bool {
         let slot = &mut self.reader_owners[slot_index as usize];
         if slot.is_some() {
@@ -173,6 +204,7 @@ impl ProcessLocalOwnershipState {
         true
     }
 
+    /// Clear same-process ownership for one reader slot.
     fn unregister_reader(&mut self, slot_index: u32, owner: SharedOwnerRecord) {
         let slot = &mut self.reader_owners[slot_index as usize];
         turso_assert!(
@@ -182,20 +214,24 @@ impl ProcessLocalOwnershipState {
         *slot = None;
     }
 
+    /// Return the same-process owner recorded for one reader slot, if any.
     fn reader_owner(&self, slot_index: u32) -> Option<SharedOwnerRecord> {
         self.reader_owners[slot_index as usize]
     }
 
+    /// Return the published shared-snapshot registration for `max_frame`, if any.
     fn shared_snapshot_reader(&self, max_frame: u64) -> Option<SharedReadMarkRegistration> {
         self.shared_snapshot_readers.get(&max_frame).copied()
     }
 
+    /// Reuse an existing shared-snapshot reader registration and bump its refcount.
     fn retain_shared_snapshot_reader(&mut self, max_frame: u64) -> Option<SharedReaderSlot> {
         let registration = self.shared_snapshot_readers.get_mut(&max_frame)?;
         registration.ref_count += 1;
         Some(registration.slot)
     }
 
+    /// Publish a fresh shared-snapshot reader registration for reuse by sibling connections.
     fn publish_shared_snapshot_reader(&mut self, slot: SharedReaderSlot) {
         let previous = self.shared_snapshot_readers.insert(
             slot.max_frame,
@@ -208,6 +244,10 @@ impl ProcessLocalOwnershipState {
         );
     }
 
+    /// Drop one reference to a shared-snapshot reader registration.
+    ///
+    /// Returns `true` only when the caller must also release the underlying
+    /// shared reader slot.
     fn release_shared_snapshot_reader(&mut self, slot: SharedReaderSlot) -> bool {
         let registration = self
             .shared_snapshot_readers
@@ -236,8 +276,8 @@ impl ProcessLocalOwnershipState {
 }
 
 /// Packed (PID, instance_id) pair identifying a specific connection across
-/// processes. Stored in shared memory owner slots so that stale-owner
-/// reclamation can `kill(pid, 0)` to check liveness on non-OFD platforms.
+/// processes. Stored in shared memory owner slots for diagnostics and to make
+/// ownership mismatches explicit in assertions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SharedOwnerRecord(u64);
 
@@ -252,10 +292,12 @@ impl SharedOwnerRecord {
         }
     }
 
+    /// Build an owner record for one connection in the current process.
     pub(crate) fn current_process(instance_id: u32) -> Self {
         Self::new(std::process::id(), instance_id)
     }
 
+    /// Pack a `(pid, instance_id)` pair into the durable owner-slot format.
     pub(crate) fn new(pid: u32, instance_id: u32) -> Self {
         let raw = ((pid as u64) << 32) | instance_id as u64;
         turso_assert!(raw != UNOWNED_LOCK, "shared owner record must be non-zero");
@@ -275,6 +317,10 @@ impl SharedOwnerRecord {
     }
 }
 
+/// Allocate the next process-local connection instance ID.
+///
+/// IDs only need to be unique within one process lifetime; wraparound back to
+/// `1` is acceptable once the full `u32` space is exhausted.
 fn next_shared_owner_instance_id() -> u32 {
     loop {
         let current = NEXT_SHARED_OWNER_INSTANCE_ID.load(Ordering::Relaxed);
@@ -325,6 +371,7 @@ pub(crate) struct SharedWalCoordinationHeader {
 impl SharedWalCoordinationHeader {
     pub(crate) const BYTE_LEN: usize = 76;
 
+    /// Encode the durable header payload stored at the start of the `.tshm` file.
     pub(crate) fn encode(self) -> [u8; Self::BYTE_LEN] {
         let mut bytes = [0u8; Self::BYTE_LEN];
         bytes[0..8].copy_from_slice(&SHARED_WAL_COORDINATION_MAGIC);
@@ -344,6 +391,7 @@ impl SharedWalCoordinationHeader {
         bytes
     }
 
+    /// Decode and validate the durable header payload read from the `.tshm` file.
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != Self::BYTE_LEN {
             return Err(LimboError::Corrupt(format!(
@@ -388,38 +436,21 @@ pub(crate) struct SharedReaderSlot {
     pub owner: SharedOwnerRecord,
 }
 
-/// Process-local atomic counters and slot bitmaps for WAL coordination.
-///
-/// Holds WAL snapshot metadata, reader/writer ownership
-pub(crate) struct SharedWalCoordinationState {
-    max_frame: AtomicU64,
-    nbackfills: AtomicU64,
-    transaction_count: AtomicU64,
-    visibility_generation: AtomicU64,
-    checkpoint_seq: AtomicU32,
-    checkpoint_epoch: AtomicU32,
-    page_size: AtomicU32,
-    salt_1: AtomicU32,
-    salt_2: AtomicU32,
-    checksum_1: AtomicU32,
-    checksum_2: AtomicU32,
-    writer_owner: AtomicU64,
-    checkpoint_owner: AtomicU64,
-    reader_frames: Box<[AtomicU64]>,
-    reader_owners: Box<[AtomicU64]>,
-    reader_slots: AtomicSlotBitmap,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SharedWalBackfillProof {
+    /// Durable checkpoint progress being claimed.
     nbackfills: u64,
+    /// WAL tail this proof belongs to.
     max_frame: u64,
+    /// WAL generation identity. A proof must not survive RESTART/TRUNCATE.
     checkpoint_seq: u32,
     page_size: u32,
     salt_1: u32,
     salt_2: u32,
     checksum_1: u32,
     checksum_2: u32,
+    /// Main-database identity after backfill. This ties the proof to the DB file,
+    /// not just to the WAL metadata.
     db_size_pages: u32,
     db_header_crc32c: u32,
 }
@@ -427,6 +458,7 @@ struct SharedWalBackfillProof {
 impl SharedWalBackfillProof {
     const CRC_INPUT_LEN: usize = 52;
 
+    /// Build the durable checkpoint-proof payload tied to one WAL snapshot and DB header.
     fn from_snapshot_and_db(
         snapshot: SharedWalCoordinationHeader,
         db_size_pages: u32,
@@ -446,6 +478,7 @@ impl SharedWalBackfillProof {
         }
     }
 
+    /// Compute the checksum covering the serialized proof payload.
     fn crc32c(self) -> u32 {
         let mut bytes = [0u8; Self::CRC_INPUT_LEN];
         bytes[0..4].copy_from_slice(&SHARED_WAL_BACKFILL_PROOF_VERSION.to_le_bytes());
@@ -462,12 +495,17 @@ impl SharedWalBackfillProof {
         crc32c::crc32c(&bytes)
     }
 
+    /// Reject impossible proof payloads before trusting the checksum or contents.
     fn is_structurally_valid(self) -> bool {
         self.nbackfills != 0 && self.nbackfills <= self.max_frame && self.page_size != 0
     }
 }
 
 #[repr(C)]
+/// Fixed header stored at the beginning of the `.tshm` mapping.
+///
+/// The layout is part of the durable file format. Fields here must stay
+/// append-only or be changed with a coordinated version bump.
 struct SharedWalCoordinationMapHeader {
     magic: [u8; 8],
     version: u32,
@@ -514,6 +552,10 @@ struct SharedWalCoordinationMapHeader {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// One append-only page->frame mapping in the shared frame index.
+///
+/// Entries are stored in monotonically increasing `frame_id` order so reverse
+/// scans can find the newest visible version of a page without sorting.
 struct SharedWalFrameIndexEntry {
     page_id: u64,
     frame_id: u64,
@@ -538,7 +580,8 @@ enum SharedWalOwnershipMode {
     /// across separate `open()` calls. Stale detection: probe the lock.
     LinuxOfd,
     /// `F_SETLK`: per-process, shared across all fds to the same file.
-    /// Stale detection: `kill(pid, 0)` on the owner's PID.
+    /// Stale detection must probe the lock byte itself because PID liveness is
+    /// not a reliable ownership proof after PID reuse.
     ProcessScopedFcntl,
 }
 
@@ -560,8 +603,10 @@ enum SharedWalOwnershipMode {
 ///   the owner is dead.
 ///
 /// - **macOS / other Unix (process-scoped fcntl)**: Classical `F_SETLK`
-///   locks (per-process, not per-fd). Stale-owner detection falls back to
-///   `kill(pid, 0)` liveness checks on the `SharedOwnerRecord` PID.
+///   locks (per-process, not per-fd). Stale-owner detection must still probe
+///   the lock byte itself; PID liveness is not a reliable ownership proof once
+///   PIDs can be recycled. The shared owner fields remain metadata used for
+///   diagnostics and non-owner assertions.
 ///
 /// ## Lock byte layout on the tshm file
 ///
@@ -573,25 +618,44 @@ enum SharedWalOwnershipMode {
 /// | 3..3+N    | Reader slot locks (one byte per slot)
 pub(crate) struct MappedSharedWalCoordination {
     file: Arc<dyn File>,
+    /// Mapping containing the fixed header and reader arrays.
     _base_mapping: Box<dyn SharedWalMappedRegion>,
+    /// Base address of `_base_mapping`, used to slice the header/arrays without
+    /// remapping or re-parsing on every access.
     base_ptr: NonNull<u8>,
     base_len: usize,
+    /// This process mapping's owner identity written into shared owner slots.
     owner_record: SharedOwnerRecord,
     ownership_mode: SharedWalOwnershipMode,
+    /// Lazily mapped frame-index blocks after the fixed header region.
     frame_index_blocks: RwLock<Vec<FrameIndexBlockMapping>>,
+    /// Same-process serialization for appending to the shared frame index.
     frame_index_publish_lock: Arc<Mutex<()>>,
+    /// Same-process ownership bookkeeping layered on top of shared memory.
     process_local_ownership: Arc<Mutex<ProcessLocalOwnershipState>>,
+    /// Per-mapping lock counts used to make `Drop` and stale probing precise.
     local_lock_state: Mutex<LocalLockState>,
     open_mode: SharedWalCoordinationOpenMode,
+    /// Whether exclusive open had to discard an invalid persisted backfill proof.
     sanitized_backfill_proof_on_open: bool,
-    primary_process_mapping: bool,
+    /// Canonical path used as the key in `PROCESS_LOCAL_COORDINATION_OPENS`.
     registry_path: Option<PathBuf>,
 }
 
+/// One lazily mapped frame-index block.
+///
+/// The mapped bytes hold two logical regions:
+/// 1. `entries_ptr`: the append-only `SharedWalFrameIndexEntry` array
+/// 2. `hash_ptr`: the per-block open-addressing hash table used to avoid
+///    scanning every entry in the block during page lookups
 struct FrameIndexBlockMapping {
+    /// Owns the mmap for this block so `entries_ptr`/`hash_ptr` stay valid.
     _mapping: Box<dyn SharedWalMappedRegion>,
+    /// Start of the block's frame-index entry array.
     entries_ptr: NonNull<SharedWalFrameIndexEntry>,
+    /// Start of the block's hash table region.
     hash_ptr: NonNull<u16>,
+    /// Total mapped byte length for this block.
     byte_len: usize,
 }
 
@@ -600,18 +664,13 @@ unsafe impl Sync for MappedSharedWalCoordination {}
 
 impl std::fmt::Debug for MappedSharedWalCoordination {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mapped_blocks = self
-            .frame_index_blocks
-            .read()
-            .expect("shared WAL frame index lock poisoned")
-            .len();
+        let mapped_blocks = self.frame_index_blocks.read().len();
         f.debug_struct("MappedSharedWalCoordination")
             .field("base_len", &self.base_len)
             .field("owner_record", &self.owner_record)
             .field("ownership_mode", &self.ownership_mode)
             .field("mapped_blocks", &mapped_blocks)
             .field("open_mode", &self.open_mode)
-            .field("primary_process_mapping", &self.primary_process_mapping)
             .field("snapshot", &self.snapshot())
             .finish()
     }
@@ -621,9 +680,7 @@ impl Drop for MappedSharedWalCoordination {
     fn drop(&mut self) {
         self.release_owned_locks_on_drop();
         if let Some(path) = self.registry_path.as_ref() {
-            let mut opens = PROCESS_LOCAL_COORDINATION_OPENS
-                .lock()
-                .expect("process-local coordination registry poisoned");
+            let mut opens = PROCESS_LOCAL_COORDINATION_OPENS.lock();
             let count = opens
                 .get_mut(path)
                 .expect("shared WAL coordination registry entry missing");
@@ -636,243 +693,18 @@ impl Drop for MappedSharedWalCoordination {
                 opens.remove(path);
             }
         }
-        self.frame_index_blocks
-            .get_mut()
-            .expect("shared WAL frame index lock poisoned")
-            .clear();
+        self.frame_index_blocks.get_mut().clear();
         let _ = self
             .file
             .shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, self.lock_kind());
     }
 }
 
-impl std::fmt::Debug for SharedWalCoordinationState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SharedWalCoordinationState")
-            .field("snapshot", &self.snapshot())
-            .finish()
-    }
-}
-
-impl SharedWalCoordinationState {
-    pub(crate) fn new(reader_slot_count: u32) -> Self {
-        turso_assert!(
-            reader_slot_count >= 64 && reader_slot_count % 64 == 0,
-            "reader_slot_count must be a non-zero multiple of 64"
-        );
-        let reader_frames = (0..reader_slot_count)
-            .map(|_| AtomicU64::new(UNUSED_READER_FRAME))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        let reader_owners = (0..reader_slot_count)
-            .map(|_| AtomicU64::new(UNOWNED_LOCK))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        Self {
-            max_frame: AtomicU64::new(0),
-            nbackfills: AtomicU64::new(0),
-            transaction_count: AtomicU64::new(0),
-            visibility_generation: AtomicU64::new(0),
-            checkpoint_seq: AtomicU32::new(0),
-            checkpoint_epoch: AtomicU32::new(0),
-            page_size: AtomicU32::new(0),
-            salt_1: AtomicU32::new(0),
-            salt_2: AtomicU32::new(0),
-            checksum_1: AtomicU32::new(0),
-            checksum_2: AtomicU32::new(0),
-            writer_owner: AtomicU64::new(UNOWNED_LOCK),
-            checkpoint_owner: AtomicU64::new(UNOWNED_LOCK),
-            reader_frames,
-            reader_owners,
-            reader_slots: AtomicSlotBitmap::new(reader_slot_count),
-        }
-    }
-
-    pub(crate) fn snapshot(&self) -> SharedWalCoordinationHeader {
-        SharedWalCoordinationHeader {
-            max_frame: self.max_frame.load(Ordering::Acquire),
-            nbackfills: self.nbackfills.load(Ordering::Acquire),
-            transaction_count: self.transaction_count.load(Ordering::Acquire),
-            visibility_generation: self.visibility_generation.load(Ordering::Acquire),
-            checkpoint_seq: self.checkpoint_seq.load(Ordering::Acquire),
-            checkpoint_epoch: self.checkpoint_epoch.load(Ordering::Acquire),
-            page_size: self.page_size.load(Ordering::Acquire),
-            salt_1: self.salt_1.load(Ordering::Acquire),
-            salt_2: self.salt_2.load(Ordering::Acquire),
-            checksum_1: self.checksum_1.load(Ordering::Acquire),
-            checksum_2: self.checksum_2.load(Ordering::Acquire),
-            reader_slot_count: self.reader_frames.len() as u32,
-        }
-    }
-
-    pub(crate) fn install_snapshot(&self, snapshot: SharedWalCoordinationHeader) {
-        self.max_frame.store(snapshot.max_frame, Ordering::Release);
-        self.nbackfills
-            .store(snapshot.nbackfills, Ordering::Release);
-        self.transaction_count
-            .store(snapshot.transaction_count, Ordering::Release);
-        self.visibility_generation
-            .store(snapshot.visibility_generation, Ordering::Release);
-        self.checkpoint_seq
-            .store(snapshot.checkpoint_seq, Ordering::Release);
-        self.checkpoint_epoch
-            .store(snapshot.checkpoint_epoch, Ordering::Release);
-        self.page_size.store(snapshot.page_size, Ordering::Release);
-        self.salt_1.store(snapshot.salt_1, Ordering::Release);
-        self.salt_2.store(snapshot.salt_2, Ordering::Release);
-        self.checksum_1
-            .store(snapshot.checksum_1, Ordering::Release);
-        self.checksum_2
-            .store(snapshot.checksum_2, Ordering::Release);
-    }
-
-    pub(crate) fn publish_commit(
-        &self,
-        max_frame: u64,
-        checksum_1: u32,
-        checksum_2: u32,
-        transaction_count: u64,
-    ) {
-        self.max_frame.store(max_frame, Ordering::Release);
-        self.checksum_1.store(checksum_1, Ordering::Release);
-        self.checksum_2.store(checksum_2, Ordering::Release);
-        self.transaction_count
-            .store(transaction_count, Ordering::Release);
-        self.visibility_generation.fetch_add(1, Ordering::AcqRel);
-    }
-
-    pub(crate) fn publish_backfill(&self, nbackfills: u64) {
-        self.nbackfills.store(nbackfills, Ordering::Release);
-    }
-
-    pub(crate) fn install_header_fields(&self, page_size: u32, salt_1: u32, salt_2: u32) {
-        self.page_size.store(page_size, Ordering::Release);
-        self.salt_1.store(salt_1, Ordering::Release);
-        self.salt_2.store(salt_2, Ordering::Release);
-    }
-
-    pub(crate) fn bump_checkpoint_seq(&self) -> u32 {
-        self.checkpoint_seq.fetch_add(1, Ordering::AcqRel) + 1
-    }
-
-    pub(crate) fn checkpoint_epoch(&self) -> u32 {
-        self.checkpoint_epoch.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn bump_checkpoint_epoch(&self) -> u32 {
-        self.checkpoint_epoch.fetch_add(1, Ordering::AcqRel)
-    }
-
-    pub(crate) fn try_acquire_writer(&self, owner: SharedOwnerRecord) -> bool {
-        self.writer_owner
-            .compare_exchange(
-                UNOWNED_LOCK,
-                owner.raw(),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    }
-
-    pub(crate) fn release_writer(&self, owner: SharedOwnerRecord) {
-        turso_assert!(
-            self.writer_owner
-                .compare_exchange(
-                    owner.raw(),
-                    UNOWNED_LOCK,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok(),
-            "writer released by non-owner"
-        );
-    }
-
-    pub(crate) fn writer_owner(&self) -> Option<SharedOwnerRecord> {
-        SharedOwnerRecord::from_raw(self.writer_owner.load(Ordering::Acquire))
-    }
-
-    pub(crate) fn try_acquire_checkpoint(&self, owner: SharedOwnerRecord) -> bool {
-        self.checkpoint_owner
-            .compare_exchange(
-                UNOWNED_LOCK,
-                owner.raw(),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    }
-
-    pub(crate) fn release_checkpoint(&self, owner: SharedOwnerRecord) {
-        turso_assert!(
-            self.checkpoint_owner
-                .compare_exchange(
-                    owner.raw(),
-                    UNOWNED_LOCK,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok(),
-            "checkpoint released by non-owner"
-        );
-    }
-
-    pub(crate) fn checkpoint_owner(&self) -> Option<SharedOwnerRecord> {
-        SharedOwnerRecord::from_raw(self.checkpoint_owner.load(Ordering::Acquire))
-    }
-
-    pub(crate) fn register_reader(
-        &self,
-        owner: SharedOwnerRecord,
-        max_frame: u64,
-    ) -> Option<SharedReaderSlot> {
-        let slot_index = self.reader_slots.alloc_one()?;
-        self.reader_owners[slot_index as usize].store(owner.raw(), Ordering::Release);
-        self.reader_frames[slot_index as usize].store(max_frame, Ordering::Release);
-        Some(SharedReaderSlot {
-            slot_index,
-            max_frame,
-            owner,
-        })
-    }
-
-    pub(crate) fn update_reader(&self, slot: SharedReaderSlot, max_frame: u64) -> SharedReaderSlot {
-        turso_assert!(
-            self.reader_owners[slot.slot_index as usize].load(Ordering::Acquire)
-                == slot.owner.raw(),
-            "reader slot updated by non-owner"
-        );
-        self.reader_frames[slot.slot_index as usize].store(max_frame, Ordering::Release);
-        SharedReaderSlot {
-            slot_index: slot.slot_index,
-            max_frame,
-            owner: slot.owner,
-        }
-    }
-
-    pub(crate) fn unregister_reader(&self, slot: SharedReaderSlot) {
-        turso_assert!(
-            self.reader_owners[slot.slot_index as usize].load(Ordering::Acquire)
-                == slot.owner.raw(),
-            "reader slot released by non-owner"
-        );
-        self.reader_frames[slot.slot_index as usize].store(UNUSED_READER_FRAME, Ordering::Release);
-        self.reader_owners[slot.slot_index as usize].store(UNOWNED_LOCK, Ordering::Release);
-        self.reader_slots.free_one(slot.slot_index);
-    }
-
-    pub(crate) fn reader_owner(&self, slot_index: u32) -> Option<SharedOwnerRecord> {
-        SharedOwnerRecord::from_raw(self.reader_owners[slot_index as usize].load(Ordering::Acquire))
-    }
-
-    pub(crate) fn min_active_reader_frame(&self) -> Option<u64> {
-        self.reader_frames
-            .iter()
-            .map(|frame| frame.load(Ordering::Acquire))
-            .filter(|&frame| frame != UNUSED_READER_FRAME)
-            .min()
-    }
-}
+type ProcessMappingResult = (
+    PathBuf,
+    Arc<Mutex<()>>,
+    Arc<Mutex<ProcessLocalOwnershipState>>,
+);
 
 impl MappedSharedWalCoordination {
     const fn default_ownership_mode() -> SharedWalOwnershipMode {
@@ -903,59 +735,55 @@ impl MappedSharedWalCoordination {
     /// Returns shared Arcs for locks and ownership state so that multiple
     /// mappings of the same file (only possible in tests — production uses
     /// `DATABASE_MANAGER` which ensures one `Database` per file) coordinate
-    /// correctly. Also returns whether this is the first mapping for this path
-    /// (`primary_process_mapping`), which controls invalidation-on-close.
+    /// correctly.
     fn register_process_mapping(
         path: &Path,
         reader_slot_count: u32,
-    ) -> (
-        PathBuf,
-        bool,
-        Arc<Mutex<()>>,
-        Arc<Mutex<ProcessLocalOwnershipState>>,
-    ) {
+        frame_index_publish_lock: Arc<Mutex<()>>,
+        process_local_ownership: Arc<Mutex<ProcessLocalOwnershipState>>,
+    ) -> Result<ProcessMappingResult> {
         let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        let mut opens = PROCESS_LOCAL_COORDINATION_OPENS
-            .lock()
-            .expect("process-local coordination registry poisoned");
-        let entry =
-            opens
-                .entry(canonical_path.clone())
-                .or_insert_with(|| ProcessLocalCoordinationEntry {
-                    open_count: 0,
-                    frame_index_publish_lock: Arc::new(Mutex::new(())),
-                    ownership: Arc::new(Mutex::new(ProcessLocalOwnershipState::new(
-                        reader_slot_count,
-                    ))),
-                });
-        turso_assert!(
-            entry
-                .ownership
-                .lock()
-                .expect("process-local ownership registry poisoned")
-                .reader_owners
-                .len()
-                == reader_slot_count as usize,
-            "process-local coordination slot count mismatch"
-        );
-        let primary_process_mapping = entry.open_count == 0;
-        entry.open_count += 1;
-        (
-            canonical_path,
-            primary_process_mapping,
-            entry.frame_index_publish_lock.clone(),
-            entry.ownership.clone(),
-        )
-    }
+        let mut opens = PROCESS_LOCAL_COORDINATION_OPENS.lock();
+        #[cfg(not(test))]
+        let _ = reader_slot_count;
 
-    fn process_already_has_mapping(path: &Path) -> bool {
-        let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        let opens = PROCESS_LOCAL_COORDINATION_OPENS
-            .lock()
-            .expect("process-local coordination registry poisoned");
-        opens
-            .get(&canonical_path)
-            .is_some_and(|entry| entry.open_count > 0)
+        #[cfg(test)]
+        if let Some(entry) = opens.get_mut(&canonical_path) {
+            turso_assert!(
+                entry.ownership.lock().reader_owners.len() == reader_slot_count as usize,
+                "process-local coordination slot count mismatch"
+            );
+            entry.open_count += 1;
+            return Ok((
+                canonical_path,
+                entry.frame_index_publish_lock.clone(),
+                entry.ownership.clone(),
+            ));
+        }
+
+        #[cfg(not(test))]
+        if opens.contains_key(&canonical_path) {
+            return Err(LimboError::InternalError(format!(
+                "duplicate same-process shared WAL coordination open for '{}' is unsupported; callers must reuse the existing Database/authority",
+                canonical_path.display()
+            )));
+        }
+
+        opens.insert(
+            canonical_path.clone(),
+            ProcessLocalCoordinationEntry {
+                open_count: 1,
+                #[cfg(test)]
+                frame_index_publish_lock: frame_index_publish_lock.clone(),
+                #[cfg(test)]
+                ownership: process_local_ownership.clone(),
+            },
+        );
+        Ok((
+            canonical_path,
+            frame_index_publish_lock,
+            process_local_ownership,
+        ))
     }
 
     /// Open (or create) the `.tshm` coordination file at `path`.
@@ -973,6 +801,9 @@ impl MappedSharedWalCoordination {
         Self::create_or_open_with_mode(io, path, reader_slot_count, Self::default_ownership_mode())
     }
 
+    /// Open an already-existing `.tshm` file without creating or resizing it.
+    ///
+    /// Returns `Ok(None)` when the file does not exist yet.
     pub(crate) fn open_existing(
         io: &Arc<dyn IO>,
         path: &Path,
@@ -996,6 +827,7 @@ impl MappedSharedWalCoordination {
     }
 
     #[cfg(test)]
+    /// Force the overflow bit for tests that need to exercise fallback WAL scans.
     pub(crate) fn mark_frame_index_overflowed_for_tests(&self) {
         self.header()
             .frame_index_overflowed
@@ -1020,10 +852,7 @@ impl MappedSharedWalCoordination {
             LimboError::InternalError("shared WAL coordination path is not valid UTF-8".into())
         })?)?;
         let lock_kind = Self::lock_kind_for_mode(ownership_mode);
-        let open_mode = if Self::process_already_has_mapping(path) {
-            file.shared_wal_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, false, lock_kind)?;
-            SharedWalCoordinationOpenMode::MultiProcess
-        } else {
+        let open_mode =
             match file.shared_wal_try_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, true, lock_kind)? {
                 true => {
                     file.shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
@@ -1034,8 +863,7 @@ impl MappedSharedWalCoordination {
                     file.shared_wal_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, false, lock_kind)?;
                     SharedWalCoordinationOpenMode::MultiProcess
                 }
-            }
-        };
+            };
         let metadata_len = file.size()? as usize;
         let initialize = metadata_len == 0
             || (open_mode == SharedWalCoordinationOpenMode::Exclusive && metadata_len < base_len);
@@ -1071,7 +899,6 @@ impl MappedSharedWalCoordination {
             }),
             open_mode,
             sanitized_backfill_proof_on_open: false,
-            primary_process_mapping: false,
             registry_path: None,
         };
         if initialize {
@@ -1090,15 +917,15 @@ impl MappedSharedWalCoordination {
         }
         let mapped_blocks = region.header().frame_index_blocks.load(Ordering::Acquire);
         region.ensure_mapped_frame_index_blocks(mapped_blocks)?;
-        let (
-            registry_path,
-            primary_process_mapping,
-            frame_index_publish_lock,
-            process_local_ownership,
-        ) = Self::register_process_mapping(path, reader_slot_count);
+        let (registry_path, frame_index_publish_lock, process_local_ownership) =
+            Self::register_process_mapping(
+                path,
+                reader_slot_count,
+                region.frame_index_publish_lock.clone(),
+                region.process_local_ownership.clone(),
+            )?;
         region.frame_index_publish_lock = frame_index_publish_lock;
         region.process_local_ownership = process_local_ownership;
-        region.primary_process_mapping = primary_process_mapping;
         region.registry_path = Some(registry_path);
         Ok(region)
     }
@@ -1130,10 +957,7 @@ impl MappedSharedWalCoordination {
             Err(err) => return Err(err),
         };
         let lock_kind = Self::lock_kind_for_mode(ownership_mode);
-        let open_mode = if Self::process_already_has_mapping(path) {
-            file.shared_wal_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, false, lock_kind)?;
-            SharedWalCoordinationOpenMode::MultiProcess
-        } else {
+        let open_mode =
             match file.shared_wal_try_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, true, lock_kind)? {
                 true => {
                     file.shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
@@ -1144,8 +968,7 @@ impl MappedSharedWalCoordination {
                     file.shared_wal_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, false, lock_kind)?;
                     SharedWalCoordinationOpenMode::MultiProcess
                 }
-            }
-        };
+            };
         let metadata_len = file.size()? as usize;
         if metadata_len < base_len {
             file.shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
@@ -1175,7 +998,6 @@ impl MappedSharedWalCoordination {
             }),
             open_mode,
             sanitized_backfill_proof_on_open: false,
-            primary_process_mapping: false,
             registry_path: None,
         };
         if let Err(err) = region.validate_existing(reader_slot_count, metadata_len) {
@@ -1186,15 +1008,15 @@ impl MappedSharedWalCoordination {
         }
         let mapped_blocks = region.header().frame_index_blocks.load(Ordering::Acquire);
         region.ensure_mapped_frame_index_blocks(mapped_blocks)?;
-        let (
-            registry_path,
-            primary_process_mapping,
-            frame_index_publish_lock,
-            process_local_ownership,
-        ) = Self::register_process_mapping(path, reader_slot_count);
+        let (registry_path, frame_index_publish_lock, process_local_ownership) =
+            Self::register_process_mapping(
+                path,
+                reader_slot_count,
+                region.frame_index_publish_lock.clone(),
+                region.process_local_ownership.clone(),
+            )?;
         region.frame_index_publish_lock = frame_index_publish_lock;
         region.process_local_ownership = process_local_ownership;
-        region.primary_process_mapping = primary_process_mapping;
         region.registry_path = Some(registry_path);
         Ok(Some(region))
     }
@@ -1203,6 +1025,11 @@ impl MappedSharedWalCoordination {
         READER_LOCK_START_OFFSET + slot_index as u64
     }
 
+    /// Return whether dropping this mapping would leave no other process with
+    /// the lifetime byte lock held.
+    ///
+    /// Close-time shutdown checkpointing uses this to approximate SQLite's
+    /// "last connection cleans up shared state" behavior.
     pub(crate) fn is_last_process_mapping(&self) -> bool {
         if !matches!(
             self.file.shared_wal_try_lock_byte(
@@ -1220,12 +1047,14 @@ impl MappedSharedWalCoordination {
         true
     }
 
+    /// Best-effort cleanup for locks held by this mapping.
+    ///
+    /// This must tolerate partially stale owner fields because drop can run
+    /// during error unwinding or after external repair paths have already
+    /// cleared shared metadata.
     fn release_owned_locks_on_drop(&mut self) {
         let (writer_lock_held, checkpoint_lock_held, reader_locks) = {
-            let local = self
-                .local_lock_state
-                .get_mut()
-                .expect("shared WAL local lock state poisoned");
+            let local = self.local_lock_state.get_mut();
             let writer_lock_held = local.writer_lock_held;
             let checkpoint_lock_held = local.checkpoint_lock_held;
             let reader_locks = std::mem::take(&mut local.reader_locks);
@@ -1317,6 +1146,12 @@ impl MappedSharedWalCoordination {
         }
     }
 
+    /// Read a consistent snapshot of the shared coordination header.
+    ///
+    /// # Safety invariant
+    /// Individual fields are read with atomic loads, but the multi-field read is
+    /// NOT an atomic snapshot. Consistency relies on the writer lock serializing
+    /// all modifications — any concurrent modifier MUST hold the writer lock.
     pub(crate) fn snapshot(&self) -> SharedWalCoordinationHeader {
         let header = self.header();
         SharedWalCoordinationHeader {
@@ -1339,18 +1174,20 @@ impl MappedSharedWalCoordination {
         self.open_mode
     }
 
+    /// Return whether exclusive open sanitized an invalid persisted backfill proof.
     pub(crate) const fn sanitized_backfill_proof_on_open(&self) -> bool {
         self.sanitized_backfill_proof_on_open
     }
 
+    /// Return this mapping's durable owner identity.
     pub(crate) const fn owner_record(&self) -> SharedOwnerRecord {
         self.owner_record
     }
 
-    pub(crate) const fn is_primary_process_mapping(&self) -> bool {
-        self.primary_process_mapping
-    }
-
+    /// Replace the authoritative shared snapshot visible to all processes.
+    ///
+    /// Any frame-index entries beyond the new tail are discarded first so the
+    /// published header and published page-to-frame index stay in sync.
     pub(crate) fn install_snapshot(&self, snapshot: SharedWalCoordinationHeader) {
         self.clear_backfill_proof();
         // Snapshots define the authoritative visible WAL range. If the shared
@@ -1402,10 +1239,9 @@ impl MappedSharedWalCoordination {
     /// "reader slot released by non-owner" when they try to end their read
     /// transactions, corrupting the shared WAL state.
     ///
-    /// - **OFD (Linux)**: probe each slot's OFD byte-range lock. If the lock
-    ///   can be acquired, the owner is dead and the slot is safe to reclaim.
-    /// - **Process-scoped fcntl (macOS)**: check `kill(pid, 0)` on the slot's
-    ///   `SharedOwnerRecord` PID. Same semantics — dead owner ⇒ reclaim.
+    /// Probe the slot byte lock directly on every platform. That lock is the
+    /// authoritative liveness signal for this database file; relying on PID
+    /// probes here is weaker and can misclassify recycled PIDs as live.
     pub(crate) fn repair_transient_state_for_exclusive_open(&self) {
         let header = self.header();
         header.writer_owner.store(UNOWNED_LOCK, Ordering::Release);
@@ -1413,59 +1249,36 @@ impl MappedSharedWalCoordination {
             .checkpoint_owner
             .store(UNOWNED_LOCK, Ordering::Release);
 
-        // For reader slots, we must check OFD locks before
+        // For reader slots, we must check byte-range locks before
         // clearing: another live process may hold a slot. Blindly clearing
         // would cause that process to panic with "reader slot released by
         // non-owner" and corrupt the shared WAL state.
-        if self.uses_linux_ofd_locking() {
-            for slot_index in 0..header.reader_slot_count {
-                let offset = Self::process_lock_offset_for_reader(slot_index);
-                match self
-                    .file
-                    .shared_wal_try_lock_byte(offset, true, self.lock_kind())
-                {
-                    Ok(true) => {
-                        // Lock acquired → slot is stale (owner is dead), safe to clear.
-                        self.reader_frames()[slot_index as usize]
-                            .store(UNUSED_READER_FRAME, Ordering::Release);
-                        self.reader_owners()[slot_index as usize]
-                            .store(UNOWNED_LOCK, Ordering::Release);
-                        let word_idx = (slot_index >> 6) as usize;
-                        let bit = slot_index & 63;
-                        self.reader_bitmap_words()[word_idx]
-                            .fetch_or(1u64 << bit, Ordering::Release);
-                        self.file
-                            .shared_wal_unlock_byte(offset, self.lock_kind())
-                            .expect("failed to release reader slot lock during reset");
-                    }
-                    Ok(false) | Err(_) => {
-                        // Lock held by another live process → leave this slot alone.
-                    }
-                }
+        for slot_index in 0..header.reader_slot_count {
+            if !self.uses_linux_ofd_locking()
+                && self
+                    .with_process_local_ownership(|entry| entry.reader_owner(slot_index).is_some())
+            {
+                continue;
             }
-        } else {
-            // Non-OFD path (macOS, etc.): use PID liveness checks to avoid
-            // clearing reader slots owned by live processes.
-            for slot_index in 0..header.reader_slot_count {
-                let owner = self.reader_owner(slot_index);
-                match owner {
-                    None => {
-                        // Already unowned — ensure bitmap marks it available.
-                        self.reader_frames()[slot_index as usize]
-                            .store(UNUSED_READER_FRAME, Ordering::Release);
-                        let word_idx = (slot_index >> 6) as usize;
-                        let bit = slot_index & 63;
-                        self.reader_bitmap_words()[word_idx]
-                            .fetch_or(1u64 << bit, Ordering::Release);
-                    }
-                    Some(owner_rec) => {
-                        if pid_is_alive(owner_rec.pid()) {
-                            // Owner is alive — leave this slot alone.
-                            continue;
-                        }
-                        // Owner is dead — safe to reclaim.
-                        self.try_reclaim_dead_reader_owner(slot_index, owner_rec);
-                    }
+            let offset = Self::process_lock_offset_for_reader(slot_index);
+            match self
+                .file
+                .shared_wal_try_lock_byte(offset, true, self.lock_kind())
+            {
+                Ok(true) => {
+                    self.reader_frames()[slot_index as usize]
+                        .store(UNUSED_READER_FRAME, Ordering::Release);
+                    self.reader_owners()[slot_index as usize]
+                        .store(UNOWNED_LOCK, Ordering::Release);
+                    let word_idx = (slot_index >> 6) as usize;
+                    let bit = slot_index & 63;
+                    self.reader_bitmap_words()[word_idx].fetch_or(1u64 << bit, Ordering::Release);
+                    self.file
+                        .shared_wal_unlock_byte(offset, self.lock_kind())
+                        .expect("failed to release reader slot lock during reset");
+                }
+                Ok(false) | Err(_) => {
+                    // Lock held by another live process → leave this slot alone.
                 }
             }
         }
@@ -1475,19 +1288,23 @@ impl MappedSharedWalCoordination {
     /// from a local WAL scan. The caller must decide separately when that is
     /// safe; this is intentionally distinct from transient-state repair.
     pub(crate) fn discard_durable_frame_index_for_exclusive_rebuild(&self) {
-        let _publish_guard = self
-            .frame_index_publish_lock
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _publish_guard = self.frame_index_publish_lock.lock();
         let header = self.header();
         header.frame_index_len.store(0, Ordering::Release);
         header.frame_index_overflowed.store(0, Ordering::Release);
     }
 
+    /// Return whether the durable shared frame index exhausted its reserved capacity.
     pub(crate) fn frame_index_overflowed(&self) -> bool {
         self.header().frame_index_overflowed.load(Ordering::Acquire) != 0
     }
 
+    /// Publish a committed transaction to the shared coordination header.
+    ///
+    /// # Precondition
+    /// The caller MUST hold the WAL writer lock. The multi-field update is not
+    /// atomic; the writer lock serializes all writers so readers see a consistent
+    /// state (the checksum TOCTOU below is safe only under this invariant).
     pub(crate) fn publish_commit(
         &self,
         max_frame: u64,
@@ -1510,10 +1327,14 @@ impl MappedSharedWalCoordination {
         }
         header
             .transaction_count
-            .store(transaction_count, Ordering::Release);
+            .fetch_max(transaction_count, Ordering::AcqRel);
         header.visibility_generation.fetch_add(1, Ordering::AcqRel);
     }
 
+    /// Publish durable checkpoint progress after a successful backfill step.
+    ///
+    /// A zero publish also clears any persisted proof because no positive
+    /// checkpoint claim remains to be validated on reopen.
     pub(crate) fn publish_backfill(&self, nbackfills: u64) {
         if nbackfills == 0 {
             self.clear_backfill_proof();
@@ -1523,6 +1344,7 @@ impl MappedSharedWalCoordination {
             .store(nbackfills, Ordering::Release);
     }
 
+    /// Clear the persisted durable proof that positive checkpoint progress is safe to trust.
     pub(crate) fn clear_backfill_proof(&self) {
         let header = self.header();
         header.backfill_proof_version.store(0, Ordering::Release);
@@ -1545,6 +1367,7 @@ impl MappedSharedWalCoordination {
         header.backfill_proof_crc32c.store(0, Ordering::Release);
     }
 
+    /// Persist a proof that the current positive `nbackfills` state matches the main DB file.
     pub(crate) fn install_backfill_proof(
         &self,
         snapshot: SharedWalCoordinationHeader,
@@ -1597,6 +1420,7 @@ impl MappedSharedWalCoordination {
             .store(SHARED_WAL_BACKFILL_PROOF_VERSION, Ordering::Release);
     }
 
+    /// Validate the persisted backfill proof against the current WAL snapshot and DB header.
     pub(crate) fn validate_backfill_proof(
         &self,
         snapshot: SharedWalCoordinationHeader,
@@ -1637,12 +1461,14 @@ impl MappedSharedWalCoordination {
             )
     }
 
+    /// fsync the `.tshm` coordination file when the caller needs durable publication.
     pub(crate) fn sync(&self, io: &Arc<dyn IO>, sync_type: FileSyncType) -> Result<()> {
         let c = self.file.sync(Completion::new_sync(|_| {}), sync_type)?;
         io.wait_for_completion(c)?;
         Ok(())
     }
 
+    /// On exclusive open, discard any persisted backfill proof that is malformed or stale.
     fn sanitize_backfill_proof_for_exclusive_open(&self) -> bool {
         let header = self.header();
         let version = header.backfill_proof_version.load(Ordering::Acquire);
@@ -1675,6 +1501,7 @@ impl MappedSharedWalCoordination {
         false
     }
 
+    /// Seed only the WAL header identity fields needed before the first commit is published.
     pub(crate) fn install_header_fields(&self, page_size: u32, salt_1: u32, salt_2: u32) {
         let header = self.header();
         header.page_size.store(page_size, Ordering::Release);
@@ -1682,85 +1509,40 @@ impl MappedSharedWalCoordination {
         header.salt_2.store(salt_2, Ordering::Release);
     }
 
+    /// Advance the durable WAL generation counter and return the new value.
     pub(crate) fn bump_checkpoint_seq(&self) -> u32 {
         self.header().checkpoint_seq.fetch_add(1, Ordering::AcqRel) + 1
     }
 
+    /// Read the checkpoint epoch used to detect same-generation visibility changes.
     pub(crate) fn checkpoint_epoch(&self) -> u32 {
         self.header().checkpoint_epoch.load(Ordering::Acquire)
     }
 
+    /// Bump the checkpoint epoch after a visibility-affecting checkpoint step.
     pub(crate) fn bump_checkpoint_epoch(&self) -> u32 {
         self.header()
             .checkpoint_epoch
             .fetch_add(1, Ordering::AcqRel)
     }
 
+    /// Borrow the per-process local lock counters under the mapping mutex.
     fn with_local_lock_state<T>(&self, f: impl FnOnce(&mut LocalLockState) -> T) -> T {
-        let mut entry = self
-            .local_lock_state
-            .lock()
-            .expect("shared WAL local lock state poisoned");
+        let mut entry = self.local_lock_state.lock();
         f(&mut entry)
     }
 
+    /// Borrow the same-process ownership registry under the mapping mutex.
     fn with_process_local_ownership<T>(
         &self,
         f: impl FnOnce(&mut ProcessLocalOwnershipState) -> T,
     ) -> T {
-        let mut entry = self
-            .process_local_ownership
-            .lock()
-            .expect("process-local ownership registry poisoned");
+        let mut entry = self.process_local_ownership.lock();
         f(&mut entry)
     }
 
-    fn try_acquire_shared_owner_slot(slot: &AtomicU64, owner: SharedOwnerRecord) -> bool {
-        let desired = owner.raw();
-        loop {
-            let current = slot.load(Ordering::Acquire);
-            if current == UNOWNED_LOCK {
-                return slot
-                    .compare_exchange(UNOWNED_LOCK, desired, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok();
-            }
-            if current == desired {
-                return false;
-            }
-            let Some(current_owner) = SharedOwnerRecord::from_raw(current) else {
-                continue;
-            };
-            if pid_is_alive(current_owner.pid()) {
-                return false;
-            }
-            if slot
-                .compare_exchange(current, desired, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return true;
-            }
-        }
-    }
-
-    fn shared_owner_slot_active(slot: &AtomicU64) -> bool {
-        loop {
-            let current = slot.load(Ordering::Acquire);
-            let Some(owner) = SharedOwnerRecord::from_raw(current) else {
-                return false;
-            };
-            if pid_is_alive(owner.pid()) {
-                return true;
-            }
-            if slot
-                .compare_exchange(current, UNOWNED_LOCK, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return false;
-            }
-        }
-    }
-
-    fn release_shared_owner_slot(slot: &AtomicU64, owner: SharedOwnerRecord, _what: &str) {
+    /// Clear one shared owner slot, asserting it still records `owner`.
+    fn release_shared_owner_slot(slot: &AtomicU64, owner: SharedOwnerRecord) {
         turso_assert!(
             slot.compare_exchange(
                 owner.raw(),
@@ -1773,12 +1555,35 @@ impl MappedSharedWalCoordination {
         );
     }
 
-    /// Try to reclaim a reader slot whose owner PID is dead (non-OFD path).
-    /// Uses `kill(pid, 0)` to check liveness, then CAS to atomically clear
-    /// the owner. Returns true if the slot was successfully reclaimed.
+    /// Try to reclaim a reader slot whose lock byte is no longer held.
+    /// Returns true if the slot was successfully reclaimed.
     fn try_reclaim_dead_reader_owner(&self, slot_index: u32, owner: SharedOwnerRecord) -> bool {
         if self.with_process_local_ownership(|entry| entry.reader_owner(slot_index).is_some()) {
             return false;
+        }
+        if !self.uses_linux_ofd_locking() {
+            let offset = Self::process_lock_offset_for_reader(slot_index);
+            if !self.try_acquire_supplemental_byte_lock(offset) {
+                return false;
+            }
+            let reclaimed = self.reader_owners()[slot_index as usize]
+                .compare_exchange(
+                    owner.raw(),
+                    UNOWNED_LOCK,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok();
+            if !reclaimed {
+                self.release_supplemental_byte_lock(offset);
+                return false;
+            }
+            self.reader_frames()[slot_index as usize].store(UNUSED_READER_FRAME, Ordering::Release);
+            let word_idx = (slot_index >> 6) as usize;
+            let bit = slot_index & 63;
+            self.reader_bitmap_words()[word_idx].fetch_or(1u64 << bit, Ordering::Release);
+            self.release_supplemental_byte_lock(offset);
+            return true;
         }
         if pid_is_alive(owner.pid()) {
             return false;
@@ -1801,6 +1606,7 @@ impl MappedSharedWalCoordination {
         true
     }
 
+    /// Attempt to acquire a supplemental byte lock for this mapping.
     fn try_acquire_supplemental_byte_lock(&self, offset: u64) -> bool {
         matches!(
             self.file
@@ -1809,17 +1615,16 @@ impl MappedSharedWalCoordination {
         )
     }
 
+    /// Release a supplemental byte lock previously acquired by this mapping.
     fn release_supplemental_byte_lock(&self, offset: u64) {
         self.file
             .shared_wal_unlock_byte(offset, self.lock_kind())
             .expect("failed to release shared WAL supplemental byte lock");
     }
 
+    /// Attempt to acquire the writer lock for this mapping.
     pub(crate) fn try_acquire_writer(&self, owner: SharedOwnerRecord) -> bool {
-        let mut local = self
-            .local_lock_state
-            .lock()
-            .expect("shared WAL local lock state poisoned");
+        let mut local = self.local_lock_state.lock();
         if local.writer_lock_held {
             return false;
         }
@@ -1835,15 +1640,13 @@ impl MappedSharedWalCoordination {
             if !self.with_process_local_ownership(|entry| entry.try_acquire_writer(owner)) {
                 return false;
             }
-            if !Self::try_acquire_shared_owner_slot(&self.header().writer_owner, owner) {
-                self.with_process_local_ownership(|entry| entry.release_writer(owner));
-                return false;
-            }
             if !self.try_acquire_supplemental_byte_lock(WRITER_LOCK_OFFSET) {
-                Self::release_shared_owner_slot(&self.header().writer_owner, owner, "writer");
                 self.with_process_local_ownership(|entry| entry.release_writer(owner));
                 return false;
             }
+            self.header()
+                .writer_owner
+                .store(owner.raw(), Ordering::Release);
         }
         local.writer_lock_held = true;
         drop(local);
@@ -1855,11 +1658,9 @@ impl MappedSharedWalCoordination {
         true
     }
 
+    /// Release the writer lock held by this mapping.
     pub(crate) fn release_writer(&self, owner: SharedOwnerRecord) {
-        let mut local = self
-            .local_lock_state
-            .lock()
-            .expect("shared WAL local lock state poisoned");
+        let mut local = self.local_lock_state.lock();
         turso_assert!(local.writer_lock_held, "writer registry count underflow");
         if self.uses_linux_ofd_locking() {
             let observed_owner = self.header().writer_owner.load(Ordering::Acquire);
@@ -1878,12 +1679,19 @@ impl MappedSharedWalCoordination {
                 .expect("failed to release shared WAL writer lock");
         } else {
             self.release_supplemental_byte_lock(WRITER_LOCK_OFFSET);
-            Self::release_shared_owner_slot(&self.header().writer_owner, owner, "writer");
+            self.header()
+                .writer_owner
+                .store(UNOWNED_LOCK, Ordering::Release);
             self.with_process_local_ownership(|entry| entry.release_writer(owner));
         }
         local.writer_lock_held = false;
     }
 
+    /// Probe whether a given coordination byte lock is currently held.
+    ///
+    /// The lock byte is the authoritative cross-process liveness signal for
+    /// writer/checkpoint/reader ownership. Shared owner fields are metadata and
+    /// may legitimately lag behind crash recovery or repair paths.
     fn byte_lock_is_held(&self, offset: u64, local_held: bool) -> bool {
         if local_held {
             return true;
@@ -1906,6 +1714,7 @@ impl MappedSharedWalCoordination {
         }
     }
 
+    /// Determine whether the writer or checkpoint lock is currently held by any process.
     pub(crate) fn writer_or_checkpoint_lock_active(&self) -> bool {
         let (writer_held, checkpoint_held) = self
             .with_local_lock_state(|entry| (entry.writer_lock_held, entry.checkpoint_lock_held));
@@ -1918,10 +1727,11 @@ impl MappedSharedWalCoordination {
         }) {
             return true;
         }
-        Self::shared_owner_slot_active(&self.header().writer_owner)
-            || Self::shared_owner_slot_active(&self.header().checkpoint_owner)
+        self.byte_lock_is_held(WRITER_LOCK_OFFSET, false)
+            || self.byte_lock_is_held(CHECKPOINT_LOCK_OFFSET, false)
     }
 
+    /// Determine whether the checkpoint lock is currently held by any process.
     pub(crate) fn checkpoint_lock_active(&self) -> bool {
         let checkpoint_held = self.with_local_lock_state(|entry| entry.checkpoint_lock_held);
         if self.uses_linux_ofd_locking() {
@@ -1930,18 +1740,18 @@ impl MappedSharedWalCoordination {
         if self.with_process_local_ownership(|entry| entry.checkpoint_active()) {
             return true;
         }
-        Self::shared_owner_slot_active(&self.header().checkpoint_owner)
+        self.byte_lock_is_held(CHECKPOINT_LOCK_OFFSET, false)
     }
 
+    /// Return the owner record of the current writer, if any.
+    /// This is metadata and may legitimately lag behind crash recovery or repair paths;
     pub(crate) fn writer_owner(&self) -> Option<SharedOwnerRecord> {
         SharedOwnerRecord::from_raw(self.header().writer_owner.load(Ordering::Acquire))
     }
 
+    /// Attempt to acquire the checkpoint lock for this mapping.
     pub(crate) fn try_acquire_checkpoint(&self, owner: SharedOwnerRecord) -> bool {
-        let mut local = self
-            .local_lock_state
-            .lock()
-            .expect("shared WAL local lock state poisoned");
+        let mut local = self.local_lock_state.lock();
         if local.checkpoint_lock_held {
             return false;
         }
@@ -1957,19 +1767,13 @@ impl MappedSharedWalCoordination {
             if !self.with_process_local_ownership(|entry| entry.try_acquire_checkpoint(owner)) {
                 return false;
             }
-            if !Self::try_acquire_shared_owner_slot(&self.header().checkpoint_owner, owner) {
-                self.with_process_local_ownership(|entry| entry.release_checkpoint(owner));
-                return false;
-            }
             if !self.try_acquire_supplemental_byte_lock(CHECKPOINT_LOCK_OFFSET) {
-                Self::release_shared_owner_slot(
-                    &self.header().checkpoint_owner,
-                    owner,
-                    "checkpoint",
-                );
                 self.with_process_local_ownership(|entry| entry.release_checkpoint(owner));
                 return false;
             }
+            self.header()
+                .checkpoint_owner
+                .store(owner.raw(), Ordering::Release);
         }
         local.checkpoint_lock_held = true;
         drop(local);
@@ -1981,11 +1785,9 @@ impl MappedSharedWalCoordination {
         true
     }
 
+    /// Release the checkpoint lock held by this mapping.
     pub(crate) fn release_checkpoint(&self, owner: SharedOwnerRecord) {
-        let mut local = self
-            .local_lock_state
-            .lock()
-            .expect("shared WAL local lock state poisoned");
+        let mut local = self.local_lock_state.lock();
         turso_assert!(
             local.checkpoint_lock_held,
             "checkpoint registry count underflow"
@@ -2007,16 +1809,23 @@ impl MappedSharedWalCoordination {
                 .expect("failed to release shared WAL checkpoint lock");
         } else {
             self.release_supplemental_byte_lock(CHECKPOINT_LOCK_OFFSET);
-            Self::release_shared_owner_slot(&self.header().checkpoint_owner, owner, "checkpoint");
+            self.header()
+                .checkpoint_owner
+                .store(UNOWNED_LOCK, Ordering::Release);
             self.with_process_local_ownership(|entry| entry.release_checkpoint(owner));
         }
         local.checkpoint_lock_held = false;
     }
 
+    /// Return the owner record of the current checkpoint holder, if any.
     pub(crate) fn checkpoint_owner(&self) -> Option<SharedOwnerRecord> {
         SharedOwnerRecord::from_raw(self.header().checkpoint_owner.load(Ordering::Acquire))
     }
 
+    /// Attempt to reclaim a reader slot whose lock byte is no longer held.
+    ///
+    /// This is the safe stale-reader path because the reader byte lock is what
+    /// actually blocks checkpoints; shared owner metadata can be stale.
     fn try_reclaim_stale_reader_slot(&self, slot_index: u32) -> bool {
         if self.uses_linux_ofd_locking() {
             let should_probe = self.with_local_lock_state(|entry| {
@@ -2054,6 +1863,7 @@ impl MappedSharedWalCoordination {
         self.try_reclaim_dead_reader_owner(slot_index, owner)
     }
 
+    /// Probe every occupied reader slot once, reclaiming the ones proven dead.
     fn reclaim_stale_reader_slots(&self) {
         for slot_index in 0..self.header().reader_slot_count {
             let word_idx = (slot_index >> 6) as usize;
@@ -2083,14 +1893,8 @@ impl MappedSharedWalCoordination {
     ) -> Option<SharedReaderSlot> {
         for attempt in 0..2 {
             let bitmap = self.reader_bitmap_words();
-            let mut local = self
-                .local_lock_state
-                .lock()
-                .expect("shared WAL local lock state poisoned");
-            let mut process_local = self
-                .process_local_ownership
-                .lock()
-                .expect("process-local ownership registry poisoned");
+            let mut local = self.local_lock_state.lock();
+            let mut process_local = self.process_local_ownership.lock();
             for slot_index in 0..self.header().reader_slot_count {
                 if local.reader_locks[slot_index as usize] > 0 {
                     continue;
@@ -2145,31 +1949,15 @@ impl MappedSharedWalCoordination {
                                     word.fetch_or(mask, Ordering::Release);
                                     break;
                                 }
-                                if self.reader_owners()[slot_index as usize]
-                                    .compare_exchange(
-                                        UNOWNED_LOCK,
-                                        owner.raw(),
-                                        Ordering::AcqRel,
-                                        Ordering::Acquire,
-                                    )
-                                    .is_err()
-                                {
-                                    process_local.unregister_reader(slot_index, owner);
-                                    word.fetch_or(mask, Ordering::Release);
-                                    break;
-                                }
                                 let offset = Self::process_lock_offset_for_reader(slot_index);
                                 if !self.try_acquire_supplemental_byte_lock(offset) {
-                                    Self::release_shared_owner_slot(
-                                        &self.reader_owners()[slot_index as usize],
-                                        owner,
-                                        "reader slot",
-                                    );
                                     process_local.unregister_reader(slot_index, owner);
                                     word.fetch_or(mask, Ordering::Release);
                                     break;
                                 }
                                 local.reader_locks[slot_index as usize] += 1;
+                                self.reader_owners()[slot_index as usize]
+                                    .store(owner.raw(), Ordering::Release);
                                 self.reader_frames()[slot_index as usize]
                                     .store(max_frame, Ordering::Release);
                                 drop(process_local);
@@ -2194,6 +1982,7 @@ impl MappedSharedWalCoordination {
         None
     }
 
+    /// Update the pinned frame for an already-owned reader slot.
     pub(crate) fn update_reader(&self, slot: SharedReaderSlot, max_frame: u64) -> SharedReaderSlot {
         turso_assert!(
             self.reader_owners()[slot.slot_index as usize].load(Ordering::Acquire)
@@ -2208,26 +1997,24 @@ impl MappedSharedWalCoordination {
         }
     }
 
+    /// Reuse a same-process shared reader slot for identical snapshots when possible.
+    ///
+    /// Multiple sibling connections reading the same `max_frame` should share
+    /// one slot so they do not exhaust the global reader-slot pool.
     pub(crate) fn register_reader_for_snapshot(
         &self,
         owner: SharedOwnerRecord,
         max_frame: u64,
     ) -> Option<SharedReaderSlot> {
         {
-            let mut process_local = self
-                .process_local_ownership
-                .lock()
-                .expect("process-local ownership registry poisoned");
+            let mut process_local = self.process_local_ownership.lock();
             if let Some(slot) = process_local.retain_shared_snapshot_reader(max_frame) {
                 return Some(slot);
             }
         }
 
         let slot = self.register_reader(owner, max_frame)?;
-        let mut process_local = self
-            .process_local_ownership
-            .lock()
-            .expect("process-local ownership registry poisoned");
+        let mut process_local = self.process_local_ownership.lock();
         if let Some(existing_slot) = process_local.shared_snapshot_reader(max_frame) {
             let retained = process_local.retain_shared_snapshot_reader(max_frame);
             turso_assert!(
@@ -2249,10 +2036,7 @@ impl MappedSharedWalCoordination {
     /// thought we held it, which is a correctness bug in the coordination
     /// layer (see `repair_transient_state_for_exclusive_open`).
     pub(crate) fn unregister_reader(&self, slot: SharedReaderSlot) {
-        let mut local = self
-            .local_lock_state
-            .lock()
-            .expect("shared WAL local lock state poisoned");
+        let mut local = self.local_lock_state.lock();
         turso_assert!(
             local.reader_locks[slot.slot_index as usize] > 0,
             "reader registry count underflow"
@@ -2280,7 +2064,6 @@ impl MappedSharedWalCoordination {
             Self::release_shared_owner_slot(
                 &self.reader_owners()[slot.slot_index as usize],
                 slot.owner,
-                "reader slot",
             );
         }
         local.reader_locks[slot.slot_index as usize] -= 1;
@@ -2294,12 +2077,10 @@ impl MappedSharedWalCoordination {
         self.reader_bitmap_words()[word_idx].fetch_or(1u64 << bit, Ordering::Release);
     }
 
+    /// Drop one snapshot-scoped reader reference, releasing the slot on the final ref.
     pub(crate) fn unregister_reader_for_snapshot(&self, slot: SharedReaderSlot) {
         let release_slot = {
-            let mut process_local = self
-                .process_local_ownership
-                .lock()
-                .expect("process-local ownership registry poisoned");
+            let mut process_local = self.process_local_ownership.lock();
             process_local.release_shared_snapshot_reader(slot)
         };
         if release_slot {
@@ -2307,6 +2088,7 @@ impl MappedSharedWalCoordination {
         }
     }
 
+    /// Read the shared owner metadata stored for one reader slot.
     pub(crate) fn reader_owner(&self, slot_index: u32) -> Option<SharedOwnerRecord> {
         SharedOwnerRecord::from_raw(
             self.reader_owners()[slot_index as usize].load(Ordering::Acquire),
@@ -2340,7 +2122,8 @@ impl MappedSharedWalCoordination {
                     if local_owner.is_some() {
                         return Some(frame);
                     }
-                    if pid_is_alive(owner.pid()) {
+                    let offset = Self::process_lock_offset_for_reader(slot_index as u32);
+                    if self.byte_lock_is_held(offset, false) {
                         return Some(frame);
                     }
                     let _ = self.try_reclaim_dead_reader_owner(slot_index as u32, owner);
@@ -2395,10 +2178,7 @@ impl MappedSharedWalCoordination {
     /// is reset to empty before appending.
     #[track_caller]
     pub(crate) fn record_frame(&self, page_id: u64, frame_id: u64) {
-        let _publish_guard = self
-            .frame_index_publish_lock
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _publish_guard = self.frame_index_publish_lock.lock();
         let header = self.header();
         if frame_id == 1 && header.max_frame.load(Ordering::Acquire) == 0 {
             header.frame_index_len.store(0, Ordering::Release);
@@ -2431,10 +2211,7 @@ impl MappedSharedWalCoordination {
         let required_blocks = (slot / FRAME_INDEX_BLOCK_CAPACITY) + 1;
         self.ensure_mapped_frame_index_blocks(required_blocks)
             .expect("shared WAL frame index block missing");
-        let mappings = self
-            .frame_index_blocks
-            .read()
-            .expect("shared WAL frame index block lock poisoned");
+        let mappings = self.frame_index_blocks.read();
         if slot > 0 {
             let previous = Self::frame_index_entry(&mappings, slot - 1);
             assert!(
@@ -2474,10 +2251,7 @@ impl MappedSharedWalCoordination {
     /// clear the entire index) and by `install_snapshot` to trim stale
     /// entries from a previous WAL generation.
     pub(crate) fn rollback_frames(&self, max_frame: u64) {
-        let _publish_guard = self
-            .frame_index_publish_lock
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _publish_guard = self.frame_index_publish_lock.lock();
         let header = self.header();
         let len = header
             .frame_index_len
@@ -2489,10 +2263,7 @@ impl MappedSharedWalCoordination {
         let old_blocks = len.div_ceil(FRAME_INDEX_BLOCK_CAPACITY);
         self.ensure_mapped_frame_index_blocks(old_blocks)
             .expect("shared WAL frame index block missing");
-        let mappings = self
-            .frame_index_blocks
-            .read()
-            .expect("shared WAL frame index block lock poisoned");
+        let mappings = self.frame_index_blocks.read();
         let mut new_len = len;
         while new_len > 0 {
             let last = Self::frame_index_entry(&mappings, new_len - 1);
@@ -2553,10 +2324,7 @@ impl MappedSharedWalCoordination {
         let required_blocks = len.div_ceil(FRAME_INDEX_BLOCK_CAPACITY);
         self.ensure_mapped_frame_index_blocks(required_blocks)
             .expect("shared WAL frame index block missing");
-        let mappings = self
-            .frame_index_blocks
-            .read()
-            .expect("shared WAL frame index block lock poisoned");
+        let mappings = self.frame_index_blocks.read();
         let visible_slots = Self::visible_frame_index_slots(&mappings, len, upper_frame);
         if visible_slots == 0 {
             return None;
@@ -2598,10 +2366,7 @@ impl MappedSharedWalCoordination {
         let required_blocks = len.div_ceil(FRAME_INDEX_BLOCK_CAPACITY);
         self.ensure_mapped_frame_index_blocks(required_blocks)
             .expect("shared WAL frame index block missing");
-        let mappings = self
-            .frame_index_blocks
-            .read()
-            .expect("shared WAL frame index block lock poisoned");
+        let mappings = self.frame_index_blocks.read();
         let visible_slots = Self::visible_frame_index_slots(&mappings, len, max_frame);
         if visible_slots == 0 {
             return Vec::new();
@@ -2633,6 +2398,10 @@ impl MappedSharedWalCoordination {
 
     fn base_mapped_len(reader_slot_count: u32) -> usize {
         let reader_bitmap_words = (reader_slot_count / 64) as usize;
+        // Layout after header: reader_bitmap | reader_frames | reader_owners
+        // Only 3 arrays are currently used; the remaining 2 are reserved space
+        // for future per-reader arrays (e.g. backfill proof bitmaps) and must
+        // not be removed without a coordinated file format version bump.
         let raw_len = size_of::<SharedWalCoordinationMapHeader>()
             + reader_bitmap_words * size_of::<AtomicU64>()
             + reader_slot_count as usize * size_of::<AtomicU64>()
@@ -2705,6 +2474,10 @@ impl MappedSharedWalCoordination {
         unsafe { std::slice::from_raw_parts(ptr, header.reader_slot_count as usize) }
     }
 
+    /// Map one frame-index block on demand.
+    ///
+    /// Blocks are kept separate from the fixed header mapping so we only pay
+    /// for the shared index capacity we actually need to touch in this process.
     fn map_frame_index_block(&self, block_index: u32) -> Result<FrameIndexBlockMapping> {
         let offset = (Self::base_mapped_len(self.header().reader_slot_count)
             + block_index as usize * Self::frame_index_block_byte_len())
@@ -2727,11 +2500,9 @@ impl MappedSharedWalCoordination {
         })
     }
 
+    /// Ensure the first `target_blocks` frame-index blocks are mapped locally.
     fn ensure_mapped_frame_index_blocks(&self, target_blocks: u32) -> Result<()> {
-        let mut mappings = self
-            .frame_index_blocks
-            .write()
-            .expect("shared WAL frame index block lock poisoned");
+        let mut mappings = self.frame_index_blocks.write();
         while mappings.len() < target_blocks as usize {
             let block_index = mappings.len() as u32;
             mappings.push(self.map_frame_index_block(block_index)?);
@@ -2739,6 +2510,10 @@ impl MappedSharedWalCoordination {
         Ok(())
     }
 
+    /// Publish a larger shared frame-index capacity by extending the file.
+    ///
+    /// This only changes the durable mapping size metadata; callers still need
+    /// `ensure_mapped_frame_index_blocks()` locally before dereferencing.
     fn try_grow_frame_index_blocks(&self, target_blocks: u32) -> bool {
         let target_len = Self::file_len_for_blocks(self.header().reader_slot_count, target_blocks);
         if self.file.shared_wal_set_len(target_len as u64).is_err() {
@@ -2772,18 +2547,18 @@ impl MappedSharedWalCoordination {
         unsafe { mappings[block_index].entries_ptr.as_ptr().add(entry_index) }
     }
 
-    #[allow(clippy::mut_from_ref)]
-    fn frame_index_block_hash_slice(mapping: &FrameIndexBlockMapping) -> &mut [u16] {
-        unsafe {
-            std::slice::from_raw_parts_mut(
-                mapping.hash_ptr.as_ptr(),
-                FRAME_INDEX_BLOCK_HASH_SLOTS as usize,
-            )
-        }
+    fn frame_index_block_hash_ptr(mapping: &FrameIndexBlockMapping) -> *mut u16 {
+        mapping.hash_ptr.as_ptr()
     }
 
     fn clear_frame_index_block_hash(mapping: &FrameIndexBlockMapping) {
-        Self::frame_index_block_hash_slice(mapping).fill(0);
+        unsafe {
+            std::ptr::write_bytes(
+                Self::frame_index_block_hash_ptr(mapping),
+                0,
+                FRAME_INDEX_BLOCK_HASH_SLOTS as usize,
+            );
+        }
     }
 
     /// sqlite wal.c:
@@ -2805,13 +2580,15 @@ impl MappedSharedWalCoordination {
             local_index < FRAME_INDEX_BLOCK_CAPACITY,
             "frame index block local index out of range"
         );
-        let hash = Self::frame_index_block_hash_slice(mapping);
+        let hash_ptr = Self::frame_index_block_hash_ptr(mapping);
         let mut slot = Self::hash_page_id(page_id);
         let value = (local_index + 1) as u16;
         for _ in 0..FRAME_INDEX_BLOCK_HASH_SLOTS {
-            if hash[slot] == 0 {
-                hash[slot] = value;
-                return;
+            unsafe {
+                if std::ptr::read(hash_ptr.add(slot)) == 0 {
+                    std::ptr::write(hash_ptr.add(slot), value);
+                    return;
+                }
             }
             slot = (slot + 1) % FRAME_INDEX_BLOCK_HASH_SLOTS as usize;
         }
@@ -2853,7 +2630,11 @@ impl MappedSharedWalCoordination {
             }
             let local_index = local_plus_one as u32 - 1;
             if local_index >= visible_entries {
-                break;
+                // In a linear-probing hash table, an entry beyond visible_entries
+                // does not terminate the probe chain — valid entries may follow.
+                // (A writer may have built the hash with more entries than this
+                // reader's snapshot makes visible.)
+                continue;
             }
             let entry = unsafe { *mapping.entries_ptr.as_ptr().add(local_index as usize) };
             if entry.page_id == page_id {
@@ -2874,7 +2655,7 @@ impl MappedSharedWalCoordination {
                 FRAME_INDEX_BLOCK_HASH_SLOTS as usize,
             )
         };
-        let mut latest_entries: HashMap<u64, u32> = HashMap::new();
+        let mut latest_entries: HashMap<u64, u32> = HashMap::default();
         for &local_plus_one in hash {
             if local_plus_one == 0 {
                 continue;
@@ -3051,12 +2832,7 @@ impl MappedSharedWalCoordination {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::{OpenFlags, PlatformIO, IO};
-    use crate::storage::database::DatabaseFile;
-    use crate::storage::wal::{CheckpointMode, CheckpointResult};
-    use crate::types::Value;
-    use crate::util::IOExt;
-    use crate::{Connection, Database, DatabaseOpts, IOResult, OpenDbAsyncState, Result, SyncMode};
+    use crate::io::{PlatformIO, IO};
     use std::sync::Arc;
 
     fn colliding_page_ids(count: usize) -> Vec<u64> {
@@ -3179,67 +2955,6 @@ mod tests {
     }
 
     #[test]
-    fn shared_owner_slot_active_clears_dead_owner() {
-        let dead_owner = SharedOwnerRecord::new(exited_child_pid(), 99);
-        let slot = AtomicU64::new(dead_owner.raw());
-
-        assert!(!MappedSharedWalCoordination::shared_owner_slot_active(
-            &slot
-        ));
-        assert_eq!(slot.load(Ordering::Acquire), UNOWNED_LOCK);
-    }
-
-    #[test]
-    fn mapped_shared_wal_coordination_reclaims_dead_writer_owner() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("coordination.tshm");
-        let mapped = create_mapping(&path);
-        let dead_owner = SharedOwnerRecord::new(exited_child_pid(), 41);
-
-        mapped
-            .header()
-            .writer_owner
-            .store(dead_owner.raw(), Ordering::Release);
-
-        assert!(MappedSharedWalCoordination::try_acquire_shared_owner_slot(
-            &mapped.header().writer_owner,
-            mapped.owner_record(),
-        ));
-        assert_eq!(mapped.writer_owner(), Some(mapped.owner_record()));
-        MappedSharedWalCoordination::release_shared_owner_slot(
-            &mapped.header().writer_owner,
-            mapped.owner_record(),
-            "writer",
-        );
-        assert_eq!(mapped.writer_owner(), None);
-    }
-
-    #[test]
-    fn mapped_shared_wal_coordination_reclaims_dead_checkpoint_owner() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("coordination.tshm");
-        let mapped = create_mapping(&path);
-        let dead_owner = SharedOwnerRecord::new(exited_child_pid(), 42);
-
-        mapped
-            .header()
-            .checkpoint_owner
-            .store(dead_owner.raw(), Ordering::Release);
-
-        assert!(MappedSharedWalCoordination::try_acquire_shared_owner_slot(
-            &mapped.header().checkpoint_owner,
-            mapped.owner_record(),
-        ));
-        assert_eq!(mapped.checkpoint_owner(), Some(mapped.owner_record()));
-        MappedSharedWalCoordination::release_shared_owner_slot(
-            &mapped.header().checkpoint_owner,
-            mapped.owner_record(),
-            "checkpoint",
-        );
-        assert_eq!(mapped.checkpoint_owner(), None);
-    }
-
-    #[test]
     fn mapped_shared_wal_coordination_reclaims_dead_reader_owner() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("coordination.tshm");
@@ -3316,72 +3031,42 @@ mod tests {
     }
 
     #[test]
-    fn shared_wal_coordination_tracks_writer_and_checkpoint_owners() {
-        let state = SharedWalCoordinationState::new(64);
-        let writer = SharedOwnerRecord::new(11, 1);
-        let checkpoint = SharedOwnerRecord::new(21, 2);
+    fn process_scoped_mapping_ignores_stale_same_pid_writer_owner_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let mapped = create_process_scoped_mapping(&path);
+        let stale_owner = SharedOwnerRecord::new(std::process::id(), 7);
+        assert_ne!(stale_owner, mapped.owner_record());
 
-        assert!(state.try_acquire_writer(writer));
-        assert_eq!(state.writer_owner(), Some(writer));
-        assert!(!state.try_acquire_writer(SharedOwnerRecord::new(12, 1)));
-        state.release_writer(writer);
-        assert_eq!(state.writer_owner(), None);
+        mapped
+            .header()
+            .writer_owner
+            .store(stale_owner.raw(), Ordering::Release);
 
-        assert!(state.try_acquire_checkpoint(checkpoint));
-        assert_eq!(state.checkpoint_owner(), Some(checkpoint));
-        assert!(!state.try_acquire_checkpoint(SharedOwnerRecord::new(22, 2)));
-        state.release_checkpoint(checkpoint);
-        assert_eq!(state.checkpoint_owner(), None);
+        assert!(mapped.try_acquire_writer(mapped.owner_record()));
+        assert_eq!(mapped.writer_owner(), Some(mapped.owner_record()));
+        mapped.release_writer(mapped.owner_record());
+        assert_eq!(mapped.writer_owner(), None);
     }
 
     #[test]
-    fn shared_wal_coordination_tracks_reader_registrations() {
-        let state = SharedWalCoordinationState::new(64);
-        let owner_a = SharedOwnerRecord::new(31, 1);
-        let owner_b = SharedOwnerRecord::new(31, 2);
+    fn process_scoped_mapping_reclaims_stale_same_pid_reader_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let mapped = create_process_scoped_mapping(&path);
+        let stale_owner = SharedOwnerRecord::new(std::process::id(), 9);
+        assert_ne!(stale_owner, mapped.owner_record());
 
-        let reader_a = state.register_reader(owner_a, 9).unwrap();
-        let reader_b = state.register_reader(owner_b, 5).unwrap();
-        assert_eq!(state.reader_owner(reader_a.slot_index), Some(owner_a));
-        assert_eq!(state.reader_owner(reader_b.slot_index), Some(owner_b));
-        assert_eq!(state.min_active_reader_frame(), Some(5));
+        mapped.reader_bitmap_words()[0].fetch_and(!1u64, Ordering::Release);
+        mapped.reader_frames()[0].store(17, Ordering::Release);
+        mapped.reader_owners()[0].store(stale_owner.raw(), Ordering::Release);
 
-        let reader_a = state.update_reader(reader_a, 3);
-        assert_eq!(reader_a.max_frame, 3);
-        assert_eq!(state.min_active_reader_frame(), Some(3));
+        assert_eq!(mapped.min_active_reader_frame(), None);
+        assert_eq!(mapped.reader_owner(0), None);
 
-        state.unregister_reader(reader_b);
-        assert_eq!(state.reader_owner(reader_b.slot_index), None);
-        assert_eq!(state.min_active_reader_frame(), Some(3));
-
-        state.unregister_reader(reader_a);
-        assert_eq!(state.reader_owner(reader_a.slot_index), None);
-        assert_eq!(state.min_active_reader_frame(), None);
-    }
-
-    #[test]
-    fn shared_wal_coordination_publishes_snapshot_fields() {
-        let state = SharedWalCoordinationState::new(64);
-
-        state.install_header_fields(4096, 17, 23);
-        state.publish_commit(14, 31, 37, 9);
-        state.publish_backfill(8);
-        assert_eq!(state.bump_checkpoint_seq(), 1);
-        assert_eq!(state.bump_checkpoint_epoch(), 0);
-
-        let snapshot = state.snapshot();
-        assert_eq!(snapshot.max_frame, 14);
-        assert_eq!(snapshot.nbackfills, 8);
-        assert_eq!(snapshot.transaction_count, 9);
-        assert_eq!(snapshot.visibility_generation, 1);
-        assert_eq!(snapshot.checkpoint_seq, 1);
-        assert_eq!(snapshot.checkpoint_epoch, 1);
-        assert_eq!(snapshot.page_size, 4096);
-        assert_eq!(snapshot.salt_1, 17);
-        assert_eq!(snapshot.salt_2, 23);
-        assert_eq!(snapshot.checksum_1, 31);
-        assert_eq!(snapshot.checksum_2, 37);
-        assert_eq!(snapshot.reader_slot_count, 64);
+        let reader = mapped.register_reader(mapped.owner_record(), 23).unwrap();
+        assert_eq!(reader.slot_index, 0);
+        mapped.unregister_reader(reader);
     }
 
     #[test]
@@ -3556,26 +3241,6 @@ mod tests {
         assert_eq!(mapped_a.checkpoint_owner(), Some(mapped_b.owner_record()));
         mapped_b.release_checkpoint(mapped_b.owner_record());
         assert_eq!(mapped_a.checkpoint_owner(), None);
-    }
-
-    #[test]
-    fn mapped_shared_wal_coordination_second_process_local_mapping_is_multiprocess() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("coordination.tshm");
-
-        let mapped_a = create_mapping(&path);
-        assert_eq!(
-            mapped_a.open_mode(),
-            SharedWalCoordinationOpenMode::Exclusive
-        );
-        assert!(mapped_a.is_primary_process_mapping());
-
-        let mapped_b = create_mapping(&path);
-        assert_eq!(
-            mapped_b.open_mode(),
-            SharedWalCoordinationOpenMode::MultiProcess
-        );
-        assert!(!mapped_b.is_primary_process_mapping());
     }
 
     #[test]
@@ -3911,13 +3576,45 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("coordination.tshm");
         let mapped = create_mapping(&path);
+        let stale_owner = SharedOwnerRecord::new(exited_child_pid(), 7);
 
         mapped
             .header()
             .writer_owner
-            .store(SharedOwnerRecord::new(99, 7).raw(), Ordering::Release);
+            .store(stale_owner.raw(), Ordering::Release);
         assert!(mapped.try_acquire_writer(mapped.owner_record()));
         mapped.release_writer(mapped.owner_record());
+    }
+
+    #[test]
+    fn mapped_shared_wal_coordination_ignores_stale_checkpoint_owner_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let mapped = create_mapping(&path);
+        let stale_owner = SharedOwnerRecord::new(exited_child_pid(), 8);
+
+        mapped
+            .header()
+            .checkpoint_owner
+            .store(stale_owner.raw(), Ordering::Release);
+        assert!(mapped.try_acquire_checkpoint(mapped.owner_record()));
+        mapped.release_checkpoint(mapped.owner_record());
+    }
+
+    #[test]
+    fn mapped_shared_wal_coordination_publish_commit_keeps_monotonic_transaction_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let mapped = create_mapping(&path);
+
+        mapped.publish_commit(12, 31, 37, 9);
+        mapped.publish_commit(11, 41, 43, 8);
+
+        let snapshot = mapped.snapshot();
+        assert_eq!(snapshot.max_frame, 12);
+        assert_eq!(snapshot.transaction_count, 9);
+        assert_eq!(snapshot.checksum_1, 31);
+        assert_eq!(snapshot.checksum_2, 37);
     }
 
     #[test]
@@ -3925,10 +3622,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("coordination.tshm");
         let mapped = create_mapping(&path);
+        let stale_owner = SharedOwnerRecord::new(exited_child_pid(), 9);
 
         mapped.reader_bitmap_words()[0].fetch_and(!1u64, Ordering::Release);
         mapped.reader_frames()[0].store(17, Ordering::Release);
-        mapped.reader_owners()[0].store(SharedOwnerRecord::new(42, 9).raw(), Ordering::Release);
+        mapped.reader_owners()[0].store(stale_owner.raw(), Ordering::Release);
 
         assert_eq!(mapped.min_active_reader_frame(), None);
         assert_eq!(mapped.reader_owner(0), None);
@@ -4239,523 +3937,5 @@ mod tests {
             mapped.find_frame(7, 0, boundary + 3, None),
             Some(boundary + 3)
         );
-    }
-
-    fn try_open_isolated_database(
-        db_path: &std::path::Path,
-    ) -> Result<(Arc<Database>, Arc<Connection>)> {
-        let db_path_str = db_path.to_str().unwrap();
-        let wal_path = format!("{db_path_str}-wal");
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-        let file = io
-            .open_file(db_path_str, OpenFlags::default(), true)
-            .unwrap();
-        let db_file = Arc::new(DatabaseFile::new(file));
-        let mut state = OpenDbAsyncState::new();
-        let db = loop {
-            match Database::open_with_flags_bypass_registry_async(
-                &mut state,
-                io.clone(),
-                db_path_str,
-                Some(&wal_path),
-                db_file.clone(),
-                OpenFlags::default(),
-                DatabaseOpts::new().with_multiprocess_wal(true),
-                None,
-                None,
-            )? {
-                IOResult::Done(db) => break db,
-                IOResult::IO(io_completion) => io_completion.wait(&*io)?,
-            }
-        };
-        let conn = db.connect()?;
-        Ok((db, conn))
-    }
-
-    fn open_mp_database() -> (Arc<Database>, Arc<Connection>, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.pragma_update(None, "journal_mode", "wal").unwrap();
-        }
-        let (db, conn) = try_open_isolated_database(&db_path).unwrap();
-        (db, conn, dir)
-    }
-
-    fn open_second_process(dir: &std::path::Path) -> (Arc<Database>, Arc<Connection>) {
-        try_open_isolated_database(&dir.join("test.db")).unwrap()
-    }
-
-    fn exec(conn: &Arc<Connection>, sql: &str) {
-        conn.execute(sql).unwrap();
-    }
-
-    fn query_i64(conn: &Arc<Connection>, sql: &str) -> i64 {
-        try_query_i64(conn, sql).unwrap()
-    }
-
-    fn try_query_i64(conn: &Arc<Connection>, sql: &str) -> Result<i64> {
-        let mut stmt = conn.prepare(sql).unwrap();
-        let mut value = 0i64;
-        stmt.run_with_row_callback(|row| {
-            value = row.get(0).unwrap();
-            Ok(())
-        })?;
-        Ok(value)
-    }
-
-    fn query_rows(conn: &Arc<Connection>, sql: &str) -> Vec<Vec<Value>> {
-        let mut stmt = conn.prepare(sql).unwrap();
-        stmt.run_collect_rows().unwrap()
-    }
-
-    fn run_checkpoint(conn: &Arc<Connection>, mode: CheckpointMode) -> CheckpointResult {
-        let pager = conn.pager.load();
-        pager
-            .io
-            .block(|| pager.checkpoint(mode, SyncMode::Full, true))
-            .unwrap()
-    }
-
-    fn assert_integrity_ok(conn: &Arc<Connection>) {
-        let rows = query_rows(conn, "PRAGMA integrity_check");
-        assert!(!rows.is_empty(), "integrity_check returned no rows");
-        match &rows[0][0] {
-            Value::Text(s) => assert_eq!(s.as_ref(), "ok", "integrity_check failed: {s}"),
-            other => panic!("unexpected integrity_check result: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_mp_snapshot_isolation() {
-        let (_db_writer, conn_writer, dir) = open_mp_database();
-
-        exec(
-            &conn_writer,
-            "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)",
-        );
-        exec(&conn_writer, "INSERT INTO t VALUES (1,'a'), (2,'b')");
-        let (_db_reader, conn_reader) = open_second_process(dir.path());
-
-        exec(&conn_reader, "BEGIN");
-        assert_eq!(query_i64(&conn_reader, "SELECT count(*) FROM t"), 2);
-
-        exec(&conn_writer, "INSERT INTO t VALUES (3,'c'), (4,'d')");
-
-        assert_eq!(
-            query_i64(&conn_reader, "SELECT count(*) FROM t"),
-            2,
-            "reader should keep its original snapshot while the transaction stays open"
-        );
-
-        exec(&conn_reader, "COMMIT");
-        assert_eq!(query_i64(&conn_reader, "SELECT count(*) FROM t"), 4);
-
-        assert_integrity_ok(&conn_writer);
-    }
-
-    #[test]
-    fn test_mp_checkpoint_respects_active_reader() {
-        let (_db_writer, conn_writer, dir) = open_mp_database();
-
-        exec(
-            &conn_writer,
-            "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)",
-        );
-
-        exec(&conn_writer, "BEGIN");
-        for i in 0..100 {
-            exec(&conn_writer, &format!("INSERT INTO t VALUES ({i}, 'v{i}')"));
-        }
-        exec(&conn_writer, "COMMIT");
-        let (_db_reader, conn_reader) = open_second_process(dir.path());
-
-        exec(&conn_reader, "BEGIN");
-        assert_eq!(query_i64(&conn_reader, "SELECT count(*) FROM t"), 100);
-
-        exec(&conn_writer, "BEGIN");
-        for i in 100..200 {
-            exec(&conn_writer, &format!("INSERT INTO t VALUES ({i}, 'v{i}')"));
-        }
-        exec(&conn_writer, "COMMIT");
-
-        let first_checkpoint = run_checkpoint(
-            &conn_writer,
-            CheckpointMode::Passive {
-                upper_bound_inclusive: None,
-            },
-        );
-        assert!(
-            !first_checkpoint.everything_backfilled(),
-            "passive checkpoint should stop at the active reader snapshot"
-        );
-
-        exec(&conn_reader, "COMMIT");
-
-        let second_checkpoint = run_checkpoint(
-            &conn_writer,
-            CheckpointMode::Passive {
-                upper_bound_inclusive: None,
-            },
-        );
-        assert!(
-            second_checkpoint.everything_backfilled(),
-            "checkpoint should fully backfill after the reader releases its snapshot"
-        );
-        assert_eq!(query_i64(&conn_writer, "SELECT count(*) FROM t"), 200);
-        assert_integrity_ok(&conn_writer);
-    }
-
-    #[test]
-    fn test_mp_reader_crash_recovery_releases_checkpoint_barrier() {
-        let (_db_writer, conn_writer, dir) = open_mp_database();
-
-        exec(
-            &conn_writer,
-            "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)",
-        );
-        exec(&conn_writer, "INSERT INTO t VALUES (1,'a'), (2,'b')");
-
-        let (_db_reader, conn_reader) = open_second_process(dir.path());
-        exec(&conn_reader, "BEGIN");
-        assert_eq!(query_i64(&conn_reader, "SELECT count(*) FROM t"), 2);
-
-        exec(&conn_writer, "INSERT INTO t VALUES (3,'c')");
-
-        let checkpoint_with_reader = run_checkpoint(
-            &conn_writer,
-            CheckpointMode::Passive {
-                upper_bound_inclusive: None,
-            },
-        );
-        assert!(
-            !checkpoint_with_reader.everything_backfilled(),
-            "active reader snapshot should limit passive checkpoint progress"
-        );
-
-        drop(conn_reader);
-        drop(_db_reader);
-
-        let checkpoint_after_crash = run_checkpoint(
-            &conn_writer,
-            CheckpointMode::Passive {
-                upper_bound_inclusive: None,
-            },
-        );
-        assert!(
-            checkpoint_after_crash.everything_backfilled(),
-            "dropped reader process should no longer block checkpoint progress"
-        );
-
-        assert_eq!(query_i64(&conn_writer, "SELECT count(*) FROM t"), 3);
-        assert_integrity_ok(&conn_writer);
-    }
-
-    #[test]
-    fn test_mp_writer_crash_recovery_only_exposes_committed_rows() {
-        let (_db_writer, conn_writer, dir) = open_mp_database();
-
-        exec(
-            &conn_writer,
-            "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)",
-        );
-        exec(&conn_writer, "BEGIN");
-        for i in 0..10 {
-            exec(&conn_writer, &format!("INSERT INTO t VALUES ({i}, 'v{i}')"));
-        }
-        exec(&conn_writer, "COMMIT");
-        assert_eq!(query_i64(&conn_writer, "SELECT count(*) FROM t"), 10);
-
-        exec(&conn_writer, "BEGIN");
-        for i in 10..20 {
-            exec(&conn_writer, &format!("INSERT INTO t VALUES ({i}, 'v{i}')"));
-        }
-
-        drop(conn_writer);
-        drop(_db_writer);
-
-        let (_db_recovered, conn_recovered) = open_second_process(dir.path());
-        assert_eq!(
-            query_i64(&conn_recovered, "SELECT count(*) FROM t"),
-            10,
-            "recovery should ignore uncommitted rows from the crashed writer"
-        );
-        assert_integrity_ok(&conn_recovered);
-    }
-
-    #[test]
-    fn test_mp_multiple_readers_hold_distinct_snapshots() {
-        let (_db_writer, conn_writer, dir) = open_mp_database();
-
-        exec(
-            &conn_writer,
-            "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)",
-        );
-
-        exec(&conn_writer, "BEGIN");
-        for i in 0..10 {
-            exec(&conn_writer, &format!("INSERT INTO t VALUES ({i}, 'v{i}')"));
-        }
-        exec(&conn_writer, "COMMIT");
-
-        let (_db_reader1, conn_reader1) = open_second_process(dir.path());
-        exec(&conn_reader1, "BEGIN");
-        assert_eq!(query_i64(&conn_reader1, "SELECT count(*) FROM t"), 10);
-
-        exec(&conn_writer, "BEGIN");
-        for i in 10..20 {
-            exec(&conn_writer, &format!("INSERT INTO t VALUES ({i}, 'v{i}')"));
-        }
-        exec(&conn_writer, "COMMIT");
-
-        let (_db_reader2, conn_reader2) = open_second_process(dir.path());
-        exec(&conn_reader2, "BEGIN");
-        assert_eq!(query_i64(&conn_reader2, "SELECT count(*) FROM t"), 20);
-
-        exec(&conn_writer, "BEGIN");
-        for i in 20..30 {
-            exec(&conn_writer, &format!("INSERT INTO t VALUES ({i}, 'v{i}')"));
-        }
-        exec(&conn_writer, "COMMIT");
-
-        let (_db_reader3, conn_reader3) = open_second_process(dir.path());
-        exec(&conn_reader3, "BEGIN");
-        assert_eq!(query_i64(&conn_reader3, "SELECT count(*) FROM t"), 30);
-
-        assert_eq!(query_i64(&conn_reader1, "SELECT count(*) FROM t"), 10);
-        assert_eq!(query_i64(&conn_reader2, "SELECT count(*) FROM t"), 20);
-        assert_eq!(query_i64(&conn_reader3, "SELECT count(*) FROM t"), 30);
-
-        let checkpoint = run_checkpoint(
-            &conn_writer,
-            CheckpointMode::Passive {
-                upper_bound_inclusive: None,
-            },
-        );
-        assert!(
-            !checkpoint.everything_backfilled(),
-            "oldest reader snapshot should limit passive checkpoint progress"
-        );
-
-        exec(&conn_reader1, "COMMIT");
-        exec(&conn_reader2, "COMMIT");
-        exec(&conn_reader3, "COMMIT");
-
-        let final_checkpoint = run_checkpoint(
-            &conn_writer,
-            CheckpointMode::Passive {
-                upper_bound_inclusive: None,
-            },
-        );
-        assert!(
-            final_checkpoint.everything_backfilled(),
-            "checkpoint should complete once all reader snapshots are released"
-        );
-
-        assert_eq!(query_i64(&conn_writer, "SELECT count(*) FROM t"), 30);
-        assert_integrity_ok(&conn_writer);
-    }
-
-    #[test]
-    fn test_mp_stale_frame_cache_after_repeated_truncate() {
-        let (_db0, conn0, dir) = open_mp_database();
-
-        exec(&conn0, "CREATE TABLE t1(id INTEGER PRIMARY KEY)");
-        exec(&conn0, "CREATE TABLE t2(id INTEGER PRIMARY KEY)");
-        run_checkpoint(
-            &conn0,
-            CheckpointMode::Truncate {
-                upper_bound_inclusive: None,
-            },
-        );
-
-        let (_db1, conn1) = open_second_process(dir.path());
-        let (_db2, conn2) = open_second_process(dir.path());
-
-        exec(&conn1, "INSERT INTO t1 VALUES (1)");
-        assert_eq!(query_i64(&conn2, "SELECT count(*) FROM t1"), 1);
-
-        run_checkpoint(
-            &conn0,
-            CheckpointMode::Truncate {
-                upper_bound_inclusive: None,
-            },
-        );
-
-        exec(&conn1, "INSERT INTO t2 VALUES (100)");
-        assert_eq!(query_i64(&conn2, "SELECT count(*) FROM t2"), 1);
-        assert_integrity_ok(&conn2);
-    }
-
-    #[test]
-    fn test_mp_restart_checkpoint_on_empty_wal() {
-        let (_db1, conn1, dir) = open_mp_database();
-
-        exec(&conn1, "CREATE TABLE t1 (id INTEGER PRIMARY KEY)");
-        exec(&conn1, "INSERT INTO t1 VALUES (1)");
-
-        run_checkpoint(
-            &conn1,
-            CheckpointMode::Truncate {
-                upper_bound_inclusive: None,
-            },
-        );
-
-        let (_db2, conn2) = open_second_process(dir.path());
-        run_checkpoint(&conn2, CheckpointMode::Restart);
-        exec(&conn2, "INSERT INTO t1 VALUES (2)");
-
-        assert_eq!(query_i64(&conn2, "SELECT count(*) FROM t1"), 2);
-        assert_integrity_ok(&conn2);
-    }
-
-    #[test]
-    fn test_mp_uncommitted_frames_not_visible_cross_process() {
-        let (_db_writer, conn_writer, dir) = open_mp_database();
-
-        exec(&conn_writer, "CREATE TABLE t(id INTEGER PRIMARY KEY)");
-        exec(&conn_writer, "INSERT INTO t VALUES (1)");
-
-        let (_db_reader, conn_reader) = open_second_process(dir.path());
-        assert_eq!(query_i64(&conn_reader, "SELECT count(*) FROM t"), 1);
-
-        exec(&conn_writer, "BEGIN");
-        exec(&conn_writer, "INSERT INTO t VALUES (2)");
-
-        assert_eq!(
-            query_i64(&conn_reader, "SELECT count(*) FROM t"),
-            1,
-            "uncommitted frames must stay invisible to other processes"
-        );
-
-        exec(&conn_writer, "COMMIT");
-        assert_eq!(query_i64(&conn_reader, "SELECT count(*) FROM t"), 2);
-    }
-
-    #[test]
-    fn test_mp_rollback_wal_index_cross_process() {
-        let (_db_writer, conn_writer, dir) = open_mp_database();
-
-        exec(
-            &conn_writer,
-            "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)",
-        );
-        exec(&conn_writer, "INSERT INTO t VALUES (1, 'baseline')");
-
-        let (_db_reader, conn_reader) = open_second_process(dir.path());
-        assert_eq!(query_i64(&conn_reader, "SELECT count(*) FROM t"), 1);
-
-        exec(&conn_writer, "BEGIN");
-        exec(&conn_writer, "INSERT INTO t VALUES (2, 'will_rollback')");
-        exec(&conn_writer, "INSERT INTO t VALUES (3, 'will_rollback')");
-        exec(&conn_writer, "ROLLBACK");
-
-        assert_eq!(query_i64(&conn_writer, "SELECT count(*) FROM t"), 1);
-        assert_eq!(query_i64(&conn_reader, "SELECT count(*) FROM t"), 1);
-
-        let rows = query_rows(&conn_reader, "SELECT val FROM t WHERE id = 1");
-        match &rows[0][0] {
-            Value::Text(s) => assert_eq!(s.as_ref(), "baseline"),
-            other => panic!("unexpected val: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_mp_truncate_then_cross_process_write() {
-        let (_db_writer, conn_writer, dir) = open_mp_database();
-
-        exec(
-            &conn_writer,
-            "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)",
-        );
-        exec(&conn_writer, "INSERT INTO t VALUES (1, 'before_truncate')");
-
-        let (_db_reader, conn_reader) = open_second_process(dir.path());
-        assert_eq!(query_i64(&conn_reader, "SELECT count(*) FROM t"), 1);
-
-        run_checkpoint(
-            &conn_writer,
-            CheckpointMode::Truncate {
-                upper_bound_inclusive: None,
-            },
-        );
-
-        exec(&conn_reader, "INSERT INTO t VALUES (2, 'after_truncate')");
-
-        assert_eq!(query_i64(&conn_writer, "SELECT count(*) FROM t"), 2);
-        assert_eq!(query_i64(&conn_reader, "SELECT count(*) FROM t"), 2);
-        assert_integrity_ok(&conn_writer);
-        assert_integrity_ok(&conn_reader);
-    }
-
-    #[test]
-    fn test_mp_rapid_open_close_cycles() {
-        let (_db_writer, conn_writer, dir) = open_mp_database();
-
-        exec(
-            &conn_writer,
-            "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)",
-        );
-        for i in 1..=10 {
-            exec(
-                &conn_writer,
-                &format!("INSERT INTO t VALUES ({i}, 'row{i}')"),
-            );
-        }
-
-        for cycle in 0..50 {
-            let (db, conn) = open_second_process(dir.path());
-            let count = query_i64(&conn, "SELECT count(*) FROM t");
-            assert_eq!(count, 10, "cycle {cycle}: expected 10 rows, got {count}");
-            drop(conn);
-            drop(db);
-        }
-
-        assert_eq!(query_i64(&conn_writer, "SELECT count(*) FROM t"), 10);
-        assert_integrity_ok(&conn_writer);
-
-        exec(&conn_writer, "INSERT INTO t VALUES (11, 'after_churn')");
-        assert_eq!(query_i64(&conn_writer, "SELECT count(*) FROM t"), 11);
-    }
-
-    #[test]
-    fn test_mp_dbfile_readers_do_not_consume_shared_reader_slots() {
-        let (db, conn_writer, _dir) = open_mp_database();
-
-        exec(
-            &conn_writer,
-            "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)",
-        );
-        exec(&conn_writer, "INSERT INTO t VALUES (1, 'baseline')");
-        run_checkpoint(
-            &conn_writer,
-            CheckpointMode::Truncate {
-                upper_bound_inclusive: None,
-            },
-        );
-
-        let mut readers = Vec::new();
-        for slot in 0..128 {
-            let conn = db.connect().unwrap();
-            exec(&conn, "BEGIN");
-            assert_eq!(
-                query_i64(&conn, "SELECT count(*) FROM t"),
-                1,
-                "db-file reader {slot} should not fail due to shared-reader slot pressure"
-            );
-            readers.push(conn);
-        }
-
-        let authority = db.shared_wal_coordination().unwrap().unwrap();
-        assert_eq!(
-            authority.min_active_reader_frame(),
-            None,
-            "db-file-only readers should not publish shared WAL reader slots"
-        );
-
-        for conn in readers {
-            exec(&conn, "COMMIT");
-        }
     }
 }
