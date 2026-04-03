@@ -35,6 +35,8 @@
 use smallvec::SmallVec;
 use turso_parser::ast::{self, Expr, TableInternalId, UnaryOperator};
 
+use crate::translate::plan::Plan;
+
 use crate::function::{Deterministic, Func};
 use crate::translate::{
     expr::{walk_expr, WalkControl},
@@ -78,6 +80,10 @@ fn try_unnest_exists(plan: &mut SelectPlan, subquery_idx: usize) -> bool {
             return false;
         };
         let Some(inner) = inner.as_ref() else {
+            return false;
+        };
+        let Plan::Select(inner) = inner.as_ref() else {
+            // Compound selects cannot be unnested.
             return false;
         };
         inner.clone()

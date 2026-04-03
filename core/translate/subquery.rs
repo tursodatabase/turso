@@ -127,7 +127,7 @@ fn mark_shared_cte_materialization_requirements(program: &ProgramBuilder, plan: 
         else {
             continue;
         };
-        mark_shared_cte_materialization_requirements(program, subquery_plan);
+        annotate_plan(program, subquery_plan);
     }
 }
 
@@ -535,7 +535,7 @@ fn get_subquery_parser<'a>(
                     internal_id: subquery_id,
                     query_type: subquery_type,
                     state: SubqueryState::Unevaluated {
-                        plan: Some(Box::new(plan)),
+                        plan: Some(Box::new(Plan::Select(plan))),
                     },
                     correlated,
                     origin,
@@ -626,7 +626,7 @@ fn get_subquery_parser<'a>(
                         num_regs: reg_count,
                     },
                     state: SubqueryState::Unevaluated {
-                        plan: Some(Box::new(plan)),
+                        plan: Some(Box::new(Plan::Select(plan))),
                     },
                     correlated,
                     origin,
@@ -649,12 +649,34 @@ fn get_subquery_parser<'a>(
                     QueryDestination::Unset,
                     connection,
                 )?;
-                let Plan::Select(mut plan) = plan else {
-                    crate::bail_parse_error!(
-                        "compound SELECT queries not supported yet in WHERE clause subqueries"
-                    );
+                let mut plan = match plan {
+                    Plan::Select(mut select_plan) => {
+                        optimize_select_plan(&mut select_plan, resolver.schema())?;
+                        Plan::Select(select_plan)
+                    }
+                    Plan::CompoundSelect {
+                        mut left,
+                        mut right_most,
+                        limit,
+                        offset,
+                        order_by,
+                    } => {
+                        optimize_select_plan(&mut right_most, resolver.schema())?;
+                        for (select_plan, _) in left.iter_mut() {
+                            optimize_select_plan(select_plan, resolver.schema())?;
+                        }
+                        Plan::CompoundSelect {
+                            left,
+                            right_most,
+                            limit,
+                            offset,
+                            order_by,
+                        }
+                    }
+                    _ => unreachable!("prepare_select_plan cannot return Delete/Update"),
                 };
-                optimize_select_plan(&mut plan, resolver.schema())?;
+                let result_columns = plan.select_result_columns().unwrap();
+                let table_references = plan.select_table_references().unwrap();
                 // e.g. (x,y) IN (SELECT ...)
                 // or x IN (SELECT ...)
                 let lhs_columns = match unwrap_parens(lhs.as_ref())? {
@@ -664,10 +686,10 @@ fn get_subquery_parser<'a>(
                     expr => either::Right(core::iter::once(expr)),
                 };
                 let lhs_column_count = lhs_columns.len();
-                if lhs_column_count != plan.result_columns.len() {
+                if lhs_column_count != result_columns.len() {
                     crate::bail_parse_error!(
                         "sub-select returns {} columns - expected {lhs_column_count}",
-                        plan.result_columns.len()
+                        result_columns.len()
                     );
                 }
                 // Collect affinity and LHS collation in a single pass over lhs_columns.
@@ -682,9 +704,9 @@ fn get_subquery_parser<'a>(
                         get_expr_affinity_info(lhs_expr, Some(referenced_tables), None);
                     affinity_chars.push(
                         compare_affinity(
-                            &plan.result_columns[i].expr,
+                            &result_columns[i].expr,
                             lhs_affinity,
-                            Some(&plan.table_references),
+                            Some(table_references),
                             None,
                         )
                         .aff_mask(),
@@ -693,14 +715,13 @@ fn get_subquery_parser<'a>(
                 }
                 let in_affinity_str: Arc<String> = Arc::new(affinity_chars);
 
-                let columns = plan
-                    .result_columns
+                let columns = result_columns
                     .iter()
                     .enumerate()
                     .map(|(i, c)| {
-                        let rhs_collation = get_collseq_from_expr(&c.expr, &plan.table_references)?;
+                        let rhs_collation = get_collseq_from_expr(&c.expr, table_references)?;
                         Ok(IndexColumn {
-                            name: c.name(&plan.table_references).unwrap_or("").to_string(),
+                            name: c.name(table_references).unwrap_or("").to_string(),
                             order: SortOrder::Asc,
                             pos_in_table: i,
                             collation: lhs_collations[i].or(rhs_collation),
@@ -726,7 +747,7 @@ fn get_subquery_parser<'a>(
                 let cursor_id =
                     program.alloc_cursor_id(CursorType::BTreeIndex(ephemeral_index.clone()));
 
-                plan.query_destination = QueryDestination::EphemeralIndex {
+                *plan.select_query_destination_mut().unwrap() = QueryDestination::EphemeralIndex {
                     cursor_id,
                     index: ephemeral_index,
                     affinity_str: Some(in_affinity_str.clone()),
@@ -743,7 +764,7 @@ fn get_subquery_parser<'a>(
                     },
                 };
 
-                let correlated = plan.is_correlated();
+                let correlated = plan_is_correlated(&plan);
                 handle_unsupported_correlation(correlated, position, allow_correlated)?;
 
                 out_subqueries.push(NonFromClauseSubquery {
@@ -875,7 +896,7 @@ fn update_column_used_masks(
             panic!("subquery has no plan");
         };
 
-        propagate_outer_refs_from_select_plan(table_refs, child_plan);
+        propagate_outer_refs_from_plan(table_refs, child_plan);
     }
 
     // Collect raw plan pointers to avoid cloning while sidestepping borrow rules.
@@ -946,7 +967,7 @@ fn pre_materialize_multi_ref_ctes_in_non_from_subqueries(
         else {
             continue;
         };
-        pre_materialize_multi_ref_ctes_in_select_plan(program, subquery_plan.as_mut(), t_ctx)?;
+        pre_materialize_multi_ref_ctes(program, subquery_plan.as_mut(), t_ctx)?;
     }
     Ok(())
 }
@@ -1593,7 +1614,7 @@ fn emit_materialized_subquery_table(
 pub fn emit_non_from_clause_subquery(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    plan: SelectPlan,
+    plan: Plan,
     query_type: &SubqueryType,
     is_correlated: bool,
     preserve_outer_expr_cache: bool,
@@ -1632,6 +1653,32 @@ pub fn emit_non_from_clause_subquery(
             None
         };
 
+        // Helper closure to emit a select plan (simple or compound).
+        let emit_plan = |program: &mut ProgramBuilder,
+                         resolver: &Resolver,
+                         plan: Plan,
+                         preserve_cache: bool|
+         -> Result<()> {
+            match plan {
+                Plan::Select(select_plan) => {
+                    if preserve_cache {
+                        emit_program_for_select_with_resolver(
+                            program,
+                            resolver.fork_with_expr_cache(),
+                            select_plan,
+                        )
+                    } else {
+                        emit_program_for_select(program, resolver, select_plan)
+                    }
+                }
+                Plan::CompoundSelect { .. } => {
+                    emit_program_for_compound_select(program, resolver, plan)?;
+                    Ok(())
+                }
+                _ => unreachable!("DML plans cannot be subqueries"),
+            }
+        };
+
         match query_type {
             SubqueryType::Exists { result_reg, .. } => {
                 let subroutine_reg = program.alloc_register();
@@ -1643,15 +1690,7 @@ pub fn emit_non_from_clause_subquery(
                     value: 0,
                     dest: *result_reg,
                 });
-                if preserve_outer_expr_cache {
-                    emit_program_for_select_with_resolver(
-                        program,
-                        resolver.fork_with_expr_cache(),
-                        plan,
-                    )?;
-                } else {
-                    emit_program_for_select(program, resolver, plan)?;
-                }
+                emit_plan(program, resolver, plan, preserve_outer_expr_cache)?;
                 program.emit_insn(Insn::Return {
                     return_reg: subroutine_reg,
                     can_fallthrough: true,
@@ -1662,15 +1701,7 @@ pub fn emit_non_from_clause_subquery(
                     cursor_id: *cursor_id,
                     is_table: false,
                 });
-                if preserve_outer_expr_cache {
-                    emit_program_for_select_with_resolver(
-                        program,
-                        resolver.fork_with_expr_cache(),
-                        plan,
-                    )?;
-                } else {
-                    emit_program_for_select(program, resolver, plan)?;
-                }
+                emit_plan(program, resolver, plan, preserve_outer_expr_cache)?;
             }
             SubqueryType::RowValue {
                 result_reg_start,
@@ -1687,15 +1718,7 @@ pub fn emit_non_from_clause_subquery(
                         dest_end: None,
                     });
                 }
-                if preserve_outer_expr_cache {
-                    emit_program_for_select_with_resolver(
-                        program,
-                        resolver.fork_with_expr_cache(),
-                        plan,
-                    )?;
-                } else {
-                    emit_program_for_select(program, resolver, plan)?;
-                }
+                emit_plan(program, resolver, plan, preserve_outer_expr_cache)?;
                 program.emit_insn(Insn::Return {
                     return_reg: subroutine_reg,
                     can_fallthrough: true,

@@ -1596,18 +1596,12 @@ pub fn table_mask_from_expr(
                 };
                 match &subquery.state {
                     SubqueryState::Unevaluated { plan } => {
-                        let used_outer_query_refs = plan
-                            .as_ref()
-                            .unwrap()
-                            .table_references
-                            .outer_query_refs()
-                            .iter()
-                            .filter(|t| t.is_used());
-                        for outer_query_ref in used_outer_query_refs {
+                        let outer_ref_ids = plan.as_ref().unwrap().used_outer_query_ref_ids();
+                        for outer_ref_id in &outer_ref_ids {
                             if let Some(table_idx) = table_references
                                 .joined_tables()
                                 .iter()
-                                .position(|t| t.internal_id == outer_query_ref.internal_id)
+                                .position(|t| t.internal_id == *outer_ref_id)
                             {
                                 mask.add_table(table_idx);
                             }
@@ -1691,17 +1685,11 @@ pub fn determine_where_to_eval_expr(
                         eval_at = eval_at.max(*evaluated_at);
                     }
                     SubqueryState::Unevaluated { plan } => {
-                        let used_outer_refs = plan
-                            .as_ref()
-                            .unwrap()
-                            .table_references
-                            .outer_query_refs()
-                            .iter()
-                            .filter(|t| t.is_used());
-                        for outer_ref in used_outer_refs {
+                        let outer_ref_ids = plan.as_ref().unwrap().used_outer_query_ref_ids();
+                        for outer_ref_id in &outer_ref_ids {
                             let join_idx = join_order
                                 .iter()
-                                .position(|t| t.table_id == outer_ref.internal_id)
+                                .position(|t| t.table_id == *outer_ref_id)
                                 .or_else(|| {
                                     let tables = table_references?;
                                     for (probe_idx, member) in join_order.iter().enumerate() {
@@ -1710,7 +1698,7 @@ pub fn determine_where_to_eval_expr(
                                         if let Operation::HashJoin(ref hj) = probe_table.op {
                                             let build_table =
                                                 &tables.joined_tables()[hj.build_table_idx];
-                                            if build_table.internal_id == outer_ref.internal_id {
+                                            if build_table.internal_id == *outer_ref_id {
                                                 return Some(probe_idx);
                                             }
                                         }
