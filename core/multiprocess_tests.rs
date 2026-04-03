@@ -12,6 +12,8 @@ const MULTIPROCESS_SHM_SCHEMA_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_schema_child_process";
 const MULTIPROCESS_SHM_INSERT_AND_CLOSE_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_insert_and_close_child_process";
+const MULTIPROCESS_SHM_EXPECT_OPEN_FAILURE_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_shm_expect_open_failure_child_process";
 const DEFAULT_LOCKED_DB_CHILD_TEST: &str = "multiprocess_tests::default_locked_db_child_process";
 
 fn count_test_rows(conn: &Arc<Connection>) -> i64 {
@@ -148,6 +150,7 @@ fn flip_db_header_reserved_byte(path: &std::path::Path) {
 }
 
 #[test]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn shared_wal_coordination_rejects_remote_filesystem_magic_values() {
     assert!(!Database::filesystem_magic_allows_shared_wal(0x6969));
     assert!(!Database::filesystem_magic_allows_shared_wal(
@@ -156,6 +159,18 @@ fn shared_wal_coordination_rejects_remote_filesystem_magic_values() {
     assert!(!Database::filesystem_magic_allows_shared_wal(0x0102_1997));
     assert!(Database::filesystem_magic_allows_shared_wal(0xEF53));
     assert!(Database::filesystem_magic_allows_shared_wal(0x0102_1994));
+}
+
+#[test]
+#[cfg(all(unix, target_pointer_width = "64"))]
+fn shared_wal_coordination_path_probe_accepts_nonexistent_relative_paths() {
+    let result = Database::path_allows_shared_wal_coordination(std::path::Path::new(
+        "nonexistent-relative-multiprocess-wal.db",
+    ));
+    assert!(
+        result.is_ok(),
+        "nonexistent relative paths should probe the current directory instead of erroring: {result:?}"
+    );
 }
 
 #[test]
@@ -197,6 +212,94 @@ fn database_open_without_experimental_multiprocess_wal_rejects_second_process() 
     assert!(
         child_output.status.success(),
         "second default-open child process unexpectedly succeeded: stdout={}; stderr={}",
+        String::from_utf8_lossy(&child_output.stdout),
+        String::from_utf8_lossy(&child_output.stderr)
+    );
+}
+
+#[test]
+fn database_open_with_experimental_multiprocess_wal_rejects_unsupported_io_backend() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let err = Database::open_file_with_flags(
+        io,
+        "unsupported-multiprocess.db",
+        OpenFlags::default(),
+        multiprocess_wal_db_opts(),
+        None,
+    )
+    .expect_err("multiprocess WAL should reject IO backends without shared coordination");
+    assert!(
+        matches!(err, LimboError::InvalidArgument(ref message) if message.contains("active IO backend")),
+        "expected InvalidArgument about unsupported IO backend, got {err:?}"
+    );
+}
+
+#[test]
+fn readonly_open_with_experimental_multiprocess_wal_allows_missing_coordination_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("readonly-multiprocess-no-tshm.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+    {
+        let db = Database::open_file(io.clone(), db_path_str).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("create table test(id integer primary key, value text)")
+            .unwrap();
+    }
+
+    let readonly = open_multiprocess_db_with_flags(io, db_path_str, OpenFlags::ReadOnly)
+        .expect("read-only open should degrade gracefully when no .tshm exists");
+    assert!(readonly.shared_wal_coordination().unwrap().is_none());
+}
+
+#[test]
+fn database_open_with_experimental_multiprocess_wal_rejects_second_default_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir
+        .path()
+        .join("coordination-multiprocess-parent-default-child.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let _db = open_multiprocess_db(io, db_path_str).unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let child_output = Command::new(&current_exe)
+        .arg(DEFAULT_LOCKED_DB_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        child_output.status.success(),
+        "default-open child process unexpectedly succeeded against multiprocess parent: stdout={}; stderr={}",
+        String::from_utf8_lossy(&child_output.stdout),
+        String::from_utf8_lossy(&child_output.stderr)
+    );
+}
+
+#[test]
+fn database_open_without_experimental_multiprocess_wal_rejects_second_multiprocess_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir
+        .path()
+        .join("coordination-default-parent-multiprocess-child.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let _db = Database::open_file(io, db_path_str).unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let child_output = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_EXPECT_OPEN_FAILURE_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        child_output.status.success(),
+        "multiprocess child process unexpectedly opened against default parent: stdout={}; stderr={}",
         String::from_utf8_lossy(&child_output.stdout),
         String::from_utf8_lossy(&child_output.stderr)
     );
@@ -272,44 +375,35 @@ fn database_open_rebuilds_from_disk_scan_when_exclusive_shm_snapshot_is_stale() 
 }
 
 #[test]
-fn database_open_reuses_trusted_tshm_snapshot_after_partial_checkpoint_with_backfill_proof() {
+fn database_open_reuses_trusted_tshm_snapshot_without_disk_scan_when_no_backfill_proof_is_needed() {
     let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("coordination-partial-checkpoint-reopen.db");
+    let db_path = dir.path().join("coordination-trusted-tail-reopen.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
 
     let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
     let conn = db.connect().unwrap();
-    conn.wal_auto_checkpoint_disable();
-    conn.execute("create table test(id integer primary key, value blob)")
+    conn.execute("create table test(id integer primary key, value text)")
         .unwrap();
-    conn.execute("begin immediate").unwrap();
-    for _ in 0..32 {
-        conn.execute("insert into test(value) values (randomblob(2048))")
-            .unwrap();
-    }
-    conn.execute("commit").unwrap();
-    assert!(
-        wal_max_frame(&conn) > 1,
-        "partial-checkpoint reopen coverage requires more than one WAL frame before checkpointing"
-    );
-
-    run_checkpoint(
-        &conn,
-        CheckpointMode::Passive {
-            upper_bound_inclusive: Some(1),
-        },
-    );
+    conn.execute("insert into test(value) values ('before-reopen')")
+        .unwrap();
+    conn.execute("insert into test(value) values ('after-reopen')")
+        .unwrap();
 
     let authority = db.shared_wal_coordination().unwrap().unwrap();
     let snapshot_before = authority.snapshot();
     assert!(
-        snapshot_before.nbackfills > 0,
-        "partial-checkpoint reopen coverage requires persisted positive nbackfills"
+        snapshot_before.max_frame > 0,
+        "trusted-tail reopen coverage requires committed WAL frames before reopen"
     );
+    assert_eq!(
+        snapshot_before.nbackfills, 0,
+        "this coverage only applies when no positive backfill proof is required"
+    );
+    let frames_before = authority.iter_latest_frames(0, snapshot_before.max_frame);
     assert!(
-        snapshot_before.max_frame > snapshot_before.nbackfills,
-        "partial-checkpoint reopen coverage requires live WAL frames beyond the backfill point"
+        !frames_before.is_empty(),
+        "trusted-tail reopen coverage requires a populated durable frame index"
     );
 
     drop(conn);
@@ -326,22 +420,23 @@ fn database_open_reuses_trusted_tshm_snapshot_after_partial_checkpoint_with_back
             .metadata
             .loaded_from_disk_scan
             .load(Ordering::Acquire),
-        "reopen should reuse the persisted tshm snapshot when the backfill proof still matches the WAL and DB header"
+        "reopen should trust the persisted tshm snapshot when no backfill-proof validation is needed"
     );
 
     let reopened_authority = reopened.shared_wal_coordination().unwrap().unwrap();
     assert_eq!(
         reopened_authority.snapshot(),
         snapshot_before,
-        "trusted reopen must preserve the authoritative partial-checkpoint snapshot"
+        "trusted reopen must preserve the authoritative WAL snapshot"
+    );
+    assert_eq!(
+        reopened_authority.iter_latest_frames(0, snapshot_before.max_frame),
+        frames_before,
+        "trusted reopen must preserve durable frame-index content"
     );
 
     let reopened_conn = reopened.connect().unwrap();
-    assert_eq!(
-        count_test_rows(&reopened_conn),
-        32,
-        "trusted partial-checkpoint reopen should preserve committed rows without a disk scan"
-    );
+    assert_eq!(count_test_rows(&reopened_conn), 2);
 }
 
 #[test]
@@ -580,6 +675,21 @@ fn default_locked_db_child_process() {
     assert!(
         matches!(err, LimboError::LockingError(_)),
         "expected LockingError from second default open, got {err:?}"
+    );
+}
+
+#[test]
+fn multiprocess_shm_expect_open_failure_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let err = open_multiprocess_db(io, db_path.to_str().unwrap())
+        .expect_err("multiprocess open should fail when a legacy opener already owns the DB");
+    assert!(
+        matches!(err, LimboError::LockingError(_)),
+        "expected LockingError from incompatible multiprocess open, got {err:?}"
     );
 }
 

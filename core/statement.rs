@@ -323,11 +323,19 @@ impl Statement {
             if !matches!(res, Err(LimboError::SchemaUpdated)) {
                 break;
             }
-            // In multiprocess mode, a cross-process schema change during a
-            // write transaction cannot be resolved by reprepare alone (the
-            // in-memory db.schema hasn't been refreshed from disk). The
-            // MAX_SCHEMA_RETRY loop will exhaust attempts and surface
-            // SchemaUpdated naturally in that case.
+            // In a write transaction, reprepare may not help (e.g. cross-process
+            // schema change where the in-memory schema hasn't been refreshed from
+            // disk). Allow a few retries for the in-process case where reprepare
+            // *can* resolve the issue, but bail early to avoid burning 50 attempts.
+            if attempt >= 2
+                && !self.program.connection.get_auto_commit()
+                && matches!(
+                    self.program.connection.get_tx_state(),
+                    TransactionState::Write { .. } | TransactionState::PendingUpgrade { .. }
+                )
+            {
+                break;
+            }
             tracing::debug!("reprepare: attempt={}", attempt);
             if let Err(err) = self.reprepare() {
                 self.release_active_root_if_counted();
