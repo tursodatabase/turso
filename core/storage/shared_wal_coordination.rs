@@ -1317,6 +1317,12 @@ impl MappedSharedWalCoordination {
         }
     }
 
+    /// Read a consistent snapshot of the shared coordination header.
+    ///
+    /// # Safety invariant
+    /// Individual fields are read with atomic loads, but the multi-field read is
+    /// NOT an atomic snapshot. Consistency relies on the writer lock serializing
+    /// all modifications — any concurrent modifier MUST hold the writer lock.
     pub(crate) fn snapshot(&self) -> SharedWalCoordinationHeader {
         let header = self.header();
         SharedWalCoordinationHeader {
@@ -1488,6 +1494,12 @@ impl MappedSharedWalCoordination {
         self.header().frame_index_overflowed.load(Ordering::Acquire) != 0
     }
 
+    /// Publish a committed transaction to the shared coordination header.
+    ///
+    /// # Precondition
+    /// The caller MUST hold the WAL writer lock. The multi-field update is not
+    /// atomic; the writer lock serializes all writers so readers see a consistent
+    /// state (the checksum TOCTOU below is safe only under this invariant).
     pub(crate) fn publish_commit(
         &self,
         max_frame: u64,
@@ -2633,6 +2645,10 @@ impl MappedSharedWalCoordination {
 
     fn base_mapped_len(reader_slot_count: u32) -> usize {
         let reader_bitmap_words = (reader_slot_count / 64) as usize;
+        // Layout after header: reader_bitmap | reader_frames | reader_owners
+        // Only 3 arrays are currently used; the remaining 2 are reserved space
+        // for future per-reader arrays (e.g. backfill proof bitmaps) and must
+        // not be removed without a coordinated file format version bump.
         let raw_len = size_of::<SharedWalCoordinationMapHeader>()
             + reader_bitmap_words * size_of::<AtomicU64>()
             + reader_slot_count as usize * size_of::<AtomicU64>()
@@ -2772,18 +2788,18 @@ impl MappedSharedWalCoordination {
         unsafe { mappings[block_index].entries_ptr.as_ptr().add(entry_index) }
     }
 
-    #[allow(clippy::mut_from_ref)]
-    fn frame_index_block_hash_slice(mapping: &FrameIndexBlockMapping) -> &mut [u16] {
-        unsafe {
-            std::slice::from_raw_parts_mut(
-                mapping.hash_ptr.as_ptr(),
-                FRAME_INDEX_BLOCK_HASH_SLOTS as usize,
-            )
-        }
+    fn frame_index_block_hash_ptr(mapping: &FrameIndexBlockMapping) -> *mut u16 {
+        mapping.hash_ptr.as_ptr()
     }
 
     fn clear_frame_index_block_hash(mapping: &FrameIndexBlockMapping) {
-        Self::frame_index_block_hash_slice(mapping).fill(0);
+        unsafe {
+            std::ptr::write_bytes(
+                Self::frame_index_block_hash_ptr(mapping),
+                0,
+                FRAME_INDEX_BLOCK_HASH_SLOTS as usize,
+            );
+        }
     }
 
     /// sqlite wal.c:
@@ -2805,13 +2821,15 @@ impl MappedSharedWalCoordination {
             local_index < FRAME_INDEX_BLOCK_CAPACITY,
             "frame index block local index out of range"
         );
-        let hash = Self::frame_index_block_hash_slice(mapping);
+        let hash_ptr = Self::frame_index_block_hash_ptr(mapping);
         let mut slot = Self::hash_page_id(page_id);
         let value = (local_index + 1) as u16;
         for _ in 0..FRAME_INDEX_BLOCK_HASH_SLOTS {
-            if hash[slot] == 0 {
-                hash[slot] = value;
-                return;
+            unsafe {
+                if std::ptr::read(hash_ptr.add(slot)) == 0 {
+                    std::ptr::write(hash_ptr.add(slot), value);
+                    return;
+                }
             }
             slot = (slot + 1) % FRAME_INDEX_BLOCK_HASH_SLOTS as usize;
         }
@@ -2853,7 +2871,11 @@ impl MappedSharedWalCoordination {
             }
             let local_index = local_plus_one as u32 - 1;
             if local_index >= visible_entries {
-                break;
+                // In a linear-probing hash table, an entry beyond visible_entries
+                // does not terminate the probe chain — valid entries may follow.
+                // (A writer may have built the hash with more entries than this
+                // reader's snapshot makes visible.)
+                continue;
             }
             let entry = unsafe { *mapping.entries_ptr.as_ptr().add(local_index as usize) };
             if entry.page_id == page_id {

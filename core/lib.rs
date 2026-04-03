@@ -306,6 +306,10 @@ pub(crate) type MvStore = mvcc::MvStore<mvcc::MvccClock>;
 
 pub(crate) type MvCursor = mvcc::cursor::MvccLazyCursor<mvcc::MvccClock>;
 
+fn is_memory_like(path: &str) -> bool {
+    path.starts_with(":memory:") || path.starts_with("file::memory:") || path.is_empty()
+}
+
 /// Creates a read completion for database header reads that checks for short reads.
 /// The header is always on page 1, so this function hardcodes that page index.
 fn new_header_read_completion(buf: Arc<Buffer>) -> Completion {
@@ -609,9 +613,10 @@ impl Database {
         flags: OpenFlags,
         opts: DatabaseOpts,
     ) -> OpenFlags {
-        let is_memory_like =
-            path.starts_with(":memory:") || path.starts_with("file::memory:") || path.is_empty();
-        if opts.enable_multiprocess_wal && !flags.contains(OpenFlags::ReadOnly) && !is_memory_like {
+        if opts.enable_multiprocess_wal
+            && !flags.contains(OpenFlags::ReadOnly)
+            && !is_memory_like(path)
+        {
             return flags | OpenFlags::NoLock;
         }
 
@@ -1735,56 +1740,12 @@ impl Database {
     pub(crate) fn shared_wal_coordination(
         &self,
     ) -> Result<Option<Arc<MappedSharedWalCoordination>>> {
-        let is_memory_like = |path: &str| {
-            path.starts_with(":memory:") || path.starts_with("file::memory:") || path.is_empty()
-        };
-        if !self.opts.enable_multiprocess_wal {
-            return Ok(None);
-        }
-        if !self.io.supports_shared_wal_coordination() {
-            return Ok(None);
-        }
-        if is_memory_like(&self.path) || is_memory_like(&self.wal_path) {
-            return Ok(None);
-        }
-        if !Self::path_allows_shared_wal_coordination(Path::new(&self.path))? {
-            return Ok(None);
-        }
         let shared_wal = self.shared_wal.read();
         if !shared_wal.metadata.enabled.load(Ordering::Acquire) {
             return Ok(None);
         }
         drop(shared_wal);
-
-        if let Some(authority) = self.shared_wal_coordination.get() {
-            return Ok(Some(authority.clone()));
-        }
-
-        let path = storage::wal::coordination_path_for_wal_path(&self.wal_path);
-        let authority = if self.open_flags.contains(OpenFlags::ReadOnly) {
-            let Some(authority) = MappedSharedWalCoordination::open_existing(
-                &self.io,
-                std::path::Path::new(&path),
-                64,
-            )?
-            else {
-                return Ok(None);
-            };
-            Arc::new(authority)
-        } else {
-            Arc::new(MappedSharedWalCoordination::create_or_open(
-                &self.io,
-                std::path::Path::new(&path),
-                64,
-            )?)
-        };
-        let _ = self.shared_wal_coordination.set(authority.clone());
-        Ok(Some(
-            self.shared_wal_coordination
-                .get()
-                .cloned()
-                .unwrap_or(authority),
-        ))
+        self.open_shared_wal_coordination_inner()
     }
 
     #[cfg(not(all(unix, target_pointer_width = "64")))]
@@ -1796,9 +1757,13 @@ impl Database {
     pub(crate) fn open_shared_wal_coordination_for_open(
         &self,
     ) -> Result<Option<Arc<MappedSharedWalCoordination>>> {
-        let is_memory_like = |path: &str| {
-            path.starts_with(":memory:") || path.starts_with("file::memory:") || path.is_empty()
-        };
+        self.open_shared_wal_coordination_inner()
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    fn open_shared_wal_coordination_inner(
+        &self,
+    ) -> Result<Option<Arc<MappedSharedWalCoordination>>> {
         if !self.opts.enable_multiprocess_wal {
             return Ok(None);
         }
