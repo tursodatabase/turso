@@ -280,10 +280,18 @@ pub(crate) fn unix_shared_wal_map(
         )
     };
     if ptr == libc::MAP_FAILED {
-        return Err(io_error(
-            std::io::Error::last_os_error(),
-            "mmap shared WAL coordination file",
-        ));
+        let error = std::io::Error::last_os_error();
+        let file_size = unsafe {
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if libc::fstat(fd, stat.as_mut_ptr()) == 0 {
+                stat.assume_init().st_size
+            } else {
+                -1
+            }
+        };
+        return Err(LimboError::LockingError(format!(
+            "mmap shared WAL coordination file failed: {error} (offset={offset}, len={len}, fd={fd}, file_size={file_size})"
+        )));
     }
     Ok(Box::new(UnixSharedWalMapping {
         ptr: NonNull::new(ptr.cast::<u8>()).expect("mmap returned null"),
