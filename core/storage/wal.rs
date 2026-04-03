@@ -1302,22 +1302,6 @@ impl ShmWalCoordination {
         }
     }
 
-    fn authority_frame_index_matches_local_scan(&self, max_frame: u64) -> bool {
-        let local_entries = {
-            let shared = self.shared.read();
-            let frame_cache = shared.runtime.frame_cache.lock();
-            let mut entries = Vec::with_capacity(frame_cache.len());
-            for (&page_id, frames) in frame_cache.iter() {
-                if let Some(&frame_id) = frames.iter().rfind(|&&frame_id| frame_id <= max_frame) {
-                    entries.push((page_id, frame_id));
-                }
-            }
-            entries.sort_unstable_by_key(|&(page_id, _)| page_id);
-            entries
-        };
-        self.authority.iter_latest_frames(0, max_frame) == local_entries
-    }
-
     fn repair_or_reseed_authority_from_local_disk_scan(
         &self,
         mut authority_snapshot: SharedWalCoordinationHeader,
@@ -1347,8 +1331,37 @@ impl ShmWalCoordination {
         }
         if Self::authority_matches_local_wal_scan(authority_snapshot, local_snapshot) {
             self.sync_local_from_authority(authority_snapshot);
+            // Matching header metadata is not enough to trust the durable
+            // frame index. A restart or interrupted reopen can leave stale or
+            // empty page->frame mappings behind while max_frame/checksums
+            // still match the scanned WAL. When both snapshots describe the
+            // same visible WAL generation, compare the latest per-page
+            // mappings directly and rebuild if they diverge.
             if self.authority.frame_index_overflowed()
-                || !self.authority_frame_index_matches_local_scan(local_snapshot.max_frame)
+                || (self.authority.open_mode() == SharedWalCoordinationOpenMode::Exclusive
+                    && !self.authority_frame_index_matches_local_wal_scan(local_snapshot.max_frame))
+            {
+                self.authority
+                    .discard_durable_frame_index_for_exclusive_rebuild();
+                self.sync_authority_frames_from_local();
+            }
+            return;
+        }
+        // The authority and disk scan are from the same generation (matching
+        // checkpoint_seq/salts) but disagree on max_frame or checksums. This
+        // happens when a concurrent write advances the authority between the
+        // snapshot read and the disk scan.  Or the authority is from a strictly
+        // newer generation (higher checkpoint_seq) because the WAL was
+        // restarted but the on-disk header hasn't been rewritten yet.
+        //
+        // In both cases the authority's header fields are at least as current
+        // as the disk, so adopt them.  As above, preserve the authority's
+        // frame index — it is maintained by writers and must not be replaced
+        // with a potentially incomplete reconstruction.
+        if Self::authority_is_same_or_newer_generation(authority_snapshot, local_snapshot) {
+            self.sync_local_from_authority(authority_snapshot);
+            if authority_snapshot.checkpoint_seq == local_snapshot.checkpoint_seq
+                && self.authority.frame_index_overflowed()
             {
                 self.authority
                     .discard_durable_frame_index_for_exclusive_rebuild();
@@ -1394,6 +1407,36 @@ impl ShmWalCoordination {
             && local_snapshot.salt_2 == authority_snapshot.salt_2
     }
 
+    /// The authority is from a strictly newer WAL generation (higher
+    /// checkpoint_seq), OR from the same generation with at least as many
+    /// frames.  In either case the authority's header fields were updated
+    /// atomically by writers and are at least as current as a point-in-time
+    /// disk scan of the WAL file.
+    ///
+    /// When the generations match but the authority has a *lower* max_frame,
+    /// the authority was likely rolled back or corrupted; the disk scan's
+    /// higher max_frame is more accurate, so we must NOT match here.
+    fn authority_is_same_or_newer_generation(
+        authority_snapshot: SharedWalCoordinationHeader,
+        local_snapshot: SharedWalCoordinationHeader,
+    ) -> bool {
+        if Self::authority_is_uninitialized(authority_snapshot) {
+            return false;
+        }
+        // Strictly newer generation — always trust authority.
+        if authority_snapshot.checkpoint_seq > local_snapshot.checkpoint_seq {
+            return true;
+        }
+        // Same generation: the authority is atomically updated by writers,
+        // so its max_frame is at least as current as what the disk scan
+        // observed.  Only match when authority.max_frame >= local to
+        // avoid masking a genuinely rolled-back authority.
+        authority_snapshot.checkpoint_seq == local_snapshot.checkpoint_seq
+            && authority_snapshot.salt_1 == local_snapshot.salt_1
+            && authority_snapshot.salt_2 == local_snapshot.salt_2
+            && authority_snapshot.max_frame >= local_snapshot.max_frame
+    }
+
     fn authority_matches_local_wal_scan(
         authority_snapshot: SharedWalCoordinationHeader,
         local_snapshot: SharedWalCoordinationHeader,
@@ -1405,6 +1448,11 @@ impl ShmWalCoordination {
             && authority_snapshot.salt_2 == local_snapshot.salt_2
             && authority_snapshot.checksum_1 == local_snapshot.checksum_1
             && authority_snapshot.checksum_2 == local_snapshot.checksum_2
+    }
+
+    fn authority_frame_index_matches_local_wal_scan(&self, max_frame: u64) -> bool {
+        self.authority.iter_latest_frames(0, max_frame)
+            == self.fallback.iter_latest_frames(0, max_frame)
     }
 
     fn local_zero_frame_generation_is_initialized(
@@ -3198,8 +3246,30 @@ impl Wal for WalFile {
 
         self.max_frame.store(0, Ordering::Release);
         let file = self.coordination.wal_file()?;
-        let c = sqlite3_ondisk::begin_write_wal_header(file.as_ref(), &header)?;
-        Ok(Some(c))
+        let header_c = sqlite3_ondisk::begin_write_wal_header(file.as_ref(), &header)?;
+
+        // After a RESTART or try_restart_log_before_write the WAL file may
+        // still contain orphaned frames from the previous epoch. Truncate
+        // them so that classify_authority_snapshot_against_wal does not see a
+        // length mismatch and unnecessarily fall back to a full disk scan
+        // (which can race with concurrent writers and corrupt the authority).
+        let file_size = file.size()?;
+        if file_size > WAL_HEADER_SIZE as u64 {
+            let trunc_c = file.truncate(
+                WAL_HEADER_SIZE as u64,
+                Completion::new_trunc(|res| {
+                    if let Err(err) = res {
+                        tracing::warn!("WAL truncate of orphaned frames failed: {err}");
+                    }
+                }),
+            )?;
+            let mut group = CompletionGroup::new(|_| {});
+            group.add(&header_c);
+            group.add(&trunc_c);
+            Ok(Some(group.build()))
+        } else {
+            Ok(Some(header_c))
+        }
     }
 
     fn prepare_wal_finish(&self, sync_type: FileSyncType) -> Result<Completion> {
@@ -6738,9 +6808,11 @@ pub mod test {
             header.checksum_1 = authoritative.last_checksum.0;
             header.checksum_2 = authoritative.last_checksum.1;
         }
-        let (authority, coordination_a) = make_test_shm_coordination(&shared_a, &shm_path);
-        coordination_a.cache_frame(7, 2);
-        coordination_a.cache_frame(9, 4);
+        {
+            let (_authority, coordination_a) = make_test_shm_coordination(&shared_a, &shm_path);
+            coordination_a.cache_frame(7, 2);
+            coordination_a.cache_frame(9, 4);
+        }
 
         let file_b = io
             .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
@@ -6763,7 +6835,11 @@ pub mod test {
             shared.runtime.frame_cache.lock().insert(9, vec![5]);
         }
 
-        let (_authority_b, coordination_b) = make_test_shm_coordination(&shared_b, &shm_path);
+        let (authority, coordination_b) = make_test_shm_coordination(&shared_b, &shm_path);
+        assert_eq!(
+            authority.open_mode(),
+            SharedWalCoordinationOpenMode::Exclusive
+        );
 
         let reopened = coordination_b.load_snapshot();
         assert_eq!(reopened.max_frame, authoritative.max_frame);
