@@ -1284,8 +1284,18 @@ impl Func {
             "length" => Ok(Some(Self::Scalar(ScalarFunc::Length))),
             "octet_length" => Ok(Some(Self::Scalar(ScalarFunc::OctetLength))),
             "sign" => Ok(Some(Self::Scalar(ScalarFunc::Sign))),
-            "substr" => Ok(Some(Self::Scalar(ScalarFunc::Substr))),
-            "substring" => Ok(Some(Self::Scalar(ScalarFunc::Substring))),
+            "substr" => {
+                if arg_count != 2 && arg_count != 3 {
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+                Ok(Some(Self::Scalar(ScalarFunc::Substr)))
+            }
+            "substring" => {
+                if arg_count != 2 && arg_count != 3 {
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+                Ok(Some(Self::Scalar(ScalarFunc::Substring)))
+            }
             "date" => Ok(Some(Self::Scalar(ScalarFunc::Date))),
             "time" => Ok(Some(Self::Scalar(ScalarFunc::Time))),
             "datetime" => Ok(Some(Self::Scalar(ScalarFunc::DateTime))),
