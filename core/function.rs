@@ -1263,8 +1263,18 @@ impl Func {
             "json_group_object" => Ok(Some(Self::Agg(AggFunc::JsonGroupObject))),
             "char" => Ok(Some(Self::Scalar(ScalarFunc::Char))),
             "coalesce" => Ok(Some(Self::Scalar(ScalarFunc::Coalesce))),
-            "concat" => Ok(Some(Self::Scalar(ScalarFunc::Concat))),
-            "concat_ws" => Ok(Some(Self::Scalar(ScalarFunc::ConcatWs))),
+            "concat" => {
+                if arg_count == 0 {
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+                Ok(Some(Self::Scalar(ScalarFunc::Concat)))
+            }
+            "concat_ws" => {
+                if arg_count < 2 {
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+                Ok(Some(Self::Scalar(ScalarFunc::ConcatWs)))
+            }
             "changes" => Ok(Some(Self::Scalar(ScalarFunc::Changes))),
             "total_changes" => Ok(Some(Self::Scalar(ScalarFunc::TotalChanges))),
             "glob" => Ok(Some(Self::Scalar(ScalarFunc::Glob))),
