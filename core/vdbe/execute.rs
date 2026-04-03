@@ -7453,6 +7453,32 @@ pub fn op_function(
                     }
                 }
             }
+            // Untyped WASM path: handles WASM UDFs without a turso_sig section
+            // (e.g. plain C extensions compiled to WASM). UDFs with a typed
+            // signature use the dedicated WasmFunction instruction instead.
+            ExtFunc::Wasm {
+                ref name, ref sig, ..
+            } => {
+                let wasm_runtime =
+                    program.connection.db.wasm_runtime.as_ref().ok_or_else(|| {
+                        LimboError::InternalError(
+                            "no WASM runtime registered. Install a runtime (e.g. turso_wasm_wasmtime)."
+                                .to_string(),
+                        )
+                    })?;
+                let instance = state
+                    .wasm_instance_cache
+                    .get_or_create(name, || wasm_runtime.create_instance(name))?;
+                let value = crate::wasm::wasm_call_from_regs(
+                    instance,
+                    &state.registers,
+                    *start_reg,
+                    arg_count,
+                    sig.as_ref(),
+                )?;
+                state.metrics.wasm_instructions += instance.last_fuel_consumed();
+                state.registers[*dest].set_value(value);
+            }
             _ => unreachable!("aggregate called in scalar context"),
         },
         crate::function::Func::Math(math_func) => match math_func.arity() {
@@ -8205,6 +8231,43 @@ pub fn op_function(
             unreachable!("Window functions should not be handled here")
         }
     }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_wasm_function(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        WasmFunction {
+            func_name,
+            arg_count: _,
+            start_reg,
+            dest,
+            sig,
+        },
+        insn
+    );
+    let wasm_runtime = program.connection.db.wasm_runtime.as_ref().ok_or_else(|| {
+        LimboError::InternalError(
+            "no WASM runtime registered. Install a runtime (e.g. turso_wasm_wasmtime).".to_string(),
+        )
+    })?;
+    let instance = state
+        .wasm_instance_cache
+        .get_or_create(func_name, || wasm_runtime.create_instance(func_name))?;
+    let value = crate::wasm::wasm_call_from_regs(
+        instance,
+        &state.registers,
+        *start_reg,
+        0, // unused when sig is present
+        Some(sig),
+    )?;
+    state.metrics.wasm_instructions += instance.last_fuel_consumed();
+    state.registers[*dest].set_value(value);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -10099,6 +10162,230 @@ pub fn op_add_type(
     }
     let conn = program.connection.clone();
     conn.with_schema_mut(|schema| schema.add_type_from_sql(sql))?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_drop_function(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(DropFunction { db, function_name }, insn);
+    if *db == crate::TEMP_DB_ID {
+        return Err(crate::LimboError::InternalError(
+            "dropping WASM functions from temp databases is not supported".into(),
+        ));
+    }
+    if crate::is_attached_db(*db) {
+        return Err(crate::LimboError::InternalError(
+            "dropping WASM functions from attached databases is not supported".into(),
+        ));
+    }
+    let conn = program.connection.clone();
+    conn.with_schema_mut(|schema| {
+        schema.remove_function(function_name);
+        Ok::<(), crate::LimboError>(())
+    })?;
+    if let Some(ref runtime) = conn.db.wasm_runtime {
+        runtime.remove_module(function_name);
+    }
+    // Remove from symbol table (both per-connection and shared)
+    conn.syms.write().functions.remove(function_name.as_str());
+    conn.db
+        .builtin_syms
+        .write()
+        .functions
+        .remove(function_name.as_str());
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_add_function(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        AddFunction {
+            db,
+            name,
+            language,
+            wasm_blob,
+            export_name
+        },
+        insn
+    );
+    if *db == crate::TEMP_DB_ID {
+        return Err(crate::LimboError::InternalError(
+            "creating WASM functions in temp databases is not supported".into(),
+        ));
+    }
+    if crate::is_attached_db(*db) {
+        return Err(crate::LimboError::InternalError(
+            "creating WASM functions in attached databases is not supported".into(),
+        ));
+    }
+    let conn = program.connection.clone();
+
+    let func_def = Arc::new(crate::schema::FunctionDef {
+        name: name.clone(),
+        language: language.clone(),
+        wasm_blob: wasm_blob.clone(),
+        export_name: export_name.clone(),
+    });
+    conn.with_schema_mut(|schema| {
+        schema
+            .function_registry
+            .insert(name.to_lowercase(), func_def.clone());
+    });
+
+    let runtime = conn.db.wasm_runtime.as_ref().ok_or_else(|| {
+        crate::LimboError::InternalError(
+            "no WASM runtime registered. Install a runtime (e.g. turso_wasm_wasmtime).".to_string(),
+        )
+    })?;
+    crate::wasm::compile_and_register_wasm_func(runtime.as_ref(), &conn.syms, &func_def)?;
+
+    // Also register in db.builtin_syms so new connections inherit the function.
+    // compile_and_register_wasm_func already compiled the module into the shared
+    // runtime, so we only need the metadata (name, narg, sig) in builtin_syms.
+    {
+        let export = func_def.export_name.as_deref().unwrap_or(&func_def.name);
+        let sig = crate::wasm::parse_sig_from_wasm(&func_def.wasm_blob, export);
+        let narg = sig.as_ref().map_or_else(
+            || crate::wasm::parse_narg_from_wasm(&func_def.wasm_blob, export).unwrap_or(-1),
+            |s| s.param_types.len() as i32,
+        );
+        conn.db
+            .builtin_syms
+            .write()
+            .register_wasm_func(func_def.name.clone(), narg, sig);
+    }
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_add_extension(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        AddExtension {
+            db,
+            name,
+            language,
+            wasm_blob
+        },
+        insn
+    );
+    if *db == crate::TEMP_DB_ID {
+        return Err(crate::LimboError::InternalError(
+            "creating WASM extensions in temp databases is not supported".into(),
+        ));
+    }
+    if crate::is_attached_db(*db) {
+        return Err(crate::LimboError::InternalError(
+            "creating WASM extensions in attached databases is not supported".into(),
+        ));
+    }
+
+    if !language.eq_ignore_ascii_case("wasm") {
+        return Err(crate::LimboError::InternalError(format!(
+            "unsupported extension language: {language}"
+        )));
+    }
+
+    let conn = program.connection.clone();
+    let runtime = conn.db.wasm_runtime.as_ref().ok_or_else(|| {
+        crate::LimboError::InternalError(
+            "no WASM runtime registered. Install a runtime (e.g. turso_wasm_wasmtime).".to_string(),
+        )
+    })?;
+
+    let regs = crate::wasm::compile_and_register_wasm_extension(runtime, &conn.syms, wasm_blob)?;
+
+    // Also register extension functions in db.builtin_syms so new connections
+    // inherit them without needing WASM loading in refresh_schema.
+    {
+        let mut builtin = conn.db.builtin_syms.write();
+        for func_name in &regs.func_names {
+            builtin.register_wasm_func(func_name.clone(), -1, None);
+        }
+    }
+
+    conn.with_schema_mut(|schema| {
+        // Register each function from the extension
+        for func_name in &regs.func_names {
+            let func_def = crate::schema::FunctionDef {
+                name: func_name.clone(),
+                language: language.clone(),
+                wasm_blob: wasm_blob.clone(),
+                export_name: Some(func_name.clone()),
+            };
+            schema
+                .function_registry
+                .insert(func_name.to_lowercase(), std::sync::Arc::new(func_def));
+        }
+
+        let ext_def = crate::schema::ExtensionDef {
+            name: name.clone(),
+            language: language.clone(),
+            wasm_blob: wasm_blob.clone(),
+            functions: regs.func_names,
+            types: regs.type_names,
+            vtabs: regs.vtab_names,
+        };
+        schema
+            .extension_registry
+            .insert(name.to_lowercase(), std::sync::Arc::new(ext_def));
+    });
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_drop_extension(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(DropExtension { db, extension_name }, insn);
+    if *db == crate::TEMP_DB_ID {
+        return Err(crate::LimboError::InternalError(
+            "dropping WASM extensions from temp databases is not supported".into(),
+        ));
+    }
+    if crate::is_attached_db(*db) {
+        return Err(crate::LimboError::InternalError(
+            "dropping WASM extensions from attached databases is not supported".into(),
+        ));
+    }
+    let conn = program.connection.clone();
+
+    // Remove from schema and get the list of registered resources
+    let ext = conn.with_schema_mut(|schema| schema.remove_extension(extension_name));
+
+    if let Some(ext) = ext {
+        conn.syms.write().remove_extension_resources(
+            &ext.functions,
+            &ext.vtabs,
+            conn.db.wasm_runtime.as_ref(),
+        );
+        // Also remove from shared builtin_syms
+        conn.db.builtin_syms.write().remove_extension_resources(
+            &ext.functions,
+            &ext.vtabs,
+            None, // runtime modules already removed above
+        );
+    }
+
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

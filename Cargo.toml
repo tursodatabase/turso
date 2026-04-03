@@ -41,9 +41,18 @@ members = [
     "testing/differential-oracle/sql_gen_prop",
     "testing/differential-oracle/sql_gen",
     "testing/differential-oracle/fuzzer",
-    "testing/sqltests"
+    "testing/sqltests",
+    "wasm-runtime-wasmtime",
+    "bindings/wasm-runtime-wasmtime",
+    "wasm-sdk/turso-wasm-sdk",
+    "wasm-sdk/turso-wasm-sdk-macros",
 ]
-exclude = ["perf/latency/limbo"]
+exclude = [
+    "perf/latency/limbo",
+    "wasm-sdk/examples/rust",
+    "wasm-sdk/examples/geo-extension",
+    "wasm-sdk/examples/bench-extension",
+]
 
 default-members = [
     "bindings/java",
@@ -105,6 +114,7 @@ turso_sync_engine = { path = "sync/engine", version = "0.6.0-pre.15" }
 turso_ext = { path = "extensions/core", version = "0.6.0-pre.15" }
 turso_macros = { path = "macros", version = "0.6.0-pre.15" }
 turso_parser = { path = "parser", version = "0.6.0-pre.15" }
+turso_wasm_wasmtime = { path = "wasm-runtime-wasmtime", version = "0.6.0-pre.15" }
 sql_generation = { path = "sql_generation" }
 turso-dbhash = { path = "tools/dbhash" }
 strum = { version = "0.26", features = ["derive"] }

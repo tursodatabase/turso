@@ -1,0 +1,103 @@
+---
+title: CREATE FUNCTION / DROP FUNCTION
+description: Register and remove WASM user-defined functions (UDFs).
+---
+
+## CREATE FUNCTION
+
+Registers a WebAssembly user-defined function.
+
+### Syntax
+
+```sql
+CREATE FUNCTION name LANGUAGE wasm AS X'<hex>' EXPORT 'export_name';
+
+-- Idempotent creation
+CREATE FUNCTION IF NOT EXISTS name LANGUAGE wasm AS X'<hex>' EXPORT 'export_name';
+
+-- Replace existing
+CREATE OR REPLACE FUNCTION name LANGUAGE wasm AS X'<hex>' EXPORT 'export_name';
+```
+
+The WASM binary is provided as a hex blob literal (`X'...'`). In the Turso CLI, you can
+use `file://` to load from disk:
+
+```sql
+-- CLI only: reads the file and substitutes the blob automatically
+CREATE FUNCTION name LANGUAGE wasm AS file:///path/to/module.wasm EXPORT 'export_name';
+
+-- Paths with spaces use single quotes after file://
+CREATE FUNCTION name LANGUAGE wasm AS file://'path with spaces/module.wasm' EXPORT 'export_name';
+```
+
+### Parameters
+
+| Parameter | Description |
+|-----------|-------------|
+| `name` | The SQL function name used in queries |
+| `LANGUAGE` | `wasm` for precompiled WASM binary |
+| `AS` | WASM binary as hex blob `X'...'`, or `file://path` in the CLI |
+| `EXPORT` | The exported function name inside the WASM module |
+
+### WASM module requirements
+
+WASM modules must export:
+
+- **`memory`** — a WebAssembly memory (at least 2 pages / 128 KB)
+- **`turso_malloc(size: i32) → i32`** — a bump allocator returning a pointer
+- **The UDF function** — `(argc: i32, argv: i32) → i64`, specified by the `EXPORT` clause
+
+### ABI encoding
+
+Arguments are passed as an array of `i64` slots at the `argv` pointer. Each slot contains either a raw integer value or a pointer to tagged data in WASM memory.
+
+| Tag byte | Type | Layout |
+|----------|------|--------|
+| `0x01` | INTEGER | `[tag][8-byte LE i64]` |
+| `0x02` | REAL | `[tag][8-byte LE f64]` |
+| `0x03` | TEXT | `[tag][UTF-8 bytes][0x00]` |
+| `0x04` | BLOB | `[tag][4-byte LE size][data]` |
+| `0x05` | NULL | `[tag]` |
+
+Integer and float arguments are passed as raw i64 values in the argv slot (not pointers). Text, blob, and null values are allocated via `turso_malloc` and the slot contains the pointer.
+
+The return value follows the same convention: return a raw i64 for integers, or a pointer to tagged data for other types.
+
+### Execution model
+
+- UDFs execute **synchronously** with a **2 second wall-clock timeout**. Functions exceeding 2 seconds are terminated and return an error.
+- Fuel-based instruction counting is available via statement metrics (`wasm_instructions`).
+- A WASM runtime must be registered on the database for UDF support. Without one, `CREATE FUNCTION` returns an error.
+
+### Examples
+
+```sql
+-- Register from inline binary
+CREATE FUNCTION add2 LANGUAGE wasm AS X'0061736d...' EXPORT 'add';
+
+-- Use in queries
+SELECT add2(40, 2);  -- returns 42
+
+-- CLI: register from file
+CREATE FUNCTION hash_fn LANGUAGE wasm AS file://./hash.wasm EXPORT 'sha256';
+```
+
+## DROP FUNCTION
+
+Removes a previously registered WASM user-defined function.
+
+### Syntax
+
+```sql
+DROP FUNCTION name;
+DROP FUNCTION IF EXISTS name;
+```
+
+`DROP FUNCTION` without `IF EXISTS` returns an error if the function does not exist.
+
+### Examples
+
+```sql
+DROP FUNCTION add2;
+DROP FUNCTION IF EXISTS nonexistent;  -- no error
+```

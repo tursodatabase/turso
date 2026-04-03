@@ -1,0 +1,23 @@
+{
+  "name": "@tursodatabase/wasm-runtime-wasmtime",
+  "version": "0.6.0-pre.13",
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "scripts": {
+    "napi-build": "napi build --platform --profile release-official --esm --manifest-path ../../../wasm-runtime-wasmtime/Cargo.toml --output-dir .",
+    "build": "npm run napi-build"
+  },
+  "napi": {
+    "binaryName": "turso-wasm-wasmtime",
+    "targets": [
+      "x86_64-unknown-linux-gnu",
+      "x86_64-pc-windows-msvc",
+      "aarch64-apple-darwin",
+      "aarch64-unknown-linux-gnu"
+    ]
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.1.5"
+  }
+}

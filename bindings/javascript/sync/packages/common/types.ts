@@ -134,6 +134,11 @@ export interface DatabaseOpts {
         /* optional parameter which makes sync engine to prefetch pages which probably will be accessed soon */
         prefetch?: boolean,
     }
+    /**
+     * optional WASM runtime for executing user-defined functions (unstable, subject to change)
+     * pass any truthy value to enable the built-in Node.js WebAssembly runtime
+     */
+    unstableWasmRuntime?: unknown;
 }
 export interface DatabaseStats {
     /**

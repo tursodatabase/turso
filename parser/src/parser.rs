@@ -941,8 +941,20 @@ impl<'a> Parser<'a> {
             TK_UNIQUE,
             TK_TRIGGER,
             TK_MATERIALIZED,
-            TK_TYPE
+            TK_TYPE,
+            TK_FUNCTION,
+            TK_EXTENSION,
+            TK_OR
         );
+
+        // Handle CREATE OR REPLACE FUNCTION
+        if first_tok.token_type == TK_OR {
+            eat_assert!(self, TK_OR);
+            eat_expect!(self, TK_REPLACE);
+            eat_expect!(self, TK_FUNCTION);
+            return self.parse_create_function(true);
+        }
+
         let mut temp = false;
         if first_tok.token_type == TK_TEMP {
             eat_assert!(self, TK_TEMP);
@@ -958,6 +970,14 @@ impl<'a> Parser<'a> {
             TK_VIRTUAL => self.parse_create_virtual(),
             TK_INDEX | TK_UNIQUE => self.parse_create_index(),
             TK_TYPE => self.parse_create_type(),
+            TK_FUNCTION => {
+                eat_assert!(self, TK_FUNCTION);
+                self.parse_create_function(false)
+            }
+            TK_EXTENSION => {
+                eat_assert!(self, TK_EXTENSION);
+                self.parse_create_extension()
+            }
             _ => unreachable!(),
         }
     }
@@ -4467,9 +4487,117 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parse `CREATE [OR REPLACE] FUNCTION [IF NOT EXISTS] name
+    ///     LANGUAGE wasm AS <string_or_blob> [EXPORT <string>]`
+    ///
+    /// Called after FUNCTION has already been consumed.
+    /// `or_replace` indicates whether OR REPLACE was present before FUNCTION.
+    fn parse_create_function(&mut self, or_replace: bool) -> Result<Stmt> {
+        let if_not_exists = if or_replace {
+            false
+        } else {
+            self.parse_if_not_exists()?
+        };
+
+        // Parse function name (accepts identifiers and non-reserved keywords)
+        let name = self.parse_nm()?.as_str().to_owned();
+
+        // Parse LANGUAGE <identifier>
+        eat_expect!(self, TK_LANGUAGE);
+        let lang_tok = self.eat()?;
+        let language = match lang_tok {
+            Some(tok) if tok.token_type == TK_ID => from_bytes(tok.as_bytes()).to_lowercase(),
+            _ => return Err(Error::ParseError("expected language name".to_owned())),
+        };
+
+        // Parse AS X'<hex_blob>'
+        eat_expect!(self, TK_AS);
+        let wasm_blob = {
+            let blob_tok = eat_expect!(self, TK_BLOB);
+            let hex = from_bytes(blob_tok.as_bytes());
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| {
+                    u8::from_str_radix(&hex[i..i + 2], 16)
+                        .map_err(|_| Error::ParseError("invalid hex in blob".to_owned()))
+                })
+                .collect::<std::result::Result<Vec<u8>, _>>()?
+        };
+
+        // Parse optional EXPORT <string>
+        let export_name = match self.peek()? {
+            Some(tok) if tok.token_type == TK_EXPORT => {
+                eat_assert!(self, TK_EXPORT);
+                let export_tok = eat_expect!(self, TK_STRING);
+                let raw = from_bytes(export_tok.as_bytes());
+                let name = raw
+                    .strip_prefix('\'')
+                    .and_then(|s| s.strip_suffix('\''))
+                    .unwrap_or(&raw)
+                    .to_owned();
+                Some(name)
+            }
+            _ => None,
+        };
+
+        Ok(Stmt::CreateFunction {
+            or_replace,
+            if_not_exists,
+            name,
+            language,
+            wasm_blob,
+            export_name,
+        })
+    }
+
+    fn parse_create_extension(&mut self) -> Result<Stmt> {
+        let if_not_exists = self.parse_if_not_exists()?;
+
+        // Parse extension name
+        let name = self.parse_nm()?.as_str().to_owned();
+
+        // Parse LANGUAGE <identifier>
+        eat_expect!(self, TK_LANGUAGE);
+        let lang_tok = self.eat()?;
+        let language = match lang_tok {
+            Some(tok) if tok.token_type == TK_ID => from_bytes(tok.as_bytes()).to_lowercase(),
+            _ => return Err(Error::ParseError("expected language name".to_owned())),
+        };
+
+        // Parse AS X'<hex_blob>'
+        eat_expect!(self, TK_AS);
+        let wasm_blob = {
+            let blob_tok = eat_expect!(self, TK_BLOB);
+            let hex = from_bytes(blob_tok.as_bytes());
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| {
+                    u8::from_str_radix(&hex[i..i + 2], 16)
+                        .map_err(|_| Error::ParseError("invalid hex in blob".to_owned()))
+                })
+                .collect::<std::result::Result<Vec<u8>, _>>()?
+        };
+
+        Ok(Stmt::CreateExtension {
+            if_not_exists,
+            name,
+            language,
+            wasm_blob,
+        })
+    }
+
     fn parse_drop_stmt(&mut self) -> Result<Stmt> {
         eat_assert!(self, TK_DROP);
-        let tok = peek_expect!(self, TK_TABLE, TK_INDEX, TK_TRIGGER, TK_VIEW, TK_TYPE);
+        let tok = peek_expect!(
+            self,
+            TK_TABLE,
+            TK_INDEX,
+            TK_TRIGGER,
+            TK_VIEW,
+            TK_TYPE,
+            TK_FUNCTION,
+            TK_EXTENSION
+        );
 
         match tok.token_type {
             TK_TABLE => {
@@ -4520,6 +4648,26 @@ impl<'a> Parser<'a> {
                     if_exists,
                     type_name,
                 })
+            }
+            TK_FUNCTION => {
+                eat_assert!(self, TK_FUNCTION);
+                let if_exists = self.parse_if_exists()?;
+                let name_tok = self.eat()?;
+                let name = match name_tok {
+                    Some(tok) if tok.token_type == TK_ID => from_bytes(tok.as_bytes()),
+                    _ => return Err(Error::ParseError("expected function name".to_owned())),
+                };
+                Ok(Stmt::DropFunction { if_exists, name })
+            }
+            TK_EXTENSION => {
+                eat_assert!(self, TK_EXTENSION);
+                let if_exists = self.parse_if_exists()?;
+                let name_tok = self.eat()?;
+                let name = match name_tok {
+                    Some(tok) if tok.token_type == TK_ID => from_bytes(tok.as_bytes()),
+                    _ => return Err(Error::ParseError("expected extension name".to_owned())),
+                };
+                Ok(Stmt::DropExtension { if_exists, name })
             }
             _ => unreachable!(),
         }

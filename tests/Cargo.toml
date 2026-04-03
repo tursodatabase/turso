@@ -39,6 +39,8 @@ turso_parser = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tracing = { workspace = true }
 turso-dbhash.workspace = true
+wat = { version = "1", optional = true }
+turso_wasm_wasmtime = { workspace = true, optional = true }
 
 [dev-dependencies]
 similar-asserts.workspace = true
@@ -53,3 +55,4 @@ test_helper = ["turso_core/test_helper"]
 fts = ["turso_core/fts"]
 io_uring = ["turso_core/io_uring"]
 win_iocp = ["turso_core/experimental_win_iocp"]
+wasm-udf = ["dep:wat", "dep:turso_wasm_wasmtime", "turso_core/wasm-udf"]

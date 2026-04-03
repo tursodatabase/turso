@@ -95,7 +95,8 @@ class Database extends DatabasePromise {
             bootstrapIfEmpty: typeof opts.url != "function" || opts.url() != null,
             remoteEncryptionCipher: opts.remoteEncryption?.cipher,
             remoteEncryptionKey: opts.remoteEncryption?.key,
-            partialSyncOpts: partialSyncOpts
+            partialSyncOpts: partialSyncOpts,
+            unstableWasmRuntime: opts.unstableWasmRuntime,
         });
 
         let headers: { [K: string]: string } | (() => Promise<{ [K: string]: string }>);

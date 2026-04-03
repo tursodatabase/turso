@@ -9,6 +9,7 @@
   "workspaces": [
     "packages/common",
     "packages/wasm-common",
+    "packages/wasm-runtime-wasmtime",
     "packages/native",
     "packages/wasm",
     "sync/packages/common",

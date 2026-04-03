@@ -101,6 +101,11 @@ pub struct Opts {
         help = "Enable unsafe testing features (e.g. sqlite_dbpage writes)"
     )]
     pub unsafe_testing: bool,
+    #[clap(
+        long,
+        help = "Enable unstable WASM user-defined functions and extensions"
+    )]
+    pub unstable_wasm: bool,
 }
 
 const PROMPT: &str = "turso> ";
@@ -225,7 +230,7 @@ impl Limbo {
             .as_ref()
             .map_or(":memory:".to_string(), |p| p.to_string_lossy().to_string());
 
-        let db_opts = turso_core::DatabaseOpts::new()
+        let mut db_opts = turso_core::DatabaseOpts::new()
             .with_views(opts.experimental_views)
             .with_custom_types(opts.experimental_custom_types)
             .with_encryption(opts.experimental_encryption)
@@ -234,6 +239,13 @@ impl Limbo {
             .with_attach(opts.experimental_attach)
             .with_generated_columns(opts.experimental_generated_columns)
             .with_unsafe_testing(opts.unsafe_testing);
+
+        // Inject wasmtime WASM runtime for UDF support (unstable feature)
+        if opts.unstable_wasm {
+            if let Ok(runtime) = turso_wasm_wasmtime::WasmtimeRuntime::new() {
+                db_opts = db_opts.with_unstable_wasm_runtime(std::sync::Arc::new(runtime));
+            }
+        }
 
         let db_file = normalize_db_path(db_file);
 
@@ -533,6 +545,17 @@ impl Limbo {
         if echo {
             let _ = self.writeln(input);
         }
+
+        // Expand file:// URLs to inline X'hex' blobs before the parser sees them.
+        let input = match expand_file_urls(input) {
+            Ok(expanded) => expanded,
+            Err(e) => {
+                let _ = self.writeln(format!("Error: {e}"));
+                self.had_query_error = true;
+                return;
+            }
+        };
+        let input = input.as_ref();
 
         let start = Instant::now();
         let mut stats = if self.opts.timer {
@@ -1784,8 +1807,11 @@ impl Limbo {
         if let Some(mut rows) = conn.query(q_tables)? {
             rows.run_with_row_callback(|row| {
                 let name: &str = row.get::<&str>(0)?;
-                // Skip sqlite_sequence and internal types metadata table
-                if name == "sqlite_sequence" || name == turso_core::schema::TURSO_TYPES_TABLE_NAME {
+                // Skip sqlite_sequence and internal metadata tables
+                if name == "sqlite_sequence"
+                    || name == turso_core::schema::TURSO_TYPES_TABLE_NAME
+                    || name == turso_core::schema::TURSO_WASM_TABLE_NAME
+                {
                     return Ok(());
                 }
                 let ddl: &str = row.get::<&str>(1)?;
@@ -1796,6 +1822,7 @@ impl Limbo {
             })?;
         }
         Self::dump_sqlite_sequence(&conn, out)?;
+        Self::dump_wasm(&conn, out)?;
         Self::dump_schema_objects(&conn, out, &mut progress)?;
         Self::exec_all_conn(&conn, "COMMIT")?;
         writeln!(out, "COMMIT;")?;
@@ -1878,6 +1905,35 @@ impl Limbo {
         let q = format!(
             "SELECT sql FROM {} ORDER BY rowid",
             turso_core::schema::TURSO_TYPES_TABLE_NAME
+        );
+        if let Some(mut rows) = conn.query(&q)? {
+            rows.run_with_row_callback(|row| {
+                let sql: &str = row.get::<&str>(0)?;
+                writeln!(out, "{sql};").map_err(|e| io_error(e, "write"))?;
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    fn dump_wasm<W: Write>(conn: &Arc<Connection>, out: &mut W) -> anyhow::Result<()> {
+        let check = format!(
+            "SELECT 1 FROM sqlite_schema WHERE name='{}' AND type='table'",
+            turso_core::schema::TURSO_WASM_TABLE_NAME
+        );
+        let mut has_table = false;
+        if let Some(mut rows) = conn.query(&check)? {
+            rows.run_with_row_callback(|_| {
+                has_table = true;
+                Ok(())
+            })?;
+        }
+        if !has_table {
+            return Ok(());
+        }
+        let q = format!(
+            "SELECT sql FROM {} ORDER BY rowid",
+            turso_core::schema::TURSO_WASM_TABLE_NAME
         );
         if let Some(mut rows) = conn.query(&q)? {
             rows.run_with_row_callback(|row| {
@@ -2340,6 +2396,53 @@ fn normalize_db_path(db_file: String) -> String {
     db_file
 }
 
+/// Replace every `file://` reference in SQL input with an inline `X'hex'` blob.
+///
+/// Supported forms:
+///   file:///absolute/path.wasm          — bare path, ends at whitespace or `;`
+///   file://relative/path.wasm           — bare path (no leading `/`)
+///   file://'path with spaces/m.wasm'    — single-quoted path
+///
+/// The CLI reads the file and substitutes the entire `file://...` token with
+/// `X'<hex>'` so the SQL parser only ever sees a blob literal.
+fn expand_file_urls(input: &str) -> Result<std::borrow::Cow<'_, str>, String> {
+    const PREFIX: &str = "file://";
+    if !input.contains(PREFIX) {
+        return Ok(std::borrow::Cow::Borrowed(input));
+    }
+
+    let mut result = String::with_capacity(input.len());
+    let mut rest = input;
+
+    while let Some(start) = rest.find(PREFIX) {
+        result.push_str(&rest[..start]);
+        let after_prefix = &rest[start + PREFIX.len()..];
+
+        let (path, consumed) = if let Some(after_quote) = after_prefix.strip_prefix('\'') {
+            // Quoted: file://'some path.wasm'
+            match after_quote.find('\'') {
+                Some(end) => (&after_quote[..end], PREFIX.len() + 1 + end + 1),
+                None => return Err("unterminated quote in file:// path".to_string()),
+            }
+        } else {
+            // Bare: file:///path/to/file.wasm  or  file://relative.wasm
+            let end = after_prefix
+                .find(|c: char| c.is_whitespace() || c == ';')
+                .unwrap_or(after_prefix.len());
+            (&after_prefix[..end], PREFIX.len() + end)
+        };
+
+        let bytes = std::fs::read(path).map_err(|e| format!("failed to read '{path}': {e}"))?;
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        result.push_str(&format!("X'{hex}'"));
+
+        rest = &rest[start + consumed..];
+    }
+    result.push_str(rest);
+
+    Ok(std::borrow::Cow::Owned(result))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2409,5 +2512,67 @@ mod tests {
             normalize_db_path("foo.bar?mode=ro?mode=ro".into()),
             "file:foo.bar%3Fmode=ro?mode=ro"
         );
+    }
+
+    #[test]
+    fn test_expand_file_urls_no_urls() {
+        let input = "SELECT 1; CREATE FUNCTION foo LANGUAGE wasm AS X'00' EXPORT 'bar'";
+        let result = expand_file_urls(input).unwrap();
+        assert_eq!(result.as_ref(), input);
+    }
+
+    #[test]
+    fn test_expand_file_urls_bare_path() {
+        let dir = std::env::temp_dir().join("turso_test_expand_bare");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.wasm");
+        std::fs::write(&path, [0x00, 0x61, 0x73, 0x6d]).unwrap();
+
+        let input = format!(
+            "CREATE FUNCTION f LANGUAGE wasm AS file://{} EXPORT 'e'",
+            path.display()
+        );
+        let result = expand_file_urls(&input).unwrap();
+        assert_eq!(
+            result.as_ref(),
+            "CREATE FUNCTION f LANGUAGE wasm AS X'0061736d' EXPORT 'e'"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_expand_file_urls_quoted_path() {
+        let dir = std::env::temp_dir().join("turso_test_expand_quoted");
+        let sub = dir.join("has spaces");
+        let _ = std::fs::create_dir_all(&sub);
+        let path = sub.join("test.wasm");
+        std::fs::write(&path, [0xde, 0xad]).unwrap();
+
+        let input = format!(
+            "CREATE FUNCTION f LANGUAGE wasm AS file://'{}' EXPORT 'e'",
+            path.display()
+        );
+        let result = expand_file_urls(&input).unwrap();
+        assert_eq!(
+            result.as_ref(),
+            "CREATE FUNCTION f LANGUAGE wasm AS X'dead' EXPORT 'e'"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_expand_file_urls_missing_file() {
+        let result = expand_file_urls("AS file:///no/such/file.wasm");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("failed to read"));
+    }
+
+    #[test]
+    fn test_expand_file_urls_unterminated_quote() {
+        let result = expand_file_urls("AS file://'unterminated");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unterminated quote"));
     }
 }

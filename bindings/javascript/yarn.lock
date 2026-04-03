@@ -1676,6 +1676,14 @@ __metadata:
   languageName: unknown
   linkType: soft
 
+"@tursodatabase/wasm-runtime-wasmtime@workspace:packages/wasm-runtime-wasmtime":
+  version: 0.0.0-use.local
+  resolution: "@tursodatabase/wasm-runtime-wasmtime@workspace:packages/wasm-runtime-wasmtime"
+  dependencies:
+    "@napi-rs/cli": "npm:^3.1.5"
+  languageName: unknown
+  linkType: soft
+
 "@tybys/wasm-util@npm:^0.10.1":
   version: 0.10.1
   resolution: "@tybys/wasm-util@npm:0.10.1"

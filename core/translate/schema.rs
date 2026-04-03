@@ -1,7 +1,8 @@
 use crate::sync::Arc;
 
-use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
+#[cfg(feature = "wasm-udf")]
+use crate::schema::TURSO_WASM_TABLE_NAME;
 use crate::schema::{
     create_table, translate_ident_to_string_literal, BTreeTable, ColDef, Column, SchemaObjectType,
     Table, Type, RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
@@ -1292,7 +1293,10 @@ fn create_table_body_to_str(
     Ok(sql)
 }
 
-fn create_vtable_body_to_str(vtab: &ast::CreateVirtualTable, module: Arc<VTabImpl>) -> String {
+fn create_vtable_sql(
+    vtab: &ast::CreateVirtualTable,
+    impl_kind: &crate::ext::VTabImplKind,
+) -> String {
     let args = vtab
         .args
         .iter()
@@ -1309,18 +1313,20 @@ fn create_vtable_body_to_str(vtab: &ast::CreateVirtualTable, module: Arc<VTabImp
         .iter()
         .map(|a| turso_ext::Value::from_text(a.to_string()))
         .collect::<Vec<_>>();
-    let schema = module
-        .implementation
+    let schema_comment = impl_kind
         .create_schema(ext_args)
+        .map(|schema| {
+            let vtab_args = if let Some(first_paren) = schema.find('(') {
+                let closing_paren = schema.rfind(')').unwrap_or_default();
+                schema[first_paren..=closing_paren].to_string()
+            } else {
+                "()".to_string()
+            };
+            format!("\n /*{}{}*/", vtab.tbl_name.name.as_ident(), vtab_args)
+        })
         .unwrap_or_default();
-    let vtab_args = if let Some(first_paren) = schema.find('(') {
-        let closing_paren = schema.rfind(')').unwrap_or_default();
-        &schema[first_paren..=closing_paren]
-    } else {
-        "()"
-    };
     format!(
-        "CREATE VIRTUAL TABLE {} {} USING {}{}\n /*{}{}*/",
+        "CREATE VIRTUAL TABLE {} {} USING {}{}{}",
         vtab.tbl_name.name.as_ident(),
         if_not_exists,
         vtab.module_name.as_ident(),
@@ -1329,8 +1335,7 @@ fn create_vtable_body_to_str(vtab: &ast::CreateVirtualTable, module: Arc<VTabImp
         } else {
             format!("({args})")
         },
-        vtab.tbl_name.name.as_ident(),
-        vtab_args
+        schema_comment,
     )
 }
 
@@ -1353,12 +1358,14 @@ pub fn translate_create_virtual_table(
     let table_name = tbl_name.name.as_str().to_string();
     let module_name_str = module_name.as_str().to_string();
     let args_vec = args.clone();
+
     let Some(vtab_module) = resolver.symbol_table.vtab_modules.get(&module_name_str) else {
         bail_parse_error!("no such module: {}", module_name_str);
     };
     if !vtab_module.module_kind.eq(&VTabKind::VirtualTable) {
         bail_parse_error!("module {} is not a virtual table", module_name_str);
     };
+    let vtab_module = vtab_module.clone();
     if resolver.schema().get_table(&table_name).is_some() {
         if *if_not_exists {
             return Ok(());
@@ -1372,7 +1379,7 @@ pub fn translate_create_virtual_table(
         approx_num_labels: 2,
     };
     program.extend(&opts);
-    let module_name_reg = program.emit_string8_new_reg(module_name_str.clone());
+    let module_name_reg = program.emit_string8_new_reg(module_name_str);
     let table_name_reg = program.emit_string8_new_reg(table_name.clone());
     let args_reg = if !args_vec.is_empty() {
         let args_start = program.alloc_register();
@@ -1410,7 +1417,7 @@ pub fn translate_create_virtual_table(
     });
 
     let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), SQLITE_TABLEID)?;
-    let sql = create_vtable_body_to_str(&vtab, vtab_module.clone());
+    let sql = create_vtable_sql(&vtab, &vtab_module.implementation);
     emit_schema_entry(
         program,
         resolver,
@@ -2249,4 +2256,524 @@ pub fn translate_drop_type(
     });
 
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn translate_create_function(
+    or_replace: bool,
+    if_not_exists: bool,
+    name: &str,
+    language: &str,
+    wasm_blob: &[u8],
+    export_name: &Option<String>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    #[cfg(not(feature = "wasm-udf"))]
+    {
+        let _ = (
+            or_replace,
+            if_not_exists,
+            name,
+            language,
+            wasm_blob,
+            export_name,
+            resolver,
+            program,
+        );
+        bail_parse_error!("CREATE FUNCTION requires the wasm-udf feature");
+    }
+
+    #[cfg(feature = "wasm-udf")]
+    {
+        let normalized_name = normalize_ident(name);
+
+        // Check if function already exists
+        if resolver
+            .schema()
+            .get_function_def(&normalized_name)
+            .is_some()
+        {
+            if or_replace {
+                translate_drop_function(false, &normalized_name, resolver, program)?;
+            } else if if_not_exists {
+                return Ok(());
+            } else {
+                bail_parse_error!("function '{}' already exists", normalized_name);
+            }
+        }
+
+        // Build SQL for storage
+        let sql = build_create_function_sql(&normalized_name, language, wasm_blob, export_name);
+
+        // Ensure __turso_internal_wasm table exists (lazy creation)
+        let functions_table: Arc<BTreeTable>;
+        let functions_root_page: RegisterOrLiteral<i64>;
+
+        if let Some(existing) = resolver.schema().get_btree_table(TURSO_WASM_TABLE_NAME) {
+            functions_table = existing.clone();
+            functions_root_page = RegisterOrLiteral::Literal(existing.root_page);
+        } else {
+            // Create the __turso_internal_wasm btree
+            let table_root_reg = program.alloc_register();
+            program.emit_insn(Insn::CreateBtree {
+                db: 0,
+                root: table_root_reg,
+                flags: CreateBTreeFlags::new_table(),
+            });
+            let create_sql =
+                format!("CREATE TABLE {TURSO_WASM_TABLE_NAME}(name TEXT PRIMARY KEY, sql TEXT)");
+            functions_table = Arc::new(BTreeTable::from_sql(&create_sql, 0)?);
+            functions_root_page = RegisterOrLiteral::Register(table_root_reg);
+
+            // Register it in sqlite_schema so it persists
+            let schema_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
+            let schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
+            program.emit_insn(Insn::OpenWrite {
+                cursor_id: schema_cursor_id,
+                root_page: 1i64.into(),
+                db: 0,
+            });
+            emit_schema_entry(
+                program,
+                resolver,
+                schema_cursor_id,
+                None,
+                SchemaEntryType::Table,
+                TURSO_WASM_TABLE_NAME,
+                TURSO_WASM_TABLE_NAME,
+                table_root_reg,
+                Some(create_sql),
+            )?;
+
+            // Parse schema to register the new table in-memory
+            program.emit_insn(Insn::ParseSchema {
+                db: schema_cursor_id,
+                where_clause: Some(format!(
+                    "tbl_name = '{TURSO_WASM_TABLE_NAME}' AND type != 'trigger'"
+                )),
+            });
+        }
+
+        // Open __turso_internal_wasm for writing
+        let functions_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(functions_table));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: functions_cursor_id,
+            root_page: functions_root_page,
+            db: 0,
+        });
+
+        // Insert (name, sql) record
+        let rowid_reg = program.alloc_register();
+        program.emit_insn(Insn::NewRowid {
+            cursor: functions_cursor_id,
+            rowid_reg,
+            prev_largest_reg: 0,
+        });
+        let name_reg = program.emit_string8_new_reg(normalized_name.clone());
+        program.emit_string8_new_reg(sql);
+        let record_reg = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u16(name_reg),
+            count: to_u16(2),
+            dest_reg: to_u16(record_reg),
+            index_name: None,
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: functions_cursor_id,
+            key_reg: rowid_reg,
+            record_reg,
+            flag: InsertFlags::new(),
+            table_name: TURSO_WASM_TABLE_NAME.to_string(),
+        });
+
+        // Add the function to the in-memory registry and compile it
+        program.emit_insn(Insn::AddFunction {
+            db: 0,
+            name: normalized_name,
+            language: language.to_string(),
+            wasm_blob: wasm_blob.to_vec(),
+            export_name: export_name.clone(),
+        });
+
+        program.emit_insn(Insn::SetCookie {
+            db: 0,
+            cookie: Cookie::SchemaVersion,
+            value: (resolver.schema().schema_version + 1) as i32,
+            p5: 0,
+        });
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "wasm-udf")]
+fn build_create_function_sql(
+    name: &str,
+    language: &str,
+    wasm_blob: &[u8],
+    export_name: &Option<String>,
+) -> String {
+    let hex: String = wasm_blob.iter().map(|b| format!("{b:02x}")).collect();
+    let export_clause = match export_name {
+        Some(ename) => format!(" EXPORT '{ename}'"),
+        None => String::new(),
+    };
+    format!("CREATE FUNCTION {name} LANGUAGE {language} AS X'{hex}'{export_clause}")
+}
+
+pub fn translate_drop_function(
+    if_exists: bool,
+    name: &str,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    #[cfg(not(feature = "wasm-udf"))]
+    {
+        let _ = (if_exists, name, resolver, program);
+        bail_parse_error!("DROP FUNCTION requires the wasm-udf feature");
+    }
+
+    #[cfg(feature = "wasm-udf")]
+    {
+        let normalized_name = normalize_ident(name);
+
+        // Check if function exists
+        if resolver
+            .schema()
+            .get_function_def(&normalized_name)
+            .is_none()
+        {
+            if if_exists {
+                return Ok(());
+            }
+            bail_parse_error!("function '{}' does not exist", normalized_name);
+        }
+
+        // Open __turso_internal_wasm and delete the row
+        let functions_table = resolver
+            .schema()
+            .get_btree_table(TURSO_WASM_TABLE_NAME)
+            .ok_or_else(|| {
+                crate::LimboError::ParseError(format!("no such function: {normalized_name}"))
+            })?;
+        let functions_cursor_id =
+            program.alloc_cursor_id(CursorType::BTreeTable(functions_table.clone()));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: functions_cursor_id,
+            root_page: functions_table.root_page.into(),
+            db: 0,
+        });
+
+        // Search for matching row: name=function_name (col 0)
+        let name_reg = program.alloc_register();
+        program.emit_insn(Insn::String8 {
+            dest: name_reg,
+            value: normalized_name.clone(),
+        });
+
+        let end_loop_label = program.allocate_label();
+        let loop_start_label = program.allocate_label();
+
+        program.emit_insn(Insn::Rewind {
+            cursor_id: functions_cursor_id,
+            pc_if_empty: end_loop_label,
+        });
+        program.preassign_label_to_next_insn(loop_start_label);
+
+        // Read name (col 0)
+        let col0_reg = program.alloc_register();
+        program.emit_column_or_rowid(functions_cursor_id, 0, col0_reg);
+
+        let skip_delete_label = program.allocate_label();
+
+        // Check name=function_name
+        program.emit_insn(Insn::Ne {
+            lhs: col0_reg,
+            rhs: name_reg,
+            target_pc: skip_delete_label,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
+
+        // Delete matching row
+        program.emit_insn(Insn::Delete {
+            cursor_id: functions_cursor_id,
+            table_name: TURSO_WASM_TABLE_NAME.to_string(),
+            is_part_of_update: false,
+        });
+
+        program.resolve_label(skip_delete_label, program.offset());
+
+        program.emit_insn(Insn::Next {
+            cursor_id: functions_cursor_id,
+            pc_if_next: loop_start_label,
+        });
+
+        program.preassign_label_to_next_insn(end_loop_label);
+
+        // Remove from in-memory schema
+        program.emit_insn(Insn::DropFunction {
+            db: 0,
+            function_name: normalized_name,
+        });
+
+        program.emit_insn(Insn::SetCookie {
+            db: 0,
+            cookie: Cookie::SchemaVersion,
+            value: (resolver.schema().schema_version + 1) as i32,
+            p5: 0,
+        });
+
+        Ok(())
+    }
+}
+
+pub fn translate_create_extension(
+    if_not_exists: bool,
+    name: &str,
+    language: &str,
+    wasm_blob: &[u8],
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    #[cfg(not(feature = "wasm-udf"))]
+    {
+        let _ = (if_not_exists, name, language, wasm_blob, resolver, program);
+        bail_parse_error!("CREATE EXTENSION requires the wasm-udf feature");
+    }
+
+    #[cfg(feature = "wasm-udf")]
+    {
+        let normalized_name = normalize_ident(name);
+
+        // Check if extension already exists
+        if resolver
+            .schema()
+            .get_extension_def(&normalized_name)
+            .is_some()
+        {
+            if if_not_exists {
+                return Ok(());
+            }
+            bail_parse_error!("extension '{}' already exists", normalized_name);
+        }
+
+        // Build SQL for storage
+        let sql = build_create_extension_sql(&normalized_name, language, wasm_blob);
+
+        // Ensure __turso_internal_wasm table exists (lazy creation)
+        let extensions_table: Arc<BTreeTable>;
+        let extensions_root_page: RegisterOrLiteral<i64>;
+
+        if let Some(existing) = resolver.schema().get_btree_table(TURSO_WASM_TABLE_NAME) {
+            extensions_table = existing.clone();
+            extensions_root_page = RegisterOrLiteral::Literal(existing.root_page);
+        } else {
+            // Create the __turso_internal_wasm btree
+            let table_root_reg = program.alloc_register();
+            program.emit_insn(Insn::CreateBtree {
+                db: 0,
+                root: table_root_reg,
+                flags: CreateBTreeFlags::new_table(),
+            });
+            let create_sql =
+                format!("CREATE TABLE {TURSO_WASM_TABLE_NAME}(name TEXT PRIMARY KEY, sql TEXT)");
+            extensions_table = Arc::new(BTreeTable::from_sql(&create_sql, 0)?);
+            extensions_root_page = RegisterOrLiteral::Register(table_root_reg);
+
+            // Register it in sqlite_schema so it persists
+            let schema_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
+            let schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
+            program.emit_insn(Insn::OpenWrite {
+                cursor_id: schema_cursor_id,
+                root_page: 1i64.into(),
+                db: 0,
+            });
+            emit_schema_entry(
+                program,
+                resolver,
+                schema_cursor_id,
+                None,
+                SchemaEntryType::Table,
+                TURSO_WASM_TABLE_NAME,
+                TURSO_WASM_TABLE_NAME,
+                table_root_reg,
+                Some(create_sql),
+            )?;
+
+            // Parse schema to register the new table in-memory
+            program.emit_insn(Insn::ParseSchema {
+                db: schema_cursor_id,
+                where_clause: Some(format!(
+                    "tbl_name = '{TURSO_WASM_TABLE_NAME}' AND type != 'trigger'"
+                )),
+            });
+        }
+
+        // Open __turso_internal_wasm for writing
+        let extensions_cursor_id =
+            program.alloc_cursor_id(CursorType::BTreeTable(extensions_table));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: extensions_cursor_id,
+            root_page: extensions_root_page,
+            db: 0,
+        });
+
+        // Insert (name, sql) record
+        let rowid_reg = program.alloc_register();
+        program.emit_insn(Insn::NewRowid {
+            cursor: extensions_cursor_id,
+            rowid_reg,
+            prev_largest_reg: 0,
+        });
+        let name_reg = program.emit_string8_new_reg(normalized_name.clone());
+        program.emit_string8_new_reg(sql);
+        let record_reg = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u16(name_reg),
+            count: to_u16(2),
+            dest_reg: to_u16(record_reg),
+            index_name: None,
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: extensions_cursor_id,
+            key_reg: rowid_reg,
+            record_reg,
+            flag: InsertFlags::new(),
+            table_name: TURSO_WASM_TABLE_NAME.to_string(),
+        });
+
+        // Add the extension to the in-memory registry and compile it
+        program.emit_insn(Insn::AddExtension {
+            db: 0,
+            name: normalized_name,
+            language: language.to_string(),
+            wasm_blob: wasm_blob.to_vec(),
+        });
+
+        program.emit_insn(Insn::SetCookie {
+            db: 0,
+            cookie: Cookie::SchemaVersion,
+            value: (resolver.schema().schema_version + 1) as i32,
+            p5: 0,
+        });
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "wasm-udf")]
+fn build_create_extension_sql(name: &str, language: &str, wasm_blob: &[u8]) -> String {
+    let hex: String = wasm_blob.iter().map(|b| format!("{b:02x}")).collect();
+    format!("CREATE EXTENSION {name} LANGUAGE {language} AS X'{hex}'")
+}
+
+pub fn translate_drop_extension(
+    if_exists: bool,
+    name: &str,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    #[cfg(not(feature = "wasm-udf"))]
+    {
+        let _ = (if_exists, name, resolver, program);
+        bail_parse_error!("DROP EXTENSION requires the wasm-udf feature");
+    }
+
+    #[cfg(feature = "wasm-udf")]
+    {
+        let normalized_name = normalize_ident(name);
+
+        // Check if extension exists
+        if resolver
+            .schema()
+            .get_extension_def(&normalized_name)
+            .is_none()
+        {
+            if if_exists {
+                return Ok(());
+            }
+            bail_parse_error!("extension '{}' does not exist", normalized_name);
+        }
+
+        // Open __turso_internal_wasm and delete the row
+        let extensions_table = resolver
+            .schema()
+            .get_btree_table(TURSO_WASM_TABLE_NAME)
+            .ok_or_else(|| {
+                crate::LimboError::ParseError(format!("no such extension: {normalized_name}"))
+            })?;
+        let extensions_cursor_id =
+            program.alloc_cursor_id(CursorType::BTreeTable(extensions_table.clone()));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: extensions_cursor_id,
+            root_page: extensions_table.root_page.into(),
+            db: 0,
+        });
+
+        // Search for matching row: name=extension_name (col 0)
+        let name_reg = program.alloc_register();
+        program.emit_insn(Insn::String8 {
+            dest: name_reg,
+            value: normalized_name.clone(),
+        });
+
+        let end_loop_label = program.allocate_label();
+        let loop_start_label = program.allocate_label();
+
+        program.emit_insn(Insn::Rewind {
+            cursor_id: extensions_cursor_id,
+            pc_if_empty: end_loop_label,
+        });
+        program.preassign_label_to_next_insn(loop_start_label);
+
+        // Read name (col 0)
+        let col0_reg = program.alloc_register();
+        program.emit_column_or_rowid(extensions_cursor_id, 0, col0_reg);
+
+        let skip_delete_label = program.allocate_label();
+
+        // Check name=extension_name
+        program.emit_insn(Insn::Ne {
+            lhs: col0_reg,
+            rhs: name_reg,
+            target_pc: skip_delete_label,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
+
+        // Delete matching row
+        program.emit_insn(Insn::Delete {
+            cursor_id: extensions_cursor_id,
+            table_name: TURSO_WASM_TABLE_NAME.to_string(),
+            is_part_of_update: false,
+        });
+
+        program.resolve_label(skip_delete_label, program.offset());
+
+        program.emit_insn(Insn::Next {
+            cursor_id: extensions_cursor_id,
+            pc_if_next: loop_start_label,
+        });
+
+        program.preassign_label_to_next_insn(end_loop_label);
+
+        // Remove from in-memory schema
+        program.emit_insn(Insn::DropExtension {
+            db: 0,
+            extension_name: normalized_name,
+        });
+
+        program.emit_insn(Insn::SetCookie {
+            db: 0,
+            cookie: Cookie::SchemaVersion,
+            value: (resolver.schema().schema_version + 1) as i32,
+            p5: 0,
+        });
+
+        Ok(())
+    }
 }

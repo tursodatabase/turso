@@ -1,0 +1,10 @@
+[package]
+name = "bench-extension"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+turso-wasm-sdk = { path = "../../turso-wasm-sdk" }

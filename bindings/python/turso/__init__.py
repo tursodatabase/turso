@@ -17,6 +17,7 @@ from .lib import (  # noqa: E402
     ProgrammingError,
     Row,
     Warning,
+    WasmtimeRuntime,
     apilevel,
     connect,
     paramstyle,
@@ -48,4 +49,5 @@ __all__ = [
     "sqlite_version_info",
     "threadsafety",
     "EncryptionOpts",
+    "WasmtimeRuntime",
 ]

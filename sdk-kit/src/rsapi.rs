@@ -18,9 +18,9 @@ use tracing_subscriber::{
     EnvFilter, Layer,
 };
 use turso_core::{
-    storage::database::DatabaseFile, types::AsValueRef, Connection, Database, DatabaseOpts,
-    DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState, OpenFlags, QueryMode,
-    Statement, StepResult, IO,
+    storage::database::DatabaseFile, types::AsValueRef, wasm::WasmRuntimeApi, Connection, Database,
+    DatabaseOpts, DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState,
+    OpenFlags, QueryMode, Statement, StepResult, IO,
 };
 
 use crate::{
@@ -142,6 +142,9 @@ pub struct TursoDatabaseConfig {
     /// optional custom DatabaseStorage provided by the caller
     /// if provided, caller must guarantee that IO used by the TursoDatabase will be consistent with underlying DatabaseStorage IO
     pub db_file: Option<Arc<dyn DatabaseStorage>>,
+
+    /// optional WASM runtime for executing WASM UDFs
+    pub wasm_runtime: Option<Arc<dyn WasmRuntimeApi>>,
 }
 
 pub fn turso_slice_from_bytes(bytes: &[u8]) -> capi::c::turso_slice_ref_t {
@@ -283,6 +286,9 @@ impl TursoDatabaseConfig {
             },
             io: None,
             db_file: None,
+            wasm_runtime: turso_wasm_wasmtime::WasmtimeRuntime::new().ok().map(|r| {
+                std::sync::Arc::new(r) as std::sync::Arc<dyn turso_core::wasm::WasmRuntimeApi>
+            }),
         })
     }
 }
@@ -666,6 +672,9 @@ impl TursoDatabase {
                         }
                     }
 
+                    if let Some(runtime) = &self.config.wasm_runtime {
+                        opts = opts.with_unstable_wasm_runtime(runtime.clone());
+                    }
                     if self.config.encryption.is_some() && !opts.enable_encryption {
                         return Err(TursoError::Error(
                             "encryption is experimental and must be explicitly enabled through experimental features list".to_string(),
@@ -1051,6 +1060,24 @@ impl TursoStatement {
             None => 0,
         }
     }
+    /// Total rows read during statement execution.
+    pub fn rows_read(&self) -> u64 {
+        let handle = self.handle.lock().unwrap();
+        match handle.as_ref() {
+            Some(stmt) => stmt.metrics().rows_read,
+            None => 0,
+        }
+    }
+
+    /// Total rows written during statement execution.
+    pub fn rows_written(&self) -> u64 {
+        let handle = self.handle.lock().unwrap();
+        match handle.as_ref() {
+            Some(stmt) => stmt.metrics().rows_written,
+            None => 0,
+        }
+    }
+
     /// returns parameters count for the statement
     pub fn parameters_count(&self) -> usize {
         let handle = self.handle.lock().unwrap();
@@ -1292,6 +1319,7 @@ mod tests {
                 vfs: None,
                 io: None,
                 db_file: None,
+                wasm_runtime: None,
             });
             let result = db.open().unwrap();
             assert!(!result.is_io());
@@ -1353,6 +1381,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            wasm_runtime: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1373,6 +1402,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            wasm_runtime: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1403,6 +1433,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            wasm_runtime: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1426,6 +1457,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            wasm_runtime: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1476,6 +1508,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            wasm_runtime: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1535,6 +1568,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            wasm_runtime: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1567,6 +1601,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            wasm_runtime: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1596,6 +1631,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            wasm_runtime: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1621,6 +1657,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            wasm_runtime: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1647,6 +1684,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            wasm_runtime: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1697,6 +1735,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            wasm_runtime: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1785,6 +1824,7 @@ mod tests {
                     vfs: None,
                     io: None,
                     db_file: None,
+                    wasm_runtime: None,
                 });
                 let result = db.open().unwrap();
                 assert!(!result.is_io());
@@ -1825,6 +1865,7 @@ mod tests {
                     vfs: None,
                     io: None,
                     db_file: None,
+                    wasm_runtime: None,
                 });
                 let result = db.open().unwrap();
                 assert!(!result.is_io());
@@ -1851,6 +1892,7 @@ mod tests {
                     vfs: None,
                     io: None,
                     db_file: None,
+                    wasm_runtime: None,
                 });
                 assert!(db.open().is_err(), "Opening with wrong key should fail");
             }
@@ -1865,6 +1907,7 @@ mod tests {
                     vfs: None,
                     io: None,
                     db_file: None,
+                    wasm_runtime: None,
                 });
                 let result = db.open();
                 println!("result: {result:?}");
@@ -1971,6 +2014,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            wasm_runtime: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2005,6 +2049,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            wasm_runtime: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());

@@ -22,6 +22,7 @@ from ._turso import (
     PyTursoSetupConfig,
     PyTursoStatement,
     PyTursoStatusCode,
+    WasmtimeRuntime,
     py_turso_database_open,
     py_turso_setup,
 )
@@ -885,6 +886,7 @@ def connect(
     encryption: Optional[EncryptionOpts] = None,
     isolation_level: Optional[str] = "DEFERRED",
     extra_io: Optional[Callable[[], None]] = None,
+    unstable_wasm_runtime=None,
 ) -> Connection:
     """
     Open a Turso (SQLite-compatible) database and return a Connection.
@@ -893,6 +895,8 @@ def connect(
     - database: path or identifier of the database.
     - experimental_features: comma-separated list of features to enable.
     - isolation_level: one of "DEFERRED" (default), "IMMEDIATE", "EXCLUSIVE", or None.
+    - unstable_wasm_runtime: optional WASM runtime for user-defined functions (e.g. WasmtimeRuntime()).
+      WASM UDFs are an unstable feature and subject to change.
     """
     try:
         cfg = PyTursoDatabaseConfig(
@@ -902,6 +906,7 @@ def connect(
             encryption=PyTursoEncryptionConfig(cipher=encryption.cipher, hexkey=encryption.hexkey)
             if encryption
             else None,
+            unstable_wasm_runtime=unstable_wasm_runtime,
         )
         db: PyTursoDatabase = py_turso_database_open(cfg)
         conn: PyTursoConnection = db.connect()

@@ -133,7 +133,8 @@ impl Statement {
             QueryMode::Explain => (EXPLAIN_COLUMNS.len(), 0),
             QueryMode::ExplainQueryPlan => (EXPLAIN_QUERY_PLAN_COLUMNS.len(), 0),
         };
-        let state = vdbe::ProgramState::new(max_registers, cursor_count);
+        let wasm_budget = program.connection.db.wasm_budget.clone();
+        let state = vdbe::ProgramState::with_wasm_budget(max_registers, cursor_count, wasm_budget);
         Self {
             program,
             state,
@@ -309,6 +310,7 @@ impl Statement {
 
         // Aggregate metrics when statement completes
         if matches!(res, Ok(StepResult::Done)) {
+            self.state.merge_wasm_cache_metrics();
             self.program
                 .connection
                 .metrics

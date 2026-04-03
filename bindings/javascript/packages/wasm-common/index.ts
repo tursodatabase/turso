@@ -6,6 +6,7 @@ import {
     instantiateNapiModuleSync,
     MessageHandler
 } from '@napi-rs/wasm-runtime'
+import { udfImports } from './udf.js'
 
 function getUint8ArrayFromMemory(memory: WebAssembly.Memory, ptr: number, len: number): Uint8Array {
     ptr = ptr >>> 0;
@@ -375,6 +376,7 @@ function setupWebWorker() {
                         ...importObject.napi,
                         ...importObject.emnapi,
                         ...workerImports(opfs, memory),
+                        ...udfImports(wasmMemory),
                         memory: wasmMemory,
                     }
                 },
@@ -443,6 +445,7 @@ async function setupMainThread(wasmFile: ArrayBuffer, factory: () => Worker): Pr
                 ...importObject.napi,
                 ...importObject.emnapi,
                 ...mainImports(worker, (c, res) => completeOpfs(c, res)),
+                ...udfImports(__sharedMemory),
                 memory: __sharedMemory,
             }
             return importObject

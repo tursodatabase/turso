@@ -9,7 +9,8 @@ use std::{
     sync::{Arc, Mutex, RwLock, RwLockReadGuard},
 };
 
-use napi::bindgen_prelude::{AsyncTask, Either5, Null};
+use napi::bindgen_prelude::{AsyncTask, Either5, FromNapiValue, JsObjectValue, Null, Unknown};
+use napi::{Env, JsValue, ValueType};
 use napi_derive::napi;
 use turso_node::{DatabaseOpts, IoLoopTask};
 use turso_sync_engine::{
@@ -193,8 +194,34 @@ impl CipherMode {
 
 #[napi]
 impl SyncEngine {
-    #[napi(constructor)]
-    pub fn new(opts: SyncEngineOpts) -> napi::Result<Self> {
+    #[napi(constructor, ts_args_type = "opts: SyncEngineOpts")]
+    pub fn new(env: Env, opts: Unknown) -> napi::Result<Self> {
+        // Extract unstableWasmRuntime from opts before deserializing the rest
+        let obj = opts.coerce_to_object()?;
+        #[allow(unused_variables)]
+        let wasm_runtime_val = if obj.has_named_property("unstableWasmRuntime")? {
+            let v = obj.get_named_property::<Unknown>("unstableWasmRuntime")?;
+            match v.get_type()? {
+                ValueType::Undefined | ValueType::Null => None,
+                _ => Some(v),
+            }
+        } else {
+            None
+        };
+        let opts =
+            unsafe { <SyncEngineOpts as FromNapiValue>::from_napi_value(env.raw(), obj.raw())? };
+
+        // If unstableWasmRuntime was provided, create a NodeWasmRuntime
+        #[cfg(not(feature = "browser"))]
+        let wasm_runtime: Option<Arc<dyn turso_core::wasm::WasmRuntimeApi>> =
+            if wasm_runtime_val.is_some() {
+                Some(Arc::new(turso_node::node_wasm_udf::NodeWasmRuntime::new()))
+            } else {
+                None
+            };
+        #[cfg(feature = "browser")]
+        let wasm_runtime: Option<Arc<dyn turso_core::wasm::WasmRuntimeApi>> = None;
+
         let is_memory = opts.path == ":memory:";
         let io: Arc<dyn turso_core::IO> = if is_memory {
             Arc::new(turso_core::MemoryIO::new())
@@ -246,6 +273,7 @@ impl SyncEngine {
                 experimental: None,
                 encryption: None, // Local encryption not supported in sync mode
             }),
+            wasm_runtime,
         )?));
         let opts_filled = SyncEngineOptsFilled {
             path: opts.path,

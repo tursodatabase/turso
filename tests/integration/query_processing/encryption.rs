@@ -1172,7 +1172,7 @@ fn test_encrypted_db_then_enable_mvcc(_db: TempDatabase) -> anyhow::Result<()> {
             io.clone(),
             db_path_str,
             OpenFlags::Create,
-            opts,
+            opts.clone(),
             enc_opts.clone(),
         )?;
         let key = EncryptionKey::from_hex_string(hex_key)?;
@@ -1208,7 +1208,7 @@ fn test_encrypted_db_then_enable_mvcc(_db: TempDatabase) -> anyhow::Result<()> {
             io.clone(),
             db_path_str,
             OpenFlags::default(),
-            opts,
+            opts.clone(),
             None,
         );
         assert!(
@@ -1278,7 +1278,7 @@ fn test_encrypted_db_with_data_then_enable_mvcc(_db: TempDatabase) -> anyhow::Re
             io.clone(),
             db_path_str,
             OpenFlags::Create,
-            opts,
+            opts.clone(),
             enc_opts.clone(),
         )?;
         let key = EncryptionKey::from_hex_string(hex_key)?;
@@ -1296,7 +1296,7 @@ fn test_encrypted_db_with_data_then_enable_mvcc(_db: TempDatabase) -> anyhow::Re
             io.clone(),
             db_path_str,
             OpenFlags::default(),
-            opts,
+            opts.clone(),
             enc_opts.clone(),
         )?;
         let key = EncryptionKey::from_hex_string(hex_key)?;

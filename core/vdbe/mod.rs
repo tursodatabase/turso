@@ -468,6 +468,8 @@ pub struct ProgramState {
     op_vacuum_into_state: Option<OpVacuumIntoState>,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
+    /// LRU cache for WASM UDF instances, coordinated with a database-wide memory budget.
+    pub(crate) wasm_instance_cache: crate::wasm::instance_cache::WasmInstanceCache,
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
     /// This is used when statement in auto-commit mode reseted after previous uncomplete execution - in which case we may need to rollback transaction started on previous attempt
     pub(crate) auto_txn_cleanup: TxnCleanup,
@@ -534,6 +536,18 @@ crate::assert::assert_send_sync!(ProgramState);
 
 impl ProgramState {
     pub fn new(max_registers: usize, max_cursors: usize) -> Self {
+        Self::with_wasm_budget(
+            max_registers,
+            max_cursors,
+            crate::wasm::WasmBudget::new(crate::wasm::DEFAULT_WASM_CACHE_CAPACITY),
+        )
+    }
+
+    pub fn with_wasm_budget(
+        max_registers: usize,
+        max_cursors: usize,
+        wasm_budget: crate::wasm::WasmBudget,
+    ) -> Self {
         let cursors: Vec<Option<Cursor>> = (0..max_cursors).map(|_| None).collect();
         let cursor_seqs = vec![0i64; max_cursors];
         let registers = vec![Register::Value(Value::Null); max_registers].into_boxed_slice();
@@ -583,6 +597,7 @@ impl ProgramState {
             op_journal_mode_state: OpJournalModeState::default(),
             op_vacuum_into_state: None,
             view_delta_state: ViewDeltaCommitState::NotStarted,
+            wasm_instance_cache: crate::wasm::instance_cache::WasmInstanceCache::new(wasm_budget),
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
@@ -609,6 +624,15 @@ impl ProgramState {
 
     pub fn get_register(&self, idx: usize) -> &Register {
         &self.registers[idx]
+    }
+
+    /// Merge WASM instance cache metrics into statement metrics.
+    pub fn merge_wasm_cache_metrics(&mut self) {
+        let cm = self.wasm_instance_cache.metrics();
+        self.metrics.wasm_cache_hits = cm.hits;
+        self.metrics.wasm_cache_misses = cm.misses;
+        self.metrics.wasm_cache_evictions = cm.evictions;
+        self.metrics.wasm_instances_created = cm.instances_created;
     }
 
     pub fn column_count(&self) -> usize {

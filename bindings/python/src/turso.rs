@@ -3,6 +3,7 @@ use pyo3::{
     types::{PyBytes, PyTuple},
 };
 use std::sync::Arc;
+use turso_core::wasm::WasmRuntimeApi;
 use turso_sdk_kit::rsapi::{self, EncryptionOpts, Numeric, TursoError, TursoStatusCode, Value};
 
 use pyo3::create_exception;
@@ -113,6 +114,25 @@ impl PyTursoEncryptionConfig {
     }
 }
 
+/// A Wasmtime-based WASM runtime for executing user-defined functions.
+#[pyclass(name = "WasmtimeRuntime")]
+pub struct PyWasmtimeRuntime {
+    pub(crate) inner: Arc<dyn WasmRuntimeApi>,
+}
+
+#[pymethods]
+impl PyWasmtimeRuntime {
+    #[new]
+    fn new() -> PyResult<Self> {
+        let runtime = turso_wasm_wasmtime::WasmtimeRuntime::new().map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("WASM runtime init failed: {e}"))
+        })?;
+        Ok(Self {
+            inner: Arc::new(runtime),
+        })
+    }
+}
+
 #[pyclass]
 pub struct PyTursoDatabaseConfig {
     pub path: String,
@@ -131,23 +151,28 @@ pub struct PyTursoDatabaseConfig {
     /// optional encryption parameters
     /// as encryption is experimental - experimental_features must have "encryption" in the list
     pub encryption: Option<PyTursoEncryptionConfig>,
+
+    /// optional WASM runtime for user-defined functions (unstable)
+    pub wasm_runtime: Option<Arc<dyn WasmRuntimeApi>>,
 }
 
 #[pymethods]
 impl PyTursoDatabaseConfig {
     #[new]
-    #[pyo3(signature = (path, experimental_features=None, vfs=None, encryption=None))]
+    #[pyo3(signature = (path, experimental_features=None, vfs=None, encryption=None, unstable_wasm_runtime=None))]
     fn new(
         path: String,
         experimental_features: Option<String>,
         vfs: Option<String>,
         encryption: Option<&PyTursoEncryptionConfig>,
+        unstable_wasm_runtime: Option<&PyWasmtimeRuntime>,
     ) -> Self {
         Self {
             path,
             experimental_features,
             vfs,
             encryption: encryption.cloned(),
+            wasm_runtime: unstable_wasm_runtime.map(|r| r.inner.clone()),
         }
     }
 }
@@ -200,6 +225,7 @@ pub fn py_turso_database_open(config: &PyTursoDatabaseConfig) -> PyResult<PyTurs
         vfs: config.vfs.clone(),
         io: None,
         db_file: None,
+        wasm_runtime: config.wasm_runtime.clone(),
     });
     let result = database.open().map_err(turso_error_to_py_err)?;
     // async_io is false - so db.open() will return result immediately

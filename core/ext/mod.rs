@@ -63,7 +63,7 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
     let module = Arc::new(module);
     let vmodule = VTabImpl {
         module_kind: kind,
-        implementation: module,
+        implementation: VTabImplKind::Native(module),
     };
 
     unsafe {
@@ -89,9 +89,57 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
 }
 
 #[derive(Clone)]
+pub enum VTabImplKind {
+    Native(Arc<VTabModuleImpl>),
+    #[cfg(feature = "wasm-udf")]
+    Wasm {
+        def: Arc<crate::wasm::WasmVTabModuleDef>,
+        runtime: Arc<dyn crate::wasm::WasmRuntimeApi>,
+    },
+}
+
+impl VTabImplKind {
+    /// Ask the native module to produce a column schema string.
+    /// Returns `None` for WASM modules (schema is embedded in the definition).
+    pub fn create_schema(&self, args: Vec<turso_ext::Value>) -> Option<String> {
+        match self {
+            Self::Native(module) => module.create_schema(args).ok(),
+            #[cfg(feature = "wasm-udf")]
+            Self::Wasm { .. } => None,
+        }
+    }
+
+    /// Instantiate the virtual table, returning the VirtualTableType and schema string.
+    pub(crate) fn create_vtab_type(
+        &self,
+        name: &str,
+        args: Vec<turso_ext::Value>,
+        kind: VTabKind,
+    ) -> crate::Result<(crate::vtab::VirtualTableType, String)> {
+        match self {
+            Self::Native(module) => {
+                let (table, schema) =
+                    crate::vtab::ExtVirtualTable::create(name, module, args, kind)?;
+                Ok((crate::vtab::VirtualTableType::External(table), schema))
+            }
+            #[cfg(feature = "wasm-udf")]
+            Self::Wasm { def, runtime } => {
+                let schema = def.schema.clone();
+                let vtab_type =
+                    crate::vtab::VirtualTableType::Wasm(crate::vtab::WasmVirtualTable {
+                        def: def.clone(),
+                        runtime: runtime.clone(),
+                    });
+                Ok((vtab_type, schema))
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct VTabImpl {
     pub module_kind: VTabKind,
-    pub implementation: Arc<VTabModuleImpl>,
+    pub implementation: VTabImplKind,
 }
 
 pub(crate) unsafe extern "C" fn register_scalar_function(

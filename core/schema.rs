@@ -155,6 +155,7 @@ pub const SCHEMA_TABLE_NAME: &str = "sqlite_schema";
 const SCHEMA_TABLE_NAME_ALT: &str = "sqlite_master";
 pub const SQLITE_SEQUENCE_TABLE_NAME: &str = "sqlite_sequence";
 pub const TURSO_TYPES_TABLE_NAME: &str = "__turso_internal_types";
+pub const TURSO_WASM_TABLE_NAME: &str = "__turso_internal_wasm";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
 
@@ -286,6 +287,28 @@ struct MakeFromBtreeAccumulators {
     materialized_view_info: HashMap<String, (String, i64)>,
 }
 
+/// User-defined function definition, loaded from __turso_internal_wasm
+#[derive(Debug, Clone)]
+pub struct FunctionDef {
+    pub name: String,
+    pub language: String,
+    pub wasm_blob: Vec<u8>,
+    pub export_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtensionDef {
+    pub name: String,
+    pub language: String,
+    pub wasm_blob: Vec<u8>,
+    /// Names of functions registered by this extension
+    pub functions: Vec<String>,
+    /// Names of custom types registered by this extension
+    pub types: Vec<String>,
+    /// Names of virtual table modules registered by this extension
+    pub vtabs: Vec<String>,
+}
+
 /// Phase tracking for async schema loading
 #[derive(Default, Debug)]
 pub enum MakeFromBtreePhase {
@@ -400,6 +423,12 @@ pub struct Schema {
     /// Custom type registry, loaded from sqlite_turso_types
     pub type_registry: HashMap<String, Arc<TypeDef>>,
 
+    /// User-defined function registry, loaded from __turso_internal_wasm
+    pub function_registry: HashMap<String, Arc<FunctionDef>>,
+
+    /// Extension registry, loaded from __turso_internal_wasm
+    pub extension_registry: HashMap<String, Arc<ExtensionDef>>,
+
     pub generated_columns_enabled: bool,
 }
 
@@ -506,6 +535,8 @@ impl Schema {
                 }
                 registry
             },
+            function_registry: HashMap::default(),
+            extension_registry: HashMap::default(),
             generated_columns_enabled: false,
         }
     }
@@ -560,6 +591,132 @@ impl Schema {
             self.add_type_from_sql(sql)?;
         }
         self.resolve_all_custom_type_affinities();
+        Ok(())
+    }
+
+    /// Look up a user-defined function by name.
+    pub fn get_function_def(&self, name: &str) -> Option<&Arc<FunctionDef>> {
+        self.function_registry.get(&name.to_lowercase())
+    }
+
+    /// Remove a user-defined function from the registry.
+    pub fn remove_function(&mut self, name: &str) {
+        self.function_registry.remove(&name.to_lowercase());
+    }
+
+    /// Parse a CREATE FUNCTION SQL string and add the function to the in-memory registry.
+    /// Returns the normalized (lowercased) function name on success.
+    pub fn add_function_from_sql(&mut self, sql: &str) -> crate::Result<String> {
+        use turso_parser::ast::{Cmd, Stmt};
+        use turso_parser::parser::Parser;
+
+        let mut parser = Parser::new(sql.as_bytes());
+        let Ok(Some(Cmd::Stmt(Stmt::CreateFunction {
+            name,
+            language,
+            wasm_blob,
+            export_name,
+            ..
+        }))) = parser.next_cmd()
+        else {
+            return Err(crate::LimboError::ParseError(format!(
+                "invalid function sql: {sql}"
+            )));
+        };
+
+        let normalized = name.to_lowercase();
+        let func_def = FunctionDef {
+            name,
+            language,
+            wasm_blob,
+            export_name,
+        };
+        self.function_registry
+            .insert(normalized.clone(), Arc::new(func_def));
+        Ok(normalized)
+    }
+
+    /// Load function definitions from CREATE FUNCTION SQL strings.
+    pub fn load_function_definitions(&mut self, func_sqls: &[String]) -> crate::Result<()> {
+        for sql in func_sqls {
+            self.add_function_from_sql(sql)?;
+        }
+        Ok(())
+    }
+
+    /// Look up an extension by name.
+    pub fn get_extension_def(&self, name: &str) -> Option<&Arc<ExtensionDef>> {
+        self.extension_registry.get(&name.to_lowercase())
+    }
+
+    /// Remove an extension and all its registered functions from the registry.
+    pub fn remove_extension(&mut self, name: &str) -> Option<Arc<ExtensionDef>> {
+        let ext = self.extension_registry.remove(&name.to_lowercase())?;
+        for func_name in &ext.functions {
+            self.function_registry.remove(&func_name.to_lowercase());
+        }
+        for type_name in &ext.types {
+            self.type_registry.remove(&type_name.to_lowercase());
+        }
+        Some(ext)
+    }
+
+    /// Parse a CREATE EXTENSION SQL string and add the extension to the in-memory registry.
+    pub fn add_extension_from_sql(
+        &mut self,
+        sql: &str,
+        function_names: Vec<String>,
+        type_names: Vec<String>,
+        vtab_names: Vec<String>,
+    ) -> crate::Result<()> {
+        use turso_parser::ast::{Cmd, Stmt};
+        use turso_parser::parser::Parser;
+
+        let mut parser = Parser::new(sql.as_bytes());
+        let Ok(Some(Cmd::Stmt(Stmt::CreateExtension {
+            name,
+            language,
+            wasm_blob,
+            ..
+        }))) = parser.next_cmd()
+        else {
+            return Err(crate::LimboError::ParseError(format!(
+                "invalid extension sql: {sql}"
+            )));
+        };
+
+        // Register each function from the extension in the function registry
+        // so the translator can resolve them as WASM functions.
+        for func_name in &function_names {
+            let func_def = FunctionDef {
+                name: func_name.clone(),
+                language: language.clone(),
+                wasm_blob: wasm_blob.clone(),
+                export_name: Some(func_name.clone()),
+            };
+            self.function_registry
+                .insert(func_name.to_lowercase(), Arc::new(func_def));
+        }
+
+        let ext_def = ExtensionDef {
+            name: name.clone(),
+            language,
+            wasm_blob,
+            functions: function_names,
+            types: type_names,
+            vtabs: vtab_names,
+        };
+        self.extension_registry
+            .insert(name.to_lowercase(), Arc::new(ext_def));
+        Ok(())
+    }
+
+    /// Load extension definitions from CREATE EXTENSION SQL strings.
+    pub fn load_extension_definitions(&mut self, ext_sqls: &[String]) -> crate::Result<()> {
+        for sql in ext_sqls {
+            // During reload, function names will be populated when the manifest is read
+            self.add_extension_from_sql(sql, Vec::new(), Vec::new(), Vec::new())?;
+        }
         Ok(())
     }
 
@@ -1896,6 +2053,8 @@ impl Clone for Schema {
             incompatible_views,
             dropped_root_pages: self.dropped_root_pages.clone(),
             type_registry: self.type_registry.clone(),
+            function_registry: self.function_registry.clone(),
+            extension_registry: self.extension_registry.clone(),
             generated_columns_enabled: self.generated_columns_enabled,
         }
     }

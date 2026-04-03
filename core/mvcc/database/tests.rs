@@ -146,7 +146,7 @@ impl MvccTestDbNoConn {
             io,
             path.as_os_str().to_str().unwrap(),
             OpenFlags::default(),
-            opts,
+            opts.clone(),
             Some(enc_opts.clone()),
         )
         .unwrap();

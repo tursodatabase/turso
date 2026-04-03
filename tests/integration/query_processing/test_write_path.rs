@@ -803,7 +803,7 @@ fn test_read_wal_dumb_no_frames(tmp_db: TempDatabase) -> anyhow::Result<()> {
         conn.close()?;
     }
     {
-        let tmp_db = TempDatabase::new_with_existent_with_opts(&db_path, opts);
+        let tmp_db = TempDatabase::new_with_existent_with_opts(&db_path, opts.clone());
         let conn = tmp_db.connect_limbo();
         conn.execute("INSERT INTO t0(x) VALUES (1)")?;
         conn.close()?;
