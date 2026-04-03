@@ -5,9 +5,10 @@ use std::sync::Arc;
 use turso_core::{
     Connection, Database, DatabaseOpts, IO, LimboError, OpenFlags, PlatformIO, Statement,
 };
+#[cfg(all(unix, target_pointer_width = "64"))]
+use turso_whopper::multiprocess::{MultiprocessOpts, MultiprocessWhopper};
 use turso_whopper::{
     IOFaultConfig, SimulatorIO,
-    multiprocess::{MultiprocessOpts, MultiprocessWhopper},
     workloads::{
         BeginWorkload, CommitWorkload, CreateIndexWorkload, CreateSimpleTableWorkload,
         DeleteWorkload, DropIndexWorkload, IntegrityCheckWorkload, RollbackWorkload,
@@ -183,11 +184,23 @@ fn create_partial_checkpoint_state(whopper: &mut MultiprocessWhopper) -> (u64, u
 
 #[cfg(all(unix, target_pointer_width = "64"))]
 fn count_test_rows(whopper: &mut MultiprocessWhopper, worker_idx: usize) -> i64 {
-    let rows = whopper
-        .execute_sql_direct(worker_idx, "select count(*) from test")
-        .expect("count rows")
-        .expect("count should succeed");
-    rows[0][0].as_int().expect("count should be integer")
+    for _ in 0..32 {
+        let rows = whopper
+            .execute_sql_direct(worker_idx, "select count(*) from test")
+            .expect("count rows");
+        match rows {
+            Ok(rows) => return rows[0][0].as_int().expect("count should be integer"),
+            Err(
+                LimboError::SchemaUpdated
+                | LimboError::SchemaConflict
+                | LimboError::Busy
+                | LimboError::BusySnapshot
+                | LimboError::TableLocked,
+            ) => continue,
+            Err(err) => panic!("count should succeed: {err}"),
+        }
+    }
+    panic!("count rows did not stabilize after transient multiprocess errors");
 }
 
 #[cfg(all(unix, target_pointer_width = "64"))]

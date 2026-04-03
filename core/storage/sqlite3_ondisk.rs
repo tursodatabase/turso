@@ -51,7 +51,7 @@ use tracing::{instrument, Level};
 
 use super::pager::PageRef;
 pub use super::pager::{PageContent, PageInner};
-use super::wal::{TursoRwLock, WalSharedMetadata, WalSharedRuntime};
+use super::wal::{OverflowFallbackCoverage, TursoRwLock, WalSharedMetadata, WalSharedRuntime};
 use crate::error::LimboError;
 use crate::fast_lock::SpinLock;
 use crate::io::{Buffer, Completion, FileSyncType, ReadComplete};
@@ -1448,6 +1448,9 @@ pub fn build_shared_wal(
             write_lock: TursoRwLock::new(),
             checkpoint_lock: TursoRwLock::new(),
             epoch: AtomicU32::new(0),
+            overflow_fallback_coverage: Arc::new(
+                SpinLock::new(OverflowFallbackCoverage::default()),
+            ),
         },
     }));
 
@@ -1796,6 +1799,15 @@ impl StreamingWalReader {
                 frames.retain(|&f| f <= max_frame);
             }
             frame_cache.retain(|_, frames| !frames.is_empty());
+            let header = wfs.metadata.wal_header.lock();
+            wfs.runtime.overflow_fallback_coverage.lock().record(
+                header.checkpoint_seq,
+                header.salt_1,
+                header.salt_2,
+                max_frame,
+            );
+        } else {
+            wfs.runtime.overflow_fallback_coverage.lock().clear();
         }
 
         wfs.metadata.max_frame.store(max_frame, Ordering::SeqCst);

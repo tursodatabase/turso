@@ -522,7 +522,7 @@ impl IO for UringIO {
             id,
         });
         if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
-            || !flags.contains(OpenFlags::ReadOnly)
+            && !flags.intersects(OpenFlags::ReadOnly | OpenFlags::NoLock)
         {
             uring_file.lock_file(true)?;
         }

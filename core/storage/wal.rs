@@ -356,7 +356,13 @@ impl TursoRwLock {
         turso_debug_assert!(Self::has_writer(cur));
         // Preserve value bits, replace writer with one reader
         let desired = (cur & Self::VALUE_MASK) | Self::READER_INC;
-        self.0.store(desired, Ordering::Release);
+        let prev = self
+            .0
+            .compare_exchange(cur, desired, Ordering::AcqRel, Ordering::Relaxed);
+        turso_debug_assert!(
+            prev.is_ok(),
+            "downgrade CAS failed — lock was mutated concurrently"
+        );
     }
 
     #[inline]
@@ -431,6 +437,15 @@ enum CoordinationCheckpointGuardKind {
 trait WalCoordination: Debug + Send + Sync {
     /// Load the current authoritative WAL snapshot.
     fn load_snapshot(&self) -> WalSnapshot;
+
+    /// Ensure any process-local fallback cache is complete for `snapshot`.
+    fn ensure_local_frame_cache_covers(
+        &self,
+        _io: &Arc<dyn IO>,
+        _snapshot: WalSnapshot,
+    ) -> Result<()> {
+        Ok(())
+    }
 
     /// Publish a newly committed WAL state snapshot.
     fn publish_commit(&self, commit: WalCommitState);
@@ -816,6 +831,10 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn try_begin_read_tx(&self, snapshot: WalSnapshot) -> Option<ReadGuardKind> {
+        turso_assert!(
+            snapshot.max_frame <= u32::MAX as u64,
+            "max_frame exceeds u32 read mark range"
+        );
         if snapshot.max_frame == snapshot.nbackfills {
             if !self.try_read_mark_shared(0) {
                 return None;
@@ -946,6 +965,10 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn determine_max_safe_checkpoint_frame(&self, max_frame: u64) -> u64 {
+        turso_assert!(
+            max_frame <= u32::MAX as u64,
+            "max_frame exceeds u32 read mark range"
+        );
         let mut max_safe_frame = max_frame;
         for read_lock_idx in 1..5 {
             let this_mark = self.read_mark_value(read_lock_idx);
@@ -1152,6 +1175,61 @@ struct ShmWalCoordination {
 
 #[cfg(all(unix, target_pointer_width = "64"))]
 impl ShmWalCoordination {
+    fn overflow_fallback_covers(
+        &self,
+        snapshot: SharedWalCoordinationHeader,
+        max_frame: u64,
+    ) -> bool {
+        self.shared
+            .read()
+            .runtime
+            .overflow_fallback_coverage
+            .lock()
+            .covers(snapshot, max_frame)
+    }
+
+    fn clear_overflow_fallback_coverage(&self) {
+        self.shared
+            .read()
+            .runtime
+            .overflow_fallback_coverage
+            .lock()
+            .clear();
+    }
+
+    fn local_overflow_scan_covers_snapshot(
+        authority_snapshot: SharedWalCoordinationHeader,
+        required_snapshot: WalSnapshot,
+        scanned: SharedWalCoordinationHeader,
+    ) -> bool {
+        scanned.checkpoint_seq == required_snapshot.checkpoint_seq
+            && scanned.page_size == authority_snapshot.page_size
+            && scanned.salt_1 == authority_snapshot.salt_1
+            && scanned.salt_2 == authority_snapshot.salt_2
+            && scanned.max_frame >= required_snapshot.max_frame
+    }
+
+    fn local_authority_snapshot_from_shared(
+        shared: &WalFileShared,
+        authority_snapshot: SharedWalCoordinationHeader,
+    ) -> SharedWalCoordinationHeader {
+        let header = shared.metadata.wal_header.lock();
+        SharedWalCoordinationHeader {
+            max_frame: shared.metadata.max_frame.load(Ordering::Acquire),
+            nbackfills: shared.metadata.nbackfills.load(Ordering::Acquire),
+            transaction_count: shared.metadata.transaction_count.load(Ordering::Acquire),
+            visibility_generation: authority_snapshot.visibility_generation,
+            checkpoint_seq: header.checkpoint_seq,
+            checkpoint_epoch: shared.runtime.epoch.load(Ordering::Acquire),
+            page_size: header.page_size,
+            salt_1: header.salt_1,
+            salt_2: header.salt_2,
+            checksum_1: shared.metadata.last_checksum.0,
+            checksum_2: shared.metadata.last_checksum.1,
+            reader_slot_count: authority_snapshot.reader_slot_count,
+        }
+    }
+
     fn new(
         shared: Arc<RwLock<WalFileShared>>,
         authority: Arc<MappedSharedWalCoordination>,
@@ -1185,21 +1263,7 @@ impl ShmWalCoordination {
     fn local_authority_snapshot(&self) -> SharedWalCoordinationHeader {
         let authority_snapshot = self.authority.snapshot();
         let shared = self.shared.read();
-        let header = shared.metadata.wal_header.lock();
-        SharedWalCoordinationHeader {
-            max_frame: shared.metadata.max_frame.load(Ordering::Acquire),
-            nbackfills: shared.metadata.nbackfills.load(Ordering::Acquire),
-            transaction_count: shared.metadata.transaction_count.load(Ordering::Acquire),
-            visibility_generation: authority_snapshot.visibility_generation,
-            checkpoint_seq: header.checkpoint_seq,
-            checkpoint_epoch: shared.runtime.epoch.load(Ordering::Acquire),
-            page_size: header.page_size,
-            salt_1: header.salt_1,
-            salt_2: header.salt_2,
-            checksum_1: shared.metadata.last_checksum.0,
-            checksum_2: shared.metadata.last_checksum.1,
-            reader_slot_count: authority_snapshot.reader_slot_count,
-        }
+        Self::local_authority_snapshot_from_shared(&shared, authority_snapshot)
     }
 
     fn sync_local_from_authority(&self, snapshot: SharedWalCoordinationHeader) {
@@ -1267,6 +1331,7 @@ impl ShmWalCoordination {
             header.checksum_2 = snapshot.checksum_2;
         }
         shared.runtime.frame_cache.lock().clear();
+        shared.runtime.overflow_fallback_coverage.lock().clear();
     }
 
     fn sync_authority_frames_from_local(&self) {
@@ -1286,22 +1351,6 @@ impl ShmWalCoordination {
         for (frame_id, page_id) in entries {
             self.authority.record_frame(page_id, frame_id);
         }
-    }
-
-    fn authority_frame_index_matches_local_scan(&self, max_frame: u64) -> bool {
-        let local_entries = {
-            let shared = self.shared.read();
-            let frame_cache = shared.runtime.frame_cache.lock();
-            let mut entries = Vec::with_capacity(frame_cache.len());
-            for (&page_id, frames) in frame_cache.iter() {
-                if let Some(&frame_id) = frames.iter().rfind(|&&frame_id| frame_id <= max_frame) {
-                    entries.push((page_id, frame_id));
-                }
-            }
-            entries.sort_unstable_by_key(|&(page_id, _)| page_id);
-            entries
-        };
-        self.authority.iter_latest_frames(0, max_frame) == local_entries
     }
 
     fn repair_or_reseed_authority_from_local_disk_scan(
@@ -1333,8 +1382,37 @@ impl ShmWalCoordination {
         }
         if Self::authority_matches_local_wal_scan(authority_snapshot, local_snapshot) {
             self.sync_local_from_authority(authority_snapshot);
+            // Matching header metadata is not enough to trust the durable
+            // frame index. A restart or interrupted reopen can leave stale or
+            // empty page->frame mappings behind while max_frame/checksums
+            // still match the scanned WAL. When both snapshots describe the
+            // same visible WAL generation, compare the latest per-page
+            // mappings directly and rebuild if they diverge.
             if self.authority.frame_index_overflowed()
-                || !self.authority_frame_index_matches_local_scan(local_snapshot.max_frame)
+                || (self.authority.open_mode() == SharedWalCoordinationOpenMode::Exclusive
+                    && !self.authority_frame_index_matches_local_wal_scan(local_snapshot.max_frame))
+            {
+                self.authority
+                    .discard_durable_frame_index_for_exclusive_rebuild();
+                self.sync_authority_frames_from_local();
+            }
+            return;
+        }
+        // The authority and disk scan are from the same generation (matching
+        // checkpoint_seq/salts) but disagree on max_frame or checksums. This
+        // happens when a concurrent write advances the authority between the
+        // snapshot read and the disk scan.  Or the authority is from a strictly
+        // newer generation (higher checkpoint_seq) because the WAL was
+        // restarted but the on-disk header hasn't been rewritten yet.
+        //
+        // In both cases the authority's header fields are at least as current
+        // as the disk, so adopt them.  As above, preserve the authority's
+        // frame index — it is maintained by writers and must not be replaced
+        // with a potentially incomplete reconstruction.
+        if Self::authority_is_same_or_newer_generation(authority_snapshot, local_snapshot) {
+            self.sync_local_from_authority(authority_snapshot);
+            if authority_snapshot.checkpoint_seq == local_snapshot.checkpoint_seq
+                && self.authority.frame_index_overflowed()
             {
                 self.authority
                     .discard_durable_frame_index_for_exclusive_rebuild();
@@ -1380,6 +1458,36 @@ impl ShmWalCoordination {
             && local_snapshot.salt_2 == authority_snapshot.salt_2
     }
 
+    /// The authority is from a strictly newer WAL generation (higher
+    /// checkpoint_seq), OR from the same generation with at least as many
+    /// frames.  In either case the authority's header fields were updated
+    /// atomically by writers and are at least as current as a point-in-time
+    /// disk scan of the WAL file.
+    ///
+    /// When the generations match but the authority has a *lower* max_frame,
+    /// the authority was likely rolled back or corrupted; the disk scan's
+    /// higher max_frame is more accurate, so we must NOT match here.
+    fn authority_is_same_or_newer_generation(
+        authority_snapshot: SharedWalCoordinationHeader,
+        local_snapshot: SharedWalCoordinationHeader,
+    ) -> bool {
+        if Self::authority_is_uninitialized(authority_snapshot) {
+            return false;
+        }
+        // Strictly newer generation — always trust authority.
+        if authority_snapshot.checkpoint_seq > local_snapshot.checkpoint_seq {
+            return true;
+        }
+        // Same generation: the authority is atomically updated by writers,
+        // so its max_frame is at least as current as what the disk scan
+        // observed.  Only match when authority.max_frame >= local to
+        // avoid masking a genuinely rolled-back authority.
+        authority_snapshot.checkpoint_seq == local_snapshot.checkpoint_seq
+            && authority_snapshot.salt_1 == local_snapshot.salt_1
+            && authority_snapshot.salt_2 == local_snapshot.salt_2
+            && authority_snapshot.max_frame >= local_snapshot.max_frame
+    }
+
     fn authority_matches_local_wal_scan(
         authority_snapshot: SharedWalCoordinationHeader,
         local_snapshot: SharedWalCoordinationHeader,
@@ -1391,6 +1499,11 @@ impl ShmWalCoordination {
             && authority_snapshot.salt_2 == local_snapshot.salt_2
             && authority_snapshot.checksum_1 == local_snapshot.checksum_1
             && authority_snapshot.checksum_2 == local_snapshot.checksum_2
+    }
+
+    fn authority_frame_index_matches_local_wal_scan(&self, max_frame: u64) -> bool {
+        self.authority.iter_latest_frames(0, max_frame)
+            == self.fallback.iter_latest_frames(0, max_frame)
     }
 
     fn local_zero_frame_generation_is_initialized(
@@ -1516,6 +1629,7 @@ impl ShmWalCoordination {
             }
 
             shared.runtime.frame_cache.lock().clear();
+            shared.runtime.overflow_fallback_coverage.lock().clear();
             shared.runtime.read_locks[0].set_value_exclusive(0);
             shared.runtime.read_locks[1].set_value_exclusive(0);
             for lock in &shared.runtime.read_locks[2..] {
@@ -1548,6 +1662,51 @@ impl ShmWalCoordination {
             transaction_count: snapshot.transaction_count,
         }
     }
+
+    fn ensure_local_frame_cache_covers_snapshot(
+        &self,
+        io: &Arc<dyn IO>,
+        required_snapshot: WalSnapshot,
+    ) -> Result<()> {
+        if required_snapshot.max_frame == 0 || !self.authority.frame_index_overflowed() {
+            return Ok(());
+        }
+
+        let authority_snapshot = self.authority.snapshot();
+        if authority_snapshot.checkpoint_seq != required_snapshot.checkpoint_seq {
+            return Err(LimboError::Busy);
+        }
+        if self.overflow_fallback_covers(authority_snapshot, required_snapshot.max_frame) {
+            return Ok(());
+        }
+
+        let wal_file = self.fallback.wal_file()?;
+        let scanned = sqlite3_ondisk::build_shared_wal(&wal_file, io)?;
+        let (scanned_snapshot, scanned_frame_cache) = {
+            let scanned_guard = scanned.read();
+            let snapshot =
+                Self::local_authority_snapshot_from_shared(&scanned_guard, authority_snapshot);
+            let frame_cache = scanned_guard.runtime.frame_cache.lock().clone();
+            (snapshot, frame_cache)
+        };
+
+        if !Self::local_overflow_scan_covers_snapshot(
+            authority_snapshot,
+            required_snapshot,
+            scanned_snapshot,
+        ) {
+            return Err(LimboError::Busy);
+        }
+
+        let shared = self.shared.write();
+        *shared.runtime.frame_cache.lock() = scanned_frame_cache;
+        shared
+            .runtime
+            .overflow_fallback_coverage
+            .lock()
+            .record_snapshot(scanned_snapshot, scanned_snapshot.max_frame);
+        Ok(())
+    }
 }
 
 #[cfg(all(unix, target_pointer_width = "64"))]
@@ -1561,6 +1720,14 @@ impl WalCoordination for ShmWalCoordination {
             checkpoint_seq: snapshot.checkpoint_seq,
             transaction_count: snapshot.transaction_count,
         }
+    }
+
+    fn ensure_local_frame_cache_covers(
+        &self,
+        io: &Arc<dyn IO>,
+        snapshot: WalSnapshot,
+    ) -> Result<()> {
+        self.ensure_local_frame_cache_covers_snapshot(io, snapshot)
     }
 
     fn publish_commit(&self, commit: WalCommitState) {
@@ -1585,6 +1752,14 @@ impl WalCoordination for ShmWalCoordination {
             commit.last_checksum.1,
             commit.transaction_count,
         );
+        if self.authority.frame_index_overflowed() {
+            let snapshot = self.authority.snapshot();
+            let shared = self.shared.read();
+            let mut coverage = shared.runtime.overflow_fallback_coverage.lock();
+            if coverage.covers(snapshot, commit.max_frame.saturating_sub(1)) {
+                coverage.record_snapshot(snapshot, commit.max_frame);
+            }
+        }
     }
 
     fn publish_backfill(&self, max_frame: u64) {
@@ -1668,6 +1843,10 @@ impl WalCoordination for ShmWalCoordination {
     }
 
     fn try_begin_read_tx(&self, snapshot: WalSnapshot) -> Option<ReadGuardKind> {
+        turso_assert!(
+            snapshot.max_frame <= u32::MAX as u64,
+            "max_frame exceeds u32 read mark range"
+        );
         let shared = self.shared.read();
         let read_locks = &shared.runtime.read_locks;
 
@@ -1823,6 +2002,10 @@ impl WalCoordination for ShmWalCoordination {
     }
 
     fn determine_max_safe_checkpoint_frame(&self, max_frame: u64) -> u64 {
+        turso_assert!(
+            max_frame <= u32::MAX as u64,
+            "max_frame exceeds u32 read mark range"
+        );
         let mut max_safe_frame = max_frame;
         for read_lock_idx in 1..5 {
             let this_mark = self.fallback.read_mark_value(read_lock_idx);
@@ -1970,6 +2153,7 @@ impl WalCoordination for ShmWalCoordination {
     fn rollback_cache(&self, max_frame: u64) {
         self.fallback.rollback_cache(max_frame);
         self.authority.rollback_frames(max_frame);
+        self.clear_overflow_fallback_coverage();
     }
 
     fn should_checkpoint_on_close(&self) -> bool {
@@ -2406,12 +2590,69 @@ pub struct WalSharedRuntime {
     /// Increments on each checkpoint, used to prevent stale cached pages being used for
     /// backfilling.
     pub epoch: AtomicU32,
+    /// Tracks how far the process-local `frame_cache` is known to be complete
+    /// for overflow fallback in the current WAL generation.
+    pub overflow_fallback_coverage: Arc<SpinLock<OverflowFallbackCoverage>>,
 }
 
 /// WalFileShared holds process-wide WAL metadata plus process-local coordination state.
 pub struct WalFileShared {
     pub metadata: WalSharedMetadata,
     pub runtime: WalSharedRuntime,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OverflowFallbackCoverage {
+    checkpoint_seq: u32,
+    salt_1: u32,
+    salt_2: u32,
+    max_frame: u64,
+    valid: bool,
+}
+
+impl OverflowFallbackCoverage {
+    pub(crate) fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    pub(crate) fn record(&mut self, checkpoint_seq: u32, salt_1: u32, salt_2: u32, max_frame: u64) {
+        if max_frame == 0 {
+            self.clear();
+            return;
+        }
+        self.checkpoint_seq = checkpoint_seq;
+        self.salt_1 = salt_1;
+        self.salt_2 = salt_2;
+        self.max_frame = max_frame;
+        self.valid = true;
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    pub(crate) fn record_snapshot(
+        &mut self,
+        snapshot: SharedWalCoordinationHeader,
+        max_frame: u64,
+    ) {
+        self.record(
+            snapshot.checkpoint_seq,
+            snapshot.salt_1,
+            snapshot.salt_2,
+            max_frame,
+        );
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    pub(crate) fn same_generation(&self, snapshot: SharedWalCoordinationHeader) -> bool {
+        self.valid
+            && self.checkpoint_seq == snapshot.checkpoint_seq
+            && self.salt_1 == snapshot.salt_1
+            && self.salt_2 == snapshot.salt_2
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    pub(crate) fn covers(&self, snapshot: SharedWalCoordinationHeader, max_frame: u64) -> bool {
+        self.same_generation(snapshot) && self.max_frame >= max_frame
+    }
 }
 
 impl fmt::Debug for WalFileShared {
@@ -2478,6 +2719,8 @@ enum TryBeginReadResult {
     Ok(bool),
     /// Transient condition, caller should retry immediately (like SQLite's WAL_RETRY)
     Retry,
+    /// Non-retriable failure while preparing the local WAL view.
+    Err(LimboError),
 }
 
 impl WalFile {
@@ -2542,6 +2785,15 @@ impl WalFile {
             shared_snapshot.checkpoint_seq,
             shared_snapshot.transaction_count
         );
+        if let Err(err) = self
+            .coordination
+            .ensure_local_frame_cache_covers(&self.io, shared_snapshot)
+        {
+            return match err {
+                LimboError::Busy => TryBeginReadResult::Retry,
+                other => TryBeginReadResult::Err(other),
+            };
+        }
 
         // Check if database changed since this connection's last read transaction.
         // If it has, the connection will invalidate its page cache.
@@ -2586,6 +2838,7 @@ impl Wal for WalFile {
             tracing::trace!("begin_read_tx: cnt={cnt}");
             match self.try_begin_read_tx() {
                 TryBeginReadResult::Ok(changed) => return Ok(changed),
+                TryBeginReadResult::Err(err) => return Err(err),
                 TryBeginReadResult::Retry => {
                     cnt += 1;
                     if cnt > 100 {
@@ -2658,7 +2911,11 @@ impl Wal for WalFile {
                 // Return BusySnapshot instead of Busy so the caller knows it must
                 // restart the read transaction to get a fresh snapshot.
                 // Retrying with busy_timeout will NEVER HELP.
-                tracing::info!("unable to upgrade transaction from read to write: snapshot is stale, give up and let caller retry from scratch, self.max_frame={}, shared_max={}", self.max_frame.load(Ordering::Acquire), self.load_coordination_snapshot().max_frame);
+                tracing::info!(
+                    "unable to upgrade transaction from read to write: snapshot is stale, give up and let caller retry from scratch, self.max_frame={}, shared_max={}",
+                    self.max_frame.load(Ordering::Acquire),
+                    self.load_coordination_snapshot().max_frame
+                );
                 self.coordination.end_write_tx();
                 return Err(LimboError::BusySnapshot);
             }
@@ -2765,6 +3022,16 @@ impl Wal for WalFile {
         }
         let min_frame = self.min_frame.load(Ordering::Acquire);
         let max_frame = self.max_frame.load(Ordering::Acquire);
+        self.coordination.ensure_local_frame_cache_covers(
+            &self.io,
+            WalSnapshot {
+                max_frame,
+                nbackfills: self.min_frame.load(Ordering::Acquire).saturating_sub(1),
+                last_checksum: *self.last_checksum.read(),
+                checkpoint_seq: self.coordination.wal_header().checkpoint_seq,
+                transaction_count: self.transaction_count.load(Ordering::Acquire),
+            },
+        )?;
         tracing::debug!(
             "find_frame(page_id={}, frame_watermark={:?}): min_frame={}, max_frame={}",
             page_id,
@@ -3176,8 +3443,36 @@ impl Wal for WalFile {
 
         self.max_frame.store(0, Ordering::Release);
         let file = self.coordination.wal_file()?;
-        let c = sqlite3_ondisk::begin_write_wal_header(file.as_ref(), &header)?;
-        Ok(Some(c))
+        let header_c = sqlite3_ondisk::begin_write_wal_header(file.as_ref(), &header)?;
+
+        // After a RESTART or try_restart_log_before_write the WAL file may
+        // still contain orphaned frames from the previous epoch. Truncate
+        // them so that classify_authority_snapshot_against_wal does not see a
+        // length mismatch and unnecessarily fall back to a full disk scan
+        // (which can race with concurrent writers and corrupt the authority).
+        let should_skip_truncate = match file.size() {
+            Ok(size) => size <= WAL_HEADER_SIZE as u64,
+            Err(_) => {
+                tracing::warn!("Failed to get WAL file size");
+                true
+            }
+        };
+        if !should_skip_truncate {
+            let trunc_c = file.truncate(
+                WAL_HEADER_SIZE as u64,
+                Completion::new_trunc(|res| {
+                    if let Err(err) = res {
+                        tracing::warn!("WAL truncate of orphaned frames failed: {err}");
+                    }
+                }),
+            )?;
+            let mut group = CompletionGroup::new(|_| {});
+            group.add(&header_c);
+            group.add(&trunc_c);
+            Ok(Some(group.build()))
+        } else {
+            Ok(Some(header_c))
+        }
     }
 
     fn prepare_wal_finish(&self, sync_type: FileSyncType) -> Result<Completion> {
@@ -3679,7 +3974,16 @@ impl WalFile {
                         let oc = self.ongoing_checkpoint.read();
                         (oc.min_frame, oc.max_frame)
                     };
-                    tracing::info!("checkpoint_inner::Start: min_frame={oc_min_frame}, max_frame={oc_max_frame}");
+                    self.coordination.ensure_local_frame_cache_covers(
+                        &self.io,
+                        WalSnapshot {
+                            max_frame: oc_max_frame,
+                            ..self.load_coordination_snapshot()
+                        },
+                    )?;
+                    tracing::info!(
+                        "checkpoint_inner::Start: min_frame={oc_min_frame}, max_frame={oc_max_frame}"
+                    );
                     let mut to_checkpoint = self
                         .coordination
                         .iter_latest_frames(oc_min_frame, oc_max_frame);
@@ -4515,6 +4819,9 @@ impl WalFileShared {
                 write_lock: TursoRwLock::new(),
                 checkpoint_lock: TursoRwLock::new(),
                 epoch: AtomicU32::new(snapshot.checkpoint_epoch),
+                overflow_fallback_coverage: Arc::new(SpinLock::new(
+                    OverflowFallbackCoverage::default(),
+                )),
             },
         };
         Ok(Arc::new(RwLock::new(shared)))
@@ -4579,6 +4886,9 @@ impl WalFileShared {
                 write_lock: TursoRwLock::new(),
                 checkpoint_lock: TursoRwLock::new(),
                 epoch: AtomicU32::new(0),
+                overflow_fallback_coverage: Arc::new(SpinLock::new(
+                    OverflowFallbackCoverage::default(),
+                )),
             },
         };
         Arc::new(RwLock::new(shared))
@@ -4616,6 +4926,9 @@ impl WalFileShared {
                 write_lock: TursoRwLock::new(),
                 checkpoint_lock: TursoRwLock::new(),
                 epoch: AtomicU32::new(0),
+                overflow_fallback_coverage: Arc::new(SpinLock::new(
+                    OverflowFallbackCoverage::default(),
+                )),
             },
         };
         Ok(Arc::new(RwLock::new(shared)))
@@ -5882,21 +6195,23 @@ pub mod test {
 
     #[cfg(all(unix, target_pointer_width = "64"))]
     #[test]
-    fn test_open_shared_from_authority_reuses_trusted_positive_snapshot() {
+    fn test_open_shared_from_authority_reuses_trusted_snapshot_after_exclusive_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test.db-wal");
         let shm_path = dir.path().join("test.db-tshm");
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
         let snapshot = write_test_wal_with_single_commit_frame(&io, &wal_path);
-        let authority =
-            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
-        authority.install_snapshot(snapshot);
-        authority.record_frame(7, 1);
+        {
+            let authority =
+                Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+            authority.install_snapshot(snapshot);
+            authority.record_frame(7, 1);
+        }
         let reopened_authority =
             Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
         assert_eq!(
             reopened_authority.open_mode(),
-            SharedWalCoordinationOpenMode::MultiProcess
+            SharedWalCoordinationOpenMode::Exclusive
         );
 
         let shared = WalFileShared::open_shared_from_authority_if_exists(
@@ -5929,6 +6244,53 @@ pub mod test {
             .loaded_from_disk_scan
             .load(Ordering::Acquire));
         assert!(shared.runtime.frame_cache.lock().is_empty());
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_shm_coordination_live_overflow_refreshes_reused_fallback_for_active_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-live-overflow.db-wal");
+        let shm_path = dir.path().join("test-live-overflow.db-tshm");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let snapshot = write_test_wal_with_single_commit_frame(&io, &wal_path);
+        let authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        authority.install_snapshot(snapshot);
+        authority.record_frame(7, 1);
+
+        let reopened_authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        let shared = WalFileShared::open_shared_from_authority_if_exists(
+            &io,
+            wal_path.to_str().unwrap(),
+            crate::OpenFlags::Create,
+            &reopened_authority,
+            &open_test_db_file_for_wal(&io, &wal_path),
+        )
+        .unwrap();
+        assert!(shared.read().runtime.frame_cache.lock().is_empty());
+
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        buffer_pool.finalize_with_page_size(4096).unwrap();
+        let wal = WalFile::new_with_shared_coordination(
+            io.clone(),
+            shared.clone(),
+            reopened_authority.clone(),
+            ((0, 0), 0),
+            buffer_pool,
+        );
+
+        wal.begin_read_tx().unwrap();
+        reopened_authority.mark_frame_index_overflowed_for_tests();
+
+        assert_eq!(wal.find_frame(7, None).unwrap(), Some(1));
+        assert_eq!(
+            shared.read().runtime.frame_cache.lock().get(&7).cloned(),
+            Some(vec![1])
+        );
+
+        wal.end_read_tx();
     }
 
     #[cfg(all(unix, target_pointer_width = "64"))]
@@ -6075,7 +6437,7 @@ pub mod test {
 
     #[cfg(all(unix, target_pointer_width = "64"))]
     #[test]
-    fn test_open_shared_from_authority_exclusive_disk_scan_rebuilds_authority_via_coordination() {
+    fn test_open_shared_from_authority_rebuilt_authority_persists_across_exclusive_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test-republish.db-wal");
         let shm_path = dir.path().join("test-republish.db-tshm");
@@ -6107,11 +6469,14 @@ pub mod test {
         assert_eq!(authority.iter_latest_frames(0, u64::MAX), vec![(7, 1)]);
         assert_eq!(exclusive_coordination.find_frame(7, 0, 1, None), Some(1));
 
+        drop(exclusive_coordination);
+        drop(authority);
+
         let reopened_authority =
             Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
         assert_eq!(
             reopened_authority.open_mode(),
-            SharedWalCoordinationOpenMode::MultiProcess
+            SharedWalCoordinationOpenMode::Exclusive
         );
 
         let reopened_shared = WalFileShared::open_shared_from_authority_if_exists(
@@ -6193,28 +6558,30 @@ pub mod test {
 
     #[cfg(all(unix, target_pointer_width = "64"))]
     #[test]
-    fn test_open_shared_from_authority_ignores_unpublished_backfill_proof() {
+    fn test_open_shared_from_authority_ignores_unpublished_backfill_proof_after_exclusive_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test-unpublished-proof.db-wal");
         let shm_path = dir.path().join("test-unpublished-proof.db-tshm");
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
         let snapshot = write_test_wal_with_single_commit_frame(&io, &wal_path);
-        let authority =
-            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
-        authority.install_snapshot(snapshot);
-        authority.install_backfill_proof(
-            SharedWalCoordinationHeader {
-                nbackfills: snapshot.max_frame,
-                ..snapshot
-            },
-            11,
-            0xAABB_CCDD,
-        );
+        {
+            let authority =
+                Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+            authority.install_snapshot(snapshot);
+            authority.install_backfill_proof(
+                SharedWalCoordinationHeader {
+                    nbackfills: snapshot.max_frame,
+                    ..snapshot
+                },
+                11,
+                0xAABB_CCDD,
+            );
+        }
         let reopened_authority =
             Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
         assert_eq!(
             reopened_authority.open_mode(),
-            SharedWalCoordinationOpenMode::MultiProcess
+            SharedWalCoordinationOpenMode::Exclusive
         );
 
         let shared = WalFileShared::open_shared_from_authority_if_exists(
@@ -6490,7 +6857,8 @@ pub mod test {
 
     #[cfg(all(unix, target_pointer_width = "64"))]
     #[test]
-    fn test_open_shared_from_authority_keeps_zero_length_wal_uninitialized() {
+    fn test_open_shared_from_authority_keeps_zero_length_wal_uninitialized_after_exclusive_reopen()
+    {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test-empty.db-wal");
         let shm_path = dir.path().join("test-empty.db-tshm");
@@ -6498,27 +6866,29 @@ pub mod test {
 
         io.open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
             .unwrap();
-        let authority =
-            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
-        authority.install_snapshot(SharedWalCoordinationHeader {
-            max_frame: 0,
-            nbackfills: 0,
-            transaction_count: 9,
-            visibility_generation: 1,
-            checkpoint_seq: 5,
-            checkpoint_epoch: 7,
-            page_size: 4096,
-            salt_1: 17,
-            salt_2: 23,
-            checksum_1: 31,
-            checksum_2: 37,
-            reader_slot_count: 64,
-        });
+        {
+            let authority =
+                Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+            authority.install_snapshot(SharedWalCoordinationHeader {
+                max_frame: 0,
+                nbackfills: 0,
+                transaction_count: 9,
+                visibility_generation: 1,
+                checkpoint_seq: 5,
+                checkpoint_epoch: 7,
+                page_size: 4096,
+                salt_1: 17,
+                salt_2: 23,
+                checksum_1: 31,
+                checksum_2: 37,
+                reader_slot_count: 64,
+            });
+        }
         let reopened_authority =
             Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
         assert_eq!(
             reopened_authority.open_mode(),
-            SharedWalCoordinationOpenMode::MultiProcess
+            SharedWalCoordinationOpenMode::Exclusive
         );
 
         let shared = WalFileShared::open_shared_from_authority_if_exists(
@@ -6716,9 +7086,11 @@ pub mod test {
             header.checksum_1 = authoritative.last_checksum.0;
             header.checksum_2 = authoritative.last_checksum.1;
         }
-        let (authority, coordination_a) = make_test_shm_coordination(&shared_a, &shm_path);
-        coordination_a.cache_frame(7, 2);
-        coordination_a.cache_frame(9, 4);
+        {
+            let (_authority, coordination_a) = make_test_shm_coordination(&shared_a, &shm_path);
+            coordination_a.cache_frame(7, 2);
+            coordination_a.cache_frame(9, 4);
+        }
 
         let file_b = io
             .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
@@ -6741,7 +7113,11 @@ pub mod test {
             shared.runtime.frame_cache.lock().insert(9, vec![5]);
         }
 
-        let (_authority_b, coordination_b) = make_test_shm_coordination(&shared_b, &shm_path);
+        let (authority, coordination_b) = make_test_shm_coordination(&shared_b, &shm_path);
+        assert_eq!(
+            authority.open_mode(),
+            SharedWalCoordinationOpenMode::Exclusive
+        );
 
         let reopened = coordination_b.load_snapshot();
         assert_eq!(reopened.max_frame, authoritative.max_frame);
