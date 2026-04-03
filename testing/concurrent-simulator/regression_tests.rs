@@ -5,9 +5,10 @@ use std::sync::Arc;
 use turso_core::{
     Connection, Database, DatabaseOpts, IO, LimboError, OpenFlags, PlatformIO, Statement,
 };
+#[cfg(all(unix, target_pointer_width = "64"))]
+use turso_whopper::multiprocess::{MultiprocessOpts, MultiprocessWhopper};
 use turso_whopper::{
     IOFaultConfig, SimulatorIO,
-    multiprocess::{MultiprocessOpts, MultiprocessWhopper},
     workloads::{
         BeginWorkload, CommitWorkload, CreateIndexWorkload, CreateSimpleTableWorkload,
         DeleteWorkload, DropIndexWorkload, IntegrityCheckWorkload, RollbackWorkload,

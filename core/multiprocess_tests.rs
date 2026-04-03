@@ -148,6 +148,7 @@ fn flip_db_header_reserved_byte(path: &std::path::Path) {
 }
 
 #[test]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn shared_wal_coordination_rejects_remote_filesystem_magic_values() {
     assert!(!Database::filesystem_magic_allows_shared_wal(0x6969));
     assert!(!Database::filesystem_magic_allows_shared_wal(
