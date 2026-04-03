@@ -355,24 +355,67 @@ impl Plan {
         }
     }
 
-    /// Returns the result columns for Select/CompoundSelect plans.
-    /// Returns None for Delete/Update plans.
-    pub fn select_result_columns(&self) -> Option<&[ResultSetColumn]> {
+    /// Returns the result columns of a SELECT or compound SELECT plan. For a
+    /// compound SELECT the columns of the right-most component are returned,
+    /// since every component must agree on column count and naming.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on a DELETE or UPDATE plan, which have no result
+    /// columns.
+    pub fn select_result_columns(&self) -> &[ResultSetColumn] {
         match self {
-            Plan::Select(select_plan) => Some(&select_plan.result_columns),
-            Plan::CompoundSelect { right_most, .. } => Some(&right_most.result_columns),
-            Plan::Delete(_) | Plan::Update(_) => None,
+            Plan::Select(select_plan) => &select_plan.result_columns,
+            Plan::CompoundSelect { right_most, .. } => &right_most.result_columns,
+            Plan::Delete(_) | Plan::Update(_) => {
+                panic!("select_result_columns called on a non-SELECT plan")
+            }
         }
     }
 
-    /// Returns the table references for Select/CompoundSelect plans.
-    /// Returns None for Delete/Update plans.
-    pub fn select_table_references(&self) -> Option<&TableReferences> {
+    /// Returns the table references of a SELECT or compound SELECT plan. For
+    /// a compound SELECT the references of the right-most component are
+    /// returned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on a DELETE or UPDATE plan.
+    pub fn select_table_references(&self) -> &TableReferences {
         match self {
-            Plan::Select(select_plan) => Some(&select_plan.table_references),
-            Plan::CompoundSelect { right_most, .. } => Some(&right_most.table_references),
-            Plan::Delete(_) | Plan::Update(_) => None,
+            Plan::Select(select_plan) => &select_plan.table_references,
+            Plan::CompoundSelect { right_most, .. } => &right_most.table_references,
+            Plan::Delete(_) | Plan::Update(_) => {
+                panic!("select_table_references called on a non-SELECT plan")
+            }
         }
+    }
+
+    /// Returns the IDs of every outer-query reference that this plan actually
+    /// uses. For a compound SELECT, the result spans all of its component
+    /// SELECTs. DELETE and UPDATE plans have no outer-query references and
+    /// always return an empty vector.
+    pub fn used_outer_query_ref_ids(&self) -> Vec<TableInternalId> {
+        fn collect_from_select(plan: &SelectPlan, out: &mut Vec<TableInternalId>) {
+            for outer_ref in plan.table_references.outer_query_refs().iter() {
+                if outer_ref.is_used() {
+                    out.push(outer_ref.internal_id);
+                }
+            }
+        }
+        let mut ids = Vec::new();
+        match self {
+            Plan::Select(plan) => collect_from_select(plan, &mut ids),
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => {
+                for (plan, _) in left {
+                    collect_from_select(plan, &mut ids);
+                }
+                collect_from_select(right_most, &mut ids);
+            }
+            Plan::Delete(_) | Plan::Update(_) => {}
+        }
+        ids
     }
 
     /// Returns true if this plan or any of its subplans read from the given table.
@@ -2524,7 +2567,7 @@ pub enum SubqueryState {
     /// The subquery has not been evaluated yet.
     /// The 'plan' field is only optional because it is .take()'d when the the subquery
     /// is translated into bytecode.
-    Unevaluated { plan: Option<Box<SelectPlan>> },
+    Unevaluated { plan: Option<Box<Plan>> },
     /// The subquery has been evaluated.
     /// The [evaluated_at] field contains the loop index where the subquery was evaluated.
     /// The query plan struct no longer exists because translating the plan currently
@@ -2601,7 +2644,7 @@ impl NonFromClauseSubquery {
     pub fn reads_table(&self, database_id: usize, table_name: &str) -> bool {
         match &self.state {
             SubqueryState::Unevaluated { plan: Some(plan) } => {
-                plan.reads_table(database_id, table_name)
+                Plan::reads_table(plan, database_id, table_name)
             }
             _ => false,
         }
@@ -2623,26 +2666,19 @@ impl NonFromClauseSubquery {
                 return Ok(*evaluated_at);
             }
         };
-        eval_at_for_select_plan(plan, join_order, table_references)
+        eval_at_for_plan(plan, join_order, table_references)
     }
 
     /// Consumes the plan and returns it, and sets the subquery to the evaluated state.
     ///
     /// This captures any outer references before the plan is moved so later
     /// phases can still reason about dependencies.
-    pub fn consume_plan(&mut self, evaluated_at: EvalAt) -> Box<SelectPlan> {
+    pub fn consume_plan(&mut self, evaluated_at: EvalAt) -> Box<Plan> {
         match &mut self.state {
             SubqueryState::Unevaluated { plan } => {
                 let outer_ref_ids = plan
                     .as_ref()
-                    .map(|plan| {
-                        plan.table_references
-                            .outer_query_refs()
-                            .iter()
-                            .filter(|t| t.is_used())
-                            .map(|t| t.internal_id)
-                            .collect::<Vec<_>>()
-                    })
+                    .map(|plan| plan.used_outer_query_ref_ids())
                     .unwrap_or_default();
                 let plan = plan.take().unwrap();
                 self.state = SubqueryState::Evaluated {
@@ -2734,7 +2770,7 @@ pub fn plan_has_outer_scope_dependency(plan: &Plan) -> bool {
                     .any(|subquery| match &subquery.state {
                         SubqueryState::Unevaluated {
                             plan: Some(subquery_plan),
-                        } => select_plan_has_outer_scope_dependency(
+                        } => plan_has_outer_scope_dependency_with_tables(
                             subquery_plan,
                             accessible_table_ids,
                         ),
