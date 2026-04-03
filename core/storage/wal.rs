@@ -356,7 +356,13 @@ impl TursoRwLock {
         turso_debug_assert!(Self::has_writer(cur));
         // Preserve value bits, replace writer with one reader
         let desired = (cur & Self::VALUE_MASK) | Self::READER_INC;
-        self.0.store(desired, Ordering::Release);
+        let prev = self
+            .0
+            .compare_exchange(cur, desired, Ordering::AcqRel, Ordering::Relaxed);
+        turso_debug_assert!(
+            prev.is_ok(),
+            "downgrade CAS failed — lock was mutated concurrently"
+        );
     }
 
     #[inline]
@@ -816,6 +822,10 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn try_begin_read_tx(&self, snapshot: WalSnapshot) -> Option<ReadGuardKind> {
+        turso_assert!(
+            snapshot.max_frame <= u32::MAX as u64,
+            "max_frame exceeds u32 read mark range"
+        );
         if snapshot.max_frame == snapshot.nbackfills {
             if !self.try_read_mark_shared(0) {
                 return None;
@@ -946,6 +956,10 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn determine_max_safe_checkpoint_frame(&self, max_frame: u64) -> u64 {
+        turso_assert!(
+            max_frame <= u32::MAX as u64,
+            "max_frame exceeds u32 read mark range"
+        );
         let mut max_safe_frame = max_frame;
         for read_lock_idx in 1..5 {
             let this_mark = self.read_mark_value(read_lock_idx);
@@ -1668,6 +1682,10 @@ impl WalCoordination for ShmWalCoordination {
     }
 
     fn try_begin_read_tx(&self, snapshot: WalSnapshot) -> Option<ReadGuardKind> {
+        turso_assert!(
+            snapshot.max_frame <= u32::MAX as u64,
+            "max_frame exceeds u32 read mark range"
+        );
         let shared = self.shared.read();
         let read_locks = &shared.runtime.read_locks;
 
@@ -1823,6 +1841,10 @@ impl WalCoordination for ShmWalCoordination {
     }
 
     fn determine_max_safe_checkpoint_frame(&self, max_frame: u64) -> u64 {
+        turso_assert!(
+            max_frame <= u32::MAX as u64,
+            "max_frame exceeds u32 read mark range"
+        );
         let mut max_safe_frame = max_frame;
         for read_lock_idx in 1..5 {
             let this_mark = self.fallback.read_mark_value(read_lock_idx);

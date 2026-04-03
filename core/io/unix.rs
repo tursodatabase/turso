@@ -160,7 +160,9 @@ impl Drop for UnixSharedWalMapping {
     fn drop(&mut self) {
         let rc = unsafe { libc::munmap(self.ptr.as_ptr().cast(), self.len) };
         if rc != 0 {
-            panic!(
+            // Log rather than panic — panicking in Drop aborts if we're already
+            // unwinding (double panic).
+            tracing::error!(
                 "munmap failed for shared WAL coordination region: {}",
                 std::io::Error::last_os_error()
             );
@@ -200,22 +202,26 @@ pub(crate) fn unix_shared_wal_lock_byte(
             ))
         }
     };
-    let rc = unsafe { libc::fcntl(fd, cmd, &mut flock) };
-    if rc == -1 {
-        let error = std::io::Error::last_os_error();
-        if !blocking && error.kind() == ErrorKind::WouldBlock {
-            return Ok(false);
-        }
-        let message = match error.kind() {
-            ErrorKind::WouldBlock => {
-                "Failed locking shared WAL coordination file. File is locked by another process"
-                    .to_string()
+    loop {
+        let rc = unsafe { libc::fcntl(fd, cmd, &mut flock) };
+        if rc == -1 {
+            let error = std::io::Error::last_os_error();
+            if blocking && error.kind() == ErrorKind::Interrupted {
+                continue;
             }
-            _ => format!("Failed locking shared WAL coordination file, {error}"),
-        };
-        Err(LimboError::LockingError(message))
-    } else {
-        Ok(true)
+            if !blocking && error.kind() == ErrorKind::WouldBlock {
+                return Ok(false);
+            }
+            let message = match error.kind() {
+                ErrorKind::WouldBlock => {
+                    "Failed locking shared WAL coordination file. File is locked by another process"
+                        .to_string()
+                }
+                _ => format!("Failed locking shared WAL coordination file, {error}"),
+            };
+            return Err(LimboError::LockingError(message));
+        }
+        return Ok(true);
     }
 }
 
@@ -258,6 +264,11 @@ pub(crate) fn unix_shared_wal_map(
     len: usize,
     fd: RawFd,
 ) -> Result<Box<dyn SharedWalMappedRegion>> {
+    if len == 0 {
+        return Err(LimboError::InternalError(
+            "cannot mmap shared WAL coordination region with zero length".into(),
+        ));
+    }
     let ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
