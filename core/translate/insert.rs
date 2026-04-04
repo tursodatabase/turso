@@ -1988,7 +1988,8 @@ fn init_source_emission<'a>(
         // If we had a single tuple in VALUES, it was inserted into the values vector parameter.
         if values.len() != required_column_count {
             crate::bail_parse_error!(
-                "{} values for {required_column_count} columns",
+                "table {} has {required_column_count} columns but {} values were supplied",
+                table.get_name(),
                 values.len()
             );
         }
@@ -2035,7 +2036,8 @@ fn init_source_emission<'a>(
                 })?;
                 if num_result_cols != required_column_count {
                     crate::bail_parse_error!(
-                        "{} values for {required_column_count} columns",
+                        "table {} has {required_column_count} columns but {} values were supplied",
+                        table.get_name(),
                         num_result_cols,
                     );
                 }
