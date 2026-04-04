@@ -159,6 +159,117 @@ impl<C: Parser + Send + Sync + 'static> Completer for TursoCompleter<C> {
     }
 }
 
+// --- Nucleo History Completer ---
+
+pub struct NucleoHistoryCompleter {
+    nucleo: nucleo::Nucleo<String>,
+    last_line: String,
+    matcher: nucleo::Matcher,
+    indices_buf: Vec<u32>,
+    utf32_buf: Vec<char>,
+}
+
+impl NucleoHistoryCompleter {
+    pub fn new(history_path: PathBuf) -> Self {
+        let nucleo = nucleo::Nucleo::new(
+            nucleo::Config::DEFAULT,
+            Arc::new(|| {}),
+            Some(1), // single worker thread is enough for history
+            1,       // single column
+        );
+
+        let injector = nucleo.injector();
+
+        // Load and inject history entries (deduped, most recent first)
+        if let Ok(content) = std::fs::read_to_string(&history_path) {
+            let mut seen = std::collections::HashSet::new();
+            for line in content.lines().rev() {
+                if !line.is_empty() && seen.insert(line.to_string()) {
+                    injector.push(line.to_string(), |s, cols| {
+                        cols[0] = s.as_str().into();
+                    });
+                }
+            }
+        }
+
+        Self {
+            nucleo,
+            last_line: String::new(),
+            matcher: nucleo::Matcher::new(nucleo::Config::DEFAULT),
+            indices_buf: Vec::new(),
+            utf32_buf: Vec::new(),
+        }
+    }
+}
+
+impl Completer for NucleoHistoryCompleter {
+    fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
+        use nucleo::pattern::{CaseMatching, Normalization};
+
+        // Update pattern only when input changed
+        let append = line.starts_with(self.last_line.as_str()) && !self.last_line.is_empty();
+        self.nucleo
+            .pattern
+            .reparse(0, line, CaseMatching::Smart, Normalization::Smart, append);
+        self.last_line = line.to_string();
+
+        // Let the matcher process
+        self.nucleo.tick(10);
+
+        let snapshot = self.nucleo.snapshot();
+
+        if line.is_empty() {
+            // No query: return recent history as-is
+            let count = snapshot.matched_item_count().min(50);
+            return snapshot
+                .matched_items(..count)
+                .map(|item| Suggestion {
+                    value: item.data.clone(),
+                    description: None,
+                    style: None,
+                    extra: None,
+                    span: Span::new(pos - line.len(), pos),
+                    append_whitespace: false,
+                    display_override: None,
+                    match_indices: None,
+                })
+                .collect();
+        }
+
+        // Compute match indices for highlighting, reusing buffers
+        let pattern = snapshot.pattern();
+        let count = snapshot.matched_item_count().min(50);
+        let items: Vec<_> = snapshot.matched_items(..count).collect();
+
+        items
+            .into_iter()
+            .map(|item| {
+                self.indices_buf.clear();
+                self.utf32_buf.clear();
+                let haystack = nucleo::Utf32Str::new(item.data, &mut self.utf32_buf);
+                pattern.column_pattern(0).indices(
+                    haystack,
+                    &mut self.matcher,
+                    &mut self.indices_buf,
+                );
+                self.indices_buf.sort_unstable();
+                self.indices_buf.dedup();
+
+                Suggestion {
+                    value: item.data.clone(),
+                    description: None,
+                    style: None,
+                    extra: None,
+                    span: Span::new(pos - line.len(), pos),
+                    append_whitespace: false,
+                    display_override: None,
+                    match_indices: Some(self.indices_buf.iter().map(|&i| i as usize).collect()),
+                }
+            })
+            .collect()
+    }
+}
+
 // --- Highlighter ---
 
 pub struct TursoHighlighter {
