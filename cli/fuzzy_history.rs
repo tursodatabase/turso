@@ -246,8 +246,17 @@ impl FzfState {
     }
 }
 
-pub fn run(history_path: &PathBuf, highlight_config: Option<&HighlightConfig>) -> Option<String> {
+pub fn run(
+    history_path: &PathBuf,
+    highlight_config: Option<&HighlightConfig>,
+    initial_query: String,
+) -> Option<String> {
     let mut state = FzfState::new(history_path, highlight_config)?;
+
+    if !initial_query.is_empty() {
+        state.input = Input::new(initial_query);
+        state.update_pattern(false);
+    }
 
     let mut terminal = ratatui::try_init().ok()?;
 

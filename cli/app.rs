@@ -1843,17 +1843,20 @@ impl Limbo {
         if let Some(rl) = &mut self.rl {
             match rl.read_line(&self.prompt) {
                 Ok(Signal::Success(ref result)) if result == "__fzf_history__" => {
-                    // Launch full-screen fuzzy history search
+                    // Launch full-screen fuzzy history search, pre-filled with current input
                     let hl_config = self.config.as_ref().map(|c| &c.highlight);
+                    let current_input = rl.current_buffer_contents().to_string();
                     if let Some(selected) =
-                        crate::fuzzy_history::run(&crate::HISTORY_FILE, hl_config)
+                        crate::fuzzy_history::run(&crate::HISTORY_FILE, hl_config, current_input)
                     {
-                        self.read_state.process(&selected);
-                        let _ = self.input_buff.write_str(selected.as_str());
-                    } else {
-                        // User cancelled - re-prompt
-                        return Ok(());
+                        // Place the selected text into reedline's buffer for editing
+                        rl.run_edit_commands(&[
+                            reedline::EditCommand::Clear,
+                            reedline::EditCommand::InsertString(selected),
+                        ]);
                     }
+                    // Re-prompt so the user can review/edit before executing
+                    return Ok(());
                 }
                 Ok(Signal::Success(result)) => {
                     self.read_state.process(&result);
