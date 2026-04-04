@@ -94,6 +94,7 @@ fn test_sdk_close_finalizes_leaked_statements() {
         vfs: None,
         io: None,
         db_file: None,
+        flags: None,
     });
     let _ = db_a.open().unwrap();
     let conn_a = db_a.connect().unwrap();

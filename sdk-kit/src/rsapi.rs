@@ -1294,6 +1294,7 @@ mod tests {
                 vfs: None,
                 io: None,
                 db_file: None,
+                flags: None,
             });
             let result = db.open().unwrap();
             assert!(!result.is_io());
@@ -1355,6 +1356,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1375,6 +1377,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1405,6 +1408,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1428,6 +1432,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1478,6 +1483,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1537,6 +1543,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1569,6 +1576,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1598,6 +1606,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1623,6 +1632,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1649,6 +1659,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1699,6 +1710,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1787,6 +1799,7 @@ mod tests {
                     vfs: None,
                     io: None,
                     db_file: None,
+                    flags: None,
                 });
                 let result = db.open().unwrap();
                 assert!(!result.is_io());
@@ -1827,6 +1840,7 @@ mod tests {
                     vfs: None,
                     io: None,
                     db_file: None,
+                    flags: None,
                 });
                 let result = db.open().unwrap();
                 assert!(!result.is_io());
@@ -1853,6 +1867,7 @@ mod tests {
                     vfs: None,
                     io: None,
                     db_file: None,
+                    flags: None,
                 });
                 assert!(db.open().is_err(), "Opening with wrong key should fail");
             }
@@ -1867,6 +1882,7 @@ mod tests {
                     vfs: None,
                     io: None,
                     db_file: None,
+                    flags: None,
                 });
                 let result = db.open();
                 println!("result: {result:?}");
@@ -1902,6 +1918,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         });
         let _ = db_a.open().unwrap();
         let conn_a = db_a.connect().unwrap();
@@ -1939,6 +1956,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         });
         let _ = db_a2.open().unwrap();
         let conn_a2 = db_a2.connect().unwrap();
@@ -1973,6 +1991,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2007,6 +2026,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
