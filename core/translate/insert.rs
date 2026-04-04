@@ -2036,7 +2036,8 @@ fn init_source_emission<'a>(
                 })?;
                 if num_result_cols != required_column_count {
                     crate::bail_parse_error!(
-                        "{} values for {required_column_count} columns",
+                        "table {} has {required_column_count} columns but {} values were supplied",
+                        table.get_name(),
                         num_result_cols,
                     );
                 }

@@ -1,6 +1,6 @@
 use crate::vdbe::builder::SelfTableContext;
 use crate::{
-    schema::{Index, Schema, Table},
+    schema::{GeneratedType, Index, Schema, Table},
     translate::{
         emitter::Resolver,
         expr::{
@@ -292,18 +292,20 @@ fn translate_integrity_check_impl(
             )?);
         }
 
-        let not_null_columns: Vec<(usize, String)> = btree_table
+        let not_null_columns: Vec<(BoundIndexColumn, String)> = btree_table
             .columns
             .iter()
             .enumerate()
+            .filter(|(_, col)| col.notnull() && !col.is_rowid_alias())
             .filter_map(|(idx, col)| {
-                if col.notnull() && !col.is_rowid_alias() {
-                    Some((
-                        idx,
-                        col.name.clone().unwrap_or_else(|| format!("column{idx}")),
-                    ))
-                } else {
-                    None
+                let name = col.name.clone().unwrap_or_else(|| format!("column{idx}"));
+                match col.generated_type() {
+                    GeneratedType::Virtual { resolved, .. } => {
+                        let bound =
+                            bind_expr_for_table(resolved, &mut table_references, resolver).ok()?;
+                        Some((BoundIndexColumn::Expr(Box::new(bound)), name))
+                    }
+                    GeneratedType::NotGenerated => Some((BoundIndexColumn::Column(idx), name)),
                 }
             })
             .collect();
@@ -325,9 +327,35 @@ fn translate_integrity_check_impl(
             value: 1,
         });
 
-        for (col_idx, col_name) in &not_null_columns {
+        for (col_ref, col_name) in &not_null_columns {
             let col_value_reg = program.alloc_register();
-            program.emit_column_or_rowid(table_cursor_id, *col_idx, col_value_reg);
+            match col_ref {
+                BoundIndexColumn::Column(idx) => {
+                    program.emit_column_or_rowid(table_cursor_id, *idx, col_value_reg);
+                }
+                BoundIndexColumn::Expr(expr) => {
+                    let self_table_context = table_references.joined_tables().first().map(|jt| {
+                        SelfTableContext::ForSelect {
+                            table_ref_id: jt.internal_id,
+                            referenced_tables: table_references.clone(),
+                        }
+                    });
+                    program.with_self_table_context(
+                        self_table_context.as_ref(),
+                        |program, _| {
+                            translate_expr_no_constant_opt(
+                                program,
+                                Some(&table_references),
+                                expr,
+                                col_value_reg,
+                                resolver,
+                                NoConstantOptReason::RegisterReuse,
+                            )?;
+                            Ok(())
+                        },
+                    )?;
+                }
+            }
 
             let not_null_ok = program.allocate_label();
             program.emit_insn(Insn::NotNull {

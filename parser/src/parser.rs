@@ -186,7 +186,7 @@ impl<'a> Parser<'a> {
             self.last_variable_id += 1;
             let index = NonZeroU32::new(self.last_variable_id).unwrap();
             Ok(Expr::Variable(Variable::indexed(index)))
-        } else if matches!(token[0], b':' | b'@' | b'$' | b'#') {
+        } else if matches!(token[0], b':' | b'@' | b'$') {
             let index = if let Some(index) = self.named_variables.get(token).copied() {
                 index
             } else {
