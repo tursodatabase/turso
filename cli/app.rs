@@ -1844,7 +1844,10 @@ impl Limbo {
             match rl.read_line(&self.prompt) {
                 Ok(Signal::Success(ref result)) if result == "__fzf_history__" => {
                     // Launch full-screen fuzzy history search
-                    if let Some(selected) = crate::fuzzy_history::run(&crate::HISTORY_FILE) {
+                    let hl_config = self.config.as_ref().map(|c| &c.highlight);
+                    if let Some(selected) =
+                        crate::fuzzy_history::run(&crate::HISTORY_FILE, hl_config)
+                    {
                         self.read_state.process(&selected);
                         let _ = self.input_buff.write_str(selected.as_str());
                     } else {
