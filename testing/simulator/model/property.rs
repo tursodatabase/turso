@@ -182,6 +182,20 @@ pub enum Property {
     FaultyQuery {
         query: Query,
     },
+    /// GroupByAggregateCheck verifies that GROUP BY with aggregate functions
+    /// returns the correct results by comparing the database output against
+    /// the shadow model's computed aggregates.
+    ///
+    /// Execution:
+    ///     SELECT <group_cols>, <agg_funcs> FROM <t> WHERE <pred> GROUP BY <group_cols> [HAVING ...]
+    ///
+    /// Assertion: results match shadow model's GROUP BY computation (unordered comparison).
+    GroupByAggregateCheck {
+        /// The GROUP BY + aggregate select query
+        select: Select,
+        /// Table name for dependency tracking
+        table: String,
+    },
     /// Property used to subsititute a property with its queries only
     Queries {
         queries: Vec<Query>,
@@ -228,7 +242,8 @@ impl Property {
             | Property::UnionAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
             | Property::TableHasExpectedContent { .. }
-            | Property::AllTableHaveExpectedContent { .. } => None,
+            | Property::AllTableHaveExpectedContent { .. }
+            | Property::GroupByAggregateCheck { .. } => None,
         }
     }
 }

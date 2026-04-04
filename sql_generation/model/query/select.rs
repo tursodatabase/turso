@@ -14,6 +14,52 @@ use crate::model::table::{JoinTable, JoinType, JoinedTable, Table};
 
 use super::predicate::Predicate;
 
+/// Aggregate function type
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum AggFunc {
+    Count,
+    CountStar,
+    Sum,
+    Min,
+    Max,
+}
+
+impl Display for AggFunc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AggFunc::Count => write!(f, "COUNT"),
+            AggFunc::CountStar => write!(f, "COUNT"),
+            AggFunc::Sum => write!(f, "SUM"),
+            AggFunc::Min => write!(f, "MIN"),
+            AggFunc::Max => write!(f, "MAX"),
+        }
+    }
+}
+
+/// Aggregate expression: func(column)
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AggregateExpr {
+    pub func: AggFunc,
+    /// Column name (qualified as table.column). None for COUNT(*)
+    pub column: Option<String>,
+}
+
+impl Display for AggregateExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.column {
+            Some(col) => write!(f, "{}({})", self.func, col),
+            None => write!(f, "{}(*)", self.func),
+        }
+    }
+}
+
+/// GROUP BY clause
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GroupByClause {
+    pub columns: Vec<String>,
+    pub having: Option<Predicate>,
+}
+
 /// `SELECT` or `RETURNING` result column
 // https://sqlite.org/syntax/result-column.html
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -25,6 +71,8 @@ pub enum ResultColumn {
     Star,
     /// column name
     Column(String),
+    /// aggregate expression e.g. SUM(col), COUNT(*)
+    Aggregate(AggregateExpr),
 }
 
 impl Display for ResultColumn {
@@ -33,6 +81,7 @@ impl Display for ResultColumn {
             ResultColumn::Expr(expr) => write!(f, "({expr})"),
             ResultColumn::Star => write!(f, "*"),
             ResultColumn::Column(name) => write!(f, "{name}"),
+            ResultColumn::Aggregate(agg) => write!(f, "{agg}"),
         }
     }
 }
@@ -62,6 +111,7 @@ impl Select {
                     from: None,
                     where_clause: Predicate::true_(),
                     order_by: None,
+                    group_by: None,
                 }),
                 compounds: Vec::new(),
             },
@@ -87,6 +137,7 @@ impl Select {
                     }),
                     where_clause,
                     order_by: None,
+                    group_by: None,
                 }),
                 compounds: Vec::new(),
             },
@@ -156,6 +207,8 @@ pub struct SelectInner {
     pub where_clause: Predicate,
     /// `ORDER BY` clause
     pub order_by: Option<OrderBy>,
+    /// `GROUP BY` clause
+    pub group_by: Option<GroupByClause>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -329,20 +382,11 @@ impl Select {
                         .select
                         .columns
                         .iter()
-                        .map(|col| match col {
-                            ResultColumn::Expr(expr) => {
-                                ast::ResultColumn::Expr(expr.0.clone().into_boxed(), None)
-                            }
-                            ResultColumn::Star => ast::ResultColumn::Star,
-                            ResultColumn::Column(name) => ast::ResultColumn::Expr(
-                                column_qualified_expr(name).into_boxed(),
-                                None,
-                            ),
-                        })
+                        .map(result_column_to_ast)
                         .collect(),
                     from: self.body.select.from.as_ref().map(|f| f.to_sql_ast()),
                     where_clause: Some(self.body.select.where_clause.0.clone().into_boxed()),
-                    group_by: None,
+                    group_by: self.body.select.group_by.as_ref().map(group_by_to_ast),
                     window_clause: Vec::new(),
                 },
                 compounds: self
@@ -360,20 +404,11 @@ impl Select {
                                 .select
                                 .columns
                                 .iter()
-                                .map(|col| match col {
-                                    ResultColumn::Expr(expr) => {
-                                        ast::ResultColumn::Expr(expr.0.clone().into_boxed(), None)
-                                    }
-                                    ResultColumn::Star => ast::ResultColumn::Star,
-                                    ResultColumn::Column(name) => ast::ResultColumn::Expr(
-                                        ast::Expr::Id(ast::Name::exact(name.clone())).into_boxed(),
-                                        None,
-                                    ),
-                                })
+                                .map(result_column_to_ast)
                                 .collect(),
                             from: compound.select.from.as_ref().map(|f| f.to_sql_ast()),
                             where_clause: Some(compound.select.where_clause.0.clone().into_boxed()),
-                            group_by: None,
+                            group_by: compound.select.group_by.as_ref().map(group_by_to_ast),
                             window_clause: Vec::new(),
                         },
                     })
@@ -430,5 +465,56 @@ impl SelectTable {
                 }
             }
         }
+    }
+}
+
+fn result_column_to_ast(col: &ResultColumn) -> ast::ResultColumn {
+    match col {
+        ResultColumn::Expr(expr) => ast::ResultColumn::Expr(expr.0.clone().into_boxed(), None),
+        ResultColumn::Star => ast::ResultColumn::Star,
+        ResultColumn::Column(name) => {
+            ast::ResultColumn::Expr(column_qualified_expr(name).into_boxed(), None)
+        }
+        ResultColumn::Aggregate(agg) => {
+            let expr = aggregate_expr_to_ast(agg);
+            ast::ResultColumn::Expr(expr.into_boxed(), None)
+        }
+    }
+}
+
+fn aggregate_expr_to_ast(agg: &AggregateExpr) -> ast::Expr {
+    let func_name = match agg.func {
+        AggFunc::Count | AggFunc::CountStar => "COUNT",
+        AggFunc::Sum => "SUM",
+        AggFunc::Min => "MIN",
+        AggFunc::Max => "MAX",
+    };
+    let no_filter = ast::FunctionTail {
+        filter_clause: None,
+        over_clause: None,
+    };
+    match &agg.column {
+        Some(col) => ast::Expr::FunctionCall {
+            name: ast::Name::exact(func_name.to_string()),
+            distinctness: None,
+            args: vec![column_qualified_expr(col).into_boxed()],
+            order_by: Vec::new(),
+            filter_over: no_filter,
+        },
+        None => ast::Expr::FunctionCallStar {
+            name: ast::Name::exact(func_name.to_string()),
+            filter_over: no_filter,
+        },
+    }
+}
+
+fn group_by_to_ast(group_by: &GroupByClause) -> ast::GroupBy {
+    ast::GroupBy {
+        exprs: group_by
+            .columns
+            .iter()
+            .map(|col| column_qualified_expr(col).into_boxed())
+            .collect(),
+        having: group_by.having.as_ref().map(|h| h.0.clone().into_boxed()),
     }
 }
