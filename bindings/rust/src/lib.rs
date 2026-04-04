@@ -256,8 +256,8 @@ impl Builder {
                 vfs: self.vfs,
                 io: None,
                 db_file: None,
-              
-             flags: if self.read_only {
+
+                flags: if self.read_only {
                     Some(turso_sdk_kit::rsapi::PubOpenFlags::ReadOnly)
                 } else {
                     None

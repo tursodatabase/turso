@@ -111,7 +111,7 @@ impl TursoSetupConfig {
         })
     }
 }
-                
+
 pub use turso_core::io::OpenFlags as PubOpenFlags;
 
 #[derive(Clone)]
