@@ -2,6 +2,7 @@
 mod app;
 mod commands;
 mod config;
+mod fuzzy_history;
 mod helper;
 mod input;
 mod manual;
