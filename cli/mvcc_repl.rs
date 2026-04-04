@@ -35,7 +35,7 @@
 //! [conn2] ERROR: write-write conflict (transaction rolled back)
 //! ```
 use anyhow::Context as _;
-use rustyline::DefaultEditor;
+use reedline::{DefaultPrompt, DefaultPromptSegment, Reedline, Signal};
 use std::{collections::HashMap, sync::Arc};
 use turso_core::{Connection, Database, DatabaseOpts, LimboError, OpenFlags, Value};
 
@@ -50,11 +50,15 @@ pub fn run(path: &str) -> anyhow::Result<()> {
 
     let db = open_mvcc_db(path)?;
     let mut connections: HashMap<String, Arc<Connection>> = HashMap::new();
-    let mut rl = DefaultEditor::new()?;
+    let mut rl = Reedline::create();
+    let prompt = DefaultPrompt::new(
+        DefaultPromptSegment::Basic("mvcc> ".to_string()),
+        DefaultPromptSegment::Empty,
+    );
 
     loop {
-        match rl.readline("mvcc> ") {
-            Ok(line) => {
+        match rl.read_line(&prompt) {
+            Ok(Signal::Success(line)) => {
                 let line = line.trim();
                 if line.is_empty() {
                     continue;
@@ -78,8 +82,8 @@ pub fn run(path: &str) -> anyhow::Result<()> {
                     eprintln!("Error: format is `connN SQL` (e.g. `conn1 SELECT * FROM t`)");
                 }
             }
-            Err(rustyline::error::ReadlineError::Eof) => break,
-            Err(rustyline::error::ReadlineError::Interrupted) => {
+            Ok(Signal::CtrlD) => break,
+            Ok(Signal::CtrlC) => {
                 println!();
                 continue;
             }
