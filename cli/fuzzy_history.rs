@@ -7,6 +7,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, List, ListItem, ListState, Paragraph},
 };
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,6 +23,11 @@ use tui_input::backend::crossterm::EventHandler;
 use crate::config::{CONFIG_DIR, HighlightConfig};
 
 type HighlightSpans = Vec<(Style, String)>;
+
+struct HistoryEntry {
+    text: String,
+    alive: Arc<AtomicBool>,
+}
 
 struct SqlHighlighter {
     syntax_set: SyntaxSet,
@@ -106,7 +112,7 @@ impl ItemsCache {
         self.dirty = true;
     }
 
-    fn get(&mut self, nucleo: &Nucleo<String>, query: &str) -> &[VisibleRow] {
+    fn get(&mut self, nucleo: &Nucleo<HistoryEntry>, query: &str) -> &[VisibleRow] {
         if !self.dirty {
             return &self.rows;
         }
@@ -115,17 +121,20 @@ impl ItemsCache {
         let snapshot = nucleo.snapshot();
         let matched = snapshot.matched_item_count();
         let pattern = snapshot.pattern();
-        let count = matched.min(500) as usize;
 
         self.rows.clear();
-        self.rows
-            .reserve(count.saturating_sub(self.rows.capacity()));
-        for i in 0..count {
+        for i in 0..matched {
+            if self.rows.len() == 500 {
+                break;
+            }
             if let Some(item) = snapshot.get_matched_item(i as u32) {
+                if !item.data.alive.load(Ordering::Acquire) {
+                    continue;
+                }
                 self.indices_buf.clear();
                 self.utf32_buf.clear();
                 if !query.is_empty() {
-                    let haystack = Utf32Str::new(item.data, &mut self.utf32_buf);
+                    let haystack = Utf32Str::new(&item.data.text, &mut self.utf32_buf);
                     pattern.column_pattern(0).indices(
                         haystack,
                         &mut self.matcher,
@@ -135,10 +144,14 @@ impl ItemsCache {
                     self.indices_buf.dedup();
                 }
                 self.rows.push(VisibleRow {
-                    text: item.data.clone(),
+                    text: item.data.text.clone(),
                     indices: self.indices_buf.clone(),
                 });
             }
+        }
+
+        if query.is_empty() {
+            self.rows.reverse();
         }
 
         &self.rows
@@ -146,13 +159,14 @@ impl ItemsCache {
 }
 
 struct FzfState {
-    nucleo: Nucleo<String>,
+    nucleo: Nucleo<HistoryEntry>,
     input: Input,
     selected: usize,
     highlighter: SqlHighlighter,
     highlight_cache: std::collections::HashMap<String, HighlightSpans>,
     items_cache: ItemsCache,
     history_loaded: Arc<AtomicBool>,
+    live_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 enum AppEvent {
@@ -179,20 +193,41 @@ impl FzfState {
         let nucleo_notify = Arc::new(move || {
             let _ = notify_tx.send(AppEvent::DataChanged);
         });
-        let nucleo: Nucleo<String> = Nucleo::new(Config::DEFAULT, nucleo_notify, Some(1), 1);
+        let nucleo: Nucleo<HistoryEntry> = Nucleo::new(Config::DEFAULT, nucleo_notify, Some(1), 1);
         let injector = nucleo.injector();
 
         let highlighter = SqlHighlighter::new(highlight_config);
         let history_loaded = Arc::new(AtomicBool::new(false));
+        let live_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let history_path = history_path.clone();
         let history_loaded_clone = history_loaded.clone();
+        let live_count_clone = live_count.clone();
         let loader_wake_tx = app_tx.clone();
         std::thread::spawn(move || {
-            let history = read_history(&history_path);
-            for entry in history.iter() {
-                injector.push(entry, |s, cols| {
-                    cols[0] = s.as_str().into();
+            let mut latest = std::collections::HashMap::<String, Arc<AtomicBool>>::new();
+            let Ok(file) = std::fs::File::open(history_path) else {
+                history_loaded_clone.store(true, Ordering::Release);
+                let _ = loader_wake_tx.send(AppEvent::DataChanged);
+                return;
+            };
+            for line in BufReader::new(file).lines() {
+                let Ok(text) = line else {
+                    continue;
+                };
+                if text.is_empty() {
+                    continue;
+                }
+
+                let alive = Arc::new(AtomicBool::new(true));
+                if let Some(previous) = latest.insert(text.clone(), alive.clone()) {
+                    previous.store(false, Ordering::Release);
+                } else {
+                    live_count_clone.fetch_add(1, Ordering::Relaxed);
+                }
+
+                injector.push(HistoryEntry { text, alive }, |entry, cols| {
+                    cols[0] = entry.text.as_str().into();
                 });
             }
             history_loaded_clone.store(true, Ordering::Release);
@@ -207,6 +242,7 @@ impl FzfState {
             highlight_cache: std::collections::HashMap::new(),
             items_cache: ItemsCache::new(),
             history_loaded,
+            live_count,
         })
     }
 
@@ -231,33 +267,30 @@ impl FzfState {
         }
 
         self.items_cache.invalidate();
-        let matched = self.matched_count() as usize;
-        if matched == 0 {
+        let visible = self.visible_count();
+        if visible == 0 {
             self.selected = 0;
         } else {
-            self.selected = self.selected.min(matched - 1);
+            self.selected = self.selected.min(visible - 1);
         }
     }
 
-    fn matched_count(&self) -> u32 {
-        self.nucleo.snapshot().matched_item_count()
+    fn visible_rows(&mut self) -> &[VisibleRow] {
+        let query = self.query().to_string();
+        self.items_cache.get(&self.nucleo, &query)
+    }
+
+    fn visible_count(&mut self) -> usize {
+        self.visible_rows().len()
     }
 
     fn total_count(&self) -> u32 {
-        self.nucleo.snapshot().item_count()
+        self.live_count.load(Ordering::Acquire) as u32
     }
 
-    fn get_selected(&self) -> Option<String> {
-        let snapshot = self.nucleo.snapshot();
-        if snapshot.matched_item_count() == 0 {
-            return None;
-        }
-        let idx = self
-            .selected
-            .min(snapshot.matched_item_count() as usize - 1);
-        snapshot
-            .get_matched_item(idx as u32)
-            .map(|item| item.data.clone())
+    fn get_selected(&mut self) -> Option<String> {
+        let idx = self.selected.min(self.visible_count().saturating_sub(1));
+        self.visible_rows().get(idx).map(|row| row.text.clone())
     }
 
     fn render_row(&mut self, row: &VisibleRow) -> ListItem<'static> {
@@ -346,12 +379,10 @@ fn draw(frame: &mut ratatui::Frame, state: &mut FzfState) {
     ])
     .areas(area);
 
-    let query = state.query().to_string();
-    let matched = state.matched_count();
+    let rows = state.visible_rows().to_vec();
+    let matched = rows.len();
     let total = state.total_count();
     let selected = state.selected;
-
-    let rows = state.items_cache.get(&state.nucleo, &query).to_vec();
     let items = rows
         .iter()
         .map(|row| state.render_row(row))
@@ -359,7 +390,7 @@ fn draw(frame: &mut ratatui::Frame, state: &mut FzfState) {
 
     let mut list_state = ListState::default();
     if matched > 0 {
-        list_state.select(Some(selected.min(matched as usize - 1)));
+        list_state.select(Some(selected.min(matched - 1)));
     }
 
     let list = List::new(items)
@@ -472,7 +503,7 @@ fn handle_event(state: &mut FzfState, event: &Event) -> EventOutcome {
             modifiers: KeyModifiers::CONTROL,
             ..
         } => {
-            let max = state.matched_count().saturating_sub(1) as usize;
+            let max = state.visible_count().saturating_sub(1);
             state.selected = (state.selected + 1).min(max);
             EventOutcome::Continue { tick: false }
         }
@@ -490,26 +521,5 @@ fn handle_event(state: &mut FzfState, event: &Event) -> EventOutcome {
                 EventOutcome::Continue { tick: false }
             }
         }
-    }
-}
-
-struct History {
-    content: String,
-}
-
-impl History {
-    fn iter(&self) -> impl Iterator<Item = String> + use<'_> {
-        let mut seen = std::collections::HashSet::new();
-        self.content
-            .lines()
-            .rev()
-            .filter(move |line| !line.is_empty() && seen.insert((*line).to_string()))
-            .map(|s| s.to_string())
-    }
-}
-
-fn read_history(path: &PathBuf) -> History {
-    History {
-        content: std::fs::read_to_string(path).unwrap_or_default(),
     }
 }
