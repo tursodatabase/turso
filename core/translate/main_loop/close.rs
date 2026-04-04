@@ -104,6 +104,13 @@ impl CloseLoop {
                                 pc_if_next: loop_labels.loop_start,
                             });
                         }
+                        Scan::RecursiveCte { cursor_id } => {
+                            // Iterate through the ephemeral queue cursor
+                            program.emit_insn(Insn::Next {
+                                cursor_id: *cursor_id,
+                                pc_if_next: loop_labels.loop_start,
+                            });
+                        }
                         Scan::Subquery { iter_dir } => {
                             // Check if this is a materialized CTE (EphemeralTable) or coroutine
                             if let Table::FromClauseSubquery(subquery) = &table.table {
