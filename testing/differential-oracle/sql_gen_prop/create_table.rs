@@ -7,7 +7,7 @@ use std::fmt;
 use std::ops::RangeInclusive;
 
 use crate::profile::StatementProfile;
-use crate::schema::{ColumnDef, DataType, Schema};
+use crate::schema::{Collation, ColumnDef, DataType, GeneratedColumn, GeneratedStorage, Schema};
 
 // =============================================================================
 // DATA TYPE WEIGHTS
@@ -102,6 +102,13 @@ pub struct ColumnProfile {
     pub check_constraint_probability: u8,
     /// Weights for data type generation.
     pub data_type_weights: DataTypeWeights,
+    /// Probability (0-100) that a non-PK column is a virtual generated (computed) column.
+    pub generated_probability: u8,
+    /// Probability (0-100) that a generated column has COLLATE on TEXT types.
+    pub generated_collation_probability: u8,
+    /// Probability (0-100) of generating an intentionally invalid expression
+    /// for error testing. Default 0 (all expressions valid).
+    pub invalid_generated_expr_probability: u8,
 }
 
 impl Default for ColumnProfile {
@@ -112,6 +119,9 @@ impl Default for ColumnProfile {
             default_probability: 15,
             check_constraint_probability: 15,
             data_type_weights: DataTypeWeights::default(),
+            generated_probability: 25,
+            generated_collation_probability: 10,
+            invalid_generated_expr_probability: 0,
         }
     }
 }
@@ -124,7 +134,8 @@ impl ColumnProfile {
             unique_probability: 0,
             default_probability: 0,
             check_constraint_probability: 0,
-            data_type_weights: self.data_type_weights,
+            generated_probability: 0,
+            ..self
         }
     }
 
@@ -135,7 +146,7 @@ impl ColumnProfile {
             unique_probability: 30,
             default_probability: 20,
             check_constraint_probability: 20,
-            data_type_weights: self.data_type_weights,
+            ..self
         }
     }
 
@@ -146,7 +157,34 @@ impl ColumnProfile {
             unique_probability: 50,
             default_probability: 40,
             check_constraint_probability: 40,
-            data_type_weights: self.data_type_weights,
+            ..self
+        }
+    }
+
+    /// Builder method to create a profile with many generated columns for targeted testing.
+    pub fn generated_heavy(self) -> Self {
+        Self {
+            generated_probability: 60,
+            invalid_generated_expr_probability: 0,
+            ..self
+        }
+    }
+
+    /// Builder method for heavy generated column testing with some invalid expressions.
+    pub fn generated_heavy_with_errors(self) -> Self {
+        Self {
+            generated_probability: 60,
+            invalid_generated_expr_probability: 30,
+            ..self
+        }
+    }
+
+    /// Builder method for testing error handling with all invalid generated expressions.
+    pub fn generated_all_invalid(self) -> Self {
+        Self {
+            generated_probability: 60,
+            invalid_generated_expr_probability: 100,
+            ..self
         }
     }
 
@@ -177,6 +215,18 @@ impl ColumnProfile {
     /// Builder method to set data type weights.
     pub fn with_data_type_weights(mut self, weights: DataTypeWeights) -> Self {
         self.data_type_weights = weights;
+        self
+    }
+
+    /// Builder method to set generated column probability.
+    pub fn with_generated_probability(mut self, probability: u8) -> Self {
+        self.generated_probability = probability.min(100);
+        self
+    }
+
+    /// Builder method to set invalid generated expression probability for error testing.
+    pub fn with_invalid_generated_expr_probability(mut self, probability: u8) -> Self {
+        self.invalid_generated_expr_probability = probability.min(100);
         self
     }
 }
@@ -550,6 +600,351 @@ fn check_constraint_for_column(name: &str, data_type: DataType) -> BoxedStrategy
     }
 }
 
+// =============================================================================
+// GENERATED COLUMN EXPRESSION GENERATION
+// =============================================================================
+
+/// Generate a valid expression for a generated column.
+///
+/// The expression can only reference columns that appear before this column
+/// (provided in `prior_columns`). The expression must be deterministic.
+fn generated_expr_for_type(
+    data_type: DataType,
+    prior_columns: &[ColumnDef],
+) -> BoxedStrategy<String> {
+    // Filter prior columns to those we can reference (non-generated only)
+    let referenceable: Vec<_> = prior_columns.iter().filter(|c| !c.is_generated()).collect();
+
+    if referenceable.is_empty() {
+        // No prior columns to reference, use a literal expression
+        return literal_expr_for_type(data_type);
+    }
+
+    // Generate expressions based on target type
+    match data_type {
+        DataType::Integer => integer_generated_expr(&referenceable),
+        DataType::Real => real_generated_expr(&referenceable),
+        DataType::Text => text_generated_expr(&referenceable),
+        DataType::Blob => blob_generated_expr(&referenceable),
+        DataType::Null => Just("NULL".to_string()).boxed(),
+    }
+}
+
+/// Generate a literal expression for a type (when no prior columns available).
+fn literal_expr_for_type(data_type: DataType) -> BoxedStrategy<String> {
+    match data_type {
+        DataType::Integer => prop_oneof![
+            Just("0".to_string()),
+            Just("1".to_string()),
+            Just("42".to_string()),
+            (0i64..1000).prop_map(|n| n.to_string()),
+        ]
+        .boxed(),
+        DataType::Real => prop_oneof![
+            Just("0.0".to_string()),
+            Just("1.0".to_string()),
+            (0.0f64..100.0).prop_map(|n| format!("{n:.2}")),
+        ]
+        .boxed(),
+        DataType::Text => prop_oneof![
+            Just("''".to_string()),
+            Just("'computed'".to_string()),
+            "[a-z]{1,8}".prop_map(|s| format!("'{s}'")),
+        ]
+        .boxed(),
+        DataType::Blob => prop_oneof![Just("X''".to_string()), Just("X'00'".to_string()),].boxed(),
+        DataType::Null => Just("NULL".to_string()).boxed(),
+    }
+}
+
+/// Generate an integer expression referencing prior columns.
+fn integer_generated_expr(prior_columns: &[&ColumnDef]) -> BoxedStrategy<String> {
+    let int_cols: Vec<_> = prior_columns
+        .iter()
+        .filter(|c| c.data_type == DataType::Integer)
+        .map(|c| c.name.clone())
+        .collect();
+
+    if int_cols.is_empty() {
+        // No integer columns, use CAST or LENGTH
+        let text_cols: Vec<_> = prior_columns
+            .iter()
+            .filter(|c| c.data_type == DataType::Text)
+            .map(|c| c.name.clone())
+            .collect();
+
+        if text_cols.is_empty() {
+            return literal_expr_for_type(DataType::Integer);
+        }
+
+        return proptest::sample::select(text_cols)
+            .prop_flat_map(|col| {
+                prop_oneof![
+                    Just(format!("LENGTH({col})")),
+                    Just(format!("INSTR({col}, 'a')")),
+                    Just(format!("CAST({col} AS INTEGER)")),
+                ]
+            })
+            .boxed();
+    }
+
+    proptest::sample::select(int_cols)
+        .prop_flat_map(move |col| {
+            prop_oneof![
+                // Simple reference
+                Just(col.clone()),
+                // Arithmetic
+                Just(format!("{col} + 1")),
+                Just(format!("{col} * 2")),
+                Just(format!("ABS({col})")),
+                Just(format!("{col} % 10")),
+                // Functions
+                Just(format!("COALESCE({col}, 0)")),
+                Just(format!("IFNULL({col}, -1)")),
+                Just(format!("MAX({col}, 0)")),
+            ]
+        })
+        .boxed()
+}
+
+/// Generate a real expression referencing prior columns.
+fn real_generated_expr(prior_columns: &[&ColumnDef]) -> BoxedStrategy<String> {
+    let real_cols: Vec<_> = prior_columns
+        .iter()
+        .filter(|c| c.data_type == DataType::Real)
+        .map(|c| c.name.clone())
+        .collect();
+
+    let int_cols: Vec<_> = prior_columns
+        .iter()
+        .filter(|c| c.data_type == DataType::Integer)
+        .map(|c| c.name.clone())
+        .collect();
+
+    if real_cols.is_empty() && int_cols.is_empty() {
+        return literal_expr_for_type(DataType::Real);
+    }
+
+    let all_numeric: Vec<_> = real_cols.iter().chain(int_cols.iter()).cloned().collect();
+
+    proptest::sample::select(all_numeric)
+        .prop_flat_map(|col| {
+            prop_oneof![
+                Just(format!("CAST({col} AS REAL)")),
+                Just(format!("{col} * 1.0")),
+                Just(format!("{col} / 2.0")),
+                Just(format!("ABS({col})")),
+                Just(format!("ROUND({col}, 2)")),
+                Just(format!("COALESCE({col}, 0.0)")),
+            ]
+        })
+        .boxed()
+}
+
+/// Generate a text expression referencing prior columns.
+fn text_generated_expr(prior_columns: &[&ColumnDef]) -> BoxedStrategy<String> {
+    let text_cols: Vec<_> = prior_columns
+        .iter()
+        .filter(|c| c.data_type == DataType::Text)
+        .map(|c| c.name.clone())
+        .collect();
+
+    let int_cols: Vec<_> = prior_columns
+        .iter()
+        .filter(|c| c.data_type == DataType::Integer)
+        .map(|c| c.name.clone())
+        .collect();
+
+    if text_cols.is_empty() && int_cols.is_empty() {
+        return literal_expr_for_type(DataType::Text);
+    }
+
+    if !text_cols.is_empty() {
+        proptest::sample::select(text_cols)
+            .prop_flat_map(move |col| {
+                prop_oneof![
+                    // Simple reference
+                    Just(col.clone()),
+                    // String functions
+                    Just(format!("UPPER({col})")),
+                    Just(format!("LOWER({col})")),
+                    Just(format!("TRIM({col})")),
+                    Just(format!("'{col}: ' || {col}")),
+                    Just(format!("COALESCE({col}, '')")),
+                    Just(format!("SUBSTR({col}, 1, 10)")),
+                    Just(format!("REPLACE({col}, 'a', 'A')")),
+                ]
+            })
+            .boxed()
+    } else {
+        // Only integer columns available, convert to text
+        proptest::sample::select(int_cols)
+            .prop_flat_map(|col| {
+                prop_oneof![
+                    Just(format!("CAST({col} AS TEXT)")),
+                    Just(format!("'#' || {col}")),
+                    Just(format!("PRINTF('%d', {col})")),
+                ]
+            })
+            .boxed()
+    }
+}
+
+/// Generate a blob expression referencing prior columns.
+fn blob_generated_expr(prior_columns: &[&ColumnDef]) -> BoxedStrategy<String> {
+    let blob_cols: Vec<_> = prior_columns
+        .iter()
+        .filter(|c| c.data_type == DataType::Blob)
+        .map(|c| c.name.clone())
+        .collect();
+
+    let text_cols: Vec<_> = prior_columns
+        .iter()
+        .filter(|c| c.data_type == DataType::Text)
+        .map(|c| c.name.clone())
+        .collect();
+
+    if !blob_cols.is_empty() {
+        proptest::sample::select(blob_cols)
+            .prop_map(|col| format!("COALESCE({col}, X'')"))
+            .boxed()
+    } else if !text_cols.is_empty() {
+        // Convert text to blob
+        proptest::sample::select(text_cols)
+            .prop_map(|col| format!("CAST({col} AS BLOB)"))
+            .boxed()
+    } else {
+        literal_expr_for_type(DataType::Blob)
+    }
+}
+
+/// Generate an intentionally invalid expression for error testing.
+fn invalid_generated_expr() -> BoxedStrategy<String> {
+    prop_oneof![
+        // Subquery (not allowed in generated columns)
+        Just("(SELECT 1)".to_string()),
+        // Non-deterministic function
+        Just("RANDOM()".to_string()),
+        Just("datetime('now')".to_string()),
+        // Aggregate function
+        Just("SUM(1)".to_string()),
+        Just("COUNT(*)".to_string()),
+        // Window function
+        Just("ROW_NUMBER() OVER ()".to_string()),
+    ]
+    .boxed()
+}
+
+/// Generate optional collation for a TEXT generated column.
+fn generated_collation(collation_probability: u8) -> BoxedStrategy<Option<Collation>> {
+    (0u8..100)
+        .prop_flat_map(move |roll| {
+            if roll < collation_probability {
+                prop_oneof![
+                    Just(Some(Collation::NoCase)),
+                    Just(Some(Collation::RTrim)),
+                    Just(Some(Collation::Binary)),
+                ]
+                .boxed()
+            } else {
+                Just(None).boxed()
+            }
+        })
+        .boxed()
+}
+
+// =============================================================================
+// COLUMN GENERATION WITH GENERATED COLUMN SUPPORT
+// =============================================================================
+
+/// Generate a column definition that may be a generated column.
+/// Takes prior columns so generated expressions can reference them.
+pub fn column_def_with_profile_and_context(
+    profile: &ColumnProfile,
+    prior_columns: Vec<ColumnDef>,
+) -> BoxedStrategy<ColumnDef> {
+    let not_null_prob = profile.not_null_probability;
+    let unique_prob = profile.unique_probability;
+    let default_prob = profile.default_probability;
+    let generated_prob = profile.generated_probability;
+    let collation_prob = profile.generated_collation_probability;
+    let invalid_prob = profile.invalid_generated_expr_probability;
+    let data_type_weights = profile.data_type_weights.clone();
+
+    (
+        identifier(),
+        data_type_weighted(&data_type_weights),
+        0u8..100, // for NOT NULL decision
+        0u8..100, // for UNIQUE decision
+        0u8..100, // for DEFAULT decision
+        0u8..100, // for GENERATED decision
+        0u8..100, // for INVALID expr decision
+    )
+        .prop_flat_map(
+            move |(name, dt, not_null_roll, unique_roll, default_roll, gen_roll, invalid_roll)| {
+                let nullable = not_null_roll >= not_null_prob;
+                let unique = unique_roll < unique_prob;
+                let is_generated = gen_roll < generated_prob;
+                let prior_cols = prior_columns.clone();
+
+                if is_generated {
+                    // Generate a virtual generated column
+                    let use_invalid = invalid_roll < invalid_prob;
+                    let expr_strategy = if use_invalid {
+                        invalid_generated_expr()
+                    } else {
+                        generated_expr_for_type(dt, &prior_cols)
+                    };
+
+                    let collation_strategy = if dt == DataType::Text {
+                        generated_collation(collation_prob)
+                    } else {
+                        Just(None).boxed()
+                    };
+
+                    (expr_strategy, collation_strategy)
+                        .prop_map(move |(expr, collation)| ColumnDef {
+                            name: name.clone(),
+                            data_type: dt,
+                            nullable,
+                            primary_key: false,
+                            unique,
+                            default: None, // Generated columns cannot have DEFAULT
+                            check_constraint: None,
+                            generated: Some(GeneratedColumn {
+                                expr,
+                                storage: GeneratedStorage::Virtual,
+                                collation,
+                            }),
+                        })
+                        .boxed()
+                } else {
+                    // Generate a regular column
+                    let has_default = default_roll < default_prob;
+                    let default_strategy = if has_default {
+                        default_value_for_type(dt)
+                    } else {
+                        Just(None).boxed()
+                    };
+
+                    default_strategy
+                        .prop_map(move |default| ColumnDef {
+                            name: name.clone(),
+                            data_type: dt,
+                            nullable,
+                            primary_key: false,
+                            unique,
+                            default,
+                            check_constraint: None,
+                            generated: None,
+                        })
+                        .boxed()
+                }
+            },
+        )
+        .boxed()
+}
+
 /// Generate a column definition with profile-controlled constraints.
 pub fn column_def_with_profile(profile: &ColumnProfile) -> BoxedStrategy<ColumnDef> {
     let not_null_prob = profile.not_null_probability;
@@ -594,6 +989,7 @@ pub fn column_def_with_profile(profile: &ColumnProfile) -> BoxedStrategy<ColumnD
                         unique,
                         default,
                         check_constraint,
+                        generated: None,
                     }
                 })
             },
@@ -621,6 +1017,7 @@ pub fn primary_key_column_def_with_profile(
             unique: false,
             default: None,
             check_constraint: None,
+            generated: None,
         })
         .boxed()
 }
@@ -658,6 +1055,107 @@ fn if_not_exists_with_probability(probability: u8) -> BoxedStrategy<bool> {
     (0u8..100).prop_map(move |roll| roll < probability).boxed()
 }
 
+/// Generate columns incrementally, allowing generated columns to reference prior columns.
+fn columns_with_generated_support(
+    pk_col: Option<ColumnDef>,
+    column_count: usize,
+    profile: &ColumnProfile,
+) -> BoxedStrategy<Vec<ColumnDef>> {
+    let generated_prob = profile.generated_probability;
+    let collation_prob = profile.generated_collation_probability;
+    let invalid_prob = profile.invalid_generated_expr_probability;
+    let profile = profile.clone();
+
+    // First, generate all column base info (names, types, constraints)
+    let base_columns_strategy =
+        proptest::collection::vec(column_def_with_profile(&profile), column_count);
+
+    base_columns_strategy
+        .prop_flat_map(move |base_cols| {
+            // Now decide which columns become generated and generate their expressions
+            let mut strategies: Vec<BoxedStrategy<ColumnDef>> = Vec::new();
+
+            // Add PK column first if present (PKs are never generated for now)
+            let prior_cols: Vec<ColumnDef> = if let Some(ref pk) = pk_col {
+                vec![pk.clone()]
+            } else {
+                vec![]
+            };
+
+            if let Some(pk) = pk_col.clone() {
+                strategies.push(Just(pk).boxed());
+            }
+
+            // Track columns as we build up the list
+            let mut all_prior: Vec<ColumnDef> = prior_cols;
+
+            for col in base_cols {
+                let prior_for_this = all_prior.clone();
+                let col_for_closure = col.clone();
+
+                // Generate random values for this column's generated status
+                let strategy = (0u8..100, 0u8..100, 0u8..100)
+                    .prop_flat_map(move |(gen_roll, collation_roll, invalid_roll)| {
+                        let is_generated = gen_roll < generated_prob;
+
+                        if is_generated {
+                            let use_invalid = invalid_roll < invalid_prob;
+                            let expr_strategy = if use_invalid {
+                                invalid_generated_expr()
+                            } else {
+                                generated_expr_for_type(col_for_closure.data_type, &prior_for_this)
+                            };
+
+                            let collation = if col_for_closure.data_type == DataType::Text
+                                && collation_roll < collation_prob
+                            {
+                                Some(match collation_roll % 3 {
+                                    0 => Collation::NoCase,
+                                    1 => Collation::RTrim,
+                                    _ => Collation::Binary,
+                                })
+                            } else {
+                                None
+                            };
+
+                            let col_name = col_for_closure.name.clone();
+                            let col_type = col_for_closure.data_type;
+                            let col_nullable = col_for_closure.nullable;
+                            let col_unique = col_for_closure.unique;
+
+                            expr_strategy
+                                .prop_map(move |expr| ColumnDef {
+                                    name: col_name.clone(),
+                                    data_type: col_type,
+                                    nullable: col_nullable,
+                                    primary_key: false,
+                                    unique: col_unique,
+                                    default: None,
+                                    check_constraint: None,
+                                    generated: Some(GeneratedColumn {
+                                        expr,
+                                        storage: GeneratedStorage::Virtual,
+                                        collation,
+                                    }),
+                                })
+                                .boxed()
+                        } else {
+                            // Keep as regular column
+                            Just(col_for_closure.clone()).boxed()
+                        }
+                    })
+                    .boxed();
+
+                strategies.push(strategy);
+                all_prior.push(col);
+            }
+
+            // Combine all column strategies
+            strategies.into_iter().collect::<Vec<_>>()
+        })
+        .boxed()
+}
+
 /// Generate a CREATE TABLE statement with profile.
 pub fn create_table(
     schema: &Schema,
@@ -679,65 +1177,68 @@ pub fn create_table(
         if_not_exists_with_probability(if_not_exists_prob),
         (0u8..100),
         optional_primary_key(&pk_profile),
-        proptest::collection::vec(column_def_with_profile(&column_profile), column_count_range),
+        column_count_range,
         // 50% chance of targeting an attached database when available
         any::<proptest::sample::Index>(),
     )
-        .prop_map(
-            move |(table_name, if_not_exists, strict_roll, pk_col, other_cols, db_idx)| {
+        .prop_flat_map(
+            move |(table_name, if_not_exists, strict_roll, pk_col, col_count, db_idx)| {
                 let strict = strict_roll < strict_prob;
+                let column_profile = column_profile.clone();
+                let attached_databases = attached_databases.clone();
 
-                let mut columns = Vec::with_capacity(other_cols.len() + 1);
-                if let Some(pk) = pk_col {
-                    columns.push(pk);
-                }
-                columns.extend(other_cols);
+                columns_with_generated_support(pk_col, col_count, &column_profile).prop_map(
+                    move |columns| {
+                        let mut final_columns = columns;
 
-                // Ensure at least one column exists
-                if columns.is_empty() {
-                    columns.push(ColumnDef {
-                        name: "id".to_string(),
-                        data_type: DataType::Integer,
-                        nullable: false,
-                        primary_key: true,
-                        unique: false,
-                        default: None,
-                        check_constraint: None,
-                    });
-                }
-
-                // For strict tables, convert any Null types to Integer (STRICT doesn't allow
-                // untyped columns).
-                if strict {
-                    for col in &mut columns {
-                        if col.data_type == DataType::Null {
-                            col.data_type = DataType::Integer;
+                        // Ensure at least one column exists
+                        if final_columns.is_empty() {
+                            final_columns.push(ColumnDef {
+                                name: "id".to_string(),
+                                data_type: DataType::Integer,
+                                nullable: false,
+                                primary_key: true,
+                                unique: false,
+                                default: None,
+                                check_constraint: None,
+                                generated: None,
+                            });
                         }
-                    }
-                }
 
-                // Optionally qualify the table name with an attached database.
-                // We use a list of [None, Some("aux"), ...] to give ~50% chance to main.
-                let qualified_name = if attached_databases.is_empty() {
-                    table_name
-                } else {
-                    let mut choices: Vec<Option<&str>> = vec![None];
-                    for db in &attached_databases {
-                        choices.push(Some(db.as_str()));
-                    }
-                    let choice = db_idx.index(choices.len());
-                    match choices[choice] {
-                        Some(db) => format!("{db}.{table_name}"),
-                        None => table_name,
-                    }
-                };
+                        // For strict tables, convert any Null types to Integer (STRICT doesn't allow
+                        // untyped columns).
+                        if strict {
+                            for col in &mut final_columns {
+                                if col.data_type == DataType::Null {
+                                    col.data_type = DataType::Integer;
+                                }
+                            }
+                        }
 
-                CreateTableStatement {
-                    table_name: qualified_name,
-                    columns,
-                    if_not_exists,
-                    strict,
-                }
+                        // Optionally qualify the table name with an attached database.
+                        // We use a list of [None, Some("aux"), ...] to give ~50% chance to main.
+                        let qualified_name = if attached_databases.is_empty() {
+                            table_name.clone()
+                        } else {
+                            let mut choices: Vec<Option<&str>> = vec![None];
+                            for db in &attached_databases {
+                                choices.push(Some(db.as_str()));
+                            }
+                            let choice = db_idx.index(choices.len());
+                            match choices[choice] {
+                                Some(db) => format!("{db}.{table_name}"),
+                                None => table_name.clone(),
+                            }
+                        };
+
+                        CreateTableStatement {
+                            table_name: qualified_name,
+                            columns: final_columns,
+                            if_not_exists,
+                            strict,
+                        }
+                    },
+                )
             },
         )
         .boxed()
@@ -767,6 +1268,7 @@ mod tests {
                     unique: false,
                     default: None,
                     check_constraint: None,
+                    generated: None,
                 },
                 ColumnDef {
                     name: "name".to_string(),
@@ -776,6 +1278,7 @@ mod tests {
                     unique: false,
                     default: None,
                     check_constraint: None,
+                    generated: None,
                 },
                 ColumnDef {
                     name: "email".to_string(),
@@ -785,6 +1288,7 @@ mod tests {
                     unique: true,
                     default: None,
                     check_constraint: None,
+                    generated: None,
                 },
             ],
             if_not_exists: false,
@@ -809,6 +1313,7 @@ mod tests {
                 unique: false,
                 default: None,
                 check_constraint: None,
+                generated: None,
             }],
             if_not_exists: true,
             strict: false,
@@ -818,6 +1323,83 @@ mod tests {
             stmt.to_string(),
             "CREATE TABLE IF NOT EXISTS test (id INTEGER PRIMARY KEY)"
         );
+    }
+
+    #[test]
+    fn test_create_table_with_generated_column() {
+        use crate::schema::{Collation, GeneratedColumn, GeneratedStorage};
+
+        let stmt = CreateTableStatement {
+            table_name: "products".to_string(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Integer,
+                    nullable: false,
+                    primary_key: true,
+                    unique: false,
+                    default: None,
+                    check_constraint: None,
+                    generated: None,
+                },
+                ColumnDef {
+                    name: "price".to_string(),
+                    data_type: DataType::Real,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    default: None,
+                    check_constraint: None,
+                    generated: None,
+                },
+                ColumnDef {
+                    name: "quantity".to_string(),
+                    data_type: DataType::Integer,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    default: None,
+                    check_constraint: None,
+                    generated: None,
+                },
+                // VIRTUAL generated column
+                ColumnDef {
+                    name: "total".to_string(),
+                    data_type: DataType::Real,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    default: None,
+                    check_constraint: None,
+                    generated: Some(GeneratedColumn {
+                        expr: "price * quantity".to_string(),
+                        storage: GeneratedStorage::Virtual,
+                        collation: None,
+                    }),
+                },
+                // VIRTUAL generated column with collation
+                ColumnDef {
+                    name: "description".to_string(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    default: None,
+                    check_constraint: None,
+                    generated: Some(GeneratedColumn {
+                        expr: "'Item #' || id".to_string(),
+                        storage: GeneratedStorage::Virtual,
+                        collation: Some(Collation::NoCase),
+                    }),
+                },
+            ],
+            if_not_exists: false,
+            strict: false,
+        };
+
+        let sql = stmt.to_string();
+        assert!(sql.contains("total REAL AS (price * quantity) VIRTUAL"));
+        assert!(sql.contains("description TEXT AS ('Item #' || id) VIRTUAL COLLATE NOCASE"));
     }
 
     #[test]

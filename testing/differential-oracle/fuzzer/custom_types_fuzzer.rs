@@ -18,6 +18,7 @@ use rand_chacha::ChaCha8Rng;
 use sql_gen::{Full, Policy, SqlGen, StmtKind, StmtWeights};
 use turso_core::Database;
 
+use differential_fuzzer::generate::to_sql_gen_schema;
 use differential_fuzzer::memory::MemorySimIO;
 use differential_fuzzer::schema::SchemaIntrospector;
 
@@ -139,8 +140,10 @@ fn main() -> Result<()> {
             }
         }
 
-        schema = SchemaIntrospector::from_turso(&conn)
-            .context("Failed to introspect schema after CREATE TABLE")?;
+        schema = to_sql_gen_schema(
+            &SchemaIntrospector::from_turso(&conn)
+                .context("Failed to introspect schema after CREATE TABLE")?,
+        );
     }
 
     tracing::info!("Schema: {} tables created", schema.tables.len(),);
@@ -215,8 +218,10 @@ fn main() -> Result<()> {
 
         // Re-introspect after DDL
         if is_ddl {
-            schema = SchemaIntrospector::from_turso(&conn)
-                .context("Failed to introspect schema after DDL")?;
+            schema = to_sql_gen_schema(
+                &SchemaIntrospector::from_turso(&conn)
+                    .context("Failed to introspect schema after DDL")?,
+            );
         }
 
         // Periodic self-consistency checks every 50 statements

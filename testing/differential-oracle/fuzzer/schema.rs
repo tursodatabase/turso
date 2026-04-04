@@ -6,7 +6,8 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use sql_gen::{ColumnDef, DataType, Schema, SchemaBuilder, Table};
+use sql_gen_prop::schema::{GeneratedColumn, GeneratedStorage};
+use sql_gen_prop::{ColumnDef, DataType, Schema, SchemaBuilder, Table};
 
 /// Introspects schema from a database connection.
 pub struct SchemaIntrospector;
@@ -25,7 +26,7 @@ impl SchemaIntrospector {
                 } else {
                     Table::new(table_name, columns)
                 };
-                builder = builder.table(table);
+                builder = builder.add_table(table);
             }
         }
 
@@ -45,7 +46,7 @@ impl SchemaIntrospector {
                 } else {
                     Table::new(table_name, columns)
                 };
-                builder = builder.table(table);
+                builder = builder.add_table(table);
             }
         }
 
@@ -133,15 +134,16 @@ impl SchemaIntrospector {
         table_name: &str,
     ) -> Result<Vec<ColumnDef>> {
         let mut columns = Vec::new();
-        // Use PRAGMA table_info to get column information
-        let query = format!("PRAGMA table_info(\"{table_name}\")");
+        // Use PRAGMA table_xinfo to get column information including generated column status.
+        // table_xinfo returns: cid, name, type, notnull, dflt_value, pk, hidden
+        // hidden: 0=normal, 2=VIRTUAL generated
+        let query = format!("PRAGMA table_xinfo(\"{table_name}\")");
         let mut rows = conn
             .query(&query)
             .context("Failed to query column info")?
             .context("Expected rows from PRAGMA")?;
 
         rows.run_with_row_callback(|row| {
-            // PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
             let name = match row.get_value(1) {
                 turso_core::Value::Text(s) => s.as_str().to_string(),
                 _ => return Ok(()),
@@ -162,6 +164,12 @@ impl SchemaIntrospector {
                 _ => false,
             };
 
+            // hidden column: 0=normal, 2=VIRTUAL generated
+            let hidden = match row.get_value(6) {
+                turso_core::Value::Numeric(turso_core::Numeric::Integer(i)) => *i,
+                _ => 0,
+            };
+
             let data_type = Self::parse_type(&type_str);
             let mut column = ColumnDef::new(name, data_type);
 
@@ -175,6 +183,17 @@ impl SchemaIntrospector {
                 column = column.primary_key();
             }
 
+            // Set generated column info if this is a virtual generated column.
+            // Note: We cannot introspect the actual expression from PRAGMA,
+            // but we record that it's generated so INSERT/UPDATE exclude it.
+            if hidden == 2 {
+                column.generated = Some(GeneratedColumn {
+                    expr: "/* introspected */".to_string(),
+                    storage: GeneratedStorage::Virtual,
+                    collation: None,
+                });
+            }
+
             columns.push(column);
             Ok(())
         })
@@ -184,7 +203,10 @@ impl SchemaIntrospector {
     }
 
     fn get_columns_sqlite(conn: &rusqlite::Connection, table_name: &str) -> Result<Vec<ColumnDef>> {
-        let query = format!("PRAGMA table_info(\"{table_name}\")");
+        // Use PRAGMA table_xinfo to get column information including generated column status.
+        // table_xinfo returns: cid, name, type, notnull, dflt_value, pk, hidden
+        // hidden: 0=normal, 2=VIRTUAL generated
+        let query = format!("PRAGMA table_xinfo(\"{table_name}\")");
         let mut stmt = conn.prepare(&query).context("Failed to prepare PRAGMA")?;
 
         let columns = stmt
@@ -193,15 +215,16 @@ impl SchemaIntrospector {
                 let type_str: String = row.get::<_, String>(2).unwrap_or_else(|_| "TEXT".into());
                 let notnull: i64 = row.get(3)?;
                 let pk: i64 = row.get(5)?;
+                let hidden: i64 = row.get(6)?;
 
-                Ok((name, type_str, notnull != 0, pk != 0))
+                Ok((name, type_str, notnull != 0, pk != 0, hidden))
             })
             .context("Failed to query columns")?
             .collect::<std::result::Result<Vec<_>, _>>()
             .context("Failed to collect columns")?;
 
         let mut result = Vec::new();
-        for (name, type_str, notnull, pk) in columns {
+        for (name, type_str, notnull, pk, hidden) in columns {
             let data_type = Self::parse_type(&type_str.to_uppercase());
             let mut column = ColumnDef::new(name, data_type);
 
@@ -211,6 +234,15 @@ impl SchemaIntrospector {
 
             if pk {
                 column = column.primary_key();
+            }
+
+            // Set generated column info if this is a virtual generated column.
+            if hidden == 2 {
+                column.generated = Some(GeneratedColumn {
+                    expr: "/* introspected */".to_string(),
+                    storage: GeneratedStorage::Virtual,
+                    collation: None,
+                });
             }
 
             result.push(column);
@@ -232,14 +264,14 @@ impl SchemaIntrospector {
                 } else {
                     Table::new(table_name, columns)
                 };
-                builder = builder.table(table);
+                builder = builder.add_table(table);
             }
         }
 
         // Discover attached databases
         let attached_dbs = Self::get_attached_databases_turso(conn)?;
         for db_name in &attached_dbs {
-            builder = builder.database(db_name.clone());
+            builder = builder.add_database(db_name.clone());
             let attached_tables = Self::get_table_info_turso(conn, Some(db_name))?;
             for (table_name, strict) in attached_tables {
                 let query = format!("PRAGMA {db_name}.table_info(\"{table_name}\")");
@@ -250,7 +282,7 @@ impl SchemaIntrospector {
                     } else {
                         Table::new(table_name, columns)
                     };
-                    builder = builder.table(table.in_database(db_name));
+                    builder = builder.add_table(table.in_database(db_name));
                 }
             }
         }
@@ -271,14 +303,14 @@ impl SchemaIntrospector {
                 } else {
                     Table::new(table_name, columns)
                 };
-                builder = builder.table(table);
+                builder = builder.add_table(table);
             }
         }
 
         // Discover attached databases
         let attached_dbs = Self::get_attached_databases_sqlite(conn)?;
         for db_name in &attached_dbs {
-            builder = builder.database(db_name.clone());
+            builder = builder.add_database(db_name.clone());
             let attached_tables = Self::get_table_info_sqlite(conn, Some(db_name))?;
 
             for (table_name, strict) in attached_tables {
@@ -318,7 +350,7 @@ impl SchemaIntrospector {
                     } else {
                         Table::new(table_name, result)
                     };
-                    builder = builder.table(table.in_database(db_name));
+                    builder = builder.add_table(table.in_database(db_name));
                 }
             }
         }
@@ -421,14 +453,15 @@ impl SchemaIntrospector {
         // SQLite type affinity rules (simplified)
         let upper = type_str.to_uppercase();
         // Check for array types first (e.g., "INTEGER[]", "TEXT[]", "REAL[]")
+        // sql_gen_prop::DataType has no array variants, so map to the base type.
         if upper.ends_with("[]") {
             let base = upper.trim_end_matches("[]").trim();
             return if base.contains("INT") {
-                DataType::IntegerArray
+                DataType::Integer
             } else if base.contains("REAL") || base.contains("FLOA") || base.contains("DOUB") {
-                DataType::RealArray
+                DataType::Real
             } else {
-                DataType::TextArray
+                DataType::Text
             };
         }
         if upper.contains("INT") {
