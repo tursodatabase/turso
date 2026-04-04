@@ -609,28 +609,131 @@ impl Database {
     #[cfg(feature = "fs")]
     #[cfg(all(unix, target_pointer_width = "64"))]
     fn effective_open_flags_for_path(
+        io: &Arc<dyn IO>,
         path: &str,
         flags: OpenFlags,
         opts: DatabaseOpts,
-    ) -> OpenFlags {
-        if opts.enable_multiprocess_wal
-            && !flags.contains(OpenFlags::ReadOnly)
-            && !is_memory_like(path)
-        {
-            return flags | OpenFlags::NoLock;
+    ) -> Result<OpenFlags> {
+        if !opts.enable_multiprocess_wal {
+            return Ok(flags);
         }
 
-        flags
+        if is_memory_like(path) {
+            return Err(LimboError::InvalidArgument(format!(
+                "experimental multiprocess WAL is not supported for in-memory database path '{path}'"
+            )));
+        }
+        if !io.supports_shared_wal_coordination() {
+            return Err(LimboError::InvalidArgument(format!(
+                "experimental multiprocess WAL is not supported by the active IO backend for '{path}'"
+            )));
+        }
+        if !Self::path_allows_shared_wal_coordination(Path::new(path))? {
+            return Err(LimboError::InvalidArgument(format!(
+                "experimental multiprocess WAL is not supported on the filesystem backing '{path}'"
+            )));
+        }
+
+        if !flags.contains(OpenFlags::ReadOnly) {
+            return Ok(flags | OpenFlags::NoLock);
+        }
+
+        Ok(flags)
     }
 
     #[cfg(feature = "fs")]
     #[cfg(not(all(unix, target_pointer_width = "64")))]
     fn effective_open_flags_for_path(
+        _io: &Arc<dyn IO>,
         _path: &str,
         flags: OpenFlags,
+        opts: DatabaseOpts,
+    ) -> Result<OpenFlags> {
+        if opts.enable_multiprocess_wal {
+            return Err(LimboError::InvalidArgument(
+                "experimental multiprocess WAL is only supported on 64-bit Unix platforms"
+                    .to_string(),
+            ));
+        }
+        Ok(flags)
+    }
+
+    #[cfg(feature = "fs")]
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    fn reject_live_multiprocess_wal_for_legacy_open(
+        io: &Arc<dyn IO>,
+        path: &str,
+        opts: DatabaseOpts,
+    ) -> Result<()> {
+        if opts.enable_multiprocess_wal
+            || is_memory_like(path)
+            || !io.supports_shared_wal_coordination()
+            || !Self::path_allows_shared_wal_coordination(Path::new(path))?
+        {
+            return Ok(());
+        }
+
+        let coordination_path =
+            storage::wal::coordination_path_for_wal_path(&format!("{path}-wal"));
+        let Some(authority) =
+            MappedSharedWalCoordination::open_existing(io, Path::new(&coordination_path), 64)?
+        else {
+            return Ok(());
+        };
+
+        if matches!(
+            authority.open_mode(),
+            storage::shared_wal_coordination::SharedWalCoordinationOpenMode::MultiProcess
+        ) {
+            return Err(LimboError::LockingError(format!(
+                "Failed opening database '{path}'. Database is already open with experimental multiprocess WAL in another process"
+            )));
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "fs")]
+    #[cfg(not(all(unix, target_pointer_width = "64")))]
+    fn reject_live_multiprocess_wal_for_legacy_open(
+        _io: &Arc<dyn IO>,
+        _path: &str,
         _opts: DatabaseOpts,
-    ) -> OpenFlags {
-        flags
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(feature = "fs")]
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    fn reject_live_legacy_wal_for_multiprocess_open(
+        io: &Arc<dyn IO>,
+        path: &str,
+        flags: OpenFlags,
+        opts: DatabaseOpts,
+    ) -> Result<()> {
+        if !opts.enable_multiprocess_wal || flags.contains(OpenFlags::ReadOnly) {
+            return Ok(());
+        }
+
+        let probe_flags = (flags | OpenFlags::Create) & !OpenFlags::NoLock & !OpenFlags::ReadOnly;
+        match io.open_file(path, probe_flags, true) {
+            Ok(_probe_file) => Ok(()),
+            Err(LimboError::LockingError(_)) => Err(LimboError::LockingError(format!(
+                "Failed opening database '{path}'. Database is already open without experimental multiprocess WAL in another process"
+            ))),
+            Err(err) => Err(err),
+        }
+    }
+
+    #[cfg(feature = "fs")]
+    #[cfg(not(all(unix, target_pointer_width = "64")))]
+    fn reject_live_legacy_wal_for_multiprocess_open(
+        _io: &Arc<dyn IO>,
+        _path: &str,
+        _flags: OpenFlags,
+        _opts: DatabaseOpts,
+    ) -> Result<()> {
+        Ok(())
     }
 
     /// Look up a database in the process-wide registry by file identity.
@@ -699,8 +802,22 @@ impl Database {
             }
             return Ok(db);
         }
-        let effective_flags = Self::effective_open_flags_for_path(path, flags, opts);
+        // Mixed legacy/multiprocess opens are incompatible, but the two modes
+        // advertise themselves through different lock domains (`.tshm` vs DB
+        // file lock). We therefore probe both directions around the actual file
+        // open to narrow the TOCTOU window:
+        //
+        // 1. legacy open rejects an already-live multiprocess authority
+        Self::reject_live_multiprocess_wal_for_legacy_open(&io, path, opts)?;
+        let effective_flags = Self::effective_open_flags_for_path(&io, path, flags, opts)?;
+
+        // 2. multiprocess open rejects an already-live legacy DB-file lock
+        Self::reject_live_legacy_wal_for_multiprocess_open(&io, path, flags, opts)?;
         let file = io.open_file(path, effective_flags, true)?;
+
+        // 3. legacy open re-checks after `open_file()` in case a multiprocess
+        //    authority appeared between the initial probe and the actual open
+        Self::reject_live_multiprocess_wal_for_legacy_open(&io, path, opts)?;
         let db_file = Arc::new(DatabaseFile::new(file));
         Self::open_with_flags(
             io,
@@ -1674,7 +1791,9 @@ impl Database {
         let probe_path = if path.exists() {
             path
         } else {
-            path.parent().unwrap_or_else(|| Path::new("."))
+            path.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
         };
         let c_path = CString::new(probe_path.as_os_str().as_bytes()).map_err(|_| {
             LimboError::InvalidArgument(format!(
@@ -1708,7 +1827,9 @@ impl Database {
         let probe_path = if path.exists() {
             path
         } else {
-            path.parent().unwrap_or_else(|| Path::new("."))
+            path.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
         };
         let c_path = CString::new(probe_path.as_os_str().as_bytes()).map_err(|_| {
             LimboError::InvalidArgument(format!(
@@ -1768,13 +1889,22 @@ impl Database {
             return Ok(None);
         }
         if !self.io.supports_shared_wal_coordination() {
-            return Ok(None);
+            return Err(LimboError::InvalidArgument(format!(
+                "experimental multiprocess WAL is not supported by the active IO backend for '{}'",
+                self.path
+            )));
         }
         if is_memory_like(&self.path) || is_memory_like(&self.wal_path) {
-            return Ok(None);
+            return Err(LimboError::InvalidArgument(format!(
+                "experimental multiprocess WAL is not supported for in-memory database path '{}'",
+                self.path
+            )));
         }
         if !Self::path_allows_shared_wal_coordination(Path::new(&self.path))? {
-            return Ok(None);
+            return Err(LimboError::InvalidArgument(format!(
+                "experimental multiprocess WAL is not supported on the filesystem backing '{}'",
+                self.path
+            )));
         }
         if let Some(authority) = self.shared_wal_coordination.get() {
             return Ok(Some(authority.clone()));
@@ -1788,7 +1918,10 @@ impl Database {
                 64,
             )?
             else {
-                return Ok(None);
+                return Err(LimboError::LockingError(format!(
+                    "Failed opening database '{}'. Experimental multiprocess WAL requires an existing shared WAL coordination file",
+                    self.path
+                )));
             };
             Arc::new(authority)
         } else {

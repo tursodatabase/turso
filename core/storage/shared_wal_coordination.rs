@@ -3933,11 +3933,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("coordination.tshm");
         let mapped = create_mapping(&path);
+        let stale_owner = SharedOwnerRecord::new(exited_child_pid(), 7);
 
         mapped
             .header()
             .writer_owner
-            .store(SharedOwnerRecord::new(99, 7).raw(), Ordering::Release);
+            .store(stale_owner.raw(), Ordering::Release);
         assert!(mapped.try_acquire_writer(mapped.owner_record()));
         mapped.release_writer(mapped.owner_record());
     }
@@ -3947,10 +3948,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("coordination.tshm");
         let mapped = create_mapping(&path);
+        let stale_owner = SharedOwnerRecord::new(exited_child_pid(), 9);
 
         mapped.reader_bitmap_words()[0].fetch_and(!1u64, Ordering::Release);
         mapped.reader_frames()[0].store(17, Ordering::Release);
-        mapped.reader_owners()[0].store(SharedOwnerRecord::new(42, 9).raw(), Ordering::Release);
+        mapped.reader_owners()[0].store(stale_owner.raw(), Ordering::Release);
 
         assert_eq!(mapped.min_active_reader_frame(), None);
         assert_eq!(mapped.reader_owner(0), None);
