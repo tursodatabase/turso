@@ -112,6 +112,8 @@ impl TursoSetupConfig {
     }
 }
 
+pub use turso_core::io::OpenFlags as PubOpenFlags;
+
 #[derive(Clone)]
 pub struct TursoDatabaseConfig {
     /// path to the database file or ":memory:" for in-memory connection
@@ -142,6 +144,8 @@ pub struct TursoDatabaseConfig {
     /// optional custom DatabaseStorage provided by the caller
     /// if provided, caller must guarantee that IO used by the TursoDatabase will be consistent with underlying DatabaseStorage IO
     pub db_file: Option<Arc<dyn DatabaseStorage>>,
+
+    pub flags: Option<OpenFlags>,
 }
 
 pub fn turso_slice_from_bytes(bytes: &[u8]) -> capi::c::turso_slice_ref_t {
@@ -283,6 +287,7 @@ impl TursoDatabaseConfig {
             },
             io: None,
             db_file: None,
+            flags: None,
         })
     }
 }
@@ -1289,6 +1294,7 @@ mod tests {
                 vfs: None,
                 io: None,
                 db_file: None,
+                flags: None,
             });
             let result = db.open().unwrap();
             assert!(!result.is_io());
@@ -1350,6 +1356,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1370,6 +1377,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1400,6 +1408,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1423,6 +1432,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1473,6 +1483,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1532,6 +1543,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1564,6 +1576,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1593,6 +1606,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1618,6 +1632,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1644,6 +1659,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1694,6 +1710,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1782,6 +1799,7 @@ mod tests {
                     vfs: None,
                     io: None,
                     db_file: None,
+                    flags: None,
                 });
                 let result = db.open().unwrap();
                 assert!(!result.is_io());
@@ -1822,6 +1840,7 @@ mod tests {
                     vfs: None,
                     io: None,
                     db_file: None,
+                    flags: None,
                 });
                 let result = db.open().unwrap();
                 assert!(!result.is_io());
@@ -1848,6 +1867,7 @@ mod tests {
                     vfs: None,
                     io: None,
                     db_file: None,
+                    flags: None,
                 });
                 assert!(db.open().is_err(), "Opening with wrong key should fail");
             }
@@ -1862,6 +1882,7 @@ mod tests {
                     vfs: None,
                     io: None,
                     db_file: None,
+                    flags: None,
                 });
                 let result = db.open();
                 println!("result: {result:?}");
@@ -1897,6 +1918,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         });
         let _ = db_a.open().unwrap();
         let conn_a = db_a.connect().unwrap();
@@ -1934,6 +1956,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         });
         let _ = db_a2.open().unwrap();
         let conn_a2 = db_a2.connect().unwrap();
@@ -1968,6 +1991,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2002,6 +2026,7 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());

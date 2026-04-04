@@ -183,6 +183,7 @@ impl Builder {
             vfs: None,
             io: None,
             db_file: None,
+            flags: None,
         };
 
         let url = if let Some(remote_url) = &self.remote_url {
