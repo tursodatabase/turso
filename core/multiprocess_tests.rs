@@ -12,6 +12,8 @@ const MULTIPROCESS_SHM_SCHEMA_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_schema_child_process";
 const MULTIPROCESS_SHM_INSERT_AND_CLOSE_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_insert_and_close_child_process";
+const MULTIPROCESS_SHM_EXPECT_OPEN_FAILURE_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_shm_expect_open_failure_child_process";
 const DEFAULT_LOCKED_DB_CHILD_TEST: &str = "multiprocess_tests::default_locked_db_child_process";
 
 fn count_test_rows(conn: &Arc<Connection>) -> i64 {
@@ -160,6 +162,18 @@ fn shared_wal_coordination_rejects_remote_filesystem_magic_values() {
 }
 
 #[test]
+#[cfg(all(unix, target_pointer_width = "64"))]
+fn shared_wal_coordination_path_probe_accepts_nonexistent_relative_paths() {
+    let result = Database::path_allows_shared_wal_coordination(std::path::Path::new(
+        "nonexistent-relative-multiprocess-wal.db",
+    ));
+    assert!(
+        result.is_ok(),
+        "nonexistent relative paths should probe the current directory instead of erroring: {result:?}"
+    );
+}
+
+#[test]
 fn database_open_without_experimental_multiprocess_wal_uses_in_process_backend() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("coordination-default-off.db");
@@ -198,6 +212,75 @@ fn database_open_without_experimental_multiprocess_wal_rejects_second_process() 
     assert!(
         child_output.status.success(),
         "second default-open child process unexpectedly succeeded: stdout={}; stderr={}",
+        String::from_utf8_lossy(&child_output.stdout),
+        String::from_utf8_lossy(&child_output.stderr)
+    );
+}
+
+#[test]
+fn database_open_with_experimental_multiprocess_wal_rejects_unsupported_io_backend() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let err = Database::open_file_with_flags(
+        io,
+        "unsupported-multiprocess.db",
+        OpenFlags::default(),
+        multiprocess_wal_db_opts(),
+        None,
+    )
+    .expect_err("multiprocess WAL should reject IO backends without shared coordination");
+    assert!(
+        matches!(err, LimboError::InvalidArgument(ref message) if message.contains("active IO backend")),
+        "expected InvalidArgument about unsupported IO backend, got {err:?}"
+    );
+}
+
+#[test]
+fn database_open_with_experimental_multiprocess_wal_rejects_second_default_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir
+        .path()
+        .join("coordination-multiprocess-parent-default-child.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let _db = open_multiprocess_db(io, db_path_str).unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let child_output = Command::new(&current_exe)
+        .arg(DEFAULT_LOCKED_DB_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        child_output.status.success(),
+        "default-open child process unexpectedly succeeded against multiprocess parent: stdout={}; stderr={}",
+        String::from_utf8_lossy(&child_output.stdout),
+        String::from_utf8_lossy(&child_output.stderr)
+    );
+}
+
+#[test]
+fn database_open_without_experimental_multiprocess_wal_rejects_second_multiprocess_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir
+        .path()
+        .join("coordination-default-parent-multiprocess-child.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let _db = Database::open_file(io, db_path_str).unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let child_output = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_EXPECT_OPEN_FAILURE_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        child_output.status.success(),
+        "multiprocess child process unexpectedly opened against default parent: stdout={}; stderr={}",
         String::from_utf8_lossy(&child_output.stdout),
         String::from_utf8_lossy(&child_output.stderr)
     );
@@ -581,6 +664,21 @@ fn default_locked_db_child_process() {
     assert!(
         matches!(err, LimboError::LockingError(_)),
         "expected LockingError from second default open, got {err:?}"
+    );
+}
+
+#[test]
+fn multiprocess_shm_expect_open_failure_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let err = open_multiprocess_db(io, db_path.to_str().unwrap())
+        .expect_err("multiprocess open should fail when a legacy opener already owns the DB");
+    assert!(
+        matches!(err, LimboError::LockingError(_)),
+        "expected LockingError from incompatible multiprocess open, got {err:?}"
     );
 }
 
