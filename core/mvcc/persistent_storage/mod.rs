@@ -130,7 +130,7 @@ impl DurableStorage for Storage {
     }
 
     fn get_logical_log_file(&self) -> Arc<dyn File> {
-        self.logical_log.write().file.clone()
+        self.logical_log.read().file.clone()
     }
 
     fn encryption_ctx(&self) -> Option<EncryptionContext> {
