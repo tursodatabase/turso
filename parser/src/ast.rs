@@ -40,6 +40,44 @@ pub struct CreateVirtualTable {
     pub args: Vec<String>, // TODO smol str
 }
 
+/// Key-value option for CREATE SERVER / CREATE FOREIGN TABLE
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ServerOption {
+    /// option key
+    pub key: Name,
+    /// option value (string literal)
+    pub value: String,
+}
+
+/// `CREATE SERVER`
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CreateServer {
+    /// `IF NOT EXISTS`
+    pub if_not_exists: bool,
+    /// server name
+    pub server_name: Name,
+    /// OPTIONS (key 'value', ...)
+    pub options: Vec<ServerOption>,
+}
+
+/// `CREATE FOREIGN TABLE`
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CreateForeignTable {
+    /// `IF NOT EXISTS`
+    pub if_not_exists: bool,
+    /// table name
+    pub tbl_name: QualifiedName,
+    /// column definitions
+    pub columns: Vec<ColumnDefinition>,
+    /// SERVER name
+    pub server_name: Name,
+    /// table-level OPTIONS
+    pub options: Vec<ServerOption>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Update {
@@ -183,8 +221,25 @@ pub enum Stmt {
         select: Select,
     },
 
+    /// `REFRESH MATERIALIZED VIEW`
+    RefreshMaterializedView {
+        /// view name
+        view_name: QualifiedName,
+    },
+
     /// `CREATE VIRTUAL TABLE`
     CreateVirtualTable(CreateVirtualTable),
+    /// `CREATE SERVER`
+    CreateServer(CreateServer),
+    /// `CREATE FOREIGN TABLE`
+    CreateForeignTable(CreateForeignTable),
+    /// `DROP SERVER`
+    DropServer {
+        /// `IF EXISTS`
+        if_exists: bool,
+        /// server name
+        server_name: Name,
+    },
     /// `CREATE TYPE`
     CreateType {
         /// `IF NOT EXISTS`

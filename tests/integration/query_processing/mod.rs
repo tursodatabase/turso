@@ -10,6 +10,8 @@ mod test_write_path;
 
 mod encryption;
 mod test_expr_index;
+mod test_fdw_matview;
+mod test_foreign_table;
 mod test_multi_thread;
 mod test_page1;
 mod test_schema_updated;

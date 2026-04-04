@@ -2,13 +2,14 @@ use super::compiler::{DbspCircuit, DbspCompiler, DeltaSet};
 use super::dbsp::Delta;
 use super::operator::ComputationTracker;
 use crate::numeric::Numeric;
-use crate::schema::{BTreeTable, Schema};
+use crate::schema::{BTreeTable, Column, Schema, Table};
 use crate::storage::btree::CursorTrait;
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::logical::LogicalPlanBuilder;
 use crate::types::{IOResult, Value};
 use crate::util::{extract_view_columns, ViewColumnSchema};
+use crate::vtab::VirtualTable;
 use crate::{return_if_io, LimboError, Pager, Result, Statement};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::cell::RefCell;
@@ -186,6 +187,55 @@ impl AllViewsTxState {
     }
 }
 
+/// Lightweight representation of a table referenced by a materialized view.
+/// Works for both BTree tables and virtual/foreign tables.
+#[derive(Debug, Clone)]
+pub struct ReferencedTable {
+    pub name: String,
+    pub columns: Vec<Column>,
+    pub has_rowid: bool,
+    rowid_alias_index: Option<usize>,
+    /// Virtual/foreign tables don't expose `rowid` in SQL — need synthetic rowids.
+    is_virtual: bool,
+}
+
+impl ReferencedTable {
+    /// Build from any table type in the schema.
+    /// Returns None for FromClauseSubquery (not a real table).
+    pub fn from_schema(schema: &Schema, table_name: &str) -> Option<Self> {
+        match schema.get_table(table_name)?.as_ref() {
+            Table::BTree(btree) => Some(Self::from_btree(btree)),
+            Table::Virtual(vtab) => Some(Self::from_virtual(vtab)),
+            Table::FromClauseSubquery(_) => None,
+        }
+    }
+
+    pub fn from_btree(table: &BTreeTable) -> Self {
+        let rowid_alias_index = table.get_rowid_alias_column().map(|(idx, _)| idx);
+        Self {
+            name: table.name.clone(),
+            columns: table.columns.clone(),
+            has_rowid: table.has_rowid,
+            rowid_alias_index,
+            is_virtual: false,
+        }
+    }
+
+    pub fn from_virtual(table: &VirtualTable) -> Self {
+        Self {
+            name: table.name.clone(),
+            columns: table.columns.clone(),
+            has_rowid: true,
+            rowid_alias_index: None,
+            is_virtual: true,
+        }
+    }
+
+    pub fn get_rowid_alias_column(&self) -> Option<usize> {
+        self.rowid_alias_index
+    }
+}
+
 /// Incremental view that maintains its state through a DBSP circuit
 ///
 /// This version keeps everything in-memory. This is acceptable for small views, since DBSP
@@ -207,7 +257,7 @@ pub struct IncrementalView {
     circuit: DbspCircuit,
 
     // All tables referenced by this view (from FROM clause and JOINs)
-    referenced_tables: Vec<Arc<BTreeTable>>,
+    referenced_tables: Vec<ReferencedTable>,
     // Mapping from table aliases to actual table names (e.g., "c" -> "customers")
     table_aliases: HashMap<String, String>,
     // Mapping from table name to fully qualified name (e.g., "customers" -> "main.customers")
@@ -372,7 +422,7 @@ impl IncrementalView {
     pub fn new(
         name: String,
         select_stmt: ast::Select,
-        referenced_tables: Vec<Arc<BTreeTable>>,
+        referenced_tables: Vec<ReferencedTable>,
         table_aliases: HashMap<String, String>,
         qualified_table_names: HashMap<String, String>,
         table_conditions: HashMap<String, Vec<Option<ast::Expr>>>,
@@ -413,6 +463,11 @@ impl IncrementalView {
         &self.name
     }
 
+    /// Reset the populate state so the view can be repopulated (used by REFRESH).
+    pub fn reset_populate_state(&mut self) {
+        self.populate_state = PopulateState::Start;
+    }
+
     /// Execute the circuit with uncommitted changes to get processed delta
     pub fn execute_with_uncommitted(
         &mut self,
@@ -441,8 +496,8 @@ impl IncrementalView {
     }
 
     /// Get all tables referenced by this view
-    pub fn get_referenced_tables(&self) -> Vec<Arc<BTreeTable>> {
-        self.referenced_tables.clone()
+    pub fn get_referenced_tables(&self) -> &[ReferencedTable] {
+        &self.referenced_tables
     }
 
     /// Process a single table reference from a FROM or JOIN clause
@@ -450,7 +505,7 @@ impl IncrementalView {
         name: &ast::QualifiedName,
         alias: &Option<ast::As>,
         schema: &Schema,
-        table_map: &mut HashMap<String, Arc<BTreeTable>>,
+        table_map: &mut HashMap<String, ReferencedTable>,
         aliases: &mut HashMap<String, String>,
         qualified_names: &mut HashMap<String, String>,
         cte_names: &HashSet<String>,
@@ -466,21 +521,18 @@ impl IncrementalView {
 
         // Skip CTEs - they're not real tables
         if !cte_names.contains(table_name) {
-            if let Some(table) = schema.get_btree_table(table_name) {
-                table_map.insert(table_name.to_string(), table);
-                qualified_names.insert(table_name.to_string(), qualified_name);
+            let ref_table = ReferencedTable::from_schema(schema, table_name).ok_or_else(|| {
+                LimboError::ParseError(format!("Table '{table_name}' not found in schema"))
+            })?;
+            table_map.insert(table_name.to_string(), ref_table);
+            qualified_names.insert(table_name.to_string(), qualified_name);
 
-                // Store the alias mapping if there is an alias
-                if let Some(alias_enum) = alias {
-                    aliases.insert(
-                        alias_enum.name().as_str().to_string(),
-                        table_name.to_string(),
-                    );
-                }
-            } else {
-                return Err(LimboError::ParseError(format!(
-                    "Table '{table_name}' not found in schema"
-                )));
+            // Store the alias mapping if there is an alias
+            if let Some(alias_enum) = alias {
+                aliases.insert(
+                    alias_enum.name().as_str().to_string(),
+                    table_name.to_string(),
+                );
             }
         }
         Ok(())
@@ -489,7 +541,7 @@ impl IncrementalView {
     fn extract_one_statement(
         select: &ast::OneSelect,
         schema: &Schema,
-        table_map: &mut HashMap<String, Arc<BTreeTable>>,
+        table_map: &mut HashMap<String, ReferencedTable>,
         aliases: &mut HashMap<String, String>,
         qualified_names: &mut HashMap<String, String>,
         table_conditions: &mut HashMap<String, Vec<Option<ast::Expr>>>,
@@ -588,7 +640,7 @@ impl IncrementalView {
     fn extract_all_tables(
         select: &ast::Select,
         schema: &Schema,
-        tables: &mut Vec<Arc<BTreeTable>>,
+        tables: &mut Vec<ReferencedTable>,
         aliases: &mut HashMap<String, String>,
         qualified_names: &mut HashMap<String, String>,
         table_conditions: &mut HashMap<String, Vec<Option<ast::Expr>>>,
@@ -615,7 +667,7 @@ impl IncrementalView {
     fn extract_all_tables_inner(
         select: &ast::Select,
         schema: &Schema,
-        table_map: &mut HashMap<String, Arc<BTreeTable>>,
+        table_map: &mut HashMap<String, ReferencedTable>,
         aliases: &mut HashMap<String, String>,
         qualified_names: &mut HashMap<String, String>,
         table_conditions: &mut HashMap<String, Vec<Option<ast::Expr>>>,
@@ -688,7 +740,7 @@ impl IncrementalView {
 
     pub fn generate_populate_queries(
         select_stmt: &ast::Select,
-        referenced_tables: &[Arc<BTreeTable>],
+        referenced_tables: &[ReferencedTable],
         table_aliases: &HashMap<String, String>,
         qualified_table_names: &HashMap<String, String>,
         table_conditions: &HashMap<String, Vec<Option<ast::Expr>>>,
@@ -702,12 +754,10 @@ impl IncrementalView {
         let mut queries = Vec::new();
 
         for table in referenced_tables {
-            // Check if the table has a rowid alias (INTEGER PRIMARY KEY column)
-            let has_rowid_alias = table.columns.iter().any(|col| col.is_rowid_alias());
-
-            // Select all columns. The circuit will handle filtering and projection
-            // If there's a rowid alias, we don't need to select rowid separately
-            let select_clause = if has_rowid_alias {
+            // Virtual tables (including foreign tables) don't expose `rowid` in SQL.
+            // BTree tables with a rowid alias include it in `*`.
+            // Only bare BTree tables without a rowid alias need explicit `, rowid`.
+            let select_clause = if table.is_virtual || table.get_rowid_alias_column().is_some() {
                 "*".to_string()
             } else {
                 "*, rowid".to_string()
@@ -750,7 +800,7 @@ impl IncrementalView {
         _select_stmt: &ast::Select,
         conditions: &[Option<ast::Expr>],
         table_name: &str,
-        _referenced_tables: &[Arc<BTreeTable>],
+        _referenced_tables: &[ReferencedTable],
         table_aliases: &HashMap<String, String>,
     ) -> crate::Result<String> {
         // Check if any conditions are None (SELECTs without WHERE)
@@ -1096,9 +1146,9 @@ impl IncrementalView {
                 } else {
                     // Check which table has this column
                     for table_name in all_tables {
-                        if let Some(table) = schema.get_btree_table(table_name) {
+                        if let Some(table) = schema.get_table(table_name) {
                             if table
-                                .columns
+                                .columns()
                                 .iter()
                                 .any(|col| col.name.as_deref() == Some(column.as_str()))
                             {
@@ -1266,15 +1316,18 @@ impl IncrementalView {
                                     row.get_values().cloned().collect();
 
                                 // Extract rowid and values using helper
-                                let (rowid, values) =
-                                    match self.extract_rowid_and_values(all_values, current_idx) {
-                                        Some(result) => result,
-                                        None => {
-                                            // Invalid rowid, skip this row
-                                            rows_processed += 1;
-                                            continue;
-                                        }
-                                    };
+                                let (rowid, values) = match self.extract_rowid_and_values(
+                                    all_values,
+                                    current_idx,
+                                    rows_processed as i64 + 1,
+                                ) {
+                                    Some(result) => result,
+                                    None => {
+                                        // Invalid rowid, skip this row
+                                        rows_processed += 1;
+                                        continue;
+                                    }
+                                };
 
                                 // Process this row
                                 match self.process_one_row(
@@ -1372,27 +1425,31 @@ impl IncrementalView {
         self.merge_delta(delta_set, pager)
     }
 
-    /// Extract rowid and values from a row
+    /// Extract rowid and values from a row.
+    /// `synthetic_rowid` is used for virtual/foreign tables that don't expose rowid in SQL.
     fn extract_rowid_and_values(
         &self,
         all_values: Vec<Value>,
         table_idx: usize,
+        synthetic_rowid: i64,
     ) -> Option<(i64, Vec<Value>)> {
-        if let Some((idx, _)) = self.referenced_tables[table_idx].get_rowid_alias_column() {
+        let table = &self.referenced_tables[table_idx];
+        if table.is_virtual {
+            // Virtual/foreign tables: all values are columns, use synthetic rowid
+            Some((synthetic_rowid, all_values))
+        } else if let Some(idx) = table.get_rowid_alias_column() {
             // The rowid is the value at the rowid alias column index
             let rowid = match all_values.get(idx) {
                 Some(Value::Numeric(Numeric::Integer(id))) => *id,
-                _ => return None, // Invalid rowid
+                _ => return None,
             };
-            // All values are table columns (no separate rowid was selected)
             Some((rowid, all_values))
         } else {
             // The last value is the explicitly selected rowid
             let rowid = match all_values.last() {
                 Some(Value::Numeric(Numeric::Integer(id))) => *id,
-                _ => return None, // Invalid rowid
+                _ => return None,
             };
-            // Get all values except the rowid
             let values = all_values[..all_values.len() - 1].to_vec();
             Some((rowid, values))
         }
@@ -1633,7 +1690,7 @@ mod tests {
 
     // Type alias for the complex return type of extract_all_tables
     type ExtractedTableInfo = (
-        Vec<Arc<BTreeTable>>,
+        Vec<ReferencedTable>,
         HashMap<String, String>,
         HashMap<String, String>,
         HashMap<String, Vec<Option<ast::Expr>>>,
@@ -2567,7 +2624,7 @@ mod tests {
         let schema = create_test_schema();
 
         // Get the orders table twice (simulating what would happen with CTEs)
-        let orders_table = schema.get_btree_table("orders").unwrap();
+        let orders_table = ReferencedTable::from_btree(&schema.get_btree_table("orders").unwrap());
 
         let referenced_tables = vec![orders_table.clone(), orders_table];
 
