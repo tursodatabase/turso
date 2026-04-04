@@ -139,6 +139,8 @@ pub struct UnixFile {
 }
 
 pub(crate) struct UnixSharedWalMapping {
+    mapping_ptr: NonNull<u8>,
+    mapping_len: usize,
     ptr: NonNull<u8>,
     len: usize,
 }
@@ -158,7 +160,7 @@ impl SharedWalMappedRegion for UnixSharedWalMapping {
 
 impl Drop for UnixSharedWalMapping {
     fn drop(&mut self) {
-        let rc = unsafe { libc::munmap(self.ptr.as_ptr().cast(), self.len) };
+        let rc = unsafe { libc::munmap(self.mapping_ptr.as_ptr().cast(), self.mapping_len) };
         if rc != 0 {
             // Log rather than panic — panicking in Drop aborts if we're already
             // unwinding (double panic).
@@ -269,17 +271,30 @@ pub(crate) fn unix_shared_wal_map(
             "cannot mmap shared WAL coordination region with zero length".into(),
         ));
     }
-    let ptr = unsafe {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return Err(LimboError::LockingError(format!(
+            "failed to determine shared WAL mmap page size: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let page_size = page_size as u64;
+    let aligned_offset = offset / page_size * page_size;
+    let prefix_len = (offset - aligned_offset) as usize;
+    let mapping_len = prefix_len
+        .checked_add(len)
+        .ok_or_else(|| LimboError::InternalError("shared WAL mmap length overflow".into()))?;
+    let mapping_ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
-            len,
+            mapping_len,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_SHARED,
             fd,
-            offset as libc::off_t,
+            aligned_offset as libc::off_t,
         )
     };
-    if ptr == libc::MAP_FAILED {
+    if mapping_ptr == libc::MAP_FAILED {
         let error = std::io::Error::last_os_error();
         let file_size = unsafe {
             let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -290,11 +305,17 @@ pub(crate) fn unix_shared_wal_map(
             }
         };
         return Err(LimboError::LockingError(format!(
-            "mmap shared WAL coordination file failed: {error} (offset={offset}, len={len}, fd={fd}, file_size={file_size})"
+            "mmap shared WAL coordination file failed: {error} (offset={offset}, aligned_offset={aligned_offset}, len={len}, mapping_len={mapping_len}, fd={fd}, file_size={file_size})"
         )));
     }
+    let mapping_ptr =
+        NonNull::new(mapping_ptr.cast::<u8>()).expect("mmap returned null for shared WAL map");
+    let ptr = NonNull::new(unsafe { mapping_ptr.as_ptr().add(prefix_len) })
+        .expect("aligned mmap base plus prefix_len returned null");
     Ok(Box::new(UnixSharedWalMapping {
-        ptr: NonNull::new(ptr.cast::<u8>()).expect("mmap returned null"),
+        mapping_ptr,
+        mapping_len,
+        ptr,
         len,
     }))
 }
@@ -579,9 +600,25 @@ impl Drop for UnixFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn test_multiple_processes_cannot_open_file() {
         common::tests::test_multiple_processes_cannot_open_file(UnixIO::new);
+    }
+
+    #[test]
+    fn test_shared_wal_map_supports_unaligned_logical_offset() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let backing_len = 128 * 1024;
+        let bytes: Vec<u8> = (0..backing_len).map(|i| (i % 251) as u8).collect();
+        file.as_file().write_all(&bytes).unwrap();
+        file.as_file().sync_all().unwrap();
+
+        let mapped = unix_shared_wal_map(4096, 81920, file.as_file().as_raw_fd()).unwrap();
+        assert_eq!(mapped.len(), 81920);
+        let slice = unsafe { std::slice::from_raw_parts(mapped.ptr().as_ptr(), mapped.len()) };
+        assert_eq!(&slice[..128], &bytes[4096..4096 + 128]);
+        assert_eq!(&slice[mapped.len() - 128..], &bytes[4096 + 81920 - 128..4096 + 81920]);
     }
 }
