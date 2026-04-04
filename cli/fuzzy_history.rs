@@ -19,6 +19,8 @@ use tui_input::Input;
 
 use crate::config::{HighlightConfig, CONFIG_DIR};
 
+type HighlightSpans = Vec<(Style, String)>;
+
 struct SqlHighlighter {
     syntax_set: SyntaxSet,
     theme_set: ThemeSet,
@@ -47,7 +49,7 @@ impl SqlHighlighter {
         }
     }
 
-    fn highlight(&self, text: &str) -> Vec<(Style, String)> {
+    fn highlight(&self, text: &str) -> HighlightSpans {
         let syntax = self
             .syntax_set
             .find_syntax_by_scope(Scope::new("source.sql").unwrap())
@@ -72,21 +74,123 @@ impl SqlHighlighter {
     }
 }
 
+/// Caches the rendered list items, only rebuilding when the query or matches change.
+struct ItemsCache {
+    items: Vec<ListItem<'static>>,
+    dirty: bool,
+    matcher: Matcher,
+    indices_buf: Vec<u32>,
+    utf32_buf: Vec<char>,
+}
+
+impl ItemsCache {
+    fn new() -> Self {
+        Self {
+            items: Vec::new(),
+            dirty: true,
+            matcher: Matcher::new(Config::DEFAULT),
+            indices_buf: Vec::new(),
+            utf32_buf: Vec::new(),
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.dirty = true;
+    }
+
+    fn get(
+        &mut self,
+        nucleo: &Nucleo<String>,
+        query: &str,
+        highlighter: &SqlHighlighter,
+        highlight_cache: &mut std::collections::HashMap<String, HighlightSpans>,
+    ) -> &[ListItem<'static>] {
+        if !self.dirty {
+            return &self.items;
+        }
+        self.dirty = false;
+
+        let snapshot = nucleo.snapshot();
+        let matched = snapshot.matched_item_count();
+        let pattern = snapshot.pattern();
+        let count = matched.min(500) as usize;
+
+        // Collect entries + indices first to release snapshot borrow
+        let mut entries: Vec<(String, Vec<u32>)> = Vec::with_capacity(count);
+        for i in 0..count {
+            if let Some(item) = snapshot.get_matched_item(i as u32) {
+                self.indices_buf.clear();
+                self.utf32_buf.clear();
+                if !query.is_empty() {
+                    let haystack = Utf32Str::new(item.data, &mut self.utf32_buf);
+                    pattern.column_pattern(0).indices(
+                        haystack,
+                        &mut self.matcher,
+                        &mut self.indices_buf,
+                    );
+                    self.indices_buf.sort_unstable();
+                    self.indices_buf.dedup();
+                }
+                entries.push((item.data.clone(), self.indices_buf.clone()));
+            }
+        }
+
+        let match_modifier = Modifier::BOLD | Modifier::UNDERLINED;
+        self.items.clear();
+        for (text, indices) in &entries {
+            let syntax_spans = highlight_cache
+                .entry(text.clone())
+                .or_insert_with(|| highlighter.highlight(text))
+                .clone();
+
+            let mut result_spans = Vec::new();
+            let mut char_offset = 0;
+            for (base_style, fragment) in &syntax_spans {
+                let mut current_text = String::new();
+                let mut current_style = *base_style;
+
+                for ch in fragment.chars() {
+                    let is_match = indices.contains(&(char_offset as u32));
+                    let style = if is_match {
+                        base_style.add_modifier(match_modifier)
+                    } else {
+                        *base_style
+                    };
+                    if style != current_style && !current_text.is_empty() {
+                        result_spans.push(Span::styled(
+                            std::mem::take(&mut current_text),
+                            current_style,
+                        ));
+                    }
+                    current_style = style;
+                    current_text.push(ch);
+                    char_offset += 1;
+                }
+                if !current_text.is_empty() {
+                    result_spans.push(Span::styled(current_text, current_style));
+                }
+            }
+            self.items.push(ListItem::new(Line::from(result_spans)));
+        }
+
+        &self.items
+    }
+}
+
 struct FzfState {
     nucleo: Nucleo<String>,
     input: Input,
     selected: usize,
-    matcher: Matcher,
-    indices_buf: Vec<u32>,
-    utf32_buf: Vec<char>,
     highlighter: SqlHighlighter,
-    // Cache: syntax highlighting is expensive, but stable per-entry.
-    // Key is the raw text, value is the pre-highlighted spans.
-    highlight_cache: std::collections::HashMap<String, Vec<(Style, String)>>,
+    highlight_cache: std::collections::HashMap<String, HighlightSpans>,
+    items_cache: ItemsCache,
 }
 
 impl FzfState {
-    fn new(history_path: &PathBuf, highlight_config: Option<&HighlightConfig>) -> Option<Self> {
+    fn new(
+        history_path: &PathBuf,
+        highlight_config: Option<&HighlightConfig>,
+    ) -> Option<(Self, std::sync::mpsc::Receiver<(String, HighlightSpans)>)> {
         let entries = read_history(history_path);
         if entries.is_empty() {
             return None;
@@ -107,23 +211,31 @@ impl FzfState {
 
         let highlighter = SqlHighlighter::new(highlight_config);
 
-        // Pre-cache syntax highlighting for all entries
-        let mut highlight_cache = std::collections::HashMap::new();
-        for entry in &entries {
-            let spans = highlighter.highlight(entry);
-            highlight_cache.insert(entry.clone(), spans);
-        }
+        // Populate highlight cache in background thread
+        let (hl_tx, hl_rx) = std::sync::mpsc::channel();
+        let entries_clone = entries.clone();
+        let hl_config_clone = highlight_config.cloned();
+        std::thread::spawn(move || {
+            let hl = SqlHighlighter::new(hl_config_clone.as_ref());
+            for entry in entries_clone {
+                let spans = hl.highlight(&entry);
+                if hl_tx.send((entry, spans)).is_err() {
+                    break;
+                }
+            }
+        });
 
-        Some(Self {
-            nucleo,
-            input: Input::default(),
-            selected: 0,
-            matcher: Matcher::new(Config::DEFAULT),
-            indices_buf: Vec::new(),
-            utf32_buf: Vec::new(),
-            highlighter,
-            highlight_cache,
-        })
+        Some((
+            Self {
+                nucleo,
+                input: Input::default(),
+                selected: 0,
+                highlighter,
+                highlight_cache: std::collections::HashMap::new(),
+                items_cache: ItemsCache::new(),
+            },
+            hl_rx,
+        ))
     }
 
     fn query(&self) -> &str {
@@ -139,6 +251,7 @@ impl FzfState {
             append,
         );
         self.nucleo.tick(10);
+        self.items_cache.invalidate();
     }
 
     fn matched_count(&self) -> u32 {
@@ -161,89 +274,6 @@ impl FzfState {
             .get_matched_item(idx as u32)
             .map(|item| item.data.clone())
     }
-
-    fn build_items(&mut self) -> Vec<ListItem<'static>> {
-        // Collect data from snapshot first to release the borrow on self.nucleo
-        let snapshot = self.nucleo.snapshot();
-        let matched = snapshot.matched_item_count();
-        let pattern = snapshot.pattern();
-        let count = matched.min(200) as usize;
-        let query = self.query().to_string();
-
-        let mut entries: Vec<(String, Vec<u32>)> = Vec::with_capacity(count);
-        for i in 0..count {
-            if let Some(item) = snapshot.get_matched_item(i as u32) {
-                self.indices_buf.clear();
-                self.utf32_buf.clear();
-                if !query.is_empty() {
-                    let haystack = Utf32Str::new(item.data, &mut self.utf32_buf);
-                    pattern.column_pattern(0).indices(
-                        haystack,
-                        &mut self.matcher,
-                        &mut self.indices_buf,
-                    );
-                    self.indices_buf.sort_unstable();
-                    self.indices_buf.dedup();
-                }
-                entries.push((item.data.clone(), self.indices_buf.clone()));
-            }
-        }
-
-        // Now build highlighted lines without borrowing self.nucleo
-        entries
-            .into_iter()
-            .map(|(text, indices)| {
-                self.indices_buf = indices;
-                let line = self.build_highlighted_line(&text);
-                ListItem::new(line)
-            })
-            .collect()
-    }
-
-    fn build_highlighted_line(&mut self, text: &str) -> Line<'static> {
-        let match_modifier = Modifier::BOLD | Modifier::UNDERLINED;
-
-        // Get cached syntax-highlighted spans (or compute on cache miss)
-        let syntax_spans = self
-            .highlight_cache
-            .entry(text.to_string())
-            .or_insert_with(|| self.highlighter.highlight(text))
-            .clone();
-
-        // Overlay fuzzy match highlighting onto syntax spans
-        let mut result_spans = Vec::new();
-        let mut char_offset = 0;
-
-        for (base_style, fragment) in &syntax_spans {
-            let mut current_text = String::new();
-            let mut current_style = *base_style;
-
-            for ch in fragment.chars() {
-                let is_match = self.indices_buf.contains(&(char_offset as u32));
-                let style = if is_match {
-                    base_style.add_modifier(match_modifier)
-                } else {
-                    *base_style
-                };
-
-                if style != current_style && !current_text.is_empty() {
-                    result_spans.push(Span::styled(
-                        std::mem::take(&mut current_text),
-                        current_style,
-                    ));
-                }
-                current_style = style;
-                current_text.push(ch);
-                char_offset += 1;
-            }
-
-            if !current_text.is_empty() {
-                result_spans.push(Span::styled(current_text, current_style));
-            }
-        }
-
-        Line::from(result_spans)
-    }
 }
 
 pub fn run(
@@ -251,7 +281,7 @@ pub fn run(
     highlight_config: Option<&HighlightConfig>,
     initial_query: String,
 ) -> Option<String> {
-    let mut state = FzfState::new(history_path, highlight_config)?;
+    let (mut state, hl_rx) = FzfState::new(history_path, highlight_config)?;
 
     if !initial_query.is_empty() {
         state.input = Input::new(initial_query);
@@ -272,7 +302,7 @@ pub fn run(
         }
     });
 
-    let result = event_loop(&mut terminal, &mut state, &term_rx);
+    let result = event_loop(&mut terminal, &mut state, &term_rx, &hl_rx);
 
     ratatui::try_restore().ok()?;
 
@@ -289,15 +319,24 @@ fn draw(frame: &mut ratatui::Frame, state: &mut FzfState) {
     ])
     .areas(area);
 
-    let items = state.build_items();
+    let query = state.query().to_string();
     let matched = state.matched_count();
+    let total = state.total_count();
+    let selected = state.selected;
+
+    let items = state.items_cache.get(
+        &state.nucleo,
+        &query,
+        &state.highlighter,
+        &mut state.highlight_cache,
+    );
 
     let mut list_state = ListState::default();
     if matched > 0 {
-        list_state.select(Some(state.selected.min(matched as usize - 1)));
+        list_state.select(Some(selected.min(matched as usize - 1)));
     }
 
-    let list = List::new(items)
+    let list = List::new(items.to_vec())
         .highlight_style(
             Style::default()
                 .bg(Color::DarkGray)
@@ -309,7 +348,6 @@ fn draw(frame: &mut ratatui::Frame, state: &mut FzfState) {
     frame.render_stateful_widget(list, list_area, &mut list_state);
 
     // Info line
-    let total = state.total_count();
     let info = Paragraph::new(Line::from(vec![Span::styled(
         format!("  {matched}/{total}"),
         Style::default().fg(Color::Yellow),
@@ -334,8 +372,14 @@ fn event_loop(
     terminal: &mut DefaultTerminal,
     state: &mut FzfState,
     term_rx: &std::sync::mpsc::Receiver<Event>,
+    hl_rx: &std::sync::mpsc::Receiver<(String, HighlightSpans)>,
 ) -> Option<String> {
     loop {
+        // Drain any ready highlight results into the cache
+        while let Ok((text, spans)) = hl_rx.try_recv() {
+            state.highlight_cache.insert(text, spans);
+        }
+
         terminal.draw(|frame| draw(frame, state)).ok()?;
 
         // Process all queued events before next render, drain the backlog
