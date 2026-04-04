@@ -1,26 +1,26 @@
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use nucleo::{Config, Matcher, Nucleo, Utf32Str};
 use ratatui::{
-    DefaultTerminal,
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, List, ListItem, ListState, Paragraph},
+    DefaultTerminal,
 };
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use syntect::dumps::from_uncompressed_data;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
 use syntect::parsing::{Scope, SyntaxSet};
 use syntect::util::LinesWithEndings;
-use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
+use tui_input::Input;
 
-use crate::config::{CONFIG_DIR, HighlightConfig};
+use crate::config::{HighlightConfig, CONFIG_DIR};
 
 type HighlightSpans = Vec<(Style, String)>;
 
@@ -159,140 +159,64 @@ impl ItemsCache {
 }
 
 struct FzfState {
-    nucleo: Nucleo<HistoryEntry>,
+    ui: UiState,
+    matches: MatchState,
+    render: RenderState,
+}
+
+struct UiState {
     input: Input,
     selected: usize,
-    highlighter: SqlHighlighter,
-    highlight_cache: std::collections::HashMap<String, HighlightSpans>,
-    items_cache: ItemsCache,
     history_loaded: Arc<AtomicBool>,
+}
+
+struct MatchState {
+    nucleo: Nucleo<HistoryEntry>,
+    items_cache: ItemsCache,
     live_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-enum AppEvent {
-    Terminal(Event),
-    DataChanged,
+struct RenderState {
+    highlighter: SqlHighlighter,
+    highlight_cache: std::collections::HashMap<String, HighlightSpans>,
 }
 
-enum EventOutcome {
-    Continue { tick: bool },
-    Exit(Option<String>),
-}
-
-impl FzfState {
-    fn new(
-        history_path: &PathBuf,
-        highlight_config: Option<&HighlightConfig>,
-        app_tx: std::sync::mpsc::Sender<AppEvent>,
-    ) -> Option<Self> {
-        if !history_path.exists() {
-            return None;
-        }
-
-        let notify_tx = app_tx.clone();
-        let nucleo_notify = Arc::new(move || {
-            let _ = notify_tx.send(AppEvent::DataChanged);
-        });
-        let nucleo: Nucleo<HistoryEntry> = Nucleo::new(Config::DEFAULT, nucleo_notify, Some(1), 1);
-        let injector = nucleo.injector();
-
-        let highlighter = SqlHighlighter::new(highlight_config);
-        let history_loaded = Arc::new(AtomicBool::new(false));
-        let live_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-
-        let history_path = history_path.clone();
-        let history_loaded_clone = history_loaded.clone();
-        let live_count_clone = live_count.clone();
-        let loader_wake_tx = app_tx.clone();
-        std::thread::spawn(move || {
-            let mut latest = std::collections::HashMap::<String, Arc<AtomicBool>>::new();
-            let Ok(file) = std::fs::File::open(history_path) else {
-                history_loaded_clone.store(true, Ordering::Release);
-                let _ = loader_wake_tx.send(AppEvent::DataChanged);
-                return;
-            };
-            for line in BufReader::new(file).lines() {
-                let Ok(text) = line else {
-                    continue;
-                };
-                if text.is_empty() {
-                    continue;
-                }
-
-                let alive = Arc::new(AtomicBool::new(true));
-                if let Some(previous) = latest.insert(text.clone(), alive.clone()) {
-                    previous.store(false, Ordering::Release);
-                } else {
-                    live_count_clone.fetch_add(1, Ordering::Relaxed);
-                }
-
-                injector.push(HistoryEntry { text, alive }, |entry, cols| {
-                    cols[0] = entry.text.as_str().into();
-                });
-            }
-            history_loaded_clone.store(true, Ordering::Release);
-            let _ = loader_wake_tx.send(AppEvent::DataChanged);
-        });
-
-        Some(Self {
-            nucleo,
-            input: Input::default(),
-            selected: 0,
-            highlighter,
-            highlight_cache: std::collections::HashMap::new(),
-            items_cache: ItemsCache::new(),
-            history_loaded,
-            live_count,
-        })
+impl MatchState {
+    fn update_pattern(&mut self, query: &str, append: bool) {
+        self.nucleo
+            .pattern
+            .reparse(0, query, Default::default(), Default::default(), append);
     }
 
-    fn query(&self) -> &str {
-        self.input.value()
-    }
-
-    fn update_pattern(&mut self, append: bool) {
-        self.nucleo.pattern.reparse(
-            0,
-            self.input.value(),
-            Default::default(),
-            Default::default(),
-            append,
-        );
-    }
-
-    fn refresh_matches(&mut self) {
+    fn refresh(&mut self, query: &str, selected: &mut usize) {
         let status = self.nucleo.tick(10);
         if !status.changed {
             return;
         }
 
         self.items_cache.invalidate();
-        let visible = self.visible_count();
+        let visible = self.visible_count(query);
         if visible == 0 {
-            self.selected = 0;
+            *selected = 0;
         } else {
-            self.selected = self.selected.min(visible - 1);
+            *selected = (*selected).min(visible - 1);
         }
     }
 
-    fn visible_rows(&mut self) -> &[VisibleRow] {
-        let query = self.query().to_string();
-        self.items_cache.get(&self.nucleo, &query)
+    fn visible_rows(&mut self, query: &str) -> &[VisibleRow] {
+        self.items_cache.get(&self.nucleo, query)
     }
 
-    fn visible_count(&mut self) -> usize {
-        self.visible_rows().len()
+    fn visible_count(&mut self, query: &str) -> usize {
+        self.visible_rows(query).len()
     }
 
     fn total_count(&self) -> u32 {
         self.live_count.load(Ordering::Acquire) as u32
     }
+}
 
-    fn get_selected(&mut self) -> Option<String> {
-        let idx = self.selected.min(self.visible_count().saturating_sub(1));
-        self.visible_rows().get(idx).map(|row| row.text.clone())
-    }
-
+impl RenderState {
     fn render_row(&mut self, row: &VisibleRow) -> ListItem<'static> {
         let syntax_spans = self
             .highlight_cache
@@ -333,6 +257,122 @@ impl FzfState {
     }
 }
 
+enum AppEvent {
+    Terminal(Event),
+    DataChanged,
+}
+
+enum EventOutcome {
+    Continue { tick: bool },
+    Exit(Option<String>),
+}
+
+impl FzfState {
+    fn new(
+        history_path: &PathBuf,
+        highlight_config: Option<&HighlightConfig>,
+        app_tx: std::sync::mpsc::Sender<AppEvent>,
+    ) -> Option<Self> {
+        if !history_path.exists() {
+            return None;
+        }
+
+        let notify_tx = app_tx.clone();
+        let nucleo_notify = Arc::new(move || {
+            let _ = notify_tx.send(AppEvent::DataChanged);
+        });
+        let nucleo: Nucleo<HistoryEntry> = Nucleo::new(Config::DEFAULT, nucleo_notify, Some(1), 1);
+        let injector = nucleo.injector();
+
+        let history_loaded = Arc::new(AtomicBool::new(false));
+        let live_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let history_path = history_path.clone();
+        let history_loaded_clone = history_loaded.clone();
+        let live_count_clone = live_count.clone();
+        let loader_wake_tx = app_tx.clone();
+        std::thread::spawn(move || {
+            let mut latest = std::collections::HashMap::<String, Arc<AtomicBool>>::new();
+            let Ok(file) = std::fs::File::open(history_path) else {
+                history_loaded_clone.store(true, Ordering::Release);
+                let _ = loader_wake_tx.send(AppEvent::DataChanged);
+                return;
+            };
+            for line in BufReader::new(file).lines() {
+                let Ok(text) = line else {
+                    continue;
+                };
+                if text.is_empty() {
+                    continue;
+                }
+
+                let alive = Arc::new(AtomicBool::new(true));
+                if let Some(previous) = latest.insert(text.clone(), alive.clone()) {
+                    previous.store(false, Ordering::Release);
+                } else {
+                    live_count_clone.fetch_add(1, Ordering::Relaxed);
+                }
+
+                injector.push(HistoryEntry { text, alive }, |entry, cols| {
+                    cols[0] = entry.text.as_str().into();
+                });
+            }
+            history_loaded_clone.store(true, Ordering::Release);
+            let _ = loader_wake_tx.send(AppEvent::DataChanged);
+        });
+
+        Some(Self {
+            ui: UiState {
+                input: Input::default(),
+                selected: 0,
+                history_loaded,
+            },
+            matches: MatchState {
+                nucleo,
+                items_cache: ItemsCache::new(),
+                live_count,
+            },
+            render: RenderState {
+                highlighter: SqlHighlighter::new(highlight_config),
+                highlight_cache: std::collections::HashMap::new(),
+            },
+        })
+    }
+
+    fn query(&self) -> &str {
+        self.ui.input.value()
+    }
+
+    fn update_pattern(&mut self, append: bool) {
+        let query = self.ui.input.value();
+        self.matches.update_pattern(query, append);
+    }
+
+    fn refresh_matches(&mut self) {
+        let query = self.ui.input.value();
+        self.matches.refresh(query, &mut self.ui.selected);
+    }
+
+    fn visible_rows(&mut self) -> &[VisibleRow] {
+        let query = self.ui.input.value();
+        self.matches.visible_rows(query)
+    }
+
+    fn visible_count(&mut self) -> usize {
+        let query = self.ui.input.value();
+        self.matches.visible_count(query)
+    }
+
+    fn total_count(&self) -> u32 {
+        self.matches.total_count()
+    }
+
+    fn get_selected(&mut self) -> Option<String> {
+        let idx = self.ui.selected.min(self.visible_count().saturating_sub(1));
+        self.visible_rows().get(idx).map(|row| row.text.clone())
+    }
+}
+
 pub fn run(
     history_path: &PathBuf,
     highlight_config: Option<&HighlightConfig>,
@@ -342,7 +382,7 @@ pub fn run(
     let mut state = FzfState::new(history_path, highlight_config, app_tx.clone())?;
 
     if !initial_query.is_empty() {
-        state.input = Input::new(initial_query);
+        state.ui.input = Input::new(initial_query);
         state.update_pattern(false);
         let _ = app_tx.send(AppEvent::DataChanged);
     }
@@ -350,13 +390,11 @@ pub fn run(
     let mut terminal = ratatui::try_init().ok()?;
 
     // Dedicated thread for terminal events — never blocks rendering
-    std::thread::spawn(move || {
-        loop {
-            if event::poll(Duration::from_millis(50)).unwrap_or(false) {
-                if let Ok(ev) = event::read() {
-                    if app_tx.send(AppEvent::Terminal(ev)).is_err() {
-                        break;
-                    }
+    std::thread::spawn(move || loop {
+        if event::poll(Duration::from_millis(50)).unwrap_or(false) {
+            if let Ok(ev) = event::read() {
+                if app_tx.send(AppEvent::Terminal(ev)).is_err() {
+                    break;
                 }
             }
         }
@@ -382,10 +420,10 @@ fn draw(frame: &mut ratatui::Frame, state: &mut FzfState) {
     let rows = state.visible_rows().to_vec();
     let matched = rows.len();
     let total = state.total_count();
-    let selected = state.selected;
+    let selected = state.ui.selected;
     let items = rows
         .iter()
-        .map(|row| state.render_row(row))
+        .map(|row| state.render.render_row(row))
         .collect::<Vec<_>>();
 
     let mut list_state = ListState::default();
@@ -409,7 +447,7 @@ fn draw(frame: &mut ratatui::Frame, state: &mut FzfState) {
         format!("  {matched}/{total}"),
         Style::default().fg(Color::Yellow),
     )];
-    if !state.history_loaded.load(Ordering::Acquire) {
+    if !state.ui.history_loaded.load(Ordering::Acquire) {
         info_spans.push(Span::raw(" "));
         info_spans.push(Span::styled(
             "loading history...",
@@ -420,15 +458,15 @@ fn draw(frame: &mut ratatui::Frame, state: &mut FzfState) {
     frame.render_widget(info, info_area);
 
     // Input line with tui-input
-    let scroll = state.input.visual_scroll(input_area.width as usize - 2);
+    let scroll = state.ui.input.visual_scroll(input_area.width as usize - 2);
     let input_widget = Paragraph::new(Line::from(vec![
         Span::styled("> ", Style::default().fg(Color::Cyan)),
-        Span::raw(state.input.value()),
+        Span::raw(state.ui.input.value()),
     ]));
     frame.render_widget(input_widget, input_area);
 
     frame.set_cursor_position((
-        input_area.x + 2 + (state.input.visual_cursor() - scroll) as u16,
+        input_area.x + 2 + (state.ui.input.visual_cursor() - scroll) as u16,
         input_area.y,
     ));
 }
@@ -491,7 +529,7 @@ fn handle_event(state: &mut FzfState, event: &Event) -> EventOutcome {
             modifiers: KeyModifiers::CONTROL,
             ..
         } => {
-            state.selected = state.selected.saturating_sub(1);
+            state.ui.selected = state.ui.selected.saturating_sub(1);
             EventOutcome::Continue { tick: false }
         }
         KeyEvent {
@@ -504,18 +542,18 @@ fn handle_event(state: &mut FzfState, event: &Event) -> EventOutcome {
             ..
         } => {
             let max = state.visible_count().saturating_sub(1);
-            state.selected = (state.selected + 1).min(max);
+            state.ui.selected = (state.ui.selected + 1).min(max);
             EventOutcome::Continue { tick: false }
         }
         _ => {
             let old_value = state.query().to_string();
-            state.input.handle_event(event);
+            state.ui.input.handle_event(event);
             let new_value = state.query();
             if new_value != old_value {
                 let append = new_value.starts_with(&old_value) && !old_value.is_empty();
-                state.selected = 0;
+                state.ui.selected = 0;
                 state.update_pattern(append);
-                state.items_cache.invalidate();
+                state.matches.items_cache.invalidate();
                 EventOutcome::Continue { tick: true }
             } else {
                 EventOutcome::Continue { tick: false }
