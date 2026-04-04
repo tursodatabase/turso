@@ -2491,3 +2491,123 @@ fn test_vacuum_into_compacts_fragmented_database(tmp_db: TempDatabase) -> anyhow
 
     Ok(())
 }
+
+/// Regression test: column names containing commas must not confuse the
+/// bind-parameter count in the generated INSERT statement.
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_column_name_with_comma(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    // Use a column name that contains a comma — valid SQL when quoted.
+    conn.execute("CREATE TABLE t(\"a,b\" INTEGER, c TEXT)")?;
+    conn.execute("INSERT INTO t VALUES (1, 'hello')")?;
+    conn.execute("INSERT INTO t VALUES (2, 'world')")?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("comma_col.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    let rows: Vec<(i64, String)> = dest_conn.exec_rows("SELECT \"a,b\", c FROM t ORDER BY \"a,b\"");
+    assert_eq!(
+        rows,
+        vec![(1, "hello".to_string()), (2, "world".to_string())]
+    );
+
+    Ok(())
+}
+
+/// Regression test: VACUUM INTO must preserve sqlite_stat1 data from ANALYZE.
+/// The old code skipped all sqlite_* tables except sqlite_sequence, which
+/// silently dropped query planner statistics.
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_preserves_sqlite_stat1(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")?;
+    conn.execute("CREATE INDEX idx_val ON t (val)")?;
+    for i in 0..50 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'row_{i}')"))?;
+    }
+    conn.execute("ANALYZE")?;
+
+    // Verify sqlite_stat1 exists and has data on source.
+    // Use tbl and stat columns (both always TEXT); idx can be NULL.
+    let source_stats: Vec<(String, String)> =
+        conn.exec_rows("SELECT tbl, stat FROM sqlite_stat1 ORDER BY tbl, stat");
+    assert!(
+        !source_stats.is_empty(),
+        "ANALYZE should populate sqlite_stat1"
+    );
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("stat1_test.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    // Verify sqlite_stat1 was preserved in destination
+    let dest_stats: Vec<(String, String)> =
+        dest_conn.exec_rows("SELECT tbl, stat FROM sqlite_stat1 ORDER BY tbl, stat");
+    assert_eq!(
+        source_stats, dest_stats,
+        "sqlite_stat1 data should be preserved by VACUUM INTO"
+    );
+
+    Ok(())
+}
+
+/// Regression test: VACUUM INTO must correctly handle deferred index creation.
+/// Indexes are now created after data copy for performance. Verify that the
+/// destination still has working indexes with correct data.
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_deferred_indexes(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER)")?;
+    conn.execute("CREATE INDEX idx_a ON t (a)")?;
+    conn.execute("CREATE UNIQUE INDEX idx_b ON t (b)")?;
+
+    for i in 0..30 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'val_{i}', {i})"))?;
+    }
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("deferred_idx.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+
+    // Verify indexes exist in destination schema
+    let indexes: Vec<(String,)> = dest_conn.exec_rows(
+        "SELECT name FROM sqlite_schema WHERE type = 'index' AND sql IS NOT NULL ORDER BY name",
+    );
+    assert_eq!(indexes.len(), 2);
+    assert_eq!(indexes[0].0, "idx_a");
+    assert_eq!(indexes[1].0, "idx_b");
+
+    // Verify data is accessible and correct
+    let count: Vec<(i64,)> = dest_conn.exec_rows("SELECT COUNT(*) FROM t");
+    assert_eq!(count[0].0, 30);
+
+    // Verify index-backed lookups work
+    let row: Vec<(i64, String)> = dest_conn.exec_rows("SELECT id, a FROM t WHERE a = 'val_15'");
+    assert_eq!(row, vec![(15, "val_15".to_string())]);
+
+    let row: Vec<(i64, i64)> = dest_conn.exec_rows("SELECT id, b FROM t WHERE b = 20");
+    assert_eq!(row, vec![(20, 20)]);
+
+    Ok(())
+}
