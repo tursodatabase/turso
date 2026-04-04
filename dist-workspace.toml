@@ -4,7 +4,7 @@ members = ["cargo:."]
 # Config for 'dist'
 [dist]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
-cargo-dist-version = "0.30.2"
+cargo-dist-version = "0.31.0"
 # CI backends to support
 ci = "github"
 # The installers to generate for each app
@@ -21,3 +21,5 @@ install-updater = true
 dist = false
 # Whether to enable GitHub Attestations
 github-attestations = true
+# Build only the required packages
+precise-builds = true
