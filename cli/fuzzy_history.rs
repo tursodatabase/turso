@@ -1,26 +1,26 @@
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use nucleo::{Config, Matcher, Nucleo, Utf32Str};
 use ratatui::{
+    DefaultTerminal,
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, List, ListItem, ListState, Paragraph},
-    DefaultTerminal,
 };
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use syntect::dumps::from_uncompressed_data;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
 use syntect::parsing::{Scope, SyntaxSet};
 use syntect::util::LinesWithEndings;
-use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
+use tui_input::backend::crossterm::EventHandler;
 
-use crate::config::{HighlightConfig, CONFIG_DIR};
+use crate::config::{CONFIG_DIR, HighlightConfig};
 
 type HighlightSpans = Vec<(Style, String)>;
 
@@ -390,11 +390,13 @@ pub fn run(
     let mut terminal = ratatui::try_init().ok()?;
 
     // Dedicated thread for terminal events — never blocks rendering
-    std::thread::spawn(move || loop {
-        if event::poll(Duration::from_millis(50)).unwrap_or(false) {
-            if let Ok(ev) = event::read() {
-                if app_tx.send(AppEvent::Terminal(ev)).is_err() {
-                    break;
+    std::thread::spawn(move || {
+        loop {
+            if event::poll(Duration::from_millis(50)).unwrap_or(false) {
+                if let Ok(ev) = event::read() {
+                    if app_tx.send(AppEvent::Terminal(ev)).is_err() {
+                        break;
+                    }
                 }
             }
         }
@@ -423,12 +425,13 @@ fn draw(frame: &mut ratatui::Frame, state: &mut FzfState) {
     let selected = state.ui.selected;
     let items = rows
         .iter()
+        .rev()
         .map(|row| state.render.render_row(row))
         .collect::<Vec<_>>();
 
     let mut list_state = ListState::default();
     if matched > 0 {
-        list_state.select(Some(selected.min(matched - 1)));
+        list_state.select(Some(matched - 1 - selected.min(matched - 1)));
     }
 
     let list = List::new(items)
@@ -529,7 +532,8 @@ fn handle_event(state: &mut FzfState, event: &Event) -> EventOutcome {
             modifiers: KeyModifiers::CONTROL,
             ..
         } => {
-            state.ui.selected = state.ui.selected.saturating_sub(1);
+            let max = state.visible_count().saturating_sub(1);
+            state.ui.selected = (state.ui.selected + 1).min(max);
             EventOutcome::Continue { tick: false }
         }
         KeyEvent {
@@ -541,8 +545,7 @@ fn handle_event(state: &mut FzfState, event: &Event) -> EventOutcome {
             modifiers: KeyModifiers::CONTROL,
             ..
         } => {
-            let max = state.visible_count().saturating_sub(1);
-            state.ui.selected = (state.ui.selected + 1).min(max);
+            state.ui.selected = state.ui.selected.saturating_sub(1);
             EventOutcome::Continue { tick: false }
         }
         _ => {
