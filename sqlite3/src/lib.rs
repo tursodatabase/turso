@@ -3,11 +3,30 @@
 
 use std::ffi::{self, CStr, CString};
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tracing::trace;
-use turso_core::{CheckpointMode, LimboError, Value};
+use turso_core::{CheckpointMode, DatabaseOpts, LimboError, Value};
 use turso_ext::ScalarFunction;
 use turso_ext::Value as ExtValue;
+
+/// Global flag: when set, all subsequently opened databases enable experimental features.
+static EXPERIMENTAL_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable all experimental features for databases opened after this call.
+#[no_mangle]
+pub extern "C" fn turso_enable_experimental() {
+    EXPERIMENTAL_ENABLED.store(true, Ordering::Release);
+}
+
+/// Build `DatabaseOpts` respecting the global experimental flag.
+fn default_db_opts() -> DatabaseOpts {
+    let mut opts = DatabaseOpts::new();
+    if EXPERIMENTAL_ENABLED.load(Ordering::Acquire) {
+        opts = opts.with_generated_columns(true);
+    }
+    opts
+}
 
 macro_rules! stub {
     () => {
@@ -338,7 +357,13 @@ pub unsafe extern "C" fn sqlite3_open(
             Err(_) => return SQLITE_CANTOPEN,
         },
     };
-    match turso_core::Database::open_file(io.clone(), filename_str) {
+    match turso_core::Database::open_file_with_flags(
+        io.clone(),
+        filename_str,
+        turso_core::OpenFlags::default(),
+        default_db_opts(),
+        None,
+    ) {
         Ok(db) => {
             let conn = db.connect().unwrap();
             let filename = match filename_str {
@@ -507,7 +532,13 @@ pub unsafe extern "C" fn sqlite3_open_v2(
         }
     } else if use_memory {
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
-        match turso_core::Database::open_file(io.clone(), ":memory:") {
+        match turso_core::Database::open_file_with_flags(
+            io.clone(),
+            ":memory:",
+            turso_core::OpenFlags::default(),
+            default_db_opts(),
+            None,
+        ) {
             Ok(db) => (io, db),
             Err(e) => {
                 trace!("error opening memory database: {e:?}");
@@ -519,7 +550,13 @@ pub unsafe extern "C" fn sqlite3_open_v2(
             Ok(io) => Arc::new(io),
             Err(_) => return SQLITE_CANTOPEN,
         };
-        match turso_core::Database::open_file(io.clone(), &effective_filename) {
+        match turso_core::Database::open_file_with_flags(
+            io.clone(),
+            &effective_filename,
+            turso_core::OpenFlags::default(),
+            default_db_opts(),
+            None,
+        ) {
             Ok(db) => (io, db),
             Err(e) => {
                 trace!("error opening database {effective_filename}: {e:?}");

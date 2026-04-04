@@ -353,6 +353,11 @@ int sqlite3_table_column_metadata(
     int *pAutoinc
 );
 
+/*
+** Enable all Turso experimental features for subsequently opened databases.
+*/
+void turso_enable_experimental(void);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus

@@ -602,6 +602,8 @@ int Tursotcl_Init(Tcl_Interp *interp)
         return TCL_ERROR;
     }
 
+    turso_enable_experimental();
+
     Tcl_CreateObjCommand(interp, "sqlite3", TursoOpenCmd, NULL, NULL);
 
     Tcl_PkgProvide(interp, "tursotcl", TURSO_TCL_VERSION);
