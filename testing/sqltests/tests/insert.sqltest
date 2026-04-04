@@ -2151,3 +2151,21 @@ test integer-pk-omit-column {
 expect {
     integer|1|alice
 }
+
+@cross-check-integrity
+test insert-column-count-mismatch-values {
+    CREATE TABLE t1 (x);
+    INSERT INTO t1 VALUES (1, 2, 3);
+}
+expect error {
+    table t1 has 1 columns but 3 values were supplied
+}
+
+@cross-check-integrity
+test insert-column-count-mismatch-select {
+    CREATE TABLE t1 (x);
+    INSERT INTO t1 SELECT 1,2,3,4,5,6,7 UNION ALL SELECT 1,2,3,4,5,6,7 ORDER BY 1;
+}
+expect error {
+    table t1 has 1 columns but 7 values were supplied
+}
