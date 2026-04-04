@@ -258,7 +258,9 @@ fn update_pragma(
             connection.set_short_column_names(enabled);
             Ok(TransactionMode::None)
         }
-        PragmaName::LegacyFileFormat => Ok(TransactionMode::None),
+        PragmaName::LegacyFileFormat | PragmaName::EmptyResultCallbacks => {
+            Ok(TransactionMode::None)
+        }
         PragmaName::WalCheckpoint => query_pragma(
             PragmaName::WalCheckpoint,
             resolver,
@@ -694,7 +696,9 @@ fn query_pragma(
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)
         }
-        PragmaName::LegacyFileFormat => Ok(TransactionMode::None),
+        PragmaName::LegacyFileFormat | PragmaName::EmptyResultCallbacks => {
+            Ok(TransactionMode::None)
+        }
         PragmaName::WalCheckpoint => {
             // Checkpoint uses 3 registers: P1, P2, P3. Ref Insn::Checkpoint for more info.
             // Allocate two more here as one was allocated at the top.

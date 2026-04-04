@@ -66,6 +66,9 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
         LegacyFileFormat => {
             unreachable!("pragma_for() called with LegacyFileFormat, which is unsupported")
         }
+        EmptyResultCallbacks => {
+            unreachable!("pragma_for() called with EmptyResultCallbacks, which is a no-op")
+        }
         ModuleList => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::Result0 | PragmaFlags::SchemaReq,
             &["module_list"],
@@ -218,6 +221,7 @@ impl PragmaVirtualTable {
                 *name != PragmaName::LegacyFileFormat
                     && *name != PragmaName::FullColumnNames
                     && *name != PragmaName::ShortColumnNames
+                    && *name != PragmaName::EmptyResultCallbacks
             })
             .filter_map(|name| {
                 let pragma = pragma_for(&name);
