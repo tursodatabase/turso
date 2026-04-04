@@ -1749,6 +1749,8 @@ pub enum PragmaName {
     MvccCheckpointThreshold,
     /// List all available types (built-in and custom)
     ListTypes,
+    /// Deprecated no-op: control whether callback is invoked for empty result sets
+    EmptyResultCallbacks,
 }
 
 /// `CREATE TRIGGER` time
