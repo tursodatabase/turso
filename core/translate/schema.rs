@@ -4,7 +4,8 @@ use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
 use crate::schema::{
     create_table, translate_ident_to_string_literal, BTreeTable, ColDef, Column, SchemaObjectType,
-    Table, Type, RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
+    Table, Type, RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME, TURSO_COMMENTS_TABLE_NAME,
+    TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -2247,6 +2248,246 @@ pub fn translate_drop_type(
         value: (resolver.schema().schema_version + 1) as i32,
         p5: 0,
     });
+
+    Ok(())
+}
+
+pub fn translate_comment_on(
+    object_type: &ast::CommentObjectType,
+    object_name: &ast::QualifiedName,
+    column_name: Option<&ast::Name>,
+    comment: Option<&str>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    let obj_name = normalize_ident(object_name.name.as_str());
+
+    // Determine the object_type string and validate the target exists
+    let type_str = match object_type {
+        ast::CommentObjectType::Table => {
+            if resolver.schema().get_btree_table(&obj_name).is_none() {
+                bail_parse_error!("no such table: {obj_name}");
+            }
+            "table"
+        }
+        ast::CommentObjectType::Column => {
+            let col_name = column_name.expect("column_name required for COMMENT ON COLUMN");
+            let col_name_str = normalize_ident(col_name.as_str());
+            let table = resolver
+                .schema()
+                .get_btree_table(&obj_name)
+                .ok_or_else(|| {
+                    crate::LimboError::ParseError(format!("no such table: {obj_name}"))
+                })?;
+            if !table
+                .columns
+                .iter()
+                .any(|c| c.name.as_deref() == Some(&col_name_str))
+            {
+                bail_parse_error!("no such column: {obj_name}.{col_name_str}");
+            }
+            "column"
+        }
+        ast::CommentObjectType::Index => {
+            let found = resolver.schema().indexes.values().any(|idxs| {
+                idxs.iter()
+                    .any(|idx| normalize_ident(&idx.name) == obj_name)
+            });
+            if !found {
+                bail_parse_error!("no such index: {obj_name}");
+            }
+            "index"
+        }
+        ast::CommentObjectType::View => {
+            if resolver.schema().get_view(&obj_name).is_none() {
+                bail_parse_error!("no such view: {obj_name}");
+            }
+            "view"
+        }
+        ast::CommentObjectType::Type => {
+            if resolver
+                .schema()
+                .get_type_def_unchecked(&obj_name)
+                .is_none()
+            {
+                bail_parse_error!("no such type: {obj_name}");
+            }
+            "type"
+        }
+    };
+
+    let sub_name = column_name
+        .map(|n| normalize_ident(n.as_str()))
+        .unwrap_or_default();
+
+    // Ensure __turso_internal_comments table exists (lazy creation)
+    let comments_table: Arc<BTreeTable>;
+    let comments_root_page: RegisterOrLiteral<i64>;
+
+    let need_schema_bump;
+    if let Some(existing) = resolver.schema().get_btree_table(TURSO_COMMENTS_TABLE_NAME) {
+        comments_table = existing.clone();
+        comments_root_page = RegisterOrLiteral::Literal(existing.root_page);
+        need_schema_bump = false;
+    } else {
+        let table_root_reg = program.alloc_register();
+        program.emit_insn(Insn::CreateBtree {
+            db: 0,
+            root: table_root_reg,
+            flags: CreateBTreeFlags::new_table(),
+        });
+        let create_sql = format!(
+            "CREATE TABLE {TURSO_COMMENTS_TABLE_NAME}(object_type TEXT, object_name TEXT, sub_name TEXT, description TEXT)"
+        );
+        comments_table = Arc::new(BTreeTable::from_sql(&create_sql, 0)?);
+        comments_root_page = RegisterOrLiteral::Register(table_root_reg);
+
+        let schema_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
+        let schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: schema_cursor_id,
+            root_page: 1i64.into(),
+            db: 0,
+        });
+        emit_schema_entry(
+            program,
+            resolver,
+            schema_cursor_id,
+            None,
+            SchemaEntryType::Table,
+            TURSO_COMMENTS_TABLE_NAME,
+            TURSO_COMMENTS_TABLE_NAME,
+            table_root_reg,
+            Some(create_sql),
+        )?;
+
+        program.emit_insn(Insn::ParseSchema {
+            db: schema_cursor_id,
+            where_clause: Some(format!(
+                "tbl_name = '{TURSO_COMMENTS_TABLE_NAME}' AND type != 'trigger'"
+            )),
+        });
+        need_schema_bump = true;
+    }
+
+    // Open comments table for writing
+    let comments_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(comments_table));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: comments_cursor_id,
+        root_page: comments_root_page,
+        db: 0,
+    });
+
+    // Scan and delete any existing row matching (object_type, object_name, sub_name)
+    let type_match_reg = program.alloc_register();
+    program.emit_insn(Insn::String8 {
+        dest: type_match_reg,
+        value: type_str.to_string(),
+    });
+    let name_match_reg = program.alloc_register();
+    program.emit_insn(Insn::String8 {
+        dest: name_match_reg,
+        value: obj_name.clone(),
+    });
+    let sub_match_reg = program.alloc_register();
+    program.emit_insn(Insn::String8 {
+        dest: sub_match_reg,
+        value: sub_name.clone(),
+    });
+
+    let end_scan_label = program.allocate_label();
+    let scan_start_label = program.allocate_label();
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id: comments_cursor_id,
+        pc_if_empty: end_scan_label,
+    });
+    program.preassign_label_to_next_insn(scan_start_label);
+
+    // Read columns and compare
+    let col0_reg = program.alloc_register();
+    let col1_reg = program.alloc_register();
+    let col2_reg = program.alloc_register();
+    program.emit_column_or_rowid(comments_cursor_id, 0, col0_reg);
+    program.emit_column_or_rowid(comments_cursor_id, 1, col1_reg);
+    program.emit_column_or_rowid(comments_cursor_id, 2, col2_reg);
+
+    let skip_delete_label = program.allocate_label();
+
+    program.emit_insn(Insn::Ne {
+        lhs: col0_reg,
+        rhs: type_match_reg,
+        target_pc: skip_delete_label,
+        flags: CmpInsFlags::default(),
+        collation: program.curr_collation(),
+    });
+    program.emit_insn(Insn::Ne {
+        lhs: col1_reg,
+        rhs: name_match_reg,
+        target_pc: skip_delete_label,
+        flags: CmpInsFlags::default(),
+        collation: program.curr_collation(),
+    });
+    program.emit_insn(Insn::Ne {
+        lhs: col2_reg,
+        rhs: sub_match_reg,
+        target_pc: skip_delete_label,
+        flags: CmpInsFlags::default(),
+        collation: program.curr_collation(),
+    });
+
+    program.emit_insn(Insn::Delete {
+        cursor_id: comments_cursor_id,
+        table_name: TURSO_COMMENTS_TABLE_NAME.to_string(),
+        is_part_of_update: false,
+    });
+
+    program.resolve_label(skip_delete_label, program.offset());
+
+    program.emit_insn(Insn::Next {
+        cursor_id: comments_cursor_id,
+        pc_if_next: scan_start_label,
+    });
+
+    program.preassign_label_to_next_insn(end_scan_label);
+
+    // If comment is not NULL, insert a new row
+    if let Some(text) = comment {
+        let rowid_reg = program.alloc_register();
+        program.emit_insn(Insn::NewRowid {
+            cursor: comments_cursor_id,
+            rowid_reg,
+            prev_largest_reg: 0,
+        });
+        let start_reg = program.emit_string8_new_reg(type_str.to_string());
+        program.emit_string8_new_reg(obj_name);
+        program.emit_string8_new_reg(sub_name);
+        program.emit_string8_new_reg(text.to_string());
+        let record_reg = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u16(start_reg),
+            count: to_u16(4),
+            dest_reg: to_u16(record_reg),
+            index_name: None,
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: comments_cursor_id,
+            key_reg: rowid_reg,
+            record_reg,
+            flag: InsertFlags::new(),
+            table_name: TURSO_COMMENTS_TABLE_NAME.to_string(),
+        });
+    }
+
+    if need_schema_bump {
+        program.emit_insn(Insn::SetCookie {
+            db: 0,
+            cookie: Cookie::SchemaVersion,
+            value: (resolver.schema().schema_version + 1) as i32,
+            p5: 0,
+        });
+    }
 
     Ok(())
 }

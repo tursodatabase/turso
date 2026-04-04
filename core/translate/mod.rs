@@ -153,6 +153,7 @@ pub fn translate_inner(
             | ast::Stmt::DropType { .. }
             | ast::Stmt::DropView { .. }
             | ast::Stmt::Reindex { .. }
+            | ast::Stmt::CommentOn { .. }
             | ast::Stmt::Optimize { .. }
             | ast::Stmt::Update { .. }
             | ast::Stmt::Insert { .. }
@@ -321,6 +322,19 @@ pub fn translate_inner(
             }
             schema::translate_drop_type(&type_name, if_exists, resolver, program)?
         }
+        ast::Stmt::CommentOn {
+            object_type,
+            object_name,
+            column_name,
+            comment,
+        } => schema::translate_comment_on(
+            &object_type,
+            &object_name,
+            column_name.as_ref(),
+            comment.as_deref(),
+            resolver,
+            program,
+        )?,
         ast::Stmt::Pragma { .. } => {
             bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
         }

@@ -1364,6 +1364,134 @@ impl Limbo {
         Ok(guard)
     }
 
+    /// Get comments for a database object using PRAGMA comment_list.
+    /// Returns a map of sub_name -> description (None key = comment on the object itself).
+    fn get_object_comments(
+        &mut self,
+        obj_name: &str,
+    ) -> std::collections::HashMap<Option<String>, String> {
+        let mut comments = std::collections::HashMap::new();
+        let sql = format!("PRAGMA comment_list('{obj_name}')");
+        let handler = |row: &turso_core::Row| {
+            // Columns: object_type, object_name, sub_name, description
+            let sub_name = match row.get::<&Value>(2) {
+                Ok(Value::Text(s)) if !s.as_str().is_empty() => Some(s.as_str().to_string()),
+                _ => None,
+            };
+            if let Ok(Value::Text(desc)) = row.get::<&Value>(3) {
+                comments.insert(sub_name, desc.as_str().to_string());
+            }
+            Ok(())
+        };
+        let _ = self.handle_row(&sql, handler);
+        comments
+    }
+
+    /// Format a CREATE TABLE statement as multi-line with one column per line.
+    fn format_create_table_multiline(sql: &str) -> String {
+        // Find the opening paren after CREATE TABLE <name>
+        let Some(open_paren) = sql.find('(') else {
+            return sql.to_string();
+        };
+        let prefix = &sql[..=open_paren]; // "CREATE TABLE name("
+        let rest = &sql[open_paren + 1..];
+
+        // Find the matching closing paren (skip quoted strings)
+        let mut depth = 0;
+        let mut close_pos = None;
+        let mut in_quote = false;
+        let rest_bytes = rest.as_bytes();
+        let mut i = 0;
+        while i < rest_bytes.len() {
+            let ch = rest_bytes[i];
+            if in_quote {
+                if ch == b'\'' {
+                    // Check for escaped quote ('')
+                    if i + 1 < rest_bytes.len() && rest_bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    in_quote = false;
+                }
+            } else {
+                match ch {
+                    b'\'' => in_quote = true,
+                    b'(' => depth += 1,
+                    b')' => {
+                        if depth == 0 {
+                            close_pos = Some(i);
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        let Some(close_pos) = close_pos else {
+            return sql.to_string();
+        };
+
+        let inner = &rest[..close_pos];
+        let suffix = &rest[close_pos..]; // includes ")" and anything after
+
+        // Split at depth-0 commas (skip quoted strings and parenthesized expressions)
+        let mut columns = Vec::new();
+        let mut current = String::new();
+        let mut depth = 0;
+        let mut in_quote = false;
+        for ch in inner.chars() {
+            if in_quote {
+                current.push(ch);
+                if ch == '\'' {
+                    // Peek: if next char is also a quote, it's an escape
+                    // We handle this by toggling in_quote off now; the next
+                    // iteration will see the second quote and toggle it back on.
+                    in_quote = false;
+                }
+                continue;
+            }
+            match ch {
+                '\'' => {
+                    in_quote = true;
+                    current.push(ch);
+                }
+                '(' => {
+                    depth += 1;
+                    current.push(ch);
+                }
+                ')' => {
+                    depth -= 1;
+                    current.push(ch);
+                }
+                ',' if depth == 0 => {
+                    columns.push(current.trim().to_string());
+                    current = String::new();
+                }
+                _ => current.push(ch),
+            }
+        }
+        if !current.trim().is_empty() {
+            columns.push(current.trim().to_string());
+        }
+
+        if columns.len() <= 1 {
+            return sql.to_string();
+        }
+
+        let mut result = format!("{prefix}\n");
+        for (i, col) in columns.iter().enumerate() {
+            if i < columns.len() - 1 {
+                result.push_str(&format!("  {col},\n"));
+            } else {
+                result.push_str(&format!("  {col}\n"));
+            }
+        }
+        result.push_str(suffix.trim_start());
+        result
+    }
+
     fn print_schema_entry(&mut self, db_display_name: &str, row: &turso_core::Row) -> bool {
         if let (Ok(Value::Text(schema)), Ok(Value::Text(obj_type)), Ok(Value::Text(obj_name))) = (
             row.get::<&Value>(0),
@@ -1373,12 +1501,8 @@ impl Limbo {
             let modified_schema = if db_display_name == "main" {
                 schema.as_str().to_string()
             } else {
-                // We need to modify the SQL to include the database prefix in table names
-                // This is a simple approach - for CREATE TABLE statements, insert db name after "TABLE "
-                // For CREATE INDEX statements, insert db name after "ON "
                 let schema_str = schema.as_str();
                 if schema_str.to_uppercase().contains("CREATE TABLE ") {
-                    // Find "CREATE TABLE " and insert database name after it
                     if let Some(pos) = schema_str.to_uppercase().find("CREATE TABLE ") {
                         let before = &schema_str[..pos + "CREATE TABLE ".len()];
                         let after = &schema_str[pos + "CREATE TABLE ".len()..];
@@ -1387,7 +1511,6 @@ impl Limbo {
                         schema_str.to_string()
                     }
                 } else if schema_str.to_uppercase().contains(" ON ") {
-                    // For indexes, find " ON " and insert database name after it
                     if let Some(pos) = schema_str.to_uppercase().find(" ON ") {
                         let before = &schema_str[..pos + " ON ".len()];
                         let after = &schema_str[pos + " ON ".len()..];
@@ -1399,17 +1522,98 @@ impl Limbo {
                     schema_str.to_string()
                 }
             };
-            let _ = self.writeln_fmt(format_args!("{modified_schema};"));
-            // For views, add the column comment like SQLite does
-            if obj_type.as_str() == "view" {
-                let columns = self
-                    .get_view_columns(obj_name.as_str())
-                    .unwrap_or_else(|_| "x".to_string());
-                let _ = self.writeln_fmt(format_args!("/* {}({}) */", obj_name.as_str(), columns));
+
+            let obj_type_str = obj_type.as_str();
+            let obj_name_str = obj_name.as_str();
+            let comments = self.get_object_comments(obj_name_str);
+
+            if obj_type_str == "table" && !comments.is_empty() {
+                // Format as multi-line and inject comments
+                let multiline = Self::format_create_table_multiline(&modified_schema);
+                if let Some(table_comment) = comments.get(&None) {
+                    let _ = self.writeln_fmt(format_args!("-- {table_comment}"));
+                }
+                if comments.iter().any(|(k, _)| k.is_some()) {
+                    // Inject column comments into the multi-line output
+                    let mut output = String::new();
+                    for line in multiline.lines() {
+                        let trimmed = line.trim();
+                        // Try to find which column this line belongs to
+                        if let Some(col_name) = Self::extract_column_name(trimmed) {
+                            if let Some(comment) = comments.get(&Some(col_name)) {
+                                output.push_str(&format!("{line} -- {comment}\n"));
+                                continue;
+                            }
+                        }
+                        output.push_str(line);
+                        output.push('\n');
+                    }
+                    let _ = self.write(format!("{};", output.trim_end()));
+                    let _ = self.writeln("");
+                } else {
+                    let _ = self.writeln_fmt(format_args!("{multiline};"));
+                }
+            } else if obj_type_str == "table" {
+                let _ = self.writeln_fmt(format_args!("{modified_schema};"));
+            } else {
+                // For non-table objects, just add a comment line before if present
+                if let Some(obj_comment) = comments.get(&None) {
+                    let _ = self.writeln_fmt(format_args!("-- {obj_comment}"));
+                }
+                let _ = self.writeln_fmt(format_args!("{modified_schema};"));
+                if obj_type_str == "view" {
+                    let columns = self
+                        .get_view_columns(obj_name_str)
+                        .unwrap_or_else(|_| "x".to_string());
+                    let _ = self.writeln_fmt(format_args!("/* {obj_name_str}({columns}) */"));
+                }
             }
             true
         } else {
             false
+        }
+    }
+
+    /// Extract the column name from a CREATE TABLE column definition line.
+    fn extract_column_name(line: &str) -> Option<String> {
+        let trimmed = line.trim().trim_end_matches(',');
+        if trimmed.is_empty() || trimmed.starts_with(')') || trimmed.starts_with('(') {
+            return None;
+        }
+        // Skip constraint definitions
+        let upper = trimmed.to_uppercase();
+        if upper.starts_with("PRIMARY KEY")
+            || upper.starts_with("UNIQUE")
+            || upper.starts_with("CHECK")
+            || upper.starts_with("FOREIGN KEY")
+            || upper.starts_with("CONSTRAINT")
+        {
+            return None;
+        }
+        // The column name is the first token, possibly quoted
+        let bytes = trimmed.as_bytes();
+        if bytes[0] == b'"' {
+            // Quoted identifier
+            if let Some(end) = trimmed[1..].find('"') {
+                return Some(trimmed[1..=end].to_string());
+            }
+        } else if bytes[0] == b'[' {
+            if let Some(end) = trimmed.find(']') {
+                return Some(trimmed[1..end].to_string());
+            }
+        } else if bytes[0] == b'`' {
+            if let Some(end) = trimmed[1..].find('`') {
+                return Some(trimmed[1..=end].to_string());
+            }
+        }
+        // Unquoted: first word
+        let end = trimmed
+            .find(|c: char| c.is_whitespace() || c == ',' || c == ')')
+            .unwrap_or(trimmed.len());
+        if end > 0 {
+            Some(trimmed[..end].to_string())
+        } else {
+            None
         }
     }
 
@@ -1784,8 +1988,11 @@ impl Limbo {
         if let Some(mut rows) = conn.query(q_tables)? {
             rows.run_with_row_callback(|row| {
                 let name: &str = row.get::<&str>(0)?;
-                // Skip sqlite_sequence and internal types metadata table
-                if name == "sqlite_sequence" || name == turso_core::schema::TURSO_TYPES_TABLE_NAME {
+                // Skip sqlite_sequence and internal metadata tables
+                if name == "sqlite_sequence"
+                    || name == turso_core::schema::TURSO_TYPES_TABLE_NAME
+                    || name == turso_core::schema::TURSO_COMMENTS_TABLE_NAME
+                {
                     return Ok(());
                 }
                 let ddl: &str = row.get::<&str>(1)?;
@@ -1797,6 +2004,7 @@ impl Limbo {
         }
         Self::dump_sqlite_sequence(&conn, out)?;
         Self::dump_schema_objects(&conn, out, &mut progress)?;
+        Self::dump_comments(&conn, out)?;
         Self::exec_all_conn(&conn, "COMMIT")?;
         writeln!(out, "COMMIT;")?;
         Ok(())
@@ -1883,6 +2091,55 @@ impl Limbo {
             rows.run_with_row_callback(|row| {
                 let sql: &str = row.get::<&str>(0)?;
                 writeln!(out, "{sql};").map_err(|e| io_error(e, "write"))?;
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    fn dump_comments<W: Write>(conn: &Arc<Connection>, out: &mut W) -> anyhow::Result<()> {
+        let check = format!(
+            "SELECT 1 FROM sqlite_schema WHERE name='{}' AND type='table'",
+            turso_core::schema::TURSO_COMMENTS_TABLE_NAME
+        );
+        let mut has_comments = false;
+        if let Some(mut rows) = conn.query(&check)? {
+            rows.run_with_row_callback(|_| {
+                has_comments = true;
+                Ok(())
+            })?;
+        }
+        if !has_comments {
+            return Ok(());
+        }
+        let q = format!(
+            "SELECT object_type, object_name, sub_name, description FROM {} ORDER BY rowid",
+            turso_core::schema::TURSO_COMMENTS_TABLE_NAME
+        );
+        if let Some(mut rows) = conn.query(&q)? {
+            rows.run_with_row_callback(|row| {
+                let obj_type: &str = row.get::<&str>(0)?;
+                let obj_name: &str = row.get::<&str>(1)?;
+                let sub_name: &str = row.get::<&str>(2)?;
+                let description: &str = row.get::<&str>(3)?;
+                let quoted_desc = sql_quote_string(description);
+                match obj_type {
+                    "column" => {
+                        writeln!(
+                            out,
+                            "COMMENT ON COLUMN {obj_name}.{sub_name} IS {quoted_desc};"
+                        )
+                        .map_err(|e| io_error(e, "write"))?;
+                    }
+                    _ => {
+                        let type_keyword = obj_type.to_uppercase();
+                        writeln!(
+                            out,
+                            "COMMENT ON {type_keyword} {obj_name} IS {quoted_desc};"
+                        )
+                        .map_err(|e| io_error(e, "write"))?;
+                    }
+                }
                 Ok(())
             })?;
         }

@@ -186,6 +186,7 @@ pub enum TokenType {
     TK_COLON = 191,
     TK_ARRAY_CONTAINS = 192, // @>
     TK_ARRAY_OVERLAP = 193,  // &&
+    TK_COMMENT = 194,
     // None token
     TK_NONE = 255,
 }
@@ -217,6 +218,7 @@ impl TokenType {
             TokenType::TK_CHECK => Some("CHECK"),
             TokenType::TK_COLLATE => Some("COLLATE"),
             TokenType::TK_COLUMNKW => Some("COLUMN"),
+            TokenType::TK_COMMENT => Some("COMMENT"),
             TokenType::TK_COMMIT => Some("COMMIT"),
             TokenType::TK_CONFLICT => Some("CONFLICT"),
             TokenType::TK_CONSTRAINT => Some("CONSTRAINT"),
@@ -500,6 +502,7 @@ impl Display for TokenType {
             TK_CONCAT => "TK_CONCAT",
             TK_PTR => "TK_PTR",
             TK_COLLATE => "TK_COLLATE",
+            TK_COMMENT => "TK_COMMENT",
             TK_BITNOT => "TK_BITNOT",
             TK_ON => "TK_ON",
             TK_INDEXED => "TK_INDEXED",
@@ -583,7 +586,7 @@ impl TokenType {
             | TK_LAST | TK_CURRENT | TK_FOLLOWING | TK_PARTITION | TK_PRECEDING | TK_RANGE
             | TK_UNBOUNDED | TK_EXCLUDE | TK_GROUPS | TK_OTHERS | TK_TIES | TK_ALWAYS
             | TK_MATERIALIZED | TK_REINDEX | TK_RENAME | TK_CTIME_KW | TK_IF | TK_OPTIMIZE
-            | TK_TYPE => TK_ID,
+            | TK_TYPE | TK_COMMENT => TK_ID,
             // | TK_COLUMNKW | TK_UNION | TK_EXCEPT | TK_INTERSECT | TK_GENERATED | TK_WITHOUT
             // see comments in `next_token` of parser
             _ => self,

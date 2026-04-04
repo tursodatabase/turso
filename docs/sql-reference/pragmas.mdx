@@ -186,6 +186,36 @@ Similar to `index_info` but includes additional columns.
 PRAGMA index_xinfo(index-name);
 ```
 
+### comment_list
+
+<Info>
+**Turso Extension**: This pragma is a Turso-specific feature.
+</Info>
+
+Lists comments attached to database objects via `COMMENT ON`. With no argument, returns all comments. With an argument, returns comments for the named object (the object itself and its columns, if it is a table).
+
+```sql
+PRAGMA comment_list;
+-- object_type | object_name | sub_name | description
+-- table       | users       |          | Core user accounts
+-- column      | users       | name     | Full display name
+-- index       | idx_email   |          | Email lookup
+
+PRAGMA comment_list(users);
+-- object_type | object_name | sub_name | description
+-- table       | users       |          | Core user accounts
+-- column      | users       | name     | Full display name
+```
+
+| Column | Type | Description |
+|--------|------|-------------|
+| object_type | TEXT | Type of object: `table`, `column`, `index`, `view`, or `type` |
+| object_name | TEXT | Name of the object (for columns, the parent table name) |
+| sub_name | TEXT | Column name (empty for non-column objects) |
+| description | TEXT | The comment text |
+
+Returns no rows if no comments have been set. See [COMMENT ON](/docs/sql-reference/statements/comment-on) for setting comments.
+
 ### function_list
 
 Returns one row for each SQL function available.
@@ -507,4 +537,5 @@ See [CREATE TYPE](/docs/sql-reference/statements/create-type) for creating custo
 
 - [Transactions](/docs/sql-reference/statements/transactions) for transaction control
 - [CREATE TYPE](/docs/sql-reference/statements/create-type) for custom type definitions
+- [COMMENT ON](/docs/sql-reference/statements/comment-on) for attaching comments to database objects
 - [Compatibility](/docs/sql-reference/compatibility) for the full list of supported PRAGMAs

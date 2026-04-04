@@ -1,0 +1,206 @@
+@database :memory:
+
+# Test: COMMENT ON TABLE stores a comment
+test comment-on-table {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score REAL);
+    COMMENT ON TABLE t IS 'Test table';
+    SELECT description FROM __turso_internal_comments
+      WHERE object_type = 'table' AND object_name = 't';
+}
+expect {
+    Test table
+}
+
+# Test: COMMENT ON COLUMN stores a comment
+test comment-on-column {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score REAL);
+    COMMENT ON COLUMN t.name IS 'User name';
+    SELECT description FROM __turso_internal_comments
+      WHERE object_type = 'column' AND object_name = 't' AND sub_name = 'name';
+}
+expect {
+    User name
+}
+
+# Test: COMMENT ON INDEX stores a comment
+test comment-on-index {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE INDEX idx_name ON t(name);
+    COMMENT ON INDEX idx_name IS 'Name lookup index';
+    SELECT description FROM __turso_internal_comments
+      WHERE object_type = 'index' AND object_name = 'idx_name';
+}
+expect {
+    Name lookup index
+}
+
+# Test: Multiple comments on different objects
+test comment-on-multiple-objects {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score REAL);
+    CREATE INDEX idx_name ON t(name);
+    COMMENT ON TABLE t IS 'Main table';
+    COMMENT ON COLUMN t.name IS 'User name';
+    COMMENT ON COLUMN t.score IS 'Player score';
+    COMMENT ON INDEX idx_name IS 'Name lookup';
+    SELECT object_type, object_name, sub_name, description
+      FROM __turso_internal_comments
+      ORDER BY object_type, object_name, sub_name;
+}
+expect {
+    column|t|name|User name
+    column|t|score|Player score
+    index|idx_name||Name lookup
+    table|t||Main table
+}
+
+# Test: Update an existing comment
+test comment-on-update {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
+    COMMENT ON TABLE t IS 'Original';
+    COMMENT ON TABLE t IS 'Updated';
+    SELECT description FROM __turso_internal_comments
+      WHERE object_type = 'table' AND object_name = 't';
+}
+expect {
+    Updated
+}
+
+# Test: Drop a comment with IS NULL
+test comment-on-drop-with-null {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
+    COMMENT ON TABLE t IS 'Will be removed';
+    COMMENT ON TABLE t IS NULL;
+    SELECT count(*) FROM __turso_internal_comments
+      WHERE object_type = 'table' AND object_name = 't';
+}
+expect {
+    0
+}
+
+# Test: Comment on nonexistent table produces error
+test comment-on-nonexistent-table {
+    COMMENT ON TABLE nonexistent IS 'should fail';
+}
+expect error {
+}
+
+# Test: Comment on nonexistent column produces error
+test comment-on-nonexistent-column {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
+    COMMENT ON COLUMN t.nonexistent IS 'should fail';
+}
+expect error {
+}
+
+# Test: Comment on nonexistent index produces error
+test comment-on-nonexistent-index {
+    COMMENT ON INDEX nonexistent IS 'should fail';
+}
+expect error {
+}
+
+# Test: Comments table is created lazily
+test comment-on-lazy-table-creation {
+    CREATE TABLE t (id INTEGER PRIMARY KEY);
+    SELECT count(*) FROM sqlite_master WHERE name = '__turso_internal_comments';
+    COMMENT ON TABLE t IS 'hello';
+    SELECT count(*) FROM sqlite_master WHERE name = '__turso_internal_comments';
+}
+expect {
+    0
+    1
+}
+
+# Test: Comment with special characters
+test comment-on-special-chars {
+    CREATE TABLE t (id INTEGER PRIMARY KEY);
+    COMMENT ON TABLE t IS 'It''s a "test" with special chars: <>&';
+    SELECT description FROM __turso_internal_comments
+      WHERE object_type = 'table' AND object_name = 't';
+}
+expect {
+    It's a "test" with special chars: <>&
+}
+
+# Test: PRAGMA comment_list returns all comments
+test pragma-comment-list-all {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score REAL);
+    CREATE INDEX idx_name ON t(name);
+    COMMENT ON TABLE t IS 'Main table';
+    COMMENT ON COLUMN t.name IS 'User name';
+    COMMENT ON INDEX idx_name IS 'Name lookup';
+    PRAGMA comment_list;
+}
+expect unordered {
+    table|t||Main table
+    column|t|name|User name
+    index|idx_name||Name lookup
+}
+
+# Test: PRAGMA comment_list filtered by object name
+test pragma-comment-list-filtered {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score REAL);
+    CREATE INDEX idx_name ON t(name);
+    COMMENT ON TABLE t IS 'Main table';
+    COMMENT ON COLUMN t.name IS 'User name';
+    COMMENT ON INDEX idx_name IS 'Name lookup';
+    PRAGMA comment_list(t);
+}
+expect unordered {
+    table|t||Main table
+    column|t|name|User name
+}
+
+# Test: PRAGMA comment_list on db with no comments returns no rows
+test pragma-comment-list-empty {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
+    PRAGMA comment_list;
+}
+expect {
+}
+
+# Test: PRAGMA comment_list after dropping a comment
+test pragma-comment-list-after-drop {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
+    COMMENT ON TABLE t IS 'Will be removed';
+    COMMENT ON TABLE t IS NULL;
+    PRAGMA comment_list;
+}
+expect {
+}
+
+# Test: .schema shows inline comments
+@backend cli
+test schema-with-comments {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score REAL);
+    CREATE INDEX idx_name ON t(name);
+    COMMENT ON TABLE t IS 'Main table';
+    COMMENT ON COLUMN t.name IS 'User name';
+    COMMENT ON INDEX idx_name IS 'Name lookup';
+    .schema
+}
+expect raw {
+-- Main table
+CREATE TABLE t (
+  id INTEGER PRIMARY KEY,
+  name TEXT, -- User name
+  score REAL
+);
+-- Name lookup
+CREATE INDEX idx_name ON t (name);
+}
+
+# Test: .schema handles commas inside CHECK constraints and quoted defaults
+@backend cli
+test schema-with-check-and-quoted-default {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER CHECK(val IN (1,2,3)), name TEXT DEFAULT 'a,b');
+    COMMENT ON COLUMN t.val IS 'Allowed values';
+    .schema
+}
+expect raw {
+CREATE TABLE t (
+  id INTEGER PRIMARY KEY,
+  val INTEGER CHECK (val IN (1, 2, 3)), -- Allowed values
+  name TEXT DEFAULT 'a,b'
+);
+}

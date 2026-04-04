@@ -200,6 +200,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::Result0,
             &["type", "parent", "encode", "decode", "default", "operators"],
         ),
+        CommentList => Pragma::new(
+            PragmaFlags::NeedSchema | PragmaFlags::Result0 | PragmaFlags::Result1,
+            &["object_type", "object_name", "sub_name", "description"],
+        ),
     }
 }
 
