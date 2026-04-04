@@ -5,9 +5,7 @@ use crate::{
         Command, CommandParser,
     },
     config::Config,
-    helper::{
-        NucleoHistoryCompleter, TursoCompleter, TursoHighlighter, TursoPrompt, TursoValidator,
-    },
+    helper::{TursoCompleter, TursoHighlighter, TursoPrompt, TursoValidator},
     input::{
         get_io, get_writer, ApplyWriter, DbLocation, NoopProgress, OutputMode, ProgressSink,
         Settings, StderrProgress,
@@ -378,35 +376,6 @@ impl Limbo {
                 .with_selected_match_text_style(nu_ansi_term::Style::new().underline().reverse()),
         );
 
-        // Set up fuzzy history search menu (Ctrl+R)
-        let history_completer = Box::new(NucleoHistoryCompleter::new(crate::HISTORY_FILE.clone()));
-        let history_menu = Box::new(
-            IdeMenu::default()
-                .with_name("history_menu")
-                .with_min_completion_width(0)
-                .with_max_completion_width(80)
-                .with_max_completion_height(15)
-                .with_padding(0)
-                .with_default_border()
-                .with_cursor_offset(0)
-                .with_correct_cursor_pos(false)
-                .with_marker("? ")
-                .with_only_buffer_difference(true)
-                .with_text_style(nu_ansi_term::Color::Default.normal())
-                .with_selected_text_style(nu_ansi_term::Style::new().reverse())
-                .with_match_text_style(
-                    nu_ansi_term::Style::new()
-                        .fg(nu_ansi_term::Color::Green)
-                        .bold(),
-                )
-                .with_selected_match_text_style(
-                    nu_ansi_term::Style::new()
-                        .fg(nu_ansi_term::Color::Green)
-                        .bold()
-                        .reverse(),
-                ),
-        );
-
         // Set up keybindings
         let mut keybindings = default_emacs_keybindings();
         // Tab: inline completion
@@ -424,11 +393,11 @@ impl Limbo {
             KeyCode::Char(' '),
             ReedlineEvent::Menu("ide_completion_menu".to_string()),
         );
-        // Ctrl+R: fuzzy history search
+        // Ctrl+R: fuzzy history search (full-screen fzf-like TUI)
         keybindings.add_binding(
             KeyModifiers::CONTROL,
             KeyCode::Char('r'),
-            ReedlineEvent::Menu("history_menu".to_string()),
+            ReedlineEvent::ExecuteHostCommand("__fzf_history__".to_string()),
         );
         let edit_mode = Box::new(Emacs::new(keybindings));
 
@@ -439,10 +408,6 @@ impl Limbo {
             .with_hinter(hinter)
             .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
             .with_menu(ReedlineMenu::EngineCompleter(ide_menu))
-            .with_menu(ReedlineMenu::WithCompleter {
-                menu: history_menu,
-                completer: history_completer,
-            })
             .with_edit_mode(edit_mode);
 
         self.rl = Some(rl);
@@ -1877,6 +1842,16 @@ impl Limbo {
 
         if let Some(rl) = &mut self.rl {
             match rl.read_line(&self.prompt) {
+                Ok(Signal::Success(ref result)) if result == "__fzf_history__" => {
+                    // Launch full-screen fuzzy history search
+                    if let Some(selected) = crate::fuzzy_history::run(&crate::HISTORY_FILE) {
+                        self.read_state.process(&selected);
+                        let _ = self.input_buff.write_str(selected.as_str());
+                    } else {
+                        // User cancelled - re-prompt
+                        return Ok(());
+                    }
+                }
                 Ok(Signal::Success(result)) => {
                     self.read_state.process(&result);
                     let _ = self.input_buff.write_str(result.as_str());
