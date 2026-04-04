@@ -256,10 +256,11 @@ impl Builder {
                 vfs: self.vfs,
                 io: None,
                 db_file: None,
-                flags: if self.read_only {
-                    turso_sdk_kit::rsapi::OpenFlags::ReadOnly
+              
+             flags: if self.read_only {
+                    Some(turso_sdk_kit::rsapi::PubOpenFlags::ReadOnly)
                 } else {
-                    turso_sdk_kit::rsapi::OpenFlags::default()
+                    None
                 },
             });
         while let Some(io_c) = db.open()?.io() {

@@ -200,6 +200,7 @@ pub fn py_turso_database_open(config: &PyTursoDatabaseConfig) -> PyResult<PyTurs
         vfs: config.vfs.clone(),
         io: None,
         db_file: None,
+        flags: None,
     });
     let result = database.open().map_err(turso_error_to_py_err)?;
     // async_io is false - so db.open() will return result immediately

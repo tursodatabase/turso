@@ -111,6 +111,8 @@ impl TursoSetupConfig {
         })
     }
 }
+                
+pub use turso_core::io::OpenFlags as PubOpenFlags;
 
 #[derive(Clone)]
 pub struct TursoDatabaseConfig {
@@ -142,6 +144,8 @@ pub struct TursoDatabaseConfig {
     /// optional custom DatabaseStorage provided by the caller
     /// if provided, caller must guarantee that IO used by the TursoDatabase will be consistent with underlying DatabaseStorage IO
     pub db_file: Option<Arc<dyn DatabaseStorage>>,
+
+    pub flags: Option<OpenFlags>,
 }
 
 pub fn turso_slice_from_bytes(bytes: &[u8]) -> capi::c::turso_slice_ref_t {
@@ -283,6 +287,7 @@ impl TursoDatabaseConfig {
             },
             io: None,
             db_file: None,
+            flags: None,
         })
     }
 }
