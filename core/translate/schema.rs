@@ -959,12 +959,6 @@ pub fn translate_create_table(
         }
     }
 
-    if has_autoincrement && connection.mvcc_enabled() {
-        bail_parse_error!(
-            "AUTOINCREMENT is not supported in MVCC mode (journal_mode=experimental_mvcc)"
-        );
-    }
-
     let schema_master_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id =
         program.alloc_cursor_id(CursorType::BTreeTable(schema_master_table));

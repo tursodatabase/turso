@@ -8572,10 +8572,13 @@ pub fn op_insert(
                             unreachable!("Cannot insert an aggregate value.")
                         }
                     };
-                    let cursor = get_cursor!(state, *cursor_id);
-                    let cursor = cursor.as_btree_mut();
-                    return_if_io!(cursor.insert(&BTreeKey::new_table_rowid(key, Some(&record))));
+                    {
+                        let cursor = get_cursor!(state, *cursor_id);
+                        let cursor = cursor.as_btree_mut();
+                        return_if_io!(cursor.insert(&BTreeKey::new_table_rowid(key, Some(&record))));
+                    }
                     state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);
+                    maybe_bump_mvcc_autoincrement_sequence(program, state, *cursor_id, *flag, key)?;
                 }
                 // Only update last_insert_rowid for regular table inserts, not schema modifications
                 let root_page = {
@@ -8687,6 +8690,52 @@ pub fn op_insert(
     state.op_insert_state.is_noop_update = false;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+fn maybe_mvcc_autoincrement_floor(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: usize,
+) -> i64 {
+    let Some((_, CursorType::BTreeTable(table))) = program.cursor_ref.get(cursor_id) else {
+        return i64::MIN;
+    };
+    if !table.has_autoincrement {
+        return i64::MIN;
+    }
+
+    let cursor = state.get_cursor(cursor_id);
+    let cursor = cursor.as_btree_mut() as &mut dyn Any;
+    cursor
+        .downcast_mut::<MvCursor>()
+        .map(|mvcc_cursor| mvcc_cursor.autoincrement_sequence())
+        .unwrap_or(i64::MIN)
+}
+
+fn maybe_bump_mvcc_autoincrement_sequence(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: usize,
+    flag: InsertFlags,
+    key: i64,
+) -> Result<()> {
+    if flag.has(InsertFlags::SKIP_LAST_ROWID) {
+        return Ok(());
+    }
+
+    let Some((_, CursorType::BTreeTable(table))) = program.cursor_ref.get(cursor_id) else {
+        return Ok(());
+    };
+    if !table.has_autoincrement {
+        return Ok(());
+    }
+
+    let cursor = state.get_cursor(cursor_id);
+    let cursor = cursor.as_btree_mut() as &mut dyn Any;
+    if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
+        mvcc_cursor.bump_autoincrement_sequence(key)?;
+    }
+    Ok(())
 }
 
 pub fn op_int_64(
@@ -9167,10 +9216,11 @@ fn new_rowid_inner(
         match state.op_new_rowid_state {
             OpNewRowidState::Start => {
                 if mv_store.is_some() {
+                    let minimum_rowid = maybe_mvcc_autoincrement_floor(program, state, *cursor);
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut() as &mut dyn Any;
                     if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
-                        match return_if_io!(mvcc_cursor.start_new_rowid()) {
+                        match return_if_io!(mvcc_cursor.start_new_rowid(minimum_rowid)) {
                             NextRowidResult::Uninitialized => {
                                 state.op_new_rowid_state = OpNewRowidState::SeekingToLast {
                                     mvcc_already_initialized: false,
@@ -9243,6 +9293,7 @@ fn new_rowid_inner(
                 };
 
                 if mv_store.is_some() {
+                    let minimum_rowid = maybe_mvcc_autoincrement_floor(program, state, *cursor);
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut() as &mut dyn Any;
                     if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
@@ -9251,7 +9302,7 @@ fn new_rowid_inner(
                         // race between this read and initialize.
                         mvcc_cursor.initialize_max_rowid(current_max)?;
                         // Allocate the first rowid from the freshly initialized counter.
-                        match mvcc_cursor.allocate_next_rowid() {
+                        match mvcc_cursor.allocate_next_rowid(minimum_rowid) {
                             Some((new_rowid, prev_rowid)) => {
                                 state.registers[*rowid_reg].set_int(new_rowid);
                                 if *prev_largest_reg > 0 {
