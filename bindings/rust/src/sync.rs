@@ -1347,6 +1347,7 @@ mod tests {
         )
         .await
         .unwrap();
+        conn.execute("PRAGMA busy_timeout=5000", ()).await.unwrap();
 
         // ~200KB payload per row
         let payload = "X".repeat(200 * 1024);
@@ -1423,12 +1424,22 @@ mod tests {
         // Sequential writes: 3 more large inserts
         for i in 0..after_cnt {
             let data = format!("sequential_{i}_{payload}");
-            conn.execute(
-                "INSERT INTO test_data (payload) VALUES (?)",
-                crate::params::Params::Positional(vec![Value::Text(data)]),
-            )
-            .await
-            .unwrap();
+            loop {
+                match conn
+                    .execute(
+                        "INSERT INTO test_data (payload) VALUES (?)",
+                        crate::params::Params::Positional(vec![Value::Text(data.clone())]),
+                    )
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(crate::Error::Busy(_)) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
+                    Err(e) => panic!("sequential insert failed (row{i}): {e:?}"),
+                }
+            }
         }
 
         // Signal sync task to stop and wait for it
