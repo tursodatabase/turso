@@ -2,6 +2,7 @@
 mod app;
 mod commands;
 mod config;
+mod fuzzy_history;
 mod helper;
 mod input;
 mod manual;
@@ -13,9 +14,10 @@ mod sync_server;
 #[cfg(feature = "mvcc_repl")]
 mod mvcc_repl;
 
+use app::ReadlineEvent;
 use config::CONFIG_DIR;
 use mcp_server::TursoMcpServer;
-use rustyline::{error::ReadlineError, Config, Editor};
+use reedline::{FileBackedHistory, Reedline};
 use std::{
     path::PathBuf,
     sync::{atomic::Ordering, LazyLock},
@@ -26,13 +28,6 @@ use crate::sync_server::TursoSyncServer;
 #[cfg(all(feature = "mimalloc", not(target_family = "wasm"), not(miri)))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
-fn rustyline_config() -> Config {
-    Config::builder()
-        .completion_type(rustyline::CompletionType::List)
-        .auto_add_history(true)
-        .build()
-}
 
 pub static HOME_DIR: LazyLock<PathBuf> =
     LazyLock::new(|| dirs::home_dir().expect("Could not determine home directory"));
@@ -83,12 +78,13 @@ fn main() -> anyhow::Result<()> {
 
     let interactive_stdin = std::io::IsTerminal::is_terminal(&std::io::stdin());
     if interactive_stdin {
-        let mut rl = Editor::with_config(rustyline_config())?;
-        if HISTORY_FILE.exists() {
-            rl.load_history(HISTORY_FILE.as_path())?;
-        }
-        let config_file = CONFIG_DIR.join("limbo.toml");
+        let history = Box::new(
+            FileBackedHistory::with_file(1000, HISTORY_FILE.clone())
+                .expect("Error configuring history file"),
+        );
+        let rl = Reedline::create().with_history(history);
 
+        let config_file = CONFIG_DIR.join("limbo.toml");
         let config = config::Config::from_config_file(config_file);
         tracing::info!("Configuration: {:?}", config);
         app = app.with_config(config);
@@ -101,7 +97,7 @@ fn main() -> anyhow::Result<()> {
     loop {
         match app.readline() {
             Ok(_) => app.consume(false),
-            Err(ReadlineError::Interrupted) => {
+            Err(ReadlineEvent::Interrupted) => {
                 // At prompt, increment interrupt count
                 if app.interrupt_count.fetch_add(1, Ordering::SeqCst) >= 1 {
                     eprintln!("Interrupted. Exiting...");
@@ -112,7 +108,7 @@ fn main() -> anyhow::Result<()> {
                 app.reset_input();
                 continue;
             }
-            Err(ReadlineError::Eof) => {
+            Err(ReadlineEvent::Eof) => {
                 // consume remaining input before exit
                 app.consume(true);
                 let _ = app.close_conn();
