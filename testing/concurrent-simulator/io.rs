@@ -83,6 +83,19 @@ impl SimulatorIO {
         }
         Ok(())
     }
+
+    /// Inject raw bytes into a file's memory at a specific offset.
+    /// Used for targeted structural corruption injection in regression tests
+    /// (e.g., corrupting freelist metadata to test allocate_page robustness).
+    pub fn inject_bytes(&self, path: &str, offset: usize, bytes: &[u8]) {
+        let files = self.files.lock().unwrap();
+        let (_, file) = files
+            .iter()
+            .find(|(p, _)| p == path)
+            .unwrap_or_else(|| panic!("inject_bytes: file '{}' not found", path));
+        let mut mmap = file.mmap.lock().unwrap();
+        mmap[offset..offset + bytes.len()].copy_from_slice(bytes);
+    }
 }
 
 impl Drop for SimulatorIO {
