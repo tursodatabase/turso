@@ -1915,10 +1915,12 @@ impl Database {
                 64,
             )?
             else {
-                return Err(LimboError::LockingError(format!(
-                    "Failed opening database '{}'. Experimental multiprocess WAL requires an existing shared WAL coordination file",
-                    self.path
-                )));
+                // Read-only opens cannot create `.tshm`. If no shared
+                // coordination file exists, degrade to the legacy read-only WAL
+                // path rather than failing the open. This keeps binding-level
+                // option plumbing advisory for readers while writable opens
+                // still enforce the stricter multiprocess contract.
+                return Ok(None);
             };
             Arc::new(authority)
         } else {

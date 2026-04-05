@@ -235,6 +235,25 @@ fn database_open_with_experimental_multiprocess_wal_rejects_unsupported_io_backe
 }
 
 #[test]
+fn readonly_open_with_experimental_multiprocess_wal_allows_missing_coordination_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("readonly-multiprocess-no-tshm.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+    {
+        let db = Database::open_file(io.clone(), db_path_str).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("create table test(id integer primary key, value text)")
+            .unwrap();
+    }
+
+    let readonly = open_multiprocess_db_with_flags(io, db_path_str, OpenFlags::ReadOnly)
+        .expect("read-only open should degrade gracefully when no .tshm exists");
+    assert!(readonly.shared_wal_coordination().unwrap().is_none());
+}
+
+#[test]
 fn database_open_with_experimental_multiprocess_wal_rejects_second_default_process() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir
@@ -353,6 +372,71 @@ fn database_open_rebuilds_from_disk_scan_when_exclusive_shm_snapshot_is_stale() 
     assert_eq!(rows[0][1].to_string(), "before-stale");
     assert_eq!(rows[1][0].as_int().unwrap(), 2);
     assert_eq!(rows[1][1].to_string(), "after-stale");
+}
+
+#[test]
+fn database_open_reuses_trusted_tshm_snapshot_without_disk_scan_when_no_backfill_proof_is_needed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-trusted-tail-reopen.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+    let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("insert into test(value) values ('before-reopen')")
+        .unwrap();
+    conn.execute("insert into test(value) values ('after-reopen')")
+        .unwrap();
+
+    let authority = db.shared_wal_coordination().unwrap().unwrap();
+    let snapshot_before = authority.snapshot();
+    assert!(
+        snapshot_before.max_frame > 0,
+        "trusted-tail reopen coverage requires committed WAL frames before reopen"
+    );
+    assert_eq!(
+        snapshot_before.nbackfills, 0,
+        "this coverage only applies when no positive backfill proof is required"
+    );
+    let frames_before = authority.iter_latest_frames(0, snapshot_before.max_frame);
+    assert!(
+        !frames_before.is_empty(),
+        "trusted-tail reopen coverage requires a populated durable frame index"
+    );
+
+    drop(conn);
+    drop(db);
+    let mut manager = DATABASE_MANAGER.lock();
+    manager.clear();
+    drop(manager);
+
+    let reopened = open_multiprocess_db(io, db_path_str).unwrap();
+    assert!(
+        !reopened
+            .shared_wal
+            .read()
+            .metadata
+            .loaded_from_disk_scan
+            .load(Ordering::Acquire),
+        "reopen should trust the persisted tshm snapshot when no backfill-proof validation is needed"
+    );
+
+    let reopened_authority = reopened.shared_wal_coordination().unwrap().unwrap();
+    assert_eq!(
+        reopened_authority.snapshot(),
+        snapshot_before,
+        "trusted reopen must preserve the authoritative WAL snapshot"
+    );
+    assert_eq!(
+        reopened_authority.iter_latest_frames(0, snapshot_before.max_frame),
+        frames_before,
+        "trusted reopen must preserve durable frame-index content"
+    );
+
+    let reopened_conn = reopened.connect().unwrap();
+    assert_eq!(count_test_rows(&reopened_conn), 2);
 }
 
 #[test]
