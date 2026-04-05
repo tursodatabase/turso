@@ -1717,6 +1717,10 @@ impl Database {
         self.opts.enable_generated_columns
     }
 
+    pub fn autovacuum_enabled(&self) -> bool {
+        self.opts.enable_autovacuum
+    }
+
     /// check if database is currently in MVCC mode
     pub fn mvcc_enabled(&self) -> bool {
         self.mv_store.load().is_some()

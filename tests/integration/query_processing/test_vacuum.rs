@@ -2713,15 +2713,15 @@ fn test_vacuum_into_deferred_indexes(tmp_db: TempDatabase) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Regression test: VACUUM INTO must not try to copy data from rootpage=0 schema
-/// entries (e.g. virtual table definitions). These have no storage to copy — only
-/// the schema definition should be replayed on the destination.
+/// Smoke test: VACUUM INTO on a database whose data was populated via built-in
+/// table-valued functions (generate_series). Verifies that the regular table data
+/// is correctly copied to the destination.
+/// Note: generate_series is a built-in TVF, not a persisted rootpage=0 entry in
+/// sqlite_schema, so this does not exercise the rootpage=0 skip path directly.
 #[turso_macros::test(mvcc)]
-fn test_vacuum_into_skips_data_copy_for_virtual_tables(tmp_db: TempDatabase) -> anyhow::Result<()> {
+fn test_vacuum_into_with_generate_series(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
-    // Create a regular table with data alongside usage of generate_series
-    // (a table-valued function backed by a rootpage=0 virtual table entry).
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")?;
     conn.execute("INSERT INTO t SELECT value, 'row_' || value FROM generate_series(1, 10)")?;
 
@@ -2753,9 +2753,7 @@ fn test_vacuum_into_skips_data_copy_for_virtual_tables(tmp_db: TempDatabase) -> 
 #[test]
 fn test_vacuum_into_preserves_generated_columns() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let opts = turso_core::DatabaseOpts::new()
-        .with_generated_columns(true)
-        .with_encryption(true);
+    let opts = turso_core::DatabaseOpts::new().with_generated_columns(true);
     let tmp_db = TempDatabase::builder().with_opts(opts).build();
     let conn = tmp_db.connect_limbo();
 
@@ -2797,9 +2795,7 @@ fn test_vacuum_into_preserves_generated_columns() -> anyhow::Result<()> {
 #[test]
 fn test_vacuum_into_generated_column_with_rowid_and_deletes() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let opts = turso_core::DatabaseOpts::new()
-        .with_generated_columns(true)
-        .with_encryption(true);
+    let opts = turso_core::DatabaseOpts::new().with_generated_columns(true);
     let tmp_db = TempDatabase::builder().with_opts(opts).build();
     let conn = tmp_db.connect_limbo();
 

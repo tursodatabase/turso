@@ -13932,6 +13932,7 @@ fn op_vacuum_into_inner(
                     .with_index_method(source_db.experimental_index_method_enabled())
                     .with_custom_types(source_db.experimental_custom_types_enabled())
                     .with_generated_columns(source_db.experimental_generated_columns_enabled())
+                    .with_autovacuum(source_db.autovacuum_enabled())
                     .with_attach(source_db.experimental_attach_enabled());
 
                 // Always use PlatformIO for the destination file, even if source
