@@ -4083,6 +4083,11 @@ impl Pager {
                             !self.syncing.load(Ordering::SeqCst),
                             "syncing should be done"
                         );
+                        {
+                            let mut state = self.checkpoint_state.write();
+                            let result = state.result.as_mut().expect("result should be set");
+                            wal.complete_checkpoint_sync(self, result)?;
+                        }
                         // After DB is synced, truncate WAL if in TRUNCATE mode
                         let is_truncate_mode = {
                             let state = self.checkpoint_state.read();
@@ -4159,6 +4164,35 @@ impl Pager {
 
                     return Ok(IOResult::Done(res));
                 }
+            }
+        }
+    }
+
+    #[cfg(feature = "simulator")]
+    pub fn run_checkpoint_until_post_sync_gap_for_testing(
+        &self,
+        mode: CheckpointMode,
+    ) -> Result<u64> {
+        loop {
+            match self.checkpoint(mode, crate::SyncMode::Full, true)? {
+                IOResult::Done(_) => {
+                    return Err(LimboError::InternalError(
+                        "checkpoint completed before reaching the post-sync pre-publish gap"
+                            .to_string(),
+                    ));
+                }
+                IOResult::IO(io) => io.wait(self.io.as_ref())?,
+            }
+
+            let state = self.checkpoint_state.read();
+            let Some(result) = state.result.as_ref() else {
+                continue;
+            };
+            if matches!(state.phase, CheckpointPhase::SyncDbFile { .. })
+                && result.db_sync_sent
+                && !self.syncing.load(Ordering::SeqCst)
+            {
+                return Ok(result.wal_total_backfilled);
             }
         }
     }
@@ -5345,6 +5379,136 @@ mod ptrmap_tests {
         assert_eq!(
             get_ptrmap_offset_in_page(108, 105, page_size).unwrap(),
             2 * PTRMAP_ENTRY_SIZE
+        );
+    }
+}
+
+#[cfg(all(test, feature = "fs", unix, target_pointer_width = "64"))]
+mod checkpoint_phase_tests {
+    use super::*;
+    use crate::io::{PlatformIO, IO};
+    use crate::storage::sqlite3_ondisk::DatabaseHeader;
+    use crate::storage::wal::CheckpointMode;
+    use crate::sync::atomic::Ordering;
+    use crate::types::IOResult;
+    use crate::Database;
+
+    fn open_checkpoint_test_database() -> (Arc<Database>, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let db_path = dir.join("test.db");
+        {
+            let connection = rusqlite::Connection::open(&db_path).unwrap();
+            connection
+                .pragma_update(None, "journal_mode", "wal")
+                .unwrap();
+        }
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            db_path.to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new().with_multiprocess_wal(true),
+            None,
+        )
+        .unwrap();
+        (db, dir)
+    }
+
+    fn db_identity(db_path: &std::path::Path) -> (u32, u32) {
+        let bytes = std::fs::read(db_path).unwrap();
+        assert!(bytes.len() >= DatabaseHeader::SIZE);
+        let db_size_pages = u32::from_be_bytes(bytes[28..32].try_into().unwrap());
+        let crc = crc32c::crc32c(&bytes[..DatabaseHeader::SIZE]);
+        (db_size_pages, crc)
+    }
+
+    #[test]
+    fn checkpoint_db_sync_completion_still_leaves_backfill_unpublished_until_proof_install() {
+        let (db, dir) = open_checkpoint_test_database();
+        let db_path = dir.join("test.db");
+        let conn = db.connect().unwrap();
+        conn.wal_auto_checkpoint_disable();
+        conn.execute("create table test(id integer primary key, value blob)")
+            .unwrap();
+        conn.execute("begin immediate").unwrap();
+        for _ in 0..32 {
+            conn.execute("insert into test(value) values (randomblob(2048))")
+                .unwrap();
+        }
+        conn.execute("commit").unwrap();
+        assert!(
+            db.shared_wal
+                .read()
+                .metadata
+                .max_frame
+                .load(Ordering::SeqCst)
+                > 1,
+            "checkpoint setup requires more than one WAL frame"
+        );
+
+        let pager = conn.pager.load();
+        let mode = CheckpointMode::Passive {
+            upper_bound_inclusive: Some(1),
+        };
+
+        loop {
+            match pager.checkpoint(mode, crate::SyncMode::Full, true).unwrap() {
+                IOResult::Done(_) => {
+                    panic!("checkpoint should not finish before we observe the post-sync gap")
+                }
+                IOResult::IO(io) => io.wait(pager.io.as_ref()).unwrap(),
+            }
+
+            let state = pager.checkpoint_state.read();
+            let Some(result) = state.result.as_ref() else {
+                continue;
+            };
+            if matches!(state.phase, CheckpointPhase::SyncDbFile { .. })
+                && result.db_sync_sent
+                && !pager.syncing.load(Ordering::SeqCst)
+            {
+                break;
+            }
+        }
+
+        let authority = db.shared_wal_coordination().unwrap().unwrap();
+        let snapshot_before_publish = authority.snapshot();
+        let (db_size_pages, db_header_crc32c) = db_identity(&db_path);
+        assert_eq!(
+            snapshot_before_publish.nbackfills, 0,
+            "DB sync completion alone must not publish positive nbackfills"
+        );
+        assert!(
+            !authority.validate_backfill_proof(
+                snapshot_before_publish,
+                db_size_pages,
+                db_header_crc32c
+            ),
+            "DB sync completion must still leave the durable backfill proof absent"
+        );
+
+        let result = pager
+            .io
+            .block(|| pager.checkpoint(mode, crate::SyncMode::Full, true))
+            .unwrap();
+        assert!(
+            result.wal_total_backfilled > 0 && !result.everything_backfilled(),
+            "resumed checkpoint should complete the partial checkpoint after proof installation"
+        );
+
+        let snapshot_after_publish = authority.snapshot();
+        let (db_size_pages_after, db_header_crc32c_after) = db_identity(&db_path);
+        assert!(
+            snapshot_after_publish.nbackfills > 0,
+            "proof installation step must publish positive nbackfills"
+        );
+        assert!(
+            authority.validate_backfill_proof(
+                snapshot_after_publish,
+                db_size_pages_after,
+                db_header_crc32c_after
+            ),
+            "resuming after the post-sync gap must install a valid durable backfill proof"
         );
     }
 }
