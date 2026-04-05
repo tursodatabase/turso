@@ -294,6 +294,29 @@ fn make_sort_comparator(
     }
 }
 
+/// Apply affinity conversion for comparison purposes.
+///
+/// Unlike storage affinity, comparison affinity for REAL must NOT convert
+/// Integer operands to Float. Converting Integer(i) to Float(i as f64) loses
+/// precision for large integers (beyond 2^53), causing incorrect equality
+/// results. Instead, leave integers as-is — `Numeric::cmp` uses
+/// `sqlite_int_float_cmp` which handles Float-vs-Integer without precision loss.
+///
+/// Only TEXT values need conversion (e.g. "3.14" → Float for REAL affinity).
+fn convert_for_comparison<'a>(
+    affinity: Affinity,
+    val: &'a impl AsValueRef,
+) -> Option<either::Either<ValueRef<'a>, crate::Value>> {
+    // For REAL affinity: if the value is already an integer, skip conversion.
+    // Numeric::cmp handles Float-vs-Integer correctly via sqlite_int_float_cmp.
+    if matches!(affinity, Affinity::Real)
+        && matches!(val.as_value_ref(), ValueRef::Numeric(Numeric::Integer(_)))
+    {
+        return None;
+    }
+    affinity.convert(val)
+}
+
 /// Compare two values using the specified collation for text values.
 /// Non-text values are compared using their natural ordering.
 fn compare_with_collation(
@@ -953,7 +976,10 @@ pub fn op_comparison(
         }
     }
 
-    let (new_lhs, new_rhs) = (affinity.convert(lhs_value), affinity.convert(rhs_value));
+    let (new_lhs, new_rhs) = (
+        convert_for_comparison(affinity, lhs_value),
+        convert_for_comparison(affinity, rhs_value),
+    );
 
     let should_jump = op.compare(
         new_lhs
