@@ -1,26 +1,26 @@
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use nucleo::{Config, Matcher, Nucleo, Utf32Str};
 use ratatui::{
-    DefaultTerminal,
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, List, ListItem, ListState, Paragraph},
+    DefaultTerminal,
 };
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use syntect::dumps::from_uncompressed_data;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
 use syntect::parsing::{Scope, SyntaxSet};
 use syntect::util::LinesWithEndings;
-use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
+use tui_input::Input;
 
-use crate::config::{CONFIG_DIR, HighlightConfig};
+use crate::config::{HighlightConfig, CONFIG_DIR};
 
 type HighlightSpans = Vec<(Style, String)>;
 
@@ -127,7 +127,7 @@ impl ItemsCache {
             if self.rows.len() == 500 {
                 break;
             }
-            if let Some(item) = snapshot.get_matched_item(i as u32) {
+            if let Some(item) = snapshot.get_matched_item(i) {
                 if !item.data.alive.load(Ordering::Acquire) {
                     continue;
                 }
@@ -269,7 +269,7 @@ enum EventOutcome {
 
 impl FzfState {
     fn new(
-        history_path: &PathBuf,
+        history_path: &std::path::Path,
         highlight_config: Option<&HighlightConfig>,
         app_tx: std::sync::mpsc::Sender<AppEvent>,
     ) -> Option<Self> {
@@ -287,7 +287,7 @@ impl FzfState {
         let history_loaded = Arc::new(AtomicBool::new(false));
         let live_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-        let history_path = history_path.clone();
+        let history_path = history_path.to_path_buf();
         let history_loaded_clone = history_loaded.clone();
         let live_count_clone = live_count.clone();
         let loader_wake_tx = app_tx.clone();
@@ -390,13 +390,11 @@ pub fn run(
     let mut terminal = ratatui::try_init().ok()?;
 
     // Dedicated thread for terminal events — never blocks rendering
-    std::thread::spawn(move || {
-        loop {
-            if event::poll(Duration::from_millis(50)).unwrap_or(false) {
-                if let Ok(ev) = event::read() {
-                    if app_tx.send(AppEvent::Terminal(ev)).is_err() {
-                        break;
-                    }
+    std::thread::spawn(move || loop {
+        if event::poll(Duration::from_millis(50)).unwrap_or(false) {
+            if let Ok(ev) = event::read() {
+                if app_tx.send(AppEvent::Terminal(ev)).is_err() {
+                    break;
                 }
             }
         }
