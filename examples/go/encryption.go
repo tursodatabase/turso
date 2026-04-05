@@ -40,7 +40,7 @@ func main() {
 
 	// Create an encrypted database
 	fmt.Println("1. Creating encrypted database...")
-	dsn := fmt.Sprintf("%s?experimental=encryption&encryption_cipher=aegis256&encryption_hexkey=%s", dbPath, encryptionKey)
+	dsn := fmt.Sprintf("%s?experimental=encryption&cipher=aegis256&hexkey=%s", dbPath, encryptionKey)
 	db, err := sql.Open("turso", dsn)
 	if err != nil {
 		log.Fatalf("Failed to open database: %v", err)
