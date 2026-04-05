@@ -4534,12 +4534,43 @@ impl Pager {
                     let number_of_freelist_leaves =
                         page_contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_LEAF_COUNT);
 
+                    // Validate leaf count fits within page capacity (same check as free_page)
+                    let max_freelist_entries = (header.usable_space() / FREELIST_LEAF_PTR_SIZE) - 2; // 2 reserved slots: next ptr + count
+                    if number_of_freelist_leaves as usize > max_freelist_entries {
+                        return Err(LimboError::Corrupt(format!(
+                            "Freelist trunk page {} has invalid leaf count: {} (max {})",
+                            trunk_page.get().id,
+                            number_of_freelist_leaves,
+                            max_freelist_entries
+                        )));
+                    }
+
+                    // Validate next trunk page ID is within database bounds
+                    if next_trunk_page_id != 0
+                        && (next_trunk_page_id < 2
+                            || next_trunk_page_id as usize > header.database_size.get() as usize)
+                    {
+                        return Err(LimboError::Corrupt(format!(
+                            "Invalid freelist next trunk page ID: {next_trunk_page_id}"
+                        )));
+                    }
+
                     // There are leaf pointers on this trunk page, so we can reuse one of the pages
                     // for the allocation.
                     if number_of_freelist_leaves != 0 {
                         let page_contents = trunk_page.get_contents();
                         let next_leaf_page_id =
                             page_contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR);
+
+                        // Validate leaf page ID is within database bounds
+                        if next_leaf_page_id < 2
+                            || next_leaf_page_id as usize > header.database_size.get() as usize
+                        {
+                            return Err(LimboError::Corrupt(format!(
+                                "Invalid freelist leaf page ID: {next_leaf_page_id}"
+                            )));
+                        }
+
                         let (leaf_page, c) = self.read_page(next_leaf_page_id as i64)?;
 
                         turso_assert!(
