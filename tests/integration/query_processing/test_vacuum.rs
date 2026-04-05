@@ -2712,3 +2712,141 @@ fn test_vacuum_into_deferred_indexes(tmp_db: TempDatabase) -> anyhow::Result<()>
 
     Ok(())
 }
+
+/// Regression test: VACUUM INTO must not try to copy data from rootpage=0 schema
+/// entries (e.g. virtual table definitions). These have no storage to copy — only
+/// the schema definition should be replayed on the destination.
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_skips_data_copy_for_virtual_tables(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    // Create a regular table with data alongside usage of generate_series
+    // (a table-valued function backed by a rootpage=0 virtual table entry).
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")?;
+    conn.execute("INSERT INTO t SELECT value, 'row_' || value FROM generate_series(1, 10)")?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vtab_skip.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+
+    // Regular table data should be intact
+    let count: Vec<(i64,)> = dest_conn.exec_rows("SELECT COUNT(*) FROM t");
+    assert_eq!(count[0].0, 10);
+
+    let first_row: Vec<(i64, String)> = dest_conn.exec_rows("SELECT id, val FROM t WHERE id = 1");
+    assert_eq!(first_row, vec![(1, "row_1".to_string())]);
+
+    Ok(())
+}
+
+/// Regression test: VACUUM INTO must preserve generated column values.
+/// Generated columns are excluded from the data-copy column list (they're
+/// computed, not stored), but the destination schema includes them and the
+/// values should be recomputed correctly from the copied base columns.
+#[test]
+fn test_vacuum_into_preserves_generated_columns() -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let opts = turso_core::DatabaseOpts::new()
+        .with_generated_columns(true)
+        .with_encryption(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute(
+        "CREATE TABLE t (
+            a INTEGER,
+            b INTEGER,
+            c INTEGER GENERATED ALWAYS AS (a + b) VIRTUAL
+        )",
+    )?;
+    conn.execute("INSERT INTO t (a, b) VALUES (10, 20)")?;
+    conn.execute("INSERT INTO t (a, b) VALUES (100, 200)")?;
+
+    // Verify generated column works on source
+    let source_rows: Vec<(i64, i64, i64)> = conn.exec_rows("SELECT a, b, c FROM t ORDER BY a");
+    assert_eq!(source_rows, vec![(10, 20, 30), (100, 200, 300)]);
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("gencol.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent_with_opts(&dest_path, opts);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+
+    // Generated column values should be recomputed correctly on destination
+    let dest_rows: Vec<(i64, i64, i64)> = dest_conn.exec_rows("SELECT a, b, c FROM t ORDER BY a");
+    assert_eq!(dest_rows, vec![(10, 20, 30), (100, 200, 300)]);
+
+    Ok(())
+}
+
+/// Regression test: VACUUM INTO with generated columns that reference the rowid
+/// alias, after deletes that create gaps. Verifies that rowid values are preserved
+/// and the generated column recomputes correctly from the rowid on the destination.
+#[test]
+fn test_vacuum_into_generated_column_with_rowid_and_deletes() -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let opts = turso_core::DatabaseOpts::new()
+        .with_generated_columns(true)
+        .with_encryption(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    // id is INTEGER PRIMARY KEY (rowid alias), label is generated from id
+    conn.execute(
+        "CREATE TABLE t (
+            id INTEGER PRIMARY KEY,
+            name TEXT,
+            label TEXT GENERATED ALWAYS AS ('item_' || id) VIRTUAL
+        )",
+    )?;
+    conn.execute("INSERT INTO t (id, name) VALUES (1, 'a')")?;
+    conn.execute("INSERT INTO t (id, name) VALUES (2, 'b')")?;
+    conn.execute("INSERT INTO t (id, name) VALUES (3, 'c')")?;
+    conn.execute("INSERT INTO t (id, name) VALUES (4, 'd')")?;
+    conn.execute("INSERT INTO t (id, name) VALUES (5, 'e')")?;
+
+    // Delete some rows to create gaps in rowid space
+    conn.execute("DELETE FROM t WHERE id IN (2, 4)")?;
+
+    // Source should have rows 1, 3, 5 with correct generated labels
+    let source_rows: Vec<(i64, String, String)> =
+        conn.exec_rows("SELECT id, name, label FROM t ORDER BY id");
+    assert_eq!(
+        source_rows,
+        vec![
+            (1, "a".to_string(), "item_1".to_string()),
+            (3, "c".to_string(), "item_3".to_string()),
+            (5, "e".to_string(), "item_5".to_string()),
+        ]
+    );
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("gencol_rowid.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent_with_opts(&dest_path, opts);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+
+    // Rowids must be preserved (not compacted), and generated labels must match
+    let dest_rows: Vec<(i64, String, String)> =
+        dest_conn.exec_rows("SELECT id, name, label FROM t ORDER BY id");
+    assert_eq!(source_rows, dest_rows);
+
+    Ok(())
+}
