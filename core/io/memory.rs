@@ -138,7 +138,7 @@ impl File for MemoryFile {
                 remaining -= bytes_to_read;
             }
         }
-        c.complete(read_len as i32);
+        c.complete(read_len as i64);
         Ok(c)
     }
 
@@ -179,7 +179,7 @@ impl File for MemoryFile {
         self.size
             .set(core::cmp::max(pos + buf_len as u64, self.size.get()));
 
-        c.complete(buf_len as i32);
+        c.complete(buf_len as i64);
         Ok(c)
     }
 
@@ -241,7 +241,7 @@ impl File for MemoryFile {
             }
             total_written += buf_len;
         }
-        c.complete(total_written as i32);
+        c.complete(total_written as i64);
         self.size
             .set(core::cmp::max(pos + total_written as u64, self.size.get()));
         Ok(c)

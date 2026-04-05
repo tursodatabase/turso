@@ -1663,7 +1663,7 @@ impl Pager {
 
         let write_complete = {
             let buf_copy = buffer.clone();
-            Box::new(move |res: Result<i32, CompletionError>| {
+            Box::new(move |res: Result<i64, CompletionError>| {
                 let Ok(bytes_written) = res else {
                     return;
                 };
@@ -1671,7 +1671,7 @@ impl Pager {
                 let buf_len = buf_copy.len();
 
                 turso_assert!(
-                    bytes_written == buf_len as i32,
+                    bytes_written == buf_len as i64,
                     "wrote({bytes_written}) != expected({buf_len})"
                 );
 

@@ -152,7 +152,7 @@ pub trait File: Send + Sync {
                         total_written.fetch_add(n as usize, Ordering::SeqCst);
                         if outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
                             // last one finished
-                            c_main.complete(total_written.load(Ordering::Acquire) as i32);
+                            c_main.complete(total_written.load(Ordering::Acquire) as i64);
                         }
                     }
                 })
@@ -392,7 +392,7 @@ impl<'a> WriteBatch<'a> {
     pub fn submit(self) -> Result<Vec<Completion>> {
         let mut completions = Vec::with_capacity(self.ops.len());
         for WriteOp { pos, bufs } in self.ops {
-            let total_len = bufs.iter().map(|b| b.len()).sum::<usize>() as i32;
+            let total_len = bufs.iter().map(|b| b.len()).sum::<usize>() as i64;
             let c = Completion::new_write(move |res| {
                 let Ok(bytes_written) = res else {
                     return;

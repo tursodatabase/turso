@@ -437,12 +437,12 @@ impl LogicalLog {
         let buffer = Arc::new(Buffer::new(self.write_buf.to_vec()));
         let c = Completion::new_write({
             let buffer_len = buffer.len();
-            move |res: Result<i32, CompletionError>| {
+            move |res: Result<i64, CompletionError>| {
                 let Ok(bytes_written) = res else {
                     return;
                 };
                 turso_assert!(
-                    bytes_written == buffer_len as i32,
+                    bytes_written == buffer_len as i64,
                     "wrote({bytes_written}) != expected({buffer_len})"
                 );
             }
@@ -588,12 +588,12 @@ impl LogicalLog {
         let buffer = Arc::new(Buffer::new(header_bytes.to_vec()));
         let c = Completion::new_write({
             let buffer_len = buffer.len();
-            move |res: Result<i32, CompletionError>| {
+            move |res: Result<i64, CompletionError>| {
                 let Ok(bytes_written) = res else {
                     return;
                 };
                 turso_assert!(
-                    bytes_written == buffer_len as i32,
+                    bytes_written == buffer_len as i64,
                     "wrote({bytes_written}) != expected({buffer_len})"
                 );
             }
