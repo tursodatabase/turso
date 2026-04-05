@@ -647,14 +647,11 @@ impl Database {
         _io: &Arc<dyn IO>,
         _path: &str,
         flags: OpenFlags,
-        opts: DatabaseOpts,
+        _opts: DatabaseOpts,
     ) -> Result<OpenFlags> {
-        if opts.enable_multiprocess_wal {
-            return Err(LimboError::InvalidArgument(
-                "experimental multiprocess WAL is only supported on 64-bit Unix platforms"
-                    .to_string(),
-            ));
-        }
+        // On unsupported platforms, keep the flag as a no-op so generic
+        // cross-platform helpers/tests can request multiprocess WAL without
+        // breaking legacy single-process behavior.
         Ok(flags)
     }
 
