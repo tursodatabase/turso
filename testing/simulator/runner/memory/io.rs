@@ -189,6 +189,10 @@ impl SimIO for MemorySimIO {
         }
     }
 
+    fn inject_async_fault(&self, _fault: bool) {}
+
+    fn inject_async_fault_selective(&self, _faults: &[(&str, bool)]) {}
+
     fn print_stats(&self) {
         for (path, file) in self.files.borrow().iter() {
             if path.contains("ephemeral") {

@@ -704,11 +704,23 @@ impl OngoingCheckpoint {
     #[inline]
     /// Remove any completed write operations from `inflight_writes`,
     /// returns whether any progress was made.
-    fn process_inflight_writes(&mut self) -> bool {
-        let before_len = self.inflight_writes.len();
-        self.inflight_writes
-            .retain(|w| !w.done.load(Ordering::Acquire));
-        before_len > self.inflight_writes.len()
+    fn process_inflight_writes(&mut self) -> Result<bool> {
+        let mut moved = false;
+        let mut err: Option<CompletionError> = None;
+        self.inflight_writes.retain(|w| {
+            if !w.done.load(Ordering::Acquire) {
+                return true;
+            }
+            if let Some(e) = w.err.get() {
+                err = Some(e.clone());
+            }
+            moved = true;
+            false
+        });
+        if let Some(e) = err {
+            return Err(LimboError::CompletionError(e));
+        }
+        Ok(moved)
     }
 
     #[inline]
@@ -2474,7 +2486,7 @@ impl WalFile {
                     let mut ongoing_chkpt = self.ongoing_checkpoint.write();
 
                     // Check and clean any completed writes from pending flush
-                    if ongoing_chkpt.process_inflight_writes() {
+                    if ongoing_chkpt.process_inflight_writes()? {
                         tracing::trace!("Completed a write batch");
                     }
                     // Process completed reads into current batch
