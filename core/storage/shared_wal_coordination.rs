@@ -680,6 +680,12 @@ impl Drop for MappedSharedWalCoordination {
     }
 }
 
+type ProcessMappingResult = (
+    PathBuf,
+    Arc<Mutex<()>>,
+    Arc<Mutex<ProcessLocalOwnershipState>>,
+);
+
 impl MappedSharedWalCoordination {
     const fn default_ownership_mode() -> SharedWalOwnershipMode {
         if cfg!(target_os = "linux") {
@@ -715,11 +721,7 @@ impl MappedSharedWalCoordination {
         reader_slot_count: u32,
         frame_index_publish_lock: Arc<Mutex<()>>,
         process_local_ownership: Arc<Mutex<ProcessLocalOwnershipState>>,
-    ) -> Result<(
-        PathBuf,
-        Arc<Mutex<()>>,
-        Arc<Mutex<ProcessLocalOwnershipState>>,
-    )> {
+    ) -> Result<ProcessMappingResult> {
         let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let mut opens = PROCESS_LOCAL_COORDINATION_OPENS
             .lock()
@@ -1233,6 +1235,12 @@ impl MappedSharedWalCoordination {
         // would cause that process to panic with "reader slot released by
         // non-owner" and corrupt the shared WAL state.
         for slot_index in 0..header.reader_slot_count {
+            if !self.uses_linux_ofd_locking()
+                && self
+                    .with_process_local_ownership(|entry| entry.reader_owner(slot_index).is_some())
+            {
+                continue;
+            }
             let offset = Self::process_lock_offset_for_reader(slot_index);
             match self
                 .file

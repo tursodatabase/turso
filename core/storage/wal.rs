@@ -2627,6 +2627,7 @@ impl OverflowFallbackCoverage {
         self.valid = true;
     }
 
+    #[cfg(all(unix, target_pointer_width = "64"))]
     pub(crate) fn record_snapshot(
         &mut self,
         snapshot: SharedWalCoordinationHeader,
@@ -2640,6 +2641,7 @@ impl OverflowFallbackCoverage {
         );
     }
 
+    #[cfg(all(unix, target_pointer_width = "64"))]
     pub(crate) fn same_generation(&self, snapshot: SharedWalCoordinationHeader) -> bool {
         self.valid
             && self.checkpoint_seq == snapshot.checkpoint_seq
@@ -2647,6 +2649,7 @@ impl OverflowFallbackCoverage {
             && self.salt_2 == snapshot.salt_2
     }
 
+    #[cfg(all(unix, target_pointer_width = "64"))]
     pub(crate) fn covers(&self, snapshot: SharedWalCoordinationHeader, max_frame: u64) -> bool {
         self.same_generation(snapshot) && self.max_frame >= max_frame
     }
