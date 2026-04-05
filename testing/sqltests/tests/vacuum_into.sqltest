@@ -17,3 +17,11 @@ test vacuum-into-rejected-in-transaction {
 expect error {
     cannot VACUUM INTO from within a transaction
 }
+
+@backend rust
+test vacuum-into-nonexistent-schema {
+    VACUUM bogus INTO 'limbo_vacuum_bogus_schema.db';
+}
+expect error {
+    no such database: bogus
+}

@@ -5,7 +5,7 @@ use crate::translate::ProgramBuilderOpts;
 use crate::util::{escape_sql_string_literal, normalize_ident};
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{Cookie, Insn};
-use crate::{bail_parse_error, Result};
+use crate::{bail_parse_error, Result, MAIN_DB_ID};
 use turso_parser::ast::{self, QualifiedName};
 
 /// Reconstruct SQL string from CREATE TRIGGER AST
@@ -452,7 +452,7 @@ pub fn translate_drop_trigger(
     program.extend(&opts);
 
     // Open cursor to sqlite_schema table (structure is the same for all databases)
-    let table = resolver.with_schema(0, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
+    let table = resolver.with_schema(MAIN_DB_ID, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,

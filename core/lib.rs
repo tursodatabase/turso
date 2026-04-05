@@ -157,6 +157,11 @@ pub const TEMP_DB_ID: usize = 1;
 /// start at index 2.
 pub const FIRST_ATTACHED_DB_ID: usize = 2;
 
+/// Returns true if the database index refers to "main" or "temp"
+pub const fn is_main_or_temp_db(database_id: usize) -> bool {
+    database_id == MAIN_DB_ID || database_id == TEMP_DB_ID
+}
+
 /// Returns true if the database index refers to an attached database
 /// (i.e. not "main" and not "temp").
 pub const fn is_attached_db(database_id: usize) -> bool {

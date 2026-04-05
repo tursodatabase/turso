@@ -1,4 +1,4 @@
-use crate::{turso_assert, turso_assert_eq, turso_debug_assert};
+use crate::{turso_assert, turso_assert_eq, turso_debug_assert, MAIN_DB_ID};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
@@ -1481,7 +1481,7 @@ impl ProgramBuilder {
     /// Tries to mirror: https://github.com/sqlite/sqlite/blob/e77e589a35862f6ac9c4141cfd1beb2844b84c61/src/build.c#L5379
     pub fn begin_write_operation(&mut self) {
         self.txn_mode = TransactionMode::Write;
-        self.write_databases.insert(0);
+        self.write_databases.insert(MAIN_DB_ID);
     }
 
     /// Begin a write operation on a specific database (for attached databases).
