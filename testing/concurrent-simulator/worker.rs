@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use turso_core::{
-    CheckpointMode, Connection, Database, DatabaseOpts, OpenFlags,
+    CheckpointMode, Connection, Database, DatabaseOpts, LimboError, OpenFlags,
     SharedWalCoordinationOpenTelemetryMode, SharedWalTestingSnapshot, StepResult, UnixIO, Value,
 };
 
@@ -23,7 +23,11 @@ fn worker_trace_enabled() -> bool {
 }
 
 /// Run the worker process main loop.
-pub fn run_worker(db_path: &str, enable_mvcc: bool) -> anyhow::Result<()> {
+pub fn run_worker(
+    db_path: &str,
+    enable_mvcc: bool,
+    connections_per_process: usize,
+) -> anyhow::Result<()> {
     // Install a panic hook that writes to stderr so panics don't pollute stdout JSON protocol.
     std::panic::set_hook(Box::new(|info| {
         eprintln!("WORKER PANIC: {info}");
@@ -55,10 +59,18 @@ pub fn run_worker(db_path: &str, enable_mvcc: bool) -> anyhow::Result<()> {
         None, // encryption_opts
     )?;
 
-    let conn = db.connect()?;
+    if connections_per_process == 0 {
+        return Err(anyhow::anyhow!(
+            "connections_per_process must be greater than zero"
+        ));
+    }
+
+    let connections = (0..connections_per_process)
+        .map(|_| db.connect())
+        .collect::<turso_core::Result<Vec<_>>>()?;
 
     if enable_mvcc {
-        conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+        connections[0].execute("PRAGMA journal_mode = 'mvcc'")?;
     }
 
     let telemetry = worker_startup_telemetry(&db)?;
@@ -74,7 +86,20 @@ pub fn run_worker(db_path: &str, enable_mvcc: bool) -> anyhow::Result<()> {
         }
         let cmd: WorkerCommand = serde_json::from_str(&line)?;
         match cmd {
-            WorkerCommand::Execute { sql } => {
+            WorkerCommand::Execute {
+                connection_idx,
+                sql,
+            } => {
+                let conn = match connection_at(&connections, connection_idx) {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        send_response(&WorkerResponse::Error {
+                            error_kind: "InvalidArgument".to_string(),
+                            message: err.to_string(),
+                        })?;
+                        continue;
+                    }
+                };
                 let response = execute_sql(&conn, &sql);
                 if let WorkerResponse::Error {
                     ref error_kind,
@@ -87,13 +112,34 @@ pub fn run_worker(db_path: &str, enable_mvcc: bool) -> anyhow::Result<()> {
                 }
                 send_response(&response)?;
             }
-            WorkerCommand::DisableAutoCheckpoint => {
+            WorkerCommand::DisableAutoCheckpoint { connection_idx } => {
+                let conn = match connection_at(&connections, connection_idx) {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        send_response(&WorkerResponse::Error {
+                            error_kind: "InvalidArgument".to_string(),
+                            message: err.to_string(),
+                        })?;
+                        continue;
+                    }
+                };
                 conn.wal_auto_checkpoint_disable();
                 send_response(&WorkerResponse::Ack)?;
             }
             WorkerCommand::PassiveCheckpoint {
+                connection_idx,
                 upper_bound_inclusive,
             } => {
+                let conn = match connection_at(&connections, connection_idx) {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        send_response(&WorkerResponse::Error {
+                            error_kind: "InvalidArgument".to_string(),
+                            message: err.to_string(),
+                        })?;
+                        continue;
+                    }
+                };
                 conn.checkpoint_for_testing(CheckpointMode::Passive {
                     upper_bound_inclusive,
                 })?;
@@ -104,8 +150,19 @@ pub fn run_worker(db_path: &str, enable_mvcc: bool) -> anyhow::Result<()> {
                 send_response(&WorkerResponse::Ack)?;
             }
             WorkerCommand::InstallUnpublishedBackfillProof {
+                connection_idx,
                 upper_bound_inclusive,
             } => {
+                let conn = match connection_at(&connections, connection_idx) {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        send_response(&WorkerResponse::Error {
+                            error_kind: "InvalidArgument".to_string(),
+                            message: err.to_string(),
+                        })?;
+                        continue;
+                    }
+                };
                 conn.install_unpublished_backfill_proof_for_testing(upper_bound_inclusive)?;
                 send_response(&WorkerResponse::Ack)?;
             }
@@ -120,13 +177,24 @@ pub fn run_worker(db_path: &str, enable_mvcc: bool) -> anyhow::Result<()> {
                 send_response(&WorkerResponse::FrameLookup { frame_id })?;
             }
             WorkerCommand::Shutdown => {
-                conn.close()?;
+                for conn in &connections {
+                    conn.close()?;
+                }
                 break;
             }
         }
     }
 
     Ok(())
+}
+
+fn connection_at(
+    connections: &[Arc<Connection>],
+    connection_idx: usize,
+) -> turso_core::Result<Arc<Connection>> {
+    connections.get(connection_idx).cloned().ok_or_else(|| {
+        LimboError::InvalidArgument(format!("invalid connection index {connection_idx}"))
+    })
 }
 
 fn worker_startup_telemetry(db: &Arc<Database>) -> anyhow::Result<WorkerStartupTelemetry> {
