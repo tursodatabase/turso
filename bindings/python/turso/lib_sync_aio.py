@@ -74,6 +74,7 @@ def connect_sync(
     partial_sync_experimental: Optional[PartialSyncOpts] = None,
     experimental_features: Optional[str] = None,
     isolation_level: Optional[str] = "DEFERRED",
+    unstable_wasm_runtime=None,
 ) -> ConnectionSync:
     # Connector creating the blocking synchronized connection in the worker thread
     def _connector() -> BlockingConnectionSync:
@@ -87,6 +88,7 @@ def connect_sync(
             partial_sync_experimental=partial_sync_experimental,
             experimental_features=experimental_features,
             isolation_level=isolation_level,
+            unstable_wasm_runtime=unstable_wasm_runtime,
         )
 
     # Return awaitable async wrapper with sync extras

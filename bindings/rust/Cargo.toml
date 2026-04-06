@@ -16,6 +16,7 @@ workspace = true
 default = ["mimalloc"]
 mimalloc = ["dep:mimalloc"]
 pure-rust-crypto = ["turso_sdk_kit/pure-rust-crypto", "turso_sync_sdk_kit/pure-rust-crypto"]
+wasm-udf = ["turso_sdk_kit/wasm-udf"]
 sync = [
     "dep:hyper",
     "dep:tokio",
@@ -26,6 +27,7 @@ sync = [
 ]
 
 [dependencies]
+turso_core = { workspace = true }
 turso_sdk_kit = { workspace = true }
 turso_sync_sdk_kit = { workspace = true }
 thiserror = { workspace = true }
@@ -50,12 +52,16 @@ required-features = ["sync"]
 [[example]]
 name = "concurrent_writes"
 
+[[example]]
+name = "wasm_udf"
+
 [dev-dependencies]
+turso_wasm_wasmtime = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 rand.workspace = true
 rand_chacha = { workspace = true }
 anyhow.workspace = true
-reqwest = { version = "0.12.28", features = ["json"] }
+reqwest = { version = "0.12.28", features = ["json", "blocking"] }
 serde_json.workspace = true
 

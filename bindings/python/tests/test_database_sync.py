@@ -219,6 +219,105 @@ def test_bootstrap_concurrency():
             assert t2.exitcode == 0, f"t2 exitcode: {t2.exitcode}"
 
 
+def test_sync_wasm_udf_with_runtime():
+    """Server creates WASM UDF → sync client with runtime pulls → SELECT works."""
+    from turso import WasmtimeRuntime
+
+    with TursoServer() as server:
+        # Read the WASM binary for the add UDF
+        import os
+
+        wasm_path = os.path.join(
+            os.path.dirname(__file__), "..", "..", "..", "wasm-sdk", "examples", "c", "udfs.wasm"
+        )
+        with open(wasm_path, "rb") as f:
+            wasm_bytes = f.read()
+        wasm_hex = wasm_bytes.hex()
+
+        # Server-side: create the UDF
+        server.db_sql(
+            f"CREATE FUNCTION add2 LANGUAGE wasm AS X'{wasm_hex}' EXPORT 'add'"
+        )
+
+        # Verify server can execute the UDF
+        rows = server.db_sql("SELECT add2(1, 2)")
+        assert rows == [["3"]]
+
+        # Client: connect with WASM runtime
+        runtime = WasmtimeRuntime()
+        conn = turso.sync.connect(":memory:", server.db_url(), unstable_wasm_runtime=runtime)
+
+        # Verify the UDF works via sync
+        rows = conn.execute("SELECT add2(40, 2)").fetchall()
+        assert rows == [(42,)]
+
+
+def test_sync_wasm_udf_no_runtime():
+    """Server creates WASM UDF → sync client WITHOUT runtime → pull OK, SELECT UDF fails."""
+    with TursoServer() as server:
+        import os
+
+        wasm_path = os.path.join(
+            os.path.dirname(__file__), "..", "..", "..", "wasm-sdk", "examples", "c", "udfs.wasm"
+        )
+        with open(wasm_path, "rb") as f:
+            wasm_bytes = f.read()
+        wasm_hex = wasm_bytes.hex()
+
+        # Server-side: create the UDF
+        server.db_sql(
+            f"CREATE FUNCTION add2 LANGUAGE wasm AS X'{wasm_hex}' EXPORT 'add'"
+        )
+
+        # Client: connect WITHOUT WASM runtime
+        conn = turso.sync.connect(":memory:", server.db_url())
+
+        # DDL syncs fine, but SELECT using the UDF should fail
+        try:
+            conn.execute("SELECT add2(1, 2)").fetchall()
+            assert False, "SELECT with WASM UDF should fail without runtime"
+        except Exception:
+            pass  # expected
+
+
+def test_sync_wasm_udf_client_creates_function():
+    """Client with runtime creates UDF → push → new client pulls → SELECT works."""
+    from turso import WasmtimeRuntime
+
+    with TursoServer() as server:
+        import os
+
+        wasm_path = os.path.join(
+            os.path.dirname(__file__), "..", "..", "..", "wasm-sdk", "examples", "c", "udfs.wasm"
+        )
+        with open(wasm_path, "rb") as f:
+            wasm_bytes = f.read()
+        wasm_hex = wasm_bytes.hex()
+
+        # Create a table on the server first so bootstrap works
+        server.db_sql("CREATE TABLE IF NOT EXISTS _dummy (x)")
+
+        # Client 1: connect with WASM runtime and create the UDF
+        runtime = WasmtimeRuntime()
+        conn1 = turso.sync.connect(":memory:", server.db_url(), unstable_wasm_runtime=runtime)
+        conn1.execute(
+            f"CREATE FUNCTION add2 LANGUAGE wasm AS X'{wasm_hex}' EXPORT 'add'"
+        )
+        conn1.commit()
+
+        # Verify locally
+        rows = conn1.execute("SELECT add2(10, 20)").fetchall()
+        assert rows == [(30,)]
+
+        # Push to server
+        conn1.push()
+
+        # Client 2: connect with runtime, pull, and verify UDF works
+        conn2 = turso.sync.connect(":memory:", server.db_url(), unstable_wasm_runtime=WasmtimeRuntime())
+        rows = conn2.execute("SELECT add2(100, 200)").fetchall()
+        assert rows == [(300,)]
+
+
 def test_configuration_persistence():
     with TursoServer() as server:
         server.db_sql("CREATE TABLE t(x)")

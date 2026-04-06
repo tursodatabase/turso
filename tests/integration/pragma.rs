@@ -61,9 +61,11 @@ fn test_pragma_module_list_generate_series(db: TempDatabase) {
 
 #[turso_macros::test(mvcc)]
 fn test_pragma_page_sizes_without_writes_persists(db: TempDatabase) {
-    let opts = db.db_opts;
+    let opts = db.db_opts.clone();
     let flags = db.db_flags;
-    let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+    let builder = TempDatabase::builder()
+        .with_flags(flags)
+        .with_opts(opts.clone());
 
     for test_page_size in [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536] {
         let db = builder.clone().build();
@@ -102,9 +104,11 @@ fn test_pragma_page_sizes_without_writes_persists(db: TempDatabase) {
 
 #[turso_macros::test(mvcc)]
 fn test_pragma_page_sizes_with_writes_persists(db: TempDatabase) {
-    let opts = db.db_opts;
+    let opts = db.db_opts.clone();
     let flags = db.db_flags;
-    let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+    let builder = TempDatabase::builder()
+        .with_flags(flags)
+        .with_opts(opts.clone());
 
     for test_page_size in [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536] {
         let db = builder.clone().build();

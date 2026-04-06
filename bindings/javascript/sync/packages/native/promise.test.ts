@@ -897,3 +897,93 @@ test('transform-many', async () => {
     expect(rows1).toEqual([{ key: '1', value: 1001 + 1002 }]);
     expect(rows2).toEqual([{ key: '1', value: 1001 + 1002 }]);
 })
+
+// ── WASM UDF Sync tests ──────────────────────────────────────────────────
+
+const ADD_WASM_HEX =
+    "0061736d01000000010c0260017f017f60027f7f017e030302000105030100020607017f014180080b" +
+    "071f03066d656d6f727902000c747572736f5f6d616c6c6f6300000361646400010a24021101017f23" +
+    "002101230020006a240020010b10002001290300200141086a2903007c0b002c046e616d65021c0200" +
+    "02000473697a6501037074720102000461726763010461726776070701000462756d70";
+
+test('wasm-udf-sync-with-runtime', async () => {
+    // Server: create UDF
+    {
+        const db = await connect({
+            path: ':memory:',
+            url: process.env.VITE_TURSO_DB_URL,
+            unstableWasmRuntime: true,
+        });
+        await db.exec(`CREATE FUNCTION add2 LANGUAGE wasm AS X'${ADD_WASM_HEX}' EXPORT 'add'`);
+        await db.push();
+        await db.close();
+    }
+
+    // Client: connect with WASM runtime, pull, verify UDF works
+    const db = await connect({
+        path: ':memory:',
+        url: process.env.VITE_TURSO_DB_URL,
+        unstableWasmRuntime: true,
+    });
+    expect(await db.prepare("SELECT add2(40, 2) AS r").all()).toEqual([{ r: 42 }]);
+    await db.close();
+})
+
+test('wasm-udf-sync-no-runtime', async () => {
+    // Server: create UDF with runtime
+    {
+        const db = await connect({
+            path: ':memory:',
+            url: process.env.VITE_TURSO_DB_URL,
+            unstableWasmRuntime: true,
+        });
+        await db.exec(`CREATE FUNCTION add2 LANGUAGE wasm AS X'${ADD_WASM_HEX}' EXPORT 'add'`);
+        await db.push();
+        await db.close();
+    }
+
+    // Client: connect WITHOUT runtime
+    const db = await connect({
+        path: ':memory:',
+        url: process.env.VITE_TURSO_DB_URL,
+    });
+
+    // DDL syncs fine, but SELECT UDF should fail
+    await expect(async () => await db.prepare("SELECT add2(1, 2)").all()).rejects.toThrow();
+    await db.close();
+})
+
+test('wasm-udf-sync-client-creates', async () => {
+    // Server: create table so bootstrap works
+    {
+        const db = await connect({
+            path: ':memory:',
+            url: process.env.VITE_TURSO_DB_URL,
+        });
+        await db.exec("CREATE TABLE IF NOT EXISTS _wasm_dummy (x)");
+        await db.push();
+        await db.close();
+    }
+
+    // Client 1: create UDF and push
+    {
+        const db = await connect({
+            path: ':memory:',
+            url: process.env.VITE_TURSO_DB_URL,
+            unstableWasmRuntime: true,
+        });
+        await db.exec(`CREATE FUNCTION add2 LANGUAGE wasm AS X'${ADD_WASM_HEX}' EXPORT 'add'`);
+        expect(await db.prepare("SELECT add2(10, 20) AS r").all()).toEqual([{ r: 30 }]);
+        await db.push();
+        await db.close();
+    }
+
+    // Client 2: pull and verify UDF works
+    const db = await connect({
+        path: ':memory:',
+        url: process.env.VITE_TURSO_DB_URL,
+        unstableWasmRuntime: true,
+    });
+    expect(await db.prepare("SELECT add2(100, 200) AS r").all()).toEqual([{ r: 300 }]);
+    await db.close();
+})

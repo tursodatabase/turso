@@ -10,6 +10,7 @@ repository.workspace = true
 [features]
 encryption = ["turso_core/encryption"]
 pure-rust-crypto = ["turso_core/pure-rust-crypto"]
+wasm-udf = ["turso_core/wasm-udf"]
 
 [lib]
 doc = false
@@ -23,6 +24,7 @@ turso_core = { workspace = true, features = [
     "experimental_win_iocp",
 ] }
 turso_sdk_kit_macros = { workspace = true }
+turso_wasm_wasmtime = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }

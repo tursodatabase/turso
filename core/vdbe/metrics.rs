@@ -91,6 +91,13 @@ pub struct StatementMetrics {
 
     // Hash join spill/probe metrics
     pub hash_join: HashJoinMetrics,
+
+    // WASM UDF metrics
+    pub wasm_instructions: u64,
+    pub wasm_cache_hits: u64,
+    pub wasm_cache_misses: u64,
+    pub wasm_cache_evictions: u64,
+    pub wasm_instances_created: u64,
 }
 
 impl StatementMetrics {
@@ -119,6 +126,19 @@ impl StatementMetrics {
         self.btree_next = self.btree_next.saturating_add(other.btree_next);
         self.btree_prev = self.btree_prev.saturating_add(other.btree_prev);
         self.hash_join.merge(&other.hash_join);
+        self.wasm_instructions = self
+            .wasm_instructions
+            .saturating_add(other.wasm_instructions);
+        self.wasm_cache_hits = self.wasm_cache_hits.saturating_add(other.wasm_cache_hits);
+        self.wasm_cache_misses = self
+            .wasm_cache_misses
+            .saturating_add(other.wasm_cache_misses);
+        self.wasm_cache_evictions = self
+            .wasm_cache_evictions
+            .saturating_add(other.wasm_cache_evictions);
+        self.wasm_instances_created = self
+            .wasm_instances_created
+            .saturating_add(other.wasm_instances_created);
     }
 
     /// Reset all counters to zero
@@ -195,6 +215,12 @@ impl fmt::Display for StatementMetrics {
             self.hash_join.grace_probe_rows_buffered
         )?;
         writeln!(f, "    Grace matches:     {}", self.hash_join.grace_matches)?;
+        writeln!(f, "  WASM UDF:")?;
+        writeln!(f, "    Instructions:      {}", self.wasm_instructions)?;
+        writeln!(f, "    Cache hits:        {}", self.wasm_cache_hits)?;
+        writeln!(f, "    Cache misses:      {}", self.wasm_cache_misses)?;
+        writeln!(f, "    Cache evictions:   {}", self.wasm_cache_evictions)?;
+        writeln!(f, "    Instances created: {}", self.wasm_instances_created)?;
         Ok(())
     }
 }

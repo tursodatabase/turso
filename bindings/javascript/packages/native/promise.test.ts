@@ -1,6 +1,8 @@
-import { unlinkSync } from "node:fs";
+import { unlinkSync, readFileSync, existsSync } from "node:fs";
+import { resolve } from "node:path";
+import { execSync } from "node:child_process";
 import { expect, test } from 'vitest'
-import { Database, connect } from './promise.js'
+import { Database, connect, createUnstableNativeWasmRuntime } from './promise.js'
 import { sql } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 
@@ -308,4 +310,112 @@ test('example-2', async () => {
         { name: 'Alice', email: 'alice@example.com' },
         { name: 'Bob', email: 'bob@example.com' }
     ]);
+})
+
+// ── WASM UDF tests ──────────────────────────────────────────────────────────
+
+// Old-convention WAT: add(argc, argv) -> argv[0] + argv[1]
+const ADD_WASM_HEX =
+    "0061736d01000000010c0260017f017f60027f7f017e030302000105030100020607017f014180080b" +
+    "071f03066d656d6f727902000c747572736f5f6d616c6c6f6300000361646400010a24021101017f23" +
+    "002101230020006a240020010b10002001290300200141086a2903007c0b002c046e616d65021c0200" +
+    "02000473697a6501037074720102000461726763010461726776070701000462756d70";
+
+test('wasm-udf-no-runtime', async () => {
+    const db = await connect(":memory:");
+    await expect(async () => {
+        await db.exec(`CREATE FUNCTION add2 LANGUAGE wasm AS X'${ADD_WASM_HEX}' EXPORT 'add'`);
+    }).rejects.toThrowError();
+    await db.close();
+})
+
+test('wasm-udf-old-convention', async () => {
+    const db = await connect(":memory:", { unstableWasmRuntime: createUnstableNativeWasmRuntime() });
+    await db.exec(`CREATE FUNCTION add2 LANGUAGE wasm AS X'${ADD_WASM_HEX}' EXPORT 'add'`);
+
+    expect(await db.prepare("SELECT add2(40, 2) AS r").all()).toEqual([{ r: 42 }]);
+    expect(await db.prepare("SELECT add2(-10, 3) AS r").all()).toEqual([{ r: -7 }]);
+    expect(await db.prepare("SELECT add2(add2(1,2), add2(3,4)) AS r").all()).toEqual([{ r: 10 }]);
+
+    // UDF on table data
+    await db.exec("CREATE TABLE data (a INT, b INT)");
+    await db.exec("INSERT INTO data VALUES (10, 20), (30, 40), (50, 60)");
+    expect(await db.prepare("SELECT add2(a, b) AS s FROM data ORDER BY s").all()).toEqual([
+        { s: 30 }, { s: 70 }, { s: 110 },
+    ]);
+
+    await db.exec("DROP FUNCTION add2");
+    expect(() => db.prepare("SELECT add2(1,2)")).toThrowError(/no such function/);
+    await db.close();
+})
+
+// Build SDK WASM if needed and return its hex string
+function getSdkWasmHex(): string {
+    const root = resolve(import.meta.dirname, "../../../..");
+    const wasmPath = resolve(root, "wasm-sdk/examples/rust/target/wasm32-unknown-unknown/release/turso_udf_examples.wasm");
+    if (!existsSync(wasmPath)) {
+        execSync("cargo build --release --target wasm32-unknown-unknown", {
+            cwd: resolve(root, "wasm-sdk/examples/rust"),
+            stdio: "ignore",
+        });
+    }
+    const bytes = readFileSync(wasmPath);
+    return Buffer.from(bytes).toString("hex");
+}
+
+test('wasm-udf-sdk-integer-add', async () => {
+    const hex = getSdkWasmHex();
+    const db = await connect(":memory:", { unstableWasmRuntime: createUnstableNativeWasmRuntime() });
+    await db.exec(`CREATE FUNCTION sdk_add LANGUAGE wasm AS X'${hex}' EXPORT 'add'`);
+
+    expect(await db.prepare("SELECT sdk_add(40, 2) AS r").all()).toEqual([{ r: 42 }]);
+    expect(await db.prepare("SELECT sdk_add(-100, 50) AS r").all()).toEqual([{ r: -50 }]);
+    expect(await db.prepare("SELECT sdk_add(0, 0) AS r").all()).toEqual([{ r: 0 }]);
+    await db.close();
+})
+
+test('wasm-udf-sdk-text-upper', async () => {
+    const hex = getSdkWasmHex();
+    const db = await connect(":memory:", { unstableWasmRuntime: createUnstableNativeWasmRuntime() });
+    await db.exec(`CREATE FUNCTION sdk_upper LANGUAGE wasm AS X'${hex}' EXPORT 'upper'`);
+
+    expect(await db.prepare("SELECT sdk_upper('hello') AS r").all()).toEqual([{ r: "HELLO" }]);
+    expect(await db.prepare("SELECT sdk_upper('Hello World!') AS r").all()).toEqual([{ r: "HELLO WORLD!" }]);
+    await db.close();
+})
+
+test('wasm-udf-sdk-float-mul', async () => {
+    const hex = getSdkWasmHex();
+    const db = await connect(":memory:", { unstableWasmRuntime: createUnstableNativeWasmRuntime() });
+    await db.exec(`CREATE FUNCTION sdk_float_mul LANGUAGE wasm AS X'${hex}' EXPORT 'float_mul'`);
+
+    expect(await db.prepare("SELECT sdk_float_mul(2.5, 4.0) AS r").all()).toEqual([{ r: 10.0 }]);
+    expect(await db.prepare("SELECT sdk_float_mul(-1.5, 2.0) AS r").all()).toEqual([{ r: -3.0 }]);
+    await db.close();
+})
+
+test('wasm-udf-sdk-nullable', async () => {
+    const hex = getSdkWasmHex();
+    const db = await connect(":memory:", { unstableWasmRuntime: createUnstableNativeWasmRuntime() });
+    await db.exec(`CREATE FUNCTION sdk_nullable_len LANGUAGE wasm AS X'${hex}' EXPORT 'nullable_len'`);
+
+    expect(await db.prepare("SELECT sdk_nullable_len('hello') AS r").all()).toEqual([{ r: 5 }]);
+    expect(await db.prepare("SELECT TYPEOF(sdk_nullable_len(NULL)) AS r").all()).toEqual([{ r: "null" }]);
+    await db.close();
+})
+
+test('wasm-udf-sdk-on-table-data', async () => {
+    const hex = getSdkWasmHex();
+    const db = await connect(":memory:", { unstableWasmRuntime: createUnstableNativeWasmRuntime() });
+    await db.exec(`CREATE FUNCTION sdk_add LANGUAGE wasm AS X'${hex}' EXPORT 'add'`);
+    await db.exec(`CREATE FUNCTION sdk_upper LANGUAGE wasm AS X'${hex}' EXPORT 'upper'`);
+
+    await db.exec("CREATE TABLE items (name TEXT, price INT, tax INT)");
+    await db.exec("INSERT INTO items VALUES ('widget', 100, 8), ('gadget', 250, 20)");
+
+    expect(await db.prepare("SELECT sdk_upper(name) AS n, sdk_add(price, tax) AS total FROM items ORDER BY total").all()).toEqual([
+        { n: "WIDGET", total: 108 },
+        { n: "GADGET", total: 270 },
+    ]);
+    await db.close();
 })

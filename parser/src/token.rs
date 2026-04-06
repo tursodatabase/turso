@@ -186,6 +186,10 @@ pub enum TokenType {
     TK_COLON = 191,
     TK_ARRAY_CONTAINS = 192, // @>
     TK_ARRAY_OVERLAP = 193,  // &&
+    TK_FUNCTION = 194,
+    TK_LANGUAGE = 195,
+    TK_EXPORT = 196,
+    TK_EXTENSION = 197,
     // None token
     TK_NONE = 255,
 }
@@ -357,6 +361,10 @@ impl TokenType {
             TokenType::TK_COLON => Some(":"),
             TokenType::TK_ARRAY_CONTAINS => Some("@>"),
             TokenType::TK_ARRAY_OVERLAP => Some("&&"),
+            TokenType::TK_FUNCTION => Some("FUNCTION"),
+            TokenType::TK_LANGUAGE => Some("LANGUAGE"),
+            TokenType::TK_EXPORT => Some("EXPORT"),
+            TokenType::TK_EXTENSION => Some("EXTENSION"),
             _ => None,
         }
     }
@@ -559,6 +567,10 @@ impl Display for TokenType {
             TK_COLON => "TK_COLON",
             TK_ARRAY_CONTAINS => "TK_ARRAY_CONTAINS",
             TK_ARRAY_OVERLAP => "TK_ARRAY_OVERLAP",
+            TK_FUNCTION => "TK_FUNCTION",
+            TK_LANGUAGE => "TK_LANGUAGE",
+            TK_EXPORT => "TK_EXPORT",
+            TK_EXTENSION => "TK_EXTENSION",
             // None
             TK_NONE => "TK_NONE",
         };
@@ -583,7 +595,7 @@ impl TokenType {
             | TK_LAST | TK_CURRENT | TK_FOLLOWING | TK_PARTITION | TK_PRECEDING | TK_RANGE
             | TK_UNBOUNDED | TK_EXCLUDE | TK_GROUPS | TK_OTHERS | TK_TIES | TK_ALWAYS
             | TK_MATERIALIZED | TK_REINDEX | TK_RENAME | TK_CTIME_KW | TK_IF | TK_OPTIMIZE
-            | TK_TYPE => TK_ID,
+            | TK_TYPE | TK_FUNCTION | TK_LANGUAGE | TK_EXPORT | TK_EXTENSION => TK_ID,
             // | TK_COLUMNKW | TK_UNION | TK_EXCEPT | TK_INTERSECT | TK_GENERATED | TK_WITHOUT
             // see comments in `next_token` of parser
             _ => self,

@@ -16,8 +16,10 @@ crate-type = ["cdylib"]
 
 [dependencies]
 anyhow = "1.0"
+turso_core = { workspace = true }
 turso_sdk_kit = { workspace = true }
 turso_sync_sdk_kit = { workspace = true }
+turso_wasm_wasmtime = { workspace = true }
 pyo3 = { version = "0.28.2", features = ["anyhow"] }
 
 [build-dependencies]

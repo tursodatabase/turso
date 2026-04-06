@@ -21,11 +21,32 @@ export interface DatabaseOpts {
     experimental?: ExperimentalFeature[]
     /** Optional local encryption configuration */
     encryption?: EncryptionOpts
+    /** Optional WASM runtime for user-defined functions (unstable, subject to change).
+     *  Pass `createUnstableNativeWasmRuntime()` for built-in WebAssembly support,
+     *  or an external runtime object implementing the WasmRuntime interface. */
+    unstableWasmRuntime?: WasmRuntime
 }
 
 export interface QueryOptions {
     /** Per-query timeout in milliseconds. Overrides defaultQueryTimeout for this call. */
     queryTimeout?: number
+}
+
+/** Interface that any WASM runtime must implement. */
+export interface WasmRuntime {
+    addModule(name: string, wasmBytes: Uint8Array, exportName: string): void;
+    removeModule(name: string): void;
+    createInstance(name: string): WasmInstance;
+    hasModule(name: string): boolean;
+}
+
+/** Interface for a WASM module instance. */
+export interface WasmInstance {
+    writeMemory(offset: number, bytes: Uint8Array): void;
+    readMemory(offset: number, len: number): Uint8Array;
+    memorySize(): number;
+    malloc(size: number): number;
+    callRaw(argc: number, argvPtr: number): number | bigint;
 }
 
 export interface NativeDatabase {

@@ -18,7 +18,7 @@ mod tests {
 
         // First session: create a custom type, table, and insert data
         {
-            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts.clone());
             let conn = db.connect_limbo();
             conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
                 .unwrap();
@@ -35,7 +35,7 @@ mod tests {
 
         // Second session: reopen and verify decoded values
         {
-            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts.clone());
             let conn = db.connect_limbo();
 
             // SELECT must return decoded values, not raw encoded (4200, 10000)
@@ -70,7 +70,7 @@ mod tests {
 
         // First session: create type, table, insert data
         {
-            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts.clone());
             let conn = db.connect_limbo();
             conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
                 .unwrap();
@@ -82,7 +82,7 @@ mod tests {
 
         // Second session: reopen, create a new table using the same type
         {
-            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts.clone());
             let conn = db.connect_limbo();
 
             // Original table still decodes
@@ -109,7 +109,7 @@ mod tests {
 
         // Third session: reopen again, both tables must still work
         {
-            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts.clone());
             let conn = db.connect_limbo();
 
             let rows: Vec<(i64,)> = conn.exec_rows("SELECT amount FROM t1 WHERE id = 1");
@@ -133,7 +133,7 @@ mod tests {
             .with_custom_types(true)
             .with_encryption(true);
 
-        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts.clone());
         let conn1 = db.connect_limbo();
         conn1
             .execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
@@ -174,7 +174,7 @@ mod tests {
         let opts = turso_core::DatabaseOpts::new()
             .with_custom_types(true)
             .with_encryption(true);
-        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts.clone());
         let conn = db.connect_limbo();
 
         conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
@@ -264,7 +264,7 @@ mod tests {
         let opts = turso_core::DatabaseOpts::new()
             .with_custom_types(true)
             .with_encryption(true);
-        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts.clone());
         let conn = db.connect_limbo();
 
         conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
@@ -330,7 +330,7 @@ mod tests {
 
         // Create source database with custom type and data
         {
-            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts.clone());
             let conn = db.connect_limbo();
             conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
                 .unwrap();
@@ -347,7 +347,7 @@ mod tests {
 
         // Open the vacuumed database and verify
         {
-            let db = TempDatabase::new_with_existent_with_opts(&dest_path, opts);
+            let db = TempDatabase::new_with_existent_with_opts(&dest_path, opts.clone());
             let conn = db.connect_limbo();
 
             // Data must be decoded correctly
@@ -384,7 +384,7 @@ mod tests {
         let opts = turso_core::DatabaseOpts::new()
             .with_custom_types(true)
             .with_encryption(true);
-        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts.clone());
         let conn = db.connect_limbo();
 
         conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")

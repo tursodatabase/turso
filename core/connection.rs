@@ -330,12 +330,12 @@ impl Connection {
                     ));
                 }
             };
-            let syms = self.syms.read();
             let byte_offset_end = parser.offset();
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
             self.maybe_update_schema();
+            let syms = self.syms.read();
             let pager = self.pager.load().clone();
             let mode = QueryMode::new(&cmd);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
@@ -499,6 +499,13 @@ impl Connection {
 
         reparse_result?;
 
+        // Re-sync WASM function metadata from the shared builtin_syms so this
+        // connection can resolve functions created by other connections.
+        {
+            let builtin_syms = self.db.builtin_syms.read();
+            self.syms.write().extend(&builtin_syms);
+        }
+
         let schema = self.schema.read().clone();
         self.db.update_schema_if_newer(schema);
         Ok(())
@@ -564,6 +571,11 @@ impl Connection {
             }
         }
 
+        // WASM function/extension metadata is propagated via db.builtin_syms
+        // (populated by DDL opcodes and Database::open). No per-connection WASM
+        // loading or compilation needed here — new connections inherit builtin_syms
+        // via connect(), and schema changes trigger re-sync in maybe_update_schema.
+
         // Best-effort load stats if sqlite_stat1 is present and DB is initialized.
         refresh_analyze_stats(self);
 
@@ -593,24 +605,29 @@ impl Connection {
         tracing::trace!("Preparing and executing batch: {}", sql);
         let mut parser = Parser::new(sql.as_bytes());
         while let Some(cmd) = parser.next_cmd()? {
-            let syms = self.syms.read();
-            let pager = self.pager.load().clone();
-            let byte_offset_end = parser.offset();
-            let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
-                .unwrap()
-                .trim();
-            let mode = QueryMode::new(&cmd);
-            let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
-            let schema = self.schema.read().clone();
-            let program = translate::translate(
-                &schema,
-                stmt,
-                pager.clone(),
-                self.clone(),
-                &syms,
-                mode,
-                input,
-            )?;
+            let (program, pager, mode) = {
+                let syms = self.syms.read();
+                let pager = self.pager.load().clone();
+                let byte_offset_end = parser.offset();
+                let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
+                    .unwrap()
+                    .trim();
+                let mode = QueryMode::new(&cmd);
+                let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+                let schema = self.schema.read().clone();
+                let program = translate::translate(
+                    &schema,
+                    stmt,
+                    pager.clone(),
+                    self.clone(),
+                    &syms,
+                    mode,
+                    input,
+                )?;
+                (program, pager, mode)
+            };
+            // syms read lock dropped — execution may take syms.write()
+            // (e.g. AddExtension, DropExtension opcodes).
             Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
         }
         Ok(())
@@ -678,24 +695,29 @@ impl Connection {
         self.maybe_update_schema();
         let mut parser = Parser::new(sql.as_bytes());
         while let Some(cmd) = parser.next_cmd()? {
-            let syms = self.syms.read();
-            let pager = self.pager.load().clone();
-            let byte_offset_end = parser.offset();
-            let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
-                .unwrap()
-                .trim();
-            let mode = QueryMode::new(&cmd);
-            let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
-            let schema = self.schema.read().clone();
-            let program = translate::translate(
-                &schema,
-                stmt,
-                pager.clone(),
-                self.clone(),
-                &syms,
-                mode,
-                input,
-            )?;
+            let (program, pager, mode) = {
+                let syms = self.syms.read();
+                let pager = self.pager.load().clone();
+                let byte_offset_end = parser.offset();
+                let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
+                    .unwrap()
+                    .trim();
+                let mode = QueryMode::new(&cmd);
+                let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+                let schema = self.schema.read().clone();
+                let program = translate::translate(
+                    &schema,
+                    stmt,
+                    pager.clone(),
+                    self.clone(),
+                    &syms,
+                    mode,
+                    input,
+                )?;
+                (program, pager, mode)
+            };
+            // syms read lock dropped — execution may take syms.write()
+            // (e.g. AddExtension, DropExtension opcodes).
             Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
         }
         Ok(())
@@ -878,6 +900,49 @@ impl Connection {
         Ok(type_rows)
     }
 
+    pub(crate) fn query_stored_function_definitions(self: &Arc<Connection>) -> Result<Vec<String>> {
+        let has_wasm_table = {
+            let s = self.schema.read();
+            s.tables.contains_key(crate::schema::TURSO_WASM_TABLE_NAME)
+        };
+        if !has_wasm_table {
+            return Ok(Vec::new());
+        }
+        let mut func_stmt = self.prepare(format!(
+            "SELECT name, sql FROM {} WHERE sql LIKE 'CREATE FUNCTION%'",
+            crate::schema::TURSO_WASM_TABLE_NAME
+        ))?;
+        let mut func_rows = Vec::new();
+        func_stmt.run_with_row_callback(|row| {
+            func_rows.push(row.get::<&str>(1)?.to_string());
+            Ok(())
+        })?;
+        Ok(func_rows)
+    }
+
+    #[cfg(feature = "wasm-udf")]
+    pub(crate) fn query_stored_extension_definitions(
+        self: &Arc<Connection>,
+    ) -> Result<Vec<String>> {
+        let has_wasm_table = {
+            let s = self.schema.read();
+            s.tables.contains_key(crate::schema::TURSO_WASM_TABLE_NAME)
+        };
+        if !has_wasm_table {
+            return Ok(Vec::new());
+        }
+        let mut ext_stmt = self.prepare(format!(
+            "SELECT name, sql FROM {} WHERE sql LIKE 'CREATE EXTENSION%'",
+            crate::schema::TURSO_WASM_TABLE_NAME
+        ))?;
+        let mut ext_rows = Vec::new();
+        ext_stmt.run_with_row_callback(|row| {
+            ext_rows.push(row.get::<&str>(1)?.to_string());
+            Ok(())
+        })?;
+        Ok(ext_rows)
+    }
+
     pub fn maybe_update_schema(&self) {
         let current_schema_version = self.schema.read().schema_version;
         let schema = self.db.schema.lock();
@@ -885,6 +950,8 @@ impl Connection {
             && current_schema_version != schema.schema_version
         {
             *self.schema.write() = schema.clone();
+            let builtin_syms = self.db.builtin_syms.read();
+            self.syms.write().extend(&builtin_syms);
         }
     }
 
@@ -1221,6 +1288,18 @@ impl Connection {
     pub fn set_cache_size(&self, size: i32) {
         self.cache_size.store(size, Ordering::SeqCst);
         self.bump_prepare_context_generation();
+    }
+
+    pub fn get_wasm_cache_capacity(&self) -> i64 {
+        self.db.wasm_budget.capacity()
+    }
+
+    pub fn get_wasm_cache_used(&self) -> i64 {
+        self.db.wasm_budget.used()
+    }
+
+    pub fn set_wasm_cache_capacity(&self, bytes: i64) {
+        self.db.wasm_budget.set_capacity(bytes);
     }
 
     pub fn get_capture_data_changes_info(
@@ -2155,6 +2234,7 @@ impl Connection {
                 let is_agg = matches!(f.func, function::ExtFunc::Aggregate { .. });
                 let argc = match &f.func {
                     function::ExtFunc::Aggregate { argc, .. } => *argc as i32,
+                    function::ExtFunc::Wasm { narg, .. } => *narg,
                     function::ExtFunc::Scalar(_) => -1,
                 };
                 (f.name.clone(), is_agg, argc)
@@ -2498,12 +2578,87 @@ impl SymbolTable {
             index_methods: HashMap::default(),
         }
     }
+    /// Remove all extension-registered resources (vtab modules, index methods)
+    /// from the symbol table and WASM runtime. Called when dropping an extension.
+    pub fn remove_extension_resources(
+        &mut self,
+        func_names: &[String],
+        vtab_names: &[String],
+        wasm_runtime: Option<&Arc<dyn crate::wasm::WasmRuntimeApi>>,
+    ) {
+        // Remove scalar/aggregate functions
+        for name in func_names {
+            self.functions.remove(name);
+            if let Some(runtime) = wasm_runtime {
+                runtime.remove_module(name);
+            }
+        }
+
+        // Remove vtab modules
+        for vtab_name in vtab_names {
+            self.vtab_modules.remove(vtab_name);
+            if let Some(runtime) = wasm_runtime {
+                let prefix = format!("__wasm_vtab_{vtab_name}");
+                for suffix in [
+                    "_open", "_filter", "_column", "_next", "_eof", "_rowid", "_close",
+                ] {
+                    runtime.remove_module(&format!("{prefix}{suffix}"));
+                }
+            }
+        }
+    }
+
     pub fn resolve_function(
         &self,
         name: &str,
         _arg_count: usize,
     ) -> Option<Arc<function::ExternalFunc>> {
         self.functions.get(name).cloned()
+    }
+
+    /// Check that `name` doesn't conflict with a builtin or already-registered function.
+    pub fn check_function_name(&self, name: &str) -> crate::Result<()> {
+        if function::Func::is_builtin_function_name(name) {
+            return Err(LimboError::ExtensionError(format!(
+                "function '{name}' conflicts with a built-in function"
+            )));
+        }
+        if self.functions.contains_key(name) {
+            return Err(LimboError::ExtensionError(format!(
+                "function '{name}' conflicts with an already-registered function"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Check that `name` doesn't conflict with an already-registered vtab module.
+    pub fn check_vtab_module_name(&self, name: &str) -> crate::Result<()> {
+        if self.vtab_modules.contains_key(name) {
+            return Err(LimboError::ExtensionError(format!(
+                "virtual table module '{name}' conflicts with an already-registered module"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Register a WASM function by name in the symbol table.
+    /// `narg` is the declared argument count, or -1 for variadic.
+    /// `sig` is the typed ABI signature (if available from turso_sig section).
+    pub fn register_wasm_func(
+        &mut self,
+        name: String,
+        narg: i32,
+        sig: Option<crate::wasm::WasmFuncSig>,
+    ) {
+        let ext = Arc::new(function::ExternalFunc {
+            name: name.clone(),
+            func: function::ExtFunc::Wasm {
+                name: name.clone(),
+                narg,
+                sig,
+            },
+        });
+        self.functions.insert(name, ext);
     }
 
     pub fn extend(&mut self, other: &SymbolTable) {

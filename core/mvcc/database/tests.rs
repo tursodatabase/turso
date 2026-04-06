@@ -73,8 +73,14 @@ impl MvccTestDbNoConn {
     pub fn new() -> Self {
         let io = Arc::new(MemoryIO::new());
         let opts = DatabaseOpts::new();
-        let db = Database::open_file_with_flags(io, ":memory:", OpenFlags::default(), opts, None)
-            .unwrap();
+        let db = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::default(),
+            opts.clone(),
+            None,
+        )
+        .unwrap();
         // Enable MVCC via PRAGMA
         let conn = db.connect().unwrap();
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
@@ -106,7 +112,7 @@ impl MvccTestDbNoConn {
             io,
             path.as_os_str().to_str().unwrap(),
             OpenFlags::default(),
-            opts,
+            opts.clone(),
             None,
         )
         .unwrap();
@@ -140,7 +146,7 @@ impl MvccTestDbNoConn {
             io,
             path.as_os_str().to_str().unwrap(),
             OpenFlags::default(),
-            opts,
+            opts.clone(),
             Some(enc_opts.clone()),
         )
         .unwrap();
@@ -178,7 +184,7 @@ impl MvccTestDbNoConn {
             io,
             path,
             OpenFlags::default(),
-            self.opts,
+            self.opts.clone(),
             self.enc_opts.clone(),
         )?;
         self.db.replace(db);

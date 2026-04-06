@@ -1529,13 +1529,37 @@ pub fn translate_expr(
                 Func::Window(_) => {
                     crate::bail_parse_error!("misuse of window function {}()", name.as_str())
                 }
-                Func::External(_) => {
+                Func::External(ext) => {
                     let regs = program.alloc_registers(args_count);
                     for (i, arg_expr) in args.iter().enumerate() {
                         translate_expr(program, referenced_tables, arg_expr, regs + i, resolver)?;
                     }
 
-                    // Use shared function call helper
+                    // WASM UDFs with a typed signature (from turso_sig section,
+                    // emitted by the SDK macros) get a dedicated WasmFunction
+                    // instruction. Those without (e.g. plain C extensions compiled
+                    // to WASM) fall through to the generic Function instruction.
+                    if let crate::function::ExtFunc::Wasm {
+                        ref name,
+                        sig: Some(ref sig),
+                        ..
+                    } = ext.func
+                    {
+                        program.emit_insn(Insn::WasmFunction {
+                            func_name: name.clone(),
+                            arg_count: args_count,
+                            start_reg: if args_count == 0 {
+                                target_register
+                            } else {
+                                regs
+                            },
+                            dest: target_register,
+                            sig: sig.clone(),
+                        });
+                        return Ok(target_register);
+                    }
+
+                    // Generic path: untyped WASM or non-WASM external functions
                     let arg_registers: Vec<usize> = (regs..regs + args_count).collect();
                     emit_function_call(program, func_ctx, &arg_registers, target_register)?;
 

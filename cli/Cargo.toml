@@ -33,7 +33,9 @@ turso_core = { workspace = true, default-features = true, features = [
     "conn_raw_api",
     "fs",
 	"fts",
+	"wasm-udf",
 ] }
+turso_wasm_wasmtime = { workspace = true }
 turso_sync_engine = { workspace = true }
 limbo_completion = { workspace = true, features = ["static"] }
 miette = { workspace = true, features = ["fancy"] }

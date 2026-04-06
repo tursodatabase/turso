@@ -1,6 +1,86 @@
 use tokio::fs;
 use turso::{Builder, EncryptionOpts, Error, Value};
 
+// ── Sync WASM UDF test helper ──────────────────────────────────────────────
+
+#[cfg(feature = "sync")]
+mod sync_test_helpers {
+    /// Helper that spawns a local tursodb sync server for testing.
+    /// Reads the binary path from the `LOCAL_SYNC_SERVER` env var.
+    pub struct TursoSyncServer {
+        process: std::process::Child,
+        url: String,
+    }
+
+    impl TursoSyncServer {
+        pub fn new() -> Option<Self> {
+            let bin = std::env::var("LOCAL_SYNC_SERVER").ok()?;
+            let port = 10_000 + (rand::random::<u16>() % 55_000);
+            let process = std::process::Command::new(&bin)
+                .arg("--sync-server")
+                .arg(format!("0.0.0.0:{port}"))
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("failed to spawn sync server");
+
+            let url = format!("http://localhost:{port}");
+            let server = Self { process, url };
+
+            // Wait for server to be ready
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while std::time::Instant::now() < deadline {
+                if let Ok(resp) = reqwest::blocking::get(&server.url) {
+                    let _ = resp;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Some(server)
+        }
+
+        pub fn db_url(&self) -> &str {
+            &self.url
+        }
+
+        /// Execute SQL on the server via the v2 pipeline API.
+        pub async fn db_sql(&self, sql: &str) -> Vec<Vec<serde_json::Value>> {
+            let client = reqwest::Client::new();
+            let body = serde_json::json!({
+                "requests": [{"type": "execute", "stmt": {"sql": sql}}]
+            });
+            let resp = client
+                .post(format!("{}/v2/pipeline", self.url))
+                .json(&body)
+                .send()
+                .await
+                .expect("failed to POST to sync server");
+            let json: serde_json::Value = resp.json().await.expect("invalid JSON from sync server");
+            let result = &json["results"][0];
+            assert_eq!(result["type"], "ok", "remote sql failed: {json}");
+            result["response"]["result"]["rows"]
+                .as_array()
+                .unwrap_or(&vec![])
+                .iter()
+                .map(|row| {
+                    row.as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|cell| cell["value"].clone())
+                        .collect()
+                })
+                .collect()
+        }
+    }
+
+    impl Drop for TursoSyncServer {
+        fn drop(&mut self) {
+            let _ = self.process.kill();
+            let _ = self.process.wait();
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_rows_next() {
     let builder = Builder::new_local(":memory:");
@@ -1828,4 +1908,172 @@ async fn test_autoincrement_blocked_in_mvcc() {
         .unwrap();
     let count = query_i64(&conn, "SELECT COUNT(*) FROM t").await;
     assert_eq!(count, 1);
+}
+
+// ── WASM UDF SDK-level tests ────────────────────────────────────────────────
+
+const ADD_WASM_HEX: &str = concat!(
+    "0061736d01000000010c0260017f017f60027f7f017e030302000105030100020607017f014180080b",
+    "071f03066d656d6f727902000c747572736f5f6d616c6c6f6300000361646400010a24021101017f23",
+    "002101230020006a240020010b10002001290300200141086a2903007c0b002c046e616d65021c0200",
+    "02000473697a6501037074720102000461726763010461726776070701000462756d70",
+);
+
+/// CREATE FUNCTION should fail when no WASM runtime is configured.
+#[tokio::test]
+async fn test_wasm_udf_no_runtime() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+    let create_sql =
+        format!("CREATE FUNCTION add2 LANGUAGE wasm AS X'{ADD_WASM_HEX}' EXPORT 'add'");
+    let result = conn.execute(&create_sql, ()).await;
+    assert!(
+        result.is_err(),
+        "CREATE FUNCTION should fail without a WASM runtime"
+    );
+}
+
+/// WASM UDFs should work when a Wasmtime runtime is provided.
+#[tokio::test]
+async fn test_wasm_udf_with_wasmtime() {
+    let runtime = std::sync::Arc::new(
+        turso_wasm_wasmtime::WasmtimeRuntime::new().expect("failed to create wasmtime runtime"),
+    );
+    let db = Builder::new_local(":memory:")
+        .with_unstable_wasm_runtime(runtime)
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    let create_sql =
+        format!("CREATE FUNCTION add2 LANGUAGE wasm AS X'{ADD_WASM_HEX}' EXPORT 'add'");
+    conn.execute(&create_sql, ()).await.unwrap();
+
+    let mut rows = conn.query("SELECT add2(40, 2) AS r", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get_value(0).unwrap(), Value::Integer(42));
+
+    // Verify DROP FUNCTION works
+    conn.execute("DROP FUNCTION add2", ()).await.unwrap();
+    let result = conn.query("SELECT add2(1, 2)", ()).await;
+    assert!(result.is_err(), "add2 should not exist after DROP FUNCTION");
+}
+
+// ── Sync WASM UDF tests ───────────────��────────────────────────────────────
+// These tests require LOCAL_SYNC_SERVER=path/to/tursodb to be set.
+
+/// Server creates WASM UDF → sync client with runtime pulls → SELECT works.
+#[cfg(feature = "sync")]
+#[tokio::test]
+#[ignore = "requires LOCAL_SYNC_SERVER"]
+async fn test_sync_wasm_udf_with_runtime() {
+    use sync_test_helpers::TursoSyncServer;
+    let server = TursoSyncServer::new().expect("LOCAL_SYNC_SERVER not set");
+
+    // Server-side: create the UDF
+    let create_sql =
+        format!("CREATE FUNCTION add2 LANGUAGE wasm AS X'{ADD_WASM_HEX}' EXPORT 'add'");
+    server.db_sql(&create_sql).await;
+
+    // Verify server can execute the UDF
+    let rows = server.db_sql("SELECT add2(1, 2)").await;
+    assert_eq!(rows[0][0], serde_json::json!("3"));
+
+    // Client: connect with WASM runtime
+    let runtime = std::sync::Arc::new(
+        turso_wasm_wasmtime::WasmtimeRuntime::new().expect("failed to create wasmtime runtime"),
+    );
+    let db = turso::sync::Builder::new_remote(":memory:")
+        .with_remote_url(server.db_url())
+        .with_unstable_wasm_runtime(runtime)
+        .build()
+        .await
+        .unwrap();
+
+    let conn = db.connect().await.unwrap();
+
+    // Verify the UDF works via sync
+    let mut rows = conn.query("SELECT add2(40, 2) AS r", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get_value(0).unwrap(), Value::Integer(42));
+}
+
+/// Server creates WASM UDF → sync client WITHOUT runtime → pull succeeds, SELECT UDF fails.
+#[cfg(feature = "sync")]
+#[tokio::test]
+#[ignore = "requires LOCAL_SYNC_SERVER"]
+async fn test_sync_wasm_udf_no_runtime() {
+    use sync_test_helpers::TursoSyncServer;
+    let server = TursoSyncServer::new().expect("LOCAL_SYNC_SERVER not set");
+
+    // Server-side: create the UDF
+    let create_sql =
+        format!("CREATE FUNCTION add2 LANGUAGE wasm AS X'{ADD_WASM_HEX}' EXPORT 'add'");
+    server.db_sql(&create_sql).await;
+
+    // Client: connect WITHOUT WASM runtime
+    let db = turso::sync::Builder::new_remote(":memory:")
+        .with_remote_url(server.db_url())
+        .build()
+        .await
+        .unwrap();
+
+    let conn = db.connect().await.unwrap();
+
+    // Pull succeeds (DDL syncs fine)
+    // But SELECT using the UDF should fail
+    let result = conn.query("SELECT add2(1, 2)", ()).await;
+    assert!(
+        result.is_err(),
+        "SELECT with WASM UDF should fail without runtime"
+    );
+}
+
+/// Client with runtime creates UDF locally → push → new client pulls → SELECT works.
+#[cfg(feature = "sync")]
+#[tokio::test]
+#[ignore = "requires LOCAL_SYNC_SERVER"]
+async fn test_sync_wasm_udf_client_creates_function() {
+    use sync_test_helpers::TursoSyncServer;
+    let server = TursoSyncServer::new().expect("LOCAL_SYNC_SERVER not set");
+
+    // Create a table on the server first so bootstrap works
+    server.db_sql("CREATE TABLE IF NOT EXISTS _dummy (x)").await;
+
+    // Client 1: connect with WASM runtime and create the UDF
+    let runtime = std::sync::Arc::new(
+        turso_wasm_wasmtime::WasmtimeRuntime::new().expect("failed to create wasmtime runtime"),
+    );
+    let db1 = turso::sync::Builder::new_remote(":memory:")
+        .with_remote_url(server.db_url())
+        .with_unstable_wasm_runtime(runtime.clone())
+        .build()
+        .await
+        .unwrap();
+
+    let conn1 = db1.connect().await.unwrap();
+    let create_sql =
+        format!("CREATE FUNCTION add2 LANGUAGE wasm AS X'{ADD_WASM_HEX}' EXPORT 'add'");
+    conn1.execute(&create_sql, ()).await.unwrap();
+
+    // Verify locally
+    let mut rows = conn1.query("SELECT add2(10, 20) AS r", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get_value(0).unwrap(), Value::Integer(30));
+
+    // Push to server
+    db1.push().await.unwrap();
+
+    // Client 2: connect with runtime, pull, and verify UDF works
+    let db2 = turso::sync::Builder::new_remote(":memory:")
+        .with_remote_url(server.db_url())
+        .with_unstable_wasm_runtime(runtime)
+        .build()
+        .await
+        .unwrap();
+
+    let conn2 = db2.connect().await.unwrap();
+    let mut rows = conn2.query("SELECT add2(100, 200) AS r", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get_value(0).unwrap(), Value::Integer(300));
 }

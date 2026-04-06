@@ -445,13 +445,13 @@ fn write_at<F: File + ?Sized>(io: &impl IO, file: &F, offset: usize, data: &[u8]
 fn test_btree(tmp_db: TempDatabase) {
     let _ = env_logger::try_init();
     let mut rng = ChaCha8Rng::seed_from_u64(0);
-    let opts = tmp_db.db_opts;
+    let opts = tmp_db.db_opts.clone();
     let flags = tmp_db.db_flags;
     for depth in 0..4 {
         for attempt in 0..16 {
             let db = TempDatabase::builder()
                 .with_flags(flags)
-                .with_opts(opts)
+                .with_opts(opts.clone())
                 .with_init_sql("create table test (k INTEGER PRIMARY KEY, b BLOB);")
                 .build();
             log::info!(

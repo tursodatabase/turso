@@ -1,0 +1,13 @@
+[package]
+name = "turso-wasm-sdk"
+version = "0.6.0-pre.13"
+edition = "2021"
+license = "MIT"
+description = "SDK for writing Turso WASM user-defined functions in Rust"
+
+[dependencies]
+turso-wasm-sdk-macros = { path = "../turso-wasm-sdk-macros" }
+
+[features]
+default = ["allocator"]
+allocator = []

@@ -17,8 +17,10 @@ pub struct ExternalFunc {
 
 impl Deterministic for ExternalFunc {
     fn is_deterministic(&self) -> bool {
-        // external functions can be whatever so let's just default to false
-        false
+        match &self.func {
+            ExtFunc::Wasm { .. } => true, // WASM UDFs have no I/O
+            _ => false, // external FFI functions can be whatever so default to false
+        }
     }
 }
 
@@ -30,6 +32,13 @@ pub enum ExtFunc {
         init: InitAggFunction,
         step: StepFunction,
         finalize: FinalizeFunction,
+    },
+    Wasm {
+        name: String,
+        /// Number of arguments, or -1 for variadic.
+        narg: i32,
+        /// Typed ABI signature (from turso_sig section). None = use old marshalling path.
+        sig: Option<crate::wasm::WasmFuncSig>,
     },
 }
 
@@ -1453,6 +1462,16 @@ impl Func {
             "array_contains_all" => Ok(Some(Self::Scalar(ScalarFunc::ArrayContainsAll))),
             _ => Ok(None),
         }
+    }
+
+    /// Check whether a name matches any built-in function (regardless of arity).
+    /// Uses `resolve_function` with a dummy arg count: `Ok(Some(_))` means it
+    /// resolved, `Err(_)` means the name matched but arity was wrong — either
+    /// way the name is a builtin. Only `Ok(None)` means it is not.
+    pub fn is_builtin_function_name(name: &str) -> bool {
+        // Try with 1 arg — covers most builtins.  If it returns Err
+        // (arity mismatch for row_number, etc.) the name is still a builtin.
+        !matches!(Self::resolve_function(name, 1), Ok(None))
     }
 
     /// Returns a list of all built-in functions for PRAGMA function_list.

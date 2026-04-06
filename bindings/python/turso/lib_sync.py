@@ -420,6 +420,7 @@ def connect_sync(
     isolation_level: Optional[str] = "DEFERRED",
     remote_encryption_key: Optional[str] = None,
     remote_encryption_cipher: Optional[RemoteEncryptionCipher] = None,
+    unstable_wasm_runtime=None,
 ) -> ConnectionSync:
     """
     Create and open a synchronized database connection.
@@ -445,6 +446,7 @@ def connect_sync(
     db_cfg = PyTursoDatabaseConfig(
         path=path,
         experimental_features=experimental_features,
+        unstable_wasm_runtime=unstable_wasm_runtime,
     )
 
     # Sync config with optional partial bootstrap strategy

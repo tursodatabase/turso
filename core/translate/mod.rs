@@ -147,10 +147,14 @@ pub fn translate_inner(
             | ast::Stmt::CreateMaterializedView { .. }
             | ast::Stmt::CreateVirtualTable(..)
             | ast::Stmt::CreateType { .. }
+            | ast::Stmt::CreateFunction { .. }
+            | ast::Stmt::CreateExtension { .. }
             | ast::Stmt::Delete { .. }
             | ast::Stmt::DropIndex { .. }
             | ast::Stmt::DropTable { .. }
             | ast::Stmt::DropType { .. }
+            | ast::Stmt::DropFunction { .. }
+            | ast::Stmt::DropExtension { .. }
             | ast::Stmt::DropView { .. }
             | ast::Stmt::Reindex { .. }
             | ast::Stmt::Optimize { .. }
@@ -320,6 +324,42 @@ pub fn translate_inner(
                 bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
             schema::translate_drop_type(&type_name, if_exists, resolver, program)?
+        }
+        ast::Stmt::CreateFunction {
+            or_replace,
+            if_not_exists,
+            name,
+            language,
+            wasm_blob,
+            export_name,
+        } => schema::translate_create_function(
+            or_replace,
+            if_not_exists,
+            &name,
+            &language,
+            &wasm_blob,
+            &export_name,
+            resolver,
+            program,
+        )?,
+        ast::Stmt::DropFunction { if_exists, name } => {
+            schema::translate_drop_function(if_exists, &name, resolver, program)?
+        }
+        ast::Stmt::CreateExtension {
+            if_not_exists,
+            name,
+            language,
+            wasm_blob,
+        } => schema::translate_create_extension(
+            if_not_exists,
+            &name,
+            &language,
+            &wasm_blob,
+            resolver,
+            program,
+        )?,
+        ast::Stmt::DropExtension { if_exists, name } => {
+            schema::translate_drop_extension(if_exists, &name, resolver, program)?
         }
         ast::Stmt::Pragma { .. } => {
             bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")

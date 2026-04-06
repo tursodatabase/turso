@@ -1006,12 +1006,37 @@ pub enum Insn {
         batch: i32,                // P4 - batch identifier
     },
 
-    /// Function
+    /// Generic function call. Handles built-in scalars, aggregates, external
+    /// FFI functions, and WASM UDFs that lack a typed signature (sig == None).
+    ///
+    /// WASM UDFs without a `turso_sig` section (e.g. plain C extensions compiled
+    /// to WASM) are dispatched here via the `ExtFunc::Wasm` arm, using the
+    /// untyped raw-pointer ABI. See `WasmFunction` for the typed fast path.
     Function {
         constant_mask: i32, // P1
         start_reg: usize,   // P2, start of argument registers
         dest: usize,        // P3
         func: FuncCtx,      // P4
+    },
+
+    /// Typed WASM function call — the fast path for WASM UDFs that have a
+    /// `turso_sig` section (emitted by the Turso WASM SDK macros). Stores the
+    /// module name, typed ABI signature, and register layout directly, bypassing
+    /// the generic Function dispatch.
+    ///
+    /// WASM UDFs without a typed signature (e.g. plain C extensions compiled to
+    /// WASM) go through the generic `Function` instruction instead.
+    WasmFunction {
+        /// WASM module name (key into wasm_instance_cache)
+        func_name: String,
+        /// Number of SQL arguments
+        arg_count: usize,
+        /// Start of argument registers
+        start_reg: usize,
+        /// Destination register for the result
+        dest: usize,
+        /// Typed ABI signature from the `turso_sig` custom section
+        sig: crate::wasm::WasmFuncSig,
     },
 
     /// Cast register P1 to affinity P2 and store in register P1
@@ -1233,6 +1258,35 @@ pub enum Insn {
         db: usize,
         /// The full CREATE TYPE SQL string
         sql: String,
+    },
+    /// Drop a user-defined function from the in-memory schema
+    DropFunction {
+        /// The database within which this function needs to be dropped
+        db: usize,
+        /// The name of the function being dropped
+        function_name: String,
+    },
+    /// Add a user-defined WASM function to the in-memory schema and compile it
+    AddFunction {
+        db: usize,
+        name: String,
+        language: String,
+        wasm_blob: Vec<u8>,
+        export_name: Option<String>,
+    },
+    /// Add a WASM extension to the in-memory schema and compile it
+    AddExtension {
+        db: usize,
+        name: String,
+        language: String,
+        wasm_blob: Vec<u8>,
+    },
+    /// Drop an extension from the in-memory schema
+    DropExtension {
+        /// The database within which this extension needs to be dropped
+        db: usize,
+        /// The name of the extension being dropped
+        extension_name: String,
     },
 
     /// Close a cursor.
@@ -1814,6 +1868,7 @@ impl InsnVariants {
             InsnVariants::RowSetRead => execute::op_rowset_read,
             InsnVariants::RowSetTest => execute::op_rowset_test,
             InsnVariants::Function => execute::op_function,
+            InsnVariants::WasmFunction => execute::op_wasm_function,
             InsnVariants::Cast => execute::op_cast,
             InsnVariants::InitCoroutine => execute::op_init_coroutine,
             InsnVariants::EndCoroutine => execute::op_end_coroutine,
@@ -1841,6 +1896,10 @@ impl InsnVariants {
             InsnVariants::DropTrigger => execute::op_drop_trigger,
             InsnVariants::DropType => execute::op_drop_type,
             InsnVariants::AddType => execute::op_add_type,
+            InsnVariants::DropFunction => execute::op_drop_function,
+            InsnVariants::AddFunction => execute::op_add_function,
+            InsnVariants::AddExtension => execute::op_add_extension,
+            InsnVariants::DropExtension => execute::op_drop_extension,
             InsnVariants::DropView => execute::op_drop_view,
             InsnVariants::Close => execute::op_close,
             InsnVariants::IsNull => execute::op_is_null,

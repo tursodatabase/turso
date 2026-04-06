@@ -13,7 +13,7 @@ mod _turso {
     use crate::turso::{
         py_turso_database_open, py_turso_setup, PyTursoConnection, PyTursoDatabase,
         PyTursoDatabaseConfig, PyTursoEncryptionConfig, PyTursoExecutionResult, PyTursoLog,
-        PyTursoSetupConfig, PyTursoStatement, PyTursoStatusCode,
+        PyTursoSetupConfig, PyTursoStatement, PyTursoStatusCode, PyWasmtimeRuntime,
     };
 
     // exception exports

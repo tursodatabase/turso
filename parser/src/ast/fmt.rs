@@ -772,6 +772,78 @@ impl ToTokens for Stmt {
                 s.append(TK_ID, Some(type_name))?;
                 Ok(())
             }
+            Self::CreateFunction {
+                or_replace,
+                if_not_exists,
+                name,
+                language,
+                wasm_blob,
+                export_name,
+            } => {
+                s.append(TK_CREATE, None)?;
+                if *or_replace {
+                    s.append(TK_OR, None)?;
+                    s.append(TK_REPLACE, None)?;
+                }
+                s.append(TK_FUNCTION, None)?;
+                if *if_not_exists {
+                    s.append(TK_IF, None)?;
+                    s.append(TK_NOT, None)?;
+                    s.append(TK_EXISTS, None)?;
+                }
+                s.append(TK_ID, Some(name))?;
+                s.append(TK_LANGUAGE, None)?;
+                s.append(TK_ID, Some(language))?;
+                s.append(TK_AS, None)?;
+                let hex: String = wasm_blob.iter().map(|b| format!("{b:02x}")).collect();
+                s.append(TK_BLOB, Some(&format!("X'{hex}'")))?;
+                if let Some(export) = export_name {
+                    s.append(TK_EXPORT, None)?;
+                    s.append(TK_STRING, Some(&format!("'{export}'")))?;
+                }
+                Ok(())
+            }
+            Self::DropFunction { if_exists, name } => {
+                s.append(TK_DROP, None)?;
+                s.append(TK_FUNCTION, None)?;
+                if *if_exists {
+                    s.append(TK_IF, None)?;
+                    s.append(TK_EXISTS, None)?;
+                }
+                s.append(TK_ID, Some(name))?;
+                Ok(())
+            }
+            Self::CreateExtension {
+                if_not_exists,
+                name,
+                language,
+                wasm_blob,
+            } => {
+                s.append(TK_CREATE, None)?;
+                s.append(TK_EXTENSION, None)?;
+                if *if_not_exists {
+                    s.append(TK_IF, None)?;
+                    s.append(TK_NOT, None)?;
+                    s.append(TK_EXISTS, None)?;
+                }
+                s.append(TK_ID, Some(name))?;
+                s.append(TK_LANGUAGE, None)?;
+                s.append(TK_ID, Some(language))?;
+                s.append(TK_AS, None)?;
+                let hex: String = wasm_blob.iter().map(|b| format!("{b:02x}")).collect();
+                s.append(TK_BLOB, Some(&format!("X'{hex}'")))?;
+                Ok(())
+            }
+            Self::DropExtension { if_exists, name } => {
+                s.append(TK_DROP, None)?;
+                s.append(TK_EXTENSION, None)?;
+                if *if_exists {
+                    s.append(TK_IF, None)?;
+                    s.append(TK_EXISTS, None)?;
+                }
+                s.append(TK_ID, Some(name))?;
+                Ok(())
+            }
         }
     }
 }

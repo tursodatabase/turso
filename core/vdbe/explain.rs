@@ -1329,6 +1329,32 @@ pub fn insn_to_row(
                     )
                 },
             ),
+            Insn::WasmFunction {
+                func_name,
+                arg_count,
+                start_reg,
+                dest,
+                ..
+            } => (
+                "WasmFunction",
+                0i64,
+                *start_reg as i64,
+                *dest as i64,
+                Value::build_text(func_name.clone()),
+                0,
+                if *arg_count == 0 {
+                    format!("r[{dest}]=wasm()")
+                } else if *start_reg == *start_reg + *arg_count - 1 {
+                    format!("r[{dest}]=wasm(r[{start_reg}])")
+                } else {
+                    format!(
+                        "r[{}]=wasm(r[{}..{}])",
+                        dest,
+                        start_reg,
+                        start_reg + *arg_count - 1
+                    )
+                },
+            ),
             Insn::InitCoroutine {
                 yield_reg,
                 jump_on_definition,
@@ -1622,6 +1648,45 @@ pub fn insn_to_row(
                 Value::build_text(sql.clone()),
                 0,
                 "ADD TYPE".to_string(),
+            ),
+            Insn::DropFunction { db, function_name } => (
+                "DropFunction",
+                *db as i64,
+                0,
+                0,
+                Value::build_text(function_name.clone()),
+                0,
+                format!("DROP FUNCTION {function_name}"),
+            ),
+            Insn::AddFunction { db, name, .. } => (
+                "AddFunction",
+                *db as i64,
+                0,
+                0,
+                Value::build_text(name.clone()),
+                0,
+                format!("ADD FUNCTION {name}"),
+            ),
+            Insn::AddExtension { db, name, .. } => (
+                "AddExtension",
+                *db as i64,
+                0,
+                0,
+                Value::build_text(name.clone()),
+                0,
+                format!("ADD EXTENSION {name}"),
+            ),
+            Insn::DropExtension {
+                db,
+                extension_name,
+            } => (
+                "DropExtension",
+                *db as i64,
+                0,
+                0,
+                Value::build_text(extension_name.clone()),
+                0,
+                format!("DROP EXTENSION {extension_name}"),
             ),
             Insn::DropView { db, view_name } => (
                 "DropView",

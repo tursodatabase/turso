@@ -280,7 +280,7 @@ fn test_vector_sparse_ivf_fuzz(tmp_db: TempDatabase) {
 
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let builder = TempDatabase::builder()
-            .with_opts(opts)
+            .with_opts(opts.clone())
             .with_flags(flags)
             .with_init_sql("CREATE TABLE t(key TEXT PRIMARY KEY, embedding)");
         let simple_db = builder.clone().build();

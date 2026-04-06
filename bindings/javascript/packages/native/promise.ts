@@ -1,5 +1,5 @@
 import { DatabasePromise, NativeDatabase, SqliteError, DatabaseOpts } from "@tursodatabase/database-common"
-import { Database as NativeDB } from "#index";
+import { Database as NativeDB, createUnstableNativeWasmRuntime } from "#index";
 
 class Database extends DatabasePromise {
     constructor(path: string, opts: DatabaseOpts = {}) {
@@ -9,9 +9,9 @@ class Database extends DatabasePromise {
 
 /**
  * Creates a new database connection asynchronously.
- * 
+ *
  * @param {string} path - Path to the database file.
- * @param {Object} opts - Options for database behavior.
+ * @param {Object} opts - Options for database behavior. May include `unstableWasmRuntime`.
  * @returns {Promise<Database>} - A promise that resolves to a Database instance.
  */
 async function connect(path: string, opts: DatabaseOpts = {}): Promise<Database> {
@@ -20,4 +20,4 @@ async function connect(path: string, opts: DatabaseOpts = {}): Promise<Database>
     return db;
 }
 
-export { connect, Database, SqliteError }
+export { connect, Database, SqliteError, createUnstableNativeWasmRuntime }

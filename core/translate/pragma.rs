@@ -583,6 +583,18 @@ fn update_pragma(
             database_id,
             program,
         ),
+        PragmaName::WasmCacheSize => {
+            let bytes = match parse_signed_number(&value)? {
+                Value::Numeric(Numeric::Integer(n)) => n,
+                Value::Numeric(Numeric::Float(f)) => f64::from(f) as i64,
+                _ => bail_parse_error!("expected integer for wasm_cache_size"),
+            };
+            if bytes < 0 {
+                bail_parse_error!("wasm_cache_size must be non-negative");
+            }
+            connection.set_wasm_cache_capacity(bytes);
+            Ok(TransactionMode::None)
+        }
     }
 }
 
@@ -1385,6 +1397,19 @@ fn query_pragma(
                 }
             }
 
+            let pragma_meta = pragma_for(&pragma);
+            for col_name in pragma_meta.columns.iter() {
+                program.add_pragma_result_column(col_name.to_string());
+            }
+            Ok(TransactionMode::None)
+        }
+        PragmaName::WasmCacheSize => {
+            let used = connection.get_wasm_cache_used();
+            let capacity = connection.get_wasm_cache_capacity();
+            let max_reg = program.alloc_register();
+            program.emit_int(used, register);
+            program.emit_int(capacity, max_reg);
+            program.emit_result_row(register, 2);
             let pragma_meta = pragma_for(&pragma);
             for col_name in pragma_meta.columns.iter() {
                 program.add_pragma_result_column(col_name.to_string());

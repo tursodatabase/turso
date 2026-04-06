@@ -17,6 +17,7 @@ pub mod types;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod vdbe;
 pub mod vector;
+pub mod wasm;
 
 #[cfg(feature = "cli_only")]
 pub(crate) mod btree_dump;
@@ -164,7 +165,7 @@ pub const fn is_attached_db(database_id: usize) -> bool {
 }
 
 /// Configuration for database features
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct DatabaseOpts {
     pub enable_views: bool,
     pub enable_custom_types: bool,
@@ -175,6 +176,8 @@ pub struct DatabaseOpts {
     pub enable_generated_columns: bool,
     pub unsafe_testing: bool,
     enable_load_extension: bool,
+    /// Pluggable WASM runtime. None means WASM UDFs are unavailable.
+    pub wasm_runtime: Option<Arc<dyn wasm::WasmRuntimeApi>>,
 }
 
 impl DatabaseOpts {
@@ -225,6 +228,11 @@ impl DatabaseOpts {
 
     pub fn with_unsafe_testing(mut self, enable: bool) -> Self {
         self.unsafe_testing = enable;
+        self
+    }
+
+    pub fn with_unstable_wasm_runtime(mut self, runtime: Arc<dyn wasm::WasmRuntimeApi>) -> Self {
+        self.wasm_runtime = Some(runtime);
         self
     }
 }
@@ -402,6 +410,8 @@ pub struct Database {
     // in std.
     builtin_syms: parking_lot::RwLock<SymbolTable>,
     opts: DatabaseOpts,
+    pub wasm_runtime: Option<Arc<dyn wasm::WasmRuntimeApi>>,
+    pub wasm_budget: wasm::WasmBudget,
     n_connections: AtomicUsize,
 
     /// In Memory Page 1 for Empty Dbs
@@ -523,6 +533,8 @@ impl Database {
             io: io.clone(),
             open_flags: flags,
             init_lock: Arc::new(Mutex::new(())),
+            wasm_runtime: opts.wasm_runtime.clone(),
+            wasm_budget: wasm::WasmBudget::new(wasm::DEFAULT_WASM_CACHE_CAPACITY),
             opts,
             buffer_pool: BufferPool::begin_init(io, arena_size),
             n_connections: AtomicUsize::new(0),
@@ -691,7 +703,7 @@ impl Database {
                 path,
                 db_file.clone(),
                 flags,
-                opts,
+                opts.clone(),
                 encryption_opts.clone(),
                 durable_storage.clone(),
             )? {
@@ -845,7 +857,7 @@ impl Database {
                 Some(wal_path),
                 db_file.clone(),
                 flags,
-                opts,
+                opts.clone(),
                 encryption_opts.clone(),
                 None,
             )? {
@@ -923,7 +935,7 @@ impl Database {
                         &format!("{path}-wal")
                     };
                     let mut db = Self::new(
-                        opts,
+                        opts.clone(),
                         flags,
                         path,
                         wal_path,
@@ -996,40 +1008,44 @@ impl Database {
                         .conn
                         .as_ref()
                         .expect("conn must be initialized in Init phase");
-                    let syms = conn.syms.read();
 
-                    let guard = state
-                        .schema_guard
-                        .as_mut()
-                        .expect("schema_guard must be acquired in Init phase");
-                    // while we logically exclusively own schema as we hold DATABASE_MANAGER lock in the top level `open_with_flags_async_internal` function
-                    // at the moment we already created connection which cloned the schema internally
-                    // so, we can't use get_mut here for now
-                    //
-                    // it's not ideal but correctness is OK - before prepare connection call maybe_update_schema and in case of divergence update schema ref from the db + we always check connection cookie in the VDBE program itself
-                    let schema = Arc::make_mut(&mut **guard);
+                    {
+                        let syms = conn.syms.read();
+                        let guard = state
+                            .schema_guard
+                            .as_mut()
+                            .expect("schema_guard must be acquired in Init phase");
+                        // while we logically exclusively own schema as we hold DATABASE_MANAGER lock in the top level `open_with_flags_async_internal` function
+                        // at the moment we already created connection which cloned the schema internally
+                        // so, we can't use get_mut here for now
+                        //
+                        // it's not ideal but correctness is OK - before prepare connection call maybe_update_schema and in case of divergence update schema ref from the db + we always check connection cookie in the VDBE program itself
+                        let schema = Arc::make_mut(&mut **guard);
 
-                    let result = schema.make_from_btree(
-                        &mut state.make_from_btree_state,
-                        None,
-                        pager,
-                        &syms,
-                    );
+                        let result = schema.make_from_btree(
+                            &mut state.make_from_btree_state,
+                            None,
+                            pager,
+                            &syms,
+                        );
 
-                    match result {
-                        Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
-                        Ok(IOResult::Done(())) => {
-                            // Release the schema lock
-                            state.schema_guard = None;
+                        match result {
+                            Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                            Ok(IOResult::Done(())) => {
+                                // Release the schema lock
+                                state.schema_guard = None;
+                            }
+                            Err(LimboError::ExtensionError(e)) => {
+                                // this means that a vtab exists and we no longer have the module loaded.
+                                // we print a warning to the user to load the module
+                                state.schema_guard = None;
+                                tracing::warn!("open warning, failed to load extension: {e}");
+                            }
+                            Err(e) => return Err(e),
                         }
-                        Err(LimboError::ExtensionError(e)) => {
-                            // this means that a vtab exists and we no longer have the module loaded.
-                            // we print a warning to the user to load the module
-                            state.schema_guard = None;
-                            tracing::warn!("open warning, failed to load extension: {e}");
-                        }
-                        Err(e) => return Err(e),
                     }
+                    // syms read guard dropped — code below calls maybe_update_schema
+                    // which may take syms.write().
 
                     // Load custom types from __turso_internal_types if the table
                     // exists and custom types are enabled. The schema loaded by
@@ -1061,6 +1077,19 @@ impl Database {
                         if let Err(e) = load_result {
                             tracing::warn!("Failed to load custom types during open: {}", e);
                         }
+                    }
+
+                    // Load persisted WASM functions and extensions
+                    {
+                        let conn = state
+                            .conn
+                            .as_ref()
+                            .expect("conn must be initialized in Init phase");
+                        let db = state
+                            .db
+                            .as_ref()
+                            .expect("db must be initialized in Init phase");
+                        crate::wasm::bootstrap_from_storage(conn, db);
                     }
 
                     state.phase = OpenDbAsyncPhase::BootstrapMvStore;

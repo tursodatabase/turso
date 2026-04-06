@@ -1,0 +1,19 @@
+[package]
+name = "turso_wasm_wasmtime"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Wasmtime-based WASM runtime for Turso UDFs"
+
+[lints]
+workspace = true
+
+[dependencies]
+turso_core = { workspace = true }
+sha2 = "0.10"
+wasmtime = { version = "29", default-features = false, features = ["cranelift", "runtime"] }
+
+[dev-dependencies]
+wat = "1"

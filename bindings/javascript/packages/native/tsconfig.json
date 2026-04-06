@@ -17,5 +17,9 @@
   },
   "include": [
     "*"
+  ],
+  "exclude": [
+    "dist",
+    "wasm_udf_example.ts"
   ]
 }

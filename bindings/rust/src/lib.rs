@@ -144,6 +144,7 @@ pub struct Builder {
     enable_generated_columns: bool,
     vfs: Option<String>,
     encryption_opts: Option<turso_sdk_kit::rsapi::EncryptionOpts>,
+    wasm_runtime: Option<std::sync::Arc<dyn turso_core::wasm::WasmRuntimeApi>>,
 }
 
 impl Builder {
@@ -159,6 +160,7 @@ impl Builder {
             enable_generated_columns: false,
             vfs: None,
             encryption_opts: None,
+            wasm_runtime: None,
         }
     }
 
@@ -211,6 +213,18 @@ impl Builder {
         self.vfs = Some(vfs);
         self
     }
+
+    /// Register a WASM runtime for executing WASM user-defined functions.
+    ///
+    /// WASM UDFs and extensions are an unstable feature and subject to change.
+    pub fn with_unstable_wasm_runtime(
+        mut self,
+        runtime: std::sync::Arc<dyn turso_core::wasm::WasmRuntimeApi>,
+    ) -> Self {
+        self.wasm_runtime = Some(runtime);
+        self
+    }
+
     fn build_features_string(&self) -> Option<String> {
         let mut features = Vec::new();
         if self.enable_encryption {
@@ -250,6 +264,7 @@ impl Builder {
                 vfs: self.vfs,
                 io: None,
                 db_file: None,
+                wasm_runtime: self.wasm_runtime,
             });
         while let Some(io_c) = db.open()?.io() {
             // At this point IO must already be created

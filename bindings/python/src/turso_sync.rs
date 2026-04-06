@@ -157,6 +157,7 @@ pub fn py_turso_sync_new(
         vfs: None,
         io: None,
         db_file: None,
+        wasm_runtime: db_config.wasm_runtime.clone(),
     };
     // calculate and set reserved_bytes from cipher if necessary
     let reserved_bytes = sync_config

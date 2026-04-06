@@ -1584,3 +1584,49 @@ def test_encryption(tmp_path):
         cursor5 = conn5.cursor()
         cursor5.execute("select * from t")
         cursor5.fetchone()  # trigger actual data read to cause decryption error
+
+
+# ── WASM UDF tests ──────────────────────────────────────────────────────────
+
+ADD_WASM_HEX = (
+    "0061736d01000000010c0260017f017f60027f7f017e030302000105030100020607017f014180080b"
+    "071f03066d656d6f727902000c747572736f5f6d616c6c6f6300000361646400010a24021101017f23"
+    "002101230020006a240020010b10002001290300200141086a2903007c0b002c046e616d65021c0200"
+    "02000473697a6501037074720102000461726763010461726776070701000462756d70"
+)
+
+
+def test_wasm_udf_no_runtime():
+    """CREATE FUNCTION should fail when no WASM runtime is configured."""
+    conn = turso.connect(":memory:")
+    with pytest.raises(Exception):
+        conn.execute(f"CREATE FUNCTION add2 LANGUAGE wasm AS X'{ADD_WASM_HEX}' EXPORT 'add'")
+    conn.close()
+
+
+def test_wasm_udf_wasmtime_runtime():
+    """WASM UDFs should work when a WasmtimeRuntime is provided."""
+    from turso import WasmtimeRuntime
+
+    conn = turso.connect(":memory:", unstable_wasm_runtime=WasmtimeRuntime())
+    conn.execute(f"CREATE FUNCTION add2 LANGUAGE wasm AS X'{ADD_WASM_HEX}' EXPORT 'add'")
+
+    cur = conn.execute("SELECT add2(40, 2) AS r")
+    assert cur.fetchone()[0] == 42
+
+    cur = conn.execute("SELECT add2(-10, 3) AS r")
+    assert cur.fetchone()[0] == -7
+
+    # UDF on table data
+    conn.execute("CREATE TABLE data (a INT, b INT)")
+    conn.execute("INSERT INTO data VALUES (10, 20), (30, 40)")
+    cur = conn.execute("SELECT add2(a, b) AS s FROM data ORDER BY s")
+    rows = cur.fetchall()
+    assert rows == [(30,), (70,)]
+
+    # Drop and verify
+    conn.execute("DROP FUNCTION add2")
+    with pytest.raises(Exception):
+        conn.execute("SELECT add2(1, 2)")
+
+    conn.close()

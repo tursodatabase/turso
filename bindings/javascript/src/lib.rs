@@ -12,6 +12,12 @@
 
 #[cfg(feature = "browser")]
 pub mod browser;
+#[cfg(not(feature = "browser"))]
+pub mod js_wasm_bridge;
+#[cfg(not(feature = "browser"))]
+pub mod node_wasm_udf;
+#[cfg(feature = "browser")]
+pub mod wasm_udf;
 
 use napi::bindgen_prelude::*;
 use napi::{Env, Task};
@@ -48,6 +54,19 @@ enum PresentationMode {
     Pluck,
 }
 
+/// Opaque marker class for the built-in native WASM runtime.
+/// Returned by `createUnstableNativeWasmRuntime()`, detected by the Database constructor.
+#[napi]
+pub struct NativeWasmRuntimeHandle {}
+
+/// Create the built-in native WASM runtime (uses the host's `WebAssembly` API).
+/// WASM UDFs and extensions are an unstable feature and subject to change.
+/// Pass the returned handle as `opts.unstableWasmRuntime` to `new Database(path, opts)`.
+#[napi]
+pub fn create_unstable_native_wasm_runtime() -> NativeWasmRuntimeHandle {
+    NativeWasmRuntimeHandle {}
+}
+
 /// A database connection.
 #[napi]
 #[derive(Clone)]
@@ -67,6 +86,8 @@ pub struct DatabaseInner {
     /// `close()` upgrades each live handle and sets it to `None`, which
     /// finalizes the statement and releases its `Arc<Connection>`.
     stmts: Mutex<Vec<Weak<RefCell<Option<turso_core::Statement>>>>>,
+    /// Optional WASM runtime for UDF support. None = no WASM support.
+    wasm_runtime: Option<Arc<dyn turso_core::wasm::WasmRuntimeApi>>,
 }
 
 pub struct DatabaseConnect {
@@ -299,6 +320,10 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
         None
     };
 
+    if let Some(ref runtime) = db.wasm_runtime {
+        core_opts = core_opts.with_unstable_wasm_runtime(runtime.clone());
+    }
+
     let db_core = turso_core::Database::open_file_with_flags(
         io.clone(),
         &db.path,
@@ -336,8 +361,11 @@ impl Database {
     ///
     /// # Arguments
     /// * `path` - The path to the database file.
-    #[napi(constructor)]
-    pub fn new(path: String, opts: Option<DatabaseOpts>) -> napi::Result<Self> {
+    /// * `opts` - Optional database configuration. May include `unstableWasmRuntime`
+    ///   for WASM UDF support: pass `createUnstableNativeWasmRuntime()` for built-in
+    ///   WebAssembly support, or an external runtime object.
+    #[napi(constructor, ts_args_type = "path: string, opts?: DatabaseOpts")]
+    pub fn new(env: Env, path: String, opts: Option<Unknown>) -> napi::Result<Self> {
         let io: Arc<dyn turso_core::IO> = if is_memory(&path) {
             Arc::new(turso_core::MemoryIO::new())
         } else {
@@ -353,13 +381,84 @@ impl Database {
                 browser::opfs()
             }
         };
-        Self::new_with_io(path, io, opts)
+
+        let (parsed_opts, wasm_runtime_val) = match opts {
+            Some(val) => {
+                let obj = val.coerce_to_object()?;
+                // Extract unstableWasmRuntime from the options object
+                let wasm_val = if obj.has_named_property("unstableWasmRuntime")? {
+                    let v = obj.get_named_property::<Unknown>("unstableWasmRuntime")?;
+                    match v.get_type()? {
+                        ValueType::Undefined | ValueType::Null => None,
+                        _ => Some(v),
+                    }
+                } else {
+                    None
+                };
+                // Deserialize the rest as DatabaseOpts (unknown fields like unstableWasmRuntime are ignored)
+                let db_opts = unsafe {
+                    <DatabaseOpts as FromNapiValue>::from_napi_value(env.raw(), obj.raw())?
+                };
+                (Some(db_opts), wasm_val)
+            }
+            None => (None, None),
+        };
+
+        let runtime = match wasm_runtime_val {
+            None => None,
+            Some(val) => {
+                let raw_val = val.raw();
+                // Try napi_unwrap to detect NativeWasmRuntimeHandle (same addon).
+                let mut raw_ptr = std::ptr::null_mut();
+                let status = unsafe { napi::sys::napi_unwrap(env.raw(), raw_val, &mut raw_ptr) };
+                if status == napi::sys::Status::napi_ok {
+                    // Native runtime handle detected — use built-in runtime directly.
+                    #[cfg(feature = "browser")]
+                    {
+                        Some(Arc::new(crate::wasm_udf::WebWasmRuntime::new())
+                            as Arc<dyn turso_core::wasm::WasmRuntimeApi>)
+                    }
+                    #[cfg(not(feature = "browser"))]
+                    {
+                        Some(Arc::new(crate::node_wasm_udf::NodeWasmRuntime::new())
+                            as Arc<dyn turso_core::wasm::WasmRuntimeApi>)
+                    }
+                } else {
+                    // External runtime object — wrap in JsBridgeWasmRuntime.
+                    #[cfg(not(feature = "browser"))]
+                    {
+                        let mut ref_out = std::ptr::null_mut();
+                        let ref_status = unsafe {
+                            napi::sys::napi_create_reference(env.raw(), raw_val, 1, &mut ref_out)
+                        };
+                        if ref_status != napi::sys::Status::napi_ok {
+                            return Err(create_generic_error(
+                                "failed to create reference for WASM runtime object",
+                            ));
+                        }
+                        Some(
+                            Arc::new(crate::js_wasm_bridge::JsBridgeWasmRuntime::new(ref_out))
+                                as Arc<dyn turso_core::wasm::WasmRuntimeApi>,
+                        )
+                    }
+                    #[cfg(feature = "browser")]
+                    {
+                        return Err(create_generic_error(
+                            "external WASM runtime not supported in browser builds",
+                        ));
+                    }
+                }
+            }
+        };
+
+        Self::new_with_io(path, io, parsed_opts, runtime)
     }
 
     pub fn new_with_io(
         path: String,
         io: Arc<dyn turso_core::IO>,
         opts: Option<DatabaseOpts>,
+        wasm_runtime: Option<Arc<dyn turso_core::wasm::WasmRuntimeApi>>,
     ) -> napi::Result<Self> {
         if let Some(opts) = &opts {
             init_tracing(&opts.tracing);
@@ -373,6 +472,7 @@ impl Database {
                 connect: OnceLock::new(),
                 default_safe_integers: Mutex::new(false),
                 stmts: Mutex::new(Vec::new()),
+                wasm_runtime,
             })),
         })
     }
@@ -397,7 +497,11 @@ impl Database {
     /// Connect the database synchronously
     /// This method is idempotent and can be called multiple times safely until the database will be closed
     #[napi]
-    pub fn connect_sync(&self) -> napi::Result<()> {
+    pub fn connect_sync(&self, env: Env) -> napi::Result<()> {
+        #[cfg(not(feature = "browser"))]
+        crate::node_wasm_udf::set_env(env.raw());
+        #[cfg(feature = "browser")]
+        let _ = env;
         connect_sync(self.inner()?)
     }
 
@@ -609,7 +713,11 @@ pub struct BatchExecutor {
 #[napi]
 impl BatchExecutor {
     #[napi]
-    pub fn step_sync(&mut self) -> Result<u32> {
+    pub fn step_sync(&mut self, env: Env) -> Result<u32> {
+        #[cfg(not(feature = "browser"))]
+        crate::node_wasm_udf::set_env(env.raw());
+        #[cfg(feature = "browser")]
+        let _ = env;
         loop {
             if self.stmt.is_none() && self.position >= self.sql.len() {
                 return Ok(STEP_DONE);
@@ -787,7 +895,11 @@ impl Statement {
     /// Step the statement and return result code (executed on the main thread):
     /// 1 = Row available, 2 = Done, 3 = I/O needed
     #[napi]
-    pub fn step_sync(&self) -> Result<u32> {
+    pub fn step_sync(&self, env: Env) -> Result<u32> {
+        #[cfg(not(feature = "browser"))]
+        crate::node_wasm_udf::set_env(env.raw());
+        #[cfg(feature = "browser")]
+        let _ = env;
         step_sync(self.statement_handle()?)
     }
 

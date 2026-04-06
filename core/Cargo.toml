@@ -39,6 +39,7 @@ test_helper = []
 bench = []
 nanosecond-bench = ["bench"]
 fts = ["dep:tantivy"]
+wasm-udf = ["serde", "dep:serde_json"]
 codspeed = ["bench"]
 optimizer_params = ["serde", "dep:serde_json"]
 
@@ -162,6 +163,8 @@ test-log = { version = "0.2.17", features = ["trace"] }
 sorted-vec = "0.8.6"
 mimalloc = { workspace = true, default-features = false }
 divan.workspace = true
+wat = "1"
+turso_wasm_wasmtime = { path = "../wasm-runtime-wasmtime" }
 
 
 [[bench]]
@@ -206,3 +209,8 @@ harness = false
 [[bench]]
 name = "triggers"
 harness = false
+
+[[bench]]
+name = "wasm_udf_benchmark"
+harness = false
+required-features = ["wasm-udf"]

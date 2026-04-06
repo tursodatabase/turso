@@ -17,6 +17,10 @@ mod stmt_journal;
 mod storage;
 mod trigger;
 mod wal;
+#[cfg(feature = "wasm-udf")]
+mod wasm_extension;
+#[cfg(feature = "wasm-udf")]
+mod wasm_udf;
 
 #[cfg(test)]
 mod tests {

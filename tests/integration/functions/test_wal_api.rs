@@ -29,9 +29,11 @@ fn test_wal_frame_count(db: TempDatabase) {
 // TODO: mvcc
 #[turso_macros::test()]
 fn test_wal_frame_transfer_no_schema_changes(db: TempDatabase) {
-    let opts = db.db_opts;
+    let opts = db.db_opts.clone();
     let flags = db.db_flags;
-    let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+    let builder = TempDatabase::builder()
+        .with_flags(flags)
+        .with_opts(opts.clone());
     let db1 = builder.clone().build();
     let conn1 = db1.connect_limbo();
     let db2 = builder.build();
@@ -66,9 +68,11 @@ fn test_wal_frame_transfer_no_schema_changes(db: TempDatabase) {
 // TODO: mvcc
 #[turso_macros::test()]
 fn test_wal_frame_transfer_various_schema_changes(db: TempDatabase) {
-    let opts = db.db_opts;
+    let opts = db.db_opts.clone();
     let flags = db.db_flags;
-    let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+    let builder = TempDatabase::builder()
+        .with_flags(flags)
+        .with_opts(opts.clone());
 
     let db1 = builder.clone().build();
     let conn1 = db1.connect_limbo();
@@ -122,9 +126,11 @@ fn test_wal_frame_transfer_various_schema_changes(db: TempDatabase) {
 // TODO: mvcc
 #[turso_macros::test()]
 fn test_wal_frame_transfer_schema_changes(db: TempDatabase) {
-    let opts = db.db_opts;
+    let opts = db.db_opts.clone();
     let flags = db.db_flags;
-    let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+    let builder = TempDatabase::builder()
+        .with_flags(flags)
+        .with_opts(opts.clone());
 
     let db1 = builder.clone().build();
     let conn1 = db1.connect_limbo();
@@ -160,9 +166,11 @@ fn test_wal_frame_transfer_schema_changes(db: TempDatabase) {
 // TODO: mvcc
 #[turso_macros::test()]
 fn test_wal_frame_transfer_no_schema_changes_rollback(db: TempDatabase) {
-    let opts = db.db_opts;
+    let opts = db.db_opts.clone();
     let flags = db.db_flags;
-    let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+    let builder = TempDatabase::builder()
+        .with_flags(flags)
+        .with_opts(opts.clone());
 
     let db1 = builder.clone().build();
     let conn1 = db1.connect_limbo();
@@ -200,9 +208,11 @@ fn test_wal_frame_transfer_no_schema_changes_rollback(db: TempDatabase) {
 // TODO: mvcc
 #[turso_macros::test()]
 fn test_wal_frame_transfer_schema_changes_rollback(db: TempDatabase) {
-    let opts = db.db_opts;
+    let opts = db.db_opts.clone();
     let flags = db.db_flags;
-    let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+    let builder = TempDatabase::builder()
+        .with_flags(flags)
+        .with_opts(opts.clone());
 
     let db1 = builder.clone().build();
     let conn1 = db1.connect_limbo();
@@ -236,9 +246,11 @@ fn test_wal_frame_transfer_schema_changes_rollback(db: TempDatabase) {
 // TODO: mvcc
 #[turso_macros::test()]
 fn test_wal_frame_conflict(db: TempDatabase) {
-    let opts = db.db_opts;
+    let opts = db.db_opts.clone();
     let flags = db.db_flags;
-    let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+    let builder = TempDatabase::builder()
+        .with_flags(flags)
+        .with_opts(opts.clone());
 
     let db1 = builder.clone().build();
     let conn1 = db1.connect_limbo();
@@ -260,9 +272,11 @@ fn test_wal_frame_conflict(db: TempDatabase) {
 // TODO: mvcc
 #[turso_macros::test()]
 fn test_wal_frame_far_away_write(db: TempDatabase) {
-    let opts = db.db_opts;
+    let opts = db.db_opts.clone();
     let flags = db.db_flags;
-    let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+    let builder = TempDatabase::builder()
+        .with_flags(flags)
+        .with_opts(opts.clone());
 
     let db1 = builder.clone().build();
     let conn1 = db1.connect_limbo();
@@ -293,9 +307,11 @@ fn test_wal_frame_far_away_write(db: TempDatabase) {
 fn test_wal_frame_api_no_schema_changes_fuzz(db: TempDatabase) {
     let (mut rng, _) = rng_from_time();
 
-    let opts = db.db_opts;
+    let opts = db.db_opts.clone();
     let flags = db.db_flags;
-    let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+    let builder = TempDatabase::builder()
+        .with_flags(flags)
+        .with_opts(opts.clone());
 
     for _ in 0..4 {
         let db1 = builder.clone().build();
@@ -928,9 +944,11 @@ fn test_db_share_same_file() {
 #[turso_macros::test(mvcc)]
 fn test_wal_api_simulate_spilled_frames(db: TempDatabase) {
     let (mut rng, _) = rng_from_time();
-    let opts = db.db_opts;
+    let opts = db.db_opts.clone();
     let flags = db.db_flags;
-    let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+    let builder = TempDatabase::builder()
+        .with_flags(flags)
+        .with_opts(opts.clone());
 
     let db1 = builder.clone().build();
     let conn1 = db1.connect_limbo();

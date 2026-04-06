@@ -95,6 +95,8 @@ pub struct Builder {
     remote_encryption_key: Option<String>,
     // Encryption cipher for the Turso Cloud database
     remote_encryption_cipher: Option<RemoteEncryptionCipher>,
+    // Optional WASM runtime for executing WASM user-defined functions.
+    wasm_runtime: Option<Arc<dyn turso_core::wasm::WasmRuntimeApi>>,
 }
 
 impl Builder {
@@ -110,6 +112,7 @@ impl Builder {
             partial_sync_config_experimental: None,
             remote_encryption_key: None,
             remote_encryption_cipher: None,
+            wasm_runtime: None,
         }
     }
 
@@ -171,6 +174,17 @@ impl Builder {
         self
     }
 
+    /// Register a WASM runtime for executing WASM user-defined functions.
+    ///
+    /// WASM UDFs and extensions are an unstable feature and subject to change.
+    pub fn with_unstable_wasm_runtime(
+        mut self,
+        runtime: Arc<dyn turso_core::wasm::WasmRuntimeApi>,
+    ) -> Self {
+        self.wasm_runtime = Some(runtime);
+        self
+    }
+
     // Build the synced database object, initialize and open it.
     pub async fn build(self) -> Result<Database> {
         // Build core database config for the embedded engine.
@@ -183,6 +197,7 @@ impl Builder {
             vfs: None,
             io: None,
             db_file: None,
+            wasm_runtime: self.wasm_runtime,
         };
 
         let url = if let Some(remote_url) = &self.remote_url {

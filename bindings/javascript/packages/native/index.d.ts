@@ -5,10 +5,6 @@ export declare class BatchExecutor {
   reset(): void
 }
 
-export interface QueryOptions {
-  queryTimeout?: number
-}
-
 /** A database connection. */
 export declare class Database {
   /**
@@ -16,6 +12,9 @@ export declare class Database {
    *
    * # Arguments
    * * `path` - The path to the database file.
+   * * `opts` - Optional database configuration. May include `unstableWasmRuntime`
+   *   for WASM UDF support: pass `createUnstableNativeWasmRuntime()` for built-in
+   *   WebAssembly support, or an external runtime object.
    */
   constructor(path: string, opts?: DatabaseOpts | undefined | null)
   /**
@@ -97,6 +96,14 @@ export declare class Database {
   classifySql(sql: string): string
 }
 
+/**
+ * Opaque marker class for the built-in native WASM runtime.
+ * Returned by `createUnstableNativeWasmRuntime()`, detected by the Database constructor.
+ */
+export declare class NativeWasmRuntimeHandle {
+
+}
+
 /** A prepared statement. */
 export declare class Statement {
   reset(): void
@@ -147,6 +154,12 @@ export declare class Statement {
 }
 
 /**
+ * Create the built-in native WASM runtime (uses the host's `WebAssembly` API).
+ * Pass the returned handle as `opts.unstableWasmRuntime` to `new Database(path, opts)`.
+ */
+export declare function createUnstableNativeWasmRuntime(): NativeWasmRuntimeHandle
+
+/**
  * Most of the options are aligned with better-sqlite API
  * (see https://github.com/WiseLibs/better-sqlite3/blob/master/docs/api.md#new-databasepath-options)
  */
@@ -160,6 +173,8 @@ export interface DatabaseOpts {
   experimental?: Array<string>
   /** Optional encryption configuration for local database encryption */
   encryption?: EncryptionOpts
+  /** Optional WASM runtime for user-defined functions */
+  unstableWasmRuntime?: unknown
 }
 
 /** Supported encryption ciphers for local database encryption. */
@@ -179,4 +194,8 @@ export interface EncryptionOpts {
   cipher: EncryptionCipher
   /** The hex-encoded encryption key */
   hexkey: string
+}
+
+export interface QueryOptions {
+  queryTimeout?: number
 }

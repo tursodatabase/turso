@@ -217,7 +217,7 @@ impl TempDatabaseBuilder {
             io.clone(),
             db_path.to_str().unwrap(),
             flags,
-            opts,
+            opts.clone(),
             None,
         )
         .unwrap();
@@ -271,7 +271,7 @@ impl TempDatabase {
     pub fn new_with_existent_with_opts(db_path: &Path, opts: turso_core::DatabaseOpts) -> Self {
         Self::builder()
             .with_db_path(db_path)
-            .with_opts(opts)
+            .with_opts(opts.clone())
             .build()
     }
 

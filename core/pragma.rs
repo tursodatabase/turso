@@ -203,6 +203,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::Result0,
             &["type", "parent", "encode", "decode", "default", "operators"],
         ),
+        WasmCacheSize => Pragma::new(
+            PragmaFlags::Result0 | PragmaFlags::NoColumns1,
+            &["used", "max"],
+        ),
     }
 }
 

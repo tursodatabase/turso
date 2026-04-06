@@ -246,7 +246,7 @@ pub fn journal_mode_fuzz(db: TempDatabase) {
     let builder = TempDatabaseBuilder::new()
         .with_db_path(&db_path)
         .with_flags(db.db_flags)
-        .with_opts(db.db_opts);
+        .with_opts(db.db_opts.clone());
 
     let limbo_db = builder.build();
     let limbo_conn = limbo_db.connect_limbo();

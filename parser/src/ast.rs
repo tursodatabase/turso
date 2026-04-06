@@ -194,6 +194,32 @@ pub enum Stmt {
         /// type body
         body: CreateTypeBody,
     },
+    /// `CREATE FUNCTION`
+    CreateFunction {
+        /// `OR REPLACE`
+        or_replace: bool,
+        /// `IF NOT EXISTS`
+        if_not_exists: bool,
+        /// function name
+        name: String,
+        /// language (e.g. "wasm")
+        language: String,
+        /// WASM binary blob
+        wasm_blob: Vec<u8>,
+        /// optional export name within the WASM module
+        export_name: Option<String>,
+    },
+    /// `CREATE EXTENSION`
+    CreateExtension {
+        /// `IF NOT EXISTS`
+        if_not_exists: bool,
+        /// extension name
+        name: String,
+        /// language (e.g. "wasm")
+        language: String,
+        /// WASM binary blob
+        wasm_blob: Vec<u8>,
+    },
     /// `DELETE`
     Delete {
         /// CTE
@@ -250,6 +276,20 @@ pub enum Stmt {
         if_exists: bool,
         /// type name
         type_name: String,
+    },
+    /// `DROP FUNCTION`
+    DropFunction {
+        /// `IF EXISTS`
+        if_exists: bool,
+        /// function name
+        name: String,
+    },
+    /// `DROP EXTENSION`
+    DropExtension {
+        /// `IF EXISTS`
+        if_exists: bool,
+        /// extension name
+        name: String,
     },
     /// `INSERT`
     Insert {
@@ -1751,6 +1791,8 @@ pub enum PragmaName {
     ListTypes,
     /// Deprecated no-op: control whether callback is invoked for empty result sets
     EmptyResultCallbacks,
+    /// Get or set the WASM instance cache size budget (bytes)
+    WasmCacheSize,
 }
 
 /// `CREATE TRIGGER` time
