@@ -983,6 +983,10 @@ pub struct OuterQueryReference {
     /// col_used_mask because rowid is not a real column and setting a fake
     /// column index in col_used_mask could mislead covering index decisions.
     pub rowid_referenced: bool,
+    /// Scope depth for this outer reference. 0 = immediate outer scope,
+    /// 1 = grandparent scope, etc. Used to avoid false "ambiguous column"
+    /// errors when the same column name exists at different nesting depths.
+    pub scope_depth: usize,
 }
 
 impl OuterQueryReference {

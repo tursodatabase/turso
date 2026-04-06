@@ -5659,7 +5659,11 @@ pub fn bind_and_rewrite_expr<'a>(
                     // In this case, there is no ambiguity:
                     // - x in the outer query refers to t.x,
                     // - x in the inner query refers to t2.x.
+                    //
+                    // Ambiguity is only checked within the same scope depth. Once a match
+                    // is found at depth N, deeper scopes (N+1, N+2, ...) are not checked.
                     if match_result.is_none() {
+                        let mut matched_scope_depth = None;
                         for outer_ref in referenced_tables.outer_query_refs().iter() {
                             // CTEs (FromClauseSubquery) in outer_query_refs are only for table
                             // lookup (e.g., FROM cte1), not for column resolution. Columns from
@@ -5667,6 +5671,12 @@ pub fn bind_and_rewrite_expr<'a>(
                             // FROM clause, not as implicit outer references.
                             if matches!(outer_ref.table, Table::FromClauseSubquery(_)) {
                                 continue;
+                            }
+                            // Skip refs from deeper scopes once we found a match
+                            if let Some(depth) = matched_scope_depth {
+                                if outer_ref.scope_depth > depth {
+                                    continue;
+                                }
                             }
                             let col_idx = outer_ref.table.columns().iter().position(|c| {
                                 c.name
@@ -5686,6 +5696,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                     col_idx.unwrap(),
                                     col.is_rowid_alias(),
                                 ));
+                                matched_scope_depth = Some(outer_ref.scope_depth);
                             }
                         }
                     }
