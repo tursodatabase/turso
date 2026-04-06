@@ -4320,12 +4320,16 @@ pub fn op_seek(
         ),
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
-assert!(
+    assert!(
         target_pc.is_offset(),
         "op_seek: target_pc should be an offset, is: {target_pc:?}"
     );
 
-    if let RecordSource::Unpacked { start_reg, num_regs } = record_source {
+    if let RecordSource::Unpacked {
+        start_reg,
+        num_regs,
+    } = record_source
+    {
         for i in 0..num_regs {
             if state.registers[(start_reg + i) as usize].is_null() {
                 // To jump, we update the program counter directly and tell the engine to Step
