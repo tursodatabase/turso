@@ -33,7 +33,8 @@ use crate::{SimulatorState, Stats, StepResult, create_initial_indexes, create_in
 pub struct MultiprocessOpts {
     pub seed: Option<u64>,
     pub enable_mvcc: bool,
-    pub max_connections: usize,
+    pub process_count: usize,
+    pub connections_per_process: usize,
     pub max_steps: usize,
     pub elle_tables: Vec<(String, String)>,
     pub workloads: Vec<(u32, Box<dyn Workload>)>,
@@ -81,20 +82,21 @@ impl OperationHistoryWriter {
 enum HistoryEvent {
     WorkerSpawned {
         step: Option<usize>,
-        worker: usize,
+        process: usize,
         pid: u32,
         reason: &'static str,
         telemetry: WorkerStartupTelemetry,
     },
     WorkerKilled {
         step: usize,
-        worker: usize,
+        process: usize,
         pid: u32,
         reason: &'static str,
     },
     WorkerStateAborted {
         step: usize,
-        worker: usize,
+        process: usize,
+        connection: usize,
         reason: &'static str,
         txn_id: Option<u64>,
         exec_id: Option<u64>,
@@ -103,11 +105,13 @@ enum HistoryEvent {
     },
     CohortRestartStarted {
         step: usize,
-        worker_count: usize,
+        process_count: usize,
+        connection_count: usize,
     },
     OperationStarted {
         step: usize,
-        worker: usize,
+        process: usize,
+        connection: usize,
         exec_id: u64,
         txn_id: Option<u64>,
         op: String,
@@ -115,7 +119,8 @@ enum HistoryEvent {
     },
     OperationFinished {
         step: usize,
-        worker: usize,
+        process: usize,
+        connection: usize,
         exec_id: u64,
         txn_id: Option<u64>,
         op: String,
@@ -124,7 +129,8 @@ enum HistoryEvent {
     },
     OperationTransportFailure {
         step: usize,
-        worker: usize,
+        process: usize,
+        connection: usize,
         exec_id: Option<u64>,
         txn_id: Option<u64>,
         op: Option<String>,
@@ -153,15 +159,21 @@ impl From<&OpResult> for HistoryResult {
 }
 
 /// Handle for a worker child process.
-struct WorkerHandle {
+struct WorkerProcessHandle {
     child: Child,
     stdin: BufWriter<ChildStdin>,
     responses: Receiver<anyhow::Result<WorkerResponse>>,
-    worker_id: usize,
+    process_idx: usize,
 }
 
-/// Mirror of each worker's state, maintained by the coordinator.
-struct WorkerState {
+#[derive(Debug, Clone, Copy)]
+struct LogicalConnectionLocation {
+    process_idx: usize,
+    connection_idx: usize,
+}
+
+/// Mirror of each logical connection's state, maintained by the coordinator.
+struct ConnectionState {
     fiber_state: FiberState,
     txn_id: Option<u64>,
     execution_id: Option<u64>,
@@ -170,7 +182,7 @@ struct WorkerState {
     last_chaotic_result: Option<OpResult>,
 }
 
-impl WorkerState {
+impl ConnectionState {
     fn new() -> Self {
         Self {
             fiber_state: FiberState::Idle,
@@ -185,8 +197,8 @@ impl WorkerState {
 
 /// The multiprocess Whopper coordinator.
 pub struct MultiprocessWhopper {
-    workers: Vec<WorkerHandle>,
-    worker_states: Vec<WorkerState>,
+    processes: Vec<WorkerProcessHandle>,
+    connection_states: Vec<ConnectionState>,
     sim_state: SimulatorState,
     worker_startup_telemetries: Vec<WorkerStartupTelemetry>,
     history: OperationHistoryWriter,
@@ -202,6 +214,7 @@ pub struct MultiprocessWhopper {
     pub stats: Stats,
     db_path: PathBuf,
     enable_mvcc: bool,
+    connections_per_process: usize,
     kill_probability: f64,
     restart_probability: f64,
     keep_files: bool,
@@ -211,6 +224,14 @@ impl MultiprocessWhopper {
     /// Create a new multiprocess coordinator.
     /// Bootstraps the database schema, then spawns worker processes.
     pub fn new(opts: MultiprocessOpts) -> anyhow::Result<Self> {
+        if opts.process_count == 0 {
+            return Err(anyhow::anyhow!("process_count must be greater than zero"));
+        }
+        if opts.connections_per_process == 0 {
+            return Err(anyhow::anyhow!(
+                "connections_per_process must be greater than zero"
+            ));
+        }
         let seed = opts.seed.unwrap_or_else(|| {
             let mut rng = rand::rng();
             rng.next_u64()
@@ -289,34 +310,49 @@ impl MultiprocessWhopper {
         }
 
         let total_weight: u32 = opts.workloads.iter().map(|(w, _)| w).sum();
+        let total_connections = opts
+            .process_count
+            .checked_mul(opts.connections_per_process)
+            .ok_or_else(|| anyhow::anyhow!("multiprocess connection topology overflow"))?;
 
         // Spawn worker processes one at a time.
         // Each worker must fully initialize (open DB, create .tshm) before the next
         // starts, to avoid races on coordination file creation.
-        let mut workers = Vec::new();
-        let mut worker_states = Vec::new();
+        let mut processes = Vec::new();
+        let mut connection_states = Vec::with_capacity(total_connections);
         let mut worker_startup_telemetries = Vec::new();
         let mut history = OperationHistoryWriter::new(opts.history_output.as_deref())?;
-        for i in 0..opts.max_connections {
-            let (handle, telemetry) = spawn_ready_worker(i, &db_path, opts.enable_mvcc)?;
-            debug!("worker {} ready: {:?}", handle.worker_id, telemetry);
+        for process_idx in 0..opts.process_count {
+            let (handle, telemetry) = spawn_ready_worker(
+                process_idx,
+                &db_path,
+                opts.enable_mvcc,
+                opts.connections_per_process,
+            )?;
+            debug!("process {} ready: {:?}", handle.process_idx, telemetry);
             history.record(&HistoryEvent::WorkerSpawned {
                 step: None,
-                worker: i,
+                process: process_idx,
                 pid: handle.child.id(),
                 reason: "initial_spawn",
                 telemetry,
             })?;
             worker_startup_telemetries.push(telemetry);
-            workers.push(handle);
-            worker_states.push(WorkerState::new());
+            processes.push(handle);
+            for _ in 0..opts.connections_per_process {
+                connection_states.push(ConnectionState::new());
+            }
         }
 
-        info!("all {} workers ready", workers.len());
+        info!(
+            "all {} processes ready ({} total connections)",
+            processes.len(),
+            connection_states.len()
+        );
 
         Ok(Self {
-            workers,
-            worker_states,
+            processes,
+            connection_states,
             sim_state,
             worker_startup_telemetries,
             history,
@@ -336,6 +372,7 @@ impl MultiprocessWhopper {
             stats: Stats::default(),
             db_path,
             enable_mvcc: opts.enable_mvcc,
+            connections_per_process: opts.connections_per_process,
             kill_probability: opts.kill_probability,
             restart_probability: opts.restart_probability,
             keep_files: opts.keep_files,
@@ -355,29 +392,45 @@ impl MultiprocessWhopper {
         &self.worker_startup_telemetries
     }
 
-    /// Execute SQL directly on one worker without involving workload generation.
+    fn connection_location(&self, logical_connection_idx: usize) -> LogicalConnectionLocation {
+        LogicalConnectionLocation {
+            process_idx: logical_connection_idx / self.connections_per_process,
+            connection_idx: logical_connection_idx % self.connections_per_process,
+        }
+    }
+
+    fn process_connection_indices(&self, process_idx: usize) -> std::ops::Range<usize> {
+        let start = process_idx * self.connections_per_process;
+        start..start + self.connections_per_process
+    }
+
+    /// Execute SQL directly on one logical connection without involving workload generation.
     /// This is used by deterministic restart regressions.
     pub fn execute_sql_direct(
         &mut self,
-        worker_idx: usize,
+        connection_idx: usize,
         sql: impl Into<String>,
     ) -> anyhow::Result<OpResult> {
         let sql = sql.into();
+        let location = self.connection_location(connection_idx);
         send_command(
-            &mut self.workers[worker_idx],
-            &WorkerCommand::Execute { sql },
+            &mut self.processes[location.process_idx],
+            &WorkerCommand::Execute {
+                connection_idx: location.connection_idx,
+                sql,
+            },
         )?;
-        let response = recv_response(&mut self.workers[worker_idx])?;
+        let response = recv_response(&mut self.processes[location.process_idx])?;
         Ok(response.into_op_result())
     }
 
-    /// Execute SQL on an idle worker that is not currently inside a simulated transaction.
+    /// Execute SQL on an idle logical connection that is not currently inside a simulated transaction.
     pub fn execute_sql_via_idle_worker(
         &mut self,
         sql: impl Into<String>,
     ) -> anyhow::Result<(usize, OpResult)> {
-        let worker_idx = self
-            .worker_states
+        let connection_idx = self
+            .connection_states
             .iter()
             .enumerate()
             .find_map(|(idx, state)| {
@@ -389,21 +442,24 @@ impl MultiprocessWhopper {
                     && state.last_chaotic_result.is_none())
                 .then_some(idx)
             })
-            .ok_or_else(|| anyhow::anyhow!("no idle worker available for probe"))?;
-        let result = self.execute_sql_direct(worker_idx, sql)?;
-        Ok((worker_idx, result))
+            .ok_or_else(|| anyhow::anyhow!("no idle logical connection available for probe"))?;
+        let result = self.execute_sql_direct(connection_idx, sql)?;
+        Ok((connection_idx, result))
     }
 
-    pub fn disable_auto_checkpoint_direct(&mut self, worker_idx: usize) -> anyhow::Result<()> {
+    pub fn disable_auto_checkpoint_direct(&mut self, connection_idx: usize) -> anyhow::Result<()> {
+        let location = self.connection_location(connection_idx);
         send_command(
-            &mut self.workers[worker_idx],
-            &WorkerCommand::DisableAutoCheckpoint,
+            &mut self.processes[location.process_idx],
+            &WorkerCommand::DisableAutoCheckpoint {
+                connection_idx: location.connection_idx,
+            },
         )?;
-        match recv_response(&mut self.workers[worker_idx])? {
+        match recv_response(&mut self.processes[location.process_idx])? {
             WorkerResponse::Ack => Ok(()),
             other => Err(anyhow::anyhow!(
-                "worker {} returned unexpected response to DisableAutoCheckpoint: {:?}",
-                worker_idx,
+                "logical connection {} returned unexpected response to DisableAutoCheckpoint: {:?}",
+                connection_idx,
                 other
             )),
         }
@@ -411,35 +467,38 @@ impl MultiprocessWhopper {
 
     pub fn passive_checkpoint_direct(
         &mut self,
-        worker_idx: usize,
+        connection_idx: usize,
         upper_bound_inclusive: Option<u64>,
     ) -> anyhow::Result<()> {
+        let location = self.connection_location(connection_idx);
         send_command(
-            &mut self.workers[worker_idx],
+            &mut self.processes[location.process_idx],
             &WorkerCommand::PassiveCheckpoint {
+                connection_idx: location.connection_idx,
                 upper_bound_inclusive,
             },
         )?;
-        match recv_response(&mut self.workers[worker_idx])? {
+        match recv_response(&mut self.processes[location.process_idx])? {
             WorkerResponse::Ack => Ok(()),
             other => Err(anyhow::anyhow!(
-                "worker {} returned unexpected response to PassiveCheckpoint: {:?}",
-                worker_idx,
+                "logical connection {} returned unexpected response to PassiveCheckpoint: {:?}",
+                connection_idx,
                 other
             )),
         }
     }
 
-    pub fn clear_backfill_proof_direct(&mut self, worker_idx: usize) -> anyhow::Result<()> {
+    pub fn clear_backfill_proof_direct(&mut self, connection_idx: usize) -> anyhow::Result<()> {
+        let location = self.connection_location(connection_idx);
         send_command(
-            &mut self.workers[worker_idx],
+            &mut self.processes[location.process_idx],
             &WorkerCommand::ClearBackfillProof,
         )?;
-        match recv_response(&mut self.workers[worker_idx])? {
+        match recv_response(&mut self.processes[location.process_idx])? {
             WorkerResponse::Ack => Ok(()),
             other => Err(anyhow::anyhow!(
-                "worker {} returned unexpected response to ClearBackfillProof: {:?}",
-                worker_idx,
+                "logical connection {} returned unexpected response to ClearBackfillProof: {:?}",
+                connection_idx,
                 other
             )),
         }
@@ -447,20 +506,22 @@ impl MultiprocessWhopper {
 
     pub fn install_unpublished_backfill_proof_direct(
         &mut self,
-        worker_idx: usize,
+        connection_idx: usize,
         upper_bound_inclusive: u64,
     ) -> anyhow::Result<()> {
+        let location = self.connection_location(connection_idx);
         send_command(
-            &mut self.workers[worker_idx],
+            &mut self.processes[location.process_idx],
             &WorkerCommand::InstallUnpublishedBackfillProof {
+                connection_idx: location.connection_idx,
                 upper_bound_inclusive,
             },
         )?;
-        match recv_response(&mut self.workers[worker_idx])? {
+        match recv_response(&mut self.processes[location.process_idx])? {
             WorkerResponse::Ack => Ok(()),
             other => Err(anyhow::anyhow!(
-                "worker {} returned unexpected response to InstallUnpublishedBackfillProof: {:?}",
-                worker_idx,
+                "logical connection {} returned unexpected response to InstallUnpublishedBackfillProof: {:?}",
+                connection_idx,
                 other
             )),
         }
@@ -468,17 +529,18 @@ impl MultiprocessWhopper {
 
     pub fn shared_wal_snapshot_direct(
         &mut self,
-        worker_idx: usize,
+        connection_idx: usize,
     ) -> anyhow::Result<Option<WorkerSharedWalSnapshot>> {
+        let location = self.connection_location(connection_idx);
         send_command(
-            &mut self.workers[worker_idx],
+            &mut self.processes[location.process_idx],
             &WorkerCommand::ReadSharedWalSnapshot,
         )?;
-        match recv_response(&mut self.workers[worker_idx])? {
+        match recv_response(&mut self.processes[location.process_idx])? {
             WorkerResponse::SharedWalSnapshot { snapshot } => Ok(snapshot),
             other => Err(anyhow::anyhow!(
-                "worker {} returned unexpected response to ReadSharedWalSnapshot: {:?}",
-                worker_idx,
+                "logical connection {} returned unexpected response to ReadSharedWalSnapshot: {:?}",
+                connection_idx,
                 other
             )),
         }
@@ -486,18 +548,19 @@ impl MultiprocessWhopper {
 
     pub fn find_frame_for_page_direct(
         &mut self,
-        worker_idx: usize,
+        connection_idx: usize,
         page_id: u64,
     ) -> anyhow::Result<Option<u64>> {
+        let location = self.connection_location(connection_idx);
         send_command(
-            &mut self.workers[worker_idx],
+            &mut self.processes[location.process_idx],
             &WorkerCommand::FindFrameForPage { page_id },
         )?;
-        match recv_response(&mut self.workers[worker_idx])? {
+        match recv_response(&mut self.processes[location.process_idx])? {
             WorkerResponse::FrameLookup { frame_id } => Ok(frame_id),
             other => Err(anyhow::anyhow!(
-                "worker {} returned unexpected response to FindFrameForPage: {:?}",
-                worker_idx,
+                "logical connection {} returned unexpected response to FindFrameForPage: {:?}",
+                connection_idx,
                 other
             )),
         }
@@ -510,13 +573,19 @@ impl MultiprocessWhopper {
         sql: impl Into<String>,
     ) -> anyhow::Result<(WorkerStartupTelemetry, OpResult)> {
         let sql = sql.into();
-        let probe_worker_id = self.workers.len();
+        let probe_worker_id = self.processes.len();
         let (mut worker, telemetry) =
-            spawn_ready_worker(probe_worker_id, &self.db_path, self.enable_mvcc)?;
+            spawn_ready_worker(probe_worker_id, &self.db_path, self.enable_mvcc, 1)?;
 
         let result = (|| -> anyhow::Result<OpResult> {
             for _ in 0..8 {
-                send_command(&mut worker, &WorkerCommand::Execute { sql: sql.clone() })?;
+                send_command(
+                    &mut worker,
+                    &WorkerCommand::Execute {
+                        connection_idx: 0,
+                        sql: sql.clone(),
+                    },
+                )?;
                 let response = recv_response(&mut worker)?;
                 let op_result = response.into_op_result();
                 match &op_result {
@@ -548,7 +617,8 @@ impl MultiprocessWhopper {
         );
         self.history.record(&HistoryEvent::CohortRestartStarted {
             step: self.current_step,
-            worker_count: self.workers.len(),
+            process_count: self.processes.len(),
+            connection_count: self.connection_states.len(),
         })?;
 
         self.stop_all_workers_preserve_files("cohort_restart")?;
@@ -569,46 +639,49 @@ impl MultiprocessWhopper {
     }
 
     fn stop_all_workers_preserve_files(&mut self, reason: &'static str) -> anyhow::Result<()> {
-        for worker_idx in 0..self.workers.len() {
-            let worker_id = self.workers[worker_idx].worker_id;
-            let pid = self.workers[worker_idx].child.id();
+        for process_idx in 0..self.processes.len() {
+            let pid = self.processes[process_idx].child.id();
             self.history.record(&HistoryEvent::WorkerKilled {
                 step: self.current_step,
-                worker: worker_id,
+                process: process_idx,
                 pid,
                 reason,
             })?;
-            let _ = self.workers[worker_idx].child.kill();
+            let _ = self.processes[process_idx].child.kill();
         }
-        for worker in &mut self.workers {
-            let _ = worker.child.wait();
+        for process in &mut self.processes {
+            let _ = process.child.wait();
         }
 
-        for worker_idx in 0..self.worker_states.len() {
-            self.abort_worker_state(worker_idx, reason)?;
+        for process_idx in 0..self.processes.len() {
+            self.abort_process_state(process_idx, reason)?;
         }
         Ok(())
     }
 
     fn respawn_all_workers_preserve_files(&mut self, reason: &'static str) -> anyhow::Result<()> {
-        let mut new_workers = Vec::with_capacity(self.workers.len());
-        let mut new_telemetries = Vec::with_capacity(self.workers.len());
-        for worker_idx in 0..self.workers.len() {
-            let (handle, telemetry) =
-                spawn_ready_worker(worker_idx, &self.db_path, self.enable_mvcc)?;
+        let mut new_processes = Vec::with_capacity(self.processes.len());
+        let mut new_telemetries = Vec::with_capacity(self.processes.len());
+        for process_idx in 0..self.processes.len() {
+            let (handle, telemetry) = spawn_ready_worker(
+                process_idx,
+                &self.db_path,
+                self.enable_mvcc,
+                self.connections_per_process,
+            )?;
             self.history.record(&HistoryEvent::WorkerSpawned {
                 step: Some(self.current_step),
-                worker: worker_idx,
+                process: process_idx,
                 pid: handle.child.id(),
                 reason,
                 telemetry,
             })?;
-            info!("worker {} restarted: {:?}", worker_idx, telemetry);
-            new_workers.push(handle);
+            info!("process {} restarted: {:?}", process_idx, telemetry);
+            new_processes.push(handle);
             new_telemetries.push(telemetry);
         }
 
-        self.workers = new_workers;
+        self.processes = new_processes;
         self.worker_startup_telemetries = new_telemetries;
         Ok(())
     }
@@ -625,39 +698,46 @@ impl MultiprocessWhopper {
             return Ok(StepResult::Ok);
         }
 
-        let worker_idx = self.current_step % self.workers.len();
+        let connection_idx = self.current_step % self.connection_states.len();
 
-        // Optionally kill a worker for crash recovery testing
+        // Optionally kill a worker process for crash recovery testing
         if self.kill_probability > 0.0 && self.rng.random_bool(self.kill_probability) {
-            self.kill_and_respawn(worker_idx, "crash_recovery_test")?;
+            self.kill_and_respawn_process(connection_idx, "crash_recovery_test")?;
         }
 
-        self.perform_work(worker_idx)?;
+        self.perform_work(connection_idx)?;
         self.current_step += 1;
 
         Ok(StepResult::Ok)
     }
 
-    fn perform_work(&mut self, worker_idx: usize) -> anyhow::Result<()> {
-        let ws = &self.worker_states[worker_idx];
+    fn perform_work(&mut self, connection_idx: usize) -> anyhow::Result<()> {
+        let location = self.connection_location(connection_idx);
+        let ws = &self.connection_states[connection_idx];
         let exec_id = ws.execution_id;
         let txn_id = ws.txn_id;
 
         debug!(
-            "perform_work: step={}, worker={}, exec_id={:?}, txn_id={:?}, state={:?}",
-            self.current_step, worker_idx, exec_id, txn_id, ws.fiber_state
+            "perform_work: step={}, process={}, connection={}, exec_id={:?}, txn_id={:?}, state={:?}",
+            self.current_step,
+            location.process_idx,
+            connection_idx,
+            exec_id,
+            txn_id,
+            ws.fiber_state
         );
 
         // If the worker has a pending operation (e.g., auto-rollback), use that.
         // Otherwise, try chaotic workload, then regular workloads.
-        if self.worker_states[worker_idx].current_op.is_none() {
+        if self.connection_states[connection_idx].current_op.is_none() {
             // Try chaotic workload first
             if !self.chaotic_profiles.is_empty() {
-                self.try_resume_chaotic(worker_idx);
+                self.try_resume_chaotic(connection_idx);
             }
 
             // Fall through to regular workloads if chaotic didn't produce an op
-            if self.worker_states[worker_idx].current_op.is_none() && self.total_weight > 0 {
+            if self.connection_states[connection_idx].current_op.is_none() && self.total_weight > 0
+            {
                 let mut roll = self.rng.random_range(0..self.total_weight);
                 for (weight, workload) in &self.workloads {
                     if roll >= *weight {
@@ -665,7 +745,7 @@ impl MultiprocessWhopper {
                         continue;
                     }
                     let ctx = WorkloadContext {
-                        fiber_state: &self.worker_states[worker_idx].fiber_state,
+                        fiber_state: &self.connection_states[connection_idx].fiber_state,
                         sim_state: &self.sim_state,
                         opts: &self.opts,
                         enable_mvcc: self.enable_mvcc,
@@ -674,32 +754,32 @@ impl MultiprocessWhopper {
                     let Some(op) = workload.generate(&ctx, &mut self.rng) else {
                         continue;
                     };
-                    debug!("generated op for worker {}: {:?}", worker_idx, op);
-                    self.worker_states[worker_idx].current_op = Some(op);
+                    debug!("generated op for connection {}: {:?}", connection_idx, op);
+                    self.connection_states[connection_idx].current_op = Some(op);
                     break;
                 }
             }
         }
 
         // Execute the operation
-        let Some(op) = self.worker_states[worker_idx].current_op.take() else {
+        let Some(op) = self.connection_states[connection_idx].current_op.take() else {
             return Ok(()); // No operation generated this step
         };
 
         // Assign execution ID
         let exec_id = self.sim_state.gen_execution_id();
-        self.worker_states[worker_idx].execution_id = Some(exec_id);
+        self.connection_states[connection_idx].execution_id = Some(exec_id);
 
         // Assign txn_id for BEGIN
         if let Operation::Begin { .. } = &op {
-            self.worker_states[worker_idx].txn_id = Some(self.sim_state.gen_txn_id());
+            self.connection_states[connection_idx].txn_id = Some(self.sim_state.gen_txn_id());
         }
-        let txn_id = self.worker_states[worker_idx].txn_id;
+        let txn_id = self.connection_states[connection_idx].txn_id;
 
         // Notify properties: operation starting
         for property in &self.properties {
             let mut property = property.lock().unwrap();
-            property.init_op(self.current_step, worker_idx, txn_id, exec_id, &op)?;
+            property.init_op(self.current_step, connection_idx, txn_id, exec_id, &op)?;
         }
 
         // Send to worker and get result
@@ -707,41 +787,50 @@ impl MultiprocessWhopper {
         let op_description = format!("{op:?}");
         self.history.record(&HistoryEvent::OperationStarted {
             step: self.current_step,
-            worker: worker_idx,
+            process: location.process_idx,
+            connection: connection_idx,
             exec_id,
             txn_id,
             op: op_description.clone(),
             sql: sql.clone(),
         })?;
-        debug!("sending to worker {}: {}", worker_idx, sql);
+        debug!(
+            "sending to process {} connection {}: {}",
+            location.process_idx, location.connection_idx, sql
+        );
         send_command(
-            &mut self.workers[worker_idx],
-            &WorkerCommand::Execute { sql: sql.clone() },
+            &mut self.processes[location.process_idx],
+            &WorkerCommand::Execute {
+                connection_idx: location.connection_idx,
+                sql: sql.clone(),
+            },
         )?;
-        let response = match recv_response(&mut self.workers[worker_idx]) {
+        let response = match recv_response(&mut self.processes[location.process_idx]) {
             Ok(r) => r,
             Err(e) => {
-                // Worker crashed - kill old process before respawning to prevent
-                // two workers for the same slot from accessing the database simultaneously.
-                error!("worker {} crashed: {}", worker_idx, e);
+                // The worker process crashed. Kill the old process before respawning to prevent
+                // duplicate live access to the same database from one logical slot.
+                error!("process {} crashed: {}", location.process_idx, e);
                 self.history
                     .record(&HistoryEvent::OperationTransportFailure {
                         step: self.current_step,
-                        worker: worker_idx,
+                        process: location.process_idx,
+                        connection: connection_idx,
                         exec_id: Some(exec_id),
                         txn_id,
                         op: Some(op_description),
                         sql: Some(sql),
                         error: e.to_string(),
                     })?;
-                self.kill_and_respawn(worker_idx, "transport_failure")?;
+                self.kill_and_respawn_process(connection_idx, "transport_failure")?;
                 return Ok(());
             }
         };
         let op_result = response.into_op_result();
         self.history.record(&HistoryEvent::OperationFinished {
             step: self.current_step,
-            worker: worker_idx,
+            process: location.process_idx,
+            connection: connection_idx,
             exec_id,
             txn_id,
             op: op_description,
@@ -749,8 +838,8 @@ impl MultiprocessWhopper {
             result: HistoryResult::from(&op_result),
         })?;
         match &op_result {
-            Ok(_) => debug!("worker {} result: ok", worker_idx),
-            Err(err) => debug!("worker {} result: err={err:?}", worker_idx),
+            Ok(_) => debug!("connection {} result: ok", connection_idx),
+            Err(err) => debug!("connection {} result: err={err:?}", connection_idx),
         }
 
         // Skip benign errors that occur in multiprocess mode
@@ -761,24 +850,27 @@ impl MultiprocessWhopper {
                 || err.contains("already exists")
                 || err.contains("not exist")
             {
-                debug!("worker {}: skipped op ({})", worker_idx, err);
-                self.worker_states[worker_idx].execution_id = None;
+                debug!("connection {}: skipped op ({})", connection_idx, err);
+                self.connection_states[connection_idx].execution_id = None;
                 return Ok(());
             }
             // Schema/index desync after respawn or cross-process schema lag
             if err.contains("not found in schema") {
-                debug!("worker {}: schema desync ({})", worker_idx, err);
-                self.worker_states[worker_idx].execution_id = None;
+                debug!("connection {}: schema desync ({})", connection_idx, err);
+                self.connection_states[connection_idx].execution_id = None;
                 return Ok(());
             }
             // Worker's connection already auto-rolled back (state desync)
             if err.contains("no transaction is active") || err.contains("cannot rollback") {
-                debug!("worker {}: transaction already ended ({})", worker_idx, err);
-                self.worker_states[worker_idx].fiber_state = FiberState::Idle;
-                self.worker_states[worker_idx].txn_id = None;
-                self.worker_states[worker_idx].execution_id = None;
-                self.worker_states[worker_idx].chaotic_workload = None;
-                self.worker_states[worker_idx].last_chaotic_result = None;
+                debug!(
+                    "connection {}: transaction already ended ({})",
+                    connection_idx, err
+                );
+                self.connection_states[connection_idx].fiber_state = FiberState::Idle;
+                self.connection_states[connection_idx].txn_id = None;
+                self.connection_states[connection_idx].execution_id = None;
+                self.connection_states[connection_idx].chaotic_workload = None;
+                self.connection_states[connection_idx].last_chaotic_result = None;
                 return Ok(());
             }
         }
@@ -786,7 +878,8 @@ impl MultiprocessWhopper {
         // Update fiber state for BEGIN
         if let Operation::Begin { mode } = &op {
             if op_result.is_ok() {
-                self.worker_states[worker_idx].fiber_state = if *mode == TxMode::Concurrent {
+                self.connection_states[connection_idx].fiber_state = if *mode == TxMode::Concurrent
+                {
                     FiberState::InConcurrentTx
                 } else {
                     FiberState::InTx
@@ -809,7 +902,7 @@ impl MultiprocessWhopper {
             property
                 .finish_op(
                     self.current_step,
-                    worker_idx,
+                    connection_idx,
                     txn_id,
                     exec_id,
                     end_exec_id,
@@ -820,16 +913,20 @@ impl MultiprocessWhopper {
         }
 
         // Save result for chaotic workload
-        if self.worker_states[worker_idx].chaotic_workload.is_some()
-            && self.worker_states[worker_idx].last_chaotic_result.is_none()
+        if self.connection_states[connection_idx]
+            .chaotic_workload
+            .is_some()
+            && self.connection_states[connection_idx]
+                .last_chaotic_result
+                .is_none()
         {
-            self.worker_states[worker_idx].last_chaotic_result = Some(op_result.clone());
+            self.connection_states[connection_idx].last_chaotic_result = Some(op_result.clone());
         }
 
         // Update fiber state for COMMIT/ROLLBACK and auto-commit
         if matches!(op, Operation::Commit | Operation::Rollback) && op_result.is_ok() {
-            self.worker_states[worker_idx].fiber_state = FiberState::Idle;
-            self.worker_states[worker_idx].txn_id = None;
+            self.connection_states[connection_idx].fiber_state = FiberState::Idle;
+            self.connection_states[connection_idx].txn_id = None;
         }
 
         // Handle errors: initiate auto-rollback for retryable errors
@@ -843,27 +940,34 @@ impl MultiprocessWhopper {
                 | LimboError::WriteWriteConflict
                 | LimboError::CommitDependencyAborted
                 | LimboError::InvalidArgument(..) => {
-                    if self.worker_states[worker_idx].fiber_state.is_in_tx() {
-                        debug!("worker {}: auto-rollback after {:?}", worker_idx, error);
-                        self.worker_states[worker_idx].current_op = Some(Operation::Rollback);
+                    if self.connection_states[connection_idx]
+                        .fiber_state
+                        .is_in_tx()
+                    {
+                        debug!(
+                            "connection {}: auto-rollback after {:?}",
+                            connection_idx, error
+                        );
+                        self.connection_states[connection_idx].current_op =
+                            Some(Operation::Rollback);
                     } else {
-                        self.worker_states[worker_idx].txn_id = None;
+                        self.connection_states[connection_idx].txn_id = None;
                     }
                 }
                 // Corruption and checkpoint errors: log and respawn the worker.
                 // These are real multiprocess bugs we want to surface but not crash on.
                 LimboError::Corrupt(_) | LimboError::CheckpointFailed(_) => {
                     error!(
-                        "worker {} hit corruption on step {}: {} -- respawning",
-                        worker_idx, self.current_step, error
+                        "process {} hit corruption on step {} via connection {}: {} -- respawning",
+                        location.process_idx, self.current_step, connection_idx, error
                     );
                     self.stats.corruption_events += 1;
-                    self.kill_and_respawn(worker_idx, "corruption_recovery")?;
+                    self.kill_and_respawn_process(connection_idx, "corruption_recovery")?;
                 }
                 _ => {
                     return Err(anyhow::anyhow!(
-                        "worker {} fatal error on step {}: {}",
-                        worker_idx,
+                        "connection {} fatal error on step {}: {}",
+                        connection_idx,
                         self.current_step,
                         error
                     ));
@@ -871,73 +975,85 @@ impl MultiprocessWhopper {
             }
         }
 
-        self.worker_states[worker_idx].execution_id = None;
+        self.connection_states[connection_idx].execution_id = None;
         Ok(())
     }
 
-    /// Try to resume or start a chaotic workload for the given worker.
-    fn try_resume_chaotic(&mut self, worker_idx: usize) {
+    /// Try to resume or start a chaotic workload for the given logical connection.
+    fn try_resume_chaotic(&mut self, connection_idx: usize) {
         // Resume active workload with saved result
-        if let Some(result) = self.worker_states[worker_idx].last_chaotic_result.take() {
-            let mut workload = self.worker_states[worker_idx].chaotic_workload.take();
+        if let Some(result) = self.connection_states[connection_idx]
+            .last_chaotic_result
+            .take()
+        {
+            let mut workload = self.connection_states[connection_idx]
+                .chaotic_workload
+                .take();
             if let Some(ref mut wl) = workload {
                 if let Some(op) = wl.next(Some(result)) {
                     debug!(
-                        "chaotic: resumed workload for worker {}, next op: {:?}",
-                        worker_idx, op
+                        "chaotic: resumed workload for connection {}, next op: {:?}",
+                        connection_idx, op
                     );
-                    self.worker_states[worker_idx].current_op = Some(op);
-                    self.worker_states[worker_idx].chaotic_workload = workload;
+                    self.connection_states[connection_idx].current_op = Some(op);
+                    self.connection_states[connection_idx].chaotic_workload = workload;
                     return;
                 }
-                debug!("chaotic: workload completed for worker {}", worker_idx);
+                debug!(
+                    "chaotic: workload completed for connection {}",
+                    connection_idx
+                );
             }
         }
 
         // Pick a new chaotic workload (only when idle)
-        if self.worker_states[worker_idx].chaotic_workload.is_none()
-            && self.worker_states[worker_idx].fiber_state == FiberState::Idle
+        if self.connection_states[connection_idx]
+            .chaotic_workload
+            .is_none()
+            && self.connection_states[connection_idx].fiber_state == FiberState::Idle
         {
-            if let Some(op) = self.pick_chaotic_workload(worker_idx) {
-                self.worker_states[worker_idx].current_op = Some(op);
+            if let Some(op) = self.pick_chaotic_workload(connection_idx) {
+                self.connection_states[connection_idx].current_op = Some(op);
             }
         }
     }
 
-    fn pick_chaotic_workload(&mut self, worker_idx: usize) -> Option<Operation> {
+    fn pick_chaotic_workload(&mut self, connection_idx: usize) -> Option<Operation> {
         for (probability, name, profile) in &self.chaotic_profiles {
             if !self.rng.random_bool(*probability) {
                 continue;
             }
             let fiber_rng = ChaCha8Rng::seed_from_u64(self.rng.next_u64());
-            let mut workload = profile.generate(fiber_rng, worker_idx);
+            let mut workload = profile.generate(fiber_rng, connection_idx);
             if let Some(op) = workload.next(None) {
                 debug!(
-                    "chaotic: picked workload '{}' for worker {}",
-                    name, worker_idx
+                    "chaotic: picked workload '{}' for connection {}",
+                    name, connection_idx
                 );
-                self.worker_states[worker_idx].chaotic_workload = Some(workload);
+                self.connection_states[connection_idx].chaotic_workload = Some(workload);
                 return Some(op);
             }
         }
         None
     }
 
-    fn abort_worker_state(
+    fn abort_connection_state(
         &mut self,
-        worker_idx: usize,
+        connection_idx: usize,
         reason: &'static str,
     ) -> anyhow::Result<()> {
-        let txn_id = self.worker_states[worker_idx].txn_id;
-        let exec_id = self.worker_states[worker_idx].execution_id;
-        let fiber_state = format!("{:?}", self.worker_states[worker_idx].fiber_state);
-        let current_op = self.worker_states[worker_idx]
+        let location = self.connection_location(connection_idx);
+        let txn_id = self.connection_states[connection_idx].txn_id;
+        let exec_id = self.connection_states[connection_idx].execution_id;
+        let fiber_state = format!("{:?}", self.connection_states[connection_idx].fiber_state);
+        let current_op = self.connection_states[connection_idx]
             .current_op
             .as_ref()
             .map(|op| format!("{op:?}"));
         self.history.record(&HistoryEvent::WorkerStateAborted {
             step: self.current_step,
-            worker: worker_idx,
+            process: location.process_idx,
+            connection: connection_idx,
             reason,
             txn_id,
             exec_id,
@@ -946,41 +1062,67 @@ impl MultiprocessWhopper {
         })?;
         for property in &self.properties {
             let mut property = property.lock().unwrap();
-            property.abort_fiber(worker_idx, txn_id)?;
+            property.abort_fiber(connection_idx, txn_id)?;
         }
-        self.worker_states[worker_idx] = WorkerState::new();
+        self.connection_states[connection_idx] = ConnectionState::new();
         Ok(())
     }
 
-    /// Kill a worker and respawn it (tests crash recovery).
-    fn kill_and_respawn(&mut self, worker_idx: usize, reason: &'static str) -> anyhow::Result<()> {
-        let pid = self.workers[worker_idx].child.id();
-        info!("killing worker {} (pid {}) for {}", worker_idx, pid, reason);
+    fn abort_process_state(
+        &mut self,
+        process_idx: usize,
+        reason: &'static str,
+    ) -> anyhow::Result<()> {
+        for connection_idx in self.process_connection_indices(process_idx) {
+            self.abort_connection_state(connection_idx, reason)?;
+        }
+        Ok(())
+    }
+
+    /// Kill one worker process and respawn it (tests crash recovery).
+    fn kill_and_respawn_process(
+        &mut self,
+        connection_idx: usize,
+        reason: &'static str,
+    ) -> anyhow::Result<()> {
+        let location = self.connection_location(connection_idx);
+        let pid = self.processes[location.process_idx].child.id();
+        info!(
+            "killing process {} (pid {}) for {}",
+            location.process_idx, pid, reason
+        );
         self.history.record(&HistoryEvent::WorkerKilled {
             step: self.current_step,
-            worker: worker_idx,
+            process: location.process_idx,
             pid,
             reason,
         })?;
-        let _ = self.workers[worker_idx].child.kill();
-        let _ = self.workers[worker_idx].child.wait();
+        let _ = self.processes[location.process_idx].child.kill();
+        let _ = self.processes[location.process_idx].child.wait();
 
-        // Reset worker state and let properties discard or finalize any
-        // pending per-fiber state that died with the worker.
-        self.abort_worker_state(worker_idx, reason)?;
+        // Reset every logical connection hosted by the dead process.
+        self.abort_process_state(location.process_idx, reason)?;
 
         // Respawn
-        let (handle, telemetry) = spawn_ready_worker(worker_idx, &self.db_path, self.enable_mvcc)?;
+        let (handle, telemetry) = spawn_ready_worker(
+            location.process_idx,
+            &self.db_path,
+            self.enable_mvcc,
+            self.connections_per_process,
+        )?;
         self.history.record(&HistoryEvent::WorkerSpawned {
             step: Some(self.current_step),
-            worker: worker_idx,
+            process: location.process_idx,
             pid: handle.child.id(),
             reason,
             telemetry,
         })?;
-        self.workers[worker_idx] = handle;
-        self.worker_startup_telemetries[worker_idx] = telemetry;
-        info!("worker {} respawned and ready: {:?}", worker_idx, telemetry);
+        self.processes[location.process_idx] = handle;
+        self.worker_startup_telemetries[location.process_idx] = telemetry;
+        info!(
+            "process {} respawned and ready: {:?}",
+            location.process_idx, telemetry
+        );
         Ok(())
     }
 
@@ -1002,9 +1144,9 @@ impl MultiprocessWhopper {
         }
 
         // Shut down workers
-        for worker in &mut self.workers {
-            let _ = send_command(worker, &WorkerCommand::Shutdown);
-            let _ = worker.child.wait();
+        for process in &mut self.processes {
+            let _ = send_command(process, &WorkerCommand::Shutdown);
+            let _ = process.child.wait();
         }
 
         // Clean up database files
@@ -1022,26 +1164,27 @@ impl MultiprocessWhopper {
 
 impl Drop for MultiprocessWhopper {
     fn drop(&mut self) {
-        // Ensure workers are killed on drop
-        for worker in &mut self.workers {
-            let _ = worker.child.kill();
-            let _ = worker.child.wait();
+        // Ensure worker processes are killed on drop
+        for process in &mut self.processes {
+            let _ = process.child.kill();
+            let _ = process.child.wait();
         }
     }
 }
 
 fn spawn_ready_worker(
-    worker_id: usize,
+    process_idx: usize,
     db_path: &Path,
     enable_mvcc: bool,
-) -> anyhow::Result<(WorkerHandle, WorkerStartupTelemetry)> {
-    let mut handle = spawn_worker(worker_id, db_path, enable_mvcc)?;
+    connections_per_process: usize,
+) -> anyhow::Result<(WorkerProcessHandle, WorkerStartupTelemetry)> {
+    let mut handle = spawn_worker(process_idx, db_path, enable_mvcc, connections_per_process)?;
     let response = recv_response(&mut handle)?;
     match response {
         WorkerResponse::Ready { telemetry } => Ok((handle, telemetry)),
         other => Err(anyhow::anyhow!(
-            "worker {} sent unexpected response during init: {:?}",
-            worker_id,
+            "process {} sent unexpected response during init: {:?}",
+            process_idx,
             other
         )),
     }
@@ -1049,15 +1192,18 @@ fn spawn_ready_worker(
 
 /// Spawn a worker child process.
 fn spawn_worker(
-    worker_id: usize,
+    process_idx: usize,
     db_path: &Path,
     enable_mvcc: bool,
-) -> anyhow::Result<WorkerHandle> {
+    connections_per_process: usize,
+) -> anyhow::Result<WorkerProcessHandle> {
     let exe = worker_executable()?;
     let mut cmd = Command::new(&exe);
     cmd.arg("worker")
         .arg("--db-path")
         .arg(db_path)
+        .arg("--connections-per-process")
+        .arg(connections_per_process.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -1068,17 +1214,17 @@ fn spawn_worker(
 
     let mut child = cmd
         .spawn()
-        .map_err(|e| anyhow::anyhow!("failed to spawn worker {worker_id}: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("failed to spawn process {process_idx}: {e}"))?;
 
     let stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
-    let responses = spawn_stdout_reader(worker_id, stdout);
+    let responses = spawn_stdout_reader(process_idx, stdout);
 
-    Ok(WorkerHandle {
+    Ok(WorkerProcessHandle {
         child,
         stdin: BufWriter::new(stdin),
         responses,
-        worker_id,
+        process_idx,
     })
 }
 
@@ -1093,32 +1239,32 @@ fn worker_executable() -> anyhow::Result<PathBuf> {
 }
 
 /// Send a command to a worker.
-fn send_command(worker: &mut WorkerHandle, cmd: &WorkerCommand) -> anyhow::Result<()> {
-    serde_json::to_writer(&mut worker.stdin, cmd)?;
-    worker.stdin.write_all(b"\n")?;
-    worker.stdin.flush()?;
+fn send_command(process: &mut WorkerProcessHandle, cmd: &WorkerCommand) -> anyhow::Result<()> {
+    serde_json::to_writer(&mut process.stdin, cmd)?;
+    process.stdin.write_all(b"\n")?;
+    process.stdin.flush()?;
     Ok(())
 }
 
 /// Receive a response from a worker.
-fn recv_response(worker: &mut WorkerHandle) -> anyhow::Result<WorkerResponse> {
-    recv_response_timeout(worker, Duration::from_secs(10))
+fn recv_response(process: &mut WorkerProcessHandle) -> anyhow::Result<WorkerResponse> {
+    recv_response_timeout(process, Duration::from_secs(10))
 }
 
 fn recv_response_timeout(
-    worker: &mut WorkerHandle,
+    process: &mut WorkerProcessHandle,
     timeout: Duration,
 ) -> anyhow::Result<WorkerResponse> {
-    match worker.responses.recv_timeout(timeout) {
+    match process.responses.recv_timeout(timeout) {
         Ok(result) => result,
         Err(RecvTimeoutError::Timeout) => Err(anyhow::anyhow!(
-            "worker {} timed out after {:?} waiting for response",
-            worker.worker_id,
+            "process {} timed out after {:?} waiting for response",
+            process.process_idx,
             timeout
         )),
         Err(RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
-            "worker {} response channel disconnected",
-            worker.worker_id
+            "process {} response channel disconnected",
+            process.process_idx
         )),
     }
 }
@@ -1187,7 +1333,7 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use super::WorkerHandle;
+    use super::WorkerProcessHandle;
 
     fn history_output_path(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -1213,16 +1359,16 @@ mod tests {
             .spawn()
             .expect("failed to spawn placeholder child");
         let stdin = child.stdin.take();
-        let mut handle = WorkerHandle {
+        let mut handle = WorkerProcessHandle {
             child,
             stdin: BufWriter::new(stdin.expect("placeholder child should have stdin")),
             responses: rx,
-            worker_id: 3,
+            process_idx: 3,
         };
 
         let err = recv_response_timeout(&mut handle, Duration::from_millis(10))
             .expect_err("recv_response should time out");
-        assert!(err.to_string().contains("worker 3 timed out"));
+        assert!(err.to_string().contains("process 3 timed out"));
 
         let _ = handle.child.kill();
         let _ = handle.child.wait();
@@ -1263,7 +1409,7 @@ mod tests {
         writer
             .record(&super::HistoryEvent::WorkerSpawned {
                 step: None,
-                worker: 1,
+                process: 1,
                 pid: 4242,
                 reason: "initial_spawn",
                 telemetry,
@@ -1272,7 +1418,8 @@ mod tests {
         writer
             .record(&super::HistoryEvent::OperationFinished {
                 step: 7,
-                worker: 1,
+                process: 1,
+                connection: 3,
                 exec_id: 12,
                 txn_id: Some(5),
                 op: "SimpleSelect { table_name: \"t\", key: \"k\" }".to_string(),
@@ -1295,12 +1442,15 @@ mod tests {
         let worker_spawned: JsonValue =
             serde_json::from_str(lines[0]).expect("parse worker spawned event");
         assert_eq!(worker_spawned["kind"], "worker_spawned");
+        assert_eq!(worker_spawned["process"], 1);
         assert_eq!(worker_spawned["reason"], "initial_spawn");
         assert_eq!(worker_spawned["telemetry"]["reopened_nbackfills"], 3);
 
         let operation_finished: JsonValue =
             serde_json::from_str(lines[1]).expect("parse operation finished event");
         assert_eq!(operation_finished["kind"], "operation_finished");
+        assert_eq!(operation_finished["process"], 1);
+        assert_eq!(operation_finished["connection"], 3);
         assert_eq!(operation_finished["exec_id"], 12);
         assert_eq!(operation_finished["result"]["status"], "err");
         assert_eq!(operation_finished["result"]["error_kind"], "Busy");

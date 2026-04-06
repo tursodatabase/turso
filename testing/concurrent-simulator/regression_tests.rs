@@ -99,15 +99,33 @@ fn create_multiprocess_whopper(max_connections: usize) -> MultiprocessWhopper {
 }
 
 #[cfg(all(unix, target_pointer_width = "64"))]
+fn create_multiprocess_whopper_with_shape(
+    process_count: usize,
+    connections_per_process: usize,
+) -> MultiprocessWhopper {
+    create_multiprocess_whopper_with_shape_and_keep(process_count, connections_per_process, false)
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
 fn create_multiprocess_whopper_with_keep(
     max_connections: usize,
+    keep_files: bool,
+) -> MultiprocessWhopper {
+    create_multiprocess_whopper_with_shape_and_keep(max_connections, 1, keep_files)
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
+fn create_multiprocess_whopper_with_shape_and_keep(
+    process_count: usize,
+    connections_per_process: usize,
     keep_files: bool,
 ) -> MultiprocessWhopper {
     configure_worker_exe();
     MultiprocessWhopper::new(MultiprocessOpts {
         seed: Some(7),
         enable_mvcc: false,
-        max_connections,
+        process_count,
+        connections_per_process,
         max_steps: 0,
         elle_tables: vec![],
         workloads: vec![],
@@ -204,6 +222,27 @@ fn count_test_rows(whopper: &mut MultiprocessWhopper, worker_idx: usize) -> i64 
 }
 
 #[cfg(all(unix, target_pointer_width = "64"))]
+fn truncate_checkpoint_until_stable(whopper: &mut MultiprocessWhopper, connection_idx: usize) {
+    for _ in 0..32 {
+        let result = whopper
+            .execute_sql_direct(connection_idx, "PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("run TRUNCATE checkpoint");
+        match result {
+            Ok(_) => return,
+            Err(
+                LimboError::Busy
+                | LimboError::BusySnapshot
+                | LimboError::SchemaUpdated
+                | LimboError::SchemaConflict
+                | LimboError::TableLocked,
+            ) => continue,
+            Err(err) => panic!("TRUNCATE checkpoint should stabilize: {err}"),
+        }
+    }
+    panic!("TRUNCATE checkpoint did not stabilize after transient multiprocess errors");
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
 fn assert_integrity_check_ok(whopper: &mut MultiprocessWhopper, worker_idx: usize) {
     let rows = whopper
         .execute_sql_direct(worker_idx, "PRAGMA integrity_check")
@@ -220,6 +259,121 @@ fn assert_integrity_check_ok(whopper: &mut MultiprocessWhopper, worker_idx: usiz
         Some("ok"),
         "integrity_check should report ok"
     );
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
+#[test]
+fn multiprocess_same_process_sibling_reader_keeps_shared_snapshot_live_until_last_release() {
+    let mut whopper = create_multiprocess_whopper_with_shape(2, 2);
+
+    for connection_idx in 0..4 {
+        whopper
+            .disable_auto_checkpoint_direct(connection_idx)
+            .expect("disable auto checkpoint");
+    }
+
+    whopper
+        .execute_sql_direct(
+            0,
+            "create table test(id integer primary key, value text not null)",
+        )
+        .expect("create table")
+        .expect("create table should succeed");
+    whopper
+        .execute_sql_direct(2, "insert into test(value) values ('base')")
+        .expect("insert base row")
+        .expect("base insert should succeed");
+
+    let initial_snapshot = whopper
+        .shared_wal_snapshot_direct(0)
+        .expect("read initial shared WAL snapshot")
+        .expect("shared WAL snapshot should exist");
+    assert!(
+        initial_snapshot.max_frame > 0,
+        "shared reader-slot regression requires visible WAL frames before read transactions begin"
+    );
+
+    for connection_idx in [0usize, 1usize] {
+        whopper
+            .execute_sql_direct(connection_idx, "begin")
+            .expect("begin read transaction")
+            .expect("begin should succeed");
+        assert_eq!(
+            count_test_rows(&mut whopper, connection_idx),
+            1,
+            "same-process sibling readers should share the initial snapshot before the second writer commits",
+        );
+    }
+
+    whopper
+        .execute_sql_direct(2, "insert into test(value) values ('new')")
+        .expect("insert new row")
+        .expect("second insert should succeed");
+
+    let post_append_snapshot = whopper
+        .shared_wal_snapshot_direct(2)
+        .expect("read post-append shared WAL snapshot")
+        .expect("shared WAL snapshot should exist after append");
+    assert!(
+        post_append_snapshot.max_frame > initial_snapshot.max_frame,
+        "second writer should advance the authoritative WAL tail"
+    );
+
+    whopper
+        .execute_sql_direct(0, "rollback")
+        .expect("rollback first sibling reader")
+        .expect("rollback should succeed");
+
+    let truncate_while_reader_active = whopper
+        .execute_sql_direct(3, "PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect("attempt TRUNCATE checkpoint while sibling reader is active");
+    match truncate_while_reader_active {
+        Ok(_) => {}
+        Err(
+            LimboError::Busy
+            | LimboError::BusySnapshot
+            | LimboError::SchemaUpdated
+            | LimboError::SchemaConflict
+            | LimboError::TableLocked,
+        ) => {}
+        Err(err) => panic!("unexpected TRUNCATE result while sibling reader is active: {err}"),
+    }
+
+    let snapshot_while_reader_active = whopper
+        .shared_wal_snapshot_direct(3)
+        .expect("read shared WAL snapshot while sibling reader is active")
+        .expect("shared WAL snapshot should exist while sibling reader is active");
+    assert!(
+        snapshot_while_reader_active.max_frame > 0,
+        "one same-process sibling must keep the shared WAL generation live after the other releases",
+    );
+    assert_eq!(
+        count_test_rows(&mut whopper, 1),
+        1,
+        "remaining same-process sibling reader must keep its original snapshot after the other connection rolls back",
+    );
+
+    whopper
+        .execute_sql_direct(1, "rollback")
+        .expect("rollback second sibling reader")
+        .expect("rollback should succeed");
+
+    truncate_checkpoint_until_stable(&mut whopper, 3);
+    let snapshot_after_release = whopper
+        .shared_wal_snapshot_direct(3)
+        .expect("read shared WAL snapshot after both readers release")
+        .expect("shared WAL snapshot should exist after both readers release");
+    assert_eq!(
+        snapshot_after_release.max_frame, 0,
+        "TRUNCATE should only reset the WAL generation after the last same-process sibling reader releases",
+    );
+    assert_eq!(
+        count_test_rows(&mut whopper, 2),
+        2,
+        "writer process should observe both committed rows after the shared reader snapshot is released",
+    );
+
+    whopper.finalize().expect("finalize multiprocess whopper");
 }
 
 #[cfg(all(unix, target_pointer_width = "64"))]
@@ -598,7 +752,8 @@ fn multiprocess_seed_5724542806254236599_restart_then_finalize_preserves_key_684
     let mut whopper = MultiprocessWhopper::new(MultiprocessOpts {
         seed: Some(5724542806254236599),
         enable_mvcc: false,
-        max_connections: 16,
+        process_count: 16,
+        connections_per_process: 1,
         max_steps: 4951,
         elle_tables: vec![],
         workloads: vec![
@@ -717,7 +872,8 @@ fn multiprocess_seed_5724542806254236599_localizes_key_4994_loss() {
     let mut whopper = MultiprocessWhopper::new(MultiprocessOpts {
         seed: Some(5724542806254236599),
         enable_mvcc: false,
-        max_connections: 16,
+        process_count: 16,
+        connections_per_process: 1,
         max_steps: 317,
         elle_tables: vec![],
         workloads: vec![
@@ -814,7 +970,8 @@ fn multiprocess_seed_8849519299024683634_localizes_schema_loss_boundary() {
     let mut whopper = MultiprocessWhopper::new(MultiprocessOpts {
         seed: Some(8849519299024683634),
         enable_mvcc: false,
-        max_connections: 16,
+        process_count: 16,
+        connections_per_process: 1,
         max_steps: 72,
         elle_tables: vec![],
         workloads: vec![
