@@ -82,7 +82,16 @@ pub fn translate_create_index(
     }
 
     let original_idx_name = idx_name;
-    let database_id = resolver.resolve_database_id(&original_idx_name)?;
+    let table_qname = QualifiedName {
+        db_name: None,
+        name: tbl_name.clone(),
+        alias: None,
+    };
+    let database_id = if original_idx_name.db_name.is_some() {
+        resolver.resolve_database_id(&original_idx_name)?
+    } else {
+        resolver.resolve_existing_table_database_id(&table_qname)?
+    };
     let idx_name = normalize_ident(original_idx_name.name.as_str());
     let tbl_name = normalize_ident(tbl_name.as_str());
 
@@ -106,7 +115,7 @@ pub fn translate_create_index(
     };
     program.extend(&opts);
 
-    if crate::is_attached_db(database_id) {
+    if database_id != crate::MAIN_DB_ID {
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }
@@ -899,7 +908,7 @@ pub fn translate_drop_index(
     if_exists: bool,
     program: &mut ProgramBuilder,
 ) -> crate::Result<()> {
-    let database_id = resolver.resolve_database_id(qualified_name)?;
+    let database_id = resolver.resolve_existing_index_database_id(qualified_name)?;
     let idx_name = normalize_ident(qualified_name.name.as_str());
     let opts = ProgramBuilderOpts {
         num_cursors: 5,
@@ -908,7 +917,7 @@ pub fn translate_drop_index(
     };
     program.extend(&opts);
 
-    if crate::is_attached_db(database_id) {
+    if database_id != crate::MAIN_DB_ID {
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }

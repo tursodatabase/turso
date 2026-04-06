@@ -502,7 +502,7 @@ impl Statement {
             .write_databases
             .iter()
             .chain(self.program.prepared.read_databases.iter())
-            .filter(|&&id| crate::is_attached_db(id))
+            .filter(|&&id| id != crate::MAIN_DB_ID)
             .copied()
             .collect();
         for db_id in attached_db_ids {

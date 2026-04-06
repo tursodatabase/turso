@@ -2957,6 +2957,9 @@ pub fn op_transaction_inner(
             "Transaction instruction should not be used in trigger subprograms"
         );
     }
+    if *db == crate::TEMP_DB_ID {
+        program.connection.ensure_temp_database()?;
+    }
     let pager = program.get_pager_from_database_index(db);
     // Get the MvStore for the specific database (main or attached).
     let mv_store = program.connection.mv_store_for_db(*db);
@@ -2971,10 +2974,10 @@ pub fn op_transaction_inner(
 
                 // 1. We try to upgrade current version
                 let current_state = conn.get_tx_state();
-                let is_attached = is_attached_db(*db);
+                let is_secondary_db = *db != crate::MAIN_DB_ID;
                 let (new_transaction_state, updated) = if conn.is_nested_stmt() {
                     (current_state, false)
-                } else if is_attached {
+                } else if is_secondary_db {
                     // For attached databases, don't modify the connection-level
                     // transaction state — it tracks the main database's state.
                     // Attached pager locks are managed independently below.
@@ -3020,7 +3023,7 @@ pub fn op_transaction_inner(
 
                 // 2. Start transaction if needed
                 if let Some(mv_store) = mv_store.as_ref() {
-                    if is_attached {
+                    if is_secondary_db {
                         // Attached databases don't participate in the connection-level
                         // transaction state machine above (phase 1), so the pager read
                         // tx that the main DB path starts on None→Read isn't triggered
@@ -3162,8 +3165,7 @@ pub fn op_transaction_inner(
                     // For attached databases without MVCC, always start read/write
                     // transactions on the attached pager, since the connection-level
                     // transaction state may already be Read/Write from the main database.
-                    let is_attached = is_attached_db(*db);
-                    if is_attached {
+                    if is_secondary_db {
                         // If the pager already holds a read lock (e.g., after
                         // SchemaUpdated reprepare or prior write tx), skip
                         // locks that are already held.
@@ -3195,7 +3197,7 @@ pub fn op_transaction_inner(
                         state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                     }
 
-                    if !is_attached
+                    if !is_secondary_db
                         && updated
                         && matches!(new_transaction_state, TransactionState::Write { .. })
                     {
@@ -3292,7 +3294,7 @@ pub fn op_transaction_inner(
                     if let IOResult::IO(io) = res {
                         return Ok(InsnFunctionStepResult::IO(io));
                     }
-                } else if is_attached_db(*db)
+                } else if *db != crate::MAIN_DB_ID
                     && matches!(tx_mode, TransactionMode::Write)
                     && needs_stmt_journal
                 {
@@ -9912,13 +9914,10 @@ pub fn op_destroy(
             db,
             root,
             former_root_reg,
-            is_temp,
+            is_temp: _,
         },
         insn
     );
-    if *is_temp == 1 {
-        todo!("temp databases not implemented yet.");
-    }
     let mv_store = program.connection.mv_store_for_db(*db);
     if mv_store.is_some() {
         // MVCC only does pager operations in checkpoint
@@ -10074,11 +10073,8 @@ pub fn op_drop_type(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DropType { db, type_name }, insn);
-    if *db > 0 {
-        todo!("temp databases not implemented yet");
-    }
     let conn = program.connection.clone();
-    conn.with_schema_mut(|schema| {
+    conn.with_database_schema_mut(*db, |schema| {
         schema.remove_type(type_name);
         Ok::<(), crate::LimboError>(())
     })?;
@@ -10093,11 +10089,8 @@ pub fn op_add_type(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(AddType { db, sql }, insn);
-    if *db > 0 {
-        todo!("temp databases not implemented yet");
-    }
     let conn = program.connection.clone();
-    conn.with_schema_mut(|schema| schema.add_type_from_sql(sql))?;
+    conn.with_database_schema_mut(*db, |schema| schema.add_type_from_sql(sql))?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -10235,7 +10228,7 @@ pub fn op_parse_schema(
     conn.auto_commit.store(false, Ordering::SeqCst);
 
     // For attached databases, qualify the sqlite_schema table with the database name
-    let schema_table = if is_attached_db(*db) {
+    let schema_table = if *db != crate::MAIN_DB_ID {
         let db_name = conn
             .get_database_name_by_index(*db)
             .unwrap_or_else(|| "main".to_string());
@@ -10255,29 +10248,27 @@ pub fn op_parse_schema(
     // which also acquires the schema / database_schemas write lock, so holding
     // it here would deadlock on the same thread (parking_lot RwLock is not
     // re-entrant).
-    let schema_arc = if is_attached_db(*db) {
-        // Fetch the fallback schema from attached_databases BEFORE acquiring
-        // database_schemas.write() to avoid a nested lock ordering dependency
-        // (database_schemas.write -> attached_databases.read).
-        let fallback_schema = {
+    let schema_arc = if *db != crate::MAIN_DB_ID {
+        let fallback_schema = if *db == crate::TEMP_DB_ID {
+            conn.temp_database
+                .read()
+                .as_ref()
+                .map(|temp_db| temp_db.db.schema.lock().clone())
+                .unwrap_or_else(|| conn.empty_temp_schema())
+        } else {
             let attached_dbs = conn.attached_databases.read();
-            attached_dbs
-                .index_to_data
-                .get(db)
-                .map(|(db_inst, _pager)| db_inst.schema.lock().clone())
-        };
-        let Some(fallback_schema) = fallback_schema else {
-            conn.auto_commit
-                .store(previous_auto_commit, Ordering::SeqCst);
-            return Err(LimboError::InternalError(format!(
-                "stale reference to detached database (index {db})"
-            )));
+            let Some((db_inst, _pager)) = attached_dbs.index_to_data.get(db) else {
+                conn.auto_commit
+                    .store(previous_auto_commit, Ordering::SeqCst);
+                return Err(LimboError::InternalError(format!(
+                    "stale reference to detached database (index {db})"
+                )));
+            };
+            let schema = db_inst.schema.lock().clone();
+            schema
         };
         let mut schemas = conn.database_schemas().write();
-        schemas
-            .entry(*db)
-            .or_insert_with(|| fallback_schema)
-            .clone() // cheap Arc clone; write lock released at end of block
+        schemas.entry(*db).or_insert(fallback_schema).clone() // cheap Arc clone; write lock released at end of block
     } else {
         conn.schema.read().clone()
     };
@@ -10381,7 +10372,7 @@ fn op_parse_schema_step(
                 );
 
                 // Store the modified schema back
-                if is_attached_db(db) {
+                if db != crate::MAIN_DB_ID {
                     conn.database_schemas().write().insert(db, schema_arc);
                 } else {
                     *conn.schema.write() = schema_arc;

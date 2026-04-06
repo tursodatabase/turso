@@ -148,7 +148,7 @@ pub fn translate_analyze(
     // Register a write transaction for the target database so that the
     // epilogue emits a Transaction instruction (which starts the MVCC
     // exclusive transaction required by OpenWrite on sqlite_schema).
-    if crate::is_attached_db(database_id) {
+    if database_id != crate::MAIN_DB_ID {
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }

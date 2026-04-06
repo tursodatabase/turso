@@ -101,8 +101,8 @@ impl InitLoop {
             if !required_tables.contains(&table_index) {
                 continue;
             }
-            // Ensure attached databases have a Transaction instruction for read access
-            if crate::is_attached_db(table.database_id) {
+            // Ensure non-main databases have a Transaction instruction for read access.
+            if table.database_id != crate::MAIN_DB_ID {
                 let schema_cookie = t_ctx
                     .resolver
                     .with_schema(table.database_id, |s| s.schema_version);
