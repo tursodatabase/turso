@@ -4324,15 +4324,15 @@ pub fn op_seek(
         target_pc.is_offset(),
         "op_seek: target_pc should be an offset, is: {target_pc:?}"
     );
+    let is_eq_only = match insn {
+        Insn::SeekGE { eq_only, .. } => *eq_only,
+        Insn::SeekLE { eq_only, .. } => *eq_only,
+        _ => false,
+    };
 
-    if let RecordSource::Unpacked {
-        start_reg,
-        num_regs,
-    } = record_source
-    {
-        for i in 0..num_regs {
-            if state.registers[(start_reg + i) as usize].is_null() {
-                // To jump, we update the program counter directly and tell the engine to Step
+    if is_eq_only {
+        if let RecordSource::Unpacked { start_reg, .. } = record_source {
+            if state.registers[start_reg as usize].is_null() {
                 let offset = match target_pc {
                     crate::vdbe::BranchOffset::Offset(o) => *o,
                     _ => unreachable!("Seek target must be an offset"),
