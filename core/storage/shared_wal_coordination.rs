@@ -1054,7 +1054,7 @@ impl MappedSharedWalCoordination {
     /// cleared shared metadata.
     fn release_owned_locks_on_drop(&mut self) {
         let (writer_lock_held, checkpoint_lock_held, reader_locks) = {
-            let local = self.local_lock_state.get_mut();
+            let mut local = self.local_lock_state.lock();
             let writer_lock_held = local.writer_lock_held;
             let checkpoint_lock_held = local.checkpoint_lock_held;
             let reader_locks = std::mem::take(&mut local.reader_locks);
