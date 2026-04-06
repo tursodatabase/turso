@@ -4320,10 +4320,25 @@ pub fn op_seek(
         ),
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
-    assert!(
+assert!(
         target_pc.is_offset(),
         "op_seek: target_pc should be an offset, is: {target_pc:?}"
     );
+
+    if let RecordSource::Unpacked { start_reg, num_regs } = record_source {
+        for i in 0..num_regs {
+            if state.registers[(start_reg + i) as usize].is_null() {
+                // To jump, we update the program counter directly and tell the engine to Step
+                let offset = match target_pc {
+                    crate::vdbe::BranchOffset::Offset(o) => *o,
+                    _ => unreachable!("Seek target must be an offset"),
+                };
+                state.pc = offset;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
+    }
+
     let op = match insn {
         Insn::SeekGE { eq_only, .. } => SeekOp::GE { eq_only: *eq_only },
         Insn::SeekGT { .. } => SeekOp::GT,
