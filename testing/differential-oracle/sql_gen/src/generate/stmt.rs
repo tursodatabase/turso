@@ -4,8 +4,8 @@ use crate::SqlGen;
 use crate::ast::{
     AlterTableAction, AlterTableActionKind, AlterTableStmt, BinOp, ColumnDefStmt, ConflictClause,
     CreateIndexStmt, CreateTableStmt, CreateTriggerStmt, DeleteStmt, DropIndexStmt, DropTableStmt,
-    DropTriggerStmt, Expr, InsertStmt, Literal, Stmt, TriggerBodyStmtKind, TriggerEvent,
-    TriggerEventKind, TriggerStmt, TriggerTiming, UpdateStmt,
+    DropTriggerStmt, Expr, InsertStmt, Literal, Stmt, TemporaryKeyword, TriggerBodyStmtKind,
+    TriggerEvent, TriggerEventKind, TriggerStmt, TriggerTiming, UpdateStmt,
 };
 use crate::capabilities::Capabilities;
 use crate::context::Context;
@@ -609,8 +609,21 @@ pub fn generate_create_table<C: Capabilities>(
 ) -> Result<Stmt, GenError> {
     let create_table_config = &generator.policy().create_table_config;
 
-    // Generate a unique table name
-    let existing_names = generator.schema().table_names();
+    let attached = &generator.schema().attached_databases;
+    let target_db = {
+        let mut choices: Vec<Option<&str>> = vec![None];
+        choices.push(Some("temp"));
+        for db in attached {
+            if db == "temp" {
+                continue;
+            }
+            choices.push(Some(db.as_str()));
+        }
+        ctx.choose(&choices).copied().flatten()
+    };
+
+    // Generate a unique table name in the target schema.
+    let existing_names = generator.schema().table_names_in_database(target_db);
     let table_name = ctx.gen_unique_name("tbl", &existing_names);
 
     // Generate columns
@@ -694,20 +707,18 @@ pub fn generate_create_table<C: Capabilities>(
         let _ = generate_foreign_key(generator, ctx);
     }
 
-    // Optionally qualify the table name with an attached database.
-    // We use a list of [None, Some("aux"), ...] to give ~50% chance to main.
-    let attached = &generator.schema().attached_databases;
-    let qualified_table_name = if attached.is_empty() {
-        table_name
-    } else {
-        let mut choices: Vec<Option<&str>> = vec![None];
-        for db in attached {
-            choices.push(Some(db.as_str()));
-        }
-        match ctx.choose(&choices).copied().flatten() {
-            Some(db) => format!("{db}.{table_name}"),
-            None => table_name,
-        }
+    let temporary = match target_db {
+        Some("temp") => Some(if ctx.gen_bool() {
+            TemporaryKeyword::Temp
+        } else {
+            TemporaryKeyword::Temporary
+        }),
+        _ => None,
+    };
+    let qualified_table_name = match target_db {
+        Some("temp") => table_name,
+        Some(db) => format!("{db}.{table_name}"),
+        None => table_name,
     };
 
     // Force STRICT when any column has an array type (arrays require STRICT tables).
@@ -728,6 +739,7 @@ pub fn generate_create_table<C: Capabilities>(
         columns,
         if_not_exists: ctx.gen_bool_with_prob(create_table_config.if_not_exists_probability),
         strict,
+        temporary,
     }))
 }
 
@@ -814,7 +826,9 @@ fn generate_alter_table_action<C: Capabilities>(
         )
     })?;
 
-    let existing_table_names = generator.schema().table_names();
+    let existing_table_names = generator
+        .schema()
+        .table_names_in_database(table.database.as_deref());
     let existing_col_names: std::collections::HashSet<String> =
         table.columns.iter().map(|c| c.name.clone()).collect();
 
@@ -874,9 +888,24 @@ pub fn generate_create_index<C: Capabilities>(
         .clone();
 
     // Generate unique index name
-    let existing_names = generator.schema().index_names();
+    let existing_names = generator
+        .schema()
+        .index_names_in_database(table.database.as_deref());
     let prefix = format!("idx_{}", table.name);
     let index_name = ctx.gen_unique_name(&prefix, &existing_names);
+    let temporary = match table.database.as_deref() {
+        Some("temp") => Some(if ctx.gen_bool() {
+            TemporaryKeyword::Temp
+        } else {
+            TemporaryKeyword::Temporary
+        }),
+        _ => None,
+    };
+    let qualified_index_name = match table.database.as_deref() {
+        Some("temp") => index_name,
+        Some(db) => format!("{db}.{index_name}"),
+        None => index_name,
+    };
 
     // Select columns for the index
     let max_cols = table.columns.len().min(create_index_config.max_columns);
@@ -900,11 +929,12 @@ pub fn generate_create_index<C: Capabilities>(
     }
 
     Ok(Stmt::CreateIndex(CreateIndexStmt {
-        name: index_name,
-        table: table.qualified_name(),
+        name: qualified_index_name,
+        table: table.unqualified_name().to_string(),
         columns,
         unique: ctx.gen_bool_with_prob(create_index_config.unique_probability),
         if_not_exists: ctx.gen_bool_with_prob(create_index_config.if_not_exists_probability),
+        temporary,
     }))
 }
 
@@ -918,7 +948,7 @@ pub fn generate_drop_index<C: Capabilities>(
 
     // Try to use an existing index, or generate a plausible name
     let index_name = if let Some(index) = ctx.choose(&generator.schema().indexes) {
-        index.name.clone()
+        index.qualified_name()
     } else {
         format!("idx_{}", ctx.gen_range(ident_config.name_suffix_range))
     };

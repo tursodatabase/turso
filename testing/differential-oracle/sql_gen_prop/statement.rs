@@ -290,7 +290,7 @@ impl SqlGeneratorKind for StatementKind {
                 .boxed(),
             StatementKind::DropIndex => {
                 let index_names: Vec<String> =
-                    schema.indexes.iter().map(|i| i.name.clone()).collect();
+                    schema.indexes.iter().map(|i| i.qualified_name()).collect();
                 (proptest::sample::select(index_names), any::<bool>())
                     .prop_map(|(name, if_exists)| {
                         SqlStatement::DropIndex(DropIndexStatement {

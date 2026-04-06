@@ -518,6 +518,25 @@ impl Fuzzer {
             );
         }
 
+        let turso_indexes: std::collections::HashSet<_> = turso_schema
+            .indexes
+            .iter()
+            .map(|i| i.qualified_name())
+            .collect();
+        let sqlite_indexes: std::collections::HashSet<_> = sqlite_schema
+            .indexes
+            .iter()
+            .map(|i| i.qualified_name())
+            .collect();
+
+        if turso_indexes != sqlite_indexes {
+            bail!(
+                "Index mismatch: Turso has {:?}, SQLite has {:?}",
+                turso_indexes,
+                sqlite_indexes
+            );
+        }
+
         // Verify each table's columns and strict flags match
         for turso_table in turso_schema.tables.iter() {
             let sqlite_table = sqlite_schema
@@ -544,6 +563,41 @@ impl Fuzzer {
                     turso_table.qualified_name(),
                     turso_cols,
                     sqlite_cols
+                );
+            }
+        }
+
+        for turso_index in turso_schema.indexes.iter() {
+            let sqlite_index = sqlite_schema
+                .indexes
+                .iter()
+                .find(|i| i.name == turso_index.name && i.database == turso_index.database)
+                .expect("Index should exist in SQLite schema");
+
+            if turso_index.table_name != sqlite_index.table_name {
+                bail!(
+                    "Index target mismatch for '{}': Turso targets '{}', SQLite targets '{}'",
+                    turso_index.qualified_name(),
+                    turso_index.table_name,
+                    sqlite_index.table_name
+                );
+            }
+
+            if turso_index.unique != sqlite_index.unique {
+                bail!(
+                    "UNIQUE mismatch for index '{}': Turso unique={}, SQLite unique={}",
+                    turso_index.qualified_name(),
+                    turso_index.unique,
+                    sqlite_index.unique
+                );
+            }
+
+            if turso_index.columns != sqlite_index.columns {
+                bail!(
+                    "Index column mismatch for '{}': Turso has {:?}, SQLite has {:?}",
+                    turso_index.qualified_name(),
+                    turso_index.columns,
+                    sqlite_index.columns
                 );
             }
         }
