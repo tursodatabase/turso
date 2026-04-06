@@ -93,23 +93,45 @@ pub fn translate_create_trigger(
     commands: &[ast::TriggerCmd],
     when_clause: Option<&ast::Expr>,
 ) -> Result<()> {
-    let database_id = resolver.resolve_database_id(&trigger_name)?;
+    let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
+    let normalized_table_name = normalize_ident(tbl_name.name.as_str());
+    let database_id = resolve_create_trigger_database_id(resolver, &trigger_name, &tbl_name)?;
+    let target_table_database_id = if tbl_name.db_name.is_some() {
+        resolver.resolve_database_id(&tbl_name)?
+    } else {
+        database_id
+    };
+    if target_table_database_id != database_id {
+        let table_db_name = tbl_name
+            .db_name
+            .as_ref()
+            .map(|db_name| db_name.as_str().to_string())
+            .or_else(|| resolver.get_database_name_by_index(target_table_database_id))
+            .unwrap_or_else(|| "main".to_string());
+        bail_parse_error!(
+            "trigger {} cannot reference objects in database {}",
+            normalized_trigger_name,
+            table_db_name
+        );
+    }
+
     if crate::is_attached_db(database_id) {
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }
     program.begin_write_operation();
-    let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
-    let normalized_table_name = normalize_ident(tbl_name.name.as_str());
 
-    // Validate that trigger body does not reference other databases.
-    validate_trigger_no_cross_db_refs(
-        resolver,
-        database_id,
-        &normalized_trigger_name,
-        commands,
-        when_clause,
-    )?;
+    // Temp-backed triggers follow SQLite's looser name-resolution rules and may
+    // access objects across schemas. Ordinary triggers stay schema-local.
+    if database_id != crate::TEMP_DB_ID {
+        validate_trigger_no_cross_db_refs(
+            resolver,
+            database_id,
+            &normalized_trigger_name,
+            commands,
+            when_clause,
+        )?;
+    }
 
     if crate::schema::is_system_table(&normalized_table_name) {
         bail_parse_error!("cannot create trigger on system table");
@@ -193,6 +215,23 @@ pub fn translate_create_trigger(
     });
 
     Ok(())
+}
+
+fn resolve_create_trigger_database_id(
+    resolver: &Resolver,
+    trigger_name: &QualifiedName,
+    tbl_name: &QualifiedName,
+) -> Result<usize> {
+    if trigger_name.db_name.is_some() {
+        return resolver.resolve_database_id(trigger_name);
+    }
+
+    // Unqualified trigger names default to main, except when the trigger is
+    // attached to a temp object. SQLite stores those triggers in temp.
+    match resolver.resolve_existing_table_database_id(tbl_name)? {
+        crate::TEMP_DB_ID => Ok(crate::TEMP_DB_ID),
+        _ => Ok(crate::MAIN_DB_ID),
+    }
 }
 
 /// Validate that no table or expression reference in a trigger body points to a
